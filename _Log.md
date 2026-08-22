@@ -103636,3 +103636,29 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/dataplane/userspace/heartbeat_slots_narrowing_5718_test.go`,
   `pkg/dataplane/userspace/worker_count_single_source_5718_test.go`,
   `docs/config-schema.md`
+
+## 2026-08-22 — #6711 a backward clock step no longer destroys the boot epoch
+- **Action**: A single backward wall-clock step larger than `bootEpochMaxSkew`,
+  with persisted state intact, regressed the sender boot epoch AND durably
+  overwrote the higher persisted value with the lower one, so the peer refused
+  the node and every later boot re-published from the same bad clock — the
+  lockout outlived every restart. `refineBootEpoch` now SEPARATES "this value is
+  garbage" from "this value could be an intact predecessor our clock stepped
+  back behind": inside the new `bootEpochPreserveMaxSkew` (30 days) it still
+  declines to chain — chaining across a large step is the unrecoverable
+  direction — but no longer overwrites, so correcting the clock and restarting
+  chains from the preserved value and clears the peer's floor at once. Outside
+  the band (zero, year-2200+, unparseable) the file is still healed, so #6669's
+  self-healing property is intact. The published epoch is unchanged in every
+  case: nothing about what this node puts on the wire moves.
+  `TestArchivedEpochPoisonsAFreshFloor_6711` and the `6169`
+  `value_beyond_the_forward_bound` subtest both carried explicit notes saying
+  they pinned today's behaviour and were to be rewritten by a real #6711 fix;
+  both are rewritten against the new semantics, with a recovery leg added rather
+  than deleted. The three documentation sites #6711 cites were already corrected
+  in the tree; the remaining overwrite claims are updated here.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_admit.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
+  pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go

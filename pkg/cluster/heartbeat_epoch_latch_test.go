@@ -941,10 +941,22 @@ func senderIncarnationAt(t *testing.T, path string, clock int64) (published, per
 // re-injection per restart, exactly as residual 5 defeats the restart recovery
 // for the LATCH.
 //
-// THIS PINS TODAY'S BEHAVIOUR, NOT THE DESIRED BEHAVIOUR. A real #6711 fix
-// changes it, and this test is then expected to fail and be rewritten against
-// the new semantics — deliberately, so the change is visible rather than
-// silent. It is NOT a safety property to preserve.
+// REWRITTEN AGAINST THE #6711 FIX. The header used to end: "THIS PINS TODAY'S
+// BEHAVIOUR, NOT THE DESIRED BEHAVIOUR. A real #6711 fix changes it, and this
+// test is then expected to fail and be rewritten against the new semantics —
+// deliberately, so the change is visible rather than silent." That fix has now
+// landed, and this is that rewrite rather than a deletion, because everything
+// the sequence pinned EXCEPT the overwrite is still true and still worth
+// guarding.
+//
+// What changed: incarnation B no longer DESTROYS the intact predecessor. It
+// still declines to chain from it (chaining across a step that large is the
+// unrecoverable direction), so B still publishes the lower value and is still
+// refused — the lockout while the clock is wrong is unchanged, and the archived-
+// frame poisoning below is untouched. What the preserved file buys is the exit:
+// the leg at the end shows a restart AFTER the clock is corrected chaining back
+// above the floor immediately, which before the fix was impossible because the
+// value it needed had been overwritten.
 func TestArchivedEpochPoisonsAFreshFloor_6711(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 
@@ -966,15 +978,22 @@ func TestArchivedEpochPoisonsAFreshFloor_6711(t *testing.T) {
 	}
 
 	// --- SENDER 2: incarnation B starts 2h behind with the file INTACT.
-	// It declines to chain from the correct T, publishes the LOWER value, and
-	// durably overwrites the intact higher one. That overwrite is what makes
-	// the regression survive a sender restart.
+	// It declines to chain from the correct T and publishes the LOWER value —
+	// unchanged by the #6711 fix, because chaining across a step that large
+	// would strand this node ABOVE the range its peer accepts, which is the
+	// unrecoverable direction.
+	//
+	// What the fix changes is the file: the intact higher value is PRESERVED,
+	// not overwritten. Before the fix the overwrite is what made the regression
+	// survive a sender restart even after the clock was corrected.
 	epochB, fileB := senderIncarnationAt(t, path, back)
 	if epochB != uint64(back) {
 		t.Fatalf("B: published=%d, want %d — refinement must decline to chain from the intact T", epochB, back)
 	}
-	if fileB != uint64(back) {
-		t.Fatalf("B: persisted=%d, want %d — the intact higher value must have been overwritten", fileB, back)
+	if fileB != uint64(tNow) {
+		t.Fatalf("B: persisted=%d, want the PRESERVED intact value %d — overwriting it with the "+
+			"stepped-back seed is what makes a single backward clock step outlive every restart (#6711)",
+			fileB, tNow)
 	}
 
 	// --- SENDER 3: restarting B while the clock is still wrong does NOT recover.
@@ -1030,6 +1049,35 @@ func TestArchivedEpochPoisonsAFreshFloor_6711(t *testing.T) {
 	if admitted := feedCount(e, e.captureIncarnation(0xB714, epochB2, epochFramesPerIncarnation)); admitted != 0 {
 		t.Fatalf("live peer after receiver restart + re-injection: %d/%d admitted, want 0 — "+
 			"the restart escape must be defeated", admitted, epochFramesPerIncarnation)
+	}
+
+	// --- THE EXIT THE #6711 FIX BUYS: correct the clock and restart the sender.
+	// The preserved predecessor is still on disk, so refinement chains from it
+	// and publishes STRICTLY ABOVE the poisoned floor — admitted on the raise
+	// path, which rebinds the floor to the live incarnation.
+	//
+	// Before the fix this leg was impossible: incarnation B had overwritten the
+	// file with the stepped-back value, so a corrected-clock restart published
+	// only its own wall clock, which sits AT the floor rather than above it, and
+	// the equality door is finite (heartbeatEpochSessionsPerEpoch, no refill).
+	epochC, fileC := senderIncarnationAt(t, path, tNow+int64(time.Second))
+	if epochC <= uint64(tNow) {
+		t.Fatalf("after the clock was corrected the sender published %d, which does not clear the "+
+			"poisoned floor %d; recovery depends on chaining from the preserved predecessor (#6711)",
+			epochC, tNow)
+	}
+	if fileC <= uint64(tNow) {
+		t.Fatalf("the corrected incarnation persisted %d, want a value above %d so the NEXT restart "+
+			"keeps climbing", fileC, tNow)
+	}
+	e.restartDaemon()
+	if !e.feed(archived[2]) {
+		t.Fatal("the archived frame was refused after the receiver restart")
+	}
+	if admitted := feedCount(e, e.captureIncarnation(0xB715, epochC, epochFramesPerIncarnation)); admitted == 0 {
+		t.Fatalf("the corrected sender (epoch %d) was refused against the archived floor %d even "+
+			"though it is strictly above it — the raise path is the documented exit and must work",
+			epochC, tNow)
 	}
 }
 

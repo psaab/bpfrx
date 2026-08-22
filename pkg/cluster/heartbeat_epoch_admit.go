@@ -61,7 +61,8 @@ package cluster
 //     It rises above the LIVE peer whenever the peer's own epoch has REGRESSED
 //     since the archived frame was signed (#6711: a backward clock step larger
 //     than bootEpochMaxSkew makes refineBootEpoch decline the intact persisted
-//     value and durably overwrite it with the lower one). One archived frame
+//     value; since #6711 it no longer overwrites it, so correcting the clock
+//     recovers, but the regression itself is unchanged). One archived frame
 //     then locks the live peer out, and because the archived frame re-raises a
 //     CLEARED floor exactly as it re-arms a cleared latch, a receiver restart
 //     does not recover while it is being replayed. Measured in
@@ -153,7 +154,8 @@ package cluster
 //     It rises above the LIVE peer whenever the peer's own epoch has REGRESSED
 //     since the archived frame was signed (#6711: a backward clock step larger
 //     than bootEpochMaxSkew makes refineBootEpoch decline the intact persisted
-//     value and durably overwrite it with the lower one). One archived frame
+//     value; since #6711 it no longer overwrites it, so correcting the clock
+//     recovers, but the regression itself is unchanged). One archived frame
 //     then locks the live peer out, and because the archived frame re-raises a
 //     CLEARED floor exactly as it re-arms a cleared latch, a receiver restart
 //     does not recover while it is being replayed. Measured in

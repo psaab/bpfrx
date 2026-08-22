@@ -44,8 +44,11 @@ import (
 //     is max(persisted+1, wall clock), and the persisted term is BOUNDED: a
 //     value more than bootEpochMaxSkew ahead of `now` is not chained from (see
 //     refineBootEpoch). A backward clock step larger than that bound regresses
-//     this node's epoch even with the file perfectly intact, and refinement then
-//     overwrites the file with the lower value. #6711; README residuals 3 and 5.
+//     this node's epoch even with the file perfectly intact. Since #6711 the
+//     file is PRESERVED rather than overwritten when the persisted value could
+//     be an intact predecessor (bootEpochPreserveMaxSkew), so the regression
+//     lasts only until the clock is corrected instead of outliving every
+//     restart. README residuals 3 and 5.
 //   - The floor is a HIGH-WATER MARK, not a statement about which incarnation is
 //     live. Once a sender has regressed, the highest epoch on the wire is a
 //     RETIRED incarnation's, so an archived frame from it is admitted — it
@@ -173,6 +176,26 @@ const (
 	// floor outright) — never the passage of time alone.
 	// Pinned by TestRunningSenderDoesNotRecoverByWaiting_6669.
 	bootEpochMaxSkew uint64 = 60 * 60 * 1_000_000_000
+
+	// bootEpochPreserveMaxSkew is how far ahead of our own clock a persisted
+	// epoch may be and still be treated as POSSIBLY an intact predecessor
+	// rather than garbage (#6711). Inside this band refineBootEpoch declines to
+	// chain from it — unchanged — but also declines to OVERWRITE it, so a
+	// backward clock step cannot destroy the value that keeps this node
+	// acceptable to its peer.
+	//
+	// It is deliberately much larger than bootEpochMaxSkew and much smaller
+	// than the absolute plausibility band. bootEpochMaxSkew (one hour) answers
+	// "how far ahead may a value be and still be CHAINED FROM", which has to
+	// stay tight because chaining is what strands a node above its peer's
+	// range. This one answers a different question — "could a real backward
+	// clock step explain this value" — and the events that produce one are a VM
+	// restored from an old snapshot, a timezone or DST error, a manual `date`,
+	// or an NTP correction after a long unsynchronised run. Thirty days covers
+	// those with room to spare while remaining ~2000x short of the year-2200
+	// absolute bound, so a genuinely corrupt far-future value is still healed
+	// rather than preserved forever.
+	bootEpochPreserveMaxSkew uint64 = 30 * 24 * 60 * 60 * 1_000_000_000
 
 	// epochClockSaneFloor is 2020-01-01T00:00:00Z in nanoseconds: the point
 	// below which the LOCAL clock is obviously unset rather than merely wrong.
@@ -689,9 +712,16 @@ func bootEpochSeed() uint64 {
 // stepped backwards"). Storage failure is one way in; a SINGLE backward clock
 // step larger than bootEpochMaxSkew is another, with the file perfectly intact
 // and every write succeeding, because refineBootEpoch declines to chain from a
-// persisted value that far ahead of `now` — and then durably overwrites it with
-// the lower one, so a sender restart does not recover while the wrong clock
-// still reads below the peer's floor. That is #6711; README residual 3.
+// persisted value that far ahead of `now`. A sender restart does not recover
+// while the wrong clock still reads below the peer's floor. That is #6711;
+// README residual 3.
+//
+// The #6711 fix narrows it to exactly that window. Refinement no longer
+// OVERWRITES a persisted value that could be an intact predecessor
+// (bootEpochPreserveMaxSkew), so correcting the clock and restarting chains from
+// it and clears the floor at once. Before the fix the value that recovery needed
+// had already been destroyed, and the node stayed refused until wall time
+// climbed back past the old floor on its own.
 func (m *Manager) heartbeatBootEpoch() uint64 {
 	if m == nil {
 		return 0
@@ -1166,6 +1196,44 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 			// now+bootEpochMaxSkew likewise publishes one nanosecond past the
 			// bound. Not overflow — ordering. n+1 cannot overflow here: the
 			// first disjunct short-circuits unless n < epochPlausibleMax.
+			// #6711: SEPARATE "this value is garbage" from "this value could be
+			// an intact predecessor that OUR clock has stepped back behind".
+			// Both fail epochOrderable, and the old code treated them
+			// identically — declining to chain AND then durably overwriting the
+			// file with this incarnation's lower wall-clock seed. That
+			// overwrite is what turns a single backward clock step into a
+			// lockout that SURVIVES RESTARTS: the good predecessor is gone, so
+			// every later boot re-publishes from the same bad clock instead of
+			// chaining back above the peer's floor. #6711 reproduced exactly
+			// that, with the file perfectly intact.
+			//
+			// Preserving costs nothing when the value really was written by a
+			// clock running ahead: this node still declines to chain and still
+			// publishes the same wall-clock seed, bit-identically to before.
+			// The ONLY thing that changes is that the file is left alone, so a
+			// later boot with a corrected clock can chain from it again.
+			//
+			// The band has to be bounded, and epochUsableAsFloor is far too wide
+			// for it — that predicate admits anything before year 2200, so it
+			// would preserve a year-2191 value no clock ever produced.
+			// bootEpochPreserveMaxSkew is the "could a real backward step
+			// explain this" window instead: a VM restored from an old snapshot,
+			// a timezone or DST error, a manual `date`, an NTP correction. A
+			// value beyond it is garbage and still gets healed.
+			//
+			// This is the same reasoning the read-error branch below already
+			// applies — "overwriting unknown state is not a safe way to fail".
+			// This branch is unknown state too; it only looked decided because
+			// the bytes parsed.
+			case (!epochOrderable(n, now) || !epochOrderable(n+1, now)) &&
+				epochUsableAsFloor(n) && epochUsableAsFloor(n+1) &&
+				n <= uint64(now)+bootEpochPreserveMaxSkew:
+				slog.Warn("cluster: HA boot-epoch state is ahead of this node's clock by more than "+
+					"the chaining bound; keeping the wall-clock epoch and PRESERVING the persisted "+
+					"value — it may be an intact predecessor this node's clock has stepped back "+
+					"behind, and overwriting it would make the lockout survive restarts (#6711)",
+					"path", path, "value", n, "now", now)
+				return
 			case !epochOrderable(n, now) || !epochOrderable(n+1, now):
 				// Corrupt, hand-edited, or written while this node's clock ran
 				// ahead. Chaining from it would push this node toward MaxUint64,
