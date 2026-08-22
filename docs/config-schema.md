@@ -6689,7 +6689,13 @@ reserved for whole-dataplane selection where a rewrite shim
   `source-address` (`ValueIPAddress`). `source-interface` uses
   `ValidateSyslogSourceInterface`, which rejects a non-numeric `.<unit>`
   suffix (`resolveSourceAddr` silently `Atoi`-fell-back to unit 0, binding the
-  wrong source IP). The enum value sets live in `schema_security.go`
+  wrong source IP) AND, since #6218 item 7, a `.<unit>` above `MaxLogicalUnit`
+  (16385) — e.g. `ge-0-0-0.50000` — which previously committed even though no
+  real interface unit can exceed that ceiling (`compiler_interfaces.go` caps a
+  real `unit <n>` there), so the reference could never resolve and
+  `ResolveSyslogSourceAddr` silently returned "" (the same audit-source-IP
+  loss the non-numeric case closes, reached via an out-of-range unit instead
+  of a typo'd one). The enum value sets live in `schema_security.go`
   (`syslogLogModes`/`syslogLogFormats`/`syslogSeverities`/`syslogFacilities`/
   `syslogCategories`) and MUST stay in sync with those `pkg/logging` parsers —
   a value the validator allows but the runtime does not recognize would

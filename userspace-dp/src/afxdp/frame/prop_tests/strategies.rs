@@ -770,6 +770,12 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
             3 => Just(0x10u8),        // ACK
             2 => Just(0x18u8),        // PSH|ACK
             1 => Just(0x10u8 | 0x40), // ECE|ACK — exotic but legal
+            // #5191: CWR and URG are the flags software segmentation must not
+            // clone verbatim. Before #5191 the generator sampled neither, so
+            // the S4 flag expectation varied an axis it never actually
+            // exercised — a fixture that could only ever agree with the code.
+            1 => Just(0x10u8 | 0x80), // CWR|ACK
+            1 => Just(0x10u8 | 0x20), // URG|ACK
         ],
         prop_oneof![
             4 => any::<u32>(),

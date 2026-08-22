@@ -184,6 +184,10 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	}
 	m.cfg = cfg
 	m.proc = cmd
+	// #5838: one waiter per generation, started here and nowhere else. Until
+	// this existed a helper that died AFTER reporting ready was never reaped,
+	// never noticed, and left every `m.proc == nil` liveness test reading TRUE.
+	m.startHelperSupervisorLocked(cmd)
 	// Bootstrap XSK fill ring on all queues: send broadcast pings
 	// 3 seconds after helper start. During this window, ctrl is disabled;
 	// the shim only passes proven local/control traffic and drops transit.
@@ -211,8 +215,25 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 				return nil
 			}
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			break
+		// #5838: ask the generation's WAITER whether the child is gone, not
+		// cmd.ProcessState. ProcessState is written by cmd.Wait(), which now
+		// runs on the supervisor goroutine, so reading it here would be a data
+		// race — and before a waiter existed it was simply always nil, which is
+		// why this early-out could never fire. The closed channel is the
+		// race-free happens-before edge for the same question.
+		if m.procSup != nil {
+			select {
+			case <-m.procSup.exited:
+				// Read the disposition BEFORE the teardown: stopLocked clears
+				// procSup, so reporting it afterwards would dereference nil.
+				disposition := m.procSup.describeExit()
+				slog.Error("userspace dataplane helper exited before becoming ready",
+					"disposition", disposition)
+				m.stopLocked()
+				return fmt.Errorf("userspace dataplane helper exited before becoming ready at %s: %s",
+					cfg.ControlSocket, disposition)
+			default:
+			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -309,11 +330,14 @@ func (m *Manager) stopLocked() {
 	// before the helper shutdown below (#5486).
 	_ = m.disableCtrlBeforeTeardownLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
-	done := make(chan struct{})
-	go func(cmd *exec.Cmd) {
-		_ = cmd.Wait()
-		close(done)
-	}(m.proc)
+	// The waiter started at spawn owns this child's Wait. Waiting on ITS
+	// completion — rather than launching a second cmd.Wait() here, which is
+	// what this code used to do — is what makes "exactly one Wait per
+	// generation" true; two waiters race and one of them gets ECHILD.
+	//
+	// Blocking on it while holding m.mu is safe because superviseHelper closes
+	// exited BEFORE it acquires m.mu.
+	done := m.helperExitedChanLocked()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -330,6 +354,45 @@ func (m *Manager) stopLocked() {
 		}
 	}
 	m.proc = nil
+	m.procSup = nil
+	m.resetAfterHelperGoneLocked()
+}
+
+// helperExitedChanLocked returns the channel the current generation's waiter
+// closes when the child is reaped. A generation with no supervisor record
+// cannot happen for a running helper (startHelperSupervisorLocked runs under
+// the same lock as the m.proc assignment), but returning an already-closed
+// channel keeps a teardown from blocking forever if it ever did.
+func (m *Manager) helperExitedChanLocked() chan struct{} {
+	if m.procSup != nil {
+		return m.procSup.exited
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// resetAfterHelperGoneLocked clears every piece of manager state that describes
+// a helper which is no longer running.
+//
+// It is shared by the intentional teardown (stopLocked) and the crash path
+// (handleUnexpectedHelperExitLocked) precisely so the two cannot drift about
+// WHICH state a departed helper invalidates. A crash that cleared less than a
+// stop would leave exactly the stale readiness the issue is about; before this
+// existed the crash path cleared nothing at all.
+func (m *Manager) resetAfterHelperGoneLocked() {
+	if m.eventStreamCancel != nil {
+		m.eventStreamCancel()
+		m.eventStreamCancel = nil
+	}
+	if m.eventStream != nil {
+		m.eventStream.Close()
+		m.eventStream = nil
+	}
+	if m.syncCancel != nil {
+		m.syncCancel()
+		m.syncCancel = nil
+	}
 	m.clearLastStatusLocked()
 	m.neighborsPrewarmed = false
 	m.ctrlEnableAt = time.Time{}

@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -65,7 +66,9 @@ type pciNIC struct {
 // interfaces in that set (Codex H1 — prevents ethtool from reshaping
 // sibling mlx5 PFs or non-userspace-dp netdevs).
 func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers int, rssEnabled bool, rssAllowedInterfaces []string) error {
-	nics, err := enumeratePCINICs()
+	// #5842: through the injectable seam (shared with the device-map path) so
+	// the positional error channel is testable end to end, not only per-helper.
+	nics, err := enumeratePCINICsFn()
 	if err != nil {
 		return fmt.Errorf("enumerate NICs: %w", err)
 	}
@@ -85,17 +88,25 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers
 	// changes the positional index→name map) from corrupting the .link
 	// OriginalName= chain or EEXIST-stranding a rename — the discipline
 	// device-map mode already had and positional mode previously lacked.
-	changed := renamePositional(nics, fpc, clusterMode, renameInterface)
+	changed, nameErrs := renamePositional(nics, fpc, clusterMode, renameInterfaceFn)
 
 	// Ensure fxp0 has a bootstrap DHCP .network file (needed before
 	// the daemon writes its own networkd configs).
-	if wrote := writeBootstrapFxp0Network(); wrote {
+	wrote, err := writeBootstrapFxp0Network()
+	if err != nil {
+		nameErrs = append(nameErrs, err)
+	}
+	if wrote {
 		changed = true
 	}
 
 	if changed {
-		if err := networkctlReload(); err != nil {
+		if err := networkctlReloadFn(); err != nil {
 			slog.Warn("linksetup: networkctl reload failed", "err", err)
+			// #5842: a reload failure means the .link set on disk is correct
+			// and the RUNNING names are not — precisely the state a caller
+			// must not mistake for convergence.
+			nameErrs = append(nameErrs, fmt.Errorf("networkctl reload: %w", err))
 		}
 		slog.Info("linksetup: interface naming updated")
 	} else {
@@ -110,6 +121,21 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers
 	// userspace-dp binding plan (Codex H1) so we never touch sibling
 	// mlx5 PFs that xpf is not driving.
 	applyRSSIndirection(rssEnabled, userspaceWorkers, rssAllowedInterfaces, realRSSExecutor{})
+
+	// #5842: surface any rename / .link-write / reload failure, mirroring the
+	// device-map path (#4956). This is what stops maybeReapplyConfigArrivalNaming
+	// from consuming its one-shot emptyHANamingPending marker on a boot where
+	// naming did NOT converge: positional mode always returned nil, so a
+	// config-less HA node whose renames all failed burned its single retry and
+	// stayed on standalone names until a restart.
+	//
+	// RSS indirection runs first and unconditionally: it is best-effort tuning
+	// keyed on interface names that either did or did not change, and skipping
+	// it on a naming error would turn a naming fault into a throughput fault.
+	if len(nameErrs) > 0 {
+		return fmt.Errorf("linksetup: %d interface rename/write/reload step(s) failed: %w",
+			len(nameErrs), errors.Join(nameErrs...))
+	}
 	return nil
 }
 
@@ -228,7 +254,7 @@ func assignName(idx, fpc int, clusterMode bool) string {
 // final name. renameFn is injected so production passes renameInterface and
 // tests can model EEXIST semantics. Returns true if any .link changed or any
 // rename ran.
-func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(from, to string) error) bool {
+func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(from, to string) error) (bool, []error) {
 	// Phase 0: snapshot targets and capture EVERY OriginalName up-front, from
 	// the .link set as it exists BEFORE this pass writes anything. This is the
 	// core of the #4178 fix: the previous single-pass loop wrote .link file idx
@@ -255,18 +281,29 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 
 	// Phase 2: write each .link with its pre-captured OriginalName and rename
 	// to the final name. Collisions are already broken, so no EEXIST here.
+	//
+	// #5842: errs accumulates every failure so the pass still COMPLETES —
+	// abandoning it midway would leave the NIC set half-renamed, which is
+	// worse than finishing and reporting — while the caller learns naming did
+	// not converge. Mirrors the device-map path's renameErrs (#4956).
+	var errs []error
 	for current, final := range desiredByCurrent {
 		original := originalByCurrent[current]
 		if original == "" {
 			original = recoverOriginalName(current)
 		}
-		if writeLinkFile(final, original) {
+		wrote, err := writeLinkFile(final, original)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if wrote {
 			changed = true
 		}
 		if current != final {
 			if err := renameFn(current, final); err != nil {
 				slog.Warn("linksetup: rename failed",
 					"from", current, "to", final, "err", err)
+				errs = append(errs, fmt.Errorf("rename %s->%s: %w", current, final, err))
 			} else {
 				slog.Info("linksetup: renamed interface",
 					"from", current, "to", final)
@@ -274,7 +311,7 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 			}
 		}
 	}
-	return changed
+	return changed, errs
 }
 
 // breakNameCollisions is the shared phase-1 collision break used by BOTH the
@@ -403,8 +440,17 @@ func containsLine(text, s string) bool {
 }
 
 // writeLinkFile writes a systemd .link file for the given target name.
-// Returns true if the file was created or changed.
-func writeLinkFile(target, originalName string) bool {
+// Returns (changed, err): changed is true when the file was created or
+// rewritten, err is non-nil when the write failed.
+//
+// #5842: the two were one `bool` before, and `false` meant BOTH "already
+// correct, nothing to do" and "the write failed" — opposite facts under one
+// value. A caller could not distinguish a converged boot from one where the
+// .link set never landed, so a failed write left the NIC un-renamed on the
+// next boot with the only trace a WARN nobody polls. The rename path is the
+// one that matters: a .link that did not land is a NIC that comes up with its
+// kernel name and no zone.
+func writeLinkFile(target, originalName string) (bool, error) {
 	path := filepath.Join(linkDir, linkPrefix+target+".link")
 	content := fmt.Sprintf(`# Managed by xpfd — do not edit
 [Match]
@@ -415,7 +461,7 @@ Name=%s`, originalName, target)
 
 	existing, err := os.ReadFile(path)
 	if err == nil && string(existing) == content {
-		return false // unchanged
+		return false, nil // unchanged
 	}
 
 	// AtomicGeneratedConfig: regenerated at daemon start; a torn file is
@@ -423,20 +469,22 @@ Name=%s`, originalName, target)
 	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("linksetup: failed to write .link file",
 			"path", path, "err", err)
-		return false
+		return false, fmt.Errorf("write .link %s: %w", path, err)
 	}
 	slog.Info("linksetup: wrote .link file",
 		"original", originalName, "target", target)
-	return true
+	return true, nil
 }
 
 // writeBootstrapFxp0Network writes a bootstrap DHCP .network file for fxp0
 // if one doesn't already exist (needed during provisioning before the daemon
-// writes its own networkd configs).
-func writeBootstrapFxp0Network() bool {
+// writes its own networkd configs). Returns (changed, err) for the same #5842
+// reason as writeLinkFile — a missing bootstrap DHCP file on the management
+// NIC is the difference between a reachable box and a console-only one.
+func writeBootstrapFxp0Network() (bool, error) {
 	path := filepath.Join(linkDir, linkPrefix+"fxp0.network")
 	if _, err := os.Stat(path); err == nil {
-		return false // already exists
+		return false, nil // already exists
 	}
 
 	content := `# Managed by xpfd — bootstrap DHCP for provisioning
@@ -455,10 +503,10 @@ UseRoutes=yes`
 	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("linksetup: failed to write fxp0 .network file",
 			"path", path, "err", err)
-		return false
+		return false, fmt.Errorf("write fxp0 .network %s: %w", path, err)
 	}
 	slog.Info("linksetup: created fxp0 DHCP .network file")
-	return true
+	return true, nil
 }
 
 // renameInterface brings the interface down, renames it, and brings it back up.

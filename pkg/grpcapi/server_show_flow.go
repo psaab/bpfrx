@@ -135,7 +135,10 @@ func (s *Server) showFlowTimeouts(cfg *config.Config, buf *strings.Builder) {
 		buf.WriteString("  Allow embedded ICMP:  enabled\n")
 	}
 	if flow.GREPerformanceAcceleration {
-		buf.WriteString("  GRE acceleration:     enabled\n")
+		// #5804: accepted-only. Same wording contract as the local CLI
+		// (pkg/cli/cli_show_flow.go) — a remote operator must not read a
+		// stronger claim than an on-box one.
+		buf.WriteString("  GRE acceleration:     configured (accepted-only; GRE sessions remain 5-tuple keyed — #5804)\n")
 	}
 	if flow.PowerModeDisable {
 		buf.WriteString("  Power mode:           disabled\n")

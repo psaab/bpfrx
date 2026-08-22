@@ -49,6 +49,46 @@ network-exposed gRPC surface is the **separate** fabric listener
 (`RunFabricListener`), which authenticates (#4107) and allowlists (#4122)
 every call.
 
+### Peer hop markers are a listener capability, not a header (#5883)
+
+Two internal metadata keys bound cluster forwarding to one hop:
+`x-peer-forwarded` (session clear, summary/zone-pair fan-out, system-action
+proxying) and `xpf-no-peer` (chassis-forwarding and `MonitorInterface`
+proxies). Every handler that reads one uses it to **suppress** work.
+
+They used to be read straight off incoming metadata by presence, which made
+them caller-settable: any client that could reach a listener could claim to
+be a forwarded peer request and have the node skip the peer half of a
+cluster-wide operation while still returning success — a clear that reports
+it cleared the cluster and did not.
+
+The trust is now a property of **which listener received the call**, and a
+listener decides it:
+
+- the **fabric** listener is the only one a peer dials. Its chain is
+  `fabricAuth -> fabricAllowlist -> peerMarker(trust=true)`, in that order,
+  so #4107 auth and the #4122 allowlist both accept the call before the
+  header is promoted into an in-process context value;
+- the **loopback** listener installs `peerMarker(trust=false)`. No peer
+  dials it, so an inbound marker there is forged by definition: it is
+  stripped and nothing is promoted.
+
+Both listeners then **strip** the reserved keys, so a handler that reaches
+for the raw header finds nothing. That is not belt-and-braces — a site in
+`server_sessions.go` did exactly that instead of calling the helper, and
+stripping is what stops the next one from re-opening the hole.
+`reservedPeerMetadataKeys` is the single source of truth for both the strip
+and the promote, pinned by `TestReservedPeerMetadataKeysAreComplete`.
+
+The absent-capability default is `false` for both markers, which is the safe
+direction: false means *do the peer work*, so a stripped or forged header can
+only cause more work to be attempted, never less.
+
+The marker still rides an ordinary metadata header on the wire between nodes
+— that is the only channel there is. What changed is that a header is
+evidence only when the listener that received it is one a peer could have
+dialed.
+
 ### Fabric-listener supervision (#5047)
 
 `RunFabricListener` is a supervised loop, not a one-shot. A transient

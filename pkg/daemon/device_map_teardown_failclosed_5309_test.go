@@ -42,8 +42,8 @@ func unmappedTeardownConfig() *config.DeviceMapConfig {
 // 10-xpf-<name>.network) for an unmapped name, returning their paths.
 func seedUnmappedMarkers(t *testing.T, dir, name string) (linkPath, netPath string) {
 	t.Helper()
-	if !writeLinkFile(name, "enp99s0") {
-		t.Fatalf("seed: writeLinkFile(%q) reported unchanged", name)
+	if wrote, err := writeLinkFile(name, "enp99s0"); err != nil || !wrote {
+		t.Fatalf("seed: writeLinkFile(%q) = (%v, %v), want (true, nil)", name, wrote, err)
 	}
 	linkPath = filepath.Join(dir, linkPrefix+name+".link")
 	netPath = filepath.Join(dir, linkPrefix+name+".network")
@@ -207,7 +207,7 @@ func TestTeardownUnmappedManaged_IdempotentAlreadyTornDown_5309(t *testing.T) {
 // returns nil (a benign no-op is never a spurious fail-closed error).
 func TestTeardownUnmappedManaged_PureNoOpNoReload_5309(t *testing.T) {
 	dir := withTempLinkDir(t)
-	writeLinkFile("ge-0-0-3", "enp9s0") // still mapped (desired)
+	_, _ = writeLinkFile("ge-0-0-3", "enp9s0") // still mapped (desired)
 
 	_, reloadCalls := stubTeardownSeams(t, true, "enp99s0", nil, nil)
 

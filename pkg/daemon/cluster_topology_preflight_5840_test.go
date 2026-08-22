@@ -116,7 +116,7 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 	}
 
 	d := &Daemon{store: store, applySem: semaphore.NewWeighted(1)}
-	_, cerr := d.commitAndApply(context.Background(), "add chassis cluster", false)
+	_, cerr := d.commitAndApply(context.Background(), "add chassis cluster", peerSyncNever)
 	if cerr == nil || !errors.Is(cerr, errClusterTopologyRequiresRestart) {
 		t.Fatalf("commitAndApply of a standalone->cluster transition must be "+
 			"rejected with the restart-required sentinel; got %v", cerr)
@@ -160,7 +160,7 @@ func TestClusterTopologyDay2TransitionRejected(t *testing.T) {
 	}
 
 	dcl := &Daemon{store: cfgless, applySem: semaphore.NewWeighted(1)}
-	_, clErr := dcl.commitAndApply(context.Background(), "config-less add chassis cluster", false)
+	_, clErr := dcl.commitAndApply(context.Background(), "config-less add chassis cluster", peerSyncNever)
 	if clErr == nil || !errors.Is(clErr, errClusterTopologyRequiresRestart) {
 		t.Fatalf("commitAndApply on a config-less node (nil active, nil runtime) adding "+
 			"chassis cluster must be rejected with the restart-required sentinel; got %v", clErr)

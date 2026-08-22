@@ -176,7 +176,25 @@ sync.
         eviction coherent; invalidate matches physical-only and thus over-evicts
         a co-5-tuple VLAN sibling (safe — a re-miss re-evaluates from policy),
         never stranding a stale entry.
-    Untagged ports resolve physical == logical, so all nine sites are
+      - **#6227 item 6 / #7198 — NPTv6 embedded-ICMP reverse lookup:**
+        `icmp_embed/nat_match_v6.rs::match_outer_v6` resolves the LOGICAL
+        ingress unit ifindex before the `ifindex_to_zone_id` lookup that
+        gates the NPTv6 reverse (inbound) translation for an embedded
+        ICMPv6 error. Before this fix it keyed on the raw physical
+        `meta.ingress_ifindex` — the fourth instance of this class (the
+        site's own comment already stated the #5176 intent it failed to
+        implement: gate on "THIS packet's ingress zone", which on a VLAN
+        trunk is the logical unit's zone, not the parent's). On a trunk
+        carrying multiple units in different zones, an ICMP error (e.g.
+        Packet-Too-Big) for any unit but the trunk's first-configured one
+        evaluated the wrong zone; a zone-scoped NPTv6 rule for the real
+        zone never matched, so the embedded source stayed untranslated and
+        the reverse lookup failed outright — PMTUD black-holing for that
+        flow. Confined to this one reverse-lookup site: it does not affect
+        policy/screen zone resolution on the forward transit path (the
+        sites above already resolve correctly) and gates no permit/deny
+        decision.
+    Untagged ports resolve physical == logical, so all ten sites are
     no-ops there (non-VLAN behavior preserved).
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`
@@ -1119,6 +1137,27 @@ the journald line, whereas the old `.ok()` reads recovered nothing and
 logged nothing. Note that counter is still not exported as a Prometheus
 metric, unlike its #1807 twin
 (`xpf_userspace_worker_command_queue_poison_recoveries_total`) — see #6641.
+
+## WireGuard handshake-session poison policy (#6227 item 5)
+
+`afxdp/wg/handshake_session.rs` holds seven call sites across the
+`WgEngine` `reconcile_lock` (peer-table/pending-handshake serialization)
+and `cookie_gen` (per-peer initiator cookie state) mutexes. All seven used
+`.lock().unwrap()`, so a control-thread panic while holding either lock
+(contained by the same #925-class supervision as the worker/shared-session
+cases above) poisoned the mutex and PANICKED the next unrelated caller too
+— tearing down the tunnel's whole handshake path over one contained panic
+that had nothing to do with it.
+
+Mirrors the established policy exactly: a file-local generic
+`lock_recover<T>` (`clear_poison()` + `into_inner()`) replaces all seven
+sites, bumping `WG_HANDSHAKE_LOCK_POISON_RECOVERIES` and emitting a sparse
+journald line on the cold recovery path, same shape as
+`worker_queue::lock_recover` (#1807) and `shared_ops::lock_shared_recover`
+(#2402). Every caller here is control-thread only (never the AF_XDP poll
+worker — see the module doc), so a blocking `lock()` is correct; only the
+poison-recovery arm is shared with the crate-wide pattern, not the
+`try_lock` shape `worker_queue.rs` uses on its hot path.
 
 ## RG-activation prewarm dedup is O(N+M) (#4069)
 
