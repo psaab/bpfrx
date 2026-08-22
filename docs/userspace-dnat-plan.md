@@ -507,10 +507,18 @@ class from the issue's malformed CIDR):
   strips the mask and parses only the address part, while its Go builder
   (`dnatDestinationParts`) uses `net.ParseCIDR` and skips the entry — a
   validator/builder divergence in the OLDER gate.
-- **#7216** — an explicitly quoted empty value (`match destination-address ""`)
-  is still accepted on static-NAT `match destination-address`, where an empty
-  slot carries the deliberate #6673 "authored blank selection" meaning, so
-  closing it needs to separate a machinery-produced blank from a typed one.
+- **#7216** — CLOSED. An explicitly quoted empty value (`match
+  destination-address ""`) was still accepted on static-NAT `match
+  destination-address`. The resolution did NOT need to separate a
+  machinery-produced blank from a typed one: #6673's empty-slot meaning turned
+  out to be a rule about COUNTING the list (an empty slot is not a second
+  prefix), not about whether a blank SELECTION is shippable — and #6673 already
+  rejected the blank selection in the one place it could see it. The new gate
+  (`validateStaticNATSelectedMatchAddressStrict`) reads `rule.Match`, the
+  SELECTION, so the empty SLOT keeps its #6673 meaning untouched. It covers all
+  FOUR authoring shapes that reach `rule.Match == ""`, including the omitted
+  statement, and exempts NPTv6 and `then static-nat inet`, each already refused
+  by its own gate. See `docs/config-schema.md` "#7216".
 
 ### Static-NAT invalid `match destination-port` fails closed (#5101)
 
