@@ -1,3 +1,43 @@
+## 2026-08-21 — #5804: gre-performance-acceleration was reported as enabled while doing nothing
+
+- **Timestamp**: 2026-08-21 (fix/5804-gre-acceleration-advisory)
+- **Action**: Added the #2078/#4231 accepted-only commit advisory for
+  `security flow gre-performance-acceleration` and qualified both `show
+  security flow` surfaces, so the knob stops reading as a feature in force.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/gre_acceleration_advisory_5804_test.go` (new),
+  `pkg/cli/cli_show_flow.go`, `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_gre_5804_test.go` (new), `docs/feature-gaps.md`
+
+  The flag reaches `ForwardingState.gre_acceleration` and stops; no packet path
+  reads it. GRE is protocol 47 with no L4 ports, the shim stamps
+  `flow_src_port = flow_dst_port = 0`, and `SessionKey` has no tunnel
+  discriminator — so two GRE/PPTP tunnels between the same outer endpoints
+  share one session and its policy decision, NAT state, counters and timeout.
+  An operator enabling the knob is asking for exactly the opposite.
+
+  Every other accepted-only knob in the tree already warns (#2078 tcp-session,
+  #4231 flow knobs, #4299 vpn-monitor). This one did not, and the two `show`
+  surfaces printed an unqualified `enabled`, which is the stronger claim of the
+  two: commit output scrolls past, `show` is what an operator reads on a box
+  someone else configured. The advisory names the consequence rather than
+  saying "no effect" — a test asserts the wording contains both `5-tuple` and
+  `one session`, so a future edit cannot quietly reduce it to a generic
+  not-enforced line.
+
+  Mutation proof, each one line, each at a production-reachable site:
+  - `if flow.GREPerformanceAcceleration {` -> `if false && ...` in
+    validateSecurityFlowAcceptedOnly — exit=1, "no advisory names the knob";
+  - collapse the advisory text to a generic "does not enforce it" — exit=1,
+    both wording assertions red, quoting the weakened string.
+  Negative control in the same file: a config that does not set the knob must
+  not be warned about it, and the `show` test asserts no line is rendered when
+  it is unset, so neither fix is satisfiable by emitting unconditionally.
+
+  Control: `go test -count=1 ./pkg/config/ ./pkg/cli/ ./pkg/grpcapi/` exit=0,
+  `go vet` clean, `go build ./...` clean. Go-only; no dataplane binary moves,
+  so no cluster smoke is owed. The dataplane feature is #7188 and retires both
+  the advisory and the `show` qualifier.
 ## 2026-08-21 — #5858: tightening an interface input filter reported clean while established sessions kept forwarding
 
 - **Timestamp**: 2026-08-21 (fix/5858-filter-change-advisory)
