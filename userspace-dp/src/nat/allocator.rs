@@ -1617,6 +1617,105 @@ impl PortAllocator {
         true
     }
 
+
+    /// #6528: unlink ONE flow's `live_by_flow` record, applying the teardown its
+    /// allocation MODE requires. This is the half of a teardown that is
+    /// IDENTICAL across all THREE paths that retire a record — `release_flow`,
+    /// `rollback_flow`, and `reserve_flow`'s stale-tuple eviction — and it exists
+    /// so a fourth cannot diverge from the other three.
+    ///
+    /// Three modes, three different obligations, and getting the mode wrong is
+    /// not a no-op — it mutates state belonging to an UNRELATED flow:
+    ///
+    ///   - ADDRESS-ONLY (`port no-translation` / port-less, #5269/#6041): owns
+    ///     NO occupancy bit. `addr_index` is a hardcoded 0 and `translated.port`
+    ///     is the PRESERVED internal source port, so calling
+    ///     `free_translated_port` on it clears whatever bit pool address 0
+    ///     happens to hold at that offset — which, when a PAT rule shares the
+    ///     allocator (`allocator_key()` is pool name + addresses + port range;
+    ///     it does NOT include `no_translation`), is a LIVE PAT flow's port, and
+    ///     `free_recycle` then hands it to the next allocation. What it owns
+    ///     instead is the reverse-identity token in `address_only_owners`, which
+    ///     must be cleared or that public identity is denied forever.
+    ///   - PERSISTENT (`persistent_key = Some`): the port/address belongs to the
+    ///     LEASE, not the flow. Freeing the bit here hands out a port the lease
+    ///     still claims. Only the lease teardown frees it — see the caller-owned
+    ///     lease arms below.
+    ///   - Plain PAT: owns its port outright — free the bit, recycling it unless
+    ///     it is a deterministic block port (#4559).
+    ///
+    /// The LEASE arm is deliberately NOT here: `release_flow` completes a flow
+    /// (bump `completed_flows`, refresh the idle expiry) while `rollback_flow`
+    /// undoes an activation (restore or remove the lease). Each caller runs its
+    /// own; this helper owns only what they share.
+    fn unlink_live_allocation_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        flow: &SourceNatFlowKey,
+        existing: LiveAllocation,
+    ) {
+        live.live_by_flow.remove(flow);
+        // #6041: the address-only reverse-identity token (#5269) is orthogonal
+        // to the persistent lease — it exists for BOTH a non-persistent
+        // address-only flow AND an address-only PERSISTENT flow
+        // (`persistent_key = Some` AND `address_only = true`). The key mirrors
+        // what `reserve_address_only` / `reserve_address_only_roundrobin` /
+        // `reserve_address_only_persistent` inserted (stored translated tuple +
+        // the flow's remote endpoint).
+        if existing.address_only {
+            live.address_only_owners.remove(&AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip: existing.translated.ip,
+                translated_port: existing.translated.port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            });
+        }
+        if existing.persistent_key.is_none() && !existing.address_only {
+            self.free_translated_port(
+                existing.addr_index,
+                existing.translated.port,
+                !existing.deterministic,
+            );
+        }
+    }
+
+    /// #6528: the RELEASE-semantics persistent-lease arm — a flow that WAS in
+    /// service on this translation has finished with it.
+    ///
+    /// Shared by `release_flow` and `reserve_flow`'s stale-tuple eviction: an
+    /// evicted reservation was in service on the tuple it is being replaced on,
+    /// so the flow completed on it. Dropping the refcount is what makes the
+    /// lease reclaimable — a leaked refcount is never idle, so the lease never
+    /// enters `lease_expirations` and NO GC path can reclaim it.
+    ///
+    /// No-op for a non-persistent record.
+    fn complete_persistent_lease_locked(
+        live: &mut PortAllocatorLiveState,
+        existing: LiveAllocation,
+        now_ns: u64,
+    ) {
+        let Some(key) = existing.persistent_key else {
+            return;
+        };
+        let mut refresh_expiry = None;
+        if let Some(lease) = live.persistent_by_source.get_mut(&key) {
+            lease.completed_flows = lease.completed_flows.saturating_add(1);
+            lease.activation_saw_completion = true;
+            lease.active_flows = lease.active_flows.saturating_sub(1);
+            if lease.active_flows == 0 {
+                let old_expires_at_ns = lease.expires_at_ns;
+                let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
+                lease.expires_at_ns = expires_at_ns;
+                refresh_expiry = Some((lease.addr_index, old_expires_at_ns, expires_at_ns));
+            }
+        }
+        if let Some((addr_index, old_expires_at_ns, expires_at_ns)) = refresh_expiry {
+            Self::remove_lease_expiration_locked(live, addr_index, old_expires_at_ns, key);
+            Self::insert_lease_expiration_locked(live, addr_index, expires_at_ns, key);
+        }
+    }
+
     pub(super) fn release_flow(
         &self,
         flow: SourceNatFlowKey,
@@ -1634,53 +1733,12 @@ impl PortAllocator {
         if Self::drop_holder_locked(&mut live, &flow, existing, holder) {
             return false;
         }
-        live.live_by_flow.remove(&flow);
-        // #6041: the address-only reverse-identity token (#5269) is orthogonal to
-        // the persistent lease. Clear THIS flow's ownership first — it exists for
-        // BOTH a non-persistent address-only flow AND an address-only PERSISTENT
-        // flow (`persistent_key = Some` AND `address_only = true`). No pool port
-        // bit was claimed for any address-only flow, so nothing is freed on the
-        // occupancy bitmap. The key mirrors what `reserve_address_only` /
-        // `reserve_address_only_persistent` inserted (stored translated tuple +
-        // the flow's remote endpoint).
-        if existing.address_only {
-            live.address_only_owners.remove(&AddressOnlyReverseKey {
-                protocol: flow.protocol,
-                translated_ip: existing.translated.ip,
-                translated_port: existing.translated.port,
-                dst_ip: flow.dst_ip,
-                dst_port: flow.dst_port,
-            });
-        }
-        if let Some(key) = existing.persistent_key {
-            let mut refresh_expiry = None;
-            if let Some(lease) = live.persistent_by_source.get_mut(&key) {
-                lease.completed_flows = lease.completed_flows.saturating_add(1);
-                lease.activation_saw_completion = true;
-                lease.active_flows = lease.active_flows.saturating_sub(1);
-                if lease.active_flows == 0 {
-                    let old_expires_at_ns = lease.expires_at_ns;
-                    let expires_at_ns = now_ns.saturating_add(lease.timeout_ns);
-                    lease.expires_at_ns = expires_at_ns;
-                    refresh_expiry = Some((lease.addr_index, old_expires_at_ns, expires_at_ns));
-                }
-            }
-            if let Some((addr_index, old_expires_at_ns, expires_at_ns)) = refresh_expiry {
-                Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
-                Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
-            }
-        } else if !existing.address_only {
-            // Non-persistent (or deterministic) flow owns its port outright:
-            // free the bit, recycling it unless it is a deterministic block
-            // port (#4559). The persistent case keeps the port/address on the
-            // lease until the lease itself is torn down; the address-only case
-            // (handled above) never claimed a port bit to free.
-            self.free_translated_port(
-                existing.addr_index,
-                translated.port,
-                !existing.deterministic,
-            );
-        }
+        // #6528: mode-correct unlink + the release-semantics lease arm, both
+        // shared with `reserve_flow`'s stale-tuple eviction so the two cannot
+        // drift. `existing.translated == translated` was checked above, so
+        // freeing `existing.translated.port` is the same port as before.
+        self.unlink_live_allocation_locked(&mut live, &flow, existing);
+        Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
         live.gc_counter = live.gc_counter.wrapping_add(1);
         let run_gc = live.gc_counter % GC_PERIOD == 0;
         // #4676: drop the release guard BEFORE the periodic idle-lease sweep so
@@ -1712,20 +1770,9 @@ impl PortAllocator {
         if Self::drop_holder_locked(&mut live, &flow, existing, holder) {
             return false;
         }
-        live.live_by_flow.remove(&flow);
-        // #6041: clear this flow's address-only reverse-identity token first
-        // (present for both a #5269 non-persistent and a #6041 persistent
-        // address-only flow); it is independent of the lease refcount below and
-        // no pool port bit is ever freed for an address-only flow.
-        if existing.address_only {
-            live.address_only_owners.remove(&AddressOnlyReverseKey {
-                protocol: flow.protocol,
-                translated_ip: existing.translated.ip,
-                translated_port: existing.translated.port,
-                dst_ip: flow.dst_ip,
-                dst_port: flow.dst_port,
-            });
-        }
+        // #6528: the shared mode-correct unlink. Rollback keeps its OWN lease
+        // arm below — it undoes an activation rather than completing a flow.
+        self.unlink_live_allocation_locked(&mut live, &flow, existing);
         if let Some(key) = existing.persistent_key {
             let mut remove_lease = false;
             let mut insert_expiry = None;
@@ -1756,12 +1803,6 @@ impl PortAllocator {
             if let Some((addr_index, expires_at_ns)) = insert_expiry {
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
-        } else if !existing.address_only {
-            self.free_translated_port(
-                existing.addr_index,
-                translated.port,
-                !existing.deterministic,
-            );
         }
         true
     }
@@ -1997,6 +2038,12 @@ impl PortAllocator {
         translated: TranslatedTuple,
         addr_index: usize,
         deterministic: bool,
+        // #6528: the stale-tuple eviction below retires the incumbent record
+        // with RELEASE semantics, and a persistent lease that falls to zero
+        // active flows needs a real clock to re-arm its idle expiry. Threaded
+        // from `handle_upsert_synced`, the same `now_ns` the synced install
+        // already uses.
+        now_ns: u64,
         holder: NatHolder,
     ) -> bool {
         if addr_index >= self.shared.occupancy.len() {
@@ -2005,10 +2052,10 @@ impl PortAllocator {
         let mut live = self.lock_live();
         // A refresh of the same synced flow: if it already holds this exact
         // translated tuple, it is reserved — nothing to do. If the tuple
-        // changed (should not happen on a stable sync), drop the stale
-        // reservation first so we do not leak the old port's bit. Honour the
-        // stale reservation's own mode (#5178): a deterministic reservation is
-        // freed WITHOUT recycling, matching its release path.
+        // changed (should not happen on a stable sync), retire the stale
+        // reservation first so we do not leak the old port's bit — through the
+        // shared mode-correct teardown (#6528), which also honours a
+        // deterministic reservation's free-without-recycle (#5178).
         if let Some(existing) = live.live_by_flow.get(&flow).copied() {
             if existing.translated == translated {
                 // #6211 F2: this early return is where workers 2..N land — the
@@ -2024,12 +2071,27 @@ impl PortAllocator {
                 }
                 return true;
             }
-            live.live_by_flow.remove(&flow);
-            self.free_translated_port(
-                existing.addr_index,
-                existing.translated.port,
-                !existing.deterministic,
-            );
+            // #6528: retire the incumbent through the SAME mode-correct
+            // teardown `release_flow` uses. The unconditional
+            // `free_translated_port` this replaces was correct for exactly one
+            // of the three allocation modes:
+            //   - an ADDRESS-ONLY incumbent owns no occupancy bit, so the call
+            //     cleared a bit on pool address 0 (its hardcoded `addr_index`)
+            //     at the offset of the PRESERVED internal source port — a LIVE
+            //     PAT flow's bit whenever a PAT rule shares this allocator —
+            //     and recycled it, putting two flows on one translated tuple;
+            //     meanwhile its `address_only_owners` token was never cleared,
+            //     denying that public reverse identity forever.
+            //   - a PERSISTENT incumbent's port belongs to the LEASE, so the
+            //     call freed a port the lease still claimed, and the lease's
+            //     `active_flows` refcount was never dropped — a leaked refcount
+            //     is never idle, so the lease never enters `lease_expirations`
+            //     and no GC path can reclaim it.
+            // The eviction uses RELEASE (not rollback) semantics because the
+            // incumbent tuple WAS in service: this is a re-decision of a live
+            // flow, not the withdrawal of an allocation that never shipped.
+            self.unlink_live_allocation_locked(&mut live, &flow, existing);
+            Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
         }
         // Never steal a port owned by a DIFFERENT live allocation: the bit CAS
         // fails when the port is already occupied, so `reserve` returns false
