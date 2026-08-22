@@ -261,7 +261,7 @@ fn queue_planner_filters_non_data_interfaces() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let bindings = replan_queues(Some(&snapshot), 2, &[], true);
     assert_eq!(bindings.len(), 2);
     assert!(bindings.iter().all(|b| {
         b.interface.starts_with("ge-")
@@ -315,7 +315,7 @@ fn queue_planner_and_plan_key_agree_on_binding_set() {
     let base = mk(99, 1);
 
     // Property 1: the mgmt-zone `ge-*` is NOT planned; only the data iface is.
-    let bindings = replan_queues(Some(&base), 1, &[]);
+    let bindings = replan_queues(Some(&base), 1, &[], true);
     assert!(
         bindings.iter().all(|b| b.interface == "ge-0-0-1"),
         "mgmt-zone ge-* must be excluded from the plan, got: {:?}",
@@ -333,7 +333,7 @@ fn queue_planner_and_plan_key_agree_on_binding_set() {
          plan key — the hash and planner must share the exclusion contract"
     );
     // ...and the planned set is identical regardless of the mgmt change.
-    let bindings_changed = replan_queues(Some(&mgmt_changed), 1, &[]);
+    let bindings_changed = replan_queues(Some(&mgmt_changed), 1, &[], true);
     assert_eq!(
         bindings.iter().map(|b| b.interface.clone()).collect::<Vec<_>>(),
         bindings_changed
@@ -392,7 +392,7 @@ fn plan_key_covers_every_replan_queues_input() {
 
     let base = mk("ge-0-0-1", 11, 2);
     let base_key = snapshot_binding_plan_key(&base);
-    let base_layout: Vec<(String, i32, u32)> = replan_queues(Some(&base), 2, &[])
+    let base_layout: Vec<(String, i32, u32)> = replan_queues(Some(&base), 2, &[], true)
         .iter()
         .map(|b| (b.interface.clone(), b.ifindex, b.queue_id))
         .collect();
@@ -405,7 +405,7 @@ fn plan_key_covers_every_replan_queues_input() {
         "a candidate linux_name change must bump the plan key (#2916): the \
          same-plan branch would otherwise leave the binding on the old netdev"
     );
-    let name_layout: Vec<String> = replan_queues(Some(&name_changed), 2, &[])
+    let name_layout: Vec<String> = replan_queues(Some(&name_changed), 2, &[], true)
         .iter()
         .map(|b| b.interface.clone())
         .collect();
@@ -424,7 +424,7 @@ fn plan_key_covers_every_replan_queues_input() {
          ifindex"
     );
     assert!(
-        replan_queues(Some(&ifindex_changed), 2, &[])
+        replan_queues(Some(&ifindex_changed), 2, &[], true)
             .iter()
             .all(|b| b.ifindex == 99),
         "replan_queues must carry the new ifindex onto every binding"
@@ -440,7 +440,7 @@ fn plan_key_covers_every_replan_queues_input() {
     );
     assert_ne!(
         base_layout.len(),
-        replan_queues(Some(&rx_changed), 2, &[]).len(),
+        replan_queues(Some(&rx_changed), 2, &[], true).len(),
         "replan_queues must emit a different number of bindings when \
          rx_queues changes"
     );
@@ -598,7 +598,7 @@ fn queue_planner_dedups_wan_vlan_child_onto_physical_parent() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
 
     // The VLAN-child netdevs must NOT be planned as separate candidates.
     assert!(
@@ -671,7 +671,7 @@ fn queue_planner_rekeys_orphan_vlan_child_onto_parent_netdev() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let bindings = replan_queues(Some(&snapshot), 2, &[], true);
     assert!(
         bindings.iter().all(|b| b.interface == "ge-0-0-9"),
         "orphan VLAN child must bind on the parent netdev, not its own \
@@ -736,7 +736,7 @@ fn replan_queues_binds_vlan_unit_on_parent_netdev() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let bound: std::collections::BTreeSet<&str> =
         bindings.iter().map(|b| b.interface.as_str()).collect();
 
@@ -908,7 +908,7 @@ fn queue_planner_excludes_tunnel_and_local_fabric_ge_interfaces() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    let bindings = replan_queues(Some(&snapshot), 1, &[], true);
     assert_eq!(
         bindings.iter().map(|b| b.interface.clone()).collect::<Vec<_>>(),
         vec!["ge-0-0-7".to_string()],
@@ -956,7 +956,7 @@ fn queue_planner_includes_fabric_parent_interface() {
         }],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    let bindings = replan_queues(Some(&snapshot), 1, &[], true);
     // Should have 3 bindings: ge-0-0-1, ge-0-0-2, ge-0-0-0 (fabric parent)
     assert_eq!(bindings.len(), 3);
     let fabric_binding = bindings
@@ -996,7 +996,7 @@ fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
         }],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    let bindings = replan_queues(Some(&snapshot), 1, &[], true);
     // ge-0-0-0 appears in both interfaces and fabrics but should only
     // produce one binding.
     assert_eq!(bindings.len(), 1);
@@ -1271,6 +1271,7 @@ fn queue_planner_preserves_existing_state() {
         &existing,
         vec![("ge-0-0-1".to_string(), 1)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        true,
     );
     if let Some(b0) = bindings.iter().find(|b| b.slot == 0) {
         assert!(b0.registered);
@@ -1305,7 +1306,7 @@ fn queue_planner_ignores_tunnel_netdevices_for_transit() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    let bindings = replan_queues(Some(&snapshot), 1, &[], true);
     assert_eq!(bindings.len(), 1);
     assert_eq!(bindings[0].interface, "ge-0-0-2.80");
     assert_eq!(bindings[0].ifindex, 24);
@@ -1329,6 +1330,7 @@ fn queue_planner_preserves_manual_unregistration() {
         &existing,
         vec![("ge-0-0-1".to_string(), 1)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        true,
     );
     let b0 = bindings.iter().find(|b| b.slot == 0).expect("binding 0");
     assert!(!b0.registered);
@@ -1362,7 +1364,7 @@ fn queue_planner_keeps_queue_zero_available_for_userspace() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let bindings = replan_queues(Some(&snapshot), 2, &[], true);
     let q0 = bindings
         .iter()
         .find(|b| b.interface == "ge-0-0-1" && b.queue_id == 0)
@@ -1396,7 +1398,7 @@ fn queue_planner_uses_smallest_queue_count() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let bindings = replan_queues(Some(&snapshot), 2, &[], true);
     assert_eq!(bindings.len(), 4);
     let queues = summarize_queues(&bindings);
     assert_eq!(queues.len(), 2);
@@ -1439,7 +1441,7 @@ fn queue_planner_dedups_physical_and_unit_to_same_netdev() {
         ],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    let bindings = replan_queues(Some(&snapshot), 1, &[], true);
     // 4 queues x 1 netdev = 4 bindings, NOT 8.
     assert_eq!(
         bindings.len(),
@@ -2471,7 +2473,7 @@ fn binding_candidate_excludes_secure_tunnel() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 2, &[]);
+    let bindings = replan_queues(Some(&snapshot), 2, &[], true);
     assert!(
         !bindings.is_empty(),
         "premise broken: the ordinary data interface must still be planned, \
@@ -2542,8 +2544,8 @@ fn secure_tunnel_adds_nothing_to_the_binding_plan() {
         ..Default::default()
     };
 
-    let got = replan_queues(Some(&with_tunnel), 2, &[]);
-    let want = replan_queues(Some(&without_tunnel), 2, &[]);
+    let got = replan_queues(Some(&with_tunnel), 2, &[], true);
+    let want = replan_queues(Some(&without_tunnel), 2, &[], true);
 
     assert!(
         !want.is_empty(),
@@ -2631,6 +2633,7 @@ fn secure_tunnel_would_collapse_the_global_queue_count() {
         }),
         4,
         &[],
+        true,
     );
 
     let lan_queues = bindings
@@ -4286,6 +4289,7 @@ fn replan_refuses_worker_ids_beyond_the_nat_holder_mask_6211_f2() {
         &[],
         vec![("ge-0-0-1".to_string(), queues)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        true,
     );
     assert!(
         bindings.is_empty(),
@@ -4307,6 +4311,7 @@ fn replan_accepts_the_widest_representable_worker_id_6211_f2() {
         &[],
         vec![("ge-0-0-1".to_string(), queues)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        true,
     );
     assert_eq!(
         bindings.len(),
@@ -4338,6 +4343,7 @@ fn replan_accepts_huge_worker_count_on_a_small_queue_nic_6211_f2() {
         &[],
         vec![("ge-0-0-1".to_string(), 16)],
         BTreeMap::from([("ge-0-0-1".to_string(), 11)]),
+        true,
     );
     assert_eq!(
         bindings.len(),
@@ -4450,7 +4456,7 @@ fn orphan_vlan_child_cannot_readmit_its_refused_parent() {
         interfaces: vec![lan.clone(), xfrmi, sibling],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 4, &[]);
+    let bindings = replan_queues(Some(&snapshot), 4, &[], true);
 
     assert!(
         bindings.iter().all(|b| b.interface != "st10"),
@@ -4567,7 +4573,7 @@ fn orphan_vlan_child_still_rekeys_onto_an_unzoned_parent() {
         interfaces: vec![parent, child],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -4682,7 +4688,7 @@ fn a_netdev_with_a_bindable_owner_is_not_refused() {
         interfaces: vec![base, tunnel_unit, vlan_child],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -4797,7 +4803,7 @@ fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
         }],
         ..Default::default()
     };
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -4903,7 +4909,7 @@ fn ownerless_fabric_parent_is_refused() {
         "premise: the ownerless case needs NO interface row for the fabric parent"
     );
 
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -4962,7 +4968,7 @@ fn ownerless_fabric_parent_is_refused() {
         }],
         ..Default::default()
     };
-    let planned = replan_queues(Some(&bindable), 6, &[])
+    let planned = replan_queues(Some(&bindable), 6, &[], true)
         .iter()
         .map(|b| b.interface.clone())
         .collect::<std::collections::BTreeSet<_>>();
@@ -5052,7 +5058,7 @@ fn fabric_vote_cannot_overturn_an_owning_row() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -5226,7 +5232,7 @@ fn zero_ifindex_owner_row_still_refuses_the_fabric_parent() {
         ..Default::default()
     };
 
-    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let bindings = replan_queues(Some(&snapshot), 6, &[], true);
     let planned = bindings
         .iter()
         .map(|b| b.interface.clone())
@@ -5247,3 +5253,120 @@ fn zero_ifindex_owner_row_still_refuses_the_fabric_parent() {
     clear_rx_queue_count_override();
 }
 
+
+/// #6749: a binding-plan EXPANSION must not disable the whole dataplane.
+///
+/// `replan_bindings_from_candidates` rebuilds the binding vector by SLOT, and a
+/// slot that did not exist before comes from `BindingStatus::default()` —
+/// `armed: false`. `refresh_status` then computes
+/// `enabled = forwarding_armed && ... && bindings.iter().all(|b| b.registered
+/// && b.armed)` (helpers/status.rs), so ONE unarmed slot makes `enabled` false
+/// for every binding on the box, and Go's `resolveCtrlEnableLocked` keys
+/// ctrl-enable on that flag: ctrl goes to 0 and ALL transit drops.
+///
+/// It does not self-heal, and that is what makes it indefinite rather than a
+/// one-tick blip. The only other writer of per-binding `armed` is
+/// `set_bindings_forwarding_armed`, reached only from the `set_forwarding_state`
+/// handler — and Go suppresses that RPC as a no-op whenever the arm state has
+/// not CHANGED (`syncDesiredForwardingStateLocked`:
+/// `if m.lastStatus.ForwardingArmed == desired { return nil }`). The helper's
+/// global `forwarding_armed` is still true across an expansion, so nothing ever
+/// re-arms the new slot.
+///
+/// The second cell is the load-bearing one. Hardcoding `armed = true` for new
+/// slots passes the first cell and silently ARMS a box that is deliberately
+/// disarmed — an HA secondary, a shutdown, a protocol-gate disarm — which is a
+/// forwarding fail-OPEN, strictly worse than the outage being fixed. The new
+/// slot must INHERIT the global state, exactly as `set_bindings_forwarding_armed`
+/// would have set it.
+#[test]
+fn expansion_arms_new_slots_from_the_global_state_6749() {
+    fn expand(forwarding_armed: bool) -> Vec<BindingStatus> {
+        // One pre-existing, fully armed slot — the box is forwarding.
+        let existing = vec![BindingStatus {
+            slot: 0,
+            interface: "ge-0-0-1".into(),
+            ifindex: 11,
+            registered: true,
+            armed: forwarding_armed,
+            last_change: Some(chrono::Utc::now()),
+            ..Default::default()
+        }];
+        // The plan grows to two interfaces: slot 1 is NEW.
+        let mut ifindex_by_name = std::collections::BTreeMap::new();
+        ifindex_by_name.insert("ge-0-0-1".to_string(), 11);
+        ifindex_by_name.insert("ge-0-0-2".to_string(), 12);
+        replan_bindings_from_candidates(
+            1,
+            &existing,
+            vec![("ge-0-0-1".to_string(), 1), ("ge-0-0-2".to_string(), 1)],
+            ifindex_by_name,
+            forwarding_armed,
+        )
+    }
+
+    let armed = expand(true);
+    assert_eq!(armed.len(), 2, "premise: the plan must actually have expanded");
+    assert!(
+        armed.iter().all(|b| b.registered),
+        "premise: both slots must be registered, else `enabled` is false for a different reason",
+    );
+    assert!(
+        armed.iter().all(|b| b.armed),
+        "a NEW slot came back unarmed on an ARMED box. refresh_status requires \
+         all(registered && armed), so this makes status.enabled false for EVERY \
+         binding, Go drops ctrl to 0, and all transit stops — indefinitely, because \
+         Go suppresses set_forwarding_state when the arm state has not changed \
+         (#6749). Slots: {:?}",
+        armed.iter().map(|b| (b.slot, b.armed)).collect::<Vec<_>>(),
+    );
+
+    let disarmed = expand(false);
+    assert_eq!(disarmed.len(), 2);
+    assert!(
+        disarmed.iter().all(|b| !b.armed),
+        "a new slot came back ARMED on a DISARMED box. The new slot must INHERIT \
+         the global arm state, not assume `true` — hardcoding it would arm an HA \
+         secondary or a box mid-shutdown, a forwarding fail-OPEN strictly worse \
+         than the outage #6749 is about. Slots: {:?}",
+        disarmed.iter().map(|b| (b.slot, b.armed)).collect::<Vec<_>>(),
+    );
+}
+
+/// #6749: an EXISTING slot's arm state is preserved across a replan, and is not
+/// overwritten by the global flag.
+///
+/// The inheritance above applies only to slots that did not exist before
+/// (`!had_existing`). A slot that is mid-bringup — registered but not yet armed
+/// — must stay unarmed through an unrelated replan rather than being declared
+/// armed because the box as a whole is. Without this cell, "inherit on new
+/// slots" and "stamp the global flag over every slot" are indistinguishable,
+/// and the second would claim a queue is carrying before its XSK is bound.
+#[test]
+fn expansion_does_not_overwrite_an_existing_slots_arm_state_6749() {
+    let existing = vec![BindingStatus {
+        slot: 0,
+        interface: "ge-0-0-1".into(),
+        ifindex: 11,
+        registered: true,
+        armed: false, // mid-bringup on an otherwise armed box
+        last_change: Some(chrono::Utc::now()),
+        ..Default::default()
+    }];
+    let mut ifindex_by_name = std::collections::BTreeMap::new();
+    ifindex_by_name.insert("ge-0-0-1".to_string(), 11);
+    ifindex_by_name.insert("ge-0-0-2".to_string(), 12);
+    let out = replan_bindings_from_candidates(
+        1,
+        &existing,
+        vec![("ge-0-0-1".to_string(), 1), ("ge-0-0-2".to_string(), 1)],
+        ifindex_by_name,
+        true,
+    );
+    assert!(
+        !out[0].armed,
+        "the pre-existing mid-bringup slot was declared armed by the replan; \
+         only a NEW slot inherits the global state (#6749)",
+    );
+    assert!(out[1].armed, "the new slot must inherit the armed box state");
+}
