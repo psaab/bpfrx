@@ -1,3 +1,39 @@
+## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
+
+- **Timestamp**: 2026-08-22
+- **Action**: Landed the one clause the #6612 audit found missing. A
+  `to-zone junos-host` permit narrowed on DESTINATION (or carrying
+  `destination-address-excluded`) rendered no kernel rule AND produced
+  ZERO warnings of any kind: `junosHostProjectTerm` already refused to
+  render it, while `junosHostPolicyStricterThanCoarseGate` admitted a
+  permit as stricter-than-coarse only through
+  `junosHostPolicySourceScoped`, which inspects the source dimension
+  alone. The advisory now keys on the SAME expression the projection
+  applies (`junosHostAddrScoped(DestinationAddresses) ||
+  DestinationAddressExcluded`) rather than a second copy — a divergence
+  between "the projection refuses to render it" and "the warning says
+  so" is always a bug, which is the discriminator for single-sourcing
+  over binding two copies with an agreement test. Restored the two table
+  rows so each asserts BOTH halves in one cell. Measured, rather than
+  assumed, that a fixture cannot make both halves gate-sensitive at
+  once: the rules half needs a CONCRETE permit source (with
+  `source-address any` the permit sets permitAllV4 and shadows every
+  later deny, so nothing renders with or without the projection gate),
+  while the warning half needs NO concrete source (or it warns through
+  the source predicate and says nothing about the destination
+  dimension). The class is therefore bound by a table row plus the
+  separate widening test, and the doc records why so neither is
+  "simplified" into the other later. Re-shaped the excluded row to
+  `destination-address any` + excluded so the two disjuncts localise
+  independently. Three one-line mutations, each `go vet` clean at the
+  mutated state, each reddening exactly one row: dropping the named
+  disjunct reds only `dst-permit`, dropping the excluded disjunct reds
+  only `dstx-permit`, and dropping the projection gate reds only the
+  widening test's two subtests and none of the table rows — the split
+  the doc describes, confirmed by measurement.
+- **File(s)**: `pkg/config/compiler_validate_warn_host_inbound.go`,
+  `pkg/dataplane/userspace/junos_host_residual_6612_test.go`,
+  `docs/host-inbound-service-matrix.md`
 ## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
 
 - **Timestamp**: 2026-08-21

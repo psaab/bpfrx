@@ -1733,19 +1733,38 @@ way. Covered today: scheduler-gated deny, feed-bound source, feed-bound
 destination, `reject`, `tcp-rst` zone, ALG application, IKE-exempt-tuple
 application, source-restricted permit.
 
-**Open: a destination-scoped `permit` renders nothing AND warns nothing (#6612).**
-Measured, such a policy produces zero warnings of any kind at commit. The
-projection correctly refuses to render it
-(`junosHostProjectTerm`: `p.Action != PolicyDeny && (junosHostAddrScoped(dest) ||
-DestinationAddressExcluded)`), but `junosHostPolicyStricterThanCoarseGate`
-(`pkg/config/compiler_validate_warn_host_inbound.go`) admits a permit as
+A destination-scoped `permit` was silent on BOTH halves until #6612: it rendered
+nothing and produced **zero warnings of any kind**. The projection correctly
+refused to render it (`junosHostProjectTerm`: `p.Action != PolicyDeny &&
+(junosHostAddrScoped(dest) || DestinationAddressExcluded)`), but
+`junosHostPolicyStricterThanCoarseGate`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) admitted a permit as
 stricter-than-coarse only through `junosHostPolicySourceScoped`, which inspects
-the SOURCE dimension alone — so the two halves disagree: the projection knows it
-cannot enforce the policy and the warning never says so. The fix is one clause
-keying the warning on the SAME expression the projection uses, so they cannot
-drift. Until it lands, the rendered-nothing half is locked by
-`TestJunosHostDestinationScopedPermitRendersNothing6612` and the missing half is
-named there.
+the SOURCE dimension alone. One system held both beliefs: the projection knew it
+could not enforce the policy, and the advisory never said so. The warning now
+keys on the SAME expression the projection applies — deliberately not a second
+copy of the condition, because a divergence between the two is always a bug.
+`destination-address-excluded` is covered as its own disjunct, so a config using
+the inverted form is not left with a residual of the bug's own shape.
+
+**Worse than silence — the shape to remember.** A destination-scoped permit
+followed by a deny emitted exactly ONE warning, and it named the **deny**. An
+operator saw output, reasonably concluded the config had been checked, and the
+policy that silently enforced nothing was not the one named. A partial signal
+that points at the wrong policy is more dangerous than no signal, which at least
+invites suspicion.
+
+**Why this class needs two fixtures.** The two halves cannot be made
+gate-sensitive by one config, and the reason is structural. For the RULES half to
+red when the projection's destination gate is removed, the permit needs a
+CONCRETE source — with `source-address any` it sets `permitAllV4` and shadows
+every later deny outright, so nothing renders either way. For the WARNING half to
+red when the advisory clause is removed, the permit must NOT be source-scoped, or
+it warns through the source predicate and proves nothing about the destination
+dimension. The two requirements are mutually exclusive, so the class is bound by a
+table row (source `any`, pinning the advisory clause) plus
+`TestJunosHostDestinationScopedPermitDoesNotWidenALaterDeny6612` (concrete source
+ahead of a deny, pinning the projection gate).
 
 The third dimension, an APPLICATION-scoped permit, has the same silent shape and
 is tracked separately in #7374: it needs a comparison against the zone's
