@@ -263,13 +263,25 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 			// Ensure a .link exists for boot persistence even when the name
 			// already matches (idempotent — writeDeviceMapLinkFile skips
 			// unchanged files).
-			if writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries) {
+			wroteLink, werr := writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries)
+			if werr != nil {
+				// #5842: a .link that did not land means this NIC comes up
+				// under its kernel name on the NEXT boot, unzoned — the same
+				// unconverged state a failed rename leaves, so it joins the
+				// same error channel.
+				renameErrs = append(renameErrs, werr)
+			}
+			if wroteLink {
 				changed = true
 			}
 			continue
 		}
 		// Write the .link FIRST so next boot's udev is correct, then rename.
-		if writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries) {
+		wroteLink, werr := writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries)
+		if werr != nil {
+			renameErrs = append(renameErrs, werr)
+		}
+		if wroteLink {
 			changed = true
 		}
 		if err := renameInterfaceFn(current, final); err != nil {
@@ -328,7 +340,13 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 	// (§9.6: console is the lifeline; no fabricated fxp0). It is written
 	// only if the operator explicitly mapped a NIC to fxp0.
 	if desiredNames["fxp0"] {
-		if writeBootstrapFxp0Network() {
+		wroteFxp0, err := writeBootstrapFxp0Network()
+		if err != nil {
+			// #5842: previously a bool, so a failed write was indistinguishable
+			// from "already exists" and the device-map path launders it too.
+			renameErrs = append(renameErrs, err)
+		}
+		if wroteFxp0 {
 			changed = true
 		}
 	}
@@ -355,8 +373,9 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 // writeDeviceMapLinkFile writes the .link for a mapped NIC. RETH members
 // match by OriginalName= (their MAC alternates — R-6); the file content is
 // identical to the positional path's writeLinkFile, so the two share a format.
-// Returns true if the file changed.
-func writeDeviceMapLinkFile(target, originalName string, rethMembers map[string]bool, entries []config.DeviceMapEntry) bool {
+// Returns (changed, err) — see writeLinkFile for why the two are separate
+// (#5842).
+func writeDeviceMapLinkFile(target, originalName string, rethMembers map[string]bool, entries []config.DeviceMapEntry) (bool, error) {
 	// All device-map .link files match by OriginalName= (the current kernel
 	// name at rename time). This is correct for RETH members (mandatory) and
 	// is also stable for plain NICs because device-map mode resolves the

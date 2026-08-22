@@ -25,14 +25,14 @@ func withTempLinkDir(t *testing.T) string {
 // never rewrites files or triggers a networkctl reload / link flap.
 func TestWriteLinkFileIdempotent(t *testing.T) {
 	withTempLinkDir(t)
-	if !writeLinkFile("ge-0-0-3", "enp9s0") {
+	if wrote, err := writeLinkFile("ge-0-0-3", "enp9s0"); err != nil || !wrote {
 		t.Fatalf("first write should report changed")
 	}
-	if writeLinkFile("ge-0-0-3", "enp9s0") {
+	if wrote, err := writeLinkFile("ge-0-0-3", "enp9s0"); err != nil || wrote {
 		t.Fatalf("second identical write must report UNCHANGED (no churn)")
 	}
 	// A different OriginalName is a real change.
-	if !writeLinkFile("ge-0-0-3", "eth7") {
+	if wrote, err := writeLinkFile("ge-0-0-3", "eth7"); err != nil || !wrote {
 		t.Fatalf("changed OriginalName should report changed")
 	}
 }
@@ -41,8 +41,8 @@ func TestWriteLinkFileIdempotent(t *testing.T) {
 // every still-desired .link untouched (no churn) and removes only orphans.
 func TestScrubStaleDeviceMapLinksNoOpWhenAllDesired(t *testing.T) {
 	dir := withTempLinkDir(t)
-	writeLinkFile("ge-0-0-3", "enp9s0")
-	writeLinkFile("ge-0-0-4", "enp10s0")
+	_, _ = writeLinkFile("ge-0-0-3", "enp9s0")
+	_, _ = writeLinkFile("ge-0-0-4", "enp10s0")
 
 	desired := map[string]bool{"ge-0-0-3": true, "ge-0-0-4": true}
 	if scrubStaleDeviceMapLinks(desired) {
@@ -73,7 +73,7 @@ func TestScrubStaleDeviceMapLinksNoOpWhenAllDesired(t *testing.T) {
 // in the no-op path (all names desired), so it is safe in the unit sandbox.
 func TestTeardownUnmappedManagedNoOpWhenAllMapped(t *testing.T) {
 	dir := withTempLinkDir(t)
-	writeLinkFile("ge-0-0-3", "enp9s0")
+	_, _ = writeLinkFile("ge-0-0-3", "enp9s0")
 
 	dm := &config.DeviceMapConfig{
 		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
@@ -89,7 +89,7 @@ func TestTeardownUnmappedManagedNoOpWhenAllMapped(t *testing.T) {
 // manage-down (that mode keeps today's claim-all via the compiler reconcile).
 func TestTeardownManageDownIsNoOp(t *testing.T) {
 	dir := withTempLinkDir(t)
-	writeLinkFile("ge-0-0-9", "enp99s0") // not in the map
+	_, _ = writeLinkFile("ge-0-0-9", "enp99s0") // not in the map
 
 	dm := &config.DeviceMapConfig{
 		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
@@ -108,7 +108,7 @@ func TestTeardownManageDownIsNoOp(t *testing.T) {
 func TestDeviceMapLinkOriginalNameRoundTrips(t *testing.T) {
 	withTempLinkDir(t)
 	// First run: enp9s0 -> ge-0-0-3 records OriginalName=enp9s0.
-	if !writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil) {
+	if wrote, err := writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil); err != nil || !wrote {
 		t.Fatalf("first .link write should report changed")
 	}
 	// A subsequent run that sees the NIC already named ge-0-0-3 must recover
@@ -117,7 +117,7 @@ func TestDeviceMapLinkOriginalNameRoundTrips(t *testing.T) {
 		t.Fatalf("OriginalName round-trip failed: recovered %q, want enp9s0", got)
 	}
 	// Re-writing the identical .link is a no-op (no churn).
-	if writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil) {
+	if wrote, err := writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil); err != nil || wrote {
 		t.Fatalf("identical .link re-write must be a no-op")
 	}
 }
@@ -163,7 +163,7 @@ func TestDeviceMapOriginalNameFallbackViaDeriveKernelName(t *testing.T) {
 		t.Fatalf("OriginalName fallback must yield kernel name %q, got %q", "enp9s0", orig)
 	}
 	// Prove the .link is written with the TRUE kernel OriginalName, not the logical name.
-	changed := writeDeviceMapLinkFile("ge-0-0-3", orig, nil, nil)
+	changed, _ := writeDeviceMapLinkFile("ge-0-0-3", orig, nil, nil)
 	if !changed {
 		t.Fatalf("first write should create the .link")
 	}
@@ -355,7 +355,7 @@ func TestTeardownSkipsProtectedInterface(t *testing.T) {
 	// AGY r2 CRITICAL: an unmapped-but-protected mgmt interface must NOT be
 	// torn down (no immediate lockout). The .link survives.
 	dir := withTempLinkDir(t)
-	writeLinkFile("fxp0", "enp5s0") // mgmt NIC currently managed as fxp0
+	_, _ = writeLinkFile("fxp0", "enp5s0") // mgmt NIC currently managed as fxp0
 	dm := &config.DeviceMapConfig{
 		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
 		UnmappedPolicy: config.DeviceMapPolicyLeaveAlone,
