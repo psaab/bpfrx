@@ -100909,3 +100909,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_validate_warn.go,
   pkg/config/compiler_validate_warn_lag_6544_test.go (new),
   docs/feature-gaps.md, docs/phases.md, docs/vsrx-gaps.md, _Log.md
+
+## 2026-08-21 — #6546: device-map duplicate logical name refused
+- **Timestamp**: 2026-08-21
+- **Action**: `devicemap.Resolve`'s post-pass guarded two entries → ONE NIC but
+  not two entries → ONE LOGICAL NAME, so a duplicate name bound both entries
+  and the daemon renamed a nondeterministically-chosen NIC, durably via
+  `.link`. Added the symmetric guard with its own `BindRefusedDupName` status
+  (distinct remedy), keyed on the RESOLVED Linux name — which also closes a
+  strict-path hole: `ge-0/0/3` + `ge-0-0-3` are one interface and the raw-string
+  compare in `validateDeviceMapStrict` accepted them. Strict gate now
+  canonicalises; the commit pre-flight hard-stops via `Status.Refused()`.
+- **File(s)**: pkg/devicemap/devicemap.go, pkg/config/compiler_chassis.go,
+  pkg/daemon/device_map.go, pkg/devicemap/dup_logical_name_6546_test.go (new),
+  pkg/config/compiler_device_map_dup_name_6546_test.go (new),
+  pkg/daemon/device_map_dup_name_6546_test.go (new),
+  docs/bare-metal-device-map.md, _Log.md
