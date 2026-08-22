@@ -32,6 +32,107 @@
   only). No dataplane change; the Rust helper binary is not reached.
 - **File(s)**: `pkg/nftables/host_inbound_any_service_verdict_6618_test.go`
   (new), `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6656 transfer-out override cleared on peer loss
+
+- **Timestamp**: 2026-08-21
+- **Action**: `handlePeerTimeout` cleared `ManualFailover`, `peerGroups`,
+  `peerMonitors` and both peer version fields but left
+  `peerTransferOutOverride` armed. That override has NO expiry and is
+  re-applied to the rebuilt peer-group map on every heartbeat, and it
+  feeds BOTH the election AND the operator-facing status render
+  (`FormatStatus` prints the post-override `m.peerGroups`) — so an
+  override outliving its peer incarnation makes this node force a
+  reconnecting peer to secondary-hold forever and self-elect primary,
+  which is the reported signature (node0 primary for all RGs, node1
+  carrying the traffic). Cleared beside the existing ManualFailover
+  clear, using the same argument that comment already makes.
+  RECORD CORRECTION: the issue's VRRP virtual-MAC/VIP hypothesis is
+  INAPPLICABLE — `private-rg-election` is the compiler default
+  (`compiler_system.go`), so `CollectRethInstances` returns nil and the
+  cluster has no RETH VRRP instances at all.
+  Mutation matrix: V1 (no clear — the shipped state) and V2 (clear only
+  the first RG) RED; V3 (drop only the map entry, keep the Previous
+  snapshot) GREEN and disclosed — with the override gone the snapshot is
+  unreachable, so it is a bounded leak, not a correctness gap.
+  NOT REPRODUCED on hardware: the loss cluster is shared and serialized
+  by the lead. Successors filed for the two cluster-dependent gaps.
+- **File(s)**: pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/transfer_override_peer_loss_6656_test.go,
+  pkg/cluster/README.md
+
+## 2026-08-21 — #6534 port-mirroring: dropped instances stop rendering as armed
+
+- **Timestamp**: 2026-08-21
+- **Action**: Third family of #6534. A port-mirroring instance the
+  snapshot builder drops now carries a `NOT INSTALLED: <reason>` line on
+  both show surfaces. Sharpest case: both renderers print `Input rate:
+  all packets` whenever the rate is not > 0, so an instance with a
+  NEGATIVE rate — which the builder drops outright — advertised the most
+  permissive mirror possible while mirroring nothing.
+  BOTH surfaces are annotated because `cli.showPortMirroring` and
+  `Server.showForwardingOptionsPortMirroring` are byte-identical COPIES
+  with no shared formatter (unlike pkg/natshow and .../format, which were
+  extracted precisely to prevent this). Annotating one would have left
+  the other lying with the suite green, so the surfaces test asserts the
+  gRPC copy directly and the builder test pins the shared predicate.
+  COVERAGE IS DELIBERATELY PARTIAL, and this is the one place in the
+  audit where the issue's "give the renderer applied state" instinct has
+  real force: two of the four mirror drops depend on the runtime IFINDEX
+  TABLE (output interface unresolvable; ingress already claimed by a
+  lower-sorted instance), which a config-only renderer cannot reach.
+  Those are documented as uncovered rather than silently omitted.
+  Note the `no output interface` clause is redundant for the BUILDER — an
+  empty output name also fails the later ifindex lookup — but not for the
+  RENDERER, which has no ifindex table. It earns its place on the
+  renderer side only. The R1 mutation cell shows this directly: reverting
+  the builder drop reds only the negative-rate case.
+  Validation: `go test -count=1` green on pkg/config,
+  pkg/dataplane/userspace, pkg/cli, pkg/grpcapi; `go vet` clean on all
+  four; 5-cell mutation matrix all red with 29 `=== RUN` lines in every
+  cell, vet clean at each mutated state, control and restored green.
+- **File(s)**: pkg/config/mirror_exclusion_reason.go,
+  pkg/dataplane/userspace/mirrors.go,
+  pkg/dataplane/userspace/mirror_exclusion_6534_test.go,
+  pkg/cli/show_services_mirror.go,
+  pkg/grpcapi/server_show_forwarding.go,
+  pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
+  docs/junos-cli-reference.md, _Log.md
+
+## 2026-08-21 — #6650 cross-chassis snapshot-protocol gate
+
+- **Timestamp**: 2026-08-21
+- **Action**: Added a peer capability exchange + a COMMIT preflight so a
+  current primary refuses to push a multi-zone scoped policy to a peer
+  that would narrow it. `syncMsgPeerCapabilities` (additive, no version
+  bump — the #2239 DHCP-lease precedent; the receive switch has no
+  default arm) advertises the sender's config-snapshot protocol version
+  once per installed session-sync connection, beside the clock sync.
+  Chose the sync channel over the heartbeat: same connection as the
+  config push (one lifecycle), and the heartbeat's optional sections are
+  back-indexed from a fixed-size auth trailer (#6169 epoch at len-68)
+  AND require a PSK. Gate refuses in the commit PREFLIGHT, not at push:
+  skipping the push would trade a narrowing for a config divergence.
+  Floor is a new per-feature immutable `MinProtocolMultiZoneScopedPolicy
+  = 4`, deliberately NOT `ProtocolVersion` — keying on the shared
+  constant imports open #6648's defect into new code. Arming predicate is
+  an exported WRAPPER of the local gate's, not a copy.
+  Corrected a FALSE CLAIM in docs/userspace-dataplane-architecture.md
+  ("a multi-zone scope can never reach a reader that would narrow it") —
+  true only for the local skew.
+  Mutation matrix 8/8 RED: U1 unadvertised-reads-capable, U2 wiring
+  deleted from the preflight, U3 key on the shared version, U4
+  capability survives disconnect, U5 never advertise, U6 refuse when the
+  peer is down, U7 floor renumbered, U8 drop the receive store.
+  Issue citations were stale: the gate is at
+  `pkg/dataplane/userspace/manager_compile.go:857` (not
+  `pkg/daemon/manager_compile.go:750`), and `ProtocolVersion` is 8, not 4.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_capabilities_6650.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync_conn_read.go, pkg/cluster/sync_conn_write.go,
+  pkg/daemon/peer_snapshot_protocol_gate_6650.go,
+  pkg/daemon/daemon_apply_commit.go, pkg/daemon/daemon_ha_sync.go,
+  docs/userspace-dataplane-architecture.md
 
 ## 2026-08-21 — #6533 applied/published/converged marker rule: audited, PLAN-KILLED
 
@@ -101669,6 +101770,23 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/api/show_text.go, pkg/api/show_nat_shared_test.go (new),
   pkg/api/README.md, _Log.md
 
+## 2026-08-22 — #6607 kernel promote Gate 4 forward beacon
+- **Timestamp**: 2026-08-22
+- **Action**: Gate 4's second condition probed `systemctl is-active
+  xpfd-userspace-dp`, a unit that exists nowhere in the repo (the helper is a
+  child process xpfd spawns). OR'd with the xpfd probe it could contribute
+  neither pass nor fail, so the guard degenerated to "xpfd is active" — the
+  pre-#5286 mistake, failing PERMISSIVE on the one gate that proves the
+  candidate kernel forwards. Replaced with the control-socket
+  enabled+forwarding-armed probe, injected from cmd/xpfd via the existing
+  HelperStatusFunc seam. Made both preconditions and the ping/gateway calls
+  injectable — without a ping seam every "the beacon rejects X" assertion was
+  decided by the ping instead (two mutation cells initially passed vacuously).
+- **File(s)**: pkg/upgrade/kernel_linux.go,
+  pkg/upgrade/kernel_forward_beacon_6607_test.go (new),
+  cmd/xpfd/upgrade_kernel.go,
+  cmd/xpfd/upgrade_kernel_beacon_6607_test.go (new),
+  docs/in-place-upgrade.md, _Log.md
 ## 2026-08-22 — #6609 RedactURL credential slots
 - **Timestamp**: 2026-08-22
 - **Action**: `config.RedactURL` leaked a credential in three slots, all three
@@ -101693,3 +101811,73 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/daemon_ha_comms_wiring.go, docs/session-sync-architecture.md,
     pkg/cluster/sync_config_apply_nack_7328_test.go,
     pkg/daemon/configsync_rearm_7328_test.go
+
+## 2026-08-22 — #6606 dyndns2 raw server render
+- **Timestamp**: 2026-08-22
+- **Action**: `resolveDyndns2Endpoint` interpolated the raw `server` at FOUR
+  sites (the issue named two; its review comment warned that fixing only the
+  cited ones leaves the other half open). Applied the #6594 parse-first split:
+  on a parse failure render NO part of the input plus `urlParseCause`; on the
+  branches where the URL parsed, `config.RedactURL` is provably sound. Verified
+  empirically that dropping only the `%w` still leaks — `invalid port %q after
+  host` and `invalid host: ParseAddr(...)` are unbounded inner causes — so the
+  mutation that keeps a redacted render on the parse branch reds. Removed the
+  self-expiring `issue6606Exemption` from the source gate, which fired on cue.
+- **File(s)**: pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/dyndns2_server_leak_6606_test.go (new),
+  pkg/ddns/url_render_class_6545_test.go, pkg/ddns/README.md, _Log.md
+## 2026-08-21 — #6568: Rust-dataplane cohort, provable subset
+- **Timestamp**: 2026-08-21
+- **Action**: Swept all 8 rows individually. Member 1 was filed as a
+  low-materiality residual with "no traffic fail-open" — measured, both halves
+  are wrong: `ipnet` requires a prefix length and the config compiler validates
+  nothing, so `route 10.0.0.1 discard`, `route 2001:db8::1 discard` and
+  `route default discard` all commit, ship, and VANISH in the helper; for a
+  discard route that is a fail-OPEN (packet matches a less-specific route and is
+  forwarded). Fixed at the Go chokepoint (`routeDestinationForWire` normalises a
+  bare host to /32 or /128, drops anything unusable with a WARN) plus a Rust
+  fail-closed `RouteDestinationUnparseable`. Member 3 doc-parity (per-worker
+  screen rate multiplier). Member 4 Err-arm `refresh_status` (latent —
+  `update_ha_state` returns Ok on every path today). Member 6 poisoned-lock
+  panic amplification on the NAT path. Member 7 does NOT reproduce (has a
+  live `debug_log!` caller). Members 2/5/8 split to #7359/#7360/#7361.
+- **File(s)**: pkg/dataplane/userspace/routes.go,
+  pkg/dataplane/userspace/route_dest_unparseable_6568_test.go (new),
+  userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/policy_snapshot_error.rs,
+  userspace-dp/src/server/handlers/ha.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_counter.rs,
+  docs/syn-cookie-flood-protection.md, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (shape family) — fixed the four compact-leaf members whose
+    operand was dropped before a strict gate read it: ALG disable, prefix-list,
+    static next-hop (inverse shape), tcp-mss. Single-sourced the tcp-mss reader.
+  - **File(s)**: pkg/config/compiler_security_alg.go, pkg/config/compiler_routing.go,
+    pkg/config/compiler_security_flow.go, pkg/config/compact_leaf_cohort_6564_test.go,
+    docs/config-schema.md
+
+## 2026-08-22 — #6610 snat_allocator bench flow-key overflow
+- **Timestamp**: 2026-08-22
+- **Action**: Determined READING 1 (benign) with evidence, not assumption: the
+  overflowing add is in the bench's synthetic dst_ip uniqueness TAG, not an
+  accumulator and not port accounting; the release wrap was a pure mod-256 fold
+  of the top byte leaving all nine producer tags distinct, and a post-fix
+  release run reproduces the published fail-fraction fingerprint exactly. Fixed
+  by building the tag as two disjoint bit fields OR'd together with named
+  producer bytes; `saturating_add` would have been WRONG (collapses the low-24
+  discriminator). Added const-assert invariants and a `cargo check --benches`
+  leg to `make test-rust` — compiling a bench is what evaluates its const
+  asserts, so the compile-only gate is meaningful for this class.
+- **File(s)**: userspace-dp/benches/snat_allocator.rs, Makefile,
+  docs/research/2852-portalloc/microbench-results.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 (strict-reject family, members 2/5/6) — malformed
+    autonomous-system, chained zone `screen` statement, and malformed OSPF area
+    id now REJECT at strict commit and WARN on the tolerant load/peer-sync path
+    (#1960 no-brick, via the #1319 SchemaValidate split). Added ValidateOSPFArea.
+  - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
+    pkg/config/schema_validators_network.go,
+    pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md

@@ -689,6 +689,30 @@ pub(crate) enum SnapshotIntegrityError {
         destination: String,
         family: String,
     },
+    /// #6568 (member 1): a `RouteSnapshot` carried a `destination` that parses
+    /// as NEITHER `Ipv4Net` NOR `Ipv6Net`, so no FIB can hold it.
+    ///
+    /// `populate_routes` used to fall off the end of the loop body here — no
+    /// `Err`, no counter, no log — at a boundary whose entire #2409/#2410/#3771
+    /// contract is "no silent skips". It was filed as a low-materiality
+    /// residual with "no traffic fail-open"; that is wrong. `ipnet`'s parsers
+    /// REQUIRE a prefix length and nothing in the config compiler validated the
+    /// destination, so a bare host address (`10.0.0.1`, `2001:db8::1`) or the
+    /// Junos `default` keyword committed cleanly, shipped, and VANISHED here.
+    ///
+    /// For a `discard`/`reject` route that is a fail-OPEN: the blackhole entry
+    /// is absent, the packet longest-prefix matches a LESS-SPECIFIC route
+    /// (typically the default) and is FORWARDED where the operator asked for it
+    /// to be dropped — and it presents as a routing mystery, because the
+    /// control plane, FRR and the kernel all show the route as configured.
+    ///
+    /// The Go producer now normalises a bare address to its /32 or /128 host
+    /// prefix and drops anything still unusable with a WARN naming the route
+    /// (`routeDestinationForWire`, pkg/dataplane/userspace/routes.go), so a
+    /// clean snapshot never trips this. It is the helper-boundary backstop for
+    /// a corrupt / hand-built / version-drifted snapshot, consistent with the
+    /// #2410/#2409 fail-closed family.
+    RouteDestinationUnparseable { table: String, destination: String },
     /// #3771 (L1): a `RouteSnapshot` carried a NEGATIVE `preference`. Junos route
     /// preference is a non-negative administrative distance (default 5; lower =
     /// more preferred); the FIB tie-breaks same-prefix routes by ASCENDING
@@ -1035,6 +1059,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "route {:?} in table {:?} declares family {:?} that does not match the address family of its destination prefix — refusing to install it into the prefix-parsed FIB while the family metadata claims the other",
                 destination, table, family
+            ),
+            Self::RouteDestinationUnparseable { table, destination } => write!(
+                f,
+                "route {:?} in table {:?} has a destination that parses as neither an IPv4 nor an IPv6 prefix — refusing to skip it silently, because a dropped discard/reject route falls through to a less-specific route and FORWARDS traffic the operator asked to blackhole (a bare host address needs its /32 or /128)",
+                destination, table
             ),
             Self::RoutePreferenceOutOfRange {
                 table,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -93,13 +94,7 @@ func runUpgradeKernelSubcommand(args []string) {
 		defer func() { _ = h.Release() }()
 	}
 
-	cfg := upgrade.KernelConfig{
-		JournalPath:    *journalPath,
-		StrictWatchdog: *strictWatchdog,
-		BeaconDeadline: *beaconDeadline,
-		Sys:            upgrade.NewKernelSystem(),
-		Logf:           func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
-	}
+	cfg := newKernelConfig(*journalPath, *strictWatchdog, *beaconDeadline)
 	r, err := upgrade.NewKernelRunner(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "upgrade kernel: %v\n", err)
@@ -224,4 +219,44 @@ func validateKernelVerbArgs(verb string, positionals []string) error {
 		}
 	}
 	return nil
+}
+
+// newKernelConfig assembles the production KernelConfig for the kernel
+// promote/rollback channel.
+//
+// Factored out of the verb function so the WIRING is bindable (#6607): the Gate
+// 4 dataplane probe is the whole point of that change, and a test that only
+// exercised realKernelSystem.ForwardBeacon directly would stay green if this
+// site were reverted to upgrade.NewKernelSystem(). It mirrors newUpgradeConfig,
+// which the binary channel factored out for exactly the same reason (#5286).
+func newKernelConfig(journalPath string, strictWatchdog bool, beaconDeadline time.Duration) upgrade.KernelConfig {
+	return upgrade.KernelConfig{
+		JournalPath:    journalPath,
+		StrictWatchdog: strictWatchdog,
+		BeaconDeadline: beaconDeadline,
+		// #6607: wire Gate 4's dataplane-liveness probe. Without it the beacon
+		// can only assert that xpfd is up, which a Type=simple unit reports
+		// while its helper is down, stale or crash-looping and NOT forwarding —
+		// the exact state a kernel change is most likely to cause and the one
+		// Gate 4 exists to catch.
+		//
+		// Routed through the same package-level seams the binary channel uses
+		// (upgradeHelperStatus / upgradeControlSock) so there is ONE adapter per
+		// primitive rather than a second copy for the kernel channel, and so a
+		// test can inject fakes.
+		//
+		// The socket is resolved from upgrade.DefaultConfigDBDir: the kernel
+		// verbs carry no --configdb-dir flag (they run from
+		// xpf-kernel-promote.service, not an operator command line), and
+		// upgradeControlSock already falls back to the default socket path when
+		// that dir is absent or unreadable.
+		Sys: upgrade.NewKernelSystemWithHelperStatus(
+			func(ctx context.Context) (bool, error) {
+				return upgradeUnitActive(ctx, upgrade.DefaultUnit)
+			},
+			upgradeHelperStatus,
+			upgradeControlSock(upgrade.DefaultConfigDBDir),
+		),
+		Logf: func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+	}
 }
