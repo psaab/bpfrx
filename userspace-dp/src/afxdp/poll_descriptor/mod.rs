@@ -3554,7 +3554,22 @@ pub(super) fn poll_binding_process_descriptor(
 
                     // (3) Zone security policy — only for TRANSIT
                     //     (ForwardCandidate). Local delivery (host-inbound) is
-                    //     #3292; NoRoute drops anyway; MissingNeighbor keeps its
+                    //     #3292; NoRoute is NOT adjudicated here and does NOT
+                    //     drop — it is slow-path eligible
+                    //     (ForwardingDisposition::is_slow_path_eligible) and is
+                    //     REINJECTED to the kernel FIB, which forwards it with
+                    //     no zone policy, session, NAT or screen. This comment
+                    //     claimed "NoRoute drops anyway" until #7409; that was
+                    //     false, and being false in the SAFE direction is why
+                    //     the gap went unexamined for so long. #7409 narrows the
+                    //     exposure by importing kernel-learned routes into the
+                    //     helper FIB so NoRoute becomes rare rather than routine,
+                    //     but does NOT close it: the FIB is refreshed only on
+                    //     commit and ip-monitoring actuation, so a route learned
+                    //     between pushes still lands here. Do not "fix" this by
+                    //     dropping NoRoute — that black-holes every learned
+                    //     destination for the width of that window;
+                    //     MissingNeighbor keeps its
                     //     own cold-path arm, which now enforces this SAME zone
                     //     policy on its flowless (flow == None) branch (#4024 —
                     //     before which a flowless MissingNeighbor fragment was

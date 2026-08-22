@@ -433,6 +433,14 @@ func (m *Manager) Start(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
+	// #7409: arm the kernel-learned route import for every subsequent
+	// snapshot build. This is the ONE production bring-up path for the
+	// userspace dataplane (LegacyDataPlaneAdapter.Start delegates here), and
+	// the import defaults to DISABLED precisely so that reaching this line is
+	// the only way it can switch on — see EnableLearnedRouteImport in
+	// routes.go for why a build-host-dependent default would be worse than
+	// no feature at all.
+	EnableLearnedRouteImport()
 	return m.Load()
 }
 

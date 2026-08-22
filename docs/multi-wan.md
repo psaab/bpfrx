@@ -662,12 +662,34 @@ routing, and only on double fault).
   `request dhcp client renew` removes the lease record first, so an
   active failover route is withdrawn and re-injected once the new
   lease lands.
-- **DHCP uplink as PRIMARY fast-path uplink still needs a static
-  default.** The dataplane FIB baseline is config-derived and carries
-  no DHCP-learned routes; #1844 makes a DHCP uplink usable as the
-  *failover target* (the overlay carries the resolved next-hop into
-  both FRR and the snapshot), not as the primary fast-path uplink
-  without a static default.
+- **DHCP uplink as primary fast-path uplink (updated by #7409).** The
+  dataplane FIB baseline is config-derived — config statics, connected
+  prefixes, the ip-rule leak mirror and the ip-monitoring overlay — and
+  before #7409 it carried no kernel-learned routes at all, so a
+  DHCP-learned default was invisible to the fast path and a static
+  default was mandatory. #7409 adds a fifth source: `pkg/routing`
+  `ImportLearnedRoutes` dumps the kernel tables xpf owns and feeds the
+  unicast, gateway-bearing, learned routes (BGP/OSPF/IS-IS/RIP and the
+  AD-200 DHCP default plus its RFC 3442 classless routes) into
+  `buildRouteSnapshots`. A DHCP uplink therefore now works as a primary
+  fast-path uplink without a static default.
+  - The import is **gap-fill only**: an imported route is discarded
+    whenever the config-derived set already covers the same
+    `(table, family, prefix)`, so an operator's route always wins and no
+    existing precedence contract changes.
+  - It **narrows a window rather than closing it.** The snapshot is
+    republished on operator commit and on ip-monitoring actuation only —
+    there is no kernel route-event subscription — so a route learned
+    between two pushes is still absent from the helper FIB until the
+    next one, and traffic for it still takes the `NoRoute` slow-path
+    reinject in the meantime. Watch
+    `xpf_userspace_binding_slow_path_no_route_packets_total`: a
+    sustained non-zero rate is the helper FIB disagreeing with the
+    kernel FIB.
+  - #1844 remains what makes a DHCP uplink usable as the *failover
+    target* (the overlay carries the resolved next-hop into both FRR and
+    the snapshot); that path is unchanged and still takes precedence
+    over an imported route for the same prefix.
 - Failover actuation is a differential frr-reload + one snapshot push
   per debounce window; detection time (probe interval × threshold)
   dominates end-to-end failover latency.

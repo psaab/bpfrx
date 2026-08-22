@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/routing"
 	"github.com/vishvananda/netlink"
 )
 
@@ -375,6 +376,44 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 		}
 	}
 
+	// #7409 (fifth source): kernel-learned routes.
+	//
+	// The four sources above are ALL config-derived, so a route FRR installs
+	// (BGP/OSPF/IS-IS/RIP) or that a DHCP lease on a non-management interface
+	// contributes (the AD-200 default and its RFC 3442 classless routes) is
+	// invisible to the helper FIB while the kernel routes it happily. A
+	// transit packet toward such a destination either resolves NoRoute and is
+	// REINJECTED to the kernel unadjudicated — no zone policy, no session, no
+	// NAT, no screen, and no nftables `hook forward` chain behind it — or, if
+	// a config default happens to cover it, is forwarded to the STATIC
+	// default's next-hop instead of the learned one. Import closes both.
+	//
+	// GAP-FILL ONLY. An imported route is dropped whenever the config-derived
+	// set above already carries the same (table, family, prefix). That single
+	// rule is what makes this safe to add without renegotiating any existing
+	// precedence contract: the #3770 dedupe key, the #2390 preference
+	// tie-break and the overlay's whole-entry replacement all keep operating
+	// on exactly the routes they did before, because no imported route can
+	// ever contend with one of theirs.
+	//
+	// THE OVERLAY ALWAYS WINS, and the gap-fill rule — not this call's
+	// position — is what guarantees it. Measured, because the obvious claim
+	// is wrong: moving this call BELOW applyRouteOverlay changes nothing.
+	// Import-first, the overlay's whole-entry replacement removes anything
+	// imported for its prefix; import-last, `covered` is computed from an
+	// `out` that already holds the overlay's entries, so the imported route
+	// is suppressed as covered. Both orders end with only the overlay's
+	// route, so #1827's no-half-override contract holds either way.
+	//
+	// It runs here anyway because the overlay is documented as the LAST
+	// transform on the snapshot and reading it that way should stay true.
+	// Do not restate the position as a safety property: it is not one, and a
+	// comment claiming a guarantee the code does not depend on is how the
+	// next reader stops looking for the guarantee that matters.
+	if err := addLearnedRouteSnapshots(cfg, out, addSnapshot); err != nil {
+		return nil, err
+	}
+
 	out = applyRouteOverlay(out, overlay)
 
 	// #3770 (M10): stable sort with a TOTAL order. The old comparator
@@ -626,4 +665,202 @@ func normalizeRouteSnapshotFamily(table, family, destination string) (string, st
 		table = strings.TrimSuffix(table, ".inet6.0") + ".inet.0"
 	}
 	return table, family
+}
+
+// learnedRouteImportFn is the kernel-FIB importer, indirected so the
+// snapshot builder can be driven against synthetic kernel tables.
+//
+// It defaults to a DISABLED importer, not to routing.ImportLearnedRoutes,
+// and that default is load-bearing in two directions:
+//
+//   - HERMETICITY. buildRouteSnapshots is called by a large number of unit
+//     tests with synthetic configs. A default that read the real kernel
+//     would splice the BUILD HOST's routing table into every one of those
+//     snapshots — measured on a dev box, a `default via ... proto dhcp`
+//     route is RTN_UNICAST, has a gateway and carries an admitted RTPROT,
+//     so it satisfies every import predicate and would appear in test
+//     snapshots as a phantom default route. Tests would then pass or fail
+//     according to the machine they ran on, which is worse than not having
+//     the feature.
+//   - FAIL-SAFE DEFAULT. A caller that has not deliberately enabled the
+//     import gets exactly the pre-#7409 config-derived FIB. The import can
+//     only ever be switched on by an explicit production wiring decision,
+//     never by forgetting to switch it off.
+//
+// EnableLearnedRouteImport installs the real importer; production calls it
+// once during dataplane bring-up.
+var learnedRouteImportFn func(tableIDs []int) ([]routing.LearnedRoute, error)
+
+// EnableLearnedRouteImport turns on the #7409 kernel-learned route import
+// for every subsequent snapshot build.
+//
+// Idempotent, and deliberately a package-level switch rather than a config
+// stanza: importing the routes the kernel would have used is a correctness
+// property of the dataplane, not an operator preference. There is no
+// supported configuration in which the helper FIB should knowingly disagree
+// with the kernel FIB the slow path reinjects into.
+func EnableLearnedRouteImport() {
+	learnedRouteImportFn = routing.ImportLearnedRoutes
+}
+
+// learnedRouteTableName maps a kernel table id to the Junos-style route
+// table name the snapshot wire format uses.
+//
+// Returns ok=false for a table the config does not name, so a table xpf
+// does not own can never be published into the helper FIB under a
+// fabricated name.
+func learnedRouteTableName(tableID int, family string, instByTableID map[int]string) (string, bool) {
+	suffix := ".inet.0"
+	if family == "inet6" {
+		suffix = ".inet6.0"
+	}
+	if tableID == learnedRouteMainTableID {
+		if family == "inet6" {
+			return "inet6.0", true
+		}
+		return "inet.0", true
+	}
+	if name, ok := instByTableID[tableID]; ok && name != "" {
+		return name + suffix, true
+	}
+	return "", false
+}
+
+// learnedRouteMainTableID mirrors pkg/routing mainTableID (RT_TABLE_MAIN).
+// Duplicated rather than exported because the two packages agree on a
+// kernel constant, not on a shared policy.
+const learnedRouteMainTableID = 254
+
+// addLearnedRouteSnapshots imports kernel-learned routes and feeds the ones
+// that fill a genuine gap to addSnapshot.
+//
+// `existing` is the config-derived snapshot set built so far; it is read to
+// compute the gap-fill key and never mutated. The key is built from the
+// SAME (table, family, destination) triple the caller's dedupe uses, and
+// the imported destination is normalised through routeDestinationForWire
+// first so a kernel rendering can never miss a config route it is
+// semantically identical to (which would let a duplicate through and hand
+// the Rust FIB two routes for one prefix to tie-break).
+//
+// A failure from the importer is returned, not swallowed: same #3772 M9
+// reasoning as the ip-rule enumeration above — a snapshot silently missing
+// a subset of learned destinations is a FIB that disagrees with the kernel
+// in exactly the way this issue exists to stop.
+func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addSnapshot func(RouteSnapshot)) error {
+	if learnedRouteImportFn == nil {
+		return nil
+	}
+	instByTableID := make(map[int]string)
+	instanceTableIDs := make([]int, 0, len(cfg.RoutingInstances))
+	for _, inst := range cfg.RoutingInstances {
+		if inst == nil || inst.TableID <= 0 {
+			continue
+		}
+		instByTableID[inst.TableID] = inst.Name
+		instanceTableIDs = append(instanceTableIDs, inst.TableID)
+	}
+	sort.Ints(instanceTableIDs)
+
+	learned, err := learnedRouteImportFn(routing.LearnedRouteTableIDs(instanceTableIDs))
+	if err != nil {
+		return fmt.Errorf("route snapshot: %w", err)
+	}
+	if len(learned) == 0 {
+		return nil
+	}
+
+	covered := make(map[string]struct{}, len(existing))
+	for _, snap := range existing {
+		covered[learnedRouteGapKey(snap.Table, snap.Family, snap.Destination)] = struct{}{}
+	}
+
+	// Deterministic emission order. The kernel dump order is not a stable
+	// function of content, and the caller's final sort tie-breaks on
+	// next-hops/next-table/discard/preference — all of which two learned
+	// routes for different prefixes share — so leaving kernel order to leak
+	// through would produce snapshot-to-snapshot diffs (and a needless FIB
+	// re-install) for an unchanged routing table.
+	sorted := make([]routing.LearnedRoute, len(learned))
+	copy(sorted, learned)
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := sorted[i], sorted[j]
+		if a.TableID != b.TableID {
+			return a.TableID < b.TableID
+		}
+		if a.Family != b.Family {
+			return a.Family < b.Family
+		}
+		if a.Destination != b.Destination {
+			return a.Destination < b.Destination
+		}
+		return strings.Join(a.NextHops, ",") < strings.Join(b.NextHops, ",")
+	})
+
+	for _, lr := range sorted {
+		family := "inet"
+		if lr.Family == netlink.FAMILY_V6 {
+			family = "inet6"
+		}
+		table, ok := learnedRouteTableName(lr.TableID, family, instByTableID)
+		if !ok {
+			continue
+		}
+		dest := lr.Destination
+		if normalized, ok := routeDestinationForWire(dest); ok {
+			dest = normalized
+		} else {
+			// Unparseable from the kernel should be impossible, but the
+			// #6568 contract at this boundary is "no silent skips" — and a
+			// destination the Rust FIB cannot parse is dropped there
+			// anyway, so refuse it here where the operator can see why.
+			slog.Warn("dropping a kernel-learned route with an unusable "+
+				"destination from the helper FIB (#7409)",
+				"destination", lr.Destination, "table", table,
+				"family", family, "protocol", lr.Protocol)
+			continue
+		}
+		if _, ok := covered[learnedRouteGapKey(table, family, dest)]; ok {
+			// The operator's own route wins, always. This is the gap-fill
+			// rule; see the call site for why it is what makes the import
+			// safe to add.
+			continue
+		}
+		addSnapshot(RouteSnapshot{
+			Table:       table,
+			Family:      family,
+			Destination: dest,
+			NextHops:    lr.NextHops,
+			Preference:  routing.LearnedRouteImportPreference,
+		})
+	}
+	return nil
+}
+
+// learnedRouteGapKey is the (table, family, destination) identity the
+// gap-fill test uses.
+//
+// Deliberately NARROWER than the caller's #3770 dedupe key, which also
+// spans next-hops, next-table, discard and preference. The dedupe key
+// answers "is this the same route?"; this key answers "does the operator
+// already have an answer for this destination?" — and if they do, the
+// kernel's answer must not be published alongside it, however different its
+// next-hop is. Using the wider key here would let an imported route sit
+// beside a config route for the same prefix and leave the Rust FIB to pick
+// between them by preference, which is precisely the contention the
+// gap-fill rule exists to prevent.
+//
+// The destination is CANONICALISED, matching what applyRouteOverlay does on
+// both sides of its own comparison. routeDestinationForWire passes a parseable
+// CIDR through untouched, so a config static written with host bits set
+// (`route 10.20.30.1/24`) reaches the snapshot in that literal form while the
+// kernel always reports the masked prefix — comparing the raw strings would
+// therefore MISS the coverage, emit the imported route alongside the
+// operator's, and hand the Rust FIB two routes for one prefix. An
+// uncanonicalisable destination falls back to its raw text so it can still
+// match itself rather than collapsing every such route onto one empty key.
+func learnedRouteGapKey(table, family, destination string) string {
+	if canonical := canonicalRoutePrefix(destination); canonical != "" {
+		destination = canonical
+	}
+	return table + "|" + family + "|" + destination
 }
