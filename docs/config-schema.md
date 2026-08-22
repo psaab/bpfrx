@@ -2769,6 +2769,31 @@ whether or not it reads the node — and
 `TestRedundancyGroupNoArgStatementsAreRegistered_6588` keeps it from naming a
 statement the dispatch table does not have.
 
+**The dispatch table and `setSchema` are two SSOTs for one grammar, and they
+had drifted (#6663).** `redundancyGroupStatements` is what `compileChassis`
+actually compiles; `setSchema` is what config-mode completion and `?` help
+read. `strict-vip-ownership` was in the first and missing from the second.
+
+It was **not** a commit rejection — the redundancy-group subtree is
+open-world (`schema_walk.go`), so the statement committed and took effect. It
+was a COMPLETION gap: `set chassis cluster redundancy-group 1 ?` never offered
+a knob the compiler implements, so it was discoverable only by reading the
+compiler.
+
+`TestRedundancyGroupCompilerAndSchemaAgree_6663` now binds them, and it
+deliberately asserts **one direction only**:
+
+- **compiler ⇒ schema** is checked. A statement the compiler honours while the
+  schema omits it is always a defect, for the reason above.
+- **schema ⇒ compiler** is NOT checked. A leaf declared but not yet compiled is
+  the documented accepted-only posture (#2078/#4231/#5804): advertised,
+  committing, with an advisory saying it is inert. Asserting that direction
+  would red every deliberate use of it.
+
+A second test pins that `strict-vip-ownership` is both declared AND still
+compiles — otherwise the agreement test could be satisfied by deleting the
+compiler entry, which is a feature removal wearing the shape of a fix.
+
 **The packing recurses: an INSTANCE can carry its whole body on its own Keys
 too.** Everything above is about a statement inside a named instance's body.
 The instance line itself packs the same way:
