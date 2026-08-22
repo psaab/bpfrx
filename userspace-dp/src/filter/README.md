@@ -713,6 +713,44 @@ peer-sync path. An EMPTY reference (no filter on the hook) is the legitimate
 both lo0 input families. Tests: `missing_filter_ref_3296_*` /
 `defined_filter_ref_3296_compiles_cleanly` in `filter/tests.rs` (fail-on-revert).
 
+#### Dangling `then policer <name>` (#6540)
+
+`then policer <name>` naming a policer defined nowhere was the odd one out of
+three sibling reference mechanisms. Filters raise `MissingFilterRef` and screen
+reports `ScreenMissingProfileRef`, but the policer reference had NO backstop:
+the compiler resolved it with a bare `.get(...)` yielding `None`, and
+`apply_term_three_color_policer` then no-opped the meter — so a configured rate
+limit forwarded UNPOLICED with no `Err`, no warning and no counter.
+
+Primary defense (Go): the strict commit gate (#2217 Finding A,
+`pkg/config/compiler_validate_strict_filter.go`) hard-rejects a term whose
+`then policer` names neither a defined `firewall policer` nor a defined
+`firewall three-color-policer`, downgraded to a warning on the tolerant
+load / peer-sync path (`opts.lenientFirewallRefs`, #1960).
+
+Dataplane backstop (Rust): `preflight_term_policer_ref` raises
+`SnapshotIntegrityError::MissingPolicerRef`, rejecting the whole snapshot.
+
+The predicate is DEFINEDNESS — the name appears in the `policers` or
+`three_color_policers` snapshot collection — and deliberately NOT presence in
+the compiled `three_color_policer_by_name` map. Those two differ, and the
+difference is load-bearing: `lower_single_rate_policer_runtimes` (#4514) SKIPS
+a degenerate zero-rate METER-ONLY policer because it has no action to enforce,
+so that policer is defined, absent from the map, and boots fine today. Keying
+the rejection on the map would refuse a working config. Definedness is also the
+same question the Go gate asks, so the two cannot disagree about which
+references are dangling. An EMPTY reference (no policer on the term) is the
+legitimate "unpoliced" case and is NOT an error.
+
+Severity is Medium, not High: a policer is a RATE control, so its absence
+over-permits bandwidth rather than admitting traffic a policy would deny.
+
+Tests: `missing_policer_ref_6540_rejects_rather_than_forwarding_unpoliced`,
+`defined_{single_rate,three_color}_policer_ref_6540_compiles`,
+`degenerate_meter_only_policer_ref_6540_is_defined_and_must_not_be_rejected`
+(the cell that pins definedness-not-map), and
+`empty_policer_ref_6540_is_unpoliced_not_an_error` in `filter/tests.rs`.
+
 The fail-closed contract keys off the RETAINED per-interface fast maps
 (`iface_filter_*_fast`) — the structures the per-interface hot path consults —
 and the FAMILY-WIDE global TX gate keys off the `has_output_needs_tx_eval_*`
