@@ -473,6 +473,14 @@ func (c *CLI) showISIS(args []string) error {
 		fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
 			"System ID", "Interface", "Level", "State", "Hold Time")
 		for _, a := range adjs {
+			// #6590: an ambiguous row must not be rendered as though its
+			// columns were values — the derived fields are empty and the
+			// peer chose the text. Report it instead.
+			if a.Malformed {
+				fmt.Printf("  %s\n", termsafe.SanitizeForDisplay(
+					"(unparseable adjacency row: "+a.Raw+")"))
+				continue
+			}
 			fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
 				termsafe.SanitizeRowForDisplay(
 					a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)

@@ -284,6 +284,13 @@ func (s *Server) GetISISStatus(_ context.Context, req *pb.GetISISStatusRequest) 
 			fmt.Fprintf(&b, "  %-20s %-14s %-10s %-10s %s\n",
 				"System ID", "Interface", "Level", "State", "Hold Time")
 			for _, a := range adjs {
+				// #6590: see the CLI sibling — an ambiguous row is reported,
+				// never rendered as columns.
+				if a.Malformed {
+					fmt.Fprintf(&b, "  %s\n", termsafe.SanitizeForDisplay(
+						"(unparseable adjacency row: "+a.Raw+")"))
+					continue
+				}
 				fmt.Fprintf(&b, "  %-20s %-14s %-10s %-10s %s\n",
 					termsafe.SanitizeRowForDisplay(
 						a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)

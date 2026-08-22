@@ -102792,3 +102792,20 @@ prose edit above them added. No diff falls in the new test body.
   the CLEAR half was live.
 - **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go,
   pkg/dataplane/userspace/clear_policy_counters_6566_test.go (new), _Log.md
+
+## 2026-08-22 — #6590: IS-IS adjacency column shift
+- **Timestamp**: 2026-08-22
+- **Action**: `GetISISAdjacency` assigned `strings.Fields` tokens to columns
+  POSITIONALLY, and the first column is the peer-advertised Dynamic Hostname
+  TLV, in which FRR retains printable ASCII spaces. A space-bearing hostname
+  shifted every later column, letting the peer forge Interface/Level/State/
+  HoldTime — terminal-safe after #6579 but materially false. The parse now
+  validates the FRR-GENERATED columns (exactly 5 or 6 fields, IS-IS level
+  shape, numeric holdtime) and marks an ambiguous row `Malformed` with the
+  derived fields empty and `Raw` carrying the line; both display sites branch
+  on it. An escape-bearing but space-free hostname stays well-formed so the
+  #6468/#6579 fixtures keep exercising the display guard.
+- **File(s)**: pkg/frr/status_parse.go,
+  pkg/frr/isis_adjacency_shift_6590_test.go (new),
+  pkg/cli/cli_show_routing.go, pkg/grpcapi/server_routing.go,
+  pkg/frr/README.md, _Log.md

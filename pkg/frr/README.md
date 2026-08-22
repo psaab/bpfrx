@@ -708,6 +708,39 @@ also carries operator content:
   community (set|add) <value>` carries a community VALUE (e.g. `65000:100`),
   not a list reference, and is not validated. Same fail-closed-the-whole-reload
   class as the community-list definition gate above.
+- **A shifted `show isis neighbor` row is REPORTED, not rendered (#6590).**
+  The first column is the hostname the peer advertised in its Dynamic Hostname
+  TLV (RFC 5301, `hostname dynamic`, on by default), and FRR retains printable
+  ASCII **spaces** when decoding it. Assigning tokens to columns by POSITION
+  therefore let a space-bearing hostname shift every later column and put peer
+  bytes in each of them — with enough tokens the peer controlled all five
+  displayed cells, and the operator saw a well-formed adjacency table whose
+  values came from the adjacency's own remote end.
+
+  **This is not the #6468 escape-injection defect and the #6579 display guard
+  does not fix it.** Sanitizing preserves plausible printable text, so it cannot
+  distinguish a genuine `State=Up` from a peer-supplied token: the row can be
+  terminal-safe and still materially false. That is a display INTEGRITY defect
+  and its fix belongs in the parser.
+
+  `GetISISAdjacency` now validates the columns FRR GENERATES rather than
+  trusting position — the row must hold exactly 5 or 6 fields (SNPA optional),
+  its `L` slot must be an IS-IS level, and its `Holdtime` slot must be numeric.
+  A space in the hostname can only ADD tokens, never remove them, so it cannot
+  reach a valid count while also satisfying the shape checks. Note that the
+  count bound alone is NOT sufficient: a one-space hostname on a row without
+  SNPA yields exactly 6 fields, and only the level-shape check rejects it.
+
+  An ambiguous row sets `ISISAdjacency.Malformed`, leaves every derived field
+  EMPTY, and carries the original line in `Raw`. It is neither dropped (that
+  would hide a real adjacency) nor rendered as columns (that would assert values
+  the peer chose). **Display sites MUST branch on `Malformed`** — both
+  `pkg/cli/cli_show_routing.go` and `pkg/grpcapi/server_routing.go` do.
+
+  An escape-bearing but SPACE-FREE hostname stays a well-formed row on purpose:
+  the escape is the display guard's job, and if such a row went `Malformed` the
+  #6468/#6579 regression fixtures would stop exercising the guard they exist
+  for. That orthogonality is pinned by a test.
 - **`GetBGPSummary` parses JSON, not the text table (#3942).**
   `GetBGPSummary` runs `show bgp summary json` and decodes it via
   `parseBGPSummaryJSON` (`status_parse.go`), mirroring the `parseRouteJSON`

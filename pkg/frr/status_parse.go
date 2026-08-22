@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,27 +79,76 @@ func (m *Manager) GetRIPRoutes() ([]RIPRouteEntry, error) {
 // puts peer bytes in each of them. Display sites must sanitize the WHOLE row —
 // see termsafe.SanitizeRowForDisplay.
 //
-// Sanitizing does NOT repair that shift. It keeps the row safe to print; the
-// VALUES remain positionally derived from peer-controlled text, so a shifted
-// row can display a State the peer chose and no display guard can detect it.
-// Fixing that needs this parse to change — FRR's IS-IS JSON output, or
-// right-anchored columns with malformed rows reported rather than rendered.
-// Tracked as #6590. Do not cite the display guard as making this struct
-// trustworthy.
+// #6590: a shifted row is now DETECTED rather than rendered. Sanitizing cannot
+// repair the shift — it keeps the row safe to print, but the VALUES stay
+// positionally derived from peer-controlled text, so a shifted row could
+// display a State the peer chose and no display guard could tell. The parse
+// validates the FRR-GENERATED columns instead (see GetISISAdjacency) and marks
+// an ambiguous row Malformed, leaving every derived field EMPTY.
+//
+// Display sites MUST branch on Malformed. Rendering the empty fields as though
+// they were values would report a neighbour in state "" — quieter than the
+// forgery, but still false. Show the raw row instead, sanitized.
 type ISISAdjacency struct {
 	SystemID  string
 	Interface string
 	Level     string
 	State     string
 	HoldTime  string
+
+	// Malformed is set when the row could not be attributed to columns with
+	// confidence. Every other field is then EMPTY and Raw carries the original
+	// line for display.
+	Malformed bool
+	// Raw is the original row text, populated only when Malformed. It is
+	// peer-tainted like every other field and must be sanitized at the display
+	// site.
+	Raw string
 }
+
+// isisLevelToken matches the `L` column FRR emits for an IS-IS adjacency. FRR
+// generates it, so a row whose level slot does not match has been shifted by a
+// space-bearing token earlier in the line.
+var isisLevelToken = regexp.MustCompile(`^(1|2|1-2|L1|L2|L1L2)$`)
+
+// isisHoldTimeToken matches the Holdtime column, likewise FRR-generated.
+var isisHoldTimeToken = regexp.MustCompile(`^[0-9]+$`)
 
 // GetISISAdjacency queries FRR for IS-IS adjacencies.
 //
 // strings.Fields splits on unicode.IsSpace ONLY, so ESC, DEL, BEL and the C1
 // controls ride inside a token untouched — tokenizing is not sanitizing. The
-// guard belongs at the display sites (see the ISISAdjacency doc); the values
-// here stay raw for machine consumers.
+// display guard belongs at the display sites (see the ISISAdjacency doc); the
+// values here stay raw for machine consumers.
+//
+// #6590: the first column is the hostname the peer advertised in its Dynamic
+// Hostname TLV (RFC 5301), and FRR retains printable ASCII SPACES when decoding
+// that TLV. Assigning tokens to columns purely by POSITION therefore let a
+// space-bearing hostname shift every later column and put peer bytes in each of
+// them — with enough tokens the peer controlled all five displayed cells, and
+// the operator saw a well-formed adjacency table whose values came from the
+// adjacency's own remote end. That is a display INTEGRITY defect, and no
+// display guard can detect it: sanitizing preserves plausible printable text,
+// so a forged `State` survives it intact.
+//
+// The fix validates the columns FRR GENERATES rather than trusting position:
+//
+//   - the row must hold EXACTLY 5 or 6 fields — `System Id, Interface, L,
+//     State, Holdtime` with SNPA optional. Any space in the hostname adds a
+//     token and pushes the count past 6.
+//   - the `L` slot must be an IS-IS level and the `Holdtime` slot must be
+//     numeric. Both are FRR-generated, so a shift that stays within the count
+//     bound still lands peer text in one of them.
+//
+// Together those close the gap: a hostname carrying one space yields 6 fields
+// with `Level` holding an interface name (rejected) or 7 fields (rejected on
+// count), and a hostname crafted to satisfy the shape checks can only ADD
+// tokens, never remove them, so it cannot reach a valid count.
+//
+// An ambiguous row is REPORTED, not rendered and not dropped: Malformed is set,
+// every derived field is left empty, and Raw carries the original line. Dropping
+// it would hide a real adjacency; rendering it would assert values the peer
+// chose.
 func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 	output, err := m.executor().Vtysh("show isis neighbor")
 	if err != nil {
@@ -114,22 +164,21 @@ func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 		if fields[0] == "System" || strings.HasPrefix(line, "Area") {
 			continue
 		}
-		adj := ISISAdjacency{
-			SystemID: fields[0],
+		// FRR emits `System Id | Interface | L | State | Holdtime [| SNPA]`.
+		// Anything else means a token carried a space.
+		if len(fields) < 5 || len(fields) > 6 ||
+			!isisLevelToken.MatchString(fields[2]) ||
+			!isisHoldTimeToken.MatchString(fields[4]) {
+			adjs = append(adjs, ISISAdjacency{Malformed: true, Raw: strings.TrimSpace(line)})
+			continue
 		}
-		if len(fields) >= 2 {
-			adj.Interface = fields[1]
-		}
-		if len(fields) >= 3 {
-			adj.Level = fields[2]
-		}
-		if len(fields) >= 4 {
-			adj.State = fields[3]
-		}
-		if len(fields) >= 5 {
-			adj.HoldTime = fields[4]
-		}
-		adjs = append(adjs, adj)
+		adjs = append(adjs, ISISAdjacency{
+			SystemID:  fields[0],
+			Interface: fields[1],
+			Level:     fields[2],
+			State:     fields[3],
+			HoldTime:  fields[4],
+		})
 	}
 	return adjs, nil
 }
