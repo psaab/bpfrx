@@ -287,8 +287,15 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
 
 Every state-changing route is gated on a **server-derived principal** before it
 reaches its handler. `authz.go` owns the route table and the middleware; the
-decision itself lives in `pkg/authz` so the gRPC surface can reach the same
-verdict when #5278 lands.
+decision itself lives in `pkg/authz` so the gRPC surface reaches the same
+verdict. That gRPC leg has since landed (#5278) — see
+[`pkg/grpcapi/README.md`](../grpcapi/README.md) "Server-side authorization",
+which documents where the two legs deliberately differ: gRPC gates READS too,
+has no `api-auth` credential and therefore no precedence rule, resolves the peer
+inline (grpc-go calls its accept hook off the accept loop, `http.Server` does
+not), and prices the multiplexed `SystemAction` verb-by-verb because a unary
+interceptor is handed the decoded request that this middleware deliberately
+never reads.
 
 **Why the loopback bind was not enough.** The daemon provisions every `system
 login user` a real shell account (`useradd -m -s /bin/bash`), and the CLI's RBAC
@@ -943,7 +950,12 @@ count, and the outcome is fail-closed.
 — is unchanged and remains reachable by any local process on a loopback bind.
 #5561 is scoped to the mutation surface; a read-side principal check is a
 separate question with a different blast radius (`/metrics` scrapers, health
-probes).
+probes). The gRPC leg (#5278) made the opposite call on ITS surface and gates
+reads as well, because its read surface has no scraper population: nothing polls
+`GetSessions` on a timer, and `show configuration` there is exactly the render a
+`config-viewer` class exists to scope. The two legs therefore disagree about
+read gating BY DESIGN, and this is the sentence that says so rather than leaving
+a reader to infer a bug.
 
 ## Callers
 

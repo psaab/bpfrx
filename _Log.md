@@ -1,3 +1,63 @@
+## 2026-08-21 — #5278 round 2: ShowText was priced flat; topics span two command families
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Corrected the `ShowText` entry in the #5278 method table. It was
+  `PermView` with the comment "every topic is a `show ...`", which is FALSE:
+  three of its ~127 topics (`test-policy:`, `test-routing:`, `test-zone:`) are
+  emitted by the top-level word `test`, which pkg/cli charges at `PermControl`
+  — so a `read-only` class could run policy reconnaissance over gRPC. `ShowText`
+  is now priced from the decoded request's TOPIC, exactly as `SystemAction` is
+  priced from its verb, with an unknown topic costing the strictest tier and the
+  name-level entry demoted to a `PermControl` FLOOR for a request whose topic
+  cannot be read.
+
+  Nothing caught it because `TestEveryServiceMethodHasAPermission_5278`
+  enumerates the service DESCRIPTOR — i.e. methods. Topic pricing is a
+  different property, so a complete method table is a VACUOUS pass for it: a
+  guard proves the property it enumerates and nothing adjacent to it. Added the
+  sibling guard `TestEveryShowTextTopicHasAPermission_5278`, which parses every
+  literal compared against `req.Topic` in `server_show.go` (HasPrefix, `==`,
+  and `switch` case labels) and checks the tables in both directions.
+
+  Also removed the root `t.Skip` from
+  `TestProductionServerEnforcesRealPeerIdentity_5278`: it went vacuous in
+  exactly the environment CI usually runs in. Both arms now assert the kernel
+  attributed the connection, and the root arm additionally drives the
+  class-decision path, so no arm of the policy goes unasserted. Verified by
+  running the whole `5278` set under `sudo go test` (rc=0, root arm logged).
+
+- **File(s)**: `pkg/grpcapi/authz_methods.go`,
+  `pkg/grpcapi/authz_method_table_5278_test.go`,
+  `pkg/grpcapi/principal_authz_5278_test.go`, `pkg/grpcapi/README.md`
+
+## 2026-08-21 — #5278: per-principal authorization on the primary gRPC listener
+
+- **Timestamp**: 2026-08-21 (fix/5278-grpc-principal-auth)
+- **Action**: Added a login-class authorization gate to the primary (loopback)
+  gRPC listener. A `stats.Handler` resolves the connection's peer UID from the
+  kernel socket table at connection setup; unary + stream interceptors evaluate
+  the caller's `system login user <name> class` through the shared `pkg/authz`
+  decision (#5561) against a method -> permission table derived from
+  `pkg/cli/permissions.go` `requiredPermission`. An unmapped method costs
+  `PermAll` (super-user only) and the miss is logged at Error; the completeness
+  guard enumerates the GENERATED service descriptor and the `SystemAction`
+  handler's own switch labels, so neither table can silently go stale. The
+  fabric listener is untouched and keeps its #4107/#4122 chain.
+
+  Firsthand corrections to the research plan: the in-process console CLI does
+  NOT self-dial the local listener (all three `NewBpfrxServiceClient` sites go
+  through `dialPeer()` to the PEER's fabric address), and the plan's rejection
+  of a loopback peer lookup as TOCTOU described a socket-inode -> `/proc/<pid>`
+  mechanism that `pkg/authz` does not use. No transport change, no new config
+  knob, no client migration.
+
+- **File(s)**: `pkg/grpcapi/authz.go` (new), `pkg/grpcapi/authz_methods.go`
+  (new), `pkg/grpcapi/principal_authz_5278_test.go` (new),
+  `pkg/grpcapi/authz_method_table_5278_test.go` (new),
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_shutdown_monitor_4910_test.go`,
+  `pkg/grpcapi/README.md`, `pkg/api/README.md`, `pkg/api/authz.go`,
+  `pkg/authz/authz.go`, `pkg/config/login_perms.go`, `cmd/cli/main.go`,
+  `docs/system-login.md`, `CLAUDE.md`
 ## 2026-08-21 — #5804: gre-performance-acceleration was reported as enabled while doing nothing
 
 - **Timestamp**: 2026-08-21 (fix/5804-gre-acceleration-advisory)
@@ -99441,7 +99501,149 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/filter_counters_metrics_test.go,
   pkg/api/zone_counters_metrics_test.go, pkg/api/README.md,
   pkg/daemon/README.md, _Log.md
+- **Action**: #7216 — reject a static-NAT rule whose selected `match
+  destination-address` is empty.
 ## 2026-08-21 — userspace-dp LOW cohorts (#5191/#5193): three bounded residuals
+
+  Reproduced firsthand at `7230dcdcd` over the #7145 base config. Of the six
+  (NAT kind x match leaf) slots, static-NAT `match destination-address` was the
+  only one that accepted a quoted `""`: it lowered `Match=""`,
+  `MatchAddresses=[""]`, which `buildStaticNATSnapshots` carries as
+  `ExternalIP=""`, on which the Rust `parse_nat_prefix` returns None and
+  `from_snapshots` drops the WHOLE mapping.
+
+  Established what the empty value means before rejecting it. #6673's
+  empty-slot meaning is a COUNTING rule — an empty slot is a SELECTION marker,
+  not a second prefix, so the cardinality gate counts only non-empty values. It
+  says nothing about whether a blank SELECTION is shippable, and #6673's own
+  `rule.Match == ""` arm already rejects the blank selection where it can see
+  it (inside `len(addrs) > 1`). The new gate reads `rule.Match`, the SELECTION,
+  never the slot count, so `[ 192.0.2.1/32 "" ]` still commits.
+
+  Scope is the SELECTION, not the keystrokes. Measured four authoring shapes
+  reaching a surviving rule with `Match == ""` — quoted `""`, the valueless
+  leaf, a prefix followed by a blank that re-selects, and no `match
+  destination-address` at all — all committing clean and all dropped
+  identically. The gate covers all four; the message distinguishes the two
+  remedies. Exempts NPTv6 and `then static-nat inet`, each MEASURED to be
+  already refused by its own gate.
+
+  Three #6673 tests changed contract, deliberately: they asserted a blanked
+  prefix COMMITS, which was the residue of the cardinality gate being the only
+  observer. Their real property is re-bound more sharply — the rejection must
+  be #7216's and must NOT be the cardinality gate's "declares N prefixes" — and
+  the drift invariant (Match always in MatchAddresses) moved to the tolerant
+  path, where every fixture still compiles. The `nat static match
+  source-address` slot-escape fixture gained a valid `match
+  destination-address` so its control commits.
+
+  Mutation-proved five ways, `go vet` clean on each: removing the gate call ->
+  exit 1 at "committed CLEAN" and at the `Store.Load` warning assertion; keying
+  on any empty SLOT instead of the selection -> exit 1 in the #6673
+  preservation cell AND in the original #6673 tests; dropping the NPTv6/inet
+  exemption -> exit 1 at the wrong-message assertion; collapsing the two
+  remedies -> exit 1 at the remedy assertion; running the gate BEFORE the
+  cardinality gate -> exit 1 at the #6659-message cell. Restored by file copy,
+  byte-identical.
+
+  Go-only, `pkg/config` plus a `pkg/configstore` test; nothing reaches the Rust
+  helper or the wire protocol, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/nat_static_blank_external_prefix_7216_test.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/schema_slot_escape_fixtures_test.go,
+  pkg/configstore/nat_static_blank_prefix_boot_7216_test.go,
+- **Action**: #7215 — make the destination-NAT `match destination-address`
+  commit gate use its own builder's parse predicate.
+
+  Reproduced firsthand at `353f09592` over the #7145 base config. Of the six
+  (NAT kind x match leaf) slots, destination-NAT `match destination-address`
+  was the only one that still accepted an out-of-range mask: `10.0.0.0/33`
+  lowered to `Match.DestinationAddresses = ["10.0.0.0/33"]` and committed
+  clean, as did `2001:db8::/129`, `10.0.0.0/abc`, `10.0.0.0/`, `1.2.3.4/-1`
+  and `10.0.0.1/255.255.255.0`. #7145 did not reach the slot because its probe
+  (`999.1.1.1/24`) is malformed in the ADDRESS half, which the old predicate
+  did see.
+
+  `validateDestinationNATAddressesStrict` (#2396(c)/#3228) split the token at
+  the first `/` and ran `net.ParseIP` on the address half only, while its own
+  consumer `dnatDestinationParts` calls `net.ParseCIDR` and returns
+  `ok == false`. The gate's doc comment promised the two matched exactly; they
+  did not. Predicate is now `natMatchPrefixParses`, extensionally equal to the
+  builder's `ok`, and the equality is bound by a cross-package differential
+  rather than by the comment.
+
+  Strictly a narrowing; every newly-refused value is one the builder already
+  discarded, and the over-rejection guard pins `0.0.0.0/0`, `::/0`, a bare
+  host, a host-bits CIDR and `1.2.3.4/024` still committing. Lenient needed no
+  new plumbing — the slot's existing `lenientDestNATAddresses` flag downgrades
+  it and KEEPS the value (pruning would clear the Rust
+  `destination_constrained` flag and collapse the rule to MATCH-ANY).
+
+  Mutation-proved three ways, `go vet` clean on each so the red is an assertion
+  and not a build break: reverting the gate predicate -> exit 1 at "committed
+  CLEAN" in the census and at the warning assertion in `Store.Load`; drifting
+  `natMatchPrefixParses` back to the mask-stripping form -> exit 1 at
+  "DIVERGENCE on 10.0.0.0/33" in the builder-agreement differential; swapping it
+  to `netip.ParsePrefix` -> exit 1 at the `1.2.3.4/024` over-rejection cell in
+  BOTH the guard and the differential. Restored by file copy, byte-identical.
+
+  Go-only, `pkg/config` plus two test packages; nothing reaches the Rust helper
+  or the wire protocol, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_helpers.go,
+  pkg/config/nat_dnat_match_destination_mask_7215_test.go,
+  pkg/configstore/nat_dnat_match_mask_boot_7215_test.go,
+  pkg/dataplane/userspace/dnat_gate_builder_agreement_7215_test.go,
+  docs/config-schema.md, docs/userspace-dnat-plan.md, _Log.md
+
+## 2026-08-22 — #7233 two comments claimed the shim fails OPEN on a missing heartbeat
+
+- **Timestamp**: 2026-08-22T01:xx UTC
+- **Action**: Delete the never-wired `HEARTBEAT_GRACE_PERIOD_NS` constant
+  (`#[allow(dead_code)]`, one grep hit — its own declaration) whose doc comment
+  claimed "the XDP shim sees no heartbeat -> XDP_PASS -> kernel forwards
+  packets", and correct a second block in `server/helpers/status.rs` that said
+  un-bootstrapped queues "get XDP_PASS" and described the old deadlock as
+  "ctrl=0 -> XDP_PASS". Both are false at HEAD: every such path reaches
+  `drop_degraded_transit` -> `XDP_DROP`, and only `pass_local_control` admits
+  proven local/control traffic. Added a two-test doc guard that scans both
+  dataplane crates, fails non-vacuously if a source root yields no files, and
+  carries a narrow greppable escape (`#7233-ok`, `not/rather than/instead of
+  XDP_PASS`) so correcting prose is still writable.
+- **File(s)**: `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/server/helpers/status.rs`,
+  `userspace-dp/tests/heartbeat_failclosed_doc_guard.rs` (new)
+
+## 2026-08-21 — #5838 follow-up: a pending crash restart survived an intentional stop
+
+- **Timestamp**: 2026-08-21
+- **Action**: The #7228 helper supervisor arms a bounded-backoff restart after an
+  unexpected helper exit and fences the attempt on `(m.procGen != gen ||
+  m.proc != nil || !m.helperCrash.Crashed)`. An intentional teardown satisfied
+  none of those: `stopLocked` cleared `m.proc` and `m.procSup` but never
+  advanced `m.procGen` and never cleared `m.helperCrash`. And the stop that
+  FOLLOWS a crash takes `stopLocked`'s `m.proc == nil` early return — the crash
+  path already nil'd `m.proc` — so it reached none of the teardown below it
+  either. A crash whose backoff was still pending when the daemon shut down
+  therefore spawned a helper for a Manager that had been torn down, and the
+  restart chain kept re-arming afterwards; after `Close()` that child outlives
+  xpfd holding the NIC queues, which is the EBUSY-on-zero-copy-queues collision
+  the next start hits. Fix: retire the generation (`m.procGen++`) at the TOP of
+  `stopLocked`, above the early return. Deliberately NOT clearing
+  `m.helperCrash` there: `ensureProcessLocked` calls `stopLocked` when a spawn
+  misses its readiness wait, and the crash record is the retry debt that path
+  depends on — clearing it made a failed restart forget it was retrying and
+  turned `TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838` RED, which is
+  how the narrower fix was found. Mutation-proven: dropping the bump reds the
+  new marker assertion (a helper is spawned after the stop); anti-over-reject
+  cell asserts the ordinary crash->restart path still spawns. `go vet` clean,
+  `pkg/dataplane/userspace` and `pkg/daemon` suites green at `-count=1`, and the
+  new cells green under `-race`. Go-only diff, no shim `.o` or protocol
+  movement, so no cluster smoke is owed.
+- **File(s)**: pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/helper_restart_after_stop_5838_test.go, _Log.md
 
 - **Timestamp**: 2026-08-21
 - **Action**: Fixed three bounded items across two userspace-dp LOW cohorts.
