@@ -1416,9 +1416,10 @@ Two deliberate non-annotations:
 
 ## Port-mirroring instances the dataplane does not install (#6534)
 
-`show forwarding-options` (gRPC) and the CLI `show forwarding-options
-port-mirroring` render instances from configuration. An instance the
-snapshot builder DROPS carries a `NOT INSTALLED` line naming why:
+Three commands render a port-mirroring instance from configuration —
+the CLI `show forwarding-options port-mirroring`, its gRPC twin, and the
+CLI `show forwarding-options`. All three annotate an instance the
+snapshot builder DROPS with a `NOT INSTALLED` line naming why:
 
 ```
 Instance: span1
@@ -1428,10 +1429,23 @@ Instance: span1
   NOT INSTALLED: negative input rate
 ```
 
-The negative-rate case is the one to know about. Both renderers print
-`Input rate: all packets` whenever the rate is not greater than zero, so
-before this annotation a dropped instance advertised the most permissive
-mirror possible while mirroring nothing at all.
+The negative-rate case is the one to know about. Every renderer prints
+`Input rate: all packets` (or `Sampling rate:` omitted, in the `show
+forwarding-options` layout) whenever the rate is not greater than zero,
+so before this annotation a dropped instance advertised the most
+permissive mirror possible while mirroring nothing at all.
+
+`no output interface configured` is reachable through an ordinary
+`commit`, not only through the lenient load path: `compilePortMirroring`
+rejects a negative or non-integer rate, but nothing rejects an instance
+with no `output interface`.
+
+The gRPC `show forwarding-options` does not repeat the per-instance
+detail — it emits a pointer to `show forwarding-options port-mirroring`
+— so only the local CLI renders the full instance under that command.
+That asymmetry is why the local copy was the last one still rendering a
+dropped instance as armed; `pkg/showaudit` now enumerates every renderer
+of the collection so a fourth copy cannot be added unannotated.
 
 Coverage is deliberately partial. The annotation covers the drops
 decidable from configuration — no output interface, and a negative input
@@ -1465,6 +1479,20 @@ The annotation appears on `show security nat source rule detail`,
 `destination rule detail`, `static [rule [detail]]`, and `nptv6`. It is
 emitted ONLY for a rule the dataplane is not enforcing, so output for a
 healthy configuration is unchanged.
+
+**It does NOT yet appear on the source/destination SUMMARY topics.**
+`show security nat source`, `... source summary`, `... source pool`,
+`... source rule-set`, `... source rule` (without `detail`) and their
+destination equivalents — plus the REST `/nat/*` views and the gRPC
+`GetNATSource` / `GetNATDestination` / `GetNATPoolStats` /
+`GetNATRuleStats` responses — still render a disarmed rule as though it
+were enforced, several of them alongside a translation-hit counter. The
+static-NAT and NPTv6 topics are complete because every surface delegates
+to `pkg/natshow`; the source and destination summaries have their own
+formatters, which is how they diverged from their own `detail` views.
+20 render functions are affected; they are enumerated exactly in
+`pkg/showaudit` and tracked in #7473. Until that closes, read `rule
+detail` before believing a summary.
 
 Reachability: the strict commit gates reject these configurations, so a
 rule cannot reach this state through `commit`. It reaches it through the

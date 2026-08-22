@@ -1151,6 +1151,18 @@ func (c *CLI) showForwardingOptions() error {
 			if inst.Output != "" {
 				fmt.Printf("    Output interface:  %s\n", inst.Output)
 			}
+			// #6534: this is the THIRD renderer of a port-mirroring instance
+			// and the only one that was still printing a dropped instance as
+			// if it were armed. `show forwarding-options port-mirroring`
+			// (showPortMirroring) and the gRPC ShowText twin both annotate;
+			// this one prints strictly MORE per-instance detail than the gRPC
+			// `show forwarding-options`, which only emits a pointer line, so
+			// it was the surface most likely to be believed. Same verdict
+			// function as the snapshot builder, so the three copies cannot
+			// disagree about which instances the dataplane installs.
+			if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
+				fmt.Printf("    NOT INSTALLED: %s\n", reason)
+			}
 		}
 		hasContent = true
 	}
