@@ -41,7 +41,6 @@
 [WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
 [WATCH]      1595  pkg/cluster/heartbeat.go
 [WATCH]      1586  userspace-dp/src/afxdp/tx/cos_classify.rs
-[WATCH]      1585  pkg/daemon/daemon_ha_sync.go
 [WATCH]      1582  userspace-dp/src/afxdp/frame/tcp_segmentation.rs
 [WATCH]      1581  pkg/routing/rules.go
 [WATCH]      1547  userspace-dp/src/afxdp/session_glue/mod.rs

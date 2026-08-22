@@ -10,11 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func (d *Daemon) stopSyncReadyTimer() {
@@ -734,11 +731,32 @@ func (d *Daemon) publishFabricRefreshChansIfCurrent(gen uint64, ch0, ch1 chan st
 	return true
 }
 
-// watchClusterEvents monitors cluster state transitions and toggles
-// config store read-only mode based on primary/secondary state.
 // startClusterComms starts heartbeat and session sync after VRFs are created.
 // Called after applyConfig so that control/fabric interfaces are already in
 // the management VRF (if configured).
+//
+// The sub-constructions were extracted into focused builders in #6428
+// (daemon_ha_comms_wiring.go); what remains here is the control-flow spine,
+// because the ORDER below is the contract:
+//
+//   - beginClusterCommsEpoch runs FIRST: it bumps clusterCommsGen and installs
+//     the cancellable sub-context every goroutine spawned below captures and
+//     every publish presents.
+//   - resolveClusterVRFDevice runs before the heartbeat goroutine and before
+//     the sync constructor goroutine; both take vrfDevice by value.
+//   - syncRGStrictVIPOwnershipMode runs before the heartbeat goroutine: once
+//     VRRP starts driving rg_active it must already follow VIP ownership.
+//   - clusterCommsWG.Add(1) executes on THIS stack, never inside the goroutine,
+//     so stopClusterComms cannot Wait() past an unregistered constructor.
+//   - inside the constructor goroutine: address resolution -> ss construction ->
+//     publishSessionSyncIfCurrent -> ALL wiring -> ss.Start. Every ss.On*
+//     callback, cluster-Manager hook and SetVRFDevice must be installed before
+//     Start, which spawns the accept/connect goroutines whose first connection
+//     runs the authoritative cold-prime bulk.
+//   - wireUserspaceEventStreamForSync runs before the Start retry loop: its
+//     result selects which drain loop that loop launches.
+//   - the fabric refresh channels are published before startFabricForwardingLoops
+//     hands each loop its own channel by value.
 func (d *Daemon) startClusterComms(ctx context.Context) {
 	cfg := d.store.ActiveConfig()
 	if cfg == nil || cfg.Chassis.Cluster == nil {
@@ -755,65 +773,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
 	d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg))
 
-	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
-	// Check mgmtVRFInterfaces first, then fall back to probing the control
-	// interface directly (handles config-only mode where applyConfig may
-	// have run but mgmtVRFInterfaces is empty due to VRF creation failure).
-	vrfDevice := ""
-	if len(d.mgmtVRFIfaceSet()) > 0 {
-		vrfDevice = "vrf-mgmt"
-	} else if cc.ControlInterface != "" {
-		// Control/fabric interfaces (em*, fab*) are always placed in
-		// vrf-mgmt by the compiler. Check if the VRF device exists.
-		if _, err := net.InterfaceByName("vrf-mgmt"); err == nil {
-			vrfDevice = "vrf-mgmt"
-		}
-	}
+	vrfDevice := d.resolveClusterVRFDevice(cc)
 
-	// Start BPF watchdog heartbeat: write monotonic timestamp to ha_watchdog
-	// map every 500ms for each configured RG. If the daemon is SIGKILL'd,
-	// the timestamp goes stale and BPF stops forwarding within 2s.
-	//
-	// #3917: gate on the published dataplane only (not the startup RG
-	// count) and re-read the
-	// CURRENT redundancy-group set each tick. Comms are only restarted on a
-	// transport-field change, so binding cc.RedundancyGroups here would
-	// starve a day-2 RG (added by a later commit) of watchdog heartbeats ->
-	// its watchdog goes stale -> the dataplane stops forwarding for it.
-	// This mirrors the live-config read the fence path now uses.
-	if d.dataplane() != nil {
-		go func() {
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-commsCtx.Done():
-					return
-				case <-ticker.C:
-					// #2114: ONE load per tick, shared across the RG loop
-					// (plan §5.3 rule 1) — never per-RG, never a lifetime
-					// capture.
-					rt := d.dataplane()
-					if rt == nil {
-						continue
-					}
-					rgs := d.currentRedundancyGroups()
-					if len(rgs) == 0 {
-						continue
-					}
-					var ts unix.Timespec
-					_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
-					now := uint64(ts.Sec)
-					for _, rg := range rgs {
-						if err := rt.HA().SetHAWatchdog(commsCtx, rg.ID, now); err != nil {
-							slog.Warn("ha watchdog write failed", "rg", rg.ID, "err", err)
-						}
-					}
-				}
-			}
-		}()
-		slog.Info("HA watchdog heartbeat started", "rgs", len(cc.RedundancyGroups))
-	}
+	d.startHAWatchdogHeartbeat(commsCtx, cc)
 
 	// In VRRP mode, make strict VIP ownership the runtime default so
 	// rg_active follows VIP/MAC ownership rather than cluster-primary
@@ -829,18 +791,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		go d.startHeartbeatWithRetry(commsCtx, cc.ControlInterface, cc.PeerAddress, vrfDevice)
 	}
 
-	// Start session/config sync on the control link (same interface as
-	// heartbeat, port 4785). Consolidates all control-plane traffic onto
-	// the dedicated control path. Falls back to fabric if no control
-	// interface is configured (legacy compatibility).
-	syncIface := cc.ControlInterface
-	syncPeerAddr := cc.PeerAddress
-	syncTransport := "control-link"
-	if syncIface == "" || syncPeerAddr == "" {
-		syncIface = cc.FabricInterface
-		syncPeerAddr = cc.FabricPeerAddress
-		syncTransport = "fabric"
-	}
+	syncIface, syncPeerAddr, syncTransport := clusterSyncTransport(cc)
 	if syncIface != "" && syncPeerAddr != "" {
 		// Track the constructor goroutine so stopClusterComms can join it
 		// before tearing the epoch down (#4958): a cancelled constructor must
@@ -924,273 +875,26 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				// sync address; abort before wiring cluster state or binding.
 				return
 			}
-			// #4107 F23: authenticate the session-sync stream with the same
-			// control-link PSK the heartbeat + fabric-gRPC use (#4357). The
-			// cluster Manager supplies both the key and the heartbeat
-			// downgrade-guard signal (HeartbeatPeerAuthSeen). With no key
-			// configured the stream stays legacy unauthenticated (dual-accept).
-			ss.SetAuthProvider(d.cluster)
+			d.wireSessionSyncTransportRefs(ss, cc, syncTransport, syncPeerAddr, syncLocal1)
 
-			d.cluster.SetSyncTransport(syncTransport)
-
-			// Store sync peer addresses for gRPC peer dialing (session queries etc).
-			d.syncPeerAddr = syncPeerAddr
-			if syncLocal1 != "" {
-				d.syncPeerAddr1 = cc.Fabric1PeerAddress
-			}
-
-			// Start gRPC fabric listener(s) so peer can proxy monitor requests.
-			// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
-			// Uses the sync interface address (fabric or control-link).
-			// When dual-fabric is configured, listen on both fabric IPs.
-			go func() {
-				for i := 0; i < 30; i++ {
-					if d.grpcSrv != nil {
-						grpcAddr := fmt.Sprintf("%s:50051", syncIP)
-						if syncLocal1 != "" {
-							// Extract fab1 local IP (syncLocal1 is "ip:4785").
-							fab1Host, _, _ := net.SplitHostPort(syncLocal1)
-							grpcAddr1 := fmt.Sprintf("%s:50051", fab1Host)
-							go d.grpcSrv.RunFabricListener(commsCtx, grpcAddr1, vrfDevice)
-							slog.Info("gRPC dual fabric listeners", "fab0", grpcAddr, "fab1", grpcAddr1)
-						}
-						d.grpcSrv.RunFabricListener(commsCtx, grpcAddr, vrfDevice)
-						return
-					}
-					time.Sleep(time.Second)
-				}
-			}()
+			d.startFabricGRPCListeners(commsCtx, syncIP, syncLocal1, vrfDevice)
 
 			// Wire sync stats into cluster manager for CLI display.
 			d.cluster.SetSyncStats(ss)
 
-			// Wire config sync callback: when secondary receives config from primary.
-			ss.OnConfigReceived = func(configText string) error {
-				d.cluster.RecordEvent(cluster.EventConfigSync, -1, fmt.Sprintf("Config received (%d bytes)", len(configText)))
-				return d.handleConfigSync(configText)
-			}
+			d.wireSessionSyncConfigCallbacks(ss)
 
-			// #6387: surface a persistent config-sync APPLY failure as a
-			// node-global CF monitor-failure / degraded health. configApplyLoop
-			// fires this on the time-based stale-duration edge (raise) and on
-			// the first post-failure success (clear); the cluster manager stores
-			// it as a diagnostic-only annotation. This never gates failover —
-			// manual failover stays gated solely by ConfigStale(); crash
-			// takeover stays ungated.
-			ss.OnConfigApplyHealth = func(failing bool, reason string) {
-				d.cluster.SetConfigSyncHealth(failing, reason)
-			}
+			d.wireSessionSyncPeerCallbacks(ss)
 
-			// Wire peer connected callback: reconcile config to the returning
-			// peer. #5863: the push is level-triggered, not a one-shot connect
-			// edge — reconcileConfigSyncToPeer re-evaluates the RG0-authority +
-			// stability + config-generation invariant and pushes at most once
-			// per connection/generation. A node that is secondary or too young
-			// at connect time correctly skips here, and a LATER promotion or
-			// stability crossing re-pushes via the promotion hook / reconcile
-			// loop, instead of leaving the peer indefinitely divergent.
-			ss.OnPeerConnected = func() {
-				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
-				d.onSessionSyncPeerConnected()
-				// #2239 Q7: a peer that just (re)connected (e.g. a restarted
-				// standby) has an empty in-memory peerDHCPLeases set. Nudge a
-				// full lease re-push so it is not briefly empty until the next
-				// heartbeat tick. The nudge is RG-MASTER gated inside the push
-				// loop (this node pushes only its own owned set), so it is safe
-				// regardless of RG0 config authority — done before the
-				// RG0-only config-push gating below.
-				if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync {
-					d.nudgeDHCPLeaseSync()
-				}
-				// #4385: a peer that just (re)connected may have missed the
-				// one-shot empty IPsec SA advertisement during the gap, or (a
-				// same-process standby) retained a stale peer set across the
-				// blip. Nudge a forced re-advertise of the current set (empty or
-				// not) so it converges — gated on primary + IPsecSASync inside
-				// advertiseIPsecSAOnce, so it is safe regardless of this branch.
-				if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync {
-					d.nudgeIPsecSASync()
-				}
-				d.reconcileConfigSyncToPeer("peer-connect")
-			}
+			d.wireSessionSyncFailoverCallbacks(ss)
 
-			ss.OnBulkSyncReceived = func() {
-				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
-				slog.Info("cluster: session sync complete, releasing VRRP hold")
-				d.onSessionSyncBulkReceived()
-			}
+			d.wireClusterPeerFailoverHooks(ss)
 
-			ss.OnBulkSyncAckReceived = func() {
-				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync acknowledged by peer")
-				d.onSessionSyncBulkAckReceived()
-			}
-
-			ss.OnForwardSessionInstalled = func() {
-				d.scheduleStandbyNeighborRefresh()
-			}
-
-			// #5085: do NOT wire the event-stream export as the cold-prime
-			// bulk override. That path delivered sessions as async, LOSSY
-			// event-stream incrementals (QueueSessionV4/V6 -> non-blocking
-			// sendCh) and then sent an EMPTY BulkStart/BulkEnd, so the receiver
-			// recorded zero session keys and skipped authoritative stale
-			// reconciliation — a stale peer-owned session the standby held
-			// survived cold-prime. Cold-prime now uses the lossless BulkSync
-			// direct-write window (doBulkSync), which delimits a COMPLETE
-			// authoritative snapshot the receiver reconciles against. A
-			// table-truth, owner-RG-filtered snapshot via ExportOwnerRGSessions
-			// (eliminating the BulkSync mirror-map drift residual) is tracked as
-			// a follow-up.
-
-			ss.OnPeerDisconnected = func() {
-				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
-				d.onSessionSyncPeerDisconnected()
-			}
-
-			// Wire remote failover: when the peer requests us to transfer an RG
-			// out of primary and explicitly acknowledge the result.
-			// Guard: only honor the request if we are actually primary for
-			// this RG. Stale/delayed sync messages can arrive after we've
-			// already transitioned to secondary — blindly calling
-			// ManualFailover would cause dual-resign (both nodes secondary)
-			// and a 30-second traffic blackhole.
-			ss.OnRemoteFailover = func(rgID int, reqID uint64) error {
-				if !d.cluster.IsLocalPrimary(rgID) {
-					return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
-				}
-				slog.Info("cluster: remote failover request from peer", "rg", rgID, "req_id", reqID)
-				// #5640: arm the fence-completion barrier BEFORE ManualFailover
-				// enqueues the async demotion event, so watchClusterEvents
-				// cannot actuate-and-forget before WaitFailoverApplied observes
-				// it. The applied-ack (sync layer) then waits on this barrier.
-				barrier := d.armFailoverActuation(rgID, reqID)
-				if err := d.cluster.ManualFailover(rgID); err != nil {
-					d.disarmFailoverActuation(rgID, reqID, barrier)
-					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
-					return err
-				}
-				// #5079: bind an auto-restore lease to this request. If the
-				// requester aborts after this ACK (or crashes / loses the fabric)
-				// and never sends a commit, electRG restores us when the lease
-				// expires so a failed coordinated failover cannot strand us
-				// secondary. The matching commit clears the lease.
-				d.cluster.ArmRemoteTransferOutLease([]int{rgID}, reqID)
-				return nil
-			}
-			ss.OnRemoteFailoverBatch = func(rgIDs []int, reqID uint64) error {
-				for _, rgID := range rgIDs {
-					if !d.cluster.IsLocalPrimary(rgID) {
-						return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
-					}
-				}
-				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs, "req_id", reqID)
-				// #5640: arm every member's fence barrier before the batch
-				// demotion enqueues its per-RG events.
-				barriers := make(map[int]*failoverActuation, len(rgIDs))
-				for _, rgID := range rgIDs {
-					barriers[rgID] = d.armFailoverActuation(rgID, reqID)
-				}
-				if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
-					for _, rgID := range rgIDs {
-						d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
-					}
-					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
-					return err
-				}
-				// #5079: bind auto-restore leases to this request across the set.
-				d.cluster.ArmRemoteTransferOutLease(rgIDs, reqID)
-				return nil
-			}
-			ss.OnRemoteFailoverCommit = func(rgID int, reqID uint64) error {
-				if err := d.cluster.FinalizePeerTransferOut(rgID); err != nil {
-					return err
-				}
-				// #5079: the transfer committed — drop the auto-restore lease so
-				// it can never fire on a legitimately completed handoff.
-				d.cluster.ClearRemoteTransferOutLease(rgID, reqID)
-				return nil
-			}
-			ss.OnRemoteFailoverCommitBatch = func(rgIDs []int, reqID uint64) error {
-				if err := d.cluster.FinalizePeerTransferOutBatch(rgIDs); err != nil {
-					return err
-				}
-				for _, rgID := range rgIDs {
-					d.cluster.ClearRemoteTransferOutLease(rgID, reqID)
-				}
-				return nil
-			}
-			// #5640: gate the transfer-out applied-ack on the local demotion
-			// actually being actuated (VRRP resigned / rg_active cleared),
-			// closing the two-owner window where the peer promoted off an ack
-			// sent before this node had resigned.
-			ss.WaitFailoverApplied = d.waitFailoverActuated
-			ss.WaitFailoverAppliedBatch = d.waitFailoverActuatedBatch
-
-			// Wire peer failover sender so cluster Manager can send remote
-			// failover requests via the fabric sync connection.
-			d.cluster.SetPeerFailoverFunc(ss.SendFailover)
-			d.cluster.SetPeerFailoverCommitFunc(ss.SendFailoverCommit)
-			d.cluster.SetPeerFailoverBatchFunc(ss.SendFailoverBatch)
-			d.cluster.SetPeerFailoverCommitBatchFunc(ss.SendFailoverCommitBatch)
-			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
-			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
-			// #5079: size the owner-side transfer-out lease above the requester's
-			// worst-case post-ACK commit latency — the local commit-ready settle
-			// window (localFailoverCommitTimeout) plus the commit round-trip — so
-			// a legitimate slow commit never trips it. The cluster floors it. The
-			// upstream 20s failover-ACK cap (failoverAckTimeout, sync.go) bounds
-			// the actuation-barrier contribution: if the owner takes longer than
-			// 20s to ack, the requester times out and sends NO commit, so a large
-			// failoverActuateTimeout cannot delay a real commit past this lease.
-			d.cluster.SetRemoteTransferOutLeaseDuration(2*d.localFailoverCommitTimeout + 20*time.Second)
-			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
-			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
-			// #1792: while our heartbeat sockets restart (VRF rebind),
-			// keep the peer's suppression guard fed with fresh sync
-			// traffic so a >500ms restart does not fire a false
-			// peer-timeout/fence on the peer. Bounded by the peer's
-			// 5s continuous-suppression cap.
-			d.cluster.SetHeartbeatRestartNotifyFunc(ss.SendLivenessKeepalive)
-
-			// Wire peer fencing: on heartbeat timeout, cluster sends
-			// fence via sync; on receive, disable all local RGs.
-			d.cluster.SetPeerFenceFunc(ss.SendFence)
-			ss.OnFenceReceived = func() {
-				slog.Warn("cluster: fence received from peer")
-				// #3917: fence the CURRENT redundancy-group set, not the
-				// `cfg` snapshot captured in this closure at
-				// startClusterComms time. Comms are only restarted on a
-				// transport-field change (clusterTransportKey), so a
-				// redundancy-group added by a day-2 commit is absent from
-				// the startup snapshot. Fencing off the snapshot would
-				// leave that RG active on this node while the peer also
-				// becomes active for it -> split-brain dual-active. The
-				// dp==nil (config-only) and nil-cluster guards live in
-				// fenceAllRedundancyGroups.
-				d.fenceAllRedundancyGroups(commsCtx)
-			}
+			d.wireClusterFenceCallbacks(commsCtx, ss)
 
 			ss.SetVRFDevice(vrfDevice)
-			// r6-F4: the wiring resolves the provider from the #2114
-			// cell per poll, so it never installs callbacks on a backend
-			// the daemon has since disowned. wiredStream is the instance
-			// the callbacks landed on; the fallback loop re-installs if a
-			// rollback + corrected re-arm replaces it.
-			var wiredStream *dpuserspace.EventStream
-			if _, ok := d.dataplane().(userspaceEventStreamProvider); ok {
-				// userspaceEventStreamProvider is a local probe;
-				// userspace LegacyDataPlaneAdapter satisfies it via
-				// EventStream (legacy_dataplane.go:414). Type-
-				// assertion target is the published dataplane directly —
-				// the legacyDP() round-trip retired in #1519 added no
-				// method-set coverage.
-				wireCtx, cancel := context.WithTimeout(commsCtx, 5*time.Second)
-				wiredStream = d.wireUserspaceEventStreamCallbacks(wireCtx)
-				cancel()
-				if wiredStream == nil {
-					slog.Warn("userspace: event stream callbacks not ready before session sync start; falling back to polling until stream wires")
-				}
-			}
+
+			wiredStream := d.wireUserspaceEventStreamForSync(commsCtx)
 
 			// Retry sync start: the VRF device and address binding may not
 			// be ready during daemon startup (networkd race).
@@ -1264,28 +968,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				break
 			}
 
-			// Start periodic IPsec SA sync if enabled.
-			if cc.IPsecSASync && d.ipsec != nil {
-				go d.syncIPsecSAPeriodic(commsCtx)
-			}
-
-			// #5863: start the level-triggered config-sync reconcile loop.
-			// It is the low-frequency safety net that (a) fires the moment the
-			// node crosses the stability threshold and (b) recovers any dropped
-			// promotion/connect edge. Started unconditionally (config-sync may
-			// be enabled by a later commit without a comms restart); it is a
-			// cheap no-op on any node that is not the RG0 config authority or
-			// whose current generation is already pushed.
-			go d.configSyncReconcileLoop(commsCtx)
-
-			// #2239: start the DHCP-server lease-sync push loop if enabled.
-			// The loop is gated on the RG-MASTER node-level gate internally;
-			// on the BACKUP it pushes nothing and the standby holds the peer
-			// set via OnDHCPLeasesReceived. Routed through the idempotent
-			// starter (#4647) so a later `dhcp-lease-synchronization` knob
-			// toggle from the apply path shares this same launch/stop path
-			// (and cannot double-launch).
-			d.ensureDHCPLeaseSyncLoop(cc.DHCPLeaseSync)
+			d.startClusterSyncAuxLoops(commsCtx, cc)
 
 			// Initialize per-fabric refresh channels for event-driven
 			// updates (#124). Each fabric owns its own channel so a
@@ -1304,30 +987,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				return
 			}
 
-			// Populate fabric_fwd BPF map for cross-chassis redirect,
-			// then periodically refresh to correct neighbor drift.
-			// Resolve to physical parent (ge-0-0-0) — BPF runs on
-			// the parent, not the IPVLAN overlay. Neighbor resolution
-			// uses the overlay (fab0/fab1) where the sync IP lives (#129).
-			fabParent := d.resolveFabricParent(cc.FabricInterface)
-			fabOverlay := config.LinuxIfName(cc.FabricInterface)
-			if fabOverlay == fabParent {
-				fabOverlay = "" // no overlay — legacy mode
-			}
-			go d.populateFabricFwd(commsCtx, fabParent, fabOverlay, cc.FabricPeerAddress, fabRefreshCh)
-
-			// Populate secondary fabric_fwd entry (key=1) if fab1 configured.
-			if cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
-				fab1Parent := d.resolveFabricParent(cc.Fabric1Interface)
-				fab1Overlay := config.LinuxIfName(cc.Fabric1Interface)
-				if fab1Overlay == fab1Parent {
-					fab1Overlay = "" // no overlay
-				}
-				go d.populateFabricFwd1(commsCtx, fab1Parent, fab1Overlay, cc.Fabric1PeerAddress, fabRefreshCh1)
-			}
-
-			// Monitor fabric link/neighbor state via netlink (#124).
-			go d.monitorFabricState(commsCtx)
+			d.startFabricForwardingLoops(commsCtx, cc, fabRefreshCh, fabRefreshCh1)
 		}()
 	}
 }

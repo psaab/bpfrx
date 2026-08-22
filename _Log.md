@@ -99940,3 +99940,28 @@ prose edit above them added. No diff falls in the new test body.
   cluster smoke is OWED.
 - **File(s)**: userspace-dp/src/afxdp/forward_request.rs,
   userspace-dp/src/afxdp/frame/wg_tests.rs, docs/wireguard-interop.md, _Log.md
+- **Timestamp**: 2026-08-21
+- **Action**: #6428 — `Daemon.startClusterComms` was a 602-line constructor
+  wiring the whole cluster-comms stack. Extracted thirteen sub-constructions
+  into focused builders in a new `daemon_ha_comms_wiring.go`: VRF-device
+  resolution, HA watchdog heartbeat, sync-transport selection, session-sync
+  transport refs, fabric gRPC listeners, the config / peer-lifecycle /
+  remote-failover callback groups, cluster peer-failover hooks, fence wiring,
+  event-stream wiring, the auxiliary comms loops, and the fabric-forwarding
+  loops. `startClusterComms` drops 602 -> 233 lines and keeps only the
+  control-flow spine, because in a cluster bring-up constructor the ORDER is
+  the contract. Pure code motion: all thirteen bodies verified byte-identical
+  modulo indentation by an independent extract/normalise/diff verifier (10
+  exactly identical, 3 with a pure appended `return`), and a second verifier
+  proved the only lines that left `daemon_ha_sync.go` are those thirteen blocks
+  plus two now-unused imports and an orphaned `watchClusterEvents` doc comment.
+  Every argument is passed under the identifier it binds, and each such variable
+  was shown single-assignment before its moved consumer, so by-value parameters
+  are equivalent to the original by-reference captures. The five blocks that
+  `return` out of the constructor goroutine were deliberately left inline.
+  `daemon_ha_sync.go` left the refactor-audit WATCH tier (1585 -> 1245 LOC);
+  audit regenerated. `make test-failover` and a startup validation are OWED and
+  UNRUN.
+- **File(s)**: pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_ha_comms_wiring.go, pkg/daemon/README.md,
+  docs/refactoring-audit-current.txt, _Log.md
