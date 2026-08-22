@@ -1,7 +1,10 @@
 // #1345: per-verb handler for set_binding_state. Body byte-identical to
 // handlers.rs lines 265-291.
 
-use super::super::helpers::{reconcile_status_bindings, refresh_status};
+use super::super::helpers::{
+    capture_binding_arm_state, reconcile_status_bindings, refresh_status,
+    restore_binding_arm_state,
+};
 use super::super::ServerState;
 use chrono::Utc;
 use crate::{BindingControlRequest, ControlResponse};
@@ -24,6 +27,9 @@ pub(super) fn set(
         response.error = "missing binding state".to_string();
         return;
     };
+    // #6750: capture BEFORE the commit so a failed reconcile can put the
+    // helper's report back to the truth. See BindingArmSnapshot.
+    let prior = capture_binding_arm_state(&guard.status);
     if let Some(binding) = guard
         .status
         .bindings
@@ -51,6 +57,10 @@ pub(super) fn set(
             if let Err(err) = reconcile_status_bindings(guard) {
                 response.ok = false;
                 response.error = format!("binding reconcile failed: {err}");
+                // #6750: roll the requested state back BEFORE refreshing, so
+                // the helper stops reporting a registration its sockets never
+                // took and Go's poll can see the mismatch that drives a retry.
+                restore_binding_arm_state(&mut guard.status, prior);
                 refresh_status(guard);
                 return;
             }

@@ -343,6 +343,42 @@ type WireRRClaim struct {
 	FQDN        string // canonical form (dnsCanonicalFQDN)
 	ForwardType string // "A" | "AAAA"
 	Rdata       string // textual published address (the rdata)
+	// Authority is the credential-free fingerprint of the DNS endpoint this
+	// claim was published to (#6755). Two records with an equal (FQDN, type,
+	// rdata) at DIFFERENT authorities are NOT one wire resource: they are two
+	// records on two servers, and treating them as one made a teardown suppress
+	// its DELETE and leave the record published at its own authority forever.
+	//
+	// Empty means UNKNOWN — a pre-#6755 durable record with no stored
+	// fingerprint, or a lease surface with no resolved policy. See coOwns for
+	// why unknown compares as "cannot prove different".
+	Authority string
+}
+
+// coOwns reports whether two wire-RR claims name the SAME wire resource (#6755).
+//
+// It is NOT struct equality, because the Authority field has a third state.
+// An EMPTY authority means unknown, not "a different authority": a Surface A
+// record persisted before #6755 has no stored BackendFingerprint
+// (`backend_fingerprint,omitempty`), and the lease surface has none before its
+// first policy resolves.
+//
+// Unknown compares as "cannot prove different", so such a pair still co-owns
+// and the DELETE is still suppressed. That is the FAIL-SAFE direction and it is
+// the same doctrine ownedBackendOK already states for the withdraw path — "one
+// side is unknown, so no mismatch can be proven". It preserves #5748's
+// cross-surface clobber protection for legacy records at the cost of leaving
+// #6755's stale-record hazard for them until they are republished, which is the
+// right way round: a stale RR is recoverable, a clobbered one owned by the other
+// surface is not.
+func (c WireRRClaim) coOwns(other WireRRClaim) bool {
+	if c.FQDN != other.FQDN || c.ForwardType != other.ForwardType || c.Rdata != other.Rdata {
+		return false
+	}
+	if c.Authority == "" || other.Authority == "" {
+		return true // unknown on one side: no mismatch can be proven
+	}
+	return c.Authority == other.Authority
 }
 
 // wireRRClaim builds a canonicalized WireRRClaim from a name, forward type, and
@@ -355,12 +391,13 @@ type WireRRClaim struct {
 // a stored address is normally well-formed). Empty rdata yields the zero-Rdata
 // claim; callers skip records with no rdata (a rdata-less claim must never
 // co-match another rdata-less one).
-func wireRRClaim(fqdn, forwardType, rdata string) WireRRClaim {
+func wireRRClaim(fqdn, forwardType, rdata, authority string) WireRRClaim {
 	norm := rdata
 	if a, err := netip.ParseAddr(rdata); err == nil {
 		norm = a.Unmap().String()
 	}
 	return WireRRClaim{
+		Authority:   authority,
 		FQDN:        dnsCanonicalFQDN(fqdn),
 		ForwardType: forwardType,
 		Rdata:       norm,

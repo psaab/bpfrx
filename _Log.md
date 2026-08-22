@@ -104027,6 +104027,71 @@ prose edit above them added. No diff falls in the new test body.
   userspace-dp/src/server/handlers/snapshot.rs,
   userspace-dp/src/main_tests.rs
 
+## 2026-08-22 — #6750 failed reconcile no longer retains the requested state
+- **Action**: Re-derived the rotted cites by SYMBOL at `ac4f5dce1`. All three
+  control handlers (`set_forwarding_state`, `set_binding_state`,
+  `set_queue_state`) commit the REQUESTED arm/registration bits into
+  `guard.status` and only then call `reconcile_status_bindings`. #5621/#6135 made
+  the failure honest to the CALLER (ok=false + error, no persist) but left the
+  committed state committed, so the helper reported a posture its AF_XDP sockets
+  had never been reconciled to. The suppression half is on the Go side:
+  `syncDesiredForwardingStateLocked` short-circuits on
+  `m.lastStatus.ForwardingArmed == desired`, and the 1 Hz poll feeds
+  `m.lastStatus` straight from the helper (`applyHelperStatusLocked` ->
+  `recordHelperStatusLocked`, maps_sync.go:503) — so the poll ADOPTS the retained
+  value, the equality holds, and the retry is never sent. Fix: one shared
+  `BindingArmSnapshot` capture/restore in `helpers/status.rs`, used by all three
+  handlers, restoring the global flag and the per-slot registered/armed/
+  last_change on the reconcile-failure path only. Restoring makes the helper
+  truthful, which is all automatic recovery needs — no new retry machinery and
+  no persisted debt, so the issue's larger desired/applied split is not required.
+- **File(s)**: userspace-dp/src/server/helpers/status.rs,
+  userspace-dp/src/server/handlers/forwarding.rs,
+  userspace-dp/src/server/handlers/binding.rs,
+  userspace-dp/src/server/handlers/queue.rs,
+  userspace-dp/src/server/tests.rs
+
+## 2026-08-22 — #6741 Increment 1: count obsolete registry generations
+- **Timestamp**: 2026-08-22
+- **Action**: Split #6741 and shipped the observability half only. Added
+  registryGeneration (bumped inside publishShimRegistryLocked's existing m.mu
+  hold), registryObsoleteFrom (recorded by Teardown, NOT Close — Close keeps its
+  pinned handles live for hitless restart), and a counter incremented at the two
+  lookup choke points when a lookup SERVES a handle from a superseded
+  generation, with a once-per-epoch warn naming the map. No behaviour change at
+  any of the 135 call sites.
+- **Deliberately NOT closed**: the escape window. lookupMapLocked returns the
+  handle by reference then releases m.mu, so a republish after the lookup is
+  invisible; a zero counter means "no lookup observed a superseded generation",
+  not "no obsolete mutation occurred". Said so in the source, the README and on
+  the issue — a metric implying a guard it lacks is worse than no metric.
+- **Design tension recorded on #6741**: #6740 forbids a BPF syscall under m.mu;
+  a mutation-time generation check requires exactly that (or a token threaded
+  through 135 sites). The two fixes pull in opposite directions and someone must
+  decide deliberately.
+- **Not wired to Prometheus**: the collector reaches the dataplane through the
+  narrow apiRuntimeDataPlane interface (47 references + test fakes); widening it
+  is a separable change. Counter is readable via ObsoleteRegistryAccesses().
+- **Also filed**: #7547 (AttachXDP/DetachXDP read-modify-write sequences have no
+  concurrent coverage; their atomicity rests on an untested applySem claim) —
+  kept OUT of #6741 so a concrete gap does not get buried in a design item.
+- **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go,
+  pkg/dataplane/registry_generation_6741_test.go (new),
+  pkg/dataplane/armed_gate_matrix_test.go, pkg/dataplane/README.md
+
+
+## 2026-08-22 — #6755 DDNS wire-RR claims carry their DNS authority
+- **Timestamp**: 2026-08-22
+- **Action**: WireRRClaim was {FQDN,type,rdata} with no authority, so two
+  surfaces publishing the same RR to DIFFERENT servers compared equal and the
+  teardown suppressed its own DELETE, leaving the record published forever.
+  Added Authority (credential-free endpoint fingerprint) + a coOwns predicate
+  treating an empty authority as UNKNOWN rather than different. Single-sourced
+  the fingerprint format so the two surfaces cannot drift.
+- **File(s)**: pkg/ddns/state.go, pkg/ddns/surface_a.go, pkg/ddns/manager.go,
+  pkg/ddns/cross_surface_authority_6755_test.go,
+  pkg/ddns/cross_surface_clobber_5748_test.go
+
 ## 2026-08-22 — #6752 half-open flow no longer holds the established window
 - **Action**: Promotion is on the reverse SYN-ACK, not the final ACK, so the
   reverse half jumped to the 300s class immediately; #4109 deliberately did not

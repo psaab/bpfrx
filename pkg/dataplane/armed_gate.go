@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"errors"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/cilium/ebpf"
@@ -114,7 +115,67 @@ func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st re
 		registryLookupHook()
 	}
 	h, present = m.maps[name]
+	if present {
+		m.obsoleteRegistryLocked("map", name)
+	}
 	return h, present, classifyRegistry(&m.loaded, len(m.maps))
+}
+
+// obsoleteRegistryLocked records that a lookup just served a handle from a
+// SUPERSEDED registry generation (#6741). The caller must hold m.mu.
+//
+// WHAT THIS IS. Teardown's Cleanup destroys the pinned kernel objects but does
+// not clear m.maps / m.programs, and the #2114 A3 rule deliberately lets a
+// retained-state method PROCEED. So between a Teardown-retain and the next
+// publish, a lookup hands back a handle to an obsolete forwarding generation and
+// the caller mutates it: a mutation that succeeds and reaches nothing. Nothing
+// measured that before this counter, on either recurrence path
+// (bootstrap.go's enterBootstrapMode, and the standalone first-commit timeout in
+// daemon_apply_commit.go).
+//
+// WHAT THIS IS NOT — and the distinction is the whole reason it is a counter and
+// not a guard. It does NOT close the hazard, and it must not be read as
+// evidence that the hazard cannot happen:
+//
+//   - it is a LOOKUP-TIME observation. lookupMapLocked returns the *ebpf.Map by
+//     reference and then RELEASES m.mu, so a republish that lands after the
+//     lookup returns is invisible here. A caller holding an escaped handle
+//     across a republish is counted zero times.
+//   - it changes no behaviour. Every caller proceeds exactly as before,
+//     deliberately: making retained mutations fail is a behaviour change at 135
+//     call sites and is the deferred half of #6741.
+//
+// A zero counter therefore means "no lookup OBSERVED a superseded generation",
+// never "no obsolete mutation occurred". The design tension that makes the
+// stronger guarantee expensive — #6740 forbids holding m.mu across a BPF
+// syscall, which is what a mutation-time check would require — is recorded on
+// #6741.
+func (m *Manager) obsoleteRegistryLocked(kind, name string) {
+	if m.registryObsoleteFrom == 0 || m.registryGeneration > m.registryObsoleteFrom {
+		return
+	}
+	m.obsoleteRegistryAccesses++
+	if m.obsoleteEpochLogged {
+		return
+	}
+	// Once per obsolete epoch, not once per access: these helpers are on every
+	// registry access, and a per-access log here would flood exactly when the
+	// daemon is already in a degraded lifecycle state.
+	m.obsoleteEpochLogged = true
+	slog.Warn("dataplane: registry lookup served a handle from a superseded generation",
+		"kind", kind, "name", name,
+		"generation", m.registryGeneration, "obsolete_from", m.registryObsoleteFrom,
+		"detail", "Teardown retained the registry and no publish has followed; "+
+			"mutations through this handle reach an obsolete forwarding generation (#6741)")
+}
+
+// ObsoleteRegistryAccesses reports how many registry lookups have served a
+// handle from a superseded generation (#6741). See obsoleteRegistryLocked for
+// what a zero does and does not prove.
+func (m *Manager) ObsoleteRegistryAccesses() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.obsoleteRegistryAccesses
 }
 
 // lookupProgramLocked is lookupMapLocked for the m.programs registry
@@ -129,6 +190,9 @@ func (m *Manager) lookupProgramLocked(name string) (p *ebpf.Program, present boo
 		registryLookupHook()
 	}
 	p, present = m.programs[name]
+	if present {
+		m.obsoleteRegistryLocked("program", name)
+	}
 	return p, present, classifyRegistry(&m.loaded, len(m.maps))
 }
 
@@ -159,6 +223,11 @@ func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps, shared
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// #6741: a new registry generation. Bumped inside the SAME m.mu hold that
+	// installs the handles, so the counter and the map contents can never be
+	// read out of step. Publishing above registryObsoleteFrom is what ends an
+	// obsolete epoch.
+	m.registryGeneration++
 	m.programs[userspaceShimEntryProg] = prog
 	for name, umap := range collMaps {
 		m.maps[name] = umap

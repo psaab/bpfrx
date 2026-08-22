@@ -51,18 +51,34 @@ type Manager struct {
 	// SNAPSHOT rather than the live map: handing out the map by reference put
 	// the range loop outside any lock the accessor could take, which is how the
 	// race survived the #2114 A3 registry rule.
-	xdpLinks                map[int]link.Link
-	tcLinks                 map[int]link.Link
-	lastCompile             *CompileResult
-	applyMu                 sync.Mutex
-	applyGeneration         uint64
-	lastApply               *ApplyResult
-	PersistentNAT           *PersistentNATTable
-	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
-	xdpEntryProg            string
-	vlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these); guarded by m.mu (#6740)
-	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets; #2114 A3: also the uniform m.maps/m.programs registry rule (every access goes through the lookupMapLocked/lookupProgramLocked scoped helpers, classification + handle selection atomic inside) and the xdpEntryProg field
-	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
+	xdpLinks        map[int]link.Link
+	tcLinks         map[int]link.Link
+	lastCompile     *CompileResult
+	applyMu         sync.Mutex
+	applyGeneration uint64
+	// registryGeneration counts REGISTRY publications (#6741). It is bumped
+	// inside publishShimRegistryLocked's m.mu hold, so it and the m.maps /
+	// m.programs contents always move together.
+	//
+	// registryObsoleteFrom records the generation that Teardown superseded.
+	// Teardown's Cleanup destroys the pinned kernel objects, so every handle
+	// still sitting in the registry at that moment refers to an obsolete
+	// forwarding generation — Close does NOT set this, because Close
+	// deliberately keeps its pinned handles live for hitless-restart reuse.
+	//
+	// obsoleteRegistryAccesses counts lookups that SERVED such a handle. It is
+	// an observability counter, not a guard: see obsoleteRegistryLocked.
+	registryGeneration       uint64
+	registryObsoleteFrom     uint64
+	obsoleteRegistryAccesses uint64
+	obsoleteEpochLogged      bool
+	lastApply                *ApplyResult
+	PersistentNAT            *PersistentNATTable
+	EnableCPUMap             bool // Enable cpumap multi-CPU distribution (adds startup overhead)
+	xdpEntryProg             string
+	vlanSubInterfaces        map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these); guarded by m.mu (#6740)
+	mu                       sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets; #2114 A3: also the uniform m.maps/m.programs registry rule (every access goes through the lookupMapLocked/lookupProgramLocked scoped helpers, classification + handle selection atomic inside) and the xdpEntryProg field
+	userspaceCounterOffsets  map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
 	// natRuleCounterOffsets holds per-rule NAT translation hit totals reported
 	// by the Rust userspace dataplane (keyed by compiler-assigned counter ID),
 	// merged into ReadNATRuleCounter. The Rust forwarder never writes the
@@ -1381,6 +1397,16 @@ func (m *Manager) Close() error {
 func (m *Manager) Teardown() error {
 	m.Close()
 	err := teardownCleanupFn()
+	// #6741: Cleanup has just destroyed the pinned kernel objects, so every
+	// handle still in m.maps / m.programs now refers to an obsolete forwarding
+	// generation. Record the boundary so a lookup that serves one can be
+	// counted. The registry itself is deliberately NOT cleared — the retained
+	// state is what the #2114 A3 proceed-on-retained rule acts on, and changing
+	// that is the deferred half of #6741.
+	m.mu.Lock()
+	m.registryObsoleteFrom = m.registryGeneration
+	m.obsoleteEpochLogged = false
+	m.mu.Unlock()
 	// #6740: scoped section around the clears. teardownCleanupFn's unpin/remove
 	// sweep runs BEFORE it, never under the lock.
 	m.mu.Lock()
