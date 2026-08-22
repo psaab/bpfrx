@@ -818,6 +818,19 @@ func policyScopeIsMultiZone(pol *config.Policy) bool {
 // emitter stamps MatchFromZone/MatchToZone from the SAME Match fields for every
 // rule, so the gate covers the whole emission surface rather than assuming the
 // compiler's current tier discipline.
+// ConfigHasMultiZoneScopedPolicy is the exported form of
+// configHasMultiZoneScopedPolicy, for the #6650 CROSS-CHASSIS gate in
+// pkg/daemon.
+//
+// It is a thin wrapper rather than a copy on purpose. The local gate (#5488)
+// and the cross-chassis gate must arm on the SAME shape: two predicates that
+// drift would mean a config the local helper refuses is still pushed to the
+// peer, or the reverse. TestCrossChassisGateSharesTheLocalArmingPredicate6650
+// pins the sharing.
+func ConfigHasMultiZoneScopedPolicy(cfg *config.Config) bool {
+	return configHasMultiZoneScopedPolicy(cfg)
+}
+
 func configHasMultiZoneScopedPolicy(cfg *config.Config) bool {
 	if cfg == nil {
 		return false
