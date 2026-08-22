@@ -98188,3 +98188,17 @@ prose edit above them added. No diff falls in the new test body.
   **File(s)**: userspace-dp/src/afxdp/frame/mod.rs,
     userspace-dp/src/afxdp/frame/tests_nat_rewrite.rs,
     userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-08-21
+  **Action**: #5191 A1-b2-F6 — one shared `finalize_tcp_segment_headers` for both TCP
+    segmentation twins: CWR on the first segment only, per-segment IPv4 Identification when
+    DF is clear, urgent pointer rebased to the absolute urgent octet. Four fail-on-revert
+    tests; TSO proptest expectations extended and its flag generator widened to sample
+    CWR|ACK / URG|ACK.
+  **File(s)**: userspace-dp/src/tcp_flags.rs, userspace-dp/src/afxdp/mod.rs,
+    userspace-dp/src/afxdp/frame/tcp_segmentation.rs, userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/tx/tcp_segmentation.rs,
+    userspace-dp/src/afxdp/frame/tests_segment_tcp.rs,
+    userspace-dp/src/afxdp/frame/prop_tests/segment.rs,
+    userspace-dp/src/afxdp/frame/prop_tests/strategies.rs,
+    userspace-dp/src/afxdp/frame/README.md

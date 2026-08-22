@@ -130,7 +130,8 @@ use inspect::icmp_identifier_bearing;
 // continues to surface them at the same call sites in tx/dispatch.rs.
 mod tcp_segmentation;
 pub(in crate::afxdp) use tcp_segmentation::{
-    segment_forwarded_tcp_frames, segment_forwarded_tcp_frames_from_frame,
+    finalize_tcp_segment_headers, segment_forwarded_tcp_frames,
+    segment_forwarded_tcp_frames_from_frame,
 };
 
 // #1352 — extracted build orchestrator + per-address-family helpers.
