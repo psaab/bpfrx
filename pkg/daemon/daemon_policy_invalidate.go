@@ -19,9 +19,20 @@ import (
 //
 // Only DELETED policies are reported. A policy whose match/action CHANGED but
 // whose zones+name are unchanged keeps the same stable key, is present in both
-// maps, and is therefore NOT reported here — that in-progress re-evaluation is
-// the deferred #4234 modified-policy (policy-rematch) half, intentionally out of
-// scope for the Junos-default deletion-clear.
+// maps, and is therefore NOT reported here.
+//
+// That is a division of labour, NOT a gap. The changed-policy case is handled
+// by changedPolicyRuntimeIDs / clearSessionsForModifiedPolicies in this file,
+// gated on `security policies policy-rematch`, and
+// clearSessionsForPolicyChanges runs both on every commit. An earlier revision
+// of this comment called it "the deferred #4234 modified-policy
+// (policy-rematch) half, intentionally out of scope" — which was true when it
+// was written and stopped being true when that half shipped. It matters
+// because this is the first comment a reader hits when tracing commit-time
+// session invalidation: following it to a now-closed issue leads to the
+// conclusion that a shipped, security-relevant behaviour (in-progress sessions
+// re-evaluated against a tightened policy) is missing, and then to
+// re-implementing it or telling an operator xpf does not do it.
 //
 // policy_id 0 is EXCLUDED from the returned set even when the literal first
 // policy (PolicySetID 0, RuleIndex 0 — policyID() == 0) is deleted or renamed.
@@ -97,7 +108,9 @@ func deletedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 //     session-table scan.
 //   - It clears ONLY sessions whose stored policy_id matches a deleted policy;
 //     a MODIFIED policy (same zones+name) keeps its key and is never touched
-//     (the deferred policy-rematch half).
+//     HERE — clearSessionsForModifiedPolicies covers it under `policy-rematch`.
+//     (This said "the deferred policy-rematch half"; it is not deferred, it
+//     ships in this file.)
 //
 // The clear reuses the same companion-aware delete the GC and cluster-stale
 // reconcile use (SessionStore.DeleteBatchKnownV4/V6 removes the forward entry,
