@@ -102686,3 +102686,15 @@ prose edit above them added. No diff falls in the new test body.
     starvation — and reds on a revert to `while !stop`.
   - **File(s)**: userspace-dp/src/afxdp/wg/engine_tests.rs,
     docs/engineering-style.md
+
+## 2026-08-22 — #6566 member 2: clear policy hit-counts reaches the helper
+- **Timestamp**: 2026-08-22
+- **Action**: `LegacyDataPlaneAdapter` had no `ClearPolicyCounters`, so the
+  operator clear promoted to the embedded bpfShim and zeroed the RETIRED eBPF
+  `policy_counters` array while the live helper `PolicyCounterStore` — the one
+  the display reads — was untouched, both surfaces printing success. Added the
+  6-line override mirroring `ClearZoneCounters` (#3651). The READ half of that
+  cohort row was already fixed by the `ReadAllPolicyCounters` override; only
+  the CLEAR half was live.
+- **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/clear_policy_counters_6566_test.go (new), _Log.md
