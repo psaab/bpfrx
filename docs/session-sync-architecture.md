@@ -1668,10 +1668,12 @@ by the daemon's `watchClusterEvents` consumer, not synchronously inside
 On the RETH-VRRP path `ResignRG` itself is only half-synchronous: it drops the
 instance priority to 0 under the instance lock and then does a **non-blocking**
 send on `resignCh`. The priority-0 adverts and the `becomeBackup` VIP removal
-run on the VRRP instance's own loop, so "resigned" below means *resignation
-signalled and priority driven to 0*, not *VIPs off the wire* (#6177 item 1).
+run on the VRRP instance's own loop, so `ResignRG` *returning* means
+*resignation signalled and priority driven to 0*, not *VIPs off the wire*.
 Direct-VIP mode (`no-reth-vrrp`) has no such gap — `reconcileDirectVIPOwnership`
-removes the addresses inline on the event goroutine.
+removes the addresses inline on the event goroutine. `ResignRG` therefore
+returns a `vrrp.ResignBarrier`, and the fence waits on it rather than on the
+call returning (step 5 below, #6177 item 1).
 
 `handleRemoteFailover` (`pkg/cluster/sync_failover.go`) therefore must **not**
 reply `failoverAckApplied` the instant `OnRemoteFailover` returns: the sender
@@ -1715,7 +1717,25 @@ The fix gates the applied-ack on a fence-completion barrier:
    left in the map for `waitFailoverActuated` to consume (a re-arm replaces it):
    deleting it at resolution time would make a failure that lands before the
    waiter arrives read as "never armed", i.e. success.
-5. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
+5. On the RETH-VRRP path the verdict is deferred to the **VIP release itself**
+   (#6177 item 1). `ResignRG` returns a `vrrp.ResignBarrier` armed on every
+   targeted instance BEFORE `triggerResign`; each instance reports to it from
+   the site that actually completes a release — `becomeBackup` (with the
+   `removeVIPs` outcome), the MASTER-arm shutdown removal, the BACKUP arm of the
+   run loop consuming a resign token for an instance that was already BACKUP,
+   and `stop()` for a retired instance. `handleClusterEvent` hands the barrier to
+   `awaitRethVIPRelease` **on its own goroutine** — `watchClusterEvents`
+   serialises every cluster event, so blocking there would stall unrelated RGs
+   behind one VIP removal — and that resolves the fence: `signalFailoverActuated`
+   on a clean release, `signalFailoverActuationFailed` when `removeVIPs` failed
+   (a stale VIP is still answering ARP, so it is not a two-owner-safe
+   resignation) or when the release does not report within
+   `rethVIPReleaseTimeout` (500 ms default — far below the 3 s
+   `failoverActuateTimeout` so the verdict NAMES the un-released addresses, and
+   far below the initiator's 20 s ack timeout so the ack is a decision, not a
+   hang). Already-BACKUP and no-instance RGs resolve promptly rather than
+   stalling, so a clean failover is not downgraded to a hold.
+6. The wait is bounded by `failoverActuateTimeout` (3s default). A demotion that
    never actuates (superseded reset, event-channel drop) downgrades the ack to
    `failoverAckFailed` so the peer **holds** rather than promoting into the
    two-owner window — safety over latency in the race. On the normal path the
@@ -1726,18 +1746,17 @@ The batch path (`handleRemoteFailoverBatch` / `WaitFailoverAppliedBatch`) applie
 the same barrier across the whole set, all members armed under the one batch
 request id; the first non-nil verdict fails the batch ack.
 
-**Residual (#6177 item 1, open).** On the RETH-VRRP path the barrier releases
-once resignation has been *signalled* (priority 0 set synchronously) and
-`rg_active` is cleared — not once `becomeBackup` has physically removed the
-VIPs. A sub-millisecond window therefore remains in which the peer may promote
-while the old owner's VIPs are still on the interface. It is safe-direction
-rather than benign-by-luck: priority-0 is set synchronously so the resigning
-node cannot win a re-election, and the demotion preflight
+**Closed (#6177 item 1).** The RETH-VRRP path used to release the barrier once
+resignation had been *signalled* (priority 0 set synchronously) and `rg_active`
+was cleared — not once `becomeBackup` had physically removed the VIPs — leaving
+a sub-millisecond window in which the peer could promote while the old owner's
+VIPs were still on the interface. Step 5 above closes it by gating the release
+on a `becomeBackup` completion signal out of the VRRP instance loop. The
+pre-existing mitigations still stand behind it: priority-0 is set synchronously
+so the resigning node cannot win a re-election, and the demotion preflight
 (`tryPrepareUserspaceRGDemotion`) has already shifted the flow cache to
 `FabricRedirect`, so transit traffic reaching the old owner is forwarded over
-the fabric rather than dropped. Closing it means gating the barrier release on a
-`becomeBackup` completion signal from the VRRP instance loop, which is a change
-to the VRRP state machine rather than to this barrier.
+the fabric rather than dropped.
 
 Once the RG is marked standby, each worker processes a
 `WorkerCommand::DemoteOwnerRGS` on its packet thread

@@ -718,22 +718,41 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 // re-election before the debounced priority update fires.
 // Used when cluster state transitions from Primary to Secondary
 // (manual failover, weight drop, etc.) in non-preempt mode.
-func (m *Manager) ResignRG(rgID int) {
+//
+// The returned ResignBarrier completes when every targeted instance has
+// physically released its virtual addresses (#6177 item 1). The priority-0
+// write is synchronous, but triggerResign is not: the advert burst and the
+// becomeBackup VIP removal run on each instance's own goroutine, so ResignRG
+// returning means "resignation signalled and priority driven to 0", NOT "the
+// VIPs are off the wire". A caller fencing a remote failover against a
+// two-owner window must wait on the barrier; a caller that only needs the
+// election result (the reconcile safety net) may ignore it. Never nil: an RG
+// with no matching instances yields an already-complete barrier.
+func (m *Manager) ResignRG(rgID int) *ResignBarrier {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	vrid := 100 + rgID
+	var targets []*vrrpInstance
 	for _, vi := range m.instances {
 		if isRethInstance(vi.cfg) && vi.cfg.GroupID == vrid {
-			// Set priority to 0 BEFORE triggering resign. Without this,
-			// the masterDown timer (~97ms) can fire before the debounced
-			// priority update (500ms), causing the instance to re-elect
-			// at the old high priority and knock the peer back to BACKUP.
-			vi.mu.Lock()
-			vi.cfg.Priority = 0
-			vi.mu.Unlock()
-			vi.triggerResign()
+			targets = append(targets, vi)
 		}
 	}
+	barrier := newResignBarrier(len(targets))
+	for _, vi := range targets {
+		// Arm the barrier BEFORE the trigger so the run loop cannot complete
+		// the release in the gap and leave this registration unreported.
+		vi.armResignAck(barrier)
+		// Set priority to 0 BEFORE triggering resign. Without this,
+		// the masterDown timer (~97ms) can fire before the debounced
+		// priority update (500ms), causing the instance to re-elect
+		// at the old high priority and knock the peer back to BACKUP.
+		vi.mu.Lock()
+		vi.cfg.Priority = 0
+		vi.mu.Unlock()
+		vi.triggerResign()
+	}
+	return barrier
 }
 
 // UpdateRGPriority immediately sets the VRRP priority for all instances
