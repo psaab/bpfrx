@@ -1,3 +1,22 @@
+## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
+
+- **Timestamp**: 2026-08-22
+- **Action**: Repo-wide sweep correcting the RFC 6052 section cited for the
+  NAT64 non-global embedded-IPv4 rule. 17 occurrences across 11 files said
+  §2.2; §2.2 is the IPv4-Embedded IPv6 Address *Format* section and states no
+  such rule. The normative "MUST NOT translate / MUST drop" language is §3.1
+  (Restrictions on the use of the Well-Known Prefix).
+- **File(s)**: docs/feature-coverage.md, pkg/dataplane/userspace/format/
+  status_test.go, pkg/dataplane/userspace/protocol_binding.go,
+  userspace-dp/src/FEATURES.md, userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/protocol/binding.rs
+- **Note**: the 2026-07-24 #6475 heading above carries the original mis-citation
+  and is deliberately left as written. This log is append-only and records what
+  was believed at the time; rewriting a past entry would falsify the record.
+  This entry is the correction.
+
 ## 2026-08-21 — #6422: a poisoned mutex panicked the WireGuard worker instead of recovering
 
 - **Timestamp**: 2026-08-21 (fix/6422-wg-lock-poison)
