@@ -63,19 +63,16 @@ impl Default for SharedSessionOwnerRgIndexes {
 }
 
 impl SharedSessionOwnerRgIndexes {
+    /// #6653: RECOVERING locks, for the same reason as the session maps this
+    /// mirrors. `if let Ok(..)` skipped a poisoned index, so a teardown could
+    /// empty the maps and leave an index populated (or the reverse) — the
+    /// indexes exist to mirror the maps, and a poisoned one that survives
+    /// teardown is precisely the divergence they cannot represent.
     pub(super) fn clear(&self) {
-        if let Ok(mut index) = self.sessions.lock() {
-            index.clear();
-        }
-        if let Ok(mut index) = self.nat_sessions.lock() {
-            index.clear();
-        }
-        if let Ok(mut index) = self.forward_wire_sessions.lock() {
-            index.clear();
-        }
-        if let Ok(mut index) = self.reverse_prewarm_sessions.lock() {
-            index.clear();
-        }
+        crate::afxdp::shared_ops::lock_shared_recover(&self.sessions).clear();
+        crate::afxdp::shared_ops::lock_shared_recover(&self.nat_sessions).clear();
+        crate::afxdp::shared_ops::lock_shared_recover(&self.forward_wire_sessions).clear();
+        crate::afxdp::shared_ops::lock_shared_recover(&self.reverse_prewarm_sessions).clear();
     }
 }
 
