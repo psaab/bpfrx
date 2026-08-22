@@ -216,7 +216,7 @@ func TestReconcileProxyARP_V6InstallsPneigh(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	added, _, err := ReconcileProxyARP(cfg, ifaceMap, nil)
+	added, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil)
 	if err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestReconcileProxyARP_V6StaleRemoval(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 
@@ -309,7 +309,7 @@ func TestReconcileProxyARP_V4MappedClassifiesAsV4(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": 7}
 
-	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 	if len(*sets) != 1 {
@@ -342,7 +342,7 @@ func TestReconcileProxyARP_V6Idempotent(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": idx}
 
-	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil); err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
 	if len(*sets) != 0 {
@@ -380,7 +380,7 @@ func TestReconcileProxyARP_EnablesSysctl(t *testing.T) {
 	// install inside ReconcileProxyARP, so if the install errors we cannot
 	// reach the sysctl step — skip rather than false-fail in an unprivileged
 	// sandbox.
-	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil); err != nil {
 		t.Skipf("ReconcileProxyARP needs privileges in this env: %v", err)
 	}
 	// Clean up the NTF_PROXY neighbor entry this test installed on lo so the
@@ -428,7 +428,7 @@ func TestReconcileProxyARP_V6InstallsPneighLive(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"lo": lo.Index}
 
-	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil); err != nil {
+	if _, _, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil); err != nil {
 		t.Skipf("ReconcileProxyARP needs privileges in this env: %v", err)
 	}
 	t.Cleanup(func() {

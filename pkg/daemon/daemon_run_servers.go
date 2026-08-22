@@ -137,6 +137,15 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// kernel-upgrade`. Same assembly the in-process CLI reads
 		// (daemon_run.go SetKernelUpgradeStatusFn).
 		KernelUpgradeStatusFn: d.kernelUpgradeStatus,
+		// #6496: the day-0 config-import verdict for `show system
+		// bootstrap-import`. Same recorded snapshot /health reports below and
+		// the in-process CLI reads (daemon_run.go SetBootstrapImportFn), so
+		// the three surfaces cannot disagree about whether a day-0 config
+		// applied. Unlike /health this path renders b.Error: it is
+		// authenticated, and the failure REASON is the entire point of the
+		// command (#5031 withholds it from /health because that endpoint is
+		// unauthenticated, which is a different question from privilege).
+		BootstrapImportFn: d.bootstrapShowSnapshot,
 		RPMResultsFn: func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()

@@ -70,3 +70,65 @@ audit_is_excluded() {
 audit_loc() {
     wc -l < "$1"
 }
+
+# ---------------------------------------------------------------------
+# Audited roots and thresholds (#7253)
+#
+# These were literals inside scripts/refactoring-audit.sh until the
+# touched-file gate needed the same "would the generator measure this
+# path?" answer for an arbitrary path coming out of `git diff`. Two
+# copies of a root list drift, so the generator now word-splits these
+# variables and scripts/refactoring-audit-touched.sh asks
+# audit_is_audited_path. pkg/refactoraudit binds the agreement
+# behaviourally (TestAuditedPathPredicateAgreesWithGenerator: every path
+# the generator emitted must satisfy the predicate) and pins the floors
+# against the Go constants (TestShellFloorsMatchGoConstants).
+
+# LOC at which a file enters the heatmap, and at which it is promoted to
+# [REFACTOR]. Mirrored by auditFloor / refactorFloor in
+# pkg/refactoraudit/audit_canary_test.go.
+# shellcheck disable=SC2034 # consumed by sourcing scripts, not here.
+AUDIT_FLOOR=1500
+# shellcheck disable=SC2034 # consumed by sourcing scripts, not here.
+AUDIT_REFACTOR_FLOOR=2000
+
+# Audited roots, per language. A path is audited only if it lives under
+# one of the roots for ITS extension — pkg/x.rs and userspace-dp/src/x.go
+# are both uninteresting — and is not excluded by AUDIT_SKIP_RE.
+#
+# bpf/xdp and bpf/tc were deleted in #1476 and are currently absent; the
+# generator tolerates that (audit_existing_dirs) and the predicate below
+# answers for them the same way it always would, so the two agree if the
+# roots ever return.
+AUDIT_ROOTS_RS="userspace-dp/src userspace-xdp/src"
+AUDIT_ROOTS_GO="pkg cmd"
+AUDIT_ROOTS_C="bpf/xdp bpf/tc"
+
+# audit_is_audited_path <path>
+# Exit 0 (true) if the generator would measure <path> — i.e. it is a
+# repo-relative path under one of its language's audit roots and is not
+# excluded as test/generated/vendored code. Files below the LOC floor
+# still answer true here: this is "is this path in the audited
+# population", not "is it in the heatmap".
+audit_is_audited_path() {
+    local p="$1" roots root
+    case "$p" in
+        *.rs) roots="$AUDIT_ROOTS_RS" ;;
+        *.go) roots="$AUDIT_ROOTS_GO" ;;
+        *.c)  roots="$AUDIT_ROOTS_C" ;;
+        *)    return 1 ;;
+    esac
+    # Root test first: it is a shell builtin, while audit_is_excluded
+    # spawns a grep. A caller feeds this every untracked path in the tree
+    # (`git ls-files --others`), most of which live nowhere near an audit
+    # root, so the cheap test has to be the one that rejects them.
+    for root in $roots; do
+        case "$p" in
+            "$root"/*)
+                audit_is_excluded "$p" && return 1
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}

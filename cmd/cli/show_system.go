@@ -139,6 +139,11 @@ func (c *ctl) handleShowSystem(args []string) error {
 		// #6495: the #1930 kernel-channel state, rendered daemon-side through
 		// pkg/upgrade — the same implementation the console CLI uses.
 		return c.showText("kernel-upgrade")
+	case "bootstrap-import":
+		// #6496: the day-0 config-import verdict. Rendered daemon-side through
+		// pkg/bootstrapshow — the same implementation the in-process console
+		// CLI uses — so the two clients cannot show different answers.
+		return c.showText("bootstrap-import")
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}

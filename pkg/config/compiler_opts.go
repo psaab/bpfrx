@@ -511,6 +511,21 @@ type compileOpts struct {
 	// told to write it once. Same doctrine as lenientDuplicateNATRuleName.
 	lenientDuplicateNATRuleSetName bool
 
+	// lenientDuplicateNamesExpanded (#6455 Finding 1) downgrades the
+	// POST-expansion duplicate-name gate (validateDuplicateNamesExpandedAST)
+	// from a hard error to a warning on the tolerant load / peer-sync paths.
+	//
+	// It is a separate flag from the three pre-expansion gates it re-runs
+	// (#5180 / #5649 / #6454) even though the tolerant profile sets all four
+	// together, because the two views detect on different evidence: the
+	// pre-expansion gates see what the OPERATOR AUTHORED, this one sees what
+	// apply-groups PRODUCED. Folding them onto one flag would mean a future
+	// decision to keep authored duplicates strict while tolerating
+	// group-produced ones (or the reverse) could not be expressed. Same #1960
+	// doctrine as the other three: an already-persisted or peer-synced config
+	// carrying a group-authored duplicate must still boot.
+	lenientDuplicateNamesExpanded bool
+
 	// lenientNATHostMask (#2173) downgrades the static-NAT / NAT64
 	// host-mask gate (validateNATHostMaskStrict) from a hard compile error
 	// to a cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync
@@ -2285,6 +2300,7 @@ func lenientCompileOpts() compileOpts {
 		lenientDuplicateNamedBlock:             true,
 		lenientDuplicateNATRuleName:            true,
 		lenientDuplicateNATRuleSetName:         true,
+		lenientDuplicateNamesExpanded:          true,
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,

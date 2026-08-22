@@ -343,23 +343,26 @@ func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 //
 // Reaching every PHASE is not the same as reaching every phase's WRITE
 // SURFACE, and at r2 this test reached only 28 of the 40 overrides (#6894 r3
-// F1). idProbeConfig now carries a destination-NAT rule-set, static NAT v4 and
-// v6, an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6 SNAT
-// rule, an interface-SNAT rule and a security policy, which takes the reached
-// set to 39 of 40. Instrumented count, measured by overriding all 40 with a
-// name recorder: 38 from the first leg below, plus SetSNATEgressIP from the
-// second. The 40th is IsLoaded, which CompileConfig calls itself
-// (compiler.go, CompileConfig's IsLoaded gate) before the pre-pass runs, so no config can reach it from
-// here.
+// F1). idProbeConfig carries a destination-NAT rule-set, static NAT v4 and v6,
+// an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6 SNAT rule,
+// an interface-SNAT rule and a security policy so every covered phase is
+// entered on every branch it has.
 //
-// The second leg exists because SetSNATEgressIP is the one covered write that
-// is not a pure function of cfg: compileNAT's interface-SNAT branch resolves
-// the egress zone's member through result.cachedInterfaceByName and soft-skips
-// when it misses, so on a host without that link the branch never writes.
-// Seeding the cache with a synthetic entry reaches it. Naming a REAL link
-// instead would work on this host and is exactly what must not be done -- a
-// fixture that resolves to a live interface is one CompileConfig call away
-// from reconciling that interface's addresses (#6894 r2 F1).
+// #6420 deleted the eBPF NAT record construction, so the NAT setters are no
+// longer CALLED by the compiler and their overrides here are defensive. The
+// per-method counting leg that used to bind SetSNATEgressIP is replaced by
+// TestNATCompilerCallsNoDataplaneNATWriter_6420, which drives the same rows
+// against a dataplane that ERRORS from every NAT writer and requires a clean
+// validate. That binds the ABSENCE of the calls, which a counter cannot: a
+// counter can only observe a call that happens.
+//
+// The seeded-ifCache leg stays, and is load-bearing for that replacement: it
+// is what makes compileNAT's interface-SNAT branch resolve its egress member
+// instead of soft-skipping, so the branch is executed rather than
+// short-circuited. Naming a REAL link instead would work on this host and is
+// exactly what must not be done -- a fixture that resolves to a live interface
+// is one CompileConfig call away from reconciling that interface's addresses
+// (#6894 r2 F1).
 func TestPrePassShimCoversTheCalledSurface_4960(t *testing.T) {
 	cfg := idProbeConfig()
 
@@ -367,28 +370,12 @@ func TestPrePassShimCoversTheCalledSurface_4960(t *testing.T) {
 		t.Fatalf("rich config must validate clean: %v", err)
 	}
 
-	// The seeded leg is TWO runs, and it has to be: a counting dp would
-	// override SetSNATEgressIP itself and so could not detect the override
-	// missing from the shim — the exact method it exists to cover.
-	//
-	// Run one is the PLAIN shim, so a deleted SetSNATEgressIP nil-panics here.
+	// The PLAIN shim with the egress interface resolvable: a method the
+	// compiler calls but the shim does not override nil-panics here.
 	if err := validateBeforeMutateWithResult(
 		discardingDataPlane{}, cfg, seededEgressResult()); err != nil {
 		t.Fatalf("rich config must validate clean with the egress interface "+
 			"resolvable: %v", err)
-	}
-	// Run two counts, which is what makes run one meaningful: without it, a
-	// fixture that stopped declaring the egress member — or a compileNAT that
-	// stopped resolving it through the interface cache — would soft-skip past
-	// the write again and both runs would stay green having proved nothing.
-	egress := &egressCountingDP{}
-	if err := validateBeforeMutateWithResult(egress, cfg, seededEgressResult()); err != nil {
-		t.Fatalf("counting leg must validate clean: %v", err)
-	}
-	if egress.writes == 0 {
-		t.Fatal("the seeded ifCache entry did not reach SetSNATEgressIP, so " +
-			"that override is NOT covered by this test and could be deleted " +
-			"with the suite still green (#6894 r3 F1)")
 	}
 }
 
@@ -402,20 +389,6 @@ func seededEgressResult() *CompileResult {
 		Index: 4960, Name: idProbeEgressIface,
 	}
 	return result
-}
-
-// egressCountingDP is the pre-pass shim plus a counter on the one covered
-// write that a config alone cannot reach. It overrides SetSNATEgressIP only —
-// everything else, including the xpfValidationPass marker, comes from the
-// embedded discardingDataPlane.
-type egressCountingDP struct {
-	discardingDataPlane
-	writes int
-}
-
-func (d *egressCountingDP) SetSNATEgressIP(SNATEgressKey, SNATEgressValue) error {
-	d.writes++
-	return nil
 }
 
 // notAValidationDP is a DataPlane that reports FALSE for the pre-pass marker.

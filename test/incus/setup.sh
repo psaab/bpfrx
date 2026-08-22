@@ -585,6 +585,22 @@ cmd_deploy() {
 		warn "Rust toolchain not found; skipping xpf-userspace-dp build"
 	fi
 
+	# #1864/#6493 pre-flight: prove the NEW binary's embedded AF_XDP shim is
+	# ACCEPTED by THIS VM's kernel verifier before anything on the box is
+	# disturbed. sha256 equality (deploy_verify_pushed_sha) and "systemd
+	# launched the pushed binary" (deploy_verify_running_xpfd) both pass for a
+	# binary whose shim loads nothing — they verify bytes and process identity,
+	# never verifier acceptance — so without this the standalone deploy reports
+	# success and leaves the VM in config-only mode with no dataplane.
+	#
+	# POSITION IS THE POINT: this runs before the bpfrxd migration, the pin
+	# reconcile, `systemctl stop xpfd`, the pkills and the binary push, so a
+	# REJECT aborts with the old daemon still running. The cluster deploy has
+	# had this gate since #1869; the standalone path — the venue where
+	# `make generate` shim iteration actually happens, against a VM kernel
+	# independent of the build host's — did not (#6493).
+	deploy_verify_dataplane_preflight "$INSTANCE_NAME" "$PROJECT_ROOT/xpfd"
+
 	# Migrate from old bpfrxd naming if present.
 	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- /usr/local/sbin/bpfrxd cleanup 2>/dev/null || true

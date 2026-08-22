@@ -653,6 +653,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// xpf-deploy roll orchestrator polled that same verb over node_exec.
 		// Automation had a path; the human did not.
 		shell.SetKernelUpgradeStatusFn(d.kernelUpgradeStatus)
+		// #6496: the day-0 config-import verdict for `show system
+		// bootstrap-import` on the console. Same recorded snapshot /health and
+		// the gRPC ShowText renderer read, so an operator standing at a fresh
+		// box can answer "why didn't my day-0 config apply?" from the CLI they
+		// are already in instead of leaving it to curl the loopback REST API.
+		shell.SetBootstrapImportFn(d.bootstrapShowSnapshot)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
