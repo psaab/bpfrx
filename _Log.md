@@ -58,6 +58,30 @@
 - **File(s)**: pkg/upgrade/cutover.go,
   pkg/upgrade/resume_dbsnapshot_6556_test.go, docs/in-place-upgrade.md
 
+## 2026-08-21 — #6557 rolling step 7 confirms the rejoin per-RG
+
+- **Timestamp**: 2026-08-21
+- **Action**: `runRollingWith` step 7 called a bare `cl.ResetFailover()`
+  and reported "cut complete" without confirming it. Replaced with
+  `RejoinAndConfirm(cl, rc.RejoinDeadline)` — the #5138 per-RG readback
+  that was declared on the `RollingCluster` interface in `rolling.go`
+  itself but wired only into `kernel_drain.go`. Reusing it (rather than
+  open-coding a poll) keeps the binary rolling cut and the LANE-1 kernel
+  roll on one definition of "rejoined". The failure error now tells the
+  driver explicitly not to advance to the peer. Added a `rejoinChecks`
+  counter to `fakeCluster`: the pre-existing `TestRolling_HappyPath`
+  asserted only that `ResetFailover` was CALLED, which a step 7 that
+  never confirms satisfies just as well.
+  Mutation matrix: R1 (restore the shipped bare `ResetFailover`) → all
+  three tests red; R2 (confirm but log-and-continue) → both behavioural
+  tests red; R3 (drop the "MUST NOT advance to the peer" guidance) → the
+  incomplete-rejoin test reds.
+  NOTE: `docs/in-place-upgrade.md` already DESCRIBED this behaviour as
+  shipped — the doc was ahead of the code, and now says so.
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go,
+  pkg/upgrade/rolling_rejoin_confirm_6557_test.go,
+  docs/in-place-upgrade.md
+
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
@@ -101040,6 +101064,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/device_map_dup_name_6546_test.go (new),
   docs/bare-metal-device-map.md, _Log.md
 
+## 2026-08-21 — #6515 (b): the narrowing advisory is guarded on the real commit paths
+- **Timestamp**: 2026-08-21
+- **Action**: The #6515 advisory warns that established sessions are FLUSHED at
+  commit (#5566), not merely that new connections are refused — but nothing
+  bound either that sentence or the claim that the advisory reaches an operator
+  who types `commit` without ever running `commit check`. MEASURED by driving
+  the real handlers rather than reading the wiring: the local CLI prints it on
+  `commit`, `commit check` and `commit confirmed`, and all three gRPC commit
+  RPCs return it in their `Warnings` field. No product change was needed; the
+  guards are new. Also renamed the new test functions to carry `_6515` — the
+  file name alone made `-run 6515` select ZERO tests and exit 0.
+- **File(s)**: pkg/cli/commit_advisory_surface_6515_test.go (new),
+  pkg/grpcapi/commit_advisory_warnings_6515_test.go (new)
 ## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
 - **Timestamp**: 2026-08-21
 - **Action**: #6515 and #6519 landed independently, each carrying its own copy of
@@ -101099,6 +101136,19 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_validate_warn.go,
   pkg/config/dhcp_host_inbound_bypass_6460_test.go (new),
   docs/host-inbound-multicast.md, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-08-21 — #6555 ddns default interface source DHCP-restart guard
+- **Timestamp**: 2026-08-21
+- **Action**: The #4423 M10 guard existed only on the `dhcp` address source. The
+  DEFAULT source (`interface`, what an unset `address-source` resolves to) still
+  read a DHCP client-restart address-gone window as a DEFINITIVE loss and
+  withdrew the public A/AAAA record. Added the symmetric guard to
+  `observeInterfaceAddr`, gated on an EMPTY family address list (the restart
+  window) rather than on selection failure (tentative/non-public stays
+  definitive, matching the dhcp source). Single-sourced both sources' predicate
+  as `unitRunsDHCPForFamily`.
+- **File(s)**: pkg/daemon/daemon_ddns_surface_a.go,
+  pkg/daemon/daemon_ddns_surface_a_test.go, pkg/ddns/README.md, _Log.md
 
 ## 2026-08-21 — #6548: console `load ... terminal` aborts on Ctrl-C
 - **Timestamp**: 2026-08-21
