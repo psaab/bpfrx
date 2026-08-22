@@ -10413,7 +10413,8 @@ enum and rejected (an IP is not a severity).
   switches on the known modifier keywords before the pair fallback. Host
   `source-address`/`port` are captured into `SyslogHostConfig.SourceAddress`
   / `.Port`; `match`/`structured-data`/`explicit-priority`/`log-prefix`/
-  `facility-override`/`archive` are recognized-and-skipped. The
+  `facility-override` are recognized-and-skipped, and `archive` is
+  recognized-recorded-and-warned (see #7146 below). The
   `syslogFacilitySeverity` helper extracts the pair (flat `Keys[0]/Keys[1]`
   or hierarchical `Keys[0]` + child) and returns ok=false for a valueless
   leaf, so a bare/garbage keyword is dropped instead of appended as a
@@ -10428,6 +10429,77 @@ enum and rejected (an IP is not a severity).
   hardcoded 514.
 - **tests** — `pkg/config/compiler_syslog_hostmods_4303_test.go` (facilities
   not polluted, source-address/port captured, strict commit accepts).
+
+## Syslog file `archive` is accepted-but-inert (#7146)
+
+The `archive` sub-statement of `system syslog file <name>` is modeled in
+`setSchema` in full — `files`, `size`, `start-time`, `transfer-interval`,
+`archive-sites` (`multi: true`), `world-readable` / `no-world-readable` — and
+is implemented by **nothing**. The #4303 S-1 work above put `archive` in
+`compileSystem`'s recognized-modifier skip list so it would not be captured as
+a bogus `<facility> <severity>` pair, but no consumer was ever written: the
+whole subtree was read and discarded. Every knob committed clean, rendered back
+in `show configuration`, and produced no rotation, no retention, and no
+off-box transfer. An operator who configured log archival got a clean commit
+and no archiving.
+
+The runtime for a syslog file is `applySyslogFiles` (`pkg/daemon/daemon_system.go`),
+which writes an rsyslog drop-in (`/etc/rsyslog.d/10-xpf-<name>.conf`) directing
+matching facility/severity messages to `/var/log/<name>` — and nothing else.
+There is no rotation, size accounting, schedule, or transfer anywhere in the
+daemon for a syslog file. (The `archiveConfig` / `archiveTransfer` machinery in
+`pkg/daemon` is the **unrelated** `system archival configuration` feature, which
+archives the running **config**, not logs, and does work.)
+
+#7146 keeps the block unimplemented and makes it **loud**, the same
+accept-with-advisory shape as #4316:
+
+- **compiler** — `compileSystem`'s syslog `file` loop switches `archive` out of
+  the skip list into its own case. It sets `SyslogFileConfig.ArchiveConfigured`
+  (presence: a bare `archive;` is archiving-with-defaults in Junos, so presence
+  alone is what the operator asked for) and records the sub-statement
+  **keywords** in `SyslogFileConfig.ArchiveKnobs` (sorted, deduplicated).
+  `syslogArchiveTokens` flattens the subtree depth-first pre-order so ONE walker
+  covers every shape the dual AST produces for the same stanza — the flat block
+  (`Keys=["archive"]` + sibling children), the flat compact form
+  (`archive size 1m files 5` → a NESTED key chain, not siblings), the
+  hierarchical block, and the hierarchical one-line form
+  (`archive size 1m files 5;` → all tokens on `Keys`, no children).
+  `syslogArchiveKnobs` then walks those tokens against the
+  `syslogArchiveKeywordArgs` allowlist, stepping over each keyword's value so an
+  `archive-sites` URL that happens to equal a keyword is not read as one.
+- **keywords only, never values** — an `archive-sites` URL can embed credentials
+  (`scp://user:pass@host/`), and the advisory is printed at commit and pasted
+  into support tickets. This is the same rule `systemInertKnobWarnings` applies
+  to the NTP `authentication-key`.
+- **advisory** — `ValidateConfig` (`compiler_validate_warn.go`) emits one
+  warning per archiving file naming the file, the configured knobs, and the
+  consequence:
+
+  ```
+  system syslog file "f1" archive [archive-sites files size start-time transfer-interval]:
+  accepted for Junos compatibility but NOT implemented — xpf writes /var/log/f1
+  through an rsyslog drop-in and applies no rotation, no size cap, no retention
+  count, no start-time schedule, and no off-box transfer, so this log file is
+  never rotated and its contents are NOT archived anywhere. The configuration is
+  valid and this is expected, not a fault in it; rotate and collect /var/log/f1
+  with the host's own log policy (#7146)
+  ```
+
+- **warn, never reject** — the stanza commits today. A hard reject would fail
+  the tolerant load / peer-sync path on a config an operator already has, which
+  is the #1960 brick-on-upgrade shape.
+- **not a CWE-88** — the #4589 leading-dash gate on `system archival
+  configuration archive-sites` exists because that value is handed to `scp` as a
+  destination (`pkg/daemon/daemon_flow.go`). The syslog leaf has no such gate and
+  does not need one: it reaches no `scp` invocation because it reaches nothing at
+  all. Implementing archival would change that and would then owe the #4589
+  treatment.
+- **tests** — `pkg/config/syslog_archive_inert_7146_test.go`: the advisory fires
+  in all four AST shapes and for a bare `archive`, one per file, never on the
+  common case (a plain facility/severity file, a `host`/`user` destination,
+  `system archival configuration`, or no syslog block), never echoes a value,
+  and the commit still succeeds.
 
 ## Custom system login class (#4304 S-2)
 
