@@ -1244,7 +1244,13 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
 /// BUILD FAILURE in the non-test profile rather than a silent single-holder
 /// release of a reservation every worker holds. Production uses the
 /// `_for_worker` twin.
-#[cfg(test)]
+///
+/// #6600: one production caller now exists, and it is the exact case the guard
+/// above was written to permit — the ROLLBACK of an `Untracked` reservation the
+/// coordinator took moments earlier and no worker has adopted. There is no
+/// worker_id to thread, because no worker holds it: the reservation is being
+/// withdrawn precisely BECAUSE the import is not going to be published. A
+/// holder-aware release would be the wrong call here, not a safer one.
 pub(crate) fn release_source_nat_allocation(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1576,7 +1582,7 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
     // expiry off a real clock.
     now_ns: u64,
     worker_id: u32,
-) {
+) -> bool {
     reserve_synced_source_nat_allocation_with_holder(
         rules,
         key,
@@ -1585,9 +1591,46 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
         synced_zones,
         now_ns,
         NatHolder::Worker(worker_id),
-    );
+    )
 }
 
+/// #6600: the COORDINATOR-side reservation, taken BEFORE the shared session
+/// entry is published.
+///
+/// It holds `NatHolder::Untracked`, which contributes no holder bit, so the
+/// per-worker reservations that follow are absorbed rather than doubled:
+/// `reserve_flow` finds the identical `(flow, translated)` already live and
+/// takes its idempotent early-return, OR-ing the worker's bit in. The last
+/// worker's release then empties the mask and frees the port exactly as before.
+pub(crate) fn reserve_synced_source_nat_allocation_untracked(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    synced_zones: SyncedNatZones<'_>,
+    now_ns: u64,
+) -> bool {
+    reserve_synced_source_nat_allocation_with_holder(
+        rules,
+        key,
+        nat,
+        is_reverse,
+        synced_zones,
+        now_ns,
+        NatHolder::Untracked,
+    )
+}
+
+/// Returns whether the translation is RESERVED on this node — either because a
+/// pass took it, or because there was nothing to reserve (a reverse entry, or a
+/// decision with no `rewrite_src`). `false` means every candidate rule REFUSED,
+/// i.e. a different live allocation already owns the port (#6600).
+///
+/// Before #6600 the bool `reserve_synced_on_first_pool_owner` already computed
+/// was discarded here, and the whole chain up to `handle_upsert_synced` returned
+/// `()` — so a refusal was not returned, not counted and not logged. The
+/// coordinator uses this return to refuse the import outright rather than
+/// publishing a session whose translation names a port this node does not own.
 fn reserve_synced_source_nat_allocation_with_holder(
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
@@ -1597,12 +1640,12 @@ fn reserve_synced_source_nat_allocation_with_holder(
     synced_zones: SyncedNatZones<'_>,
     now_ns: u64,
     holder: NatHolder,
-) {
+) -> bool {
     if is_reverse {
-        return;
+        return true;
     }
     let Some(rewrite_src) = nat.rewrite_src else {
-        return;
+        return true;
     };
     let flow = SourceNatFlowKey {
         protocol: key.protocol,
@@ -1643,7 +1686,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
             holder,
         )
     {
-        return;
+        return true;
     }
     // #6211 PASS 2 — the pre-#6211 behaviour, unchanged: the first rule whose
     // pool CONTAINS the translated address, with no zone/tuple narrowing.
@@ -1664,7 +1707,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
         nat.rewrite_src_port,
         now_ns,
         holder,
-    );
+    )
 }
 
 /// #6211: reserve the synced translation on the first rule in `rules` whose
