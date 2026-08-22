@@ -102485,3 +102485,18 @@ prose edit above them added. No diff falls in the new test body.
     controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
     was still unbound — severing it left every 5086 test green.
   - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go
+
+## 2026-08-22 — #6660 REST read-surface authorization
+- **Timestamp**: 2026-08-22
+- **Action**: #5561 gated the 19 mutating REST routes and scoped reads out, so
+  any local uid could GET the full running configuration unidentified. Measured
+  what is actually disclosed before designing: the compiled *config.Config is
+  json-encoded, so #2053's Secret marshaller applies and NO secret is rendered
+  in cleartext — this is configuration/topology disclosure, not credential
+  disclosure. Added restReadPermissions (every /api/v1 GET -> PermView) and
+  readAuthz, reusing #5561's machinery. /health + /metrics stay open (harness
+  consumers; swept every in-tree consumer and found nothing else on REST).
+  Safe because PrincipalForUID returns superuser for uid 0 unconditionally, so
+  root-run tooling on a box with no login model is unaffected.
+- **File(s)**: pkg/api/authz.go, pkg/api/read_authz_6660_test.go (new),
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md

@@ -3,9 +3,14 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+
+	"github.com/psaab/xpf/pkg/authz"
 	"testing"
 	"time"
 )
@@ -25,8 +30,46 @@ import (
 
 // startEscapeTestREST runs the production HTTP startup path on an
 // ephemeral loopback port and returns the effective base URL.
+// authorizeEscapeTestREST gives the test process an IDENTIFIED, authorized
+// principal for the REST read surface (#6660).
+//
+// These cases assert what `/api/v1/status` REPORTS about the dataplane; they are
+// not about authorization. Before #6660 the read surface was ungated so any
+// caller reached the handler. Now a read requires PermView, and the test runner
+// (an ordinary uid, not root) is not in the login model — so without this the
+// cases fail at 403 having never exercised their subject.
+//
+// It maps the RUNNING uid to a name and grants that name super-user, rather than
+// hardcoding a uid, so it is correct on any machine and in CI.
+func authorizeEscapeTestREST(t *testing.T, d *Daemon) {
+	t.Helper()
+	const user = "xpf-escape-test"
+	uid := os.Getuid()
+	passwd := filepath.Join(t.TempDir(), "passwd")
+	line := fmt.Sprintf("%s:x:%d:%d::/home/%s:/bin/bash\n", user, uid, uid, user)
+	if err := os.WriteFile(passwd, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(authz.SetPasswdPathForTest(passwd))
+
+	text := fmt.Sprintf(
+		"system {\n    login {\n        user %s {\n            class super-user;\n        }\n    }\n}\n",
+		user)
+	if err := d.store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := d.store.LoadOverride(text); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	if _, err := d.store.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	d.store.ExitConfigure()
+}
+
 func startEscapeTestREST(t *testing.T, d *Daemon) string {
 	t.Helper()
+	authorizeEscapeTestREST(t, d)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	d.opts.APIAddr = "127.0.0.1:0"
