@@ -440,6 +440,65 @@
 - **File(s)**: scripts/image/validate.py,
   scripts/image/test_validate_ab_substrate_6498.py,
   docs/image-validation.md
+## 2026-08-22 — #5968: the REST include_peer path walked the local session table twice
+
+- **Timestamp**: 2026-08-22 (fix/5968-peer-only-delegation)
+- **Action**: Added peer-ONLY in-process entry points (`PeerSessions`,
+  `PeerSessionSummary`, `PeerZonePairSummary`) and pointed the three REST
+  include_peer handlers at them, removing a second full v4+v6 table traversal
+  per request.
+- **File(s)**: `pkg/grpcapi/peer_only_5968.go` (new),
+  `pkg/grpcapi/peer_only_5968_test.go` (new), `pkg/grpcapi/server_sessions.go`,
+  `pkg/api/server.go`, `pkg/api/sessions.go`, `pkg/api/README.md`, plus three
+  retargeted test files.
+
+  A REST list / summary / zone-pair request with `include_peer` walks the LOCAL
+  table in the REST handler, then delegated to the in-process gRPC method purely
+  to read `.Peer` — and that method walked the local table AGAIN to build a local
+  answer the caller discarded. #5880 fixed the double-ACQUIRE on this path (the
+  nested call re-acquired the shared limiter and self-rejected at capacity); the
+  redundant WALK survived it. One slot, two full traversals, each contending
+  with the live session-sync path for the same per-bucket map locks.
+
+  All THREE handlers had the identical shape, so a fix covering only the list —
+  the one the issue names — would have left two-thirds of the redundant work.
+
+  The new entry points are Go-interface methods on `ClusterSessionService`, not
+  registered gRPC methods, so this costs no protobuf or wire change and no
+  version negotiation: the REST bridge and the gRPC server are the same process
+  by construction.
+
+  ADMISSION IS DELIBERATELY UNCHANGED. Skipping the limiter was tempting — these
+  perform no local walk — but it would have silently retired the #5880
+  lease-propagation guard on exactly the delegation that guard was written for,
+  turning `TestRESTIncludePeerReusesLease_5880` vacuous without failing it. Each
+  peer-only method acquires through the same lease-aware `AcquireCtx`, so slot
+  accounting is identical before and after and the change is purely about the
+  walk.
+
+  Peer-status classification (#5320 OK / UNREACHABLE / NOT_APPLICABLE) is
+  single-sourced in `attachPeerSessionSummary` / `attachPeerZonePairSummary`,
+  shared with the full paths: a divergence between how the full method and the
+  peer-only method classify the SAME fetch would always be a bug, so it is
+  single-sourced rather than bound by a test.
+
+  Mutation proof — `go build ./...` checked clean before every cell:
+  - `PeerSessions` delegates to `GetSessions` (restores the double walk) —
+    TEST_RC=1 on the zero-walk measurement;
+  - peer-only paths skip admission — TEST_RC=1 on
+    `TestPeerOnlyStillAcquiresAdmission`;
+  - each of the three REST call sites reverted to its full-view method —
+    TEST_RC=1 each, localising to that surface's tests.
+  The zero-walk test carries `GetSessions` on the SAME server and dataplane as a
+  positive control, so it cannot be satisfied by a dataplane that never
+  iterates.
+
+  Control: `go test -count=1 ./pkg/api/ ./pkg/grpcapi/` TEST_RC=0,
+  `go test -count=1 ./pkg/daemon/` TEST_RC=0, `go vet` VET_RC=0, `go build ./...`
+  BUILD_RC=0. Go-only; no dataplane binary moves, so no cluster smoke is owed.
+  Touches no cluster/session-sync/failover code — the peer fan-out here is the
+  read-only diagnostic path, not the sync path.
+
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
