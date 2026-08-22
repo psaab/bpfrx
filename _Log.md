@@ -78,6 +78,30 @@
   `pkg/upgrade/kernel_verify_no_inference_6620_test.go` (new),
   `docs/in-place-upgrade.md`, `_Log.md`
 
+## 2026-08-21 — #6583 next-table window drawn down v4-first structurally
+
+- **Timestamp**: 2026-08-21
+- **Action**: The v4-before-v6 next-table draw-down order was set entirely
+  by two `append` lines in `pkg/daemon/daemon_apply_routing.go` and bound
+  by nothing on either side. Fixed STRUCTURALLY rather than by asserting
+  on the caller: `nextTableManager.Apply` now stable-partitions the slice
+  v4-first (`nextTableFamilyOrdered`), so the kernel agrees with the FIB
+  (`addRoutes("inet.0")` before `addRoutes("inet6.0")`) by construction
+  and no caller can get it wrong. Also closed the fixture gap the
+  kernel-side #6467 guard had — every case generated `10.%d.%d.0/24`
+  only, so its `count(AF_INET)+count(AF_INET6)` totals always carried a
+  zero v6 term and could not see a family reordering at all.
+  Mutation matrix: X1 (no ordering — the pre-fix state) and X2 (v6 first)
+  RED; X3 (unstable within family) initially GREEN — the stability claim
+  was unbound, so a per-slot destination assertion was added and it now
+  reds. X4 (swap the daemon appends) is GREEN **by design**: the whole
+  point is that the swap is now a no-op. That deviates from the issue's
+  acceptance criterion 1, which asked for the swap to turn a test RED;
+  making it harmless is strictly stronger, and adding an assertion on a
+  condition that can no longer vary would be a guard on a dead branch.
+- **File(s)**: pkg/routing/rules.go, pkg/routing/rules_6467_test.go,
+  pkg/routing/README.md
+
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
