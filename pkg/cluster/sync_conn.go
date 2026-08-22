@@ -382,6 +382,11 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		s.receiveLoop(ctx, conn)
 	}()
 	s.sendClockSync(conn)
+	// #6650: advertise our config-snapshot protocol version on every installed
+	// connection, so the peer's commit path can refuse to push a config this
+	// node cannot represent. Beside the clock sync because it has the same
+	// lifetime: per-incarnation, cleared on full disconnect.
+	s.sendCapabilities(conn)
 	coldStart := !s.bulkEverCompleted.Load()
 	if d.shouldColdPrime {
 		slog.Info("cluster sync: driving authoritative cold-prime bulk on active connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "cold_start", coldStart, "was_disconnected", d.wasDisconnected)
@@ -897,6 +902,13 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 			close(waiter.ch)
 		}
 		s.clockSynced.Store(false)
+		// #6650: the peer's snapshot-protocol capability is scoped to the peer
+		// INCARNATION that advertised it, exactly like clockSynced. A full
+		// disconnect ends that incarnation and the peer that reconnects may be
+		// an OLDER process (that is the rolling-upgrade case this gate exists
+		// for), so a retained capability would authorise a push the new
+		// incarnation cannot represent.
+		s.peerSnapshotProtocol.Store(0)
 		// #5718 C01a: peerHeartbeatAckEver is a capability probe of the peer
 		// PROCESS, not of this node, so it must be scoped to the peer
 		// incarnation exactly like clockSynced above. Full disconnect ends

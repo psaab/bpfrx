@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -38,6 +39,30 @@ type realKernelSystem struct {
 	// BeaconTarget is the ForwardBeacon ping target; empty -> the IPv4 default
 	// gateway. Set via XPF_KERNEL_BEACON_TARGET for a topology-specific peer.
 	BeaconTarget string
+
+	// UnitActive is Gate 4's precondition-A probe: is xpfd up at all. nil ->
+	// unitActiveProbeCtx(ctx, DefaultUnit), the package's SINGLE is-active
+	// primitive. Injectable for the same reason HelperHealthDeps.UnitActive is
+	// (#5286/#5808): BOTH of Gate 4's preconditions have to be drivable from one
+	// place, or a test can only ever reach whichever one the host it runs on
+	// happens to satisfy.
+	UnitActive func(ctx context.Context) (bool, error)
+	// HelperStatus is Gate 4's dataplane-liveness probe (#6607): the
+	// control-socket status query, adapted to the same primitive tuple the
+	// binary channel's helper-readiness gate consumes (HelperStatusFunc). It is
+	// wired by cmd/xpfd, which owns the dataplane package; pkg/upgrade
+	// deliberately does not import pkg/dataplane/userspace (see helper_health.go).
+	//
+	// nil means NO dataplane probe is available to this caller, and ForwardBeacon
+	// then falls back to the xpfd-liveness-plus-ping check alone — documented as
+	// the weaker statement it is. Production always wires it.
+	HelperStatus HelperStatusFunc
+	// ControlSocket is the helper control-socket path HelperStatus queries,
+	// resolved from the active config by the caller (honoring an operator
+	// `system dataplane control-socket` override).
+	ControlSocket string
+	// StatusTimeout bounds a single control-socket status query (default 2s).
+	StatusTimeout time.Duration
 
 	// Test seams (#5076). All nil/"" in production; a test injects them to
 	// drive the purge-failure path deterministically without shelling out to
@@ -96,6 +121,24 @@ var _ KernelSystem = (*realKernelSystem)(nil)
 // IPv4 default gateway is used).
 func NewKernelSystem() *realKernelSystem {
 	return &realKernelSystem{BeaconTarget: os.Getenv("XPF_KERNEL_BEACON_TARGET")}
+}
+
+// NewKernelSystemWithHelperStatus returns the production KernelSystem with Gate
+// 4's dataplane-liveness probe wired (#6607). It mirrors
+// NewSystemWithHelperHealth, which does the same job for the BINARY channel's
+// post-cut readiness gate: pkg/upgrade owns the gate logic, cmd/xpfd injects the
+// dataplane primitives so this package need not import (and cannot cycle with)
+// pkg/dataplane/userspace.
+func NewKernelSystemWithHelperStatus(
+	unitActive func(ctx context.Context) (bool, error),
+	status HelperStatusFunc,
+	controlSocket string,
+) *realKernelSystem {
+	s := NewKernelSystem()
+	s.UnitActive = unitActive
+	s.HelperStatus = status
+	s.ControlSocket = controlSocket
+	return s
 }
 
 func (s *realKernelSystem) IsUEFI() bool {
@@ -702,9 +745,9 @@ func (s *realKernelSystem) VerifyDataplane() (bool, error) {
 // but the strong gate is an operator-set dataplane BeaconTarget. A wired
 // ProbeFunc (the richest probe, when the caller has the dataplane manager) takes
 // precedence; otherwise this does a REAL reachability probe through the
-// dataplane: the dataplane daemon (xpfd OR xpfd-userspace-dp) must be active AND
-// a ping to BeaconTarget (default: the IPv4
-// default gateway) must succeed within the
+// dataplane: xpfd must be active AND the dataplane helper must report
+// enabled+forwarding-armed over its control socket (#6607) AND a ping to
+// BeaconTarget (default: the IPv4 default gateway) must succeed within the
 // deadline. A candidate kernel whose shim verified (Gate 3) but cannot forward
 // fails the ping -> revert. The gateway is the most universally-available
 // off-box target that exercises the forwarding path; an operator can override
@@ -713,16 +756,54 @@ func (s *realKernelSystem) ForwardBeacon(deadline time.Duration) (bool, error) {
 	if s.ProbeFunc != nil {
 		return s.ProbeFunc(time.Now().Add(deadline))
 	}
-	// the dataplane daemon (xpfd OR xpfd-userspace-dp) must be up at all — a
-	// down daemon cannot
-	// forward regardless of ping.
-	if runCmd("systemctl", "is-active", "xpfd") != nil &&
-		runCmd("systemctl", "is-active", "xpfd-userspace-dp") != nil {
+	// Precondition A: xpfd must be up at all — a down daemon cannot forward
+	// regardless of ping. Routed through unitActiveProbeCtx, the package's
+	// SINGLE is-active primitive (#5808): ctx-bounded so a wedged DBus is killed
+	// rather than blocking the gate past the rollback deadline, and exit-code
+	// aware so "unit not found" is not silently read as "inactive".
+	beaconCtx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	unitActive := s.UnitActive
+	if unitActive == nil {
+		unitActive = func(ctx context.Context) (bool, error) {
+			return unitActiveProbeCtx(ctx, DefaultUnit)
+		}
+	}
+	if active, err := unitActive(beaconCtx); err != nil || !active {
 		return false, nil
+	}
+	// Precondition B: the DATAPLANE must actually be forwarding (#6607).
+	//
+	// This used to be `systemctl is-active xpfd-userspace-dp` — a unit that
+	// exists nowhere in the repository and never has. The helper is a CHILD
+	// PROCESS xpfd spawns, not a systemd unit, so that probe could never report
+	// active; combined into an OR with the xpfd probe it could contribute
+	// neither a pass nor a fail, and the guard silently degenerated to "xpfd is
+	// active". That is exactly the pre-#5286 mistake: a Type=simple xpfd reports
+	// active immediately while its helper is down, stale or crash-looping and
+	// NOT forwarding — and a kernel change (AF_XDP shim vs a new kernel,
+	// verifier, driver) is the single most likely cause of precisely that state,
+	// which is what Gate 4 exists to catch. The fail direction of the old shape
+	// was PERMISSIVE, so a bad kernel was more likely to be promoted than
+	// rolled back.
+	//
+	// A nil probe means this caller has no dataplane to ask (a non-xpfd embedder
+	// or a test). Fall back to A alone rather than failing closed: a missing
+	// seam is "no information", not "unhealthy", and failing closed on it would
+	// revert every such caller's promotion. Production always wires it.
+	if s.HelperStatus != nil {
+		timeout := s.StatusTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		enabled, armed, _, err := s.HelperStatus(s.ControlSocket, timeout)
+		if err != nil || !enabled || !armed {
+			return false, nil
+		}
 	}
 	target := s.BeaconTarget
 	if target == "" {
-		target = defaultGateway()
+		target = beaconDefaultGateway()
 	}
 	if target == "" {
 		// No reachable target to probe. Be HONEST: we cannot prove forwarding,
@@ -737,11 +818,31 @@ func (s *realKernelSystem) ForwardBeacon(deadline time.Duration) (bool, error) {
 	}
 	// ping -c <n> -w <deadline>: a single reply within the window proves the
 	// dataplane forwarded a packet off-box on the candidate kernel.
-	if err := runCmd("ping", "-c", "3", "-w", fmt.Sprintf("%d", secs), target); err != nil {
+	if err := beaconPing(target, secs); err != nil {
 		return false, nil
 	}
 	return true, nil
 }
+
+// beaconPing is ForwardBeacon's off-box reachability probe. Package var for the
+// same reason as beaconDefaultGateway and unitActiveProbeCtx (#6607): without a
+// seam, EVERY assertion about the gates upstream of it is decided by whether the
+// test host can reach the target. That is not a convenience — a test that
+// asserts "the beacon rejects an unhealthy dataplane" while the ping is also
+// failing cannot tell the two rejections apart, so deleting the dataplane
+// condition outright leaves it green. Forcing a SUCCESSFUL ping is what makes
+// the dataplane condition the only thing left that can reject.
+var beaconPing = func(target string, secs int) error {
+	return runCmd("ping", "-c", "3", "-w", fmt.Sprintf("%d", secs), target)
+}
+
+// beaconDefaultGateway is ForwardBeacon's target-of-last-resort resolver. A
+// package var for the same reason as unitActiveProbeCtx: it is the only other
+// thing in the beacon that reaches outside the process, so without a seam every
+// assertion about the code AFTER it depends on whether the machine running the
+// test happens to have a default route (#6607). TestDefaultGatewayParseLogic
+// covers the parsing; this covers the branch that consumes it.
+var beaconDefaultGateway = defaultGateway
 
 // defaultGateway returns the IPv4 default-route next hop, or "" if none.
 func defaultGateway() string {

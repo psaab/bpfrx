@@ -72,6 +72,42 @@ diagnostics (#2781). A construction failure
 already fired) — fail-open, matching the rfc2136 posture. Live-provider verify
 is the deferred lab gate; the mock-server tests are the merge gate.
 
+### `server` / URL rendering in errors — parse first, then redact (#6545, #6606)
+
+Two rules, and the split between them is the whole discipline:
+
+- **The URL PARSED** → render `config.RedactURL(value)`. That is provably
+  sound here: a successfully-parsed URL cannot hide a credential in the
+  `host:port` slot (`http://h:abc/x` is itself a parse error), so the
+  redactor's slot list — userinfo, query, fragment, and a non-port host
+  slot (#6609) — is complete for this input. The host stays legible, which
+  is what makes the diagnostic worth emitting.
+- **The URL did NOT parse** → render **no part of the input at all**, just
+  the provider name and `urlParseCause(err)`, which returns only closed
+  `parseReason` constants.
+
+`resolveDyndns2Endpoint` was the last site rendering a raw `server`, and it
+is why the second rule cannot be relaxed. Dropping the `%w` wrap is
+necessary — `(*url.Error).Error()` re-embeds the whole raw input — but **it
+is not sufficient**, because several inner `net/url` causes embed input
+themselves and two are UNBOUNDED:
+
+    invalid port ":s3cr3t-PASSWORD.example" after host
+    invalid host: ParseAddr("s3cr3t-PASSWORD"): unable to parse IP
+
+The first is reached by the commonest credentialed typo — omitting the `@`
+— so the failure mode puts the PASSWORD in the message. A fix that dropped
+`%w` while still rendering the value, even redacted, leaks: `RedactURL` is
+sound for a URL that parsed, and this one did not, so a credential can sit
+in a slot no redactor can identify. `TestDyndns2ServerNeverLeaksCredential_6606`
+pins exactly that, with the sentinel in the malformed portion — a
+userinfo-or-query sentinel passes even when the typed cause leaks.
+
+`TestDDNSURLErrorRendersGoThroughScrubber` now has **no exempted site**.
+It used to carry a self-expiring exemption naming this one; landing the fix
+turned the gate red and forced the stale entry out, which is what a
+self-expiring exemption is for.
+
 ### Redirect policy — no downgrade, no cross-host (#4861, #6545)
 
 Every HTTP DDNS client is built at ONE site (`newHTTPClientBound`) and every

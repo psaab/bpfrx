@@ -185,3 +185,35 @@ func parseCIDRStrict(raw, example string) (net.IP, error) {
 	}
 	return ip, nil
 }
+
+// ValidateOSPFArea accepts an OSPF/OSPFv3 area identifier in either Junos
+// spelling: an IPv4 dotted-quad (0.0.0.0, 10.1.2.3) or a 32-bit unsigned
+// integer (0, 1, 4294967295). Both are legitimate and FRR renders either.
+//
+// #6564: the `area` key carried NO validator, while its siblings `route`
+// (ValidateRouteDestination) and `next-hop` (ValidateStaticNextHop) both do.
+// compileProtocols takes the area name verbatim from Keys[1] via
+// namedInstances and pkg/frr writes it straight into frr.conf (` area %s %s`,
+// ` ip ospf area %s`), so a malformed id reached the routing daemon's config
+// file unexamined. Unlike a BGP cluster-id, area 0 is the BACKBONE and must be
+// accepted — the integer arm therefore has no >= 1 floor.
+func ValidateOSPFArea(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected an OSPF area id: an IPv4 dotted-quad like 0.0.0.0, or an integer 0..4294967295)")
+	}
+	// Dotted-quad form. net.ParseIP rejects a bare integer, so the integer
+	// spelling falls through to the ParseUint arm below.
+	if ip := net.ParseIP(trimmed); ip != nil {
+		if ip.To4() == nil {
+			return fmt.Errorf("invalid area id %q (an IPv6 address is not a valid OSPF area id; use an IPv4 dotted-quad or a 32-bit integer)", raw)
+		}
+		return nil
+	}
+	// 32-bit unsigned integer form. ParseUint with bitSize 32 rejects a value
+	// above 4294967295. Area 0 is the backbone, so there is no lower bound.
+	if _, err := strconv.ParseUint(trimmed, 10, 32); err == nil {
+		return nil
+	}
+	return fmt.Errorf("invalid area id %q (expected an IPv4 dotted-quad like 0.0.0.0, or a 32-bit integer 0..4294967295)", raw)
+}
