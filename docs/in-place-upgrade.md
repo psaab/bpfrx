@@ -1618,7 +1618,29 @@ use:
   action (drain, arm+reboot, image-recreate, rejoin) it renews-and-verifies
   ownership of every relevant lease and, unless it can prove we still own
   them, `die()`s fail-closed. The load-bearing invariant: an orchestrator
-  that has lost (or cannot confirm) its lease MUST NOT mutate the pair.
+  that has lost (or cannot confirm) its lease MUST NOT mutate the pair. A
+  fence answers the phase BOUNDARY, not the phase: it extends the leases to
+  one fresh TTL and returns.
+- **Keep-alive across the recreate hook (#6762).** The image-roll recreate
+  is an ARBITRARY operator script doing destroy+launch+day-0 — an image
+  pull, a cloud API wait, a bare-metal re-flash — with no bound on its
+  duration, and it used to run with NOTHING renewing. A hook outliving the
+  TTL let the still-up peer's lease expire, and that peer lease is the SOLE
+  remaining reservation once the recreate wipes the node's own `/var/lib`;
+  a successor could then acquire BOTH node leases and start a concurrent
+  roll on a pair this driver was mid-recreate on. The fence before it names
+  exactly this risk (#5545 flagged the recreate as "potentially outlasting
+  a short TTL") — one extension was simply the wrong shape of answer. The
+  hook now runs under `_run_with_lease_keepalive`, which polls it to
+  completion and renews the peer lease every `max(5, ttl // 3)` seconds.
+  Renewal polls in the FOREGROUND rather than from a background thread: the
+  renewal path shells out through the same runner the main flow uses, and a
+  second thread driving it concurrently would add a new concurrency surface
+  to the one code path whose whole job is preventing two drivers touching
+  one pair. A loss detected mid-hook does NOT kill the hook — interrupting
+  a half-finished destroy+launch is worse than letting it finish — it is
+  recorded, and the caller `die()`s fail-closed BEFORE rejoin, the same
+  response the boot-poll loop already gives.
   Because `die()` is a `SystemExit`, `kernel-roll`'s `finally` still runs
   after a fence-abort — and its own best-effort restore-forwarding rejoin
   IS a pair mutation. So the fence records the loss (a `lost_lease` flag,
