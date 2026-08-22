@@ -103324,6 +103324,27 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/frr/policy_render.go`,
   `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
   `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`
+## 2026-08-22 — #6693 NAT match arms read both AST slots
+- **Timestamp**: 2026-08-22
+- **Action**: Replace the either/or reader at five NAT match-address arms with
+  an accumulate-both reader that preserves authored empties and synthesizes
+  nothing; add the mixed spelling to the schema spelling differential gate.
+- **File(s)**: pkg/config/compiler_nat_match_values.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/nat_match_mixed_shape_6693_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6693 follow-up on the rescued commit — widened the coverage to
+    all five arms on BOTH compile paths (strict + tolerant, asserted to agree),
+    per-arm malformed-tail gate reachability with a tolerant-accept no-brick leg,
+    the spelling-equivalence test extended from one arm to five, and a new
+    persistence round-trip test (Format / FormatSet re-readings must agree with
+    the authored tree). Completed the static-NAT fixture with a valid `match
+    destination-address` so the #7216 gate cannot fire first and mask the gate
+    under test.
+  - **File(s)**: pkg/config/nat_match_mixed_shape_6693_test.go,
+    docs/config-schema.md
 
 ## 2026-08-22 — #6534 closure: third port-mirroring renderer + cross-surface gate
 - **Action**: Closed #6534 by fixing the one live instance the three landed

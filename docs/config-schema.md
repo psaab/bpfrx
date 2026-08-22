@@ -3874,6 +3874,91 @@ both AST shapes):
   isolation break. Coverage: `compiler_routing_instance_interface_3904_test.go`
   (both AST shapes + single-value back-compat).
 
+**NAT match address arms read both slots (#6693) — the #4121 defect at five
+sites that were not swept.** Source-NAT `match source-address` /
+`match destination-address`, destination-NAT `match destination-address` /
+`match source-address`, and static-NAT `match source-address` all carried the
+same per-arm either/or (`if len(m.Keys) >= 2 { Keys[1:] } else { Children }`),
+while the four SIBLING arms in the same switch — `source-address-name`,
+`destination-address-name`, `protocol`, `application` — already read both slots.
+
+The reachable input is `match { source-address 10.0.0.0/8 { 192.0.2.0/24; } }`:
+`parseStatement`'s `case TokenLBrace` keeps every key token AND the block, so
+`Keys=["source-address","10.0.0.0/8"]` with `Children=[["192.0.2.0/24"]]`, the
+first branch fires, and the `else if` is structurally unreachable. It commits
+CLEAN — these leaves are untyped (`args: 1, multi: true, children: nil`, no
+validator) in an open-world subtree — and the second prefix never reaches the
+dataplane. Two consequences, and they are independent: the rule silently matches
+LESS traffic than authored (for source NAT that means untranslated egress, i.e.
+an internal source address on the wire), and the dropped value ESCAPES
+`validateNATMatchAddressLiteralsStrict` (#7145), which reasons from the compiled
+list — so a malformed prefix in the child slot committed clean.
+
+It is NOT reachable from flat-set: for a `multi` leaf with no children `SetPath`
+always emits a leaf at the same level and never descends, so a flat replay
+produces packed Keys or sibling leaves and never both slots. That is worth
+recording, because a prior investigation enumerated the flat and one-slot
+hierarchical spellings, found perfect agreement, and concluded the shape was
+unreachable and a fix would be unfalsifiable. The enumeration was sound; it was
+not exhaustive.
+
+The five arms now use `natMatchAddressValues`
+(`compiler_nat_match_values.go`), which accumulates both slots. It is
+deliberately NEITHER of the two existing readers, and both alternatives were
+measured rather than reasoned about:
+
+- **not `firewallMatchValues`** (what the siblings use): it DROPS empty tokens,
+  and here an authored empty is not absence. Switching these arms to it turned
+  five #7216 subtests from reject to commit-clean, because `match
+  source-address ""` no longer reached the compiled list that
+  `validateStaticNATSelectedMatchAddressStrict` reasons from. Fixing a
+  fail-closed drop by opening a fail-open hole is worse than the drop.
+- **not `multiLeafAuthoredValues`** (#6673, which does keep empties): it
+  synthesizes ONE empty value for a node with no value slot at all, to keep
+  `values[0] == nodeVal(n)` total for a SELECTION leaf. These arms have no such
+  scalar invariant, and a bare `source-address;` compiling to `[""]` would make
+  the Rust `source_constrained` flag true over a prefix that parses as nothing —
+  the rule then matches NOTHING instead of leaving the criterion absent.
+
+So: accumulate both slots, keep empties, synthesize nothing. It reads every KEY
+of each child rather than `child.Name()`, per #6714.
+
+**The durable half is the gate.** `TestSchemaSpellingDifferentialGate` gains a
+SEVENTH spelling, `F-hier-mixed` (`leaf <v1> { <v2>; }`) — the only spelling that
+puts values in both AST slots of one node, which is exactly what an either/or
+reader cannot see. Across the whole schema it moved ONE site beyond the five it
+was added for, and that site is not a defect: `system archival configuration
+archive-sites` puts a per-site MODIFIER block under an authored value
+(`archive-sites a { password S; }`), so its child is not a member and dropping it
+is correct. That is recorded in a third category,
+`mixedChildIsAModifierBlock` — separate from `notAValueList` (the leaf is not a
+list in ANY spelling) and from `knownSpellingInconsistencies` (a tracked
+DEFECT), because neither of those is true here and using either would state
+something false.
+
+**The sharpest statement of the defect is a PERSISTENCE divergence.** The mixed
+shape round-trips two different ways and they used to disagree with each other.
+`ConfigTree.Format()` re-renders it verbatim (value in the identifier slot, tail
+in the block), while `FormatSet()` — the spelling the configstore persists and
+the CLI replays — renders it PACKED (`set … match source-address 10.0.0.0/8
+192.0.2.0/24`). Both re-parse to a ONE-SLOT shape the either/or reader handled
+correctly, so one config text had two meanings: as authored it matched only the
+first prefix, and after any save/load cycle through the set spelling it matched
+both. A rule silently WIDENS on the next reboot while `show | compare` reports no
+change. `TestMixedShapeAgreesWithItsOwnPersistedRendering_6693` asserts the three
+readings AGREE rather than pinning any one of them to a hand-written expectation.
+
+Coverage is per-arm on both compile paths. The five arms are each asserted under
+STRICT `CompileConfig` and tolerant `CompileConfigLenient`, agreeing with each
+other before either is compared to the authored pair, and each is separately
+shown to carry a malformed tail INTO its strict gate (three different gates cover
+the five arms) while the tolerant path still ACCEPTS it — the #1960 no-brick
+half, since a box can already hold a config whose tail never reached a gate. The
+static-NAT fixture carries a valid `match destination-address` sibling for the
+same reason the issue names: without it the #7216 "selected external prefix is
+MISSING" gate fires first and its rejection is indistinguishable from the gate
+under test firing on the tail.
+
 **Policy match source-/destination-address/application share the reader
 (#4121, divergence-elimination, NOT a fail-open).** `compilePolicy`
 (`compiler_security.go`) previously read the three `multi: true` policy-match
