@@ -1,3 +1,19 @@
+## 2026-08-22 — #6498 Tier-1 A/B substrate + kernel-hold assertions
+
+- **Timestamp**: 2026-08-22
+- **Action**: Added two pure verdict helpers to the Tier-1 image gate —
+  `_ab_slot_esp_verdict` (both slot ESP dirs staged; each `xpf.selector`
+  names the running kernel) and `_kernel_hold_verdict` (every kernel
+  package the bake holds appears in `apt-mark showhold`), wired into
+  scenario A with the ESP check ordered BEFORE the NVRAM check.
+  AC4 as written ("every installed `linux-*` package is held") is
+  unreachable — `linux-base` is a hard dependency of
+  `linux-image-*-generic` — so the gate asserts the bake's own kernel
+  enumeration plus a drift canary binding the two lists, and a
+  non-vacuity guard so an empty enumeration cannot pass trivially.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_ab_substrate_6498.py,
+  docs/image-validation.md
 ## 2026-08-22 — #6521 RFC 6052 citation correction (§2.2 → §3.1)
 
 - **Timestamp**: 2026-08-22
