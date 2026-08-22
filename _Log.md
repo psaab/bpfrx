@@ -103983,3 +103983,13 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: userspace-dp/src/afxdp/gre.rs, userspace-dp/src/afxdp/mod.rs,
   userspace-dp/src/afxdp/tests_gre_outer_bound_6748.rs (new),
   docs/userspace-native-gre-plan.md
+
+## 2026-08-22 — #7522 malformed address-family node no longer panics
+- **Timestamp**: 2026-08-22
+- **Action**: compileInterfaces indexed afNode.Keys[0] with no bounds check; a
+  family child with empty Keys (reachable from a malformed persisted AST, which
+  configstore unmarshals with no Node validator) panicked. Switched to the
+  nil-safe Name(), matching #4827's fix on the sibling firewall walkers. Swept
+  pkg/config for the same shape: no other unguarded site.
+- **File(s)**: pkg/config/compiler_interfaces.go,
+  pkg/config/compiler_interfaces_malformed_af_7522_test.go
