@@ -8,21 +8,28 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// unionHostInboundTokens returns the EFFECTIVE host-inbound system-service and
-// protocol token sets for an interface (#3362): the zone-level set UNION the
-// per-interface override, lower-cased, trimmed, and de-duplicated, with
-// zone-level tokens kept first in their original order and override-only tokens
-// appended. Either argument may be nil. Junos host-inbound is additive across
-// the two levels, so an interface admits a service when EITHER level lists it.
-// #3226 fold: the union itself is now config.UnionHostInboundTokens, shared with
-// the commit-time advisories. Before that this file owned the only union and the
-// advisories computed their own per-RAW-STANZA view, so the two reasoned about
-// DIFFERENT objects and the advice contradicted enforcement (a zone-level
-// `any-service` with a per-interface `rpm` warned rpm was DENIED while this
-// builder full-admitted it). This wrapper keeps the lower-casing the dataplane
-// needs for map keying — config's shared union preserves authored case for the
-// display surfaces — and keeps the local name its callers already use.
-func unionHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
+// effectiveHostInboundTokens returns the EFFECTIVE host-inbound system-service
+// and protocol token sets for an interface (#3362), lower-cased, trimmed and
+// de-duplicated for map keying. Either argument may be nil.
+//
+// #6515: an interface that declares a `host-inbound-traffic` stanza is described
+// ENTIRELY by it — the zone-level set is REPLACED, not unioned ("Interface
+// configuration overrides that of the zone", Junos Security Zones). Presence of
+// the stanza, not emptiness, is the discriminator: ifaceHI non-nil means the
+// operator authored one, and an explicitly empty one is a deny-all override. The
+// decision itself is config.EffectiveHostInboundTokens, shared with the display
+// surfaces, the commit-time advisories and the duplicate-host-address gate, so
+// enforcement and every description of it act on ONE object. Before #3226 this
+// file owned its own combination and the advisories computed a per-RAW-STANZA
+// view, so the two reasoned about DIFFERENT objects and the advice contradicted
+// enforcement (a zone-level `any-service` with a per-interface `rpm` warned rpm
+// was DENIED while this builder admitted it). This wrapper keeps the lower-casing
+// the dataplane needs for map keying — the shared config helper preserves
+// authored case for the display surfaces.
+//
+// Before #6515 this was a UNION (unionHostInboundTokens), so an interface stanza
+// could only ever WIDEN admission relative to the zone.
+func effectiveHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
 	var zs, zp, is, ip []string
 	if zoneHI != nil {
 		zs, zp = zoneHI.SystemServices, zoneHI.Protocols
@@ -30,12 +37,13 @@ func unionHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, pr
 	if ifaceHI != nil {
 		is, ip = ifaceHI.SystemServices, ifaceHI.Protocols
 	}
-	return lowerDedup(config.UnionHostInboundTokens(zs, is)),
-		lowerDedup(config.UnionHostInboundTokens(zp, ip))
+	overridden := ifaceHI != nil
+	return lowerDedup(config.EffectiveHostInboundTokens(zs, is, overridden)),
+		lowerDedup(config.EffectiveHostInboundTokens(zp, ip, overridden))
 }
 
 // lowerDedup lower-cases, trims and de-duplicates in one pass, preserving first
-// -seen order. The shared config union dedups on the AUTHORED token (it
+// -seen order. The shared config helper dedups on the AUTHORED token (it
 // preserves case for the display surfaces), so `SSH` and `ssh` both survive it
 // and would collapse to a duplicate `ssh` here. Plain lowerTokens does not
 // dedup, so it would leak that duplicate into the dataplane view — harmless for
@@ -64,11 +72,12 @@ func lowerDedup(in []string) []string {
 
 // mergeHostInboundTraffic returns a NEW *config.HostInboundTraffic whose token
 // lists are the order-preserving UNION of a and b (a's tokens first, then any of
-// b's not already present, exact-string dedup). It underpins the #3720 additive
+// b's not already present, exact-string dedup). It underpins the #3720
 // physical→unit override resolution: a physical-interface override and a
-// more-specific unit-level override on the same unit are UNIONed (Junos
-// host-inbound is additive across levels) rather than the sorted-first physical
-// ref silently shadowing the unit ref (the #3720 first-writer-wins bug). Returns
+// more-specific unit-level override on the same unit are UNIONed (both are
+// INTERFACE-level statements) rather than the sorted-first physical ref silently
+// shadowing the unit ref (the #3720 first-writer-wins bug). #6515 changed how the
+// RESULT combines with the zone level — it replaces it — not this merge. Returns
 // nil only when BOTH inputs are nil; a fresh struct is always allocated so the
 // shared config-owned override objects are never mutated in place.
 func mergeHostInboundTraffic(a, b *config.HostInboundTraffic) *config.HostInboundTraffic {
@@ -105,11 +114,13 @@ func mergeHostInboundTraffic(a, b *config.HostInboundTraffic) *config.HostInboun
 // (#3362) keyed by the interface ref as it appears on a resolved interface
 // snapshot (InterfaceSnapshot.Name).
 //
-// Precedence / merge rule (#3720). Junos host-inbound is ADDITIVE across the
-// override levels, so the EFFECTIVE override for a unit is the UNION of any
-// physical-interface-level override that applies to it and its own unit-level
-// override — never the less-specific physical ref shadowing the more-specific
-// unit ref:
+// Precedence / merge rule (#3720). A physical-interface override and a
+// unit-level override are BOTH interface-level statements, so the EFFECTIVE
+// override for a unit is the UNION of any physical-interface-level override that
+// applies to it and its own unit-level override — never the less-specific
+// physical ref shadowing the more-specific unit ref. (#6515 changed how this
+// result combines with the ZONE level — it REPLACES it — and did not change this
+// within-level union.):
 //   - A ref naming a logical unit (contains ".") is the MOST specific override.
 //     It maps ONLY itself — never a sibling unit — and is MERGED (unioned) onto
 //     whatever physical-inherited set already sits on that unit key, BUT only

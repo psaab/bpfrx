@@ -193,8 +193,8 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     deny-all; kept split so a system-service such as ssh/ping/dhcp is
     distinguishable from a routing protocol such as ospf/bgp), plus any
     `interface_host_inbound` per-interface override (#3362, omitted when
-    none; the effective set for an interface is the union of the zone-level
-    set and its override). The legacy flattened `host_inbound_services`
+    none; the effective set for such an interface IS the override — it REPLACES
+    the zone-level set, #6515). The legacy flattened `host_inbound_services`
     (services + protocols concatenated) is retained as a back-compat alias.
     Before #3653 the bit was re-derived from config shape and reported
     `false` for a no-stanza zone — the pre-#3405 "false = admit-all"

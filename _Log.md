@@ -1,3 +1,44 @@
+## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
+
+- **Timestamp**: 2026-08-22
+- **Action**: `xpf-deploy.py fetch` with no `--version` now resolves
+  `<base>/<channel>/latest.json`, minisign-verifies it against the
+  pinned image pubkey, and flows the resolved version through the
+  EXISTING path (#5992 filename validation, watermark, per-file
+  verification, import) — an entry point, not a second trust path. The
+  pointer is AUTHENTICATED, not trusted: a signed pointer naming
+  `../../etc/cron.d/x` is still refused by the filename gate, and a
+  `stable` pointer mis-synced into `edge/` is refused on the channel
+  field (the same key signs every channel, so it verifies perfectly).
+  An ABSENT channel field is accepted — absence is not disagreement.
+  Also corrected docs/distribution.md, whose row stays false if only
+  the code lands, since validate.py is still not a consumer.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_channel_fetch_6504.py,
+  scripts/dist/selftest.sh, docs/distribution.md
+
+## 2026-08-22 — #6515 host-inbound per-interface override REPLACES the zone stanza
+
+- **Timestamp**: 2026-08-22
+- **Action**: Flipped the per-interface host-inbound override from UNION
+  (additive) to REPLACE, matching Junos ("Interface configuration
+  overrides that of the zone"), across all four effective-set
+  resolvers, and shipped a commit-time migration advisory in the same
+  commit. The advisory names every (zone, interface, lost-token) triple
+  and states that established sessions to a removed service are FLUSHED
+  at commit — the #5566 reconcile rebuilds its admit set from the same
+  views and deletes established conntrack entries — rather than merely
+  refused for new connections, because "I am already connected" is the
+  wrong inference here. WARN-only, never a reject: the config is valid
+  Junos and the new behaviour IS the Junos behaviour. Lifeline
+  interfaces are skipped (excluded from host-inbound scoping, so an
+  advisory there would be a false alarm). Measured in-repo blast
+  radius: zero configs author an interface-level override.
+- **File(s)**: pkg/config/compiler_validate_warn_host_inbound.go,
+  pkg/config/compiler_validate_warn.go, pkg/config/host_inbound_view.go,
+  pkg/dataplane/userspace/zones_host_inbound.go, cmd/cli, plus the
+  eight fixtures that encoded the union semantics
+
 ## 2026-08-21 — #6552 diagnostic-fork concurrency bound on ShowText/GetSystemInfo
 
 - **Timestamp**: 2026-08-21
@@ -69,6 +110,32 @@
 - **File(s)**: scripts/image/xpf-day0-config,
   scripts/image/test_day0_probe_order_6502.py
 
+## 2026-08-21 — #6550 cluster monitor poll/UpdateGroups map race
+
+- **Timestamp**: 2026-08-21
+- **Action**: Took `mon.mu` around the poll goroutine's mutations of
+  `ifaceState`, `ipState`, `ipDebts` and `ipThresholdState`, which
+  `UpdateGroups` deletes from under that same lock on every cluster
+  config apply — a Go runtime FATAL (`concurrent map read and map
+  write`) reachable from a routine commit, and via config-sync on both
+  nodes. Not one lock around the apply phase: the order is
+  `m.mu -> mon.mu` (`Manager.UpdateConfig` holds `m.mu` and calls
+  `UpdateGroups`), and the poll path calls `SetMonitorWeight`, which
+  takes `m.mu` — holding `mon.mu` across that inverts the order and
+  deadlocks. `reconcileRGIPDebts` now computes its whole diff under the
+  lock into a `[]ipDebtAction` and replays the manager callbacks after
+  releasing it, preserving the removals-then-installs emission order.
+  Added a race probe, a deterministic lock-order probe (new
+  `beforeManagerApplyHook` seam), and a Makefile canary; added the
+  missing `./pkg/cluster/` leg to `test-race-dp` — no make target raced
+  this package at all, so #6550 and #7257 were races CI had no PATH to.
+  Mutation matrix: M1/M2/M3 (each site's lock removed, verbatim pre-fix
+  form) → 5/5/7 DATA RACEs; M4 (lock held across the manager callback)
+  → the lock-order probe reds on timeout; W1 (delete the Makefile leg)
+  and W2 (drop a probe name from its pattern) → the canary reds.
+- **File(s)**: pkg/cluster/monitor.go,
+  pkg/cluster/monitor_poll_update_race_6550_test.go,
+  pkg/cluster/README.md, Makefile
 ## 2026-08-22 — #6501 pinned-base docs corrected + negation-immune guard
 
 - **Timestamp**: 2026-08-22
@@ -100762,6 +100829,51 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_ha_sync.go,
   pkg/cluster/heartbeat_start_stop_race_7257_test.go (new), pkg/cluster/README.md
 
+## 2026-08-21 — #6515: host-inbound interface stanza REPLACES the zone stanza
+- **Timestamp**: 2026-08-21
+- **Action**: The zone-level and per-interface `host-inbound-traffic` sets were
+  UNIONed and asserted in-tree as "Junos additive semantics", so an interface
+  stanza could only ever WIDEN admission. Junos replaces
+  ("Interface configuration overrides that of the zone"). Added
+  `config.EffectiveHostInboundTokens` as the SSOT for the zone↔interface choice
+  (presence of the stanza, not emptiness — an explicit empty stanza is a
+  deny-all override) and routed all four resolvers through it: the display view
+  (`InterfaceHostInboundEffective`), the dataplane/nft builder
+  (`effectiveHostInboundTokens`, renamed from `unionHostInboundTokens`), the
+  #3718 duplicate-address commit gate (`effectiveHostInboundSigLocal`), and the
+  remote CLI projection. `UnionHostInboundTokens` is retained for the
+  WITHIN-level merges (#3720 physical∪unit, #4544 repeated blocks). Added the
+  migration advisory `validateHostInboundOverrideReplaceWarnings` naming every
+  (zone, interface, lost token) triple at commit-check, and corrected every
+  in-tree comment/doc asserting the union, including the .proto (regenerated).
+- **File(s)**: pkg/config/host_inbound_view.go, pkg/config/types_security.go,
+  pkg/config/schema_security.go, pkg/config/dup_host_local_address.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_host_inbound.go,
+  pkg/dataplane/userspace/zones_override.go,
+  pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/protocol.go, pkg/cli/cli_show_interfaces.go,
+  pkg/api/types.go, pkg/api/README.md, pkg/policymatch/policymatch.go,
+  cmd/cli/show_security.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go (regenerated),
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound_tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  docs/host-inbound-service-matrix.md, docs/host-inbound-multicast.md,
+  docs/junos-cli-reference.md, docs/config-schema.md,
+  pkg/config/host_inbound_replace_6515_test.go (new),
+  pkg/dataplane/userspace/host_inbound_replace_6515_test.go (new),
+  cmd/cli/zone_hostinbound_replace_6515_test.go (new),
+  pkg/config/host_inbound_view_3654_test.go,
+  pkg/config/host_inbound_fulladmit_warn_3226_test.go,
+  pkg/dataplane/userspace/host_inbound_per_iface_3362_test.go,
+  pkg/dataplane/userspace/host_inbound_baseunit0_5699_test.go,
+  pkg/dataplane/userspace/host_inbound_view_grouping_3721_test.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go
 ## 2026-08-21 — #6520: cluster DHCP RG filter drops node-local members
 - **Timestamp**: 2026-08-21
 - **Action**: `filterDHCPConfigForMasterRGs` built its keep-set only from RETH
@@ -100779,3 +100891,114 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
+
+## 2026-08-21 — #6519: zone-level DHCP/BOOTP host-inbound parity advisory
+- **Timestamp**: 2026-08-21
+- **Action**: Junos accepts `dhcp`/`bootp` host-inbound only per INTERFACE ("All
+  services (except DHCP and BOOTP) can be configured either per zone or per
+  interface"). xpf accepts them at the zone level, where they authorize every
+  member interface. Added `validateHostInboundZoneLevelDHCPWarnings`, a
+  commit-time WARN naming the token (including the `all` case, since `all`
+  expands to a union containing dhcp/bootp) and the member interfaces the
+  zone-level authorization reaches, skipping lifelines and any interface that
+  authorized the service through its own stanza. Added
+  `ZoneConfig.InterfaceHostInboundOverride` as the interface-level half of the
+  effective-set resolution, bound to `InterfaceHostInboundEffective` by test.
+  Enforcement is NOT changed: the flip has a real population (the shipped
+  cluster configs) and would cost a zoned DHCP-client interface its address.
+- **File(s)**: pkg/config/host_inbound_dhcp_scope_6519.go (new),
+  pkg/config/host_inbound_dhcp_scope_6519_test.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/testdata/golden_4406.json (regenerated — 12 added warning lines,
+  one per case cell, no config-shape change),
+  docs/host-inbound-service-matrix.md
+## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
+- **Timestamp**: 2026-08-21
+- **Action**: `terminateRemovedConns` was fire-and-forget while
+  `promoteConnNames` advanced `prevConnNames` first, so a failed
+  `swanctl --terminate` lost the teardown debt permanently and `Apply` still
+  returned nil — a deleted/unrenderable VPN kept forwarding under its stale
+  child SA. The failed subset is now carried in `pendingTerminate`, unioned
+  into the next apply's removed set (filtered by the loaded names so a
+  re-added VPN is never torn down), and returned as an `Apply`/`Clear` error.
+  Debt discharges when the SA is no longer live, so it cannot latch.
+- **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+  pkg/ipsec/terminate_debt_6542_test.go (new), pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go
+
+## 2026-08-21 — #6543: redundancy-group ids folded by canonical value
+- **Timestamp**: 2026-08-21
+- **Action**: `compileChassis` appended one `*RedundancyGroup` per AST
+  instance, so `redundancy-group 1` + `redundancy-group 01` (and a repeated
+  hierarchical block) committed TWO records with `ID=1` — one with an empty
+  `NodePriorities`. `cluster.Manager.UpdateConfig`'s id-keyed last-wins loop
+  then overwrote `LocalPriority` with the map-miss zero and the #4880 gate
+  passed vacuously on the empty record. Instances are now folded by canonical
+  int id and each body is replayed into the single record through the same
+  statement dispatch table (leaf-level last-wins, Junos `set` semantics);
+  first-appearance order preserved.
+- **File(s)**: pkg/config/compiler_system.go,
+  pkg/config/compiler_chassis_rg_id_canonical_6543_test.go (new),
+  pkg/cluster/rg_id_canonical_6543_test.go (new), docs/config-schema.md,
+  pkg/cluster/README.md, _Log.md
+
+## 2026-08-21 — #6544: LAG (ae/802.3ad) accepted-only advisory + doc correction
+- **Timestamp**: 2026-08-21
+- **Action**: `ae` / `802.3ad` is schema-advertised, commits with ZERO warnings,
+  and is inert — `AggregatedEtherOpts` / `LAGParent` compile and nothing reads
+  them; measured `buildFabricBondModels` produces ZERO models for a full LAG
+  config, so no `.netdev`, no `Bond=` member, no bond device, no LACP,
+  `minimum-links` unhonoured. Added `validateLinkAggregationWarnings` (the
+  #2078/#4231/#5804 accepted-only doctrine) and corrected the two docs that
+  claimed LAG was Done (`docs/feature-gaps.md` x2, `docs/phases.md`), pointing
+  the remaining feature work at the `docs/vsrx-gaps.md` parity row.
+- **File(s)**: pkg/config/compiler_validate_warn_routing.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_lag_6544_test.go (new),
+  docs/feature-gaps.md, docs/phases.md, docs/vsrx-gaps.md, _Log.md
+
+## 2026-08-21 — #6546: device-map duplicate logical name refused
+- **Timestamp**: 2026-08-21
+- **Action**: `devicemap.Resolve`'s post-pass guarded two entries → ONE NIC but
+  not two entries → ONE LOGICAL NAME, so a duplicate name bound both entries
+  and the daemon renamed a nondeterministically-chosen NIC, durably via
+  `.link`. Added the symmetric guard with its own `BindRefusedDupName` status
+  (distinct remedy), keyed on the RESOLVED Linux name — which also closes a
+  strict-path hole: `ge-0/0/3` + `ge-0-0-3` are one interface and the raw-string
+  compare in `validateDeviceMapStrict` accepted them. Strict gate now
+  canonicalises; the commit pre-flight hard-stops via `Status.Refused()`.
+- **File(s)**: pkg/devicemap/devicemap.go, pkg/config/compiler_chassis.go,
+  pkg/daemon/device_map.go, pkg/devicemap/dup_logical_name_6546_test.go (new),
+  pkg/config/compiler_device_map_dup_name_6546_test.go (new),
+  pkg/daemon/device_map_dup_name_6546_test.go (new),
+  docs/bare-metal-device-map.md, _Log.md
+
+## 2026-08-21 — #6519 follow-up: one interface-level host-inbound walk, not two
+- **Timestamp**: 2026-08-21
+- **Action**: #6515 and #6519 landed independently, each carrying its own copy of
+  the #3720 physical∪unit interface-level override walk —
+  `InterfaceHostInboundEffective` inline, and `InterfaceHostInboundOverride` in
+  the #6519 advisory. `InterfaceHostInboundEffective` now CALLS
+  `InterfaceHostInboundOverride`. Single-sourced rather than bound with an
+  agreement test because a divergence would ALWAYS be a bug: the #6519 advisory
+  asks "does the interface's own stanza authorize this?" to decide what the
+  zone-level stanza is answerable for, and must be asking about the set the
+  resolver admits. Behaviour-preserving; no advisory or enforcement change.
+- **File(s)**: pkg/config/host_inbound_view.go,
+  pkg/config/host_inbound_dhcp_scope_6519.go
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #7304 follow-up — folded a post-merge hostile Codex review: closed
+    two vacuous-green holes in the #6419 assertions (errors.Is(nil,nil) sentinel
+    mutation; the production OnConfigReceived wiring was never bound), corrected
+    the backwards R1 comment, and recorded the tagged-epoch variant that refutes
+    the categorical #6419 close.
+  - **File(s)**: pkg/daemon/config_sync_test.go, pkg/daemon/daemon_ha_sync.go,
+    pkg/cluster/sync_conn_gen.go, docs/session-sync-architecture.md

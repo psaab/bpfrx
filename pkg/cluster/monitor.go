@@ -151,6 +151,24 @@ type Monitor struct {
 
 	// nowFunc can be overridden for testing time-dependent behavior.
 	nowFunc func() time.Time
+
+	// beforeManagerApplyHook is a test seam fired immediately before the poll
+	// cycle calls out to the Manager (SetMonitorWeight / RecordEvent). nil in
+	// production. It exists so a test can assert that mon.mu is NOT held
+	// across that callback (#6550): the lock order in this package is
+	// m.mu -> mon.mu (Manager.UpdateConfig holds m.mu and calls
+	// Monitor.UpdateGroups), so holding mon.mu while calling into the manager
+	// inverts it and deadlocks a commit against a poll cycle. Called with no
+	// Monitor lock held.
+	beforeManagerApplyHook func()
+}
+
+// beforeManagerApply fires the #6550 lock-order test seam. Production installs
+// no hook, so this is a nil check on the poll path.
+func (mon *Monitor) beforeManagerApply() {
+	if mon.beforeManagerApplyHook != nil {
+		mon.beforeManagerApplyHook()
+	}
 }
 
 // nlLinkGetter abstracts netlink.Handle.LinkByName for testing.
@@ -517,15 +535,25 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 			RedundancyGroup: rg.ID,
 		})
 
+		// #6550: ifaceState is shared with UpdateGroups, which DELETES from it
+		// under mon.mu on every cluster config apply. The map access and the
+		// dampening update it feeds are one critical section; the manager
+		// callbacks below are deliberately OUTSIDE it (see the lock-order note
+		// on beforeManagerApplyHook).
+		mon.mu.Lock()
 		state := mon.ifaceState[key]
 		if state == nil {
 			state = &monitorState{}
 			mon.ifaceState[key] = state
 		}
+		transitioned := mon.evaluateTransition(state, !up)
+		nowDown := state.down
+		mon.mu.Unlock()
 
-		if mon.evaluateTransition(state, !up) {
-			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, state.down, weight)
-			if state.down {
+		if transitioned {
+			mon.beforeManagerApply()
+			mon.mgr.SetMonitorWeight(rg.ID, im.Interface, nowDown, weight)
+			if nowDown {
 				mon.mgr.RecordEvent(EventMonitor, rg.ID, fmt.Sprintf(
 					"Interface %s state changed to down, weight %d", im.Interface, weight))
 			} else {
@@ -670,12 +698,19 @@ func (mon *Monitor) ipTargetWeight(rg *config.RedundancyGroup, target *config.IP
 // RG/target order.
 func (mon *Monitor) updateIPTargetDampenedState(rg *config.RedundancyGroup, target *config.IPMonitorTarget, reachable bool) {
 	key := ipMonitorKey{rgID: rg.ID, address: target.Address}
+	// #6550: ipState is shared with UpdateGroups, which deletes a removed RG's
+	// targets from it under mon.mu. This body makes no manager call, so the
+	// whole of it can run under the lock.
+	mon.mu.Lock()
 	state := mon.ipState[key]
 	if state == nil {
 		state = &monitorState{}
 		mon.ipState[key] = state
 	}
-	if mon.evaluateTransition(state, !reachable) {
+	transitioned := mon.evaluateTransition(state, !reachable)
+	mon.mu.Unlock()
+
+	if transitioned {
 		slog.Info("cluster monitor: IP probe reachability changed",
 			"rg", rg.ID, "address", target.Address, "reachable", reachable)
 	}
@@ -715,6 +750,9 @@ func isIPMonitorName(iface string) bool {
 //   - ip-monitoring absent: nothing is owed.
 //
 // Returned as monitor-name → weight.
+//
+// Callers must hold mon.mu: this reads mon.ipState, which UpdateGroups deletes
+// from concurrently (#6550).
 func (mon *Monitor) desiredRGIPDebts(rg *config.RedundancyGroup) map[string]int {
 	desired := map[string]int{}
 	if rg.IPMonitoring == nil {
@@ -769,35 +807,45 @@ func (mon *Monitor) desiredRGIPDebts(rg *config.RedundancyGroup) map[string]int 
 //     fire; the full reconcile does.
 //
 // Called for EVERY RG each cycle, including one that has dropped ip-monitoring.
+//
+// #6550: the bookkeeping (ipState, ipDebts, ipThresholdState) is driven to its
+// new value under mon.mu — UpdateGroups deletes from all three under that same
+// lock — and the resulting manager callbacks are replayed AFTER the lock is
+// dropped. They cannot run under it: SetMonitorWeight takes m.mu and
+// Manager.UpdateConfig holds m.mu while calling UpdateGroups, so mon.mu held
+// across the callback inverts the m.mu -> mon.mu order and deadlocks. The
+// emitted sequence is unchanged — all removals, then all installs, in the same
+// (map-iteration, i.e. already unordered) order as before.
 func (mon *Monitor) reconcileRGIPDebts(rg *config.RedundancyGroup) {
+	mon.mu.Lock()
 	desired := mon.desiredRGIPDebts(rg)
 
 	installed := mon.ipDebts[rg.ID]
 	if installed == nil {
 		if len(desired) == 0 {
+			mon.mu.Unlock()
 			return // nothing installed, nothing desired — no-op
 		}
 		installed = make(map[string]int)
 		mon.ipDebts[rg.ID] = installed
 	}
 
+	var pending []ipDebtAction
 	// Remove installed debts that are no longer desired.
 	for name, w := range installed {
 		if _, ok := desired[name]; ok {
 			continue
 		}
-		mon.mgr.SetMonitorWeight(rg.ID, name, false, w)
 		delete(installed, name)
-		mon.recordIPDebtChange(rg.ID, name, false, w)
+		pending = append(pending, ipDebtAction{name: name, weight: w, install: false})
 	}
 	// Install (or reweight) desired debts not already matching.
 	for name, w := range desired {
 		if cur, ok := installed[name]; ok && cur == w {
 			continue
 		}
-		mon.mgr.SetMonitorWeight(rg.ID, name, true, w)
 		installed[name] = w
-		mon.recordIPDebtChange(rg.ID, name, true, w)
+		pending = append(pending, ipDebtAction{name: name, weight: w, install: true})
 	}
 
 	if len(installed) == 0 {
@@ -806,6 +854,33 @@ func (mon *Monitor) reconcileRGIPDebts(rg *config.RedundancyGroup) {
 	// Mirror the aggregate-installed flag for readability/tests.
 	_, aggInstalled := installed[ipAggregateMonitorName]
 	mon.ipThresholdState[rg.ID] = aggInstalled
+	mon.mu.Unlock()
+
+	// Removals first, then installs — the pre-#6550 emission order.
+	for _, act := range pending {
+		if act.install {
+			continue
+		}
+		mon.beforeManagerApply()
+		mon.mgr.SetMonitorWeight(rg.ID, act.name, false, act.weight)
+		mon.recordIPDebtChange(rg.ID, act.name, false, act.weight)
+	}
+	for _, act := range pending {
+		if !act.install {
+			continue
+		}
+		mon.beforeManagerApply()
+		mon.mgr.SetMonitorWeight(rg.ID, act.name, true, act.weight)
+		mon.recordIPDebtChange(rg.ID, act.name, true, act.weight)
+	}
+}
+
+// ipDebtAction is one pending manager-side ip-monitor debt change: computed by
+// reconcileRGIPDebts while it holds mon.mu, applied after it drops it (#6550).
+type ipDebtAction struct {
+	name    string
+	weight  int
+	install bool
 }
 
 // recordIPDebtChange emits the operator event + log for an ip-monitor debt

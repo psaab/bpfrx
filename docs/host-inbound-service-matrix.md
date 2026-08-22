@@ -99,7 +99,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | Web-management HTTPS. Admit port = `webmgmt.HTTPSPort` = 443 = the listener bind (#5715, was 8443). Same contract as `http` above. |
 | `ping` | icmp/icmpv6 echo-request | ICMP type 8 (v4) / 128 (v6) | dual | Echo-request only; ICMP errors are global-accepted (see below). |
 | `dns` | udp 53, tcp 53 | udp 53, tcp 53 | dual | |
-| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). |
+| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). **Junos accepts these two per INTERFACE only** — see [DHCP and BOOTP are per-interface only in Junos (#6519)](#dhcp-and-bootp-are-per-interface-only-in-junos-6519). |
 | `dhcpv6` | udp {546, 547} | udp 546, 547 | **ip6** | DHCPv6; v6-only (#3225). |
 | `ntp` | udp 123 | udp 123 | dual | |
 | `snmp` | udp 161 | udp 161 | dual | |
@@ -1024,23 +1024,105 @@ Two observability surfaces consume it (mirroring #3698):
   aggregate — this per-interface series is strictly more sensitive and is exported
   alongside it, not in place of it.
 
-## Per-interface override precedence (#3362, #3720)
+## Per-interface override precedence (#3362, #3720, #6515)
 
-Host-inbound-traffic can be authored at three granularities, and the EFFECTIVE
-admission set for a logical unit is the **UNION** of all three (Junos
-host-inbound is additive — an interface admits a service listed at ANY level):
+Host-inbound-traffic can be authored at three granularities:
 
 1. **zone-level** — `security zones <z> host-inbound-traffic { ... }`, applies to
-   every interface in the zone;
+   every interface in the zone **that does not declare its own stanza**;
 2. **physical-interface-level** — `security zones <z> interfaces <ifN>
    host-inbound-traffic { ... }` (a bare interface ref), applies to every
    configured unit of that physical interface;
 3. **unit-level** — `security zones <z> interfaces <ifN.M>
    host-inbound-traffic { ... }`, applies only to that logical unit.
 
-So for unit `ifN.M`: `effective = zone ∪ physical(ifN) ∪ unit(ifN.M)`. A
-more-specific unit override never *replaces* a physical override — they are
-merged. Before #3720 the resolver
+Levels 2 and 3 are both the **interface level** and they UNION with each other.
+The interface level as a whole **REPLACES** the zone level:
+
+```
+effective(ifN.M) = physical(ifN) ∪ unit(ifN.M)     if either is declared
+                 = zone                             otherwise
+```
+
+`config.EffectiveHostInboundTokens` is the SSOT for that outer choice and
+`config.UnionHostInboundTokens` for the inner merge; every surface that resolves
+an interface's admission routes through the former — the kernel nft view builder
+(`BuildZoneHostInboundViews`), the per-interface classifier
+(`ClassifyHostInboundForInterface`), the commit-time advisories, the
+duplicate-host-address gate, and all six display surfaces.
+
+### Replace, not union (#6515) — UPGRADE NOTE
+
+> **This is an admission NARROWING. Read it before upgrading if any of your
+> configs author a per-interface `host-inbound-traffic` stanza.**
+
+Junos, [Security Zones](https://www.juniper.net/documentation/us/en/software/junos/security-policies/topics/topic-map/security-zone-configuration.html):
+"You can configure these parameters at the zone level, in which case they affect
+all interfaces of the zone, or at the interface level. **(Interface configuration
+overrides that of the zone.)**"
+
+Before #6515 xpf UNIONed the two levels and asserted "Junos additive semantics"
+in-tree, so an interface stanza could only ever WIDEN admission and never narrow
+it: a zone admitting `protocols ospf` with an interface stanza admitting only
+`ping` still admitted OSPF on that interface, where Junos denies it. #6515 makes
+the interface stanza replace the zone stanza on the interfaces that declare one.
+
+**Presence, not emptiness.** An explicit `host-inbound-traffic { }` on an
+interface is a **deny-all** override, not a fallback to the zone set.
+`parseHostInboundNode` compiles a present-but-empty stanza to a non-nil empty
+struct precisely so the two are distinguishable.
+
+**The WHOLE stanza replaces, not each leaf.** An interface stanza that declares
+only `protocols` also drops the zone's `system-services`. That is the literal
+reading of the sentence above, and the community consensus states it the same way
+("if you configure anything under specific interface level, then zone-specific
+configuration doesn't apply to this interface anymore"). No vendor text was found
+describing a per-leaf inheritance, so none is implemented — a per-leaf rule would
+be a guess, and a guess that silently widens admission.
+
+**Junos's own narrowing idiom is `except`, which xpf does not implement.** The
+worked example in the Juniper topic narrows a second interface with
+`system-services all` plus `ftp except` / `http except`. xpf's schema has no
+`except` keyword, so the only way to narrow an interface here is to author the
+narrower token list directly. That is a separate parity gap, not a consequence of
+this change.
+
+**What upgrading takes away.** For every interface that declares a stanza, the
+lost set is the zone-level tokens the interface stanza does not repeat (after
+`all`-expansion). The services most likely to disappear are exactly the ones that
+hurt: `ssh`, `https`/webmgmt, `ike` (ESP/AH keep their global accept, but IKE
+udp/500,4500 is token-gated, so tunnels stop rekeying), and unicast `bgp`/`ospf`
+to the interface address.
+
+**It is not only new connections.** The #5566 conntrack reconcile
+(`buildHostInboundConntrackFlushFilter`) rebuilds its admit set from these same
+views and DELETES established kernel conntrack entries to a covered
+firewall-local address that the new set no longer admits. A narrowing commit
+therefore drops LIVE sessions to a removed service, not merely refuses new ones.
+
+**What is structurally out of scope.** Lifeline interfaces (`fxp0` / `em0` /
+`fab*` and the configured control + fabric links) are excluded from host-inbound
+deny scoping by INTERFACE, so management over `fxp0` and the HA control plane are
+unaffected by this flip. That exclusion is by interface, not by address value —
+a management address also configured on a zoned interface is NOT exempt (see
+"Lifeline exclusion is by INTERFACE, not by address value"). VRRP advertisements
+are unaffected because the views scope drops to unicast interface addresses plus
+VRRP VIPs only, and 224.0.0.18 is never in that scope.
+
+**Migration.** `validateHostInboundOverrideReplaceWarnings`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) emits a commit-time
+advisory naming every `(zone, interface, lost tokens)` triple, so `commit check`
+shows the loss BEFORE the commit that would cause it. The remedy is mechanical:
+repeat the zone-level tokens in the interface stanza. It is WARN-only — the new
+behaviour is the Junos behaviour, and rejecting the config would refuse something
+Junos accepts. Lifeline interfaces and effective sets that full-admit
+(`any-service`) are skipped: nothing is lost there, and an advisory that fires on
+configs losing nothing is one operators learn to ignore.
+
+### Physical∪unit merge (#3720)
+
+A more-specific unit override never *replaces* a physical override — they are
+merged, because both are interface-level statements. Before #3720 the resolver
 (`buildInterfaceHostInboundMap`, `pkg/dataplane/userspace/zones.go`) walked refs
 in sorted order and wrote each key first-writer-wins; a bare physical ref sorts
 before (is a prefix of) its units, so it filled `out["ifN.M"]` first and the
@@ -1073,8 +1155,9 @@ enforce the owner predicate `zoneByIface[ref] == zn`:
 **Presentation parity (#3720 H05).** `ZoneConfig.InterfaceHostInboundEffective`
 (`pkg/config/host_inbound_view.go`) — used by `show interfaces <unit>`, `show
 security zones`, and the gRPC interface diagnostic — folds the physical-parent
-override into a unit ref's effective set with the same additive rule, so the
-operator diagnostic agrees with what the dataplane admits. Before #3720 it read
+override into a unit ref's effective set with the same within-level union rule
+(and then replaces the zone level with it, #6515), so the operator diagnostic
+agrees with what the dataplane admits. Before #3720 it read
 only the exact ref and reported "no override / default-deny" for a unit that in
 fact inherited a physical override.
 
@@ -1094,8 +1177,9 @@ false-deny (the base view's narrower set drops a service the unit-0 override
 opened). The fix skips the base (physical) snapshot's host-inbound address
 contribution when unit 0 is configured: unit 0's snapshot is the authoritative
 carrier (its merged override matches enforcement and `InterfaceHostInboundEffective`),
-so the address resolves to ONE view carrying the additive `zone ∪ physical ∪
-unit-0` admit set. The skip is gated on the ACTUAL same-netdev collapse
+so the address resolves to ONE view carrying the `physical ∪ unit-0` admit set
+(which post-#6515 replaces the zone level; before #6515 it was `zone ∪ physical ∪
+unit-0`). The skip is gated on the ACTUAL same-netdev collapse
 (`snapshotLinuxName(base, unit0) == snapshotLinuxName(base, nil)`), NOT merely
 "unit 0 exists": a VLAN unit 0 (`VlanID > 0` → Linux `<base>.<vlan>`) or a
 tunnel-mapped unit 0 resolves to a DISTINCT netdev, so the base and unit-0
@@ -1109,8 +1193,71 @@ address is never dropped from the deny scope.
 **Gate alignment.** The commit-time duplicate-address gate
 (`buildHostInboundOverrideMapLocal` +
 `validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
-mirrors the same additive resolution and quarantine, so the
+mirrors the same resolution and quarantine — `effectiveHostInboundSigLocal`
+delegates to `EffectiveHostInboundTokens` — so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
+That matters here specifically: the gate rejects two zones claiming one
+firewall-local address with DIFFERING admission, so a signature built from a
+different combination rule than enforcement uses would compare the wrong sets.
+
+## DHCP and BOOTP are per-interface only in Junos (#6519)
+
+Juniper, [Security Zones](https://www.juniper.net/documentation/us/en/software/junos/security-policies/topics/topic-map/security-zone-configuration.html):
+
+> "All services (except DHCP and BOOTP) can be configured either per zone or per
+> interface. A DHCP server is configured only per interface because the incoming
+> interface must be known by the server to be able to send out DHCP replies."
+
+`dhcp` and `bootp` are therefore the two `system-services` tokens Junos does NOT
+accept at the zone level. xpf accepts them there, and a zone-level token
+authorizes udp/67-68 on the firewall-local addresses of every member interface —
+an over-authorization relative to Junos, which would make the operator admit the
+service interface by interface.
+
+**Status: WARN-only parity deviation. Enforcement is unchanged.**
+`validateHostInboundZoneLevelDHCPWarnings`
+(`pkg/config/host_inbound_dhcp_scope_6519.go`) emits one commit-time advisory per
+zone, naming the token and the member interfaces the zone-level authorization
+actually reaches, with the remedy: move it to
+`interfaces <if> host-inbound-traffic system-services dhcp`.
+
+Three details that matter:
+
+- **A zone-level `all` counts.** `all` expands to the named-service union, which
+  contains `dhcp` and `bootp` (`HostInboundAllExpansionServices`), so a zone-level
+  `all` authorizes them on every member exactly as a named token would. The
+  advisory reports that case explicitly, marked "via `all`", because the edit that
+  fixes it is a different edit. An advisory that reported only the named token
+  would have left the `all` case as a silent deviation.
+- **`dhcpv6` is deliberately NOT covered.** The vendor sentence names DHCP and
+  BOOTP. Extending it to the v6 token would be an inference, not a citation.
+- **An interface that authorized the service ITSELF is not named.** The advisory
+  fires for an interface whose EFFECTIVE set admits the token while its OWN
+  interface-level stanza does not — i.e. the zone-level token is the authorizer.
+  Stating the predicate that way keeps it correct both while the two levels union
+  and after #6515 makes the interface level replace the zone level, without
+  asserting which rule is in force.
+
+### Why the enforcement flip is staged separately
+
+Withdrawing the zone-level authorization is a NARROWING with a real population,
+unlike #6515:
+
+- Configs **in this repo** author zone-level `dhcp` today —
+  `test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
+  `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`. The
+  `ha-cluster-userspace` `lan` zone even carries a comment explaining that it
+  MUST admit dhcp or client DISCOVER to the firewall is denied. The advisory
+  fires on exactly that zone (`reth1`) and on nothing else in those files — the
+  `mgmt` and `control` zones' members are lifelines, which are excluded from
+  host-inbound deny scoping and so are skipped.
+- The traffic it would stop is not only a DHCP *server*'s. The firewall's own
+  DHCP **client** on a zoned, non-lifeline interface needs udp/68 admitted for
+  its unicast renewals, so a flip costs that interface its ADDRESS rather than
+  merely refusing a service — and the vendor rationale quoted above ("the server
+  must know the incoming interface") does not speak to the client case at all.
+- #6519 is filed as an enhancement and asks for the staged treatment: advisory,
+  then an all-planes flip in its own release with the shipped configs migrated.
 
 ## Multi-member bracket body applies to every member (#6391) — UPGRADE NOTE
 
@@ -1236,9 +1383,10 @@ unchanged, with no dedup, so a single block keeps its exact token multiset;
 dedup applies only when a second block is actually merged. RED-on-revert guards:
 `pkg/config/host_inbound_dup_block_4544_test.go`.
 
-This is orthogonal to the "Per-interface override precedence (#3362, #3720)"
-union above, which merges host-inbound authored at DIFFERENT granularities
-(zone ∪ physical ∪ unit). #4544 merges repeated blocks at the SAME granularity.
+This is orthogonal to the "Per-interface override precedence (#3362, #3720,
+#6515)" section above, which resolves host-inbound authored at DIFFERENT
+granularities (`physical ∪ unit`, then REPLACING the zone level). #4544 merges
+repeated blocks at the SAME granularity.
 
 **#4818 extends this merge one level UP.** #4544 merges repeated
 `host-inbound-traffic {}` blocks *within one* `security-zone <name> {}`
@@ -1407,7 +1555,8 @@ helper never sees it, so a helper crash cannot lock management out).
   shield must carve TCP/113 out (`HostInboundServiceTokenExpansion`).
   - **Per-interface scope of the IKE / ident shield (#5565).** The shield is
     scoped to the SPECIFIC netdevs whose EFFECTIVE per-interface host-inbound set
-    (`InterfaceHostInboundEffective`, zone-level ∪ interface override) admits the
+    (`InterfaceHostInboundEffective`: the interface override where declared,
+    else the zone-level set — #6515) admits the
     exemption — `JunosHostDenyProgram.IKEExemptNetdevs` / `IdentResetNetdevs`,
     each a subset of the program's `IngressNetdevs`. A per-INTERFACE `ike` /
     `ident-reset` override therefore shields only the interface(s) that configured

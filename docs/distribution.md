@@ -15,7 +15,9 @@ Two independent trust roots, by design:
 
 | Artifact | Tool | Public key (pinned) | Consumer |
 |---|---|---|---|
-| Appliance image (qcow2 + incus metadata) + `install.sh` + `latest.json` | **minisign** (Ed25519) | `scripts/dist/xpf-image.pub` | our scripts (`validate.py`, `xpf-deploy.py fetch`) + the operator |
+| Appliance image (qcow2 + incus metadata) + its `.manifest` / `.pkgs` sidecars, via `xpf-<ver>.SHA256SUMS` | **minisign** (Ed25519) | `scripts/dist/xpf-image.pub` | `validate.py`, `xpf-deploy.py fetch`, `publish.py gate_provenance` + the operator |
+| `install.sh` | **minisign** (Ed25519) | `scripts/dist/xpf-image.pub` | `publish.py gate_images` + the operator (Tier B, before running it) |
+| `latest.json` (per-channel pointer) | **minisign** (Ed25519) | `scripts/dist/xpf-image.pub` | `xpf-deploy.py fetch` (the channel default, #6504), `publish.py gate_latest` + the operator |
 | Apt repository (`Release`/`InRelease`) | **OpenPGP** | `scripts/dist/xpf-archive-keyring.asc` | `apt` itself |
 
 minisign and OpenPGP are NOT redundant — they authenticate different artifacts
@@ -118,7 +120,22 @@ publisher isolates suites in its own database and is unaffected. `selftest.sh`
   `XPF_APT_VALID_DAYS`). A SHORT window with manual/air-gap signing would
   expire the repo between releases — keep it long for a manual cadence, or run
   an automated re-sign job.
-- Images: `latest.json` (signed) names the current version per channel.
+- Images: `latest.json` (signed) names the current version per channel, and
+  `xpf-deploy.py fetch` **consumes** it: with no `--version` it fetches
+  `<channel>/latest.json`, minisign-verifies it against the pinned image
+  pubkey, and then fetches + verifies exactly the version it names (#6504).
+  Until then the pointer had no reader outside `publish.py`'s own gate, so a
+  day-zero operator could not ask for "current stable" without already knowing
+  a version string.
+
+  The pointer is authenticated, not trusted: a verified signature says WHO
+  wrote the bytes, so the version it yields still goes through the same
+  filename-safety validation an operator's `--version` does, and a pointer
+  whose `channel` field disagrees with the channel it was served from is
+  refused (the same key signs every channel, so a mis-synced or swapped
+  pointer verifies perfectly). The resolved version then feeds the existing
+  anti-rollback watermark at `${XDG_STATE_HOME}/xpf/image-watermark.json`
+  exactly as an explicit `--version` does.
 - Each version's signed `xpf-<ver>.SHA256SUMS` covers the qcow2, the incus
   metadata, the `.manifest` provenance sidecar, AND the `xpf-<ver>.pkgs`
   image inventory (guest kernel + installed package versions, #6500), so
