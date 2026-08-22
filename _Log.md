@@ -100200,6 +100200,21 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_ha_reth_vip_fence_6177_test.go (new),
   docs/session-sync-architecture.md
 
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 — fence-only drop scope (`BuildFenceAddrSets`): withhold
+    lifeline-shared addresses (Finding A), cover every firewall-local address
+    including on a zone-less router (Finding B); wire both fence call sites.
+  - **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
+    pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+    pkg/daemon/host_inbound_fence_scope_6492_test.go,
+    pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+    docs/host-inbound-service-matrix.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6492 Finding C — add the sticky-re-render subsumption proof
+    (the #6489 whole-table re-render never fences a lifeline-shared address on
+    ANY render, and still picks up an address that appears mid-degradation).
+  - **File(s)**: pkg/daemon/host_inbound_fence_scope_6492_test.go
 ## 2026-08-21 — #6427: split manager_ha.go into seven responsibility-scoped files
 
 - **Timestamp**: 2026-08-21

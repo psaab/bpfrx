@@ -774,8 +774,9 @@ filter is unenforced.
 The fix mirrors the host-inbound cold-boot fence for the lo0 table:
 
 - `installLo0ColdBootFence` / `buildLo0FencePayload` (`daemon_nft.go`) build the
-  fence from the SAME lifeline-excluded firewall-local address sets
-  (`BuildZoneHostInboundViews` + `BuildUnzonedHostInboundAddrs`) and the SAME
+  fence from the SAME fence-only address scope as the host-inbound cold-boot fence
+  (`dpuserspace.BuildFenceAddrSets`, #6492 — see "Fence drop scope is not the real
+  ruleset's scope" below) and the SAME
   `buildFenceTablePayload` body as the host-inbound cold-boot fence — mandatory L3
   / return admits (`ct established,related`, raw ESP/AH, IPv6 ND, v4/v6
   PMTUD+error, the configured WireGuard listen port) then a catch-all
@@ -849,13 +850,66 @@ separately):**
   new day-2 address. That is the lo0 filter's own coverage semantics, independent
   of this boot fence — the fence only guarantees the RE path is not left fully
   open when NO real filter is loaded.
-- The shared fence body / `BuildZoneHostInboundViews` / `BuildUnzonedHostInbound
-  Addrs` that this fence reuses carry two known behaviours that affect the
-  **host-inbound #5644 fence identically** (a shared-mechanism concern, not
-  lo0-specific — tracked in **#6492**): a management IP shared onto a non-lifeline
-  interface can pick up a global `daddr` drop, and a zone-less router yields empty
-  address sets → an accept-all fence shell. Both live in the shared mechanism and
-  pre-date #6476.
+- The two shared-mechanism behaviours #6492 filed against this fence body — a
+  management IP shared onto a non-lifeline interface picking up a global `daddr`
+  drop, and a zone-less router yielding empty address sets → an accept-all fence
+  shell — are **fixed**; see "Fence drop scope is not the real ruleset's scope"
+  below.
+
+### Fence drop scope is not the real ruleset's scope (#6492)
+
+A fence is the real table with **every per-service ACCEPT removed**, so it cannot
+reuse the real ruleset's address scope unchanged. `dpuserspace.BuildFenceAddrSets`
+(`pkg/dataplane/userspace/zones_host_inbound.go`) derives the fence-only scope and
+is called by BOTH fence sites (`installHostInboundColdBootFence`,
+`installLo0ColdBootFence`). It differs from `BuildZoneHostInboundViews` +
+`BuildUnzonedHostInboundAddrs` in two directions:
+
+- **Narrower — lifeline-shared addresses are WITHHELD (Finding A).** The view
+  builders exclude lifeline INTERFACES (fxp0 / em0 / fab* / the configured
+  control+fabric links), not lifeline address VALUES. If the SAME IP is also
+  configured on a non-lifeline interface — a topology xpf explicitly accepts,
+  `pkg/config/dup_host_local_address_3718_test.go` — that snapshot re-adds it, and
+  the fence's drop rule carries **no `iifname` qualifier**, so it renders as a bare
+  `ip daddr <mgmt-ip> drop` that kills every NEW management connection to it for
+  the whole fence window. Such addresses are removed from the fence's drop set and
+  reported at WARN (`logFenceWithheld`: `withheld_v4` / `withheld_v6`). This is
+  fence-only: the REAL table keeps denying them, because its per-service accepts
+  (the mgmt zone's `system-services ssh`) precede its catch-all DROP and still
+  admit the session. Withholding them in the view builder instead would relax the
+  real table's default-deny — a fail-open.
+- **Wider — every firewall-local address is covered, zones or not (Finding B).**
+  Both view builders return nothing when the config declares no security zone,
+  because the real host-inbound default-deny is a zone-model construct. But
+  host-inbound / lo0 filters are independently valid without zones
+  (`pkg/config/compiler_filter_ref_3296_test.go`), so on a zone-less-but-addressed
+  router a failed cold-boot lo0 install produced an accept-policy fence shell with
+  **ZERO drops** — fail-OPEN, defeating the fence's whole purpose. The fence's drop
+  set is therefore derived from the firewall-local ADDRESSES (every non-lifeline
+  interface address from the canonical snapshot builder, plus every configured VRRP
+  virtual address — a VIP is live only on the RG master, so the backup node's
+  snapshot misses it, #3172), not from zone membership. There is no
+  "are there zones?" branch: the address walk is identical either way and simply
+  yields more than the zone views do when zones are absent or incomplete. It also
+  closes the smaller same-shape hole in a ZONED config — a VRRP VIP on an unzoned
+  interface, which neither view builder collected.
+
+  This reaches production through `applyLo0Filter` only: `applyHostInboundFilter`
+  returns on its teardown branch before the install when nothing is enforceable, so
+  a zone-less router never reaches the host-inbound fence.
+
+Because the fence's coverage now differs from the real ruleset's desired-drop set
+in both directions, `installHostInboundColdBootFence` records
+`hostInboundCoveredAddrs` from the **fence's own** sets, not from the real
+ruleset's `desiredDrop` — the #5789 day-2 gap check must describe what the
+retained enforcement actually drops.
+
+Fail-on-revert proof: `pkg/daemon/host_inbound_fence_scope_6492_test.go` —
+`TestFenceWithholdsLifelineSharedAddress6492` (which also asserts the REAL views
+still carry the shared address, so an over-fix in the view builder goes RED) and
+`TestFenceCoversZonelessRouter6492`, both driven through the production
+`applyLo0Filter` → `installLo0ColdBootFence` path with an injected install
+failure.
 
 Fail-on-revert proof: `pkg/daemon/lo0_coldboot_fence_6476_test.go` —
 `TestColdBootLo0FenceThenNewAddressReFences` pins the #6489 fence→fail→re-fence
