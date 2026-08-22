@@ -1,7 +1,7 @@
 // #1345: per-verb handler for set_binding_state. Body byte-identical to
 // handlers.rs lines 265-291.
 
-use super::super::helpers::{reconcile_status_bindings, refresh_status, wait_for_binding_settle};
+use super::super::helpers::{reconcile_status_bindings, refresh_status};
 use super::super::ServerState;
 use chrono::Utc;
 use crate::{BindingControlRequest, ControlResponse};
@@ -12,6 +12,12 @@ pub(super) fn set(
     binding: Option<BindingControlRequest>,
     response: &mut ControlResponse,
     persist_state: &mut bool,
+    // #5862: where the caller records that a binding-settle wait is owed. The
+    // wait itself runs in handlers::handle_request AFTER the global ServerState
+    // lock is dropped — the same locked-kick / unlocked-wait split #2962 and
+    // #4054 use. Holding the lock across a 2 s settle stalled every HA
+    // `sync_session` on the "dedicated" session socket, which shares this mutex.
+    settle_wait: &mut Option<Duration>,
 ) {
     let Some(binding_req) = binding else {
         response.ok = false;
@@ -48,7 +54,7 @@ pub(super) fn set(
                 refresh_status(guard);
                 return;
             }
-            wait_for_binding_settle(guard, Duration::from_secs(2));
+            *settle_wait = Some(Duration::from_secs(2));
         }
         refresh_status(guard);
         *persist_state = true;

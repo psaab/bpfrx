@@ -143,7 +143,7 @@ func (d *Daemon) commitWithGenBinding(
 // cancellation after store.Commit is deliberately ignored (aborting a
 // promoted commit on a still-running daemon would diverge the store from the
 // dataplane). See applyCancelCtx for the full rationale.
-func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer peerSyncPolicy) (*config.Config, error) {
 	// #1922 Item 2 first-takeover gate (OQ-B, blunt resolution). In
 	// bootstrap mode a plain `commit` is refused: the first commit on a
 	// foreign/non-appliance host claims interfaces and can cut off
@@ -242,7 +242,7 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 // from a non-fatal subsystem error that must NOT. On a non-fatal error the
 // committed config is returned alongside the error so the operator sees the
 // failure while the standby still converges.
-func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer peerSyncPolicy) (*config.Config, error) {
 	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
 	if applyErrSkipsPeerSync(applyErr) {
 		// Fatal (required-protocol-gate: dataplane disarmed / fail-closed) or a
@@ -271,7 +271,15 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
-	if syncPeer {
+	//
+	// #5962: the policy is RESOLVED HERE, not at the entry point. The commit
+	// has succeeded and the store's writability check (ensureWritableLocked,
+	// itself tied to RG0 ownership via applyRG0OwnershipTransition) has already
+	// run, so this reads the same ownership the commit was allowed under. The
+	// pre-#5962 code resolved rg0ConfigSyncAuthority in commitAndApplyOperator
+	// instead — before Commit — so a promotion landing between the two checks
+	// produced a successful commit with the push silently skipped.
+	if syncPeer.wantsPush(d.cluster) {
 		d.pushCommittedConfigToPeer()
 	}
 	joined := errors.Join(applyErr, clearErr)
@@ -524,7 +532,7 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
-func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {
+func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer peerSyncPolicy) (*config.Config, error) {
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -594,18 +602,18 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 // as gRPC always did.
 //
 // The autonomous event-options engine deliberately does NOT use this wrapper: it
-// commits with syncPeer=false (commitAndApply directly, see initEventEngine)
+// commits with peerSyncNever (commitAndApply directly, see initEventEngine)
 // because each node fires its remediation independently from that node's local
 // RPM events and must not push node-local state to the peer.
 func (d *Daemon) commitAndApplyOperator(ctx context.Context, comment string) (*config.Config, error) {
-	return d.commitAndApply(ctx, comment, rg0ConfigSyncAuthority(d.cluster))
+	return d.commitAndApply(ctx, comment, peerSyncIfRG0Authority)
 }
 
 // commitConfirmedAndApplyOperator is the commit-confirmed analogue of
 // commitAndApplyOperator: the same transport-independent RG0-ownership peer-sync
 // policy for an operator-initiated `commit confirmed` (#5054).
 func (d *Daemon) commitConfirmedAndApplyOperator(ctx context.Context, minutes int) (*config.Config, error) {
-	return d.commitConfirmedAndApply(ctx, minutes, rg0ConfigSyncAuthority(d.cluster))
+	return d.commitConfirmedAndApply(ctx, minutes, peerSyncIfRG0Authority)
 }
 
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout

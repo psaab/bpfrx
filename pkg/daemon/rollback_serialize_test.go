@@ -105,7 +105,7 @@ func TestExecuteConfirmedRollbackSerializesWithCommit(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = d.commitAndApply(t.Context(), "", false)
+		_, _ = d.commitAndApply(t.Context(), "", peerSyncNever)
 	}()
 	wg.Wait()
 
@@ -268,7 +268,7 @@ func TestExecuteConfirmedRollbackStoreApplyConsistency(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			_, _ = d.commitAndApply(t.Context(), "", false)
+			_, _ = d.commitAndApply(t.Context(), "", peerSyncNever)
 		}()
 		wg.Wait()
 
