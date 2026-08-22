@@ -123,7 +123,19 @@ pub(super) fn populate_routes(
                     next_table: route.next_table.clone(),
                     preference: route.preference,
                 });
+            continue;
         }
+        // #6568 (member 1): the destination parses as NEITHER family. Before
+        // this the loop body simply ended here — no Err, no counter, no log —
+        // at a boundary whose whole #2409/#2410/#3771 contract is "no silent
+        // skips", and for a discard/reject route that silence is a traffic
+        // FAIL-OPEN: the blackhole entry is absent, the packet matches a
+        // less-specific route and is forwarded. Fail CLOSED, like every sibling
+        // check in this function.
+        return Err(SnapshotIntegrityError::RouteDestinationUnparseable {
+            table: route.table.clone(),
+            destination: route.destination.clone(),
+        });
     }
     Ok(())
 }
