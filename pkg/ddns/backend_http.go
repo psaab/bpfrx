@@ -701,6 +701,38 @@ func doRequest(ctx context.Context, client *http.Client, req *http.Request) (int
 // for identity panics when the dynamic type is not comparable. A budget is
 // sufficient anyway -- a cycle exhausts it, and so does a nest deep enough to
 // overflow. Recursion here is self-limiting because every call spends budget.
+//
+// #6635 MOVED THE CALL SITES. Round 11's guard ran once, at the two PUBLIC
+// entry points, and validated the tree AS PRESENTED THERE. That is not the tree
+// the stdlib ends up walking, because errors.As dispatches to an As(any) bool
+// method the caller defines, and that method hands back a value of the caller's
+// choosing:
+//
+//	func (e hostile) As(target any) bool {
+//	    *target.(**url.Error) = &url.Error{Err: selfUnwrappingError{}}
+//	    return true
+//	}
+//
+// The tree at entry is a single node, so the guard passes; the SUBTREE the As
+// installs was never walked, and scrubURLErrorAt descends straight into it and
+// spins forever inside the next errors.As. Reproduced before the fix: the entry
+// guard returned true and the scrubber did not return.
+//
+// So the guard now runs at every entry to the depth-carrying functions, which
+// is where a caller-supplied subtree can first appear. The cost is a re-walk
+// per level -- at most maxUnwrapDepth^2 Unwrap calls, on an error path that
+// runs at most once per reconcile tick, and only for trees that are already
+// pathological. A legitimate error walks one or two levels.
+//
+// WHAT IS STILL NOT BOUNDED, stated rather than implied. A caller-supplied
+// Error() or Unwrap() that BLOCKS or never returns hangs the first render or
+// the guard itself, and no placement of this function fixes that. Bounding it
+// would need a watchdog goroutine per render. That is deliberately not done,
+// and the reason is not only cost: a blocking Error() hangs ANY fmt render of
+// that error anywhere in the daemon, so bounding it inside one package's
+// scrubber buys nothing while adding a goroutine to a path that must stay
+// cheap. Neither is reachable in production -- errors on these paths come from
+// net/http and the stdlib, and a provider can choose BYTES but not a Go type.
 func errTreeWithinBound(err error) bool {
 	budget := maxUnwrapDepth
 	var walk func(error) bool
@@ -743,9 +775,6 @@ func errTreeWithinBound(err error) bool {
 }
 
 func scrubURLError(err error) string {
-	if !errTreeWithinBound(err) {
-		return string(transportWithheld)
-	}
 	return scrubURLErrorAt(err, 0)
 }
 
@@ -758,6 +787,12 @@ func scrubURLError(err error) string {
 // budgeted for. A deep non-cyclic nest did the same.
 func scrubURLErrorAt(err error, depth int) string {
 	if depth >= maxUnwrapDepth {
+		return string(transportWithheld)
+	}
+	// RE-GUARD AT EVERY ENTRY, not only at the public one (#6635). See
+	// errTreeWithinBound's own comment for why the guard has to precede the
+	// first errors.As; this is about which TREE it is applied to.
+	if !errTreeWithinBound(err) {
 		return string(transportWithheld)
 	}
 	var ue *url.Error
@@ -1048,12 +1083,8 @@ const (
 // prose, the failing address, and the unknown-error type name are all gone. An
 // unrecognised error is exactly the case where we cannot say what it contains.
 func scrubInnerError(err error) string {
-	// Same stdlib-traversal guard as scrubURLError: this is an entry point for
-	// a caller-supplied error, and everything below it (errors.Is, errors.As,
-	// classifyTransportError) walks the tree with the caller's own Unwrap.
-	if !errTreeWithinBound(err) {
-		return string(transportWithheld)
-	}
+	// The stdlib-traversal guard lives in scrubInnerErrorAt now, so it applies
+	// to every entry rather than only this one (#6635).
 	return scrubInnerErrorAt(err, 0)
 }
 
@@ -1065,6 +1096,13 @@ func scrubInnerErrorAt(err error, depth int) string {
 	}
 	if err == nil {
 		return string(transportNil)
+	}
+	// RE-GUARD (#6635). Everything below — findRedirectRefusal aside, which
+	// walks with its own bounded loop — hands this tree to the stdlib:
+	// errors.As here, and errors.Is/errors.As throughout
+	// classifyTransportError. Each dispatches to the caller's own Unwrap.
+	if !errTreeWithinBound(err) {
+		return string(transportWithheld)
 	}
 	// Our own typed refusal, found by assertion over the chain.
 	if r := findRedirectRefusal(err); r != nil {

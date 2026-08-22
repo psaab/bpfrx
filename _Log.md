@@ -1,3 +1,30 @@
+## 2026-08-21 — #6635 ddns: the error-tree bound follows a caller-supplied `As`
+
+- **Timestamp**: 2026-08-21
+- **Action**: `errTreeWithinBound` ran ONCE, at the two public scrubber entry
+  points, validating the `Unwrap` tree AS PRESENTED there — which is not the
+  tree the stdlib ends up walking. `errors.As` dispatches to an `As(any) bool`
+  method the CALLER defines, and that method returns a value of the caller's
+  choosing: an error with a one-node tree (guard passes) can install a fresh
+  `*url.Error` whose `Err` self-unwraps, and the next `errors.As` spins forever.
+  REPRODUCED AT MY HEAD before fixing: the entry guard returned true and
+  `scrubURLError` did not return in 5s.
+  The guard now runs at every entry to `scrubURLErrorAt` / `scrubInnerErrorAt`,
+  which is where a caller-supplied subtree can first appear; the public wrappers
+  become thin delegates. Cost is a re-walk per level, at most maxUnwrapDepth^2
+  Unwrap calls on an error path that runs once per reconcile tick.
+  NOT CLOSED, deliberately and stated: a caller-supplied `Error()`/`Unwrap()`
+  that BLOCKS. No placement of the guard fixes that — it needs a watchdog
+  goroutine per render — and the reason to decline is not only cost: a blocking
+  `Error()` hangs ANY fmt render of that error anywhere in the daemon, so
+  bounding it inside one package's scrubber buys nothing.
+  REACHABILITY, checked rather than assumed: caller-supplied, in-process only.
+  Production builds its own client; the only caller passing one is the Surface A
+  reconcile path passing its own. A provider chooses BYTES over the wire, not a
+  Go type. Robustness, NOT a live DoS, and the PR says so.
+- **File(s)**: `pkg/ddns/backend_http.go`,
+  `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
+
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21
