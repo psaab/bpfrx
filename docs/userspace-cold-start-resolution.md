@@ -336,7 +336,11 @@ The #1651 dead-host negative cache (`afxdp/neg_neigh.rs`) fast-fails a
 SYN to a negatively-cached `(egress_ifindex, next_hop)` **before** the
 ARP probe and the `pending_neigh` buffer
 (`poll_descriptor/mod.rs` MissingNeighbor arm). That is correct for a
-genuinely dead host, but it produced a stuck state for a
+genuinely dead host — and #6710 is the case where the dst is not a host at
+all: an IPsec `xfrmi` egress has no link-layer address, so the
+resolved-neighbor-wins escape can never fire and the cache is never allowed
+to arm for it (`ForwardingState.lladdrless_egress`). It also produced a
+stuck state for a
 directly-connected, **outbound-only** target (e.g. the smoke iperf3 dst
 `172.16.80.200` on `ge-0-0-2.80`):
 

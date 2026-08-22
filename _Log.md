@@ -103662,3 +103662,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/heartbeat_epoch_preserve_6711_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go,
   pkg/cluster/heartbeat_epoch_test.go
+
+## 2026-08-22 — #6710 measured: the dead-host cache drops permitted LAN->tunnel traffic
+- **Action**: #6710 was filed as an OPEN QUESTION, read from source with the
+  worker loop never executed. MEASURED it: a LAN->xfrmi egress resolves
+  `MissingNeighbor` with a `next_hop` and `tunnel_endpoint_id == 0` — the last
+  is the discriminator against #1912, which excludes tunnel-MARKED decisions
+  from `pending_neigh` and therefore from the cache; an xfrmi is a connected
+  route to an ordinary ifindex, so it takes the buffered path and the cache CAN
+  arm. Once armed the fast-fail recycles the frame before the fall-through to
+  the slow-path reinject, and that reinject is the only way LAN->tunnel traffic
+  reaches the kernel XFRM stack (an xfrmi gets no AF_XDP binding). Because an
+  xfrmi has no lladdr, resolved-neighbor-wins can never evict, so it is a
+  permanent drop cycle rather than the 3s the issue estimated. Fix:
+  `ForwardingState.lladdrless_egress`, built from the ALREADY-SHIPPED
+  `InterfaceSnapshot.secure_tunnel` flag (no wire change, no Go change),
+  suppresses the ARMING for those ifindexes only; the negative control asserts
+  an ordinary egress still arms, so #1651's storm defense is intact.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  docs/userspace-dataplane-architecture.md,
+  docs/userspace-cold-start-resolution.md

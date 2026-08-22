@@ -7070,3 +7070,142 @@ fn next_table_cycle_resolves_unsupported_and_is_not_slow_path_eligible_6664() {
          forbids black-holing a destination the kernel can still reach"
     );
 }
+
+/// #6710 — THE MEASUREMENT. The issue was filed as an OPEN QUESTION, read from
+/// source with the worker loop never executed, and asks first whether the
+/// interaction occurs at all. It does, and this is the half of the chain that
+/// can be executed here: what a LAN→xfrmi egress actually RESOLVES to, and
+/// which properties of that resolution decide whether the dead-host negative
+/// cache can be armed against it.
+///
+/// `secure_tunnel_unit_ifindex_decides_route_disposition` above already
+/// establishes `MissingNeighbor`; what #6710 turns on are two further facts it
+/// does not assert, and each is load-bearing in a different direction:
+///
+///   * `next_hop` is `Some(..)` — the negative cache is keyed
+///     `(egress_ifindex, next_hop)`, and the arming site in
+///     `neighbor_dispatch.rs` is inside `if let Some(next_hop)`. No next hop,
+///     no key, no interaction.
+///   * `tunnel_endpoint_id == 0` — this is the discriminator against #1912,
+///     which states that "tunnel-marked decisions are NEVER buffered in
+///     pending_neigh ... so for an unresolved OUTER hop the top-of-arm neg
+///     fast-fail can never arm". That exclusion is real, and it is exactly why
+///     a GRE outer hop is safe and an xfrmi is not: an xfrmi egress is a
+///     CONNECTED route to an ordinary ifindex, not a tunnel endpoint, so it
+///     takes the buffered path and the cache CAN arm.
+///
+/// The third fact — that an armed entry then recycles the frame before the
+/// slow-path reinject — is control flow inside
+/// `poll_binding_process_descriptor`, which no test in this crate can drive
+/// (it needs a live binding, UMEM and descriptor ring). It is stated in the
+/// PR body with its line references rather than asserted here, and the
+/// behavioural guard for the fix lives at the arming site instead, where it
+/// IS executable: `lan_to_xfrmi_timeout_does_not_arm_the_dead_host_cache_6710`
+/// in neighbor_dispatch.rs.
+#[test]
+fn xfrmi_egress_resolves_a_negative_cache_key_6710() {
+    fn snapshot(secure_tunnel: bool) -> ConfigSnapshot {
+        let addr = |a: &str| crate::InterfaceAddressSnapshot {
+            family: "inet".into(),
+            address: a.into(),
+            scope: 0,
+        };
+        ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "trust".into(),
+                    id: 1,
+                    ..Default::default()
+                },
+                ZoneSnapshot {
+                    name: "vpn".into(),
+                    id: 2,
+                    ..Default::default()
+                },
+            ],
+            interfaces: vec![
+                crate::InterfaceSnapshot {
+                    name: "ge-0/0/1.0".into(),
+                    zone: "trust".into(),
+                    linux_name: "ge-0-0-1.0".into(),
+                    ifindex: 11,
+                    mtu: 1500,
+                    addresses: vec![addr("10.0.1.1/24")],
+                    ..Default::default()
+                },
+                crate::InterfaceSnapshot {
+                    name: "st0.0".into(),
+                    zone: "vpn".into(),
+                    linux_name: "st0.0".into(),
+                    ifindex: 42,
+                    mtu: 1400,
+                    addresses: vec![addr("10.5.5.1/30")],
+                    secure_tunnel,
+                    ..Default::default()
+                },
+            ],
+            routes: vec![crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "192.168.99.0/24".into(),
+                next_hops: vec!["10.5.5.2".into()],
+                preference: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    let state = build_forwarding_state(&snapshot(true));
+    let dst = Ipv4Addr::new(192, 168, 99, 5);
+    let r = lookup_forwarding_resolution_v4(&state, None, dst, "inet.0", 0, true, None);
+
+    assert_eq!(
+        r.disposition,
+        ForwardingDisposition::MissingNeighbor,
+        "premise: a LAN→xfrmi packet must take the cold MissingNeighbor arm — \
+         an xfrmi has no lladdr, so lookup_neighbor_entry can never hit"
+    );
+    assert_eq!(r.egress_ifindex, 42);
+    assert!(
+        r.next_hop.is_some(),
+        "the negative cache is keyed (egress_ifindex, next_hop) and the arming \
+         site is inside `if let Some(next_hop)`; with no next hop there is no \
+         key and #6710's interaction cannot occur at all"
+    );
+    assert_eq!(
+        r.tunnel_endpoint_id, 0,
+        "THE #1912 DISCRIMINATOR. A tunnel-marked decision is never buffered in \
+         pending_neigh, so its hop can never arm the cache — that is why a GRE \
+         outer hop is safe. An xfrmi egress is a CONNECTED route to an ordinary \
+         ifindex, carries no endpoint id, takes the buffered path, and therefore \
+         CAN arm it. If this ever becomes non-zero, #6710 stops applying and \
+         this test should say so rather than being deleted"
+    );
+    assert!(
+        r.disposition.is_slow_path_eligible(),
+        "the intended fate of this packet is the slow-path reinject — an xfrmi \
+         gets no AF_XDP binding, so the kernel XFRM stack is the ONLY way it is \
+         ever encrypted. A negative-cache fast-fail recycles it before that."
+    );
+
+    // The fix is keyed on the shipped `secure_tunnel` flag, not on a name
+    // grammar. Assert both directions so the set cannot silently become
+    // "everything" or "nothing".
+    assert!(
+        state.lladdrless_egress.contains(&42),
+        "the xfrmi ifindex must be recorded as lladdr-less so the dead-host \
+         cache is not armed against a device that has nothing to answer with"
+    );
+    assert!(
+        !state.lladdrless_egress.contains(&11),
+        "an ordinary LAN interface must NOT be recorded lladdr-less; the #1651 \
+         dead-host protection has to keep working everywhere else"
+    );
+    let plain = build_forwarding_state(&snapshot(false));
+    assert!(
+        plain.lladdrless_egress.is_empty(),
+        "with secure_tunnel unset the set must be empty — the flag is the only \
+         input, so an older control plane that omits it changes nothing"
+    );
+}
