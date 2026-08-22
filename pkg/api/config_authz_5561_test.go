@@ -345,10 +345,22 @@ func TestAuthorizedPrincipalStillMutatesConfig_5561(t *testing.T) {
 	}
 }
 
-// TestReadOnlyEndpointsUnaffected_5561 pins the blast radius: with NO
-// establishable principal at all, the read surface — REST GETs, /health and
-// /metrics — behaves exactly as before. The gate must not have turned a
-// monitoring endpoint into a 403.
+// TestReadOnlyEndpointsUnaffected_5561 pins the blast radius of the MUTATION
+// gate on the read surface: with no establishable principal at all, the health
+// and metrics endpoints behave exactly as before. The gate must not have turned
+// a monitoring endpoint into a 403.
+//
+// #6660 NARROWED THIS TEST, and the narrowing is the point rather than a
+// concession. When #5561 shipped, "the read surface is unaffected" was the whole
+// truth, because reads were not authorized at all — which is precisely the gap
+// #6660 closes. The /api/v1 GETs that used to be listed here are now REFUSED for
+// an unattributable caller, and TestUnattributableCallerIsDeniedReads_6660 pins
+// that in the opposite direction.
+//
+// What survives here is the half that must NEVER change: /health and /metrics
+// carry no configuration, are exempt in authCheck, and are read by the in-tree
+// incus harnesses. A gate that took them down would break monitoring on every
+// box, which is the failure this test exists to catch.
 func TestReadOnlyEndpointsUnaffected_5561(t *testing.T) {
 	usePasswdFixture(t)
 	store := authzStore(t, authzTestConfig)
@@ -361,12 +373,6 @@ func TestReadOnlyEndpointsUnaffected_5561(t *testing.T) {
 	for _, path := range []string{
 		"/health",
 		"/metrics",
-		"/api/v1/config",
-		"/api/v1/config/show",
-		"/api/v1/config/status",
-		"/api/v1/status",
-		"/api/v1/interfaces",
-		"/api/v1/security/zones",
 	} {
 		t.Run(path, func(t *testing.T) {
 			resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(base + path)
@@ -376,8 +382,8 @@ func TestReadOnlyEndpointsUnaffected_5561(t *testing.T) {
 			defer resp.Body.Close()
 			if resp.StatusCode == http.StatusForbidden {
 				body, _ := io.ReadAll(resp.Body)
-				t.Fatalf("GET %s returned 403 — the mutation gate is refusing read traffic: %s",
-					path, body)
+				t.Fatalf("GET %s returned 403 — an unauthenticated monitoring endpoint is refusing "+
+					"traffic; /health and /metrics must stay open (#6660): %s", path, body)
 			}
 		})
 	}
