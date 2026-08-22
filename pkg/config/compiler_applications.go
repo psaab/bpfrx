@@ -631,6 +631,11 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	// a default arm an unknown leaf (and its value) were silently dropped,
 	// widening the term. Record them for the deferred strict gate.
 	var badTermLeaves []string
+	// #6564 member 9: RECOGNIZED value-taking leaves that appeared with NO
+	// value (last token in the term). Distinct from badTermLeaves, which holds
+	// UNRECOGNIZED tokens — the keyword here IS supported, it just has nothing
+	// to constrain with, so the strict gate words the two differently.
+	var incompleteTermLeaves []string
 	// #3348: per normalized-protocol echo-type implied by a junos-ping /
 	// junos-pingv6 alias inside an inline term. normalizeProtocol folds the
 	// alias to "icmp"/"icmpv6" and loses the ping distinction, so capture the
@@ -648,6 +653,27 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	unconstrainedICMP := map[string]bool{}
 
 	for i := 1; i < len(keys); i++ {
+		// #6564 member 9: a RECOGNIZED value-taking leaf in the LAST position
+		// has no value to consume. Every arm below is guarded by
+		// `if i+1 < len(keys)` with no else, so such a keyword fell through
+		// recording NOTHING — and the `default:` arm that feeds badTermLeaves
+		// is unreachable for a keyword the switch recognizes.
+		//
+		// That is the same fail-open the rest of this function exists to stop:
+		// the constraint is dropped and the term WIDENS. `term t1 protocol tcp
+		// destination-port` compiled to protocol-only, so an application
+		// written to match ONE port matched EVERY TCP port, and any policy
+		// permitting it widened with it. #3320 / #3348 / #3352 / #6524 each
+		// instrument a MALFORMED value; this shape has no value to be
+		// malformed, which is why none of them caught it.
+		//
+		// Checked ONCE here rather than as eight `else` branches: a per-arm
+		// else would have to be repeated for every future value-taking leaf and
+		// is exactly the kind of duplication that drifts.
+		if i+1 >= len(keys) && valueTakingTermLeaves[keys[i]] {
+			incompleteTermLeaves = append(incompleteTermLeaves, keys[i])
+			continue
+		}
 		switch keys[i] {
 		case "protocol":
 			if i+1 < len(keys) {
@@ -789,21 +815,42 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			it = echoByProto[proto]
 		}
 		result = append(result, &Application{
-			Name:                name,
-			Protocol:            proto,
-			DestinationPort:     dstPort,
-			SourcePort:          srcPort,
-			InactivityTimeout:   timeout,
-			ALG:                 alg,
-			UnknownTimeouts:     badTimeouts,
-			ICMPType:            it,
-			ICMPCode:            icmpCode,
-			UnknownICMP:         badICMP,
-			UnknownTermLeaves:   badTermLeaves,
-			DuplicateTermLeaves: dupTermLeaves,
+			Name:                 name,
+			Protocol:             proto,
+			DestinationPort:      dstPort,
+			SourcePort:           srcPort,
+			InactivityTimeout:    timeout,
+			ALG:                  alg,
+			UnknownTimeouts:      badTimeouts,
+			ICMPType:             it,
+			ICMPCode:             icmpCode,
+			UnknownICMP:          badICMP,
+			UnknownTermLeaves:    badTermLeaves,
+			IncompleteTermLeaves: incompleteTermLeaves,
+			DuplicateTermLeaves:  dupTermLeaves,
 		})
 	}
 	return result
+}
+
+// valueTakingTermLeaves is the set of inline-`term` leaves that REQUIRE a
+// following value token (#6564 member 9). It is the arity contract for
+// parseApplicationTerms' switch: every arm below that consumes `keys[i+1]`
+// must appear here, so a keyword left dangling in the last position is
+// recorded rather than silently dropping its constraint.
+//
+// Adding a value-taking leaf to the switch without adding it here re-opens the
+// fail-open, so the two are pinned together by
+// TestValueTakingTermLeavesCoversEveryConsumingArm6564.
+var valueTakingTermLeaves = map[string]bool{
+	"protocol":           true,
+	"destination-port":   true,
+	"source-port":        true,
+	"icmp-type":          true,
+	"icmp-code":          true,
+	"inactivity-timeout": true,
+	"timeout":            true,
+	"alg":                true,
 }
 
 // aliasEchoICMPType returns the echo-request ICMP / ICMPv6 type implied by a

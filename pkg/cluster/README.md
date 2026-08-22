@@ -2539,6 +2539,38 @@ outside the monitor loop:
   `TestRequestPeerFailoverCommitFailureRollsBackOverrideOnBothPaths`
   (`failover_commit_rollback_6527_test.go`) binds the agreement rather than
   either copy.
+- **The override must also not outlive the PEER INCARNATION that granted it
+  (#6656).** #6527 above closed the requester-side commit-failure leak. It did
+  not bound the override generally, and `handlePeerTimeout` — which already
+  clears `ManualFailover` on every RG with the reasoning "the peer is dead, so
+  the surviving node MUST be able to take over", plus `peerGroups`,
+  `peerMonitors` and both peer version fields — left this one armed.
+
+  That is the other half of the same transfer: `ManualFailover` parks the LOCAL
+  node, `peerTransferOutOverride` forces our view of the PEER. Because it has no
+  expiry and is re-applied to the rebuilt peer-group map on every heartbeat, an
+  override that survives peer loss means the peer reconnects — a reboot, a
+  rolling deploy, or simply a new process — and from its FIRST heartbeat this
+  node overwrites its reported state with `SecondaryHold`, `electRG` takes the
+  "Peer transfer out" arm, and this node self-elects primary regardless of what
+  the peer says. `FormatStatus` renders the POST-override `m.peerGroups`, so the
+  operator sees a healthy primary row whose session table is empty while the
+  peer carries the traffic.
+
+  `handlePeerTimeout` now clears it, after the two
+  `suppressPeerTimeoutForTransferCommitLocked` consultations have declined so an
+  in-flight commit keeps its suppression window. The time-bounded maps
+  (`peerTransferCommitGraceUntil` / `localTransferOutHoldUntil`) are left alone:
+  they expire on their own, and clearing them would shorten a window a live
+  transfer may still be inside.
+
+  Note for whoever investigates the next occurrence: `reassert_primary_node0`
+  (`test/incus/cluster-setup.sh`) issues
+  `request chassis cluster failover redundancy-group <rg> node 0` for EVERY RG
+  on node0 after EVERY rolling deploy and swallows errors, so the arming step is
+  routine rather than exceptional. And `RequestPeerFailover` early-returns
+  "node is already primary" without touching the peer, which is why re-issuing
+  the same failover to diagnose the state changes nothing.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).

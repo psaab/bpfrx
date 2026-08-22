@@ -103,6 +103,22 @@ const (
 	// still says "4 -> 5" and "moved to 6"; those describe each branch's own
 	// history, not this constant's current value.
 	ProtocolVersion                  = 8
+
+	// MinProtocolMultiZoneScopedPolicy is the FIRST snapshot protocol version
+	// that can represent a multi-zone scoped global policy — the plural
+	// MatchFromZones/MatchToZones fields landed in the v4 bump (#6644/#5488).
+	// A reader below it sees only the singular MatchFromZone/MatchToZone and
+	// NARROWS the policy to its first zone.
+	//
+	// It is a per-feature IMMUTABLE floor, deliberately not `ProtocolVersion`.
+	// The cross-chassis gate (#6650) asks "can the PEER represent this shape?",
+	// and that answer does not change when an unrelated wire field is added --
+	// pinning it to the shared constant would make every future bump
+	// retroactively refuse multi-zone commits across a version skew, which is
+	// exactly the defect open #6648 describes in the LOCAL gates. This is the
+	// first per-feature floor in the tree; #6648 tracks giving the local gates
+	// the same treatment. Never renumber it: it names a historical wire fact.
+	MinProtocolMultiZoneScopedPolicy = 4
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 

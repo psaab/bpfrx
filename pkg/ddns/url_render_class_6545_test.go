@@ -1049,27 +1049,16 @@ var urlErrorRenderers = map[string]bool{
 	"errors.Is":       true,
 }
 
-// issue6606Exemption is the ONE knowingly-unfixed site, kept explicit rather
-// than tuned out of the gate: resolveDyndns2Endpoint renders a malformed
-// `server` (and its %w-wrapped parse error) raw. That is tracked as #6606 and
-// was declared out of scope for #6545.
+// #6606 CLOSED: this gate used to carry a self-expiring exemption for
+// resolveDyndns2Endpoint, the ONE site that rendered a malformed `server` (and
+// its %w-wrapped parse error) raw. That site is fixed, so the exemption is gone
+// and pkg/ddns now has NO exempted URL-error render at all: every handler in
+// the package must scrub.
 //
-// It is written to SELF-EXPIRE: the gate asserts the exemption is actually HIT,
-// so when #6606 lands this test goes red and forces the stale exemption out
-// instead of quietly widening the hole for whatever moves in next.
-// ROUND 8 MADE IT SITE-SPECIFIC. It used to name only a FILE and a FUNCTION, so
-// every unsafe handler inside resolveDyndns2Endpoint was exempt: fixing the one
-// that exists while adding a different unsafe handler in the same function kept
-// the exemption satisfied and the new leak silent. It now pins the exact
-// PRODUCER and error variable, and the gate additionally requires that exactly
-// ONE unsafe site exists in that function — a second one is not exempt, it is a
-// failure.
-var issue6606Exemption = struct{ file, fn, producer, errVar string }{
-	file:     "backend_dyndns2.go",
-	fn:       "resolveDyndns2Endpoint",
-	producer: "url.Parse",
-	errVar:   "err",
-}
+// The exemption did its job on the way out. It was written to assert it was
+// actually HIT, so landing the fix turned this test RED and forced the stale
+// entry out rather than leaving a silently-widened hole for whatever occupied
+// that slot next.
 
 // minURLErrorSites is the non-vacuity floor. If a refactor renames the
 // producers or restructures the error handling, the walk must not silently
@@ -1091,7 +1080,6 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	sites := 0
-	exemptionHit := false
 	exemptedSites := 0
 
 	for _, entry := range entries {
@@ -1113,24 +1101,6 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 				for _, site := range urlErrorHandlers(n, aliases) {
 					sites++
 					bad := unscrubbedUses(fset, site.stmts, site.errVar, aliases)
-					if len(bad) > 0 && name == issue6606Exemption.file &&
-						fn.Name.Name == issue6606Exemption.fn &&
-						site.producer == issue6606Exemption.producer &&
-						site.errVar == issue6606Exemption.errVar {
-						// The exemption is only HIT when the EXACT pinned site is
-						// still UNSAFE. Round 6 recorded the hit merely because a
-						// handler existed in this function, so sanitizing the
-						// site left the exemption standing and green — the
-						// opposite of self-expiring. Round 8 narrowed it from
-						// file+function to file+function+producer+variable, so a
-						// DIFFERENT unsafe handler moving into the same function
-						// is not covered by it (it falls through and fails), and
-						// exemptedSites below rejects a second copy of even the
-						// pinned shape.
-						exemptionHit = true
-						exemptedSites++
-						continue
-					}
 					for _, pos := range bad {
 						t.Errorf("%s: %s renders the error from a URL-bearing call (%q) without "+
 							"the scrubber.\n"+
@@ -1153,17 +1123,14 @@ func TestDDNSURLErrorRendersGoThroughScrubber(t *testing.T) {
 			"the walk is probably not matching the code it is supposed to check, and a gate "+
 			"that matches nothing passes vacuously", sites, minURLErrorSites)
 	}
-	if !exemptionHit {
-		t.Errorf("the #6606 exemption for %s/%s (%s -> %q) was never hit. If that site was "+
-			"fixed, DELETE the exemption — leaving it standing silently exempts whatever "+
-			"occupies that slot next.", issue6606Exemption.file, issue6606Exemption.fn,
-			issue6606Exemption.producer, issue6606Exemption.errVar)
-	}
-	if exemptedSites > 1 {
-		t.Errorf("the #6606 exemption covered %d sites, want exactly 1. It names ONE known "+
-			"leak. A second handler of the same shape in %s/%s is a NEW leak and must be "+
-			"fixed, not absorbed by an exemption written for a different one.",
-			exemptedSites, issue6606Exemption.file, issue6606Exemption.fn)
+	// #6606: there is no longer ANY exempted site, so the gate is now a plain
+	// "every URL-error handler in pkg/ddns scrubs". The two assertions that used
+	// to police the exemption's own liveness are gone with it; minURLErrorSites
+	// above remains the non-vacuity floor.
+	if exemptedSites != 0 {
+		t.Errorf("%d handler(s) were treated as exempt, want 0 — pkg/ddns has no exempted "+
+			"URL-error render since #6606. An exemption reintroduced here must come with "+
+			"its own self-expiry assertion.", exemptedSites)
 	}
 }
 

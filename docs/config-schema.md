@@ -2217,6 +2217,89 @@ brace and flat-set spellings AGREE with the compact one rather than asserting
 the compact one alone — a test that pinned only the compact shape would not
 notice the two drifting apart again.
 
+### The strict-reject members of the same cohort (#6564)
+
+Three further #6564 members are NOT shape defects and must not be fixed as if
+they were. The statement is structurally readable; its VALUE is malformed, or
+its trailing token is unreachable, and the compiler silently coerced or
+discarded it. There is no correct value to infer, so the only honest repair is
+to refuse it.
+
+| Statement | Silent behaviour before | Repair |
+|---|---|---|
+| `routing-options autonomous-system <bad>` | `strconv.ParseUint`'s error was discarded with no `else` and no record, so `AutonomousSystem` stayed 0, `resolveBGPAutonomousSystem` left `LocalAS` 0, and `pkg/frr` gates `router bgp` on `LocalAS > 0` — **one bad token silently disabled BGP entirely** | `valueType` + `validator`, matching its `local-as` / `peer-as` siblings, which already had both |
+| `security-zone <z> screen <p> <trailing>` | the zone compiler reads `Keys[1]` via `nodeVal` and never the node's children, so a chained statement after the profile name is dropped | `scalar: true`, so the existing `validateScalarValueLeaf` arity gate sees it |
+| `protocols ospf area <bad>` (×4 sites) | no key validator at all, so a malformed id was written **verbatim** into `frr.conf` | `keyValidator: ValidateOSPFArea` |
+
+**Member 2 is a swallowed error, not a Keys-vs-Children defect** — `nodeVal`
+already reads both shapes. A shape-family fix applied there would have looked
+right and changed nothing, which is precisely why each member of a cohort has
+to be diagnosed rather than pattern-matched to the family.
+
+**The posture is asymmetric, and that is the point (#1960 no-brick).** All three
+repairs are schema-level, so they inherit the #1319 PR 2 split for free:
+`SchemaValidate` is STRICT on the operator commit / commit-check path
+(`Store.compileTree`) and DOWNGRADED TO A WARNING on the tolerant
+`Store.Load` / `Store.SyncApply` path (`Store.compileTreeLenient`). A new
+operator edit is refused loudly; a config an older binary already accepted still
+BOOTS after an upgrade. Refusing on both paths would blackout-boot a node or
+alarm-loop HA config sync at the worst possible moment — during an upgrade,
+possibly on the standby of an HA pair mid-ISSU.
+
+`pkg/config/silent_drop_strict_6564_test.go` asserts BOTH directions: the strict
+gate must reject, AND the compiler must still produce a config so the lenient
+wrapper has something to continue with. A strict-only matrix would pass a fix
+that bricks the boot path.
+
+Two further guards worth keeping when this area is edited: the OSPF area
+validator must accept **area 0** (the backbone has no `>= 1` floor, unlike a BGP
+cluster-id), and the `autonomous-system` range must stay `1..4294967295` — a
+mutation loosening either is a silent over-acceptance, and both are pinned.
+
+### The dangling-keyword member (#6564 member 9)
+
+`parseApplicationTerms` guards every value-taking arm with
+`if i+1 < len(keys)` and has no `else`, so a RECOGNIZED leaf keyword in the LAST
+position fell through recording nothing at all — and the `default:` arm that
+feeds `UnknownTermLeaves` is unreachable for a keyword the switch recognizes.
+
+The consequence is the exact fail-open the rest of that function exists to stop.
+`default:`'s own comment says it records the token "rather than silently
+dropping the constraint and widening the match", and #3348's says a dropped
+`icmp-type` "would leave the term UNCONSTRAINED ... a fail-open widening". A
+dangling keyword does precisely that: `term t1 protocol tcp destination-port`
+compiled to protocol-only, so an application written to match ONE port matched
+EVERY TCP port, and any policy permitting it widened with it.
+
+**Why the surrounding family missed it.** #3320 (malformed timeout), #3348
+(malformed icmp-type), #3352 (unrecognized leaf) and #6524 (trailing token on
+the application body) each instrument a MALFORMED VALUE. This shape has no value
+to be malformed — the defect is the ABSENCE of one — so none of their gates
+could see it. A cohort built around "instrument the bad value" has a blind spot
+at "there is no value", and that is worth checking for whenever a family of
+value-validators accumulates.
+
+**One guard, not eight `else` branches.** The check runs once before the switch,
+keyed on `valueTakingTermLeaves`. A per-arm `else` would have to be repeated for
+every future value-taking leaf, which is the duplication that drifts.
+
+**The set is pinned to the switch textually.** `valueTakingTermLeaves` is the
+arity contract, and a future leaf added to the switch WITHOUT being added to the
+set silently re-opens the fail-open — while every behavioural test still passes,
+because they can only exercise keywords someone remembered to list.
+`TestValueTakingTermLeavesCoversEveryConsumingArm6564` therefore scans the
+function's own source: every `case "<kw>":` arm whose body reads `keys[i+1]`
+must be a member, and the counts must match in both directions so the set cannot
+accumulate entries for leaves that no longer exist. It fails loudly if its own
+scan pattern stops matching, so it cannot rot into a vacuous pass. Same
+discipline as the #6588 no-arg statement registry.
+
+`IncompleteTermLeaves` is deliberately separate from `UnknownTermLeaves`: the
+keyword IS supported, so calling it an "unknown statement" would send the
+operator hunting a typo that is not there. Posture is the cohort's usual —
+strict on commit / commit-check, warn on the tolerant load / peer-sync path via
+the existing `lenientApplicationSpecs` (#2142) downgrade.
+
 REACHABILITY (honest bound): as with #6525, these compact spellings are
 hierarchical text ingest only — `load override` / `load merge` / the persisted
 config file / HA `SyncApply`. `set` cannot produce them and `display set`

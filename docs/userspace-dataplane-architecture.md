@@ -1431,8 +1431,13 @@ one, and NARROWS a global `deny` scoped `[dmz trust] -> untrust` to
 `dmz -> untrust`, so trust-sourced traffic the operator denied falls through to
 lower-precedence rules — a rolling-upgrade fail-OPEN. The version is now **4**
 and the two constants are pinned in lockstep (see *Config-snapshot protocol
-version* below), so a multi-zone scope can never reach a reader that would
-narrow it.
+version* below).
+
+**Corrected by #6650:** that closed the daemon<->LOCAL-helper skew only. The
+sentence this replaces claimed a multi-zone scope "can never reach a reader
+that would narrow it", and that was false for the CROSS-CHASSIS skew — which,
+on a product whose rolling upgrade means upgrading one chassis at a time, is
+the likelier of the two. See *Cross-chassis snapshot-protocol skew* below.
 
 `parse_policy_state` prefers the plural (falling back to `[singular]`) and
 resolves it at snapshot-build time into a `GlobalZoneScope` — `Any` for no
@@ -2181,6 +2186,72 @@ that reports agreement while the two sides disagree about the message.
 The invariant #5488 records is that **a compatibility extension which
 changes deny/reject COVERAGE must not be silently ignorable under an
 unchanged protocol version.**
+
+#### Cross-chassis snapshot-protocol skew (#6650)
+
+The gate above is node-local, and so is the version it reads. On a chassis
+cluster upgraded one node at a time, the fail-open simply moves:
+
+1. A runs a current daemon + helper; B has not been upgraded.
+2. The operator commits a multi-zone scoped global deny on A.
+3. **A's gate does not fire** — A's own helper is current — so the commit
+   succeeds and `pushCommittedConfigToPeer` ships the config **TEXT** to B.
+   `applyErrSkipsPeerSync` suppresses the push only when A's OWN gate fired.
+4. B recompiles that text with its older compiler, publishes to its older
+   helper, passes its own gate, and installs the deny scoped to the first
+   zone alone.
+5. The deny is enforced on A and not on B. On failover to B — or for any flow
+   B already owns — it is simply not enforced.
+
+B cannot defend itself: it is the old binary, and an old binary cannot be
+taught a shape it does not parse. **Only the sender can decline to push**, so
+the sender has to learn what the peer can represent, and nothing exchanged
+that: the heartbeat carries `HAProtocolVersion` and a free-form
+`SoftwareVersion`, and `cmd/xpfd protocol-versions` deliberately EXCLUDES the
+local one.
+
+**The exchange.** `syncMsgPeerCapabilities` advertises the sender's
+config-snapshot protocol version once per installed session-sync connection,
+beside the clock sync. It rides the session-sync channel rather than the
+heartbeat for three reasons: it is the SAME connection the config push goes
+over, so "peer reachable" and "peer capability known" share one lifecycle; the
+heartbeat's optional sections are located by back-indexing from a fixed-size
+auth trailer (the #6169 boot epoch sits at `len-68`), so a second tail section
+makes both readers' offsets depend on whether the other is present; and that
+epoch section requires a PSK, so an unkeyed cluster would get no advertisement
+at all. The message is ADDITIVE and carries NO version bump, following the
+#2239 DHCP-lease precedent — the receive switch has no default arm, so an old
+peer ignores the frame. Bumping `CurrentHAProtocolVersion` instead would make
+the #1930 INC-3 mixed-base gate falsely refuse SESSION sync across exactly the
+rolling upgrade this makes safe, converting a narrowing bug into an outage.
+
+**The gate.** `peerSnapshotProtocolCommitPreflight` (`pkg/daemon`) refuses the
+COMMIT — in the preflight closure, before the store promotes anything. Letting
+the local commit succeed and merely skipping the push would trade a narrowing
+for a DIVERGENCE: config-sync exists to keep the pair identical, and on
+failover the peer would enforce the other policy set.
+
+Four conditions must all hold to refuse, and each avoids a worse failure than
+the one prevented: clustered with config-sync on; a peer actually CONNECTED (a
+node whose peer is down must keep being able to commit — refusing would turn a
+peer outage into a config freeze); the config carries the misrepresentable
+shape, decided by the SAME predicate that arms the local gate
+(`userspace.ConfigHasMultiZoneScopedPolicy`, a wrapper, not a copy — two
+predicates would drift); and the peer's advertised version below the floor.
+
+An advertised **0 means INCAPABLE, not unknown**. A *connected* peer that
+advertises nothing runs a build predating #6650, which necessarily predates v4.
+The capability is cleared on full disconnect alongside `clockSynced`: it
+belongs to the peer INCARNATION that proved it, and the peer that reconnects
+may be an older process — which is the whole rolling-upgrade case.
+
+**The floor is `MinProtocolMultiZoneScopedPolicy` (an immutable 4), NOT
+`ProtocolVersion`.** The question is "can the peer represent THIS shape", and
+that answer stopped changing at v4. Keying on the shared constant would make
+every future unrelated wire bump retroactively refuse multi-zone commits across
+any skew — the defect open **#6648** describes in the local gates. This is the
+first per-feature floor in the tree; #6648 tracks giving the local gates the
+same treatment.
 
 **Why it is at 6.** #5619/#6691 added
 `InterfaceSnapshot.secure_tunnel`, and made it AUTHORITATIVE over AF_XDP

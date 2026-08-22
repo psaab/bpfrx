@@ -1298,6 +1298,18 @@ type Application struct {
 	// on the strict commit path / warns on the tolerant load / peer-sync path
 	// (#3352).
 	UnknownTermLeaves []string
+	// IncompleteTermLeaves records RECOGNIZED value-taking leaves inside an
+	// inline `term` that carried NO value — the keyword was the last token, so
+	// there was nothing to consume (#6564 member 9). parseApplicationTerms
+	// guards every consuming arm with `if i+1 < len(keys)` and has no else, and
+	// the `default:` arm that feeds UnknownTermLeaves is unreachable for a
+	// keyword the switch recognizes, so the constraint was dropped in silence
+	// and the term WIDENED — `term t1 protocol tcp destination-port` matched
+	// every TCP port. Distinct from UnknownTermLeaves because the keyword IS
+	// supported; only its value is missing, and the two are worded differently
+	// by validateApplicationSpecsStrict. Strict on commit / commit-check, warn
+	// on the tolerant load / peer-sync path (lenientApplicationSpecs, #2142).
+	IncompleteTermLeaves []string
 	// DuplicateTermLeaves records the names of single-valued (scalar) leaves
 	// (destination-port / source-port / inactivity-timeout / timeout / alg /
 	// icmp-type / icmp-code) that
