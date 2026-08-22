@@ -419,9 +419,12 @@ Two invariants hold this together:
   so a divergence between the two filters is always a bug. Single-sourcing the
   walk makes that divergence unrepresentable. This is also why the snapshot is
   framed verbatim: re-applying the coarser `ShouldSyncZone` filter on top of the
-  owner-RG one could drop an entry the incremental path admits (a fabric-redirect
-  wire alias, or a session whose owner RG this node holds but whose ingress zone
-  maps elsewhere), and that entry would then be deleted on the receiver.
+  owner-RG one could drop an entry the incremental path admits (a session whose
+  owner RG this node holds but whose ingress zone maps elsewhere), and that
+  entry would then be deleted on the receiver. Since #6599 a fabric-redirect
+  wire alias is no longer such an entry — that branch now applies
+  `ShouldSyncZone` itself — but the owner-RG example above is untouched, so the
+  verbatim framing is still what keeps the two paths' sets identical.
 - **Fail CLOSED.** If the snapshot source errors, `doBulkSync` returns the error
   and frames **no window at all** rather than falling back to the mirror walk. An
   incomplete authoritative window destroys live sessions; framing none merely
@@ -1711,11 +1714,49 @@ These deltas are **not** blindly mirrored. Filtering in
 `shouldSyncUserspaceDelta()`:
 
 - `local_delivery` disposition is never synced to the peer
-- `FabricRedirect` with `!FabricIngress`: always synced even if the local node
-  is no longer owner, because the peer needs the forward-wire alias to receive
-  redirected traffic. The daemon also synthesizes forward-wire alias session
-  keys via `userspaceForwardWireAliasFromDeltaV4/V6` so the new owner can
-  materialize the translated forward tuple it will receive over the fabric.
+- `missing_neighbor_seed` origin is never synced (a transient ARP-wait seed)
+- `FabricRedirect` with `!FabricIngress`: synced even though the local node is
+  not the owner of the session's `OwnerRGID`, because the peer needs the
+  forward-wire alias to receive redirected traffic. A fabric redirect means the
+  peer owns the flow's EGRESS side by construction, so running these deltas
+  through the owner-RG gate below would refuse every legitimate split-RG
+  handoff. The daemon also synthesizes forward-wire alias session keys via
+  `userspaceForwardWireAliasV4/V6` so the new owner can materialize the
+  translated forward tuple it will receive over the fabric.
+
+  **#6599 — the branch still requires INGRESS ownership.** It used to admit
+  every fabric-redirect delta unconditionally (`return ss != nil`), which made
+  it the emission channel for the transient-purge re-entry class. On a node
+  that is not the RG owner, a spoofed non-closing first packet carrying a
+  peer-owned flow's translated wire tuple drives
+  `should_keep_synced_hit_transient` -> `purge_translated_synced_hit`
+  (`userspace-dp/src/afxdp/session_glue/promote.rs`), which tears down this
+  node's replica of the peer's session family. The following packet
+  clean-misses and installs a fresh `ForwardFlow` whose resolution is a FABRIC
+  REDIRECT — precisely because this node does not own the RG, the same
+  condition that fired the purge. That Open (and the forward-wire alias emitted
+  alongside it) reached `QueueSessionV4` with a fresh #2170 install generation
+  and overwrote the owner's authoritative session family under
+  latest-generation-wins, swapping the victim's mid-flow translation.
+
+  The fence is ownership of the INGRESS side: `ShouldSyncZone(ingressZone)` —
+  the same predicate the non-fabric fallback below already uses. A node may
+  hand a flow off over the fabric only when it is primary for the RG the flow's
+  ingress zone belongs to, i.e. only when it actually owns the traffic it is
+  handing off. The split-RG handoff (ingress RG local, egress RG the peer's)
+  still syncs; a node that owns NEITHER side of a flow can no longer install
+  anything on the peer. Regression coverage:
+  `TestShouldSyncUserspaceDeltaFabricRedirectRequiresIngressOwnership6599` and
+  `TestWalkUserspaceSessionDeltasDropsUnownedFabricRedirect6599` in
+  `pkg/daemon` — the second binds the WALK, so the suppressed delta is proved
+  to contribute zero sessions, forward-wire alias included.
+
+  Residual (unchanged by #6599, tracked with the #6461 Phase-2 identity work):
+  the deltas that survive this gate still carry no per-flow provenance, so an
+  Open cannot prove which incarnation of a tuple it belongs to. A spoofed
+  packet arriving on an ingress zone the node DOES own still fabricates a
+  session on the victim's tuple; the ingress gate removes the unowned-emitter
+  channel, not the identity-carriage gap.
 - if the delta carries `OwnerRGID`, ownership is checked with `IsPrimaryForRGFn`
 - otherwise the fallback is `ShouldSyncZone(ingressZone)`
 

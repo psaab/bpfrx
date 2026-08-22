@@ -46,8 +46,40 @@ func (d *Daemon) shouldSyncUserspaceDelta(ss *cluster.SessionSync, delta dpusers
 		slog.Debug("userspace delta: filtered (missing_neighbor_seed)", "src", delta.SrcIP, "dst", delta.DstIP)
 		return false
 	}
+	// A fabric redirect means the PEER owns the flow's egress side, so
+	// delta.OwnerRGID names an RG this node is by construction not primary
+	// for. Judging the delta by the owner-RG gate below would therefore refuse
+	// every legitimate split-RG handoff (a flow that ingresses on an RG this
+	// node owns and leaves via an RG the peer owns), which is why this branch
+	// exists at all.
+	//
+	// #6599: it used to bypass ownership ENTIRELY (`return ss != nil`), which
+	// made it the emission channel for the transient-purge re-entry class. On a
+	// node that is not the RG owner, a spoofed first packet carrying a
+	// peer-owned flow's translated wire tuple drives
+	// should_keep_synced_hit_transient -> purge_translated_synced_hit
+	// (userspace-dp/src/afxdp/session_glue/promote.rs); the following packet
+	// clean-misses and installs a fresh ForwardFlow whose resolution is a
+	// FABRIC REDIRECT — precisely because this node does not own the RG, the
+	// same condition that fired the purge. The Open delta (and the forward-wire
+	// alias the walk emits alongside it) then reached QueueSessionV4 with a
+	// fresh #2170 install generation and overwrote the owner's authoritative
+	// session family under latest-generation-wins.
+	//
+	// The fence is ownership of the INGRESS side: sync the handoff only when
+	// this node is primary for the RG the flow's ingress zone belongs to, i.e.
+	// only when it actually owns the traffic it is handing off. That keeps the
+	// split-RG handoff (ingress RG is local) and drops the fabrication (ingress
+	// RG is the peer's — a node that owns neither side of the flow has no
+	// authority to install anything on the peer). ShouldSyncZone is the same
+	// predicate the non-fabric fallback below already uses, so the two branches
+	// now agree on what "this node owns this flow's ingress" means.
 	if delta.FabricRedirect && !delta.FabricIngress {
-		return ss != nil
+		ok := ss != nil && ss.ShouldSyncZone(ingressZone)
+		if !ok {
+			slog.Debug("userspace delta: filtered (fabric redirect from a zone this node does not own)", "zone", ingressZone, "rg", delta.OwnerRGID, "src", delta.SrcIP, "dst", delta.DstIP)
+		}
+		return ok
 	}
 	if delta.OwnerRGID > 0 && ss != nil && ss.IsPrimaryForRGFn != nil {
 		ok := ss.IsPrimaryForRGFn(delta.OwnerRGID)
