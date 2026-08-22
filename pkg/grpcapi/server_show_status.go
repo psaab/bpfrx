@@ -14,6 +14,8 @@ import (
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
@@ -200,14 +202,24 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest
 		if err != nil {
 			return nil, diagExecError("running ps", err)
 		}
-		buf.Write(out)
+		// #6584: guarded even though this text is root-controlled rather than
+		// device-originated. GetSystemInfo forks FOUR binaries from one
+		// function, so leaving three raw would let the guarded one vouch for
+		// them under any function-granularity check — the half-applied-sweep
+		// shape #6579 shipped.
+		buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 
 	case "storage":
 		out, err := outputTimeout(ctx, "df", "-h")
 		if err != nil {
 			return nil, diagExecError("running df", err)
 		}
-		buf.Write(out)
+		// #6584: guarded even though this text is root-controlled rather than
+		// device-originated. GetSystemInfo forks FOUR binaries from one
+		// function, so leaving three raw would let the guarded one vouch for
+		// them under any function-granularity check — the half-applied-sweep
+		// shape #6579 shipped.
+		buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 
 	case "arp":
 		neighbors, err := netlink.NeighList(0, netlink.FAMILY_V4)
@@ -252,14 +264,21 @@ func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest
 		if err != nil {
 			return nil, diagExecError("running journalctl", err)
 		}
-		buf.Write(out)
+		// #6584 sweep: same journald text as ShowText{log}; not named in the
+		// issue.
+		buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 
 	case "connections":
 		out, err := outputTimeout(ctx, "ss", "-tnp")
 		if err != nil {
 			return nil, diagExecError("running ss", err)
 		}
-		buf.Write(out)
+		// #6584: guarded even though this text is root-controlled rather than
+		// device-originated. GetSystemInfo forks FOUR binaries from one
+		// function, so leaving three raw would let the guarded one vouch for
+		// them under any function-granularity check — the half-applied-sweep
+		// shape #6579 shipped.
+		buf.WriteString(termsafe.SanitizeBlockForDisplay(string(out)))
 
 	case "users":
 		cfg := s.store.ActiveConfig()
