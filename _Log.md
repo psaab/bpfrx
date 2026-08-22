@@ -101847,3 +101847,13 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_security.go,
     pkg/config/schema_validators_network.go,
     pkg/config/silent_drop_strict_6564_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6564 member 9 — a recognized value-taking `term` keyword with no
+    value was silently dropped, widening the application match. Recorded as
+    IncompleteTermLeaves; strict gate rejects, tolerant path warns. Added a
+    source-scanning drift pin binding valueTakingTermLeaves to the switch.
+  - **File(s)**: pkg/config/compiler_applications.go, pkg/config/types_security.go,
+    pkg/config/compiler_validate_strict_application.go,
+    pkg/config/dangling_term_keyword_6564_test.go,
+    pkg/config/testdata/golden_4406.json, docs/config-schema.md
