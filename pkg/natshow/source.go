@@ -56,6 +56,12 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 	}
 
 	noteSessionScanError(w, scanErr)
+	// #6534: the aggregate pool-cardinality budget is a per-CONFIG walk, so
+	// hoist it out of the rule loop. The builder
+	// (buildSourceNATSnapshots) hoists the identical call for the identical
+	// reason; SourceNATPoolDisarmedReason composes it with the pool's own
+	// definition verdict in the builder's precedence order.
+	overBudgetPools := config.SourceNATAggregateOverBudgetPools(cfg)
 	ruleIdx := 0
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
@@ -84,6 +90,17 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 				fmt.Fprintf(w, "      IP protocol:           %s\n", strings.Join(protos, " "))
 			}
 			fmt.Fprintf(w, "    Action:                  %s\n", action)
+			// #6534: a pool-mode rule whose pool the builder marks unusable
+			// ships PoolUnusable=true and the Rust source-NAT path declines to
+			// translate — but every field above rendered from config as if the
+			// rule were armed. Interface-mode NAT has no pool, so gate on a
+			// non-empty pool name exactly as the builder does.
+			if rule.Then.PoolName != "" {
+				noteNotInstalled(w, config.SourceNATDisarmReasonText(
+					config.SourceNATPoolDisarmedReason(
+						cfg.Security.NAT.SourcePools[rule.Then.PoolName],
+						rule.Then.PoolName, overBudgetPools)))
+			}
 
 			if rule.Then.PoolName != "" && cfg.Security.NAT.SourcePools != nil {
 				if pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; ok {

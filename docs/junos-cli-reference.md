@@ -1383,6 +1383,38 @@ its logging/inversion intent (#3684):
 
 ---
 
+## Security: NAT rules the dataplane does not install (#6534)
+
+Every `show security nat ...` topic renders rules from the committed
+configuration. A rule the userspace snapshot builder DROPS or DISARMS —
+because it is not representable and must fail closed — would otherwise
+render identically to an enforced one, so those rules carry an extra
+line:
+
+```
+source NAT rule: r1
+  Rule-set: rs1                        ID: 1
+    From zone: trust    To zone: untrust
+    Match:
+      Source addresses:      10.0.0.0/24
+      Destination addresses: 0.0.0.0/0
+    Action:                  pool nope
+    Status:                  NOT INSTALLED — references an undefined pool
+    Number of sessions:      0
+```
+
+The annotation appears on `show security nat source rule detail`,
+`destination rule detail`, `static [rule [detail]]`, and `nptv6`. It is
+emitted ONLY for a rule the dataplane is not enforcing, so output for a
+healthy configuration is unchanged.
+
+Reachability: the strict commit gates reject these configurations, so a
+rule cannot reach this state through `commit`. It reaches it through the
+lenient boot / HA peer-sync load path (#1960 no-brick) — a configuration
+persisted by an older binary, or synced from a peer. Seeing this line
+means the box is forwarding that traffic untranslated right now; the
+reason text names which condition fired.
+
 ## Security: NAT Source Rule All
 
 **Command:** `show security nat source rule all`

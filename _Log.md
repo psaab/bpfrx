@@ -1,3 +1,36 @@
+## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
+
+- **Timestamp**: 2026-08-21
+- **Action**: Closed the NAT family of #6534, where a rule the userspace
+  snapshot builder drops or disarms still rendered on every `show
+  security nat` surface exactly like an enforced one. Extracted the four
+  drop predicates into `pkg/config` as shared exported functions and made
+  BOTH the snapshot builder and the `pkg/natshow` renderers read them, so
+  the two cannot disagree about which rules are armed; excluded rules now
+  carry a `Status: NOT INSTALLED — <reason>` line naming the condition
+  that fired.
+  Deliberately NOT the applied-set readback the issue prescribed: all of
+  these exclusions are decided by the Go builder at snapshot-build time
+  as a deterministic function of the committed config, so there is no
+  runtime fact to read back, and `AppliedNATView` returns the applied
+  CONFIG rather than the applied SNAPSHOT — it does not carry the drop
+  bit. The missing thing was the predicate, not a data path.
+  Output for a healthy configuration is byte-identical, so the existing
+  CLI/gRPC golden tests keep asserting the same bytes.
+  Validation: `go test -count=1` green on pkg/natshow, pkg/config,
+  pkg/dataplane/userspace, pkg/cli, pkg/grpcapi; `go vet` clean on the
+  three touched packages (0 diagnostics); 6-cell mutation matrix all red
+  with vet clean at each mutated state, control and restored both green.
+  Reverting either half of the agreement — a renderer annotation or a
+  builder guard — reds and names the site.
+- **File(s)**: pkg/config/nat_exclusion_reason.go,
+  pkg/dataplane/userspace/nat_static.go,
+  pkg/dataplane/userspace/nat_destination.go,
+  pkg/dataplane/userspace/nat_exclusion_agreement_6534_test.go,
+  pkg/natshow/natshow.go, pkg/natshow/source.go, pkg/natshow/dest.go,
+  pkg/natshow/static.go, docs/engineering-style.md,
+  docs/junos-cli-reference.md, _Log.md
+
 ## 2026-08-22 — #6504 signed latest.json channel pointer gets a consumer
 
 - **Timestamp**: 2026-08-22
