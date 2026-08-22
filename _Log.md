@@ -1,3 +1,31 @@
+## 2026-08-21 — #6558 ACK watermark held behind the pending-apply queue
+
+- **Timestamp**: 2026-08-21
+- **Action**: The event stream ACKed past queued-but-unapplied deltas — but
+  NOT by the mechanism the issue states. The normal path is already
+  receive→apply→ACK; the real window is that `dispatchOrQueue*` returns
+  true after an ENQUEUE, so the reader keeps reading while frames sit
+  unapplied, and all five refusal paths advanced `lastAppliedSeq` with no
+  pending-queue check. Added `applyRefusedFrameInOrder`: a refusal landing
+  on a non-empty queue enters it as a dropped marker and its watermark
+  advance happens in FIFO order; on an empty queue the advance is
+  immediate as before, so #6130's loop-break is intact. Made
+  `markFrameApplied` monotonic (was a bare Store, so an in-order flush
+  could rewind the watermark below a drop-path jump — silently swallowed
+  by `sendAckIfNeeded`'s `applied <= acked` guard and able to regress
+  `SendDrainRequest`'s fence). GO-ONLY: no Rust `userspace-dp` change, no
+  `userspace-xdp` shim `.o` movement, no `make generate` — the helper side
+  is already correct and fail-closed.
+  Mutation matrix: S1 (pre-fix unconditional advance) and S2 (never
+  advance while queued) → the core probe reds; S4 (bare Store) → the
+  monotonic test reds; S6 (marker type collides with a live frame type)
+  → the collision invariant reds. S3 (always queue the marker, even when
+  empty) and S5 (flush ignores the marker, falling through to the
+  pre-existing `default:` arm) are GREEN and disclosed as extensionally
+  equivalent variants, not holes.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_ack_behind_pending_6558_test.go,
+  docs/session-sync-architecture.md
 ## 2026-08-21 — #6553 gRPC NAT conntrack-walk admission + port-formula SSOT
 
 - **Timestamp**: 2026-08-21
