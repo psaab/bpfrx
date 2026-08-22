@@ -201,4 +201,20 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"occurred (#1807, extends #1790).",
 		nil, nil,
 	)
+	c.userspaceSharedSessionPoisonRecoveries = prometheus.NewDesc(
+		"xpf_userspace_shared_session_poison_recoveries_total",
+		"Shared-session mutex poison recoveries across every "+
+			"shared-session and owner-RG-index site (publish, remove, "+
+			"lookups, index maintenance, and the #5154 HA import "+
+			"generation-guard reads). A poisoned mutex means a worker "+
+			"thread panicked while holding the lock; recovery keeps the "+
+			"committed map and clears the poison, so HA promotion "+
+			"proceeds with the EXISTING synced sessions instead of "+
+			"treating the table as empty and dropping every one of them "+
+			"at failover (#2402). A nonzero value indicates a contained "+
+			"worker panic (#925 supervisor) that HA state survived; the "+
+			"recovery is self-healing, so this counter is the only "+
+			"durable record of it (#6641).",
+		nil, nil,
+	)
 }
