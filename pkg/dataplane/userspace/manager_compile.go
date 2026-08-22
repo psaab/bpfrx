@@ -530,16 +530,33 @@ func (m *Manager) applyCompiledSnapshot(
 //
 // When mapsMutatedInPlace is true the caller took the samePlanRefresh path: the
 // ingress/local/interface-NAT classifier BPF maps were mutated IN PLACE to the
-// new plan while the XDP shim's ctrl gate is still enabled. If the helper then
-// REJECTS the snapshot (helper-side validation failure, or any transport error)
-// it keeps enforcing the previous-good snapshot, so returning the error while
-// leaving ctrl enabled would run the shim against classifier maps a generation
-// ahead of the applied Rust snapshot — wrong kernel-pass vs XSK-redirect and
-// wrong local-vs-interface-NAT ownership, a fail-OPEN security/availability
-// mismatch instead of the intended previous-good retention. On that path a
-// publish error disables ctrl (failClosedUserspaceCtrlMapLocked) so transit
-// drops to the kernel-only fail-closed posture until a subsequent good commit
-// re-publishes and re-enables it.
+// new plan while the XDP shim's ctrl gate is still enabled. Returning a publish
+// error while leaving ctrl enabled would run the shim against classifier maps a
+// generation ahead of the snapshot the helper is actually enforcing — wrong
+// kernel-pass vs XSK-redirect and wrong local-vs-interface-NAT ownership, a
+// fail-OPEN security/availability mismatch instead of the intended
+// previous-good retention.
+//
+// #7468 splits that response by ERROR CLASS, and an earlier revision of this
+// comment is why it had to: it said the helper "keeps enforcing the
+// previous-good snapshot" on a "helper-side validation failure, OR ANY
+// TRANSPORT ERROR". The second half is false. controlRoundtripDeadline exists
+// because a fixed 3s deadline "reported the apply FAILED while the dataplane
+// had applied it live" — on a transport failure the helper's state is unknown,
+// and it may be enforcing the NEW snapshot. The uniform ctrl-disable was
+// correct precisely because it never relied on that sentence.
+//
+//   - IN-BAND REFUSAL (errHelperRejected): the helper decoded the request, ran
+//     its non-mutating integrity preflight and answered {"ok":false}. Only here
+//     does "the helper still holds m.lastSnapshot" follow. The maps are rolled
+//     BACK to m.lastSnapshot, which restores the exact plan the retained
+//     snapshot expects, so ctrl stays enabled and there is no window in which
+//     neither snapshot forwards transit (#6707 acceptance criterion 1). If the
+//     rollback itself fails the ctrl-disable is the fallback.
+//   - ANY OTHER ERROR: helper state unknown, so the pre-#7468 behaviour stands
+//     — disable ctrl (failClosedUserspaceCtrlMapLocked) and drop transit to the
+//     kernel-only fail-closed posture until a subsequent good commit
+//     re-publishes and re-enables it.
 //
 // When mapsMutatedInPlace is false the caller took the full bootstrap path,
 // which already programmed ctrl.Enabled=0 before this publish, so a publish
@@ -547,8 +564,20 @@ func (m *Manager) applyCompiledSnapshot(
 func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, status *ProcessStatus, mapsMutatedInPlace bool) error {
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: publishSnap}, status); err != nil {
 		publishErr := fmt.Errorf("publish userspace snapshot: %w", err)
+		// #7468: a rejected publish must never return with the manager lacking
+		// a reconcile worker. On the samePlanRefresh path the loop is already
+		// running and this is a no-op; on a FIRST apply the normal
+		// ensureStatusLoopLocked() call is further down applyCompiledSnapshot,
+		// past this return, so without it the manager is left inert — no status
+		// tick, no classifier re-sync, no retry-debt consumer — with transit
+		// dropped until the operator commits again. The loop cannot re-enable
+		// ctrl behind a rejected first snapshot: the helper holds no snapshot,
+		// so it reports no bindings, and status.enabled is
+		// `!bindings.is_empty() && ...` (userspace-dp status.rs), which
+		// resolveCtrlEnableLocked requires before it will arm.
+		m.ensureStatusLoopLocked()
 		if mapsMutatedInPlace {
-			return m.failClosedUserspaceCtrlMapLocked(publishSnap, publishErr)
+			return m.retainPreviousClassifierPlanLocked(publishSnap, publishErr)
 		}
 		return publishErr
 	}
@@ -561,6 +590,55 @@ func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, s
 		m.seedNeighborReplaceGenerationLocked(status.ManagerNeighborGeneration)
 	}
 	return nil
+}
+
+// classifierPlanRetainable reports whether a rejected in-place publish may roll
+// the classifier maps BACK to the retained snapshot instead of disabling ctrl.
+//
+// Pure, and separate from the action, because all three conjuncts are load
+// bearing and each fails differently:
+//
+//   - mapsMutatedInPlace: on the bootstrap path the maps were never rewritten
+//     to the new plan and ctrl is already 0, so there is nothing to roll back
+//     and nothing to keep enabled.
+//   - retained != nil: a first apply has no previous-good plan to restore. A
+//     rollback against nil would clear the classifier maps and, with ctrl left
+//     enabled, hand transit to the kernel — the fail-open this whole path
+//     exists to prevent.
+//   - errors.Is(cause, errHelperRejected): ONLY an in-band {"ok":false} proves
+//     the helper still holds `retained`. On a transport error it may already be
+//     enforcing the new snapshot, and rolling the maps back would put them a
+//     generation BEHIND — the same fail-open with the sign flipped.
+func classifierPlanRetainable(mapsMutatedInPlace bool, retained *ConfigSnapshot, cause error) bool {
+	return mapsMutatedInPlace && retained != nil && errors.Is(cause, errHelperRejected)
+}
+
+// retainPreviousClassifierPlanLocked performs the #7468 atomic retain, or falls
+// back to the #4959 ctrl-disable.
+//
+// cause is returned either way: the publish still failed and the caller must
+// still fail the apply. What changes is whether transit keeps flowing on the
+// snapshot the helper retained, or drops to kernel-only until the next tick.
+func (m *Manager) retainPreviousClassifierPlanLocked(publishSnap *ConfigSnapshot, cause error) error {
+	if !classifierPlanRetainable(true, m.lastSnapshot, cause) {
+		return m.failClosedUserspaceCtrlMapLocked(publishSnap, cause)
+	}
+	if err := m.syncUserspaceClassifierMapsLocked(m.lastSnapshot); err != nil {
+		// The maps are now in an unknown mix of the two plans, which is
+		// strictly worse than either. Disable ctrl and surface both errors —
+		// the rollback failure is the actionable one.
+		return m.failClosedUserspaceCtrlMapLocked(
+			publishSnap,
+			errors.Join(cause, fmt.Errorf("roll classifier maps back to the retained snapshot: %w", err)),
+		)
+	}
+	slog.Warn(
+		"userspace: helper refused the snapshot; classifier maps rolled back to the retained snapshot and transit continues on it",
+		"retained_generation", m.lastSnapshot.Generation,
+		"refused_generation", publishSnap.Generation,
+		"err", cause,
+	)
+	return cause
 }
 
 // rebuildScheduledPolicySectionsLocked rebuilds the policy + address-book
