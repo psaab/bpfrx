@@ -441,7 +441,11 @@ cluster-scoped.
   channel) in `drain_channel_into_write_buf()`. The cap is checked at the
   top of the drain loop, so the effective bound is `cap + one max
   EventFrame` (≤ 256 B) — the in-flight frame already pulled may carry
-  the backlog just past 16 MiB before the drain halts. A wedged daemon
+  the backlog just past 16 MiB before the drain halts. **Every producer
+  into `write_buf` is subject to the cap, the idle keepalive included
+  (#5189 A1-b10-F4)** — see the keepalive bullet below; before #5189 the
+  keepalive was the one unchecked producer and the `cap + one frame`
+  bound above was false. A wedged daemon
   (socket open but not
   reading → `write_buf` writes return `WouldBlock`) would otherwise let
   the I/O thread migrate the whole channel into the heap-backed
@@ -512,6 +516,29 @@ cluster-scoped.
   consumer is still caught by the normal socket-error / EOF path. The keepalive
   interval is `KEEPALIVE_IDLE_INTERVAL` (10s), passed into `run_connected_loop`
   (injectable so tests can fire it immediately).
+- **The keepalive obeys the write-backlog cap (#5189 A1-b10-F4).** Routing the
+  keepalive into `write_buf` (#2883) made it a PRODUCER into the backlog, and it
+  was the only producer that did not check `WRITE_BACKLOG_MAX_BYTES` — that cap
+  was enforced solely in `drain_channel_into_write_buf`. The two conditions
+  compose badly: a live-but-non-reading consumer stalls the drain AT the cap,
+  which keeps `drained_any == false` forever, which is exactly what arms the
+  idle keepalive; and the socket write returns `WouldBlock` forever, so
+  `advance` is never called and nothing reclaims the appended bytes. The backlog
+  therefore grew by one `FRAME_HEADER_SIZE` frame per keepalive interval,
+  monotonically and without bound. The growth RATE is slow (8 B / 10 s ≈ 25 MB
+  per year of continuous stall), so this was never a near-term OOM — but it is
+  unbounded, and it falsified the `cap + one max EventFrame` ceiling the section
+  above states. `append_idle_keepalive_if_due` now declines the append while
+  `write_buf.pending_len() >= WRITE_BACKLOG_MAX_BYTES` (the same UNWRITTEN-bytes
+  measure #4974 established for every other backpressure decision). Nothing is
+  lost: a backlog at the cap already holds ≥ 16 MiB of unwritten frames, so
+  pending DATA supplies all the liveness the keepalive exists to signal. A
+  suppressed attempt deliberately does NOT re-arm `last_write`, so the keepalive
+  stays due and fires on the first cycle after the backlog drains below the cap
+  rather than waiting out another full interval. Regression gates:
+  `idle_keepalive_stops_at_the_write_backlog_cap_5189` (pins the boundary — the
+  call with one frame of headroom must still append, only the crossing one is
+  suppressed) and `suppressed_idle_keepalive_does_not_rearm_the_interval_5189`.
 - **Replay/drain writes are nonblocking + stop-aware (#2877).** The reconnect
   replay (`replay_buffered`) and demotion drain (`handle_drain_request`) paths
   push frames through `write_all_backpressured`, which keeps the socket

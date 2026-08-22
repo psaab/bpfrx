@@ -1268,136 +1268,21 @@ pub(crate) fn worker_loop(
             if elapsed >= DBG_REPORT_INTERVAL_NS {
                 #[cfg(feature = "debug-log")]
                 let session_count = sessions.len();
-                let mut binding_summary = String::new();
-                for (i, b) in bindings.iter().enumerate() {
-                    use std::fmt::Write;
-                    let fill_pending = b.xsk.device.pending();
-                    let rx_avail = b.xsk.rx.available_relaxed();
-                    let xsk_stats = b.xsk.device.statistics_v2().ok();
-                    let inflight_recycles = b.tx_pipeline.in_flight_prepared_recycles.len() as u32;
-                    let scratch_recycle_len = b.scratch.scratch_recycle.len() as u32;
-                    let ptx_prepared = b.tx_pipeline.pending_tx_prepared.len() as u32;
-                    let ptx_local = b.tx_pipeline.pending_tx_local.len() as u32;
-                    let total_accounted = b.tx_pipeline.pending_fill_frames.len() as u32
-                        + fill_pending
-                        + rx_avail
-                        + b.tx_pipeline.free_tx_frames.len() as u32
-                        + b.tx_pipeline.outstanding_tx
-                        + inflight_recycles
-                        + scratch_recycle_len
-                        + ptx_prepared; // prepared TX holds UMEM frames
-                    let expected_total = b.umem.total_frames();
-                    let _ = write!(
-                        binding_summary,
-                        " [{}:if{}q{} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} scr={} ptxp={} ptxl={} total={}/{} fill_ok={} polls={} bp={} rx_empty={} wake={}",
-                        i,
-                        b.ifindex,
-                        b.queue_id,
-                        b.tx_pipeline.pending_fill_frames.len(),
-                        fill_pending,
-                        rx_avail,
-                        b.tx_pipeline.free_tx_frames.len(),
-                        b.tx_pipeline.outstanding_tx,
-                        inflight_recycles,
-                        scratch_recycle_len,
-                        ptx_prepared,
-                        ptx_local,
-                        total_accounted,
-                        expected_total,
-                        b.telemetry.dbg_fill_submitted,
-                        b.telemetry.dbg_poll_cycles,
-                        b.telemetry.dbg_backpressure,
-                        b.telemetry.dbg_rx_empty,
-                        b.telemetry.dbg_rx_wakeups,
-                    );
-                    // TX pipeline debug counters
-                    #[cfg(feature = "debug-log")]
-                    {
-                        dbg.tx_tcp_rst += b.telemetry.dbg_tx_tcp_rst;
-                    }
-                    let _ = write!(
-                        binding_summary,
-                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/bp_overflow={}/cos_overflow={}",
-                        b.telemetry.dbg_tx_ring_submitted,
-                        b.telemetry.dbg_tx_ring_full,
-                        b.telemetry.dbg_completions_reaped,
-                        b.telemetry.dbg_sendto_calls,
-                        b.telemetry.dbg_sendto_err,
-                        b.telemetry.dbg_sendto_eagain,
-                        b.telemetry.dbg_sendto_enobufs,
-                        b.telemetry.dbg_bound_pending_overflow,
-                        b.telemetry.dbg_cos_queue_overflow,
-                    );
-                    #[cfg(feature = "debug-log")]
-                    let _ = write!(binding_summary, "/rst={}", b.telemetry.dbg_tx_tcp_rst);
-                    if let Some(s) = xsk_stats {
-                        let _ = write!(
-                            binding_summary,
-                            " xsk:drop={}/inv={}/rfull={}/fempty={}/tinv={}/tempty={}",
-                            s.rx_dropped,
-                            s.rx_invalid_descs,
-                            s.rx_ring_full,
-                            s.rx_fill_ring_empty_descs,
-                            s.tx_invalid_descs,
-                            s.tx_ring_empty_descs,
-                        );
-                    }
-                    // Socket error check (SO_ERROR) — detect kernel-side errors
-                    {
-                        let fd = b.xsk.rx.as_raw_fd();
-                        let mut so_err: c_int = 0;
-                        let mut so_err_len: libc::socklen_t = core::mem::size_of::<c_int>() as _;
-                        let rc = unsafe {
-                            libc::getsockopt(
-                                fd,
-                                libc::SOL_SOCKET,
-                                libc::SO_ERROR,
-                                &mut so_err as *mut c_int as *mut c_void,
-                                &mut so_err_len,
-                            )
-                        };
-                        if rc == 0 && so_err != 0 {
-                            let _ = write!(binding_summary, " SO_ERR={so_err}");
-                        }
-                    }
-                    // Ring diagnostics from xsk_ffi API
-                    if cfg!(feature = "debug-log") {
-                        let _ = write!(
-                            binding_summary,
-                            " RING:rx_nz={}/rx_max={}/fill_pend={}/dev_avail={} RX_WAKE:ok={}/err={}/errno={}",
-                            b.telemetry.dbg_rx_avail_nonzero,
-                            b.telemetry.dbg_rx_avail_max,
-                            b.telemetry.dbg_fill_pending,
-                            b.telemetry.dbg_device_avail,
-                            b.telemetry.dbg_rx_wake_sendto_ok,
-                            b.telemetry.dbg_rx_wake_sendto_err,
-                            b.telemetry.dbg_rx_wake_sendto_errno,
-                        );
-                        // Direct mmap diagnosis: read raw ring producer/consumer
-                        if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) =
-                            diagnose_raw_ring_state(b.xsk.rx.as_raw_fd())
-                        {
-                            let _ = write!(
-                                binding_summary,
-                                " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
-                            );
-                        }
-                    }
-                    // Frame leak detection
-                    if total_accounted != expected_total {
-                        let _ = write!(
-                            binding_summary,
-                            " FRAME_LEAK:{}",
-                            expected_total as i64 - total_accounted as i64,
-                        );
-                    }
-                    binding_summary.push(']');
-                }
+                // #5189 (A1-b8-F5): the per-binding diagnostics string is built
+                // ONLY under `debug-log`. It used to be built unconditionally —
+                // a `String` + per-binding `statistics_v2()` and `SO_ERROR`
+                // getsockopt syscalls every ~1 s per worker in release builds,
+                // where the only consumer (`emit_periodic_report`) is compiled
+                // out. Release health is published as fixed scalar atomics by
+                // the always-on `BindingLiveState` loop below (#802/#878).
+                #[cfg(feature = "debug-log")]
+                let binding_summary = debug_report::build_binding_summary(&bindings, &mut dbg);
                 // #1776: the cfg(debug-log) verbose per-second report —
                 // the giant DBG summary eprintln + degraded-path dump —
                 // lives in debug_report.rs. Release builds skip it, as
-                // before (the eprintln was already cfg-gated; the
-                // always-on binding_summary build above is unchanged).
+                // before. #5189 (A1-b8-F5) moved the `binding_summary`
+                // build that feeds it into the same gated module, so a
+                // release build no longer pays for a string nothing reads.
                 #[cfg(feature = "debug-log")]
                 debug_report::emit_periodic_report(
                     worker_id,

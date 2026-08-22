@@ -319,6 +319,58 @@
   pkg/cli/show_services_ddns.go, pkg/cli/cli_residual_escape_6468_test.go,
   _Log.md
 
+## 2026-08-21 — #5189 A1-b8-F5 + A1-b10-F4: two ungated warmed-path costs
+
+- **Timestamp**: 2026-08-21 (fix/5189-cohort)
+- **Action**: Gated the worker report tick's diagnostics build behind
+  `debug-log`, and made the event-stream idle keepalive obey
+  `WRITE_BACKLOG_MAX_BYTES`. Swept all six items of the #5189 cohort
+  firsthand first; all six are LIVE, four are deferred to a successor
+  issue because they need design decisions.
+
+  **A1-b8-F5.** #1776 moved the ~1 s report tick's `eprintln!` into the
+  `#[cfg(feature = "debug-log")]` module `debug_report` but deliberately
+  left the `binding_summary` BUILD inline and ungated — its own module
+  header documented that partition. So a release build paid, per worker
+  per second: a heap `String` plus every `write!` that grows it, one
+  `statistics_v2()` (`XDP_STATISTICS` `getsockopt`) per binding, and one
+  `getsockopt(SO_ERROR)` per binding, for a value whose only consumer was
+  compiled out. The build is now `debug_report::build_binding_summary`,
+  called from a `#[cfg(feature = "debug-log")]` binding — so the module
+  gate makes it a COMPILE-TIME guarantee, not a runtime branch. The
+  report tick's always-on half is untouched: the `BindingLiveState`
+  publish loop still stores the ring-pressure counters, its own
+  `rx_fill_ring_empty_descs` sample, `outstanding_tx` and
+  `umem_inflight_frames` as fixed scalar atomics (#802/#878) — those are
+  what operators actually read.
+
+  **A1-b10-F4.** #2883 routed the idle keepalive through `write_buf` so a
+  `WouldBlock` is backpressure rather than a fatal reconnect. That made
+  the keepalive a PRODUCER into the backlog, and it was the only producer
+  that did not check `WRITE_BACKLOG_MAX_BYTES` — the cap lived solely in
+  `drain_channel_into_write_buf`. The two conditions compose: a
+  live-but-non-reading consumer stalls the drain AT the cap, which keeps
+  `drained_any == false` forever, which is exactly what arms the idle
+  keepalive; and the socket write returns `WouldBlock` forever, so
+  `advance` never reclaims. The backlog grew by one frame header per
+  keepalive interval, monotonically and without bound. The RATE is slow
+  (8 B / 10 s), so this was never a near-term OOM — but it is unbounded,
+  and it falsified the README's stated `cap + one max EventFrame` ceiling
+  and its bolded "a stuck consumer degrades telemetry, nothing else"
+  invariant. `append_idle_keepalive_if_due` now declines while
+  `pending_len() >= WRITE_BACKLOG_MAX_BYTES`, and deliberately does NOT
+  re-arm `last_write` when it declines, so the keepalive fires on the
+  first cycle after the backlog drains rather than waiting out another
+  interval.
+
+- **File(s)**: `userspace-dp/src/afxdp/worker/loop_body/mod.rs`,
+  `userspace-dp/src/afxdp/worker/loop_body/debug_report.rs`,
+  `userspace-dp/src/afxdp/worker/README.md`,
+  `userspace-dp/src/event_stream/connection.rs`,
+  `userspace-dp/src/event_stream/README.md`,
+  `userspace-dp/src/event_stream/tests/backpressure.rs`,
+  `userspace-dp/src/server/tests.rs`
+
 ## 2026-08-21 — #5797: a syslog selector for a facility the client never emits filtered every record it did
 
 - **Timestamp**: 2026-08-21 (fix/5797-syslog-selector-facility)
@@ -98975,6 +99027,69 @@ prose edit above them added. No diff falls in the new test body.
   Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no cluster
   smoke is owed.
 - **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
+
+## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
+
+- **Timestamp**: 2026-08-21
+- **Action**: Add the #5618 commit-time advisory that a WireGuard tunnel's
+  decapsulated plaintext is NOT evaluated against xpf security policies, and
+  record BOTH tunnel-plaintext adjudication gaps (#5618 WireGuard, #5619
+  IPsec) in `docs/userspace-dataplane-gaps.md`.
+
+  Reason: the XDP shim steers inbound WireGuard transport to the kernel
+  (#5582) and the helper's WG control thread writes the decrypted inner
+  packet straight to the `wgN` TUN
+  (`slowpath::write_packet_nonblocking`, wg_control/dispatch.rs), where
+  Linux routing forwards it — no zone policy, no session, no NAT, no
+  screen. `set security zones security-zone vpn interfaces wg0.0` commits
+  cleanly and READS as enforced. `allowed-ips` is a cryptographic
+  inner-source ownership gate, not a policy.
+
+  Implementation: `warnWireGuardPlaintextUnadjudicatedAST` is an AST
+  pre-walk run from compileExpanded (group-expanded, inactive-pruned), so
+  it fires on strict commit, lenient restart/peer-sync, and both HA node
+  views. It CANNOT reject — no error return, no `lenient` flag — so the
+  #1960 no-brick property is structural. ONE aggregated advisory per
+  commit, split into a ZONED (escalated) group and an unzoned group, with
+  the #6682 "unzoning is not a mitigation" caveat emitted only when an
+  unzoned tunnel exists. Keyed on the tunnel MODE
+  (`astTunnelModeWireguard`, the compiler's own extraction), never on the
+  `wg` name shape; GRE is deliberately NOT warned about because gre.rs
+  decaps inside the worker pipeline and rebinds ingress_ifindex/zone.
+  Coupling to the dataplane exclusion measured firsthand: rows wg0.0, wg1
+  and wg1.0 all report exclusion class "Tunnel" and
+  userspaceSkipsIngressInterface=true.
+
+  Shared with the #5619 IPsec advisory in
+  `compiler_tunnel_plaintext_advisory.go`, on one rule — share where a
+  divergence would ALWAYS be a bug: `forEachZoneInterfaceMemberAST`
+  (zone-membership enumeration through the compiler's own flattener, so
+  the #2419/#5248 bracket collapse cannot be re-derived differently by two
+  readers) and `renderPlaintextUnadjudicatedAdvisory` (one advisory per
+  commit, stable total sort, zoned/unzoned partition, group headings,
+  #6682 caveat). The finding walk and every protocol-specific sentence
+  stay separate. The IPsec advisory's rendered text is byte-identical.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/config/...` exit 0;
+  `go test -count=1 ./pkg/config/...` exit 0 (39.7s), plus
+  `./pkg/configstore/... ./pkg/dataplane/... ./pkg/policymatch/...
+  ./pkg/cli/...` exit 0. Mutation matrix, one mutation per cell, exit
+  codes read from `$?` directly: (1) neutralize the advisory at its only
+  call site in compileExpanded → exit 1, "want exactly 1 #5618 advisory,
+  got 0" across every positive cell while both negative controls stayed
+  green; (2) read only the FIRST zone member in the shared walker,
+  reproducing the #2419 bracket collapse → exit 1 with "a bracketed zone
+  member lost its zone clause (1 of 2 present)" on the WG bracket test and
+  the matching #5619 assertion on the IPsec one. Restore control green.
+
+  Go-only diff: `git diff --stat origin/master` touches no `.rs` file and
+  no compiled artifact, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+  pkg/config/compiler_wireguard_plaintext_warn.go,
+  pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+  pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_prewalk.go, docs/userspace-dataplane-gaps.md,
+  _Log.md
 
 - **Timestamp**: 2026-08-21
 - **Action**: #5190 userspace-dp observability/telemetry cohort — swept all six
