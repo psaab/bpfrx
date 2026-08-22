@@ -1,3 +1,35 @@
+## 2026-08-22 — #6912: an external reload discharged a postcondition it cannot perform
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced at master before fixing: first Apply runs its tail
+  (`[reconfigure trust0]`, rp_filter 0), then a SUCCESSFUL external
+  BeginReload/NoteReloadResult, then a byte-identical Apply -> reconfigure
+  calls 1 -> 1 and rp_filter still 2. The tail never ran.
+  Fixed by arming a process-scoped `tailPending` in `NoteReloadResult` on
+  success and adding it to Apply's gate; only a completed tail clears it.
+  Process-scoped for the same reason the reload debt is: pkg/daemon reloads
+  from several sites and a Manager-scoped flag could not record what they did.
+  TWO MUTATIONS CAME BACK GREEN AND BOTH WERE FINDINGS, not gaps:
+  (a) arming on the SHARED `noteReloadSucceeded` instead of the external entry
+  point is unobservable, because Apply's own tail clears the flag in the same
+  pass. My doc comment had claimed it "would make every Apply owe a tail to
+  the next one" — that claim was FALSE and is now corrected to say the choice
+  is about the flag's meaning, not about preventing a defect.
+  (b) arming on the external FAILURE branch too is redundant: noteReloadFailed
+  already sets the reload debt, so debtOwed already forces the next Apply
+  through the tail.
+  (a) also exposed a test of mine that passed for the wrong reason —
+  `TestApplyOwnReloadDoesNotOweItselfATail_6912` was named for the arming site
+  but passes under that mutation. Restated as
+  `TestApplyLeavesNoTailDebtOutstanding_6912`, which is the invariant it
+  actually checks and the one that really prevents an unchanged Apply
+  reconfiguring forever.
+  M1-M3 RED (drop the gate term, stop arming, never clear) at RUN=51 matching
+  the control, vet clean at each.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/external_reload_tail_6912_test.go` (new),
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`
+
 ## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
 
 - **Timestamp**: 2026-08-22
