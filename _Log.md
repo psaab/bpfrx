@@ -34,6 +34,51 @@
 - **File(s)**: `pkg/config/compiler_validate_warn_host_inbound.go`,
   `pkg/dataplane/userspace/junos_host_residual_6612_test.go`,
   `docs/host-inbound-service-matrix.md`
+## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
+
+- **Timestamp**: 2026-08-21
+- **Action**: The boot gate exits 0 on every path (deliberately — a non-zero
+  exit trips the unit's `OnFailure=` and reboots the box over what may be a
+  transient packaging window) and the unit is `Type=oneshot` +
+  `RemainAfterExit=yes`, so `systemctl status xpf-kernel-promote` read SUCCESS
+  and stayed active even when the gate REFUSED and the armed candidate was
+  running unverified. The only signal was a journald line, which journal
+  rotation removes.
+
+  `refuse()` now writes `/var/lib/xpf/kernel-promote-refusal`, one `key=value`
+  per line, carrying the discovery-snapshot facts the DECISION was made on
+  (`LoadState`, `MainPID`, `ControlGroup`, raw `ExecStart`), the journal bit,
+  the cause, the branch-specific advice, a timestamp and the boot id. Read by
+  `upgrade.ReadRefusalRecord` and surfaced through `ChannelStatus` /
+  `RenderChannelStatus`, so `show system kernel-upgrade`, the console CLI, the
+  remote `cli` and the status RPC all get it without touching `pkg/cli` or
+  `pkg/grpcapi`. The unit still exits 0 and still does not trip `OnFailure=`;
+  a test asserts that rather than assuming it.
+
+  The indeterminate-journal WARNING writes one too, as
+  `disposition=indeterminate`. That is what makes the record's ABSENCE
+  meaningful: if only `refuse()` wrote one, "no record" could not distinguish
+  a clean boot from a boot the gate skipped for the other reason. The quiet
+  "nothing to promote" branch and the post-exec `rc` paths deliberately write
+  nothing — the first is the ordinary boot, the second is where the Go half
+  already owns the durable state.
+
+  The record does NOT duplicate the candidate version: the gate reads the JSON
+  journal for one bit and never for a value, so the candidate is joined in Go
+  by `ReadChannelStatus`, which is accurate because a refusal never transitions
+  the journal.
+
+  Tightened `ReadRefusalRecord` while writing its test: counting `=`-bearing
+  lines rather than RECOGNISED keys let a file whose only fields are unknown
+  parse as a refusal with every field empty, rendering a REFUSED banner made
+  entirely of dashes. The first draft of the test could not see it — its own
+  fixture text contained the literal "key=value".
+- **File(s)**: `scripts/image/xpf-kernel-promote`,
+  `scripts/image/test_kernel_promote_explicit_path.py`,
+  `pkg/upgrade/kernel_promote_refusal.go` (new),
+  `pkg/upgrade/kernel_promote_refusal_6622_test.go` (new),
+  `pkg/upgrade/kernel_status.go`, `pkg/upgrade/kernel_run.go`,
+  `pkg/upgrade/kernel_arm_record.go`, `docs/in-place-upgrade.md`, `_Log.md`
 
 ## 2026-08-21 — #6612 junos-host residual: audited the claim, found it false, locked what holds
 
@@ -77,6 +122,30 @@
 - **File(s)**: `pkg/dataplane/userspace/junos_host_residual_6612_test.go`
   (new), `docs/host-inbound-service-matrix.md`
 
+## 2026-08-21 — #6585 syslog wire sanitized at the Send boundary
+
+- **Timestamp**: 2026-08-21
+- **Action**: `SyslogClient.Send` now runs
+  `termsafe.SanitizeForDisplay` on the message before it becomes a frame
+  — the LAST boundary before the wire, so no producer can bypass it
+  (the producers are any slog attribute in the daemon). Single-line
+  variant deliberately: the block variant PRESERVES LF, which is a
+  record delimiter in RFC 3164. Placed before the format branch so both
+  RFC 3164 and RFC 5424 are covered.
+  Verified the live producer FIRSTHAND: Route 53's `e.Error.Code` /
+  `e.Error.Message` (`backend_route53.go:197`) and Cloudflare's
+  `cfErrors(env)` are decoded from the PROVIDER's response body and flow
+  into `slog.Warn(..., "err", err)` in `pkg/ddns/surface_a.go`.
+  SEVERITY: log injection + deferred terminal injection, NOT command
+  injection — no exec path is involved.
+  Mutation matrix 4/4 RED: Y1 no sanitize, Y2 block variant (LF kept),
+  Y3 only the RFC3164 branch, Y4 strip instead of escape.
+  NOTE: the first frame-count test was VACUOUS — over UDP one Send is
+  one datagram regardless, and the Y2 cell proved it by staying green.
+  Replaced with an embedded-LF assertion, which is the property that
+  actually determines collector behaviour and which Y2 reds.
+- **File(s)**: pkg/logging/syslog.go,
+  pkg/logging/syslog_attr_sanitize_6585_test.go, pkg/logging/README.md
 ## 2026-08-21 — #6631 kernel arm: refuse a journal path the boot gate cannot read
 
 - **Timestamp**: 2026-08-21
@@ -102159,3 +102228,13 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compiler_validate_strict_application.go,
     pkg/config/dangling_term_keyword_6564_test.go,
     pkg/config/testdata/golden_4406.json, docs/config-schema.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6615 — repo-wide dangling doc-citation gate (pkg/docsref) with a
+    grandfathered ratchet baseline; corrected 4 provable research/->pr/ cite
+    relocations. Sweep found 53 dangling paths across live (non-archive) files.
+  - **File(s)**: pkg/docsref/{doc.go,docsref_test.go,testdata/known_dangling.txt},
+    docs/fairness-regimes.md, docs/pr/1863-realization-gap/plan.md,
+    docs/pr/1864-toolchain-pin/reviewer-ids.md,
+    userspace-dp/src/afxdp/coordinator/status.rs,
+    userspace-dp/src/afxdp/types/shared_cos_lease/{epoch.rs,rotate_epoch_v8.rs}
