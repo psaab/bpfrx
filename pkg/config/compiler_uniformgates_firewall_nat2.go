@@ -176,6 +176,41 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		}
 	}
 
+	// #7216: the SELECTED `match destination-address` is empty — the rule
+	// exists but has no external prefix, so it lowers ExternalIP as "" and the
+	// Rust parse_nat_prefix drops the WHOLE mapping. The operator authored a
+	// rule that does not exist at runtime, with no commit error and no warning.
+	//
+	// Runs AFTER the cardinality gate above ON PURPOSE. When two or more
+	// prefixes are listed and the selection is the blank, that gate's #6673 arm
+	// already rejects with a message that can name the prefixes being passed
+	// over; firing here first would replace a richer diagnosis with a poorer
+	// one. What reaches this gate is the shape #6673 could not see: a blank
+	// selection with at most one non-empty prefix beside it.
+	//
+	// This does NOT disturb #6673's empty-SLOT semantics. That rule is about
+	// COUNTING — an empty slot in MatchAddresses is the marker that nodeVal
+	// selected a blank, so the cardinality gate counts only non-empty values.
+	// This gate reads the SELECTION, never the slot count.
+	//
+	// Strict on commit / commit-check (hard reject); lenient on load /
+	// peer-sync (warn — #1960 no-brick: the value committed clean on every
+	// build before this gate, so boxes carrying one exist by construction, and
+	// the dataplane already drops the rule there so a leniently-loaded config
+	// is no worse off). Reuses lenientFirewallRefs like the sibling static-NAT
+	// gates above.
+	if err := validateStaticNATSelectedMatchAddressStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("static NAT rule with NO external prefix — the rule is "+
+					"DROPPED ENTIRELY by the dataplane and translates nothing "+
+					"(downgraded to a warning on the tolerant load / peer-sync path so an "+
+					"already-persisted config still boots): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #6659 follow-up: a `security nat proxy-arp ... address` value the
 	// dataplane cannot parse. #6659 widened this arm from nodeVal (first value
 	// only) to the full list, so a malformed tail address now MATERIALISES into

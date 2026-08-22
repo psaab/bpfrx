@@ -69,10 +69,13 @@ see the next section for the narrow, and only, way that state is reached.
 
 The **in-process console shell's** class comes from the **OS credential of the
 invoking process**, never from the environment. "The CLI" unqualified was wrong
-here (#6706 review r11): the remote `cli` client has no class at all — its OS
-credential only renders the prompt (`cmd/cli/main.go` `resolveUsername`), and
-the gRPC listener it speaks to has no per-principal authentication yet (#5278),
-so nothing on that path makes an authorization decision. See **Scope** below. `pkg/osident.Current()` reads the **real uid**
+here (#6706 review r11): the remote `cli` client still has no class of its own —
+its OS credential only renders the prompt (`cmd/cli/main.go` `resolveUsername`).
+Since #5278 that no longer means the path is ungoverned: the **server** derives
+the caller's identity from the kernel (the uid owning the peer socket, resolved
+through the same passwd rules) and enforces the class itself, so a remote `cli`
+session is bounded whether or not the client checks anything. See **Scope**
+below. `pkg/osident.Current()` reads the **real uid**
 (`os.Getuid`) and resolves it through the passwd database; the resolved name
 is matched against `system login user <name>`. `pkg/daemon`
 `applyCLILoginClass` performs the lookup once, at shell start, and logs the
@@ -221,13 +224,13 @@ nothing about root — an explicit `system login user root class <c>` wins,
 because a configured restriction silently ignored is exactly the defect class
 #6701 removes.
 
-**Scope.** This is the on-box CLI boundary. The gRPC listener
-(`127.0.0.1:50051`) still has no per-principal authentication, so a shell user
-who speaks gRPC directly bypasses `checkPermission` entirely — that is a
-separate, still-open defect (#5278) and is not addressed here. The remote `cli`
-client's prompt identity was moved to the same OS credential so that when
-#5278 wires per-principal auth it finds the identity already coming from the
-kernel, but the client is not itself an authorization boundary today.
+**Scope.** This is the on-box CLI boundary — the class a console session is
+bound to. It is no longer the ONLY boundary: since #5278 the gRPC listener
+(`127.0.0.1:50051`) derives the caller's identity server-side from the kernel
+and enforces the class itself, so a shell user who speaks gRPC directly no
+longer bypasses the model by skipping `checkPermission`. The remote `cli`
+client is still not itself an authorization boundary — it carries no class and
+makes no decision — but the server it speaks to is.
 
 The class **name** is resolved once, at shell start, and is not re-evaluated
 mid-session. That matches Junos (your class is bound at login). The class's
@@ -270,9 +273,9 @@ so the holder can bypass a CLI-side check simply by not using the CLI.
 
 | Surface | Enforcement |
 |---|---|
-| Console / SSH CLI | `checkPermission`, **client-side** — it runs in the CLI process, so it binds only callers who use the CLI. |
+| Console / SSH CLI | `checkPermission`, **client-side** — it runs in the CLI process, so it binds only callers who use the CLI. It is not the boundary; it is the surface that gives a good error message before a round trip. |
 | HTTP REST (`127.0.0.1:8080`) | **Server-side** since #5561: the mutation surface derives the caller's UID from the kernel socket table, maps it to this account, and evaluates the class before the handler runs. See `pkg/api/README.md` "Server-side authorization". |
-| gRPC (`127.0.0.1:50051`) | **Not yet enforced — #5278 is open.** The listener installs no per-principal check, so a login-class holder can still drive privileged RPCs directly. The shared layer (`pkg/authz`) is built for two consumers; the gRPC leg is an interceptor that derives the same principal and calls the same `authz.Authorize`. |
+| gRPC (`127.0.0.1:50051`) | **Server-side** since #5278: a `stats.Handler` resolves the connection's peer UID at connection setup and unary + stream interceptors evaluate the class before any handler runs, through the same `pkg/authz` decision the REST leg uses. Unlike REST it gates **every** RPC (reads included) and there is no `api-auth` credential, so an unattributed caller has nothing to fall back to. See `pkg/grpcapi/README.md` "Server-side authorization". |
 
 On the REST surface the class is evaluated against a **server-derived**
 identity, so it is a real boundary rather than an advisory one:
