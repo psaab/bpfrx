@@ -11,7 +11,6 @@
 [REFACTOR]   2375  userspace-dp/src/afxdp/worker/loop_body/mod.rs
 [REFACTOR]   2358  pkg/daemon/daemon_nft.go
 [REFACTOR]   2310  userspace-dp/src/afxdp/neighbor.rs
-[REFACTOR]   2299  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2288  pkg/ddns/surface_a.go
 [REFACTOR]   2258  userspace-dp/src/afxdp/cos/queue_service/mod.rs
 [REFACTOR]   2227  userspace-dp/src/session/mod.rs
@@ -20,7 +19,6 @@
 [REFACTOR]   2092  userspace-dp/src/afxdp/frame/mod.rs
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
-[REFACTOR]   2046  pkg/dataplane/userspace/maps_sync.go
 [REFACTOR]   2005  pkg/daemon/daemon_ha.go
 [WATCH]      1995  pkg/dataplane/compiler.go
 [WATCH]      1953  pkg/api/metrics_userspace.go
@@ -35,6 +33,7 @@
 [WATCH]      1776  pkg/config/types_system.go
 [WATCH]      1764  userspace-dp/src/screen/scan.rs
 [WATCH]      1685  pkg/api/server.go
+[WATCH]      1655  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1654  pkg/dataplane/compiler_iface.go
 [WATCH]      1652  pkg/cmdtree/tree.go
 [WATCH]      1608  userspace-dp/src/afxdp/poll_descriptor/filter.rs

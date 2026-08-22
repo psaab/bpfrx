@@ -687,7 +687,7 @@ defense-in-depth backstop against any future imbalance.
 
 `session_expires` is the SAME counter the Go control plane reads as
 `dataplane.GlobalCtrSessionsClosed` (mapped 1:1 from `cur.sessionExpires`
-in `pkg/dataplane/userspace/manager_ha.go`). That global counter feeds the
+in `pkg/dataplane/userspace/manager_counters.go`). That global counter feeds the
 exported `sessions_closed` surfaces — `pkg/api/stats.go`,
 `pkg/api/metrics_counters.go` (`xpf_sessions_closed_total` Prometheus
 metric), and `pkg/grpcapi/server_show_status.go`. So after this fix
@@ -979,7 +979,7 @@ so it never surfaces a flow on its own).
 "Inside the helper" is load-bearing, because the map has a writer OUTSIDE it
 (#6928 review). Every HA peer-synced row reaches the same `sessions` /
 `sessions_v6` map from the GO side:
-`Manager.SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/manager_ha.go`)
+`Manager.SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/manager_sessions.go`)
 call `bpfShim.SetSessionV4`/`V6`, which is `maps_session.go`'s
 `m.maps["sessions"].Update`. That is the "for peer-synced sessions the Go side
 installs directly" case named below; the three-site count is a claim about the

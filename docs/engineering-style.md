@@ -422,6 +422,39 @@ they repeatedly bite:
 - **Deploy wipes CoS config.** After `cluster-setup.sh deploy`, re-run
   `./test/incus/apply-cos-config.sh <target>` before running iperf3
   for any #706 / #707 / #708 / #709 / #718 validation.
+- **A `Mutex`/`RwLock` in production Rust is acquired
+  poison-tolerantly, never with `.unwrap()`.** `std` poisons a lock the
+  moment a thread panics under its exclusive guard, and every later
+  acquisition returns `Err` — so `.unwrap()` turns one contained panic
+  (the #925 worker supervisor contains it) into a panic on EVERY
+  subsequent acquisition of that lock, i.e. a permanent outage of
+  whatever the lock guards. Three settled forms, in order of preference:
+  - `worker_queue::lock_recover` / `try_lock_recover` (#1807) for the
+    worker-command queues and `shared_ops::lock_shared_recover` (#2402)
+    for the shared-session / owner-RG maps. These also `clear_poison()`
+    and bump a per-subsystem recovery counter. Use them **only** for
+    their own subsystem: each stamps a subsystem-specific journald line,
+    so borrowing one for unrelated state makes both the operator message
+    and the counter lie.
+  - the inline idiom `lock().unwrap_or_else(|e| e.into_inner())` — the
+    tree-wide default (`nat::allocator`, `event_stream`,
+    `afxdp::sharded_neighbor`, `afxdp::icmp_ratelimit`, `afxdp::wg`
+    #6422). It is the only form that covers `RwLock`, which neither
+    helper takes.
+  - **Never** `if let Ok(g) = m.lock()` (silently skips the operation)
+    or `.lock().map(..).unwrap_or_default()` (substitutes EMPTY state).
+    #2402 was exactly the latter: an empty shared-session table on the
+    HA promotion path silently dropped every active synced session at
+    the moment of failover.
+
+  Recovery keeps the committed prefix of everything already written,
+  which is the right answer for a map. Before converting a lock that
+  guards a cross-field invariant, check the critical section for panic
+  sites: if there are none the recovered value is by construction
+  well-formed, and if there are some, ask whether panicking forever
+  actually repairs the inconsistency (it usually does not — an
+  idempotent reconcile pass that can still run does).
+
 - **Rust tests must be parallel-safe — `make test-rust` forces
   `--test-threads=1`, but a plain `cargo test --release` does not.** A
   test that silently assumed serial execution (a shared process-global
