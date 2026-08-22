@@ -105,7 +105,7 @@ Scenarios:
 | Scenario | Proves |
 |---|---|
 | **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; the `/etc/xpf/appliance` marker present (#7114 — it is what re-enables the factory bootstrap; asserted before the DHCP wait so a bake that stopped writing it fails with its own cause); `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp; **#1930 LANE-1 A/B kernel channel live in-guest** (#6494 — both `xpf-A`/`xpf-B` registered exactly once with their own `\EFI\<slot>\shimx64.efi` loader and reachable in BootOrder, `xpf-uefi-slots.service` and `xpf-kernel-promote.service` both ran with `ExecMainStatus=0`, and the promote gate logged its ordinary-boot path); **both slot ESP dirs fully staged with selectors seeded at the running kernel** and **every installed kernel package still held** (#6498); **guest booted under UEFI Secure Boot** (#6497 — the `SecureBoot` EFI variable, corroborated by `mokutil --sb-state` when present and `/sys/kernel/security/lockdown`) |
-| **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
+| **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600` because it may carry credential material; the scenario now asserts that posture — root-owned **regular file**, mode exactly `0600` — #6503.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 | **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
 
@@ -248,6 +248,43 @@ never-installed names).
 captured command output, unit-tested (with the bake-agreement canaries and the
 call-site wiring assertions) in
 `scripts/image/test_validate_ab_substrate_6498.py`, run by `make selftest`.
+
+### The day-0 config's credential posture (#6503)
+
+The loader installs `/etc/xpf/xpf.conf` with `install -o root -g root -m 0600`
+because it "may carry credential material (root-authentication
+encrypted-password, IKE PSKs)". Until #6503 the gate asserted the file exists
+and is non-empty and **nothing about the mode** — this document said so in as
+many words — so a regression to `0644` would ship world-readable IKE PSKs and
+password hashes inside a *signed* image and pass Tier 1 green. It is pinned now
+for the same reason scenario A pins the sshd posture.
+
+Asserted in **every** scenario that installs a config — B (valid drive), C's
+retry leg, and E (node-id drive) — because they all reach the same `install`
+call and a regression there would ship from any of them.
+
+Two details a naive version of this check gets wrong:
+
+- **The mode is compared as an octal value, not the string `"600"`** — for
+  rendering independence, not because a string compare would let a bad mode
+  through. GNU `stat -c %a` emits `600` unpadded, so `!= "600"` rejects `4600`
+  exactly as `!= 0o600` does; what the value compare buys is that a zero-padded
+  `0600` from a non-GNU `stat` is the same mode and is not a false red.
+- **The probe does not pass `stat -L`.** For a symlink, `stat -c '%a %U:%G %F'`
+  reports the *link* (`777 … symbolic link`); `stat -L` reports the *target*
+  (`644 … regular file`). A check that followed the link would read the
+  target's mode while the file an attacker controls is the link — a `0600`
+  target behind a world-writable link would PASS on mode alone. The file type
+  is therefore part of the verdict, and `_DAY0_CONF_STAT` is asserted to carry
+  no `-L`.
+
+**Not** asserted: `/etc/xpf`'s own directory mode. The loader sets it
+best-effort (`chmod 0750 … || true`) and the directory comes from the `.deb` on
+a real appliance, so it is not the loader's contract to pin here.
+
+`_conf_mode_verdict` is a pure function over the captured `stat` output,
+unit-tested (with the call-site wiring assertions) in
+`scripts/image/test_validate_day0_perms_6503.py` and run by `make selftest`.
 
 ---
 

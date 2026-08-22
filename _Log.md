@@ -1,3 +1,23 @@
+## 2026-08-22 — #6503 day-0 config permission assertion (0600, root, regular file)
+
+- **Timestamp**: 2026-08-22
+- **Action**: The Tier-1 gate asserted the day-0 config was installed
+  (`test -s`) but never its MODE, so a credential-permission regression
+  shipped green. Added `_conf_mode_verdict` pinning the installed file
+  as root-owned, a REGULAR FILE, mode exactly 0600, asserted from all
+  three scenarios that install a config (B, C's retry leg, E) since
+  they share one `install` call. The probe deliberately omits `stat -L`:
+  a symlink's own mode is always 0777 on Linux, so an unfollowed stat
+  reports `777 symbolic link` and fails, while following the link would
+  report the TARGET's `600 regular file` and PASS for a path an attacker
+  controls. File type is part of the verdict and a test asserts the
+  probe carries no `-L`. Also corrected image-validation.md:108, whose
+  sentence ("asserts it exists and is non-empty, not the mode") was true
+  and became false with this change.
+- **File(s)**: scripts/image/validate.py,
+  scripts/image/test_validate_day0_perms_6503.py,
+  docs/image-validation.md
+
 ## 2026-08-22 — #6502 day-0 loader probe order (labeled-first contract)
 
 - **Timestamp**: 2026-08-22
@@ -100725,3 +100745,24 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/dhcpserver.go, pkg/daemon/dhcp_rg_filter_6520_test.go (new),
   pkg/dhcpserver/kea_filtered_group_selector_6520_test.go (new),
   pkg/daemon/README.md
+
+## 2026-08-21 — #6542: IPsec teardown debt for a failed terminate
+- **Timestamp**: 2026-08-21
+- **Action**: `terminateRemovedConns` was fire-and-forget while
+  `promoteConnNames` advanced `prevConnNames` first, so a failed
+  `swanctl --terminate` lost the teardown debt permanently and `Apply` still
+  returned nil — a deleted/unrenderable VPN kept forwarding under its stale
+  child SA. The failed subset is now carried in `pendingTerminate`, unioned
+  into the next apply's removed set (filtered by the loaded names so a
+  re-added VPN is never torn down), and returned as an `Apply`/`Clear` error.
+  Debt discharges when the SA is no longer live, so it cannot latch.
+- **File(s)**: pkg/ipsec/manager.go, pkg/ipsec/delete_terminate_3941_test.go,
+  pkg/ipsec/terminate_debt_6542_test.go (new), pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-08-21
+  - **Action**: #6419 — evaluated and closed the "reuse the authority's config-gen
+    namespace" shortcut for the active/active reverse direction; recorded the
+    structural reason in code + docs and armed the RG0-primary config-sync
+    rejection pin (previously a vacuous green).
+  - **File(s)**: pkg/cluster/sync_conn_gen.go (comment only),
+    docs/session-sync-architecture.md, pkg/daemon/config_sync_test.go

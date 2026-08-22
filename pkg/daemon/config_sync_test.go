@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,13 +36,36 @@ func newClusterManager(primary bool) *cluster.Manager {
 
 // TestHandleConfigSync_RejectsWhenPrimary verifies that the RG0 primary
 // rejects incoming config sync (prevents secondary from overwriting).
+//
+// The returned ERROR is load-bearing, not incidental. `configApplyLoop`
+// advances the config high-water (`recordAppliedConfigGen`) ONLY on a nil
+// `OnConfigReceived` return (M-2/#4151), so a short-circuit that returned nil
+// here would advance `lastAppliedConfigGen` past a config this node never
+// applied — the primary's re-push of that same generation would then be
+// dropped by `shouldApplyConfigGen` as stale and the node would sit silently
+// diverged. Asserting only "it did not panic on the nil store" cannot see that:
+// verified by mutation at `daemon_ha_sync.go`'s rejection arm — replacing
+// `return errConfigSyncRejectedPrimary` with `return nil` left the pre-#6419
+// form of this test GREEN. The `errors.Is` assertion below is what reds it.
+//
+// #6419: this rejection is also half of the reason the "reuse the authority's
+// own config-generation namespace" shortcut cannot close the active/active
+// reverse direction — see the `stampInstallGenV4` comment and
+// docs/session-sync-architecture.md. A node applies no peer config for the
+// whole of its RG0-authority tenure, so its `lastAppliedConfigGen` is frozen
+// exactly while its `configGenCounter` is the live counter, and vice versa.
 func TestHandleConfigSync_RejectsWhenPrimary(t *testing.T) {
 	d := &Daemon{
 		cluster: newClusterManager(true),
 	}
-	// If the guard doesn't work, handleConfigSync would panic accessing
-	// d.store (nil). A successful return means the guard rejected the config.
-	d.handleConfigSync("set system host-name bad-config")
+	// A nil store would panic if the guard let the call through, so reaching
+	// the assertion at all proves the short-circuit fired; the assertion then
+	// proves it short-circuited as a REJECTION rather than a silent success.
+	err := d.handleConfigSync("set system host-name bad-config")
+	if !errors.Is(err, errConfigSyncRejectedPrimary) {
+		t.Fatalf("RG0 primary must REJECT a peer config push with errConfigSyncRejectedPrimary "+
+			"so configApplyLoop leaves the config high-water pinned (M-2/#4151); got err = %v", err)
+	}
 }
 
 // TestHandleConfigSync_AcceptsWhenSecondary verifies that a secondary node
