@@ -587,6 +587,17 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 			if ierr := clusterIdentityCommitPreflight(d.cluster, cand); ierr != nil {
 				return ierr
 			}
+			// #6707: the rollback target must be APPLIABLE, not merely
+			// device-map safe. The timeout path applies it unconditionally
+			// (OQ-15.2, see the rollback callback), so a target the dataplane
+			// is guaranteed to refuse turns the safety net into a store-only
+			// revert: the store says the target, forwarding stays on the
+			// unconfirmed candidate, and the rollback is ANNOUNCED as done.
+			// Decide it here, while the operator is still connected and
+			// nothing has been promoted.
+			if rerr := rollbackTargetAppliablePreflight(d.store.ActiveConfig()); rerr != nil {
+				return rerr
+			}
 			return d.deviceMapCommitPreflight(cand, d.store.ActiveConfig())
 		},
 		func(gen uint64) (*config.Config, error) { return d.store.CommitConfirmedGen(minutes, gen) },

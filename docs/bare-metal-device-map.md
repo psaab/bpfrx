@@ -227,6 +227,11 @@ the present hardware while you are still connected:
 - `commit confirmed` validates BOTH the candidate AND the rollback target
   (the config restored on timeout), so a confirmed-commit timeout reverts to
   a known-safe config and applies it unconditionally (no split-brain).
+  "Known-safe" is device-map safety here; since #6707 the same pre-flight also
+  requires the rollback target to be APPLIABLE (its policy snapshot must not
+  carry the #5575 lenient-content poison, which the dataplane refuses whole).
+  Both are arm-time decisions for the same reason: the timeout path cannot
+  abort without diverging the already-promoted store from the dataplane.
 - **The pre-flight fails CLOSED on an unreadable NIC inventory (#5490).** If
   the present-NIC scan (a cold-path sysfs/netlink read) fails, the commit is
   **rejected** — the strand-management safety check cannot run, so the commit

@@ -167,6 +167,55 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### `commit confirmed` rollback-target pre-flight (#6707)
+
+`commit confirmed` arms a timer that, on expiry, reverts the store to the
+previously-active config and re-applies it. That re-apply is **unconditional
+by design** (#1956 OQ-15.2, `daemon_apply_commit.go`): `PromoteRollback` has
+already reverted the STORE, so aborting the dataplane apply at that point
+would leave store and dataplane disagreeing — a split-brain strictly worse
+than applying the target. The consequence is that every property the rollback
+depends on has to be decided at ARM time, which is what the pre-flight closure
+in `commitConfirmedAndApply` is for. It already validated the rollback target
+for device-map safety (#1956 R-8/V-3), cluster topology (#5840) and cluster
+identity (#6192).
+
+`rollbackTargetAppliablePreflight` (`rollback_target_appliable_6707.go`) adds
+the missing property: the target must be **appliable at all**. A config whose
+policy compile silently dropped a match / `then permit` constraint on the
+tolerant path carries `config.Policy.LenientContentDropped` (#5575); the
+snapshot lowering stamps such a rule with the `__unsupported__` application
+sentinel and the Rust integrity pre-flight then rejects the WHOLE snapshot. So
+the flag is a local, allocation-free proof that the helper will refuse this
+config — no round trip, and no dependence on helper liveness at arm time.
+`config.LenientDroppedPolicyLocator` is the predicate; it walks BOTH the
+zone-pair and the global policy shapes, because both reach the poison through
+the same `compilePolicy` path.
+
+Without the gate the #6707 sequence is: boot from a persisted config A whose
+policy hits the poison (a lenient boot load, or a peer-sync `SyncApply` — a
+strict commit rejects it outright, so the target can only be poisoned by a
+route that does not strict-compile), correct it in candidate B, `commit
+confirmed` B, then lose contact. At timeout the store reverts to A, the
+dataplane refuses A's snapshot — **logged only** — and forwarding stays on the
+UNCONFIRMED B while the store and the tail subsystems say A, with the rollback
+announced as successful. The recovery mechanism has failed to recover, which is
+the #1960 no-brick concern in its concrete form.
+
+The refusal is deliberately narrow, and only the CONFIRMED variant is gated. A
+plain `commit` of B is untouched and remains the way forward — it makes B
+permanent, which is what an operator correcting a broken active config wants.
+Gating the plain path would remove the only route OFF a poisoned active config.
+A nil rollback target (the first commit on a fresh store) is also unaffected:
+that timeout path reverts to bootstrap mode (#1922 Item 1b) rather than to a
+compiled config, so there is nothing to validate.
+
+Regression coverage: `rollback_target_appliable_6707_test.go` (gate behaviour
+plus an AST wiring guard that the call is reached from `commitConfirmedAndApply`
+and absent from the plain-commit entry points) and
+`pkg/config/lenient_dropped_locator_6707_test.go` (both policy shapes, compiled
+by the real tolerant compiler rather than asserted into a struct literal).
+
 ### Config-apply file layout (#5661)
 
 The config-apply path was carved out of the former ~3095-line
