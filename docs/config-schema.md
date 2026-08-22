@@ -6689,7 +6689,13 @@ reserved for whole-dataplane selection where a rewrite shim
   `source-address` (`ValueIPAddress`). `source-interface` uses
   `ValidateSyslogSourceInterface`, which rejects a non-numeric `.<unit>`
   suffix (`resolveSourceAddr` silently `Atoi`-fell-back to unit 0, binding the
-  wrong source IP). The enum value sets live in `schema_security.go`
+  wrong source IP) AND, since #6218 item 7, a `.<unit>` above `MaxLogicalUnit`
+  (16385) — e.g. `ge-0-0-0.50000` — which previously committed even though no
+  real interface unit can exceed that ceiling (`compiler_interfaces.go` caps a
+  real `unit <n>` there), so the reference could never resolve and
+  `ResolveSyslogSourceAddr` silently returned "" (the same audit-source-IP
+  loss the non-numeric case closes, reached via an out-of-range unit instead
+  of a typo'd one). The enum value sets live in `schema_security.go`
   (`syslogLogModes`/`syslogLogFormats`/`syslogSeverities`/`syslogFacilities`/
   `syslogCategories`) and MUST stay in sync with those `pkg/logging` parsers —
   a value the validator allows but the runtime does not recognize would
@@ -9288,6 +9294,65 @@ value. Static NAT takes literal IP/CIDR endpoints, not address-book references.
 Strict = hard commit error; lenient = `cfg.Warnings` entry (the Rust
 `from_snapshots` drop remains the lenient/peer-sync backstop). Same exemptions
 apply (NPTv6, `then static-nat inet`).
+
+**#7145 — malformed literal in a NAT `match` address, on the four slots that
+had no gate at all.** #3206 above closed static-NAT `match
+destination-address`; #3228 closed destination-NAT `match destination-address`.
+The other four (NAT kind x match leaf) slots had NO parse gate, so the SAME
+value — `999.1.1.1/24`, or `zznotanaddr`, so this is not a near-miss in the CIDR
+grammar — was refused in one slot of a rule and accepted in the sibling slot of
+the same rule:
+
+| kind | `match source-address` | `match destination-address` |
+|---|---|---|
+| `security nat source` | accepted -> **rejected (#7145)** | accepted -> **rejected (#7145)** |
+| `security nat destination` | accepted -> **rejected (#7145)** | rejected (#3228) |
+| `security nat static` | accepted -> **rejected (#7145)** | rejected (#3206) |
+
+These values are not inert. The Go snapshot builders copy them to the wire
+verbatim and each Rust consumer — `parse_match_prefix`
+(`userspace-dp/src/nat/source.rs`), `DnatTable::from_snapshots`
+(`nat/destination.rs`), `SourceConstraint::from_list` (`nat/static_nat.rs`) —
+drops the entry it cannot parse while the `*_constrained` flag stays set from
+the non-empty list. A malformed entry therefore NARROWS the rule below what was
+authored, and an all-malformed list leaves the rule constrained with zero
+prefixes: it matches NOTHING and stops translating, recorded only as a bounded
+NAT parse-error counter (#4718).
+
+`validateNATMatchAddressLiteralsStrict`
+(`pkg/config/compiler_validate_strict_nat_match_addr.go`, wired into
+`runUniformGatesNAT` immediately after the #3228 sibling) rejects it at strict
+commit / commit-check, naming the NAT kind, rule-set, rule, match leaf, and
+value. Scope is the LITERAL leaves only: `match source-address-name` /
+`destination-address-name` are address-book references whose unresolvable raw
+token is deliberately appended to the same wire list as a fail-closed backstop
+(#2416), so the gate must never walk the post-resolution list.
+
+The acceptance predicate is `net.ParseCIDR` then `net.ParseIP`
+(`natMatchPrefixParses`, `compiler_nat_helpers.go`) — the exact Rust pair,
+NOT the `netip` equivalents. `netip.ParsePrefix` is stricter than Rust on the
+mask text: it rejects a zero-padded prefix length (`1.2.3.4/024`) that Rust's
+`u8::from_str` reads as 24 and installs, and a validator that refuses a value
+the dataplane installs bricks the operator's next commit on a working box.
+
+Lenient (`Store.Load` / HA peer-sync, flag `lenientNATMatchAddressLiterals`):
+warn, do not fail. That value committed clean on every build before this gate,
+so boxes carrying one exist by construction. The tolerant path deliberately
+KEEPS the value in the compiled config: dropping it would empty an
+all-malformed list, clear the Rust `*_constrained` flag and collapse the rule to
+MATCH-ANY — a fail-OPEN regression strictly worse than the silent narrowing this
+gate is about.
+
+Regression coverage: `pkg/config/nat_match_address_literal_7145_test.go` (the
+full 3x2 census at strict, including the two pre-existing gates as controls;
+tolerant warn-and-KEEP with the good value intact and the malformed one authored
+second; an over-rejection guard that pins `0.0.0.0/0`, `::/0`, a bare host, a
+host-bits CIDR and `1.2.3.4/024` still committing) and
+`pkg/configstore/nat_match_address_no_brick_7145_test.go` (the no-brick property
+at the REAL ingresses — `Store.Load` and `Store.SyncApply` — plus a
+`CommitCheck` over-reach guard). The four sites were also removed from
+`slotEscapeUngated` (`schema_slot_escape_fixtures_test.go`), so their #7143
+slot-escape rows now run the full slot-1 comparison instead of skipping.
 
 Regression coverage: `pkg/config/compiler_nat_host_mask_test.go` (bare/​/32/​/128
 accept; v4 + v6 non-host match/prefix reject with asserted message; NPTv6 and
