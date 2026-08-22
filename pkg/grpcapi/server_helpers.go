@@ -117,9 +117,14 @@ func (s *Server) telemetry() dataplane.Telemetry {
 
 type natRuleSetKey struct{ from, to string }
 
+// natSessionCounts accumulates in int64 and is CLAMPED at each protobuf
+// assignment (#5250, A8-b2 F3). It used to accumulate directly into int32, so a
+// session table larger than MaxInt32 wrapped the counter negative rather than
+// saturating — the same class #2282 fixed for the NAT port-pool size with
+// clampInt32, which lives one file over and simply was not applied here.
 type natSessionCounts struct {
-	total           int32
-	ruleSetSessions map[natRuleSetKey]int32
+	total           int64
+	ruleSetSessions map[natRuleSetKey]int64
 }
 
 func (s *Server) countSNATSessions(zoneByID map[uint16]string) natSessionCounts {
@@ -132,7 +137,7 @@ func (s *Server) countDNATSessions(zoneByID map[uint16]string) natSessionCounts 
 
 func (s *Server) countNATSessions(flag uint16, zoneByID map[uint16]string) natSessionCounts {
 	counts := natSessionCounts{
-		ruleSetSessions: make(map[natRuleSetKey]int32),
+		ruleSetSessions: make(map[natRuleSetKey]int64),
 	}
 	if !s.dataplaneLoaded() {
 		return counts
