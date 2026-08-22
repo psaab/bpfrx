@@ -1234,6 +1234,22 @@ the drop fails loudly instead of going quietly vacuous.
       PINNED at retirement to what it was already serving, after which
       `ReplaceAuth` only intersects it. Revocations still reach a draining
       listener; grants and nils never do.
+
+      **The slot travels WITH the server it judges** (#6734, `legPlan`). The
+      pin is only worth anything if the slot `pin`/`tighten` operate on is the
+      one the handler actually reads. `pkg/api` used to substitute a fresh slot
+      for a nil in two INDEPENDENT places — `listenerHandler` when building the
+      handler and `serveLegLocked` when registering the leg — so a call site
+      passing nil to both would have pinned the leg to one slot while every
+      request on it was judged by another, making the retirement pin a silent
+      no-op. No production path did that, but nothing stopped one. `legPlan`
+      allocates the `*http.Server` and its slot together and `serveLegLocked`
+      has no slot parameter at all, so there is nothing left to substitute; the
+      `Start` path's `httpLegPlan`/`httpsLegPlan` adopt a missing slot and
+      **store it back**, which is what keeps the field, the plan and the leg one
+      object rather than three. The guard is behavioural, not a pointer
+      compare: pin a leg's slot, rotate `s.auth` away from it, and drive a real
+      request through that leg's own handler.
     - **Every leg exit DRAINS its connections** (#6827 round 7, `drainLeg`).
       `ReplaceAuth` keeps tightening a retired leg's pin only while the leg is on
       `s.retiring`, and `pruneRetiredLocked` reaps it the moment `drained` is

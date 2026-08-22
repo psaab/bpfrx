@@ -278,11 +278,12 @@ func drainLeg(srv *http.Server) error {
 // leg's pin and the handler's reads are the same object. A nil is substituted
 // rather than stored, so ReplaceAuth's walk over retiring legs can never meet
 // one.
-func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, slot *authSlot) *listenerLeg {
-	if slot == nil {
-		slot = s.newAuthSlot()
-	}
-	leg := &listenerLeg{srv: srv, ln: ln, stopCh: make(chan struct{}), slot: slot}
+func (s *Server) serveLegLocked(plan legPlan, ln net.Listener, isTLS bool) *listenerLeg {
+	// #6734: no slot parameter and no substitution. The leg's slot IS the one
+	// the plan's handler closes over, because they were allocated together —
+	// so pin / tighten can never operate on an object no request reads.
+	srv := plan.srv
+	leg := &listenerLeg{srv: srv, ln: ln, stopCh: make(chan struct{}), slot: plan.slot}
 	rootCtx := s.rootCtx
 	s.wg.Add(1)
 	go func() {
@@ -424,7 +425,7 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("api: bind HTTP listener %q: %w", s.httpServer.Addr, err)
 		}
-		s.httpLeg = s.serveLegLocked(s.httpServer, ln, false, s.httpSlot)
+		s.httpLeg = s.serveLegLocked(s.httpLegPlan(), ln, false)
 		slog.Info("HTTP API server listening", "addr", s.httpServer.Addr)
 	}
 	if s.httpsServer != nil {
@@ -433,7 +434,7 @@ func (s *Server) Start(ctx context.Context) error {
 			slog.Error("api: HTTPS listener bind failed at start; HTTPS disabled until the next reconcile",
 				"addr", s.httpsServer.Addr, "err", err)
 		} else {
-			s.httpsLeg = s.serveLegLocked(s.httpsServer, ln, true, s.httpsSlot)
+			s.httpsLeg = s.serveLegLocked(s.httpsLegPlan(), ln, true)
 			slog.Info("HTTPS API server listening", "addr", s.httpsServer.Addr)
 		}
 	}
@@ -503,14 +504,13 @@ func (s *Server) ReconcileHTTP(addr string) error {
 	if s.httpLeg != nil && s.httpLeg.srv.Addr == addr {
 		return nil
 	}
-	slot := s.newAuthSlot()
-	srv := s.buildHTTPServer(addr, slot)
+	plan := s.planHTTPLeg(addr)
 	ln, err := s.listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("api: bind HTTP listener %q: %w", addr, err)
 	}
 	old := s.httpLeg
-	s.httpLeg = s.serveLegLocked(srv, ln, false, slot)
+	s.httpLeg = s.serveLegLocked(plan, ln, false)
 	s.stopLegLocked(old) // retire the previous HTTP listener only after the new one is serving
 	return nil
 }
@@ -548,8 +548,7 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	case s.httpsLeg.serving() && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
-		slot := s.newAuthSlot()
-		srv, err := s.buildHTTPSServer(addr, slot)
+		plan, err := s.planHTTPSLeg(addr)
 		if err != nil {
 			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
 		}
@@ -558,7 +557,7 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 			return fmt.Errorf("api: bind HTTPS listener %q: %w", addr, err)
 		}
 		old := s.httpsLeg
-		s.httpsLeg = s.serveLegLocked(srv, ln, true, slot)
+		s.httpsLeg = s.serveLegLocked(plan, ln, true)
 		s.stopLegLocked(old)
 		return nil
 	}

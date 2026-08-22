@@ -103777,3 +103777,30 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/cluster/heartbeat_epoch.go`, `pkg/cluster/heartbeat.go`,
   `pkg/cluster/manager.go`,
   `pkg/cluster/heartbeat_epoch_persist_retry_6724_test.go` (new)
+
+## 2026-08-22 — #6734 pair the leg's http.Server with its authSlot
+- **Action**: `pkg/api` substituted a fresh `authSlot` for a nil in TWO
+  independent places (`listenerHandler` when building the handler,
+  `serveLegLocked` when registering the leg), so a future call site passing nil
+  to both would pin the leg to slot Y while every request on it was judged by
+  slot X — making `pin`/`tighten` a no-op and letting a RETIRED listener keep
+  following the server-wide snapshot (the #5561 round-14 defect). Latent, not
+  live: all four production sites threaded one slot through both layers. Fixed
+  by making the divergence unrepresentable: `legPlan` pairs the `*http.Server`
+  with the slot its handler closes over, `plan{HTTP,HTTPS}Leg` are the only
+  allocation sites, and `serveLegLocked` no longer takes a slot parameter at
+  all, so there is nothing left for it to substitute. `listenerHandler` keeps
+  its fallback as the SINGLE substitution in the package — one substitution
+  cannot diverge from another. Guard asserts BEHAVIOUR (pin the leg's slot,
+  rotate the server-wide snapshot, drive a request through the leg's own
+  handler) rather than pointer identity, since a pointer compare can be
+  satisfied while the property fails. The first draft claimed the paired fields
+  had a single writer and so could not diverge; TestReconcileHTTPSReplacesADeadLeg_6827
+  falsified that (its fixture sets s.httpsServer directly and calls Start),
+  producing a nil-slot leg and a nil deref in stopLegLocked. The plan getters
+  now ADOPT a missing slot and store it back — a substitution that writes the
+  field it reads, so it cannot diverge from itself, unlike the two independent
+  ones this issue is about.
+- **File(s)**: pkg/api/server.go, pkg/api/listener.go,
+  pkg/api/leg_slot_identity_6734_test.go (new),
+  pkg/api/listener_retiredauth_5561_test.go, pkg/api/README.md
