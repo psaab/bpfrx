@@ -792,12 +792,32 @@ class (`classify_ipsec_admission`):
   host-inbound gate as a NEW initiation: denied on a zone omitting `ike`,
   admitted on a zone listing `ike` (config-sanctioned openness —
   primary-path parity, since the kernel chain also admits NEW IKE there).
-  Bounded: 4096-entry cap (oldest evicted on full) + 24h sliding idle
-  reap; NOT HA-synced (the primary path's kernel conntrack for
-  host-terminated IKE is not synced either — same failover posture); an
-  xpfd restart drops the seeds, which self-heal on the next admitted
+  Bounded: 4096-entry cap (least-recently-touched evicted on full) + 24h
+  sliding idle reap; NOT HA-synced (the primary path's kernel conntrack
+  for host-terminated IKE is not synced either — same failover posture);
+  an xpfd restart drops the seeds, which self-heal on the next admitted
   initiation or firewall-outbound IKE packet, with the ESP data plane
   exempt throughout.
+- **Eviction is O(1) (#6747).** The victim used to be found with
+  `entries.iter().min_by_key(seen)` — a full traversal of all 4096
+  entries plus the empty hashbrown slots, under a lock `matches` takes on
+  the hot admission path for every Responder-SPI IKE packet, on a table
+  `Arc`-shared by every packet worker. One worker's scan stalled the
+  others. The scan was reachable exactly when 4096 DISTINCT live
+  exchanges were resident, which is also precisely the state a forged-
+  initiation flood produces — the worst case and the attack case are the
+  same case, so an "amortised reap of the idle ones first" would not have
+  helped (under a flood every entry is fresh). The table is now an
+  intrusive LRU over a fixed slab: `matches`/`seed` re-append at the
+  tail, eviction pops the head. **Semantics are unchanged** —
+  `min_by_key(seen)` with `matches` refreshing `seen` already WAS LRU,
+  just computed by scanning — so the availability reasoning above holds
+  verbatim. FIFO was rejected: it removes the scan just as well but would
+  evict a long-lived exchange that DPD refreshes in favour of a brand-new
+  forged initiation, which is worse under the flood the cap exists for
+  (`exchange_eviction_is_recency_not_insertion_order_6747`). The
+  previously unobservable eviction condition now has a counter
+  (`IkeExchangeTable::evictions`).
 
 **Two enforcement paths.** The PRIMARY host-inbound enforcement for
 IPsec-to-self is the kernel nftables chain (`pkg/daemon/daemon_nft.go`).

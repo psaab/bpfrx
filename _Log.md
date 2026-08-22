@@ -103871,3 +103871,20 @@ prose edit above them added. No diff falls in the new test body.
   RG + barrier wait, then stopClusterComms) ahead of the teardown.
 - **File(s)**: pkg/daemon/bootstrap.go,
   pkg/daemon/bootstrap_cluster_relinquish_6742_test.go
+
+## 2026-08-22 — #6747 IKE exchange table: O(1) LRU eviction
+- **Action**: `IkeExchangeTable::seed` chose its eviction victim with
+  `entries.iter().min_by_key(seen)` — a full traversal of all 4096 entries plus
+  empty hashbrown slots, plus a key clone and a second hash lookup, all under a
+  lock `matches` takes on the hot admission path for every Responder-SPI IKE
+  packet, on a table Arc-shared by every packet worker. Replaced the
+  `Mutex<FastMap<Key,u64>>` with an intrusive LRU over a fixed slab (index ->
+  slot, prev/next u32 links, free list): touch unlinks and re-appends at the
+  tail, eviction pops the head. SEMANTICS UNCHANGED — `min_by_key(seen)` with
+  `matches` refreshing `seen` already was LRU, just computed by scanning — so
+  the existing availability reasoning holds verbatim. FIFO was rejected: it
+  removes the scan equally well but evicts a DPD-refreshed long-lived exchange
+  in favour of a brand-new forged initiation, worse under the flood the cap
+  exists for. Added the eviction counter the issue notes was missing.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/ipsec.rs,
+  userspace-dp/src/afxdp/forwarding/README.md
