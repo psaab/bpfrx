@@ -430,6 +430,17 @@ Two further consequences:
   reconcile tick and only for trees that are already pathological; a legitimate
   error walks one or two levels.
 
+  The guard in `scrubURLErrorAt` is **unconditional rather than `depth == 0`**,
+  and the mutation matrix is explicit about the trade. Removing it hangs
+  `TestSelfUnwrappingErrorTerminates` — with the wrapper reduced to a delegate,
+  depth 0 IS the public entry and round 12's property lives there. Narrowing it
+  to depth 0 alone stays green, because today the only depth>0 caller is
+  `scrubInnerErrorAt` handing over a value `errors.As` already resolved to a
+  `*url.Error`, which the next `errors.As` matches at node 0 without walking
+  anything. That is a reachability argument about a caller, and this package
+  does not build invariants on those — the same stance the dyndns2 endpoint
+  scrub takes. It is kept total.
+
   **Still NOT bounded, deliberately.** A caller-supplied `Error()` or `Unwrap()`
   that BLOCKS hangs the first render or the guard itself, and no placement of
   the guard fixes that — it would need a watchdog goroutine per render. The

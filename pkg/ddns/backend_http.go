@@ -792,6 +792,20 @@ func scrubURLErrorAt(err error, depth int) string {
 	// RE-GUARD AT EVERY ENTRY, not only at the public one (#6635). See
 	// errTreeWithinBound's own comment for why the guard has to precede the
 	// first errors.As; this is about which TREE it is applied to.
+	//
+	// UNCONDITIONAL, not `depth == 0 &&`, and the mutation matrix says why that
+	// matters. Removing this entirely hangs TestSelfUnwrappingErrorTerminates —
+	// scrubURLError is now a thin delegate, so depth 0 IS the public entry and
+	// round 12's property lives here. Narrowing it to depth 0 alone stays green,
+	// because today the only depth>0 caller is scrubInnerErrorAt handing over a
+	// value errors.As already resolved to a *url.Error, which the errors.As
+	// below then matches at node 0 without walking anything.
+	//
+	// That is a REACHABILITY argument about a caller, and this package does not
+	// build invariants on those — the same stance the dyndns2 endpoint scrub
+	// takes about resolveDyndns2Endpoint having already parsed. A future caller
+	// reaching this function with an unresolved tree would silently lose the
+	// bound. The guard costs a walk of an already-small tree; keep it total.
 	if !errTreeWithinBound(err) {
 		return string(transportWithheld)
 	}

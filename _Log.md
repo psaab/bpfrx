@@ -22,6 +22,14 @@
   Production builds its own client; the only caller passing one is the Surface A
   reconcile path passing its own. A provider chooses BYTES over the wire, not a
   Go type. Robustness, NOT a live DoS, and the PR says so.
+  MATRIX FINDING, kept rather than tuned away: narrowing the `scrubURLErrorAt`
+  guard to `depth == 0` stays GREEN, because the only depth>0 caller hands over
+  a value `errors.As` already resolved to a `*url.Error`, matched at node 0
+  without walking. That is a reachability argument about a caller, which this
+  package does not build invariants on, so the guard stays unconditional and
+  the redundancy is documented instead of removed. Removing it ENTIRELY hangs
+  the pre-existing `TestSelfUnwrappingErrorTerminates` — a red only the FULL
+  suite shows, not `-run 6635`.
 - **File(s)**: `pkg/ddns/backend_http.go`,
   `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
 
