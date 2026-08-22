@@ -531,6 +531,18 @@ receiver resets `lastAppliedConfigGen` to 0 (`resetRecvGen`), so bulk re-sync
 after a peer reboot is never falsely rejected (the reset makes the compare
 baseline 0 until the peer re-pushes its current config).
 
+**The reset does not drain the config-apply QUEUE (#5084).** A config payload
+already sitting in `configApplyCh` when a rebooted peer re-primes belongs to the
+peer's PREVIOUS boot, and its generation — drawn from the pre-reboot monotonic
+seed — is far higher than anything the new boot can produce. Applying it after
+the reset records that generation as the high-water and refuses the rebooted
+peer's current config from then on. Every queued item is therefore stamped with
+the peer's BOOT INCARNATION (`/proc/sys/kernel/random/boot_id`, carried as a
+length-gated 8 → 24 byte extension of the `BulkStart` payload), and a payload
+whose incarnation a re-prime has replaced is dropped — compared for EQUALITY
+only, never ordered. Full design, fail-open rule, observability contract and the
+bounded ~20s residual: `docs/sync-protocol.md`, "Peer boot incarnation".
+
 **Enforcement is authoritative in the Go cluster layer, not the userspace
 helper.** The #3931 config-sync-generation namespace lives entirely in
 `SessionSync`; the helper's own `config_generation` is a *local* commit counter

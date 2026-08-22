@@ -461,6 +461,31 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-s.configApplyCh:
+			// #5084 rule 3, and it must run BEFORE the generation gate. The
+			// payload's generation is drawn from a DEAD peer incarnation, so it
+			// is incomparable with the current one — feeding it to a
+			// monotone-max high-water is precisely the defect: an old-boot item
+			// applying after resetRecvGen records a high mark, and the rebooted
+			// peer's lower-generation current config is then refused as stale,
+			// permanently.
+			//
+			// Dropping here strands nothing, and that is true only because
+			// membership is an EQUIVALENCE. #6900 failed partly because
+			// skipping a payload also skipped the generation gate and could
+			// leave the high-water holding information from a connection it had
+			// just fenced out; here the dropped payload's generation carries no
+			// information the current namespace needs, because it was never
+			// comparable to begin with.
+			if s.configItemIncarnationStale(item) {
+				s.stats.ConfigsDeadIncarnationDropped.Add(1)
+				slog.Warn("cluster sync: dropping config from a replaced peer boot incarnation — "+
+					"the peer rebooted and re-primed, so this payload's generation is incomparable "+
+					"with the current one (#5084)",
+					"item_incarnation", item.incarnation.String(),
+					"current_incarnation", s.PeerBootIncarnation().String(),
+					"gen", item.gen, "size", len(item.text))
+				continue
+			}
 			if !s.shouldApplyConfigGen(item.gen) {
 				s.stats.ConfigsStaleIgnored.Add(1)
 				slog.Warn("cluster sync: dropping out-of-order config sync (stale generation) — standby retains newer config",

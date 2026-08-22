@@ -215,6 +215,15 @@ type SyncStats struct {
 	// guard prevented a rapid-commit reorder (C1 applied after C2) from
 	// leaving the standby on the older config.
 	ConfigsStaleIgnored atomic.Uint64
+	// BulkPrimesWithoutIncarnation counts bulk primes received from a peer
+	// that sent no boot incarnation (#5084) — the legacy 8-byte BulkStart.
+	// A silent fail-open is how a half-upgraded cluster hides, so the fallback
+	// is counted rather than merely permitted.
+	BulkPrimesWithoutIncarnation atomic.Uint64
+	// ConfigsDeadIncarnationDropped counts config payloads dropped because
+	// they belonged to a peer boot incarnation that a re-prime has replaced
+	// (#5084 rule 3) — the defect this fence exists to close, made countable.
+	ConfigsDeadIncarnationDropped atomic.Uint64
 	// ConfigsApplyFailed counts config-sync messages that were admitted by the
 	// #3931 ordering guard but whose apply did NOT take effect on this node —
 	// a compile/promote failure (a mixed-build ISSU syntax error, a store
@@ -306,15 +315,27 @@ type SyncStats struct {
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
 // non-atomic fields, safe to copy by value and pass across API boundaries.
 type SyncStatsSnapshot struct {
-	SessionsSent               uint64
-	SessionsReceived           uint64
-	SessionsInstalled          uint64
-	DeletesSent                uint64
-	DeletesReceived            uint64
-	BulkSyncs                  uint64
-	ConfigsSent                uint64
-	ConfigsReceived            uint64
-	ConfigsStaleIgnored        uint64
+	SessionsSent        uint64
+	SessionsReceived    uint64
+	SessionsInstalled   uint64
+	DeletesSent         uint64
+	DeletesReceived     uint64
+	BulkSyncs           uint64
+	ConfigsSent         uint64
+	ConfigsReceived     uint64
+	ConfigsStaleIgnored uint64
+	// #5084 observability. A fail-open fence is silent by construction, so
+	// both halves are counted: primes that arrived without an incarnation
+	// (the peer is old, or half-upgraded and hiding), and payloads dropped
+	// because their incarnation was replaced (the fence doing its job).
+	BulkPrimesWithoutIncarnation  uint64
+	ConfigsDeadIncarnationDropped uint64
+	// PeerBootIncarnation renders the boot id of the peer incarnation that
+	// most recently primed, or "none". It travels in the snapshot rather than
+	// through a new Manager accessor because the Manager holds only the
+	// SyncStatsProvider interface, and this is the same transport every other
+	// field in the status render already uses.
+	PeerBootIncarnation        string
 	ConfigsApplyFailed         uint64
 	IPsecSASent                uint64
 	IPsecSAReceived            uint64
@@ -424,6 +445,15 @@ type SessionSync struct {
 	// which is what makes a reconnect derive a different key.
 	configCrypto0 *configCryptoState
 	configCrypto1 *configCryptoState
+	// peerBootIncarnation is the boot id of the peer incarnation that most
+	// recently primed (#5084). Zero means no incarnated prime has been seen —
+	// an old peer, or none yet — and puts the fence in its fail-open state.
+	// Guarded by mu, beside the connections whose primes set it.
+	//
+	// Compared for EQUALITY only. It is an equivalence class ("same peer
+	// boot?"), never a ranking; ordering two of these is the mistake #6900
+	// made and cannot express the predicate.
+	peerBootIncarnation bootIncarnation
 	// peerIncarnation identifies which run of the peer process the currently
 	// installed connections belong to, and conn0Gen/conn1Gen record the
 	// incarnation each slot's connection was installed under. All three are
@@ -995,6 +1025,15 @@ type SessionSync struct {
 type configApplyItem struct {
 	gen  uint64
 	text string
+	// incarnation is the peer boot the payload arrived under (#5084), taken
+	// from the connection that carried it. Zero = un-incarnated: the payload
+	// is never dropped on incarnation grounds (plan §6 rule 4).
+	//
+	// This field is the whole fix. Without it a payload queued from a peer's
+	// PRIOR boot can apply after resetRecvGen has zeroed the high-water, record
+	// a high mark, and then refuse the rebooted peer's lower-generation current
+	// config permanently.
+	incarnation bootIncarnation
 }
 type failoverAck struct {
 	status uint8
@@ -1262,7 +1301,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.
