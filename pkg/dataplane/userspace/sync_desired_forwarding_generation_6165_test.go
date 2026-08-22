@@ -48,8 +48,17 @@ func TestSyncDesiredForwardingRefusesStaleProtocolMismatch(t *testing.T) {
 	// STALE — below the required snapshot protocol version.
 	m.lastStatus.Capabilities.ForwardingSupported = true
 	m.lastStatus.ForwardingArmed = false
-	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion - 1
-	// Last-applied config REQUIRES ProtocolVersion (scheduler-driven policy).
+	// #6648: BELOW THE FEATURE'S FLOOR. This used to say `ProtocolVersion - 1`,
+	// which only produced ErrPolicySchedulerProtocolIncompatible because every
+	// gate compared against the shared constant. Policy-scheduler state has
+	// been representable since v2 (MinProtocolPolicyScheduler), so a helper one
+	// version behind the constant CAN carry this snapshot's scheduler content
+	// and the scheduler gate is the wrong thing to name for it. Retargeted, not
+	// relaxed: the assertion below is unchanged and now runs against a helper
+	// that genuinely cannot represent the feature it names.
+	m.lastStatus.ConfigSnapshotProtocolVersion = MinProtocolPolicyScheduler - 1
+	// Last-applied config carries scheduler-driven policy, so it REQUIRES at
+	// least MinProtocolPolicyScheduler.
 	m.lastSnapshot, _ = buildSnapshot(scheduledPolicyCfg(), config.UserspaceConfig{ControlSocket: sock}, 5, 0)
 
 	// Guard the premise: absent the gate the reconcile WOULD arm — it only

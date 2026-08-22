@@ -2057,6 +2057,11 @@ fn apply_path_persistent_snat_key(
 
 #[test]
 fn apply_snapshot_same_plan_preserves_persistent_snat_lease_state() {
+    // #7413: this test brings a coordinator up and therefore spawns a
+    // `neigh-monitor` thread, which the #6637 leak gates count PROCESS-WIDE.
+    // It is the one spawner outside `coordinator/tests.rs`, which is why the
+    // guard is `pub(crate)` rather than module-scoped.
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let state = Arc::new(Mutex::new(ServerState {
         status: ProcessStatus {
             forwarding_armed: true,

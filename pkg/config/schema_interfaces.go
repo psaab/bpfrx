@@ -33,7 +33,17 @@ package config
 // dhcp/dhcpv6 client knobs and tunnel keepalives (deferred:
 // low-risk pass-through integers), `speed`/`duplex`/`encapsulation`
 // (free-form pass-through strings).
-var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &schemaNode{desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
+// The interfaces wildcard identity token is TYPED (keyValidator
+// ValidateInterfaceName, #6834). The name is interpolated into four sites in
+// the generated systemd units, one of which — `[Match] Name=` in the .network
+// file — systemd reads as a WHITESPACE-SEPARATED LIST OF SHELL-STYLE GLOBS. An
+// unvalidated name containing a space or a glob metacharacter therefore does
+// not corrupt the file; it makes one .network claim SEVERAL interfaces. Gating
+// the identity here closes all four render sites at once and reports the
+// problem at commit rather than as a rename that silently fails at next boot.
+// See validate_interface_name.go for why escaping at the render site would be
+// worse than doing nothing.
+var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &schemaNode{desc: "Interface name", valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", keyValidator: ValidateInterfaceName, children: map[string]*schemaNode{
 	"description": {desc: "Text description of interface", args: 1, scalar: true, children: nil},
 	// Compiled verbatim (compiler_interfaces.go:44, Atoi with the
 	// error swallowed → garbage silently means "MTU not set", the

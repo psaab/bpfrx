@@ -353,7 +353,11 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			sys.Syslog = &SystemSyslogConfig{}
 			for _, slInst := range namedInstances(child.FindChildren("host")) {
 				host := &SyslogHostConfig{Address: slInst.name}
-				for _, prop := range slInst.node.Children {
+				// #6684: `host 10.0.0.1 any any;` packs the whole body onto the
+				// host node's Keys, leaving Children empty — the host compiled
+				// with ZERO facilities and shipped nothing, silently.
+				for _, prop := range packedBodyChildren(slInst.node,
+					schemaForPath("system", "syslog", "host")) {
 					// #4303 S-1: switch on the KNOWN host sub-statements
 					// before the facility/severity fallback. Without this
 					// every non-`allow-duplicates` child (source-address,

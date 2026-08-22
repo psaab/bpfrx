@@ -1,0 +1,168 @@
+package config
+
+// Compact ("packed") stanza bodies — #6683 / #6684 / #6685.
+//
+// Junos accepts a stanza body written either NESTED or PACKED onto one line,
+// and the two are the same configuration:
+//
+//	security { screen { ids-option s1 { icmp { ping-death; } } } }   nested
+//	security { screen { ids-option s1 icmp ping-death; } }           packed
+//
+// The parser does not normalise them. A packed body arrives as extra tokens on
+// the node's OWN Keys, with no Children at all:
+//
+//	nested   [ids-option s1] -> [icmp] -> [ping-death]
+//	packed   [ids-option s1 icmp ping-death]
+//
+// A compiler that descends only `node.Children` therefore sees an instance with
+// an EMPTY body. The instance NAME survives, which is what makes this class so
+// hard to notice: the profile/host/term exists, `show configuration` displays
+// what the operator wrote, it binds to a zone or an interface normally — and it
+// enforces nothing.
+//
+// The three known instances all fail in the security-relevant direction: a
+// screen check compiles DISABLED (#6683), a syslog host compiles with ZERO
+// facilities so nothing is shipped (#6684), and a firewall filter term compiles
+// with an EMPTY action so a `discard` does not discard (#6685).
+//
+// # Why this needs the schema rather than a split on whitespace
+//
+// The packed tail does NOT expand uniformly, which is why there was no shared
+// helper before and why fixing one site by hand does not generalise:
+//
+//	ids-option s1 icmp ping-death   ->  [icmp] -> [ping-death]     a CHAIN
+//	host 10.0.0.1 any any           ->  [any any]                  ONE 2-key leaf
+//	term t1 then discard            ->  [then] -> [discard]        a CHAIN
+//
+// How many tokens each level swallows is a property of the GRAMMAR, and the
+// grammar already has a single source of truth: `setSchema`, whose
+// `schemaNode.args` is defined as "extra tokens consumed as part of this node's
+// key". `consumeNodeKeys` is the same primitive `SchemaValidate` uses to answer
+// exactly this question, so expansion here cannot drift from validation there.
+//
+// The expansion is deliberately NOT done in the parser. `show configuration`
+// renders from the AST, so normalising at parse time would rewrite the
+// operator's packed one-liner into nested form on display — a round-trip
+// fidelity change well beyond the scope of these three fail-opens.
+
+// schemaForPath resolves the schema node addressed by an absolute keyword path
+// (e.g. []string{"security", "screen", "ids-option"}), or nil when the path is
+// not modelled. Instance-name slots resolve through the wildcard child, so the
+// path names KEYWORDS only — no instance names.
+func schemaForPath(path ...string) *schemaNode {
+	cur := setSchema
+	for i := 0; i < len(path); i++ {
+		if cur == nil {
+			return nil
+		}
+		cur = resolveSchemaChild(cur, path[i])
+		if cur == nil {
+			return nil
+		}
+		// Compound key (`family inet`): the following token is part of THIS
+		// node's key and selects a sub-child, so the caller spells it as a
+		// path element and it is consumed here rather than resolved as a
+		// child of the compound node — which is where it does not exist.
+		if cur.compoundKey && i+1 < len(path) {
+			if sub, ok := cur.children[path[i+1]]; ok {
+				cur = sub
+				i++
+			}
+		}
+	}
+	return cur
+}
+
+// packedBodyChildren returns the body a compiler should descend for node.
+//
+// When the body was written nested it is `node.Children`, returned unchanged —
+// this is the overwhelmingly common path and costs one length check.
+//
+// When the body was PACKED onto the node's Keys it is a synthesized chain that
+// is shape-identical to what the parser would have produced for the nested
+// spelling, so the caller's existing nested-shape reader handles it with no
+// second code path to keep in step.
+//
+// schema is the node's OWN schema (the one addressing e.g. `ids-option`), used
+// to learn how many leading Keys are the node's identity and how the remaining
+// tokens divide. A nil schema, or a tail that leaves the modelled grammar,
+// returns the children unchanged rather than guessing: this helper exists to
+// stop configuration being silently dropped, and inventing a shape the schema
+// does not describe would be a different way of doing the same thing.
+//
+// Synthesized nodes are FRESH allocations; the input node is never mutated, so
+// a caller that also renders or re-walks the original AST sees exactly what the
+// operator wrote.
+func packedBodyChildren(node *Node, schema *schemaNode) []*Node {
+	if node == nil || schema == nil {
+		return nodeChildren(node)
+	}
+	consumed, cur := consumeNodeKeys(node.Keys, schema)
+	tail := node.Keys[consumed:]
+	if len(tail) == 0 {
+		return node.Children
+	}
+
+	var head, last *Node
+	for len(tail) > 0 {
+		childSchema := resolveSchemaChild(cur, tail[0])
+		if childSchema == nil {
+			// Outside the modelled grammar. Do not guess.
+			return node.Children
+		}
+		n, refined := consumeNodeKeys(tail, childSchema)
+		if n <= 0 {
+			return node.Children
+		}
+		next := &Node{Keys: append([]string(nil), tail[:n]...)}
+		if last == nil {
+			head = next
+		} else {
+			last.Children = []*Node{next}
+		}
+		last = next
+		tail = tail[n:]
+		cur = refined
+	}
+
+	// A packed body and a nested body are alternative spellings, not additive,
+	// so a node carrying both is not something the parser produces. Append
+	// rather than replace anyway: dropping real children would be a silent
+	// loss, which is the very failure this helper exists to end.
+	if len(node.Children) == 0 {
+		return []*Node{head}
+	}
+	return append(append([]*Node(nil), node.Children...), head)
+}
+
+// nodeChildren is node.Children with a nil-node guard.
+func nodeChildren(node *Node) []*Node {
+	if node == nil {
+		return nil
+	}
+	return node.Children
+}
+
+// packedBody returns node with its packed tail expanded into Children, so a
+// caller can keep using the ordinary *Node helpers (FindChild / FindChildren /
+// range over Children) with no second code path for the packed spelling.
+//
+// The returned node is the ORIGINAL when there is nothing to expand — the
+// common case, and the one where identity matters to callers that compare
+// nodes. Otherwise it is a shallow copy carrying the synthesized body; the
+// original is never mutated.
+func packedBody(node *Node, schema *schemaNode) *Node {
+	if node == nil {
+		return nil
+	}
+	children := packedBodyChildren(node, schema)
+	if len(children) == len(node.Children) {
+		// Same backing slice means nothing was synthesized.
+		if len(children) == 0 || &children[0] == &node.Children[0] {
+			return node
+		}
+	}
+	clone := *node
+	clone.Children = children
+	return &clone
+}
