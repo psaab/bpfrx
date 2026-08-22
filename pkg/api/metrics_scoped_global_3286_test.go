@@ -74,15 +74,16 @@ func TestCollectPolicyCountersScopedGlobalLabels(t *testing.T) {
 	store := scopedGlobalMetricsStore(t)
 	scopedID := globalCounterPolicyID(t, store, "scoped-global")
 	openID := globalCounterPolicyID(t, store, "open-global")
-	c := &xpfCollector{
-		srv: &Server{store: store},
-		policyHitsTotal: prometheus.NewDesc(
-			"xpf_policy_hits_total",
-			"policy hits",
-			[]string{"from_zone", "to_zone", "policy_name"},
-			nil,
-		),
-	}
+	// #7016: see TestCollectPolicyCountersNilSlotsNoPanic -- initialize the
+	// real descriptor set, then override the asserted one.
+	c := &xpfCollector{srv: &Server{store: store}}
+	c.initPolicyDescriptors()
+	c.policyHitsTotal = prometheus.NewDesc(
+		"xpf_policy_hits_total",
+		"policy hits",
+		[]string{"from_zone", "to_zone", "policy_name"},
+		nil,
+	)
 	dp := &schedulerCounterAPIDP{
 		Manager: dataplane.New(),
 		counters: map[uint32]dataplane.CounterValue{

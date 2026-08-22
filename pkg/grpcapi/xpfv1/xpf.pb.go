@@ -2569,8 +2569,24 @@ type PolicyRule struct {
 	// when non-empty and fall back to the singular otherwise.
 	MatchFromZones []string `protobuf:"bytes,21,rep,name=match_from_zones,json=matchFromZones,proto3" json:"match_from_zones,omitempty"`
 	MatchToZones   []string `protobuf:"bytes,22,rep,name=match_to_zones,json=matchToZones,proto3" json:"match_to_zones,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// hit_counters_unavailable marks hit_packets/hit_bytes as NOT authoritative
+	// because the rule is counter-ELIGIBLE (system-wide `policy-stats` on, or the
+	// rule carries `then count`) but no runtime counter source answered for it:
+	// the dataplane is unloaded, or it is loaded and the helper has published no
+	// counter for THIS rule's stable rule id yet — the pre-first-status-poll
+	// warm-up window, or config skew after a non-abort-class apply failure
+	// (#5679) where the control plane has promoted a config the helper is not
+	// yet enforcing (#7016). Before this field GetPolicies answered that window
+	// with codes.Internal, discarding the WHOLE inventory for one unpublished
+	// rule. The REST sibling carries the same flag as hit_counters_unavailable
+	// (#5580). Additive; false (omitted) on a healthy read and for a rule that
+	// is legitimately not counter-enabled — that one is signalled by count=false,
+	// which is DISTINCT from counter-enabled-but-source-unavailable. A genuine
+	// read FAILURE (the dataplane snapshot itself errored) is still fail-loud as
+	// codes.Internal (#3408), never this flag.
+	HitCountersUnavailable bool `protobuf:"varint,23,opt,name=hit_counters_unavailable,json=hitCountersUnavailable,proto3" json:"hit_counters_unavailable,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *PolicyRule) Reset() {
@@ -2755,6 +2771,13 @@ func (x *PolicyRule) GetMatchToZones() []string {
 		return x.MatchToZones
 	}
 	return nil
+}
+
+func (x *PolicyRule) GetHitCountersUnavailable() bool {
+	if x != nil {
+		return x.HitCountersUnavailable
+	}
+	return false
 }
 
 type GetSessionsRequest struct {
@@ -8649,7 +8672,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xa6\x06\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xe0\x06\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -8675,7 +8698,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\x0escheduler_name\x18\x13 \x01(\tR\rschedulerName\x12\x1a\n" +
 	"\binactive\x18\x14 \x01(\bR\binactive\x12(\n" +
 	"\x10match_from_zones\x18\x15 \x03(\tR\x0ematchFromZones\x12$\n" +
-	"\x0ematch_to_zones\x18\x16 \x03(\tR\fmatchToZonesB\f\n" +
+	"\x0ematch_to_zones\x18\x16 \x03(\tR\fmatchToZones\x128\n" +
+	"\x18hit_counters_unavailable\x18\x17 \x01(\bR\x16hitCountersUnavailableB\f\n" +
 	"\n" +
 	"_policy_id\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +

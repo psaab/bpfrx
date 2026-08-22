@@ -394,7 +394,15 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 		// counted-but-idle is distinguishable from not-counted. A rule with hits
 		// prints them regardless (unchanged); an uncounted idle rule prints
 		// nothing (unchanged).
-		if rule.Count || rule.HitPackets > 0 || rule.HitBytes > 0 {
+		switch {
+		case rule.HitCountersUnavailable:
+			// #7016: the rule is counter-eligible but no runtime counter source
+			// answered for it (dataplane unloaded, or the helper has published
+			// nothing for this rule id yet -- warm-up / config skew). Say so
+			// rather than printing an authoritative-looking "0 packets, 0
+			// bytes" an operator would read as "this rule matched no traffic".
+			fmt.Printf("    Hit count: not available (no counter published for this rule)\n")
+		case rule.Count || rule.HitPackets > 0 || rule.HitBytes > 0:
 			fmt.Printf("    Hit count: %d packets, %d bytes\n", rule.HitPackets, rule.HitBytes)
 		}
 	}
@@ -726,7 +734,10 @@ func (c *ctl) showPoliciesBrief() error {
 	for _, pi := range resp.Policies {
 		for _, rule := range pi.Rules {
 			hits := "-"
-			if rule.HitPackets > 0 {
+			switch {
+			case rule.HitCountersUnavailable:
+				hits = "n/a" // #7016: no counter published for this rule
+			case rule.HitPackets > 0:
 				hits = fmt.Sprintf("%d", rule.HitPackets)
 			}
 			// #3357: a scoped global (#3148) is exposed under the global group

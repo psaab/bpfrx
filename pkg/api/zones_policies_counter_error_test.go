@@ -85,7 +85,12 @@ func TestCollectPolicyCountersCountsReadErrors(t *testing.T) {
 
 	var policyEmitted int
 	for m := range ch {
-		if strings.Contains(m.Desc().String(), "xpf_policy_hits_total") {
+		// #7016: EXTRACT the fqName rather than substring-matching
+		// Desc.String(), which embeds the HELP text -- the
+		// xpf_policy_counters_unpublished_rules gauge collectPolicyCounters now
+		// emits on every path cross-references xpf_policy_hits_total in its
+		// HELP, so a Contains match counted it as a policy sample.
+		if descFQName(m.Desc().String()) == "xpf_policy_hits_total" {
 			policyEmitted++
 		}
 	}
