@@ -56,6 +56,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     assert!(
@@ -79,6 +80,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     assert_eq!(
@@ -122,6 +124,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     assert!(
@@ -145,6 +148,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     assert_eq!(
@@ -193,6 +197,7 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         )
     };
@@ -261,6 +266,7 @@ fn source_nat_match_application_constrains_source_port_3491() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         )
     };
@@ -313,6 +319,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
         0,
         false,
         false,
+        NatHolder::Untracked,
         &mut counter,
     );
     assert_eq!(
@@ -422,6 +429,7 @@ fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         );
         assert_eq!(
@@ -461,6 +469,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
             0,
             false,
             false,
+            NatHolder::Untracked,
             &mut counter,
         )
     };

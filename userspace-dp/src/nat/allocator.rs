@@ -1196,6 +1196,12 @@ impl PortAllocator {
         persistent_nat_permit: super::source::PersistentNatPermit,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         if self.port_low == 0 || self.port_high == 0 || self.port_low > self.port_high {
             return Err(super::source::SourceNatFailureReason::InvalidPortRange);
@@ -1272,10 +1278,15 @@ impl PortAllocator {
                         addr_index: abs,
                         deterministic: false,
                         address_only: false,
-                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                        // one worker, so this record has a single holder by construction and
-                        // the first release frees it (pre-#6211-F2 contract, unchanged).
-                        holders: 0,
+                        // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                        // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                        // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                        // this worker) and each sibling reserves against this same record, so
+                        // without this bit the mask holds every worker EXCEPT the one actually
+                        // forwarding — and the last sibling replica to age-reap frees a
+                        // `(pool_addr, port)` still in use. Recording the owner here makes the
+                        // mask complete, so the port survives until the owner itself releases.
+                        holders: holder.bit(),
                     },
                 );
                 self.shared
@@ -1296,6 +1307,7 @@ impl PortAllocator {
             persistent_nat_permit,
             persistent_nat_timeout_ns,
             now_ns,
+            holder,
         )
     }
 
@@ -1315,6 +1327,12 @@ impl PortAllocator {
         persistent_nat_permit: super::source::PersistentNatPermit,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let family_len = family_addresses.len();
         let mut live = self.lock_live();
@@ -1338,6 +1356,7 @@ impl PortAllocator {
                 flow,
                 persistent_nat_timeout_ns,
                 now_ns,
+                holder,
             ) {
                 return Ok(translated);
             }
@@ -1410,10 +1429,15 @@ impl PortAllocator {
                     addr_index: abs,
                     deterministic: false,
                     address_only: false,
-                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                    // one worker, so this record has a single holder by construction and
-                    // the first release frees it (pre-#6211-F2 contract, unchanged).
-                    holders: 0,
+                    // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                    // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                    // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                    // this worker) and each sibling reserves against this same record, so
+                    // without this bit the mask holds every worker EXCEPT the one actually
+                    // forwarding — and the last sibling replica to age-reap frees a
+                    // `(pool_addr, port)` still in use. Recording the owner here makes the
+                    // mask complete, so the port survives until the owner itself releases.
+                    holders: holder.bit(),
                 },
             );
             self.shared
@@ -1450,6 +1474,12 @@ impl PortAllocator {
         flow: SourceNatFlowKey,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Option<TranslatedTuple> {
         if !live.persistent_by_source.contains_key(&key) {
             return None;
@@ -1493,10 +1523,15 @@ impl PortAllocator {
                     addr_index,
                     deterministic: false,
                     address_only: false,
-                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                    // one worker, so this record has a single holder by construction and
-                    // the first release frees it (pre-#6211-F2 contract, unchanged).
-                    holders: 0,
+                    // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                    // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                    // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                    // this worker) and each sibling reserves against this same record, so
+                    // without this bit the mask holds every worker EXCEPT the one actually
+                    // forwarding — and the last sibling replica to age-reap frees a
+                    // `(pool_addr, port)` still in use. Recording the owner here makes the
+                    // mask complete, so the port survives until the owner itself releases.
+                    holders: holder.bit(),
                 },
             );
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -1790,6 +1825,12 @@ impl PortAllocator {
         pool_v4: &[Ipv4Addr],
         params: DeterministicV4,
         src: Ipv4Addr,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         use super::source::SourceNatFailureReason;
         if self.port_low == 0 || self.port_high == 0 || self.port_low > self.port_high {
@@ -1839,10 +1880,15 @@ impl PortAllocator {
                         addr_index: ip_idx,
                         deterministic: true,
                         address_only: false,
-                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                        // one worker, so this record has a single holder by construction and
-                        // the first release frees it (pre-#6211-F2 contract, unchanged).
-                        holders: 0,
+                        // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                        // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                        // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                        // this worker) and each sibling reserves against this same record, so
+                        // without this bit the mask holds every worker EXCEPT the one actually
+                        // forwarding — and the last sibling replica to age-reap frees a
+                        // `(pool_addr, port)` still in use. Recording the owner here makes the
+                        // mask complete, so the port survives until the owner itself releases.
+                        holders: holder.bit(),
                     },
                 );
                 self.shared
@@ -1873,6 +1919,12 @@ impl PortAllocator {
         pool_v4: &[Ipv4Addr],
         params: DeterministicV6,
         src: Ipv6Addr,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         use super::source::SourceNatFailureReason;
         if self.port_low == 0 || self.port_high == 0 || self.port_low > self.port_high {
@@ -1921,10 +1973,15 @@ impl PortAllocator {
                         addr_index: ip_idx,
                         deterministic: true,
                         address_only: false,
-                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                        // one worker, so this record has a single holder by construction and
-                        // the first release frees it (pre-#6211-F2 contract, unchanged).
-                        holders: 0,
+                        // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                        // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                        // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                        // this worker) and each sibling reserves against this same record, so
+                        // without this bit the mask holds every worker EXCEPT the one actually
+                        // forwarding — and the last sibling replica to age-reap frees a
+                        // `(pool_addr, port)` still in use. Recording the owner here makes the
+                        // mask complete, so the port survives until the owner itself releases.
+                        holders: holder.bit(),
                     },
                 );
                 self.shared
@@ -2191,6 +2248,12 @@ impl PortAllocator {
         family_offset: usize,
         start_abs: usize,
         address_persistent: bool,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let family_len = family_addresses.len();
         if family_len == 0 {
@@ -2249,10 +2312,15 @@ impl PortAllocator {
                     addr_index: 0,
                     deterministic: false,
                     address_only: true,
-                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                    // one worker, so this record has a single holder by construction and
-                    // the first release frees it (pre-#6211-F2 contract, unchanged).
-                    holders: 0,
+                    // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                    // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                    // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                    // this worker) and each sibling reserves against this same record, so
+                    // without this bit the mask holds every worker EXCEPT the one actually
+                    // forwarding — and the last sibling replica to age-reap frees a
+                    // `(pool_addr, port)` still in use. Recording the owner here makes the
+                    // mask complete, so the port survives until the owner itself releases.
+                    holders: holder.bit(),
                 },
             );
             self.shared
@@ -2305,6 +2373,12 @@ impl PortAllocator {
         persistent_nat_permit: super::source::PersistentNatPermit,
         persistent_nat_timeout_ns: u64,
         now_ns: u64,
+        // #6522: the worker performing this LOCAL allocation, so the record
+        // it inserts already names its own holder before any sibling replica
+        // reserves against it. `NatHolder::Untracked` reproduces the
+        // pre-#6522 single-holder contract and is what the test entry points
+        // and the read-only fragment probe pass.
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let family_len = family_addresses.len();
         if family_len == 0 {
@@ -2442,10 +2516,15 @@ impl PortAllocator {
                 addr_index,
                 deterministic: false,
                 address_only: true,
-                // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
-                // one worker, so this record has a single holder by construction and
-                // the first release frees it (pre-#6211-F2 contract, unchanged).
-                holders: 0,
+                // #6522: the ALLOCATING worker's holder bit. A locally-born session is
+                // replicated to every SIBLING worker (`replicate_session_upsert` fans a
+                // `WorkerLocalImport` entry to `peer_worker_commands`, which EXCLUDES
+                // this worker) and each sibling reserves against this same record, so
+                // without this bit the mask holds every worker EXCEPT the one actually
+                // forwarding — and the last sibling replica to age-reap frees a
+                // `(pool_addr, port)` still in use. Recording the owner here makes the
+                // mask complete, so the port survives until the owner itself releases.
+                holders: holder.bit(),
             },
         );
         Ok(translated)

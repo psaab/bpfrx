@@ -19,6 +19,21 @@
 
 use super::*;
 
+/// #6522: resolve the source-NAT decision for a flow and, when it MINTS a pool
+/// allocation, record `worker_id` as that allocation's holder.
+///
+/// The resulting session is replicated to every SIBLING worker
+/// (`replicate_session_upsert` fans a `WorkerLocalImport` entry to
+/// `peer_worker_commands`, which excludes this worker) and each sibling
+/// reserves against the same allocator record. An allocation that does not name
+/// its own owner therefore ends up with a holder mask covering every worker
+/// EXCEPT the one forwarding, and the last sibling replica to age-reap frees a
+/// live `(pool_addr, port)`.
+///
+/// The parameter is a `u32`, not a `NatHolder`: the packet path cannot express
+/// "untracked", so a call site here CANNOT silently opt out of the holder set.
+/// The one untracked caller is the read-only fragment probe below, which reaches
+/// [`source_nat_decision_with_holder`] directly and mints nothing.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -30,10 +45,46 @@ pub(super) fn source_nat_decision_for_flow(
     egress_ifindex: i32,
     flow: &SessionFlow,
     now_ns: u64,
+    non_first_fragment: bool,
+    worker_id: u32,
+    matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
+) -> Result<NatDecision, SourceNatFailure> {
+    source_nat_decision_with_holder(
+        forwarding,
+        ingress_ifindex,
+        from_zone,
+        to_zone,
+        egress_ifindex,
+        flow,
+        now_ns,
+        non_first_fragment,
+        crate::nat::NatHolder::Worker(worker_id),
+        matched_counter,
+    )
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn source_nat_decision_with_holder(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    from_zone: &str,
+    to_zone: &str,
+    egress_ifindex: i32,
+    flow: &SessionFlow,
+    now_ns: u64,
     // #1852: gate pool-mode SNAT allocation for non-first fragments. The
     // static-NAT (address-only) match below is NOT gated — it rewrites
     // the IP on every fragment, which is correct.
     non_first_fragment: bool,
+    // #6522: THIS worker's id, recorded as the holder of any pool allocation
+    // this decision mints. A locally-born session is replicated to every
+    // SIBLING worker and each sibling reserves against the same allocator
+    // record, so without the allocating worker's own bit the holder mask names
+    // every worker EXCEPT the one forwarding — and the last sibling replica to
+    // age-reap frees a live `(pool_addr, port)`.
+    holder: crate::nat::NatHolder,
     // #2218: out-param — the matched SNAT/static-SNAT rule's per-rule hit
     // counter (None when no rule matched or the rule has no counter). The
     // caller increments it once per committed translated forward flow.
@@ -77,6 +128,7 @@ pub(super) fn source_nat_decision_for_flow(
         flow,
         now_ns,
         non_first_fragment,
+        holder,
         matched_counter,
     ) {
         SourceNatLookup::Matched(decision) => Ok(decision),
@@ -119,7 +171,7 @@ pub(super) fn source_nat_would_translate_fragment(
     now_ns: u64,
 ) -> bool {
     let mut matched_counter = None;
-    match source_nat_decision_for_flow(
+    match source_nat_decision_with_holder(
         forwarding,
         ingress_ifindex,
         from_zone,
@@ -130,6 +182,9 @@ pub(super) fn source_nat_would_translate_fragment(
         // A non-first fragment: pool-mode SNAT reports `Unavailable` before
         // allocating, so this stays read-only.
         true,
+        // #6522: side-effect-free by the contract above — it mints no pool
+        // mapping, so there is no allocation to record a holder on.
+        crate::nat::NatHolder::Untracked,
         &mut matched_counter,
     ) {
         Ok(decision) => decision.rewrite_src.is_some() || decision.rewrite_dst.is_some(),
