@@ -1,7 +1,7 @@
 # #1863 implementation — pointer + decision record
 
 Canonical converged plan (3-of-3 PLAN-READY, round 3):
-`docs/research/1863-realization-gap/plan.md` on branch
+`docs/pr/1863-realization-gap/plan.md` on branch
 `research/1863-realization-gap` @ `8309d944c` (v3.1; reviewer ledger
 + round docs alongside).
 

@@ -179,9 +179,24 @@ func joinNodePath(prefix string, keys []string) string {
 // above.
 func validateNodesControlChars(nodes []*Node, prefix string) error {
 	for _, n := range nodes {
-		nodePath := joinNodePath(prefix, n.Keys)
+		// #6625: a credential leaf must never have its VALUE rendered. The
+		// path is built from the REDACTED keys, because joinNodePath renders
+		// every key — including the value — so an un-redacted path published
+		// the secret a second time, alongside the quoted value below.
+		nodePath := joinNodePath(prefix, redactSecretKeys(prefix, n.Keys))
+		secretLeaf := isSecretLeaf(prefix, n.Keys)
 		for _, k := range n.Keys {
 			if hasControlChars(k) {
+				if secretLeaf {
+					// Report WHERE and WHAT, never the value. The offset plus
+					// the byte is enough to fix the input — a leading tab from
+					// a password manager is offset 0, a trailing CR is the last
+					// offset — and discloses nothing. Rendering it would put the
+					// credential into commit output, the daemon log and the
+					// audit journal, which is exactly what the operator was
+					// trying to set privately.
+					return fmt.Errorf("%s: value contains %s (newlines and other control characters are not allowed in configuration values; the value is not shown because this statement carries a credential)", nodePath, describeControlChar(k))
+				}
 				return fmt.Errorf("%s: value %q contains control characters (newlines and other control characters are not allowed in configuration values)", nodePath, k)
 			}
 		}

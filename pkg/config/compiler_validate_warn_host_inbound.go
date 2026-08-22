@@ -417,6 +417,22 @@ func junosHostPolicyStricterThanCoarseGate(action PolicyAction, m PolicyMatch) (
 	if junosHostPolicySourceScoped(m) {
 		return true, "source-restricted permit"
 	}
+	// #6612: a permit narrowed on DESTINATION is stricter for the same reason a
+	// source-narrowed one is — the nft chain admits every configured
+	// system-service to EVERY local address in the zone, so each firewall
+	// address the permit does not name falls to the junos-host default deny
+	// under Junos and is admitted here. Before this clause such a permit was
+	// silent on BOTH halves: junosHostProjectTerm already refuses to render it
+	// (a permit is projected only as a `saddr !=` subtraction of later denies,
+	// which cannot express a carve that is also destination-scoped), and this
+	// predicate — asking about the source alone — never said so. The condition
+	// is deliberately the SAME expression junosHostProjectTerm applies, not a
+	// second opinion: a divergence between "the projection refuses to render it"
+	// and "the warning says so" is ALWAYS a bug, so the two must not hold
+	// independent copies of it.
+	if junosHostAddrScoped(m.DestinationAddresses) || m.DestinationAddressExcluded {
+		return true, "destination-restricted permit"
+	}
 	return false, ""
 }
 
