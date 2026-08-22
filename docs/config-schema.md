@@ -976,8 +976,8 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 
 **A leaf whose flat-set bracket list lands on a CHILD's Keys needs more than
 `firewallMatchValues` (#6694).** The SSOT helper reads `Keys[1:]` of the node
-plus `Keys[0]` of each child, which covers every leaf whose flat-set path
-absorbs the list onto the node itself. `interfaces fab0 fabric-options
+plus — since #6714 — every key of each child, which covers every leaf whose
+flat-set path absorbs the list onto the node itself. `interfaces fab0 fabric-options
 member-interfaces` does not: its schema node is a plain `children: nil` leaf
 with no `args` and no `multi`, so `SetPath` files the whole bracket list as ONE
 child carrying every name on that child's Keys — and `firewallMatchValues`
@@ -1045,6 +1045,67 @@ arm leaves the other spelling broken and nothing says so. They now share
 selects with `FindChildren("")`, which matches only a child whose first key is
 the empty string, and no parse produces one. The duplication was latent, which
 is precisely why no test could have caught a divergence.)
+
+**The one-sided read has a SECOND half, and it is not a leaf spelling at all
+(#6714).** Everything above is about the five ways ONE statement can be
+spelled. Three more sites dropped values for a different reason: the parser
+keeps a repeated same-keyed STATEMENT as a SIBLING node, so a compiler that
+resolves it with `FindChild` compiles the first and discards the rest. That is
+invisible to the behavioural spelling gate
+(`schema_spelling_differential_gate_test.go`), which authors one statement per
+site and cannot emit a second one.
+
+| site | shape that dropped | fix |
+|---|---|---|
+| `event-options policy <p> then change-configuration commands` | repeated `commands` statements, and repeated `change-configuration` blocks | `FindChildren` on both levels |
+| `routing-options forwarding-table export` | two sibling `forwarding-table` blocks in ONE `routing-options` root | `FindChildren("forwarding-table")` for the LIST; the scalar still binds to the FIRST block |
+| `firewallMatchValues` (~70 call sites) | a value tail riding on a block CHILD (`flag { basic-datapath session; }`, `flag { [ a b ]; }`) | read every key of each child, not `Keys[0]` |
+
+The `commands` row is worth reading twice, because it inverts the usual
+advice. CLAUDE.md tells you to test flat-set syntax with
+`ParseSetCommand` + `SetPath`; here the flat-set spelling was the one that
+already WORKED (`SetPath` merges a repeated leaf into one node), and only the
+brace-authored file dropped. A fixture built the recommended way could not have
+seen it. Build BOTH.
+
+The `firewallMatchValues` row states a property rather than a shape: the reader
+already took every token of the node's OWN tail, so taking only `Keys[0]` of a
+child made the identical token sequence read differently depending on which
+side of the AST the parser put it on. The fix is that agreement, and it is
+pinned as an agreement (`TestFirewallMatchValues6714ReadsEveryKeyOfEveryChild`)
+rather than as an expected output. Note the blast radius is bounded by depth:
+the reader takes each child's Keys and does NOT descend, because a child with a
+sub-block (`neighbor 10.0.0.1 { metric 2; }`) contributes its name only — that
+is what separates it from `plainListValues`, which descends and must therefore
+never be pointed at a leaf whose children are containers.
+
+Other `multi: true` sites still take `Keys[0]` of each child through
+`multiLeafAuthoredValues` / `addressSetMemberValues` / `proxyARPAddressValues`,
+and that residue was MEASURED rather than assumed: a `leaf { v1 v2; }` probe
+across the whole schema names 30 sites where the second token is still
+dropped. They are left
+alone deliberately — that spelling is not authorable Junos (Junos writes one
+value per statement inside a block), the readers differ for stated reasons
+(`multiLeafAuthoredValues` keeps empty values to hold the
+`multiLeafAuthoredValues(n)[0] == nodeVal(n)` invariant; `proxyARPAddressValues`
+holds #6673's measured install-parity), and adding the spelling to the gate
+would assert a defect at 30 sites that no operator can author.
+
+**A silent DROP can be closed by diagnosing it instead of widening the read
+(#6714, proxy-ARP).** `security nat proxy-arp … address` accepts one
+address/prefix, one `<low> to <high>` range, or a list of plain addresses —
+never a MIXTURE. A statement that mixes them (`address [ 192.0.2.1 192.0.2.2 to
+192.0.2.9 ]`) falls through both range branches, and #6673 pinned the fallback
+to master's single-value read against a corpus measured through the installer's
+own `netip.ParsePrefix` gate. Widening it would have invented a grammar Junos
+does not have AND made an upgraded appliance answer ARP for addresses it did not
+answer for before. The compiler now stamps the offending statement into
+`ProxyARPEntry.MalformedRangeSpecs` (a `json:"-"` compile artifact, mirroring
+`NATPool.PortRangeInvalidSpec`) and `validateProxyARPAddressesStrict` rejects it
+at commit while the tolerant load / peer-sync path warns and installs exactly
+what it installed before. The installed set does not move; what an operator can
+COMMIT does. A rejection can be relaxed into an expansion later if the demand
+appears; an ARP response cannot be un-sent.
 
 **Widening a multi-value READ requires widening its VALIDATOR in the same
 change (#6659).** Adopting the accumulating reader at a site changes what a
@@ -1194,7 +1255,11 @@ bundled, because each needs its own value-domain gate widened in the same change
 | Leaf | Still one-sided | Tracked |
 |---|---|---|
 | ~~`system archival archive-sites` (+ three sibling system leaves)~~ | ~~reads `Children` and only slot 1 of the tail~~ | #6692 — FIXED |
-| nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
+| ~~nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves~~ | ~~assorted value drops~~ | #6714 — FIXED (see "The one-sided read has a SECOND half" above) |
+
+The table is empty of live rows. That is a state to defend rather than a state
+to fill: the next entry belongs here only after the behavioural gate below has
+been asked and found blind, with the reason it was blind written down.
 
 ### The list above is now enforced by a gate, not maintained by hand
 

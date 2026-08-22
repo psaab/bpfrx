@@ -1497,7 +1497,7 @@ func reportedScopeZone(scope []string, flowZone string) string {
 // global / junos-host policies (policy.rs evaluate_policy_result_with_icmp gates
 // the whole transit block on from_id != 0 && to_id != 0; evaluate_junos_host_policy
 // returns None for from_id == 0). A zone is "known" iff it is present in
-// cfg.Security.Zones.
+// cfg.Security.Zones AND is not QUARANTINED (#5649, C181-C14/C20).
 //
 // This mirrors the runtime UNCONDITIONALLY — there is deliberately NO
 // empty-Zones leniency. policy.rs applies the from_id/to_id != 0 gate for every
@@ -1508,9 +1508,45 @@ func reportedScopeZone(scope []string, flowZone string) string {
 // the runtime would never evaluate. A committed production config always
 // populates Zones; a synthetic config without zones now faithfully matches
 // nothing in transit.
+//
+// #5649 (C181-C14/C20): a lenient/HA-loaded config with a StableZoneID
+// collision keeps compiling — the LATER-sorting zone name is QUARANTINED at
+// snapshot build (config.QuarantinedZoneNames / zoneid.go) and dropped from
+// the dataplane: its interfaces are unzoned (fail to id 0) and its policies
+// are scrubbed. Before this fix, zoneKnown consulted only the raw typed
+// cfg.Security.Zones map, which STILL contains the quarantined name (typed
+// config carries the collision; only the built snapshot resolves it), so the
+// simulator reported a quarantined zone as policy-matchable — telling an
+// operator that a policy referencing the DROPPED zone permits or denies a
+// flow, when the runtime never installed that zone at all. Projecting the
+// same collision-quarantine result used by the wire builder keeps the
+// simulator's "known" predicate honest about what the dataplane actually
+// admitted.
 func zoneKnown(cfg *config.Config, zone string) bool {
-	_, ok := cfg.Security.Zones[zone]
-	return ok
+	if _, ok := cfg.Security.Zones[zone]; !ok {
+		return false
+	}
+	if _, quarantined := quarantinedZoneNames(cfg)[zone]; quarantined {
+		return false
+	}
+	return true
+}
+
+// quarantinedZoneNames computes the #3719 StableZoneID collision-quarantine
+// set for cfg's configured zone names — the exact projection zoneKnown needs
+// to treat a runtime-dropped zone as unknown (#5649, C181-C14/C20). This is a
+// cold config-tool path (CLI/REST/gRPC `match-policies`, not per-packet), so
+// recomputing the O(n log n) sort per zoneKnown call is not hot-path work; n
+// is the configured zone count, typically tens of entries.
+func quarantinedZoneNames(cfg *config.Config) map[string]struct{} {
+	if len(cfg.Security.Zones) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	return config.QuarantinedZoneNames(names)
 }
 
 // matchedResult builds the verdict for a concrete policy hit, stamping its zone

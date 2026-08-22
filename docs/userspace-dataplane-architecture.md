@@ -94,7 +94,10 @@ Packet arrives at NIC
   ├─ Non-IP (ARP, etc.) ──────────────────► kernel stack
   ├─ Multicast / broadcast ────────────────► cpumap → kernel stack
   ├─ Local destination ────────────────────► cpumap → kernel stack
-  ├─ GRE / ESP live exceptions ────────────► cpumap → kernel stack
+  ├─ ESP / non-native GRE to a LOCAL or ───► cpumap → kernel stack
+  │    interface-NAT destination                (kernel XFRM / GRE device)
+  ├─ ESP / non-native GRE to a REMOTE ─────► XDP_REDIRECT → XSK socket
+  │    destination (#304)                       (worker adjudicates)
   ├─ Degraded local/control cases ─────────► kernel stack
   ├─ Degraded transit cases ───────────────► XDP_DROP
   │
@@ -104,6 +107,24 @@ Packet arrives at NIC
   │
   └─ Binding/heartbeat failure on DP-managed interface ─► local/control pass or transit drop
 ```
+
+**#304 — ESP and non-native GRE are destination-qualified.** Until #304 the
+shim diverted *every* ESP packet and every non-native GRE packet to the kernel
+on a protocol-only test, with no destination predicate at all. That is correct
+for a tunnel this firewall terminates (ESP is decrypted by kernel XFRM, a
+non-native GRE tunnel is decapsulated by a kernel GRE device) and wrong for
+everything else: a TRANSIT ESP or GRE packet addressed to a host *beyond* the
+firewall was handed to the kernel forwarding path, where `ip_forward=1` and an
+all-accept nft ruleset forwarded it with no zone policy evaluated. The shim now
+lets both protocols fall into the ordinary session-miss classification, whose
+local-destination and interface-NAT arms are destination-qualified; a remote
+destination reaches the AF_XDP worker instead, where the #5620
+`owns_configured_ip` gate is table-scoped — local-destined IPsec is claimed and
+reinjected to the local stack, a remote destination is `NotClaimed` and
+continues into transit forwarding plus zone-policy evaluation. The degraded
+path (`is_degraded_local_or_control`) already demanded exactly this, so before
+#304 the degraded path was *safer* than the healthy one. Measured verifier
+cost: 773,966 → 777,901 processed insns (headroom 22.60% → 22.21%).
 
 **Key design decisions:**
 

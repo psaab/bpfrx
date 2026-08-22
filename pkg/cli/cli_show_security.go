@@ -500,6 +500,19 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	} else {
 		fmt.Printf("    Scope: zone-pair (from-zone: %s, to-zone: %s)\n", res.FromZone, res.ToZone)
 	}
+	// #5649 (C181-C20): a MATCHED to-zone junos-host fine policy still needs
+	// the coarse host-inbound-traffic admission gate (LocalDelivery evaluates
+	// BOTH — the fine policy action never overrides a coarse deny). Without
+	// this line an operator reading a matched permit could believe the fine
+	// action alone governs the flow; mirrors the HostInboundUnmatched branch's
+	// Describe() call above, which already names the gate for the no-match
+	// case (#3627 B1a). res.HostInbound is populated only for to-zone
+	// junos-host queries (matchJunosHost), so this is a no-op for transit.
+	if res.HostInbound != nil {
+		if line := res.HostInbound.Describe(); line != "" {
+			fmt.Printf("    host-inbound-traffic (zone %s): %s\n", fromZone, line)
+		}
+	}
 	if res.Description != "" {
 		fmt.Printf("    Description: %s\n", res.Description)
 	}
