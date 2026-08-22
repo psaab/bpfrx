@@ -141,12 +141,46 @@ pub fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// The terminal an extension-header walk lands on, plus the fragment sighting
+/// the caller needs to know whether the bytes THERE are an L4 header at all.
+///
+/// #6704: the walk used to return a bare `(offset, protocol)` and carry no
+/// fragment state, because nothing in the shim consumed any. For a NON-FIRST
+/// fragment the bytes at `offset` are PAYLOAD, not a TCP/UDP header, so a
+/// caller that hands them to `parse_l4` synthesises a 5-tuple out of
+/// attacker-influenced bytes. `non_first_fragment` is what lets the caller
+/// decline instead.
+#[derive(Clone, Copy)]
+pub struct ExtWalk {
+    /// Offset of the terminal — the first byte past the last walked header.
+    pub offset: u16,
+    /// The terminal next-header value.
+    pub protocol: u8,
+    /// Set when ANY Fragment header sighted along this walk carried non-zero
+    /// fragment-offset bits (`& 0xFFF8`, RFC 8200 §4.5).
+    ///
+    /// ANY, not just the first, and that is the deliberate half. It mirrors
+    /// `ExtChainWalk::non_first_fragment_offset_seen` in userspace-dp field
+    /// for field, which is what the executable parity corpus compares. The
+    /// SESSION chokepoint over there (`parse_session_flow_from_bytes` ->
+    /// `frame_is_non_first_fragment` -> `ipv6_is_non_first_fragment`) reads
+    /// only the FIRST recorded sighting, so on an RFC-8200-non-conformant
+    /// DOUBLE-Fragment chain (first offset 0, second non-zero) this side is
+    /// the STRICTER of the two. That residual disagreement is fail-closed by
+    /// construction: the shim declines the L4, forms no session key, and the
+    /// packet is redirected to userspace — the #4555 "loss of the fast path"
+    /// cost, never a bypass. Do not "fix" it by switching this to the first
+    /// sighting; that would make the shim the more permissive side, which is
+    /// the direction this issue exists to close.
+    pub non_first_fragment: bool,
+}
+
 /// Walk the extension-header chain from `first_protocol` at `offset`.
 ///
-/// Returns the terminal `(offset, protocol)` the walk lands on, or `None` when
-/// a header is truncated, a declared length overruns the packet, or an offset
-/// overflows — the fail-closed outcomes, which propagate through `?` in
-/// `parse_ipv6` to `XDP_DROP`.
+/// Returns the terminal the walk lands on, or `None` when a header is
+/// truncated, a declared length overruns the packet, or an offset overflows —
+/// the fail-closed outcomes, which propagate through `?` in `parse_ipv6` to
+/// `XDP_DROP`.
 ///
 /// Exhausting the loop is NOT an error here: it returns the last declared
 /// next-header value, which will be an extension-header type. `parse_l4`'s
@@ -183,9 +217,10 @@ pub fn walk_ipv6_ext_headers(
     l3_offset: u16,
     first_protocol: u8,
     start_offset: u16,
-) -> Option<(u16, u8)> {
+) -> Option<ExtWalk> {
     let mut protocol = first_protocol;
     let mut offset = start_offset;
+    let mut non_first_fragment = false;
     for _ in 0..MAX_EXT_HDRS {
         match eh_class(protocol) {
             EH_CLASS_GENERIC => {
@@ -212,11 +247,23 @@ pub fn walk_ipv6_ext_headers(
             }
             EH_CLASS_FRAGMENT => {
                 let frag = read_bytes(data, data_end, offset as usize, 8)?;
+                // #6704: all 8 bytes were already read for the advance, so the
+                // offset test is two of them and a mask. RFC 8200 §4.5 puts the
+                // 13-bit fragment offset in the upper bits of bytes 2..4; a
+                // non-zero offset means every byte the walk lands on after this
+                // header is PAYLOAD of an earlier datagram, not an L4 header.
+                if (u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8) != 0 {
+                    non_first_fragment = true;
+                }
                 protocol = frag[0];
                 offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
             }
             _ => break,
         }
     }
-    Some((offset, protocol))
+    Some(ExtWalk {
+        offset,
+        protocol,
+        non_first_fragment,
+    })
 }

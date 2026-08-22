@@ -535,6 +535,7 @@ type xpfCollector struct {
 	// forwarded by the kernel with no zone policy, session, NAT or screen.
 	bindingSlowPathNoRoutePackets         *prometheus.Desc
 	bindingSlowPathNextTablePackets       *prometheus.Desc
+	bindingNextTableUnsupportedDrops      *prometheus.Desc
 	bindingSlowPathLocalDeliveryPackets   *prometheus.Desc
 	bindingSlowPathMissingNeighborPackets *prometheus.Desc
 	// #1248: class-specific active flow distribution by egress CoS
@@ -908,6 +909,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.bindingVMinThrottleHardCapOverrides
 	ch <- c.bindingSlowPathNoRoutePackets
 	ch <- c.bindingSlowPathNextTablePackets
+	ch <- c.bindingNextTableUnsupportedDrops
 	ch <- c.bindingSlowPathLocalDeliveryPackets
 	ch <- c.bindingSlowPathMissingNeighborPackets
 	ch <- c.cosActiveFlowCount

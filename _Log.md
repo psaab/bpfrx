@@ -103325,6 +103325,47 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_as_path_multitoken_6686_test.go` (new),
   `pkg/frr/policy_aspath_regex_6686_test.go` (new), `docs/config-schema.md`
 
+## 2026-08-22 — #6640 host-inbound advisory consumes the enforcer's view
+- **Timestamp**: 2026-08-22
+- **Action**: Moved the per-interface host-inbound override RESOLUTION (#3720
+  physical->unit merge, #3720 M01 / #5489 cross-zone quarantines, #5878
+  canonicalisation) out of pkg/dataplane/userspace into pkg/config as
+  InterfaceZoneMap / MergeHostInboundTraffic / ResolveInterfaceHostInbound, with
+  the userspace helpers delegating, so the commit-time advisory calls the same
+  function the dataplane enforces on instead of re-deriving a raw-stanza union.
+  Re-gated the advisory on the effective view + the #3277 lifeline exemption
+  (which had never been ported to the unported-service advisory), keeping the
+  named tokens on the AUTHORED stanza so an inherited physical token is not
+  reported at a unit stanza that never named it. Four reproduced false warnings
+  now silent, three real denials still warn.
+- **File(s)**: pkg/config/host_inbound_effective_view.go (new),
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/host_inbound_advisory_effective_view_6640_test.go (new),
+  pkg/dataplane/userspace/zones.go, pkg/dataplane/userspace/zones_override.go,
+  pkg/dataplane/userspace/host_inbound_shared_view_6640_test.go (new),
+  docs/host-inbound-service-matrix.md
+## 2026-08-22 — #6693 NAT match arms read both AST slots
+- **Timestamp**: 2026-08-22
+- **Action**: Replace the either/or reader at five NAT match-address arms with
+  an accumulate-both reader that preserves authored empties and synthesizes
+  nothing; add the mixed spelling to the schema spelling differential gate.
+- **File(s)**: pkg/config/compiler_nat_match_values.go (new),
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/nat_match_mixed_shape_6693_test.go,
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+- **Timestamp**: 2026-08-22
+  - **Action**: #6693 follow-up on the rescued commit — widened the coverage to
+    all five arms on BOTH compile paths (strict + tolerant, asserted to agree),
+    per-arm malformed-tail gate reachability with a tolerant-accept no-brick leg,
+    the spelling-equivalence test extended from one arm to five, and a new
+    persistence round-trip test (Format / FormatSet re-readings must agree with
+    the authored tree). Completed the static-NAT fixture with a valid `match
+    destination-address` so the #7216 gate cannot fire first and mask the gate
+    under test.
+  - **File(s)**: pkg/config/nat_match_mixed_shape_6693_test.go,
+    docs/config-schema.md
+
 ## 2026-08-22 — #6534 closure: third port-mirroring renderer + cross-surface gate
 - **Action**: Closed #6534 by fixing the one live instance the three landed
   family PRs missed and adding the mechanism that makes the class mechanically
@@ -103348,6 +103389,223 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/mirror_exclusion_reason.go,
   pkg/grpcapi/mirror_exclusion_surfaces_6534_test.go,
   docs/junos-cli-reference.md
+
+## 2026-08-22 — #6705 junos-host unenforced-deny advisory suppression
+- **Timestamp**: 2026-08-22
+- **Action**: Gate the #4168 advisory suppression on ACTUAL rule emission, not
+  on representability. Reproduced the issue's five spellings first: the omitted
+  and valueless forms are already rejected at strict commit (#3044 / #6526), so
+  the issue's stated vector is closed; the reachable vector is an
+  application-any permit for every source, which commits cleanly with zero
+  warnings and leaves the DROP program empty while the deny still counts as
+  rendered.
+- **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/config/junos_host_deny_unenforced_6705_test.go
+
+## 2026-08-22 — #6696 dhcp-local-server group interface / pool dns-server
+- **Action**: Both arms now read every element of a bracketed list; modelled
+  the two leaves (and both families' shared `group` subtree) in `setSchema`
+  with per-element validators; `interface` keeps its per-interface modifiers
+  out of the value list via `valueList` + modelled modifier children.
+- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
+  `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
+  `docs/config-schema.md`
+
+## 2026-08-22 — #6640 split: host-inbound stanza advisories join their siblings
+- **Timestamp**: 2026-08-22
+- **Action**: The #6640 change pushed pkg/config/compiler_validate_warn.go from
+  1995 to 2081 LOC, crossing the 2000 [REFACTOR] floor and redding
+  pkg/refactoraudit.TestTouchedFileCrossedModularityThreshold on the merge with
+  master. Checked the three documented "When NOT to refactor" cases
+  (docs/refactoring-audit.md) — none apply: the file is a bag of independent
+  validators, not one cohesive schema, which argues FOR splitting. Extracted the
+  host-inbound STANZA advisory block (three advisory closures + the zone loop,
+  lines 320-689, self-contained: build passed first try) into the EXISTING
+  sibling file compiler_validate_warn_host_inbound.go as
+  validateHostInboundStanzaWarnings, joining validateHostInboundMulticast-
+  Warnings / validateHostInboundManagedRoutingMismatch /
+  validateHostInboundOverrideReplaceWarnings — it was the last member of that
+  family still inlined. Pure relocation: moved region proved BYTE-IDENTICAL
+  (370 lines, md5 bf1bc2580ca4); call placed at the exact position the block
+  occupied so ValidateConfig's ORDERED return slice is unchanged. 2081 -> 1721
+  (below its own pre-change 1995); sibling 734 -> 1125. gofmt checked on the two
+  touched files only — the package has pre-existing unformatted files and a
+  package-wide sweep would bury the diff.
+- **Also**: corrected the doc cites this move rotted (fullAdmitAdvice,
+  unportedAdvice, the two-advisory paragraph), plus two PRE-EXISTING wrong cites
+  in the same docs (validateJunosHostDirectDeliveryWarnings,
+  validateHostInboundMulticastWarnings both already lived in the host_inbound
+  file on origin/master) — flagged as pre-existing, not fallout of this move.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_host_inbound.go,
+  docs/host-inbound-service-matrix.md, docs/host-inbound-multicast.md
+
+## 2026-08-22 — #6664 NextTableUnsupported fails closed + single-door admit
+- **Action**: Removed `NextTableUnsupported` from `is_slow_path_eligible`, so an
+  inter-VRF next-table chain the helper cannot resolve (over-deep or cyclic) is
+  DROPPED instead of reinjected to the kernel FIB, which forwarded it with no
+  zone policy, session, NAT or screen. Collapsed the two refusal points (the
+  filtered `maybe_reinject_slow_path` wrapper and the `poll_descriptor`
+  chokepoint) into one `slow_path_admit` function so the predicate and the
+  fail-closed accounting cannot disagree, and added
+  `next_table_unsupported_drops` — exported as
+  `xpf_userspace_binding_next_table_unsupported_drops_total` — because the deny
+  freezes the accept-path counter the signal used to live on. Corrected two
+  stale enumerations of the unfiltered-reinject caller set (the code said ONE,
+  the architecture doc said TWO and named the wrong pair) and added a source
+  guard that reds if a second production caller of the predicate appears — the
+  `poll_descriptor` chokepoint is not reachable by any behavioural test in the
+  crate, which is how the pre-#6664 duplicated accounting survived a mutation.
+  NoRoute and LocalDelivery — the attacker-steerable legs — are filed as #7480.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/tx/dispatch/slow_path.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/binding_state/snapshot.rs,
+  userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/tests_slow_path_disposition.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/tests/slow_path_admit_single_site_6664.rs (new),
+  pkg/api/metrics.go, pkg/api/metrics_descriptors_binding.go,
+  pkg/api/metrics_userspace_slowpath.go,
+  pkg/api/metrics_slowpath_reinject_7409_test.go,
+  pkg/dataplane/userspace/protocol_binding.go,
+  docs/userspace-dataplane-architecture.md
+
+## 2026-08-22 — #5084 peer boot incarnation on the config-sync wire
+- **Action**: Stamped every queued `configApplyItem` with the peer BOOT
+  INCARNATION (`/proc/sys/kernel/random/boot_id`) carried as a length-gated
+  8→24 byte extension of the `syncMsgBulkStart` payload, and dropped a queued
+  payload whose incarnation a re-prime has replaced. Fixes a queued prior-boot
+  config applying after `resetRecvGen`, recording a dead incarnation's
+  generation as the high-water, and then refusing the rebooted peer's
+  lower-generation current config permanently. Compared for EQUALITY only (the
+  #6900 post-mortem: a ranking cannot express "same peer boot?"). Fails OPEN on
+  an absent incarnation, counts both halves, renders the incarnation + counters
+  in cluster status, and raises NO health/alarm state. The ~20s half-open-socket
+  residual is shipped bounded and documented, not closed. Two drop sites, neither
+  redundant: at RECEIVE (before recordRecvConfigGen, so a dead boot's high
+  generation cannot inflate the #5563 readiness mark and wedge the standby
+  config-stale) and at APPLY (the already-queued payload, the reported defect).
+- **File(s)**: `pkg/cluster/sync_boot_incarnation.go` (new),
+  `pkg/cluster/sync_boot_incarnation_5084_test.go` (new),
+  `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,
+  `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
+  `pkg/cluster/status.go`, `docs/sync-protocol.md`
+
+## 2026-08-22 — #7484 spelling-gate coverage is a gated property
+- **Timestamp**: 2026-08-22
+- **Action**: TestSchemaSpellingDifferentialGate passed green while 430/1049
+  enumerated leaves carried NO verdict, including the leaf #6821 reports broken.
+  Made coverage a ratchet (floor on compared, ceiling per blind class, and an
+  IMPROVEMENT also fails with the measured numbers so a ceiling cannot rot).
+  Replaced the "inert/unstable" lump with four measured classes — unreachable
+  228, flag 158, err 43, valueMoves 1 — using a BEHAVIOURAL classifier, not
+  `args == 0`: 15 of the 232 args==0 leaves are compared today and genuinely
+  value-bearing (schema under-declares), so excluding by args would have retired
+  live cells. Mutation found a latent hole: spellingVerdicts populates its map
+  over gateSpellingsMulti while scalar leaves compare over gateSpellingsScalar,
+  so a missing verdict read as a passing one — desyncing the lists made coverage
+  appear to RISE 619->1034. Fixed (explicit keep/drop only) and pinned by
+  TestGateSpellingSetsAreConsistent_7484.
+- **Measured for follow-up**: the 228 unreachable leaves span 46 parent prefixes
+  (interfaces 81, system services 28, system syslog 26, protocols bgp 25) — a
+  long tail needing per-parent prerequisites, not one bug. Cohort check: of the
+  eight open #2419 issues only #6821 is in the blind spot; #6736/#6817/#6953/
+  #6966/#7033 all carry verdicts today, so they are NOT one cohort.
+- **File(s)**: pkg/config/schema_spelling_gate_coverage_7484_test.go (new),
+  pkg/config/schema_spelling_differential_gate_test.go, docs/config-schema.md
+
+## 2026-08-22 — #6716 background applies re-read the active config
+- **Timestamp**: 2026-08-22
+- **Action**: Background apply callbacks (DHCP lease change, dynamic feed,
+  boot-time apply) captured store.ActiveConfig() BEFORE waiting on applySem and
+  then applied that snapshot, silently reverting a commit that landed during the
+  wait. Added applyActiveConfig / applyActiveConfigResult, which re-read under
+  the semaphore; removed the now-dead applyConfigResult so the pre-capturing
+  entry point cannot be reached again.
+- **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_dhcp.go,
+  pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_run_bringup.go,
+  pkg/daemon/apply_active_reread_6716_test.go,
+  pkg/daemon/cluster_transport_race_6290_test.go
+
+## 2026-08-22 — #6707 consequence 1 / #7468 atomic retain on a rejected publish
+- **Action**: A rejected `apply_snapshot` on the samePlanRefresh path disabled
+  `userspace_ctrl`, dropping ALL transit for up to a second on every rejected
+  policy update, and on a FIRST apply returned before `ensureStatusLoopLocked()`
+  so the manager was left inert with transit dropped indefinitely. #6707's own
+  fix direction ("do not disable ctrl when the helper retained a usable
+  snapshot") is unsafe as written — it leaves the new-plan maps in place, the
+  #4959 fail-open. Implemented the safe form: roll the classifier maps BACK to
+  `m.lastSnapshot` so they match what the helper is enforcing, and only for an
+  IN-BAND helper refusal (`errHelperRejected`, a decoded `{"ok":false}`), which
+  is the only class proving the helper retained its snapshot. A transport error
+  keeps the ctrl-disable — `controlRoundtripDeadline` exists because a deadline
+  once reported an apply failed while the dataplane had applied it live, so
+  rolling back there would leave the maps a generation BEHIND. Also start the
+  reconcile worker on any rejected publish; proved safe because a helper holding
+  no snapshot reports no bindings and `status.enabled` requires
+  `!bindings.is_empty()`. Corrected the "or any transport error … keeps
+  enforcing the previous-good snapshot" claim in both the code comment and the
+  architecture doc.
+- **File(s)**: pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/publish_reject_retain_7468_test.go (new),
+  docs/userspace-dataplane-architecture.md, pkg/dataplane/README.md
+
+## 2026-08-22 — #6519 stage 1.5: the DHCP host-inbound advisory names the ROLE
+- **Action**: The #6519 advisory now annotates each reported interface with WHY
+  the zone-level `dhcp`/`bootp` token is load-bearing there — `DHCP server`
+  (dhcp-local-server / dhcpv6-local-server / dhcp-relay member: the case the
+  vendor sentence covers), `DHCP client` (`family inet { dhcp; }`: the case it
+  does NOT reach, where the token holds up the interface's ADDRESS), or
+  `no DHCP configured` (pure over-admission, safe to remove today). That role is
+  the exact discriminator the deferred stage-2 enforcement flip turns on. Also
+  fixed the remedy to warn that a per-interface stanza REPLACES the zone stanza
+  (#6515), which following stage 1's wording verbatim would silently rely on.
+  Enforcement unchanged; WARN-only.
+- **File(s)**: `pkg/config/host_inbound_dhcp_scope_6519.go`,
+  `pkg/config/host_inbound_dhcp_role_6519_test.go` (new),
+  `pkg/config/testdata/golden_4406.json`,
+  `docs/host-inbound-service-matrix.md`
+
+## 2026-08-22 — #6708 fabric auth clock skew is measured and named
+- **Action**: >30s of wall-clock skew between peers kills every fabric RPC with
+  "invalid auth token" — permanently without NTP — while VRRP/forwarding/
+  failover keep working, so the cluster reads healthy and every cross-node query
+  returns LOCAL-ONLY. Measured on the loss cluster at 141s. Did NOT take the
+  issue's first option (widen the accept band): that band IS the replay horizon
+  for the allowlisted ClearSessions / cross-node-failover RPCs. Added a bounded
+  (±2h), throttled (5s) diagnostic scan on the REJECT path that reports the peer
+  offset only when the token verifies under an ACCEPTED KEY at another window —
+  an authenticated measurement no on-segment attacker can plant. The rejection
+  now names the clock and NTP, `show chassis cluster status` carries the skew,
+  and a one-shot transition warning fires. A forged token or a PSK mismatch
+  reports no skew, so an auth fault is never mislabelled as a clock fault.
+  Corrected the "accepted tradeoff rather than a bug" claim in the fabric_auth
+  header and documented the posture in docs/architecture.md.
+- **File(s)**: pkg/grpcapi/fabric_auth_skew_6708.go (new),
+  pkg/grpcapi/fabric_auth_skew_6708_test.go (new),
+  pkg/grpcapi/fabric_auth.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show_cluster_text.go, docs/architecture.md
+
+## 2026-08-22 — #6704 shim IPv6 non-first-fragment sighting
+- **Action**: Taught the shim's IPv6 ext-header walk to report a NON-FIRST
+  fragment sighting and made userspace-dp's executable parity corpus compare
+  it against `non_first_fragment_offset_seen`. Consumption of the sighting is
+  NOT included — measured over the 1M verifier cap in eight shapes; split to
+  #7494 with the matrix.
+- **File(s)**: `userspace-xdp/src/ipv6_ext_walk.rs`, `userspace-xdp/src/lib.rs`,
+  `userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs`,
+  `pkg/dataplane/userspace_xdp_bpfel.o`, `pkg/dataplane/userspace_xdp_manifest.json`,
+  `pkg/dataplane/README.md`
 
 ## 2026-08-22 — #6702 blocker 2 heartbeat zero-init bound
 - **Action**: Zero-init bound for `userspace_heartbeat` changed from a

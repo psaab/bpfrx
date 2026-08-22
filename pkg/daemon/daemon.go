@@ -595,6 +595,17 @@ type Daemon struct {
 	// exercise the semaphore contract through the real applyConfig
 	// / commitAndApply paths without standing up the full dataplane.
 	applyBodyForTest func(*config.Config)
+	// preApplyHookForTest fires in a background apply CALLBACK after it has
+	// finished reading config for its own decisions and immediately before it
+	// hands off to applyActiveConfig / applyActiveConfigResult.
+	//
+	// It exists because the #6716 inversion is only observable in that exact
+	// window: a callback must read the active config, THEN a commit must land,
+	// THEN the apply must run. Firing the callback after committing lets the
+	// callback's own read see the new config, so the test passes whether or not
+	// the wiring re-reads under the semaphore — which is how a first version of
+	// the #6716 guard stayed green against a reverted call site.
+	preApplyHookForTest func()
 
 	// bootstrapTeardownForTest, when non-nil, replaces the real per-step
 	// teardown executed inside enterBootstrapMode (#5868). Test-only seam:

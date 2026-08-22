@@ -514,11 +514,17 @@ enum Verdict {
 /// The SHIM's walk, run on a live slice, returning EXACTLY what it returns.
 ///
 /// `parse_ipv6` calls it with the frame's `data`/`data_end` and the L3 offset
-/// `parse_l2` computed; here the slice supplies its own bounds. The `(u16, u8)`
-/// is the whole of the shim's extension-header state — there is no fragment
-/// sighting, no offset bits, no M flag, because nothing downstream of it in the
-/// shim consumes any.
-fn raw_shim_walk(buf: &[u8], l3: usize) -> Option<(u16, u8)> {
+/// `parse_l2` computed; here the slice supplies its own bounds.
+///
+/// #6704: the return is no longer a bare `(u16, u8)`. The walk now also
+/// reports `non_first_fragment` — set when ANY Fragment header it stepped over
+/// carried non-zero offset bits — which is the field `shim_fragment_sighting`
+/// below compares against this crate's `non_first_fragment_offset_seen`. Until
+/// it existed, the fragment dimension could not be compared FROM THE TEST SIDE
+/// at all: there was no shim-side state to read, and the previous attempt to
+/// compare it re-derived the value with a hand-written copy of the loop, which
+/// made the assertion `X == X`.
+fn raw_shim_walk(buf: &[u8], l3: usize) -> Option<shim_walk::ExtWalk> {
     if buf.len() < l3 + 40 {
         return None;
     }
@@ -531,13 +537,22 @@ fn raw_shim_walk(buf: &[u8], l3: usize) -> Option<(u16, u8)> {
 fn shim_verdict(buf: &[u8], l3: usize) -> Verdict {
     match raw_shim_walk(buf, l3) {
         None => Verdict::FailClosed,
-        Some((off, proto)) => match shim_walk::eh_class(proto) {
+        Some(w) => match shim_walk::eh_class(w.protocol) {
             shim_walk::EH_CLASS_NONEXT => Verdict::NoL4,
-            shim_walk::EH_CLASS_TERMINAL => Verdict::L4(off as usize, proto),
+            shim_walk::EH_CLASS_TERMINAL => Verdict::L4(w.offset as usize, w.protocol),
             // Loop exhausted while still on an extension header.
             _ => Verdict::OverLimit,
         },
     }
+}
+
+/// #6704: the shim's fragment sighting, or `None` when its walk refuses.
+///
+/// The counterpart on this side is `ExtChainWalk::non_first_fragment_offset_seen`
+/// — the SAME every-sighting semantics, which is why the two can be compared
+/// for equality rather than for an inequality that would have to be justified.
+fn shim_fragment_sighting(buf: &[u8], l3: usize) -> Option<bool> {
+    raw_shim_walk(buf, l3).map(|w| w.non_first_fragment)
 }
 
 fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
@@ -2001,6 +2016,13 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
     // it, and checks the result against the cross product built independently
     // from the two inputs.
     let mut visited: BTreeSet<(usize, &str)> = BTreeSet::new();
+    // #6704 coverage accounting for the fragment dimension, kept separate
+    // because a comparison that only ever sees `false == false` proves
+    // nothing: the corpus carries NON-FIRST Fragment cases (frag_off 0x0008 /
+    // 0x0010 / 0x0100) precisely so the axis VARIES, and `frag_true` is what
+    // makes that measurable rather than assumed.
+    let mut frag_compared: BTreeSet<(usize, &str)> = BTreeSet::new();
+    let mut frag_true = 0usize;
     for l3 in L3_OFFSETS {
         for (name, base) in &cases {
             let buf = at_l3(base, l3);
@@ -2009,6 +2031,23 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
             if s != u {
                 drift.push(format!("[l3={l3}] {name}: shim={s:?} userspace={u:?}"));
             }
+            // #6704: the FRAGMENT dimension, which could not be compared at
+            // all until the shim's walk carried the sighting. Compared only
+            // where the shim resolved — a refusal (`None`) has no sighting to
+            // agree about, and the verdict comparison above already covers
+            // that case.
+            if let Some(shim_frag) = shim_fragment_sighting(&buf, l3) {
+                let us_frag = walk_ipv6_ext_chain(&buf, l3).non_first_fragment_offset_seen;
+                if shim_frag != us_frag {
+                    drift.push(format!(
+                        "[l3={l3}] {name}: FRAGMENT sighting shim={shim_frag} userspace={us_frag}"
+                    ));
+                }
+                frag_compared.insert((l3, name.as_str()));
+                if shim_frag {
+                    frag_true += 1;
+                }
+            }
             visited.insert((l3, name.as_str()));
         }
     }
@@ -2016,6 +2055,25 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         .iter()
         .flat_map(|&l3| names.iter().map(move |&n| (l3, n)))
         .collect();
+    assert!(
+        frag_true >= L3_OFFSETS.len() * 3,
+        "#6704: only {frag_true} (offset, case) pairs reported a NON-FIRST fragment sighting; the \
+         corpus carries three such cases at each of {} L3 offsets, so the fragment comparison is \
+         running over an all-`false` population and would stay green with the sighting hard-wired \
+         to `false`",
+        L3_OFFSETS.len(),
+    );
+    // Not equality: a case the shim REFUSES (`None`) has no sighting to
+    // compare, and the corpus deliberately carries truncated/over-limit cases
+    // that refuse. Subset + the `frag_true` floor above is the honest pair of
+    // claims — every pair that was compared is one the verdict loop also
+    // visited, and the population that was compared is not all-`false`.
+    assert!(
+        frag_compared.is_subset(&visited),
+        "#6704: the fragment sighting was compared on {} (offset, case) pairs the verdict loop \
+         never visited",
+        frag_compared.difference(&visited).count()
+    );
     assert_eq!(
         visited,
         expected,
@@ -2104,20 +2162,38 @@ fn shim_is_not_more_permissive() {
     let first = frag_chain(0x0001, 0xDEAD_BEEF);
     let non_first = frag_chain(0x0008, 0x0BAD_F00D);
 
-    // 1. The shim is blind, MEASURED by running it — not inferred from its
-    //    signature and not restated by a copy of its loop.
-    let shim_first = raw_shim_walk(&first, 0);
-    let shim_non_first = raw_shim_walk(&non_first, 0);
+    // 1. The shim now DISTINGUISHES the two, MEASURED by running it — and its
+    //    answer AGREES with this crate's, which is the property, rather than a
+    //    literal that would encode which side is trusted.
+    //
+    //    This is the rewrite the previous revision of this test asked for in
+    //    so many words ("if the shim now carries fragment state, the corpus
+    //    must compare it and this test must be rewritten, not deleted"). It
+    //    was rewritten, not deleted: #6704 taught `walk_ipv6_ext_headers` to
+    //    report the sighting, so the asymmetry this test used to PIN as absent
+    //    is now a symmetry it pins as present.
+    let shim_first = raw_shim_walk(&first, 0).expect("the shim's walk must resolve a first fragment");
+    let shim_non_first =
+        raw_shim_walk(&non_first, 0).expect("the shim's walk must resolve a non-first fragment");
+    let us_first = walk_ipv6_ext_chain(&first, 0);
+    let us_non_first = walk_ipv6_ext_chain(&non_first, 0);
     assert_eq!(
-        shim_first, shim_non_first,
-        "#4555: the shim's walk distinguished a first from a non-first fragment. That is the \
-         asymmetry this test exists to record as ABSENT — if the shim now carries fragment state, \
-         the corpus in shim_walk_and_userspace_walk_agree_over_a_corpus must compare it and this \
-         test must be rewritten, not deleted."
+        shim_first.non_first_fragment, us_first.non_first_fragment_offset_seen,
+        "#6704: the two walkers disagree about a FIRST fragment's sighting"
     );
     assert_eq!(
-        shim_non_first,
-        Some((48u16, TCP)),
+        shim_non_first.non_first_fragment, us_non_first.non_first_fragment_offset_seen,
+        "#6704: the two walkers disagree about a NON-FIRST fragment's sighting — the divergence \
+         this test exists to make visible"
+    );
+    assert_ne!(
+        shim_first.non_first_fragment, shim_non_first.non_first_fragment,
+        "#6704: the shim's sighting did not MOVE between a first and a non-first fragment, so the \
+         agreement asserted above holds for the wrong reason (both sides constant)"
+    );
+    assert_eq!(
+        (shim_non_first.offset, shim_non_first.protocol),
+        (48u16, TCP),
         "#4555: the shim resolved something other than L4(48, TCP) on a non-first fragment; the \
          documented divergence below is stated against that exact outcome"
     );
@@ -2134,8 +2210,7 @@ fn shim_is_not_more_permissive() {
     //    pinned — the readable/unreadable discriminant, the 13-bit offset, the
     //    M flag and the 32-bit identification. `.is_some()` alone (what the
     //    previous revision compared) collapses all of it to one bit.
-    let uf = walk_ipv6_ext_chain(&first, 0);
-    let un = walk_ipv6_ext_chain(&non_first, 0);
+    let (uf, un) = (us_first, us_non_first);
     assert_ne!(
         uf, un,
         "#4555: walk_ipv6_ext_chain stopped distinguishing a first from a non-first fragment; the \
@@ -2178,9 +2253,8 @@ fn shim_is_not_more_permissive() {
     );
     assert!(ipv6_is_any_fragment(&truncated));
     assert!(!ipv6_is_non_first_fragment(&truncated));
-    assert_eq!(
-        raw_shim_walk(&truncated, 0),
-        None,
+    assert!(
+        raw_shim_walk(&truncated, 0).is_none(),
         "#4555: the shim must fail its 8-byte Fragment read rather than advance past a truncated \
          header"
     );
@@ -2199,8 +2273,8 @@ fn shim_is_not_more_permissive() {
         "#4555: the companion case is not a complete 8-byte Fragment header"
     );
     assert_eq!(
-        raw_shim_walk(&whole_frag_hdr, 0),
-        Some((48u16, TCP)),
+        raw_shim_walk(&whole_frag_hdr, 0).map(|w| (w.offset, w.protocol, w.non_first_fragment)),
+        Some((48u16, TCP, false)),
         "#4555: the shim no longer resolves a COMPLETE 8-byte Fragment header at offset 48, so \
          the refusal asserted above cannot be attributed to the missing 6 bytes — every buffer \
          would refuse and the assertion would hold for the wrong reason"
@@ -2395,7 +2469,8 @@ fn ext_chain_frame(proto: u8, n: usize) -> Vec<u8> {
 /// Nothing here is a model of the shim: the two fields the finding turns on come
 /// out of `walk_ipv6_ext_headers` itself.
 fn shim_meta_for(frame: &[u8], l3: usize) -> UserspaceDpMeta {
-    let (l4_offset, protocol) = raw_shim_walk(frame, l3).expect("the shim's walk must not refuse");
+    let walk = raw_shim_walk(frame, l3).expect("the shim's walk must not refuse");
+    let (l4_offset, protocol) = (walk.offset, walk.protocol);
     let (src_port, dst_port) = match protocol {
         TCP => (0x1234u16, 0x5678u16),
         // `parse_l4`'s catch-all: no ports are read for any other protocol.

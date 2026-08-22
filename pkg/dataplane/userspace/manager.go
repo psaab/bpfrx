@@ -280,6 +280,11 @@ type Manager struct {
 	// readback faults without a privileged BPF map (#5486). Production leaves
 	// it nil.
 	disableCtrlMapHook ctrlMapUpdater
+	// syncClassifierMapsHook, when non-nil, replaces the ingress/local/
+	// interface-NAT classifier map writes in unit tests (#7468). Nil in
+	// production.
+	syncClassifierMapsHook func(*ConfigSnapshot) error
+
 	// controlRequestHook replaces requestLocked in unit tests that exercise
 	// manager state transitions without opening a Unix control socket.
 	controlRequestHook func(ControlRequest, *ProcessStatus) error

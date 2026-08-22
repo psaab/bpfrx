@@ -174,6 +174,24 @@ package config
 // assert a defect at 30 sites no operator can author — the same mistake
 // notAValueList exists to avoid.
 //
+// A SEVENTH spelling WAS added, by #6693: `leaf <v1> { <v2>; }` — a value in
+// the identifier slot BESIDE a block (F-hier-mixed). It is the only spelling
+// that puts values in BOTH AST slots of one node, Keys[1:] AND Children, and
+// every other spelling puts them in exactly one. An either/or reader
+// (`Keys` OR children, never both) therefore agrees with itself across A-E and
+// drops the tail only here.
+//
+// That gap is why #6693's five NAT arms survived this gate. A previous
+// investigation enumerated A-E, found perfect agreement, and recorded that the
+// mixed shape "is not reachable from any config spelling I can author" — a
+// conclusion consistent with its own enumeration and wrong about the grammar.
+// It is not reachable from FLAT-SET (SetPath emits a leaf at the same level for
+// a `multi` leaf and never descends), which is what that enumeration mostly
+// covered; hierarchical text reaches it directly.
+//
+// Adding it moved exactly ONE site beyond the five it was added for, and that
+// site is not a defect: see mixedChildIsAModifierBlock.
+//
 // This gate also sees ONE DIRECTION. It detects a compiler DROPPING a value. It
 // cannot detect the opposite defect — a reader PROMOTING a per-value modifier
 // keyword into the value list, the hazard #6690 had to avoid — and no detector
@@ -209,6 +227,34 @@ var knownSpellingInconsistencies = map[string]string{
 	// its defect: #6687, #6688, #6692, #6695, #6697, #7126. Adding a row is the
 	// THIRD response to a gate failure and the rarest — see the header: fix the
 	// read, or classify the leaf as not-a-value-list with a verified reason.
+}
+
+// ---------------------------------------------------------------------------
+// Sites where the MIXED spelling's child slot is a MODIFIER position, not a
+// second value (#6693).
+//
+// The F-hier-mixed spelling authors `<leaf> <v1> { <v2>; }`. For most value
+// leaves that is two members of one list, which is exactly what makes it able
+// to catch an either/or reader. For a leaf whose grammar puts a MODIFIER BLOCK
+// under an authored value, the child is not a member at all and dropping it is
+// correct — so the F verdict carries no information and is excluded from the
+// comparison for that site.
+//
+// This is a THIRD category, deliberately separate from both neighbours below
+// and above: notAValueList says the leaf is not a list in ANY spelling, and
+// knownSpellingInconsistencies asserts a tracked DEFECT. Neither is true here,
+// and using either would state something false.
+//
+// Every entry is verified by reading where the child tokens land, not assumed
+// from the name.
+// ---------------------------------------------------------------------------
+var mixedChildIsAModifierBlock = map[string]string{
+	// archiveSiteEntries (compiler_system.go): "Any CHILD here is a modifier
+	// block for the last authored site (`archive-sites a { password S; }`),
+	// never an additional site." An unrecognized modifier is ignored, which is
+	// what the F verdict sees as a drop. Verified against that function, whose
+	// value-on-Keys branch returns before the children are read at all.
+	"system archival configuration archive-sites": "child is a per-site modifier block (`{ password S; }`), not a second site",
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +354,10 @@ type gateLeaf struct {
 	path  []string
 	leaf  string
 	multi bool
+	// args is the schema's declared value arity. #7484 reads it to prove that
+	// `args == 0` does NOT imply value-less, so nobody "optimises" the coverage
+	// classifier into excluding those leaves.
+	args int
 }
 
 // site renders the full dotted path; siteKey renders it with synthetic names
@@ -373,7 +423,7 @@ func enumerateGateLeaves() []gateLeaf {
 				if ch.midKeyword != "" || ch.args > 1 {
 					continue
 				}
-				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi}
+				g := gateLeaf{path: append([]string{}, path...), leaf: key, multi: ch.multi, args: ch.args}
 				if _, skip := notAValueList[g.siteKey()]; skip {
 					continue
 				}
@@ -485,7 +535,7 @@ func gateCompileSet(cmds []string) (string, error) {
 	return gateMarshal(cfg)
 }
 
-var gateSpellingsMulti = []string{"A-hier-bracket", "B-hier-block", "C-hier-repeat", "D-set-bracket", "E-set-repeat"}
+var gateSpellingsMulti = []string{"A-hier-bracket", "B-hier-block", "C-hier-repeat", "D-set-bracket", "E-set-repeat", "F-hier-mixed"}
 
 // gateSpellingsScalar omits the REPEATED spellings. For a leaf the schema marks
 // multi: false, a repeated statement legitimately REPLACES (last write wins), so
@@ -543,6 +593,32 @@ func spellingVerdicts(g gateLeaf, v1, v2 string) map[string]string {
 			func() (string, error) { return gateCompileSet([]string{flat + " " + v1}) },
 			func() (string, error) { return gateCompileSet([]string{flat + " " + v1, flat + " " + v2}) },
 		},
+		// #6693: a value in the IDENTIFIER slot beside a block. It is the only
+		// spelling that puts values in BOTH AST slots of one node — Keys[1:]
+		// AND Children — and every spelling above puts them in exactly one, so
+		// an either/or reader (`Keys` OR children, never both) agrees with
+		// itself across A-E and drops the tail here.
+		//
+		// That gap is why #6693 survived this gate. A previous investigation
+		// enumerated A-E, found perfect agreement, and recorded that the mixed
+		// shape "is not reachable from any config spelling I can author" — a
+		// conclusion consistent with its own enumeration and wrong about the
+		// grammar. Adding the spelling is the durable half of that fix: the
+		// class is otherwise invisible to the one gate designed to find it.
+		//
+		// The zero-value form has no mixed spelling (there is nothing to put in
+		// the identifier slot), so it reuses the block form's empty body. That
+		// only feeds the inert-leaf check, which asks whether the FIRST value
+		// changed anything.
+		"F-hier-mixed": {
+			func() (string, error) { return gateCompileBrace(gateBraceConfig(g.path, g.leaf+" { }")) },
+			func() (string, error) {
+				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s;", g.leaf, v1)))
+			},
+			func() (string, error) {
+				return gateCompileBrace(gateBraceConfig(g.path, fmt.Sprintf("%s %s { %s; }", g.leaf, v1, v2)))
+			},
+		},
 	}
 	state := map[string]string{}
 	for _, name := range gateSpellingsMulti {
@@ -595,6 +671,19 @@ func TestSchemaSpellingDifferentialGate(t *testing.T) {
 			cmpSet := gateSpellingsScalar
 			if g.multi {
 				cmpSet = gateSpellingsMulti
+			}
+			// #6693: a leaf whose CHILD slot is a modifier position rather than
+			// another value has no meaningful mixed-spelling verdict — see
+			// mixedChildIsAModifierBlock. Drop F rather than allowlisting the
+			// site, because an allowlist row asserts a DEFECT and there is none.
+			if _, modifier := mixedChildIsAModifierBlock[g.siteKey()]; modifier {
+				var without []string
+				for _, n := range cmpSet {
+					if n != "F-hier-mixed" {
+						without = append(without, n)
+					}
+				}
+				cmpSet = without
 			}
 			var flags []bool
 			inert := 0

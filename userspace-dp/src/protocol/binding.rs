@@ -617,6 +617,12 @@ pub(crate) struct BindingStatus {
     pub slow_path_no_route_packets: u64,
     #[serde(rename = "slow_path_next_table_packets", default)]
     pub slow_path_next_table_packets: u64,
+    /// #6664: NextTableUnsupported frames dropped fail-closed by the
+    /// slow-path allow-list. Since #6664 this is where the signal lives;
+    /// `slow_path_next_table_packets` above stays on the wire for older
+    /// readers but no longer advances.
+    #[serde(rename = "next_table_unsupported_drops", default)]
+    pub next_table_unsupported_drops: u64,
     #[serde(rename = "slow_path_forward_build_packets", default)]
     pub slow_path_forward_build_packets: u64,
     #[serde(rename = "slow_path_drops", default)]
