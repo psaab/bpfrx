@@ -103511,3 +103511,28 @@ prose edit above them added. No diff falls in the new test body.
   pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_run_bringup.go,
   pkg/daemon/apply_active_reread_6716_test.go,
   pkg/daemon/cluster_transport_race_6290_test.go
+
+## 2026-08-22 — #6707 consequence 1 / #7468 atomic retain on a rejected publish
+- **Action**: A rejected `apply_snapshot` on the samePlanRefresh path disabled
+  `userspace_ctrl`, dropping ALL transit for up to a second on every rejected
+  policy update, and on a FIRST apply returned before `ensureStatusLoopLocked()`
+  so the manager was left inert with transit dropped indefinitely. #6707's own
+  fix direction ("do not disable ctrl when the helper retained a usable
+  snapshot") is unsafe as written — it leaves the new-plan maps in place, the
+  #4959 fail-open. Implemented the safe form: roll the classifier maps BACK to
+  `m.lastSnapshot` so they match what the helper is enforcing, and only for an
+  IN-BAND helper refusal (`errHelperRejected`, a decoded `{"ok":false}`), which
+  is the only class proving the helper retained its snapshot. A transport error
+  keeps the ctrl-disable — `controlRoundtripDeadline` exists because a deadline
+  once reported an apply failed while the dataplane had applied it live, so
+  rolling back there would leave the maps a generation BEHIND. Also start the
+  reconcile worker on any rejected publish; proved safe because a helper holding
+  no snapshot reports no bindings and `status.enabled` requires
+  `!bindings.is_empty()`. Corrected the "or any transport error … keeps
+  enforcing the previous-good snapshot" claim in both the code comment and the
+  architecture doc.
+- **File(s)**: pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/publish_reject_retain_7468_test.go (new),
+  docs/userspace-dataplane-architecture.md, pkg/dataplane/README.md
