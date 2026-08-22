@@ -284,8 +284,9 @@ selftest:
 	sh scripts/run-selftests.sh
 
 # Bake the distributable appliance image (#1879 Path C): one
-# offline-built bootable root disk (LATEST Ubuntu server cloudimg base
-# discovered at bake time — XPF_BASE_RELEASE pins; linux-generic
+# offline-built bootable root disk (REVIEWED-PIN Ubuntu server cloudimg
+# base — PINNED_BASE_RELEASE + PINNED_BASE_SHA256 in bake.py, not
+# auto-latest; XPF_BASE_RELEASE overrides one run; linux-generic
 # kernel >= 6.18, xpfd + cli + xpf-userspace-dp + day-0 config-drive
 # loader), exported as a qcow2 for libvirt/KVM AND as an incus VM
 # image (metadata tarball + the same qcow2). Includes the in-guest

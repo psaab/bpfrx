@@ -1340,12 +1340,27 @@ func (d *Daemon) runStartupGoodbye(rgID int, rgRA []*config.RAInterfaceConfig) {
 // rethInterfacesForRG returns the Linux interface names of RETH interfaces
 // belonging to the given redundancy group.
 func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
+	return rethInterfacesMatchingRG(cfg, func(id int) bool { return id == rgID })
+}
+
+// rethInterfacesMatchingRG returns the Linux interface names of every RETH
+// interface whose redundancy group satisfies want.
+//
+// It is the SINGLE source for both RG-derived interface sets the cluster DHCP
+// filter needs — "which interfaces does THIS node currently master" and "which
+// interfaces are redundancy-group-scoped AT ALL" (#6520). Deriving the two from
+// one walker is not a style preference: a divergence between them is ALWAYS a
+// bug, because the filter's keep rule is exactly "RG-scoped implies mastered".
+// If one set resolved a RETH member differently from the other, a node-local
+// interface would be misread as an unmastered RG member (service dropped) or an
+// RG member as node-local (both nodes serve DHCP on one redundant segment).
+func rethInterfacesMatchingRG(cfg *config.Config, want func(rgID int) bool) []string {
 	var names []string
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
 		}
-		if ifc.RedundancyGroup == rgID && strings.HasPrefix(name, "reth") {
+		if want(ifc.RedundancyGroup) && strings.HasPrefix(name, "reth") {
 			// Resolve RETH to physical member for Linux-level operations.
 			resolved := config.LinuxIfName(cfg.ResolveReth(name))
 			for _, unit := range ifc.Units {
@@ -1702,9 +1717,27 @@ func (d *Daemon) reconcileClusterDHCPServices(reason string) {
 	d.dhcpServer.ApplyAsync(desired, "reconcile: "+reason)
 }
 
-// filterDHCPConfigForMasterRGs returns a DHCP config containing only groups
-// whose interfaces belong to RGs that are currently MASTER. Returns nil if
-// no groups match.
+// filterDHCPConfigForMasterRGs returns the DHCP config this node should serve
+// in cluster mode: every group member that is either NODE-LOCAL or belongs to a
+// redundancy group this node currently masters. Returns nil if nothing
+// survives.
+//
+// #6520 (a) — mastership scoping applies ONLY to RG-scoped members. Before this
+// fix the keep-set was built exclusively from `rethInterfacesForRG` over the
+// MASTER RGs, so it could only ever contain RETH members: every interface that
+// is not part of a redundancy group — the `fxp0.0` management lifeline, and any
+// plain node-local data interface — was removed from every group on BOTH nodes,
+// and a group made only of such members disappeared entirely. That silently
+// killed DHCP service the operator configured on a node-local segment the
+// moment the box was clustered. Redundancy-group mastership says which node
+// answers for a REDUNDANT interface; it says nothing about an interface that
+// has no redundant peer, and Junos clusters likewise run `fxp0` services per
+// node. So an interface that belongs to NO redundancy group is kept
+// unconditionally, and only an RG-scoped member is gated on this node holding
+// that RG.
+//
+// The two sets are derived from ONE walker (rethInterfacesMatchingRG) so
+// "RG-scoped" and "mastered" cannot resolve a RETH member differently.
 func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPServerConfig {
 	// Collect all interfaces belonging to master RGs. Normalize the untagged
 	// ".0" suffix (#4647) so the set is keyed by the bare member name that the
@@ -1717,6 +1750,13 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 		for _, n := range rethInterfacesForRG(cfg, rgID) {
 			masterIfaces[stripUntaggedUnitSuffix(n)] = true
 		}
+	}
+	// Every interface that IS redundancy-group-scoped, regardless of which node
+	// currently masters it. An interface absent from this set has no redundant
+	// peer and is therefore node-local (#6520).
+	rgScoped := make(map[string]bool)
+	for _, n := range rethInterfacesMatchingRG(cfg, func(int) bool { return true }) {
+		rgScoped[stripUntaggedUnitSuffix(n)] = true
 	}
 
 	dhcpCfg := cfg.System.DHCPServer
@@ -1737,13 +1777,23 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 				// "ge-0-0-1.0" is not a device. Tagged units keep their
 				// ".<vlan>" and match only the tagged member.
 				norm := stripUntaggedUnitSuffix(iface)
-				if masterIfaces[norm] {
+				// #6520: node-local members (no redundancy group) are not
+				// mastership-scoped and are always kept; RG-scoped members are
+				// kept only while this node masters their RG.
+				if masterIfaces[norm] || !rgScoped[norm] {
 					kept = append(kept, norm)
 				}
 			}
 			if len(kept) > 0 {
 				cp := *group
 				cp.Interfaces = kept
+				// #6520 (b): DHCPServerGroup carries independent Interfaces and
+				// Pools arrays with no semantic edge, so a group whose member
+				// list SHRANK here no longer describes which pool belongs to
+				// which member. Record that so the Kea renderer suppresses its
+				// per-subnet interface selector instead of cross-binding a
+				// removed member's pool onto a survivor (dhcpserver.subnetInterface).
+				cp.MembersFiltered = len(kept) != len(group.Interfaces)
 				result[name] = &cp
 			}
 		}
