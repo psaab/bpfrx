@@ -82,7 +82,7 @@ func TestCommitAndApplySyncsPeerOnNonFatalApplyError(t *testing.T) {
 		syncedText = d.store.ShowActive()
 	}
 
-	compiled, err := d.commitAndApply(t.Context(), "", true)
+	compiled, err := d.commitAndApply(t.Context(), "", peerSyncAlways)
 
 	// The apply error must surface to the operator (fail-closed commit).
 	if !errors.Is(err, nonFatal) {
@@ -121,7 +121,7 @@ func TestCommitAndApplySyncsPeerOnCleanCommit(t *testing.T) {
 	var syncCalls int
 	d.syncPeerForTest = func() { syncCalls++ }
 
-	compiled, err := d.commitAndApply(t.Context(), "", true)
+	compiled, err := d.commitAndApply(t.Context(), "", peerSyncAlways)
 	if err != nil {
 		t.Fatalf("clean commit must succeed; got %v", err)
 	}
@@ -145,7 +145,7 @@ func TestCommitAndApplySkipsPeerSyncOnFatalApplyError(t *testing.T) {
 	var syncCalls int
 	d.syncPeerForTest = func() { syncCalls++ }
 
-	compiled, err := d.commitAndApply(t.Context(), "", true)
+	compiled, err := d.commitAndApply(t.Context(), "", peerSyncAlways)
 	if !errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible) {
 		t.Fatalf("fatal apply error must surface; got %v", err)
 	}
@@ -170,7 +170,7 @@ func TestCommitAndApplySkipsPeerSyncOnContextAbort(t *testing.T) {
 	var syncCalls int
 	d.syncPeerForTest = func() { syncCalls++ }
 
-	_, err := d.commitAndApply(t.Context(), "", true)
+	_, err := d.commitAndApply(t.Context(), "", peerSyncAlways)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("context abort must surface; got %v", err)
 	}
@@ -192,7 +192,7 @@ func TestCommitConfirmedAndApplySyncsPeerOnNonFatalApplyError(t *testing.T) {
 	var syncCalls int
 	d.syncPeerForTest = func() { syncCalls++ }
 
-	compiled, err := d.commitConfirmedAndApply(t.Context(), 1, true)
+	compiled, err := d.commitConfirmedAndApply(t.Context(), 1, peerSyncAlways)
 	if !errors.Is(err, nonFatal) {
 		t.Fatalf("commitConfirmedAndApply must surface the non-fatal apply error; got %v", err)
 	}

@@ -28,6 +28,14 @@ func hostInboundFenceMandatoryAdmitsNetlink(p *nlPlan, wgListenPorts []uint16) {
 // real ruleset would scope (per host-inbound-configured zone + the unzoned set).
 // The caller has created the table + `input` chain (priority
 // nftHostInboundPriority, policy accept).
+//
+// INVARIANT (#5719): this fence declares NO named counter object, and the
+// observability surface now DEPENDS on that. ReadHostInboundDenyCounters reports
+// a present-but-counterless xpf_hostinbound table as HostInboundTableCounterless,
+// which is how REST/Prometheus tell "enforcing, uncounted, degraded" from "no
+// table, genuinely zero denies". Giving the fence a counter would silently turn
+// that signal back into an authoritative zero — add a distinct fence-state
+// signal instead.
 func buildHostInboundFenceNetlink(p *nlPlan, spec FenceSpec) {
 	hostInboundFenceMandatoryAdmitsNetlink(p, spec.WGListenPorts)
 	for _, v := range spec.Views {

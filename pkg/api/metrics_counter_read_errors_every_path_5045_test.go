@@ -35,11 +35,13 @@ func stubPreGateNftReads(t *testing.T, denyFails bool) func() {
 	origLo0 := readLo0Counters
 	origAccept := readHostInboundAcceptCounters
 
-	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) {
+	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, xnft.HostInboundTableState, error) {
 		if denyFails {
-			return nil, errors.New("netlink dial: permission denied")
+			return nil, xnft.HostInboundTableAbsent, errors.New("netlink dial: permission denied")
 		}
-		return nil, nil
+		// Table ABSENT (#5719): a clean, error-free empty read that must NOT bump
+		// counterReadErrors — the deny read is the variable under test here.
+		return nil, xnft.HostInboundTableAbsent, nil
 	}
 	readHostInboundJunosHostDenyCounters = func() ([]xnft.HostInboundJunosHostDenyCount, error) {
 		return nil, nil

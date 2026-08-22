@@ -183,6 +183,7 @@ fn napt64_without_deterministic_stays_round_robin() {
 // deterministic prefix — it round-robins (the commit-time advisory covers it).
 #[test]
 fn napt64_deterministic_v6_unsupported_prefix_len_falls_back() {
+    let before = DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed);
     let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "napt64-bad-prefix".to_string(),
         prefix: "64:ff9b::/96".to_string(),
@@ -196,6 +197,51 @@ fn napt64_deterministic_v6_unsupported_prefix_len_falls_back() {
     assert!(
         state.prefixes[0].deterministic_v6.is_none(),
         "an unsupported subscriber-prefix length must not build a deterministic prefix"
+    );
+    assert_eq!(
+        DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed),
+        before + 1,
+        "#6227 item 1: a requested-but-failed deterministic build must bump the \
+         downgrade counter, not silently round-robin"
+    );
+}
+
+// #6227 item 1, RED-on-revert: `build_deterministic_v6`'s `host_count =
+// num_pool_ips.checked_mul(blocks_per_ip)` overflows `u32` when the pool is
+// large enough relative to the per-IP block count, returning `None` exactly
+// like every other "not deterministic" case — a subscriber's mapping silently
+// stops being deterministic. Before the #6227 fix this was unobservable
+// (silent round-robin fallback, no signal at all); the fix bumps
+// `DETERMINISTIC_V6_DOWNGRADE_COUNT` (and emits a paired `eprintln!`) whenever
+// the rule DID request deterministic mapping but the build failed. Reverting
+// just the new `if deterministic_v6.is_none() && ...` guard in
+// `from_snapshots_with_previous` turns this RED: the prefix still round-robins
+// (silently), but the counter no longer moves.
+#[test]
+fn napt64_deterministic_v6_host_count_overflow_warns_operator() {
+    let before = DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed);
+    // blocks_per_ip at its u16 max; a 70_000-entry pool makes
+    // `num_pool_ips * blocks_per_ip` (70_000 * 65_535 ≈ 4.59e9) exceed
+    // `u32::MAX` (≈4.29e9) — `checked_mul` returns `None`.
+    let pool_addresses = vec!["203.0.113.1".to_string(); 70_000];
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "napt64-overflow".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses,
+        no_v6_frag_header: false,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: u16::MAX,
+        deterministic_host_prefix_len: 32,
+        deterministic_host_base_v6: "2001:db8::".to_string(),
+    }]);
+    assert!(
+        state.prefixes[0].deterministic_v6.is_none(),
+        "a host_count u32 overflow must not build a deterministic prefix"
+    );
+    assert_eq!(
+        DETERMINISTIC_V6_DOWNGRADE_COUNT.load(Ordering::Relaxed),
+        before + 1,
+        "#6227 item 1: a checked_mul overflow must be counted/warned, not silent"
     );
 }
 

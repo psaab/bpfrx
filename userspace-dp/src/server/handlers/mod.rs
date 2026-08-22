@@ -34,7 +34,7 @@ mod stop_workers;
 mod sync_session;
 
 use super::super::*;
-use super::helpers::{refresh_status, write_state};
+use super::helpers::{refresh_status, wait_for_binding_settle, write_state};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +118,13 @@ pub(crate) fn handle_stream(
     // HA state updates. As with `export_wait`, the post-match status attach is
     // deferred until after the push.
     let mut all_export: Option<crate::afxdp::AllSessionsExport> = None;
+    // #5862: the binding-settle wait follows the same split. The locked arm only
+    // RECORDS that a settle is owed; the 2 s poll runs below with the lock
+    // released and re-taken per iteration, so an HA `sync_session` on the
+    // dedicated session socket — which dispatches through this same mutex — is
+    // served in the gaps instead of timing out against its 3 s deadline (and
+    // taking the rest of a #5380 bulk batch down with it).
+    let mut settle_wait: Option<Duration> = None;
 
     {
         let mut guard = state.lock().expect("server state poisoned");
@@ -134,6 +141,7 @@ pub(crate) fn handle_stream(
                 request.forwarding,
                 &mut response,
                 &mut persist_state,
+                &mut settle_wait,
             ),
             "update_ha_state" => ha::update(
                 &mut guard,
@@ -230,13 +238,20 @@ pub(crate) fn handle_stream(
                 persist_state = true;
             }
             "set_queue_state" => {
-                queue::set(&mut guard, request.queue, &mut response, &mut persist_state)
+                queue::set(
+                    &mut guard,
+                    request.queue,
+                    &mut response,
+                    &mut persist_state,
+                    &mut settle_wait,
+                )
             }
             "set_binding_state" => binding::set(
                 &mut guard,
                 request.binding,
                 &mut response,
                 &mut persist_state,
+                &mut settle_wait,
             ),
             "inject_packet" => inject_packet::handle(
                 &mut guard,
@@ -277,7 +292,25 @@ pub(crate) fn handle_stream(
         // computed after the lock-free ack-wait / push below so it reflects the
         // drained state (and is not produced while holding the lock across a
         // wait or a blocking push).
-        if export_wait.is_none() && all_export.is_none() && !suppress_status {
+        if export_wait.is_none() && all_export.is_none() && settle_wait.is_none() && !suppress_status
+        {
+            refresh_status(&mut guard);
+            response.status = Some(guard.status.clone());
+        }
+    }
+
+    // #5862: the binding-settle poll runs here, with the global ServerState lock
+    // RELEASED between iterations, so `sync_session` on the dedicated HA session
+    // socket is served in the gaps rather than queued behind a 2 s wait it
+    // cannot outlast (its round-trip deadline is 3 s and the #5380 batch abort
+    // makes the first timeout drop the rest of the burst). Status is re-derived
+    // afterwards under a fresh short-lived acquisition so the response reflects
+    // the SETTLED bindings — which is what the pre-#5862 in-lock refresh gave,
+    // and the reason the in-lock attach above is skipped when a settle is owed.
+    if let Some(timeout) = settle_wait {
+        wait_for_binding_settle(&state, timeout);
+        if !suppress_status {
+            let mut guard = state.lock().expect("server state poisoned");
             refresh_status(&mut guard);
             response.status = Some(guard.status.clone());
         }

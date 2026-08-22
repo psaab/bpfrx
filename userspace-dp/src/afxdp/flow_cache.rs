@@ -1104,6 +1104,36 @@ impl FlowCache {
         }
     }
 
+    /// #5190 (A1-b1-F6): the caller's DYNAMIC validation rejected a candidate
+    /// that `lookup_with_observed_bytes` had already accounted as a served
+    /// hit.
+    ///
+    /// The lookup commits `hits += 1` (plus the LRU promote, the
+    /// `last_used_epoch` stamp and the `observed_bytes` add) the moment
+    /// key/generation/epoch/lease pass, because it must hand the caller a
+    /// borrow of the entry and cannot hold a mutable borrow across the
+    /// caller's own validation. The caller then re-checks two things the
+    /// cache cannot see — the per-shard neighbor MAC epoch (#3048/#5147) and
+    /// the HA/fabric decision validity — and on failure evicts the slot and
+    /// falls through to the slow path. That packet was NOT served from the
+    /// cache, so counting it as a hit inflates the published hit rate exactly
+    /// when it should be falling: during gateway VRRP failover, a NIC swap or
+    /// an RG transition, i.e. the moments an operator looks at the hit rate to
+    /// diagnose a stall.
+    ///
+    /// The per-entry state (`last_used_epoch`, `observed_bytes`, the LRU
+    /// promote) needs no undo — the caller's `invalidate_slot` removes the
+    /// entry outright, taking that state with it. Only the three tallies
+    /// outlive it, so only they are corrected here. This runs on the REJECT
+    /// branch only (a neighbor MAC change / HA invalidation), never on the
+    /// steady-state hit path, so the fast path is untouched.
+    #[inline]
+    pub(super) fn reclassify_hit_as_miss(&mut self) {
+        self.hits = self.hits.saturating_sub(1);
+        self.misses += 1;
+        self.evictions += 1;
+    }
+
     pub(super) fn invalidate_slot(
         &mut self,
         key: &crate::session::SessionKey,

@@ -747,8 +747,27 @@ destination-port range the same way instead of expanding it:
   was already bounded — it parses endpoints with `ParseUint(..,16)`.)
 
 - **Builder compaction (`buildDestinationNATSnapshotsWithFeeds`).** Each term's
-  valid ports are coalesced with `coalescePortRanges` into inclusive `[Low,High]`
-  wire ranges. A single port (`Low==High`, including the `[0,0]` wildcard) keeps
+  valid ports are coalesced into inclusive `[Low,High]` wire ranges.
+
+  **#5250 (A6-b2 F3) — the intermediate per-port slice is gone.** The compaction
+  above bounded what reaches the WIRE, but the builder still built the expanded
+  `[]int` first: three sites read `coalescePortRanges(appPortsFromSpec(spec))`
+  and the DNAT `appTerm` carried the expanded slice all the way into the emit
+  loop, so `destination-port 1-65535` allocated ~65k ints per application and
+  again per application-set member — a commit-time allocation spike on the same
+  goroutine that services the control socket. `appPortRangesFromSpec` (nat.go)
+  emits the range directly: a port spec is a single value or ONE contiguous
+  range, so its coalesced form is always zero or one wire range and there is
+  nothing to merge. `appTerm` now carries `dstRanges []NatPortRangeWire` plus
+  `dstPortsPresent bool` — the latter preserving the one other thing the slice
+  was read for, whether the source list was non-empty BEFORE coalescing, which
+  the #3726/#3857 fail-closed test needs and a coalesced list cannot recover (a
+  spec of `"0"` is present but coalesces away). `appPortsFromSpec` is retained
+  and now shares `appPortSpecBounds` with the range emitter so the two cannot
+  drift; `TestAppPortRangesFromSpecMatchesCoalescedSlice` asserts they AGREE
+  across a spec corpus rather than checking a hand-written expectation table,
+  and `TestAppPortRangesFromSpecDoesNotMaterializeTheRange` reds on an
+  allocation count if the composition comes back. A single port (`Low==High`, including the `[0,0]` wildcard) keeps
   the exact-port `DnatKey` O(1) fast path (`destination_port` set,
   `match_destination_ports` empty — unchanged for the common single-port and
   IP-only rules). A multi-port range is emitted as ONE wildcard-port entry
