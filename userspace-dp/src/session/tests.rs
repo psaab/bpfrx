@@ -424,22 +424,65 @@ fn session_id_carries_the_node_discriminator_6311() {
     );
 }
 
-// #6311: the structural consequence — an id ADOPTED from the peer can never be
-// re-minted locally, so the pre-#5212 same-node uniqueness property is restored
-// without any `next_session_id` bookkeeping on the adoption path.
+// #6311: the structural consequence, driven through the REAL adoption path —
+// an id ADOPTED from the peer can never be re-minted locally, so the pre-#5212
+// same-node uniqueness property is restored without any `next_session_id`
+// bookkeeping on the adoption path.
+//
+// The peer id is MINTED BY A NODE-1 TABLE, not written as a literal. An earlier
+// draft of this test hardcoded `((1<<15)|3)<<48 | 1`, and the mutation matrix
+// caught that as VACUOUS: a hardcoded peer id simply names a value the un-bitted
+// allocator never produces, so the assertion passed with the node discriminator
+// removed. It was a probe keyed to the fix rather than to the property. Deriving
+// the peer id from a real (node 1, worker 3) table is what puts the node bit
+// under test.
 #[test]
 fn adopted_peer_id_cannot_collide_with_a_local_id_6311() {
-    let mut table = SessionTable::new();
-    table.set_session_id_namespace(0, 3);
-    // What the PEER (node 1, worker 3) would have minted for its first session.
-    let peer_id: u64 = (((1u64 << 15) | 3) << 48) | 1;
     let t0 = 1_000_000_000u64;
-    assert!(table.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
-    let local_id = table.drain_deltas(8)[0].session_id;
+
+    // What the PEER actually mints for its first worker-3 session.
+    let mut peer = SessionTable::new();
+    peer.set_session_id_namespace(1, 3);
+    assert!(peer.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let peer_id = peer.drain_deltas(8)[0].session_id;
+    assert_ne!(peer_id, 0, "fixture: the peer must have minted a real id");
+
+    // This node runs the SAME worker index, and its counter also starts at 1 —
+    // the exact point where the pre-#6311 namespaces collided.
+    let mut local = SessionTable::new();
+    local.set_session_id_namespace(0, 3);
+
+    // Adopt the peer's id verbatim (#5212).
+    let imported = key_v6();
+    assert!(local.upsert_synced_with_origin(
+        SessionInstall {
+            key: imported.clone(),
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: t0,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+            session_id: peer_id,
+        },
+        false,
+    ));
+    assert_eq!(
+        local.session_id_for(&imported),
+        peer_id,
+        "precondition: the import must ADOPT the peer id, or this test proves nothing"
+    );
+
+    // Now mint locally. The adoption did NOT advance `next_session_id`, so this
+    // is counter 1 — which is precisely the value the peer used. It must still
+    // differ, and it can only differ because of the node bit.
+    let mine = key_v4();
+    assert!(local.install_with_protocol(mine.clone(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let local_id = local.session_id_for(&mine);
     assert_ne!(
         local_id, peer_id,
-        "#6311: this node's first worker-3 id equals the peer's first worker-3 id — an \
-         adopted import would carry a duplicate correlation stamp"
+        "#6311: this node's first worker-3 id equals the peer's first worker-3 id — the \
+         adopted import and a locally-minted session share one correlation stamp"
     );
 }
 

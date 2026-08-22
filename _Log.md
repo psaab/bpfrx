@@ -99543,3 +99543,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
   pkg/dataplane/userspace/snapshot_node_id_6311_test.go,
   pkg/daemon/daemon_ha_userspace_convert.go, docs/sync-protocol.md
+
+## 2026-08-21 — #6311: de-vacuum the adoption-collision test
+- **Timestamp**: 2026-08-21
+- **Action**: The mutation matrix showed
+  `adopted_peer_id_cannot_collide_with_a_local_id_6311` passing under the
+  node-bit-removal cell. It built the peer id as a hardcoded literal, so it
+  named a value the un-bitted allocator never produces — a probe keyed to the
+  fix, not to the property. Rewrote it to MINT the peer id from a real node-1
+  `SessionTable` and drive the actual `upsert_synced_with_origin` adoption path.
+  It now reds under that cell (4 failures, was 3).
+- **File(s)**: userspace-dp/src/session/tests.rs
