@@ -75,10 +75,12 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 		if statuses, ok := monStatuses[rg.ID]; ok {
 			for _, st := range statuses {
 				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
-					Interface:       st.Interface,
-					Weight:          st.Weight,
-					Up:              st.Up,
-					RedundancyGroup: rg.ID,
+					Interface:        st.Interface,
+					Weight:           st.Weight,
+					Up:               st.Up,
+					RedundancyGroup:  rg.ID,
+					ConfiguredWeight: st.ConfiguredWeight, // #6589
+					Clamped:          st.Clamped,
 				})
 				localMonMap[st.Interface] = true
 			}
@@ -98,12 +100,14 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 				// runtime bounds it to [0,255]; reporting the raw value here
 				// would be an observability lie on exactly the config where
 				// the operator most needs the truth.
-				w, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
+				w, clamped := config.ClampInterfaceMonitorWeight(mon.Weight)
 				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
-					Interface:       mon.Interface,
-					Weight:          w,
-					Up:              false,
-					RedundancyGroup: rg.ID,
+					Interface:        mon.Interface,
+					Weight:           w,
+					Up:               false,
+					RedundancyGroup:  rg.ID,
+					ConfiguredWeight: mon.Weight,
+					Clamped:          clamped, // #6589
 				})
 				localMonMap[mon.Interface] = true
 			}
@@ -129,12 +133,14 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 				}
 				// #6549: the peer bounds this weight the same way we do, so
 				// render the effective value rather than the raw config one.
-				w, _ := config.ClampInterfaceMonitorWeight(mon.Weight)
+				w, clamped := config.ClampInterfaceMonitorWeight(mon.Weight)
 				input.PeerMonitors = append(input.PeerMonitors, cluster.InterfaceMonitorInfo{
-					Interface:       mon.Interface,
-					Weight:          w,
-					Up:              false,
-					RedundancyGroup: rg.ID,
+					Interface:        mon.Interface,
+					Weight:           w,
+					Up:               false,
+					RedundancyGroup:  rg.ID,
+					ConfiguredWeight: mon.Weight,
+					Clamped:          clamped, // #6589
 				})
 			}
 		}

@@ -497,7 +497,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 		// can still reach this poll. Deliberately NOT logged here — this loop
 		// runs every poll tick; reconcileMonitorDebtsLocked emits the
 		// config-apply-frequency warning.
-		weight, _ := config.ClampInterfaceMonitorWeight(im.Weight)
+		weight, weightClamped := config.ClampInterfaceMonitorWeight(im.Weight)
 
 		// Translate Junos name (ge-0/0/0) to Linux name (ge-0-0-0).
 		linuxName := config.LinuxIfName(im.Interface)
@@ -529,10 +529,12 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
-			Interface:       im.Interface,
-			Weight:          weight,
-			Up:              up,
-			RedundancyGroup: rg.ID,
+			Interface:        im.Interface,
+			Weight:           weight,
+			Up:               up,
+			RedundancyGroup:  rg.ID,
+			ConfiguredWeight: im.Weight,
+			Clamped:          weightClamped,
 		})
 
 		// #6550: ifaceState is shared with UpdateGroups, which DELETES from it
@@ -682,6 +684,60 @@ launch:
 // never called. Bounding here — the single place both consumers read — is what
 // closes it, and it also keeps the weight reported in the RecordEvent /
 // ipDebts bookkeeping equal to the weight actually applied.
+// ClampedIPWeight is one ip-monitoring weight the runtime bounded (#6589).
+// Target is "" for the per-RG aggregate global-weight.
+type ClampedIPWeight struct {
+	RGID       int
+	Target     string
+	Configured int
+	Effective  int
+}
+
+// ClampedIPMonitorWeights reports every ip-monitoring weight the runtime had to
+// clamp, so an operator-facing surface can show it (#6589).
+//
+// The interface-monitor class at least reaches journald —
+// reconcileMonitorDebtsLocked warns once per config apply. The IP class reached
+// NOTHING: ipTargetWeight and the global-threshold aggregate both discarded the
+// clamp signal, so an out-of-range ip-monitoring weight was invisible on every
+// surface including the log. That is worse than the interface-monitor case
+// #6589 was filed about, and it is the same failure shape: a monitor clamped to
+// 0 owes no election debt, so its RG never demotes when the probe fails.
+func (mon *Monitor) ClampedIPMonitorWeights() []ClampedIPWeight {
+	mon.mu.Lock()
+	groups := mon.groups
+	mon.mu.Unlock()
+
+	var out []ClampedIPWeight
+	for _, rg := range groups {
+		if rg == nil || rg.IPMonitoring == nil {
+			continue
+		}
+		if w, clamped := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalWeight); clamped {
+			out = append(out, ClampedIPWeight{
+				RGID: rg.ID, Configured: rg.IPMonitoring.GlobalWeight, Effective: w,
+			})
+		}
+		for _, target := range rg.IPMonitoring.Targets {
+			if target == nil {
+				continue
+			}
+			raw := target.Weight
+			if raw == 0 {
+				// Mirrors ipTargetWeight: an unset per-target weight inherits
+				// the global one, which is reported above on its own.
+				continue
+			}
+			if w, clamped := config.ClampInterfaceMonitorWeight(raw); clamped {
+				out = append(out, ClampedIPWeight{
+					RGID: rg.ID, Target: target.Address, Configured: raw, Effective: w,
+				})
+			}
+		}
+	}
+	return out
+}
+
 func (mon *Monitor) ipTargetWeight(rg *config.RedundancyGroup, target *config.IPMonitorTarget) int {
 	raw := target.Weight
 	if raw == 0 {
