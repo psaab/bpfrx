@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"slices"
 	"sort"
 	"strings"
@@ -68,6 +69,25 @@ type FeedServer struct {
 	HoldInterval   int         // seconds; 0/unset = retain last-good forever on failure, >0 = drop to empty after N seconds (#2050)
 	FeedName       string      // single feed-name (backward compat, no path)
 	FeedEntries    []FeedEntry // named feeds with per-feed paths
+}
+
+// MarshalJSON redacts the feed URL on every JSON render (#6703). A threat-feed
+// URL routinely carries the subscription token in its query string, and the
+// REST config-read surface json-encodes the compiled *Config directly, so the
+// plain string field marshalled VERBATIM — while the `show security
+// dynamic-address` surfaces have rendered it through RedactURL all along. This
+// makes the two agree.
+//
+// The alias type sheds this method to avoid recursion while preserving every
+// field, so a field added to FeedServer later is still marshalled.
+func (f *FeedServer) MarshalJSON() ([]byte, error) {
+	if f == nil {
+		return []byte("null"), nil
+	}
+	type alias FeedServer
+	v := alias(*f)
+	v.URL = RedactURL(v.URL)
+	return json.Marshal(v)
 }
 
 // FeedEntry is a named feed within a feed-server, with an optional path.

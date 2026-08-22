@@ -71,6 +71,89 @@ import (
 // and splitting enforcement between the middleware and the handler to recover
 // that one verb would put half the authorization decision somewhere a future
 // route could forget to make.
+// restReadPermissions is the authorization policy for the SAFE (read) routes
+// under /api/v1 (#6660).
+//
+// #5561 authorized the 19 MUTATING routes and deliberately scoped reads out.
+// The read surface stayed open: any local process could GET /api/v1/config and
+// the rest without being identified, and no login-class permission was
+// consulted.
+//
+// WHAT IS AND IS NOT DISCLOSED, measured rather than assumed. GET
+// /api/v1/config json-encodes the COMPILED *config.Config, so #2053's
+// config.Secret marshaller applies and no operator secret is rendered in
+// cleartext -- verified by marshalling a populated ControlLinkAuthKey and
+// checking the output. So this is NOT credential disclosure. What it is, is
+// full CONFIGURATION disclosure: zones, policies, NAT rules, interface
+// addressing, routing neighbours -- a complete map of the firewall, to any
+// local uid, including one with no `system login user` entry at all. On a
+// firewall that is reconnaissance, which is why every one of these routes is a
+// `show`-equivalent and Junos gates `show` on `view`.
+//
+// EVERY ROUTE IS PermView, deliberately, rather than a per-route tier. These
+// are all show verbs; inventing finer tiers here would be a policy the CLI's
+// own table does not have, and the two would drift. The finer question the
+// issue raises -- whether a read should be REDACTED by class rather than
+// denied -- is a different contract and is left open.
+//
+// /health and /metrics are NOT here and stay open. They carry no configuration,
+// authCheck already exempts them, and the in-tree harnesses read /metrics
+// (test/incus/*.sh) -- a sweep of every in-tree consumer found those two and
+// nothing else touching REST at all, so gating the /api/v1 surface breaks no
+// shipped tooling.
+//
+// WHY THIS IS NOT A NO-BRICK PROBLEM. PrincipalForUID returns a SUPERUSER
+// principal for uid 0 unconditionally, with no login model required, so
+// root-run monitoring and support tooling on a box that never adopted RBAC
+// keeps working byte-for-byte. What changes is a NON-root local uid outside the
+// login model -- which is exactly the population this issue exists to stop
+// reading the configuration.
+var restReadPermissions = map[string]config.LoginClassPermission{
+	// Configuration reads. The disclosure this issue is about.
+	"GET /api/v1/config":               config.PermView,
+	"GET /api/v1/config/compare":       config.PermView,
+	"GET /api/v1/config/export":        config.PermView,
+	"GET /api/v1/config/history":       config.PermView,
+	"GET /api/v1/config/search":        config.PermView,
+	"GET /api/v1/config/show":          config.PermView,
+	"GET /api/v1/config/show-rollback": config.PermView,
+	"GET /api/v1/config/status":        config.PermView,
+	"GET /api/v1/show-text":            config.PermView,
+
+	// Operational state.
+	"GET /api/v1/status":                               config.PermView,
+	"GET /api/v1/system/info":                          config.PermView,
+	"GET /api/v1/system/buffers":                       config.PermView,
+	"GET /api/v1/interfaces":                           config.PermView,
+	"GET /api/v1/interfaces/detail":                    config.PermView,
+	"GET /api/v1/routes":                               config.PermView,
+	"GET /api/v1/routing/bgp":                          config.PermView,
+	"GET /api/v1/routing/ospf":                         config.PermView,
+	"GET /api/v1/dhcp/identifiers":                     config.PermView,
+	"GET /api/v1/dhcp/leases":                          config.PermView,
+	"GET /api/v1/events/stream":                        config.PermView,
+	"GET /api/v1/logs/stream":                          config.PermView,
+	"GET /api/v1/statistics/global":                    config.PermView,
+	"GET /api/v1/statistics/interfaces":                config.PermView,
+	"GET /api/v1/statistics/zones":                     config.PermView,
+	"GET /api/v1/services/flow-exporters":              config.PermView,
+	"GET /api/v1/security/events":                      config.PermView,
+	"GET /api/v1/security/ipsec/sa":                    config.PermView,
+	"GET /api/v1/security/match":                       config.PermView,
+	"GET /api/v1/security/nat/destination":             config.PermView,
+	"GET /api/v1/security/nat/deterministic":           config.PermView,
+	"GET /api/v1/security/nat/pools":                   config.PermView,
+	"GET /api/v1/security/nat/rules":                   config.PermView,
+	"GET /api/v1/security/nat/source":                  config.PermView,
+	"GET /api/v1/security/policies":                    config.PermView,
+	"GET /api/v1/security/screen":                      config.PermView,
+	"GET /api/v1/security/sessions":                    config.PermView,
+	"GET /api/v1/security/sessions/summary":            config.PermView,
+	"GET /api/v1/security/sessions/summary/zone-pairs": config.PermView,
+	"GET /api/v1/security/vrrp":                        config.PermView,
+	"GET /api/v1/security/zones":                       config.PermView,
+}
+
 var restMutationPermissions = map[string]config.LoginClassPermission{
 	// Operational clear verbs.
 	"POST /api/v1/security/sessions/clear": config.PermClear,
@@ -758,10 +841,52 @@ func credentialPrincipalUser(cfg AuthConfig, r *http.Request) (string, bool) {
 
 // mutationAuthzGuard rejects a state-changing request whose caller the server
 // cannot authorize (#5561). Safe methods pass through untouched.
+// readAuthz adjudicates a SAFE (read) request against restReadPermissions
+// (#6660) and either serves it or refuses it.
+//
+// It is deliberately SIMPLER than the mutation path above, and the difference is
+// the point rather than an omission. The mutation gate adjudicates TWICE and
+// drains the body between the two passes, because a caller owns its body and can
+// hold an authorization open for the whole read timeout. A GET has no body to
+// withhold: the handler is entered immediately, so there is no window between
+// the verdict and the action for a revocation to fall into. One pass is the
+// whole decision here.
+//
+// An UNGUARDED safe route is served, not refused -- the opposite of the mutation
+// gate's fail-closed default. That asymmetry is deliberate too. /health and
+// /metrics are safe routes with no entry in the table and must keep serving:
+// authCheck already exempts them, the in-tree incus harnesses read /metrics, and
+// a fail-closed default here would break them at the first request. The cost is
+// that a NEW read route added without a table entry serves unauthenticated --
+// which is why TestEveryReadRouteHasAPermission_6660 enumerates the mux and
+// fails on any /api/v1 GET the table does not cover, moving that risk from
+// runtime to the test suite.
+func (s *Server) readAuthz(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	route := r.Method + " " + r.URL.Path
+	required, known := restReadPermissions[route]
+	if !known {
+		next.ServeHTTP(w, r)
+		return
+	}
+	cfg, p, _ := s.authorizeInputs(r)
+	if err := authz.Authorize(cfg, p, required); err != nil {
+		// Debug, not Warn: caller-driven and reachable unauthenticated, so a
+		// Warn here is a log-amplification lever -- the same reasoning the
+		// mutation denial states.
+		slog.Debug("api: refused unauthorized read",
+			"method", r.Method, "path", r.URL.Path,
+			"principal", p.String(), "source", p.Source.String(),
+			"required", authz.PermissionName(required), "err", err)
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	next.ServeHTTP(w, r)
+}
+
 func (s *Server) mutationAuthzGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isSafeHTTPMethod(r.Method) {
-			next.ServeHTTP(w, r)
+			s.readAuthz(w, r, next)
 			return
 		}
 		// Exact match on the registered pattern. The path is NOT cleaned or

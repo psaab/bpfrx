@@ -1,3 +1,63 @@
+## 2026-08-22 — #7406: operator note on where a credential may live in a URL
+
+- **Timestamp**: 2026-08-22
+- **Action**: Documented the hostname/path residual in `pkg/ddns/README.md`,
+  placed directly after the paragraph that already enumerates userinfo and
+  query as the slots an operator may embed a credential in — so the reader
+  learns what IS stripped and what is NOT in one place.
+  Framed deliberately as CURRENT BEHAVIOUR ("is rendered verbatim by every
+  surface that redacts these leaves today") rather than as policy ("this is
+  the supported way to configure a credential"). The former stays true
+  whichever way #7406 is resolved; the latter would presume the
+  accept-and-document resolution over the explicit-secret-marking one, and
+  would have to be retracted if the grammar option lands. Does NOT close
+  #7406 — the grammar decision is still open and belongs to the config-schema
+  owner.
+  Docs-only; no code, no behaviour change.
+- **File(s)**: `pkg/ddns/README.md`
+## 2026-08-22 — #6703: URL-bearing config leaves leaked on every config-read surface
+
+- **Timestamp**: 2026-08-22
+- **Action**: Measured the defect before designing, and the measurement moved
+  the fix. The framing in the issue (and in the brief) was that `RedactURL`
+  has a gap; the live defect was that the config-READ surfaces call **no
+  redactor at all**. Proof: `GET /api/v1/config` leaked a *userinfo*
+  credential — a case `RedactURL` has stripped since #2781 and
+  `DDNSProvider.String()` has applied all along — which is only possible if
+  neither is on the path. Confirmed on all three routes named in the
+  acceptance criteria. A fix aimed at `RedactURL` would have been invisible to
+  every one of them.
+  Fixed at the two render boundaries instead: `MarshalJSON` on `DDNSProvider`
+  and `FeedServer` (alias-copy so a field added later is still marshalled and
+  cannot be silently dropped), and a TRANSFORM pass in `redactNodes` for the
+  AST display path. URL leaves are transformed rather than masked because a
+  credential-free URL must render unchanged and the host must stay visible —
+  both explicit acceptance criteria, and a placeholder would violate both.
+  Keyed the AST rule on the LEAF NAME rather than a list of locations, so a
+  future `url` leaf inherits redaction; that also caught two leaves the issue
+  never listed — `system license autoupdate url` and `services rpm probe ...
+  target url` — both measured leaking. Gated `server`/`update-server` on a
+  `dynamic-dns` ancestor since `server` is also an NTP leaf; the gate is
+  pinned by a direct unit test because a render-level test cannot discriminate
+  (RedactURL is a no-op on a bare NTP address, so a wrongly-ungated `server`
+  would still render unchanged and pass for the wrong reason).
+  Added the symmetric commit-ingest guard the redaction creates a need for: a
+  redacted URL still LOOKS valid, so re-applying a redacted export would
+  silently install a broken endpoint instead of failing at commit. Verified it
+  is display-only — `ExportJSON` has zero non-test callers, persistence
+  marshals the AST tree (untouched), and `redactNodes` runs only from
+  `RedactedClone`.
+  Deliberately did NOT change `RedactURL`: 18 call sites across 6 packages, 9
+  of which need the host in their output (the three `show security
+  dynamic-address` surfaces, the commit warnings that name the offending
+  value, the feed-fetch logs that say which server is down).
+  Mutation matrix M1-M6 all RED with real assertions, vet clean at every
+  mutated state, RUN=17 at every cell matching the control.
+- **File(s)**: `pkg/config/ast_redact.go`, `pkg/config/types_system.go`,
+  `pkg/config/types_security.go`, `pkg/config/url_redaction_6703_test.go` (new),
+  `pkg/api/config_url_redaction_6703_test.go` (new),
+  `docs/junos-config-display-reference.md`
+
 ## 2026-08-22 — #6709/#7009: the pkg/ddns full-package flake, both mechanisms
 
 - **Timestamp**: 2026-08-22
@@ -102545,6 +102605,36 @@ prose edit above them added. No diff falls in the new test body.
     controlLinkAuthKey now REDs). Residual closed: readLoop's CALL to admitFrame
     was still unbound — severing it left every 5086 test green.
   - **File(s)**: pkg/cluster/heartbeat_replay_restart_5086_test.go
+
+## 2026-08-22 — #6663 redundancy-group schema/compiler SSOT agreement
+- **Timestamp**: 2026-08-22
+- **Action**: `compileChassis` compiles `strict-vip-ownership` (via the
+  `redundancyGroupStatements` dispatch table) but `setSchema` did not declare
+  it. Not a commit rejection — the RG subtree is open-world, so it committed
+  and took effect — a COMPLETION gap: `redundancy-group 1 ?` never offered it.
+  Declared the leaf, and bound the two SSOTs with an agreement test in ONE
+  direction (compiler ⇒ schema always a bug; schema ⇒ compiler is the
+  documented accepted-only posture). The sweep was provable rather than
+  eyeballed because both sides are enumerable: dispatch-table keys vs schema
+  children, exactly one missing.
+- **File(s)**: pkg/config/schema_chassis.go,
+  pkg/config/rg_schema_compiler_agreement_6663_test.go (new),
+  docs/config-schema.md, _Log.md
+
+## 2026-08-22 — #6660 REST read-surface authorization
+- **Timestamp**: 2026-08-22
+- **Action**: #5561 gated the 19 mutating REST routes and scoped reads out, so
+  any local uid could GET the full running configuration unidentified. Measured
+  what is actually disclosed before designing: the compiled *config.Config is
+  json-encoded, so #2053's Secret marshaller applies and NO secret is rendered
+  in cleartext — this is configuration/topology disclosure, not credential
+  disclosure. Added restReadPermissions (every /api/v1 GET -> PermView) and
+  readAuthz, reusing #5561's machinery. /health + /metrics stay open (harness
+  consumers; swept every in-tree consumer and found nothing else on REST).
+  Safe because PrincipalForUID returns superuser for uid 0 unconditionally, so
+  root-run tooling on a box with no login model is unaffected.
+- **File(s)**: pkg/api/authz.go, pkg/api/read_authz_6660_test.go (new),
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
 
 ## 2026-08-22 — #6666 mirror adopts the cross-node session id (DECISION)
 - **Timestamp**: 2026-08-22
