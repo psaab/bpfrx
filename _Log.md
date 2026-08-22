@@ -103410,3 +103410,33 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/schema_system.go`, `pkg/config/compiler_services.go`,
   `pkg/config/compiler_dhcp_group_multivalue_6696_test.go` (new),
   `docs/config-schema.md`
+
+## 2026-08-22 — #6640 split: host-inbound stanza advisories join their siblings
+- **Timestamp**: 2026-08-22
+- **Action**: The #6640 change pushed pkg/config/compiler_validate_warn.go from
+  1995 to 2081 LOC, crossing the 2000 [REFACTOR] floor and redding
+  pkg/refactoraudit.TestTouchedFileCrossedModularityThreshold on the merge with
+  master. Checked the three documented "When NOT to refactor" cases
+  (docs/refactoring-audit.md) — none apply: the file is a bag of independent
+  validators, not one cohesive schema, which argues FOR splitting. Extracted the
+  host-inbound STANZA advisory block (three advisory closures + the zone loop,
+  lines 320-689, self-contained: build passed first try) into the EXISTING
+  sibling file compiler_validate_warn_host_inbound.go as
+  validateHostInboundStanzaWarnings, joining validateHostInboundMulticast-
+  Warnings / validateHostInboundManagedRoutingMismatch /
+  validateHostInboundOverrideReplaceWarnings — it was the last member of that
+  family still inlined. Pure relocation: moved region proved BYTE-IDENTICAL
+  (370 lines, md5 bf1bc2580ca4); call placed at the exact position the block
+  occupied so ValidateConfig's ORDERED return slice is unchanged. 2081 -> 1721
+  (below its own pre-change 1995); sibling 734 -> 1125. gofmt checked on the two
+  touched files only — the package has pre-existing unformatted files and a
+  package-wide sweep would bury the diff.
+- **Also**: corrected the doc cites this move rotted (fullAdmitAdvice,
+  unportedAdvice, the two-advisory paragraph), plus two PRE-EXISTING wrong cites
+  in the same docs (validateJunosHostDirectDeliveryWarnings,
+  validateHostInboundMulticastWarnings both already lived in the host_inbound
+  file on origin/master) — flagged as pre-existing, not fallout of this move.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_validate_warn_host_inbound.go,
+  docs/host-inbound-service-matrix.md, docs/host-inbound-multicast.md
+

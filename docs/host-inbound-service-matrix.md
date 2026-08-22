@@ -232,7 +232,7 @@ below does not need it to be more.
   for the previous packet-wide admit`. Narrowing `any-service` next would break
   the same population a second time, and the second time with no remedy left.
 - **The breadth is opt-in and already announced.** An operator must write the
-  token, and `fullAdmitAdvice` (`pkg/config/compiler_validate_warn.go`) emits a
+  token, and `fullAdmitAdvice` (`pkg/config/compiler_validate_warn_host_inbound.go`) emits a
   commit-time advisory naming the stanza and the exact blast radius
   ("EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) …
   a superset of Junos's per-service union"). The surprise #6618 is concerned
@@ -440,7 +440,8 @@ Junos.** A zone that actually terminates one of these services must use
 `system-services any-service`. That is the only remedy: as shown above, an lo0
 input filter cannot rescue a host-inbound deny on either enforcement path.
 Naming one of these tokens explicitly draws a
-commit-time advisory (`compiler_validate_warn.go`) that says exactly this, so the
+commit-time advisory (`unportedAdvice`,
+`compiler_validate_warn_host_inbound.go`) that says exactly this, so the
 gap is announced rather than discovered as a silent blackhole. `system-services
 all` does **not** draw the advisory: it covers these services (contributing
 nothing), and warning there would fire on a large fraction of commits — every
@@ -494,7 +495,8 @@ such a zone emits no rules at all and `all` vs the expansion is
 indistinguishable there. HA heartbeat / session-sync / config-sync / fabric ride
 strictly the control + fabric interfaces and never reach this filter.
 
-`ValidateConfig` (`pkg/config/compiler_validate_warn.go`) emits two WARN-only
+`ValidateConfig` (via `validateHostInboundStanzaWarnings`,
+`pkg/config/compiler_validate_warn_host_inbound.go`) emits two WARN-only
 advisories, for each zone-level stanza AND each per-interface override (#3362):
 
 - **`any-service`** → the packet-wide-full-admit breadth advisory.
@@ -1929,7 +1931,8 @@ EFFECTIVE admit set rather than a token test, because a syntactic
 
 ### Commit-time warning (direction c — shipped; now suppressed on render)
 
-`config.validateJunosHostDirectDeliveryWarnings` (`pkg/config/compiler_validate_warn.go`,
+`config.validateJunosHostDirectDeliveryWarnings`
+(`pkg/config/compiler_validate_warn_host_inbound.go`,
 run inside `ValidateConfig`) emits a WARN-only commit message for each `to-zone
 junos-host` policy — zone-pair or global — that is **stricter than the coarse
 gate** (a `then deny`/`then reject`, or a source-restricted `then permit`) AND is
