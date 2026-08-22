@@ -394,15 +394,35 @@ destination (#2837), a WG transit-egress flow stores `egress_ifindex =` the
 LOGICAL wgN ifindex and:
 
 - **WG transport table HAS a default route** — the `0.0.0.0`/`::` lookup matches
-  it, so `tx_ifindex =` the default egress bind ifindex (the physical WAN
-  parent, the same NIC carrying the VLAN-tagged reth0.80 path). Dispatch already
-  egresses the correct port; the peer-route resolution is NOT consulted (the
-  `tx_ifindex > 0` fast path). **Common case, unchanged.**
+  it, so `tx_ifindex =` the default egress bind ifindex. With ONE underlay that
+  is the same physical WAN parent the peer route resolves to, so dispatch
+  already egresses the correct port. **Common case, unchanged.** With SEVERAL
+  underlays it is not: see #6345 below.
 - **ONLY a specific peer route, NO default** — `0.0.0.0`/`::` NoRoutes →
   `tx_ifindex = 0` → the fallback `resolve_tx_binding_ifindex(logical wgN)`
   returns the logical ifindex, which has **no XSK binding**, so the TX
   dispatcher `NO_EGRESS_BINDING`-DROPS a frame #5292 built correctly (the bytes
   were right; the packet never egressed). This was the #6308 bug.
+
+**#6345 (the `tx_ifindex > 0` branch — multi-underlay).** #6308 fixed only the
+`tx_ifindex == 0` branch, leaving the fast path above taking the stored
+resolution verbatim. For a WG transit-egress flow whose transport table DOES
+carry a default route, that value is the DEFAULT-route parent — while
+`wg_encap_frame` builds the outer L2/VLAN/src against the SELECTED PEER's
+more-specific route (#6306). With one underlay the two are the same NIC and
+nothing changes. With SEVERAL — a peer reachable over a different NIC than the
+default route's — dispatch targeted one NIC while the bytes carried another
+egress's L2: a frame emitted on the wrong wire, carrying a source MAC and VLAN
+belonging to a different segment.
+
+`resolve_forward_target_ifindex` therefore consults the peer-route resolution
+FIRST, on both branches, and falls back to `tx_ifindex` only when it does not
+resolve. Dispatch NIC and frame L2 are then the same NIC by construction. If the
+peer's NIC has no XSK binding the dispatcher drops, which is the correct
+fail-closed posture against emitting a mismatched frame onto the wrong underlay.
+The non-tunnel fast path is still one integer compare — the resolver's first act
+is `tunnel_endpoint_id == 0 -> None`, after which a plain forward takes
+`tx_ifindex` verbatim exactly as before.
 
 The fix resolves the physical underlay egress against the SAME selected-peer
 route #5292 uses for the bytes — `wg::wg_transit_egress_physical_egress_ifindex`
@@ -412,9 +432,7 @@ route #5292 uses for the bytes — `wg::wg_transit_egress_physical_egress_ifinde
 `resolve_forward_target_ifindex` feeds that physical egress into
 `resolve_tx_binding_ifindex`. So the dispatch SSOT and the frame-bytes SSOT
 agree on ONE physical NIC. Non-WG flows and unresolvable-peer flows keep the
-pre-#6308 logical fallback (fail-closed identical to before), and the extra FIB
-LPM runs ONLY on the `tx_ifindex == 0` (previously-dropped) path — default-route
-WG traffic and every non-WG forward pay nothing. Like #5292, this changes only
+pre-#6308 logical fallback (fail-closed identical to before). Like #5292, this changes only
 the secondary AF_XDP transit-egress path (not the canonical wgN-TUN topology
 where the WG control thread owns egress); the upstream resolution SSOT
 (`resolve_tunnel_forwarding_resolution`) is deliberately left storing the
