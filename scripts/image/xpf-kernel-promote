@@ -61,6 +61,52 @@ ARM_RECORD="/var/lib/xpf/kernel-promote-binary"
 KERNEL_JOURNAL="/var/lib/xpf/kernel-upgrade.state"
 JOURNAL_ARMED_STATE="ARMED"
 
+# The DURABLE TRACE a did-not-run outcome leaves behind (#6622).
+#
+# This gate exits 0 on every path, deliberately: a non-zero exit trips the
+# unit's OnFailure= and reboots the box over what may be a transient packaging
+# window. Combined with Type=oneshot + RemainAfterExit=yes, that means
+# `systemctl status xpf-kernel-promote` reads SUCCESS and the unit stays active
+# even when the gate REFUSED and the armed candidate is running unverified. The
+# only signal was a journald line, which is time-limited by journal rotation --
+# so an operator who armed a candidate, rebooted, and came back the next day saw
+# a box on the old kernel and a promote unit reporting success, with nothing
+# saying the gate declined or why.
+#
+# WHICH PATHS WRITE IT, and why that boundary and not another. It is written by
+# exactly the paths where THE GATE NEVER RAN xpfd AT ALL:
+#
+#   * every refuse() -- the loud declines;
+#   * the indeterminate-journal WARNING, which is not a refusal but is the same
+#     operator problem (a candidate may be armed, the gate did not run, nothing
+#     durable said so).
+#
+# Including the second is not scope creep, it is what makes the record's
+# ABSENCE meaningful: if only refuse() wrote one, "no record" would not
+# distinguish a clean boot from a boot the gate skipped for the other reason.
+#
+# It is deliberately NOT written by:
+#
+#   * the quiet "nothing to promote" branch -- that is the ORDINARY boot, where
+#     not running IS the correct outcome, and a file rewritten on every boot is
+#     noise that would bury the signal;
+#   * the post-exec rc paths -- there the gate DID run xpfd, and the Go half
+#     owns its own durable state for those (the journal, the promotion marker
+#     and the last-roll record), so a second writer would be a second source.
+#
+# Format is key=value, ONE LINE PER FIELD, values flattened by one_line: this is
+# POSIX sh writing a file Go reads, and the same "a value may legally contain
+# the delimiter" hazard that governs the ExecStart parse applies in reverse. A
+# systemd ExecStart rendering can legally contain newlines (multiple entries
+# render one per line), and an unflattened value would turn one field into
+# several bogus records. Go splits on the FIRST '=' so a value containing '='
+# survives, and unknown keys are ignored so a newer gate can add fields.
+#
+# Its path is derived from the journal's directory by ArmRecordPath's sibling
+# in Go (RefusalRecordPath) and pinned equal to this literal by a cross-language
+# canary (TestPromoteScriptRefusalRecordPathMatchesGo, pkg/upgrade).
+REFUSAL_RECORD="/var/lib/xpf/kernel-promote-refusal"
+
 # PROMOTE_UNIT is the systemd unit the record is CROSS-CHECKED against. It is no
 # longer where the binary comes from; it is a second opinion, and an absent
 # second opinion is not evidence against the record.
@@ -254,8 +300,60 @@ set_cause_advice() {
 # OnFailure= and reboots the box over what may be a transient packaging window,
 # and the firmware already cleared BootNext, so the next plain reboot falls back
 # to known-good on its own.
+# one_line flattens a value onto a single line so it cannot forge extra fields
+# in the key=value record. Newlines are the real case (a multi-entry ExecStart
+# renders one per line); tabs and CRs are folded for the same reason at no extra
+# cost. `tr` is a distribution binary on the unit's pinned PATH, like systemctl.
+one_line() {
+    printf '%s' "$1" | tr '\n\r\t' '   '
+}
+
+# record_refusal writes the durable trace. $1 is the disposition, the rest is
+# the human reason.
+#
+# BEST-EFFORT, ALWAYS. Every step is suppressed and the function always returns
+# success: this runs on a candidate boot whose whole problem may be that the
+# filesystem is not what the gate expected, and a gate that changed its exit
+# path because it could not write a DIAGNOSTIC would convert an observability
+# gap into an availability one. The caller's exit 0 must be reached either way.
+#
+# Written to a temp file and renamed so a reader never sees a half-written
+# record; the rename is within one directory, so it is atomic.
+record_refusal() {
+    rr_disposition=$1
+    shift
+    rr_dir=${REFUSAL_RECORD%/*}
+    mkdir -p "$rr_dir" 2>/dev/null || return 0
+    rr_tmp="$REFUSAL_RECORD.tmp"
+    {
+        printf 'version=1\n'
+        printf 'disposition=%s\n' "$rr_disposition"
+        printf 'refused_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+        # The boot this happened on. An early-boot clock can be wrong (no RTC,
+        # no NTP yet), so the timestamp alone cannot answer "was this THIS
+        # boot?"; the boot id can, and it costs one read of a kernel file.
+        printf 'boot_id=%s\n' "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+        printf 'journal_state=%s\n' "$(journal_state)"
+        printf 'unit=%s\n' "$PROMOTE_UNIT"
+        printf 'load_state=%s\n' "$(one_line "$SNAP_LOADSTATE_SHOW")"
+        printf 'main_pid=%s\n' "$(one_line "$SNAP_MAINPID_SHOW")"
+        printf 'control_group=%s\n' "$(one_line "$SNAP_CONTROLGROUP_SHOW")"
+        printf 'exec_start=%s\n' "$(one_line "$SNAP_EXECSTART_SHOW")"
+        printf 'reason=%s\n' "$(one_line "$*")"
+        # CAUSE and ADVICE are set by set_cause_advice on the refuse() path and
+        # empty elsewhere. They are separate fields rather than appended to the
+        # reason so a reader can render the diagnosis apart from the event, and
+        # so the branch the advice took stays legible.
+        printf 'cause=%s\n' "$(one_line "$CAUSE")"
+        printf 'advice=%s\n' "$(one_line "$ADVICE")"
+    } > "$rr_tmp" 2>/dev/null || { rm -f "$rr_tmp" 2>/dev/null; return 0; }
+    mv -f "$rr_tmp" "$REFUSAL_RECORD" 2>/dev/null || rm -f "$rr_tmp" 2>/dev/null
+    return 0
+}
+
 refuse() {
     set_cause_advice
+    record_refusal refused "$*"
     log "ERROR: $* REFUSING to promote: this gate does NOT fall back to" \
         "inferring which xpfd is live, because a runtime left behind by" \
         "--versions-dir/--sbin-dir relocation or a unit switch is" \
@@ -578,6 +676,9 @@ if [ ! -e "$ARM_RECORD" ]; then
                 "or an interrupted clear."
             ;;
         indeterminate)
+            record_refusal indeterminate "the arm record $ARM_RECORD is absent" \
+                "and $KERNEL_JOURNAL exists but cannot be read as a journal, so" \
+                "this gate could not establish whether a candidate kernel is armed"
             log "WARNING: the promotion gate did NOT run. The arm record" \
                 "$ARM_RECORD is absent, and $KERNEL_JOURNAL exists but cannot" \
                 "be read as a journal, so this gate cannot establish whether a" \

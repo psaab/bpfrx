@@ -1,3 +1,49 @@
+## 2026-08-21 — #6622 kernel promote gate: a refusal now leaves a durable record
+
+- **Timestamp**: 2026-08-21
+- **Action**: The boot gate exits 0 on every path (deliberately — a non-zero
+  exit trips the unit's `OnFailure=` and reboots the box over what may be a
+  transient packaging window) and the unit is `Type=oneshot` +
+  `RemainAfterExit=yes`, so `systemctl status xpf-kernel-promote` read SUCCESS
+  and stayed active even when the gate REFUSED and the armed candidate was
+  running unverified. The only signal was a journald line, which journal
+  rotation removes.
+
+  `refuse()` now writes `/var/lib/xpf/kernel-promote-refusal`, one `key=value`
+  per line, carrying the discovery-snapshot facts the DECISION was made on
+  (`LoadState`, `MainPID`, `ControlGroup`, raw `ExecStart`), the journal bit,
+  the cause, the branch-specific advice, a timestamp and the boot id. Read by
+  `upgrade.ReadRefusalRecord` and surfaced through `ChannelStatus` /
+  `RenderChannelStatus`, so `show system kernel-upgrade`, the console CLI, the
+  remote `cli` and the status RPC all get it without touching `pkg/cli` or
+  `pkg/grpcapi`. The unit still exits 0 and still does not trip `OnFailure=`;
+  a test asserts that rather than assuming it.
+
+  The indeterminate-journal WARNING writes one too, as
+  `disposition=indeterminate`. That is what makes the record's ABSENCE
+  meaningful: if only `refuse()` wrote one, "no record" could not distinguish
+  a clean boot from a boot the gate skipped for the other reason. The quiet
+  "nothing to promote" branch and the post-exec `rc` paths deliberately write
+  nothing — the first is the ordinary boot, the second is where the Go half
+  already owns the durable state.
+
+  The record does NOT duplicate the candidate version: the gate reads the JSON
+  journal for one bit and never for a value, so the candidate is joined in Go
+  by `ReadChannelStatus`, which is accurate because a refusal never transitions
+  the journal.
+
+  Tightened `ReadRefusalRecord` while writing its test: counting `=`-bearing
+  lines rather than RECOGNISED keys let a file whose only fields are unknown
+  parse as a refusal with every field empty, rendering a REFUSED banner made
+  entirely of dashes. The first draft of the test could not see it — its own
+  fixture text contained the literal "key=value".
+- **File(s)**: `scripts/image/xpf-kernel-promote`,
+  `scripts/image/test_kernel_promote_explicit_path.py`,
+  `pkg/upgrade/kernel_promote_refusal.go` (new),
+  `pkg/upgrade/kernel_promote_refusal_6622_test.go` (new),
+  `pkg/upgrade/kernel_status.go`, `pkg/upgrade/kernel_run.go`,
+  `pkg/upgrade/kernel_arm_record.go`, `docs/in-place-upgrade.md`, `_Log.md`
+
 ## 2026-08-21 — #6618 `any-service` protocol breadth: decided KEEP, bound by a verdict lock
 
 - **Timestamp**: 2026-08-21

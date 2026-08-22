@@ -58,6 +58,12 @@ func (r *KernelRunner) clearKernelJournal() error {
 	// gate treats an absent record as a definitive "nothing to promote", so a
 	// record surviving a cleared journal would make it refuse on every
 	// subsequent ordinary boot (#6601 r6).
+	// Same lifetime as the arm record (#6622): a refusal describes a specific
+	// armed candidate, so one that outlived its journal would accuse the next
+	// boot of a decline that happened to a candidate no longer in flight.
+	// Best-effort, and deliberately not fatal: failing to remove a DIAGNOSTIC
+	// must not fail the terminal transition that clears the journal.
+	_ = r.clearRefusalRecord()
 	if err := r.clearArmRecord(); err != nil {
 		return err
 	}
