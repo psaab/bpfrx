@@ -216,8 +216,10 @@ func (f *fakeKernelSystem) Now() time.Time { return f.now }
 
 func newKernelRunner(t *testing.T, f *fakeKernelSystem) *KernelRunner {
 	t.Helper()
+	journal := filepath.Join(t.TempDir(), "kernel-upgrade.state")
+	withBootGateJournal(t, journal)
 	r, err := NewKernelRunner(KernelConfig{
-		JournalPath: filepath.Join(t.TempDir(), "kernel-upgrade.state"),
+		JournalPath: journal,
 		Sys:         f,
 		Logf:        func(string, ...any) {},
 	})
@@ -225,6 +227,21 @@ func newKernelRunner(t *testing.T, f *fakeKernelSystem) *KernelRunner {
 		t.Fatalf("NewKernelRunner: %v", err)
 	}
 	return r
+}
+
+// withBootGateJournal models a box whose boot-time promotion gate reads
+// `path`, restoring the production value afterwards.
+//
+// Every test that arms needs this, because Arm refuses a journal the gate does
+// not read (#6631) and every test journal is a t.TempDir(). Stating it that way
+// round — "on this box the gate reads here" — is what keeps the fixtures
+// truthful; a flag that merely switched the check off would let a test assert
+// an arm that production would reject.
+func withBootGateJournal(t *testing.T, path string) {
+	t.Helper()
+	orig := bootGateJournalPath
+	t.Cleanup(func() { bootGateJournalPath = orig })
+	bootGateJournalPath = path
 }
 
 func contains(calls []string, want string) bool {
@@ -477,8 +494,10 @@ func TestKernelArmAbortsForeignDefault(t *testing.T) {
 func TestKernelArmStrictWatchdogAborts(t *testing.T) {
 	f := newFakeKernelSystem()
 	f.wdPersist = false
+	journal := filepath.Join(t.TempDir(), "k.state")
+	withBootGateJournal(t, journal)
 	r, _ := NewKernelRunner(KernelConfig{
-		JournalPath:    filepath.Join(t.TempDir(), "k.state"),
+		JournalPath:    journal,
 		Sys:            f,
 		StrictWatchdog: true,
 	})
@@ -732,8 +751,10 @@ func TestKernelPromoteBootCurrentErrRunningKnownGoodCleansUp(t *testing.T) {
 func TestKernelArmStrictWatchdogArmFailureAborts(t *testing.T) {
 	f := newFakeKernelSystem()
 	f.armWatchdogErr = fmt.Errorf("simulated /dev/watchdog I/O error")
+	journal := filepath.Join(t.TempDir(), "k.state")
+	withBootGateJournal(t, journal)
 	r, _ := NewKernelRunner(KernelConfig{
-		JournalPath:    filepath.Join(t.TempDir(), "k.state"),
+		JournalPath:    journal,
 		Sys:            f,
 		StrictWatchdog: true,
 	})
