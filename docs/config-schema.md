@@ -5191,6 +5191,57 @@ is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
 `TestGeneratePolicyOptions_ASPathPrepend` in
 `pkg/frr/policy_as_path_prepend_2892_test.go` (render).
 
+### The as-path REGEX is the whole token tail, and it is validated (#6686)
+
+`policy-options as-path <name> <regex>` is a `args: 2, multi: true` schema node
+(`schema_routing.go`), so the definition's regular expression is the node's
+whole trailing token run — not one key. The two spellings of one value land
+differently:
+
+| authored | Keys |
+|---|---|
+| `as-path AP1 ".* 65000 .*"` | `["as-path" "AP1" ".* 65000 .*"]` (one lexer string token) |
+| `as-path AP1 .* 65000 .*` | `["as-path" "AP1" ".*" "65000" ".*"]` |
+
+Reading `Keys[2]` alone kept the FIRST token of the unquoted spelling, compiling
+`.* 65000 .*` down to `.*` — the whole-path wildcard. A `from as-path AP1; then
+accept` term built on that definition accepts **every** BGP path instead of only
+those transiting AS 65000: a route-leak / hijack-acceptance exposure that
+committed clean with zero warnings, in BOTH the flat-`set` and hierarchical
+spellings, while `show configuration` displayed the authored regex back
+verbatim. The same widening applied one level down, to a hierarchical brace body
+(`as-path AP1 { .* 65000 .*; }`), whose regex tokens land on a CHILD leaf's
+`Keys` and were read as `entry.Keys[0]`.
+
+`ASPathRegexFromTokens` (`aspath_regex.go`) rejoins the tail with single spaces
+at both sites. That is reconstruction, not a guess: every regex metacharacter
+that is also lexer syntax (`^`, `{`, `}`, `|`, `[`, `]`, `;`, `"`) either fails
+to lex unquoted or is stripped, so an unquoted regex reaching the compiler is a
+whitespace-separated run of identifier tokens. FRR's `bgp as-path access-list`
+DEFUN ends in a variadic `LINE...` that `argv_concat` rejoins with single
+spaces, which is what makes a multi-AS pattern expressible at all — so the join
+matches what FRR itself does with the rendered line.
+
+**The regex is validated, at three layers with one predicate.** `ValidASPathRegex`
+(`aspath_regex.go`) rejects an EMPTY regex — reachable with no diagnostic at all
+via `set policy-options as-path AP1` with no value — and one that is not a valid
+POSIX ERE. Either renders a line frr-reload rejects (an incomplete command, or a
+regcomp failure), and a single `CMD_WARNING_CONFIG_FAILED` exits the whole vtysh
+add-batch non-zero, failing the ENTIRE reload and leaving every dynamic routing
+change stale. `validatePolicyASPathRegexStrict` hard-rejects on commit /
+commit-check; the tolerant load / peer-sync paths downgrade to a warning
+(`lenientPolicyASPathRegex`, the #1960 no-brick class); and `generatePolicyOptions`
+(`pkg/frr/policy_render.go`) OMITS an unrenderable definition so the leniently
+loaded config cannot poison the reload — FRR resolves a `match as-path <name>`
+with no such list to NO MATCH, confining the damage to the referencing terms.
+The three layers share `ValidASPathRegex` so they cannot drift.
+
+Fail-on-revert covered by `pkg/config/compiler_as_path_multitoken_6686_test.go`
+(five spellings asserted to AGREE and to equal the authored regex, the empty and
+malformed strict/lenient legs, and a tightening control that commits nine real
+AS-path regexes clean) and `pkg/frr/policy_aspath_regex_6686_test.go` (the
+multi-token regex renders whole; the unrenderable ones are omitted).
+
 ### Repeated policy-statement blocks MERGE, not last-win (#5824)
 
 A single `policy-options policy-statement <name>` may be authored across MULTIPLE

@@ -194,6 +194,29 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		}
 	}
 
+	// #6686: as-path regex gate. `policy-options as-path <name> <regex>`
+	// renders one `bgp as-path access-list <name> permit <regex>` line. An
+	// EMPTY regex (reachable with no diagnostic: `set policy-options as-path
+	// AP1` alone) is an incomplete FRR command, and a malformed one fails
+	// FRR's regcomp — either is a CMD_WARNING_CONFIG_FAILED, and a single
+	// vtysh -f add-batch exits non-zero on any of those, failing the WHOLE
+	// reload and leaving dynamic routing stale. Strict on commit /
+	// commit-check (hard reject naming the as-path and the line that would be
+	// rendered); lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960; the render path carries the
+	// ValidASPathRegex belt that keeps the unrenderable definition out of
+	// frr.conf on that path). Runs on the fully-compiled *Config so the
+	// as-path map is populated regardless of authoring order. Mirrors
+	// validatePolicyCommunityReferencesStrict.
+	if err := validatePolicyASPathRegexStrict(cfg); err != nil {
+		if opts.lenientPolicyASPathRegex {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy as-path regex (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5116: reserved route-map-suffix gate. The FRR renderer derives a
 	// per-use-site fail-closed redistribute alias `name + "-xpf-redist"`
 	// (redistFailClosedRouteMap) into FRR's GLOBAL name-keyed route-map

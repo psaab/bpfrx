@@ -682,24 +682,40 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		po.ASPaths = make(map[string]*ASPathDef)
 	}
 	for _, child := range node.FindChildren("as-path") {
-		if len(child.Keys) >= 3 {
-			// Hierarchical: Keys=["as-path", "NAME", "REGEX"]
-			po.ASPaths[child.Keys[1]] = &ASPathDef{
-				Name:  child.Keys[1],
-				Regex: child.Keys[2],
-			}
-		} else if len(child.Keys) >= 2 {
-			// Flat set syntax may produce: Keys=["as-path","NAME"] with children
-			name := child.Keys[1]
-			ap := &ASPathDef{Name: name}
-			// Look for path child (regex value)
+		if len(child.Keys) < 2 {
+			continue
+		}
+		// Keys=["as-path", NAME, REGEX-TOKEN...]. The `policy-options
+		// as-path` schema node is `args: 2, multi: true`, so the regex is
+		// the whole trailing token run, not one key: a QUOTED regex
+		// (`as-path AP1 ".* 65000 .*"`) is one lexer string token and
+		// arrives whole in Keys[2], while the UNQUOTED spelling of the
+		// same value arrives as Keys[2:] = [".*" "65000" ".*"]. The prior
+		// `Regex: child.Keys[2]` read kept only the FIRST token, so the
+		// unquoted spelling compiled `.* 65000 .*` to `.*` — the
+		// whole-path wildcard — and a `from as-path AP1; then accept`
+		// term built on it accepted EVERY BGP path (#6686). Reproduced in
+		// BOTH spellings (flat `set` and a hierarchical brace block),
+		// both of which committed clean with zero warnings while
+		// `show configuration` displayed the authored regex back verbatim.
+		name := child.Keys[1]
+		regex := ASPathRegexFromTokens(child.Keys[2:])
+		if regex == "" {
+			// No tail on the instance node: the regex sits on a CHILD
+			// leaf instead, which is what a hierarchical brace body
+			// (`as-path AP1 { ".* 65000 .*"; }`) produces. Join that
+			// leaf's keys for the same reason — an unquoted body lands as
+			// Keys=[".*" "65000" ".*"] one level down and the previous
+			// `entry.Keys[0]` read widened it identically. Last child
+			// wins, preserving the pre-#6686 behaviour for a body that
+			// somehow carries several leaves.
 			for _, entry := range child.Children {
-				if len(entry.Keys) > 0 {
-					ap.Regex = entry.Keys[0]
+				if v := ASPathRegexFromTokens(entry.Keys); v != "" {
+					regex = v
 				}
 			}
-			po.ASPaths[name] = ap
 		}
+		po.ASPaths[name] = &ASPathDef{Name: name, Regex: regex}
 	}
 
 	// Parse policy-statements. A named policy-statement may be defined across
