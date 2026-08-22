@@ -97,6 +97,16 @@ type ProbeResult struct {
 	TotalSent   int64
 	TotalRecv   int64
 	LastProbeAt time.Time
+
+	// identity is the RESOLVED measurement this result is a verdict about
+	// (#6561): probe type, target, source, routing-instance, next-hop and the
+	// destination interface AFTER RETH translation. Apply carries a verdict
+	// across a probe restart only when this is unchanged, so a verdict measured
+	// over one path is never reported for another. Unexported — it is an
+	// internal equality token, not part of the result an operator or
+	// ip-monitoring reads. `Results()` copies the whole struct, so it travels
+	// with a snapshot without anyone having to remember it.
+	identity string
 }
 
 // Event represents an RPM event for event-options matching.
@@ -357,7 +367,32 @@ func New() *Manager {
 }
 
 // Apply starts probes from the given RPM config.
+//
+// #6561: the prior results are SNAPSHOTTED before StopAll reallocates the table,
+// and a test whose definition survives the commit unchanged keeps its runtime
+// verdict. Without that, every Apply reseeded every key to LastStatus "unknown",
+// and ip-monitoring reads "unknown" as PASS (seedResultsLocked buckets it with
+// pass via `r.LastStatus == "fail"`), so at the DEFAULT hold-down of 0 an ACTIVE
+// failover route was withdrawn on the spot.
+//
+// This is not a rare path. reconcileRPM is hash-gated, but the hash covers
+// `cfg.RethToPhysical()` as well as the RPM stanza (daemon_rpm.go), so adding,
+// removing or renaming ANY RETH member -- an interface-stanza edit that never
+// mentions `services rpm` or `services ip-monitoring` -- restarts the probes and
+// wiped every verdict. The commit's own FRR render is snapshotted before this
+// runs, so the withdrawal never showed up in the commit's output; it landed on
+// the delayed actuation about a second later.
+//
+// The reconcile itself is NOT skipped -- probes genuinely must restart when
+// their marks are reprogrammed. What is preserved is the half the config does
+// not carry.
 func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
+	// Snapshot BEFORE StopAll: it reallocates m.results, and the mark map is
+	// overwritten below.
+	m.mu.Lock()
+	prevResults := m.results
+	m.mu.Unlock()
+
 	m.StopAll()
 
 	if cfg == nil || len(cfg.Probes) == 0 {
@@ -375,7 +410,8 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 	// SO_MARK and kernel fwmark rule can never disagree (#1827).
 	m.mu.Lock()
 	m.marks = make(map[string]uint32)
-	for _, pin := range routing.BuildProbePins(cfg, m.rethMap) {
+	rethMap := m.rethMap
+	for _, pin := range routing.BuildProbePins(cfg, rethMap) {
 		m.marks[pin.TestKey] = pin.Mark
 	}
 	m.mu.Unlock()
@@ -386,14 +422,17 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 	for _, probe := range cfg.Probes {
 		for _, test := range probe.Tests {
 			key := probe.Name + "/" + test.Name
-			m.mu.Lock()
-			m.results[key] = &ProbeResult{
+			res := &ProbeResult{
 				ProbeName:  probe.Name,
 				TestName:   test.Name,
 				ProbeType:  test.EffectiveProbeType(),
 				Target:     test.Target,
 				LastStatus: "unknown",
 			}
+			res.identity = probeMeasurementIdentity(test, rethMap)
+			carryProbeVerdict(res, prevResults[key])
+			m.mu.Lock()
+			m.results[key] = res
 			m.mu.Unlock()
 
 			m.wg.Add(1)
@@ -848,4 +887,65 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 		return rtt, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return rtt, nil
+}
+
+// probeMeasurementIdentity renders the RESOLVED measurement a verdict is about
+// (#6561): everything that determines WHAT is being probed and BY WHICH PATH.
+//
+// The destination interface is resolved through routing.ResolveProbeInterface
+// with the live RETH map — the same call BuildProbePins makes — so a RETH remap
+// that moves THIS test's egress member changes the identity, while a remap
+// elsewhere in the config leaves it alone. That is the whole point: the commit
+// that re-opens reconcileRPM's hash gate is usually a RETH edit, and the
+// question is whether it moved this probe.
+//
+// NOT the fwmark. An earlier revision of this fix compared marks, which looked
+// like a path identity and is not one: BuildProbePins assigns
+// `ProbeFwmarkBase + idx` over sorted probe/test names, so the mark is a
+// POSITION in the pin band. It does not move when a RETH remap changes the
+// resolved interface, and it DOES move when an unrelated test is added earlier
+// in sort order. Both directions are wrong.
+func probeMeasurementIdentity(test *config.RPMTest, rethMap map[string]string) string {
+	if test == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		test.EffectiveProbeType(),
+		test.Target,
+		test.SourceAddress,
+		test.RoutingInstance,
+		test.NextHop,
+		routing.ResolveProbeInterface(test.DestinationInterface, rethMap),
+	}, "\x00")
+}
+
+// carryProbeVerdict copies a surviving test's RUNTIME state onto its freshly
+// seeded result (#6561), and is a no-op unless the test came through the commit
+// as the SAME measurement over the SAME path — see probeMeasurementIdentity.
+//
+// A key that is new, or whose measurement identity changed, correctly keeps the
+// seeded "unknown": there is no prior verdict that means anything, and inventing
+// one would be worse than the wipe.
+//
+// ABSENT stays distinct from UNKNOWN. ip-monitoring treats an absent key as
+// "clear any stale FAIL" (#4423 M8), which is correct — no probe, no protection.
+// This only ever fills in a key present in BOTH tables, so that path is
+// untouched and a dropped probe is never resurrected.
+func carryProbeVerdict(res, prev *ProbeResult) {
+	if res == nil || prev == nil {
+		return
+	}
+	if prev.identity != res.identity {
+		return
+	}
+	res.LastRTT = prev.LastRTT
+	res.MinRTT = prev.MinRTT
+	res.MaxRTT = prev.MaxRTT
+	res.AvgRTT = prev.AvgRTT
+	res.Jitter = prev.Jitter
+	res.LastStatus = prev.LastStatus
+	res.SuccFail = prev.SuccFail
+	res.TotalSent = prev.TotalSent
+	res.TotalRecv = prev.TotalRecv
+	res.LastProbeAt = prev.LastProbeAt
 }
