@@ -546,7 +546,7 @@ fn try_open_bind(
                     )
                     .into());
                 }
-                set_busy_poll_opts(user_fd, poll_mode);
+                let busy_poll = set_busy_poll_opts(user_fd, poll_mode);
                 eprintln!(
                     "xpf-userspace-dp: libxdp bind(fd={}) OK on attempt {} role={} mode={:?} flags=0x{:04x}",
                     user_fd,
@@ -555,6 +555,19 @@ fn try_open_bind(
                     bind_mode,
                     bind_flags,
                 );
+                // #5190 (A1-b12-F2): a refused busy-poll option leaves the
+                // worker on different NAPI/poll semantics than configured.
+                // The bind is still usable, so this is a WARNING beside the
+                // OK line rather than a bind failure — but it is no longer
+                // silent.
+                if busy_poll.degraded() {
+                    eprintln!(
+                        "xpf-userspace-dp: WARNING bind(fd={}) busy-poll DEGRADED — kernel refused: {} (poll_mode={:?}); the worker runs with the kernel's default NAPI/poll semantics",
+                        user_fd,
+                        busy_poll.describe(),
+                        poll_mode,
+                    );
+                }
 
                 return Ok((user, rx, tx, bind_mode, bind_flags, device, uninserted_fill));
             }
@@ -602,7 +615,54 @@ fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
     })
 }
 
-fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
+/// #5190 (A1-b12-F2): outcome of the three busy-poll `setsockopt` calls.
+/// `0` means the option was accepted by the kernel; any other value is the
+/// `errno` the kernel returned. Every one of these can legitimately fail on
+/// a production box — `SO_PREFER_BUSY_POLL` requires `CAP_NET_ADMIN`,
+/// `SO_BUSY_POLL_BUDGET` requires it above the sysctl default, and all three
+/// are absent on old kernels — so a failure is NOT fatal to the bind. It is,
+/// however, a real change in the worker's NAPI/poll semantics, and before
+/// #5190 all three returns were discarded with `let _ =` and the caller
+/// logged an unqualified "bind OK".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BusyPollSetup {
+    pub(super) busy_poll_errno: i32,
+    pub(super) prefer_busy_poll_errno: i32,
+    pub(super) budget_errno: i32,
+}
+
+impl BusyPollSetup {
+    /// True when at least one option the worker asked for was refused, i.e.
+    /// the socket is running with different poll semantics than configured.
+    pub(super) fn degraded(&self) -> bool {
+        self.busy_poll_errno != 0 || self.prefer_busy_poll_errno != 0 || self.budget_errno != 0
+    }
+
+    /// Operator-facing summary naming each refused option and its errno.
+    /// Bind-time only — never called on the packet path.
+    pub(super) fn describe(&self) -> String {
+        let mut out = String::new();
+        for (name, err) in [
+            ("SO_BUSY_POLL", self.busy_poll_errno),
+            ("SO_PREFER_BUSY_POLL", self.prefer_busy_poll_errno),
+            ("SO_BUSY_POLL_BUDGET", self.budget_errno),
+        ] {
+            if err != 0 {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&format!("{name}=errno {err}"));
+            }
+        }
+        out
+    }
+}
+
+/// Apply the three busy-poll socket options, REPORTING which ones the kernel
+/// refused (#5190). The bind itself still succeeds on refusal — busy poll is
+/// an optimisation, not a correctness requirement — but the caller logs the
+/// degradation instead of claiming an unqualified success.
+fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) -> BusyPollSetup {
     const SO_BUSY_POLL: c_int = 46;
     const SO_PREFER_BUSY_POLL: c_int = 69;
     const SO_BUSY_POLL_BUDGET: c_int = 70;
@@ -618,28 +678,89 @@ fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
     let prefer: c_int = 1;
     let budget: c_int = RX_BATCH_SIZE as c_int;
 
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            SO_BUSY_POLL,
-            (&busy_poll_us as *const c_int).cast::<c_void>(),
-            core::mem::size_of::<c_int>() as libc::socklen_t,
+    // `errno` is only meaningful immediately after a failing call, so each
+    // return is classified before the next setsockopt runs.
+    let apply = |opt: c_int, val: &c_int| -> i32 {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (val as *const c_int).cast::<c_void>(),
+                core::mem::size_of::<c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        }
+    };
+    BusyPollSetup {
+        busy_poll_errno: apply(SO_BUSY_POLL, &busy_poll_us),
+        prefer_busy_poll_errno: apply(SO_PREFER_BUSY_POLL, &prefer),
+        budget_errno: apply(SO_BUSY_POLL_BUDGET, &budget),
+    }
+}
+
+/// #5190 (A1-b12-F2) fail-on-revert: the three busy-poll `setsockopt`
+/// returns used to be discarded with `let _ =`, so a kernel refusal
+/// (missing support, missing `CAP_NET_ADMIN`, sysctl budget cap) was
+/// invisible and the caller still logged an unqualified "bind OK". These
+/// tests drive the REAL `set_busy_poll_opts` against a closed descriptor
+/// so every call is guaranteed to fail, and assert the failure is both
+/// reported and named. Restoring `let _ =` (making the function return a
+/// default/empty report) turns them RED.
+#[cfg(test)]
+mod busy_poll_report_tests {
+    use super::{BusyPollSetup, set_busy_poll_opts};
+
+    #[test]
+    fn refused_busy_poll_opts_are_reported_not_swallowed() {
+        // fd -1 is never a socket: every setsockopt returns EBADF (9).
+        let report = set_busy_poll_opts(-1, crate::PollMode::Interrupt);
+        assert!(
+            report.degraded(),
+            "a kernel refusal of the busy-poll options must be REPORTED, \
+             not discarded — a silently-degraded socket runs with different \
+             NAPI/poll semantics than the worker asked for (#5190)"
         );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            SO_PREFER_BUSY_POLL,
-            (&prefer as *const c_int).cast::<c_void>(),
-            core::mem::size_of::<c_int>() as libc::socklen_t,
+        assert_eq!(
+            report.busy_poll_errno,
+            libc::EBADF,
+            "SO_BUSY_POLL failure must carry the kernel errno"
         );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            SO_BUSY_POLL_BUDGET,
-            (&budget as *const c_int).cast::<c_void>(),
-            core::mem::size_of::<c_int>() as libc::socklen_t,
+        assert_eq!(
+            report.prefer_busy_poll_errno,
+            libc::EBADF,
+            "SO_PREFER_BUSY_POLL failure must carry the kernel errno"
         );
+        assert_eq!(
+            report.budget_errno,
+            libc::EBADF,
+            "SO_BUSY_POLL_BUDGET failure must carry the kernel errno"
+        );
+        let described = report.describe();
+        for opt in [
+            "SO_BUSY_POLL",
+            "SO_PREFER_BUSY_POLL",
+            "SO_BUSY_POLL_BUDGET",
+        ] {
+            assert!(
+                described.contains(opt),
+                "the operator warning must NAME each refused option; {opt} \
+                 missing from {described:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_applied_busy_poll_setup_is_not_degraded() {
+        // Control: the "everything accepted" report must not warn, so the
+        // degraded() gate cannot fire on a healthy bind.
+        let ok = BusyPollSetup::default();
+        assert!(!ok.degraded());
+        assert_eq!(ok.describe(), "");
     }
 }
 

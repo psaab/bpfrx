@@ -40,7 +40,11 @@ unit tests and `--tests` adds any integration tests), run with
 `--test-threads=1` to avoid the intermittent `__skb_wait_for_more_packets`
 socket-test hang. This is the primary correctness gate for packet
 forwarding, CoS shaping, NAT, and session handling. Benches are excluded
-(perf gates run via `cargo bench`).
+(criterion's `harness = false` rejects `--test-threads`). Note (#5190): no
+make target or CI job runs `cargo bench`, and only `prefix_set_lookup` and
+`runtime_view_refresh` emit a failing verdict — every other bench prints
+measurements for a human and exits 0 regardless, so a `cargo bench` exit
+status is not a perf gate.
 
 **Must pass before any commit.**
 
