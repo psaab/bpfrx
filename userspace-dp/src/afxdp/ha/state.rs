@@ -111,7 +111,11 @@ impl crate::afxdp::Coordinator {
                 "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
                 self.workers.records.len(),
-                self.sessions.synced.lock().map(|s| s.len()).unwrap_or(0),
+                // #6653 sweep: log-only, but the same non-recovering pattern —
+                // a poisoned mutex reported shared_sessions=0 in the RG
+                // activation line, which is the single most misleading number
+                // to get wrong during a failover post-mortem.
+                lock_shared_recover(&self.sessions.synced).len(),
             );
             self.handle_activated_rgs(&activated_rgs, now_secs);
         }

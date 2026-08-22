@@ -75,6 +75,33 @@
   `pkg/dataplane/userspace/flow_tcp_timeout_carrier_6539_test.go` (new),
   `docs/feature-gaps.md`, `docs/config-schema.md`
 
+## 2026-08-21 — #6652/#6653/#6654 shared-session locks recover from poison
+
+- **Timestamp**: 2026-08-21
+- **Action**: Routed every production access to a shared-session surface
+  through `lock_shared_recover`, the module's stated poison policy. The
+  three issues cite four sites; a sweep of the PREDICATE ("every
+  production access recovers") found SIX, including two the issues do
+  not name: `ha/tunnel_purge.rs` (the #1873 R-D remap purge bailed with
+  `return 0`, leaving a live session to re-resolve a remapped
+  `tunnel_endpoint_id` into the WRONG tunnel — arguably the most severe
+  of the six) and `ha/state.rs` (the RG-activation log reported
+  `shared_sessions=0`). Added an armed source tripwire that asserts the
+  predicate, keyed on the exact field paths and WRAP-INSENSITIVE
+  (whitespace collapsed) because the #6652 site was spelled across four
+  lines. Retired the README's "known remaining sites" table, which
+  listed exactly these three issues as open.
+  Mutation matrix 5/5 RED: T1-T5 each restore one site's pre-fix bytes;
+  each reds its own behavioural probe AND the tripwire.
+  DATAPLANE: this MOVES the userspace-dp binary — owes a cluster gate.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/types/mod.rs,
+  userspace-dp/src/afxdp/ha/export.rs,
+  userspace-dp/src/afxdp/ha/tunnel_purge.rs,
+  userspace-dp/src/afxdp/ha/state.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/README.md
+
 ## 2026-08-21 — #6534 NAT fail-closed exclusions stop rendering as enforced
 
 - **Timestamp**: 2026-08-21
