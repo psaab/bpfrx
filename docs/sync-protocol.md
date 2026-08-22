@@ -828,12 +828,30 @@ HELLO-carried incarnation would be silently absent on unkeyed clusters.
 - A `BulkStart` carrying the **same** incarnation is a mid-connection re-prime
   (the #5450 forced resync) and invalidates nothing — same boot, comparable
   generations.
-- A queued config payload whose incarnation differs from the current one is
-  dropped **permanently** and is never re-admitted. Because membership is an
+- A config payload whose incarnation differs from the current one is dropped
+  **permanently** and is never re-admitted. Because membership is an
   equivalence, the dropped payload's generation carries no information the
   current high-water needs, so the drop cannot strand the mark the way #6900's
   fence could.
 - A payload with **no** incarnation is never dropped on incarnation grounds.
+
+There are **two** drop sites and neither subsumes the other:
+
+- **At receive** (`handleConfigPayload`), before `recordRecvConfigGen`. The
+  received-config high-water is a monotone max that gates manual-failover
+  readiness (#5563 refuses promotion while `PeerConfigGen > AppliedConfigGen`),
+  and a dead incarnation's generation comes from the peer's PRE-reboot counter,
+  so it is higher than anything the live incarnation can produce. Letting it
+  raise the received mark would strand the standby reading config-stale with
+  nothing able to close the gap short of another re-prime.
+- **At apply** (`configApplyLoop`), before the generation gate. This is the one
+  that catches a payload already sitting in `configApplyCh` when the re-prime
+  landed — the reported defect, since `resetRecvGen` does not drain the queue.
+
+In the `BulkStart` handler the incarnation is recorded **before**
+`resetRecvGen`. Reversing them opens a window where the high-waters are already
+zeroed while the current incarnation is still the dead one, so a prior-boot
+payload dequeued in that window passes the fence and records its generation.
 
 ### Fail-open across the mixed-version window
 

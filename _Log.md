@@ -103336,7 +103336,10 @@ prose edit above them added. No diff falls in the new test body.
   #6900 post-mortem: a ranking cannot express "same peer boot?"). Fails OPEN on
   an absent incarnation, counts both halves, renders the incarnation + counters
   in cluster status, and raises NO health/alarm state. The ~20s half-open-socket
-  residual is shipped bounded and documented, not closed.
+  residual is shipped bounded and documented, not closed. Two drop sites, neither
+  redundant: at RECEIVE (before recordRecvConfigGen, so a dead boot's high
+  generation cannot inflate the #5563 readiness mark and wedge the standby
+  config-stale) and at APPLY (the already-queued payload, the reported defect).
 - **File(s)**: `pkg/cluster/sync_boot_incarnation.go` (new),
   `pkg/cluster/sync_boot_incarnation_5084_test.go` (new),
   `pkg/cluster/sync.go`, `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_bulk.go`,

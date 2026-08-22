@@ -189,6 +189,12 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// CONNECTION so every config payload arriving on it is stamped with the
 		// incarnation that primed it, and compared against the receiver-wide
 		// current incarnation to decide a namespace switch.
+		//
+		// ORDER MATTERS: both records land BEFORE resetRecvGen below. Reversing
+		// them opens a window in which the high-waters are already zeroed while
+		// the current incarnation is still the DEAD one, so a prior-boot payload
+		// dequeued in that window passes the fence and records its (large)
+		// generation — the exact defect this exists to close.
 		inc := parseBootIncarnation(payload)
 		s.noteConnBootIncarnation(conn, inc)
 		switched := s.notePeerBootIncarnation(inc)
@@ -624,6 +630,33 @@ func (s *SessionSync) handleConfigPayload(conn net.Conn, payload []byte) {
 	// needs no CAS") holds per connection but there are TWO receive loops,
 	// so a raise driven by one fabric raced resetRecvGen's clear driven by
 	// the other and could re-raise the mark that clear had just zeroed.
+	// #5084: a payload arriving under a peer boot incarnation that a re-prime
+	// has ALREADY replaced is dead, and has to be refused here as well as at
+	// apply. recordRecvConfigGen below is a monotone max that gates
+	// manual-failover readiness (#5563 refuses promotion while PeerConfigGen >
+	// AppliedConfigGen), and a dead incarnation's generation is drawn from the
+	// peer's PRE-reboot counter, so it is far higher than anything the live
+	// incarnation can produce. Raising the received mark for a payload the
+	// apply loop is then going to drop would strand the standby reading
+	// config-stale, with nothing able to close the gap short of another
+	// re-prime — trading the #5084 divergence for a different silent wedge.
+	//
+	// The apply-time check is NOT made redundant by this one. This site sees
+	// only payloads that ARRIVE after the switch; the apply-time site catches a
+	// payload that was already QUEUED when the re-prime landed, which is the
+	// reported defect ("resetRecvGen does not drain items already queued from
+	// the prior boot"). Neither site subsumes the other.
+	item := configApplyItem{gen: gen, text: configText, incarnation: s.connBootIncarnation(conn)}
+	if s.configItemIncarnationStale(item) {
+		s.stats.ConfigsDeadIncarnationDropped.Add(1)
+		slog.Warn("cluster sync: dropping config received under a replaced peer boot "+
+			"incarnation — the peer rebooted and re-primed, so this payload's generation "+
+			"is incomparable with the current one (#5084)",
+			"item_incarnation", item.incarnation.String(),
+			"current_incarnation", s.PeerBootIncarnation().String(),
+			"gen", gen, "size", len(configText), "remote", connRemoteAddrString(conn))
+		return
+	}
 	s.recordRecvConfigGen(gen)
 	// #3931: enqueue onto the single-consumer ordered apply queue instead
 	// of spawning a racing `go OnConfigReceived`. The receiveLoop is
@@ -633,11 +666,7 @@ func (s *SessionSync) handleConfigPayload(conn net.Conn, payload []byte) {
 	// heartbeats on this connection.
 	if s.configApplyCh != nil {
 		select {
-		case s.configApplyCh <- configApplyItem{
-			gen:         gen,
-			text:        configText,
-			incarnation: s.connBootIncarnation(conn),
-		}:
+		case s.configApplyCh <- item:
 		default:
 			// Ordered apply queue full — practically impossible (commits
 			// are seconds apart, apply is sub-second). Drop with an alarm;

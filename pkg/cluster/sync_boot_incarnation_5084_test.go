@@ -637,3 +637,123 @@ func assertNoHealthEscalation5084(t *testing.T, m *Manager, when string) {
 			"must never raise a monitor failure:\n%s", when, n, m.FormatStatus())
 	}
 }
+
+// TestUnkeyedConnectionStampsTheIncarnation5084 binds the INSTALL wiring on the
+// posture the plan singles out: an UNKEYED cluster.
+//
+// `performSyncHandshake` returns immediately with syncAuthUnauthenticated when
+// `len(key) == 0`, which is exactly why the auth HELLO was rejected as the
+// carrier — a HELLO-borne incarnation would be silently absent there, making
+// the whole guard configuration-dependent. Carrying it on BulkStart is only
+// correct if the connection-install path still produces a per-connection
+// carrier on that path, and it does: handleNewConnection wraps EVERY connection
+// in an *authConn regardless of mode, and connBootIncarnation keys off that
+// wrapper.
+//
+// This drives the real thing: an unkeyed install, a BulkStart written onto the
+// wire, and the receiveLoop's own decode. Every other cell in this file injects
+// through handleMessage directly, so all of them stay green if the wrap is
+// dropped from handleNewConnection — and then connBootIncarnation returns the
+// zero value forever, every payload lands in the never-dropped class, and the
+// fence is silently inert on exactly the clusters that cannot authenticate.
+func TestUnkeyedConnectionStampsTheIncarnation5084(t *testing.T) {
+	s := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	cli, srv := net.Pipe()
+	defer cli.Close()
+	defer srv.Close()
+
+	if !s.beginSetup(srv, true) {
+		t.Fatal("setup: beginSetup should admit the first inbound connection")
+	}
+	// The install path emits advisory frames (clock sync, capabilities, key
+	// exchange). net.Pipe is unbuffered, so drain them or the install blocks.
+	drain := make(chan syncFrame, 32)
+	readFramesInto(cli, drain)
+	go s.handleNewConnection(context.Background(), 0, srv)
+
+	if err := writeMsg(cli, syncMsgBulkStart, bulkStartPayload(7, &incA)); err != nil {
+		t.Fatalf("write BulkStart: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.PeerBootIncarnation() == incA {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := s.PeerBootIncarnation(); got != incA {
+		t.Fatalf("an UNKEYED connection must still learn the peer boot incarnation; got %s. "+
+			"That posture performs no auth handshake at all, which is precisely why the "+
+			"incarnation rides on BulkStart rather than the HELLO", got)
+	}
+	s.mu.Lock()
+	installed := s.conn0
+	s.mu.Unlock()
+	if installed == nil {
+		t.Fatal("setup: the connection was never installed in fabric slot 0")
+	}
+	if got := s.connBootIncarnation(installed); got != incA {
+		t.Fatalf("the INSTALLED connection must carry the stamp (%s), so every config payload "+
+			"it delivers is enqueued with it; got %s. A connection the install path did not "+
+			"wrap yields the zero value and lands every payload in the never-dropped class",
+			incA, got)
+	}
+}
+
+// TestDeadIncarnationConfigNeverRaisesTheReceivedHighWater5084 covers the OTHER
+// drop site, and the fail state that made it necessary.
+//
+// `recordRecvConfigGen` runs at RECEIVE time and is a monotone max. #5563 gates
+// manual-failover readiness on it: `ReadyForManualFailover` refuses promotion
+// while `PeerConfigGen > AppliedConfigGen`. A dead incarnation's generation is
+// drawn from the peer's PRE-reboot counter, so it is far higher than anything
+// the live incarnation can produce. Dropping such a payload only at APPLY time
+// would leave the received mark inflated with nothing able to close the gap
+// short of another re-prime: the standby reads config-stale and refuses
+// promotion indefinitely — the #5084 divergence traded for a different silent
+// wedge, which is precisely the failure mode that killed #6900.
+//
+// The shape is the surviving-fabric one: fabric 0 primed under the dead boot,
+// the peer rebooted and re-primed over fabric 1, and a buffered payload from
+// the dead boot then arrives on fabric 0.
+//
+// FAIL-ON-REVERT: delete the receive-time check in handleConfigPayload and the
+// high-water assertion below reds while every apply-time cell stays green.
+func TestDeadIncarnationConfigNeverRaisesTheReceivedHighWater5084(t *testing.T) {
+	e := newIncEnv(t, 2)
+	e.prime(0, 1, &incA) // fabric 0 primed under boot A
+	e.prime(1, 2, &incB) // the peer rebooted; its re-prime arrives over fabric 1
+
+	e.pushConfig(0, "buffered-from-the-dead-boot", 9_000_001)
+	if got := e.waitApplied(1500 * time.Millisecond); got != "" {
+		t.Fatalf("a payload arriving under a replaced incarnation must not apply; got %q", got)
+	}
+	if n := e.s.stats.ConfigsDeadIncarnationDropped.Load(); n != 1 {
+		t.Fatalf("the receive-time drop must be counted exactly once; got %d", n)
+	}
+	if got := e.s.lastRecvConfigGen.Load(); got != 0 {
+		t.Fatalf("the received-config high-water rose to %d for a payload from a DEAD peer "+
+			"boot. #5563 refuses manual failover while PeerConfigGen > AppliedConfigGen, and "+
+			"no generation the live incarnation can produce will ever exceed a pre-reboot "+
+			"one — the standby would read config-stale and refuse promotion until the next "+
+			"re-prime", got)
+	}
+
+	// The live incarnation's own lower-generation config still applies, and
+	// leaves readiness clean (received == applied).
+	e.pushConfig(1, "current-on-the-live-fabric", 42)
+	if got := e.waitApplied(3 * time.Second); got != "current-on-the-live-fabric" {
+		t.Fatalf("the live incarnation's config must apply; got %q", got)
+	}
+	// recordAppliedConfigGen runs AFTER OnConfigReceived returns, so poll
+	// rather than read the mark the instant the text lands.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && e.s.lastAppliedConfigGen.Load() != 42 {
+		time.Sleep(time.Millisecond)
+	}
+	if r, a := e.s.lastRecvConfigGen.Load(), e.s.lastAppliedConfigGen.Load(); r != 42 || a != 42 {
+		t.Fatalf("received/applied marks = %d/%d, want 42/42 — a standby whose received mark "+
+			"exceeds its applied mark refuses manual failover (#5563)", r, a)
+	}
+}
