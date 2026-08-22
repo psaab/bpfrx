@@ -574,6 +574,13 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
 	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
+	// #6630: the rotation line appears ONLY while an additional key is
+	// configured. A permanent line reading "no rotation in progress" would be
+	// noise on every `show` a cluster ever prints, and the operator question
+	// it answers exists only inside the window.
+	if line := m.controlLinkRotationStatus(); line != "" {
+		fmt.Fprintf(&b, "    Key rotation:               %s\n", line)
+	}
 	return b.String()
 }
 
@@ -611,6 +618,46 @@ func (m *Manager) controlLinkAuthStatus() string {
 		// Local key set but the peer has not authenticated yet (peer still
 		// upgrading / not signing): grace is still open.
 		return "dual-accept (key configured; peer not yet authenticated)"
+	}
+}
+
+// controlLinkRotationStatus renders the #6630 rotation line, or "" when no
+// additional key is configured (no window open).
+//
+// It answers the ONE question a rotation raises that nothing else can: is it
+// safe to finalize? "Both configs say key B" is a statement about two files;
+// "the peer is currently SIGNING with B" is a statement about the running
+// system, and only the second makes retiring the old key safe. Retiring it
+// while the peer still signs the old one reopens the dual-master window the
+// overlap exists to close.
+//
+// It renders KEY IDS, never keys. An id is HMAC-SHA256(key, domain tag)
+// truncated to 32 bits (controlLinkKeyID) — derivable identically on both
+// nodes with no exchange, which is what lets the operator compare a `show` on
+// each node, and useless for recovering the key.
+//
+// The unknown case is reported as unknown rather than as "not safe": no
+// authenticated peer frame has been seen at all, which during a rotation
+// usually means the peer is down, and telling an operator "not safe to
+// finalize" when the real answer is "your peer is not talking to you" sends
+// them to the wrong problem.
+func (m *Manager) controlLinkRotationStatus() string {
+	signing, additional := m.ControlLinkKeyIDs()
+	if additional == "" {
+		return ""
+	}
+	peer := m.PeerControlKeyID()
+	switch {
+	case peer == "":
+		return fmt.Sprintf("in progress (signing %s, also accepting %s); peer key UNKNOWN — "+
+			"no authenticated peer frame seen, do NOT finalize", signing, additional)
+	case peer == signing:
+		return fmt.Sprintf("in progress (signing %s, also accepting %s); peer is signing %s — "+
+			"safe to finalize: `delete chassis cluster additional-authentication-key`",
+			signing, additional, peer)
+	default:
+		return fmt.Sprintf("in progress (signing %s, also accepting %s); peer is still signing "+
+			"%s — do NOT finalize, the peer has not moved yet", signing, additional, peer)
 	}
 }
 

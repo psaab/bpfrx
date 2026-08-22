@@ -1,3 +1,70 @@
+## 2026-08-22 — #6914: the activation-tail argv fixture varied one axis
+
+- **Timestamp**: 2026-08-22
+- **Action**: The tail's `networkctl reconfigure` argv was asserted in full,
+  but `activationTailIfaces()` had exactly one ELIGIBLE interface, so
+  `[reconfigure trust0]` was also the output of a hardcoded literal, a deleted
+  `Unmanaged` predicate, a deleted `Disable` predicate and a reversed
+  accumulation. Confirmed rather than assumed: all four were run against the
+  BASE fixture and all four exited 0.
+  Extended the fixture to five interfaces covering every arm — two included
+  (`trust0`, `dmz0`) sitting on either side of three excluded (bond member,
+  unmanaged, disabled) — so accumulation and ORDER are both observable, which
+  one eligible interface can never make so.
+  Spelled the expectation out as `wantActivationTailArgv` rather than deriving
+  it by filtering the fixture with the production predicate: deriving it would
+  make the assertion true by construction, since the same predicate would
+  decide both the behaviour and the expectation and deleting an arm would move
+  them together.
+  Left `debtTestIfaces()` untouched — it is deliberately minimal for the
+  reload-debt tests that share it, and the richer fixture is local to the
+  activation-tail file.
+  Mutation matrix M1-M5 all RED at RUN=48 matching the control, vet clean at
+  each; and the same four mutations verified GREEN against the base fixture,
+  which is what shows the fixture change is what closed them.
+- **File(s)**: `pkg/networkd/activation_tail_5718_test.go`,
+  `pkg/networkd/README.md`
+## 2026-08-22 — #6897: the failover gate could emit no throughput cell, and had
+
+- **Timestamp**: 2026-08-22
+- **Action**: Answered the "has it already bitten us" question with data
+  instead of leaving it open. Swept every local failover log: 71 runs at
+  `14 passed, 0 failed`, one at `12 passed, 2 failed` (12+2 = 14, all cells
+  emitted), and ONE at `13 passed, 0 failed`. That odd run
+  (`jobs/22249260/tmp/failover.log`) emits 13 cells and `grep -c "iperf3
+  throughput"` returns 0 — the cell is ABSENT, not failed, and
+  `PASS iperf3 completed successfully` fired just before it, so the run looked
+  healthy to the summary. 13 assertions plus one silent absence, reported as a
+  clean green.
+  Root cause: the parse matched only `Gbits`, so a sub-Gbit `[SUM]` line set
+  the throughput to the literal `"0"` and then matched neither the pass branch
+  nor the fail branch — there was no else. Sub-Gbit is exactly what a
+  throughput regression or a CoS-shaped class looks like, so the gate went
+  silent in the case it exists to catch.
+  Fixed by extracting the parse and the verdict into
+  `test/incus/iperf-throughput-lib.sh`: the unit is normalised (K/M/G), and
+  the verdict is TOTAL — absent, unparseable, too-low and healthy each yield
+  exactly one cell. The caller maps the verdict with a catch-all default so an
+  unknown status still emits one. Demonstrated old-vs-new on the exact
+  incident input: OLD emits 0 cells, NEW emits 1 carrying the real 0.0860 Gbps.
+  Extraction was the point, not tidiness: it makes the GATE'S OWN fix testable
+  without a cluster, which is what lets this change be reviewed on its own
+  terms. New hermetic `make test-iperf-throughput-lib` (18 cells).
+  The self-test also binds the WIRING, not just the lib — deleting the call
+  from `test-failover.sh` would otherwise leave it green, which is the shape
+  that has produced repeated false confidence. Mutation M1 is exactly that
+  deletion and it reds.
+  Defect 2 of the issue (the established-session floor) is OBSOLETE: #4052
+  already added the 20 x 0.5s poll the issue asks for, and #7368 already added
+  the fw0/fw1 cross-reference that names an ownership/forwarding divergence
+  instead of blaming establishment — which is precisely the inconsistency the
+  issue observed.
+  Mutation matrix M1-M5 all RED, `bash -n` clean at every mutated state, PASS
+  cell counts compared against the control (18) rather than merely non-zero.
+- **File(s)**: `test/incus/iperf-throughput-lib.sh` (new),
+  `test/incus/iperf-throughput-selftest.sh` (new),
+  `test/incus/test-failover.sh`, `Makefile`, `CLAUDE.md`
+
 ## 2026-08-22 — #6678: device-map OriginalName= no longer falls back to the logical name
 
 - **Timestamp**: 2026-08-22
@@ -102822,6 +102889,33 @@ prose edit above them added. No diff falls in the new test body.
   skipped). `mibOIDs` sorts, so the walk is now correct regardless.
 - **File(s)**: pkg/snmp/agent.go,
   pkg/snmp/findnext_binary_search_6597_test.go (new), pkg/snmp/README.md, _Log.md
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6630 — PSK rotation was a planned outage: with one key, the
+    moment one node commits the new one each end receives a
+    present-but-invalid HMAC, `admitFrame` rejects without refreshing
+    `lastSeen`, and after ~1s BOTH nodes declare the peer dead and BOTH take
+    over their RGs. The documented workaround (clear both keys first) is
+    refused by #6611's validator. Added `additional-authentication-key`: a
+    second key a node ACCEPTS and never SIGNS with, so the two commits can be
+    separated in time. Heartbeat AND fabric gRPC widen together; session sync
+    does not (connection-scoped, #6628's territory). Finalize is an operator
+    commit (delete the leaf), never a timer. Declined the wire key-id #6630
+    prescribed — the PROPERTY it was for is "can the operator tell whether the
+    peer moved", answered by recording which accepted key last verified a peer
+    frame and rendering its derived id in `show chassis cluster statistics`,
+    with no new bytes on the heartbeat. Mutation matrix 8/8 RED. R4 (epoch read
+    must use the VERIFYING key) was GREEN until the rotation fixture was made
+    epoch-bearing — `samplePkt()` carries no epoch, so `heartbeatFrameEpoch`
+    returned hasEpoch=false whatever key it was handed and the cell measured
+    nothing.
+  - **File(s)**: pkg/cluster/{control_key_rotation.go,
+    control_key_rotation_6630_test.go,heartbeat.go,manager.go,group_state.go,
+    status.go,README.md}, pkg/config/{types_chassis.go,compiler_system.go,
+    schema_chassis.go,ast_redact.go,compiler_validate_strict_cluster_auth.go,
+    compiler_uniformgates_cluster_zone.go,testdata/golden_4406.json},
+    pkg/grpcapi/{fabric_auth.go,server_fabric_rotation_6630_test.go},
+    docs/config-schema.md
 
 ## 2026-08-22 — #7426: single-source the predictable-name derivation
 - **Timestamp**: 2026-08-22

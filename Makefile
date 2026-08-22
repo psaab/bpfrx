@@ -395,7 +395,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-cos-apply-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -444,6 +444,16 @@ test-cos-apply-lib:
 # Run this after touching cluster-env.sh or a cluster *.env file.
 test-cluster-env-lib:
 	bash ./test/incus/cluster-env-selftest.sh
+
+# Self-test the #6897 iperf3 throughput parse + verdict used by
+# test-failover.sh. The defect it guards is a MISSING CELL, not a wrong
+# number: the old inline parse matched only "Gbits", so a sub-Gbit run
+# matched neither the pass nor the fail branch and the gate emitted nothing
+# while still summarising "0 failed". Hermetic — sources the lib and feeds it
+# literal [SUM] lines; no incus, cluster, network or iperf3.
+# Run this after touching test-failover.sh's throughput cell.
+test-iperf-throughput-lib:
+	bash ./test/incus/iperf-throughput-selftest.sh
 
 # Self-test the #4800 new-flow-ceiling analysis layer: the function that
 # turns two helper counter snapshots into "N new flows/sec, and here is

@@ -123,7 +123,8 @@ func secretIndices(fp []string) []int {
 			for ; j < len(fp); j++ {
 				out = append(out, j)
 			}
-		case "authentication-key", "authentication-password", "privacy-password",
+		case "authentication-key", "additional-authentication-key",
+			"authentication-password", "privacy-password",
 			"encrypted-password", "simple-password", "api-key", "tsig-secret",
 			"api-token", "aws-secret-key", "private-key", "preshared-key":
 			// Distinctive secret keywords: every token after the keyword is

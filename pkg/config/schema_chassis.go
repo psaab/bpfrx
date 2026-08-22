@@ -109,6 +109,11 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		// (ast_redact.go). Untyped value slot, mirroring the OSPF/IS-IS/
 		// RIP/interface authentication-key leaves.
 		"authentication-key": {desc: "Shared PSK authenticating cluster control messages (HMAC-SHA256; same key on both nodes)", args: 1, placeholder: "<key>", children: nil},
+		// #6630: a SECOND key this node accepts but never signs with, so a
+		// PSK rotation can be rolled one node at a time without losing
+		// heartbeat liveness. Same Secret + ##SECRET-DATA## treatment; the
+		// keyword is in ast_redact.go's secret set in its own right.
+		"additional-authentication-key": {desc: "Second PSK ACCEPTED (never signed with) so a key rotation can roll node-by-node; remove it to finalize", args: 1, placeholder: "<key>", children: nil},
 		// control-ports fpc/port: NOT typed — compileChassis never
 		// reads control-ports (compiled-leaf-only invariant).
 		"control-ports": {desc: "Control port assignments (accepted for Junos compatibility; ignored)", children: map[string]*schemaNode{
