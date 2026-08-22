@@ -424,8 +424,9 @@ per-path:
   `confirm.json` in `.configdb` holding the absolute **deadline**, the
   **rollback-target tree** (`confirmPrevTree` — the ORIGINAL
   last-confirmed tree for a nested re-arm), and the **first-commit**
-  flag (`confirmPrevCfg == nil`, the #1922 Item 1b never-committed
-  case). It is written durably (temp+fsync+rename+dir-fsync),
+  flag (`confirmPrevFirst`, the #1922 Item 1b never-committed case —
+  see the #6538 note below; it used to be re-derived as
+  `confirmPrevCfg == nil` at each consumer). It is written durably (temp+fsync+rename+dir-fsync),
   encrypted with the same master-password machinery as `active.json`
   (the target tree may carry secret leaves), 0600, AFTER the successful
   `writeActive`+promote (a failed commit-confirmed never leaves a
@@ -707,17 +708,60 @@ non-daemon embedders) the timer falls back to the self-contained
 `performAutoRollback`, which promotes store state but does not re-apply
 a dataplane it has no handle on.
 
-The `prevCfg == nil` first-commit rollback target (#1922 Item 1b) is now
-implemented: on a FRESH-store first `commit confirmed` timeout
-`PromoteRollback` reverts the store to the empty bootstrap tree, persists
-the **never-committed marker** (committed=0, NOT an empty *committed*
-tree — see step-0 marker below), clears the in-memory `everCommitted`
-flag, and returns `(nil, true)`. The daemon executor detects the nil
-`prevCfg` and calls `enterBootstrapMode` (interface/FRR/dataplane takeover
-cleanup, keeping the management lifeline) instead of applying an empty
-config to the dataplane. A subsequent restart therefore re-classifies into
-bootstrap (the marker disambiguates never-committed from
-operator-committed-empty).
+The first-commit rollback target (#1922 Item 1b) is now implemented: on a
+FRESH-store first `commit confirmed` timeout `PromoteRollback` reverts the
+store to the empty bootstrap tree, persists the **never-committed marker**
+(committed=0, NOT an empty *committed* tree — see step-0 marker below),
+clears the in-memory `everCommitted` flag, and returns `(nil, true)`. The
+daemon executor detects the nil `prevCfg` and calls `enterBootstrapMode`
+(interface/FRR/dataplane takeover cleanup, keeping the management lifeline)
+instead of applying an empty config to the dataplane. A subsequent restart
+therefore re-classifies into bootstrap (the marker disambiguates
+never-committed from operator-committed-empty).
+
+**First-commit-ness is RECORDED, not re-derived from the nil (#6538).**
+`confirmPrevCfg == nil` carries two unrelated meanings, and the action taken
+on one of them is destructive for the other:
+
+1. *there was no compiled config to stash* — this genuinely is the first
+   commit on a fresh store; and
+2. *the recovered rollback target failed even the LENIENT compile* —
+   `recoverPendingConfirmLocked` re-arming a window that was still open at
+   boot. `Store.Load` repairs the tree it reads from `active.json`
+   (`rewriteRetiredDataplaneType`, `SanitizeTreeControlChars`) but never the
+   `PrevTree` carried inside `confirm.json`, so a target committed on an
+   older build — `system dataplane-type ebpf` is the concrete case — reaches
+   the recovery uncompilable.
+
+`Store.confirmPrevFirst` records the fact where it is known (the arm site
+reads the PRE-promotion `s.compiled`; the recovery site reads the persisted
+`rec.FirstCommit`) and both consumers read the flag: `PromoteRollback`'s
+`firstCommitRollback`, and the `firstCommit` bit `writeConfirmState`
+persists on a nested re-arm. Deriving them from the nil made meaning (2)
+persist `committed=0` **over a real config**, so the next restart
+re-classified a production box into bootstrap (day-0 / claim-all) — and a
+nested arm wrote `FirstCommit=true` into `confirm.json`, making that
+mislabelling durable across the reboot after it.
+
+The **runtime** action on a nil `prevCfg` is deliberately unchanged and
+unbranched: with no compiled config to apply, `enterBootstrapMode`'s
+lifeline safe state is exactly what #1960 prescribes for a
+present-but-uncompilable committed config, and the next boot re-derives that
+state from disk through the main `Load` path. Only the PERSISTENCE differs
+between the two provenances.
+
+**The expired-during-downtime branch fails closed (#6538).** When that
+branch cannot compile its rollback target it still performs the rollback —
+reverting the unconfirmed config is the safety property, and the reverted
+tree must stay reachable for `configure` / `show | compare` / `rollback` —
+but `recoverPendingConfirmLocked` now RETURNS an `ErrConfigCompile`-tagged
+error, which `Load` propagates. Previously it warned, assigned the nil into
+`s.compiled`, set `everCommitted = true`, and `Load` returned success: the
+daemon then saw `ActiveConfig() == nil` + `everCommitted` and resolved to a
+NORMAL boot with **no compiled policy**, running the positional claim-all
+interface rename. That is precisely the shape #1960 fails closed on, and the
+tagged error routes it through the same `classifyLoadError` →
+`loadCompileFailed` → #1922 bootstrap/lifeline path.
 
 ### Config lock: shared/private vs. exclusive holders (#3979)
 

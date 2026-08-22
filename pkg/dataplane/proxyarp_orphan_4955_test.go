@@ -41,7 +41,7 @@ func TestReconcileProxyARP_SweepsRemovedInterface(t *testing.T) {
 	cfg := &config.Config{}
 	priorIfaceMap := map[string]int{"ge-0-0-1": removedIdx}
 
-	_, _, err := ReconcileProxyARP(cfg, map[string]int{}, priorIfaceMap)
+	_, _, err := ReconcileProxyARP(cfg, map[string]int{}, priorIfaceMap, nil)
 	if err != nil {
 		t.Fatalf("ReconcileProxyARP: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestReconcileProxyARP_PartialAddKeepsEnabledSet(t *testing.T) {
 	}
 	ifaceMap := map[string]int{"ge-0-0-2": 7}
 
-	_, enabled, err := ReconcileProxyARP(cfg, ifaceMap, nil)
+	_, enabled, err := ReconcileProxyARP(cfg, ifaceMap, nil, nil)
 	if err == nil {
 		t.Fatalf("want the NeighSet failure surfaced as an error, got nil")
 	}

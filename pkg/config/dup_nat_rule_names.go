@@ -55,8 +55,10 @@ type dupNATRule struct {
 // rejects on the operator commit / commit-check path; lenient (Load / peer-sync,
 // #1960) warns and keeps the historical two-row behavior.
 //
-// A duplicate authored ENTIRELY inside an applied group body is NOT caught here —
-// see the group-authored deferral note in dup_names_6455.go (#6455 Finding 1).
+// A duplicate authored ENTIRELY inside an applied group body is not caught here
+// — this gate is pre-expansion by design. It is caught by
+// validateDuplicateNamesExpandedAST (dup_names_expanded_6455.go, #6455
+// Finding 1), which re-runs THIS function on a group-expanded clone.
 func validateDuplicateNATRuleNamesAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil

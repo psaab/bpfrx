@@ -175,7 +175,8 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 	// CI). An unrepresentable port/DSCP token fails the build CLOSED (the installer
 	// returns an error and installs nothing), mirroring the oracle's nft rejection.
 	spec := toNftLo0Spec(cfg, filterV4, filterV6)
-	if err := nftInstaller.InstallLo0(spec); err != nil {
+	rules, err := nftInstaller.InstallLo0(spec)
+	if err != nil {
 		err = tagNftInstallErr(err)
 		slog.Warn("failed to apply lo0 filter", "err", err)
 		// #6476 cold-boot fail-closed fence. Install (or re-install) a fence UNLESS a
@@ -188,20 +189,95 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 		// govern every local address (unlike the address-scoped host-inbound table), so
 		// with lo0Enforced true no fence is installed.
 		if !d.lo0Enforced.Load() {
-			views := dpuserspace.BuildZoneHostInboundViews(cfg)
-			unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
+			// #6492: the fence's drop scope is NOT the real ruleset's scope. It
+			// withholds any address shared with a lifeline interface (the fence has
+			// no per-service accepts to let management back in) and it covers every
+			// firewall-local address, including on a router that declares no
+			// security zone at all — where the zone-model builders return nothing
+			// and the fence would otherwise be an empty `policy accept` shell.
+			sets := dpuserspace.BuildFenceAddrSets(cfg, dpuserspace.BuildZoneHostInboundViews(cfg))
 			wgListenPorts := cfg.WireGuardListenPorts()
-			if fenceErr := d.installLo0ColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
+			if fenceErr := d.installLo0ColdBootFence(sets, wgListenPorts); fenceErr != nil {
 				return errors.Join(fmt.Errorf("apply lo0 nftables filter: %w", err), fenceErr)
 			}
 		}
 		return fmt.Errorf("apply lo0 nftables filter: %w", err)
 	}
+	if rules == 0 {
+		// #6529: the install SUCCEEDED but rendered NOTHING — the live xpf_lo0
+		// table is an empty `policy accept` shell that enforces nothing. Recording
+		// that as "a real operator filter is loaded" is what defeated the #6476
+		// fence: with the flag true every later failed install skips the fence and
+		// the host input path stays open. A vacated filter is exactly as
+		// unprotecting as no filter, so clear the gate — do NOT merely leave it
+		// alone, because a peer-sync that atomically replaces a REAL filter with a
+		// vacated one would otherwise keep the stale true.
+		//
+		// Zero rules is reachable through several doors and they are not
+		// distinguishable from a boolean: a filter NAME that resolves to no filter
+		// (toNftLo0Spec's map lookup silently yields no terms), a filter with no
+		// terms, and a filter whose every term lowers to zero rules — a Junos
+		// match-nothing scope, e.g. an unresolved `from source-prefix-list`. All
+		// three arrive here through opts.lenientFirewallRefs on Store.Load at boot
+		// or Store.SyncApply on HA peer-sync, which downgrades the dangling-
+		// firewall-ref reject to a warning.
+		//
+		// This does NOT install a fence: fencing on a SUCCESSFUL install would deny
+		// host-bound traffic on a clean commit. The gate being false is what
+		// matters — the next failed install fences from the current snapshot.
+		d.lo0Enforced.Store(false)
+		slog.Warn("lo0 input filter installed but renders NO rules; the xpf_lo0 table is an empty "+
+			"policy-accept shell that enforces nothing, so it is NOT recorded as a real filter and a "+
+			"later failed install will install the cold-boot fail-closed fence",
+			"v4", filterV4, "v6", filterV6,
+			"v4_defined", lo0FilterDefined(cfg, filterV4, false),
+			"v6_defined", lo0FilterDefined(cfg, filterV6, true))
+		return nil
+	}
 	// A real lo0 filter is now the live table. Record it so a later failed install
 	// retains this generation and skips the fence (the intended day-2 divergence).
 	d.lo0Enforced.Store(true)
-	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6, "rules", rules)
 	return nil
+}
+
+// logFenceWithheld reports the firewall-local addresses the #6492 Finding-A
+// lifeline guard removed from a cold-boot fence's drop set: an address that is
+// ALSO configured on a lifeline interface (fxp0 / em0 / fab* / the configured
+// control+fabric links). The fence is the real table with every per-service
+// ACCEPT stripped and its drop rule carries no `iifname`, so fencing such an
+// address renders a bare `ip daddr <mgmt-ip> drop` that kills every NEW
+// management connection to it for the whole fence window. Withholding it trades
+// fence coverage for the lifeline, which is the standing #1960 / #3277 order of
+// priorities — but it is a real coverage hole while the fence is up, so it is
+// logged at WARN rather than silently applied. Silent when nothing was withheld
+// (the overwhelmingly common case: no address is shared with a lifeline).
+func logFenceWithheld(table string, sets dpuserspace.FenceAddrSets) {
+	if len(sets.WithheldV4) == 0 && len(sets.WithheldV6) == 0 {
+		return
+	}
+	slog.Warn("cold-boot fence withheld firewall-local addresses that are also configured on a lifeline interface; "+
+		"the fence has no per-service accepts and its drop carries no iifname, so fencing them would drop new management connections. "+
+		"They stay unfenced until a real ruleset loads",
+		"table", table, "withheld_v4", sets.WithheldV4, "withheld_v6", sets.WithheldV6)
+}
+
+// lo0FilterDefined reports whether the named lo0 input filter exists in cfg, for
+// the #6529 vacated-install diagnostic. A configured name that resolves to no
+// filter is the headline door into the zero-rule install: toNftLo0Spec's map
+// lookup yields no terms and the resulting empty table installs cleanly. An
+// empty name is "not configured", reported as defined so it does not read as the
+// cause.
+func lo0FilterDefined(cfg *config.Config, name string, v6 bool) bool {
+	if name == "" {
+		return true
+	}
+	filters := cfg.Firewall.FiltersInet
+	if v6 {
+		filters = cfg.Firewall.FiltersInet6
+	}
+	_, ok := filters[name]
+	return ok
 }
 
 // installLo0ColdBootFence installs the #6476 lo0 cold-boot fail-closed fence: a
@@ -214,11 +290,11 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // (xpf_lo0 at lo0FilterPriority). It is attempted whenever a real lo0 install
 // failed and no real filter is currently loaded (lo0Enforced false).
 //
-// Safety: the fence drops only to the SAME lifeline-excluded address sets the
-// host-inbound fence uses (fxp0/em0/fab* and their addresses are subtracted by
-// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so it can never
-// strand management or break HA. It carries no named counters (a fence is
-// transient).
+// Safety: the fence drops only to the SAME dpuserspace.BuildFenceAddrSets scope
+// the host-inbound fence uses (#6492) — lifeline interfaces excluded, addresses
+// shared with a lifeline interface withheld, and every firewall-local address
+// covered including on a zone-less router — so it can never strand management or
+// break HA. It carries no named counters (a fence is transient).
 //
 // A fence deliberately does NOT set lo0Enforced — that flag is set true ONLY by a
 // successful real InstallLo0, so it means exactly "a real operator lo0 filter is
@@ -232,8 +308,10 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // filter, so a later failure re-fences from a possibly-now-addressed snapshot. On
 // failure (nft itself is broken) the error is returned and joined into the commit
 // result; the daemon has done all it can.
-func (d *Daemon) installLo0ColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+func (d *Daemon) installLo0ColdBootFence(sets dpuserspace.FenceAddrSets, wgListenPorts []uint16) error {
+	views, unzonedV4, unzonedV6 := sets.Views, sets.UnzonedV4, sets.UnzonedV6
 	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
+	logFenceWithheld(xnft.Lo0TableName, sets)
 	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
 	if err := nftInstaller.InstallLo0ColdBootFence(spec); err != nil {
 		err = tagNftInstallErr(err)
@@ -499,7 +577,12 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// a later failed real invocation that reaches this function while state is
 		// still false.
 		if !d.hostInboundEnforced.Load() {
-			if fenceErr := d.installHostInboundColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts, desiredDrop); fenceErr != nil {
+			// #6492: fence-only scope — lifeline-shared addresses withheld (the
+			// fence strips every per-service ACCEPT, so a bare `daddr <mgmt-ip>
+			// drop` would lock out management), and every firewall-local address
+			// covered rather than only the zone-model ones.
+			sets := dpuserspace.BuildFenceAddrSets(cfg, views)
+			if fenceErr := d.installHostInboundColdBootFence(sets, wgListenPorts); fenceErr != nil {
 				return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), fenceErr)
 			}
 		} else {
@@ -603,12 +686,16 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // with a successfully loaded zero-drop table shell; it does not prove table
 // absence.
 //
-// Safety: the fence drops only to the SAME address sets the real ruleset would
-// scope (views + the addressed-but-unzoned set), which are already
-// lifeline-excluded (fxp0/em0/fab* and their addresses are subtracted by
-// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so the fence can
-// never strand management or break HA — it is strictly the real table with every
-// service ACCEPT removed. It carries no named counters (a fence is transient) so
+// Safety: the fence is the real table with every service ACCEPT removed, so its
+// drop scope is NOT the real ruleset's scope — dpuserspace.BuildFenceAddrSets
+// (#6492) derives it. Lifeline INTERFACES are excluded by the view builders as
+// before, and any address that is ALSO configured on a lifeline interface is
+// additionally WITHHELD: without the per-service accepts the fence's unqualified
+// `ip daddr <addr> drop` would kill new management connections to a shared
+// management IP. Conversely the fence covers every firewall-local address, not
+// only the zone-model ones, so a zone-less router is fenced instead of getting an
+// empty `policy accept` shell. So the fence can never strand management or break
+// HA. It carries no named counters (a fence is transient) so
 // it has fewer moving parts than the real payload and is more likely to load when
 // the real one hit a payload-specific nft error. After successful nft completion,
 // hostInboundEnforced is set true only when this exact payload contains an
@@ -618,12 +705,20 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // commit result; the caller logs it and the daemon has done all it can short of
 // holding forwarding.
 //
-// desiredDrop is this snapshot's exact destination-drop set (#5789); on a
-// successful address-scoped fence the whole-table fence IS the retained
-// enforcement, so its coverage becomes hostInboundCoveredAddrs, letting a later
-// failed rerender detect a subsequently-appeared uncovered address.
-func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16, desiredDrop map[string]struct{}) error {
+// On a successful address-scoped fence the whole-table fence IS the retained
+// enforcement, so ITS OWN drop set — derived from sets, not from the real
+// ruleset's desiredDrop, which #6492 made a different set in both directions —
+// becomes hostInboundCoveredAddrs, letting a later failed rerender detect a
+// subsequently-appeared uncovered address.
+func (d *Daemon) installHostInboundColdBootFence(sets dpuserspace.FenceAddrSets, wgListenPorts []uint16) error {
+	views, unzonedV4, unzonedV6 := sets.Views, sets.UnzonedV4, sets.UnzonedV6
 	fenceHasScopedDrop := hostInboundHasEnforceableView(views) || len(unzonedV4) > 0 || len(unzonedV6) > 0
+	logFenceWithheld(xnft.HostInboundTableName, sets)
+	// #6492: the fence's own coverage, not the real ruleset's desired-drop set.
+	// The two now differ in BOTH directions (lifeline-shared addresses withheld,
+	// zone-less / unzoned-VIP addresses added), and hostInboundCoveredAddrs must
+	// describe what the RETAINED enforcement — this fence — actually drops.
+	fenceCovered := hostInboundDesiredDropAddrs(views, unzonedV4, unzonedV6)
 	// #6387 PR-3: install via netlink (parity-proven equivalent to the exec-`nft`
 	// buildHostInboundFencePayload oracle).
 	spec := xnft.FenceSpec{Views: toNftViews(views), UnzonedV4: unzonedV4, UnzonedV6: unzonedV6, WGListenPorts: wgListenPorts}
@@ -639,7 +734,7 @@ func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInb
 		d.hostInboundEnforced.Store(true)
 		// #5789: the address-scoped fence is now the retained enforcement; record
 		// exactly which destinations it covers so the day-2 coverage check works.
-		d.hostInboundCoveredAddrs = desiredDrop
+		d.hostInboundCoveredAddrs = fenceCovered
 		slog.Warn("host-inbound real install failed; fallback succeeded with address-scoped DROPs for its rendered snapshot",
 			"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
 			"fenced_unzoned_v6", len(unzonedV6))
@@ -1785,15 +1880,26 @@ func nftAddrSet(addrs []string) string {
 }
 
 // nftFamilyAddrs keeps only the addresses belonging to the chain's family
-// ("ip" -> IPv4, "ip6" -> IPv6), dropping the empty / "any" placeholders, the
-// malformed tokens, and the wrong-family literals. This mirrors the userspace
+// ("ip" -> IPv4, "ip6" -> IPv6), dropping the empty / "any" placeholders and the
+// wrong-family literals. Dropping a WRONG-FAMILY literal mirrors the userspace
 // matcher's per-family vectors (parse_address classifies each entry into
-// source_v4 / source_v6, drops "any"/empty/malformed, and the inet / inet6 chain
-// only ever consults the matching family): a v4 CIDR carried in an inet6 filter
-// (#3433 H02) and an all-malformed list (#3433 H09) both leave THIS family's
-// vector empty, which the matcher treats as the empty positive/except set. Each
-// kept entry is re-rendered in its canonical form so a bare host IP and a CIDR
-// are both valid nft right-hand sides.
+// source_v4 / source_v6, and the inet / inet6 chain only ever consults the
+// matching family), so a v4 CIDR carried in an inet6 filter (#3433 H02) leaves
+// THIS family's vector empty, which the matcher treats as the empty
+// positive/except set. Each kept entry is re-rendered in its canonical form so a
+// bare host IP and a CIDR are both valid nft right-hand sides.
+//
+// #6512: a MALFORMED token is kept VERBATIM instead of being silently dropped.
+// The dropped-token behavior installed a NARROWED rule from a partially-
+// malformed positive list (a discard/reject term then enforced a smaller address
+// set than the operator wrote) and a WIDENED one from an except list — an
+// all-malformed except list emptied and nftAddrPredicate's empty-except arm
+// dropped the predicate entirely, leaving the direction unconstrained. Emitting
+// the raw token makes `nft -f -` REJECT the whole ruleset and retain the prior
+// generation, which is exactly the fail-closed posture this oracle already has
+// for an unresolvable port / DSCP token (#6405) — and it keeps this oracle in
+// agreement with filterFamilyAddrs in pkg/nftables/netlink_lo0.go, the
+// production builder, which errors on the same token.
 func nftFamilyAddrs(family string, addrs []string) []string {
 	wantV6 := family == "ip6"
 	out := make([]string, 0, len(addrs))
@@ -1813,9 +1919,7 @@ func nftFamilyAddrs(family string, addrs []string) []string {
 			}
 			continue
 		}
-		// Malformed token: contributes nothing (mirrors parse_address's silent
-		// drop). It still made the direction `constrained` upstream, so an
-		// all-malformed positive set fails closed below (match NOTHING).
+		out = append(out, a)
 	}
 	return out
 }

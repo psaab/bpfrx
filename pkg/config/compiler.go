@@ -274,6 +274,25 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, dupNATRuleSetErr
 	}
 
+	// #6455 Finding 1: the POST-expansion half of the duplicate-name gate
+	// family. The three gates above scan only top-level stanzas, so a duplicate
+	// authored ENTIRELY inside an applied group body — appended wholesale by
+	// apply-groups, never coalesced — reaches the compiled config with both
+	// instances alive while the byte-identical inline duplicate is rejected.
+	// This re-runs the SAME three scanners on a group-EXPANDED clone, once per
+	// cluster node (node0 AND node1) like the #5878/#5879/#6178 union gates, so
+	// the fragment-coalescing false-reject that killed a per-group-body scan
+	// cannot occur (the fragments are one node by then) and a peer-only `groups
+	// node1` duplicate is caught. Findings the pre-expansion gates already
+	// warned about are dropped so an inline duplicate reports once. See
+	// dup_names_expanded_6455.go.
+	dupExpandedWarnings, dupExpandedErr := validateDuplicateNamesExpandedAST(
+		tree, opts.lenientDuplicateNamesExpanded,
+		concatWarnings(dupBlockWarnings, dupNATRuleWarnings, dupNATRuleSetWarnings))
+	if dupExpandedErr != nil {
+		return nil, dupExpandedErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union. Runs PRE-expansion, beside the tunnel/zone/table-id gates, so a
 	// peer-only `groups node1`/`${node}` alias that collides only in the
@@ -356,6 +375,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleSetWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupExpandedWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
@@ -468,6 +488,25 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, dupNATRuleSetErr
 	}
 
+	// #6455 Finding 1: the POST-expansion half of the duplicate-name gate
+	// family. The three gates above scan only top-level stanzas, so a duplicate
+	// authored ENTIRELY inside an applied group body — appended wholesale by
+	// apply-groups, never coalesced — reaches the compiled config with both
+	// instances alive while the byte-identical inline duplicate is rejected.
+	// This re-runs the SAME three scanners on a group-EXPANDED clone, once per
+	// cluster node (node0 AND node1) like the #5878/#5879/#6178 union gates, so
+	// the fragment-coalescing false-reject that killed a per-group-body scan
+	// cannot occur (the fragments are one node by then) and a peer-only `groups
+	// node1` duplicate is caught. Findings the pre-expansion gates already
+	// warned about are dropped so an inline duplicate reports once. See
+	// dup_names_expanded_6455.go.
+	dupExpandedWarnings, dupExpandedErr := validateDuplicateNamesExpandedAST(
+		tree, opts.lenientDuplicateNamesExpanded,
+		concatWarnings(dupBlockWarnings, dupNATRuleWarnings, dupNATRuleSetWarnings))
+	if dupExpandedErr != nil {
+		return nil, dupExpandedErr
+	}
+
 	// #5878: numeric interface-unit alias gate (#5631) as a BOTH-NODE-effective
 	// union — see compileConfigWithOpts. Pre-expansion on purpose: the union
 	// across View 1 (groups) + Views 2/3 (node0/node1 expansions) is identical
@@ -548,6 +587,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleWarnings...)
 	cfg.Warnings = append(cfg.Warnings, dupNATRuleSetWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupExpandedWarnings...)
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
