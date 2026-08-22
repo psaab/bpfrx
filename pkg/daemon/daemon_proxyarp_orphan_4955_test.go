@@ -26,7 +26,7 @@ func TestReconcileProxyARP_SweepsPriorInterface(t *testing.T) {
 	var applyCalled bool
 	var gotPrior map[string]int
 	prevApply := proxyARPApplyFn
-	proxyARPApplyFn = func(_ *config.Config, _, priorIfaceMap map[string]int) ([]dataplane.ProxyARPAdded, map[string]map[int]struct{}, error) {
+	proxyARPApplyFn = func(_ *config.Config, _, priorIfaceMap map[string]int, _ map[int]string) ([]dataplane.ProxyARPAdded, map[string]map[int]struct{}, error) {
 		applyCalled = true
 		gotPrior = priorIfaceMap
 		return nil, map[string]map[int]struct{}{}, nil

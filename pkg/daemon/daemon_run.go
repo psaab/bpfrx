@@ -647,6 +647,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// state out-of-band while a concurrent commit / HA-sync / reconcile
 		// re-creates the just-erased .configdb SSOT or re-renders the wiped secrets.
 		shell.SetFactoryResetFn(d.factoryReset)
+		// #6496: the day-0 config-import verdict for `show system
+		// bootstrap-import` on the console. Same recorded snapshot /health and
+		// the gRPC ShowText renderer read, so an operator standing at a fresh
+		// box can answer "why didn't my day-0 config apply?" from the CLI they
+		// are already in instead of leaving it to curl the loopback REST API.
+		shell.SetBootstrapImportFn(d.bootstrapShowSnapshot)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
