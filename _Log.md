@@ -32,6 +32,46 @@
   pkg/ra/sender_prefixlen_6531_test.go,
   pkg/daemon/ra_pd_prefixlen_6531_test.go, pkg/dhcp/README.md
 
+## 2026-08-22 — #6619 + #6564 member 8: VRF-enslaved iifname scope, and coverage vs existence
+
+- **Timestamp**: 2026-08-22
+- **Action**: Established the kernel fact firsthand before building
+  anything (private userns+netns, real nf_tables over netlink, inet base
+  chain at hook input priority 10 — the exact hook xpf_hostinbound
+  installs): for a packet arriving on a VRF-enslaved netdev, `meta
+  iifname` at LOCAL_IN is the VRF MASTER —
+  `c_slave(veth1)=0 c_master(vrf-t)=3 c_any=3`. The `c_any=3` row is
+  what closes the argument: the hook runs exactly once, so the zero is
+  "it does not happen" rather than "a second pass was missed". Then
+  verified — measured, not inferred, per the explicit ask — that the
+  #4168 suppression really does read the resolved netdev set: a zone
+  whose only candidate is cross-zone-ambiguous resolves to none and its
+  deny warns. The same measurement caught #6564 member 8 live in the
+  neighbouring zone: it had resolved SOME of its candidates, emitted a
+  rule scoped to the survivors, and suppressed its warning. Fixed both
+  in one change because the VRF filter ENLARGES the partially-resolved
+  population. Rejected the lead's suggested shape (make a partially
+  resolved zone non-enforceable) after enumerating the cost: it would
+  withdraw a kernel deny that works. Split the single `enforceable`
+  boolean instead — `emitsRules` (any candidate resolved) still gates
+  emission, `fullyScoped` (no OWN candidate unresolved) now gates
+  suppression — so NO packet changes verdict and the only behaviour
+  change is warnings that were previously suppressed. Refined the
+  coverage predicate after an existing test went red and turned out to
+  be RIGHT: a dropped PARENT superset candidate is not a coverage gap
+  (a plain 802.1Q subunit's frames are demuxed to its own netdev), and
+  counting it would have warned on every trunk with an untagged unit-0
+  in one zone and tagged subunits in others. Only an OWN netdev counts.
+  Three one-line mutations, each `go vet` clean at the mutated state,
+  each localising: recording no netdev as enslaved reds exactly the four
+  VRF rows; reverting the coverage predicate to existence semantics reds
+  exactly the three partial-coverage rows; counting a parent candidate
+  as own reds exactly the over-warning guard row AND the shipped
+  `TestJunosHostCrossZoneAmbiguousTrunkKeepsWarning`, two independent
+  tests agreeing on that line.
+- **File(s)**: `pkg/config/junos_host_deny.go`,
+  `pkg/dataplane/userspace/junos_host_vrf_scope_6619_test.go` (new),
+  `docs/host-inbound-service-matrix.md`
 ## 2026-08-21 — #6635 ddns: the error-tree bound follows a caller-supplied `As`
 
 - **Timestamp**: 2026-08-21
@@ -66,6 +106,36 @@
   suite shows, not `-run 6635`.
 - **File(s)**: `pkg/ddns/backend_http.go`,
   `pkg/ddns/errtree_bound_after_as_6635_test.go` (new), `pkg/ddns/README.md`
+## 2026-08-22 — #6584 command-output + swanctl termsafe guards
+
+- **Timestamp**: 2026-08-22
+- **Action**: Block-sanitized `journalctl`/`tail` on BOTH renderers plus
+  `journalctl --boot` (structurally identical, not named in the issue),
+  and guarded every fork in the multi-fork gRPC functions
+  (`GetSystemInfo` ×4, `showNTP` ×4) so no guarded arm vouches for a raw
+  sibling. CORRECTED the issue's framing for site B: swanctl stdout never
+  reaches a terminal — the PARSED fields do — so it is the #6579
+  parsed-row class and is guarded once at INGEST (`sanitizeSAStatus` in
+  `GetSAStatus`) rather than at ~24 render sites across two renderers.
+  Added the mechanism the research showed was missing entirely: a
+  both-directions tripwire requiring every fork-containing function to
+  apply >= as many termsafe calls as forks, or be allowlisted with a
+  reason.
+  Mutation matrix 6/6 RED after two real fixture defects the matrix
+  itself exposed: (1) the tripwire's first version asked only whether a
+  function "references termsafe", which let one guarded arm vouch for
+  its siblings — four cells that removed a real guard stayed GREEN;
+  (2) after switching to a count, package-scope forks had an EMPTY body
+  so `0 >= 0` waved them through silently — the control run caught that.
+  Both now conservative. Successor #7389 filed for the streaming sites
+  (tcpdump renders attacker packet bytes; traceroute resolves PTR) which
+  need a line-wise writer, plus the low-taint remainder.
+- **File(s)**: pkg/cli/cli_show_system.go, pkg/grpcapi/server_show.go,
+  pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go,
+  pkg/ipsec/ike.go, pkg/ipsec/manager.go,
+  pkg/cli/command_output_termsafe_6584_test.go,
+  pkg/ipsec/sa_status_termsafe_6584_test.go, pkg/cli/README.md
+
 ## 2026-08-22 — #6612 destination-scoped junos-host permit: the missing advisory clause
 
 - **Timestamp**: 2026-08-22
@@ -102314,3 +102384,26 @@ prose edit above them added. No diff falls in the new test body.
     path-qualified (secret under snmp, a BGP route-target name elsewhere).
   - **File(s)**: pkg/config/secret.go, pkg/config/freetext.go,
     pkg/config/secret_in_error_6625_test.go
+
+- **Timestamp**: 2026-08-22
+  - **Action**: #6626 + #6627 — the heatmap hard gate could return "ok (cached)"
+    on a real threshold crossing (working tree is not a go test cache input);
+    make test-go now runs pkg/refactoraudit uncached, guarded by a Makefile
+    wiring test. #6627: a duplicated heatmap row is now rejected explicitly.
+  - **File(s)**: Makefile, pkg/refactoraudit/audit_canary_test.go
+
+## 2026-08-22 — #6639 cut re-stamps the kernel arm record
+- **Timestamp**: 2026-08-22
+- **Action**: An in-place binary cut repoints `current`, the sbin links and the
+  unit ExecStart but left the kernel arm record naming the OLD binary, so a
+  candidate boot refused. The refusal fires in the POSIX-sh OUTER hop (before it
+  execs anything), so the SIDECAR is what had to move — a Go-only change could
+  not fix it. Added step 6d inside `flip()` (after 6c, so a crash leaves today's
+  safe refusing state), gated on an ARMED journal, writing sidecar + journal
+  field from one value with `fsatomic.WriteFileDurable`, fail-closed. Left
+  `VerifyPromoteBinaryMatchesRecord` and the shell untouched: relaxing the
+  comparison would re-admit the stale leftover #6601 exists to eliminate.
+  Consequence was worse than filed — the journal is never cleared, so the gate
+  re-refuses every boot and an HA node holds SECONDARY indefinitely.
+- **File(s)**: pkg/upgrade/flip.go, pkg/upgrade/kernel.go,
+  pkg/upgrade/kernel_arm_restamp_6639_test.go (new), _Log.md

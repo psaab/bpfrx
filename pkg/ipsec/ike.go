@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // dpdSettings holds the resolved dead-peer-detection parameters for a
@@ -676,7 +678,7 @@ func (m *Manager) ActiveConnectionNames() ([]string, error) {
 // InitiateConnection initiates a single IPsec connection by name.
 func (m *Manager) InitiateConnection(name string) error {
 	if out, err := runSwanctl("--initiate", "--child", name); err != nil {
-		return fmt.Errorf("swanctl --initiate %s: %w: %s", name, err, string(out))
+		return fmt.Errorf("swanctl --initiate %s: %w: %s", name, err, termsafe.SanitizeForDisplay(string(out)))
 	}
 	return nil
 }
@@ -695,10 +697,19 @@ func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, stderr.String())
+		// #6584: the error string reaches a terminal on both renderers
+		// (pkg/cli prints "error: %v", the gRPC status is re-wrapped and
+		// printed by cmd/cli), so raw swanctl stderr is the same class.
+		return nil, fmt.Errorf("swanctl --list-sas: %w: %s", err, termsafe.SanitizeForDisplay(stderr.String()))
 	}
 
-	return parseSAOutput(stdout.String()), nil
+	sas := parseSAOutput(stdout.String())
+	// #6584: sanitize once, here, so every renderer (local CLI, gRPC mirror,
+	// and any future one) is covered by construction.
+	for i := range sas {
+		sanitizeSAStatus(&sas[i])
+	}
+	return sas, nil
 }
 
 // parseSAOutput parses the human-readable output of `swanctl --list-sas`
@@ -725,6 +736,47 @@ func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 // of this parser assumed an "ipsec statusall"-style layout (local: A === B /
 // local_ts = C / bytes_in=N) that swanctl never emits, so every SA field but
 // the name/state came back blank (#3937).
+// sanitizeSAStatus neutralizes terminal control sequences in every field of a
+// parsed swanctl SA record (#6584).
+//
+// It runs at INGEST rather than at each renderer, because the alternative is
+// roughly two dozen guard sites: `show security ipsec security-associations`
+// and its `detail` form print thirteen fields per SA one line at a time, the
+// statistics view prints a width-formatted row, and every one of those has a
+// byte-for-byte gRPC mirror. #6579's own review recorded what happens to a
+// sweep that wide -- "reverting all 14 call-site edits left the suite green,
+// because the only test file exercised the primitive" -- and the miss it
+// actually shipped was an entire renderer. One choke point cannot be
+// half-applied, and it covers a renderer added later for free. The tree
+// already accepts this shape: LLDP is sanitized at ingest for the same reason.
+//
+// SanitizeForDisplay (single-line) is right for every field here: these are
+// FIELDS the callers format into rows, so an embedded LF is itself a forgery
+// vector -- it fakes a row.
+//
+// Guarding the WHOLE record, not the fields believed to be peer-controlled, is
+// the #6579 rule. The parser is strings.Split/Fields-based, so which swanctl
+// column lands in which struct field is a property of the CURRENT strongSwan
+// output format, not an invariant. Today RemoteTS/LocalTS carry the traffic
+// selectors the peer proposed and parseEndpointHost discards the quoted peer
+// IKE identity; neither fact is guaranteed by anything in this repo.
+func sanitizeSAStatus(sa *SAStatus) {
+	sa.Name = termsafe.SanitizeForDisplay(sa.Name)
+	sa.ConnectionName = termsafe.SanitizeForDisplay(sa.ConnectionName)
+	sa.LocalAddr = termsafe.SanitizeForDisplay(sa.LocalAddr)
+	sa.RemoteAddr = termsafe.SanitizeForDisplay(sa.RemoteAddr)
+	sa.State = termsafe.SanitizeForDisplay(sa.State)
+	sa.LocalTS = termsafe.SanitizeForDisplay(sa.LocalTS)
+	sa.RemoteTS = termsafe.SanitizeForDisplay(sa.RemoteTS)
+	sa.InBytes = termsafe.SanitizeForDisplay(sa.InBytes)
+	sa.OutBytes = termsafe.SanitizeForDisplay(sa.OutBytes)
+	sa.InPackets = termsafe.SanitizeForDisplay(sa.InPackets)
+	sa.OutPackets = termsafe.SanitizeForDisplay(sa.OutPackets)
+	sa.SPIIn = termsafe.SanitizeForDisplay(sa.SPIIn)
+	sa.SPIOut = termsafe.SanitizeForDisplay(sa.SPIOut)
+	sa.Rekey = termsafe.SanitizeForDisplay(sa.Rekey)
+}
+
 func parseSAOutput(output string) []SAStatus {
 	var sas []SAStatus
 	var currentConn *SAStatus

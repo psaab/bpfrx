@@ -217,6 +217,27 @@ presenter's rendered output is byte-identical:
   Escaping LF but passing U+2028 in the field variant would be incoherent: that
   variant is the stricter of the two about line breaks.
 
+  **Command output and swanctl SAs (#6584).** `show log` / `show log <name>`
+  / `show system boot-messages` and their `ShowText` / `GetSystemInfo`
+  mirrors block-sanitize their `journalctl` / `tail` stdout — the syslog
+  stream carries the very DHCP lease hostnames #6468 was filed about, so
+  reading the LOG bypassed the sanitized lease table. The IPsec SA views
+  are the PARSED-ROW class, not the raw-block class the issue assumed
+  (`stdout` never reaches a terminal; the parsed fields do), so they are
+  guarded once at INGEST in `pkg/ipsec` — thirteen fields across four
+  renderers is exactly the width of sweep that ships half-applied.
+
+  `TestEveryCommandOutputDisplaySiteIsSanitizedOrDeclared6584`
+  (`pkg/cli`) is the mechanism that was missing: every function that
+  forks an external command must apply at least as many `termsafe` calls
+  as it makes forks, or appear in `declaredUnsanitizedForks` with a
+  reason. The count is RELATIVE on purpose — deleting a fork lowers the
+  requirement, so it cannot go vacuous the way an absolute count does,
+  while deleting a sanitize still reds. It fails in BOTH directions, so a
+  stale exemption is caught too. Streaming sites (`tcpdump`, `ping`,
+  `traceroute`) are exempted with the reason they need a shape change to
+  a line-wise writer before they can be guarded at all.
+
   **The guard goes on BOTH terminal-facing renderers.** Every one of these
   commands runs on the local CLI *and* the remote `cli`, which prints
   `resp.Output` verbatim (`cmd/cli`: `fmt.Print(resp.Output)`); a fix on one

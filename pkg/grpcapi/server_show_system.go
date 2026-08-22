@@ -36,6 +36,8 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // showVersion renders daemon version, hostname, kernel, and uptime.
@@ -294,14 +296,14 @@ func (s *Server) showNTP(ctx context.Context, buf *strings.Builder) {
 	// step only runs because the previous binary failed, and the
 	// request ctx still cancels the whole chain on client disconnect.
 	if out, err := combinedOutputTimeout(ctx, "chronyc", "tracking"); err == nil {
-		writeChronyTracking(buf, string(out))
+		writeChronyTracking(buf, termsafe.SanitizeBlockForDisplay(string(out)))
 		if src, err := combinedOutputTimeout(ctx, "chronyc", "-n", "sources"); err == nil {
-			fmt.Fprintf(buf, "\nNTP sources:\n%s", string(src))
+			fmt.Fprintf(buf, "\nNTP sources:\n%s", termsafe.SanitizeBlockForDisplay(string(src)))
 		}
 	} else if out, err := combinedOutputTimeout(ctx, "ntpq", "-pn"); err == nil {
-		fmt.Fprintf(buf, "\nNTP peers:\n%s\n", string(out))
+		fmt.Fprintf(buf, "\nNTP peers:\n%s\n", termsafe.SanitizeBlockForDisplay(string(out)))
 	} else if out, err := combinedOutputTimeout(ctx, "timedatectl", "show", "--property=NTPSynchronized", "--value"); err == nil {
-		fmt.Fprintf(buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
+		fmt.Fprintf(buf, "\nNTP synchronized: %s\n", termsafe.SanitizeForDisplay(strings.TrimSpace(string(out))))
 	}
 }
 
