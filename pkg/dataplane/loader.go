@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,9 +42,16 @@ type Manager struct {
 	// publishShimRegistryLocked's whole-batch m.mu hold; Store(false)
 	// runs at Close()'s ENTRY. It is an admission bit, NOT a lease — it
 	// cannot drain an operation that already observed true.
-	loaded                  atomic.Bool
-	programs                map[string]*ebpf.Program
-	maps                    map[string]*ebpf.Map
+	loaded   atomic.Bool
+	programs map[string]*ebpf.Program
+	maps     map[string]*ebpf.Map
+	// xdpLinks / tcLinks / vlanSubInterfaces are ALL guarded by m.mu (#6740).
+	// The 1 Hz userspace status path ranges them while CompileUserspaceShim /
+	// AttachXDP / DetachXDP mutate them, and a concurrent Go map read+write is
+	// a fatal runtime.throw, not a torn value. Every accessor below returns a
+	// SNAPSHOT rather than the live map: handing out the map by reference put
+	// the range loop outside any lock the accessor could take, which is how the
+	// race survived the #2114 A3 registry rule.
 	xdpLinks                map[int]link.Link
 	tcLinks                 map[int]link.Link
 	lastCompile             *CompileResult
@@ -53,7 +61,7 @@ type Manager struct {
 	PersistentNAT           *PersistentNATTable
 	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 	xdpEntryProg            string
-	VlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these)
+	vlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these); guarded by m.mu (#6740)
 	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets; #2114 A3: also the uniform m.maps/m.programs registry rule (every access goes through the lookupMapLocked/lookupProgramLocked scoped helpers, classification + handle selection atomic inside) and the xdpEntryProg field
 	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
 	// natRuleCounterOffsets holds per-rule NAT translation hit totals reported
@@ -111,7 +119,7 @@ func New() *Manager {
 		tcLinks:           make(map[int]link.Link),
 		PersistentNAT:     NewPersistentNATTable(),
 		xdpEntryProg:      defaultXDPEntryProg,
-		VlanSubInterfaces: make(map[int]bool),
+		vlanSubInterfaces: make(map[int]bool),
 		xdpFlagClaims:     make(map[IfaceZoneKey]map[int]bool),
 	}
 }
@@ -279,11 +287,7 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	// the exported LastCompileResult() for a diagnostic's benefit.
 	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
-	for ifidx := range result.genericXDPIfindexes {
-		if !result.tunnelIfindexes[ifidx] {
-			m.VlanSubInterfaces[ifidx] = true
-		}
-	}
+	m.markVLANSubInterfaces(result)
 	m.lastCompile = result
 	m.recordApplyResult(ApplyResultFromCompileResult(result))
 	return result, nil
@@ -581,7 +585,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		return fmt.Errorf("%s not found", entryProg)
 	}
 
-	if _, exists := m.xdpLinks[ifindex]; exists {
+	if _, exists := m.xdpLinkFor(ifindex); exists {
 		return fmt.Errorf("XDP already attached to ifindex %d", ifindex)
 	}
 
@@ -595,7 +599,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	// (which re-claims the surface based on m.xdpLinks[ifindex] and
 	// sets the bit accordingly).
 	defer func() {
-		if _, ok := m.xdpLinks[ifindex]; ok {
+		if _, ok := m.xdpLinkFor(ifindex); ok {
 			if err := m.setXDPAttachedFlag(ifindex, true); err != nil {
 				slog.Warn("AttachXDP: failed to set IFACE_FLAG_XDP_ATTACHED — tunnel-egress bypass will deny until next SetZone",
 					"ifindex", ifindex, "err", err)
@@ -615,7 +619,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	if existing, err := link.LoadPinnedLink(pinFile, nil); err == nil {
 		if xdpAttachModeMatches(ifindex, forceGeneric) {
 			if err := existing.Update(prog); err == nil {
-				m.xdpLinks[ifindex] = existing
+				m.setXDPLink(ifindex, existing)
 				slog.Info("updated pinned XDP link", "ifindex", ifindex)
 				return nil
 			}
@@ -656,7 +660,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 		slog.Warn("failed to pin XDP link", "ifindex", ifindex, "err", err)
 	}
 
-	m.xdpLinks[ifindex] = l
+	m.setXDPLink(ifindex, l)
 	m.seedInterfaceCounter(ifindex)
 	mode := "native"
 	if forceGeneric {
@@ -706,17 +710,22 @@ func (m *Manager) swapXDPEntryProg(name string) error {
 	if currentEntry == name {
 		return nil // already using this program
 	}
+	// #6740: take the swap targets as ONE snapshot under m.mu — both maps
+	// together, so the VLAN skip is decided against the same instant the link
+	// set was read — then run the BPF updates on that snapshot with the lock
+	// RELEASED. Holding m.mu across l.Update() would put a BPF syscall inside
+	// the same lock the 1 Hz status path needs, which is the thing this section
+	// exists to avoid.
+	//
+	// Skipping VLAN sub-interfaces: the parent's XDP handles VLAN-tagged
+	// traffic. Swapping the shim onto VLAN sub-interfaces breaks NDP because
+	// generic XDP + XDP_PASS doesn't properly deliver to the kernel's IPv6 NDP
+	// stack on VLAN devices.
+	targets := m.xdpSwapTargets()
 	var errs []error
-	for ifindex, l := range m.xdpLinks {
-		// Skip VLAN sub-interfaces: the parent's XDP handles VLAN-tagged
-		// traffic. Swapping the shim onto VLAN sub-interfaces breaks NDP
-		// because generic XDP + XDP_PASS doesn't properly deliver to the
-		// kernel's IPv6 NDP stack on VLAN devices.
-		if m.VlanSubInterfaces[ifindex] {
-			continue
-		}
-		if err := l.Update(prog); err != nil {
-			errs = append(errs, fmt.Errorf("swap XDP on ifindex %d: %w", ifindex, err))
+	for _, t := range targets {
+		if err := t.link.Update(prog); err != nil {
+			errs = append(errs, fmt.Errorf("swap XDP on ifindex %d: %w", t.ifindex, err))
 		}
 	}
 	if len(errs) > 0 {
@@ -731,14 +740,14 @@ func (m *Manager) swapXDPEntryProg(name string) error {
 	}
 	m.xdpEntryProg = name
 	m.mu.Unlock()
-	slog.Info("swapped XDP entry program", "program", name, "interfaces", len(m.xdpLinks))
+	slog.Info("swapped XDP entry program", "program", name, "interfaces", len(targets))
 	return nil
 }
 
 // DetachXDP detaches the XDP program from the given interface and
 // removes its pin file.
 func (m *Manager) DetachXDP(ifindex int) error {
-	l, exists := m.xdpLinks[ifindex]
+	l, exists := m.xdpLinkFor(ifindex)
 	if !exists {
 		return nil
 	}
@@ -759,7 +768,7 @@ func (m *Manager) DetachXDP(ifindex int) error {
 	// or not Close errored. Remove from m.xdpLinks so a retry doesn't
 	// infinite-loop on a stuck-close link, but surface the close
 	// error.
-	delete(m.xdpLinks, ifindex)
+	m.deleteXDPLink(ifindex)
 	if closeErr != nil {
 		return fmt.Errorf("detach XDP from ifindex %d: %w", ifindex, closeErr)
 	}
@@ -956,7 +965,7 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 	// it even though parent XDP runs on the surface.
 	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
 	claims := m.xdpFlagClaims[key]
-	if _, parentAttached := m.xdpLinks[ifindex]; parentAttached {
+	if _, parentAttached := m.xdpLinkFor(ifindex); parentAttached {
 		if claims == nil {
 			claims = make(map[int]bool)
 			m.xdpFlagClaims[key] = claims
@@ -1207,7 +1216,7 @@ func (m *Manager) AttachTC(ifindex int) error {
 		return fmt.Errorf("tc_main_prog not found")
 	}
 
-	if _, exists := m.tcLinks[ifindex]; exists {
+	if _, exists := m.tcLinkFor(ifindex); exists {
 		return fmt.Errorf("TC already attached to ifindex %d", ifindex)
 	}
 
@@ -1215,7 +1224,7 @@ func (m *Manager) AttachTC(ifindex int) error {
 	pinFile := filepath.Join(linkPinPath, fmt.Sprintf("tc_%d", ifindex))
 	if existing, err := link.LoadPinnedLink(pinFile, nil); err == nil {
 		if err := existing.Update(prog); err == nil {
-			m.tcLinks[ifindex] = existing
+			m.setTCLink(ifindex, existing)
 			slog.Info("updated pinned TC link", "ifindex", ifindex)
 			return nil
 		}
@@ -1240,7 +1249,7 @@ func (m *Manager) AttachTC(ifindex int) error {
 		slog.Warn("failed to pin TC link", "ifindex", ifindex, "err", err)
 	}
 
-	m.tcLinks[ifindex] = l
+	m.setTCLink(ifindex, l)
 	slog.Info("attached TC egress program", "ifindex", ifindex)
 	return nil
 }
@@ -1248,7 +1257,7 @@ func (m *Manager) AttachTC(ifindex int) error {
 // DetachTC detaches the TC program from the given interface and
 // removes its pin file.
 func (m *Manager) DetachTC(ifindex int) error {
-	l, exists := m.tcLinks[ifindex]
+	l, exists := m.tcLinkFor(ifindex)
 	if !exists {
 		return nil
 	}
@@ -1256,7 +1265,7 @@ func (m *Manager) DetachTC(ifindex int) error {
 	if err := l.Close(); err != nil {
 		return fmt.Errorf("detach TC from ifindex %d: %w", ifindex, err)
 	}
-	delete(m.tcLinks, ifindex)
+	m.deleteTCLink(ifindex)
 	slog.Info("detached TC egress program", "ifindex", ifindex)
 	return nil
 }
@@ -1321,12 +1330,188 @@ func (m *Manager) LastCompileResult() *CompileResult {
 	return m.lastCompile
 }
 
+// XDPLinks returns a SNAPSHOT of the attached XDP links (#6740).
+//
+// It used to return the live map by reference, which put every caller's range
+// loop outside any lock this accessor could take — the 1 Hz userspace status
+// path ranged it while CompileUserspaceShim/AttachXDP/DetachXDP mutated it, and
+// a concurrent Go map read+write is a fatal runtime.throw. A copy is the only
+// shape that makes the caller's loop safe without exporting the lock.
+//
+// The copy also makes the detach-while-ranging loop in
+// pkg/dataplane/userspace (manager_compile.go, which calls DetachXDP for each
+// non-data ifindex it iterates) operate on a stable set rather than the map it
+// is mutating.
 func (m *Manager) XDPLinks() map[int]link.Link {
-	return m.xdpLinks
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return maps.Clone(m.xdpLinks)
 }
 
+// TCLinks returns a SNAPSHOT of the attached TC links, for the same reason as
+// XDPLinks — the sibling map has the identical exposure through the identical
+// accessor, and fixing one while leaving the other is a half-fix.
 func (m *Manager) TCLinks() map[int]link.Link {
-	return m.tcLinks
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return maps.Clone(m.tcLinks)
+}
+
+// xdpSwapTarget is one interface the entry-program swap must update.
+type xdpSwapTarget struct {
+	ifindex int
+	link    link.Link
+}
+
+// xdpSwapTargets snapshots the non-VLAN XDP links under a single m.mu hold, so
+// the link set and the VLAN-skip decision come from the SAME instant. The
+// caller runs its BPF updates on the returned slice with the lock released.
+func (m *Manager) xdpSwapTargets() []xdpSwapTarget {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]xdpSwapTarget, 0, len(m.xdpLinks))
+	for ifindex, l := range m.xdpLinks {
+		if m.vlanSubInterfaces[ifindex] {
+			continue
+		}
+		out = append(out, xdpSwapTarget{ifindex: ifindex, link: l})
+	}
+	return out
+}
+
+// XDPEntryPrograms returns ifindex -> attached XDP entry-program name for every
+// non-VLAN attached interface, read under ONE m.mu hold (#6740).
+//
+// This is what the 1 Hz userspace status path consumes. It exists as a single
+// accessor rather than three calls because the status path previously ranged
+// the live xdpLinks map, indexed the exported VlanSubInterfaces map and read
+// xdpEntryProg separately: three unsynchronised reads of state that mutates
+// under it. One lock gives a consistent view and removes the cross-package
+// reach into the manager's maps entirely.
+//
+// VLAN sub-interfaces are excluded: they are skipped during userspace-shim
+// swaps and may retain the parent's program, so reporting the entry program for
+// them would be a lie.
+func (m *Manager) XDPEntryPrograms() map[int]string {
+	if muAcquireProbeHook != nil {
+		muAcquireProbeHook("XDPEntryPrograms")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.xdpLinks) == 0 {
+		return nil
+	}
+	out := make(map[int]string, len(m.xdpLinks))
+	for ifindex := range m.xdpLinks {
+		if m.vlanSubInterfaces[ifindex] {
+			continue
+		}
+		out[ifindex] = m.xdpEntryProg
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// The per-entry helpers below exist so no call site touches the link maps
+// directly (#6740). Each takes m.mu and releases it immediately, so a caller
+// can do its netlink/BPF work between a read and the matching write without
+// ever holding the lock across a syscall — which is exactly the shape
+// DetachXDP needs (read the link, Close() it unlocked, then delete the entry).
+
+// markVLANSubInterfaces records the generic-XDP, non-tunnel ifindexes of a
+// compile as VLAN sub-interfaces, under m.mu (#6740).
+//
+// SINGLE-SOURCED on purpose. CompileUserspaceShim and Compile carried two
+// identical copies of this loop, and a divergence between them is always a bug:
+// both feed the same vlanSubInterfaces map that the entry-program swap and the
+// 1 Hz status path read. One definition also makes the lock testable — a
+// concurrent regression can call this directly, where it cannot drive
+// CompileUserspaceShim without a full config and real syscalls.
+//
+// The caller's attach work has completed by the time this runs, so no netlink
+// or BPF syscall is held under the lock.
+func (m *Manager) markVLANSubInterfaces(result *CompileResult) {
+	if result == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for ifidx := range result.genericXDPIfindexes {
+		if !result.tunnelIfindexes[ifidx] {
+			m.vlanSubInterfaces[ifidx] = true
+		}
+	}
+}
+
+func (m *Manager) xdpLinkFor(ifindex int) (link.Link, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.xdpLinks[ifindex]
+	return l, ok
+}
+
+func (m *Manager) setXDPLink(ifindex int, l link.Link) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.xdpLinks[ifindex] = l
+}
+
+func (m *Manager) deleteXDPLink(ifindex int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.xdpLinks, ifindex)
+}
+
+func (m *Manager) tcLinkFor(ifindex int) (link.Link, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.tcLinks[ifindex]
+	return l, ok
+}
+
+func (m *Manager) setTCLink(ifindex int, l link.Link) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tcLinks[ifindex] = l
+}
+
+func (m *Manager) deleteTCLink(ifindex int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.tcLinks, ifindex)
+}
+
+// SetLinkForTest records link membership without performing any attach, for
+// tests that need attached-link state but cannot issue netlink/BPF syscalls.
+//
+// It exists because #6740 made XDPLinks/TCLinks return SNAPSHOTS: tests used to
+// seed membership by writing through the returned map
+// (`m.bpfShim.XDPLinks()[ifindex] = l`), which silently became a write to a
+// throwaway copy. That is the correct trade — handing out the live map is what
+// made the 1 Hz status path racy — but it removes the only seeding path a
+// cross-package test had, so the seam is explicit rather than incidental.
+//
+// A nil link is recorded as-is: several arm-proof tests deliberately track an
+// ifindex whose handle cannot be dereferenced.
+func (m *Manager) SetLinkForTest(ifindex int, xdp, tc link.Link) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if xdp != nil {
+		m.xdpLinks[ifindex] = xdp
+	}
+	if tc != nil {
+		m.tcLinks[ifindex] = tc
+	}
+}
+
+// IsVLANSubInterface reports whether this ifindex was recorded as a VLAN
+// sub-interface, under m.mu (#6740).
+func (m *Manager) IsVLANSubInterface(ifindex int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.vlanSubInterfaces[ifindex]
 }
 
 // Close releases Go handles for eBPF resources but leaves pinned maps
@@ -1345,12 +1530,16 @@ func (m *Manager) Close() error {
 	if closeWindowHook != nil {
 		closeWindowHook()
 	}
-	for ifindex, l := range m.xdpLinks {
+	// #6740: snapshot both maps under m.mu, then Close() the handles with the
+	// lock released — l.Close() is a syscall and must not run under the lock
+	// the 1 Hz status path needs. Close deliberately does NOT clear the
+	// membership maps (see Teardown), so a snapshot is the whole interaction.
+	for ifindex, l := range m.XDPLinks() {
 		if err := l.Close(); err != nil {
 			slog.Error("failed to close XDP link handle", "ifindex", ifindex, "err", err)
 		}
 	}
-	for ifindex, l := range m.tcLinks {
+	for ifindex, l := range m.TCLinks() {
 		if err := l.Close(); err != nil {
 			slog.Error("failed to close TC link handle", "ifindex", ifindex, "err", err)
 		}
@@ -1377,8 +1566,13 @@ func (m *Manager) Close() error {
 func (m *Manager) Teardown() error {
 	m.Close()
 	err := teardownCleanupFn()
+	// #6740: scoped section around the clears. teardownCleanupFn's unpin/remove
+	// sweep runs BEFORE it, never under the lock.
+	m.mu.Lock()
 	clear(m.xdpLinks)
 	clear(m.tcLinks)
+	clear(m.vlanSubInterfaces)
+	m.mu.Unlock()
 	return err
 }
 
