@@ -1,3 +1,43 @@
+## 2026-08-21 — #5804: gre-performance-acceleration was reported as enabled while doing nothing
+
+- **Timestamp**: 2026-08-21 (fix/5804-gre-acceleration-advisory)
+- **Action**: Added the #2078/#4231 accepted-only commit advisory for
+  `security flow gre-performance-acceleration` and qualified both `show
+  security flow` surfaces, so the knob stops reading as a feature in force.
+- **File(s)**: `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/gre_acceleration_advisory_5804_test.go` (new),
+  `pkg/cli/cli_show_flow.go`, `pkg/grpcapi/server_show_flow.go`,
+  `pkg/grpcapi/show_flow_gre_5804_test.go` (new), `docs/feature-gaps.md`
+
+  The flag reaches `ForwardingState.gre_acceleration` and stops; no packet path
+  reads it. GRE is protocol 47 with no L4 ports, the shim stamps
+  `flow_src_port = flow_dst_port = 0`, and `SessionKey` has no tunnel
+  discriminator — so two GRE/PPTP tunnels between the same outer endpoints
+  share one session and its policy decision, NAT state, counters and timeout.
+  An operator enabling the knob is asking for exactly the opposite.
+
+  Every other accepted-only knob in the tree already warns (#2078 tcp-session,
+  #4231 flow knobs, #4299 vpn-monitor). This one did not, and the two `show`
+  surfaces printed an unqualified `enabled`, which is the stronger claim of the
+  two: commit output scrolls past, `show` is what an operator reads on a box
+  someone else configured. The advisory names the consequence rather than
+  saying "no effect" — a test asserts the wording contains both `5-tuple` and
+  `one session`, so a future edit cannot quietly reduce it to a generic
+  not-enforced line.
+
+  Mutation proof, each one line, each at a production-reachable site:
+  - `if flow.GREPerformanceAcceleration {` -> `if false && ...` in
+    validateSecurityFlowAcceptedOnly — exit=1, "no advisory names the knob";
+  - collapse the advisory text to a generic "does not enforce it" — exit=1,
+    both wording assertions red, quoting the weakened string.
+  Negative control in the same file: a config that does not set the knob must
+  not be warned about it, and the `show` test asserts no line is rendered when
+  it is unset, so neither fix is satisfiable by emitting unconditionally.
+
+  Control: `go test -count=1 ./pkg/config/ ./pkg/cli/ ./pkg/grpcapi/` exit=0,
+  `go vet` clean, `go build ./...` clean. Go-only; no dataplane binary moves,
+  so no cluster smoke is owed. The dataplane feature is #7188 and retires both
+  the advisory and the `show` qualifier.
 ## 2026-08-21 — #5858: tightening an interface input filter reported clean while established sessions kept forwarding
 
 - **Timestamp**: 2026-08-21 (fix/5858-filter-change-advisory)
@@ -98902,6 +98942,102 @@ prose edit above them added. No diff falls in the new test body.
   "long-window-first fired at [2], short-window-first fired at [2 102]".
 - **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/README.md,
   pkg/eventengine/within_clause_order_7223_test.go, _Log.md
+
+- **Timestamp**: 2026-08-21
+- **Action**: Bound the push-time RG0 authority gate in `syncConfigToPeer`
+  (#5962's push-time half). Measured at `8d7190b4a`: deleting
+  `if !rg0ConfigSyncAuthority(d.cluster) { return }` from `syncConfigToPeer`
+  left `go vet ./pkg/daemon/` clean and `go test -count=1 ./pkg/daemon/`
+  GREEN — exit 0, zero failures. The gate was entirely unbound, and it is the
+  only thing that makes #5962's DEMOTION direction safe: production leaves
+  `d.syncPeerForTest` nil, so the single commit-path push route is
+  `applyAndSyncCommitted` -> `pushCommittedConfigToPeer` -> `syncConfigToPeer`,
+  and a node demoted between the attempt-time gate and the push would otherwise
+  overwrite the config of the node that now owns RG0. The new cells drive that
+  production route rather than the `syncPeerForTest` seam, which short-circuits
+  `pushCommittedConfigToPeer` and never reaches the gate at all; the observable
+  is the #5863 reconcile marker, which `pushConfigToPeer` stamps only after it
+  has committed to pushing. A zero-value `cluster.SessionSync` clears the
+  transport-presence guards without a socket (`QueueConfig` no-ops with no
+  active conn).
+
+  Test-only. No behavior change, so no operator-facing doc changes; the
+  invariant is documented at the gate's own doc comment and expanded in the
+  test file header.
+
+  Validation: `go vet ./pkg/daemon/` exit 0; `go test -count=1 ./pkg/daemon/`
+  exit 0 (full package, with the new file). Mutation, one mutation, exit code
+  captured from `$?`: delete the `rg0ConfigSyncAuthority` re-check from
+  `syncConfigToPeer` -> exit 1, `--- FAIL` on
+  `non-authority:_must_not_reach_the_push` while
+  `authority:_reaches_the_push_(control)` stays PASS — the red localises to the
+  asserted cell and the control proves the fixture reaches the push body.
+  Go-only, `pkg/daemon`; nothing reaches the Rust helper binary, so no cluster
+  smoke is owed.
+- **File(s)**: pkg/daemon/configsync_pushgate_5962_test.go, _Log.md
+
+## 2026-08-21 — #5618 WireGuard plaintext commit-time advisory
+
+- **Timestamp**: 2026-08-21
+- **Action**: Add the #5618 commit-time advisory that a WireGuard tunnel's
+  decapsulated plaintext is NOT evaluated against xpf security policies, and
+  record BOTH tunnel-plaintext adjudication gaps (#5618 WireGuard, #5619
+  IPsec) in `docs/userspace-dataplane-gaps.md`.
+
+  Reason: the XDP shim steers inbound WireGuard transport to the kernel
+  (#5582) and the helper's WG control thread writes the decrypted inner
+  packet straight to the `wgN` TUN
+  (`slowpath::write_packet_nonblocking`, wg_control/dispatch.rs), where
+  Linux routing forwards it — no zone policy, no session, no NAT, no
+  screen. `set security zones security-zone vpn interfaces wg0.0` commits
+  cleanly and READS as enforced. `allowed-ips` is a cryptographic
+  inner-source ownership gate, not a policy.
+
+  Implementation: `warnWireGuardPlaintextUnadjudicatedAST` is an AST
+  pre-walk run from compileExpanded (group-expanded, inactive-pruned), so
+  it fires on strict commit, lenient restart/peer-sync, and both HA node
+  views. It CANNOT reject — no error return, no `lenient` flag — so the
+  #1960 no-brick property is structural. ONE aggregated advisory per
+  commit, split into a ZONED (escalated) group and an unzoned group, with
+  the #6682 "unzoning is not a mitigation" caveat emitted only when an
+  unzoned tunnel exists. Keyed on the tunnel MODE
+  (`astTunnelModeWireguard`, the compiler's own extraction), never on the
+  `wg` name shape; GRE is deliberately NOT warned about because gre.rs
+  decaps inside the worker pipeline and rebinds ingress_ifindex/zone.
+  Coupling to the dataplane exclusion measured firsthand: rows wg0.0, wg1
+  and wg1.0 all report exclusion class "Tunnel" and
+  userspaceSkipsIngressInterface=true.
+
+  Shared with the #5619 IPsec advisory in
+  `compiler_tunnel_plaintext_advisory.go`, on one rule — share where a
+  divergence would ALWAYS be a bug: `forEachZoneInterfaceMemberAST`
+  (zone-membership enumeration through the compiler's own flattener, so
+  the #2419/#5248 bracket collapse cannot be re-derived differently by two
+  readers) and `renderPlaintextUnadjudicatedAdvisory` (one advisory per
+  commit, stable total sort, zoned/unzoned partition, group headings,
+  #6682 caveat). The finding walk and every protocol-specific sentence
+  stay separate. The IPsec advisory's rendered text is byte-identical.
+
+  Validation: `go build ./...` exit 0; `go vet ./pkg/config/...` exit 0;
+  `go test -count=1 ./pkg/config/...` exit 0 (39.7s), plus
+  `./pkg/configstore/... ./pkg/dataplane/... ./pkg/policymatch/...
+  ./pkg/cli/...` exit 0. Mutation matrix, one mutation per cell, exit
+  codes read from `$?` directly: (1) neutralize the advisory at its only
+  call site in compileExpanded → exit 1, "want exactly 1 #5618 advisory,
+  got 0" across every positive cell while both negative controls stayed
+  green; (2) read only the FIRST zone member in the shared walker,
+  reproducing the #2419 bracket collapse → exit 1 with "a bracketed zone
+  member lost its zone clause (1 of 2 present)" on the WG bracket test and
+  the matching #5619 assertion on the IPsec one. Restore control green.
+
+  Go-only diff: `git diff --stat origin/master` touches no `.rs` file and
+  no compiled artifact, so no cluster smoke is owed.
+- **File(s)**: pkg/config/compiler_tunnel_plaintext_advisory.go,
+  pkg/config/compiler_wireguard_plaintext_warn.go,
+  pkg/config/compiler_wireguard_plaintext_warn_5618_test.go,
+  pkg/config/compiler_ipsec_plaintext_warn.go,
+  pkg/config/compiler_prewalk.go, docs/userspace-dataplane-gaps.md,
+  _Log.md
 
 ## 2026-08-21 — #5838 userspace helper crash supervision
 
