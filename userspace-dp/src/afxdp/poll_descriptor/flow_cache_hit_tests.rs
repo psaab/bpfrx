@@ -717,6 +717,10 @@ impl LiveCallSiteFixture {
 /// on lifted out of the UMEM's lifetime.
 struct StageRun {
     outcome: FlowCacheOutcome,
+    /// #5190: the flow cache's own (hits, misses, evictions) tallies read
+    /// IMMEDIATELY after the call — before the `cached_observed_bytes`
+    /// probe below, whose `lookup` would itself move them.
+    flow_cache_tallies: (u64, u64, u64),
     tx_pipeline: WorkerTxPipeline,
     tx_counters: WorkerTxCounters,
     scratch: WorkerScratch,
@@ -874,6 +878,13 @@ fn run_stage_with_entry(
         &mut telemetry,
     );
     let admission_attempts = crate::afxdp::binding_state::pending_tx_admission_attempts();
+    // #5190: snapshot the cache tallies BEFORE the observed-bytes probe
+    // below — that probe calls `lookup`, which bumps hits/misses itself.
+    let flow_cache_tallies = (
+        flow_state.flow_cache.hits,
+        flow_state.flow_cache.misses,
+        flow_state.flow_cache.evictions,
+    );
     // #6304: lift the staged TX bytes out of the UMEM before the mapping dies
     // with this function's frame.
     let tx_frame = tx_pipeline_state
@@ -897,6 +908,7 @@ fn run_stage_with_entry(
 
     StageRun {
         outcome,
+        flow_cache_tallies,
         tx_pipeline: tx_pipeline_state,
         tx_counters: tx_counters_state,
         scratch: scratch_state,
@@ -2256,5 +2268,82 @@ fn live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304() {
         "#6304: a hit ADDS this packet to the flow's running total — reading \
          back the seed alone means the call site passed 0, and reading back the \
          packet length alone means the count was assigned rather than folded"
+    );
+}
+
+/// #5190 (A1-b1-F6) FAIL-ON-REVERT at the LIVE call site: a cached candidate
+/// that the caller's DYNAMIC validation rejects must NOT be published as a
+/// served flow-cache hit.
+///
+/// `lookup_counted` commits `hits += 1` the moment key/generation/epoch/lease
+/// pass, because it has to hand out a borrow of the entry and cannot hold a
+/// mutable borrow across the caller's own checks. The caller then re-tests the
+/// per-shard neighbor MAC epoch (#3048/#5147) and the HA/fabric decision, and
+/// on failure evicts the slot and falls through to the slow path — so the
+/// packet was never served from the cache. Before #5190 it was still counted
+/// as a hit, inflating the published hit rate during exactly the events
+/// (gateway VRRP failover, NIC swap, RG transition) an operator reads it to
+/// diagnose.
+///
+/// The fixture forces the neighbor-MAC-stale rejection by stamping the cached
+/// entry against a REAL shard at a MAC epoch the live map has never reached.
+/// Deleting `reclassify_hit_as_miss` turns the hits/misses assertions RED; the
+/// `FallThrough` assertion stays green either way, which is what proves the
+/// two are independent.
+#[test]
+fn live_flow_cache_callsite_rejected_candidate_is_not_a_hit_5190() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    let meta = test_meta(&frame);
+    let mut entry = cached_entry();
+    // Stamp a real shard at an epoch the live neighbor map never reached ->
+    // `neighbor_mac_epoch_stale` is true -> the caller rejects the candidate.
+    entry.neighbor_shard = 0;
+    entry.neighbor_mac_epoch = 0xDEAD_BEEF;
+    let run = run_stage_with_entry(&fixture, &frame, meta, entry, 0);
+
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::FallThrough),
+        "a MAC-stale cached descriptor must fall through to full slow-path \
+         resolution (#3048/#5147) — the fixture is not reaching the reject \
+         branch, so the tallies below would prove nothing"
+    );
+    let (hits, misses, evictions) = run.flow_cache_tallies;
+    assert_eq!(
+        hits, 0,
+        "#5190: a candidate the caller REJECTED was never served from the \
+         cache and must not be published as a flow-cache hit"
+    );
+    assert_eq!(
+        misses, 1,
+        "#5190: the rejected candidate must be accounted as a miss — the \
+         packet went to the slow path"
+    );
+    assert_eq!(
+        evictions, 1,
+        "#5190: the rejected candidate's slot was evicted; the eviction \
+         tally must show it"
+    );
+}
+
+/// #5190 control: an ACCEPTED cached candidate still counts as exactly one
+/// hit and zero misses. Without this, `reclassify_hit_as_miss` could be
+/// mis-wired onto the accept path (or `hits += 1` deleted outright) and the
+/// rejection test above would still pass.
+#[test]
+fn live_flow_cache_callsite_served_hit_still_counts_as_a_hit_5190() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    let run = run_stage(&fixture, &frame, 0);
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "the unmodified fixture must take the served-hit path"
+    );
+    let (hits, misses, evictions) = run.flow_cache_tallies;
+    assert_eq!(hits, 1, "a served cache hit must count as exactly one hit");
+    assert_eq!(misses, 0, "a served cache hit must not count as a miss");
+    assert_eq!(
+        evictions, 0,
+        "a served cache hit must not count as an eviction"
     );
 }

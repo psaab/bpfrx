@@ -7,7 +7,7 @@
 // commit paths (gRPC / REST / local shell) route through commitAndApplyOperator
 // / commitConfirmedAndApplyOperator, which derive the decision from RG0
 // ownership (rg0ConfigSyncAuthority) rather than a per-transport constant. The
-// autonomous event-options engine keeps its explicit opt-out (syncPeer=false)
+// autonomous event-options engine keeps its explicit opt-out (peerSyncNever)
 // because each node fires remediation independently from its own RPM events.
 //
 // These tests pin (1) the pure decision function across the cluster-state table,
@@ -22,7 +22,7 @@
 // FAIL-ON-REVERT: reverting commitAndApplyOperator itself (or neutralizing
 // rg0ConfigSyncAuthority to always-false) turns TestOperatorCommit* and the
 // owner decision-table case RED. INDEPENDENTLY, reverting ANY ONE transport seam
-// in daemon_run.go back to commitAndApply(ctx, comment, false) — the exact #5054
+// in daemon_run.go back to commitAndApply(ctx, comment, peerSyncNever) — the exact #5054
 // regression — turns that transport's owner sub-case in
 // TestTransportCommitFnWiringSyncsPeerByRG0Ownership /
 // TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership RED (0 pushes on
@@ -186,17 +186,20 @@ func TestOperatorCommitDoesNotSyncWhenNonOwner(t *testing.T) {
 }
 
 // TestEventEngineCommitDoesNotSyncEvenWhenRG0Owner pins the autonomous
-// event-options opt-out: the engine commits with syncPeer=false directly, so
+// event-options opt-out: the engine commits with peerSyncNever directly, so
 // even on an RG0 owner it must NOT push its node-local remediation to the peer.
 func TestEventEngineCommitDoesNotSyncEvenWhenRG0Owner(t *testing.T) {
 	d, calls := newSyncProbeDaemon(t, clusterOwningRG0(t))
 
-	// The shape initEventEngine wires: commitAndApply with syncPeer=false.
-	if _, err := d.commitAndApply(t.Context(), "", false); err != nil {
+	// The shape initEventEngine wires: commitAndApply with peerSyncNever.
+	// #5962: peerSyncNever is a POLICY, not a resolved authority answer, so it
+	// stays false however ownership moves — which is the distinction the bool
+	// it replaced could not express.
+	if _, err := d.commitAndApply(t.Context(), "", peerSyncNever); err != nil {
 		t.Fatalf("commitAndApply(false): %v", err)
 	}
 	if *calls != 0 {
-		t.Fatalf("the event-engine opt-out (syncPeer=false) must NOT sync the peer even on an RG0 owner; got %d pushes", *calls)
+		t.Fatalf("the event-engine opt-out (peerSyncNever) must NOT sync the peer even on an RG0 owner; got %d pushes", *calls)
 	}
 }
 
@@ -215,7 +218,7 @@ func TestOperatorCommitConfirmedSyncsPeerWhenRG0Owner(t *testing.T) {
 
 // syncByOwnershipCases is the shared per-transport wiring table: an operator
 // commit must sync the peer IFF this node owns RG0, on every transport. The
-// owner case reds a transport reverted to a hardcoded syncPeer=false (the #5054
+// owner case reds a transport reverted to a hardcoded peerSyncNever (the #5054
 // regression); the non-owner / standalone cases red a hardcoded syncPeer=true.
 var syncByOwnershipCases = []struct {
 	name    string

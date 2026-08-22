@@ -29,12 +29,32 @@
 //     Codex round-4 finding #5).
 //   - owner_rg_export: collect Vec<Key> for a given owner-RG.
 //
-// Pass criterion: slab shape must NOT regress on the dominant
+// Pass criterion (READ BY A HUMAN, not enforced — see the #5190
+// banner below): slab shape must NOT regress on the dominant
 // slow-path lookups (reverse_nat, alias). Small regressions on
 // `lookup_forward` (<10ns, due to slab indirection) and
 // `owner_rg_export` (~2×, on a rare HA-failover path) are
 // accepted in exchange for the secondary-index payload
 // reduction (50-byte Key → 4-byte u32).
+//
+// ---------------------------------------------------------------------------
+// #5190 (A1-b12-F3) VERDICT STATUS: THIS BENCH IS EXPLORATORY — IT DOES NOT
+// GATE. It measures and PRINTS; it compares nothing against a threshold and
+// never exits non-zero. A severe regression here still exits 0, so a wrapper
+// that reads only the exit status learns NOTHING from running it. Read the
+// printed numbers.
+//
+// The benches in this crate that DO gate are `prefix_set_lookup.rs` and
+// `runtime_view_refresh.rs`: both compare a measured percentile against a
+// named threshold and call `std::process::exit(1)` on breach. Copy that shape
+// if this target is ever promoted to a real gate.
+//
+// Nothing in CI or the Makefile runs `cargo bench` — `make test-rust` builds
+// `--bins --tests` and deliberately EXCLUDES benches — so no automated gate is
+// currently reporting a false green from this file. The hazard this banner
+// closes is a human running it on the strength of the wording below and
+// reading exit 0 as a pass.
+// ---------------------------------------------------------------------------
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rustc_hash::{FxHashMap, FxHashSet};

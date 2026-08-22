@@ -332,18 +332,32 @@ func TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983(t *test
 		want    string
 	}{
 		{
-			// The reverse companion / peer-synced / host-outbound-GRE population.
-			name: "absent identity falls back to the ingress zone's interface",
+			// The reverse companion / peer-synced / host-outbound-GRE
+			// population, in a zone binding MORE THAN ONE interface
+			// (ge-0/0/8.0 and lo.50). #6987: the column used to print the
+			// FIRST of them as though it were the session's own interface.
+			// With nothing to distinguish the members it names the zone.
+			name: "absent identity in a multi-interface zone names the zone",
 			zone: ingressIfColumnTrustZoneID,
-			want: "ge-0/0/8.0",
+			want: "trust",
 		},
 		{
 			// A real binding the config cannot name any more: an interface
 			// deleted since install, or a tunnel/fabric ingress with no unit.
-			name:    "unnameable identity falls back to the ingress zone's interface",
+			name:    "unnameable identity in a multi-interface zone names the zone",
 			ifindex: 4242,
 			zone:    ingressIfColumnTrustZoneID,
-			want:    "ge-0/0/8.0",
+			want:    "trust",
+		},
+		{
+			// The over-reach control for the two rows above: with a SINGLE
+			// bound interface the zone approximation has exactly one answer,
+			// so it is not an approximation and the column still prints it.
+			// Without this row, blanking the column unconditionally would
+			// pass — and that is the failure the #4983 message below names.
+			name: "absent identity in a single-interface zone still names it",
+			zone: ingressIfColumnUntrustZoneID,
+			want: "ge-0/0/9.0",
 		},
 		{
 			// Last resort: the zone exists but binds nothing, so there is no
@@ -369,10 +383,12 @@ func TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983(t *test
 			for i, name := range got {
 				if name != tc.want {
 					t.Errorf("In-line If: column %d = %q, want %q — a session whose ingress "+
-						"identity cannot be resolved must still print an interface (or, with "+
-						"no interface bound, the zone). Blanking it hides the ingress column "+
-						"for every peer-synced and reverse-direction flow (#4983)",
-						i, name, tc.want)
+						"identity cannot be resolved must still print SOMETHING: the zone's "+
+						"interface where the zone binds exactly one, otherwise the zone "+
+						"itself. Blanking it hides the ingress column for every peer-synced "+
+						"and reverse-direction flow (#4983); naming one member of a "+
+						"multi-interface zone claims an interface the row cannot support "+
+						"(#6987)", i, name, tc.want)
 				}
 			}
 		})

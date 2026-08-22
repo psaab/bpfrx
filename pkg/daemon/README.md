@@ -47,7 +47,19 @@ usable. Two consequences the code makes explicit:
   for the drainer, which stayed captured at loop entry and kept draining a
   disowned backend at 10 Hz on the fast fallback branch) and re-installs
   its callbacks when a rollback + corrected re-arm replaces the stream
-  instance. `handleEventStreamFullResync` likewise resolves its session
+  instance. #7017: that last clause was true of the CLUSTERED loop only.
+  `runUserspaceEventStream`'s standalone (no-cluster) arm called
+  `wireUserspaceEventStreamCallbacks` and RETURNED with it, so it never ran
+  the `es != wired` re-install and a replacement stream on a standalone
+  daemon got no callbacks at all — its dataplane events accumulated in the
+  callback-not-ready queue, and RT_FLOW records stopped reaching `show
+  log`, syslog and the flow exporter until the daemon restarted. That arm
+  now runs `watchUserspaceEventStreamCallbacks`: the same 500 ms cadence
+  and the same first-wire behaviour, but it never returns and applies the
+  same instance-identity re-install every tick. It is registered on the run
+  WaitGroup, and `runShutdownSequence` calls `stop()` before `wg.Wait()`,
+  so it joins within one tick of shutdown.
+  `handleEventStreamFullResync` likewise resolves its session
   exporter from the cell on every call, so a full resync after a rollback
   + corrected re-arm exports from the CURRENT backend rather than the
   torn-down one (#6743 r2-B8, bound by
@@ -56,7 +68,9 @@ usable. Two consequences the code makes explicit:
   (REST); `daemon_ha_userspace_stream_live_test.go` drives the event-stream
   loop across a `setDataplane(nil)`, across a stream replacement, and —
   on the reconcile-cadence branch, which needs its own connected-stream
-  fixture — across a backend republication (#6743 r2-B3).
+  fixture — across a backend republication (#6743 r2-B3);
+  `daemon_standalone_stream_rewire_7017_test.go` is the standalone twin of
+  the stream-replacement case plus the shutdown join.
 
   The console-CLI site has TWO halves, and neither covers it alone
   (corrected in #6743 r2 — an earlier revision of this paragraph said the
@@ -797,6 +811,25 @@ based on PCI bus order plus the cluster node ID. RETH members match by
 `OriginalName=` (PCI kernel name), not `MACAddress=` — the MAC alternates
 between physical and virtual at boot, and `ensureRethLinkOriginalName()`
 auto-fixes stale `.link` files.
+
+It **returns an error when naming does not converge** (#5842). Every step
+that can fail — the `.link` write, the rename, and the `networkctl reload`
+— accumulates into one aggregate that `enumerateAndRenameInterfaces`
+joins and returns, mirroring the device-map path's `renameErrs` (#4956).
+The pass still COMPLETES on a failure rather than abandoning midway: a
+half-renamed NIC set is worse than a finished-and-reported one.
+
+`writeLinkFile` and `writeBootstrapFxp0Network` return `(changed, error)`
+for the same reason. A single `bool` made `false` mean BOTH "already
+correct, nothing to do" and "the write failed" — opposite facts under one
+value, so no caller could have distinguished them even if it wanted to.
+
+This matters beyond diagnostics: `maybeReapplyConfigArrivalNaming` consumes
+the one-shot `emptyHANamingPending` marker only when
+`applyStartupNamingForConfig` returns nil. Positional mode always returned
+nil, so a #4179 config-less HA node whose renames all failed burned its
+single retry and stayed on standalone names until a restart — the failure
+#4956 had already fixed for the mapped path, still open on the default one.
 
 `deriveKernelName()` synthesizes that predictable kernel name from a NIC's
 sysfs PCI address via `pciAddrToEnp()`, which mirrors systemd's
@@ -1856,7 +1889,12 @@ never lock an operator out of a remote box it manages.
   path and is DISTINCT from the userspace-dp `xpf_host_inbound_denies_total`
   (`GlobalCtrHostInboundDeny`, #3326) — they are not double counts. Before #3361
   these kernel drops were uncounted and `host_inbound_denies` stayed 0 even while
-  the firewall was actively denying control-plane traffic.
+  the firewall was actively denying control-plane traffic. The #5644 cold-boot
+  fail-closed FENCE re-creates that blind spot on purpose (it renders catch-all
+  DROPs with NO named counters), so `ReadHostInboundDenyCounters` reports the
+  present-but-counterless table as `HostInboundTableCounterless` and the API
+  marks that zero non-authoritative rather than publishing it (#5719). Adding a
+  named counter to the fence would silently re-certify the zero.
 
 ## RPM + ip-monitoring wiring (#1827)
 

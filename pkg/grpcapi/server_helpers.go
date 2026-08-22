@@ -13,7 +13,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
-	"google.golang.org/grpc/metadata"
 )
 
 // Command trees are defined in pkg/cmdtree (single source of truth).
@@ -375,10 +374,15 @@ func writeNeighSummary(buf *strings.Builder, neighbors []netlink.Neigh, stateFn 
 
 // --- SystemAction RPC ---
 
+// peerForwardedFromContext reports whether this request was forwarded by the
+// cluster peer.
+//
+// #5883: it reads the in-process capability (peer_marker_5883.go), NOT the
+// `x-peer-forwarded` header. Only the fabric listener's interceptor promotes
+// that header into the capability, and only after #4107 auth has accepted the
+// call; the loopback listener strips it and promotes nothing. A caller cannot
+// set a context value, so the marker is no longer forgeable by anyone who can
+// merely reach a listener.
 func peerForwardedFromContext(ctx context.Context) bool {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return false
-	}
-	return len(md.Get("x-peer-forwarded")) > 0
+	return peerMarkersFromContext(ctx).forwarded
 }

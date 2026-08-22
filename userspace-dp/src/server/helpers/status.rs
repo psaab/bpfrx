@@ -282,12 +282,21 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.debug_reconcile_stage = reconcile_stage;
     state.status.ha_groups = state.afxdp.ha_groups();
     // Report enabled when all bindings are registered+armed (XSKMAP slots
-    // populated). The per-queue xsk_rx_confirmed heartbeat gating handles
-    // queues whose XSK RQ hasn't been bootstrapped yet — those get XDP_PASS
-    // until they bootstrap naturally from background traffic.
-    // Previously this required all bindings to be `ready` (first RX packet
-    // received), which created a deadlock: ctrl=0 → XDP_PASS → no XSK RX
-    // → not ready → ctrl stays 0.
+    // populated), NOT when every binding is `ready` (first RX packet
+    // received). Requiring `ready` deadlocked bring-up: nothing is admitted
+    // to the queue until ctrl is enabled, and ctrl was not enabled until a
+    // packet had arrived, so the queue never became ready.
+    //
+    // A queue whose XSK RQ has not bootstrapped yet is covered by the fill
+    // ring being primed BEFORE bind, so the driver's initial NAPI posts WQEs
+    // immediately (see `maybe_touch_heartbeat`, which is why no
+    // `xsk_rx_confirmed` gating is applied to the heartbeat any more).
+    //
+    // What such a queue does NOT get is pass-through: the shim drops transit
+    // for a binding that is missing, not READY, or whose heartbeat slot is
+    // absent or stale, and a slot that was zero-initialised and never stamped
+    // reads as stale. Only proven local/control traffic passes while a queue
+    // is not carrying (#7233).
     state.status.enabled = state.status.forwarding_armed
         && state.status.capabilities.forwarding_supported
         && !state.status.bindings.is_empty()

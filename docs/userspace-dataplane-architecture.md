@@ -1314,6 +1314,23 @@ list still collapses to `MatchAny` via `from_prefixes`, but a mixed
 hand-built / mixed-version-decode legacy path; a normal Go v3 snapshot never
 uses the legacy field.
 
+**Duplicate tunnel-endpoint-id fail-closed (#5193).** `populate_tunnel_endpoints`
+preflights endpoint-id uniqueness across the whole snapshot BEFORE it inserts
+anything, and returns `SnapshotIntegrityError::TunnelEndpointDuplicateId` on a
+repeat of a nonzero id. The function maintains two independent indexes —
+`tunnel_endpoints` keyed by id and `tunnel_endpoint_by_ifindex` keyed by ifindex
+— so a duplicate id used to keep only the LAST row under that id while BOTH
+interfaces' ifindexes resolved to it: traffic on the losing interface
+encapsulated with the winner's outer source/destination/key. Running the check
+as a preflight (rather than mid-loop) is what keeps a rejected snapshot from
+leaving a half-populated forwarding state behind, matching the #3713 pattern
+below. The Go producer drops an id collision at build time (`usedIDs`, #1873),
+so a clean commit never trips this; it is the helper-boundary backstop for a
+corrupt / mixed-version peer-sync snapshot, alongside the #2410 TTL bound in the
+same function. Two rows naming ONE ifindex (distinct ids) is not an integrity
+failure — the first row keeps the ifindex index and the collision is logged,
+rather than the later row silently overwriting it.
+
 **Duplicate rule-identity fail-closed (#3713).** `parse_policy_state_with_counters`
 preflights rule-identity uniqueness BEFORE it allocates any per-rule hit counter
 or builds a `PolicyRule` entry — the FIRST validation in the function, so no
@@ -1923,6 +1940,20 @@ CPU 7: main thread + io_uring + kernel
 | Batched counters | ~0.5% CPU | Aggregate per-packet counts, flush atomically |
 | Cached resolution | ~0.8% CPU | Reuse forwarding decision from session entry |
 | NAPI busy polling | Latency | `SO_BUSY_POLL` reduces interrupt-to-userspace latency |
+
+**Busy-poll setup is best-effort and now says so (#5190).** After each AF_XDP
+bind the worker sets `SO_BUSY_POLL`, `SO_PREFER_BUSY_POLL` and
+`SO_BUSY_POLL_BUDGET`. Any of the three can legitimately be refused on a
+production box — `SO_PREFER_BUSY_POLL` requires `CAP_NET_ADMIN`,
+`SO_BUSY_POLL_BUDGET` requires it above the sysctl default, and all three are
+absent on old kernels — so a refusal is deliberately NOT fatal to the bind. It
+does, however, mean the worker runs on the kernel's default NAPI/poll semantics
+rather than the configured ones, which shows up as latency, not as an error.
+All three returns used to be discarded (`let _ =`) and the bind logged an
+unqualified "OK". `set_busy_poll_opts` now returns a `BusyPollSetup` report and
+`bind.rs` emits a `WARNING ... busy-poll DEGRADED` line beside the OK line
+naming each refused option and its errno. If a node is inexplicably latency-slow
+after a kernel or capability change, grep the journal for that line first.
 
 ### Throughput Profile (23 Gbps, 12 streams)
 

@@ -676,7 +676,11 @@ snapshot — so once the apply reaches its tail the standby is forwarding under 
 new policy set. The three session invalidators (`clearSessionsForPolicyChanges`:
 the #4234 deletion-clear, the modified-policy re-eval, and the #4342
 default-policy change) MUST therefore run to re-authorize surviving established
-sessions against the now-active config. They run from a deferred, guarded block
+sessions against the now-active config. They are reached through
+`reportSessionAuthorizationChanges` (#5858), the single commit-time entry point
+that also emits the interface-input-filter advisory — the two halves cover the
+same hazard on different objects, so binding them makes it impossible for a
+commit path to wire one without the other. They run from a deferred, guarded block
 so they ALWAYS fire once the config reached active+armed — including on a
 NON-FATAL best-effort tail failure (host-inbound/lo0 nft, networkd, ...) that
 `applyConfigLocked` joins and returns. Skipping them on such an error (the

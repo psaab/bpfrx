@@ -32,6 +32,15 @@ pub(crate) const TCP_PSH: u8 = 0x08;
 pub(crate) const TCP_ACK: u8 = 0x10;
 /// URG — the urgent pointer field is significant.
 pub(crate) const TCP_URG: u8 = 0x20;
+/// CWR — Congestion Window Reduced (RFC 3168 §6.1.2). Set by the data
+/// sender on the FIRST new-data segment it emits after halving cwnd in
+/// response to an ECN-Echo, and on that segment only: the receiver stops
+/// echoing as soon as it sees one CWR, so a CWR replicated onto a later
+/// segment retracts an ECE the receiver may have re-raised in between and
+/// loses a congestion signal. #5191: software TCP segmentation therefore
+/// keeps CWR on segment 0 and clears it on the rest, matching what a TSO
+/// NIC and Linux's `tcp_gso_segment` do.
+pub(crate) const TCP_CWR: u8 = 0x80;
 
 /// Mask of the four flags that distinguish a pure ACK from a connection
 /// control segment: FIN | SYN | RST | ACK (0x17). Used by the flow-cache

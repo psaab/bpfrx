@@ -100,9 +100,17 @@ func TestCounterReadbackThroughExistingReaders(t *testing.T) {
 	}
 
 	// Coarse per-zone/family deny counters.
-	deny, err := ReadHostInboundDenyCounters()
+	deny, state, err := ReadHostInboundDenyCounters()
 	if err != nil {
 		t.Fatalf("ReadHostInboundDenyCounters: %v", err)
+	}
+	// #5719: a REAL host-inbound generation always carries named counter objects,
+	// so the read must report Counted — the state that makes an aggregate zero
+	// AUTHORITATIVE. (The fence/absent states are proved below and, without a
+	// kernel, by TestClassifyHostInboundDenyObjects.)
+	if state != HostInboundTableCounted {
+		t.Errorf("table state = %d, want HostInboundTableCounted (%d) for a real install",
+			state, HostInboundTableCounted)
 	}
 	denySet := map[string]bool{}
 	for _, d := range deny {
@@ -199,5 +207,64 @@ func assertChainNonEmpty(t *testing.T, table string) {
 	}
 	if len(rules) == 0 {
 		t.Errorf("table %s input chain has no rules", table)
+	}
+}
+
+// TestFenceTableReadsCounterless is the #5719 discrimination proved END-TO-END
+// against the real kernel: the #5644 M37 cold-boot fail-closed fence installs
+// xpf_hostinbound with catch-all DROPs and deliberately NO named counters, so it
+// must read back as HostInboundTableCounterless — an empty deny slice whose zero
+// is NOT authoritative — and be distinguishable from a torn-down table, which
+// reads HostInboundTableAbsent (no enforcement, so zero denies really is true).
+// Before #5719 both answered (nil, nil) and the REST/Prometheus surfaces
+// published an authoritative 0 while the appliance was fenced and dropping.
+//
+// Like every test in this file it needs CAP_NET_ADMIN and SKIPs otherwise;
+// TestClassifyHostInboundDenyObjects covers the same present-table
+// discrimination with no privilege at all.
+func TestFenceTableReadsCounterless(t *testing.T) {
+	enterPrivateNetns(t)
+	in := NewNetlinkInstaller()
+
+	// (1) Nothing installed in the fresh netns -> ABSENT.
+	counts, state, err := ReadHostInboundDenyCounters()
+	if err != nil {
+		t.Fatalf("ReadHostInboundDenyCounters (no table): %v", err)
+	}
+	if state != HostInboundTableAbsent {
+		t.Errorf("state with no table = %d, want HostInboundTableAbsent (%d)",
+			state, HostInboundTableAbsent)
+	}
+	if len(counts) != 0 {
+		t.Errorf("deny counters with no table = %v, want none", counts)
+	}
+
+	// (2) Fence installed -> PRESENT, but carrying no named counters.
+	if err := in.InstallColdBootFence(fenceScenario()); err != nil {
+		t.Fatalf("InstallColdBootFence failed: %v", err)
+	}
+	counts, state, err = ReadHostInboundDenyCounters()
+	if err != nil {
+		t.Fatalf("ReadHostInboundDenyCounters (fence): %v", err)
+	}
+	if state != HostInboundTableCounterless {
+		t.Errorf("state under the cold-boot fence = %d, want HostInboundTableCounterless (%d) "+
+			"— an enforcing but uncounted table must not look like an absent one",
+			state, HostInboundTableCounterless)
+	}
+	if len(counts) != 0 {
+		t.Errorf("deny counters under the fence = %v, want none (the fence declares none)", counts)
+	}
+
+	// (3) Torn down -> ABSENT again.
+	if err := in.DeleteTable(HostInboundTableName); err != nil {
+		t.Fatalf("DeleteTable(%s): %v", HostInboundTableName, err)
+	}
+	if _, state, err = ReadHostInboundDenyCounters(); err != nil {
+		t.Fatalf("ReadHostInboundDenyCounters (after delete): %v", err)
+	}
+	if state != HostInboundTableAbsent {
+		t.Errorf("state after teardown = %d, want HostInboundTableAbsent (%d)",
+			state, HostInboundTableAbsent)
 	}
 }

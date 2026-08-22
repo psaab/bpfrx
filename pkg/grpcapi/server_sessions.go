@@ -371,7 +371,14 @@ type sessionFilter struct {
 	inputErr     error        // invalid filter input (bad prefix/port) — must fail the RPC
 	cfg          *config.Config
 	zoneNames    map[uint16]string
-	zoneIfaces   map[uint16]string
+	// zoneIfaces holds EVERY interface bound to a zone, not just the first
+	// (#6960). The single-value form was the pre-#4792 approximation: a
+	// session ingressing (or, via the egress zone fallback, egressing) on
+	// the 2nd+ interface of a multi-interface zone reported the zone's
+	// FIRST interface, so `clear security flow session interface <first>`
+	// from the remote `cli` tore down sessions on every SIBLING interface
+	// of that zone.
+	zoneIfaces   map[uint16][]string
 	egressIfaces map[sessionEgressKey]string
 	policyNames  map[uint32]string
 	appNames     map[uint16]string
@@ -450,7 +457,7 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 		snatPool:     req.SourceNatPool,
 		cfg:          s.store.ActiveConfig(),
 		zoneNames:    make(map[uint16]string),
-		zoneIfaces:   make(map[uint16]string),
+		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
 	}
 	f.hasFilters = f.zoneFilter != 0 || f.protoFilter != "" || req.SourcePrefix != "" ||
@@ -511,39 +518,71 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 				continue
 			}
 			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
-				f.zoneIfaces[zid] = zone.Interfaces[0]
+				// #6960: keep EVERY bound interface. Collapsing to
+				// zone.Interfaces[0] made the ingress arm of the filter
+				// independent of the session, so an interface-scoped
+				// clear deleted sibling-interface sessions.
+				f.zoneIfaces[zid] = append(f.zoneIfaces[zid], zone.Interfaces...)
 			}
 		}
-		// RangeInterfaces/RangeUnits skip present-but-nil InterfaceConfig/
-		// InterfaceUnit slots admitted by the tolerant load / HA config-sync
-		// path (#3494/#5068); a raw range nil-derefs and panics the in-process
-		// daemon during a remote session display (#5813).
-		config.RangeInterfaces(f.cfg, func(ifName string, ifc *config.InterfaceConfig) {
-			resolvedParent := config.LinuxIfName(strings.SplitN(f.cfg.ResolveReth(ifName), ".", 2)[0])
-			parentLink, err := net.InterfaceByName(resolvedParent)
-			if err != nil {
-				return
-			}
-			config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
-				displayName := ifName
-				if unit.Number != 0 || unit.VlanID != 0 {
-					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
-				}
-				vlanID := uint16(unit.VlanID)
-				if vlanID == 0 && unit.Number > 0 {
-					vlanID = uint16(unit.Number)
-				}
-				key := sessionEgressKey{
-					ifindex: uint32(parentLink.Index),
-					vlanID:  vlanID,
-				}
-				if _, exists := f.egressIfaces[key]; !exists {
-					f.egressIfaces[key] = displayName
-				}
-			})
-		})
+		f.egressIfaces = buildSessionIfaceNames(f.cfg, s.ifindexLookup())
 	}
 	return f
+}
+
+// ifindexLookup returns the netdev-name -> kernel-ifindex resolver used to
+// build the session {ifindex, VLAN} -> interface-name table. Tests inject a
+// fixed table; a nil field means the real kernel lookup.
+func (s *Server) ifindexLookup() func(string) (int, error) {
+	if s != nil && s.ifindexByName != nil {
+		return s.ifindexByName
+	}
+	return func(name string) (int, error) {
+		link, err := net.InterfaceByName(name)
+		if err != nil {
+			return 0, err
+		}
+		return link.Index, nil
+	}
+}
+
+// buildSessionIfaceNames maps a session's {parent netdev ifindex, 802.1Q
+// VLAN id} to the Junos config name of that logical unit. BOTH directions of
+// the session filter read it: the egress side keys on the recorded FIB
+// result, the ingress side on the recorded ingress binding (#6960), so one
+// table defines one interface identity for the whole surface.
+//
+// RangeInterfaces/RangeUnits skip present-but-nil InterfaceConfig/
+// InterfaceUnit slots admitted by the tolerant load / HA config-sync path
+// (#3494/#5068); a raw range nil-derefs and panics the in-process daemon
+// during a remote session display (#5813).
+func buildSessionIfaceNames(cfg *config.Config, lookupIfindex func(string) (int, error)) map[sessionEgressKey]string {
+	names := make(map[sessionEgressKey]string)
+	config.RangeInterfaces(cfg, func(ifName string, ifc *config.InterfaceConfig) {
+		resolvedParent := config.LinuxIfName(strings.SplitN(cfg.ResolveReth(ifName), ".", 2)[0])
+		parentIfindex, err := lookupIfindex(resolvedParent)
+		if err != nil {
+			return
+		}
+		config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
+			displayName := ifName
+			if unit.Number != 0 || unit.VlanID != 0 {
+				displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
+			}
+			vlanID := uint16(unit.VlanID)
+			if vlanID == 0 && unit.Number > 0 {
+				vlanID = uint16(unit.Number)
+			}
+			key := sessionEgressKey{
+				ifindex: uint32(parentIfindex),
+				vlanID:  vlanID,
+			}
+			if _, exists := names[key]; !exists {
+				names[key] = displayName
+			}
+		})
+	})
+	return names
 }
 
 func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -576,9 +615,9 @@ func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionV
 		return false
 	}
 	if f.ifaceFilter != "" {
-		inIf := f.zoneIfaces[val.IngressZone]
-		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
-		if !sessionIfaceMatches(f.ifaceFilter, inIf) && !sessionIfaceMatches(f.ifaceFilter, outIf) {
+		inIfs := resolveSessionIngressIfaces(val.IngressIfindex, val.IngressVlanID, val.IngressZone, f.zoneIfaces, f.egressIfaces)
+		outIfs := resolveSessionEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
+		if !sessionIfaceMatchesAny(f.ifaceFilter, inIfs) && !sessionIfaceMatchesAny(f.ifaceFilter, outIfs) {
 			return false
 		}
 	}
@@ -621,9 +660,9 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 		return false
 	}
 	if f.ifaceFilter != "" {
-		inIf := f.zoneIfaces[val.IngressZone]
-		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
-		if !sessionIfaceMatches(f.ifaceFilter, inIf) && !sessionIfaceMatches(f.ifaceFilter, outIf) {
+		inIfs := resolveSessionIngressIfaces(val.IngressIfindex, val.IngressVlanID, val.IngressZone, f.zoneIfaces, f.egressIfaces)
+		outIfs := resolveSessionEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
+		if !sessionIfaceMatchesAny(f.ifaceFilter, inIfs) && !sessionIfaceMatchesAny(f.ifaceFilter, outIfs) {
 			return false
 		}
 	}
@@ -1186,12 +1225,13 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	defer release()
 
 	// Check if this is a forwarded request from a peer (prevent recursion).
-	forwarded := false
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get("x-peer-forwarded"); len(vals) > 0 {
-			forwarded = true
-		}
-	}
+	//
+	// #5883: via the unforgeable capability, not raw metadata. This site read
+	// the header directly rather than going through peerForwardedFromContext,
+	// so it needed its own edit — which is exactly why the reserved keys are
+	// also STRIPPED at both listeners: a site that reaches for the raw header
+	// now finds nothing rather than finding a caller-supplied value.
+	forwarded := peerForwardedFromContext(ctx)
 
 	// If no filters, clear all
 	if req.SourcePrefix == "" && req.DestinationPrefix == "" &&
@@ -1752,12 +1792,12 @@ func sessionStateName(state uint8) string {
 	}
 }
 
-func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
-	inIf := zoneIfaces[val.IngressZone]
+func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
+	inIf := sessionIngressIfaceDisplay(val.IngressIfindex, val.IngressVlanID, val.IngressZone, zoneIfaces, egressIfaces)
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
+	outIf := sessionEgressIfaceDisplay(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
 	if outIf == "" {
 		outIf = zoneNames[val.EgressZone]
 	}
@@ -1806,12 +1846,12 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	return se
 }
 
-func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
-	inIf := zoneIfaces[val.IngressZone]
+func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, now uint64, zoneNames map[uint16]string, policyNames map[uint32]string, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string, haActive bool) *pb.SessionEntry {
+	inIf := sessionIngressIfaceDisplay(val.IngressIfindex, val.IngressVlanID, val.IngressZone, zoneIfaces, egressIfaces)
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
+	outIf := sessionEgressIfaceDisplay(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
 	if outIf == "" {
 		outIf = zoneNames[val.EgressZone]
 	}
@@ -1869,15 +1909,182 @@ func sessionIfaceMatches(filter, ifName string) bool {
 	return ifName == filter || strings.HasPrefix(ifName, filter+".")
 }
 
-// resolveSessionEgressIface resolves a session's egress interface from FIB result,
-// falling back to the zone's first interface.
-func resolveSessionEgressIface(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string) string {
+// sessionIfaceMatchesAny reports whether ANY candidate interface name
+// matches the operator's filter (see sessionIfaceMatches). The candidate
+// lists come from resolveSessionIngressIfaces / resolveSessionEgressIfaces,
+// which return one exact name when the session carries a corroborated
+// identity and the zone approximation otherwise. A zone binds more than one
+// interface, so a single-name comparison could only ever answer for the
+// first (#6960).
+func sessionIfaceMatchesAny(filter string, ifNames []string) bool {
+	for _, ifName := range ifNames {
+		if sessionIfaceMatches(filter, ifName) {
+			return true
+		}
+	}
+	return false
+}
+
+// zoneBindsIface reports whether zoneMembers contains an entry naming the
+// same logical interface as ifName. The two come from different tables and
+// spell a unit differently — a zone binds "ge-0/0/0.0" while the
+// {ifindex, VLAN} name map renders unit 0 as the bare "ge-0/0/0" — and a
+// zone may bind a PARENT to cover all of its units. So the comparison is
+// the same parent/unit equivalence sessionIfaceMatches uses, in both
+// directions, not string equality.
+func zoneBindsIface(zoneMembers []string, ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	for _, member := range zoneMembers {
+		if member == "" {
+			continue
+		}
+		if member == ifName ||
+			strings.HasPrefix(member, ifName+".") ||
+			strings.HasPrefix(ifName, member+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionIngressIfaceIdentity resolves the interface name a session's
+// RECORDED ingress identity ({IngressIfindex, IngressVlanID}, stamped by the
+// dataplane at install — #4983) names in the CURRENT interface table, and
+// reports whether that name is CORROBORATED by the session's own recorded
+// ingress zone.
+//
+// The corroboration check exists because the two halves of the lookup come
+// from different points in time: the ifindex was recorded at install, the
+// name map is rebuilt from the current config and the current kernel
+// ifindexes at every query. A kernel ifindex is RECYCLED — a tunnel, VLAN
+// unit or XFRM interface is destroyed and its number handed to a different
+// interface later — so a stale ifindex can HIT the rebuilt map and name an
+// interface the session never arrived on (#6987). An uncorroborated hit is
+// therefore not returned as fact: callers widen (the filter) or decline to
+// name an interface at all (the display).
+//
+// Two distinct situations produce an uncorroborated hit and the row cannot tell
+// them apart: a recycled ifindex (the name is wrong), and an interface REZONED
+// since the session installed (the name is right, the zone moved). Because the
+// filter feeds `clear`, the tie breaks toward NOT acting on the name: an
+// uncorroborated hit is treated as a MISS and the zone answers instead — the
+// same answer this surface gave before it read the identity at all. Selecting
+// on an untrustworthy name would DELETE sessions that never touched the named
+// interface, which is the failure #6960 exists to remove; a rezone that loses
+// one route in is recoverable and the row is still reachable through its
+// egress arm and by zone.
+//
+// Residual, deliberately not closed here: a recycle WITHIN one zone
+// corroborates and still names the wrong sibling (#7239). Separating those
+// needs an install-time generation carried on the session row itself — a
+// dataplane wire change, out of scope for a control-plane fix. The EGRESS
+// resolution below carries the same hazard uncorroborated (#7240).
+func sessionIngressIfaceIdentity(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) (string, bool) {
+	if ingressIfindex == 0 {
+		return "", false
+	}
+	ifName := egressIfaces[sessionEgressKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]
+	if ifName == "" {
+		return "", false
+	}
+	return ifName, zoneBindsIface(zoneIfaces[ingressZone], ifName)
+}
+
+// resolveSessionIngressIfaces resolves a session's candidate INGRESS
+// interface names for FILTER matching.
+//
+// A corroborated identity collapses the candidate set to the single
+// interface the first packet actually arrived on, which is what removes the
+// #6960 over-reach: before this the ingress arm read zoneIfaces[IngressZone]
+// and so did not depend on the session at all, and `clear security flow
+// session interface <name>` through gRPC deleted every session in that zone.
+//
+// Everything else falls back to EVERY interface bound to the ingress zone
+// rather than to nothing, because a filter that answers "matches nothing"
+// hides a live session from `show` and leaves it behind on `clear`. Ingress
+// identity 0 — the reverse companion, an HA peer-synced row (#7095 does not
+// sync it), the host-outbound GRE encapsulation path — a non-zero ifindex the
+// config cannot name, and an uncorroborated hit all take that fallback.
+func resolveSessionIngressIfaces(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) []string {
+	if ifName, corroborated := sessionIngressIfaceIdentity(ingressIfindex, ingressVlanID, ingressZone, zoneIfaces, egressIfaces); corroborated {
+		return []string{ifName}
+	}
+	return zoneIfaces[ingressZone]
+}
+
+// resolveSessionEgressIfaces resolves a session's candidate EGRESS interface
+// names from the recorded FIB result, falling back to EVERY interface bound
+// to the egress zone (#6960 — the zone's FIRST interface answered for all of
+// them).
+func resolveSessionEgressIfaces(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) []string {
+	if fibIfindex != 0 {
+		if ifName, ok := egressIfaces[sessionEgressKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+			return []string{ifName}
+		}
+	}
+	return zoneIfaces[egressZone]
+}
+
+// sessionIngressIfaceDisplay resolves the single interface name to REPORT for
+// a session's ingress, or "" when no interface name is defensible and the
+// caller should fall back to the zone name.
+//
+// Reporting is stricter than filtering. A filter that is too wide costs the
+// operator extra rows; a name in an interface column is read as fact and
+// becomes the input to an incident decision, so it is only printed when it
+// is one of:
+//
+//   - a CORROBORATED recorded identity — exact;
+//   - the ingress zone's single bound interface, when no identity is carried
+//     at all: with one member the zone approximation has exactly one answer,
+//     so it is not an approximation.
+//
+// An UNCORROBORATED hit prints nothing, even if the zone has one member: the
+// row carries positive evidence that the interface table and the recorded
+// zone disagree, which is the one case where a confident name is most likely
+// to be the wrong one (#6987).
+func sessionIngressIfaceDisplay(ingressIfindex uint32, ingressVlanID uint16, ingressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) string {
+	ifName, corroborated := sessionIngressIfaceIdentity(ingressIfindex, ingressVlanID, ingressZone, zoneIfaces, egressIfaces)
+	if corroborated {
+		return ifName
+	}
+	// An UNCORROBORATED hit reports nothing, even when the zone binds exactly
+	// one interface: the row carries positive evidence that the interface
+	// table and its own recorded ingress zone disagree, which is the one case
+	// where a confident name is most likely to be the wrong one (#6987).
+	if ifName != "" {
+		return ""
+	}
+	return zoneDisplayIface(zoneIfaces[ingressZone])
+}
+
+// sessionEgressIfaceDisplay is the egress counterpart: the FIB-resolved name
+// when the session carries one, else the egress zone's single bound
+// interface, else "" so the caller reports the zone.
+func sessionEgressIfaceDisplay(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneIfaces map[uint16][]string, egressIfaces map[sessionEgressKey]string) string {
 	if fibIfindex != 0 {
 		if ifName, ok := egressIfaces[sessionEgressKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
 			return ifName
 		}
 	}
-	return zoneIfaces[egressZone]
+	return zoneDisplayIface(zoneIfaces[egressZone])
+}
+
+// zoneDisplayIface is the zone-derived interface name to report when a session
+// carries no usable identity: the zone's interface when it binds exactly ONE,
+// else "" so the caller reports the zone.
+//
+// With one member the zone approximation has exactly one answer, so it is not
+// an approximation. With two or more, naming the first is one interface
+// answering for all of its siblings — the reporting counterpart of the #6960
+// filter defect, and a claim the row does not support (#6987).
+func zoneDisplayIface(zoneMembers []string) string {
+	if len(zoneMembers) == 1 {
+		return zoneMembers[0]
+	}
+	return ""
 }
 
 func monotonicSeconds() uint64 {

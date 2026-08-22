@@ -86,6 +86,23 @@ var slotEscNatStatic = append(append([]string{}, slotEscZones...),
 	"set security nat static rule-set RT rule R1 then static-nat prefix 10.0.9.5/32",
 )
 
+// slotEscNatStaticSrc is slotEscNatStatic plus a valid `match
+// destination-address`, for the rows whose leaf under test is NOT that one.
+//
+// #7216: a static-NAT rule with no `match destination-address` selects an EMPTY
+// external prefix, lowers ExternalIP as "" and is dropped whole by the
+// dataplane, so it is refused at strict commit. The slot-escape harness needs
+// its CONTROL (scaffold + the leaf's GOOD value) to commit clean or the row
+// cannot distinguish a slot-1 escape from a broken fixture — and it says so
+// with "fixture broken", which is how this was caught.
+//
+// The `nat static match destination-address` row must NOT use this: that row
+// supplies the destination value itself, and a second distinct prefix beside it
+// would trip the #6659 cardinality gate instead.
+var slotEscNatStaticSrc = append(append([]string{}, slotEscNatStatic...),
+	"set security nat static rule-set RT rule R1 match destination-address 10.6.0.1/32",
+)
+
 var slotEscPolicyOptions = []string{
 	"set policy-options policy-statement PS term t1 then accept",
 	"set policy-options community C1 members 65000:1",
@@ -138,16 +155,21 @@ var slotEscRibGroup = []string{
 //
 // Every entry below was measured, not assumed.
 // ---------------------------------------------------------------------------
+// #7145 CLOSED the four NAT match-address rows this map used to carry:
+//
+//	security nat source      rule-set <*> rule <*> match source-address
+//	security nat source      rule-set <*> rule <*> match destination-address
+//	security nat destination rule-set <*> rule <*> match source-address
+//	security nat static      rule-set <*> rule <*> match source-address
+//
+// They were recorded here because a malformed CIDR (999.1.1.1/24) committed
+// clean in slot 0, while the destination-NAT and static-NAT `match
+// destination-address` siblings rejected the identical value — the asymmetry
+// this scout's inventory surfaced. validateNATMatchAddressLiteralsStrict now
+// gates all four, so their rows carry a REAL verdict and run the full slot-1
+// escape comparison instead of skipping. Removed rather than annotated: an
+// entry here means "this gate has nothing to compare", which is no longer true.
 var slotEscapeUngated = map[string]string{
-	"security nat source rule-set <*> rule <*> match source-address": "" +
-		"a malformed CIDR (999.1.1.1/24) commits clean, while the destination-NAT " +
-		"and static-NAT `match destination-address` siblings reject one",
-	"security nat source rule-set <*> rule <*> match destination-address": "" +
-		"same: no parse gate on the source rule-set's match addresses",
-	"security nat destination rule-set <*> rule <*> match source-address": "" +
-		"the destination rule-set gates match destination-address but not match source-address",
-	"security nat static rule-set <*> rule <*> match source-address": "" +
-		"the static rule-set gates match destination-address (#37b814d5) but not match source-address",
 	"snmp trap-group <*> categories": "" +
 		"trap categories are an open token set at commit; no domain check exists to escape",
 }
@@ -299,7 +321,7 @@ func slotEscapeRows() []slotEscapeRow {
 			slotEscNatStatic,
 			"set security nat static rule-set RT rule R1 match destination-address", "10.6.0.1/32", "999.1.1.1/24"},
 		{"nat static match source-address", "security nat static rule-set <*> rule <*> match source-address",
-			slotEscNatStatic,
+			slotEscNatStaticSrc,
 			"set security nat static rule-set RT rule R1 match source-address", "10.5.0.0/24", "999.1.1.1/24"},
 
 		// -- routing policy -------------------------------------------------------

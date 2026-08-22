@@ -253,7 +253,6 @@ func (c *CLI) showFlowSession(args []string) error {
 
 	// Build reverse zone ID → name map, policy name map, and zone→interface map
 	zoneNames := make(map[uint16]string)
-	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
 	var policyNames map[uint32]string
 	cr := c.applyResult()
 	if cr != nil {
@@ -262,33 +261,20 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 		policyNames = cr.PolicyNames
 	}
-	if f.cfg != nil && cr != nil {
-		for zoneName, zone := range f.cfg.Security.Zones {
-			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
-				continue
-			}
-			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
-				zoneIfaces[zid] = zone.Interfaces[0]
-			}
-		}
-	}
-	egressIfaces := buildSessionEgressIfaces(f.cfg)
 
-	// Populate filter maps for interface-level matching in matchesV4/V6.
-	// #4792: use the shared populateIfaceMaps builder (session_filter.go)
-	// rather than the single-first-interface zoneIfaces built above for
-	// display, so an interface-filtered show sees EVERY interface bound
-	// to a zone. zoneIfaces/egressIfaces above stay display-only (the
-	// "If:" column shows one representative interface name).
+	// Populate the interface maps used by BOTH the filter (matchesV4/V6) and
+	// the `If:` columns below.
+	//
+	// #6987: display used to build its own `map[uint16]string` holding each
+	// zone's FIRST interface, kept deliberately separate from the filter's
+	// widened `map[uint16][]string`. That divergence is what let the column
+	// name one interface on behalf of all of its siblings. There is now one
+	// map and one rule; where the rule cannot defend a name, the column falls
+	// back to the zone rather than picking a member arbitrarily.
 	f.populateIfaceMaps(c)
 
 	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
-		if fibIfindex != 0 {
-			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
-				return ifName
-			}
-		}
-		if ifName := zoneIfaces[zoneID]; ifName != "" {
+		if ifName := f.egressIfaceDisplay(fibIfindex, fibVlanID, zoneID); ifName != "" {
 			return ifName
 		}
 		return zoneName
@@ -304,6 +290,11 @@ func (c *CLI) showFlowSession(args []string) error {
 	// and nameable, zone-derived otherwise — so the two columns of one row are
 	// resolved by one rule.
 	//
+	// #6987: "zone-derived" is now the zone's SINGLE bound interface or
+	// nothing, and a recorded identity the zone does not corroborate is not
+	// printed at all. See sessionFilter.ingressIfaceDisplay for why a name the
+	// row cannot support is worse here than in the filter.
+	//
 	// "the sessions that arrived on ge-0/0/2" describes the INGRESS ARM, not
 	// the whole selection (#6928 review). `matchesV4`/`matchesV6` OR the two
 	// arms — `!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)` in
@@ -314,12 +305,7 @@ func (c *CLI) showFlowSession(args []string) error {
 	// filtered on, without the filter and the column having disagreed about
 	// the ingress identity.
 	sessionIngressIf := func(ingressIfindex uint32, ingressVlanID uint16, zoneID uint16, zoneName string) string {
-		if ingressIfindex != 0 {
-			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: ingressIfindex, vlanID: ingressVlanID}]; ok && ifName != "" {
-				return ifName
-			}
-		}
-		if ifName := zoneIfaces[zoneID]; ifName != "" {
+		if ifName := f.ingressIfaceDisplay(ingressIfindex, ingressVlanID, zoneID); ifName != "" {
 			return ifName
 		}
 		return zoneName
@@ -981,7 +967,14 @@ func (c *CLI) showFlowTimeouts() error {
 			fmt.Println("  allow-embedded-icmp:           enabled")
 		}
 		if flow.GREPerformanceAcceleration {
-			fmt.Println("  gre-performance-acceleration:  enabled")
+			// #5804: do NOT render this as a plain "enabled". The flag reaches
+			// ForwardingState.gre_acceleration and no packet path reads it, so
+			// an unqualified "enabled" tells an operator a tunnel-aware
+			// identity is in force when GRE sessions are still keyed on the
+			// bare 5-tuple. The commit-time advisory
+			// (validateSecurityFlowAcceptedOnly) says the same thing; this is
+			// the surface an operator reads AFTER committing.
+			fmt.Println("  gre-performance-acceleration:  configured (accepted-only; GRE sessions remain 5-tuple keyed — #5804)")
 		}
 		if flow.PowerModeDisable {
 			fmt.Println("  power-mode-disable:            yes")

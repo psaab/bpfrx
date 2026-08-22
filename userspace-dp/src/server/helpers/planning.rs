@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,12 +60,42 @@ pub(crate) fn same_plan_apply_needs_binding_reconcile(
         })
 }
 
-pub(crate) fn wait_for_binding_settle(state: &mut ServerState, timeout: Duration) {
+// wait_for_binding_settle polls until every binding has settled or the deadline
+// passes, RELEASING the global ServerState lock across each sleep (#5862).
+//
+// The poll itself is unchanged from the pre-#5862 form — same refresh, same
+// predicate, same 50 ms cadence, same deadline. The only difference is where the
+// lock lives: it is taken for the refresh+check and dropped for the sleep,
+// instead of being held by the caller across the whole 2 s.
+//
+// That matters because the lock is not the handler's; it is the WHOLE server's.
+// The HA session socket is a separate socket served by a separate thread
+// (lifecycle.rs), but `sync_session` dispatches through the same
+// `Arc<Mutex<ServerState>>`, so a settle wait held under the lock stalled every
+// session mirror behind it. The Go side gives a session request 3 s
+// (sessionSyncRoundtripDeadline, pkg/dataplane/userspace/process_control.go),
+// and #5380 aborts the REST of the bulk batch on the first transport failure —
+// so a 2 s settle overlapping a mirror burst does not merely add latency, it
+// can drop the remainder of a batch of up to 255 session mirrors during exactly
+// the failover this path exists to support.
+//
+// Interleaving is the POINT, not a side effect: another request may mutate state
+// between two polls. That is safe here because this is a CONVERGENCE wait, not a
+// transaction — the predicate is re-evaluated from scratch on every iteration
+// and the caller re-derives its response status after the wait returns.
+//
+// This is the same locked-kick / unlocked-wait split #2962 (owner-RG export
+// ack-wait) and #4054 (bulk export push) already applied to the two other
+// blocking waits that used to run under this lock.
+pub(crate) fn wait_for_binding_settle(state: &Arc<Mutex<ServerState>>, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        refresh_status(state);
-        if bindings_settled(&state.status.bindings) || Instant::now() >= deadline {
-            return;
+        {
+            let mut guard = state.lock().expect("server state poisoned");
+            refresh_status(&mut guard);
+            if bindings_settled(&guard.status.bindings) || Instant::now() >= deadline {
+                return;
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }
