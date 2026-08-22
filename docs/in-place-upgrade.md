@@ -1036,12 +1036,34 @@ build against the candidate kernel. Both hops resolve explicitly:
   systemd's *default* `PATH` ranks the operator-writable
   `/usr/local/sbin` and `/usr/local/bin` first.
 - *Inner hop* — `realKernelSystem.VerifyDataplane`
-  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) prefers
-  `os.Executable()` — the running process IS `xpfd upgrade kernel
-  promote`, and on Linux `/proc/self/exe` resolves the
+  (`resolveVerifyGateBin`, `pkg/upgrade/kernel_linux.go`) resolves
+  `os.Executable()` and **nothing else**. The running process IS `xpfd
+  upgrade kernel promote`, and on Linux `/proc/self/exe` resolves the
   sbin→`current`→`versions/<ver>/xpfd` chain down to the concrete
-  versioned artifact — then `<SbinDir>/xpfd`, then
-  `<VersionsDir>/current/xpfd`.
+  versioned artifact — so this is the kernel's answer for the running
+  process, not an inference. If it cannot be resolved and validated
+  (absolute, existing, regular, executable), the inner hop **refuses**.
+
+  **Authority order, stated for both hops together (#6620).** The outer
+  hop is `/proc/<MainPID>/exe` → strictly-parsed `ExecStart` → loud
+  refusal; the inner hop is `os.Executable()` → refusal. Neither has a
+  filesystem fallback, and they refuse for the same reason: `--sbin-dir`
+  and `--versions-dir` relocate *independently* and neither relocation
+  removes what it left behind, so a leftover at a compiled-in default is
+  byte-for-byte indistinguishable from a live install. That includes the
+  both-roots-relocated shape, where the surviving default symlink still
+  points at the surviving default runtime and the two candidates are ONE
+  INODE — exactly like a healthy layout.
+
+  The inner hop used to fall back to `<SbinDir>/xpfd` and then
+  `<VersionsDir>/current/xpfd`, ranked in that order because `flip` step
+  6b repoints the sbin entry on every cut. A better-ranked guess is still
+  a guess: on a relocated box the surviving default sbin symlink resolves
+  perfectly and names a *stale* runtime, so the ranking preferred the
+  stale build with full confidence. Refusing is not a lesser outcome — a
+  Gate-3 error routes to `revert()` (restore the known-good `BootOrder`,
+  reboot to the known-good slot), which is a correct terminal outcome,
+  strictly better than a promotion authorized by the wrong dataplane.
 
 **The arming records which xpfd must verify the candidate (#6601).**
 Six revisions tried to answer *which xpfd is live?* on the candidate boot
