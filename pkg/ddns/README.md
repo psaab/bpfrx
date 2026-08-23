@@ -840,6 +840,24 @@ deterministic test (`Test...ResamplesPastAConflictingPort_6709`) instead of by
 occupying a slice of the host's real ephemeral range, which would manufacture
 this very flake for every other test process on the box.
 
+**The seam must be injected for the SUCCEEDING attempt too (#7563).** The
+original loop test stubbed only the failing attempts and let the winning one
+fall through to `realDNSPairAttempt`, so the contention this seam exists to
+describe still reached the test through the back door: under a parallel
+`go test ./...` that fall-through attempt genuinely conflicts, the loop
+genuinely resamples, and `want 2 attempts, got 3` fails — a correct
+implementation failing an assertion about the machine. The loop test now
+returns an inert `stubPacketConn`/`stubListener` pair for the winning attempt
+and additionally asserts the loop hands back THAT pair, so it reads only the
+loop. The same-port property, which genuinely needs a real bind, moved to
+`TestListenDNSPairBindsOneRealPortInBothNamespaces_7563`, which goes through
+the bounded resample loop and so is exactly as reliable as `newFakeDNSServer`
+itself.
+
+The general rule: a test whose subject is a RETRY LOOP must not let any
+attempt reach the resource being retried, or the attempt count becomes a
+reading of the host.
+
 **Process-global warn dedup must be reset by the test that asserts on it.**
 `unsignedUpdateWarned` (`backend_rfc2136.go`) dedups the #4483 unsigned-UPDATE
 warning per update server, keyed by host:port, and it is never reset for the
