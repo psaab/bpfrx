@@ -311,6 +311,41 @@ impl super::Coordinator {
         crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed)
     }
 
+    /// #6751 PR 2/3: interface-mode SNAT identity-mint conflicts that took the
+    /// PAT probe. A nonzero value is the two-flows-one-identity shape actually
+    /// occurring; the LATER flow's wire source port moved so its replies stay
+    /// distinguishable. Surfaced as
+    /// `xpf_userspace_interface_snat_pat_collisions_total`.
+    pub fn interface_snat_pat_collisions_total(&self) -> u64 {
+        crate::nat::INTERFACE_SNAT_PAT_COLLISIONS.load(Ordering::Relaxed)
+    }
+
+    /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED with no
+    /// free translated identity for their `(egress, remote)` pair, plus
+    /// peer-synced imports refused for the same reason. Surfaced as
+    /// `xpf_userspace_interface_snat_identity_exhaustion_total`.
+    pub fn interface_snat_identity_exhaustion_total(&self) -> u64 {
+        crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION.load(Ordering::Relaxed)
+    }
+
+    /// #6751 PR 2/3: peer-synced interface-SNAT imports dropped because a
+    /// different live flow here already owns the translated identity the
+    /// active assigned. Non-zero means individual synced flows will not
+    /// survive a failover onto this node. Surfaced as
+    /// `xpf_userspace_interface_snat_sync_identity_conflict_drops_total`.
+    pub fn interface_snat_sync_identity_conflict_drops_total(&self) -> u64 {
+        crate::nat::INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS.load(Ordering::Relaxed)
+    }
+
+    /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED because
+    /// the registry could create no further state. Kept apart from identity
+    /// exhaustion: this one says raise capacity, that one says the identity
+    /// space for one remote is genuinely full. Surfaced as
+    /// `xpf_userspace_interface_snat_registry_cap_exhaustion_total`.
+    pub fn interface_snat_registry_cap_exhaustion_total(&self) -> u64 {
+        crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION.load(Ordering::Relaxed)
+    }
+
     /// #1807: total worker-command-queue poison recoveries across every
     /// producer/consumer site (worker poll peek + apply, HA enqueues,
     /// session replication, activation prewarm, tunnel install/drain-wait,
@@ -657,6 +692,7 @@ impl super::Coordinator {
     ) -> crate::nat::SourceNatLookup {
         let mut counter = None;
         crate::nat::match_source_nat_result_for_tuple(
+            &self.forwarding.iface_nat_allocators,
             &self.forwarding.source_nat_rules,
             &crate::nat::NatScopeCtx::default(),
             from_zone,
@@ -688,6 +724,7 @@ impl super::Coordinator {
         now_ns: u64,
     ) {
         crate::nat::release_source_nat_allocation(
+            &self.forwarding.iface_nat_allocators,
             &self.forwarding.source_nat_rules,
             key,
             nat,

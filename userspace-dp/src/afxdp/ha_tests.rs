@@ -2227,6 +2227,7 @@ fn upsert_synced_session_refuses_import_whose_nat_port_is_locally_owned_6600() {
     // from.
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.iface_nat_allocators,
             &coordinator.forwarding.source_nat_rules,
             &local_flow,
             NatDecision {
@@ -2310,6 +2311,7 @@ fn upsert_synced_session_skips_pre_publish_reserve_with_no_workers_6600() {
     };
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.iface_nat_allocators,
             &coordinator.forwarding.source_nat_rules,
             &unrelated,
             NatDecision {
@@ -2418,6 +2420,7 @@ fn upsert_synced_session_rolls_back_source_nat_when_nat64_refuses_6600() {
     };
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.iface_nat_allocators,
             &coordinator.forwarding.source_nat_rules,
             &unrelated,
             NatDecision {
@@ -2453,6 +2456,7 @@ fn coordinator_pre_publish_reserve_is_absorbed_by_worker_reserve_6600() {
 
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &entry.key,
             entry.decision.nat,
@@ -2468,6 +2472,7 @@ fn coordinator_pre_publish_reserve_is_absorbed_by_worker_reserve_6600() {
     for worker_id in 0..2u32 {
         assert!(
             crate::nat::reserve_synced_source_nat_allocation_for_worker(
+                &forwarding.iface_nat_allocators,
                 &forwarding.source_nat_rules,
                 &entry.key,
                 entry.decision.nat,
@@ -2484,6 +2489,7 @@ fn coordinator_pre_publish_reserve_is_absorbed_by_worker_reserve_6600() {
     // unrelated flow.
     for worker_id in 0..2u32 {
         crate::nat::release_source_nat_allocation_for_worker(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &entry.key,
             entry.decision.nat,
@@ -2499,6 +2505,7 @@ fn coordinator_pre_publish_reserve_is_absorbed_by_worker_reserve_6600() {
     };
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &other,
             entry.decision.nat,
@@ -2610,6 +2617,7 @@ fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
     // The ZONE-MATCHED rule's allocator must hold the port.
     assert!(
         !crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.iface_nat_allocators,
             &coordinator.forwarding.source_nat_rules[1..2],
             &unrelated,
             nat,
@@ -2625,6 +2633,7 @@ fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
     // fall-through allocator, leaking a port nobody reaps from.
     assert!(
         crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &coordinator.forwarding.iface_nat_allocators,
             &coordinator.forwarding.source_nat_rules[0..1],
             &unrelated,
             nat,

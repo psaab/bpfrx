@@ -40,6 +40,7 @@ pub(in crate::afxdp::session_glue) fn handle_delete_synced(
         // reservation and a no-op for a non-pool / non-reserved session
         // (`release_flow` returns false when the flow was never tracked).
         release_source_nat_allocation_for_worker(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &key,
             lookup.decision.nat,

@@ -7209,3 +7209,100 @@ fn xfrmi_egress_resolves_a_negative_cache_key_6710() {
          input, so an older control plane that omits it changes nothing"
     );
 }
+
+/// #6751 PR 2/3: the interface-mode SNAT identity registry is NODE-lifetime and
+/// must be CARRIED across an apply, not rebuilt.
+///
+/// Two assertions, because the pointer alone is not the property. `ptr_eq`
+/// pins that the same instance was carried; the second half pins what that
+/// buys — the occupancy of a session minted BEFORE the apply still forces the
+/// post-apply collider to PAT. Rebuild the registry per apply and a commit
+/// silently returns the node to the #6751 ambiguity for every live session.
+#[test]
+fn interface_snat_identity_registry_survives_apply_6751() {
+    let snap = ConfigSnapshot {
+        source_nat_rules: vec![crate::SourceNATRuleSnapshot {
+            name: "iface-snat".into(),
+            from_zone: "lan".into(),
+            to_zone: "wan".into(),
+            source_addresses: vec!["0.0.0.0/0".into()],
+            interface_mode: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let prev = build_forwarding_state(&snap);
+
+    // Mint an identity through the REAL admission path against `prev`.
+    let egress: IpAddr = "172.16.80.8".parse().unwrap();
+    let server: IpAddr = "172.16.80.200".parse().unwrap();
+    let mut counter = None;
+    let first = crate::nat::match_source_nat_result_for_tuple(
+        &prev.iface_nat_allocators,
+        &prev.source_nat_rules,
+        &crate::nat::NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.101".parse().unwrap(),
+        server,
+        Some(6),
+        5555,
+        80,
+        Some("172.16.80.8".parse().unwrap()),
+        None,
+        1_000,
+        false,
+        false,
+        crate::nat::NatHolder::Untracked,
+        &mut counter,
+    );
+    match first {
+        crate::nat::SourceNatLookup::Matched(d) => {
+            assert_eq!(d.rewrite_src, Some(egress));
+            assert_eq!(d.rewrite_src_port, None, "first flow preserves");
+        }
+        other => panic!("expected a matched interface SNAT decision, got {other:?}"),
+    }
+
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap,
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+
+    assert!(
+        std::sync::Arc::ptr_eq(&prev.iface_nat_allocators, &next.iface_nat_allocators),
+        "the identity registry must be carried, never rebuilt, across an apply"
+    );
+
+    // The property that carry-over buys: the pre-apply occupancy still binds.
+    let mut counter2 = None;
+    let second = crate::nat::match_source_nat_result_for_tuple(
+        &next.iface_nat_allocators,
+        &next.source_nat_rules,
+        &crate::nat::NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().unwrap(),
+        server,
+        Some(6),
+        5555,
+        80,
+        Some("172.16.80.8".parse().unwrap()),
+        None,
+        2_000,
+        false,
+        false,
+        crate::nat::NatHolder::Untracked,
+        &mut counter2,
+    );
+    match second {
+        crate::nat::SourceNatLookup::Matched(d) => assert!(
+            d.rewrite_src_port.is_some(),
+            "a post-apply collider must still see the pre-apply occupancy"
+        ),
+        other => panic!("expected a matched interface SNAT decision, got {other:?}"),
+    }
+}

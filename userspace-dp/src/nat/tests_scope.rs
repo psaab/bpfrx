@@ -44,7 +44,18 @@ fn source_nat_from_interface_scope_matches_only_named_iface() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &on_iface, "", "", src, dst, egress_v4, None).is_some(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &on_iface,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_some(),
         "from-interface-scoped SNAT must match traffic ingressing the named interface"
     );
 
@@ -54,7 +65,18 @@ fn source_nat_from_interface_scope_matches_only_named_iface() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &other_iface, "", "", src, dst, egress_v4, None).is_none(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &other_iface,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_none(),
         "from-interface-scoped SNAT must NOT match traffic ingressing another interface"
     );
 }
@@ -78,7 +100,18 @@ fn source_nat_from_routing_instance_scope_matches_only_named_vrf() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &in_vr1, "", "", src, dst, egress_v4, None).is_some(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &in_vr1,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_some(),
         "from-routing-instance-scoped SNAT must match traffic in the named VRF"
     );
 
@@ -87,7 +120,18 @@ fn source_nat_from_routing_instance_scope_matches_only_named_vrf() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &in_vr2, "", "", src, dst, egress_v4, None).is_none(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &in_vr2,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_none(),
         "from-routing-instance-scoped SNAT must NOT match traffic in another VRF"
     );
 }
@@ -111,7 +155,18 @@ fn source_nat_to_interface_scope_matches_only_named_egress() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &to_named, "", "", src, dst, egress_v4, None).is_some(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &to_named,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_some(),
         "to-interface-scoped SNAT must match traffic egressing the named interface"
     );
     let to_other = NatScopeCtx {
@@ -119,7 +174,18 @@ fn source_nat_to_interface_scope_matches_only_named_egress() {
         ..NatScopeCtx::default()
     };
     assert!(
-        match_source_nat(&rules, &to_other, "", "", src, dst, egress_v4, None).is_none(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &to_other,
+            "",
+            "",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_none(),
         "to-interface-scoped SNAT must NOT match traffic egressing another interface"
     );
 }
@@ -148,7 +214,18 @@ fn source_nat_zone_scope_unaffected_by_interface_plumbing() {
         egress_routing_instance: "whatever",
     };
     assert!(
-        match_source_nat(&rules, &scope, "lan", "wan", src, dst, egress_v4, None).is_some(),
+        match_source_nat(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &scope,
+            "lan",
+            "wan",
+            src,
+            dst,
+            egress_v4,
+            None
+        )
+        .is_some(),
         "zone-scoped SNAT must still match regardless of interface/RI ctx"
     );
 }

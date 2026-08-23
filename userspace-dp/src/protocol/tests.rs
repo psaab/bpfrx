@@ -501,6 +501,48 @@ fn process_status_generated_error_rate_limited_roundtrip() {
 // reverse-key displacement counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter
 // `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+/// #6751 PR 2/3: the three interface-mode SNAT registry counters round-trip on
+/// the helper status wire under their exact serde keys, and an OLD helper that
+/// omits them decodes to 0 rather than failing the whole status parse (#1961
+/// additive-counter rule). Each carries a DISTINCT value so a rename that
+/// crossed two keys cannot pass.
+#[test]
+fn process_status_interface_snat_registry_counters_roundtrip_6751() {
+    let status = ProcessStatus {
+        interface_snat_pat_collisions_total: 11,
+        interface_snat_identity_exhaustion_total: 13,
+        interface_snat_sync_identity_conflict_drops_total: 19,
+        interface_snat_registry_cap_exhaustion_total: 17,
+        ..Default::default()
+    };
+    let value: serde_json::Value = serde_json::to_value(&status).expect("serialize");
+    assert_eq!(value["interface_snat_pat_collisions_total"], 11);
+    assert_eq!(value["interface_snat_identity_exhaustion_total"], 13);
+    assert_eq!(
+        value["interface_snat_sync_identity_conflict_drops_total"],
+        19
+    );
+    assert_eq!(value["interface_snat_registry_cap_exhaustion_total"], 17);
+    let back: ProcessStatus = serde_json::from_value(value.clone()).expect("deserialize");
+    assert_eq!(back.interface_snat_pat_collisions_total, 11);
+    assert_eq!(back.interface_snat_identity_exhaustion_total, 13);
+    assert_eq!(back.interface_snat_sync_identity_conflict_drops_total, 19);
+    assert_eq!(back.interface_snat_registry_cap_exhaustion_total, 17);
+
+    // Old-helper compatibility: all four keys absent -> 0, parse still OK.
+    let mut obj = value.as_object().expect("object").clone();
+    obj.remove("interface_snat_pat_collisions_total");
+    obj.remove("interface_snat_identity_exhaustion_total");
+    obj.remove("interface_snat_sync_identity_conflict_drops_total");
+    obj.remove("interface_snat_registry_cap_exhaustion_total");
+    let legacy: ProcessStatus =
+        serde_json::from_value(serde_json::Value::Object(obj)).expect("legacy status parses");
+    assert_eq!(legacy.interface_snat_pat_collisions_total, 0);
+    assert_eq!(legacy.interface_snat_identity_exhaustion_total, 0);
+    assert_eq!(legacy.interface_snat_sync_identity_conflict_drops_total, 0);
+    assert_eq!(legacy.interface_snat_registry_cap_exhaustion_total, 0);
+}
+
 #[test]
 fn process_status_nat_reverse_key_shared_displacements_roundtrip() {
     let status = ProcessStatus {

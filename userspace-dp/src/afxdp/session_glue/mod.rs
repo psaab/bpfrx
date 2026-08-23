@@ -572,6 +572,7 @@ fn delete_terminal_half(
     now_ns: u64,
 ) {
     release_source_nat_allocation_for_worker(
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         key,
         decision.nat,

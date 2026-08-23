@@ -6561,6 +6561,7 @@ fn delete_terminal_filtered_session_releases_companion_and_allocator_5622() {
         // Reserve the pool port for the forward flow (the reservation the
         // forward-half teardown's `release_source_nat_allocation` must free).
         crate::nat::reserve_synced_source_nat_allocation(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &fwd_key,
             fwd_nat,
@@ -6717,6 +6718,7 @@ fn purge_translated_synced_hit_releases_source_nat_reservation_5295() {
     // Reserve the pool port for the synced forward flow, mirroring
     // `handle_upsert_synced`'s `reserve_synced_source_nat_allocation`.
     crate::nat::reserve_synced_source_nat_allocation(
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         &wire_key,
         nat,
@@ -6911,6 +6913,7 @@ fn purge_translated_synced_hit_reverse_entry_releases_nothing_5295() {
 
     // The forward flow owns the reservation.
     crate::nat::reserve_synced_source_nat_allocation(
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         &wire_key,
         fwd_nat,
