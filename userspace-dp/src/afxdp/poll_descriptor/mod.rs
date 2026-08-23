@@ -2364,6 +2364,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 if let Some(request) = local_icmp_te {
                                     if let Some(release_key) = source_nat_release_key.as_ref() {
                                         rollback_source_nat_allocation_for_worker(
+                                            &worker_ctx.forwarding.iface_nat_allocators,
                                             &worker_ctx.forwarding.source_nat_rules,
                                             release_key,
                                             decision.nat,
@@ -2427,6 +2428,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     if needed_sessions > 0 && !sessions.can_admit(needed_sessions) {
                                         sessions.note_admission_refused();
                                         rollback_source_nat_allocation_for_worker(
+                                            &worker_ctx.forwarding.iface_nat_allocators,
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -2534,6 +2536,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         );
                                         sessions.note_install_partial();
                                         rollback_source_nat_allocation_for_worker(
+                                            &worker_ctx.forwarding.iface_nat_allocators,
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -2719,6 +2722,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         // DNS fast-path (its guard requires no
                                         // NAT).
                                         rollback_source_nat_allocation_for_worker(
+                                            &worker_ctx.forwarding.iface_nat_allocators,
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()
@@ -5220,6 +5224,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         // buffering it for replay.
                                         seed_install_refused = true;
                                         rollback_source_nat_allocation_for_worker(
+                                            &worker_ctx.forwarding.iface_nat_allocators,
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
                                                 .as_ref()

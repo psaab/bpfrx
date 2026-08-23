@@ -39,9 +39,11 @@
 // reverse session entry).
 
 use super::allocator::{
-    DeterministicV4, DeterministicV6, NS_PER_SEC, NatHolder, PersistentSourceKey,
-    PoolAddressFamily, PortAllocator, TranslatedTuple, deterministic_indices_v4,
+    DeterministicV4, DeterministicV6, InterfaceDomainReserve, NS_PER_SEC, NatHolder,
+    PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple,
+    deterministic_indices_v4,
 };
+use super::iface_registry::InterfaceNatAllocators;
 use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
@@ -50,6 +52,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 const DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS: i64 = 300;
 
@@ -118,6 +121,20 @@ pub(crate) enum SourceNatFailureReason {
     /// Fail-closed exactly like the other pool-unusable reasons — the flow
     /// gets `Unavailable` (drop + count), never an untranslated forward.
     OverBudget,
+    /// #6751: an interface-mode source-NAT admission found NO free translated
+    /// identity for its `(egress address, remote endpoint)` — the preserved
+    /// source port was owned by another flow AND every PAT candidate in
+    /// 1024-65535 was too (or, for a port-less protocol, the single
+    /// address-only identity was owned). Fails CLOSED: admitting an unowned
+    /// duplicate is exactly the misdelivery this closes, so the flow is
+    /// dropped and counted rather than sharing a reverse tuple.
+    InterfaceIdentityExhausted,
+    /// #6751: an interface-mode source-NAT admission could not create the
+    /// REGISTRY state it needs — the retained-allocator cap with nothing
+    /// reclaimable, or the per-address tracked-flow cap. Distinct from
+    /// `InterfaceIdentityExhausted` because the remedy differs: this says
+    /// "no more bookkeeping capacity", not "this identity space is full".
+    InterfaceRegistryCap,
 }
 
 impl SourceNatFailureReason {
@@ -135,6 +152,8 @@ impl SourceNatFailureReason {
             }
             Self::InterfaceNoEgressAddress => "source_nat_interface_no_egress_address",
             Self::OverBudget => "source_nat_pool_over_budget",
+            Self::InterfaceIdentityExhausted => "source_nat_interface_identity_exhausted",
+            Self::InterfaceRegistryCap => "source_nat_interface_registry_cap",
         }
     }
 }
@@ -1435,6 +1454,12 @@ fn source_nat_runtime_compatible(new_rule: &SourceNatRule, old_rule: &SourceNatR
 /// withdrawn precisely BECAUSE the import is not going to be published. A
 /// holder-aware release would be the wrong call here, not a safer one.
 pub(crate) fn release_source_nat_allocation(
+    // #6751: the interface-mode identity registry. Passed EXPLICITLY rather
+    // than reached through `rules`, because a teardown must free the identity
+    // even after a commit that removed every source-NAT rule — a rules-derived
+    // registry would be unreachable exactly then, and the identity would be
+    // held for the node's lifetime.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1442,6 +1467,7 @@ pub(crate) fn release_source_nat_allocation(
     now_ns: u64,
 ) {
     release_source_nat_allocation_with_mode(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1460,6 +1486,8 @@ pub(crate) fn release_source_nat_allocation(
 /// only `worker_id`'s bit is cleared and the port survives until the last worker
 /// releases it.
 pub(crate) fn release_source_nat_allocation_for_worker(
+    // #6751: see `release_source_nat_allocation`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1468,6 +1496,7 @@ pub(crate) fn release_source_nat_allocation_for_worker(
     worker_id: u32,
 ) {
     release_source_nat_allocation_with_mode(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1488,6 +1517,8 @@ pub(crate) fn release_source_nat_allocation_for_worker(
 /// `_for_worker` twin.
 #[cfg(test)]
 pub(crate) fn rollback_source_nat_allocation(
+    // #6751: see `release_source_nat_allocation`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1495,6 +1526,7 @@ pub(crate) fn rollback_source_nat_allocation(
     now_ns: u64,
 ) {
     release_source_nat_allocation_with_mode(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1508,6 +1540,8 @@ pub(crate) fn rollback_source_nat_allocation(
 /// #6211 F2: roll back THIS worker's hold on a source-NAT allocation. The
 /// holder-aware twin of [`rollback_source_nat_allocation`].
 pub(crate) fn rollback_source_nat_allocation_for_worker(
+    // #6751: see `release_source_nat_allocation`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1516,6 +1550,7 @@ pub(crate) fn rollback_source_nat_allocation_for_worker(
     worker_id: u32,
 ) {
     release_source_nat_allocation_with_mode(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1528,6 +1563,7 @@ pub(crate) fn rollback_source_nat_allocation_for_worker(
 
 #[allow(clippy::too_many_arguments)]
 fn release_source_nat_allocation_with_mode(
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1632,6 +1668,27 @@ fn release_source_nat_allocation_with_mode(
                 .release_flow(flow, translated, now_ns, holder);
         }
     }
+    // #6751: free the INTERFACE-mode translated identity. LOOKUP-ONLY — a
+    // release for an address that owns no allocator has nothing to free, and
+    // creating one here would let a teardown storm fill the registry with
+    // empty allocators.
+    //
+    // Safe to run unconditionally alongside the pool sweep for the same reason
+    // the pool sweep cannot over-free: `release_flow`/`rollback_flow` return
+    // without mutating unless `live_by_flow[flow].translated` equals THIS
+    // `translated` tuple, and a pool address is never an interface egress
+    // address's allocator key (the registry is keyed by the egress address the
+    // interface decision actually wrote). `translated.port` above is
+    // `rewrite_src_port.unwrap_or(key.src_port)`, which is the PRESERVED port
+    // for a preserved mint and the PAT'd port for a PAT'd one — matching what
+    // `allocate_interface_identity` stored in both cases.
+    if let Some(alloc) = iface_allocs.allocator_if_present(rewrite_src) {
+        if rollback {
+            alloc.rollback_flow(flow, translated, now_ns, holder);
+        } else {
+            alloc.release_flow(flow, translated, now_ns, holder);
+        }
+    }
 }
 
 /// #6211: the ACTIVE node's `(from_zone, to_zone)` NAME pair for a synced
@@ -1727,6 +1784,8 @@ pub(crate) type SyncedNatZones<'a> = Option<(&'a str, &'a str)>;
 /// `_for_worker` twin.
 #[cfg(test)]
 pub(crate) fn reserve_synced_source_nat_allocation(
+    // #6751: see `reserve_synced_source_nat_allocation_with_holder`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1736,6 +1795,7 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     now_ns: u64,
 ) {
     reserve_synced_source_nat_allocation_with_holder(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1755,6 +1815,8 @@ pub(crate) fn reserve_synced_source_nat_allocation(
 /// worker lets go — without it the first worker to reap or delete-sync the
 /// session frees a port the other N-1 are still forwarding through.
 pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
+    // #6751: see `reserve_synced_source_nat_allocation_with_holder`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1767,6 +1829,7 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
     worker_id: u32,
 ) -> bool {
     reserve_synced_source_nat_allocation_with_holder(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1786,6 +1849,8 @@ pub(crate) fn reserve_synced_source_nat_allocation_for_worker(
 /// takes its idempotent early-return, OR-ing the worker's bit in. The last
 /// worker's release then empties the mask and frees the port exactly as before.
 pub(crate) fn reserve_synced_source_nat_allocation_untracked(
+    // #6751: see `reserve_synced_source_nat_allocation_with_holder`.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1794,6 +1859,7 @@ pub(crate) fn reserve_synced_source_nat_allocation_untracked(
     now_ns: u64,
 ) -> bool {
     reserve_synced_source_nat_allocation_with_holder(
+        iface_allocs,
         rules,
         key,
         nat,
@@ -1815,6 +1881,15 @@ pub(crate) fn reserve_synced_source_nat_allocation_untracked(
 /// coordinator uses this return to refuse the import outright rather than
 /// publishing a session whose translation names a port this node does not own.
 fn reserve_synced_source_nat_allocation_with_holder(
+    // #6751: the interface-mode identity registry. A peer-synced session
+    // whose translated address is an EGRESS address (interface-mode SNAT)
+    // owns no pool allocation at all, so the pool scan below answers
+    // `NothingToReserve` for it. The standby must nevertheless hold that
+    // identity BEFORE it ever mints locally: otherwise its first
+    // post-failover admission would preserve a source port an imported live
+    // session is already using, and the promoted node would carry the exact
+    // ambiguity #6751 removes.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     key: &crate::session::SessionKey,
     nat: NatDecision,
@@ -1887,15 +1962,86 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // the translated address, the shape interface-mode source NAT always
     // produces — is NOT a refusal, and is answered exactly like the
     // `rewrite_src == None` early return above.
-    reserve_synced_on_first_pool_owner(
+    match reserve_synced_on_first_pool_owner(
         rules.iter(),
         flow,
         rewrite_src,
         nat.rewrite_src_port,
         now_ns,
         holder,
-    )
-    .may_publish()
+    ) {
+        // #6751: no rule's pool owns the translated address. #7581 established
+        // that this is NOT a refusal; it is the shape interface-mode SNAT
+        // ALWAYS produces, and this is where it acquires a domain of its own.
+        SyncedReserveOutcome::NothingToReserve => {
+            reserve_synced_interface_identity(iface_allocs, flow, rewrite_src, nat, now_ns, holder)
+        }
+        // `Reserved` publishes; `Refused` (a pool-owning candidate DECLINED —
+        // a different live allocation owns the identity, #6600) does NOT, and
+        // must NOT fall through to the interface domain, or two domains would
+        // each hand out one translated identity (§5.3: the scan STOPS at
+        // `Owned` and ABORTS at `IdentityConflict`). `may_publish` stays the
+        // single place that encodes which outcomes block.
+        other => other.may_publish(),
+    }
+}
+
+/// #6751: the INTERFACE-registry arm of the synced-reserve domain scan.
+///
+/// Reached only when no pool owns the translated address (`NothingToReserve`),
+/// which is exactly the interface-mode shape. Returns whether the caller may
+/// publish the synced session.
+///
+/// IMPORT-DRIVEN CREATION is deliberate: this uses the same fallible
+/// `allocator_for` the local mint uses, not the lookup-only accessor. A fresh
+/// passive standby has an EMPTY registry, so a lookup-only reserve would record
+/// nothing for every imported row, and the node's FIRST local mint after a
+/// failover would then create an empty allocator and happily preserve a port an
+/// imported live session already owns. Creating on import makes the standby's
+/// registry mirror the active's occupied identities before any local mint runs.
+///
+/// A NAT64 decision is excluded: its reservation belongs to
+/// `reserve_synced_nat64_allocation`, and taking a second token here would put
+/// one flow in two domains.
+fn reserve_synced_interface_identity(
+    iface_allocs: &InterfaceNatAllocators,
+    flow: SourceNatFlowKey,
+    rewrite_src: IpAddr,
+    nat: NatDecision,
+    now_ns: u64,
+    holder: NatHolder,
+) -> bool {
+    if nat.nat64 {
+        return true;
+    }
+    let Some(alloc) = iface_allocs.allocator_for(rewrite_src) else {
+        // The registry is at its cap with nothing reclaimable. Refuse the
+        // import rather than publish a session whose identity this node does
+        // not hold — the standby must never carry a session it cannot own.
+        crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    // The active's decision names the translated port: `rewrite_src_port` when
+    // it PAT'd the flow, the flow's own source port when it preserved it —
+    // the same reconstruction `release_source_nat_allocation_with_mode` uses,
+    // so the reservation and its eventual release name one tuple.
+    let translated_port = nat.rewrite_src_port.unwrap_or(flow.src_port);
+    match alloc.reserve_interface_identity(flow, rewrite_src, translated_port, now_ns, holder) {
+        InterfaceDomainReserve::Owned => true,
+        // An HA-fidelity loss, not a data-path drop: this synced session will
+        // not survive a failover onto this node. Its OWN series, so it cannot
+        // be mistaken for local admissions being dropped.
+        InterfaceDomainReserve::IdentityConflict => {
+            crate::nat::INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        // Out of bookkeeping capacity — the same event class the local
+        // admission counts, reached from the import side.
+        InterfaceDomainReserve::RegistryCap => {
+            crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 /// #6211: reserve the synced translation on the first rule in `rules` whose
@@ -2172,7 +2318,14 @@ pub(crate) fn reserve_nat64_pool_port(
     allocator.reserve_flow(flow, translated, addr_index, deterministic, now_ns, holder)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat(
+    // #6751: threaded for signature symmetry with the tuple entry point. This
+    // wrapper supplies NO L4 tuple, so it always takes the `tuple_unknown`
+    // probe-pure arm and mints nothing — but the registry is passed rather
+    // than defaulted so a future change to the branch ORDER cannot silently
+    // start minting into a throwaway registry no release would ever reach.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,
     from_zone: &str,
@@ -2183,7 +2336,15 @@ pub(crate) fn match_source_nat(
     egress_v6: Option<Ipv6Addr>,
 ) -> Option<NatDecision> {
     match match_source_nat_result(
-        rules, scope, from_zone, to_zone, src_ip, dst_ip, egress_v4, egress_v6,
+        iface_allocs,
+        rules,
+        scope,
+        from_zone,
+        to_zone,
+        src_ip,
+        dst_ip,
+        egress_v4,
+        egress_v6,
     ) {
         SourceNatLookup::Matched(decision) => Some(decision),
         SourceNatLookup::NoMatch | SourceNatLookup::Unavailable(_) => None,
@@ -2192,6 +2353,8 @@ pub(crate) fn match_source_nat(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result(
+    // #6751: see `match_source_nat` — probe-pure, threaded for symmetry.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,
     from_zone: &str,
@@ -2203,6 +2366,7 @@ pub(crate) fn match_source_nat_result(
 ) -> SourceNatLookup {
     let mut counter = None;
     match_source_nat_result_for_tuple(
+        iface_allocs,
         rules,
         scope,
         from_zone,
@@ -2238,6 +2402,13 @@ pub(crate) fn match_source_nat_result(
 /// `Arc` and increments it once per committed translated flow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result_for_tuple(
+    // #6751: the node-lifetime interface-mode identity registry. Interface
+    // SNAT has no pool to allocate from, so this is where its translated
+    // identity is minted — preserve the source port when its reverse
+    // identity is free, PAT the later collider when it is not. FIRST
+    // parameter (rather than appended) so it reads as the allocation
+    // CONTEXT alongside `rules`, not as an afterthought.
+    iface_allocs: &InterfaceNatAllocators,
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,
     from_zone: &str,
@@ -2351,11 +2522,81 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     SourceNatFailureReason::InterfaceNoEgressAddress,
                 ));
             };
-            return SourceNatLookup::Matched(NatDecision {
-                rewrite_src: Some(rewrite_src),
-                rewrite_dst: None,
-                ..NatDecision::default()
-            });
+            // #6751: PROBE PURITY. Both probe classes mint NOTHING. A
+            // non-first fragment carries no L4 header, so the ports that
+            // would key its identity are payload bytes; the address-only
+            // wrapper (`tuple_unknown`) has no tuple at all. Minting on
+            // either would claim an identity no real flow owns and no
+            // teardown would ever free it — every fragment of one datagram
+            // would claim its own. They keep the pre-#6751 decision exactly.
+            if non_first_fragment || tuple_unknown {
+                return SourceNatLookup::Matched(NatDecision {
+                    rewrite_src: Some(rewrite_src),
+                    rewrite_dst: None,
+                    ..NatDecision::default()
+                });
+            }
+            let Some(alloc) = iface_allocs.allocator_for(rewrite_src) else {
+                // The registry cannot create state for this address and
+                // nothing was reclaimable. Fail CLOSED rather than fall back
+                // to the unconditional preserve — that fallback IS the bug.
+                return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                    rule,
+                    SourceNatFailureReason::InterfaceRegistryCap,
+                ));
+            };
+            // #3111/#4088: a protocol with no L4 port concept (GRE/ESP/AH/
+            // OSPF, and an ICMP control/error message with no Query
+            // Identifier) has ONE identity per `(egress, remote)` and no
+            // port to move, so it takes the same fail-closed address-only
+            // token pool mode mints. `has_l4_ports` and the ICMP-query gate
+            // are read exactly as the pool arm below reads them, so the two
+            // arms cannot classify one protocol differently.
+            let iface_icmp_query =
+                matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) && icmp_identifier_present;
+            if !crate::ip_proto::has_l4_ports(protocol) && !iface_icmp_query {
+                return match alloc.reserve_address_only(flow, rewrite_src, holder) {
+                    Ok(_) => SourceNatLookup::Matched(NatDecision {
+                        rewrite_src: Some(rewrite_src),
+                        rewrite_dst: None,
+                        ..NatDecision::default()
+                    }),
+                    Err(_) => {
+                        crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION
+                            .fetch_add(1, Ordering::Relaxed);
+                        SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                            rule,
+                            SourceNatFailureReason::InterfaceIdentityExhausted,
+                        ))
+                    }
+                };
+            }
+            return match alloc.allocate_interface_identity(flow, rewrite_src, holder) {
+                Ok(identity) => SourceNatLookup::Matched(NatDecision {
+                    rewrite_src: Some(rewrite_src),
+                    rewrite_dst: None,
+                    // PRESERVE-FIRST: an uncontended flow leaves
+                    // `rewrite_src_port` unset, so `checksum.rs`'s
+                    // `rewrite_src_port.unwrap_or(key.src_port)` keeps the
+                    // packet's own port and the wire is byte-identical to
+                    // pre-#6751. Only the LATER collider carries `Some(_)`.
+                    rewrite_src_port: identity.patted.then_some(identity.port),
+                    ..NatDecision::default()
+                }),
+                Err(reason) => {
+                    match reason {
+                        SourceNatFailureReason::InterfaceRegistryCap => {
+                            crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    SourceNatLookup::Unavailable(SourceNatFailure::for_rule(rule, reason))
+                }
+            };
         }
         if rule.pool_mode {
             if let Some(reason) = rule.pool_failure {

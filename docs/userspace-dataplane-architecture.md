@@ -731,6 +731,92 @@ address-only pool mode therefore remain indistinguishable in this telemetry.
 Distinct-source is the axis that is both free and decisive, because the leak
 shape requires two sources whatever the mode produced the shared key.
 
+**Interface-mode SNAT reserves its translated identity (#6751).** Interface
+SNAT used to preserve the source port UNCONDITIONALLY and mint no allocation,
+reservation or occupancy token of any kind. Two internal hosts that picked the
+same source port to the same server therefore produced ONE external five-tuple:
+
+```
+H1 10.0.0.1:5555 -> S:80  --(iface SNAT to E)-->  E:5555 -> S:80
+H2 10.0.0.2:5555 -> S:80  --(iface SNAT to E)-->  E:5555 -> S:80   (same tuple)
+reverse wire key for both: (S:80 -> E:5555)
+```
+
+Both forward handles sit in the 1:N bucket and BOTH validate against a reply,
+because `reply_matches_forward_session` recomputes the same translated tuple for
+each — the validation is a stale-index guard, not a disambiguator. The reply
+carries no field that could tell them apart. So every reply for the ambiguous
+tuple was un-NAT'd to whichever session installed first: H2's return traffic
+delivered to H1, across the boundary the firewall exists to keep.
+
+Admission now mints the translated identity. The mechanism is the one the
+pool-mode address-only path already ships (#5269/#5336/#5341/#6041/#6226): an
+occupancy token on the FULL reverse identity `(protocol, translated IP,
+translated port, remote IP, remote port)` in `address_only_owners`, minted at
+the decision point and freed by the EXISTING teardown (`release_flow` /
+`rollback_flow` via `release_source_nat_allocation*`) — no new delete site.
+What interface mode adds is the fallback pool mode cannot have: `port
+no-translation` must not move the port, so pool mode denies a colliding
+address-only flow as exhaustion; interface mode carries no such promise, so it
+moves the LATER collider's port instead of dropping the host.
+
+- **Preserve-first.** A flow whose reverse identity is free keeps its own
+  source port and its decision leaves `rewrite_src_port` unset, so the wire is
+  byte-identical to pre-#6751. Only the later collider carries `Some(port)`.
+  This is an INTENTIONAL xpf semantic, not claimed Junos parity — Junos
+  allocates unconditionally for interface NAT.
+- **Identity, not port.** Because occupancy carries the remote endpoint and
+  protocol, the same source port to two DIFFERENT servers both preserve, TCP
+  and UDP on one numeric port both preserve, and a source port below 1024 is
+  preserved when free (PAT candidates are drawn from 1024-65535, but
+  preservation is not restricted to that range).
+- **Registry.** `InterfaceNatAllocators` (`nat/iface_registry.rs`) holds ONE
+  `PortAllocator` per egress ADDRESS — the granularity of the ambiguity, since
+  the reverse-lookup namespace is global by address (nothing carries ingress
+  interface, zone or VRF onto the reverse path; that is open #2387). It lives
+  on `ForwardingState` as an `Arc` and is CARRIED across every apply from the
+  build's `previous` state, exactly like the pool and NAT64 allocators.
+  Rebuilding it on commit would discard the occupancy of every live session.
+  Reclamation drops an allocator only when its address is absent from the new
+  egress set AND it holds no live records; a cap of 256 RETAINED allocators
+  fails admission closed rather than evicting live state.
+- **Probe purity.** A non-first fragment (no L4 header) and the address-only
+  `match_source_nat` wrapper (no tuple at all) mint NOTHING and keep their
+  pre-#6751 decision.
+- **Port-less protocols** (GRE/ESP/AH/OSPF, and ICMP control messages with no
+  Query Identifier) have one identity per `(egress, remote)` and no port to
+  move, so a genuine collision fails CLOSED — the pool-mode address-only
+  contract, unchanged.
+- **HA.** The synced-reserve domain scan is tri-state
+  (`SyncedReserveOutcome`): a pool-owning candidate that DECLINES refuses the
+  import and never falls through, while "no pool owns this address" — the
+  shape interface-mode SNAT always produces (#7581) — falls through to the
+  interface registry. That arm CREATES the allocator on import, so a fresh
+  passive standby mirrors the active's occupied identities before its own
+  first mint; without it, the first post-failover admission would preserve a
+  port an imported live session already owns.
+- **Telemetry.** Four additive optional status fields (#1961):
+  `xpf_userspace_interface_snat_pat_collisions_total` (the #6751 shape
+  occurring and being disambiguated),
+  `xpf_userspace_interface_snat_identity_exhaustion_total` (fail-closed: no
+  free identity for that `(egress, remote)`),
+  `xpf_userspace_interface_snat_sync_identity_conflict_drops_total` (a
+  peer-synced import refused because a local flow already owns the identity —
+  an HA-fidelity loss, not a data-path drop, so it never inflates the
+  admission counter), and
+  `xpf_userspace_interface_snat_registry_cap_exhaustion_total` (fail-closed:
+  no further registry state creatable — a capacity signal, not an identity
+  one). Each failure mode is a separate series because each has a separate
+  remedy.
+
+Not in this increment: cross-domain overlap foreclosure with DRAIN (an
+interface egress address that is ALSO a pool/NAT64 address), and the
+composed-DNAT destination-PORT residual — the ownership record keys on the
+effective destination IP and the RAW destination port, which is the shipped
+pool-mode address-only shape, so `VIP:80` and `VIP:81` both DNAT'd to one
+backend occupy two registry identities. Neither is a regression introduced
+here; both are tracked on #6751.
+
 **Protocol timeouts:**
 | Protocol | Active | Closing (FIN/RST) |
 |----------|--------|-------------------|
@@ -745,7 +831,9 @@ Stateless per-packet NAT rewrite. Session table holds the NAT decision;
 the NAT module applies it:
 
 - **SNAT (interface mode):** Rewrite source IP to egress interface address.
-  Source port preserved.
+  Source port preserved when its translated reverse identity is free; the
+  LATER colliding flow is PAT'd (#6751 — see "Interface-mode SNAT identity
+  admission" below).
 - **SNAT (pool mode):** Rewrite source IP to a configured source pool address
   and allocate a source port from the pool range. For an ICMP/ICMPv6 echo or
   query message the 16-bit **Query Identifier** plays the role of the L4 port

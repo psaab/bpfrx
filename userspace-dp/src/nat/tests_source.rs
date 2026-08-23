@@ -31,6 +31,7 @@ fn interface_source_nat_matches_v4_rule() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -61,6 +62,7 @@ fn interface_source_nat_matches_v6_rule() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -103,6 +105,7 @@ fn interface_source_nat_no_v4_egress_addr_fails_closed() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -138,6 +141,7 @@ fn interface_source_nat_no_v6_egress_addr_fails_closed() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -187,6 +191,7 @@ fn interface_source_nat_translates_when_same_family_egress_addr_present() {
     ]);
     // v4 packet -> egress v4 address (v6 also present but unused).
     let v4 = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -206,6 +211,7 @@ fn interface_source_nat_translates_when_same_family_egress_addr_present() {
     );
     // v6 packet -> egress v6 address (v4 also present but unused).
     let v6 = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -237,6 +243,7 @@ fn off_rule_short_circuits_translation() {
     }]);
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -270,6 +277,7 @@ fn snat_all_malformed_source_match_fails_closed_v4() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -298,6 +306,7 @@ fn snat_all_malformed_source_match_fails_closed_v6() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -328,6 +337,7 @@ fn snat_all_malformed_destination_match_fails_closed_v4() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -362,6 +372,7 @@ fn snat_all_malformed_destination_match_fails_closed_v6() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -392,6 +403,7 @@ fn snat_bare_host_destination_match_scopes_v4() {
     }]);
     // Traffic to the configured destination host is translated.
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -412,6 +424,7 @@ fn snat_bare_host_destination_match_scopes_v4() {
     );
     // Traffic to a different destination is NOT translated (scope held).
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -440,6 +453,7 @@ fn snat_bare_host_destination_match_scopes_v6() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -459,6 +473,7 @@ fn snat_bare_host_destination_match_scopes_v6() {
         "bare-host v6 SNAT destination must translate traffic to the configured host (#2398)"
     );
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -491,6 +506,7 @@ fn snat_bare_host_source_match_scopes_v4() {
     }]);
     // Configured host is translated.
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -511,6 +527,7 @@ fn snat_bare_host_source_match_scopes_v4() {
     );
     // A different host is NOT translated (scope held, not match-any).
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -538,6 +555,7 @@ fn snat_bare_host_source_match_scopes_v6() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -557,6 +575,7 @@ fn snat_bare_host_source_match_scopes_v6() {
         "bare-host v6 SNAT source must translate the configured host (#2398)"
     );
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -584,6 +603,7 @@ fn snat_unscoped_still_translates_all_sources() {
     }]);
     for src in ["10.0.61.5", "192.0.2.7", "10.0.99.250"] {
         let decision = match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -619,6 +639,7 @@ fn snat_valid_scoped_translates_only_matching() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -630,6 +651,7 @@ fn snat_valid_scoped_translates_only_matching() {
     );
     assert!(hit.is_some(), "in-subnet source must be translated");
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -661,6 +683,7 @@ fn snat_mixed_valid_and_malformed_keeps_valid() {
     }]);
     // Valid prefix still matches.
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -676,6 +699,7 @@ fn snat_mixed_valid_and_malformed_keeps_valid() {
     );
     // Out-of-prefix source is not translated (no match-any leak from the garbage).
     let miss = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -742,6 +766,7 @@ fn source_nat_unparseable_match_prefix_surfaces_and_keeps_valid() {
     );
     // (1) The valid prefix still translates its source.
     let hit = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -831,6 +856,7 @@ fn off_wins_over_contradictory_interface_action_5717() {
     }]);
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -872,6 +898,7 @@ fn off_wins_over_contradictory_pool_action_5717() {
     }]);
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -928,6 +955,7 @@ fn actionless_rule_falls_through_to_later_broader_rule_5717() {
         },
     ]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -995,6 +1023,7 @@ fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
     }]);
     let mut counter = None;
     let lookup = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -1063,6 +1092,7 @@ fn interface_wins_over_pool_without_off_5717() {
     }]);
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -1137,6 +1167,7 @@ fn interface_with_pool_no_egress_fails_closed_5717() {
     // must not be used to translate a v4 packet, and the v4 POOL address must
     // not be used either.
     match match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -1167,6 +1198,7 @@ fn interface_with_pool_no_egress_fails_closed_5717() {
     // v6 packet, egress interface has NO v6 address — symmetric, and equally
     // pool-capable (the pool carries 2001:db8:cafe::10).
     match match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -1217,6 +1249,7 @@ fn off_wins_over_all_three_actions_5717() {
     }]);
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -1249,6 +1282,7 @@ fn off_wins_over_all_three_actions_5717() {
     // FULL match gate.
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -1266,6 +1300,7 @@ fn off_wins_over_all_three_actions_5717() {
     );
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             // Wrong ingress zone; the rule is scoped lan -> wan.

@@ -760,6 +760,32 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.NatReverseKeySharedDisplacementsTotal),
 	)
 
+	// #6751 PR 2/3: the interface-mode SNAT identity registry. Emitted
+	// unconditionally for the same reason — a published 0 on the PAT
+	// counter is the informative reading (no two flows contended for one
+	// translated identity), and a 0 on either exhaustion counter is a real
+	// "nothing failed closed" signal rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceInterfaceSNATPATCollisions,
+		prometheus.CounterValue,
+		float64(status.InterfaceSNATPATCollisionsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceInterfaceSNATIdentityExhaustion,
+		prometheus.CounterValue,
+		float64(status.InterfaceSNATIdentityExhaustionTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceInterfaceSNATSyncConflictDrops,
+		prometheus.CounterValue,
+		float64(status.InterfaceSNATSyncIdentityConflictDropsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceInterfaceSNATRegistryCap,
+		prometheus.CounterValue,
+		float64(status.InterfaceSNATRegistryCapExhaustionTotal),
+	)
+
 	// #1807: worker-command-queue poison recoveries. Also emitted
 	// unconditionally so a 0 is a real "no worker panics" signal rather
 	// than an absent series.

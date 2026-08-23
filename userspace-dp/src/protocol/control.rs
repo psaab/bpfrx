@@ -275,6 +275,29 @@ pub(crate) struct ProcessStatus {
     /// rather than failing the status parse (#1961 additive-counter rule).
     #[serde(rename = "nat_reverse_key_collisions_distinct_src", default)]
     pub nat_reverse_key_collisions_distinct_src: u64,
+    /// #6751 PR 2/3: interface-mode SNAT identity-mint conflicts that took the
+    /// PAT probe — how often two flows actually contend for one translated
+    /// reverse identity. Additive + `default`ed (#1961).
+    #[serde(rename = "interface_snat_pat_collisions_total", default)]
+    pub interface_snat_pat_collisions_total: u64,
+    /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED with no
+    /// free translated identity — a completed full-cycle PAT probe, a port-less
+    /// protocol whose single identity is owned, or a peer-synced import whose
+    /// identity a local flow already holds. Additive + `default`ed (#1961).
+    #[serde(rename = "interface_snat_identity_exhaustion_total", default)]
+    pub interface_snat_identity_exhaustion_total: u64,
+    /// #6751 PR 2/3: peer-synced interface-SNAT imports DROPPED because a
+    /// different live flow on this node already owns the translated identity
+    /// the active assigned. An HA-fidelity loss, not a data-path drop, so it
+    /// is its own series. Additive + `default`ed (#1961).
+    #[serde(rename = "interface_snat_sync_identity_conflict_drops_total", default)]
+    pub interface_snat_sync_identity_conflict_drops_total: u64,
+    /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED because
+    /// no more REGISTRY state could be created (retained-allocator cap with
+    /// nothing reclaimable, or the per-address tracked-flow cap). Distinct from
+    /// identity exhaustion because the remedy differs. Additive + `default`ed.
+    #[serde(rename = "interface_snat_registry_cap_exhaustion_total", default)]
+    pub interface_snat_registry_cap_exhaustion_total: u64,
     /// #1861: aggregate at-cap install refusals summed across the
     /// per-worker session tables (`SessionTable::create_drops` — was
     /// write-only/invisible before #1861). Additive: older helpers omit

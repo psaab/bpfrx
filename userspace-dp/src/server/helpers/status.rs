@@ -122,6 +122,20 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // the per-worker counter cannot see).
     state.status.nat_reverse_key_shared_displacements_total =
         state.afxdp.nat_reverse_key_shared_displacements_total();
+    // #6751 PR 2/3: the interface-mode SNAT identity registry's three
+    // outcomes — the PAT'd collisions this fix creates, and the two distinct
+    // fail-closed exhaustion modes it can hit.
+    state.status.interface_snat_pat_collisions_total =
+        state.afxdp.interface_snat_pat_collisions_total();
+    state.status.interface_snat_identity_exhaustion_total =
+        state.afxdp.interface_snat_identity_exhaustion_total();
+    state
+        .status
+        .interface_snat_sync_identity_conflict_drops_total = state
+        .afxdp
+        .interface_snat_sync_identity_conflict_drops_total();
+    state.status.interface_snat_registry_cap_exhaustion_total =
+        state.afxdp.interface_snat_registry_cap_exhaustion_total();
     // #1807: worker-command-queue poison recoveries (committed-prefix +
     // clear_poison policy in afxdp/worker_queue.rs). Nonzero = a worker
     // panic poisoned a command queue and it was recovered.
