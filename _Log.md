@@ -104505,3 +104505,21 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_uniformgates_cluster_zone.go`,
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
+
+## 2026-08-22 — #6787 orderly HA shutdown left the Kea units serving
+
+- **Timestamp**: 2026-08-22
+- **Action**: `runShutdownSequence` withdrew RA, removed VIPs, sent VRRP
+  priority-0 and stopped the heartbeat without ever stopping the DHCP server.
+  Kea runs as separate systemd units that outlive xpfd, so the promoted peer
+  and this node both served DHCP on one segment for the whole downtime. Added
+  `dhcpserver.Manager.Shutdown()` — synchronous (an async stop races process
+  exit) and latching (`shuttingDown` coerces every later applier to nil, since
+  a VRRP MASTER transition racing the pre-withdrawal window allocates a NEWER
+  generation the #1835 supersession guard cannot refuse). Called from
+  `runShutdownSequence` BEFORE the withdrawal, gated on cluster mode so a
+  standalone restart does not become a DHCP outage.
+- **File(s)**: pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/shutdown_latch_6787_test.go,
+  pkg/daemon/daemon_run_shutdown.go,
+  pkg/daemon/shutdown_dhcp_stop_6787_test.go, pkg/dhcpserver/README.md, _Log.md
