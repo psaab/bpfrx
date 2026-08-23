@@ -104305,3 +104305,18 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
   pkg/config/compiler_validate_strict_chassis.go,
   pkg/config/numeric_bounds_6772_6773_test.go
+
+## 2026-08-22 — #7568 compiler panic on the hierarchical prefix-list block form
+
+- **Timestamp**: 2026-08-22
+- **Action**: Fixed a `CompileConfig` panic (`slice bounds out of range [2:1]`)
+  on `policy-options { prefix-list { name; } }`. `namedInstances` returns two
+  node shapes and the #6564 compact-leaf read assumed one. Reachable on the
+  TOLERATED Store.Load / SyncApply ingress, so it crashed the daemon on load
+  rather than rejecting the config (#1960). The tail is now taken relative to
+  the instance NAME, not a fixed index, because a bare bounds check silently
+  drops the block form's compact value. Bound the one-site claim with a census
+  test over all 1129 schema paths.
+- **File(s)**: `pkg/config/compiler_routing.go`,
+  `pkg/config/compiler_prefix_list_block_7568_test.go`,
+  `pkg/config/compiler_block_form_panic_census_7568_test.go`
