@@ -104679,3 +104679,18 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/devicemap/identity_unread_6786_test.go`,
   `pkg/daemon/device_map_identity_unread_6786_test.go`,
   `docs/bare-metal-device-map.md`, `_Log.md`
+
+## 2026-08-22 — #6793 dead RA sender had no retry owner
+
+- **Timestamp**: 2026-08-22
+- **Action**: A sender's conn open is asynchronous, so a bind failure leaves the
+  sender dead with `startLocked` having reported success. `Apply`'s #2865 branch
+  rebuilds a dead sender, but standalone applies RA only from a config apply
+  (`reconcileRGStateLoop` is cluster-only) and the cluster reconcile is
+  digest-gated — a dead sender moves no digest. Added
+  `ra.Manager.HasDeadSenders()`/`DeadSenderInterfaces()`, a digest bypass in
+  `reconcileClusterRAServices`, and an always-on `raDeadSenderReassertLoop`
+  mirroring `proxyARPReassertLoop` (applySem before the config read, #4001).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/dead_sender_probe_6793_test.go,
+  pkg/daemon/daemon_ra_reconcile.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/ra_dead_sender_retry_6793_test.go, pkg/ra/README.md, _Log.md
