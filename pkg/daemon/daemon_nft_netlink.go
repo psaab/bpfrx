@@ -213,11 +213,38 @@ func toNftLo0Term(term *config.FirewallFilterTerm, pl map[string]*config.PrefixL
 		ICMPTypes:         term.ICMPTypes,
 		ICMPCodes:         term.ICMPCodes,
 		TCPFlags:          term.TCPFlags,
-		IsFragment:        term.IsFragment,
-		Log:               term.Log,
-		Count:             term.Count,
-		Action:            term.Action,
-		NextTerm:          term.NextTerm,
-		RoutingInstance:   term.RoutingInstance,
+		// #6804: carry the flexible-match-range so the kernel mirror renders the
+		// term's narrowing. Before this the spec had no field for it, so the
+		// predicate was dropped at this boundary and the term rendered WIDER
+		// than configured — a control-plane fail-open on the chain that is the
+		// PRIMARY enforcement for host traffic.
+		FlexMatch:                lo0FlexMatch(term.FlexMatch),
+		FlexMatchUnrepresentable: len(term.FlexMatchRangeNames) > 1 || len(term.UnknownFlexMatch) > 0,
+		IsFragment:               term.IsFragment,
+		Log:                      term.Log,
+		Count:                    term.Count,
+		Action:                   term.Action,
+		NextTerm:                 term.NextTerm,
+		RoutingInstance:          term.RoutingInstance,
+	}
+}
+
+// lo0FlexMatch converts a compiled flexible-match-range into the mirror's
+// transport type (#6804). nil in, nil out: a term with no flex-match carries no
+// predicate and must render exactly as before.
+//
+// The conversion is deliberately field-for-field with no interpretation — the
+// byte width, the mask application and the endianness all live in the netlink
+// builder, so the two renderers cannot disagree about what the same config
+// means.
+func lo0FlexMatch(fm *config.FlexMatchConfig) *xnft.Lo0FlexMatch {
+	if fm == nil {
+		return nil
+	}
+	return &xnft.Lo0FlexMatch{
+		ByteOffset: fm.ByteOffset,
+		BitLength:  fm.BitLength,
+		Value:      fm.Value,
+		Mask:       fm.Mask,
 	}
 }

@@ -97,12 +97,47 @@ type Lo0FilterTerm struct {
 	TCPFlags          []string
 	IsFragment        bool
 
+	// FlexMatch carries a `from flexible-match-range` predicate (#6804). Before
+	// it existed the lo0 mirror had NO field for it at all, so the predicate was
+	// dropped at this boundary and the term rendered WITHOUT its narrowing — an
+	// `accept` term meant to admit only packets whose header bytes match a
+	// pattern admitted everything else in its scope. The XDP shim shunts
+	// host-bound traffic to the kernel before userspace-dp, so this chain is the
+	// PRIMARY enforcement for host traffic: that is a control-plane fail-OPEN,
+	// the same class #5512 fixed for tcp-flags.
+	//
+	// Only `layer-3` match-start is representable, which is exactly what the
+	// compiler accepts (FlexMatchConfig.MatchStart), and it maps to nft's
+	// network-header payload base.
+	FlexMatch *Lo0FlexMatch
+	// FlexMatchUnrepresentable marks a term whose flexible-match-range could NOT
+	// be resolved — an unknown range name, or a numeric token the compiler could
+	// not parse (config.FilterTerm.UnknownFlexMatch). Strict commit rejects
+	// those, but the tolerant load / peer-sync paths only warn (#1960), so the
+	// mirror must still decide. It fails the TERM closed, mirroring the #5512
+	// tcp-flags direction: rendering the term without its narrowing is the
+	// fail-open this issue is about.
+	FlexMatchUnrepresentable bool
+
 	Log   bool
 	Count string
 
 	Action          string
 	NextTerm        bool
 	RoutingInstance string
+}
+
+// Lo0FlexMatch is a resolved `flexible-match-range` predicate: compare
+// BitLength bits at ByteOffset from the layer-3 header against Value, after
+// masking with Mask. It is a verbatim copy of config.FlexMatchConfig's
+// representable fields — the netlink builder re-derives the payload/bitwise/cmp
+// expressions, so the two renderers share this input rather than each
+// interpreting the config type.
+type Lo0FlexMatch struct {
+	ByteOffset uint8
+	BitLength  uint8
+	Value      uint32
+	Mask       uint32
 }
 
 // Lo0FilterSpec is the full lo0 input-filter render request: the ordered v4 then

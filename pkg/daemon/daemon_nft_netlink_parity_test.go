@@ -121,6 +121,139 @@ func runNftNetlinkParityInner(t *testing.T) {
 		parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
 	})
 
+	// #6804: the flexible-match-range predicate. Before the fix NEITHER renderer
+	// carried it — the lo0 netlink spec had no field for it at all — so the term
+	// rendered WITHOUT its narrowing on the chain that is the PRIMARY
+	// enforcement for host traffic. This case is what makes the two renderers'
+	// agreement real rather than asserted: both go through the actual `nft`
+	// parser and the actual netlink install, and the installed rulesets are
+	// diffed.
+	//
+	// The widths are chosen to exercise the parts most likely to diverge: a
+	// sub-byte bit length (12 -> a 2-byte load narrowed by the mask), a
+	// byte-aligned one, and a full 32-bit one.
+	t.Run("lo0_flexible_match_range", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			fm   config.FlexMatchConfig
+		}{
+			{"sub-byte-12-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 12, Value: 0x0abc, Mask: 0x0fff}},
+			{"byte-aligned-8-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 9, BitLength: 8, Value: 0x11, Mask: 0xff}},
+			{"full-32-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 12, BitLength: 32, Value: 0x0a000001, Mask: 0xffffffff}},
+			// Zero bit-length: the userspace snapshot builder DEFAULTS it to 4
+			// (32-bit). Without this row, an implementation that treated 0 as
+			// "no constraint" would render the term with no narrowing at all —
+			// the exact widening this issue is about — and every other row would
+			// still pass.
+			{"zero-bit-length-defaults-to-32", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 12, BitLength: 0, Value: 0x0a000001, Mask: 0xffffffff}},
+			// Value carrying bits OUTSIDE the mask. Every row above has the
+			// value already inside its mask, so pre-masking is a NO-OP on both
+			// sides and a renderer that skipped it would still agree — the
+			// fixture varies the right axis but samples only the point where it
+			// cannot fail. nft compares the MASKED load, so an unmasked expected
+			// value never matches: a silent never-match, which is a different
+			// fail direction from the widening but just as quiet.
+			{"value-outside-mask-is-pre-masked", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 9, BitLength: 8, Value: 0xff11, Mask: 0x0f}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				fm := tc.fm
+				cfg := &config.Config{}
+				cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+					"flexf": {Terms: []*config.FirewallFilterTerm{
+						{Name: "flex", Protocols: []string{"tcp"}, FlexMatch: &fm, Action: "accept"},
+						{Name: "deny-rest", Action: "discard"},
+					}},
+				}
+				nftDeleteTableBestEffort(xnft.Lo0TableName)
+				oracle := buildLo0FilterPayload(cfg, "flexf", "")
+				// Guard the fixture's own premise: an oracle that omitted the
+				// predicate would make the diff below pass for the wrong reason.
+				if !strings.Contains(oracle, "@nh,") {
+					t.Fatalf("the oracle emitted no raw-payload match, so this "+
+						"cell cannot detect a dropped predicate:\n%s", oracle)
+				}
+				spec := toNftLo0Spec(cfg, "flexf", "")
+				parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
+			})
+		}
+	})
+
+	// #6804: an unrepresentable flexible-match-range must make the term match
+	// NOTHING on BOTH sides — mirroring the userspace fail-closed, where the
+	// term is poisoned to FlexMatchStart::Unsupported and later terms still run.
+	// A drop would be wrong: a flex-match has no natural narrowing like
+	// tcp-flags' `meta l4proto 6`, so a term whose only predicate was the
+	// flex-match would deny ALL host-inbound traffic.
+	t.Run("lo0_unrepresentable_flex_match_matches_nothing", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			term *config.FirewallFilterTerm
+		}{
+			{
+				// #5823: more than one named range.
+				name: "multi-range",
+				term: &config.FirewallFilterTerm{
+					Name:                "multi-range",
+					Protocols:           []string{"tcp"},
+					FlexMatchRangeNames: []string{"r1", "r2"},
+					FlexMatch:           &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff},
+					Action:              "accept",
+				},
+			},
+			{
+				// An unparseable numeric token: strict commit rejects it, the
+				// tolerant load only warns (#1960), so it reaches the mirror.
+				name: "unknown-token",
+				term: &config.FirewallFilterTerm{
+					Name:             "unknown-token",
+					Protocols:        []string{"tcp"},
+					UnknownFlexMatch: []string{"byte-offset=not-a-number"},
+					FlexMatch:        &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff},
+					Action:           "accept",
+				},
+			},
+			{
+				// Width OUTSIDE 1..4 bytes. The commit gate bounds bit-length to
+				// 1..32, so 40 bits arrives only on a corrupt / version-drifted
+				// tolerant-load snapshot — and CAPPING it to 4 would compare only
+				// the truncated window and BROADEN the match (the #3406
+				// fail-open), so it must be unrepresentable, not clamped.
+				name: "oversized-width",
+				term: &config.FirewallFilterTerm{
+					Name:      "oversized-width",
+					Protocols: []string{"tcp"},
+					FlexMatch: &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 40, Value: 1, Mask: 0xff},
+					Action:    "accept",
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := &config.Config{}
+				cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+					"flexbad": {Terms: []*config.FirewallFilterTerm{
+						tc.term,
+						{Name: "deny-rest", Action: "discard"},
+					}},
+				}
+				nftDeleteTableBestEffort(xnft.Lo0TableName)
+				oracle := buildLo0FilterPayload(cfg, "flexbad", "")
+				if strings.Contains(oracle, "@nh,") {
+					t.Fatalf("an UNREPRESENTABLE flex-match still rendered a "+
+						"payload match:\n%s", oracle)
+				}
+				// The later term must survive: "matches nothing" means the term
+				// contributes no enforcement, NOT that the filter is emptied.
+				if !strings.Contains(oracle, "drop") {
+					t.Fatalf("the following deny term did not render, so the "+
+						"unrepresentable term swallowed the rest of the "+
+						"filter:\n%s", oracle)
+				}
+				spec := toNftLo0Spec(cfg, "flexbad", "")
+				parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
+			})
+		}
+	})
+
 	t.Run("lo0_unrepresentable_port_fails_closed", func(t *testing.T) {
 		// #6405 FIX-1: a port token nft cannot resolve (not numeric, not a service
 		// name). BOTH sides must FAIL CLOSED: the oracle emits the raw token and
