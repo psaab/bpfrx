@@ -622,11 +622,24 @@ the sender accepts it only when it names `lastSentConfigGen` — the generation 
 most recently put on the wire — and invalidates the push marker, so the next
 ordinary reconcile tick re-sends.
 
+#6778 added a SECOND sender of that frame: `handleConfigPayload`'s queue-full
+drop. When `configApplyCh` is full the non-blocking enqueue discards the
+INCOMING payload — the newest generation — and no apply ever runs, so
+`configApplyLoop` never reaches the failure branch and nothing re-armed the
+sender's marker. The receive-edge drop is the same condition ("this node did not
+apply the generation you pushed") reached one step earlier, so it takes the same
+three actions: its own counter (`ConfigsQueueFullDropped`), the #6387 grace
+timer, and this nack. Writing it from the receive loop matches the heartbeat-ack
+and `sendBulkAck` shape already in that switch. The drop is documented in full
+under **Queue-full drop (#6778)** in `docs/sync-protocol.md`.
+
 Properties worth stating, because the asymmetry is the whole design:
 
 - **It fires only on failure.** A successful apply sends no nack, nothing
   re-arms, and a healthy connection still pushes a generation exactly once. The
-  #5863 no-storm property is preserved unchanged.
+  #5863 no-storm property is preserved unchanged. #6778's queue-full sender is
+  inside the `default:` arm for the same reason: an enqueue that SUCCEEDS must
+  stay silent, or every push would re-arm the sender's marker.
 - **The retry is bounded to the reconciler's cadence.** The nack handler clears
   the marker and returns; it deliberately does not push inline, so a failure
   that recurs instantly cannot become a push/fail/nack tight loop on the shared

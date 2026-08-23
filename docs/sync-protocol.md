@@ -560,7 +560,10 @@ older C1 with no alarm. The receiver now:
 2. Enqueues `{gen, configText}` onto a bounded, single-consumer ordered apply
    queue (`configApplyLoop`) — the `receiveLoop` is single-threaded per
    connection, so this preserves receive order. The non-blocking enqueue never
-   stalls session sync / heartbeats behind a slow config apply.
+   stalls session sync / heartbeats behind a slow config apply. If the queue is
+   full the enqueue drops — see **Queue-full drop (#6778)** below, because the
+   `default:` arm discards the payload it is *holding*, which is the NEWEST
+   generation, not the oldest queued one.
 3. Applies a config only when `shouldApplyConfigGen` accepts its generation
    (strictly newer than the last-applied high-water mark, or `gen=0`). An
    out-of-order older config is **dropped with an alarm** and counted in
@@ -584,6 +587,58 @@ reintroduced on the *receiver* by the #3931 ordering guard). This preserves the
 #1960 lenient-load posture: whatever `syncAndApply` reports as its outcome
 (nil = store promoted + applied; error = not applied) is exactly what gates the
 mark, so the high-water always reflects the config actually in effect.
+
+**Queue-full drop (#6778).** The non-blocking enqueue in step 2 takes its
+`default:` arm when `configApplyCh` (cap 64) is full. The item it discards is
+the INCOMING one — the newest generation the peer has sent — while the queue
+retains the older ones, so the node finishes draining on a *superseded* config.
+`recordRecvConfigGen` has already run for that payload (deliberately: see the
+#5563 gate below), so the node correctly reads config-stale and manual-failover
+promotion is refused. Before #6778 nothing closed that gap: the sender's #5863
+`(epoch × generation)` marker was claimed BEFORE the push and only a nack clears
+it, so on a stable connection the standby stayed behind the primary until the
+next commit or reconnect — a wedge, not a blip.
+
+The drop is now treated as the same class of event as an apply failure, because
+the operator consequence is identical and the repairs already existed:
+
+- **Counted** on its own `ConfigsQueueFullDropped` counter, rendered in
+  `show chassis cluster information` as `Configs queue-full-dropped:`. It is
+  deliberately NOT folded into `ConfigsApplyFailed` — the apply never ran, so
+  sending an operator to look for a compile error would be wrong — nor left on
+  the generic `Errors` counter, where "the standby is behind the primary's
+  committed config" is indistinguishable from a send failure.
+- **Debt.** `noteConfigApplyFailure(errConfigApplyQueueFull)` arms the #6387
+  grace-expiry timer, so a drop that does not re-converge inside the grace
+  raises `CF` on its own with no further delivery required.
+- **Retry.** `sendConfigApplyNack(gen)` re-arms the sender's #5863 push marker
+  through `OnPeerConfigApplyFailed`, and the sender's existing 30s
+  `configSyncReconcileLoop` re-pushes. There is **no new retry queue**: buffering
+  the dropped payload on the receiver is exactly the unbounded growth the
+  non-blocking send exists to avoid, and the payload is the peer's ACTIVE config,
+  so re-asking for it is strictly better than holding a copy that may already be
+  superseded. Writing the nack from the receive loop is the established shape in
+  that switch (the heartbeat ack and `sendBulkAck` do the same under `writeMu`),
+  and it is rate-bounded by the peer's push rate.
+
+The queue itself was left lossy rather than converted to an evict-oldest
+"latest-generation slot". Evicting the oldest would require the receive loop to
+become a second consumer of `configApplyCh`, and under a cross-fabric reorder
+(the active connection flipping between `conn0`/`conn1`) it could evict a NEWER
+queued item to make room for an OLDER arrival — losing a generation that, having
+enqueued successfully, would take no nack and no debt. That trades a visible,
+recovered loss for a silent one.
+
+**Debt is not cancelled by a stale backlog apply (#6778).** A queue only fills
+because the consumer is behind, so a drop is always followed within milliseconds
+by successful applies of the backlog. `noteConfigApplySuccess` therefore takes
+the generation whose apply just succeeded and no-ops while it is still below
+`lastRecvConfigGen` — the same predicate `TransferReadinessSnapshot.ConfigStale`
+uses. Under the pre-#6778 unconditional clear those backlog successes disarmed
+the grace timer and the drop's debt evaporated long before `CF` could raise. The
+gate cannot pin `CF` raised: a payload refused before `recordRecvConfigGen` never
+raises the received mark, `resetRecvGen` clears BOTH marks to 0 on reconnect, and
+a legacy peer leaves both at 0.
 
 **Config-sync apply-failure health surfacing (`CF`, #6387).** Leaving the
 high-water pinned on a persistent apply failure is correct for convergence but
@@ -706,7 +761,8 @@ which is true per connection but there are two of them.
 **Manual-failover config-staleness gate (#5563).** A second high-water mark,
 `lastRecvConfigGen`, records the highest generation this node has *received*
 from the peer (advanced in the `syncMsgConfig` handler at enqueue, BEFORE
-apply, even if the ordered apply queue is full and the payload is dropped). It
+apply, even if the ordered apply queue is full and the payload is dropped —
+#6778 keeps that raise and adds the nack that closes the resulting gap). It
 is the receiver's local view of the config *sender's* current committed
 generation. `TransferReadiness` carries both marks (`PeerConfigGen =
 lastRecvConfigGen`, `AppliedConfigGen = lastAppliedConfigGen`), and
@@ -1303,6 +1359,8 @@ All counters are `atomic.Uint64` / `atomic.Bool`, lock-free:
 | ConfigsSent/Received | Config sync messages |
 | ConfigsStaleIgnored | Config messages dropped by the #3931 ordering guard (incoming generation not strictly newer than last-applied) |
 | ConfigsApplyFailed | Config messages admitted by the ordering guard but whose apply did NOT take effect (compile/promote failure or a transient RG0-primary rejection). The high-water is left unadvanced so the peer's re-push re-converges the standby (M-2/#4151) |
+| ConfigsQueueFullDropped | Config payloads that never reached the ordered apply queue because it was full at enqueue (#6778). The non-blocking send discards the INCOMING payload — the NEWEST generation — so the node is left on a superseded config. The received high-water is still raised (the node reads config-stale), a config-apply nack re-arms the sender's #5863 marker, and the #6387 grace timer arms. A nonzero value climbing while `ConfigApplyNacksReceived` on the PEER stays at zero means the recovery path itself is broken |
+| ConfigApplyNacksReceived | #7328 config-apply nacks accepted from the peer — one per generation this node pushed that the peer refused, failed to apply, or dropped at its receive edge (#6778). A nack naming a superseded generation is ignored and not counted |
 | BulkPrimesWithoutIncarnation | `BulkStart` frames received carrying no boot incarnation (#5084) — a peer on a pre-#5084 build, or a peer whose own `boot_id` was unreadable. The incarnation fence is in its fail-open state against that peer; expected during a rolling upgrade, and NOT a health/alarm state |
 | ConfigsDeadIncarnationDropped | Config payloads dropped because the boot incarnation they arrived under has been replaced by a re-prime (#5084) — a queued prior-boot config that would otherwise apply across the reset and strand the generation high-water. Expected once per peer reboot that races a queued config; a persistently rising counter means the peer is flapping |
 | IPsecSASent/Received | IPsec SA list messages |

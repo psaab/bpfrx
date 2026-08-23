@@ -456,7 +456,7 @@ func TestConfigSyncHealthRaiseClearReorderSerialized(t *testing.T) {
 	// (3) A successful apply runs concurrently while the raise is mid-delivery.
 	successDone := make(chan struct{})
 	go func() {
-		s.noteConfigApplySuccess()
+		s.noteConfigApplySuccess(0)
 		close(successDone)
 	}()
 

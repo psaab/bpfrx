@@ -675,12 +675,53 @@ func (s *SessionSync) handleConfigPayload(conn net.Conn, payload []byte) {
 		select {
 		case s.configApplyCh <- item:
 		default:
-			// Ordered apply queue full — practically impossible (commits
-			// are seconds apart, apply is sub-second). Drop with an alarm;
-			// the next commit / reconnect re-push (fresh higher gen)
-			// re-converges the standby.
+			// #6778: the ordered apply queue is full. The non-blocking send
+			// discards the INCOMING payload — which is the NEWEST generation
+			// the peer has sent — while the queue retains the older ones, so
+			// this node ends the drain applying a SUPERSEDED config. That
+			// inversion is what makes the drop a wedge rather than a blip: the
+			// received high-water was already raised above (deliberately, so
+			// the node reads config-stale and #5563 refuses manual-failover
+			// promotion), and before this fix nothing on either node was
+			// driving the missing generation back.
+			//
+			// The queue-full drop is treated as the same class of event as an
+			// apply failure, because the operator consequence is identical (the
+			// standby is behind the primary's committed config) and the repair
+			// is the one this repo already built:
+			//
+			//   counter  ConfigsQueueFullDropped, rendered in cluster status —
+			//            distinct from ConfigsApplyFailed because the apply
+			//            never ran, and from the generic Errors counter because
+			//            a stale standby is its own operator action.
+			//   debt     noteConfigApplyFailure arms the #6387 grace timer, so a
+			//            drop that does NOT re-converge inside the grace raises
+			//            the CF config-sync health annotation on its own — no
+			//            further delivery required. A drop that re-converges
+			//            cancels the timer on the successful apply, so a
+			//            transient saturation never flaps the flag.
+			//   retry    sendConfigApplyNack re-arms the SENDER's #5863
+			//            (epoch x generation) push marker via
+			//            OnPeerConfigApplyFailed, and the sender's existing
+			//            30s configSyncReconcileLoop re-pushes. No new retry
+			//            queue: buffering the dropped payload here is exactly
+			//            the unbounded growth the non-blocking send exists to
+			//            avoid, and the payload is the peer's ACTIVE config, so
+			//            re-asking for it is strictly better than holding a
+			//            copy that may already be superseded.
+			//
+			// Writing the nack from the receive loop is the established shape
+			// in this switch (the heartbeat ack and sendBulkAck do the same
+			// under writeMu). It is rate-bounded by the peer's push rate, which
+			// is itself bounded by the queue depth that produced the drop.
+			s.stats.ConfigsQueueFullDropped.Add(1)
 			s.stats.Errors.Add(1)
-			slog.Error("cluster sync: config apply queue full, dropping config (will re-converge on next push)", "gen", gen, "size", len(configText))
+			slog.Error("cluster sync: config apply queue full, dropping the NEWEST config generation — "+
+				"this node stays on a superseded config until the peer re-pushes (#6778)",
+				"gen", gen, "size", len(configText),
+				"queue_len", len(s.configApplyCh), "queue_cap", cap(s.configApplyCh))
+			s.noteConfigApplyFailure(errConfigApplyQueueFull)
+			s.sendConfigApplyNack(gen)
 		}
 	}
 }
