@@ -104414,3 +104414,19 @@ prose edit above them added. No diff falls in the new test body.
   documented claims with no assertion behind them; a mutation neutralising
   either left the suite green.
 - **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
+
+## 2026-08-22 — #6783 appPortsFromSpec u16 wrap: dead helper removed, ceiling guarded
+
+- **Timestamp**: 2026-08-22
+- **Action**: `pkg/dataplane.appPortsFromSpec` expanded a port range using the
+  parse's uint16 bounds as the loop counter, so any spec ending at 65535 with a
+  width > 1 never terminated. Reproduced (`65534-65535` hangs). Its last
+  production caller was removed by `ad31711e3`, so the defect is no longer
+  reachable — the helper was dead code carrying an infinite loop, and is
+  deleted with its test rather than repaired. Swept the repo for the same
+  pattern: five ascending expansion loops, four already total (int/uint64
+  counters or an explicit ceiling break). Added a watchdogged ceiling guard on
+  the surviving live helpers in pkg/dataplane/userspace, which the existing
+  agreement corpus could not cover without turning a wrap into a hung suite.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
+  pkg/dataplane/userspace/port_expansion_ceiling_6783_test.go, _Log.md
