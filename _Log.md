@@ -29493,6 +29493,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
     Prometheus list) and fairness-regimes.md (observability pointer).
   - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
     pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
+  userspace-dp/src/server/helpers/status.rs (#6641 gate repair),
     pkg/dataplane/userspace/format/cos.go,
     pkg/dataplane/userspace/format/cos_test.go,
     pkg/dataplane/userspace/protocol.go, docs/cos-validation-notes.md,
@@ -104938,6 +104939,60 @@ prose edit above them added. No diff falls in the new test body.
   no-op on both sides and skipping it still agreed. Added all three shapes plus
   an assertion that a following deny term survives an unrepresentable one.
 - **File(s)**: pkg/daemon/daemon_nft_netlink_parity_test.go, _Log.md
+
+## 2026-08-22 — #6751 PR 2/3 interface SNAT reserves its translated identity
+
+- **Timestamp**: 2026-08-22
+- **Action**: Interface-mode source NAT preserved the source port
+  unconditionally and minted no occupancy token of any kind, so two internal
+  hosts sharing one source port to one server produced byte-identical reverse
+  wire keys; both forward sessions validated against a reply and every reply
+  reached whichever installed first (cross-session misdelivery). Admission now
+  mints the translated identity on the shipped #5269 address-only token
+  machinery: preserve the source port when its full reverse identity
+  `(protocol, egress addr, port, remote ip, remote port)` is free, PAT the
+  LATER collider when it is not. New node-lifetime `InterfaceNatAllocators`
+  registry (one `PortAllocator` per egress ADDRESS) carried across every apply
+  on `ForwardingState`; release/rollback reach it EXPLICITLY (not through
+  `rules`) so a teardown still frees after a commit that removed every
+  source-NAT rule. Both probe classes (non-first fragment, tuple-unknown) mint
+  nothing. Port-less protocols fail closed on a genuine collision. The synced
+  reserve gains an interface domain with import-driven allocator creation so a
+  standby holds the active's identities before its first local mint;
+  `SyncedReserveOutcome` stays the tri-state vocabulary (Reserved / Refused /
+  NothingToReserve). FOUR additive status counters + Prometheus mirrors, one
+  per failure mode (PAT collision, identity exhaustion, sync-import identity
+  conflict, registry cap) so an operator can tell the remedies apart. Also
+  repaired the #6641 status-wiring gate, which matched `state.afxdp.<name>()`
+  as a contiguous substring and therefore went wrong the moment rustfmt
+  wrapped a long assignment: it now matches on whitespace-free text.
+  OUT OF SCOPE (PR 3/3): §5.7 cross-domain overlap foreclosure with DRAIN, and
+  the composed-DNAT destination-PORT residual (the record keys on the RAW
+  destination port, which is the shipped pool-mode address-only shape).
+- **File(s)**: userspace-dp/src/nat/iface_registry.rs (new),
+  userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/mod.rs, userspace-dp/src/nat/tests_iface.rs (new),
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/nat/tests_source.rs,
+  userspace-dp/src/nat/tests_l4_match.rs, userspace-dp/src/nat/tests_scope.rs,
+  userspace-dp/src/nat/tests_aggregate_budget.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/nat.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/session_glue/{mod.rs,promote.rs,tests.rs},
+  userspace-dp/src/afxdp/session_glue/commands/{delete_synced.rs,upsert_synced.rs},
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/lifecycle.rs, userspace-dp/src/server/helpers/status.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol_status.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors_userspace_session.go,
+  pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
+  docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
 
 - **Timestamp**: 2026-08-23

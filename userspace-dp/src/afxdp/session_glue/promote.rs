@@ -196,6 +196,7 @@ pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     // the ownership guard (a reverse entry owns no source-NAT/NAT64 reservation);
     // both calls are a no-op for a non-pool / non-reserved session.
     release_source_nat_allocation_for_worker(
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         key,
         decision.nat,

@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 
 mod allocator;
 mod destination;
+// #6751 PR 2/3: the node-lifetime interface-mode translated-identity registry.
+mod iface_registry;
 mod source;
 mod static_nat;
 mod status;
@@ -41,6 +43,9 @@ mod tests_destination;
 #[cfg(test)]
 #[path = "tests_pool.rs"]
 mod tests_pool;
+#[cfg(test)]
+#[path = "tests_iface.rs"]
+mod tests_iface;
 #[cfg(test)]
 #[path = "tests_counter.rs"]
 mod tests_counter;
@@ -81,6 +86,11 @@ pub(crate) use allocator::{
     DeterministicV6, MAX_NAT_HOLDER_WORKERS, NatHolder, PortAllocator, PortAllocatorSnapshot,
 };
 pub(crate) use destination::{DnatKey, DnatTable, DnatValue};
+pub(crate) use iface_registry::{
+    INTERFACE_SNAT_IDENTITY_EXHAUSTION, INTERFACE_SNAT_PAT_COLLISIONS,
+    INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION, INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS,
+    InterfaceNatAllocators,
+};
 pub(crate) use source::{
     SourceNatFailure, SourceNatFailureReason, SourceNatFlowKey, SourceNatLookup, SourceNatRule,
     SyncedNatZones, allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6,

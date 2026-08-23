@@ -48,6 +48,50 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"against an already-unindexed session are not counted.",
 		nil, nil,
 	)
+	c.userspaceInterfaceSNATPATCollisions = prometheus.NewDesc(
+		"xpf_userspace_interface_snat_pat_collisions_total",
+		"#6751: interface-mode source-NAT admissions whose PRESERVED "+
+			"source port was already owned for the same (egress "+
+			"address, remote endpoint) identity, so the LATER flow was "+
+			"PAT'd onto a free port. Before #6751 both flows kept the "+
+			"port and produced one indistinguishable reverse tuple, so "+
+			"replies for both reached whichever session installed "+
+			"first. Nonzero here means that shape occurred and was "+
+			"disambiguated; only the later flow's wire port moved.",
+		nil, nil,
+	)
+	c.userspaceInterfaceSNATIdentityExhaustion = prometheus.NewDesc(
+		"xpf_userspace_interface_snat_identity_exhaustion_total",
+		"#6751: interface-mode source-NAT admissions dropped because no "+
+			"free translated identity existed for their (egress "+
+			"address, remote endpoint) — every candidate port taken, a "+
+			"port-less protocol (GRE/ESP/OSPF) whose single identity "+
+			"was owned, or a peer-synced import colliding with a local "+
+			"flow. Fail-closed by design: admitting a duplicate would "+
+			"reintroduce the cross-session misdelivery.",
+		nil, nil,
+	)
+	c.userspaceInterfaceSNATSyncConflictDrops = prometheus.NewDesc(
+		"xpf_userspace_interface_snat_sync_identity_conflict_drops_total",
+		"#6751: peer-synced interface-mode source-NAT session imports "+
+			"dropped because a DIFFERENT live flow on this node already "+
+			"owns the translated identity the active node assigned. "+
+			"Fail-closed by design -- the standby never holds a session "+
+			"it cannot own -- but it is an HA-fidelity loss rather than a "+
+			"data-path drop: a non-zero value means those individual "+
+			"flows will not survive a failover onto this node.",
+		nil, nil,
+	)
+	c.userspaceInterfaceSNATRegistryCap = prometheus.NewDesc(
+		"xpf_userspace_interface_snat_registry_cap_exhaustion_total",
+		"#6751: interface-mode source-NAT admissions dropped because the "+
+			"identity registry could create no further state — the "+
+			"retained-allocator cap with nothing reclaimable, or a "+
+			"per-egress-address tracked-flow cap. Distinct from "+
+			"identity exhaustion: this says capacity, that says one "+
+			"remote's identity space is full.",
+		nil, nil,
+	)
 	c.userspaceSessionCreateDrops = prometheus.NewDesc(
 		"xpf_userspace_session_create_drops_total",
 		"Aggregate session installs refused at the max_sessions cap "+

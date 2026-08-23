@@ -901,6 +901,32 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #6751 PR 2/3: the interface-mode SNAT identity registry's three
+		// outcomes.
+		userspaceInterfaceSNATPATCollisions: prometheus.NewDesc(
+			"xpf_userspace_interface_snat_pat_collisions_total",
+			"interface snat pat collisions",
+			nil,
+			nil,
+		),
+		userspaceInterfaceSNATIdentityExhaustion: prometheus.NewDesc(
+			"xpf_userspace_interface_snat_identity_exhaustion_total",
+			"interface snat identity exhaustion",
+			nil,
+			nil,
+		),
+		userspaceInterfaceSNATSyncConflictDrops: prometheus.NewDesc(
+			"xpf_userspace_interface_snat_sync_identity_conflict_drops_total",
+			"interface snat sync identity conflict drops",
+			nil,
+			nil,
+		),
+		userspaceInterfaceSNATRegistryCap: prometheus.NewDesc(
+			"xpf_userspace_interface_snat_registry_cap_exhaustion_total",
+			"interface snat registry cap exhaustion",
+			nil,
+			nil,
+		),
 		userspaceSessionPublishErrors: prometheus.NewDesc(
 			"xpf_userspace_session_publish_errors_total",
 			"session publish errors",
@@ -1144,6 +1170,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// aggregate stays 0 in this fixture, so an emit wired to the wrong
 		// field cannot satisfy the assertion below.
 		NatReverseKeyCollisionsDistinctSrc: 5,
+		// #6751 PR 2/3: three DISTINCT non-zero values, so an emit wired to
+		// the wrong one of the trio cannot satisfy the assertions below --
+		// the two exhaustion counters exist precisely to be read apart.
+		InterfaceSNATPATCollisionsTotal:             17,
+		InterfaceSNATIdentityExhaustionTotal:        19,
+		InterfaceSNATSyncIdentityConflictDropsTotal: 29,
+		InterfaceSNATRegistryCapExhaustionTotal:     23,
 		// #1861: install-refusal trio emitted unconditionally.
 		SessionCreateDrops:             9,
 		SessionInstallAdmissionRefused: 8,
@@ -1217,9 +1250,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// high-water = 7, plus the depth SUM added when the lifetime max was
 	// demoted to operator context = 8) = 38 + the #2402/#6641
 	// shared-session poison-recovery counter = 39, plus the #6751
-	// distinct-source subset of the reverse-key collision counter = 40.
-	if len(got) != 40 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 40 metrics, got %d", len(got))
+	// distinct-source subset of the reverse-key collision counter = 40,
+	// plus the #6751 PR 2/3 interface-mode SNAT identity registry trio
+	// (PAT collisions + identity exhaustion + sync-import identity-conflict
+	// drops + registry-cap exhaustion) = 44.
+	if len(got) != 44 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 44 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1230,6 +1266,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #6751: the distinct-source subset is emitted unconditionally too, and
 	// carries its OWN value -- 5 here against an aggregate of 0.
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisionsDistinctSrc, nil, 5)
+	// #6751 PR 2/3: the interface-mode SNAT identity registry trio, each
+	// carrying its own value.
+	assertCounterClose(t, got, c.userspaceInterfaceSNATPATCollisions, nil, 17)
+	assertCounterClose(t, got, c.userspaceInterfaceSNATIdentityExhaustion, nil, 19)
+	assertCounterClose(t, got, c.userspaceInterfaceSNATSyncConflictDrops, nil, 29)
+	assertCounterClose(t, got, c.userspaceInterfaceSNATRegistryCap, nil, 23)
 	// #1789: publish-error counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
 	// #4800: every leg of the new-flow-install contention surface reaches

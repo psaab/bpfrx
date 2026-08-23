@@ -510,6 +510,34 @@ fn build_fallible_forwarding_state(
                 })
         })
         .collect();
+    // #6751: CARRY the interface-mode identity registry across the apply.
+    // It is node-lifetime state, not snapshot-derived: it holds the translated
+    // identity every LIVE interface-SNAT session owns, and the releases for
+    // those sessions arrive long after this build. Constructing a fresh one
+    // here would drop all of it, so the first post-commit flow could preserve
+    // a source port an established session is still using on the wire — the
+    // #6751 ambiguity, reintroduced once per commit. `previous` is `Some` on
+    // both production build sites (`snapshot_refresh.rs`,
+    // `reconcile/snapshot.rs`); the only `None` caller is
+    // `validate_forwarding_buildable`, whose build is discarded.
+    state.iface_nat_allocators = previous
+        .map(|prev| std::sync::Arc::clone(&prev.iface_nat_allocators))
+        .unwrap_or_default();
+    // Reclaim allocators for addresses that are no longer an egress address
+    // AND hold no live records, so a node that churns egress addressing does
+    // not walk into the retained-allocator cap. `state.egress` is populated
+    // earlier in this build, so this reads the NEW egress set.
+    let live_egress: rustc_hash::FxHashSet<std::net::IpAddr> = state
+        .egress
+        .values()
+        .flat_map(|e| {
+            e.primary_v4
+                .map(std::net::IpAddr::V4)
+                .into_iter()
+                .chain(e.primary_v6.map(std::net::IpAddr::V6))
+        })
+        .collect();
+    state.iface_nat_allocators.reclaim_absent(&live_egress);
     state.source_nat_rules = parse_source_nat_rules_with_previous(
         &snapshot.source_nat_rules,
         previous.map(|state| state.source_nat_rules.as_slice()),

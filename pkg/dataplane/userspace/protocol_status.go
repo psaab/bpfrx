@@ -348,6 +348,45 @@ type ProcessStatus struct {
 	// xpf_userspace_session_nat_reverse_key_shared_displacements_total.
 	// Omitempty for wire compat with older helpers.
 	NatReverseKeySharedDisplacementsTotal uint64 `json:"nat_reverse_key_shared_displacements_total,omitempty"`
+	// InterfaceSNATPATCollisionsTotal is #6751 PR 2/3: interface-mode SNAT
+	// identity-mint conflicts that took the PAT probe. Interface SNAT used
+	// to preserve the source port unconditionally, so two internal hosts
+	// picking one port to one server produced BYTE-IDENTICAL reverse keys
+	// and the replies for both went to whichever session installed first.
+	// The mint now reserves the translated reverse identity and moves the
+	// LATER collider's port. A nonzero value here is that shape actually
+	// occurring. Surfaced as
+	// xpf_userspace_interface_snat_pat_collisions_total. Omitempty for wire
+	// compat with older helpers.
+	InterfaceSNATPATCollisionsTotal uint64 `json:"interface_snat_pat_collisions_total,omitempty"`
+	// InterfaceSNATIdentityExhaustionTotal is #6751 PR 2/3: interface-mode
+	// SNAT admissions that failed CLOSED because no free translated
+	// identity existed for their (egress address, remote endpoint) — every
+	// port in 1024-65535 taken, a port-less protocol whose single identity
+	// was owned, or a peer-synced import whose identity a local flow held.
+	// Fail-closed is deliberate: admitting an unowned duplicate is the
+	// misdelivery #6751 closes. Surfaced as
+	// xpf_userspace_interface_snat_identity_exhaustion_total.
+	InterfaceSNATIdentityExhaustionTotal uint64 `json:"interface_snat_identity_exhaustion_total,omitempty"`
+	// InterfaceSNATSyncIdentityConflictDropsTotal is #6751 PR 2/3:
+	// peer-synced interface-SNAT imports DROPPED because a different live
+	// flow on this node already owns the translated identity the active
+	// assigned. Fail-closed is the safer posture -- the standby never
+	// holds a session it cannot own -- but it is an HA-FIDELITY loss, not
+	// a data-path drop, so it is its own series: a non-zero value means
+	// individual synced flows will not survive a failover onto this node.
+	// Surfaced as
+	// xpf_userspace_interface_snat_sync_identity_conflict_drops_total.
+	InterfaceSNATSyncIdentityConflictDropsTotal uint64 `json:"interface_snat_sync_identity_conflict_drops_total,omitempty"`
+	// InterfaceSNATRegistryCapExhaustionTotal is #6751 PR 2/3:
+	// interface-mode SNAT admissions that failed CLOSED because the
+	// identity registry could create no further state (the 256
+	// retained-allocator cap with nothing reclaimable, or a per-address
+	// tracked-flow cap). Read it apart from the identity counter: this one
+	// says raise capacity, that one says one remote's identity space is
+	// genuinely full. Surfaced as
+	// xpf_userspace_interface_snat_registry_cap_exhaustion_total.
+	InterfaceSNATRegistryCapExhaustionTotal uint64 `json:"interface_snat_registry_cap_exhaustion_total,omitempty"`
 	// #1807: total worker-command-queue poison recoveries (a helper
 	// thread panicked while holding a worker command mutex; the
 	// committed queue was recovered and the poison cleared — uniform

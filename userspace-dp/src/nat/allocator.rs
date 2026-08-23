@@ -124,6 +124,54 @@ pub(super) struct TranslatedTuple {
     pub(super) port: u16,
 }
 
+/// #6751: how many PAT candidates one `live`-mutex acquisition may probe
+/// before releasing it and yielding. A full-cycle probe on an exhausted
+/// identity space is 64512 map lookups; holding the mutex across all of them
+/// would stall every other worker's admission on this egress address for the
+/// whole walk. The #4676 `gc_expired_chunked` budget discipline, applied to the
+/// only other unbounded loop under this mutex.
+const INTERFACE_PAT_PROBE_CHUNK: u32 = 64;
+
+/// #6751: the outcome of an interface-mode identity mint.
+///
+/// `patted` is the discriminator the caller needs and cannot re-derive: it
+/// decides whether the decision carries `rewrite_src_port: Some(port)` (the
+/// wire moves) or leaves it unset (the wire is byte-identical to pre-#6751).
+/// Returning the port alone would force the caller to compare it against the
+/// flow's source port, which is the same thing said less directly and goes
+/// wrong the moment a port-less protocol reports 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InterfaceIdentity {
+    pub(super) port: u16,
+    pub(super) patted: bool,
+}
+
+/// #6751 §5.3: a domain's answer to "do you own this translated identity?".
+///
+/// The tri-state distinction lives in [`super::source::SyncedReserveOutcome`]
+/// for the whole synced-reserve scan; this is the per-allocator half of it, and
+/// deliberately carries only the two answers an allocator that HAS been asked
+/// can give. "Not this domain" is decided one level up, by whether the registry
+/// holds an allocator for the address at all — an allocator cannot report that
+/// about itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InterfaceDomainReserve {
+    /// The reservation is held for this flow.
+    Owned,
+    /// A DIFFERENT flow owns the requested identity. The caller must fail
+    /// closed — never fall through to another domain, or the two domains both
+    /// hand out one identity.
+    IdentityConflict,
+    /// The allocator could not create a further ownership record (its
+    /// per-address tracked-flow cap). Kept SEPARATE from `IdentityConflict`
+    /// because the two have different remedies and different §5.8 counters:
+    /// this one says the node is out of bookkeeping capacity, that one says a
+    /// live flow already owns this exact translated identity. Folding them
+    /// would leave an operator unable to tell "raise capacity" from "a peer's
+    /// session lost a race with a local flow".
+    RegistryCap,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PoolAddressFamily<'a> {
     V4(&'a [Ipv4Addr]),
@@ -300,6 +348,30 @@ pub(super) struct AddressOnlyReverseKey {
     pub(super) translated_port: u16,
     pub(super) dst_ip: IpAddr,
     pub(super) dst_port: u16,
+}
+
+impl AddressOnlyReverseKey {
+    /// #6751: the ONE construction the interface-mode registry uses, for the
+    /// occupancy CHECK, the record INSERT and the synced RESERVE alike.
+    ///
+    /// These three must agree by construction, not by three literals that
+    /// happen to match. A check keyed differently from its insert is invisible
+    /// to every behavioural test: the check finds nothing, so every flow
+    /// preserves and every mint "succeeds" — which is exactly the pre-#6751
+    /// behaviour the fix exists to remove, restored silently. (The pool-mode
+    /// paths keep their own inline literals; they are the shipped shape, and
+    /// re-keying them is not this change's business. The end-to-end release
+    /// test binds this constructor against what
+    /// `unlink_live_allocation_locked` removes.)
+    fn for_flow(flow: &SourceNatFlowKey, translated_ip: IpAddr, translated_port: u16) -> Self {
+        Self {
+            protocol: flow.protocol,
+            translated_ip,
+            translated_port,
+            dst_ip: flow.dst_ip,
+            dst_port: flow.dst_port,
+        }
+    }
 }
 
 /// #4559: IPv4 deterministic CGNAT (mode 1) block-allocation parameters,
@@ -1012,6 +1084,17 @@ impl PortAllocator {
             .live_lock_contended
             .fetch_add(1, Ordering::Relaxed);
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// #6751: live ownership records held by this allocator.
+    ///
+    /// The interface-mode registry uses it as its reclamation predicate — an
+    /// allocator with no live records holds no occupancy any session depends
+    /// on, so it can be dropped; one with live records must be retained until
+    /// their releases have reached it. Takes the `live` mutex, so it belongs on
+    /// apply / cap-saturation paths only, never per packet.
+    pub(crate) fn live_flow_count(&self) -> usize {
+        self.lock_live().live_by_flow.len()
     }
 
     /// White-box access to the live state for tests. NOT for production
@@ -2355,6 +2438,267 @@ impl PortAllocator {
             .allocations_total
             .fetch_add(1, Ordering::Relaxed);
         Ok(translated)
+    }
+
+    /// #6751: mint the translated identity for an INTERFACE-mode source-NAT
+    /// flow — preserve the source port when its reverse identity is free, PAT
+    /// the LATER collider when it is not.
+    ///
+    /// This is [`reserve_address_only`] plus the fallback pool mode cannot
+    /// have. Pool mode denies a colliding address-only flow as exhaustion
+    /// because `port no-translation` means what it says: the port must not
+    /// move. Interface mode carries no such promise, so instead of dropping the
+    /// second host it moves its port and both flows keep a UNIQUE reverse
+    /// identity — which is the whole point, since the reply
+    /// `(server -> egress:port)` carries nothing else to tell them apart.
+    ///
+    /// Occupancy is the full reverse identity `(protocol, egress address,
+    /// translated port, remote ip, remote port)` — the shipped
+    /// [`AddressOnlyReverseKey`]. So:
+    ///   * the same source port to two DIFFERENT servers: BOTH preserve;
+    ///   * TCP and UDP on the same numeric port: BOTH preserve;
+    ///   * a source port below 1024: PRESERVED when free (PAT candidates are
+    ///     drawn from the ephemeral range, but preservation is not);
+    ///   * two hosts, one port, one server: the first preserves, the second
+    ///     PATs. Only the second flow's wire tuple changes.
+    ///
+    /// No pool PORT bit is claimed (`address_only: true`), so the record is
+    /// byte-identical in shape to every other address-only token and the
+    /// EXISTING teardown (`release_flow` / `rollback_flow` via
+    /// `release_source_nat_allocation*`) frees it — no new delete site. That is
+    /// load-bearing: `release_source_nat_allocation_with_mode` reconstructs
+    /// `translated.port` as `rewrite_src_port.unwrap_or(key.src_port)`, which
+    /// is the preserved port for a preserved mint and the PAT'd port for a
+    /// PAT'd one, matching `LiveAllocation::translated` in both cases.
+    ///
+    /// Idempotent: a second packet of the same flow returns its first decision.
+    pub(super) fn allocate_interface_identity(
+        &self,
+        flow: SourceNatFlowKey,
+        translated_ip: IpAddr,
+        holder: NatHolder,
+    ) -> Result<InterfaceIdentity, super::source::SourceNatFailureReason> {
+        let rkey_for = |port: u16| AddressOnlyReverseKey::for_flow(&flow, translated_ip, port);
+        let preserved = flow.src_port;
+        {
+            let mut live = self.lock_live();
+            // Idempotent re-entry, and the point every already-holding worker
+            // lands on for a refresh.
+            if let Some(identity) =
+                self.reenter_interface_record_locked(&mut live, &flow, holder, preserved)
+            {
+                return Ok(identity);
+            }
+            if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+                self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+                return Err(super::source::SourceNatFailureReason::InterfaceRegistryCap);
+            }
+            // PRESERVE-FIRST. Identity check and insert happen under ONE
+            // acquisition, so two workers cannot both observe the port free.
+            if !live.address_only_owners.contains_key(&rkey_for(preserved)) {
+                self.insert_interface_record_locked(
+                    &mut live,
+                    flow,
+                    translated_ip,
+                    preserved,
+                    holder,
+                );
+                return Ok(InterfaceIdentity {
+                    port: preserved,
+                    patted: false,
+                });
+            }
+        }
+        // The preserved identity is owned by a DIFFERENT flow: this is the
+        // #6751 shape. Walk the ephemeral range for a free identity.
+        //
+        // The start ordinal is captured ONCE from the allocator's own cursor
+        // and the walk is LOCAL from there. Re-reading a shared cursor
+        // mid-walk would let a concurrent mint move it and turn a bounded
+        // single cycle into an unbounded one.
+        crate::nat::iface_registry::INTERFACE_SNAT_PAT_COLLISIONS.fetch_add(1, Ordering::Relaxed);
+        let span = u32::from(self.port_high) - u32::from(self.port_low) + 1;
+        let start = self.shared.addr_counter_v4.fetch_add(1, Ordering::Relaxed) % span;
+        let mut probed = 0u32;
+        while probed < span {
+            let mut live = self.lock_live();
+            // A chunk boundary released the mutex, so re-check the two
+            // preconditions the first critical section established. Without
+            // this a racing install of the SAME flow (a bulk-sync fan-out
+            // landing while a local packet probes) would mint a SECOND record
+            // for one flow, and only one of them would ever be released.
+            if let Some(identity) =
+                self.reenter_interface_record_locked(&mut live, &flow, holder, preserved)
+            {
+                return Ok(identity);
+            }
+            if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+                self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+                return Err(super::source::SourceNatFailureReason::InterfaceRegistryCap);
+            }
+            let chunk_end = (probed + INTERFACE_PAT_PROBE_CHUNK).min(span);
+            while probed < chunk_end {
+                // `span <= 65536` always (`port_high - port_low + 1`), so
+                // `offset` fits a u16 and `port_low + offset <= port_high`
+                // by construction — the saturating add is belt-and-braces,
+                // never a reachable clamp.
+                let offset = (start + probed) % span;
+                let candidate = self.port_low.saturating_add(offset as u16);
+                probed += 1;
+                if live.address_only_owners.contains_key(&rkey_for(candidate)) {
+                    continue;
+                }
+                self.insert_interface_record_locked(
+                    &mut live,
+                    flow,
+                    translated_ip,
+                    candidate,
+                    holder,
+                );
+                return Ok(InterfaceIdentity {
+                    port: candidate,
+                    patted: true,
+                });
+            }
+            // #4676 discipline: yield between chunks so a full-cycle probe
+            // cannot hold the mutex against every other worker's admission.
+            drop(live);
+            std::thread::yield_now();
+        }
+        // Every port in the range is owned for this `(egress, remote)`
+        // identity. Fail CLOSED — an unowned duplicate is precisely what this
+        // function exists to prevent.
+        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+        Err(super::source::SourceNatFailureReason::InterfaceIdentityExhausted)
+    }
+
+    /// #6751: reserve a PEER-SYNCED interface-mode translated identity — the
+    /// standby's mirror of [`allocate_interface_identity`], with the port
+    /// already decided by the active node.
+    ///
+    /// The standby must hold the identities the active minted BEFORE it ever
+    /// mints locally, or its first post-failover admission would preserve a
+    /// port an imported live session is already using and reintroduce the
+    /// ambiguity on the promoted node.
+    ///
+    /// Mirrors [`reserve_flow`]'s stale-tuple semantics rather than inventing
+    /// new ones: a re-sync that carries a DIFFERENT translated port for a flow
+    /// already on record replaces the record (freeing the old identity), so a
+    /// tuple-changing refresh cannot strand an identity no release will ever
+    /// name. `Owned` on success or idempotent re-entry; `IdentityConflict` when
+    /// a DIFFERENT flow owns the requested identity.
+    pub(super) fn reserve_interface_identity(
+        &self,
+        flow: SourceNatFlowKey,
+        translated_ip: IpAddr,
+        translated_port: u16,
+        now_ns: u64,
+        holder: NatHolder,
+    ) -> InterfaceDomainReserve {
+        let rkey = AddressOnlyReverseKey::for_flow(&flow, translated_ip, translated_port);
+        let mut live = self.lock_live();
+        if let Some(existing) = live.live_by_flow.get(&flow).copied() {
+            if existing.translated.ip == translated_ip
+                && existing.translated.port == translated_port
+            {
+                if let Some(slot) = live.live_by_flow.get_mut(&flow) {
+                    slot.holders |= holder.bit();
+                }
+                self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+                return InterfaceDomainReserve::Owned;
+            }
+            // A different flow may already own the NEW identity; refuse before
+            // tearing down the old record so a refused reserve is a no-op.
+            if live
+                .address_only_owners
+                .get(&rkey)
+                .is_some_and(|o| *o != flow)
+            {
+                return InterfaceDomainReserve::IdentityConflict;
+            }
+            self.unlink_live_allocation_locked(&mut live, &flow, existing);
+            Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
+        } else if live
+            .address_only_owners
+            .get(&rkey)
+            .is_some_and(|o| *o != flow)
+        {
+            return InterfaceDomainReserve::IdentityConflict;
+        } else if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return InterfaceDomainReserve::RegistryCap;
+        }
+        self.insert_interface_record_locked(
+            &mut live,
+            flow,
+            translated_ip,
+            translated_port,
+            holder,
+        );
+        InterfaceDomainReserve::Owned
+    }
+
+    /// #6751: the idempotent-re-entry answer, shared by the first critical
+    /// section and the chunk-boundary re-check.
+    ///
+    /// ONE body, because a divergence between the two is always a bug: the
+    /// chunk re-check exists precisely to catch a racing install of the SAME
+    /// flow, and a copy that computed `patted` differently would hand one flow
+    /// two different wire decisions depending on which acquisition saw it.
+    /// Records the holder on the way through, exactly as `reserve_address_only`
+    /// does on its own early return.
+    fn reenter_interface_record_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        flow: &SourceNatFlowKey,
+        holder: NatHolder,
+        preserved: u16,
+    ) -> Option<InterfaceIdentity> {
+        let existing = live.live_by_flow.get_mut(flow)?;
+        existing.holders |= holder.bit();
+        let translated = existing.translated;
+        self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+        Some(InterfaceIdentity {
+            port: translated.port,
+            patted: translated.port != preserved,
+        })
+    }
+
+    /// The record shape shared by every interface-mode mint and reserve, so a
+    /// preserved token, a PAT'd token and a synced token cannot drift apart in
+    /// the one field that decides how they are torn down (`address_only`).
+    fn insert_interface_record_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        flow: SourceNatFlowKey,
+        translated_ip: IpAddr,
+        translated_port: u16,
+        holder: NatHolder,
+    ) {
+        live.address_only_owners.insert(
+            AddressOnlyReverseKey::for_flow(&flow, translated_ip, translated_port),
+            flow,
+        );
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated: TranslatedTuple {
+                    ip: translated_ip,
+                    port: translated_port,
+                },
+                persistent_key: None,
+                // Interface mode claims no pool-port bit, so no address index
+                // is meaningful; `address_only` routes the teardown to the
+                // reverse-identity arm of `unlink_live_allocation_locked`.
+                addr_index: 0,
+                deterministic: false,
+                address_only: true,
+                holders: holder.bit(),
+            },
+        );
+        self.shared
+            .allocations_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// #6226: reserve a non-deterministic, non-persistent ADDRESS-ONLY token

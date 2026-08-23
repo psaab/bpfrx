@@ -156,6 +156,7 @@ fn over_budget_pool_fails_closed_without_bitmap() {
     // exception plumbing: a flow hitting only this rule gets Unavailable,
     // never an untranslated forward.
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules[2..],
         &NatScopeCtx::default(),
         "lan",
