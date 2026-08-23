@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"time"
 )
@@ -76,9 +77,12 @@ func (s *SessionSync) afterFunc(d time.Duration, f func()) *time.Timer {
 // raiseConfigApplyHealthLocked, which is idempotent and epoch-guarded, so CF
 // raises at most once per streak. A transient failure that clears within the
 // grace never raises (noteConfigApplySuccess cancels the timer and resets the
-// streak) — no flap. Called from the single-consumer configApplyLoop; the
-// shared state is guarded by configApplyMu because the timer callback runs on
-// its own goroutine.
+// streak) — no flap. Called from the single-consumer configApplyLoop and, since
+// #6778, from handleConfigPayload's queue-full drop on the receive loop: a
+// generation received and never applied is the condition this timer exists to
+// surface, whether the apply failed or never ran. The shared state is guarded
+// by configApplyMu, which is what makes the second (concurrent) caller safe —
+// the timer callback already runs on its own goroutine.
 func (s *SessionSync) noteConfigApplyFailure(applyErr error) {
 	now := s.nowMono()
 	reason := ""
@@ -190,15 +194,39 @@ func (s *SessionSync) fireConfigApplyGraceExpiry(epoch uint64) {
 // noteConfigApplySuccess clears the config-sync health streak on a successful
 // apply (#6387). It cancels the grace-expiry timer, resets the streak, and
 // bumps the epoch so an in-flight timer callback becomes a no-op. It then
-// clears the node-global CF annotation UNCONDITIONALLY — NOT gated on this
-// instance's configApplyHealthRaised. A comms transport change tears down this
+// clears the node-global CF annotation without consulting THIS instance's
+// configApplyHealthRaised flag. A comms transport change tears down this
 // SessionSync but KEEPS the cluster Manager (daemon stopClusterComms), so a CF
 // raised by a PRIOR SessionSync instance would otherwise stay stuck forever:
 // the replacement instance records the applied generation but, gated on its own
 // never-set flag, would never clear the manager. An idempotent clear is cheap,
-// so the first successful apply on ANY instance re-converges the annotation.
+// so a caught-up successful apply on ANY instance re-converges the annotation.
 // Called from the single-consumer configApplyLoop; guarded by configApplyMu.
-func (s *SessionSync) noteConfigApplySuccess() {
+//
+// #6778: the clear is gated on the applied generation having CAUGHT UP with the
+// received high-water — the same predicate TransferReadinessSnapshot.ConfigStale
+// uses. Before this gate any successful apply cleared the streak, so a config
+// dropped at the receive edge (queue full) armed the debt and then had it
+// cancelled milliseconds later by the apply of an OLDER generation still sitting
+// in the queue — the standby stayed behind the primary with the health signal
+// disarmed. appliedGen is the generation whose apply just succeeded; the caller
+// has not yet advanced lastAppliedConfigGen when it calls this (the advance must
+// follow, for the #6284 fence-release ordering), so the comparison is made
+// against the incoming generation rather than the mark.
+//
+// The gate cannot strand CF raised: a generation the receiver refuses before
+// recordRecvConfigGen never raises the received mark, resetRecvGen clears BOTH
+// marks to 0 on reconnect, and a legacy peer leaves both at 0 — so appliedGen >=
+// lastRecvConfigGen holds in every case where the node is genuinely caught up,
+// including the cross-instance clear the paragraph above describes.
+func (s *SessionSync) noteConfigApplySuccess(appliedGen uint64) {
+	if appliedGen < s.lastRecvConfigGen.Load() {
+		// Still behind the newest generation the peer has sent — an older
+		// queued config applied while a newer one was lost or is still in
+		// flight. Leave the streak and its grace timer armed so a drop that
+		// never re-converges still raises CF.
+		return
+	}
 	s.configApplyMu.Lock()
 	defer s.configApplyMu.Unlock()
 	s.firstUnappliedFailNano = 0
@@ -297,10 +325,19 @@ func (s *SessionSync) QueueConfig(configText string) {
 		"encrypted", encrypted)
 }
 
+// errConfigApplyQueueFull is the health-debt reason recorded when a config
+// payload is dropped at the receive edge because the #3931 ordered apply queue
+// was full (#6778). It is not returned by an apply — no apply ran — but it
+// feeds the same #6387 grace timer, because "received a generation, never
+// applied it" is the condition that timer exists to surface, and the operator
+// needs the DISTINCT reason: an apply failure points at the config or the
+// store, a queue-full drop points at a saturated receive path.
+var errConfigApplyQueueFull = errors.New("config apply queue full: the newest config generation was dropped before apply")
+
 // sendConfigApplyNack tells the SENDER that this node did not apply the config
-// generation it pushed (#7328). Called from configApplyLoop's failure branch,
-// which is the single ordered consumer, so nacks are naturally rate-bounded by
-// how often the peer pushes.
+// generation it pushed (#7328). Called from configApplyLoop's failure branch —
+// the single ordered consumer — and from handleConfigPayload's queue-full drop
+// (#6778), so nacks are rate-bounded by how often the peer pushes.
 //
 // Best-effort by construction: with no active connection there is nothing to
 // tell, and a write error disconnects, which bumps the peer's connection epoch
@@ -550,10 +587,14 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				continue
 			}
 			// #6387: a confirmed apply clears any raised CF health signal (the
-			// standby has re-converged). Fired on every success — including a
-			// gen==0 legacy apply that does not advance the high-water — since
-			// the host-inbound sub-step applied cleanly.
-			s.noteConfigApplySuccess()
+			// standby has re-converged). #6778 narrows "re-converged" to mean
+			// CAUGHT UP: the clear now takes the applied generation and no-ops
+			// while it is still behind the received high-water, so an older
+			// queued config applying after a newer one was dropped at the
+			// receive edge cannot cancel the debt for the generation that was
+			// lost. A gen==0 legacy apply still clears (a legacy peer never
+			// raises the received mark, so both sides read 0).
+			s.noteConfigApplySuccess(item.gen)
 			// Apply confirmed — advance the high-water so a duplicate re-push of
 			// the same generation is correctly skipped as stale, THEN drop the
 			// fence. Advancing first keeps the effective refusal threshold

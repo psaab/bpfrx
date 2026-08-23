@@ -591,30 +591,6 @@ func TestHostInboundAllowlistLogic(t *testing.T) {
 	}
 }
 
-func TestAppPortsFromSpec(t *testing.T) {
-	tests := []struct {
-		spec string
-		want []int
-	}{
-		{"", nil},
-		{"80", []int{80}},
-		{"8080-8083", []int{8080, 8081, 8082, 8083}},
-		{"443-443", []int{443}},
-	}
-	for _, tt := range tests {
-		got := appPortsFromSpec(tt.spec)
-		if len(got) != len(tt.want) {
-			t.Errorf("appPortsFromSpec(%q) len = %d, want %d", tt.spec, len(got), len(tt.want))
-			continue
-		}
-		for i := range got {
-			if got[i] != tt.want[i] {
-				t.Errorf("appPortsFromSpec(%q)[%d] = %d, want %d", tt.spec, i, got[i], tt.want[i])
-			}
-		}
-	}
-}
-
 func TestResolvePortName(t *testing.T) {
 	tests := []struct {
 		name string

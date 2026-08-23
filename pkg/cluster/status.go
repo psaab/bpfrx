@@ -469,6 +469,23 @@ func (m *Manager) FormatInformation() string {
 		if syncStats.ConfigsApplyFailed > 0 {
 			fmt.Fprintf(&b, "  Configs apply-failed:  %d\n", syncStats.ConfigsApplyFailed)
 		}
+		// #6778: a config that never reached the ordered apply queue. Rendered
+		// beside apply-failed because the operator consequence is identical —
+		// this node is running a config older than the primary's committed one
+		// — but the cause is different (receive-edge saturation, not a compile
+		// or promote failure), so it gets its own line rather than being folded
+		// into apply-failed.
+		if syncStats.ConfigsQueueFullDropped > 0 {
+			fmt.Fprintf(&b, "  Configs queue-full-dropped: %d\n", syncStats.ConfigsQueueFullDropped)
+		}
+		// #7328/#6778: nacks this node ACCEPTED from the peer, i.e. generations
+		// we pushed that the peer did not apply. Surfaced because it is the
+		// sender-side half of the queue-full / apply-failure recovery loop: a
+		// peer whose queue-full drops climb while this counter stays at zero has
+		// no working re-push driver.
+		if syncStats.ConfigApplyNacksReceived > 0 {
+			fmt.Fprintf(&b, "  Config apply-nacks received: %d\n", syncStats.ConfigApplyNacksReceived)
+		}
 		// #5084: the peer boot incarnation, rendered ALWAYS rather than only
 		// when non-empty. "none" is the operationally interesting value — it
 		// means the fence is in its fail-open state against this peer — and a

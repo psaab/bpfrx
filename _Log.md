@@ -104390,6 +104390,93 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
   `pkg/config/schema_walk.go`, `pkg/config/schema_block_value_6774_test.go`
 
+## 2026-08-22 — #6777 graceful RA withdrawal: final goodbye failure surfaced + retry debt
+
+- **Timestamp**: 2026-08-22
+- **Action**: Graceful RA withdrawal discarded the final lifetime-0 goodbye
+  failure and erased the state a retry needed. `finishDrainDecision` logged the
+  standalone-backstop failure, set `goodbyeClaimed`, deleted the tombstone and
+  returned only the replacement-start error; `Manager.Withdraw` returned a
+  hard-coded `nil`, making the `if err := d.ra.Withdraw(); err != nil` branch at
+  all three production call sites unreachable. Because
+  `reconcileClusterRAServices` advances `lastRAReconcileHash` only on a
+  successful apply, the swallowed failure was latched as converged and the 2s
+  pass never retried — the stale IPv6 default-router identity survived on hosts
+  until Router Lifetime expiry. Fix propagates the goodbye error out through
+  `releaseDrain` to `Withdraw`/`Apply`, and retains bounded retry debt
+  (`Manager.goodbyeOwed`) that `Apply` re-drives via `WithdrawOnce`.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go,
+  pkg/ra/goodbye_retry_debt_6777_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6777 round 2 — bound the two mutation cells that came back GREEN.
+  `recordedEpoch` (a debt recorded by the current Apply is held over, not
+  retried on the same pass) and the busy-skip attempt refund were both
+  documented claims with no assertion behind them; a mutation neutralising
+  either left the suite green.
+- **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
+## 2026-08-22 — #6776 archive reseed scan is time-bounded (fail-open)
+
+## 2026-08-22 — #6783 appPortsFromSpec u16 wrap: dead helper removed, ceiling guarded
+
+- **Timestamp**: 2026-08-22
+- **Action**: `pkg/dataplane.appPortsFromSpec` expanded a port range using the
+  parse's uint16 bounds as the loop counter, so any spec ending at 65535 with a
+  width > 1 never terminated. Reproduced (`65534-65535` hangs). Its last
+  production caller was removed by `ad31711e3`, so the defect is no longer
+  reachable — the helper was dead code carrying an infinite loop, and is
+  deleted with its test rather than repaired. Swept the repo for the same
+  pattern: five ascending expansion loops, four already total (int/uint64
+  counters or an explicit ceiling break). Added a watchdogged ceiling guard on
+  the surviving live helpers in pkg/dataplane/userspace, which the existing
+  agreement corpus could not cover without turning a wrap into a hung suite.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
+  pkg/dataplane/userspace/port_expansion_ceiling_6783_test.go, _Log.md
+
+- **Timestamp**: 2026-08-22
+- **Action**: Bound the archive-seq reseed directory scan with
+  `archiveScanBudget` (5s) so an unresponsive archive filesystem can no longer
+  hold the global store mutex — or daemon PHASE 4 bring-up — indefinitely. A
+  budget expiry maps onto the existing #6404 UNCONFIRMED semantics (counter not
+  reseeded, `archiveSeedDir` cleared, archiving commit skips its archive), i.e.
+  fail-open: the box comes up and stays configurable, only archival is
+  suspended. The abandoned scan's buffered result is retained and collected by
+  the next call, so a wedged filesystem costs one stall and one goroutine per
+  process, not one per commit.
+- **Measured, contradicting the issue title**: the scanned dir is always the
+  local hardcoded `/var/lib/xpf/archive` (no `archive-dir` config leaf exists);
+  there is no remote `ReadDir` anywhere in the archive path. The mutex claim is
+  correct (`Store.mu`, the global RWMutex, taken for writing). Also corrected a
+  pre-existing FALSE claim in `ArchiveConfig` / README that the seed scan was
+  already "a bounded ReadDir under the lock".
+- **File(s)**: `pkg/configstore/store.go`, `pkg/configstore/store_persist.go`,
+  `pkg/configstore/archive_reseed_scan_timeout_6776_test.go`,
+  `pkg/configstore/README.md`, `_Log.md`
+
+## 2026-08-22 — #6778 a full config-apply queue stranded the newest generation
+
+- **Timestamp**: 2026-08-22
+- **Action**: The `default:` arm of the non-blocking enqueue in
+  `handleConfigPayload` discards the INCOMING payload, which is the NEWEST
+  generation the peer has sent, while the queue retains older ones — so the
+  standby drains onto a superseded config. `recordRecvConfigGen` had already
+  raised the received high-water for it, so the node read config-stale and
+  #5563 refused manual-failover promotion, with nothing driving the missing
+  generation back: the sender's #5863 (epoch x generation) marker is claimed
+  BEFORE the push and only a nack clears it. The drop now takes the three
+  actions an apply failure already took — its own `ConfigsQueueFullDropped`
+  counter rendered in cluster status, the #6387 grace timer via
+  `noteConfigApplyFailure(errConfigApplyQueueFull)`, and `sendConfigApplyNack`
+  so the sender's existing 30s reconcile re-pushes. No new retry queue.
+  `noteConfigApplySuccess` was narrowed to take the applied generation and
+  no-op while it is still below `lastRecvConfigGen`, because a queue only
+  fills when the consumer is behind and the backlog's successful applies were
+  cancelling the drop's debt milliseconds after it armed.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/status.go`,
+  `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
+  `pkg/cluster/sync_config_queue_full_6778_test.go`,
+  `pkg/cluster/sync_config_health_6387_test.go`, `docs/sync-protocol.md`,
+  `docs/session-sync-architecture.md`
+
 ## 2026-08-22 — #6779 an oversized VIP set advertises nothing after claiming ownership
 
 - **Timestamp**: 2026-08-22
