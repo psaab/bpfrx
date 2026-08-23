@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -37,24 +36,10 @@ func (vi *vrrpInstance) emitEvent() {
 
 // sendAdvert sends a VRRPv3 advertisement with the given priority.
 func (vi *vrrpInstance) sendAdvert(priority int) {
-	hasIPv6 := false
-	var v4Addrs, v6Addrs []net.IP
-	for _, vip := range vi.cfg.VirtualAddresses {
-		addr := vip
-		if idx := strings.Index(addr, "/"); idx >= 0 {
-			addr = addr[:idx]
-		}
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			v4Addrs = append(v4Addrs, ip.To4())
-		} else {
-			v6Addrs = append(v6Addrs, ip.To16())
-			hasIPv6 = true
-		}
-	}
+	// Shared with checkAdvertCapacity (advert_capacity.go) so the guard that
+	// decides an advert CAN be built counts exactly the addresses this builder
+	// puts in it (#6779).
+	v4Addrs, v6Addrs := splitVIPsByFamily(vi.cfg.VirtualAddresses)
 
 	// Send IPv4 advertisement if we have any IPv4 VIPs.
 	if len(v4Addrs) > 0 {
@@ -72,7 +57,7 @@ func (vi *vrrpInstance) sendAdvert(priority int) {
 	}
 
 	// Send IPv6 advertisement if we have any IPv6 VIPs.
-	if hasIPv6 && len(v6Addrs) > 0 {
+	if len(v6Addrs) > 0 {
 		maxAdvert := uint16(vi.cfg.AdvertiseInterval / 10) // ms → centiseconds
 		pkt := &VRRPPacket{
 			VRID:         uint8(vi.cfg.GroupID),

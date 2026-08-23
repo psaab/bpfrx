@@ -1160,9 +1160,10 @@ owned by the `journal/` subpackage.
   the process-global counter cannot be bumped between its seed and its claim in
   the off-lock write window. Only the WRITE itself stays off-lock (a long
   archival I/O must not block reconcile/`QuiesceArchival`, #6185); the seed scan
-  is a bounded `ReadDir` under the lock, exactly what the commit path already
-  does. A genuine seed scan error (mount/permission — the on-disk max unknown)
-  fails the synchronous call rather than write a below-max archive; a
+  is a `ReadDir` under the lock, bounded by `archiveScanBudget` (#6776, below),
+  exactly what the commit path already does. A genuine seed scan error
+  (mount/permission — the on-disk max unknown) fails the synchronous call rather
+  than write a below-max archive, as does a scan that exceeds the budget; a
   nonexistent dir is confirmed-empty, seq 0, and the write path's `MkdirAll`
   creates it.
   These monotonicity / no-overwrite guarantees hold **once the target
@@ -1207,7 +1208,44 @@ owned by the `journal/` subpackage.
   while archival was off (edge 2); likewise a genuine scan FAILURE clears
   `archiveSeedDir`, so navigating away to a dir that fails to scan and back
   (`A`→failed-`B`→`A`) re-scans `A` rather than trusting the stale marker (Codex
-  adjacent). The
+  adjacent).
+  **The reseed scan is time-bounded (#6776).** `ensureArchiveSeededLocked` runs
+  under `s.mu` held for WRITING — the GLOBAL store mutex, the same one that
+  gates `Load`, every commit and every config read — and the scan it performs is
+  `readdir(2)`. A `readdir` on a filesystem that has stopped answering (a
+  network mount under the archive path, a stalled block device) blocks
+  uninterruptibly, and no context or deadline can cancel it: a thread parked in
+  a filesystem wait is not reachable from userspace. That matters most at cold
+  boot, where the boot apply's step 15b `SetArchiveConfig` runs in daemon
+  PHASE 4 — *before* the gRPC/REST/CLI listeners start in PHASE 5 — so an
+  unbounded scan there means the daemon never reaches its control plane at all.
+  The scan therefore runs on a throwaway goroutine and the lock-holder waits at
+  most `archiveScanBudget` (5s) for it (`awaitArchiveScanLocked`). On expiry the
+  goroutine is ABANDONED, not cancelled, and the outcome is **fail-open**: the
+  caller is released, bring-up and config work proceed, and only archival is
+  suspended. Fail-open is the deliberate choice — config archival is a
+  DR/compliance convenience, and refusing to bring a firewall up because a
+  directory did not answer converts a degraded-storage event into a total
+  outage. The suspension reuses the existing #6404 semantics exactly, because a
+  timed-out scan leaves the on-disk max in the same state a read error does —
+  UNKNOWN: the counter is NOT reseeded (never rewound to 0), `archiveSeedDir` is
+  cleared so a later call retries, and an archiving commit SKIPS its archive
+  rather than write a below-max seq rotation would prune. The abandoned scan is
+  not discarded: its buffered result channel is retained (`archiveScanCh`, keyed
+  by `archiveScanDir`), so the next call collects the result with a NON-blocking
+  poll once the filesystem answers, and archival resumes at the correct seq.
+  That retention is also what bounds the cost — a persistently wedged archive
+  filesystem costs exactly ONE budget-length stall and ONE leaked scan goroutine
+  per process, not one per commit. 5s is chosen as ~3 orders of magnitude of
+  headroom over a healthy scan (the dir is retention-capped at `max-archives`,
+  default 10, so a real `readdir` costs microseconds), so the budget cannot fire
+  on a merely loaded disk. NOTE on scope: the scanned directory is always the
+  local `/var/lib/xpf/archive` — the compiler hardcodes it and there is no
+  `archive-dir` configuration leaf — so it becomes remote only if an operator or
+  image makes that path a mount point. The `archive-sites` remote leg is a
+  separate path (scp, already 30s-bounded, off-lock); it never lists a remote
+  directory.
+  The
   rollback/archive writers
   route through package-var seams (`rbWriteFileDurable`,
   `rbWriteFileAtomic`, `rbSyncDir`, `rbRemove`) so tests can pin the

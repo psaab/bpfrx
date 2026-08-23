@@ -246,6 +246,25 @@ type Store struct {
 	// not a failure — seq 0 is correct and the write path creates the dir.
 	archiveSeedDir string
 
+	// archiveScanCh / archiveScanDir hold the result channel of a reseed
+	// directory scan that has been LAUNCHED but whose result has not been
+	// consumed yet (#6776). The scan itself is a readdir(2) — an
+	// UNINTERRUPTIBLE syscall that no context or deadline can cancel — so
+	// ensureArchiveSeededLocked runs it on a throwaway goroutine and waits only
+	// archiveScanBudget for it, rather than blocking the global store mutex
+	// (and, at boot, the whole daemon bring-up) for however long the filesystem
+	// takes to answer. When the budget expires the goroutine is ABANDONED, not
+	// cancelled: it keeps its buffered channel, eventually completes, and the
+	// reference kept here lets the NEXT call pick that result up with a
+	// non-blocking poll instead of launching a second scan. That is what bounds
+	// the cost of a wedged archive filesystem to exactly one budget-length stall
+	// per process rather than one per commit, and bounds the leaked goroutine
+	// count to one per distinct dir. The abandoned goroutine never touches Store
+	// state — it only sends on its buffered channel — so it needs no lock and
+	// can race with nothing. Both fields are guarded by s.mu.
+	archiveScanCh  chan archiveScanResult
+	archiveScanDir string
+
 	// archiveSeq is a monotonic counter appended to every archive filename
 	// (#3441 H4, Codex MAJOR). The wall-clock timestamp alone is not a unique
 	// key: two successive (mutex-serialized) commits can format the SAME

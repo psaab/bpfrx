@@ -104414,6 +104414,7 @@ prose edit above them added. No diff falls in the new test body.
   documented claims with no assertion behind them; a mutation neutralising
   either left the suite green.
 - **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
+## 2026-08-22 — #6776 archive reseed scan is time-bounded (fail-open)
 
 ## 2026-08-22 — #6783 appPortsFromSpec u16 wrap: dead helper removed, ceiling guarded
 
@@ -104430,6 +104431,80 @@ prose edit above them added. No diff falls in the new test body.
   agreement corpus could not cover without turning a wrap into a hung suite.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
   pkg/dataplane/userspace/port_expansion_ceiling_6783_test.go, _Log.md
+
+- **Timestamp**: 2026-08-22
+- **Action**: Bound the archive-seq reseed directory scan with
+  `archiveScanBudget` (5s) so an unresponsive archive filesystem can no longer
+  hold the global store mutex — or daemon PHASE 4 bring-up — indefinitely. A
+  budget expiry maps onto the existing #6404 UNCONFIRMED semantics (counter not
+  reseeded, `archiveSeedDir` cleared, archiving commit skips its archive), i.e.
+  fail-open: the box comes up and stays configurable, only archival is
+  suspended. The abandoned scan's buffered result is retained and collected by
+  the next call, so a wedged filesystem costs one stall and one goroutine per
+  process, not one per commit.
+- **Measured, contradicting the issue title**: the scanned dir is always the
+  local hardcoded `/var/lib/xpf/archive` (no `archive-dir` config leaf exists);
+  there is no remote `ReadDir` anywhere in the archive path. The mutex claim is
+  correct (`Store.mu`, the global RWMutex, taken for writing). Also corrected a
+  pre-existing FALSE claim in `ArchiveConfig` / README that the seed scan was
+  already "a bounded ReadDir under the lock".
+- **File(s)**: `pkg/configstore/store.go`, `pkg/configstore/store_persist.go`,
+  `pkg/configstore/archive_reseed_scan_timeout_6776_test.go`,
+  `pkg/configstore/README.md`, `_Log.md`
+
+## 2026-08-22 — #6778 a full config-apply queue stranded the newest generation
+
+- **Timestamp**: 2026-08-22
+- **Action**: The `default:` arm of the non-blocking enqueue in
+  `handleConfigPayload` discards the INCOMING payload, which is the NEWEST
+  generation the peer has sent, while the queue retains older ones — so the
+  standby drains onto a superseded config. `recordRecvConfigGen` had already
+  raised the received high-water for it, so the node read config-stale and
+  #5563 refused manual-failover promotion, with nothing driving the missing
+  generation back: the sender's #5863 (epoch x generation) marker is claimed
+  BEFORE the push and only a nack clears it. The drop now takes the three
+  actions an apply failure already took — its own `ConfigsQueueFullDropped`
+  counter rendered in cluster status, the #6387 grace timer via
+  `noteConfigApplyFailure(errConfigApplyQueueFull)`, and `sendConfigApplyNack`
+  so the sender's existing 30s reconcile re-pushes. No new retry queue.
+  `noteConfigApplySuccess` was narrowed to take the applied generation and
+  no-op while it is still below `lastRecvConfigGen`, because a queue only
+  fills when the consumer is behind and the backlog's successful applies were
+  cancelling the drop's debt milliseconds after it armed.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/status.go`,
+  `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
+  `pkg/cluster/sync_config_queue_full_6778_test.go`,
+  `pkg/cluster/sync_config_health_6387_test.go`, `docs/sync-protocol.md`,
+  `docs/session-sync-architecture.md`
+
+## 2026-08-22 — #6779 an oversized VIP set advertises nothing after claiming ownership
+
+- **Timestamp**: 2026-08-22
+- **Action**: Closed the ordering hole where `becomeMaster` claimed the VIP set
+  and published MASTER *before* `sendAdvert`, which discards a `Marshal`
+  failure at `slog.Debug`. A VIP set larger than the advertisement's one-byte
+  address count (255, or 254 for IPv6 where the mandatory link-local prepend
+  consumes a slot) therefore produced an owner that advertised nothing — the
+  peer promoted too (dual-master), or the VIPs were stranded. Added a
+  commit-time gate (`validateVRRPVIPCountStrict`, lenient-opt registered per
+  the #1960 no-brick contract) covering BOTH VIP sources — explicit
+  `vrrp-group` and the RETH-derived instances whose unit addresses become the
+  advertised set — plus runtime guards in `UpdateInstances` (#4573 doctrine)
+  and `becomeMaster` (#5082 doctrine). `sendAdvert` and the guard now share one
+  `splitVIPsByFamily` so the builder and the validator cannot count
+  differently, and a behavioural agreement test measures what the real
+  `Marshal` accepts instead of pinning either side to a literal. The EMPTY-VIP
+  case was measured and deliberately excluded: it is a distinct, non-colliding
+  defect with a 22-test blast radius.
+- **File(s)**: `pkg/vrrp/advert_capacity.go` (new), `pkg/vrrp/packet.go`,
+  `pkg/vrrp/instance.go`, `pkg/vrrp/instance_send.go`, `pkg/vrrp/manager.go`,
+  `pkg/vrrp/advert_capacity_gate_6779_test.go` (new),
+  `pkg/vrrp/advert_capacity_agreement_6779_test.go` (new),
+  `pkg/config/compiler_validate_strict_vrrp_vipcount.go` (new),
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
+  `pkg/config/README.md`
 
 ## 2026-08-22 — #6785 HA import capacity refusal reported as success
 

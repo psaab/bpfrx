@@ -602,7 +602,27 @@ func (s *Store) ensureArchiveSeededLocked() bool {
 	if dir == "" || s.archiveSeedDir == dir {
 		return true
 	}
-	seed, err := maxArchiveSeq(dir)
+	res, ok := s.awaitArchiveScanLocked(dir)
+	if !ok {
+		// #6776: the scan did not answer within archiveScanBudget. The archive
+		// filesystem is unresponsive, so the on-disk max is UNKNOWN — the SAME
+		// epistemic state a genuine read error leaves, and handled identically:
+		// do NOT reseed to 0, clear archiveSeedDir so a later call retries, and
+		// return false so the commit path SKIPS this commit's archive rather
+		// than writing a below-max seq rotateArchives would prune as stale.
+		//
+		// This is the deliberate FAIL-OPEN choice for the boot path. Config
+		// archival is a DR/compliance convenience; refusing to bring the
+		// firewall up because a directory did not answer would convert a
+		// degraded-storage event into a total outage. So bring-up proceeds and
+		// archival — and only archival — is suspended until a scan lands.
+		slog.Warn("archive seq reseed scan did not complete within budget; "+
+			"counter unconfirmed, archival suspended until the scan lands",
+			"dir", dir, "budget", archiveScanBudget)
+		s.archiveSeedDir = ""
+		return false
+	}
+	seed, err := res.seq, res.err
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// First use: the archive dir does not exist yet. This is NOT a scan
@@ -671,15 +691,122 @@ func parseArchiveSeq(name string) (uint64, bool) {
 // reliably forced to fail from a unit test, least of all when tests run as root.
 var archiveDirReader = os.ReadDir
 
+// archiveScanBudget bounds how long the archive-seq reseed scan may hold the
+// global store mutex waiting for the archive directory to answer (#6776).
+//
+// WHY A BUDGET AND NOT A CONTEXT. The scan is os.ReadDir — a readdir(2)
+// syscall. A context cannot cancel it: a thread parked in an uninterruptible
+// filesystem wait is not reachable from userspace, so "pass a ctx" would add a
+// parameter that never fires. The only mechanism that actually bounds the wait
+// is to run the syscall on a throwaway goroutine and stop waiting for it. That
+// is what awaitArchiveScanLocked does.
+//
+// WHY 5s. The directory being scanned is the local config archive, which the
+// retention policy caps at max-archives entries (default 10) — a readdir of it
+// costs microseconds on any healthy storage. 5s is more than three orders of
+// magnitude of headroom, so the budget cannot fire on a merely loaded disk; it
+// fires only when the filesystem has genuinely stopped answering. It is also
+// short relative to daemon bring-up: the boot apply runs before the gRPC/REST/
+// CLI listeners start (daemon PHASE 4 precedes PHASE 5), so this is the most
+// bring-up can be delayed by an unresponsive archive filesystem — once, not per
+// commit (see archiveScanCh).
+//
+// Overridable for tests only.
+var archiveScanBudget = 5 * time.Second
+
+// archiveScanResult is one completed archive-directory scan: the highest
+// on-disk sequence number, or the error that made it unknowable.
+type archiveScanResult struct {
+	seq uint64
+	err error
+}
+
+// awaitArchiveScanLocked returns the result of an archive-directory scan of
+// dir, waiting at most archiveScanBudget for it. ok is false when the budget
+// expired with no result — the on-disk max is UNKNOWN, exactly as it is after a
+// genuine read error, and callers must treat it that way.
+//
+// The caller MUST hold s.mu for WRITING: this reads and stores the pending-scan
+// fields. It deliberately keeps the lock across the wait (bounded by the budget)
+// rather than dropping and re-taking it — see #6403, which established that
+// widening this critical section around the archive WRITE is the hazard, while
+// the scan+claim belongs inside it: releasing s.mu here would let a concurrent
+// SetArchiveConfig switch archiveDir out from under a seed the caller is about
+// to store against the old dir.
+//
+// Two paths:
+//
+//   - No scan outstanding for dir: launch one on a throwaway goroutine and wait
+//     up to the budget. The goroutine gets a buffered channel and the
+//     already-sampled directory reader, so it never blocks on the send and never
+//     touches Store state or a package var — it cannot race with anything, and
+//     abandoning it is safe.
+//   - A scan for dir is already outstanding (a previous call abandoned it at the
+//     budget): poll it WITHOUT blocking. A caller must not pay a second full
+//     budget for a filesystem already known to be unresponsive, so this returns
+//     ok=false immediately when the earlier scan still has not landed. When it
+//     HAS landed, its result is consumed here — that is the retry the reseed
+//     contract promises, arriving on the first call after the filesystem
+//     recovers rather than needing a fresh scan.
+//
+// The pending scan is keyed by dir: a call for a DIFFERENT dir drops the
+// reference and launches its own scan (the abandoned goroutine still completes
+// into its buffered channel and exits). A scan is therefore leaked at most once
+// per distinct directory, never once per commit.
+func (s *Store) awaitArchiveScanLocked(dir string) (archiveScanResult, bool) {
+	if s.archiveScanCh != nil && s.archiveScanDir == dir {
+		select {
+		case res := <-s.archiveScanCh:
+			s.archiveScanCh = nil
+			s.archiveScanDir = ""
+			return res, true
+		default:
+			return archiveScanResult{}, false
+		}
+	}
+
+	// Sample the reader seam HERE, on the goroutine that holds the lock, and
+	// hand it to the scan — see maxArchiveSeqWith.
+	read := archiveDirReader
+	ch := make(chan archiveScanResult, 1)
+	s.archiveScanCh = ch
+	s.archiveScanDir = dir
+	go func() {
+		seq, err := maxArchiveSeq(read, dir)
+		ch <- archiveScanResult{seq: seq, err: err}
+	}()
+
+	timer := time.NewTimer(archiveScanBudget)
+	defer timer.Stop()
+	select {
+	case res := <-ch:
+		s.archiveScanCh = nil
+		s.archiveScanDir = ""
+		return res, true
+	case <-timer.C:
+		// Abandon the scan. The goroutine keeps ch (buffered, capacity 1), so it
+		// completes and exits on its own whenever the filesystem answers, and the
+		// reference retained in s.archiveScanCh lets the next call collect it.
+		return archiveScanResult{}, false
+	}
+}
+
 // maxArchiveSeq returns the highest config-<ts>.<seq>.conf sequence number
 // present in dir. It returns a non-nil error when the directory is UNREADABLE,
 // distinct from a readable directory that holds no well-formed archive (which
 // returns 0, nil). The caller MUST NOT treat a scan error as an empty
 // directory: seeding the monotonic counter to 0 on a transient failure would
 // pin it below the on-disk max and prune every fresh archive as stale
-// (#6396 Codex MINOR 4). Used by SetArchiveConfig to seed archiveSeq.
-func maxArchiveSeq(dir string) (uint64, error) {
-	entries, err := archiveDirReader(dir)
+// (#6396 Codex MINOR 4). Reached from SetArchiveConfig / the archiving commit
+// path via awaitArchiveScanLocked, which seeds archiveSeq.
+//
+// #6776: the directory reader is passed in rather than read from the
+// archiveDirReader package var, because this now runs on a throwaway scan
+// goroutine. The seam must be sampled ONCE on the goroutine that holds s.mu and
+// handed in — a test that restores the seam while an abandoned scan is still
+// parked in readdir(2) would otherwise be a data race on the package var.
+func maxArchiveSeq(read func(string) ([]os.DirEntry, error), dir string) (uint64, error) {
+	entries, err := read(dir)
 	if err != nil {
 		return 0, err
 	}
@@ -814,7 +941,18 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 		return nil
 	}
 	// #6403: seed the shared counter from THIS dir before claiming the seq.
-	if seed, err := maxArchiveSeq(archiveDir); err != nil {
+	// #6776: bounded by archiveScanBudget — this is the "bounded ReadDir under
+	// the lock" the comment above promises, which before #6776 it was not. A
+	// budget expiry is reported to this SYNCHRONOUS caller as an error, the same
+	// as a genuine read error below: both leave the on-disk max unknown, so the
+	// caller must learn it could not safely archive.
+	scan, ok := s.awaitArchiveScanLocked(archiveDir)
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("archive seq reseed scan of %s: did not complete within %s",
+			archiveDir, archiveScanBudget)
+	}
+	if seed, err := scan.seq, scan.err; err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			// A genuine scan error (mount/permission) leaves the on-disk max
 			// UNKNOWN, so a claimed seq cannot be guaranteed to outrank the

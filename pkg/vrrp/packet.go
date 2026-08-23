@@ -298,3 +298,27 @@ func vrrpIPv6Checksum(src, dst net.IP, payload []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
+
+// MaxConfiguredVIPs returns the largest number of CONFIGURED virtual addresses
+// of a single family that one VRRP instance can carry in a legal advertisement.
+//
+// It is DERIVED from MaxAdvertAddrCount rather than restated, because the two
+// families do not have the same budget: RFC 5798 §5.2.9 / §6.1 require an IPv6
+// advertisement to list the virtual router's link-local address FIRST, and
+// sendPacketIPv6 (instance_send.go) prepends that link-local to the configured
+// VIP slice immediately before Marshal. That prepended address occupies one of
+// the 255 slots the u8 "Count IPvX Addr" field can express, so the IPv6 budget
+// for CONFIGURED addresses is one less than the wire maximum. IPv4 has no
+// prepend and spends the full budget on configured VIPs.
+//
+// Callers that need the wire-format limit itself (Marshal's own range check)
+// use MaxAdvertAddrCount; callers that need "how many VIPs may an operator
+// configure" use this. Keeping the subtraction in one place is what stops the
+// validator and the builder from disagreeing by exactly the link-local.
+func MaxConfiguredVIPs(isIPv6 bool) int {
+	if isIPv6 {
+		// One slot is reserved for the mandatory link-local prepend.
+		return MaxAdvertAddrCount - 1
+	}
+	return MaxAdvertAddrCount
+}

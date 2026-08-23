@@ -2075,6 +2075,29 @@ type compileOpts struct {
 	// fail-closed-on-load class). Same doctrine as lenientBackupRouterDst.
 	lenientVRRPVirtualAddress bool
 
+	// lenientVRRPVIPCount (#6779) downgrades the VRRP virtual-address
+	// per-family cardinality gate (validateVRRPVIPCountStrict) from a hard
+	// compile error to a cfg.Warnings entry. A VRRP advertisement's address
+	// count is a single wire byte (RFC 5798 §5.2.4), so at most 255 addresses
+	// of one family fit — 254 for IPv6, where §6.1 reserves the first slot for
+	// the mandatory link-local prepend. pkg/vrrp Marshal REFUSES an
+	// out-of-range count rather than truncating it (#5090), and sendAdvert
+	// discards that error at slog.Debug, so an oversized set makes every advert
+	// fail AFTER becomeMaster has already claimed the VIPs and published
+	// MASTER: the node holds the addresses while emitting nothing, its peer
+	// times out and promotes too (dual-master), or — when the peer shares the
+	// same synced config — the addresses are stranded with no advertising
+	// owner. The strict commit / commit-check path hard-rejects so the operator
+	// error is visible; the tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config an older binary
+	// accepted still BOOTS (#1960 fail-closed-on-load class). The pkg/vrrp
+	// runtime guards independently refuse to build the instance
+	// (UpdateInstances) and refuse to claim MASTER (becomeMaster), so a
+	// leniently-loaded oversized set is bounded — a WARN plus a group held out
+	// of the election — not a silent non-advertising owner. Same doctrine as
+	// lenientRethVRRPGroupID.
+	lenientVRRPVIPCount bool
+
 	// lenientDNATToScope (#3444) downgrades the destination-NAT rule-set
 	// `to` scope reject (validateDNATRuleSetToScopeAST) from a hard compile
 	// error to a cfg.Warnings entry. Junos destination NAT rule-sets have
@@ -2431,6 +2454,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
+		lenientVRRPVIPCount:                    true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
 		lenientNATTerminalAction:               true,
