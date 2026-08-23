@@ -104694,3 +104694,11 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/ra/ra.go, pkg/ra/dead_sender_probe_6793_test.go,
   pkg/daemon/daemon_ra_reconcile.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
   pkg/daemon/ra_dead_sender_retry_6793_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6793 round 2 — two mutation cells came back GREEN. Removing the
+  INNER dead-sender re-check (the one after applySem) was invisible because the
+  outer check still short-circuited the healthy fixture; and nothing bound the
+  loop's START in Run, so a daemon that never launched the retry owner passed
+  every cell. Added the queue-behind-a-commit interleave, a loop-body cell with
+  a shortened interval, and a comment-stripped source check on the start site.
+- **File(s)**: pkg/daemon/ra_dead_sender_retry_6793_test.go, _Log.md

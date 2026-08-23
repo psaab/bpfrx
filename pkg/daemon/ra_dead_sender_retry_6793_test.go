@@ -10,9 +10,12 @@ package daemon
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 
@@ -234,4 +237,158 @@ chassis {
 				"config change moves the hash (#6793)", afterDead)
 		}
 	})
+}
+
+// TestReassertRechecksTheGateInsideTheSemaphore6793 binds the INNER gate.
+//
+// The outer check (before applySem) is only an optimisation: it avoids queueing
+// behind a commit for nothing. The inner one is the correctness gate — a tick
+// that blocked behind an in-flight commit may find that the commit ALREADY
+// rebuilt the sender, and re-applying then is a gratuitous RA restart on a
+// healthy interface.
+//
+// The mutation that survives without this cell removes only the inner check;
+// the outer one still short-circuits the healthy case, so
+// TestDeadSenderReassertIsANoOpWhenEverySenderIsHealthy6793 stays green. This
+// drives the exact interleave: the probe says DEAD when the tick starts, a
+// "commit" holds the semaphore, and by the time the tick acquires it the sender
+// is healthy again.
+func TestReassertRechecksTheGateInsideTheSemaphore6793(t *testing.T) {
+	d, applies, mu := standaloneRADaemon6793(t, true)
+
+	// Hold applySem, as an in-flight commit would.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		d.reassertDeadRASendersOnce(context.Background())
+		close(done)
+	}()
+	<-started
+
+	// The tick is now blocked on the semaphore (or about to be). Simulate the
+	// commit having rebuilt the sender, then let the tick through.
+	var probeMu sync.Mutex
+	healthy := false
+	d.raHasDeadSendersFn = func() bool {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		return !healthy
+	}
+	probeMu.Lock()
+	healthy = true
+	probeMu.Unlock()
+	d.applySem.Release(1)
+	<-done
+
+	mu.Lock()
+	got := *applies
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("the reassert applied RA %d times after the commit it queued "+
+			"behind had already rebuilt the sender, want 0 — re-checking the "+
+			"gate INSIDE the semaphore is what stops a gratuitous RA restart "+
+			"on a healthy interface (#6793)", got)
+	}
+}
+
+// TestDeadSenderReassertLoopTicks6793 binds the loop BODY: the ticker actually
+// drives the reassert, and stops on context cancellation.
+//
+// Separate from the source check below because they fail for different reasons:
+// this reds if the loop is wired to the wrong function or never ticks; the
+// source check reds if Run never starts it.
+func TestDeadSenderReassertLoopTicks6793(t *testing.T) {
+	d, applies, mu := standaloneRADaemon6793(t, true)
+
+	orig := raDeadSenderReassertInterval
+	raDeadSenderReassertInterval = 5 * time.Millisecond
+	t.Cleanup(func() { raDeadSenderReassertInterval = orig })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() { d.raDeadSenderReassertLoop(ctx); close(loopDone) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := *applies
+		mu.Unlock()
+		if got > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-loopDone
+			t.Fatal("the reassert loop never applied RA for a dead sender — " +
+				"standalone has no other retry owner (#6793)")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("raDeadSenderReassertLoop did not return on context cancellation")
+	}
+}
+
+// TestRunStartsTheDeadSenderReassertLoop6793 binds the WIRING.
+//
+// Every cell above stays green if Run never starts the loop — which IS the bug
+// in standalone, where nothing else re-drives Apply. It is a source check
+// because pkg/daemon has no seam that observes Run's goroutine set, and a cell
+// that started Run for real would need the whole daemon bring-up.
+//
+// The start must also be UNCONDITIONAL: the loop is cheap when no sender is
+// dead, and gating it on a config predicate read at start would miss the case
+// where RA is added by a later commit. So this asserts the call is not nested
+// inside the proxy-ARP block's conditional.
+//
+// Comments are stripped before matching: the comment introducing the start
+// names the function, and a gate satisfiable by its own documentation proves
+// nothing.
+func TestRunStartsTheDeadSenderReassertLoop6793(t *testing.T) {
+	src, err := os.ReadFile("daemon_run.go")
+	if err != nil {
+		t.Fatalf("read daemon_run.go: %v", err)
+	}
+	var code strings.Builder
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			code.WriteString("\n")
+			continue
+		}
+		code.WriteString(line)
+		code.WriteString("\n")
+	}
+	body := code.String()
+
+	const start = "d.raDeadSenderReassertLoop(ctx)"
+	at := strings.Index(body, start)
+	if at < 0 {
+		t.Fatal("Run never starts raDeadSenderReassertLoop — in standalone " +
+			"nothing else re-drives ra.Apply, so a sender whose conn open " +
+			"failed stays dead until an operator commits (#6793)")
+	}
+	// One tab of indentation = function body scope, not nested in a conditional
+	// block. Two or more means it was folded into another block's guard.
+	lineStart := strings.LastIndex(body[:at], "\n") + 1
+	indent := 0
+	for _, r := range body[lineStart:at] {
+		if r == '\t' {
+			indent++
+		}
+	}
+	if indent != 2 {
+		t.Fatalf("raDeadSenderReassertLoop is started at indent %d, want 2 (the "+
+			"goroutine body inside an unconditional wg.Add block) — a start "+
+			"nested under another feature's conditional would skip the retry "+
+			"owner on configs that do not use that feature", indent)
+	}
 }
