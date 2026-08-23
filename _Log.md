@@ -104389,3 +104389,28 @@ prose edit above them added. No diff falls in the new test body.
   schema is right and nothing changed.
 - **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
   `pkg/config/schema_walk.go`, `pkg/config/schema_block_value_6774_test.go`
+
+## 2026-08-22 — #6777 graceful RA withdrawal: final goodbye failure surfaced + retry debt
+
+- **Timestamp**: 2026-08-22
+- **Action**: Graceful RA withdrawal discarded the final lifetime-0 goodbye
+  failure and erased the state a retry needed. `finishDrainDecision` logged the
+  standalone-backstop failure, set `goodbyeClaimed`, deleted the tombstone and
+  returned only the replacement-start error; `Manager.Withdraw` returned a
+  hard-coded `nil`, making the `if err := d.ra.Withdraw(); err != nil` branch at
+  all three production call sites unreachable. Because
+  `reconcileClusterRAServices` advances `lastRAReconcileHash` only on a
+  successful apply, the swallowed failure was latched as converged and the 2s
+  pass never retried — the stale IPv6 default-router identity survived on hosts
+  until Router Lifetime expiry. Fix propagates the goodbye error out through
+  `releaseDrain` to `Withdraw`/`Apply`, and retains bounded retry debt
+  (`Manager.goodbyeOwed`) that `Apply` re-drives via `WithdrawOnce`.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go,
+  pkg/ra/goodbye_retry_debt_6777_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6777 round 2 — bound the two mutation cells that came back GREEN.
+  `recordedEpoch` (a debt recorded by the current Apply is held over, not
+  retried on the same pass) and the busy-skip attempt refund were both
+  documented claims with no assertion behind them; a mutation neutralising
+  either left the suite green.
+- **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
