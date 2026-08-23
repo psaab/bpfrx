@@ -104305,3 +104305,15 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
   pkg/config/compiler_validate_strict_chassis.go,
   pkg/config/numeric_bounds_6772_6773_test.go
+
+## 2026-08-22 — #6774 strict schema rejects the Junos hierarchical default-policy
+
+- **Timestamp**: 2026-08-22
+- **Action**: Taught SchemaValidate the hierarchical block spelling
+  `default-policy { deny-all; }` — the form Junos itself displays, which the
+  compiler already honours deliberately — via a per-leaf `blockValue` opt-in
+  rather than a blanket relaxation. A census found 42 distinct typed leaves
+  where the compiler tolerates a block form the schema rejects; for those the
+  schema is right and nothing changed.
+- **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
+  `pkg/config/schema_walk.go`, `pkg/config/schema_block_value_6774_test.go`

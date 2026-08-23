@@ -220,6 +220,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			valueExamples: []string{"deny-all", "permit-all", "reject-all"},
 			validator:     ValidateEnum([]string{"permit-all", "deny-all", "reject-all"}),
 			children:      nil,
+			// #6774: Junos displays this as `default-policy { deny-all; }` —
+			// it is a CHOICE CONTAINER there, modelled here as a valued leaf
+			// so the flat-set spelling works. Accept both; the compiler
+			// already does.
+			blockValue: true,
 		},
 		// #3534 (split from #3363 Part 2): RT_FLOW session logging for the
 		// IMPLICIT default-policy verdict. The `default-policy` leaf above is a
