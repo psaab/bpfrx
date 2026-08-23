@@ -104994,6 +104994,7 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
+## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
 
 - **Timestamp**: 2026-08-23
 - **Action**: #5841 writes the resource ownership markers BEFORE the credential
@@ -105009,3 +105010,38 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
+
+- **Timestamp**: 2026-08-23
+- **Action**: `reconcileRGState` captured a transition under `s.mu`, dropped the
+  lock, ran `SetRGActive` off-lock, then recorded with an unguarded
+  `MarkApplied(tr.Active)`. A cluster fence landing in that window armed the
+  retry debt (`InvalidateApplied`, #6530) and the completing apply erased it.
+  Added an invalidation counter to `rgStateMachine`, carried on `rgTransition`,
+  checked by a new `RecordApplied` that decides and acts under ONE lock hold;
+  routed all six apply sites through it.
+- **Claim verdict**: "epoch-stale" is only PARTLY right — the epoch cannot
+  detect this (InvalidateApplied deliberately does not bump it, and the
+  desired-value fallback would accept anyway), so the epoch is not a sufficient
+  key. "temporarily erase retry debt" UNDERSTATES it: the erasure is permanent,
+  because reconcileLocked only sets applyPending when applied != active.
+- **The reader**: `!s.NeedsApply()` gates `setLocalFailoverCommitReady`, which
+  feeds `waitLocalFailoverCommitReady` → `cluster.requestPeerFailover`. The
+  activation arm now raises it only inside the accepted branch.
+- **Matrix found an unbound branch**: reverting the DEACTIVATION arm to a raw
+  `MarkApplied` left the whole suite green — the activation cell cannot see it,
+  since each arm records its own result. Added a deactivation fixture (an RG the
+  cluster does not own, so the desired state is false deterministically). Its
+  first draft was also order-dependent — `reconcileRGState` iterates RG ids in
+  MAP order, so an unrelated RG's activation could consume a "first write" hook
+  — so the in-flight hook is keyed on (rgID, active).
+- **Matrix found a second unbound branch**: raising
+  `setLocalFailoverCommitReady` regardless of whether the record was accepted
+  also left the suite green — the gate is `noRethVRRP && ...`, and every fixture
+  had RETH configured, so the branch was unreachable. Added a direct-mode
+  (`no-reth-vrrp`) pair: a refused record must NOT raise readiness, an accepted
+  one must.
+- **Removed `ApplyIfCurrent`** (no production caller after the consolidation) and
+  MOVED its two tests onto `RecordApplied` rather than deleting them.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
+  `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`

@@ -287,7 +287,7 @@ func TestRGStateMachine_DesiredVsApplied(t *testing.T) {
 	}
 }
 
-func TestRGStateMachine_ApplyIfCurrent_StaleDetection(t *testing.T) {
+func TestRGStateMachine_RecordApplied_StaleDetection(t *testing.T) {
 	s := newRGStateMachine()
 
 	// Activate via cluster.
@@ -308,23 +308,28 @@ func TestRGStateMachine_ApplyIfCurrent_StaleDetection(t *testing.T) {
 	}
 
 	// Try to apply the stale tr1 (activation) — should be rejected.
-	if s.ApplyIfCurrent(tr1) {
-		t.Error("ApplyIfCurrent should reject stale transition (tr1)")
+	// #6799: this property MOVED from ApplyIfCurrent to RecordApplied, which is
+	// now the single recorder every apply path reaches. The expectations are
+	// unchanged because the stale transitions here carry a desired value that
+	// no longer matches (tr1/tr3 wanted active, the machine now wants inactive),
+	// which is precisely what RecordApplied refuses.
+	if s.RecordApplied(tr1, tr1.Active) {
+		t.Error("RecordApplied should reject stale transition (tr1)")
 	}
 
 	// Apply the stale tr3 — should also be rejected.
-	if s.ApplyIfCurrent(tr3) {
-		t.Error("ApplyIfCurrent should reject stale transition (tr3)")
+	if s.RecordApplied(tr3, tr3.Active) {
+		t.Error("RecordApplied should reject stale transition (tr3)")
 	}
 
 	// Apply the current tr4 — should succeed.
-	if !s.ApplyIfCurrent(tr4) {
-		t.Error("ApplyIfCurrent should accept current transition")
+	if !s.RecordApplied(tr4, tr4.Active) {
+		t.Error("RecordApplied should accept current transition")
 	}
 
 	// Verify applied state matches.
 	if s.NeedsApply() {
-		t.Error("should not need apply after successful ApplyIfCurrent")
+		t.Error("should not need apply after a successful RecordApplied")
 	}
 }
 
@@ -1038,12 +1043,18 @@ func TestRGStateMachine_ShouldLogRetry_GatesPerStreak(t *testing.T) {
 	}
 }
 
-// TestRGStateMachine_ApplyIfCurrentClearsLogGates pins a reviewer
-// finding on #757: the cluster/VRRP event handlers apply via
-// ApplyIfCurrent(), not MarkApplied(). If only MarkApplied() cleared
-// the log-once gates, a fresh failure streak after an ApplyIfCurrent
+// TestRGStateMachine_RecordAppliedClearsLogGates pins a reviewer
+// finding on #757: the cluster/VRRP event handlers apply via the
+// transition-guarded recorder, not MarkApplied(). If only MarkApplied()
+// cleared the log-once gates, a fresh failure streak after a guarded
 // success would stay silent. Both reset paths must behave identically.
-func TestRGStateMachine_ApplyIfCurrentClearsLogGates(t *testing.T) {
+//
+// #6799: retargeted from ApplyIfCurrent, which this change removed once
+// RecordApplied became the single recorder for all six apply sites. The
+// property is unchanged and is now also structural — both recorders share
+// markAppliedLocked — but it stays asserted here so a future split of that
+// body cannot silently reintroduce the drift.
+func TestRGStateMachine_RecordAppliedClearsLogGates(t *testing.T) {
 	s := newRGStateMachine()
 
 	// Start a failure streak: one INFO + one WARN fire.
@@ -1058,19 +1069,19 @@ func TestRGStateMachine_ApplyIfCurrentClearsLogGates(t *testing.T) {
 		t.Fatal("same streak should be silent")
 	}
 
-	// Grab a current transition and apply it via ApplyIfCurrent.
+	// Grab a current transition and apply it via RecordApplied.
 	tr := s.SetCluster(true)
-	if !s.ApplyIfCurrent(tr) {
-		t.Fatal("ApplyIfCurrent must succeed when epoch matches")
+	if !s.RecordApplied(tr, tr.Active) {
+		t.Fatal("RecordApplied must succeed when epoch matches")
 	}
 
 	// After the success, the gates must be cleared — a fresh
 	// failure streak must surface both INFO and WARN again.
 	if !s.ShouldLogRetry() {
-		t.Fatal("ApplyIfCurrent must clear lastRetryLogged so next streak logs")
+		t.Fatal("RecordApplied must clear lastRetryLogged so next streak logs")
 	}
 	if !s.ShouldLogApplyError("err-X") {
-		t.Fatal("ApplyIfCurrent must clear lastApplyErrMsg so next streak logs")
+		t.Fatal("RecordApplied must clear lastApplyErrMsg so next streak logs")
 	}
 }
 

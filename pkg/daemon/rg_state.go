@@ -35,7 +35,11 @@ type rgStateMachine struct {
 	active        bool            // desired rg_active value
 	applied       bool            // last successfully applied rg_active value
 	applyPending  bool            // true when desired != applied
-	epoch         uint64          // monotonic counter
+	// invalidateSeq counts InvalidateApplied calls (#6799). It is the key that
+	// makes "did anything re-arm the debt while my apply was in flight?"
+	// answerable. Guarded by mu, like every field above.
+	invalidateSeq uint64
+	epoch         uint64 // monotonic counter
 
 	// VRRP posture mismatch tracking (#86): detect when VRRP state
 	// doesn't match cluster expectations and only take corrective action
@@ -60,7 +64,7 @@ type rgStateMachine struct {
 	// for as long as the helper is down, which buries real diagnostics.
 	//
 	// Reset contract: both fields are cleared by MarkApplied() AND by
-	// ApplyIfCurrent() on success. A successful apply starts a fresh
+	// RecordApplied() on success. A successful apply starts a fresh
 	// streak so the next failure surfaces one WARN and the next retry
 	// streak surfaces one INFO.
 	lastRetryLogged bool   // "retrying" INFO already emitted for the current failure streak
@@ -73,6 +77,13 @@ type rgTransition struct {
 	Changed bool   // rg_active value changed
 	Active  bool   // new rg_active value
 	Epoch   uint64 // current epoch after this transition
+	// InvalidateSeq is the invalidation counter observed when this transition
+	// was produced (#6799). An apply carries it across its off-lock dataplane
+	// write so RecordApplied can tell whether a SECOND writer re-armed the
+	// retry debt while that write was in flight. The epoch cannot answer that:
+	// InvalidateApplied deliberately does not bump it, and even if it did, the
+	// desired-value fallback would let the record through anyway.
+	InvalidateSeq uint64
 }
 
 func newRGStateMachine() *rgStateMachine {
@@ -166,6 +177,16 @@ func (s *rgStateMachine) Reconcile(clusterPri bool, vrrpStates map[string]bool) 
 func (s *rgStateMachine) MarkApplied(active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.markAppliedLocked(active)
+}
+
+// markAppliedLocked is the ONE body every convergence record shares (#6799).
+// MarkApplied and RecordApplied both call it, so the #757 log-once gate reset
+// cannot drift between them — that drift was a real reviewer finding once
+// (an apply path that reset the gates and one that did not), and it is now
+// structurally impossible rather than pinned by a duplicate test.
+// Caller MUST hold s.mu.
+func (s *rgStateMachine) markAppliedLocked(active bool) {
 	s.applied = active
 	if s.applied == s.active {
 		s.applyPending = false
@@ -179,7 +200,7 @@ func (s *rgStateMachine) MarkApplied(active bool) {
 // dataplane.
 //
 // #6530: applied/applyPending are advanced only by MarkApplied and
-// ApplyIfCurrent, and neither has a path that SETS applyPending — both only
+// RecordApplied, and neither has a path that SETS applyPending — both only
 // CLEAR it, when applied == active. So any second writer to rg_active leaves
 // the state machine believing it has already converged: reconcileRGState's
 // retry predicate (tr.Changed || s.NeedsApply()) sees desired == applied and
@@ -204,11 +225,12 @@ func (s *rgStateMachine) MarkApplied(active bool) {
 // the struct invariant reconcileLocked relies on (applyPending is true exactly
 // when applied != active); a later successful MarkApplied clears both together.
 //
-// It deliberately does not bump the epoch. ApplyIfCurrent already fails
+// It deliberately does not bump the epoch. An epoch-guarded record already fails
 // routinely — reconcileLocked bumps the epoch on every 2s pass — and
-// recordRGActiveAppliedIfCurrentOrStable then falls back to MarkApplied
-// whenever the desired value still matches what that caller wrote, so an epoch
-// bump would not stop a concurrent in-flight apply from stamping over this.
+// RecordApplied falls back to accepting whenever the desired value still
+// matches what that caller wrote, so an epoch bump would not stop a concurrent
+// in-flight apply from stamping over this — which is exactly why #6799 added
+// the invalidation counter below instead of bumping the epoch here.
 // Ordering between two unsynchronised rg_active writers is not something this
 // struct can resolve; what it can guarantee is that it never silently believes
 // a convergence it did not observe.
@@ -217,6 +239,12 @@ func (s *rgStateMachine) InvalidateApplied() {
 	defer s.mu.Unlock()
 	s.applied = !s.active
 	s.applyPending = true
+	// #6799: stamp the invalidation so an apply that was ALREADY IN FLIGHT
+	// when this ran cannot stamp over the debt it just armed. The paragraph
+	// above correctly observed that an epoch bump would not achieve this;
+	// this counter is what does, because RecordApplied compares the value the
+	// in-flight transition captured before it started.
+	s.invalidateSeq++
 }
 
 // ShouldLogRetry reports whether the "reconcile: retrying rg_active apply"
@@ -262,27 +290,46 @@ func (s *rgStateMachine) DesiredActive() bool {
 	return s.active
 }
 
-// ApplyIfCurrent atomically marks the transition as applied only if
-// the state machine's epoch still matches the transition's epoch.
-// Returns true if the apply was recorded, false if a newer transition
-// superseded it (stale-update detection for concurrent goroutines).
-func (s *rgStateMachine) ApplyIfCurrent(tr rgTransition) bool {
+// RecordApplied records that `active` was written to the dataplane for the
+// transition tr, and reports whether that record was ACCEPTED (#6799).
+//
+// It is the single decision point for "may this apply claim convergence?", and
+// it makes that decision and acts on it under ONE lock hold. The predecessor —
+// recordRGActiveAppliedIfCurrentOrStable — took THREE separate holds
+// (ApplyIfCurrent, then CurrentDesired, then MarkApplied), so the state it
+// decided on could move between the decision and the act. That is the same
+// no-cached-boolean discipline pkg/ra's finishDrainDecision settled on: re-read
+// under the lock hold that performs the act, never carry a verdict across an
+// unlock.
+//
+// Two independent reasons to REFUSE, and they answer different questions:
+//
+//   - The invalidation counter moved. Some OTHER writer touched rg_active while
+//     this apply was in flight and armed the retry debt (the cluster fence does
+//     exactly this, #6530). Recording convergence now would erase that debt, and
+//     the erasure is not temporary: reconcileLocked only SETS applyPending when
+//     applied != active, so once this clears it with the two in agreement,
+//     nothing re-arms it and reconcileRGState's `tr.Changed || s.NeedsApply()`
+//     retry never fires again. Forwarding then stays wherever the other writer
+//     left it — precisely the "fenced-then-recovered primary stays dark forever"
+//     failure #6530 was written to prevent.
+//   - The epoch moved AND the desired value no longer matches what was written.
+//     A moved epoch alone is routine (reconcileLocked bumps it every 2s pass),
+//     so refusing on it alone would reject nearly every apply; what matters is
+//     whether the value this caller wrote is still the value the machine wants.
+//
+// On acceptance it mirrors MarkApplied exactly, including the #757 log-once
+// gate reset, so the two paths cannot drift.
+func (s *rgStateMachine) RecordApplied(tr rgTransition, active bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.epoch != tr.Epoch {
+	if s.invalidateSeq != tr.InvalidateSeq {
 		return false
 	}
-	s.applied = tr.Active
-	if s.applied == s.active {
-		s.applyPending = false
+	if s.epoch != tr.Epoch && s.active != active {
+		return false
 	}
-	// Mirror MarkApplied()'s reset of the log-once gates (#757).
-	// Without this, an apply path that uses ApplyIfCurrent() instead
-	// of MarkApplied() (e.g. the cluster/VRRP event handlers via
-	// recordRGActiveAppliedIfCurrentOrStable) leaves the gates stuck
-	// — the next failure streak would stay silent.
-	s.lastRetryLogged = false
-	s.lastApplyErrMsg = ""
+	s.markAppliedLocked(active)
 	return true
 }
 
@@ -308,7 +355,12 @@ func (s *rgStateMachine) reconcileLocked() rgTransition {
 	if s.active != s.applied {
 		s.applyPending = true
 	}
-	return rgTransition{Changed: changed, Active: desired, Epoch: s.epoch}
+	return rgTransition{
+		Changed:       changed,
+		Active:        desired,
+		Epoch:         s.epoch,
+		InvalidateSeq: s.invalidateSeq,
+	}
 }
 
 func (s *rgStateMachine) anyMasterLocked() bool {
