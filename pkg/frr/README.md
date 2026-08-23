@@ -47,6 +47,102 @@ community classification, `renderComposedRouteMap`, and the `-xpf-redist`
 alias guard. The detailed rendering semantics documented in the
 `policy_render.go` row below apply wherever each function now lives:
 
+### Non-protocol route operands have a final validity belt (#6795)
+
+The `ip route` / `ipv6 route` renderers — static routes
+(`generateStaticRouteInTable`) and generate-routes (`renderGenerateRoutes`) —
+interpolate RAW STRINGS from the parser: `sr.Destination`, `nh.Address`,
+`ifName`, `gr.Prefix`. The protocol renderers already have belts
+(`validRouterID` #2980, `validClusterID` / `validBGPOrigin` #4919); these did
+not.
+
+The blast radius is what makes it matter: a malformed operand fails the **whole**
+frr-reload — one `vtysh -f` add-batch exits non-zero on any
+`CMD_WARNING_CONFIG_FAILED` — so one bad route takes **every other route on the
+box** with it. A value carrying whitespace additionally splits into extra
+operands, or adds a statement outright. Commit validates these, but the tolerant
+load / HA config-sync paths only warn (#1960 no-brick), so the renderer is the
+last place to stop it.
+
+Three predicates in `render_validate.go`:
+
+| operand | predicate | accepts |
+|---|---|---|
+| destination / generate prefix | `validFRRRoutePrefix` | CIDR **or** a bare address |
+| gateway | `validFRRNextHopAddress` | a bare address only |
+| interface | `validFRRInterfaceOperand` | one token |
+
+`validFRRRoutePrefix` accepts a maskless host route deliberately: the
+destination is a raw string and a host route may reach here without a mask, and
+**dropping a route form that renders today is an outage**. The belt exists to
+keep UNRENDERABLE operands out of `frr.conf`, not to re-litigate the accepted
+grammar. `validFRRInterfaceOperand` is a token test rather than a name-charset
+test for the same reason.
+
+**Granularity is deliberate.** A bad DESTINATION drops the route; a bad
+NEXT-HOP drops only that next-hop. A `next-hop [ a b ]` ECMP list with one
+malformed member must still install the good ones — dropping the whole route
+would turn a typo in one gateway into a blackhole for the prefix, and the
+no-next-hop path already renders NOTHING rather than a `Null0` (#3872), so a
+whole-route drop is silently fail-wide.
+
+**The DHCP-learned routes deliberately get no belt.** They look like the
+highest-risk operands — they come from a DHCP server on the wire — but they are
+not raw strings: `lease.Gateway` is a `netip.Addr` and `cr.Destination` a
+`netip.Prefix`, both `String()`-ed, and those types cannot stringify to anything
+containing whitespace. `TestDHCPRouteOperandsAreStructurallySafe6795` records
+that measurement so the question is re-asked if either field is ever widened to
+a string.
+
+Not covered here: the `vrf <name>` clause still goes through `sanitizeFRRValue`
+(#5557). That sanitizer maps control bytes to a space — the sink's own separator
+— so it is the weaker belt described under #6796, but the routing-instance name
+is validated at commit and is out of this issue's scope.
+
+### BGP neighbor identity is a single FRR token (#6796)
+
+`n.Address` is rendered RAW at 24 sites in `protocols_render.go` — unlike every
+operand around it (`update-source`, `description`, `password` all go through
+`sanitizeFRRValue`). FRR's command lexer has **no quoted-string and no
+rest-of-line token: it splits on whitespace**, so an identity carrying a space
+or a newline SPANS MULTIPLE FRR STATEMENTS. An address of
+`1.1.1.1 remote-as 65000\n neighbor 2.2.2.2` renders a valid first statement
+followed by an attacker-chosen second one — arbitrary FRR configuration,
+including peerings the operator never wrote, injected through a config value.
+
+**`sanitizeFRRValue` is deliberately NOT the tool here.** It maps control bytes
+to a SPACE, and space is exactly the separator FRR tokenizes on: replacing a
+newline with a space still splits the token, and a plain embedded space is not a
+control byte at all, so it passes through untouched. A sanitizer whose
+replacement character is the sink's delimiter cannot make a value safe for that
+sink.
+
+The belt is `validBGPNeighborAddress` (`render_validate.go`), applied at the
+`validNeighbors` construction — the SINGLE exclusion set the declaration loop,
+the address-family activation loop and the BFD accumulator all iterate. That
+placement is deliberate: a per-site guard would have to be repeated 24 times and
+could diverge, and a neighbor declared-but-not-activated (or activated-but-not-
+declared, or carrying a `bfd` peer without a declaration) makes vtysh reject the
+**whole** managed section. It also covers the "reused raw by BGP and BFD" half of
+the issue for free.
+
+**The test is token COUNT, not address form.** FRR's grammar is
+`neighbor <A.B.C.D|X:X::X:X|WORD>`, and this tree already commits configs whose
+neighbor is a hostname — the first version of this fix required a bare IP and was
+caught by a pre-existing parser test peering with `peer.example.com`.
+Over-rejection in routing config is an outage.
+
+Commit / commit-check stay strict (`validateBGPNeighborAddressStrict`,
+`pkg/config`), with `lenientBGPNeighborAddress` registered per #1960 so a
+tolerantly-loaded or peer-synced config still boots. The two predicates must
+accept exactly the same set: a stricter commit gate tells operators a working
+config is invalid, a stricter belt silently drops a committed peering, and
+neither divergence produces an error anywhere.
+`TestNeighborTokenGateAgreesWithTheRenderBelt6796` asserts the agreement by
+reading both function bodies rather than pinning either to a literal — the first
+version had BOTH wrong in the same direction, so trusting either side would have
+encoded the mistake.
+
 | File | Owns |
 |---|---|
 | `manager.go` | `Manager` struct + lifecycle (`New`, `ApplyFull`, `Clear`, `writeManagedSection`, `reload`), top-level types (`InstanceConfig`, `DHCPRoute`, `FullConfig`), package constants, and the zero-value-safe `executor()` accessor. The legacy `Apply`/`ApplyWithInstances` partial constructors were deleted (#1827 AGY F1, PR #1843): they bypassed `assembleFRRConfig` and would have wiped an active failover overlay. |

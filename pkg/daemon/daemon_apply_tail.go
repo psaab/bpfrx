@@ -39,7 +39,7 @@ import (
 // lo0Err/hostInboundErr originate in step 9.5. The returned errors.Join
 // preserves the explicit operand order
 // (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error) error {
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error, fabricErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	var vrrpErr error
 	vrrpInstances := vrrp.CollectInstances(cfg)
@@ -362,7 +362,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr, vrrpErr)
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
@@ -448,16 +448,35 @@ func (d *Daemon) reconcileLLDP(cfg *config.Config) {
 	// Skip when the effective config is unchanged since the last reconcile, so
 	// an unrelated commit never bounces a healthy LLDP generation (sockets +
 	// neighbor table). The first reconcile (boot) always runs.
-	if d.lldpApplyInit && lldpConfigEqual(d.lldpApplied, want) {
+	//
+	// #6794: "unchanged config" is not sufficient on its own. Manager.Apply is
+	// PARTIAL — it brings each interface up independently and skips the ones it
+	// cannot resolve — so a generation can be live for some interfaces and dark
+	// for others while the config is entirely unchanged. The desired config used
+	// to be recorded as applied BEFORE Apply ran, so an incomplete generation
+	// was indistinguishable from a healthy one and every later reconcile took
+	// this early return. Recovery then required a change to `protocols lldp` or
+	// a daemon restart — on a box where the only thing wrong was that a NIC
+	// showed up a moment after boot.
+	//
+	// lldpRecoveryDue re-tests exactly the interfaces the last Apply could not
+	// resolve. It gates on the WORLD having changed in a way that could fix
+	// them, not on time or on a retry counter, so a permanently-absent
+	// interface (a typo in the config) never resolves, never triggers a retry,
+	// and cannot churn the generation on every commit — which is the #2372
+	// finding-6 regression this guard exists to prevent.
+	if d.lldpApplyInit && lldpConfigEqual(d.lldpApplied, want) && !d.lldpRecoveryDue() {
 		return
 	}
-	d.lldpApplyInit = true
-	d.lldpApplied = want
 
 	if want == nil {
 		// Disabled / empty: stop the running service (idempotent if already
-		// stopped).
+		// stopped). Stop cannot partially fail, so there is no unresolved set
+		// to carry: record convergence directly.
 		d.lldpMgr.Stop()
+		d.lldpApplyInit = true
+		d.lldpApplied = want
+		d.lldpUnresolved = nil
 		return
 	}
 
@@ -465,7 +484,48 @@ func (d *Daemon) reconcileLLDP(cfg *config.Config) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	d.lldpMgr.Apply(ctx, want)
+	// Record what the apply ACHIEVED, and record it AFTER the apply. The
+	// unresolved set is the ground truth that makes an incomplete generation
+	// distinguishable from a converged one.
+	unresolved := d.lldpMgr.Apply(ctx, want)
+	d.lldpApplyInit = true
+	d.lldpApplied = want
+	d.lldpUnresolved = unresolved
+	if len(unresolved) > 0 {
+		slog.Warn("LLDP: generation is INCOMPLETE — these configured interfaces could not be "+
+			"resolved and are dark; they will be retried automatically as soon as they appear, "+
+			"without needing a config change",
+			"interfaces", unresolved)
+	}
+}
+
+// lldpRecoveryDue reports whether any interface the last Apply could not
+// RESOLVE now resolves, i.e. whether re-applying could bring a dark interface
+// up (#6794).
+//
+// This is the whole reason the unchanged-config guard is safe to keep. It gates
+// the retry on an observable change in the world rather than on time or a
+// counter, so:
+//
+//   - a NIC that showed up after boot (renamed by a .link file, created as a
+//     VLAN/tunnel, brought up late) resolves on the next reconcile and the
+//     generation is rebuilt — recovery on an UNCHANGED config, which is what
+//     #6794 is about; and
+//   - an interface that is permanently absent (a typo, a NIC that was removed)
+//     never resolves, so this never fires and an unrelated commit never bounces
+//     a generation that is as complete as it can be.
+//
+// It deliberately re-tests only the previously-UNRESOLVED names. Testing the
+// whole desired set would fire on nothing, and testing the interfaces that
+// failed at the SOCKET layer would retry a condition that does not self-heal
+// (see Manager.Apply).
+func (d *Daemon) lldpRecoveryDue() bool {
+	for _, name := range d.lldpUnresolved {
+		if lldp.InterfaceResolvable(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // initEventEngine constructs the event-options engine and registers the RPM

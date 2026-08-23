@@ -104797,6 +104797,122 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
   `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
   `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
+## 2026-08-22 — #6789 bootstrap lifeline refuses on an incomplete addressing snapshot
+
+- **Timestamp**: 2026-08-22
+- **Action**: `interfaceAddrSnapshot` returned empty slices on a `LinkByName`
+  failure and discarded the `AddrList` error; the writer's
+  `isDHCPManaged(x) || (len(v4)==0 && len(v6)==0)` then took the DHCP branch, so
+  a statically-addressed mgmt NIC got a `DHCP=yes` .network and was renamed
+  (link cycle) — a lockout on a box reachable only over that NIC. Replaced both
+  helpers with one typed `snapshotLifelineAddrs` returning an error, added
+  injectable netlink seams, and made `setupBootstrapLifeline` abort BEFORE the
+  .link write, rename and reload.
+- **The two helpers failed in OPPOSITE directions**: `isDHCPManaged` is
+  documented to fail toward static (safe); `interfaceAddrSnapshot` failed toward
+  empty, which defeated it through the OR. They were two netlink walks over one
+  state; now one.
+- **Scoping (caught by a pre-existing test)**: the first version refused
+  unconditionally and reddened `TestSetupBootstrapLifelineAppliance` — the
+  #7114 appliance factory boot has NO default route and no addressing by design,
+  and DHCP is the image's contract. The refusal is now scoped to a lifeline
+  chosen by DEFAULT ROUTE (positive evidence of live addressing); a route-dump
+  failure is fatal only for a family the snapshot has addresses in.
+- **Second, more dangerous defect in the same issue (selection half)**:
+  `detectLifelineInterface` discarded the `RouteList` error and returned
+  `("", false)` — indistinguishable from "no default route" — and the caller
+  branches on exactly that: `applianceFactory := routeIface == "" &&
+  d.applianceFactoryBoot()`. On an appliance box a netlink error therefore
+  flipped selection to "claim the FIRST ENUMERATED NIC" and renamed it
+  (`renameInterface` = LinkSetDown/LinkSetName/LinkSetUp, i.e. the NIC cycle).
+  Now returns an error; the caller refuses when the route state is UNKNOWN.
+  Guard keys on the observation FAILING, never on an empty routeIface (keying on
+  empty would strand every factory image console-only). A found+resolved route
+  is positive identification and survives a partial error.
+- **File(s)**: `pkg/daemon/bootstrap.go`,
+  `pkg/daemon/lifeline_snapshot_failclosed_6789_test.go`,
+  `pkg/daemon/bootstrap_appliance_factory_7114_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-22 — #6796 BGP neighbor identity could span multiple FRR tokens
+
+- **Timestamp**: 2026-08-22
+- **Action**: `n.Address` was rendered RAW at 24 frr.conf sites while every
+  neighbouring operand was sanitized. FRR's lexer splits on whitespace with no
+  quoted-string token, so an identity carrying a space/newline rendered as
+  MULTIPLE statements — arbitrary FRR config injected through a config value,
+  reaching both the BGP neighbor lines and the BFD peer accumulator. Added
+  `validBGPNeighborAddress` at the shared `validNeighbors` exclusion point
+  (covers all 24 sites and BFD at once) plus a strict commit gate
+  `validateBGPNeighborAddressStrict` with `lenientBGPNeighborAddress` per
+  #1960. First version required a bare IP and was caught OVER-REJECTING by a
+  pre-existing parser test peering with `peer.example.com`; corrected to
+  single-token-ness, which is the actual property.
+- **File(s)**: pkg/frr/render_validate.go, pkg/frr/protocols_render.go,
+  pkg/frr/bgp_neighbor_token_6796_test.go,
+  pkg/config/compiler_validate_strict_routing.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/bgp_neighbor_token_6796_test.go, pkg/frr/README.md, _Log.md
+
+## 2026-08-22 — #6791 fabric IPVLAN fails closed and gains a retry owner
+
+- **Timestamp**: 2026-08-22
+- **Action**: `applyFabricIPVLAN` returned nothing: it logged "CRITICAL ...
+  cluster heartbeat will not work" after exhausting its five in-line retries
+  and the commit still reported success. The evidence was the asymmetry at the
+  call site — its neighbours are captured and joined, it was a bare statement.
+  Made it return an error, captured it as `fabricErr` and threaded it into the
+  tail `errors.Join`. Safe to surface because `ensureFabricIPVLAN` errors only
+  when there is no usable overlay (address failures are warn-only, AddrReplace
+  is idempotent, an already-correct overlay returns nil). Added
+  `fabricIPVLANReassertLoop`, started unconditionally in `Run`, as the
+  persistent recovery owner for a failure outlasting those retries and for the
+  deferred OnXSKBound overlays whose failure cannot reach the commit at all.
+- **File(s)**: `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_apply_tail.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_fabric_reassert.go` (new),
+  `pkg/daemon/fabric_ipvlan_failclosed_6791_test.go` (new),
+  `pkg/daemon/README.md`
+## 2026-08-22 — #6794 LLDP recovers a dark interface on unchanged config
+
+## 2026-08-22 — #6795 FRR non-protocol route rendering had no operand belt
+
+- **Timestamp**: 2026-08-22
+- **Action**: `generateStaticRouteInTable` and `renderGenerateRoutes`
+  interpolated raw parser strings (`Destination`, `nh.Address`, `ifName`,
+  `gr.Prefix`) into `ip route` lines with no validity check, unlike the protocol
+  renderers (#2980/#4919). A malformed operand fails the WHOLE frr-reload, so
+  one bad route takes every route on the box; a whitespace-carrying value splits
+  into extra operands or a second statement. Added `validFRRRoutePrefix` /
+  `validFRRNextHopAddress` / `validFRRInterfaceOperand`. A bad destination drops
+  the route, a bad next-hop drops only that next-hop (ECMP must still install
+  the good members). Measured that the DHCP-learned operands are netip-typed and
+  therefore structurally safe — no belt added there, recorded as a test.
+- **File(s)**: pkg/frr/render_validate.go, pkg/frr/config_render.go,
+  pkg/frr/route_operand_belt_6795_test.go, pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-08-22
+- **Action**: `reconcileLLDP` recorded `d.lldpApplied = want` BEFORE calling
+  `d.lldpMgr.Apply`, and `Apply` was void while bringing each interface up
+  INDEPENDENTLY (a lookup failure logs + `continue`s). So a partial generation
+  was indistinguishable from a converged one, and every later reconcile with the
+  same config took the early return — recovery needed a `protocols lldp` edit or
+  a daemon restart. `Apply` now returns the interfaces that failed NAME
+  resolution; the caller records it AFTER the apply and `lldpRecoveryDue`
+  re-tests exactly those names.
+- **Why not "retry whenever incomplete"**: `Apply` `Stop()`s the whole
+  generation first (closes every socket, wipes the neighbor table), so a
+  permanently-absent interface (a config typo) would rebuild LLDP on every
+  unrelated commit — the #2372 finding-6 churn the guard exists to prevent. The
+  retry gates on the WORLD changing (a previously-unresolved name now resolves),
+  not on time or a counter.
+- **Socket-failure residual, stated deliberately**: a `newIfSession` failure
+  (CAP_NET_RAW/bind) is logged and skipped but NOT reported as retry debt — it
+  does not self-heal within a process, so retrying it would churn.
+- **File(s)**: `pkg/lldp/lldp.go`, `pkg/lldp/test_seams.go`,
+  `pkg/lldp/apply_partial_6794_test.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_apply_tail.go`,
+  `pkg/daemon/lldp_recovery_6794_test.go`, `pkg/lldp/README.md`, `_Log.md`
 
 ## 2026-08-22 — #6751 PR 2/3 interface SNAT reserves its translated identity
 

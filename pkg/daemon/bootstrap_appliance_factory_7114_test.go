@@ -211,7 +211,7 @@ func TestSetupBootstrapLifelineAppliance(t *testing.T) {
 			})
 
 			// No default route — the #7114 precondition.
-			detectLifelineInterfaceFn = func() (string, bool) { return "", false }
+			detectLifelineInterfaceFn = func() (string, bool, error) { return "", false, nil }
 			// One NIC, already wearing the target name so the rename is a
 			// no-op and the test needs no netlink.
 			enumeratePCINICsFn = func() ([]pciNIC, error) {
