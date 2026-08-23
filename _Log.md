@@ -104305,3 +104305,16 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
   pkg/config/compiler_validate_strict_chassis.go,
   pkg/config/numeric_bounds_6772_6773_test.go
+
+- **Timestamp**: 2026-08-23 00:45 UTC
+  - **Action**: #7469 — replace the #6753 bounded-read string discriminator with
+    an exported ErrExceedsLimit sentinel wrapped via %w, so the refusal is
+    identified structurally. Fixed cmd/cli's `%v` wrap, which flattened the
+    chain and would have made errors.Is succeed on the local CLI and silently
+    fail on the remote one. Added the cmd/cli wiring tests that #6753 omitted.
+    Documented that the IsRegular check must precede the read, because
+    O_NONBLOCK turns a pipe read into a 0-byte read with err == nil.
+  - **File(s)**: pkg/configstore/bounded_read.go,
+    pkg/configstore/bounded_read_6753_test.go,
+    pkg/cli/load_bounded_read_6753_test.go, cmd/cli/main.go,
+    cmd/cli/load_bounded_read_7469_test.go (new), pkg/configstore/README.md
