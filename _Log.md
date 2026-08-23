@@ -104334,3 +104334,14 @@ prose edit above them added. No diff falls in the new test body.
   pkg/config/compiler_opts.go, pkg/flowexport/manager.go,
   pkg/config/flow_export_seconds_overflow_6769_test.go,
   pkg/flowexport/template_seconds_overflow_6769_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  **Action**: #6768 — turn the #5180 duplicate-named-block gate into a registry
+  and add six containers derived from the predicate "a container authorable
+  twice hierarchically whose compile silently loses config the flat spelling
+  merges": security log stream/profile (last-writer-wins), protocols bgp group
+  (split instances), services flow-monitoring/rpm/ip-monitoring (FindChild
+  first-wins). Per-container effect messages replace the single sentence that
+  said "earlier block dropped" for every mode — backwards for a first-wins read.
+  **File(s)**: pkg/config/dup_named_blocks.go,
+  pkg/config/duplicate_container_6768_test.go, docs/config-schema.md
