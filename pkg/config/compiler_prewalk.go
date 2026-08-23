@@ -513,6 +513,25 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #6782: a RETH `redundant-ether-options redundancy-group` token that is
+	// PRESENT but unusable (0 — the control-plane group, negative, non-numeric,
+	// or above the link-local third-octet ceiling). compileInterfaces reads it
+	// with Atoi-then-default, so a non-numeric token collapses to 0 and a
+	// negative one is stored verbatim; every downstream consumer then decides
+	// "is this a RETH?" with `redundancy-group > 0` and treats the interface as
+	// ORDINARY, writing the reth's service address as a plain static address on
+	// BOTH nodes (a duplicate-address / split-brain condition). Runs on the raw
+	// AST for the same reason the chassis-identity gate does: once the typed
+	// InterfaceConfig exists, a malformed token is indistinguishable from a reth
+	// with no redundant-ether-options stanza at all. Strict at commit /
+	// commit-check; warn on the tolerant load / peer-sync path, where
+	// compileInterfaces also suppresses the affected reth's addresses.
+	rethRGWarnings, err := validateRethRedundancyGroupTokensAST(
+		tree.Children, opts.lenientRethRedundancyGroup)
+	if err != nil {
+		return nil, err
+	}
+
 	// #5695 (codex-182 M16): a redundancy-group gratuitous-arp-count over the
 	// runtime clamp (config.GratuitousARPBurstClamp) is accepted and compiled
 	// verbatim but WARNS — the value is clamped at runtime, never used as
@@ -583,6 +602,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
 	warnings = append(warnings, chassisIdentityWarnings...)
+	warnings = append(warnings, rethRGWarnings...)
 	warnings = append(warnings, monitorWeightWarnings...)
 	warnings = append(warnings, rgArityWarnings...)
 	warnings = append(warnings, garpCountWarnings...)

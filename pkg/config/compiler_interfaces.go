@@ -23,6 +23,10 @@ var vrrpGroupPropertyKeywords = map[string]bool{
 }
 
 func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, warnings *[]string) error {
+	// #6782: reth interfaces whose redundancy-group token was present but
+	// unusable. Only ever populated on the tolerant path — the strict compile
+	// fails in runPreWalkGates before compileInterfaces runs.
+	var invalidRethRG map[string]bool
 	for _, child := range node.Children {
 		if child.IsLeaf {
 			continue
@@ -138,6 +142,25 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 			if rgNode := reoNode.FindChild("redundancy-group"); rgNode != nil {
 				if v, err := strconv.Atoi(nodeVal(rgNode)); err == nil {
 					ifc.RedundancyGroup = v
+				}
+				// #6782: the Atoi above deliberately keeps its
+				// discard-the-error shape so the compiled value is bit-identical
+				// to what every prior release produced. What changes is that an
+				// unusable token is no longer SILENT. On the strict path
+				// validateRethRedundancyGroupTokensAST has already hard-rejected
+				// this configuration in runPreWalkGates, so reaching here with a
+				// bad token means we are on the tolerant load / peer-sync path.
+				// Record it: the post-pass below strips this reth's addresses so
+				// the lenient boot cannot configure the reth's service address as
+				// an ordinary static address on BOTH nodes, which is precisely the
+				// duplicate-address condition the gate exists to prevent. Warning
+				// on the way in and then doing the damage anyway would make the
+				// tolerant path the bug.
+				if _, bad := rethRGTokenProblem(nodeVal(rgNode)); bad {
+					if invalidRethRG == nil {
+						invalidRethRG = make(map[string]bool)
+					}
+					invalidRethRG[ifName] = true
 				}
 			}
 		}
@@ -581,7 +604,55 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 
 		ifaces.Interfaces[ifName] = ifc
 	}
+	suppressInvalidRethAddresses(ifaces, invalidRethRG)
 	return nil
+}
+
+// suppressInvalidRethAddresses strips every configured address from a reth
+// whose redundancy-group token was present but unusable (#6782), and from any
+// interface that inherits from it as a redundant member.
+//
+// This runs on the tolerant load / peer-sync path only (the strict path
+// hard-rejects in runPreWalkGates). The reth reads as NON-redundant everywhere
+// downstream — pkg/dataplane compiler_iface.go decides both `isReth` and
+// `isVRRPReth` with `redundancy-group > 0` — so leaving the addresses in place
+// would make the lenient boot write the reth's service address onto the
+// physical device as an ordinary static address, with `KeepAddresses:false`,
+// on BOTH nodes of the cluster. Removing the addresses degrades the interface
+// to no-service rather than to duplicate-service: the node still BOOTS as
+// #1960 requires, the operator gets the warning the gate emitted, and no
+// address is contended on the wire until the group is repaired.
+//
+// It clears the addresses rather than the group id because the group id is
+// what the operator has to fix; rewriting it here would erase the evidence and
+// make a later strict commit-check pass on a config that is still wrong.
+func suppressInvalidRethAddresses(ifaces *InterfacesConfig, invalid map[string]bool) {
+	if len(invalid) == 0 || ifaces == nil {
+		return
+	}
+	clear := func(ifc *InterfaceConfig) {
+		if ifc == nil {
+			return
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			unit.Addresses = nil
+			unit.PrimaryAddress = ""
+			unit.PreferredAddress = ""
+		}
+	}
+	for name := range invalid {
+		clear(ifaces.Interfaces[name])
+	}
+	// A physical member carries the reth's addresses through RedundantParent,
+	// so an untouched member would reintroduce exactly what was just removed.
+	for _, ifc := range ifaces.Interfaces {
+		if ifc != nil && ifc.RedundantParent != "" && invalid[ifc.RedundantParent] {
+			clear(ifc)
+		}
+	}
 }
 
 // parseTunnelWireguard fills the WireGuard fields on tc from a
