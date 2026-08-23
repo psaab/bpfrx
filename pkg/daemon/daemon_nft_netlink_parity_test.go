@@ -121,6 +121,79 @@ func runNftNetlinkParityInner(t *testing.T) {
 		parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
 	})
 
+	// #6804: the flexible-match-range predicate. Before the fix NEITHER renderer
+	// carried it — the lo0 netlink spec had no field for it at all — so the term
+	// rendered WITHOUT its narrowing on the chain that is the PRIMARY
+	// enforcement for host traffic. This case is what makes the two renderers'
+	// agreement real rather than asserted: both go through the actual `nft`
+	// parser and the actual netlink install, and the installed rulesets are
+	// diffed.
+	//
+	// The widths are chosen to exercise the parts most likely to diverge: a
+	// sub-byte bit length (12 -> a 2-byte load narrowed by the mask), a
+	// byte-aligned one, and a full 32-bit one.
+	t.Run("lo0_flexible_match_range", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			fm   config.FlexMatchConfig
+		}{
+			{"sub-byte-12-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 12, Value: 0x0abc, Mask: 0x0fff}},
+			{"byte-aligned-8-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 9, BitLength: 8, Value: 0x11, Mask: 0xff}},
+			{"full-32-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 12, BitLength: 32, Value: 0x0a000001, Mask: 0xffffffff}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				fm := tc.fm
+				cfg := &config.Config{}
+				cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+					"flexf": {Terms: []*config.FirewallFilterTerm{
+						{Name: "flex", Protocols: []string{"tcp"}, FlexMatch: &fm, Action: "accept"},
+						{Name: "deny-rest", Action: "discard"},
+					}},
+				}
+				nftDeleteTableBestEffort(xnft.Lo0TableName)
+				oracle := buildLo0FilterPayload(cfg, "flexf", "")
+				// Guard the fixture's own premise: an oracle that omitted the
+				// predicate would make the diff below pass for the wrong reason.
+				if !strings.Contains(oracle, "@nh,") {
+					t.Fatalf("the oracle emitted no raw-payload match, so this "+
+						"cell cannot detect a dropped predicate:\n%s", oracle)
+				}
+				spec := toNftLo0Spec(cfg, "flexf", "")
+				parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
+			})
+		}
+	})
+
+	// #6804: an unrepresentable flexible-match-range must make the term match
+	// NOTHING on BOTH sides — mirroring the userspace fail-closed, where the
+	// term is poisoned to FlexMatchStart::Unsupported and later terms still run.
+	// A drop would be wrong: a flex-match has no natural narrowing like
+	// tcp-flags' `meta l4proto 6`, so a term whose only predicate was the
+	// flex-match would deny ALL host-inbound traffic.
+	t.Run("lo0_unrepresentable_flex_match_matches_nothing", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+			"flexbad": {Terms: []*config.FirewallFilterTerm{
+				{
+					Name:                "multi-range",
+					Protocols:           []string{"tcp"},
+					FlexMatchRangeNames: []string{"r1", "r2"},
+					FlexMatch:           &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff},
+					Action:              "accept",
+				},
+				{Name: "deny-rest", Action: "discard"},
+			}},
+		}
+		nftDeleteTableBestEffort(xnft.Lo0TableName)
+		oracle := buildLo0FilterPayload(cfg, "flexbad", "")
+		if strings.Contains(oracle, "@nh,") {
+			t.Fatalf("an UNREPRESENTABLE flex-match still rendered a payload "+
+				"match:\n%s", oracle)
+		}
+		spec := toNftLo0Spec(cfg, "flexbad", "")
+		parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
+	})
+
 	t.Run("lo0_unrepresentable_port_fails_closed", func(t *testing.T) {
 		// #6405 FIX-1: a port token nft cannot resolve (not numeric, not a service
 		// name). BOTH sides must FAIL CLOSED: the oracle emits the raw token and

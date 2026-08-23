@@ -104912,3 +104912,21 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/lldp/apply_partial_6794_test.go`, `pkg/daemon/daemon.go`,
   `pkg/daemon/daemon_apply_tail.go`,
   `pkg/daemon/lldp_recovery_6794_test.go`, `pkg/lldp/README.md`, `_Log.md`
+
+## 2026-08-23 — #6804 lo0 mirror dropped flexible-match-range
+
+- **Timestamp**: 2026-08-23
+- **Action**: The lo0 kernel nft mirror had NO handling for
+  `from flexible-match-range` — `Lo0FilterTerm` had no field for it, so the
+  predicate was dropped at the spec boundary and the term rendered without its
+  narrowing (an accept-term admitted everything it scoped) on the chain that is
+  the PRIMARY host-traffic enforcement. Added the predicate to both renderers
+  (text oracle `@nh,off,len & mask == value`; netlink payload+bitwise+cmp), with
+  an unrepresentable predicate making the term match NOTHING to mirror
+  userspace's `FlexMatchStart::Unsupported` — deliberately not the #5512
+  tcp-flags drop, which has a `meta l4proto 6` narrowing a flex-match lacks.
+  Bound by real-`nft` parity cases across three widths.
+- **File(s)**: pkg/nftables/netlink_spec.go, pkg/nftables/netlink_build.go,
+  pkg/nftables/netlink_lo0.go, pkg/daemon/daemon_nft.go,
+  pkg/daemon/daemon_nft_netlink.go,
+  pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md, _Log.md

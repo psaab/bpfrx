@@ -2196,6 +2196,24 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// this file was hardened). Record the unrepresentable expression and fail
 	// THIS term closed below (drop its scoped traffic) instead of appending a
 	// flag predicate.
+	// #6804: an unrepresentable flexible-match-range makes the term match
+	// NOTHING, mirroring userspace (which poisons it to
+	// FlexMatchStart::Unsupported so flex_matches() returns false and later
+	// terms still run). Returning "" makes buildLo0FilterPayload skip the rule,
+	// which is the kernel equivalent.
+	//
+	// Deliberately NOT the #5512 tcp-flags drop: a tcp-flags constraint only
+	// ever matches TCP, so that drop can be scoped with `meta l4proto 6`. A
+	// flexible-match-range has no such natural narrowing, so a term whose ONLY
+	// predicate was the flex-match would render a bare `drop` and deny ALL
+	// host-inbound traffic — turning a fail-open into a lockout.
+	if lo0FlexMatchUnrepresentable(term) {
+		slog.Warn("lo0 kernel nftables mirror: unrepresentable flexible-match-range; "+
+			"the term matches NOTHING (mirroring the userspace fail-closed) so its "+
+			"narrowing is never silently dropped", "term", term.Name)
+		return nil
+	}
+
 	tcpFlagsFailClosed := false
 	if len(term.TCPFlags) > 0 {
 		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
@@ -2218,6 +2236,20 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 		} else {
 			parts = append(parts, "ip frag-off & 0x1fff != 0")
 		}
+	}
+
+	// #6804: flexible-match-range. Before this the oracle had no case for it at
+	// all, so the predicate was silently DROPPED and the term rendered WIDER
+	// than configured — an accept-term admitted every packet it scoped instead
+	// of only those whose header bytes matched. This chain is the PRIMARY
+	// enforcement for host traffic (the XDP shim shunts host-bound packets to
+	// the kernel before userspace-dp), so that is a control-plane fail-OPEN.
+	//
+	// nft's raw payload syntax takes BIT offset and BIT length from the base:
+	// `@nh,<off>,<len>`. match-start layer-3 — the only start point the compiler
+	// emits — is the network header base.
+	if fm := term.FlexMatch; fm != nil && !lo0FlexMatchUnrepresentable(term) {
+		parts = append(parts, nftFlexMatchExpr(*fm))
 	}
 
 	// Disposition. Mirror the userspace lo0 evaluator
@@ -2496,4 +2528,53 @@ func nftDSCPValue(name string) string {
 		return strconv.Itoa(v)
 	}
 	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// lo0FlexMatchUnrepresentable reports whether a term's flexible-match-range
+// cannot be rendered faithfully (#6804): more than one named range (#5823), an
+// unparseable numeric token (UnknownFlexMatch), or a load width outside 1..4
+// bytes.
+//
+// The width rule mirrors the userspace snapshot builder exactly: a zero
+// bit-length defaults to 4 (32-bit) and an oversized width is NOT capped —
+// capping would compare only the truncated window and BROADEN the match, which
+// is the #3406 fail-open.
+func lo0FlexMatchUnrepresentable(term *config.FirewallFilterTerm) bool {
+	if len(term.FlexMatchRangeNames) > 1 || len(term.UnknownFlexMatch) > 0 {
+		return true
+	}
+	if term.FlexMatch == nil {
+		return false
+	}
+	n := nftFlexMatchByteLen(term.FlexMatch.BitLength)
+	return n < 1 || n > 4
+}
+
+// nftFlexMatchByteLen is the payload load width in bytes for a bit length,
+// matching the userspace snapshot builder (0 -> 4, else ceil(bits/8)).
+func nftFlexMatchByteLen(bits uint8) int {
+	if bits == 0 {
+		return 4
+	}
+	return (int(bits) + 7) / 8
+}
+
+// nftFlexMatchExpr renders `@nh,<bitoff>,<bitlen> & <mask> == <value>`.
+//
+// The load width is whole BYTES (nft loads byte-aligned), so the bit length in
+// the expression is the byte width times 8 — the sub-byte narrowing is carried
+// by the mask, exactly as the userspace matcher does it. The expected value is
+// pre-masked for the same reason the netlink builder pre-masks it: nft compares
+// the MASKED load, so a value carrying bits outside the mask would never match,
+// and a silent never-match is a different fail direction but just as quiet.
+func nftFlexMatchExpr(fm config.FlexMatchConfig) string {
+	n := nftFlexMatchByteLen(fm.BitLength)
+	mask := fm.Mask
+	value := fm.Value & mask
+	if n < 4 {
+		trunc := uint32(1)<<(uint(n)*8) - 1
+		mask &= trunc
+		value &= trunc
+	}
+	return fmt.Sprintf("@nh,%d,%d & 0x%x == 0x%x", int(fm.ByteOffset)*8, n*8, mask, value)
 }
