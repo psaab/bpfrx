@@ -91,6 +91,31 @@ installed into both places:
 install, they clear the cached FIB result so the receiving node recomputes
 node-local forwarding.
 
+**#7581 — a synced import with no pool to reserve from is not a collision.**
+Before publishing a peer-synced session the helper reserves its translated NAT
+tuple (#6600), so the standby cannot advertise a translation a local flow
+already owns. That reservation walks the source-NAT rules for one whose POOL
+contains the translated address. It used to return a bare `bool`, which
+collapsed two opposite outcomes into one `false`: a pool-owning candidate that
+DECLINED (a genuine collision), and NO candidate owning the address at all.
+
+**Interface-mode source NAT is permanently the second case** — the translated
+address is the egress interface's own address, no rule is `pool_mode`, and no
+allocator has anything to hand out. So every peer-synced import under
+interface-mode SNAT read as a collision, and `upsert_synced_session` refused it
+BEFORE `publish_shared_session`: since #6600 those sessions reached neither the
+standby's shared `synced` map nor its worker tables, and a promoted node had no
+state for the flow. It was invisible because the Go side still wrote and kept
+its BPF mirror row — which is what `show security flow session` reads — so an
+operator saw synced sessions the forwarding path did not have. Measured on the
+loss userspace cluster: 17 refusals on the standby during one iperf3 run, all
+`reserve`, with `xpf_userspace_synced_import_cap_drops_total` at 0.
+
+The reservation is now tri-state (`SyncedReserveOutcome`): `Reserved`,
+`Refused`, and `NothingToReserve`. Only `Refused` blocks the publish;
+`NothingToReserve` is answered exactly like the long-standing
+`rewrite_src == None` early return one line above it.
+
 **#5305 — the forward install is transactional.** A forward cluster-synced
 install writes the pinned BPF session mirror FIRST, then mirrors the entry to
 the Rust helper. If the helper mirror fails (connect/write/decode), the install

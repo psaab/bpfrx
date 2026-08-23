@@ -104506,6 +104506,56 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
 
+## 2026-08-22 — #7581 synced reserve read "no pool" as a collision
+
+- **Timestamp**: 2026-08-22
+- **Action**: `reserve_synced_on_first_pool_owner` returned a bare bool, so "no
+  candidate rule's pool owns the translated address" was indistinguishable from
+  "a pool-owning candidate refused". Interface-mode SNAT is permanently the
+  former, so since #6600 every peer-synced import under interface-mode SNAT was
+  refused BEFORE publish — the standby's helper never received the session,
+  while Go's BPF mirror (what `show security flow session` reads) kept the row.
+  Found by deploying #6785's refusal reporting to the loss cluster: 17
+  `reserve` refusals on fw1 in one iperf3 run, cap drops 0. Made the
+  reservation tri-state; only a pool-owning decline blocks the publish.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-22 — #6785 HA import capacity refusal reported as success
+
+- **Timestamp**: 2026-08-22
+- **Action**: `upsert_synced_session` returned `()`; its three semantic refusal
+  paths (#2170 stale generation, #5674 import cap, #6600 reserve) each bumped a
+  counter and returned silently, so the control handler answered `ok=true`, Go
+  recorded a success, and Go's BPF mirror row stayed behind for a session the
+  helper never took. Added `SyncedImportOutcome` + `SYNCED_IMPORT_REFUSED_PREFIX`
+  in Rust; the handler now answers `ok=false` with a reason token. Go classifies
+  the token into `dataplane.ErrSyncedImportRefused`, which drives the EXISTING
+  #5305 rollback but deliberately does NOT set the sticky mirror-failure flag
+  (that gates takeover-readiness, #5247, and a refusal comes from a healthy
+  helper). Refusals are counted separately as health debt and rendered in
+  `show chassis cluster information` when non-zero.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/handlers/sync_session.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/server/tests.rs,
+  pkg/dataplane/dataplane.go, pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go,
+  pkg/cluster/sync.go, pkg/cluster/sync_conn_gen.go, pkg/cluster/status.go,
+  pkg/cluster/synced_import_refusal_6785_test.go, docs/ha-failover-status.md,
+  _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6785 round 2 — the mutation matrix found a GREEN cell: making a
+  semantic refusal set the sticky mirror-failure flag left the whole suite
+  green, because the only cells that could see it need CAP_BPF and SKIP on an
+  unprivileged runner. Extracted the classification into one shared
+  `noteSyncedMirrorFailureLocked` (the V4/V6 copies were a divergence waiting to
+  happen) and bound it with an unprivileged paired table plus a
+  comment-stripped single-sourcing check.
+- **File(s)**: pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go, _Log.md
+
 ## 2026-08-22 — #6782 invalid RETH redundancy-group committed as a both-node address
 
 - **Timestamp**: 2026-08-22
