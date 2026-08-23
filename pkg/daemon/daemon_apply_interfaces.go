@@ -14,13 +14,28 @@ import (
 	"github.com/psaab/xpf/pkg/routing"
 )
 
+// deferredIPVLAN names one fabric overlay to (re)create: the physical parent,
+// the fab* device name, and the addresses it carries. Shared by the deferred
+// (OnXSKBound) creation path and the #6791 re-assert loop so both describe the
+// work the same way.
+type deferredIPVLAN struct {
+	parent string
+	name   string
+	addrs  []string
+}
+
 // applyFabricIPVLAN creates the fabric-member IPVLAN overlays (fab0/fab1) for
 // cluster heartbeat + VRRP, deferring creation past XSK bind when the userspace
 // dataplane is active (an existing IPVLAN breaks zero-copy bind, #128), and
 // cleans up stale fabric IPVLAN overlays not in the current config. Extracted
 // verbatim from applyConfigLocked (#4407); runs in the same slot, after the
 // interface-creation reconcile and before the RETH-MAC pre-check.
-func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
+func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) error {
+	// #6791: accumulates the overlays whose creation is genuinely terminal —
+	// retries exhausted and no working fab* device. Joined and returned so the
+	// commit fails closed instead of acknowledging a cluster whose heartbeat
+	// and session-sync transport does not exist.
+	var fabricErrs []error
 	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
 	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
 	// on top for IP addressing. BPF attaches to the parent.
@@ -33,11 +48,6 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 	// parent bind XSK in zerocopy first, then the IPVLAN is added for
 	// sync/heartbeat addressing.
 	activeFabricOverlays := make(map[string]bool)
-	type deferredIPVLAN struct {
-		parent string
-		name   string
-		addrs  []string
-	}
 	var deferredOverlays []deferredIPVLAN
 	bindingCtrl, isUserspaceDP := d.dataplane().(userspaceXSKBindingController)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
@@ -74,16 +84,16 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 			}
 			// XSK already bound — fall through to reconcile.
 		}
-		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
+		if err := fabricEnsureFn(parentLinux, fabLinux, addrs); err != nil {
 			// Fabric overlay is critical for cluster heartbeat and VRRP.
 			// Retry up to 5 times with 1s delay — the parent interface
 			// might not be ready yet after a power cycle.
 			var retryErr error
 			for retry := 0; retry < 5; retry++ {
-				time.Sleep(time.Second)
+				time.Sleep(fabricIPVLANRetryDelay)
 				slog.Info("retrying fabric IPVLAN creation",
 					"parent", parentLinux, "name", fabLinux, "attempt", retry+2)
-				retryErr = ensureFabricIPVLAN(parentLinux, fabLinux, addrs)
+				retryErr = fabricEnsureFn(parentLinux, fabLinux, addrs)
 				if retryErr == nil {
 					break
 				}
@@ -91,6 +101,14 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 			if retryErr != nil {
 				slog.Error("CRITICAL: fabric IPVLAN creation failed after retries — cluster heartbeat will not work",
 					"parent", parentLinux, "name", fabLinux, "err", retryErr)
+				// #6791: this log line said the cluster heartbeat will not
+				// work and then returned success. ensureFabricIPVLAN only
+				// returns an error when there is no usable overlay (address
+				// failures are warn-only inside it and AddrReplace is
+				// idempotent), so every error reaching here is terminal for
+				// fabric function, not a benign already-exists.
+				fabricErrs = append(fabricErrs, fmt.Errorf(
+					"fabric IPVLAN %s on %s: %w", fabLinux, parentLinux, retryErr))
 			}
 			continue
 		}
@@ -101,7 +119,7 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 			for _, ov := range deferredOverlays {
 				slog.Info("XSK bound — creating deferred fabric IPVLAN",
 					"parent", ov.parent, "name", ov.name)
-				if err := ensureFabricIPVLAN(ov.parent, ov.name, ov.addrs); err != nil {
+				if err := fabricEnsureFn(ov.parent, ov.name, ov.addrs); err != nil {
 					slog.Error("deferred fabric IPVLAN creation failed",
 						"parent", ov.parent, "name", ov.name, "err", err)
 				}
@@ -120,6 +138,11 @@ func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
 			}
 		}
 	}
+	// The deferred (OnXSKBound) overlays above are created asynchronously after
+	// this function has returned, so their failure cannot be reported here at
+	// all. fabricIPVLANReassertLoop (#6791) is the retry owner that covers both
+	// that window and a transient failure outlasting the in-apply retries.
+	return errors.Join(fabricErrs...)
 }
 
 // applyVRFReconcile reconciles routing-instance VRFs during a config apply:

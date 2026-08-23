@@ -411,7 +411,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// networkdErr/hostInboundErr/lo0Err (fail-closed but complete).
 	ifaceErr := d.applyInterfaceReconcile(cfg)
 
-	d.applyFabricIPVLAN(cfg)
+	// #6791: capture the fabric-overlay failure and thread it into the tail
+	// commit-error join, exactly like ifaceErr/vrfErr above. This call was the
+	// ONLY reconciler in this sequence whose error could not propagate — it
+	// returned nothing, so a fab0/fab1 that could not be created logged
+	// "CRITICAL ... cluster heartbeat will not work" and the commit still
+	// reported success. All later steps still run (fail-closed but complete).
+	fabricErr := d.applyFabricIPVLAN(cfg)
 
 	// 1.9–2.7. Dataplane apply + RETH-MAC/VIP/worker-rebind critical section
 	// (#4407). Returns the ip-monitoring commit overlay and the captured
@@ -486,7 +492,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// next-table/rib-group/PBR ip-rule reconcile failure (a partial kernel
 	// policy-routing clear/add); the helper creates lo0Err/hostInboundErr and
 	// returns the joined errors.
-	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr)
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr)
 }
 
 // applyHostAuthorizationCloseout runs ONLY the security-critical host-
