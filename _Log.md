@@ -104279,3 +104279,14 @@ prose edit above them added. No diff falls in the new test body.
   to `trigger`, `on` and `until`.
 - **File(s)**: pkg/config/compiler_services.go,
   pkg/config/event_trigger_duplicate_6771_test.go
+
+## 2026-08-22 — #6772/#6773 bound two typed leaves at their runtime domains
+- **Timestamp**: 2026-08-22
+- **Action**: #6773 DDNS ttl was min-only while reaching a uint32 DNS RR header
+  (2^32 wraps to 0, "do not cache"); bounded at MaxDNSTTLSeconds. #6772
+  heartbeat-threshold is MULTIPLIED by heartbeat-interval into a time.Duration
+  and neither field alone can be capped usefully, so the PRODUCT (doubled, as
+  failover.go computes it) is validated at strict commit.
+- **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
+  pkg/config/compiler_validate_strict_chassis.go,
+  pkg/config/numeric_bounds_6772_6773_test.go

@@ -257,6 +257,19 @@ func ValidatePercent(min, max float64) LeafValidator {
 // review on PR #1845: no schema-only caps).
 const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 
+// MaxDNSTTLSeconds is the largest TTL a DNS record can carry: the RR header's
+// TTL is a 32-bit unsigned wire field (RFC 1035 §3.2.1), so a larger value does
+// not fail — it WRAPS. 2^32 becomes 0, and a zero TTL tells every resolver not
+// to cache the record at all, which is a materially different answer from the
+// one the operator configured.
+//
+// #6773: the DDNS ttl leaf was min-only, and pkg/ddns's rfc2136 backend carried
+// `uint32(rec.TTL) //nolint:gosec // TTL is a small positive config value` — a
+// comment asserting a property nothing enforced, suppressing exactly the
+// warning that would have caught it. Same shape as MaxDurationSeconds below:
+// bound the typed leaf at the domain its runtime actually has.
+const MaxDNSTTLSeconds = int64(math.MaxUint32)
+
 // MaxDurationSeconds is the seconds analogue of MaxDurationMillis: the
 // largest second count that survives `time.Duration(n) * time.Second`
 // without int64 overflow (math.MaxInt64 / 1e9 = 9223372036). Used for
