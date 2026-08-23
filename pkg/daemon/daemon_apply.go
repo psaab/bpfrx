@@ -47,9 +47,59 @@ func setVLANSubAddrGenMode(iface string) {
 // with a request-bound context so a slow lock holder surfaces 503
 // to the client rather than hanging the request.
 func (d *Daemon) applyConfig(cfg *config.Config) {
-	_ = d.applySem.Acquire(context.Background(), 1)
+	if !d.beginBackgroundApply("applyConfig") {
+		return
+	}
 	defer d.applySem.Release(1)
 	d.applyConfigUnderSem(cfg)
+}
+
+// fenceBackgroundApplies latches the #6788 background-apply fence. Called once
+// by runShutdownSequence, at the very start and BEFORE the in-flight cancel and
+// the apply drain, so the drain is the LAST apply this process performs. Never
+// cleared: the process is exiting.
+func (d *Daemon) fenceBackgroundApplies() { d.applyFenced.Store(true) }
+
+// applyFencedForBackground reports whether background config applies are fenced
+// (see Daemon.applyFenced).
+func (d *Daemon) applyFencedForBackground() bool { return d.applyFenced.Load() }
+
+// beginBackgroundApply is the single gate every BACKGROUND full-config apply
+// passes through (#6788): the DHCP lease-change callback, the dynamic-feed
+// publication path, the config-poll / boot / rollback appliers. It reports
+// whether the caller may proceed; when it returns true the caller holds
+// d.applySem and MUST release it.
+//
+// One helper rather than three copies of the check. The three background entry
+// points (applyConfig, applyActiveConfig, applyActiveConfigResult) are a family
+// that must agree — a background applier that skips the fence is exactly the
+// defect this closes — and a shared predicate cannot drift the way three
+// hand-written guards can.
+//
+// The fence is tested TWICE, and the second test is the load-bearing one. A
+// background applier can already be BLOCKED on applySem behind an in-flight
+// apply when shutdown fences; checking only before the acquire lets it through
+// the instant that apply releases, which is precisely the moment the shutdown
+// drain is waiting for. Re-testing after the acquire closes that window, so a
+// waiter cannot inherit the semaphore the drain just freed.
+func (d *Daemon) beginBackgroundApply(who string) bool {
+	if d.applyFencedForBackground() {
+		slog.Info("shutdown: refusing background config apply; the daemon is stopping",
+			"caller", who, "issue", "#6788")
+		return false
+	}
+	_ = d.applySem.Acquire(context.Background(), 1)
+	if d.applyFencedForBackground() {
+		// Fenced while we waited: the apply we queued behind was the last one,
+		// and the shutdown drain is what freed this semaphore. Hand it straight
+		// back rather than becoming the apply that runs after the drain.
+		d.applySem.Release(1)
+		slog.Info("shutdown: refusing background config apply; the daemon began stopping "+
+			"while this applier waited for the apply lock",
+			"caller", who, "issue", "#6788")
+		return false
+	}
+	return true
 }
 
 // applyActiveConfig applies whatever config is ACTIVE at the moment the apply
@@ -82,7 +132,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 // config" — the commit paths use applyConfigLocked directly, and tests drive a
 // synthetic config through it.
 func (d *Daemon) applyActiveConfig() {
-	_ = d.applySem.Acquire(context.Background(), 1)
+	if !d.beginBackgroundApply("applyActiveConfig") {
+		return
+	}
 	defer d.applySem.Release(1)
 	if d.store == nil {
 		return
@@ -112,7 +164,13 @@ func (d *Daemon) applyActiveConfig() {
 // that must not pre-capture a config, so keeping a dead copy would invite the
 // #6716 inversion straight back in.
 func (d *Daemon) applyActiveConfigResult() error {
-	_ = d.applySem.Acquire(context.Background(), 1)
+	if !d.beginBackgroundApply("applyActiveConfigResult") {
+		// A fenced daemon is not a rejected feed: returning an error here would
+		// make the feed manager record publication DEBT for content it should
+		// simply stop retrying, on a process that is exiting. Report the same
+		// vacuous success the pre-boot nil-config case returns.
+		return nil
+	}
 	defer d.applySem.Release(1)
 	if d.store == nil {
 		return nil

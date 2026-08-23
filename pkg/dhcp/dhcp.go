@@ -118,7 +118,15 @@ type Manager struct {
 	onGatewayChange func()
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
-	stateDir        string
+	// quiesced latches the #6788 shutdown quiesce: once set, scheduleRecompile
+	// arms nothing and an already-elapsed timer's callback returns without
+	// dispatching. Guarded by mu.
+	quiesced bool
+	// recompileWG tracks an in-flight recompile callback so Quiesce can JOIN
+	// one that started before the latch. Add(1) happens under mu in
+	// scheduleRecompile (so it cannot race the latch), Done in the timer func.
+	recompileWG sync.WaitGroup
+	stateDir    string
 
 	// runClientForTest replaces the per-family run goroutine body in
 	// tests so reconcile/registry behavior can be exercised without
@@ -497,15 +505,100 @@ func (m *Manager) removeAddress(ifaceName string, lease *Lease) {
 	// Routes are cleaned up via FRR config removal.
 }
 
+// recompileDebounce is how long scheduleRecompile coalesces address-change
+// notifications before dispatching the callback. It is a package var only so a
+// test can drive the post-quiesce timer race deterministically in milliseconds
+// instead of sleeping past a 2s wall clock; production never changes it.
+//
+// The DURATION is itself part of the #6788 hazard: 2s is long enough for a
+// lease event arriving just before SIGTERM to fire its callback after the
+// shutdown apply drain has already completed.
+var recompileDebounce = 2 * time.Second
+
+// Quiesce stops the address-change callback machinery WITHOUT stopping the
+// DHCP clients or touching a single lease (#6788).
+//
+// It is deliberately NOT StopAll, and the difference is the whole point.
+// StopAll cancels every client, and a cancelled client runs finishClient, which
+// calls removeAddress: on a box whose management interface is DHCP (fxp0), that
+// strips the management address during shutdown and leaves it stripped across a
+// graceful restart. The comment on the client context in startClient states
+// that contract explicitly — clients are decoupled from the daemon lifecycle so
+// "during graceful restart (SIGTERM), the process exits without calling
+// StopAll(), so addresses stay on interfaces for the next daemon to reuse".
+// Quiesce preserves that: leases, addresses and client goroutines are left
+// exactly as they are, and only the notification path is shut off.
+//
+// What it stops is the debounce timer armed by scheduleRecompile, whose 2s
+// delay is long enough to outlive the shutdown apply drain and fire the
+// lease-change callback into a half-torn-down daemon. The latch makes that
+// one-way: a scheduleRecompile that races Quiesce arms nothing, and a timer
+// that has ALREADY fired and is running its callback is joined before Quiesce
+// returns, so the caller can order its own teardown after it.
+//
+// Idempotent, and safe on a nil-ish Manager built by a test.
+func (m *Manager) Quiesce() {
+	m.mu.Lock()
+	m.quiesced = true
+	if m.recompileTimer != nil {
+		m.recompileTimer.Stop()
+		m.recompileTimer = nil
+	}
+	m.mu.Unlock()
+	// Join a callback that was already in flight when the latch was set.
+	// scheduleRecompile's timer func takes recompileWG before it dispatches, so
+	// after the latch no new callback can start and this waits out the one that
+	// may already be running.
+	m.recompileWG.Wait()
+}
+
+// Quiesced reports whether Quiesce has latched (#6788). Exported so a caller
+// that owns teardown ordering can assert the latch rather than infer it.
+func (m *Manager) Quiesced() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.quiesced
+}
+
 // scheduleRecompile debounces address change notifications.
 func (m *Manager) scheduleRecompile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// #6788: once quiesced, arm nothing. Without this a lease event racing
+	// shutdown re-arms the 2s timer after Quiesce stopped it, and the callback
+	// lands after the apply drain — the exact ordering this closes.
+	if m.quiesced {
+		return
+	}
 	if m.recompileTimer != nil {
 		m.recompileTimer.Stop()
 	}
-	m.recompileTimer = time.AfterFunc(2*time.Second, func() {
+	m.recompileTimer = time.AfterFunc(recompileDebounce, func() {
+		// Re-test the latch and take the WaitGroup under the SAME lock, then
+		// dispatch. Both halves matter:
+		//
+		//   - The re-test is needed because time.Timer.Stop cannot un-fire an
+		//     already-elapsed timer, so this func can be entered concurrently
+		//     with Quiesce; a callback that dispatches after the latch is
+		//     exactly the late apply #6788 closes.
+		//   - Add(1) must happen HERE, not at arm time, and under mu. At arm
+		//     time it would never be matched: Quiesce stops the timer, the func
+		//     never runs, Done is never called, and Quiesce's Wait blocks
+		//     forever. Under mu it is also race-free against Wait — Quiesce sets
+		//     quiesced under mu before waiting, so a callback either registers
+		//     before the latch (and is joined) or observes the latch and never
+		//     registers. The counter cannot rise from zero concurrently with
+		//     Wait. Same Add/Wait discipline as configstore's archiveWG (#5869).
+		m.mu.Lock()
+		if m.quiesced {
+			m.mu.Unlock()
+			return
+		}
+		m.recompileWG.Add(1)
+		m.mu.Unlock()
+		defer m.recompileWG.Done()
+
 		if m.onAddressChange != nil {
 			m.onAddressChange()
 		}

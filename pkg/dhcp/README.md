@@ -34,7 +34,11 @@ power cut cannot silently change the client identity across reboot.
 - `Start(ctx context.Context, ifaceName string, af AddressFamily)` —
   `dhcp.go`. Spawn a per-interface client goroutine.
 - `Renew(ifaceName string) error` — `dhcp.go`.
-- `StopAll()` — `dhcp.go`.
+- `StopAll()` — `dhcp.go`. Cancels every client; a cancelled client runs
+  `finishClient` → `removeAddress`, so this DROPS the address. Never call it on
+  the shutdown path — see `Quiesce`.
+- `Quiesce()` / `Quiesced()` — `dhcp.go` (#6788). Stops the address-change
+  notification path and latches, WITHOUT stopping clients or touching leases.
 - `DelegatedPrefixes() []DelegatedPrefix` — `dhcp.go`.
 
 ## Reconcile lifecycle (#1793)
@@ -208,7 +212,23 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   stop — `Reconcile` removal/option change, `Renew`, `StopAll` —
   cancels a client.
 - The lease-change callback is debounced 2 seconds to avoid floods during
-  config apply.
+  config apply. **That 2s is long enough to outlive daemon shutdown's only
+  apply drain (#6788):** the callback re-enters a full config apply, so a lease
+  event arriving just before SIGTERM could land an apply on a daemon whose FRR,
+  dataplane and VIPs were already torn down. `runShutdownSequence` therefore
+  calls `Quiesce()` before that drain.
+
+  `Quiesce` is deliberately NOT `StopAll`, and the bullet above is why:
+  cancelling the clients would strip the DHCP address from every DHCP
+  interface — including a DHCP-managed management NIC (`fxp0`) — during
+  shutdown AND across the graceful restart the previous bullet's contract
+  exists to protect. `Quiesce` leaves every lease, address and client goroutine
+  exactly as they are and shuts off only the notification: it stops the armed
+  debounce timer, latches so a lease event racing shutdown re-arms nothing, and
+  JOINS a callback that had already started (a `time.Timer.Stop` cannot un-fire
+  an already-elapsed timer, so the callback re-tests the latch under the mutex
+  and takes the join WaitGroup there — registering at arm time would leave a
+  stopped timer's `Add` unmatched and wedge `Quiesce` forever).
 - DUID is cached per-interface in the state directory with type hints
   (`duid-ll`, `duid-llt`).
   - **A DUID-LLT that cannot be persisted is a hard error (#4909).** A

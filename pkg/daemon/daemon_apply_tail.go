@@ -66,7 +66,18 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// /etc/resolv.conf a dangling symlink. bootEmptyRepairOnly is set
 	// before DHCP clients start so the first apply does not blank a good
 	// resolv.conf when no static name-server is configured yet.
-	d.reconcileDNSLocked(cfg, !d.dnsBootDone)
+	// #6792: joined into the commit result, not swallowed at WARN. Its two
+	// siblings in this same function — applyLo0Filter and
+	// applyHostInboundFilter — are both captured and joined; reconcileDNS sat
+	// between them as a bare statement and was the ONLY reconciler here whose
+	// error could not propagate. A failed disable+mask leaves systemd-resolved
+	// as a second resolver owner (and xpf's own networkd .network files carry
+	// UseDNS=yes, so a surviving resolved is independently fed DHCP
+	// nameservers); a failed write leaves /etc/resolv.conf stale AFTER the mask
+	// and drop-in removal have already run. Both reported a successful commit.
+	// The remaining apply steps still run, matching the lo0/host-inbound
+	// pattern: management/SSH reconcile is never skipped by a DNS failure.
+	dnsErr := d.reconcileDNSLocked(cfg, !d.dnsBootDone)
 	d.applySystemNTP(cfg)
 
 	// 9.5. Apply system hostname, timezone, and kernel tuning
@@ -351,7 +362,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
