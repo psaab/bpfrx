@@ -104345,3 +104345,20 @@ prose edit above them added. No diff falls in the new test body.
   said "earlier block dropped" for every mode — backwards for a first-wins read.
   **File(s)**: pkg/config/dup_named_blocks.go,
   pkg/config/duplicate_container_6768_test.go, docs/config-schema.md
+
+## 2026-08-22 — #6765 SNAT/NAT64 partial-overlap pool carry-over
+- **Action**: A pool change that RETAINS an address rebuilt its allocator from
+  zero, so the next new flow was issued `(retained_addr, port_low)` — a tuple a
+  live session still held (reply mis-delivery). Added
+  `PortAllocator::reseed_retained_from` + `ReseedOutcome` and called it from the
+  FRESH-allocator arm of both rebuild sites, carrying live port ownership across
+  with REMAPPED indices (the occupancy vector is position-indexed, so wholesale
+  reuse would misindex — the obvious fix was unavailable). Re-seed goes through
+  `reserve_flow`, the audited HA-import path. Unchanged pool / disjoint swap /
+  cold start all keep resetting. Persistent leases and address-only tokens are
+  deliberately NOT carried — filed as #7560.
+- **File(s)**: `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/source.rs`, `userspace-dp/src/nat/mod.rs`,
+  `userspace-dp/src/nat64.rs`, `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/nat/tests_pool.rs`, plus `now_ns` threading in four test
+  files, `docs/pr/6765-snat-pool-carryover/plan.md`

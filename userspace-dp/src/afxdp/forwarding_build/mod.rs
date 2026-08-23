@@ -514,6 +514,9 @@ fn build_fallible_forwarding_state(
         &snapshot.source_nat_rules,
         previous.map(|state| state.source_nat_rules.as_slice()),
         nat_counters,
+        // #6765: the monotonic clock the retained-address re-seed threads down
+        // to `reserve_flow`. Read once per apply, not per rule.
+        crate::afxdp::neighbor::monotonic_nanos(),
     );
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules, nat_counters);
     state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules, nat_counters);
@@ -542,6 +545,8 @@ fn build_fallible_forwarding_state(
         &snapshot.nat64_rules,
         previous.map(|p| &p.nat64),
         snapshot.generation,
+        // #6765: monotonic clock for the retained-address re-seed.
+        crate::afxdp::neighbor::monotonic_nanos(),
     );
     // #2240: fail CLOSED on an unparseable / unsupported / mismatched NPTv6
     // rule. The preflight in the reconcile/refresh apply paths catches this
