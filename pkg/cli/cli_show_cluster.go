@@ -138,14 +138,12 @@ func (c *CLI) showChassisDeviceMapCandidates() error {
 	fmt.Printf("%-16s %-18s %-14s %s\n", "PCI address", "Permanent MAC", "Current name", "Link")
 	fmt.Printf("%-16s %-18s %-14s %s\n", "-----------", "-------------", "------------", "----")
 	for _, n := range nics {
-		perm := n.PermMAC
-		if perm == "" {
-			perm = "(none)"
-		}
-		link := "down"
-		if n.LinkUp {
-			link = "up"
-		}
+		// #6786: single-sourced so the local CLI and the remote/gRPC
+		// renderer cannot drift, and so an UNREAD identity is not reported
+		// as "(none)"/"down" — which would assert facts the failed read
+		// does not support.
+		perm := n.PermMACDisplay()
+		link := n.LinkDisplay()
 		fmt.Printf("%-16s %-18s %-14s %s\n", n.PCIAddr, perm, n.Name, link)
 	}
 	fmt.Println("\nExample:")

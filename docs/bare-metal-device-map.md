@@ -37,6 +37,11 @@ the console is your lifeline.
    0000:05:00.0     a0:36:9f:00:11:22  eno1           up
    0000:09:00.0     a0:36:9f:00:11:30  enp9s0         up
    0000:0a:00.0     a0:36:9f:00:11:31  enp10s0        down
+   0000:0b:00.0     (unknown)          enp11s0        unknown
+
+   `(none)` in the Permanent MAC column means the hardware reported no
+   permanent MAC; `(unknown)` means its identity could not be read, so a `mac`
+   pin for it cannot be verified and would be refused (#6786).
 
    Example:
      set chassis device-map interface ge-0/0/3 pci 0000:05:00.0
@@ -103,7 +108,41 @@ immediately on commit.
   binds via the MAC fallback and flags it in `show` (`bound (via MAC
   fallback — PCI moved, re-pin)`).
 - **No permanent MAC** (common on some VFs/virtio): the entry binds PCI-only
-  and `show` marks it `(PCI-only, unverified)`; `key mac` is rejected.
+  and `show` marks it `(PCI-only, unverified)`; `key mac` is rejected. This is a
+  POSITIVE fact — the read succeeded and the hardware reported no permanent-MAC
+  attribute — and is distinct from the case below.
+- **Unreadable-identity refusal (#6786).** If the NIC at the pinned PCI address
+  is present but its identity could not be READ (the per-NIC netlink query
+  failed), its permanent MAC is **UNKNOWN**, not absent. An entry that pins a
+  `mac` is **REFUSED** — `REFUSED (identity unreadable — cannot verify pinned
+  MAC)` — rather than binding it unverified.
+
+  Before this, the enumerator discarded that read error, leaving an empty
+  permanent MAC: the same value MAC-less hardware produces. The topology-change
+  refusal above is conditioned on the permanent MAC being non-empty, so a failed
+  read did not merely lose information — it silently **disabled the card-swap
+  check** and downgraded the entry to `bound (PCI-only, unverified)`, whose own
+  wording asserts "this hardware has no permanent MAC". A card swapped into the
+  pinned slot could then be renamed into the logical name — and the security
+  zone — the `mac` pin existed to keep it out of.
+
+  The remedy is the OPPOSITE of the topology-change one, so it is reported
+  separately: **retry once the interface is readable**. Nothing is known to be
+  wrong with the card, and re-pinning would have you pin against a MAC you
+  cannot currently read.
+
+  The refusal is deliberately **narrow — it applies only to entries that pin a
+  `mac`.** An entry keyed on PCI alone is unaffected: its identity is the PCI
+  address, which comes from sysfs and was read successfully, so the failed
+  netlink read cost it nothing it asked for. Widening it to every unreadable NIC
+  would let one transient netlink failure refuse every mapped interface on the
+  box, management included.
+
+  `show chassis device-map candidates` distinguishes the two states in the
+  **Permanent MAC** column: `(none)` means the hardware reported none, while
+  `(unknown)` means the read failed. The **Link** column likewise shows
+  `unknown` rather than `down`, so an unreadable NIC does not send you hunting a
+  cabling fault that does not exist.
 - **Non-PCI physical NICs** (USB / platform / SoC ethernet) have no PCI
   address but do carry a factory MAC. They are enumerated (with an empty PCI
   column) so a `key mac` entry binds them; only purely virtual netdevs
@@ -216,12 +255,22 @@ discipline.
 A commit that changes the device-map runs a **node-local pre-flight** against
 the present hardware while you are still connected:
 
-- A `REFUSED` entry is rejected, for EITHER reason — topology-changed, or a
-  logical name claimed by more than one entry (#6546). The two carry different
-  remedies, so the pre-flight reports them separately: "re-pin the entry" for a
-  card swap, "remove the duplicate entry" for a duplicate name. The check tests
-  `BindStatus.Refused()` rather than one sentinel value, so a future refusal
-  reason cannot slip past this hard stop and be treated as a clean result.
+- A `REFUSED` entry is rejected, for ANY reason — topology-changed, a logical
+  name claimed by more than one entry (#6546), or an identity that could not be
+  read (#6786). Each carries a different remedy, so the pre-flight reports them
+  separately: "re-pin the entry" for a card swap, "remove the duplicate entry"
+  for a duplicate name, and "retry once the interface is readable" for an
+  unreadable identity. The check tests `BindStatus.Refused()` rather than one
+  sentinel value, so a future refusal reason cannot slip past this hard stop and
+  be treated as a clean result.
+
+  Commit is the cheapest place for this to fail: you are still connected,
+  nothing on the box has been mutated, and the boot-time re-check (#5490) runs
+  the same detector again before any rename, retaining the current interface
+  naming if it trips. A refusal therefore never renames a NIC and never writes a
+  `.link` file — which matters because a `.link` is durable and udev replays it
+  on every subsequent boot, so a mis-binding written during a transient failure
+  would outlive the failure itself.
 - A map that would move the live management NIC's name onto a different port
   (or steal the management name) is rejected.
 - `commit confirmed` validates BOTH the candidate AND the rollback target

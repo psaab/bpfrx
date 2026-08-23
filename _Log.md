@@ -104505,3 +104505,31 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_uniformgates_cluster_zone.go`,
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
+
+## 2026-08-22 — #6786 fail closed when a NIC identity read fails
+
+- **Timestamp**: 2026-08-22
+- **Action**: `EnumeratePresentNICs` read each NIC's identity under
+  `if link, err := netlink.LinkByName(name); err == nil` with the error
+  DISCARDED, so a failed read left `PermMAC == ""` — the same value MAC-less
+  hardware produces. `Resolve`'s card-swap refusal is conditioned on
+  `PermMAC != ""`, so a failed read silently DISABLED it and bound the entry as
+  `BindBoundPCIOnly`. Added `PresentNIC.IdentityUnread`, a new
+  `BindRefusedIdentityUnknown` status (with its own operator remedy), and a
+  narrow refusal that fires only for entries pinning a `mac`.
+- **Scoping (the outage the naive fix would cause)**: the refusal does NOT
+  apply to PCI-only entries — their identity came from sysfs and was read
+  successfully. Widening it would let one transient netlink failure refuse every
+  mapped interface including management. Verified the fail-closed direction is
+  safe here: at commit the operator is still connected and nothing is mutated;
+  at boot the #5490 re-check retains the CURRENT interface naming.
+- **False green caught in my own test**: the first commit-preflight assertion
+  checked for the word "identity" and passed while the generic card-swap message
+  ("at its pinned identity") was returned — the wording it was meant to exclude.
+  Fixed by asserting the correct wording is PRESENT and the card-swap remedy
+  ABSENT, and by giving the new status its own message.
+- **File(s)**: `pkg/devicemap/devicemap.go`, `pkg/daemon/device_map.go`,
+  `pkg/grpcapi/server_show_device_map.go`, `pkg/cli/cli_show_cluster.go`,
+  `pkg/devicemap/identity_unread_6786_test.go`,
+  `pkg/daemon/device_map_identity_unread_6786_test.go`,
+  `docs/bare-metal-device-map.md`, `_Log.md`
