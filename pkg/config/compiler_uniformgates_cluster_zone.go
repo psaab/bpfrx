@@ -130,6 +130,32 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #6779 VRRP virtual-address cardinality gate. Strict on commit /
+	// commit-check (hard-reject a VRRP instance carrying more virtual
+	// addresses of one family than the advertisement's single-byte address
+	// count can express — 255, or 254 for IPv6 where RFC 5798 §6.1 reserves
+	// the first slot for the mandatory link-local prepend). Marshal refuses
+	// an out-of-range count instead of truncating it (#5090) and sendAdvert
+	// swallows that error at Debug, so an oversized set makes every advert
+	// fail AFTER becomeMaster claimed the VIPs — the node owns the addresses
+	// and advertises nothing, so the peer promotes too (dual-master) or the
+	// addresses are stranded. Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick;
+	// the pkg/vrrp runtime guards refuse to build the instance and refuse to
+	// claim MASTER, so a leniently-loaded oversized set is held out of the
+	// election, not seated as a silent non-advertiser). Runs on the
+	// fully-compiled *Config (VRRPGroups from parseVRRPGroups, RedundancyGroup
+	// and unit Addresses from compileInterfaces). Same doctrine as
+	// lenientRethVRRPGroupID.
+	if err := validateVRRPVIPCountStrict(cfg); err != nil {
+		if opts.lenientVRRPVIPCount {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("vrrp virtual-address count (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
 	// reserved sentinel — "junos-global" is reclassified by the userspace
