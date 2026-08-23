@@ -1440,28 +1440,19 @@ func parsePorts(spec string) ([]uint16, error) {
 	return []uint16{uint16(port)}, nil
 }
 
-// appPortsFromSpec parses an application's DestinationPort spec (e.g. "80", "8080-8090")
-// into a slice of individual port ints. Returns nil for empty spec.
-func appPortsFromSpec(spec string) []int {
-	if spec == "" {
-		return nil
-	}
-	lo, hi, err := parsePortRange(spec)
-	if err != nil {
-		return nil
-	}
-	if hi > lo {
-		var ports []int
-		for p := lo; p <= hi; p++ {
-			ports = append(ports, int(p))
-		}
-		return ports
-	}
-	return []int{int(lo)}
-}
-
 // parsePortRange parses a port spec like "80", "1024-65535", or "" into (low, high).
 // Unlike parsePorts, it does NOT expand ranges — returns the range boundaries.
+//
+// The bounds are uint16, so they MUST NOT be used directly as an ascending loop
+// counter to expand the range: at high == 65535 the counter wraps to 0 after the
+// final iteration, `p <= high` is true again, and the loop never terminates
+// (#6783). Callers that expand must widen to int/uint64 first, or carry an
+// explicit ceiling break the way the per-port application writer above does
+// ("prevent uint16 overflow"). Every current caller keeps the bounds AS bounds;
+// the one expander that did not was `appPortsFromSpec`, removed in #6783 after
+// ad31711e3 dropped its last production caller. pkg/dataplane/userspace owns the
+// surviving port-expansion helpers and parses into uint64 for exactly this
+// reason.
 func parsePortRange(spec string) (uint16, uint16, error) {
 	if spec == "" {
 		return 0, 0, nil

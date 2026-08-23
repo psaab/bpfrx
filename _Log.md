@@ -104414,6 +104414,43 @@ prose edit above them added. No diff falls in the new test body.
   documented claims with no assertion behind them; a mutation neutralising
   either left the suite green.
 - **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
+## 2026-08-22 — #6776 archive reseed scan is time-bounded (fail-open)
+
+## 2026-08-22 — #6783 appPortsFromSpec u16 wrap: dead helper removed, ceiling guarded
+
+- **Timestamp**: 2026-08-22
+- **Action**: `pkg/dataplane.appPortsFromSpec` expanded a port range using the
+  parse's uint16 bounds as the loop counter, so any spec ending at 65535 with a
+  width > 1 never terminated. Reproduced (`65534-65535` hangs). Its last
+  production caller was removed by `ad31711e3`, so the defect is no longer
+  reachable — the helper was dead code carrying an infinite loop, and is
+  deleted with its test rather than repaired. Swept the repo for the same
+  pattern: five ascending expansion loops, four already total (int/uint64
+  counters or an explicit ceiling break). Added a watchdogged ceiling guard on
+  the surviving live helpers in pkg/dataplane/userspace, which the existing
+  agreement corpus could not cover without turning a wrap into a hung suite.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
+  pkg/dataplane/userspace/port_expansion_ceiling_6783_test.go, _Log.md
+
+- **Timestamp**: 2026-08-22
+- **Action**: Bound the archive-seq reseed directory scan with
+  `archiveScanBudget` (5s) so an unresponsive archive filesystem can no longer
+  hold the global store mutex — or daemon PHASE 4 bring-up — indefinitely. A
+  budget expiry maps onto the existing #6404 UNCONFIRMED semantics (counter not
+  reseeded, `archiveSeedDir` cleared, archiving commit skips its archive), i.e.
+  fail-open: the box comes up and stays configurable, only archival is
+  suspended. The abandoned scan's buffered result is retained and collected by
+  the next call, so a wedged filesystem costs one stall and one goroutine per
+  process, not one per commit.
+- **Measured, contradicting the issue title**: the scanned dir is always the
+  local hardcoded `/var/lib/xpf/archive` (no `archive-dir` config leaf exists);
+  there is no remote `ReadDir` anywhere in the archive path. The mutex claim is
+  correct (`Store.mu`, the global RWMutex, taken for writing). Also corrected a
+  pre-existing FALSE claim in `ArchiveConfig` / README that the seed scan was
+  already "a bounded ReadDir under the lock".
+- **File(s)**: `pkg/configstore/store.go`, `pkg/configstore/store_persist.go`,
+  `pkg/configstore/archive_reseed_scan_timeout_6776_test.go`,
+  `pkg/configstore/README.md`, `_Log.md`
 
 ## 2026-08-22 — #6778 a full config-apply queue stranded the newest generation
 
