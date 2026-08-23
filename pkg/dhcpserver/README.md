@@ -32,6 +32,40 @@ parses a torn file, no fsync on the apply path.
   fail-open left stale/removed Kea policy serving). The generated-config
   unlink error on a removed family is surfaced too (a leftover file
   could resurrect a removed subnet on a later manual/boot start).
+- `Shutdown() error` — `dhcpserver.go`. The authoritative DHCP stop
+  for daemon shutdown (#6787), and the only one on that path. Before
+  it, an orderly HA shutdown withdrew VRRP ownership, cleared
+  `rg_active` and stopped the heartbeat while leaving the Kea units
+  RUNNING — they are separate systemd services that outlive xpfd — so
+  the promoted peer started its own Kea and both nodes served DHCP on
+  one segment: duplicate OFFERs, two lease databases issuing addresses
+  from one pool with neither aware of the other, persisting for the
+  whole xpfd downtime.
+
+  It is **synchronous**: `ApplyAsync`'s mailbox is drained by a worker
+  goroutine, so a stop enqueued during shutdown races process exit and
+  is simply lost — a fix that is present and does nothing looks exactly
+  like one that works.
+
+  It also **latches** (`shuttingDown`): once set, EVERY applier —
+  `Apply`, `ApplyClusterCommit` and the async worker — coerces its
+  desired state to `nil`. The latch is not belt-and-braces. `Shutdown`
+  runs BEFORE the priority-0 withdrawal, so this node stops serving
+  before the peer starts, and that ordering leaves a window in which a
+  VRRP MASTER transition can still enqueue an apply. That request
+  allocates a strictly NEWER generation, so the #1835 supersession
+  guard cannot refuse it — without the latch it would re-arm the units
+  after the stop had already reported success. Coercing rather than
+  REFUSING keeps the reconcile idempotent: a late applier still runs,
+  and still lands on "stopped".
+
+  **Cluster mode only** at the call site (`pkg/daemon`,
+  `runShutdownSequence`). Standalone has no peer to hand the segment
+  to and Kea deliberately survives an xpfd restart there; stopping it
+  would turn every daemon restart into a DHCP outage. The
+  discriminator is `haMode`, NOT `hitless` — VRRP sends its priority-0
+  burst even on a hitless HA restart, so the peer takes over and an HA
+  node must stop serving either way.
 - `ApplyAsync(cfg, reason)` — `dhcpserver.go`. Enqueues an `Apply` to
   a single lazily started worker via a 1-slot latest-wins mailbox and
   returns immediately (#1835 F2). Used by the VRRP transition
