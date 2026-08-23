@@ -104679,3 +104679,40 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/devicemap/identity_unread_6786_test.go`,
   `pkg/daemon/device_map_identity_unread_6786_test.go`,
   `docs/bare-metal-device-map.md`, `_Log.md`
+
+## 2026-08-22 — #6788 fence background applies at shutdown; quiesce the DHCP callback
+
+- **Timestamp**: 2026-08-22
+- **Action**: `runShutdownSequence`'s apply drain is a drain-and-RELEASE, not a
+  barrier: it acquires `applySem` to wait out an in-flight apply's closeout and
+  hands it straight back, so any background applier waking afterwards acquired
+  immediately and ran a FULL apply into a half-torn-down daemon. Added
+  `Daemon.applyFenced` + `beginBackgroundApply` (one gate shared by
+  `applyConfig` / `applyActiveConfig` / `applyActiveConfigResult`, testing the
+  fence BEFORE and AFTER the semaphore acquire), latched at the very start of
+  shutdown — fence, then cancel, then drain.
+- **Measured**: "non-cancellable" is TRUE and DELIBERATE —
+  `applyConfigUnderSem` binds `context.Background()` by design so background
+  applies always run to completion, and `applyCancelCtx()` is explicitly not
+  used there. So cancellation cannot cover a not-yet-started apply; refusing it
+  before it begins is the only mechanism, and is better than aborting midway.
+- **The obvious fix would have caused an outage**: `dhcp.Manager.StopAll()` is
+  never called in production, and calling it at shutdown cancels every client →
+  `finishClient` → `removeAddress`, stripping the DHCP address from every DHCP
+  interface including a DHCP-managed management NIC, during shutdown AND across
+  a graceful restart (the contract `pkg/dhcp`'s client-context comment states).
+  Added `Quiesce()` instead: stops the 2s debounce timer, latches, joins an
+  in-flight callback, and touches no lease/address/client.
+- **Both mechanisms are required**: the fence does not cover
+  `onDHCPAddressChange`'s non-apply work (`nudgeSurfaceADDNSReconcile`,
+  `applyMgmtVRFRoutes` netlink writes, `reconcileDNSFromDHCP`); the quiesce does
+  not cover the feed / config-poll appliers.
+- **Bug caught by my own test**: the first `Quiesce` took `recompileWG.Add(1)`
+  at arm time, so a STOPPED timer never called `Done` and `Wait` deadlocked.
+  Moved Add into the timer func under the same mutex as the latch re-test
+  (#5869 archiveWG discipline).
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_run_shutdown.go`, `pkg/dhcp/dhcp.go`,
+  `pkg/daemon/shutdown_apply_fence_6788_test.go`,
+  `pkg/dhcp/quiesce_6788_test.go`, `pkg/daemon/README.md`,
+  `pkg/dhcp/README.md`, `_Log.md`

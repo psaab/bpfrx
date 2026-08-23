@@ -594,6 +594,30 @@ type Daemon struct {
 	// concurrent apply goroutine race safely. A failed wipe clears it again so
 	// the box stays recoverable (fail-closed, see factoryReset).
 	resetting atomic.Bool
+	// applyFenced marks the daemon as SHUTTING DOWN for the purpose of
+	// background config applies (#6788). runShutdownSequence sets it at the very
+	// start — before it cancels the in-flight apply and before the single
+	// apply drain — and never clears it: unlike the reset generation there is no
+	// recoverable outcome to clear it for, because the process is exiting.
+	//
+	// It exists because the drain is a drain-and-RELEASE, not a barrier. It
+	// acquires applySem to wait for an in-flight apply's closeout and then hands
+	// the semaphore straight back, so any background applier that wakes AFTER it
+	// acquires immediately and runs a full apply into a half-torn-down daemon.
+	// Cancellation cannot cover that case: applyCancelContext aborts an apply
+	// that is already RUNNING, and the background appliers deliberately bind
+	// context.Background() precisely so they always run to completion
+	// (applyConfigUnderSem). There is nothing to cancel in an apply that has not
+	// started, so the only way to stop it is to refuse it before it begins —
+	// which is also strictly better than cancelling one midway, since no
+	// half-finished apply is ever left behind.
+	//
+	// Read/written only via applyFencedForBackground / fenceBackgroundApplies
+	// (sync/atomic), so the shutdown goroutine and any background applier race
+	// safely. The COMMIT paths are deliberately not gated here: they bind
+	// request-scoped contexts, are already covered by #2926 cancellation, and
+	// their servers are stopped during teardown.
+	applyFenced atomic.Bool
 	// applyBodyForTest, when non-nil, replaces applyConfigLocked's
 	// body. Test-only seam used by apply_serialize_test.go to
 	// exercise the semaphore contract through the real applyConfig
