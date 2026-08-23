@@ -450,3 +450,117 @@ func TestReconcileDeactivationDoesNotEraseAFenceThatLandedMidApply6799(t *testin
 			"cannot see this one (#6799)")
 	}
 }
+
+// TestRefusedRecordDoesNotRaiseFailoverReadiness6799 binds the READER the
+// issue's "erase retry debt" half is really about, and it exists because the
+// matrix proved it unbound: raising setLocalFailoverCommitReady regardless of
+// whether the record was accepted left the whole suite green.
+//
+// The gate is `noRethVRRP && clusterPri && !s.NeedsApply()`, so a fixture with
+// RETH interfaces — every other cell here — never enters it: noRethVRRP is
+// false and the branch is invisible. This one runs in direct mode
+// (`no-reth-vrrp`), which is the only configuration that reaches it.
+//
+// Why it matters: the flag feeds waitLocalFailoverCommitReady, which
+// cluster.requestPeerFailover consults before committing a failover to the
+// peer. Raising it off a convergence the state machine REFUSED tells the peer
+// this node has verified an rg_active state it explicitly declined to believe.
+//
+// FAIL-ON-REVERT: moving the setLocalFailoverCommitReady call out of the
+// accepted branch (or making the branch unconditional) reds this.
+func TestRefusedRecordDoesNotRaiseFailoverReadiness6799(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system dataplane-type userspace",
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster no-reth-vrrp",
+		"set chassis cluster authentication-key test-cluster-psk-6799",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set interfaces reth1 redundant-ether-options redundancy-group 1",
+		"set interfaces reth1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth1",
+	})
+
+	cm := cluster.NewManager(0, 1)
+	cm.UpdateConfig(store.ActiveConfig().Chassis.Cluster)
+	if !cm.IsLocalPrimary(1) {
+		t.Fatal("fixture: node 0 must own RG1, or the readiness branch is not reached at all")
+	}
+
+	rec := &midApplyFenceHA{}
+	d := &Daemon{
+		rgStates:                   make(map[int]*rgStateMachine),
+		cluster:                    cm,
+		store:                      store,
+		vrrpMgr:                    vrrp.NewManager(),
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
+	}
+	d.setDataplane(&midApplyFenceDP{Manager: dataplane.New(), ha: rec})
+
+	if !d.isNoRethVRRP() {
+		t.Fatal("fixture: direct mode must be active, or the readiness branch is unreachable and " +
+			"this cell is vacuous")
+	}
+
+	// A fence lands while the activation write is in flight, so the record is
+	// refused and the RG is NOT known to have converged.
+	rec.fireOn(rgActiveWrite{rgID: 1, active: true}, func() {
+		d.getOrCreateRGState(1).InvalidateApplied()
+	})
+
+	d.reconcileRGState()
+
+	if got := rec.countOf(rgActiveWrite{rgID: 1, active: true}); got == 0 {
+		t.Fatalf("fixture: RG1 was never activated (writes=%v)", rec.take())
+	}
+	if !d.getOrCreateRGState(1).NeedsApply() {
+		t.Fatal("premise: the refused record must leave the retry armed")
+	}
+	if d.localFailoverCommitIsReady(1) {
+		t.Error("failover-commit readiness was raised for an RG whose convergence the state " +
+			"machine REFUSED to record. That flag feeds waitLocalFailoverCommitReady, which " +
+			"cluster.requestPeerFailover consults before committing a failover — so the peer is " +
+			"told this node verified an rg_active state it explicitly declined to believe (#6799)")
+	}
+}
+
+// TestAcceptedRecordDoesRaiseFailoverReadiness6799 is the paired control for
+// the cell above: same direct-mode fixture, nothing contesting the apply.
+// Without it, simply never raising the flag would satisfy the refusal cell —
+// and would block every peer failover, since waitLocalFailoverCommitReady would
+// time out on an RG that had in fact converged.
+func TestAcceptedRecordDoesRaiseFailoverReadiness6799(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system dataplane-type userspace",
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster no-reth-vrrp",
+		"set chassis cluster authentication-key test-cluster-psk-6799",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set interfaces reth1 redundant-ether-options redundancy-group 1",
+		"set interfaces reth1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth1",
+	})
+	cm := cluster.NewManager(0, 1)
+	cm.UpdateConfig(store.ActiveConfig().Chassis.Cluster)
+
+	rec := &midApplyFenceHA{} // nothing contests the apply
+	d := &Daemon{
+		rgStates:                   make(map[int]*rgStateMachine),
+		cluster:                    cm,
+		store:                      store,
+		vrrpMgr:                    vrrp.NewManager(),
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
+	}
+	d.setDataplane(&midApplyFenceDP{Manager: dataplane.New(), ha: rec})
+
+	d.reconcileRGState()
+
+	if got := rec.countOf(rgActiveWrite{rgID: 1, active: true}); got == 0 {
+		t.Fatalf("fixture: RG1 was never activated (writes=%v)", rec.take())
+	}
+	if !d.localFailoverCommitIsReady(1) {
+		t.Error("an ACCEPTED record on a converged, locally-owned RG must raise failover-commit " +
+			"readiness; never raising it would block every peer failover (#6799)")
+	}
+}

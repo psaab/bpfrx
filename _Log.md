@@ -104938,6 +104938,12 @@ prose edit above them added. No diff falls in the new test body.
   first draft was also order-dependent — `reconcileRGState` iterates RG ids in
   MAP order, so an unrelated RG's activation could consume a "first write" hook
   — so the in-flight hook is keyed on (rgID, active).
+- **Matrix found a second unbound branch**: raising
+  `setLocalFailoverCommitReady` regardless of whether the record was accepted
+  also left the suite green — the gate is `noRethVRRP && ...`, and every fixture
+  had RETH configured, so the branch was unreachable. Added a direct-mode
+  (`no-reth-vrrp`) pair: a refused record must NOT raise readiness, an accepted
+  one must.
 - **Removed `ApplyIfCurrent`** (no production caller after the consolidation) and
   MOVED its two tests onto `RecordApplied` rather than deleting them.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
