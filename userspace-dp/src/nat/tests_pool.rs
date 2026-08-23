@@ -7432,3 +7432,176 @@ fn synced_eviction_still_frees_a_plain_pat_port_6528() {
          not shrink by one port per re-decided flow"
     );
 }
+
+// #6765 — a PARTIAL-OVERLAP pool change must not reissue a live translated
+// tuple on an address the pool RETAINS.
+//
+// Carry-over is keyed on the whole address list, so changing ONE address misses
+// the reuse lookup and rebuilds the allocator for the WHOLE pool — including the
+// retained addresses. `AddressOccupancy::new` is all-zero with `cursor: 0` and
+// the set bit is the sole ownership token, so the next new flow on a retained
+// address is handed `port_low` — a tuple a pre-change live session may still
+// hold. Two sessions on one translated tuple is reply mis-delivery.
+//
+// The fix NARROWS what the allocator will issue, so each cell below has a
+// control: a narrowing fix with no "still issues what it should" case is
+// indistinguishable from an over-narrowing one.
+
+/// A plain (non-persistent) pool rule over `pool_addresses`, so the cells below
+/// exercise ordinary PAT rather than the persistent-lease path (#7560 covers
+/// leases, which this change deliberately does not carry).
+fn overlap_pool_snapshot_6765(
+    port_low: u16,
+    port_high: u16,
+    pool_addresses: Vec<&str>,
+) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
+        name: "snat-overlap-6765".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "overlap-pool-6765".to_string(),
+        pool_addresses: pool_addresses
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        port_low,
+        port_high,
+        ..SourceNATRuleSnapshot::default()
+    }
+}
+
+/// THE BINDER. Pool `[A, B]` -> `[A, C]`: `B` is swapped out and **`A` is
+/// retained** with a live translation on it.
+///
+/// FAIL-ON-REVERT: neutralise `reseed_retained_pool` (or make
+/// `retained_pool_index_map` return an empty map) and the rebuilt allocator
+/// hands the SAME `(A, port)` to the second flow.
+#[test]
+fn pool_change_retaining_an_address_does_not_reissue_its_live_tuple_6765() {
+    let before = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.11"]);
+    let rules = parse_source_nat_rules(&[before]);
+
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(
+        first.rewrite_src.map(|ip| ip.to_string()).as_deref(),
+        Some("203.0.113.10"),
+        "setup: the first flow must land on the address the changed pool RETAINS, or this \
+         cell is not exercising the retained-address case at all",
+    );
+
+    // The pool changes: .11 is swapped for .12, .10 is RETAINED.
+    let changed = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.12"]);
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[changed],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+
+    let second = expect_snat_decision(tuple_snat_lookup(&refreshed, 23456, "8.8.8.8", 53, 11));
+    assert!(
+        !(second.rewrite_src == first.rewrite_src
+            && second.rewrite_src_port == first.rewrite_src_port),
+        "the rebuilt allocator reissued {}:{} — a translated tuple the pre-change flow still \
+         holds on a RETAINED address. Two sessions on one source tuple is reply mis-delivery \
+         (#6765)",
+        first
+            .rewrite_src
+            .map(|ip| ip.to_string())
+            .unwrap_or_default(),
+        first.rewrite_src_port.unwrap_or_default(),
+    );
+}
+
+/// CONTROL for the binder: the carried ownership must be visible as occupancy on
+/// the retained address, not merely dodged by luck of address round-robin.
+#[test]
+fn pool_change_carries_used_ports_onto_the_retained_address_6765() {
+    let before = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.11"]);
+    let rules = parse_source_nat_rules(&[before]);
+    let _ = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 1);
+
+    let changed = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.12"]);
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[changed],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&refreshed)[0].used_ports,
+        1,
+        "the live translation on the RETAINED address must survive the pool change as \
+         occupancy; a zero here means the bitmap that is the sole ownership token was \
+         rebuilt empty (#6765)",
+    );
+}
+
+/// OVER-REACH CONTROL 1: a FULLY DISJOINT swap must still reset. Nothing is
+/// retained, so nothing may be carried — re-seeding here would replay ownership
+/// against addresses the operator removed.
+#[test]
+fn fully_disjoint_pool_swap_still_resets_the_allocator_6765() {
+    let before = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.11"]);
+    let rules = parse_source_nat_rules(&[before]);
+    let _ = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 1);
+
+    let disjoint = overlap_pool_snapshot_6765(40000, 40001, vec!["198.51.100.7", "198.51.100.8"]);
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[disjoint],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&refreshed)[0].used_ports,
+        0,
+        "a fully-disjoint pool swap must reset: no address is retained, so carrying ownership \
+         would replay it against addresses that are no longer in the pool (#6765)",
+    );
+}
+
+/// OVER-REACH CONTROL 2: a COLD START (`previous = None`) must still reset.
+#[test]
+fn cold_start_still_resets_the_allocator_6765() {
+    let snap = overlap_pool_snapshot_6765(40000, 40001, vec!["203.0.113.10", "203.0.113.11"]);
+    let rules = parse_source_nat_rules(&[snap.clone()]);
+    let _ = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 1);
+
+    let cold = parse_source_nat_rules_with_previous(
+        &[snap],
+        None,
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&cold)[0].used_ports,
+        0,
+        "a cold start deliberately resets rather than replaying unproven translated tuple \
+         ownership; `previous = None` must not reach the re-seed (#6765)",
+    );
+}
+
+/// The index REMAP is the part that makes this safe. `retained_pool_index_map`
+/// must report the retained address at its NEW position, because the occupancy
+/// vector is indexed by pool-address POSITION — carrying a raw previous index
+/// onto a reordered pool would seed the wrong address's bitmap.
+#[test]
+fn retained_index_map_remaps_positions_not_replays_them_6765() {
+    use std::net::Ipv4Addr;
+    let a: Ipv4Addr = "203.0.113.10".parse().unwrap();
+    let b: Ipv4Addr = "203.0.113.11".parse().unwrap();
+    let c: Ipv4Addr = "203.0.113.12".parse().unwrap();
+
+    // [A, B] -> [C, A]: A moves from index 0 to index 1.
+    let map = crate::nat::retained_pool_index_map_v4(&[a, b], &[c, a]);
+    assert_eq!(map.get(&0), Some(&1), "A must remap 0 -> 1, not stay at 0");
+    assert_eq!(map.len(), 1, "only A is retained; B and C are not");
+
+    // Fully disjoint: nothing to carry.
+    assert!(crate::nat::retained_pool_index_map_v4(&[a, b], &[c]).is_empty());
+}
