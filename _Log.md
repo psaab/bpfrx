@@ -104218,6 +104218,30 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/ast_groups.go,
   pkg/config/group_expand_budget_6767_test.go
 
+## 2026-08-22 — #6759 detect an unverified-primary after image recreate
+- **Timestamp**: 2026-08-22
+- **Action**: Read the cluster side first and reported the boundary before
+  coding (as agreed). Finding: the kernel-roll already solves the analogous
+  problem via holdSecondaryIfKernelCandidateArmed, but it keys on the ON-NODE
+  kernel journal and folds a clean ENOENT to "never armed" — a reboot preserves
+  that journal so ENOENT is truthful, a recreate DESTROYS it so ENOENT means
+  "the evidence was wiped", and nothing on the node can distinguish them. The
+  mechanism is correct for its path and structurally unavailable to image-roll.
+  Shipped the bounded increment only: the boot poll reads the node RG state and
+  fails closed (leases held) if the recreated node is PRIMARY before the #5075
+  identity gate passes. Code states explicitly that this DETECTS and does not
+  CLOSE — the election happens at bringup before any driver command lands.
+- **Scoped honestly**: election.go's fresh-boot guard already protects a
+  NON-preempt RG with a reachable peer; the exposure is preempt RGs and boots
+  where the peer is not visible at first election.
+- **Successor filed (#7559)** with the three candidate designs and their real
+  costs (peer authority / day-0 seeded hold / default-hold), since closing it
+  needs a signal surviving a disk wipe and that is a design decision.
+- **Cite note**: within this ONE issue the Go-side cites still landed in roughly
+  the right code while the xpf-deploy.py ones were stale — staleness varies
+  within a single evidence list, so verify each cite independently.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_unverified_primary_6759.py (new),
 ## 2026-08-22 — #6762 renew the roll lease DURING the recreate hook
 - **Timestamp**: 2026-08-22
 - **Action**: _fence_before_mutate extends both leases to one fresh TTL and
