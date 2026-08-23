@@ -36,17 +36,28 @@ import (
 // slot would still pass with the guard deleted for the wrong reason (nothing
 // to collect), so each case pairs the nil with a live reth0 the collectors are
 // required to return.
-func rethCfgWithNilSlot(t *testing.T, nilIfc, nilUnit, nilRG bool) *config.Config {
+func rethCfgWithNilSlot(t *testing.T, nilIfc, nilUnit, nilRG, vlanTagged bool) *config.Config {
 	t.Helper()
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{}
 
+	// Both collectors branch on VlanTagging into SEPARATE unit loops, each with
+	// its own nil-unit guard, so the fixture must cover both. An untagged-only
+	// fixture leaves the tagged branch's guard mutation-INVISIBLE (measured: it
+	// survived deletion until this parameter was added).
 	live := &config.InterfaceConfig{
 		Name:            "reth0",
 		RedundancyGroup: 1,
-		Units: map[int]*config.InterfaceUnit{
+		VlanTagging:     vlanTagged,
+	}
+	if vlanTagged {
+		live.Units = map[int]*config.InterfaceUnit{
+			50: {Number: 50, VlanID: 50, Addresses: []string{"10.0.61.1/24"}},
+		}
+	} else {
+		live.Units = map[int]*config.InterfaceUnit{
 			0: {Number: 0, Addresses: []string{"10.0.61.1/24"}},
-		},
+		}
 	}
 	cfg.Interfaces.Interfaces["reth0"] = live
 
@@ -78,57 +89,63 @@ func TestRethOwnershipModesSkipNilSlots(t *testing.T) {
 		{"nil-redundancy-group", false, false, true},
 		{"all-three", true, true, true},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// VRRP-backed ownership mode.
-			t.Run("vrrp-mode", func(t *testing.T) {
-				cfg := rethCfgWithNilSlot(t, tc.nilIfc, tc.nilUnit, tc.nilRG)
-				defer func() {
-					if r := recover(); r != nil {
-						t.Fatalf("CollectRethInstances panicked on a %s slot: %v\n"+
-							"the VRRP-backed RETH ownership mode must skip the slot, "+
-							"not nil-deref on the HA ownership path", tc.name, r)
+		for _, tag := range []struct {
+			name   string
+			tagged bool
+		}{{"untagged", false}, {"vlan-tagged", true}} {
+			tc, tag := tc, tag
+			t.Run(tc.name+"/"+tag.name, func(t *testing.T) {
+				// VRRP-backed ownership mode.
+				t.Run("vrrp-mode", func(t *testing.T) {
+					cfg := rethCfgWithNilSlot(t, tc.nilIfc, tc.nilUnit, tc.nilRG, tag.tagged)
+					defer func() {
+						if r := recover(); r != nil {
+							t.Fatalf("CollectRethInstances panicked on a %s slot: %v\n"+
+								"the VRRP-backed RETH ownership mode must skip the slot, "+
+								"not nil-deref on the HA ownership path", tc.name, r)
+						}
+					}()
+					insts := CollectRethInstances(cfg, map[int]int{1: 200})
+					// The live reth0 must still be collected — a guard that skipped
+					// everything would otherwise pass this test.
+					if len(insts) != 1 {
+						t.Fatalf("expected the live reth0 instance to still be "+
+							"collected alongside the nil slot, got %d instances", len(insts))
 					}
-				}()
-				insts := CollectRethInstances(cfg, map[int]int{1: 200})
-				// The live reth0 must still be collected — a guard that skipped
-				// everything would otherwise pass this test.
-				if len(insts) != 1 {
-					t.Fatalf("expected the live reth0 instance to still be "+
-						"collected alongside the nil slot, got %d instances", len(insts))
-				}
-				if got := insts[0].Interface; got == "" {
-					t.Errorf("collected instance has no interface name")
-				}
-			})
+					if got := insts[0].Interface; got == "" {
+						t.Errorf("collected instance has no interface name")
+					}
+				})
 
-			// Direct (no-reth-vrrp / private-rg-election) ownership mode.
-			t.Run("direct-mode", func(t *testing.T) {
-				cfg := rethCfgWithNilSlot(t, tc.nilIfc, tc.nilUnit, tc.nilRG)
-				defer func() {
-					if r := recover(); r != nil {
-						t.Fatalf("RethVIPsForRG panicked on a %s slot: %v\n"+
-							"the direct RETH ownership mode must skip the slot, "+
-							"not nil-deref on the HA ownership path", tc.name, r)
+				// Direct (no-reth-vrrp / private-rg-election) ownership mode.
+				t.Run("direct-mode", func(t *testing.T) {
+					cfg := rethCfgWithNilSlot(t, tc.nilIfc, tc.nilUnit, tc.nilRG, tag.tagged)
+					defer func() {
+						if r := recover(); r != nil {
+							t.Fatalf("RethVIPsForRG panicked on a %s slot: %v\n"+
+								"the direct RETH ownership mode must skip the slot, "+
+								"not nil-deref on the HA ownership path", tc.name, r)
+						}
+					}()
+					vips := RethVIPsForRG(cfg, 1)
+					// The live reth0's VIP must still be returned.
+					if len(vips) == 0 {
+						t.Fatalf("expected the live reth0 VIP to still be returned " +
+							"alongside the nil slot, got an empty map")
 					}
-				}()
-				vips := RethVIPsForRG(cfg, 1)
-				// The live reth0's VIP must still be returned.
-				if len(vips) == 0 {
-					t.Fatalf("expected the live reth0 VIP to still be returned " +
-						"alongside the nil slot, got an empty map")
-				}
-				found := false
-				for _, addrs := range vips {
-					for _, a := range addrs {
-						if a == "10.0.61.1/24" {
-							found = true
+					found := false
+					for _, addrs := range vips {
+						for _, a := range addrs {
+							if a == "10.0.61.1/24" {
+								found = true
+							}
 						}
 					}
-				}
-				if !found {
-					t.Errorf("live reth0 VIP 10.0.61.1/24 missing from %v", vips)
-				}
+					if !found {
+						t.Errorf("live reth0 VIP 10.0.61.1/24 missing from %v", vips)
+					}
+				})
 			})
-		})
+		}
 	}
 }
