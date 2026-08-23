@@ -2269,6 +2269,43 @@ def _node_cluster_node_id(runner, backend, node):
         return None
 
 
+def _node_is_primary_for_any_rg(runner, backend, node, node_id):
+    """Does `node` currently hold PRIMARY for any redundancy group? (#6759)
+
+    Parses `show chassis cluster status` with the SAME contract the rest of the
+    tooling uses: inside a `Redundancy group: N ` block, a node row's FIRST
+    field is the node token and the state is a field on that row
+    (test/incus/deploy-lib.sh, scripts/userspace-ha-validation.sh). Matching on
+    exact FIELDS rather than a substring is deliberate — #4009 was a
+    rolling-deploy bug caused by a non-node line being read as a node row, and
+    it steered a deploy into restarting the PRIMARY first.
+
+    Returns None when the state cannot be read (xpfd not answering yet, cluster
+    not configured, transport blip). None is NOT "not primary": the caller must
+    not turn an unreadable state into a pass — it simply has no observation
+    this tick and tries again on the next one.
+    """
+    if node_id is None:
+        return None
+    out = _node_exec(runner, backend, node,
+                     ["cli", "-c", "show chassis cluster status"], check=False)
+    if not out or "Redundancy group" not in out:
+        return None
+    want = f"node{node_id}"
+    in_rg = False
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Redundancy group"):
+            in_rg = True
+            continue
+        if not in_rg:
+            continue
+        fields = stripped.split()
+        if len(fields) >= 2 and fields[0] == want and "primary" in fields:
+            return True
+    return False
+
+
 def _recreated_node_matches(live_versions, want_version, live_node_id, want_node_id):
     """#5075 identity+version gate for a node recreated from the new image.
     Returns (ok: bool, reason: str).
@@ -2662,6 +2699,30 @@ def cmd_image_roll(args):
                     pv, want_ver, live_nid, want_nid)
                 if back:
                     break
+                # #6759: the recreate WIPED this node, which erased the drain
+                # that was applied before it — and the identity gate above has
+                # NOT passed yet, so we do not know this is the right node
+                # running the right image. If it is nevertheless already
+                # PRIMARY, an unverified node is carrying traffic. Fail closed
+                # with the leases HELD, the same stance this loop already takes
+                # for a version/node-id mismatch.
+                #
+                # THIS DOES NOT CLOSE THE WINDOW, and must not be read as a
+                # guard. The election happens during the recreated node's own
+                # bringup (daemon_run_bringup.go runs UpdateConfig, which
+                # elects on the single-node path) — long before any driver
+                # command reaches it. By the time this check can observe
+                # anything, the election has already happened. It DETECTS the
+                # exposure and stops the roll; it cannot prevent it. Closing it
+                # needs a signal that survives the disk wipe, which the
+                # kernel-roll's on-node journal cannot provide here — see the
+                # successor issue.
+                if _node_is_primary_for_any_rg(runner, backend, node, live_nid):
+                    die(f"{node} is PRIMARY for a redundancy group but has NOT passed "
+                        f"the image/identity gate ({last_reason}). The recreate wiped "
+                        f"the drain applied before it, so an UNVERIFIED node is "
+                        f"carrying traffic. STOPPING with the never-both-down leases "
+                        f"HELD — investigate before rejoining (#6759).")
             if not back:
                 die(f"{node} did NOT come back as the expected node on the new "
                     f"image within {boot_deadline}s after image recreate: "
