@@ -104874,6 +104874,22 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/README.md`
 ## 2026-08-22 — #6794 LLDP recovers a dark interface on unchanged config
 
+## 2026-08-22 — #6795 FRR non-protocol route rendering had no operand belt
+
+- **Timestamp**: 2026-08-22
+- **Action**: `generateStaticRouteInTable` and `renderGenerateRoutes`
+  interpolated raw parser strings (`Destination`, `nh.Address`, `ifName`,
+  `gr.Prefix`) into `ip route` lines with no validity check, unlike the protocol
+  renderers (#2980/#4919). A malformed operand fails the WHOLE frr-reload, so
+  one bad route takes every route on the box; a whitespace-carrying value splits
+  into extra operands or a second statement. Added `validFRRRoutePrefix` /
+  `validFRRNextHopAddress` / `validFRRInterfaceOperand`. A bad destination drops
+  the route, a bad next-hop drops only that next-hop (ECMP must still install
+  the good members). Measured that the DHCP-learned operands are netip-typed and
+  therefore structurally safe — no belt added there, recorded as a test.
+- **File(s)**: pkg/frr/render_validate.go, pkg/frr/config_render.go,
+  pkg/frr/route_operand_belt_6795_test.go, pkg/frr/README.md, _Log.md
+
 - **Timestamp**: 2026-08-22
 - **Action**: `reconcileLLDP` recorded `d.lldpApplied = want` BEFORE calling
   `d.lldpMgr.Apply`, and `Apply` was void while bringing each interface up

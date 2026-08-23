@@ -16,6 +16,7 @@ package frr
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
 )
 
@@ -89,6 +90,64 @@ func validClusterID(s string) bool {
 	}
 	v, err := strconv.ParseUint(s, 10, 32)
 	return err == nil && v >= 1
+}
+
+// validFRRRoutePrefix reports whether a static / generate-route destination is
+// renderable as a single FRR `ip route <prefix>` operand (#6795).
+//
+// Both a CIDR prefix and a bare address are accepted. FRR's own grammar wants a
+// mask, but this tree stores the destination as a RAW STRING from the parser and
+// a host route may reach here maskless — rejecting a form that commits today
+// would drop a working route, and in routing config a dropped route is an
+// outage. The belt exists to keep UNRENDERABLE operands out of frr.conf, not to
+// re-litigate the accepted grammar.
+//
+// netip parsing is the whole check: it rejects any string containing whitespace
+// or trailing text, so a value that parses is guaranteed to be one token and to
+// be something FRR's parser can consume. A malformed destination that reaches
+// frr.conf fails the WHOLE frr-reload (one vtysh add-batch exits non-zero on any
+// CMD_WARNING_CONFIG_FAILED), taking every other route on the box with it — the
+// same blast radius #2980 documents for a bad router-id.
+func validFRRRoutePrefix(s string) bool {
+	if _, err := netip.ParsePrefix(s); err == nil {
+		return true
+	}
+	_, err := netip.ParseAddr(s)
+	return err == nil
+}
+
+// validFRRNextHopAddress reports whether a next-hop is renderable as a single
+// FRR gateway operand (#6795). Bare address only: FRR's `ip route <p> <gw>`
+// takes an address, and a prefix there is a grammar error that fails the
+// frr-reload.
+func validFRRNextHopAddress(s string) bool {
+	_, err := netip.ParseAddr(s)
+	return err == nil
+}
+
+// validFRRInterfaceOperand reports whether an interface name is renderable as a
+// single FRR token (#6795).
+//
+// Kernel interface names cannot contain whitespace or '/', but the value
+// reaching the renderer is not always a kernel name: it is assembled from
+// config, RETH resolution and a `.vlan` suffix, and on the tolerant load /
+// peer-sync path it is whatever the config carried. A name with an embedded
+// space would split `ip route <p> <gw> <ifname>` into an extra operand and
+// change what FRR installs — or, with a newline, add a statement outright.
+//
+// Deliberately a token test rather than a name-charset test: over-restricting
+// interface names would drop working routes on any naming scheme this tree has
+// not seen, and the defect is about token COUNT.
+func validFRRInterfaceOperand(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x20 || s[i] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // validBGPNeighborAddress reports whether a BGP neighbor identity occupies
