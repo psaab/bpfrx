@@ -1002,6 +1002,20 @@ type compileOpts struct {
 	// loaded negative rate runs safely as sample-all. Same doctrine as
 	// lenientSamplingInstanceConflicts.
 	lenientSamplingInputRate bool
+	// lenientFlowExportSeconds (#6769) downgrades the flow-export template
+	// `seconds` range gate (validateFlowExportSecondsStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// rejects a `template-refresh-rate` / `flow-active-timeout` /
+	// `flow-inactive-timeout` above MaxFlowExportSeconds, because the consumer
+	// converts with `time.Duration(n) * time.Second` and a large enough value
+	// overflows int64 and can WRAP to a sub-second interval — 20211507185753197
+	// yields a 512ns template ticker, flooding every collector. The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config still BOOTS (#1960 no-brick); behaviour there is safe
+	// regardless, because `flowexport.secondsToDuration` falls back to the
+	// default for an out-of-range value. Same doctrine as
+	// lenientSamplingInputRate.
+	lenientFlowExportSeconds bool
 	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
 	// application-set member cross-reference gate
 	// (validateApplicationSetMembersStrict) from a hard compile error to a
@@ -2350,6 +2364,7 @@ func lenientCompileOpts() compileOpts {
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
 		lenientSamplingInputRate:               true,
+		lenientFlowExportSeconds:               true,
 		lenientApplicationSetMembers:           true,
 		lenientPolicyMatchApplications:         true,
 		lenientNATMatchApplications:            true,

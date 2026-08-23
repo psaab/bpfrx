@@ -104318,3 +104318,19 @@ prose edit above them added. No diff falls in the new test body.
     pkg/configstore/bounded_read_6753_test.go,
     pkg/cli/load_bounded_read_6753_test.go, cmd/cli/main.go,
     cmd/cli/load_bounded_read_7469_test.go (new), pkg/configstore/README.md
+
+- **Timestamp**: 2026-08-22
+  **Action**: #6769 — bound the `services flow-monitoring` template `seconds`
+  knobs at `MaxDurationSeconds`. `template-refresh-rate seconds` was the one
+  untyped member of the trio, so a value large enough to overflow
+  `time.Duration(n) * time.Second` reached pkg/flowexport, wrapped, and became a
+  512 ns template ticker (gcd(1e9, 2^64) = 512). Three layers, one constant:
+  typed setSchema leaf, compiler-side `validateFlowExportSecondsStrict`
+  (strict-reject / lenient-warn, #1960), and `flowexport.secondsToDuration`
+  falling back at the consumer.
+  **File(s)**: pkg/config/schema_system.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates_sampling_appset.go,
+  pkg/config/compiler_opts.go, pkg/flowexport/manager.go,
+  pkg/config/flow_export_seconds_overflow_6769_test.go,
+  pkg/flowexport/template_seconds_overflow_6769_test.go, docs/config-schema.md

@@ -274,6 +274,42 @@ type templateContext struct {
 // defaultTemplateContext is the timeout/refresh fallback used for a
 // collector that referenced no template and when a referenced template
 // name has no matching definition that overrides a field.
+// #6769: the accepted range for the flow-export `seconds` knobs is
+// config.MaxDurationSeconds — the same constant the schema typed leaves and the
+// commit-time gate (validateFlowExportSecondsStrict) use, so no two layers can
+// disagree about where the ceiling is.
+//
+// The defect the bound exists for: the compiler stores these as a plain `int`
+// from `strconv.Atoi` with NO range check, and this file computed
+// `time.Duration(n) * time.Second`. For a large enough n that multiply overflows
+// int64 and WRAPS, and the wrapped value can be small and POSITIVE — which is
+// the dangerous half, because `templateRefreshInterval` only rejects `<= 0`.
+//
+// gcd(1e9, 2^64) = 512, so the wrapped residues are multiples of 512 ns and the
+// smallest positive one is exactly 512 ns: `template-refresh-rate seconds
+// 20211507185753197` yields a 512 ns ticker, and 18446744074 yields 290 ms. The
+// exporter then re-emits its templates thousands of times a second at every
+// collector — a self-inflicted flood, and the reason this is a security issue
+// rather than a cosmetic one.
+
+// secondsToDuration converts a config `seconds` value, falling back for
+// anything outside the accepted range.
+//
+// It replaces `if n > 0 { d = time.Duration(n) * time.Second }` at all three
+// sites. Behaviour for a sane value is identical; what changes is that an
+// out-of-range value now yields the DEFAULT instead of an overflowed one.
+//
+// Falling back rather than clamping to the maximum is deliberate: a value this
+// far out of range is not an operator asking for 24h, it is a typo or a hostile
+// config, and silently honouring it as "the largest thing we allow" would be
+// inventing an intent. The default is what an absent knob already means.
+func secondsToDuration(seconds int, fallback time.Duration) time.Duration {
+	if seconds <= 0 || int64(seconds) > config.MaxDurationSeconds {
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func defaultTemplateContext() templateContext {
 	return templateContext{
 		activeTimeout:   60 * time.Second,
@@ -289,15 +325,11 @@ func v9TemplateContext(tmpl *config.NetFlowV9Template) templateContext {
 	if tmpl == nil {
 		return tc
 	}
-	if tmpl.FlowActiveTimeout > 0 {
-		tc.activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-	}
-	if tmpl.FlowInactiveTimeout > 0 {
-		tc.inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-	}
-	if tmpl.TemplateRefreshRate > 0 {
-		tc.refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-	}
+	// #6769: range-checked. An untyped seconds value large enough to overflow
+	// `time.Duration(n) * time.Second` used to wrap into a sub-second ticker.
+	tc.activeTimeout = secondsToDuration(tmpl.FlowActiveTimeout, tc.activeTimeout)
+	tc.inactiveTimeout = secondsToDuration(tmpl.FlowInactiveTimeout, tc.inactiveTimeout)
+	tc.refreshRate = secondsToDuration(tmpl.TemplateRefreshRate, tc.refreshRate)
 	for _, ext := range tmpl.ExportExtensions {
 		if ext == "flow-dir" {
 			// #3270: flow-dir is applied again, derived in Go from the per-zone
@@ -318,15 +350,11 @@ func ipfixTemplateContext(tmpl *config.NetFlowIPFIXTemplate) templateContext {
 	if tmpl == nil {
 		return tc
 	}
-	if tmpl.FlowActiveTimeout > 0 {
-		tc.activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-	}
-	if tmpl.FlowInactiveTimeout > 0 {
-		tc.inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-	}
-	if tmpl.TemplateRefreshRate > 0 {
-		tc.refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-	}
+	// #6769: range-checked. An untyped seconds value large enough to overflow
+	// `time.Duration(n) * time.Second` used to wrap into a sub-second ticker.
+	tc.activeTimeout = secondsToDuration(tmpl.FlowActiveTimeout, tc.activeTimeout)
+	tc.inactiveTimeout = secondsToDuration(tmpl.FlowInactiveTimeout, tc.inactiveTimeout)
+	tc.refreshRate = secondsToDuration(tmpl.TemplateRefreshRate, tc.refreshRate)
 	for _, ext := range tmpl.ExportExtensions {
 		if ext == "flow-dir" {
 			tc.includeFlowDir = true
