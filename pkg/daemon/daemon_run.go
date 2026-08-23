@@ -554,6 +554,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}()
 	}
 
+	// #6793: the always-on retry owner for an RA sender whose ASYNCHRONOUS conn
+	// open failed. Started unconditionally, alongside the proxy-ARP re-assert
+	// and for the same reason: standalone applies RA only from a config apply
+	// and reconcileRGStateLoop is cluster-only, so a boot-time bind failure
+	// otherwise left the interface silent until an operator happened to commit.
+	// The loop is free when every sender opened (its gate is a map walk over
+	// live senders), so it costs nothing on configs that do not use RA.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.raDeadSenderReassertLoop(ctx)
+	}()
+
 	// #1387 inc-2: start the always-on DHCP dynamic-DNS reconcile loop. It
 	// is constructed UNCONDITIONALLY (idle when disabled) so an
 	// enabled→disabled commit can still withdraw published records; the loop
