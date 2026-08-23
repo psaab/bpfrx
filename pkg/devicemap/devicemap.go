@@ -8,6 +8,7 @@
 package devicemap
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,9 +23,70 @@ import (
 type PresentNIC struct {
 	Name       string // current kernel name (post-udev, pre-xpf-rename)
 	PCIAddr    string // PCI bus address ("" if none)
-	PermMAC    string // permanent/factory MAC ("" if unavailable)
+	PermMAC    string // permanent/factory MAC ("" when IdentityUnread is false: hardware has none)
 	RunningMAC string // current running MAC (diagnostic only)
 	LinkUp     bool   // operational/admin state (diagnostic; for `candidates`)
+
+	// IdentityUnread reports that the per-NIC identity read FAILED, so
+	// PermMAC / RunningMAC / LinkUp are UNKNOWN rather than known-absent
+	// (#6786).
+	//
+	// Before this the two states were the same value. EnumeratePresentNICs
+	// listed the NIC from sysfs and then read its attributes over netlink
+	// under `if link, err := netlink.LinkByName(name); err == nil` — with the
+	// error DISCARDED — so a failed read left PermMAC == "", which is exactly
+	// what hardware with no permanent-MAC attribute produces. Resolve's
+	// topology-change guard is conditioned on `PermMAC != ""`, so a failed
+	// read did not merely lose information: it silently DISABLED the card-swap
+	// refusal and downgraded the entry to BindBoundPCIOnly ("bound, PCI-only,
+	// unverified"), renaming a NIC whose permanent MAC was never checked
+	// against the one the operator pinned. That inverts the #1956 contract
+	// that a PCI hit with a mismatched permanent MAC must REFUSE and never
+	// silently hijack.
+	//
+	// INVARIANT: only EnumeratePresentNICs may set this true. A PresentNIC
+	// built by hand asserts a KNOWN identity, which is why the zero value is
+	// false — a synthesized record describes a NIC the caller already knows,
+	// and the unknown state is only observable by the code that did the read.
+	IdentityUnread bool
+}
+
+// PermMACDisplay renders this NIC's permanent MAC for the operator-facing
+// `show chassis device-map candidates` table (#6786).
+//
+// It distinguishes the two states an empty PermMAC used to collapse: "(none)"
+// asserts the positive fact that the hardware reported no permanent-MAC
+// attribute, while "(unknown)" says the identity read FAILED and nothing is
+// known. Printing "(none)" for a failed read tells an operator authoring a map
+// that this NIC cannot be MAC-pinned, which may be false — and it hides the
+// reason a MAC-pinned entry for it now refuses to bind.
+//
+// Single-sourced deliberately: the local CLI and the gRPC/remote CLI render
+// this same table from two call sites, and a divergence between them is always
+// a bug — they describe one machine's hardware to one operator.
+func (n PresentNIC) PermMACDisplay() string {
+	if n.IdentityUnread {
+		return "(unknown)"
+	}
+	if n.PermMAC == "" {
+		return "(none)"
+	}
+	return n.PermMAC
+}
+
+// LinkDisplay renders this NIC's link state for the candidates table. Like
+// PermMACDisplay it separates a read that succeeded from one that did not:
+// LinkUp is false both for a NIC that is genuinely down and for one whose
+// state was never read, and reporting an unread NIC as "down" invites an
+// operator to go hunting for a cabling fault that does not exist.
+func (n PresentNIC) LinkDisplay() string {
+	if n.IdentityUnread {
+		return "unknown"
+	}
+	if n.LinkUp {
+		return "up"
+	}
+	return "down"
 }
 
 // BindStatus classifies how a device-map entry resolved.
@@ -42,6 +104,14 @@ const (
 	// the hardware and re-pinning an identity fixes nothing — the MAP has two
 	// entries claiming one interface name and one of them must go.
 	BindRefusedDupName
+	// BindRefusedIdentityUnknown: the NIC at this entry's pinned identity
+	// could not be READ, so its permanent MAC is unknown and the entry's
+	// pinned MAC cannot be verified against it (#6786). Distinct from
+	// BindRefusedAmbig because nothing is known to be wrong with the hardware
+	// — the remedy is to retry/repair the identity read, not to re-pin the
+	// entry — and distinct from BindBoundPCIOnly, which asserts the positive
+	// fact that the hardware HAS no permanent MAC to check.
+	BindRefusedIdentityUnknown
 )
 
 func (s BindStatus) String() string {
@@ -58,6 +128,8 @@ func (s BindStatus) String() string {
 		return "REFUSED (topology changed — card swapped at this identity)"
 	case BindRefusedDupName:
 		return "REFUSED (logical name claimed by more than one device-map entry)"
+	case BindRefusedIdentityUnknown:
+		return "REFUSED (identity unreadable — cannot verify pinned MAC)"
 	default:
 		return "unknown"
 	}
@@ -76,7 +148,8 @@ func (s BindStatus) Decisive() bool {
 // single sentinel, so a new refusal reason cannot slip past a `== BindRefusedAmbig`
 // check and be silently treated as a clean result (#6546).
 func (s BindStatus) Refused() bool {
-	return s == BindRefusedAmbig || s == BindRefusedDupName
+	return s == BindRefusedAmbig || s == BindRefusedDupName ||
+		s == BindRefusedIdentityUnknown
 }
 
 // Bound reports whether the status is one of the three bound variants.
@@ -143,6 +216,25 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 			if e.MAC != "" && !isRETH && len(pm) == 1 &&
 				pm[0].PermMAC != "" && !strings.EqualFold(pm[0].PermMAC, e.MAC) {
 				rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
+				out = append(out, rb)
+				continue
+			}
+			// (c) #6786: the NIC at the pinned PCI is present but its identity
+			// could not be READ, so its permanent MAC is UNKNOWN and the check
+			// in (b) could not run. The entry pins a MAC precisely to detect a
+			// card swap at this slot; binding anyway would assert "verified by
+			// PCI, hardware has no MAC to check" — a claim the failed read does
+			// not support. Refuse instead, order-independently like (a)/(b).
+			//
+			// This is deliberately NARROW. It fires only when the operator
+			// pinned a MAC for this entry, so an entry keyed on PCI alone is
+			// unaffected: its identity is the PCI address, which came from
+			// sysfs and was read successfully, and the failed netlink read cost
+			// it nothing it asked for. Widening it to every unreadable NIC
+			// would let one transient netlink failure refuse interfaces whose
+			// operator never requested MAC verification.
+			if e.MAC != "" && !isRETH && len(pm) == 1 && pm[0].IdentityUnread {
+				rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedIdentityUnknown, "", ""
 				out = append(out, rb)
 				continue
 			}
@@ -326,27 +418,53 @@ func classifyNetdev(name, devReal string, devErr error) (pci string, keep bool) 
 // (factory) MAC, running MAC, and link state. Sorted by PCI address, then
 // kernel name, for stable output (non-PCI NICs share an empty PCI address, so
 // the name tiebreak keeps their order deterministic).
+// sysClassNetDir and linkByName are seams so the enumerator's own wiring is
+// testable (#6786). Without them the ONLY way to observe that a failed
+// per-NIC read sets IdentityUnread is on live hardware, so every test would
+// have to construct PresentNIC by hand — which binds Resolve's handling of the
+// flag while leaving the code that SETS it covered by nothing. Production
+// values are the real sysfs path and netlink.
+var (
+	sysClassNetDir = "/sys/class/net"
+	linkByName     = netlink.LinkByName
+)
+
 func EnumeratePresentNICs() ([]PresentNIC, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(sysClassNetDir)
 	if err != nil {
 		return nil, err
 	}
 	var nics []PresentNIC
 	for _, e := range entries {
 		name := e.Name()
-		devReal, derr := filepath.EvalSymlinks(filepath.Join("/sys/class/net", name, "device"))
+		devReal, derr := filepath.EvalSymlinks(filepath.Join(sysClassNetDir, name, "device"))
 		pci, keep := classifyNetdev(name, devReal, derr)
 		if !keep {
 			continue
 		}
 		nic := PresentNIC{Name: name, PCIAddr: pci}
-		if link, err := netlink.LinkByName(name); err == nil {
+		// #6786: the error from this read is RECORDED, not discarded. A failed
+		// read leaves PermMAC == "", which is the same value hardware with no
+		// permanent-MAC attribute produces — and Resolve's card-swap refusal is
+		// conditioned on PermMAC != "", so swallowing the error silently turned
+		// "REFUSE, a different card is at this identity" into "bind, unverified".
+		// The NIC is still listed (it is present in sysfs, and dropping it would
+		// make a real NIC vanish from `show chassis device-map candidates`); what
+		// changes is that its identity is marked UNKNOWN so a MAC-pinned entry
+		// refuses instead of binding blind.
+		if link, err := linkByName(name); err == nil {
 			a := link.Attrs()
 			nic.RunningMAC = a.HardwareAddr.String()
 			if len(a.PermHWAddr) != 0 {
 				nic.PermMAC = a.PermHWAddr.String()
 			}
 			nic.LinkUp = a.OperState == netlink.OperUp || a.Flags&1 != 0 // IFF_UP
+		} else {
+			nic.IdentityUnread = true
+			slog.Warn("device-map: NIC identity read failed; permanent MAC is UNKNOWN. "+
+				"A device-map entry that pins a MAC at this NIC's identity will REFUSE to bind "+
+				"rather than bind it unverified (#6786)",
+				"nic", name, "pci", pci, "err", err)
 		}
 		nics = append(nics, nic)
 	}
