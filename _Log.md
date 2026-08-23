@@ -105011,6 +105011,11 @@ prose edit above them added. No diff falls in the new test body.
 - **The reader**: `!s.NeedsApply()` gates `setLocalFailoverCommitReady`, which
   feeds `waitLocalFailoverCommitReady` → `cluster.requestPeerFailover`. The
   activation arm now raises it only inside the accepted branch.
+- **Persistence, not the instant**: the debt cell now drives further reconcile
+  passes and asserts the debt is STILL owed — checking `NeedsApply()` immediately
+  after the race proves only the transient, and the defect is that the debt never
+  comes BACK. Paired with an assertion that a genuine accepted apply DOES clear
+  it, so "never clears" cannot pass either.
 - **Matrix found an unbound branch**: reverting the DEACTIVATION arm to a raw
   `MarkApplied` left the whole suite green — the activation cell cannot see it,
   since each arm records its own result. Added a deactivation fixture (an RG the
