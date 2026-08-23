@@ -2636,3 +2636,107 @@ fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
          fall-through), which no worker will ever release"
     );
 }
+
+// #6785: `upsert_synced_session` used to return `()`. Its three SEMANTIC refusal
+// paths each bumped a counter and returned silently, so the control handler
+// answered `ok = true`, Go recorded a success, and Go's BPF mirror row stayed
+// behind for a session this helper never took — the split truth #5305's
+// transactional install already knows how to compensate but could not, because
+// the only failure it could observe was an IPC error.
+//
+// These cells bind the OUTCOME, not the side effects. The existing tests already
+// assert "the entry was not stored" and "the counter went up"; an implementation
+// that keeps both of those and still returns `Applied` passes every one of them
+// and reproduces the bug exactly. Each cell here therefore pairs a refusal with
+// the SUCCESS case on the same coordinator, so "returns a refusal" cannot be
+// satisfied by returning a refusal unconditionally.
+#[test]
+fn upsert_synced_session_reports_stale_generation_refusal_6785() {
+    let coordinator = Coordinator::new();
+
+    assert_eq!(
+        coordinator.upsert_synced_session(synced_entry_with_generation(2)),
+        SyncedImportOutcome::Applied,
+        "a first install must report Applied"
+    );
+    assert_eq!(
+        coordinator.upsert_synced_session(synced_entry_with_generation(1)),
+        SyncedImportOutcome::RejectedStaleGeneration,
+        "a strictly-older generation is refused (#2170) and the caller must be \
+         told, or Go keeps a BPF row for a session this helper did not take"
+    );
+    // Positive control on the SAME coordinator: the refusal is selective, not a
+    // blanket "reject everything after the first install".
+    assert_eq!(
+        coordinator.upsert_synced_session(synced_entry_with_generation(3)),
+        SyncedImportOutcome::Applied,
+        "a NEWER generation must still report Applied"
+    );
+}
+
+#[test]
+fn upsert_synced_session_reports_capacity_refusal_6785() {
+    let mut coordinator = Coordinator::new();
+    const LOGICAL_CEILING: u16 = 2;
+    coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    // A full symmetric-peer logical set fits and must all report Applied — the
+    // control that stops this cell from passing on "always RejectedCapacity".
+    for i in 0..LOGICAL_CEILING {
+        assert_eq!(
+            coordinator.upsert_synced_session(synced_entry_port(1000 + i, 0)),
+            SyncedImportOutcome::Applied,
+            "forward session {i} is within the ceiling and must report Applied"
+        );
+    }
+    assert_eq!(
+        coordinator.upsert_synced_session(synced_entry_port(2000, 0)),
+        SyncedImportOutcome::RejectedCapacity,
+        "a NEW forward past the entry ceiling is drop-newest rejected (#5674) \
+         and the caller must be told — otherwise the peer's session count and \
+         this node's diverge with nothing reporting it"
+    );
+    // A REPLACE of an already-admitted key does not grow the map and must still
+    // be accepted at the ceiling, so the refusal is bounded to what it claims.
+    assert_eq!(
+        coordinator.upsert_synced_session(synced_entry_port(1000, 0)),
+        SyncedImportOutcome::Applied,
+        "a REPLACE at the ceiling must still report Applied — refusing it would \
+         stop an in-flight synced session from refreshing"
+    );
+}
+
+// The refusal REASON tokens are part of the control-plane contract: Go strips
+// the prefix and surfaces the remainder to the operator, and it is the only way
+// to tell a capacity problem from a stale peer. Bind that Applied carries no
+// token and that the three refusals carry distinct ones — collapsing them to a
+// single token would compile, pass every behavioural cell above, and leave an
+// operator unable to tell which of three very different conditions they are in.
+#[test]
+fn synced_import_outcome_reason_tokens_are_distinct_6785() {
+    assert_eq!(SyncedImportOutcome::Applied.refusal_reason(), None);
+    let tokens = [
+        SyncedImportOutcome::RejectedStaleGeneration
+            .refusal_reason()
+            .expect("stale generation is a refusal"),
+        SyncedImportOutcome::RejectedCapacity
+            .refusal_reason()
+            .expect("capacity is a refusal"),
+        SyncedImportOutcome::RejectedReserve
+            .refusal_reason()
+            .expect("reserve is a refusal"),
+    ];
+    for (i, a) in tokens.iter().enumerate() {
+        assert!(!a.is_empty(), "token {i} is empty");
+        for (j, b) in tokens.iter().enumerate() {
+            if i != j {
+                assert_ne!(a, b, "refusal tokens {i} and {j} collide: {a}");
+            }
+        }
+    }
+}

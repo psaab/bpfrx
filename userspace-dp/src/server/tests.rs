@@ -3977,3 +3977,81 @@ fn failed_queue_reconcile_restores_every_binding_on_the_queue_6750() {
          whole table",
     );
 }
+
+// #6785: THE WIRING CELL. `upsert_synced_session` now returns a typed outcome,
+// but a typed outcome the handler discards is exactly the bug: the three
+// semantic refusal paths already bumped counters and returned, and the control
+// response still said `ok = true`, so Go recorded a success and kept a BPF
+// mirror row for a session this helper never took.
+//
+// The Coordinator-level cells in ha_tests.rs prove the outcome is COMPUTED. They
+// stay green if this handler drops it on the floor. This drives the real
+// `handle_stream` dispatcher and asserts what actually goes back on the wire.
+//
+// The refusal is provoked through the aggregate import cap because it is the one
+// refusal reachable from a single request pair with no worker fan-out: set the
+// logical ceiling to zero-plus-one entry's worth and push a second NEW forward.
+#[test]
+fn sync_session_upsert_reports_a_semantic_refusal_on_the_wire_6785() {
+    fn upsert_request(src_port: u16) -> ControlRequest {
+        let mut request = req("sync_session");
+        request.session_sync = Some(SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: 2,
+            protocol: 6,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port,
+            dst_port: 80,
+            egress_ifindex: 7,
+            neighbor_mac: "02:bf:72:01:02:03".to_string(),
+            src_mac: "02:bf:72:0a:0b:0c".to_string(),
+            ..SessionSyncRequest::default()
+        });
+        request
+    }
+
+    let state = new_state(ProcessStatus::default());
+    // One LOGICAL session fits (2 entries: the forward and its synthesized
+    // reverse companion); the second NEW forward is drop-newest rejected.
+    state
+        .lock()
+        .expect("state")
+        .afxdp
+        .synced_import_cap_override = 1;
+
+    // Control on the SAME state: the first import must still answer ok, so this
+    // cell cannot pass on a handler that reports a refusal unconditionally.
+    let first = run_request(state.clone(), upsert_request(1234));
+    assert!(
+        first.ok,
+        "the first import is within the ceiling and must succeed: {}",
+        first.error
+    );
+
+    let second = run_request(state.clone(), upsert_request(5678));
+    assert!(
+        !second.ok,
+        "a cap-REFUSED import answered ok=true — Go records a success and keeps \
+         a BPF mirror row for a session this helper never took (#6785)"
+    );
+    assert!(
+        second.error.starts_with(crate::afxdp::SYNCED_IMPORT_REFUSED_PREFIX),
+        "a refusal must carry the machine-readable prefix Go classifies on, or \
+         it is indistinguishable from a transport failure and would disarm HA \
+         takeover-readiness on a healthy node; got {:?}",
+        second.error
+    );
+    assert_eq!(
+        second.error,
+        format!(
+            "{}{}",
+            crate::afxdp::SYNCED_IMPORT_REFUSED_PREFIX,
+            crate::afxdp::SyncedImportOutcome::RejectedCapacity
+                .refusal_reason()
+                .expect("capacity is a refusal")
+        ),
+        "the wire error must name WHICH refusal happened — an operator cannot \
+         tell a capacity problem from a stale peer otherwise"
+    );
+}
