@@ -104817,6 +104817,18 @@ prose edit above them added. No diff falls in the new test body.
   and DHCP is the image's contract. The refusal is now scoped to a lifeline
   chosen by DEFAULT ROUTE (positive evidence of live addressing); a route-dump
   failure is fatal only for a family the snapshot has addresses in.
+- **Second, more dangerous defect in the same issue (selection half)**:
+  `detectLifelineInterface` discarded the `RouteList` error and returned
+  `("", false)` — indistinguishable from "no default route" — and the caller
+  branches on exactly that: `applianceFactory := routeIface == "" &&
+  d.applianceFactoryBoot()`. On an appliance box a netlink error therefore
+  flipped selection to "claim the FIRST ENUMERATED NIC" and renamed it
+  (`renameInterface` = LinkSetDown/LinkSetName/LinkSetUp, i.e. the NIC cycle).
+  Now returns an error; the caller refuses when the route state is UNKNOWN.
+  Guard keys on the observation FAILING, never on an empty routeIface (keying on
+  empty would strand every factory image console-only). A found+resolved route
+  is positive identification and survives a partial error.
 - **File(s)**: `pkg/daemon/bootstrap.go`,
   `pkg/daemon/lifeline_snapshot_failclosed_6789_test.go`,
+  `pkg/daemon/bootstrap_appliance_factory_7114_test.go`,
   `pkg/daemon/README.md`, `_Log.md`

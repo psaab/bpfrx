@@ -1416,6 +1416,37 @@ never lock an operator out of a remote box it manages.
     (`lifelineLinkByName` / `lifelineAddrList` / `lifelineRouteList`) so each
     observation failure is reachable from a test that asserts zero side
     effects.
+  - **An unreadable route table claims NOTHING (#6789, the selection half).**
+    The same "error reads as a confident answer" shape sits one step earlier, in
+    the SELECTION, and there it is worse. `detectLifelineInterface` dumped
+    routes with the error discarded (`if err != nil { continue }`), and a failed
+    dump returns a nil slice — byte-for-byte what "this box has no default
+    route" looks like. The caller BRANCHES on exactly that distinction:
+    `applianceFactory := routeIface == "" && d.applianceFactoryBoot()`. So on a
+    box carrying the appliance marker that has never committed, a netlink error
+    silently flipped selection from "the NIC holding the default route" to
+    "the FIRST ENUMERATED NIC" — which is then renamed, and `renameInterface`
+    is an explicit `LinkSetDown` → `LinkSetName` → `LinkSetUp`. If the real
+    management NIC is not enumeration index 0, the wrong NIC is claimed and the
+    management NIC is cycled on a box reachable only over it. It is reachable on
+    a real factory box, because the previous boot's lifeline writes an fxp0 DHCP
+    `.network`, so the next boot genuinely HAS a default route while
+    `EverCommitted()` is still false.
+
+    Note the asymmetry: on a NON-appliance box the identical error is harmless —
+    an empty `routeIface` makes `chooseBootstrapLifeline` refuse, which is the
+    console-only contract. The appliance marker is what converts a swallowed
+    netlink error into a claimed and cycled NIC.
+
+    `detectLifelineInterface` now returns an error and the caller refuses when
+    the route state is UNKNOWN (`routeIface == "" && routeErr != nil`). The
+    guard keys on the observation having FAILED, never on `routeIface` being
+    empty: keying on empty would disable the #7114 factory contract entirely and
+    strand every appliance image console-only on first boot. A route that WAS
+    found and resolved is positive identification and is used even if another
+    family's dump errored — the error only matters when it could have hidden the
+    answer. The second swallowed error there (`LinkByIndex` on a found route)
+    is propagated for the same reason.
 - **Protected set** (`resolveProtectedInterfaces` →
   `dataplane.SetProtectedInterfaceResolver`): fxp0 + the lifeline NIC + an
   explicit `system management-interface` leaf are NEVER marked Unmanaged /

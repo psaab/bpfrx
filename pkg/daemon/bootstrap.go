@@ -893,10 +893,20 @@ func (d *Daemon) applianceFactoryBoot() bool {
 
 // Returns the current kernel name of the lifeline NIC and ok=false when no
 // default route exists.
-func detectLifelineInterface() (name string, ok bool) {
+func detectLifelineInterface() (name string, ok bool, err error) {
+	var (
+		sawDefaultRoute bool
+		firstErr        error
+	)
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		routes, err := netlink.RouteList(nil, family)
-		if err != nil {
+		routes, rerr := lifelineRouteList(nil, family)
+		if rerr != nil {
+			// #6789: RECORDED, not swallowed. A failed dump returns a nil
+			// slice, which is byte-for-byte what "this box has no default
+			// route" looks like — and the caller BRANCHES on that distinction.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("route list family %d: %w", family, rerr)
+			}
 			continue
 		}
 		for i := range routes {
@@ -908,14 +918,28 @@ func detectLifelineInterface() (name string, ok bool) {
 			if r.LinkIndex <= 0 {
 				continue
 			}
-			link, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
+			sawDefaultRoute = true
+			link, lerr := lifelineLinkByIndex(r.LinkIndex)
+			if lerr != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("link by index %d: %w", r.LinkIndex, lerr)
+				}
 				continue
 			}
-			return link.Attrs().Name, true
+			// A resolved default route is POSITIVE identification. Report it
+			// even if an earlier dump errored: the error only matters when it
+			// could have hidden the answer, and here the answer was found.
+			return link.Attrs().Name, true, nil
 		}
 	}
-	return "", false
+	if firstErr != nil {
+		// Either a dump failed, or every default route we saw had an
+		// unresolvable link. Both leave "is there a default route, and on
+		// which NIC" UNKNOWN — never report that as a confident "none".
+		return "", false, firstErr
+	}
+	_ = sawDefaultRoute
+	return "", false, nil
 }
 
 // pciAddrForInterface resolves the PCI bus address + MAC for a kernel
@@ -1045,11 +1069,38 @@ func protectedInterfacesWith(mgmtLeaf, lifeline string) map[string]bool {
 // enumerated NIC is selected instead of refusing. Steps 2-4 are unchanged and
 // run identically for either provenance.
 func (d *Daemon) setupBootstrapLifeline() {
-	routeIface, _ := detectLifelineInterfaceFn()
+	routeIface, _, routeErr := detectLifelineInterfaceFn()
+	if routeIface == "" && routeErr != nil {
+		// #6789: the route observation FAILED, so "which NIC carries the
+		// default route" is UNKNOWN — not "there is none". The distinction is
+		// load-bearing because the very next line BRANCHES on it: an empty
+		// routeIface is what arms the #7114 appliance fallback, which claims
+		// the first enumerated NIC and RENAMES it (renameInterface does an
+		// explicit LinkSetDown -> LinkSetName -> LinkSetUp, so the rename IS
+		// the NIC cycle). A box whose real management NIC is not enumeration
+		// index 0 would have the wrong NIC claimed and cycled, on the strength
+		// of a netlink error.
+		//
+		// Claim NOTHING instead. That is the same console-only refusal
+		// chooseBootstrapLifeline documents for "cannot identify a management
+		// NIC", and it is what every other observation failure in this
+		// function already does.
+		slog.Warn("bootstrap lifeline: could not enumerate routes, so it is UNKNOWN whether this "+
+			"box has a default route or which NIC carries it. Claiming NOTHING and staying in "+
+			"bootstrap with NO interface changes — an unreadable route table must never be read "+
+			"as 'no default route', because that is what arms the appliance first-NIC fallback. "+
+			"Reach the box via its console and 'commit confirmed' a config.",
+			"err", routeErr)
+		return
+	}
 
 	// #7114: the appliance image's factory boot has no default route to find —
 	// the bake purges cloud-init and netplan, so nothing but xpfd ever brings a
 	// NIC up. Enumerate a fallback there, and ONLY there.
+	//
+	// #6789: reachable only when the route observation SUCCEEDED and genuinely
+	// found nothing (the unknown case returned above), so the factory contract
+	// is unchanged for every box whose route state is actually known.
 	firstNIC := ""
 	applianceFactory := routeIface == "" && d.applianceFactoryBoot()
 	if applianceFactory {
@@ -1257,9 +1308,10 @@ func (d *Daemon) resolveProtectedInterfaces() map[string]bool {
 // onto the wrong addressing — so its failure modes must be reachable from a
 // test rather than only from real hardware.
 var (
-	lifelineLinkByName = netlink.LinkByName
-	lifelineAddrList   = netlink.AddrList
-	lifelineRouteList  = netlink.RouteList
+	lifelineLinkByName  = netlink.LinkByName
+	lifelineLinkByIndex = netlink.LinkByIndex
+	lifelineAddrList    = netlink.AddrList
+	lifelineRouteList   = netlink.RouteList
 )
 
 // lifelineAddrSnapshot is a COMPLETE observation of a lifeline NIC's
