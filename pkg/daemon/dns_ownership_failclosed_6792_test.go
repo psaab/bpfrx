@@ -25,7 +25,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/daemon/system"
+	"github.com/psaab/xpf/pkg/networkd"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 func dnsInput6792() system.ResolvedDropinInput {
@@ -193,4 +196,97 @@ func TestReconcileEarlyReturnsStillCarryTheirErrors6792(t *testing.T) {
 			t.Fatalf("the boot policy clobbered a good resolv.conf:\n%s", got)
 		}
 	})
+}
+
+// TestApplyTailReconcilesSurfacesTheDNSError6792 binds the WIRING, which every
+// cell above is blind to.
+//
+// The reconcile can return errors all day and the commit still succeeds if
+// applyTailReconciles does not join them — and that join is the entire fix.
+// Removing `dnsErr` from the tail errors.Join left the whole suite green until
+// this cell existed.
+//
+// It drives the REAL applyTailReconciles, following the #5696 precedent for the
+// route-leak slot: the nft seams are stubbed to succeed so the injected DNS
+// error is the only operand that can surface.
+func TestApplyTailReconcilesSurfacesTheDNSError6792(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	t.Cleanup(func() { nftApplyPayload, nftDeleteTable = origApply, origDelete })
+
+	d := &Daemon{
+		networkd: networkd.NewInDir(t.TempDir()),
+		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		vrrpMgr:  vrrp.NewManager(),
+		opts:     Options{NoDataplane: true},
+	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{})
+
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{0: {Number: 0}}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+	}
+
+	injected := errors.New("injected: systemd-resolved may remain a second owner")
+	called := 0
+	d.reconcileDNSFn = func(*config.Config, bool) error {
+		called++
+		return injected
+	}
+
+	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	if called == 0 {
+		t.Fatal("applyTailReconciles never ran the DNS reconcile, so this cell " +
+			"cannot distinguish a joined error from a dropped one")
+	}
+	if err == nil {
+		t.Fatal("applyTailReconciles returned nil while the DNS reconcile FAILED " +
+			"— the commit reports success with a possible dual resolver or a " +
+			"stale /etc/resolv.conf, which is the whole of #6792")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("the commit error does not include the DNS failure via the tail "+
+			"errors.Join wiring, got %v", err)
+	}
+}
+
+// TestApplyTailReconcilesIsCleanWhenDNSSucceeds6792 is the paired control: with
+// the same harness and a SUCCEEDING DNS reconcile the tail must return nil.
+// Without it, the cell above is satisfied by an applyTailReconciles that always
+// returns an error — which would fail every commit.
+func TestApplyTailReconcilesIsCleanWhenDNSSucceeds6792(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	t.Cleanup(func() { nftApplyPayload, nftDeleteTable = origApply, origDelete })
+
+	d := &Daemon{
+		networkd: networkd.NewInDir(t.TempDir()),
+		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		vrrpMgr:  vrrp.NewManager(),
+		opts:     Options{NoDataplane: true},
+	}
+	d.setDataplane(&runtimeOnlyApplyTestDP{})
+
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{0: {Number: 0}}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+	}
+	d.reconcileDNSFn = func(*config.Config, bool) error { return nil }
+
+	if err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil); err != nil {
+		t.Fatalf("applyTailReconciles returned %v with a SUCCEEDING DNS "+
+			"reconcile — every commit would now fail closed on DNS", err)
+	}
 }

@@ -369,6 +369,13 @@ func disableMaskResolved() error {
 // later commit / DHCP change passes false so clearing DNS truly clears
 // the file.
 func (d *Daemon) reconcileDNSLocked(cfg *config.Config, bootEmptyRepairOnly bool) error {
+	// #6792: test seam. The reconcile's own failures are covered directly
+	// against a dnsReconciler; this exists so a test can drive the REAL
+	// applyTailReconciles and prove the error actually reaches the commit
+	// result — the wiring the per-function cells cannot see.
+	if d.reconcileDNSFn != nil {
+		return d.reconcileDNSFn(cfg, bootEmptyRepairOnly)
+	}
 	var leases []*dhcp.Lease
 	if d.dhcp != nil {
 		leases = d.dhcp.Leases()

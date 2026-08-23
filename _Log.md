@@ -104695,3 +104695,12 @@ prose edit above them added. No diff falls in the new test body.
   accumulated error.
 - **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/daemon_apply_tail.go,
   pkg/daemon/dns_ownership_failclosed_6792_test.go, docs/dns-ownership.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6792 round 2 — the mutation matrix found a GREEN cell: removing
+  `dnsErr` from `applyTailReconciles`' tail `errors.Join` left the whole suite
+  green. The reconcile can return errors all day and the commit still succeeds
+  if nothing joins them, and that join IS the fix. Added a `reconcileDNSFn`
+  seam and two cells driving the REAL `applyTailReconciles` (#5696 precedent),
+  paired so "always returns an error" also fails.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dns.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, _Log.md
