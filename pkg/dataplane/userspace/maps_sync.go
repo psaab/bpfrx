@@ -646,13 +646,30 @@ func (m *Manager) entryProgramsLocked() map[int]string {
 // inventory the reap loop below rescans.
 //
 // #6537: the inventory is recorded on EVERY exit, not only the all-succeeded
-// one. It is the sole record of which rows exist in the BPF map, and the reap
-// loop only ever revisits ifindexes named in it, so a row that is installed but
-// never recorded is permanently unreachable: when its interface later drops out
-// of the config nothing deletes it, and the XDP shim keeps redirecting that
-// interface's traffic to userspace. Recording it only when no retry is needed
-// wrote the debt down exactly when there was none — the same shape #5697 fixed
-// for the stale userspace_bindings clears (clearStaleBindingRowsLocked).
+// one. Within a process it is the record of which rows exist in the BPF map,
+// and the reap loop only ever revisits ifindexes named in it, so a row that is
+// installed but never recorded is permanently unreachable: when its interface
+// later drops out of the config nothing deletes it, and the XDP shim keeps
+// redirecting that interface's traffic to userspace. Recording it only when no
+// retry is needed wrote the debt down exactly when there was none — the same
+// shape #5697 fixed for the stale userspace_bindings clears
+// (clearStaleBindingRowsLocked).
+//
+// #6784: "within a process" is the load-bearing qualifier, and before #6784 it
+// was missing — the comment claimed the inventory was the SOLE record of the
+// map's rows. It is not: userspace_ingress_ifaces is PinByName-pinned at
+// /sys/fs/bpf/xpf, so its rows outlive xpfd while the inventory is an ordinary
+// Manager field that starts nil. A daemon restart therefore reaped nothing on
+// its first pass — the loop below scanned an empty `prior` — and any ifindex
+// that dropped out of the config while xpfd was down (or whose interface was
+// deleted and its ifindex reused) stayed in the map with the shim still
+// treating it as an ingress interface. adoptIngressInventoryLocked closes that
+// by enumerating the pinned map ONCE per Manager before the inventory is read,
+// so the reap has a truthful starting set. The sibling classifier maps already
+// worked this way — syncLocalAddressMapsLocked and
+// syncInterfaceNATAddressMapsLocked prune by iterating the MAP rather than an
+// in-process list — so this makes ingress consistent with them rather than
+// inventing a mechanism.
 //
 // On an early return the inventory becomes prior ∪ installed: the prior entries
 // are kept because a failed (or not-yet-attempted) delete still has to be
@@ -664,6 +681,14 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 	ifaceMap := m.bpfShim.Map(mapNameUserspaceIngressIfaces)
 	if ifaceMap == nil {
 		return errors.New("userspace_ingress_ifaces map not loaded")
+	}
+
+	// #6784: make the delete inventory truthful about the PINNED map before
+	// anything reads it. On a fresh Manager (daemon restart) this is what turns
+	// the reap below from a no-op into a real reconcile; on every later pass it
+	// is a single already-adopted bool test.
+	if err := m.adoptIngressInventoryLocked(ifaceMap); err != nil {
+		return fmt.Errorf("adopt userspace_ingress_ifaces inventory: %w", err)
 	}
 
 	newIngress := buildUserspaceIngressIfindexes(snapshot)
@@ -699,6 +724,81 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 		}
 	}
 	m.lastIngressIfaces = newIngress
+	return nil
+}
+
+// adoptIngressInventoryLocked folds the rows actually present in the pinned
+// userspace_ingress_ifaces map into m.lastIngressIfaces, ONCE per Manager
+// (#6784).
+//
+// WHY THIS IS NEEDED AT ALL. Session state is retained across a helper/daemon
+// restart deliberately — that is how HA continuity survives one. The classifier
+// maps are retained by the same PinByName mechanism, but NOT for the same
+// reason: nothing about a classifier row is worth preserving across a config
+// reload, and unlike sessions there is no code that rebuilds an inventory for
+// them. So a fresh Manager inherits rows it never wrote and cannot name, and
+// the reap loop — which only ever revisits ifindexes the inventory names —
+// silently reaps nothing on its first pass.
+//
+// That matters because the row is not inert. The XDP shim reads this map on
+// EVERY packet (userspace-xdp/src/lib.rs: `USERSPACE_INGRESS_IFACES.get(
+// &ingress_ifindex)`) and a present non-zero row is what diverts the packet
+// away from `cpumap_or_pass` into the AF_XDP redirect path. A stale row for an
+// interface that dropped out of the config therefore does not merely leak — it
+// keeps steering that interface's traffic, and this map is the gate every
+// later binding/XSK stage sits behind.
+//
+// UNION, not replace. The adopted set is merged with whatever the inventory
+// already holds rather than overwriting it, so adoption can never DROP a #6537
+// retry debt recorded before the first sync completed. Adoption is recorded
+// only after a successful enumeration, so a failed scan retries on the next
+// pass instead of latching a partial view.
+//
+// Only rows the SHIM ACTS ON are adopted — those with a non-zero value. The
+// shim's test is `USERSPACE_INGRESS_IFACES.get(&ifindex).map_or(true, |v| *v
+// == 0)`, so a 0-valued row means "not ingress" and takes the same
+// cpumap_or_pass path as an absent one. A 0-valued row therefore diverts no
+// traffic and is not a stale classifier row in the sense this repairs; the Go
+// sync is the map's sole producer (the Rust helper never touches it, the shim
+// only reads it) and only ever writes 1, so in production the filter excludes
+// nothing that exists.
+//
+// The filter also makes adoption correct independent of the map's DENSITY
+// rather than by assuming a HashMap. Enumerating a dense map — an Array, where
+// every index is present — would otherwise adopt every slot as a live row and
+// send the reap loop into Delete calls that an Array rejects with EINVAL.
+// Keying on the value the shim reads is the property that actually matters, and
+// it holds for either shape.
+//
+// An enumeration failure is returned to the caller and is FATAL, matching the
+// established treatment of a classifier-map iteration failure in
+// syncLocalAddressMapsLocked / syncInterfaceNATAddressMapsLocked: if the map's
+// contents cannot be established, the reap cannot be trusted, and the caller
+// (syncUserspaceClassifierMapsFailClosedLocked) drives ctrl to Enabled=0 so the
+// shim stops redirecting transit rather than running against a classifier no
+// one can account for.
+func (m *Manager) adoptIngressInventoryLocked(ifaceMap *ebpf.Map) error {
+	if m.ingressInventoryAdopted {
+		return nil
+	}
+	var (
+		key uint32
+		val uint8
+	)
+	present := make([]uint32, 0, len(m.lastIngressIfaces))
+	iter := ifaceMap.Iterate()
+	for iter.Next(&key, &val) {
+		if val == 0 {
+			// Inert: the shim reads this exactly as it reads an absent row.
+			continue
+		}
+		present = append(present, key)
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate userspace_ingress_ifaces: %w", err)
+	}
+	m.lastIngressIfaces = mergeIngressInventory(m.lastIngressIfaces, present)
+	m.ingressInventoryAdopted = true
 	return nil
 }
 
@@ -1639,6 +1739,29 @@ const heartbeatSlotsPerWorker = 2 * 16
 // function; this widens no window that call does not already open. (The binding
 // half of that hazard is separately acknowledged and repaired by
 // verifyBindingsMapLocked.)
+//
+// #6784 CORRECTION to the paragraph above: "zeroing every binding row the
+// manager wrote" is true only of rows THIS Manager wrote.
+// clearAllBindingRowsLocked iterates m.lastBindingIndices, which is nil on a
+// freshly constructed Manager, so on the first apply after a daemon restart it
+// zeroes NOTHING while userspace_bindings — PinByName-pinned like every other
+// shim map — still holds the previous process's rows. The conclusion survives,
+// but not for the stated reason: zeroing a heartbeat slot can only move a
+// packet ONTO the stale-heartbeat branch, which is fail-closed
+// (drop_degraded_transit for transit, pass_local_control for local), so the
+// widening is in the safe direction regardless of what the binding rows hold.
+//
+// The stale binding rows themselves are left alone deliberately, and the reason
+// is the gate order in the shim: userspace_ingress_ifaces is consulted BEFORE
+// the binding array, so a binding row is only ever reached for an ifindex the
+// ingress map still admits. Repairing the ingress map (adoptIngressInventoryLocked)
+// therefore makes a stale binding row for a de-configured interface
+// unreachable, and for an interface still in the config
+// applyHelperStatusLocked rewrites its rows from live helper status every poll.
+// A blanket zero of this Array is NOT the answer here the way it was for the
+// heartbeat: BindingArrayMaxEntries is MaxInterfaces*BindingQueuesPerIface =
+// 1,048,576 rows (versus the heartbeat Array's 4096), so sweeping it would put
+// a million map syscalls on every non-same-plan apply.
 //
 // Taking the Array's own capacity also closes #4572 and #5718-A6-b01-C1 BY
 // CONSTRUCTION rather than by a clamp — the bound no longer reads `workers` at

@@ -24,18 +24,50 @@ The shim checks several conditions before redirecting a packet to userspace:
 
    **Delete inventory (#6537).** `syncIngressIfaceMapLocked`
    (`pkg/dataplane/userspace/maps_sync.go`) keeps `m.lastIngressIfaces`, the
-   only record of which rows exist in this map; its reap loop rescans nothing
-   else. The inventory is therefore written on EVERY exit from the sync, not
-   only the all-succeeded one. On an early return — a failed `Update` (map
-   full / ENOMEM / EPERM) or a failed stale-row `Delete` — it becomes
-   `prior ∪ installed-this-pass`, so a row the aborted pass created is still
-   reachable later; on a clean pass it is exactly the new ingress set, because
-   every prior row outside that set was successfully deleted. Recording it only
-   on the all-succeeded path wrote the debt down exactly when there was none:
-   a row installed on a pass that failed partway became permanently
-   unreachable, and the shim kept treating a de-configured interface as ingress
-   until the daemon restarted. Same shape as the #5697 retry inventory
+   record of which rows THIS PROCESS installed in this map; its reap loop
+   rescans nothing else. The inventory is therefore written on EVERY exit from
+   the sync, not only the all-succeeded one. On an early return — a failed
+   `Update` (map full / ENOMEM / EPERM) or a failed stale-row `Delete` — it
+   becomes `prior ∪ installed-this-pass`, so a row the aborted pass created is
+   still reachable later; on a clean pass it is exactly the new ingress set,
+   because every prior row outside that set was successfully deleted. Recording
+   it only on the all-succeeded path wrote the debt down exactly when there was
+   none: a row installed on a pass that failed partway became permanently
+   unreachable, and the shim kept treating a de-configured interface as
+   ingress. Same shape as the #5697 retry inventory
    `clearStaleBindingRowsLocked` keeps for stale `userspace_bindings` rows.
+
+   **Restart adoption (#6784).** A daemon restart did NOT clear such a row —
+   this section previously said it did, and that was the defect. Every shim map
+   here is `PinByName`-pinned under `/sys/fs/bpf/xpf`, so `userspace_ingress_ifaces`
+   rows outlive xpfd, while `m.lastIngressIfaces` is an ordinary Manager field
+   that starts nil. The first sync after a restart therefore reaped nothing:
+   any ifindex that dropped out of the config while xpfd was down — or whose
+   interface was deleted and its ifindex later reused by a new tunnel/VLAN —
+   stayed in the map, and since this map is the gate every later stage sits
+   behind, the shim kept diverting that interface's traffic away from
+   `cpumap_or_pass` into the AF_XDP path. Retention is deliberate for the
+   SESSION maps (that is how HA continuity survives a restart) but it is merely
+   incidental for the classifier maps, and nothing rebuilt an inventory for
+   them. `adoptIngressInventoryLocked` now enumerates the pinned map ONCE per
+   Manager, before the inventory is read, so the reap starts from a truthful
+   set. It is a union with any inventory already held (so a #6537 retry debt is
+   never dropped) and it is recorded only after a successful enumeration (so a
+   transient scan failure retries rather than latching a partial view); an
+   enumeration failure is fatal to the classifier sync, which drives
+   `userspace_ctrl` to `Enabled=0`. It adopts only rows the shim ACTS on —
+   value != 0 — because the shim reads a 0-valued row exactly as it reads an
+   absent one (`map_or(true, |v| *v == 0)`), so such a row diverts no traffic;
+   that also keeps adoption correct independent of the map's density rather
+   than by assuming a HashMap. The sibling classifier maps
+   (`userspace_local_v4`/`_v6`, `userspace_interface_nat_v4`/`_v6`) never had
+   this hole — they prune by iterating the MAP — so this makes ingress
+   consistent with them rather than adding a new mechanism.
+
+   Adoption runs ONCE per Manager, not per pass: within a live process the
+   Manager is the sole writer of this map (the Rust helper never touches it,
+   the shim only reads it) and `m.lastIngressIfaces` is the #6537 record of
+   what this process installed.
 3. A binding must exist in `userspace_bindings` for (ifindex, queue_id) and be
    marked `USERSPACE_BINDING_READY`. `queue_id` is the packet's OWN RX queue,
    read once from the XDP context and never transformed on the way to the

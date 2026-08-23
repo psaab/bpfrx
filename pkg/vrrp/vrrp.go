@@ -152,6 +152,13 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 			advertInterval = cc.RethAdvertiseInterval
 		}
 		for _, rg := range cc.RedundancyGroups {
+			// #6780: skip a present-but-nil redundancy-group. Every sibling
+			// walk of this slice already guards it (compiler_validate_warn.go,
+			// compiler_validate_strict_chassis.go); this collector was the
+			// outlier.
+			if rg == nil {
+				continue
+			}
 			if rg.GratuitousARPCount > 0 {
 				garpCounts[rg.ID] = rg.GratuitousARPCount
 			}
@@ -169,7 +176,9 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	var instances []*Instance
 	for _, name := range names {
 		ifc := cfg.Interfaces.Interfaces[name]
-		if ifc.RedundancyGroup <= 0 {
+		// #6780: skip a present-but-nil interface, matching CollectInstances
+		// above and every RETH-ownership walk in pkg/daemon.
+		if ifc == nil || ifc.RedundancyGroup <= 0 {
 			continue
 		}
 		rgID := ifc.RedundancyGroup
@@ -201,7 +210,9 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 		if ifc.VlanTagging {
 			for _, n := range unitNums {
 				unit := ifc.Units[n]
-				if len(unit.Addresses) == 0 {
+				// #6780: a present-but-nil unit reaches len(unit.Addresses) as
+				// a nil deref, not as a zero length.
+				if unit == nil || len(unit.Addresses) == 0 {
 					continue
 				}
 				subIface := linuxName
@@ -222,7 +233,11 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 		} else {
 			var vips []string
 			for _, n := range unitNums {
-				vips = append(vips, ifc.Units[n].Addresses...)
+				unit := ifc.Units[n]
+				if unit == nil { // #6780
+					continue
+				}
+				vips = append(vips, unit.Addresses...)
 			}
 			if len(vips) == 0 {
 				continue
@@ -254,7 +269,10 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 	result := make(map[string][]string)
 	for _, name := range sortedIfNames(cfg) {
 		ifc := cfg.Interfaces.Interfaces[name]
-		if ifc.RedundancyGroup != rgID {
+		// #6780: skip a present-but-nil interface — this is the direct
+		// (no-reth-vrrp / private-rg-election) ownership mode's collector, and
+		// it carried the same raw deref as the VRRP-mode one above.
+		if ifc == nil || ifc.RedundancyGroup != rgID {
 			continue
 		}
 		// Only include actual RETH interfaces — skip fabric, control,
@@ -278,7 +296,8 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 		if ifc.VlanTagging {
 			for _, n := range unitNums {
 				unit := ifc.Units[n]
-				if len(unit.Addresses) == 0 {
+				// #6780: nil unit derefs at len(unit.Addresses).
+				if unit == nil || len(unit.Addresses) == 0 {
 					continue
 				}
 				subIface := linuxName
@@ -290,7 +309,11 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 		} else {
 			var vips []string
 			for _, n := range unitNums {
-				vips = append(vips, ifc.Units[n].Addresses...)
+				unit := ifc.Units[n]
+				if unit == nil { // #6780
+					continue
+				}
+				vips = append(vips, unit.Addresses...)
 			}
 			if len(vips) > 0 {
 				result[linuxName] = append(result[linuxName], vips...)

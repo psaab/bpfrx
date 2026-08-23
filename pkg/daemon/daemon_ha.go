@@ -1364,6 +1364,9 @@ func rethInterfacesMatchingRG(cfg *config.Config, want func(rgID int) bool) []st
 			// Resolve RETH to physical member for Linux-level operations.
 			resolved := config.LinuxIfName(cfg.ResolveReth(name))
 			for _, unit := range ifc.Units {
+				if unit == nil { // #6780
+					continue
+				}
 				if unit.VlanID > 0 {
 					names = append(names, resolved+"."+fmt.Sprintf("%d", unit.VlanID))
 				} else {
@@ -1409,6 +1412,9 @@ func (d *Daemon) injectBlackholeRoutesFor(userspaceActive bool, rgID int) {
 			continue
 		}
 		for _, unit := range ifc.Units {
+			if unit == nil { // #6780
+				continue
+			}
 			for _, addr := range unit.Addresses {
 				_, ipNet, err := net.ParseCIDR(addr)
 				if err != nil {
