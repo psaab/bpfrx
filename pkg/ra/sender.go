@@ -313,6 +313,15 @@ func (s *sender) openConn() bool {
 // Lifetime expiry while operators see success (#5093).
 var errGoodbyeWrite = errors.New("ra: goodbye RA write failed")
 
+// errGoodbyeIfaceMissing marks a goodbye that could not even be attempted
+// because the netdev no longer exists. It is PERMANENT, unlike errGoodbyeWrite
+// and a bind failure: there is no link to emit on and no host behind it left to
+// hear a lifetime-0 RA, so the #6777 retry debt deliberately does NOT retain it
+// (see recordGoodbyeDebtLocked). Retaining it would make a legitimately removed
+// interface a permanent Apply error, suppressing the daemon's RA reconcile
+// digest forever.
+var errGoodbyeIfaceMissing = errors.New("ra: goodbye interface missing")
+
 // sendGoodbyeStandalone is the WithdrawOnce goodbye-only entry point. It opens
 // a connection, emits the lifetime-0 goodbye, and closes — WITHOUT launching
 // run() and WITHOUT the startup burst (so it never re-advertises the router it

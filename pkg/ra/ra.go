@@ -13,6 +13,7 @@
 package ra
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -105,14 +106,64 @@ type Manager struct {
 	// (re)placement only if THIS interface's epoch is still unchanged. A withdraw
 	// of interface B thus cannot cancel interface A's restart.
 	ifaceEpoch map[string]uint64
+
+	// goodbyeOwed is the graceful-withdrawal RETRY DEBT (#6777). A graceful
+	// withdrawal's FINAL lifetime-0 goodbye is the last chance hosts get to drop
+	// this router before Router Lifetime (default 1800s) expiry; before #6777 a
+	// failure of that final emit was logged and then ERASED — finishDrainDecision
+	// set goodbyeClaimed, deleted the tombstone, dropped the sender, and returned
+	// only the replacement-start error, so Withdraw()/Apply() reported success.
+	// The daemon's own retry driver (reconcileClusterRAServices) advances
+	// lastRAReconcileHash ONLY on a successful apply, so a swallowed failure was
+	// latched as converged and the every-2s pass never retried it: the stale IPv6
+	// default-router identity lived on hosts for up to 30 minutes while operators
+	// saw a clean withdrawal. This is the graceful-path twin of the one-shot
+	// WithdrawOnce debt #5093 fixed.
+	//
+	// An entry here means "a lifetime-0 RA is still OWED on this interface and no
+	// sender/tombstone remains to carry it". Apply re-attempts every owed goodbye
+	// whose interface is not in the desired set and returns a non-nil error while
+	// any debt survives, which keeps the reconcile digest un-advanced so the
+	// periodic pass re-drives it. Debt is bounded (maxGoodbyeRetries) so a
+	// permanently unsendable interface cannot spin the 2s reconcile forever, and
+	// is dropped outright when a sender is (re)started on the interface — the
+	// router is BACK, so there is nothing left to withdraw.
+	goodbyeOwed map[string]*goodbyeDebt
 }
+
+// goodbyeDebt is one interface's outstanding final-goodbye retry debt (#6777).
+type goodbyeDebt struct {
+	cfg      *config.RAInterfaceConfig
+	attempts int
+	// recordedEpoch is the whole-manager epoch this debt was (re-)recorded at.
+	// retryOwedGoodbyes runs at the END of Apply, and Apply bumps the epoch at
+	// its start, so a debt recorded by THIS Apply's own withdrawal carries the
+	// current epoch. Retrying it in the same pass would burn one of the bounded
+	// attempts microseconds after the standalone backstop already failed on a
+	// fresh conn — the budget exists to span the daemon's 2s reconcile passes,
+	// not to be spent three times on one tick. Same-epoch debts are therefore
+	// held over (and still reported outstanding, which is what keeps the
+	// reconcile digest un-advanced so a next pass happens at all).
+	recordedEpoch uint64
+}
+
+// maxGoodbyeRetries bounds the #6777 retry debt. The debt exists to survive a
+// TRANSIENT emit failure (a link-local that has not come back yet, a momentary
+// write error) across the daemon's 2s reconcile pass. It must NOT become an
+// unbounded error source: Apply returns non-nil while any debt is outstanding,
+// which suppresses the reconcile digest, so an interface that can never accept
+// the goodbye (its link-local is permanently gone) would otherwise re-apply and
+// log every 2s forever. After this many further attempts the debt is dropped
+// with a single Warn — we tried, we said so, we stop.
+const maxGoodbyeRetries = 3
 
 // New creates a new RA manager.
 func New() *Manager {
 	return &Manager{
-		senders:    make(map[string]*sender),
-		draining:   make(map[string]*drainEntry),
-		ifaceEpoch: make(map[string]uint64),
+		senders:     make(map[string]*sender),
+		draining:    make(map[string]*drainEntry),
+		ifaceEpoch:  make(map[string]uint64),
+		goodbyeOwed: make(map[string]*goodbyeDebt),
 	}
 }
 
@@ -122,6 +173,132 @@ func (m *Manager) bumpEpoch() { m.epoch++ }
 // bumpIfaceEpoch increments the per-interface supersession revision for name
 // (#4961). Callers must hold m.mu.
 func (m *Manager) bumpIfaceEpoch(name string) { m.ifaceEpoch[name]++ }
+
+// recordGoodbyeDebtLocked retains the #6777 retry debt for a FAILED final
+// lifetime-0 goodbye on name, so a later Apply can re-attempt it. Callers hold
+// m.mu.
+//
+// A "interface not found" failure records NOTHING: the netdev is gone, so there
+// is no link to emit on and no host behind it left to hear a goodbye. Retrying
+// that would be a permanent error source for a legitimately-removed interface.
+// A bind or write failure IS retained — those are the transient shapes the debt
+// exists for (a link-local that has not come back yet on a demoting RETH member
+// mid-MAC-cycle, a momentary write error).
+//
+// The attempt counter is preserved across re-records so a repeatedly failing
+// interface converges on maxGoodbyeRetries rather than restarting its budget
+// every pass.
+func (m *Manager) recordGoodbyeDebtLocked(name string, cfg *config.RAInterfaceConfig, err error) {
+	if cfg == nil {
+		return
+	}
+	if !errors.Is(err, errGoodbyeWrite) && !isGoodbyeBindFailure(err) {
+		slog.Debug("ra: final goodbye failed on a vanished interface; no retry debt",
+			"interface", name, "err", err)
+		return
+	}
+	d := m.goodbyeOwed[name]
+	if d == nil {
+		d = &goodbyeDebt{}
+		m.goodbyeOwed[name] = d
+	}
+	d.cfg = cfg
+	d.recordedEpoch = m.epoch
+	slog.Info("ra: retaining final-goodbye retry debt", "interface", name,
+		"attempts", d.attempts)
+}
+
+// isGoodbyeBindFailure reports whether err is a goodbye failure that happened
+// BEFORE the lifetime-0 write — i.e. sendOneGoodbye's ndp.Listen leg failed.
+// sendOneGoodbye wraps the two pre-write failures distinctly: a missing netdev
+// is wrapped with the "goodbye interface" prefix (permanent — no debt), while a
+// bind failure propagates ndp.Listen's error unwrapped. Anything that is
+// neither a write failure nor a missing netdev is therefore a bind failure.
+func isGoodbyeBindFailure(err error) bool {
+	return err != nil && !errors.Is(err, errGoodbyeIfaceMissing)
+}
+
+// retryOwedGoodbyes re-attempts every #6777 retry debt whose interface is NOT
+// in desired, and reports whether any debt is still outstanding afterwards.
+//
+// It runs on the Apply path deliberately: Apply is what the daemon's periodic
+// reconcile drives, and reconcileClusterRAServices advances its convergence
+// digest only when Apply returns nil. Returning a non-nil error while debt
+// survives is therefore the whole retry mechanism — it keeps the digest
+// un-advanced so the every-2s pass calls Apply again instead of latching the
+// failed withdrawal as converged.
+//
+// An interface that reappeared in desired has its debt DROPPED, not retried:
+// the router is coming back on that link, so withdrawing it would be wrong.
+// The emit goes through WithdrawOnce, which takes the same claim-and-hold
+// tombstone every other goodbye path takes, so a retry can never open a second
+// conn on an interface that already has a live sender (#2033 MAJOR 1). A
+// Skipped result (the interface was busy) leaves the debt in place WITHOUT
+// spending an attempt — nothing was tried.
+func (m *Manager) retryOwedGoodbyes(desired map[string]*config.RAInterfaceConfig) error {
+	m.mu.Lock()
+	var todo []*config.RAInterfaceConfig
+	var held []string
+	for name, d := range m.goodbyeOwed {
+		if _, back := desired[name]; back {
+			slog.Info("ra: dropping final-goodbye retry debt; interface is advertised again",
+				"interface", name)
+			delete(m.goodbyeOwed, name)
+			continue
+		}
+		if d == nil || d.cfg == nil {
+			delete(m.goodbyeOwed, name)
+			continue
+		}
+		if d.recordedEpoch == m.epoch {
+			// Recorded by THIS Apply's own withdrawal — hold it over to the next
+			// pass, but still report it outstanding.
+			held = append(held, name)
+			continue
+		}
+		if d.attempts >= maxGoodbyeRetries {
+			slog.Warn("ra: giving up on the final lifetime-0 goodbye; hosts may "+
+				"hold this router until Router Lifetime expiry",
+				"interface", name, "attempts", d.attempts)
+			delete(m.goodbyeOwed, name)
+			continue
+		}
+		d.attempts++
+		todo = append(todo, d.cfg)
+	}
+	m.mu.Unlock()
+
+	var errs []error
+	for _, name := range held {
+		errs = append(errs, fmt.Errorf("ra: final goodbye owed on %s (retry deferred to the next pass)", name))
+	}
+	if len(todo) == 0 {
+		return errors.Join(errs...)
+	}
+
+	for _, r := range m.WithdrawOnce(todo) {
+		switch {
+		case r.Sent:
+			m.mu.Lock()
+			delete(m.goodbyeOwed, r.Interface)
+			m.mu.Unlock()
+			slog.Info("ra: retried final goodbye succeeded; debt cleared",
+				"interface", r.Interface)
+		case r.Skipped:
+			// Busy: another owner holds the interface and will emit. Refund the
+			// attempt — a skip is not a try.
+			m.mu.Lock()
+			if d := m.goodbyeOwed[r.Interface]; d != nil && d.attempts > 0 {
+				d.attempts--
+			}
+			m.mu.Unlock()
+			errs = append(errs, fmt.Errorf("ra: final goodbye still owed on %s (interface busy)", r.Interface))
+		default:
+			errs = append(errs, r.Err)
+		}
+	}
+	return errors.Join(errs...)
+}
 
 // interfaceBusy reports whether the named interface currently has an active
 // sender or a draining tombstone. Callers must hold m.mu.
@@ -207,12 +384,16 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 	// no observable 0-live-conn window across a config replace (#2834). The old
 	// conn was PROVEN closed before the replacement started (≤1 live conn), and
 	// waitConnReady returns promptly if the open gives up or is pre-empted.
-	repl, err := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
+	repl, goodbyeErr, startErr := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
 	if repl != nil && !repl.waitConnReady(claimWaitTimeout) {
 		slog.Warn("ra: replacement sender conn did not come up after a "+
 			"config replace", "interface", name)
 	}
-	return err
+	// #6777: a failed FINAL goodbye is a caller-visible failure, not a log line.
+	// Joining it with the start error is what makes Apply's firstErr and
+	// Withdraw's aggregate non-nil, which in turn keeps the daemon's reconcile
+	// digest un-advanced so the owed goodbye is actually retried.
+	return errors.Join(goodbyeErr, startErr)
 }
 
 // finishDrainDecision runs the ordered post-close decision for a draining
@@ -245,7 +426,13 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 // installs the entry immediately before this runs, and a racing Withdraw only
 // flips fields on that SAME entry (never replaces it), so the guard always
 // holds there — the behavior is unchanged.
-func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64, onProvenClose func() error) (*sender, error) {
+func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64, onProvenClose func() error) (*sender, error, error) {
+	// goodbyeErr survives the re-loop: the emit runs with m.mu dropped and the
+	// loop re-acquires to decide the replacement, so a failure recorded on the
+	// emit pass must still be returned after the (goodbye-free) second pass
+	// falls through to the tombstone delete. Returning it is only half of
+	// #6777 — recordGoodbyeDebtLocked below retains the state a retry needs.
+	var goodbyeErr error
 	for {
 		m.mu.Lock()
 		e := m.draining[name]
@@ -253,7 +440,7 @@ func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64,
 			// Gone, or a newer call re-claimed the interface with its own entry;
 			// that newer owner manages its own goodbye/replacement/release.
 			m.mu.Unlock()
-			return nil, nil
+			return nil, goodbyeErr, nil
 		}
 
 		// Decide goodbye claim-once with FRESH goodbyeWanted/goodbyeClaimed.
@@ -267,9 +454,22 @@ func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64,
 				// Surface a failed backstop goodbye (#5093): this is the last
 				// retry the graceful-withdraw path has, so a swallowed write
 				// error here would silently leave the stale router live on hosts.
+				// #6777: "surface" means RETURN it and RETAIN the debt — the
+				// pre-#6777 code logged it here and then fell through to the
+				// tombstone delete with goodbyeClaimed set, erasing every trace
+				// a retry could act on while reporting success to the caller.
 				if err := m.sendOneGoodbye(cfg); err != nil {
 					slog.Warn("ra: standalone goodbye failed",
 						"interface", name, "err", err)
+					goodbyeErr = err
+					m.mu.Lock()
+					m.recordGoodbyeDebtLocked(name, cfg, err)
+					m.mu.Unlock()
+				} else {
+					// A late success clears any debt an earlier attempt left.
+					m.mu.Lock()
+					delete(m.goodbyeOwed, name)
+					m.mu.Unlock()
 				}
 			}
 			// Re-loop: re-acquire the lock and re-evaluate against fresh state
@@ -297,7 +497,7 @@ func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64,
 		}
 		delete(m.draining, name)
 		m.mu.Unlock()
-		return repl, startErr
+		return repl, goodbyeErr, startErr
 	}
 }
 
@@ -328,10 +528,18 @@ func (m *Manager) reclaimTombstoneWhenStopped(name string, s *sender, startEpoch
 	go func() {
 		<-s.stopped
 		// The wedged owner has finally exited; its conn is now PROVEN closed.
-		repl, err := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
-		if err != nil {
+		repl, goodbyeErr, startErr := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
+		// #6777: the reclaimer has no caller to return to, so the retry debt
+		// recordGoodbyeDebtLocked left behind IS the surface here — the next
+		// Apply picks it up. Log the two failures distinctly; conflating them
+		// under the replacement-start message hid which one actually happened.
+		if goodbyeErr != nil {
+			slog.Warn("ra: reclaimer final goodbye failed after wedged owner "+
+				"exited; retry debt retained", "interface", name, "err", goodbyeErr)
+		}
+		if startErr != nil {
 			slog.Warn("ra: reclaimer replacement start failed after wedged owner "+
-				"exited", "interface", name, "err", err)
+				"exited", "interface", name, "err", startErr)
 			return
 		}
 		// Best-effort make-before-break for the healed replacement (bounded).
@@ -382,11 +590,22 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 		// no-goodbye primitive for a forced/unsafe stop.
 		owned, epoch := m.collectGracefulWithdrawLocked()
 		m.mu.Unlock()
+		var errs []error
 		for _, o := range owned {
 			// nil onProvenClose: a removal never starts a replacement.
-			m.releaseDrain(o.name, o.s, epoch, nil)
+			// #6777: a failed final goodbye here is returned, not dropped —
+			// this branch IS the cluster "no active owner" withdrawal, and its
+			// caller (reconcileClusterRAServices) latches convergence on a nil
+			// return.
+			if err := m.releaseDrain(o.name, o.s, epoch, nil); err != nil {
+				errs = append(errs, err)
+			}
 		}
-		return nil
+		// Nothing is desired, so every outstanding debt is still owed.
+		if err := m.retryOwedGoodbyes(nil); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
 	}
 
 	// Build desired map.
@@ -535,6 +754,16 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 		}
 	}
 
+	// #6777: re-attempt any final goodbye a PREVIOUS graceful withdrawal failed
+	// to emit. This runs LAST so the removals above have already released their
+	// tombstones — a retry claims the interface through WithdrawOnce and would
+	// otherwise self-skip on a tombstone this very Apply still holds. While any
+	// debt survives this returns non-nil, which keeps the daemon's RA reconcile
+	// digest un-advanced so the periodic pass re-drives Apply.
+	if err := m.retryOwedGoodbyes(desired); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
 	return firstErr
 }
 
@@ -636,11 +865,18 @@ func (m *Manager) Withdraw() error {
 	m.bumpEpoch()
 	owned, epoch := m.collectGracefulWithdrawLocked()
 	m.mu.Unlock()
+	// #6777: aggregate the per-interface outcomes instead of returning a
+	// hard-coded nil. Every caller already had an `if err := d.ra.Withdraw();
+	// err != nil` branch — those branches were unreachable, so a final goodbye
+	// that never went out was reported to operators as a clean withdrawal.
+	var errs []error
 	for _, o := range owned {
 		// nil onProvenClose: a withdraw never starts a replacement.
-		m.releaseDrain(o.name, o.s, epoch, nil)
+		if err := m.releaseDrain(o.name, o.s, epoch, nil); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // collectGracefulWithdrawLocked flips graceful-withdrawal intent on every active
@@ -683,7 +919,13 @@ func (m *Manager) WithdrawInterfaces(names []string) {
 	epoch := m.epoch
 	m.mu.Unlock()
 	for _, o := range owned {
-		m.releaseDrain(o.name, o.s, epoch, nil)
+		// #6777: no error return to thread this through (this entry point has
+		// no production caller today), but a failed final goodbye still leaves
+		// retry debt that the next Apply picks up. Log which interface it was.
+		if err := m.releaseDrain(o.name, o.s, epoch, nil); err != nil {
+			slog.Warn("ra: interface-scoped withdraw failed",
+				"interface", o.name, "err", err)
+		}
 	}
 }
 
@@ -884,7 +1126,7 @@ func (m *Manager) sendOneGoodbye(cfg *config.RAInterfaceConfig) error {
 	if err != nil {
 		slog.Debug("ra: WithdrawOnce: interface not found",
 			"interface", cfg.Interface, "err", err)
-		return fmt.Errorf("ra: goodbye interface %s: %w", cfg.Interface, err)
+		return fmt.Errorf("%w %s: %w", errGoodbyeIfaceMissing, cfg.Interface, err)
 	}
 	s := newSender(cfg, iface)
 	if err := s.sendGoodbyeStandalone(); err != nil {
@@ -936,7 +1178,15 @@ func (m *Manager) clearLocked() error {
 	// starts a replacement.
 	m.mu.Unlock()
 	for _, p := range ps {
-		m.releaseDrain(p.name, p.s, epoch, nil)
+		// Clear is the explicit NO-goodbye primitive, so a goodbye is owed here
+		// only when a racing graceful Withdraw flipped goodbyeWanted on one of
+		// these entries. That Withdraw does not own the release and cannot
+		// observe the outcome, so this log (plus the #6777 retry debt) is the
+		// only surface for it.
+		if err := m.releaseDrain(p.name, p.s, epoch, nil); err != nil {
+			slog.Warn("ra: clear: a goodbye claimed by a racing withdraw failed",
+				"interface", p.name, "err", err)
+		}
 	}
 	m.mu.Lock()
 	return nil
