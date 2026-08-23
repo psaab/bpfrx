@@ -296,3 +296,98 @@ func TestReseedScanTimeoutDoesNotHoldStoreMutex6776(t *testing.T) {
 			"the scan is holding the global store mutex unbounded", 20*budget)
 	}
 }
+
+// TestReseedScanTimeoutInvalidatesSeedMarkerOnReturn6776 guards the one part of
+// the timeout path the fail-open test above cannot see: clearing
+// archiveSeedDir. At cold boot the marker is already empty, so clearing it is a
+// no-op there and a fixture built around boot stays GREEN with the clear
+// deleted. The smallest shape where deleting it changes an OUTCOME is a dir
+// SWITCH: A scans cleanly (marker = A), B times out, and the process returns to
+// A. If the timeout did not invalidate the marker, the return to A finds
+// marker == A and SKIPS the rescan — so an on-disk max that advanced in A while
+// this process was pointed at B is never picked up, the counter stays low, and
+// every archive written afterwards is below-max and pruned as stale.
+//
+// This is the #6404-adjacent invariant (A → failed-B → A re-scans A) extended
+// to the #6776 timeout: a scan that did not answer leaves the counter exactly
+// as unconfirmed as a scan that errored, so it must invalidate the marker for
+// the same reason.
+//
+// FAIL-ON-REVERT: deleting `s.archiveSeedDir = ""` from the timeout branch
+// leaves the marker at dirA, the return to dirA short-circuits as
+// already-seeded, the counter stays at 5, and the archive written from it
+// (seq 6, below the advanced max 100..102) is pruned by rotation — reding both
+// the counter signal and the rotation outcome.
+func TestReseedScanTimeoutInvalidatesSeedMarkerOnReturn6776(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	// dirA holds seqs 1..5; configuring it seeds the counter to 5 and marks
+	// dirA as the successfully-scanned dir.
+	for seq := 1; seq <= 5; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirA, 100, fmt.Sprintf("a-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Store{}
+	s.SetArchiveConfig(dirA, 3)
+	if got := s.archiveSeq.Load(); got != 5 || s.archiveSeedDir != dirA {
+		t.Fatalf("after configuring dirA, archiveSeq=%d seedDir=%q, want 5 / %q", got, s.archiveSeedDir, dirA)
+	}
+
+	// Navigate to dirB, whose scan does NOT ANSWER (unresponsive filesystem)
+	// rather than erroring.
+	const budget = 100 * time.Millisecond
+	setArchiveScanBudget(t, budget)
+	realReader := archiveDirReader
+	hangUntil := make(chan struct{})
+	archiveDirReader = func(string) ([]os.DirEntry, error) {
+		select {
+		case <-hangUntil:
+		case <-time.After(5 * time.Second):
+		}
+		return nil, os.ErrPermission
+	}
+	s.SetArchiveConfig(dirB, 3)
+	archiveDirReader = realReader
+	t.Cleanup(func() { close(hangUntil) })
+
+	// While this process was pointed at dirB, an external writer advanced
+	// dirA's on-disk max to 100..102.
+	for seq := 100; seq <= 102; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second)
+		if err := writeArchive(dirA, 100, fmt.Sprintf("a-%d\n", seq), ts, uint64(seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Return to dirA. The timed-out dirB scan must have invalidated
+	// archiveSeedDir, so this re-scans dirA and catches up to 102.
+	s.SetArchiveConfig(dirA, 3)
+	// Supporting signal (non-fatal so the REAL rotation assertion is load-bearing).
+	if got := s.archiveSeq.Load(); got != 102 {
+		t.Errorf("returning to dirA after a TIMED-OUT dirB scan must rescan dirA and catch up to "+
+			"its advanced on-disk max (102); got %d", got)
+	}
+
+	// REAL rotation outcome: an archive written with the re-seeded counter must
+	// survive, and the oldest pre-existing archive (a-100) must be pruned.
+	seq := s.archiveSeq.Add(1) // 103, from the reseeded 102
+	ts := base.Add(time.Duration(seq) * time.Second)
+	if err := writeArchive(dirA, 3, "a-return-6776\n", ts, seq); err != nil {
+		t.Fatal(err)
+	}
+	remain := archiveContents(t, dirA)
+	if !remain["a-return-6776"] {
+		t.Errorf("the archive written after returning to dirA must survive rotation (its "+
+			"re-seeded seq outranks the advanced pre-existing max); remain=%v", remain)
+	}
+	if remain["a-100"] {
+		t.Errorf("the oldest pre-existing archive (a-100) must be pruned; remain=%v", remain)
+	}
+	if len(remain) != 3 {
+		t.Errorf("want 3 archives after rotation (max=3), got %d: %v", len(remain), remain)
+	}
+}
