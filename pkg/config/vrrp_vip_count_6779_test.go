@@ -257,3 +257,36 @@ func TestRethDerivedVIPCountSkippedWhenRGElectionPrivate(t *testing.T) {
 			cfg.Warnings)
 	}
 }
+
+// TestVRRPVIPCountConstantsAreInternallyConsistent is the pkg/config half of
+// the two-test binding on a number that is necessarily spelled twice (#6779).
+//
+// pkg/vrrp imports pkg/config and never the reverse, so the per-family ceiling
+// exists both here and as vrrp.MaxConfiguredVIPs. The BEHAVIOURAL binding —
+// "these constants equal what the real Marshal accepts" — can only live in
+// pkg/vrrp, because only that package can see the wire builder. A developer
+// running just `go test ./pkg/config/` would therefore not observe a broken
+// constant at all; only the repo-wide gate would.
+//
+// This test closes that window from the config side by pinning the RELATIONSHIP
+// rather than either value: an IPv6 advertisement must carry the virtual
+// router's link-local first (RFC 5798 §6.1), and pkg/vrrp sendPacketIPv6
+// prepends it, so exactly ONE slot is unavailable to configured IPv6 VIPs.
+// Editing either constant without the other reds here immediately.
+func TestVRRPVIPCountConstantsAreInternallyConsistent(t *testing.T) {
+	if d := MaxVRRPVirtualAddressesIPv4 - MaxVRRPVirtualAddressesIPv6; d != 1 {
+		t.Fatalf("IPv4 cap %d - IPv6 cap %d = %d, want exactly 1: the IPv6 advert "+
+			"reserves one slot for the mandatory link-local prepend, so the two "+
+			"caps must differ by exactly that slot (see pkg/vrrp "+
+			"MaxConfiguredVIPs, bound behaviourally in "+
+			"advert_capacity_agreement_6779_test.go)",
+			MaxVRRPVirtualAddressesIPv4, MaxVRRPVirtualAddressesIPv6, d)
+	}
+	// Both caps must be expressible in the single wire byte they describe.
+	for _, c := range []int{MaxVRRPVirtualAddressesIPv4, MaxVRRPVirtualAddressesIPv6} {
+		if c < 1 || c > 255 {
+			t.Errorf("cap %d does not fit the one-byte Count IPvX Addr field "+
+				"(RFC 5798 §5.2.4)", c)
+		}
+	}
+}
