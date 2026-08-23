@@ -23,6 +23,29 @@ import (
 // pkg/dataplane/runtime/import_canary_test.go (forbidden-import
 // canary) after #1528 deleted pkg/dataplane/dpdk and its
 // package-local test.
+// ErrSyncedImportRefused classifies an HA synced-session mirror that REACHED a
+// healthy userspace helper and was refused on SEMANTIC grounds (#6785): a stale
+// install generation (#2170), the aggregate synced-import ceiling (#5674), or a
+// translated-tuple reservation refusal (#6600).
+//
+// It lives here, not in pkg/dataplane/userspace, so the cluster session-sync
+// layer can classify the error it already receives without importing the
+// userspace manager (which would be an import cycle). The wire token that
+// produces it stays with the transport that parses it
+// (syncedImportRefusedPrefix, pkg/dataplane/userspace/process_control.go).
+//
+// The distinction it carries is load-bearing. A transport failure means the
+// helper session socket is sick and must gate HA takeover-readiness (#5247); a
+// refusal is the CORRECT answer from a healthy helper — the peer sent something
+// stale, or this node is at its own import ceiling. Marking the mirror unhealthy
+// for a refusal would latch a working standby "not takeover-ready" the first
+// time a peer oversubscribed it, which is a worse failure than the split truth
+// the refusal reporting exists to fix. What a refusal DOES owe is compensation
+// (the helper did not take the session, so the local BPF row is split truth) and
+// visibility, because the peer believes it synced a session this node does not
+// hold and only its next full sync closes that gap.
+var ErrSyncedImportRefused = errors.New("synced session import refused by helper")
+
 var ErrDPDKBackendRetired = errors.New(
 	"the DPDK dataplane backend has been retired; use " +
 		"'set system dataplane-type userspace' (see #1525)",

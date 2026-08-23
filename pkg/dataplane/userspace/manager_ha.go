@@ -17,6 +17,8 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/config"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // syncHAWatchdogOnlyLocked syncs HA state to the helper from the periodic
@@ -385,6 +387,38 @@ func (m *Manager) recordSessionMirrorFailureLocked(err error) {
 // self-heals the state without a restart. No-op when the helper is not running:
 // syncSession{V4,V6}Locked returns nil without sending in that case, so there
 // was no real mirror to prove health (and stopLocked already cleared the flag).
+// noteSyncedMirrorFailureLocked accounts a FAILED synced-session mirror for the
+// cluster install paths (#6785). It is shared by SetClusterSyncedSessionV4 and
+// V6 rather than duplicated: the two entry points would otherwise carry two
+// copies of one health decision, and a divergence between them is always a bug
+// — an IPv6-only misclassification would disarm HA takeover on exactly the
+// deployments hardest to notice it on. Callers hold m.mu.
+//
+// The classification is the point. A SEMANTIC refusal (stale generation, import
+// cap, translated-tuple reserve) is the correct answer from a HEALTHY helper:
+// the peer sent something stale, or this node is at its own ceiling. It is
+// counted as debt — the peer believes it synced a session this node does not
+// hold — and the caller still compensates its BPF write, because the helper did
+// not take the session. But it must NOT set the sticky mirror-failure flag,
+// which gates HA takeover-readiness (#5247): latching a working standby "not
+// takeover-ready" the first time a peer oversubscribed it is a worse failure
+// than the split truth being fixed, and a silent one.
+//
+// A refusal does not take the SUCCESS path either. That flag means "a mirror
+// last succeeded", and a refusal is not a mirror; clearing a sticky failure on
+// the strength of a refused write would let a helper that refuses everything
+// read as recovered.
+func (m *Manager) noteSyncedMirrorFailureLocked(err error) {
+	if errors.Is(err, dataplane.ErrSyncedImportRefused) {
+		m.syncedImportRefusals.Add(1)
+		slog.Debug("userspace: helper refused a synced session import; "+
+			"rolling back the BPF mirror", "err", err)
+		return
+	}
+	m.recordSessionMirrorFailureLocked(err)
+	slog.Debug("userspace: session mirror failed", "err", err)
+}
+
 func (m *Manager) recordSessionMirrorSuccessLocked() {
 	if m.proc == nil {
 		return
