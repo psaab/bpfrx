@@ -104622,6 +104622,180 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/shutdown_latch_6787_test.go,
   pkg/daemon/daemon_run_shutdown.go,
   pkg/daemon/shutdown_dhcp_stop_6787_test.go, pkg/dhcpserver/README.md, _Log.md
+## 2026-08-22 — #6786 fail closed when a NIC identity read fails
+
+## 2026-08-22 — #6782 invalid RETH redundancy-group committed as a both-node address
+
+- **Timestamp**: 2026-08-22
+- **Action**: `redundant-ether-options redundancy-group` is an untyped schema
+  leaf and `compileInterfaces` reads it with Atoi-then-discard-the-error, so a
+  non-numeric token collapsed to 0 and a negative one was stored verbatim.
+  Downstream every consumer asks `redundancy-group > 0` (`isReth` /
+  `isVRRPReth` in `pkg/dataplane/compiler_iface.go`), so the interface read as
+  ORDINARY: the `169.254.RG.NODE/32` substitution did not fire and the reth's
+  service address was written to the physical device on BOTH nodes. Measured
+  every value class first — 0, negative, non-numeric, fractional, int64
+  overflow, above-cap and undeclared-but-positive ALL committed clean on both
+  the strict and tolerant paths. Added `validateRethRedundancyGroupTokensAST`,
+  an AST pre-walk gate (strict reject / lenient warn via
+  `lenientRethRedundancyGroup`) accepting 1..255 — floor 1 because RG0 is the
+  control-plane group by `cluster.Manager.DataGroupIDs`' own definition,
+  ceiling 255 because the id is the third octet of the derived link-local. The
+  1..155 VRID bound stays owned by `validateRethVRRPGroupIDStrict`, which
+  correctly returns early under the default `private-rg-election`. The tolerant
+  path additionally SUPPRESSES the reth's addresses (and its members'), because
+  warning and then installing on both nodes anyway would make the lenient path
+  the bug. Deliberately not extended to a missing stanza (measured: in-tree
+  overlay fragments rely on it) or to an undeclared positive id (does not
+  trigger the fail-open).
+- **File(s)**: `pkg/config/compiler_reth_rg_token.go`,
+  `pkg/config/compiler_interfaces.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_prewalk.go`,
+  `pkg/config/compiler_reth_rg_token_6782_test.go`,
+  `pkg/daemon/vip_readiness_test.go`, `docs/config-schema.md`
+
+- **Timestamp**: 2026-08-22
+- **Action**: `EnumeratePresentNICs` read each NIC's identity under
+  `if link, err := netlink.LinkByName(name); err == nil` with the error
+  DISCARDED, so a failed read left `PermMAC == ""` — the same value MAC-less
+  hardware produces. `Resolve`'s card-swap refusal is conditioned on
+  `PermMAC != ""`, so a failed read silently DISABLED it and bound the entry as
+  `BindBoundPCIOnly`. Added `PresentNIC.IdentityUnread`, a new
+  `BindRefusedIdentityUnknown` status (with its own operator remedy), and a
+  narrow refusal that fires only for entries pinning a `mac`.
+- **Scoping (the outage the naive fix would cause)**: the refusal does NOT
+  apply to PCI-only entries — their identity came from sysfs and was read
+  successfully. Widening it would let one transient netlink failure refuse every
+  mapped interface including management. Verified the fail-closed direction is
+  safe here: at commit the operator is still connected and nothing is mutated;
+  at boot the #5490 re-check retains the CURRENT interface naming.
+- **False green caught in my own test**: the first commit-preflight assertion
+  checked for the word "identity" and passed while the generic card-swap message
+  ("at its pinned identity") was returned — the wording it was meant to exclude.
+  Fixed by asserting the correct wording is PRESENT and the card-swap remedy
+  ABSENT, and by giving the new status its own message.
+- **File(s)**: `pkg/devicemap/devicemap.go`, `pkg/daemon/device_map.go`,
+  `pkg/grpcapi/server_show_device_map.go`, `pkg/cli/cli_show_cluster.go`,
+  `pkg/devicemap/identity_unread_6786_test.go`,
+  `pkg/daemon/device_map_identity_unread_6786_test.go`,
+  `docs/bare-metal-device-map.md`, `_Log.md`
+
+## 2026-08-22 — #6793 dead RA sender had no retry owner
+
+- **Timestamp**: 2026-08-22
+- **Action**: A sender's conn open is asynchronous, so a bind failure leaves the
+  sender dead with `startLocked` having reported success. `Apply`'s #2865 branch
+  rebuilds a dead sender, but standalone applies RA only from a config apply
+  (`reconcileRGStateLoop` is cluster-only) and the cluster reconcile is
+  digest-gated — a dead sender moves no digest. Added
+  `ra.Manager.HasDeadSenders()`/`DeadSenderInterfaces()`, a digest bypass in
+  `reconcileClusterRAServices`, and an always-on `raDeadSenderReassertLoop`
+  mirroring `proxyARPReassertLoop` (applySem before the config read, #4001).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/dead_sender_probe_6793_test.go,
+  pkg/daemon/daemon_ra_reconcile.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/ra_dead_sender_retry_6793_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6793 round 2 — two mutation cells came back GREEN. Removing the
+  INNER dead-sender re-check (the one after applySem) was invisible because the
+  outer check still short-circuited the healthy fixture; and nothing bound the
+  loop's START in Run, so a daemon that never launched the retry owner passed
+  every cell. Added the queue-behind-a-commit interleave, a loop-body cell with
+  a shortened interval, and a comment-stripped source check on the start site.
+- **File(s)**: pkg/daemon/ra_dead_sender_retry_6793_test.go, _Log.md
+## 2026-08-22 — #6788 fence background applies at shutdown; quiesce the DHCP callback
+
+## 2026-08-22 — #6792 DNS ownership failures were warning-only
+
+- **Timestamp**: 2026-08-22
+- **Action**: `dnsReconciler.reconcile` logged all three failure points (mask,
+  stale drop-in removal, managed-file write) at WARN and returned nothing;
+  `reconcileDNSLocked` returned nothing, so a commit could report success while
+  leaving a dual resolver or a stale `/etc/resolv.conf`. Its two siblings in
+  `applyTailReconciles` (`applyLo0Filter`, `applyHostInboundFilter`) already
+  fail the commit closed — DNS was the only reconciler there whose error could
+  not propagate. Now accumulates and returns; joined into the commit result.
+  Accumulate-not-return-early preserves the deliberate "still own resolv.conf
+  after a mask failure" behaviour, and both SUCCESS early returns carry the
+  accumulated error.
+- **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, docs/dns-ownership.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6792 round 2 — the mutation matrix found a GREEN cell: removing
+  `dnsErr` from `applyTailReconciles`' tail `errors.Join` left the whole suite
+  green. The reconcile can return errors all day and the commit still succeeds
+  if nothing joins them, and that join IS the fix. Added a `reconcileDNSFn`
+  seam and two cells driving the REAL `applyTailReconciles` (#5696 precedent),
+  paired so "always returns an error" also fails.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dns.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, _Log.md
+
+- **Timestamp**: 2026-08-22
+- **Action**: `runShutdownSequence`'s apply drain is a drain-and-RELEASE, not a
+  barrier: it acquires `applySem` to wait out an in-flight apply's closeout and
+  hands it straight back, so any background applier waking afterwards acquired
+  immediately and ran a FULL apply into a half-torn-down daemon. Added
+  `Daemon.applyFenced` + `beginBackgroundApply` (one gate shared by
+  `applyConfig` / `applyActiveConfig` / `applyActiveConfigResult`, testing the
+  fence BEFORE and AFTER the semaphore acquire), latched at the very start of
+  shutdown — fence, then cancel, then drain.
+- **Measured**: "non-cancellable" is TRUE and DELIBERATE —
+  `applyConfigUnderSem` binds `context.Background()` by design so background
+  applies always run to completion, and `applyCancelCtx()` is explicitly not
+  used there. So cancellation cannot cover a not-yet-started apply; refusing it
+  before it begins is the only mechanism, and is better than aborting midway.
+- **The obvious fix would have caused an outage**: `dhcp.Manager.StopAll()` is
+  never called in production, and calling it at shutdown cancels every client →
+  `finishClient` → `removeAddress`, stripping the DHCP address from every DHCP
+  interface including a DHCP-managed management NIC, during shutdown AND across
+  a graceful restart (the contract `pkg/dhcp`'s client-context comment states).
+  Added `Quiesce()` instead: stops the 2s debounce timer, latches, joins an
+  in-flight callback, and touches no lease/address/client.
+- **Both mechanisms are required**: the fence does not cover
+  `onDHCPAddressChange`'s non-apply work (`nudgeSurfaceADDNSReconcile`,
+  `applyMgmtVRFRoutes` netlink writes, `reconcileDNSFromDHCP`); the quiesce does
+  not cover the feed / config-poll appliers.
+- **Matrix found an unbound guard**: deleting the PRE-acquire fence test left
+  the suite green — the post-acquire test covers safety on its own. It is not
+  redundant for LIVENESS though: `beginBackgroundApply` acquires with
+  `context.Background()`, so without it a late applier parks forever on a held
+  semaphore during teardown. Bound with a cell that holds the semaphore and
+  never releases it.
+- **Bug caught by my own test**: the first `Quiesce` took `recompileWG.Add(1)`
+  at arm time, so a STOPPED timer never called `Done` and `Wait` deadlocked.
+  Moved Add into the timer func under the same mutex as the latch re-test
+  (#5869 archiveWG discipline).
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_run_shutdown.go`, `pkg/dhcp/dhcp.go`,
+  `pkg/daemon/shutdown_apply_fence_6788_test.go`,
+  `pkg/dhcp/quiesce_6788_test.go`, `pkg/daemon/README.md`,
+  `pkg/dhcp/README.md`, `_Log.md`
+
+## 2026-08-22 — #6781 one predicate for RETH redundancy-group ownership
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced both ownership readings from real compiled configs
+  before choosing a survivor, and found BOTH wrong in opposite directions: the
+  VRRP-backed collector's bare `RedundancyGroup > 0` claimed a non-reth
+  interface (turning its own address into a MASTER-only VIP), while the direct
+  collector's `reth`-name filter dropped a structurally valid pair not spelled
+  `reth*` (leaving that group with no VIPs). Under `no-reth-vrrp` the two
+  combined with networkd's link-local substitution to strip a non-reth
+  interface's address on both nodes with nobody installing it back. Added
+  `Config.RethRGOwners` as the shared structural-or-nominal predicate, routed
+  both collectors through it, stopped networkd treating a non-reth as a VRRP
+  reth member, and added a commit gate with a lenient opt. Then folded in the
+  five pkg/daemon RG-membership readers (stable link-local add/remove, direct
+  GARP burst, DHCP RG-scoping, BACKUP blackhole routes), which each carried
+  their own name test — without them a structurally valid pair got VIPs from
+  both modes and then no GARP, link-local or blackhole routes.
+- **File(s)**: `pkg/config/reth_rg_owner.go` (new),
+  `pkg/config/compiler_validate_strict_reth_rg.go` (new),
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_routing_rib_rpm.go`,
+  `pkg/vrrp/vrrp.go`, `pkg/dataplane/compiler_iface.go`,
+  `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
+  `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
+  `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
 
 ## 2026-08-22 — #6751 PR 2/3 interface SNAT reserves its translated identity
 

@@ -130,7 +130,14 @@ type Daemon struct {
 	// once after the boot apply and read only under applySem in
 	// reconcileDNSLocked.
 	dnsBootDone bool
-	dhcpServer  *dhcpserver.Manager
+
+	// reconcileDNSFn overrides the DNS reconcile (#6792). Nil means the real
+	// one. It exists so a test can drive the REAL applyTailReconciles and prove
+	// a DNS failure reaches the commit result — before #6792 that error could
+	// not propagate at all, and the per-function cells stay green if the join
+	// is removed again.
+	reconcileDNSFn func(*config.Config, bool) error
+	dhcpServer     *dhcpserver.Manager
 	// ddns is the always-on DHCP dynamic-DNS manager (#1387 inc-2). It is
 	// constructed UNCONDITIONALLY at daemon start (plan §4.2) — even when
 	// DDNS is disabled — so an enabled→disabled commit always has a running
@@ -594,6 +601,30 @@ type Daemon struct {
 	// concurrent apply goroutine race safely. A failed wipe clears it again so
 	// the box stays recoverable (fail-closed, see factoryReset).
 	resetting atomic.Bool
+	// applyFenced marks the daemon as SHUTTING DOWN for the purpose of
+	// background config applies (#6788). runShutdownSequence sets it at the very
+	// start — before it cancels the in-flight apply and before the single
+	// apply drain — and never clears it: unlike the reset generation there is no
+	// recoverable outcome to clear it for, because the process is exiting.
+	//
+	// It exists because the drain is a drain-and-RELEASE, not a barrier. It
+	// acquires applySem to wait for an in-flight apply's closeout and then hands
+	// the semaphore straight back, so any background applier that wakes AFTER it
+	// acquires immediately and runs a full apply into a half-torn-down daemon.
+	// Cancellation cannot cover that case: applyCancelContext aborts an apply
+	// that is already RUNNING, and the background appliers deliberately bind
+	// context.Background() precisely so they always run to completion
+	// (applyConfigUnderSem). There is nothing to cancel in an apply that has not
+	// started, so the only way to stop it is to refuse it before it begins —
+	// which is also strictly better than cancelling one midway, since no
+	// half-finished apply is ever left behind.
+	//
+	// Read/written only via applyFencedForBackground / fenceBackgroundApplies
+	// (sync/atomic), so the shutdown goroutine and any background applier race
+	// safely. The COMMIT paths are deliberately not gated here: they bind
+	// request-scoped contexts, are already covered by #2926 cancellation, and
+	// their servers are stopped during teardown.
+	applyFenced atomic.Bool
 	// applyBodyForTest, when non-nil, replaces applyConfigLocked's
 	// body. Test-only seam used by apply_serialize_test.go to
 	// exercise the semaphore contract through the real applyConfig
@@ -959,6 +990,14 @@ type Daemon struct {
 	raReconcileMu       sync.Mutex
 	lastRAReconcileHash string
 	raApplyFn           func([]*config.RAInterfaceConfig) error
+
+	// raHasDeadSendersFn overrides the dead-sender probe (#6793). Nil means use
+	// d.ra.HasDeadSenders. It exists because the reassert loop's contract —
+	// "re-drive the apply if and only if a sender is DEAD" — cannot be
+	// exercised against a real ra.Manager without an interface whose ndp.Listen
+	// genuinely fails, and a fixture that manufactured that would be asserting
+	// the bind failure rather than the retry ownership.
+	raHasDeadSendersFn func() bool
 
 	// startupActiveAnnounce tracks whether the one-shot active-side
 	// neighbor refresh has been sent for each RG on this daemon run.

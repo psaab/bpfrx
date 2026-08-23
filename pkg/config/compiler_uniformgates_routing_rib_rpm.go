@@ -265,5 +265,28 @@ func runUniformGatesRoutingRibRPM(tree *ConfigTree, cfg *Config, opts compileOpt
 		}
 	}
 
+	// #6781 RETH redundancy-group ownership gate. Strict on commit /
+	// commit-check: `redundant-ether-options redundancy-group <N>` on an
+	// interface no port names as its redundant-parent is not a
+	// redundant-ethernet interface, and the three consumers of that stanza
+	// disagreed about it — networkd replaced the operator's address with a
+	// link-local /32, the VRRP-backed owner claimed the real address as a VIP,
+	// and the direct owner skipped it, so under no-reth-vrrp the address was
+	// stripped and installed by nobody on both nodes. Lenient on load /
+	// peer-sync (warn so an already-persisted or peer-synced config still
+	// boots — #1960 no-brick; the runtime resolves ownership through the shared
+	// structural predicate, so the interface stays a plain L3 interface).
+	// Runs after validateRethMemberStrict, which has already established that
+	// the redundant-parent declarations themselves are coherent. Same doctrine
+	// as lenientRethMember.
+	if err := validateRethRedundancyGroupStrict(cfg); err != nil {
+		if opts.lenientRethRGOwnership {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reth redundancy-group (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	return nil
 }

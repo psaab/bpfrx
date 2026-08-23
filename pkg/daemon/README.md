@@ -272,6 +272,48 @@ startup-phase and shutdown ordering is untouched:
   methods, `startGRPCServer`, `startHTTPServer`, `resolveAPIBinds`.
 - `daemon_run_shutdown.go` — ordered teardown: `applyCloseoutDrainTimeout`,
   `runShutdownSequence`, `runHAShutdownUpdate`.
+
+  **Background-apply fence (#6788).** The first thing `runShutdownSequence`
+  does — before it cancels the in-flight apply and before the single apply
+  drain — is latch `Daemon.applyFenced` and quiesce the DHCP client's
+  address-change callback. The ordering is load-bearing: **fence, then cancel,
+  then drain.**
+
+  The drain is a drain-and-**release**, not a barrier. It acquires `applySem`
+  to wait out an in-flight apply's #5643 closeout and hands the semaphore
+  straight back, so without the fence any background applier that wakes
+  afterwards acquires immediately and runs a FULL `applyConfigLocked` into a
+  half-torn-down daemon — after FRR is stopped, the dataplane is torn down and
+  the VIPs are withdrawn. Cancellation cannot cover it: `applyCancelContext`
+  aborts an apply that is already RUNNING, and the background appliers bind
+  `context.Background()` deliberately so they always run to completion
+  (`applyConfigUnderSem`); there is nothing to cancel in an apply that has not
+  started. Refusing before it begins is also strictly better than aborting one
+  midway, since no half-finished apply is left behind.
+
+  Every background full apply passes the fence through ONE helper,
+  `beginBackgroundApply` — `applyConfig`, `applyActiveConfig` and
+  `applyActiveConfigResult` are a family that must agree, and a shared
+  predicate cannot drift the way three hand-written guards can. It tests the
+  fence **twice**, and the second test is the load-bearing one: an applier can
+  already be blocked on `applySem` behind an in-flight apply when shutdown
+  fences, and checking only before the acquire lets it through the instant that
+  apply releases — precisely the semaphore the drain just freed. The COMMIT
+  paths are deliberately not fenced: they bind request-scoped contexts, are
+  already covered by #2926 cancellation, and their servers are stopped during
+  teardown.
+
+  The DHCP quiesce is separate and **both are required**. `dhcp.Manager.Quiesce`
+  stops the 2s lease-change debounce timer and latches so a lease event racing
+  shutdown re-arms nothing; it is emphatically NOT `StopAll`, because cancelling
+  a client runs `finishClient` → `removeAddress` and would strip the DHCP
+  address from every DHCP interface — including a DHCP-managed management NIC —
+  both during this shutdown and across a graceful restart, which is the exact
+  contract `pkg/dhcp`'s client-context comment preserves. And the fence alone is
+  not sufficient either: `onDHCPAddressChange` nudges the Surface-A DDNS
+  reconcile and, on its management-only branch, runs `applyMgmtVRFRoutes`
+  (netlink route writes) and `reconcileDNSFromDHCP` — none of which pass through
+  `beginBackgroundApply`. Stopping the callback is what closes that half.
 - `daemon_run_routehelpers.go` — route/tunnel inference helpers:
   `riMemberLinuxName`, `collectAppliedTunnels`, `linkLocalV6Net`,
   `inferIPv6StaticNextHopInterfaces`.

@@ -32,6 +32,39 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// signal-driven stop has already cancelled it; this call also covers the
 	// interactive CLI-exit path and is idempotent. The teardown itself performs
 	// no applyConfigLocked, so nothing legitimate is aborted here.
+	// #6788: fence background applies FIRST — before the cancel below, and
+	// before the single drain that follows it. The drain is a drain-and-RELEASE,
+	// not a barrier: it acquires applySem to wait out an in-flight apply's
+	// closeout and hands the semaphore straight back, so without this fence any
+	// background applier that wakes afterwards acquires immediately and runs a
+	// FULL apply into a half-torn-down daemon. The DHCP lease-change callback is
+	// the one that reaches it on a 2s debounce timer, but the feed publication
+	// and config-poll appliers take the same path.
+	//
+	// Cancellation cannot cover it. applyCancelContext aborts an apply that is
+	// already RUNNING; the background appliers deliberately bind
+	// context.Background() so they always run to completion, and there is
+	// nothing to cancel in an apply that has not started. Refusing before it
+	// begins is also strictly better than aborting one midway — no half-finished
+	// apply is left behind.
+	//
+	// Ordering is load-bearing: fence, then cancel, then drain. That makes the
+	// drain the LAST apply this process performs, which is what the drain has
+	// always been documented to be.
+	d.fenceBackgroundApplies()
+
+	// #6788: stop the DHCP client's address-change notifications BEFORE the
+	// drain, so the drain is not racing a callback that is about to be armed.
+	// Quiesce is deliberately NOT StopAll: cancelling the clients would run
+	// finishClient -> removeAddress and STRIP the DHCP address from every DHCP
+	// interface — including a DHCP-managed management NIC (fxp0) — both during
+	// this shutdown and across a graceful restart, which is the exact contract
+	// pkg/dhcp's client context comment preserves. Quiesce leaves every lease,
+	// address and client goroutine untouched and shuts off only the callback.
+	if d.dhcp != nil {
+		d.dhcp.Quiesce()
+	}
+
 	if d.applyCancel != nil {
 		d.applyCancel()
 

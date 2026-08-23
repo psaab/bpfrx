@@ -1356,11 +1356,16 @@ func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 // RG member as node-local (both nodes serve DHCP on one redundant segment).
 func rethInterfacesMatchingRG(cfg *config.Config, want func(rgID int) bool) []string {
 	var names []string
+	rgOwners := cfg.RethRGOwners() // #6781
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
 		}
-		if want(ifc.RedundancyGroup) && strings.HasPrefix(name, "reth") {
+		// #6781: RG ownership from the shared predicate, not a name test. The
+		// #6520 rationale in this function's doc comment — "a divergence
+		// between them is ALWAYS a bug" — is exactly why it must not carry a
+		// private reading of its own.
+		if owns, ok := rgOwners[name]; ok && want(owns) {
 			// Resolve RETH to physical member for Linux-level operations.
 			resolved := config.LinuxIfName(cfg.ResolveReth(name))
 			for _, unit := range ifc.Units {
@@ -1404,11 +1409,12 @@ func (d *Daemon) injectBlackholeRoutesFor(userspaceActive bool, rgID int) {
 	}
 
 	var routes []netlink.Route
+	rgOwners := cfg.RethRGOwners() // #6781
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
 		}
-		if ifc.RedundancyGroup != rgID || !strings.HasPrefix(name, "reth") {
+		if owns, ok := rgOwners[name]; !ok || owns != rgID { // #6781
 			continue
 		}
 		for _, unit := range ifc.Units {
