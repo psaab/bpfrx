@@ -476,6 +476,48 @@ Rules of thumb:
 These are not "style" but are worth keeping next to the rest because
 they repeatedly bite:
 
+- **Never assert an exact count or an in-flight state that the SCHEDULER
+  can move (#7563).** Three tests in three packages failed under a
+  full-tree parallel `go test ./...` and passed on immediate re-run of
+  the SAME tree, on branches that could not reach the code they failed
+  in. They shared one shape: each sampled an asynchronous observable at
+  a fixed point, so the value read was a reading of the machine rather
+  than of the subject.
+  The three mechanisms are worth recognising, because none of them is a
+  data race and `-race` finds none of them:
+  1. a **retry-loop test that let one attempt reach the real resource** —
+     the fixture stubbed the failing attempts and let the winning one
+     bind a live port, so a genuine conflict made the loop resample
+     correctly and the exact-attempt-count assertion fail;
+  2. a **single sample taken right after an async enqueue** — the pass
+     under test hands work to a worker goroutine and returns, so "0
+     applies so far" is the correct answer to the wrong question;
+  3. a **counter read taken from a callback the producer fires BEFORE
+     it accounts the event** — the callback is delivered first by
+     construction, so observing it and then reading the counter races
+     an `Add(1)` that has not happened yet.
+  The fixes, in preference order: make the fixture unable to observe
+  the machine at all (inject the outcome rather than sampling a real
+  resource); otherwise wait on the observable that actually implies the
+  property, and make the wait FAIL LOUDLY, naming what never arrived.
+  Where the producer already publishes a completion watermark, wait on
+  that — it is advanced by the same goroutine after the accounting, so
+  a read taken once it covers the item happens-after the accounting.
+  What NOT to do: add a retry or a sleep to the assertion. That hides
+  the sensitivity instead of removing it, and a test that passes on the
+  second attempt is indistinguishable from one that passes for the
+  wrong reason. Nor is "just re-run it" free: classifying one of these
+  costs a full repo-wide re-run, and — the real damage — it trains
+  reviewers to re-run a red instead of reading it, which is precisely
+  the habit that lets a genuine regression through.
+  **Verify the population empirically rather than by pattern.** Of the
+  15 counter reads in `eventstream_test.go` that matched shape 3 by
+  eye, injecting a delay at the producer's accounting site red-flagged
+  exactly two. Pattern-matching would have rewritten a dozen tests that
+  were already sound. Reproduce a load-sensitive assertion by injecting
+  the scheduling perturbation a loaded box supplies for free, and fix
+  what actually reds.
+
 - **A test that needs a kernel capability must STUB it, not skip on it
   (#6675).** `pkg/dataplane/userspace` builds every snapshot through
   `buildRouteSnapshots`, which dumps the kernel ip-rule table via
