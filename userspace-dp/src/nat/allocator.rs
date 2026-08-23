@@ -173,17 +173,17 @@ const _: () = assert!(u128::BITS == MAX_NAT_HOLDER_WORKERS);
 /// once per apply with the pool name attached — and so a drop is never silent,
 /// which is the same class of defect the re-seed exists to fix.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReseedOutcome {
+pub(crate) struct ReseedOutcome {
     /// Live allocations re-seeded onto a retained address.
-    pub(super) reseeded: usize,
+    pub(crate) reseeded: usize,
     /// Skipped: the port falls outside the NEW port range (range narrowed).
-    pub(super) skipped_out_of_range: usize,
+    pub(crate) skipped_out_of_range: usize,
     /// Skipped: an address-only (`port no-translation`) token, which holds no
     /// port bit and is outside the port-reissue defect.
-    pub(super) skipped_address_only: usize,
+    pub(crate) skipped_address_only: usize,
     /// `reserve_flow` refused — the tuple is already owned in the new
     /// allocator. Expected to be zero on a freshly built allocator.
-    pub(super) refused: usize,
+    pub(crate) refused: usize,
 }
 
 /// #6211 F2: which worker is taking or dropping a reservation.
@@ -2089,7 +2089,7 @@ impl PortAllocator {
     ///
     /// Runs at config-apply only. It does not touch `claim()` and adds no
     /// per-packet work.
-    pub(super) fn reseed_retained_from(
+    pub(crate) fn reseed_retained_from(
         &self,
         prev: &PortAllocator,
         index_map: &FxHashMap<usize, usize>,

@@ -2259,6 +2259,7 @@ fn pool_snat_persistent_compatible_refresh_preserves_lease_state() {
         &[snapshot],
         Some(&rules),
         &crate::nat::NatCounterStore::default(),
+        0,
     );
     let after_refresh = source_nat_pool_statuses(&refreshed);
     assert_eq!(after_refresh[0].live_flows, 0);

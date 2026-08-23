@@ -189,6 +189,7 @@ fn parsed_nat_rules_share_store_counters() {
         ],
         None,
         &store,
+        0,
     );
     let snat_counter = snat[0]
         .hit_counter
