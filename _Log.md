@@ -104389,3 +104389,28 @@ prose edit above them added. No diff falls in the new test body.
   schema is right and nothing changed.
 - **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
   `pkg/config/schema_walk.go`, `pkg/config/schema_block_value_6774_test.go`
+
+## 2026-08-22 — #6778 a full config-apply queue stranded the newest generation
+
+- **Timestamp**: 2026-08-22
+- **Action**: The `default:` arm of the non-blocking enqueue in
+  `handleConfigPayload` discards the INCOMING payload, which is the NEWEST
+  generation the peer has sent, while the queue retains older ones — so the
+  standby drains onto a superseded config. `recordRecvConfigGen` had already
+  raised the received high-water for it, so the node read config-stale and
+  #5563 refused manual-failover promotion, with nothing driving the missing
+  generation back: the sender's #5863 (epoch x generation) marker is claimed
+  BEFORE the push and only a nack clears it. The drop now takes the three
+  actions an apply failure already took — its own `ConfigsQueueFullDropped`
+  counter rendered in cluster status, the #6387 grace timer via
+  `noteConfigApplyFailure(errConfigApplyQueueFull)`, and `sendConfigApplyNack`
+  so the sender's existing 30s reconcile re-pushes. No new retry queue.
+  `noteConfigApplySuccess` was narrowed to take the applied generation and
+  no-op while it is still below `lastRecvConfigGen`, because a queue only
+  fills when the consumer is behind and the backlog's successful applies were
+  cancelling the drop's debt milliseconds after it armed.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/status.go`,
+  `pkg/cluster/sync_conn_read.go`, `pkg/cluster/sync_conn_config.go`,
+  `pkg/cluster/sync_config_queue_full_6778_test.go`,
+  `pkg/cluster/sync_config_health_6387_test.go`, `docs/sync-protocol.md`,
+  `docs/session-sync-architecture.md`

@@ -234,6 +234,19 @@ type SyncStats struct {
 	// prior config (M-2/#4151). A persistently-nonzero value means a standby is
 	// repeatedly failing to apply the peer's config — investigate divergence.
 	ConfigsApplyFailed atomic.Uint64
+	// ConfigsQueueFullDropped counts config payloads that never reached the
+	// #3931 ordered apply queue because it was full at enqueue (#6778). The
+	// non-blocking enqueue discards the INCOMING payload, which is the NEWEST
+	// generation the peer has sent, while the queue retains older ones — so the
+	// drop leaves this node applying a superseded config. Counted separately
+	// from ConfigsApplyFailed because the failure is on the RECEIVE edge (the
+	// apply never ran) and from the generic Errors counter because "the standby
+	// is behind the primary's committed config" is a distinct operator action.
+	// The recovery is the same one an apply failure uses: the received
+	// high-water is still raised (so the node reads config-stale and #5563
+	// refuses manual-failover promotion), a config-apply nack re-arms the
+	// sender's #5863 push marker, and the sender's periodic reconcile re-pushes.
+	ConfigsQueueFullDropped atomic.Uint64
 	// ConfigApplyNacksReceived counts #7328 config-apply nacks accepted from the
 	// peer — one per generation this node pushed that the peer refused or failed
 	// to apply. A nack for a superseded generation is ignored and not counted.
@@ -335,8 +348,15 @@ type SyncStatsSnapshot struct {
 	// through a new Manager accessor because the Manager holds only the
 	// SyncStatsProvider interface, and this is the same transport every other
 	// field in the status render already uses.
-	PeerBootIncarnation        string
-	ConfigsApplyFailed         uint64
+	PeerBootIncarnation string
+	ConfigsApplyFailed  uint64
+	// #6778 receive-edge loss, and #7328's nack counter alongside it: the
+	// queue-full drop is recovered BY a nack, so a drop that is climbing while
+	// nacks are not tells the operator the recovery path itself is broken (a
+	// pre-#7328 peer, or a nack that never matched lastSentConfigGen). Both are
+	// rendered only when nonzero.
+	ConfigsQueueFullDropped    uint64
+	ConfigApplyNacksReceived   uint64
 	IPsecSASent                uint64
 	IPsecSAReceived            uint64
 	IPsecSAStaleIgnored        uint64
@@ -1301,7 +1321,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), ConfigsQueueFullDropped: s.stats.ConfigsQueueFullDropped.Load(), ConfigApplyNacksReceived: s.stats.ConfigApplyNacksReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.
