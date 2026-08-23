@@ -336,3 +336,114 @@ func readDaemonSource(t *testing.T, name string) string {
 	}
 	return string(b)
 }
+
+// TestApplyConfigLockedCapturesAndPassesFabricErr is the CALL-SITE half of the
+// wiring binding, and it exists because the join cell above could not see it.
+//
+// TestApplyTailReconcilesJoinsFabricErr passes the error to applyTailReconciles
+// DIRECTLY, so it stays green if applyConfigLocked stops capturing the return
+// value or stops threading it — which would be the entire fix undone. Measured:
+// replacing the call site with `_ = d.applyFabricIPVLAN(cfg)` left the whole
+// package suite green.
+//
+// applyConfigLocked cannot be driven from a unit test (it needs netlink, a
+// dataplane, sockets), so this asserts the wiring at the source, the same way
+// the loop-START cell does for Run.
+func TestApplyConfigLockedCapturesAndPassesFabricErr_6791(t *testing.T) {
+	src := stripLineComments6791(readDaemonSource(t, "daemon_apply.go"))
+
+	if !strings.Contains(src, "fabricErr := d.applyFabricIPVLAN(cfg)") {
+		t.Errorf("applyConfigLocked does not CAPTURE applyFabricIPVLAN's error; " +
+			"a discarded return value means a terminal fabric failure is still " +
+			"reported as commit success (#6791)")
+	}
+	call := "d.applyTailReconciles("
+	i := strings.Index(src, call)
+	if i < 0 {
+		t.Fatal("could not find the applyTailReconciles call in daemon_apply.go")
+	}
+	end := strings.Index(src[i:], ")")
+	if end < 0 {
+		t.Fatal("malformed applyTailReconciles call")
+	}
+	if !strings.Contains(src[i:i+end], "fabricErr") {
+		t.Errorf("applyConfigLocked does not PASS fabricErr to "+
+			"applyTailReconciles; captured-but-unthreaded is the same false "+
+			"success. Call: %s", src[i:i+end+1])
+	}
+}
+
+// TestReassertTakesApplySemBeforeReadingConfig binds the #4001 lock discipline
+// this loop's doc comment claims.
+//
+// Reading ActiveConfig outside applySem lets a tick capture a PRE-commit
+// snapshot and re-create a fab device the commit's own stale-overlay sweep has
+// just torn down. The ordering is not observable from a unit test without a
+// real concurrent commit, so it is asserted structurally: the semaphore must be
+// acquired before the config read that drives the re-creation loop.
+//
+// FAIL-ON-REVERT: delete the applySem.Acquire and this reds — measured; the
+// behavioural cells all stayed green without it.
+func TestReassertTakesApplySemBeforeReadingConfig_6791(t *testing.T) {
+	src := stripLineComments6791(readDaemonSource(t, "daemon_fabric_reassert.go"))
+	body, ok := fabricFuncBody6791(src, "reassertFabricIPVLANOnce")
+	if !ok {
+		t.Fatal("could not locate reassertFabricIPVLANOnce")
+	}
+	acq := strings.Index(body, "d.applySem.Acquire(")
+	if acq < 0 {
+		t.Fatalf("reassertFabricIPVLANOnce does not acquire applySem; a tick can " +
+			"then re-create an overlay a concurrent commit just removed (#4001)")
+	}
+	if !strings.Contains(body, "defer d.applySem.Release(1)") {
+		t.Errorf("reassertFabricIPVLANOnce acquires applySem without releasing it")
+	}
+	// The config read that drives the re-creation loop must come AFTER the
+	// acquire. The cheap pre-check read before it is fine (it reconciles
+	// nothing), so anchor on the loop itself.
+	loop := strings.Index(body, "for _, ov := range d.missingFabricOverlays(")
+	if loop < 0 {
+		t.Fatal("could not find the re-creation loop")
+	}
+	if loop < acq {
+		t.Errorf("reassertFabricIPVLANOnce re-creates overlays BEFORE acquiring " +
+			"applySem; the config it acts on can be a pre-commit snapshot (#4001)")
+	}
+}
+
+func stripLineComments6791(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func fabricFuncBody6791(src, name string) (string, bool) {
+	i := strings.Index(src, ") "+name+"(")
+	if i < 0 {
+		return "", false
+	}
+	open := strings.Index(src[i:], "{")
+	if open < 0 {
+		return "", false
+	}
+	open += i
+	depth := 0
+	for j := open; j < len(src); j++ {
+		switch src[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[open : j+1], true
+			}
+		}
+	}
+	return "", false
+}
