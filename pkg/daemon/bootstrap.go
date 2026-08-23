@@ -893,10 +893,20 @@ func (d *Daemon) applianceFactoryBoot() bool {
 
 // Returns the current kernel name of the lifeline NIC and ok=false when no
 // default route exists.
-func detectLifelineInterface() (name string, ok bool) {
+func detectLifelineInterface() (name string, ok bool, err error) {
+	var (
+		sawDefaultRoute bool
+		firstErr        error
+	)
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		routes, err := netlink.RouteList(nil, family)
-		if err != nil {
+		routes, rerr := lifelineRouteList(nil, family)
+		if rerr != nil {
+			// #6789: RECORDED, not swallowed. A failed dump returns a nil
+			// slice, which is byte-for-byte what "this box has no default
+			// route" looks like — and the caller BRANCHES on that distinction.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("route list family %d: %w", family, rerr)
+			}
 			continue
 		}
 		for i := range routes {
@@ -908,14 +918,28 @@ func detectLifelineInterface() (name string, ok bool) {
 			if r.LinkIndex <= 0 {
 				continue
 			}
-			link, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
+			sawDefaultRoute = true
+			link, lerr := lifelineLinkByIndex(r.LinkIndex)
+			if lerr != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("link by index %d: %w", r.LinkIndex, lerr)
+				}
 				continue
 			}
-			return link.Attrs().Name, true
+			// A resolved default route is POSITIVE identification. Report it
+			// even if an earlier dump errored: the error only matters when it
+			// could have hidden the answer, and here the answer was found.
+			return link.Attrs().Name, true, nil
 		}
 	}
-	return "", false
+	if firstErr != nil {
+		// Either a dump failed, or every default route we saw had an
+		// unresolvable link. Both leave "is there a default route, and on
+		// which NIC" UNKNOWN — never report that as a confident "none".
+		return "", false, firstErr
+	}
+	_ = sawDefaultRoute
+	return "", false, nil
 }
 
 // pciAddrForInterface resolves the PCI bus address + MAC for a kernel
@@ -1045,11 +1069,38 @@ func protectedInterfacesWith(mgmtLeaf, lifeline string) map[string]bool {
 // enumerated NIC is selected instead of refusing. Steps 2-4 are unchanged and
 // run identically for either provenance.
 func (d *Daemon) setupBootstrapLifeline() {
-	routeIface, _ := detectLifelineInterfaceFn()
+	routeIface, _, routeErr := detectLifelineInterfaceFn()
+	if routeIface == "" && routeErr != nil {
+		// #6789: the route observation FAILED, so "which NIC carries the
+		// default route" is UNKNOWN — not "there is none". The distinction is
+		// load-bearing because the very next line BRANCHES on it: an empty
+		// routeIface is what arms the #7114 appliance fallback, which claims
+		// the first enumerated NIC and RENAMES it (renameInterface does an
+		// explicit LinkSetDown -> LinkSetName -> LinkSetUp, so the rename IS
+		// the NIC cycle). A box whose real management NIC is not enumeration
+		// index 0 would have the wrong NIC claimed and cycled, on the strength
+		// of a netlink error.
+		//
+		// Claim NOTHING instead. That is the same console-only refusal
+		// chooseBootstrapLifeline documents for "cannot identify a management
+		// NIC", and it is what every other observation failure in this
+		// function already does.
+		slog.Warn("bootstrap lifeline: could not enumerate routes, so it is UNKNOWN whether this "+
+			"box has a default route or which NIC carries it. Claiming NOTHING and staying in "+
+			"bootstrap with NO interface changes — an unreadable route table must never be read "+
+			"as 'no default route', because that is what arms the appliance first-NIC fallback. "+
+			"Reach the box via its console and 'commit confirmed' a config.",
+			"err", routeErr)
+		return
+	}
 
 	// #7114: the appliance image's factory boot has no default route to find —
 	// the bake purges cloud-init and netplan, so nothing but xpfd ever brings a
 	// NIC up. Enumerate a fallback there, and ONLY there.
+	//
+	// #6789: reachable only when the route observation SUCCEEDED and genuinely
+	// found nothing (the unknown case returned above), so the factory contract
+	// is unchanged for every box whose route state is actually known.
 	firstNIC := ""
 	applianceFactory := routeIface == "" && d.applianceFactoryBoot()
 	if applianceFactory {
@@ -1120,8 +1171,22 @@ func (d *Daemon) setupBootstrapLifeline() {
 	// The lifeline NIC would become fxp0. Snapshot its current addressing
 	// into the bootstrap .network BEFORE the rename, so the link cycle
 	// restores the same reachability under the fxp0 name.
-	if wrote := writeBootstrapLifelineNetwork(lifeline); wrote {
-		// reload picks up the new .network keyed on Name=fxp0.
+	// #6789: an INCOMPLETE addressing observation aborts here, before the .link
+	// write, the rename and the reload — i.e. before anything is mutated. Every
+	// other observation failure in this function already refuses that way (no
+	// default route, NIC enumeration failed, not enumeration index 0); this was
+	// the one that GUESSED instead, substituting `DHCP=yes` and proceeding to
+	// cycle the link. Refusing leaves the NIC under its kernel name with its
+	// live addressing untouched, which is the #1922 console-only posture
+	// chooseBootstrapLifeline documents as "selects nothing".
+	if _, err := writeBootstrapLifelineNetwork(lifeline, source == lifelineSourceDefaultRoute); err != nil {
+		slog.Error("bootstrap lifeline: could not observe the management NIC's addressing, so the "+
+			"bootstrap fxp0 .network cannot be written correctly. Refusing to rename/cycle any "+
+			"interface; staying in bootstrap with NO interface changes so management keeps its "+
+			"current name and addressing. Reach the box via its console and 'commit confirmed' "+
+			"a config.",
+			"interface", lifeline, "err", err)
+		return
 	}
 
 	// Rename just this one NIC to fxp0 (writes the .link + renames).
@@ -1153,15 +1218,39 @@ func (d *Daemon) setupBootstrapLifeline() {
 // reachability. DHCP-managed lifelines get a plain DHCP .network (matching the
 // historical writeBootstrapFxp0Network); a statically-addressed lifeline gets
 // Address=/Gateway= lines. Returns true if the file changed.
-func writeBootstrapLifelineNetwork(lifeline string) bool {
+func writeBootstrapLifelineNetwork(lifeline string, hasRouteEvidence bool) (bool, error) {
 	path := filepath.Join(linkDir, linkPrefix+"fxp0.network")
 
-	// Snapshot the lifeline's addressing ONCE (Copilot: avoid the duplicate
-	// netlink walk). DHCP-managed or address-less lifelines get a plain DHCP
-	// .network; a statically-addressed one gets an Address=/Gateway= snapshot.
-	v4, v6, gw4, gw6 := interfaceAddrSnapshot(lifeline)
+	// Snapshot the lifeline's addressing ONCE. #6789: an observation FAILURE is
+	// returned, never folded into "no addresses" — the address-less case takes
+	// the DHCP branch below, so a failed read that returned empty would write
+	// `DHCP=yes` over a statically-addressed management NIC and then cycle it.
+	//
+	// hasRouteEvidence scopes that refusal to the case where it means anything.
+	// A lifeline chosen because it carries a DEFAULT ROUTE is positive evidence
+	// that the NIC has live addressing which the rename must reproduce under the
+	// fxp0 name, so failing to read it is a real loss of information and the
+	// caller must refuse. The #7114 appliance factory lifeline is chosen
+	// precisely when there is NO default route — the bake purges cloud-init and
+	// netplan, so nothing has brought a NIC up and there is no addressing to
+	// reproduce. DHCP is that image's documented vNIC#1 -> fxp0 contract, and a
+	// failed observation cannot change a single byte of what gets written, so
+	// refusing there would break the factory boot to guard information that was
+	// never going to be used.
+	snap, err := snapshotLifelineAddrs(lifeline)
+	if err != nil {
+		if hasRouteEvidence {
+			return false, err
+		}
+		slog.Warn("bootstrap lifeline: addressing observation failed on an appliance factory "+
+			"boot; writing the image's factory DHCP .network, which is what an empty "+
+			"observation would have produced anyway",
+			"interface", lifeline, "err", err)
+		snap = lifelineAddrSnapshot{}
+	}
+	v4, v6, gw4, gw6 := snap.v4, snap.v6, snap.gw4, snap.gw6
 	var content string
-	if isDHCPManaged(lifeline) || (len(v4) == 0 && len(v6) == 0) {
+	if snap.dhcpManaged || (len(v4) == 0 && len(v6) == 0) {
 		content = "# Managed by xpfd — #1922 bootstrap lifeline (DHCP)\n" +
 			"[Match]\nName=fxp0\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nUseDNS=yes\nUseRoutes=yes\n"
 	} else {
@@ -1183,19 +1272,19 @@ func writeBootstrapLifelineNetwork(lifeline string) bool {
 		content = b.String()
 	}
 
-	existing, err := os.ReadFile(path)
-	if err == nil && string(existing) == content {
-		return false
+	existing, readErr := os.ReadFile(path)
+	if readErr == nil && string(existing) == content {
+		return false, nil
 	}
 	// AtomicGeneratedConfig: a bootstrap .network snapshot regenerated from
 	// the lifeline state; a torn file is unacceptable but a power-cut loss
 	// is re-derived next boot.
 	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("bootstrap lifeline: failed to write fxp0 .network", "path", path, "err", err)
-		return false
+		return false, nil
 	}
 	slog.Info("bootstrap lifeline: wrote fxp0 bootstrap .network", "source_interface", lifeline)
-	return true
+	return true, nil
 }
 
 // resolveProtectedInterfaces is the daemon's #1922 Item 4 protected-set
@@ -1213,29 +1302,96 @@ func (d *Daemon) resolveProtectedInterfaces() map[string]bool {
 	return protectedInterfaces(mgmtLeaf)
 }
 
-// interfaceAddrSnapshot collects the current global addresses + default
-// gateways on name, for the lifeline-aware bootstrap .network writer.
-func interfaceAddrSnapshot(name string) (v4, v6 []string, gw4, gw6 string) {
-	link, err := netlink.LinkByName(name)
+// Injectable netlink seams for the lifeline addressing snapshot (#6789). The
+// snapshot decides whether the bootstrap fxp0 .network is written as DHCP or as
+// a static address snapshot, and getting that wrong cycles the management NIC
+// onto the wrong addressing — so its failure modes must be reachable from a
+// test rather than only from real hardware.
+var (
+	lifelineLinkByName  = netlink.LinkByName
+	lifelineLinkByIndex = netlink.LinkByIndex
+	lifelineAddrList    = netlink.AddrList
+	lifelineRouteList   = netlink.RouteList
+)
+
+// lifelineAddrSnapshot is a COMPLETE observation of a lifeline NIC's
+// addressing. It is only ever constructed by snapshotLifelineAddrs, and only
+// returned alongside a nil error — an incomplete observation has no
+// representation, which is the point (#6789).
+type lifelineAddrSnapshot struct {
+	v4, v6   []string
+	gw4, gw6 string
+	// dhcpManaged reports a global address with a FINITE valid lifetime, the
+	// heuristic for "this address came from DHCP". Folded into the snapshot so
+	// the DHCP-vs-static decision and the address list come from ONE netlink
+	// walk: they used to be two walks over the same state (interfaceAddrSnapshot
+	// and isDHCPManaged) that FAILED IN OPPOSITE DIRECTIONS, which is what made
+	// the defect below possible.
+	dhcpManaged bool
+}
+
+// snapshotLifelineAddrs observes name's global addresses, default gateways and
+// DHCP-lease heuristic. It returns an error when ANY observation failed, and
+// the caller MUST treat that as "unknown", never as "none" (#6789).
+//
+// THE DEFECT THIS CLOSES. The two predecessors read the same netlink state and
+// disagreed on fail direction. isDHCPManaged was documented to return false on
+// any uncertainty so the writer would snapshot static addresses — the SAFE
+// direction, and deliberately so. interfaceAddrSnapshot returned empty slices
+// on a LinkByName failure and discarded the AddrList error entirely. The writer
+// then asked `isDHCPManaged(x) || (len(v4) == 0 && len(v6) == 0)`, so the very
+// failure that made isDHCPManaged fail SAFE also emptied the address list and
+// drove the OR into the DHCP branch. A statically-addressed management NIC
+// whose netlink read failed was written a `DHCP=yes` .network and then renamed
+// — a link cycle that dropped its static address on a box reachable only over
+// that NIC, in bootstrap, with no committed config to roll back to.
+//
+// WHY EVERY ERROR IS PROPAGATED, AND WHY THE ROUTE ONE IS SCOPED. A LinkByName
+// or AddrList failure is always fatal to the snapshot: the DHCP-vs-static
+// decision reads exactly that state, so an error there means the decision
+// cannot be made at all. A RouteList failure is fatal only when the snapshot
+// HAS addresses in that family — i.e. only when a `Gateway=` line for it would
+// have been written, and its absence would leave management reachable on-link
+// only. Failing the snapshot because the v6 route dump errored on a box with no
+// v6 addresses would refuse a lifeline over an observation that could not have
+// changed a single byte of the output.
+func snapshotLifelineAddrs(name string) (lifelineAddrSnapshot, error) {
+	var snap lifelineAddrSnapshot
+	link, err := lifelineLinkByName(name)
 	if err != nil {
-		return nil, nil, "", ""
+		return snap, fmt.Errorf("link %s: %w", name, err)
 	}
-	addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+	addrs, err := lifelineAddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return snap, fmt.Errorf("address list %s: %w", name, err)
+	}
 	for i := range addrs {
 		ip := addrs[i].IPNet
 		if ip == nil || ip.IP.IsLinkLocalUnicast() || ip.IP.IsLinkLocalMulticast() {
 			continue
 		}
+		// A DHCP lease carries a finite ValidLft; a static address is
+		// typically permanent (ValidLft == 0xffffffff / forever).
+		if addrs[i].ValidLft > 0 && addrs[i].ValidLft != 0xffffffff {
+			snap.dhcpManaged = true
+		}
 		if ip.IP.To4() != nil {
-			v4 = append(v4, ip.String())
+			snap.v4 = append(snap.v4, ip.String())
 		} else {
-			v6 = append(v6, ip.String())
+			snap.v6 = append(snap.v6, ip.String())
 		}
 	}
 	// Default-route gateways for this link.
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
-		routes, err := netlink.RouteList(link, family)
+		routes, err := lifelineRouteList(link, family)
 		if err != nil {
+			haveAddrs := len(snap.v4) > 0
+			if family == netlink.FAMILY_V6 {
+				haveAddrs = len(snap.v6) > 0
+			}
+			if haveAddrs {
+				return lifelineAddrSnapshot{}, fmt.Errorf("route list %s family %d: %w", name, family, err)
+			}
 			continue
 		}
 		for i := range routes {
@@ -1246,37 +1402,12 @@ func interfaceAddrSnapshot(name string) (v4, v6 []string, gw4, gw6 string) {
 			if r.Gw == nil {
 				continue
 			}
-			if r.Gw.To4() != nil && gw4 == "" {
-				gw4 = r.Gw.String()
-			} else if r.Gw.To4() == nil && gw6 == "" {
-				gw6 = r.Gw.String()
+			if r.Gw.To4() != nil && snap.gw4 == "" {
+				snap.gw4 = r.Gw.String()
+			} else if r.Gw.To4() == nil && snap.gw6 == "" {
+				snap.gw6 = r.Gw.String()
 			}
 		}
 	}
-	return v4, v6, gw4, gw6
-}
-
-// isDHCPManaged reports whether name currently has a DHCP-assigned address
-// (heuristic: a global address with a finite valid lifetime). Used by the
-// lifeline writer to choose DHCP vs static snapshot. Best-effort: on any
-// uncertainty it returns false so the writer snapshots the static addresses
-// (a static snapshot of a DHCP lease still keeps mgmt reachable until the
-// lease would have expired, which is the bootstrap window).
-func isDHCPManaged(name string) bool {
-	link, err := netlink.LinkByName(name)
-	if err != nil {
-		return false
-	}
-	addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
-	for i := range addrs {
-		if addrs[i].IP.IsLinkLocalUnicast() {
-			continue
-		}
-		// A DHCP lease carries a finite ValidLft; a static address is
-		// typically permanent (ValidLft == 0xffffffff / forever).
-		if addrs[i].ValidLft > 0 && addrs[i].ValidLft != 0xffffffff {
-			return true
-		}
-	}
-	return false
+	return snap, nil
 }
