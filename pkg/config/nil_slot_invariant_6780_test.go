@@ -140,6 +140,36 @@ func nilSlotCorpus() map[string][]string {
 	}
 }
 
+// compileForNilSlotScan runs one compile and converts a PANIC into a named test
+// failure instead of taking the test binary down with a SIGSEGV stack.
+//
+// This is not cosmetic. When the invariant is broken, the compiler frequently
+// cannot even finish compiling its own output: pkg/config's tail gates walk the
+// interface tree they just built (runTailGates -> vrrpTrackConfigWarnings,
+// compiler_interfaces.go) and dereference it raw. Measured by mutation:
+// injecting a nil interface slot at the compiler write site panics INSIDE
+// CompileConfigLenient, before any consumer ever sees the config.
+//
+// That closes the reachability question from the other end. A "tolerantly
+// loaded config carrying a nil slot" could not survive the very compile that
+// would have produced it — so the premise that such a config reaches a consumer
+// is not merely undemonstrated, it is self-defeating. Recovering here keeps the
+// failure attributable to THIS test and names the mode and corpus entry.
+func compileForNilSlotScan(t *testing.T, mode string, fn func(*ConfigTree) (*Config, error), tree *ConfigTree) (cfg *Config, err error) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("%s compile PANICKED: %v\n"+
+				"The compiler emitted a config it cannot itself walk — pkg/config's "+
+				"own tail gates dereference the interface tree raw. Fix the "+
+				"compiler write site: a nil slot must never be stored.", mode, r)
+			cfg, err = nil, nil
+		}
+	}()
+	cfg, err = fn(tree)
+	return cfg, err
+}
+
 func TestCompilerNeverEmitsNilConfigSlots(t *testing.T) {
 	for name, lines := range nilSlotCorpus() {
 		t.Run(name, func(t *testing.T) {
@@ -152,7 +182,7 @@ func TestCompilerNeverEmitsNilConfigSlots(t *testing.T) {
 				{"strict", CompileConfig},
 				{"lenient", CompileConfigLenient},
 			} {
-				cfg, err := mode.fn(tree)
+				cfg, err := compileForNilSlotScan(t, mode.name, mode.fn, tree)
 				if err != nil || cfg == nil {
 					// A rejected config emits nothing, so it cannot carry a nil
 					// slot. The tolerant path must still compile (#1960
