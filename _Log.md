@@ -104319,6 +104319,77 @@ prose edit above them added. No diff falls in the new test body.
     pkg/cli/load_bounded_read_6753_test.go, cmd/cli/main.go,
     cmd/cli/load_bounded_read_7469_test.go (new), pkg/configstore/README.md
 
+- **Timestamp**: 2026-08-22
+  **Action**: #6769 — bound the `services flow-monitoring` template `seconds`
+  knobs at `MaxDurationSeconds`. `template-refresh-rate seconds` was the one
+  untyped member of the trio, so a value large enough to overflow
+  `time.Duration(n) * time.Second` reached pkg/flowexport, wrapped, and became a
+  512 ns template ticker (gcd(1e9, 2^64) = 512). Three layers, one constant:
+  typed setSchema leaf, compiler-side `validateFlowExportSecondsStrict`
+  (strict-reject / lenient-warn, #1960), and `flowexport.secondsToDuration`
+  falling back at the consumer.
+  **File(s)**: pkg/config/schema_system.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates_sampling_appset.go,
+  pkg/config/compiler_opts.go, pkg/flowexport/manager.go,
+  pkg/config/flow_export_seconds_overflow_6769_test.go,
+  pkg/flowexport/template_seconds_overflow_6769_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-08-22
+  **Action**: #6768 — turn the #5180 duplicate-named-block gate into a registry
+  and add six containers derived from the predicate "a container authorable
+  twice hierarchically whose compile silently loses config the flat spelling
+  merges": security log stream/profile (last-writer-wins), protocols bgp group
+  (split instances), services flow-monitoring/rpm/ip-monitoring (FindChild
+  first-wins). Per-container effect messages replace the single sentence that
+  said "earlier block dropped" for every mode — backwards for a first-wins read.
+  **File(s)**: pkg/config/dup_named_blocks.go,
+  pkg/config/duplicate_container_6768_test.go, docs/config-schema.md
+
+## 2026-08-22 — #6765 SNAT/NAT64 partial-overlap pool carry-over
+- **Action**: A pool change that RETAINS an address rebuilt its allocator from
+  zero, so the next new flow was issued `(retained_addr, port_low)` — a tuple a
+  live session still held (reply mis-delivery). Added
+  `PortAllocator::reseed_retained_from` + `ReseedOutcome` and called it from the
+  FRESH-allocator arm of both rebuild sites, carrying live port ownership across
+  with REMAPPED indices (the occupancy vector is position-indexed, so wholesale
+  reuse would misindex — the obvious fix was unavailable). Re-seed goes through
+  `reserve_flow`, the audited HA-import path. Unchanged pool / disjoint swap /
+  cold start all keep resetting. Persistent leases and address-only tokens are
+  deliberately NOT carried — filed as #7560.
+- **File(s)**: `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/source.rs`, `userspace-dp/src/nat/mod.rs`,
+  `userspace-dp/src/nat64.rs`, `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/nat/tests_pool.rs`, plus `now_ns` threading in four test
+  files, `docs/pr/6765-snat-pool-carryover/plan.md`
+
+## 2026-08-22 — #7568 compiler panic on the hierarchical prefix-list block form
+
+- **Timestamp**: 2026-08-22
+- **Action**: Fixed a `CompileConfig` panic (`slice bounds out of range [2:1]`)
+  on `policy-options { prefix-list { name; } }`. `namedInstances` returns two
+  node shapes and the #6564 compact-leaf read assumed one. Reachable on the
+  TOLERATED Store.Load / SyncApply ingress, so it crashed the daemon on load
+  rather than rejecting the config (#1960). The tail is now taken relative to
+  the instance NAME, not a fixed index, because a bare bounds check silently
+  drops the block form's compact value. Bound the one-site claim with a census
+  test over all 1129 schema paths.
+- **File(s)**: `pkg/config/compiler_routing.go`,
+  `pkg/config/compiler_prefix_list_block_7568_test.go`,
+  `pkg/config/compiler_block_form_panic_census_7568_test.go`
+
+## 2026-08-22 — #6774 strict schema rejects the Junos hierarchical default-policy
+
+- **Timestamp**: 2026-08-22
+- **Action**: Taught SchemaValidate the hierarchical block spelling
+  `default-policy { deny-all; }` — the form Junos itself displays, which the
+  compiler already honours deliberately — via a per-leaf `blockValue` opt-in
+  rather than a blanket relaxation. A census found 42 distinct typed leaves
+  where the compiler tolerates a block form the schema rejects; for those the
+  schema is right and nothing changed.
+- **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
+  `pkg/config/schema_walk.go`, `pkg/config/schema_block_value_6774_test.go`
+
 ## 2026-08-22 — #6777 graceful RA withdrawal: final goodbye failure surfaced + retry debt
 
 - **Timestamp**: 2026-08-22

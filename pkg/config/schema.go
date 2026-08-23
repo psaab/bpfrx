@@ -47,6 +47,29 @@ type schemaNode struct {
 	// sets it; every other multi+children node is unchanged.
 	valueList bool
 
+	// blockValue opts a single-value typed leaf into the HIERARCHICAL BLOCK
+	// spelling `keyword { value; }`, in addition to the ordinary
+	// `keyword value` (#6774).
+	//
+	// This is an OPT-IN, not a general relaxation, because the two spellings
+	// are not interchangeable in Junos. `default-policy` is a CHOICE
+	// CONTAINER in the Junos schema — `permit-all` / `deny-all` /
+	// `reject-all` are alternative sub-statements, which is why Junos itself
+	// DISPLAYS it as `default-policy { deny-all; }` — while this schema
+	// models it as a valued leaf so the flat-set spelling works. The compiler
+	// accommodates both deliberately (compiler_security_policy.go). Without
+	// the opt-in the strict commit path rejects a configuration that is
+	// canonical Junos, that the compiler compiles correctly, and that the
+	// tolerated Load/SyncApply path already applies.
+	//
+	// Most typed leaves must NOT set this. `mtu { 1500; }` is not Junos, and
+	// the rejection there is correct; the compiler tolerates it only
+	// incidentally, through the generic nodeVal helper. A census of setSchema
+	// found 42 distinct leaves where the compiler accepts a block form the
+	// schema rejects, and `default-policy` is the only one where the block
+	// form is the shape Junos actually emits.
+	blockValue bool
+
 	// groupReplace opts a multi leaf OUT of apply-groups leaf-list UNION
 	// (#4070). By default a `multi:true && children==nil && args<=1` leaf is a
 	// pure single-token value-list whose group + inline members UNION under
