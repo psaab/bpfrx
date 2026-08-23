@@ -1377,6 +1377,76 @@ never lock an operator out of a remote box it manages.
     configured (possibly with a device-map that wants no auto-fxp0) is in
     bootstrap because its committed config stopped compiling. Steps 2-4 above
     are unchanged and run identically for either provenance.
+  - **Incomplete addressing observation refuses (#6789).** `setupBootstrapLifeline`
+    is a chain of fail-closed refusals — no default route, NIC enumeration
+    failed, not enumeration index 0 — each of which logs and returns having
+    mutated NOTHING. The addressing snapshot used to be the one observation
+    that GUESSED instead. `interfaceAddrSnapshot` returned empty slices on a
+    `LinkByName` failure and discarded the `AddrList` error, while its sibling
+    `isDHCPManaged` was documented to return false on any uncertainty so the
+    writer would snapshot static addresses — the SAFE direction. The writer
+    asked `isDHCPManaged(x) || (len(v4) == 0 && len(v6) == 0)`, so the very
+    failure that made `isDHCPManaged` fail safe also emptied the address list
+    and drove the OR into the DHCP branch. **Two helpers reading the same
+    netlink state failed in opposite directions, and the unsafe one won.** A
+    statically-addressed management NIC then received a `DHCP=yes` `.network`
+    and was renamed — and the rename cycles the link, so the static address
+    went away on a box reachable only over that NIC, in bootstrap, with no
+    committed config to roll back to.
+
+    Both helpers are now one typed observation, `snapshotLifelineAddrs`, which
+    returns an error instead of an empty result and folds the DHCP-lease
+    heuristic into the SAME netlink walk (they were two walks over one state,
+    which is what allowed them to disagree). An incomplete observation aborts
+    `setupBootstrapLifeline` **before** the `.link` write, the rename and the
+    reload, matching what every other refusal in that function already does and
+    the "selects nothing" console-only posture `chooseBootstrapLifeline`
+    documents.
+
+    The refusal is **scoped to a lifeline chosen by DEFAULT ROUTE**, which is
+    positive evidence the NIC carries live addressing the rename must reproduce
+    under the fxp0 name. The appliance factory lifeline above is chosen
+    precisely when there is no default route, so there is no addressing to
+    reproduce and DHCP is the image's documented contract: a failed observation
+    there cannot change a byte of the output, and refusing would break the
+    factory boot to guard information that was never going to be used. For the
+    same reason a route-dump failure is fatal only for a family the snapshot
+    HAS addresses in — the family whose `Gateway=` line would otherwise be
+    missing. The netlink calls sit behind injectable seams
+    (`lifelineLinkByName` / `lifelineAddrList` / `lifelineRouteList`) so each
+    observation failure is reachable from a test that asserts zero side
+    effects.
+  - **An unreadable route table claims NOTHING (#6789, the selection half).**
+    The same "error reads as a confident answer" shape sits one step earlier, in
+    the SELECTION, and there it is worse. `detectLifelineInterface` dumped
+    routes with the error discarded (`if err != nil { continue }`), and a failed
+    dump returns a nil slice — byte-for-byte what "this box has no default
+    route" looks like. The caller BRANCHES on exactly that distinction:
+    `applianceFactory := routeIface == "" && d.applianceFactoryBoot()`. So on a
+    box carrying the appliance marker that has never committed, a netlink error
+    silently flipped selection from "the NIC holding the default route" to
+    "the FIRST ENUMERATED NIC" — which is then renamed, and `renameInterface`
+    is an explicit `LinkSetDown` → `LinkSetName` → `LinkSetUp`. If the real
+    management NIC is not enumeration index 0, the wrong NIC is claimed and the
+    management NIC is cycled on a box reachable only over it. It is reachable on
+    a real factory box, because the previous boot's lifeline writes an fxp0 DHCP
+    `.network`, so the next boot genuinely HAS a default route while
+    `EverCommitted()` is still false.
+
+    Note the asymmetry: on a NON-appliance box the identical error is harmless —
+    an empty `routeIface` makes `chooseBootstrapLifeline` refuse, which is the
+    console-only contract. The appliance marker is what converts a swallowed
+    netlink error into a claimed and cycled NIC.
+
+    `detectLifelineInterface` now returns an error and the caller refuses when
+    the route state is UNKNOWN (`routeIface == "" && routeErr != nil`). The
+    guard keys on the observation having FAILED, never on `routeIface` being
+    empty: keying on empty would disable the #7114 factory contract entirely and
+    strand every appliance image console-only on first boot. A route that WAS
+    found and resolved is positive identification and is used even if another
+    family's dump errored — the error only matters when it could have hidden the
+    answer. The second swallowed error there (`LinkByIndex` on a found route)
+    is propagated for the same reason.
 - **Protected set** (`resolveProtectedInterfaces` →
   `dataplane.SetProtectedInterfaceResolver`): fxp0 + the lifeline NIC + an
   explicit `system management-interface` leaf are NEVER marked Unmanaged /
