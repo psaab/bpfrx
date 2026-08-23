@@ -124,6 +124,21 @@ func TestSaneTemplateSecondsUnchanged_6769(t *testing.T) {
 	}
 }
 
+// TestConsumerCeilingBoundaryIsExact_6769 is the consumer-side twin of
+// TestFlowExportCeilingBoundaryIsExact_6769: the ceiling converts, the first
+// value past it falls back. Without this cell the comparison could be loosened
+// by one and nothing would notice.
+func TestConsumerCeilingBoundaryIsExact_6769(t *testing.T) {
+	ceiling := int(config.MaxDurationSeconds)
+	if got := secondsToDuration(ceiling, 60*time.Second); got != time.Duration(ceiling)*time.Second {
+		t.Errorf("secondsToDuration(ceiling) = %v, want the converted ceiling — it does not overflow", got)
+	}
+	if got := secondsToDuration(ceiling+1, 60*time.Second); got != 60*time.Second {
+		t.Errorf("secondsToDuration(ceiling+1) = %v, want the 60s fallback; ceiling+1 is the "+
+			"smallest value whose nanosecond conversion overflows int64", got)
+	}
+}
+
 // TestResolveV9TemplateGroupsDoesNotShipAWrappedRefresh_6769 binds the WIRING:
 // it drives the production resolver a manager uses to build ExportConfigs, so
 // deleting the secondsToDuration call from v9TemplateContext (rather than

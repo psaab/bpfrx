@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -138,6 +139,36 @@ func TestFlowExportSaneSecondsAccepted_6769(t *testing.T) {
 		if want := atoiOrFatal(t, seconds); got != want {
 			t.Errorf("TemplateRefreshRate = %d, want %d (an in-range value must be stored unchanged)", got, want)
 		}
+	}
+}
+
+// TestFlowExportCeilingBoundaryIsExact_6769 pins the bound itself, in BOTH
+// directions. The mutation matrix for this change loosened the comparison to
+// `> MaxDurationSeconds+1` and every other cell stayed green: the ceiling was
+// accepted and a huge value rejected, but the first value PAST the ceiling was
+// exercised by nothing, so the bound could drift upward undetected. It is not a
+// cosmetic drift — MaxDurationSeconds+1 is precisely the smallest value whose
+// `time.Duration(n) * time.Second` overflows int64.
+func TestFlowExportCeilingBoundaryIsExact_6769(t *testing.T) {
+	const ceiling = MaxDurationSeconds // 9223372036
+	accept := strconv.FormatInt(ceiling, 10)
+	reject := strconv.FormatInt(ceiling+1, 10)
+
+	if _, err := CompileConfig(buildTreeFromSet(t, v9RefreshCmds(accept))); err != nil {
+		t.Errorf("CompileConfig rejected the ceiling %s, which does NOT overflow: %v", accept, err)
+	}
+	_, err := CompileConfig(buildTreeFromSet(t, v9RefreshCmds(reject)))
+	if err == nil {
+		t.Fatalf("CompileConfig accepted %s — one past the ceiling, and the smallest value "+
+			"whose nanosecond conversion overflows int64", reject)
+	}
+	if !strings.Contains(err.Error(), reject) {
+		t.Errorf("error %q does not name the offending value", err.Error())
+	}
+	if err := SchemaValidate(buildTreeFromSet(t, []string{
+		"set services flow-monitoring version9 template t template-refresh-rate seconds " + reject,
+	}), nil); err == nil {
+		t.Errorf("SchemaValidate accepted %s — the typed leaf's ceiling must be exact too", reject)
 	}
 }
 
