@@ -801,10 +801,14 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			desc:          "TTL (seconds) for published A/AAAA/PTR records (default 300)",
 			args:          1,
 			valueType:     ValueInteger,
-			valueDesc:     "Record TTL in seconds (>= 1; default 300 when unset)",
+			valueDesc:     "Record TTL in seconds (1..4294967295; default 300 when unset)",
 			valueExamples: []string{"300", "3600"},
-			validator:     ValidateIntegerMin(1),
-			children:      nil,
+			// #6773: bounded at the DNS wire domain. The RR header TTL is a
+			// 32-bit unsigned field, so a larger value WRAPS rather than
+			// failing — 2^32 lands as 0, telling every resolver not to cache
+			// the record. Min-only admitted exactly that.
+			validator: ValidateInteger(1, MaxDNSTTLSeconds),
+			children:  nil,
 		},
 		"hostname-source": {
 			desc:          "How the published label is derived from the lease",
