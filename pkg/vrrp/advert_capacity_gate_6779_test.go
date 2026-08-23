@@ -3,7 +3,10 @@ package vrrp
 import (
 	"fmt"
 	"net"
+	"sync"
 	"testing"
+
+	"github.com/vishvananda/netlink"
 )
 
 // #6779 RUNTIME GATES. becomeMaster used to claim the VIP set and publish
@@ -32,14 +35,21 @@ func makeVIPs(n int, isIPv6 bool) []string {
 }
 
 // TestBecomeMaster_RefusesOversizedVIPSet is the fail-on-revert gate for the
-// ORDERING claim. It asserts the three things that together mean "ownership was
-// not claimed": becomeMaster returned false, the state did NOT go MASTER, and
-// no VIP was actuated.
+// ORDERING claim.
 //
-// Under the pre-fix code becomeMaster returns true and setState(StateMaster)
-// has run, while every advert Marshal fails — the exact silent dual-master
-// condition. Removing the guard makes this RED on the returned value AND on the
-// observed state, so a partial revert cannot hide.
+// The VIP netlink seams are wired to SUCCEED (installFakeVIPNetlink). That is
+// essential, not incidental: becomeMaster is ALSO fail-closed on VIP actuation
+// (#5082), so on an unresolvable interface it returns false anyway and an
+// assertion on the return value alone would pass with this guard deleted — the
+// #5082 path would be doing the work. Forcing actuation to succeed leaves the
+// advert-capacity gate as the ONLY thing that can refuse the promotion.
+//
+// The discriminator is addrAdd call count. This guard runs BEFORE
+// setState/addVIPs, so a refused promotion must not have touched netlink at
+// all; the #5082 path, by contrast, refuses only AFTER attempting the adds.
+// Deleting the guard makes every assertion below RED: becomeMaster returns
+// true, the state goes MASTER, a MASTER event is published, and the VIPs are
+// actuated — the exact silent dual-master condition.
 func TestBecomeMaster_RefusesOversizedVIPSet(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -50,27 +60,60 @@ func TestBecomeMaster_RefusesOversizedVIPSet(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			over := MaxConfiguredVIPs(tc.isIPv6) + 1
+			eventCh := make(chan VRRPEvent, 8)
 			vi := newInstance(Instance{
-				Interface:         "reth0.50",
+				Interface:         "xpf-6779-a0",
 				GroupID:           42,
 				Priority:          200,
 				AdvertiseInterval: 1000,
 				VirtualAddresses:  makeVIPs(over, tc.isIPv6),
-			}, &net.Interface{Name: "reth0.50", Index: 42}, make(chan VRRPEvent, 16), nil)
+			}, &net.Interface{Name: "xpf-6779-a0"}, eventCh, nil)
+			vi.setState(StateBackup) // the state becomeMaster transitions FROM
+			vi.suppressGARP.Store(true)
+
+			// Force VIP actuation to SUCCEED so #5082 cannot mask this guard,
+			// and count the adds so we can prove netlink was never reached.
+			var mu sync.Mutex
+			addrAdds := 0
+			installFakeVIPNetlink(vi)
+			vi.addrAddFn = func(link netlink.Link, addr *netlink.Addr) error {
+				mu.Lock()
+				addrAdds++
+				mu.Unlock()
+				return nil
+			}
 
 			if vi.advertCapacityErr == nil {
 				t.Fatalf("%d %s VIPs (cap %d) must be recorded as unadvertisable",
 					over, tc.name, MaxConfiguredVIPs(tc.isIPv6))
 			}
-			before := vi.getState()
+
 			if got := vi.becomeMaster(); got {
 				t.Errorf("becomeMaster() = true for an oversized %s VIP set; "+
 					"ownership was claimed for a group that can never advertise",
 					tc.name)
 			}
 			if got := vi.getState(); got == StateMaster {
-				t.Errorf("state = MASTER after a refused promotion (was %v); the "+
-					"node holds the VIPs while every advert fails to build", before)
+				t.Errorf("state = MASTER after a refused promotion; the node " +
+					"holds the VIPs while every advert fails to build")
+			}
+			mu.Lock()
+			n := addrAdds
+			mu.Unlock()
+			if n != 0 {
+				t.Errorf("addrAdd called %d times on a refused promotion; the "+
+					"advert-capacity gate must refuse BEFORE any VIP is "+
+					"actuated (a refusal after the adds would be the #5082 "+
+					"path, not this guard)", n)
+			}
+			select {
+			case evt := <-eventCh:
+				if evt.State == StateMaster {
+					t.Errorf("a MASTER event was published for a group that " +
+						"can never advertise; dependent services would trust " +
+						"an ownership this node cannot back")
+				}
+			default:
 			}
 		})
 	}
