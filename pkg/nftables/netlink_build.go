@@ -20,6 +20,7 @@ package nftables
 // (`ip daddr X icmp type Y`) bit-equivalent to the oracle text.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 
@@ -258,6 +259,18 @@ func (a *ruleAsm) tcpFlags(required, forbidden uint8) *ruleAsm {
 func (a *ruleAsm) fragV4() *ruleAsm {
 	a.needNfproto(famV4)
 	return a.add(fragV4Match()...)
+}
+
+// flexMatch appends a `flexible-match-range` predicate (#6804): load BitLength
+// bits at ByteOffset from the LAYER-3 header, mask, and compare.
+//
+// No nfproto/l4proto dep is added, deliberately. `layer-3` means "from the start
+// of the network header", which is well-defined in both families, and adding an
+// nfproto dep would narrow the term to one family — silently dropping the
+// predicate's effect in the other pass, which is the widening this exists to
+// prevent.
+func (a *ruleAsm) flexMatch(fm Lo0FlexMatch) *ruleAsm {
+	return a.add(flexMatchExprs(fm)...)
 }
 
 // exthdrFragV6 appends `exthdr frag exists` with its nfproto(ipv6) dep.
@@ -549,6 +562,64 @@ func fragV4Match() []expr.Any {
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 6, Len: 2},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 2, Mask: []byte{0x1f, 0xff}, Xor: []byte{0x00, 0x00}},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0x00, 0x00}},
+	}
+}
+
+// flexMatchByteLen is the payload load width for a bit length: ceil(bits/8),
+// matching the userspace snapshot builder (pkg/dataplane/userspace/filters.go),
+// which derives its own load width the same way. The compiler constrains
+// BitLength to 1..32, so the result is 1..4.
+// It mirrors the userspace snapshot builder EXACTLY, including its two edge
+// rules (pkg/dataplane/userspace/filters.go): a zero bit-length defaults to 4
+// (32-bit), and an oversized width is NOT capped to 4 — capping would compare
+// only the truncated window and BROADEN the match, the #3406 fail-open. An
+// oversized width is reported here as unrepresentable instead, which is the same
+// direction userspace takes (it rejects the snapshot outright).
+func flexMatchByteLen(bits uint8) uint32 {
+	if bits == 0 {
+		return 4
+	}
+	return uint32((uint16(bits) + 7) / 8)
+}
+
+// flexMatchRepresentable reports whether a resolved predicate can be rendered
+// as an nft payload load. Only the width can fail: the commit gate bounds
+// bit-length to 1..32, so a width outside 1..4 arrives only on a corrupt /
+// version-drifted tolerant-load snapshot.
+func flexMatchRepresentable(fm Lo0FlexMatch) bool {
+	n := flexMatchByteLen(fm.BitLength)
+	return n >= 1 && n <= 4
+}
+
+// flexMatchExprs renders `@nh,<off*8>,<bits> & mask == value` as
+// payload + bitwise + cmp, the same three-expression shape fragV4Match uses.
+//
+// Value and Mask are emitted BIG-ENDIAN over the load width, because a payload
+// load returns network-order bytes and the compiler stores both as host-order
+// integers over that same width (config.FlexMatchConfig). Truncating from the
+// low end of a big-endian encoding is what keeps a 1-byte match comparing the
+// byte the operator wrote rather than the top byte of a 32-bit word.
+func flexMatchExprs(fm Lo0FlexMatch) []expr.Any {
+	n := flexMatchByteLen(fm.BitLength)
+	if !flexMatchRepresentable(fm) {
+		return nil
+	}
+	var val, mask [4]byte
+	binary.BigEndian.PutUint32(val[:], fm.Value)
+	binary.BigEndian.PutUint32(mask[:], fm.Mask)
+	v := append([]byte(nil), val[4-n:]...)
+	m := append([]byte(nil), mask[4-n:]...)
+	// Apply the mask to the expected value too. nft's own `& mask == value`
+	// lowering compares the MASKED load, so an operator value carrying bits
+	// outside the mask would otherwise never match — a silent never-match is a
+	// different fail direction from the widening this fixes, and just as quiet.
+	for i := range v {
+		v[i] &= m[i]
+	}
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: uint32(fm.ByteOffset), Len: n},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: n, Mask: m, Xor: make([]byte, n)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: v},
 	}
 }
 
