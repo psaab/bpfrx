@@ -119,6 +119,32 @@ after HA failover. To make that **structural**, not flag-defended:
   goroutine's `openConn()` BEFORE its main loop, NOT under `m.mu` (see "Bind
   retry runs unlocked" below). The tombstone (held) still provides mutual
   exclusion for the start.
+- **A dead sender has a retry owner (#6793).** `openConn` runs in the owner
+  goroutine — the bind retry must not hold `m.mu` — so `startLocked` returns
+  SUCCESS and a failed open surfaces only as `sender.dead()` afterwards. `Apply`
+  has known how to rebuild that sender since #2865 (the "rebuilding dead sender
+  (initial conn open failed)" branch), but only when something calls `Apply`
+  again, and until #6793 nothing did:
+  - **standalone** applies RA from `applyServicesReconcile`, which runs only on
+    a config apply, and `reconcileRGStateLoop` is cluster-only — so a boot-time
+    bind failure left the interface advertising nothing until an operator
+    happened to commit, on a node that reported a successful commit;
+  - **cluster** runs `reconcileClusterRAServices` every 2s but DIGEST-GATES it,
+    and a dead sender does not move the desired-set digest — so its own "a
+    transient boot-time bind failure recovers on the next reconcile with NO
+    config change" promise did not hold either.
+
+  `Manager.HasDeadSenders()` is the probe both owners gate on (a map walk over
+  live senders; `dead()` is a non-blocking channel probe, so it is free on the
+  common path). The cluster reconcile bypasses its digest while it is true; the
+  daemon additionally runs an always-on `raDeadSenderReassertLoop`, mirroring
+  `proxyARPReassertLoop` — unconditional, re-reading the active config each tick,
+  and taking `applySem` BEFORE that read for the #4001 reason (a tick that read
+  the config outside the semaphore could re-assert RA on an interface a
+  concurrent commit had just removed it from). The gate is checked again INSIDE
+  the semaphore: a commit that landed while the tick queued may already have
+  rebuilt the sender, and re-applying then would be a gratuitous RA restart.
+
 - **A failed FINAL goodbye is returned AND retained (#6777).** The graceful
   withdrawal path gets exactly two chances to put a lifetime-0 RA on the wire:
   the owner's own emit in `finishShutdown`, and — if that failed, leaving
