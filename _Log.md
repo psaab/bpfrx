@@ -104506,6 +104506,20 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
 
+## 2026-08-22 — #7581 synced reserve read "no pool" as a collision
+
+- **Timestamp**: 2026-08-22
+- **Action**: `reserve_synced_on_first_pool_owner` returned a bare bool, so "no
+  candidate rule's pool owns the translated address" was indistinguishable from
+  "a pool-owning candidate refused". Interface-mode SNAT is permanently the
+  former, so since #6600 every peer-synced import under interface-mode SNAT was
+  refused BEFORE publish — the standby's helper never received the session,
+  while Go's BPF mirror (what `show security flow session` reads) kept the row.
+  Found by deploying #6785's refusal reporting to the loss cluster: 17
+  `reserve` refusals on fw1 in one iperf3 run, cap drops 0. Made the
+  reservation tri-state; only a pool-owning decline blocks the publish.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
 ## 2026-08-22 — #6786 fail closed when a NIC identity read fails
 
 - **Timestamp**: 2026-08-22
