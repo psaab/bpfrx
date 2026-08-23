@@ -356,3 +356,124 @@ func TestVanishedInterfaceLeavesNoGoodbyeRetryDebt6777(t *testing.T) {
 			"recordGoodbyeDebtLocked is rejecting everything", got)
 	}
 }
+
+func (m *Manager) debtAttemptsForTest(name string) (int, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d := m.goodbyeOwed[name]
+	if d == nil {
+		return 0, false
+	}
+	return d.attempts, true
+}
+
+// TestFreshGoodbyeDebtIsNotRetriedInTheSamePass6777 binds the recordedEpoch
+// hold-over. retryOwedGoodbyes runs at the END of Apply, and Apply bumps the
+// epoch at its start, so a debt recorded by THIS Apply's own withdrawal would
+// otherwise be retried microseconds after the standalone backstop already
+// failed on a fresh conn — burning one of the bounded attempts on the same tick.
+// The budget exists to span the daemon's 2s reconcile passes; spending it three
+// times on one pass shortens the window in which a transient failure can
+// recover to almost nothing.
+//
+// The assertion is on the ATTEMPT COUNTER rather than on an emit count because
+// the counter is what the bound consumes; an emit count would also move for
+// reasons (owner emit vs backstop emit) that are not the property under test.
+//
+// NON-TAUTOLOGY: neutralise the `d.recordedEpoch == m.epoch` hold-over and the
+// withdrawing Apply leaves attempts at 1 → RED.
+func TestFreshGoodbyeDebtIsNotRetriedInTheSamePass6777(t *testing.T) {
+	requireLo(t)
+	g := installGoodbyeProbe(t, false)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	g.setFailing(true)
+	if err := m.Apply(nil); err == nil {
+		t.Fatal("withdrawal with a failing goodbye reported success")
+	}
+
+	attempts, owed := m.debtAttemptsForTest("lo")
+	if !owed {
+		t.Fatal("precondition: no debt was retained by the failing withdrawal")
+	}
+	if attempts != 0 {
+		t.Fatalf("the withdrawing Apply spent %d retry attempt(s) on its own "+
+			"fresh debt; the bounded budget is meant to span reconcile passes, "+
+			"not be consumed on the pass that created the debt", attempts)
+	}
+
+	// The NEXT pass is the one that may spend an attempt. Asserting this is what
+	// makes the check above a hold-over rather than a never-retry.
+	if err := m.Apply(nil); err == nil {
+		t.Fatal("the next pass reported success while the goodbye was still owed")
+	}
+	if attempts, _ := m.debtAttemptsForTest("lo"); attempts != 1 {
+		t.Fatalf("the next pass spent %d attempts, want exactly 1 — the "+
+			"hold-over must defer the retry, not cancel it", attempts)
+	}
+}
+
+// TestBusySkipDoesNotSpendARetryAttempt6777 binds the refund. A retry that finds
+// the interface BUSY (another owner holds a claim tombstone, so WithdrawOnce
+// self-skips) emitted nothing — charging it against the bounded budget would let
+// a few unlucky passes exhaust the retries without a single lifetime-0 write
+// ever having been attempted, and the debt would then be dropped as "gave up"
+// on an interface we never actually tried.
+//
+// The tombstone is installed directly because that is the state a concurrent
+// Apply/Withdraw/WithdrawOnce leaves; driving a real concurrent owner would make
+// the fixture timing-dependent for no additional coverage.
+//
+// NON-TAUTOLOGY: remove the refund and the busy pass leaves attempts at 1 → RED.
+func TestBusySkipDoesNotSpendARetryAttempt6777(t *testing.T) {
+	requireLo(t)
+	g := installGoodbyeProbe(t, false)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	g.setFailing(true)
+	if err := m.Apply(nil); err == nil {
+		t.Fatal("withdrawal with a failing goodbye reported success")
+	}
+	if attempts, owed := m.debtAttemptsForTest("lo"); !owed || attempts != 0 {
+		t.Fatalf("precondition: want owed debt with 0 attempts, got attempts=%d owed=%v",
+			attempts, owed)
+	}
+
+	// Another owner claims the interface. A retry must self-skip on this.
+	m.mu.Lock()
+	m.draining["lo"] = &drainEntry{cfg: testCfg("lo"), goodbyeClaimed: true}
+	m.mu.Unlock()
+
+	beforeBusy := g.attemptsFor("lo")
+	if err := m.Apply(nil); err == nil {
+		t.Fatal("a pass that could not emit reported success")
+	}
+	if got := g.attemptsFor("lo"); got != beforeBusy {
+		t.Fatalf("a lifetime-0 RA was emitted on an interface another owner "+
+			"holds (attempts %d -> %d) — that is the second-conn shape "+
+			"WithdrawOnce's claim exists to prevent", beforeBusy, got)
+	}
+	if attempts, owed := m.debtAttemptsForTest("lo"); !owed || attempts != 0 {
+		t.Fatalf("a busy skip spent a retry attempt (attempts=%d owed=%v): "+
+			"nothing was emitted, so nothing should be charged against the "+
+			"bounded budget", attempts, owed)
+	}
+
+	// Release the claim: the following pass must actually try.
+	m.mu.Lock()
+	delete(m.draining, "lo")
+	m.mu.Unlock()
+	if err := m.Apply(nil); err == nil {
+		t.Fatal("the pass after the claim cleared reported success")
+	}
+	if attempts, _ := m.debtAttemptsForTest("lo"); attempts != 1 {
+		t.Fatalf("after the claim cleared the retry spent %d attempts, want 1 — "+
+			"the refund must not make the debt un-spendable", attempts)
+	}
+}

@@ -104336,3 +104336,10 @@ prose edit above them added. No diff falls in the new test body.
   (`Manager.goodbyeOwed`) that `Apply` re-drives via `WithdrawOnce`.
 - **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go,
   pkg/ra/goodbye_retry_debt_6777_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6777 round 2 — bound the two mutation cells that came back GREEN.
+  `recordedEpoch` (a debt recorded by the current Apply is held over, not
+  retried on the same pass) and the busy-skip attempt refund were both
+  documented claims with no assertion behind them; a mutation neutralising
+  either left the suite green.
+- **File(s)**: pkg/ra/goodbye_retry_debt_6777_test.go, _Log.md
