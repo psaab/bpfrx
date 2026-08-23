@@ -130,7 +130,14 @@ type Daemon struct {
 	// once after the boot apply and read only under applySem in
 	// reconcileDNSLocked.
 	dnsBootDone bool
-	dhcpServer  *dhcpserver.Manager
+
+	// reconcileDNSFn overrides the DNS reconcile (#6792). Nil means the real
+	// one. It exists so a test can drive the REAL applyTailReconciles and prove
+	// a DNS failure reaches the commit result — before #6792 that error could
+	// not propagate at all, and the per-function cells stay green if the join
+	// is removed again.
+	reconcileDNSFn func(*config.Config, bool) error
+	dhcpServer     *dhcpserver.Manager
 	// ddns is the always-on DHCP dynamic-DNS manager (#1387 inc-2). It is
 	// constructed UNCONDITIONALLY at daemon start (plan §4.2) — even when
 	// DDNS is disabled — so an enabled→disabled commit always has a running
