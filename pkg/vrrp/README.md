@@ -125,6 +125,10 @@ This is the package that drives chassis-cluster failover.
     `removeVIPsLocked`, `nlLinkByName`/`nlAddrAdd`/`nlAddrDel`,
     `removeVIPsIfBackup`, `scheduleVIPRemoveReconcile`, `surfaceStaleVIP`,
     `vipActuationResult`).
+- `advert_capacity.go` — per-family VIP cardinality guard (#6779):
+  `splitVIPsByFamily` (the SSOT for how a configured VIP list is counted
+  by family, shared with `sendAdvert`) and `checkAdvertCapacity` (whether
+  that list can produce a legal advert). See "Advert capacity" below.
 - `packet.go` — VRRPv3 advert parser/builder + IPv4/IPv6 checksums.
 - `track.go` — interface tracking (#1814): the per-instance
   effective-priority primitives (`getPriority`, `setTrackDown`,
@@ -593,13 +597,75 @@ invariants hold by construction:
 - **Count stays consistent.** `Marshal` derives the "Count IPvX Addr" wire byte
   from `len(IPAddresses)` (`packet.go`), so prepending bumps the count in
   lockstep with the payload length; the `MinAdvertAddrCount..MaxAdvertAddrCount`
-  guard still applies (a 255-VIP config would push to 256 and be rejected).
+  guard still applies. The prepend is exactly why the IPv6 CONFIGURED-VIP
+  ceiling is 254 and not 255: a 255-VIP IPv6 config pushes the wire count to
+  256 and `Marshal` rejects it. That rejection is now caught before it can
+  matter — see "Advert capacity" below (#6779).
 - **IPv4 is untouched.** The prepend lives only in the IPv6 send path; the
   IPv4 `sendPacket` builder advertises the configured VIPs verbatim.
 
 Guarded by `TestSendPacketIPv6PrependsVirtualRouterLinkLocal` /
 `TestSendPacketIPv6LinkLocalFirstWithMultipleVIPs`, which re-parse the captured
 advert and assert address[0] is the link-local and the Count field includes it.
+
+### Advert capacity — per-family VIP cardinality (#6779)
+
+RFC 5798 §5.2.4 makes an advertisement's "Count IPvX Addr" a single byte, so
+one advert carries at most **255** addresses of a family. `Marshal` REFUSES an
+out-of-range count rather than truncating it (#5090). Combined with the IPv6
+link-local prepend above, the ceiling on **configured** VIPs is:
+
+| Family | Configured VIP ceiling | Why |
+|---|---|---|
+| IPv4 | 255 (`MaxAdvertAddrCount`) | no prepend — every slot is a configured VIP |
+| IPv6 | 254 (`MaxAdvertAddrCount - 1`) | slot 0 is the mandatory link-local prepend |
+
+`MaxConfiguredVIPs(isIPv6)` (`packet.go`) derives both from
+`MaxAdvertAddrCount`, so the subtraction lives in one place.
+
+**Why an oversized set was more than a malformed packet.** `sendAdvert`
+discards a `Marshal` failure at `slog.Debug`, and `becomeMaster` claimed the
+VIP set and published MASTER **before** calling it. An oversized family
+therefore produced an owner that advertised **nothing**: the peer's
+`masterDownTimer` expired and it promoted too — both nodes answering ARP for
+the same VIPs — or, with the same config synced to both nodes, no node could
+advertise and the VIPs were stranded. Note the failure is *silent* at a default
+log level, so it presented as an unexplained dual-master.
+
+Three layers now close it, and the cap is enforced at each:
+
+1. **Commit** — `validateVRRPVIPCountStrict` (`pkg/config`) hard-rejects an
+   over-capacity set at `commit` / `commit-check`, covering BOTH VIP sources:
+   explicit `vrrp-group ... virtual-address`, and the RETH-derived instances
+   where a redundancy-group interface's own unit addresses become the
+   advertised set (`CollectRethInstances`). Per #1960 no-brick the tolerant
+   load / peer-sync path downgrades it to a warning
+   (`opts.lenientVRRPVIPCount`).
+2. **Instance construction** — `UpdateInstances` refuses to build an
+   instance whose VIP set cannot advertise, same doctrine as the #4573 VRID
+   guard, so a leniently-loaded config leaves the group out of the election
+   rather than seating a silent non-advertiser.
+3. **Ownership** — `becomeMaster` consults `vi.advertCapacityErr` and returns
+   false **before** `setState`/`addVIPs`, so the VIPs are never claimed. This is
+   the #5082 "do not claim what you cannot back" rule applied to the advert
+   instead of to VIP actuation. The predicate is computed once in `newInstance`
+   (the configured VIP list is immutable per instance — a VIP change rebuilds
+   it), so the ~97ms RETH retry path pays a nil check and the operator-facing
+   `Error` is logged once, not per retry.
+
+Because `pkg/vrrp` imports `pkg/config` and never the reverse, the cap is
+necessarily spelled in both packages
+(`config.MaxVRRPVirtualAddressesIPv4/IPv6`). They are NOT independently
+maintained: `advert_capacity_agreement_6779_test.go` measures the largest count
+the REAL `Marshal` accepts per family — driving IPv6 through the same
+link-local prepend — and asserts the config constants equal exactly that, so a
+wire-format change the constants did not follow fails the suite instead of
+silently splitting the validator from the builder.
+
+**Not covered:** an EMPTY (or entirely unparseable) VIP list. Such an instance
+also holds its group without advertising, but it claims no addresses, so there
+is nothing for a second master to collide over. It is a distinct defect tracked
+separately.
 
 ### Receiver goroutine model
 

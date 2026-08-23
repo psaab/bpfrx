@@ -290,24 +290,32 @@ type vrrpInstance struct {
 	// stalling it.
 	resignAckMu sync.Mutex
 	resignAcks  []*ResignBarrier
+
+	// advertCapacityErr is non-nil when this instance's configured VIP set
+	// cannot produce a legal VRRPv3 advertisement, so becomeMaster must not
+	// claim ownership (#6779). Computed once by instanceAdvertCapacityErr
+	// (advert_capacity.go); read-only after construction.
+	advertCapacityErr error
 }
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, onEventDrop func()) *vrrpInstance {
+	capErr := instanceAdvertCapacityErr(cfg) // #6779, advert_capacity.go
 	return &vrrpInstance{
-		cfg:             cfg,
-		desiredPreempt:  cfg.Preempt,
-		state:           StateInitialize,
-		iface:           iface,
-		eventCh:         eventCh,
-		afPacketFD:      -1,
-		ipv6FD:          -1,
-		preemptNowCh:    make(chan struct{}, 1),
-		resignCh:        make(chan struct{}, 1),
-		configUpdatedCh: make(chan struct{}, 1),
-		rxCh:            make(chan *VRRPPacket, 64),
-		stopCh:          make(chan struct{}),
-		stopped:         make(chan struct{}),
-		onEventDrop:     onEventDrop,
+		cfg:               cfg,
+		desiredPreempt:    cfg.Preempt,
+		state:             StateInitialize,
+		iface:             iface,
+		eventCh:           eventCh,
+		afPacketFD:        -1,
+		ipv6FD:            -1,
+		preemptNowCh:      make(chan struct{}, 1),
+		resignCh:          make(chan struct{}, 1),
+		configUpdatedCh:   make(chan struct{}, 1),
+		rxCh:              make(chan *VRRPPacket, 64),
+		stopCh:            make(chan struct{}),
+		stopped:           make(chan struct{}),
+		onEventDrop:       onEventDrop,
+		advertCapacityErr: capErr,
 	}
 }
 
@@ -1370,6 +1378,14 @@ func (vi *vrrpInstance) vipFamilies() (hasIPv4, hasIPv6 bool) {
 // Returns true iff ownership was claimed (VIP set actuated and advert/event
 // published).
 func (vi *vrrpInstance) becomeMaster() bool {
+	// #6779: refuse ownership we cannot advertise — #5082's "do not claim what
+	// you cannot back" applied to the advert. Before setState/addVIPs so there
+	// is nothing to roll back. Rationale + log-rate note: advert_capacity.go.
+	if vi.advertCapacityErr != nil {
+		slog.Debug("vrrp: cannot build a legal advertisement, not claiming ownership (fail-closed)",
+			"key", vi.key(), "err", vi.advertCapacityErr)
+		return false
+	}
 	pri := vi.getPriority()
 	slog.Info("vrrp: transitioning to MASTER",
 		"key", vi.key(), "priority", pri)

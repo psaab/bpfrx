@@ -532,6 +532,35 @@ or peer-synced config an older binary accepted still boots (#1960 no-brick).
 This is config-only commit-time validation — it never touches the VRRP
 runtime/state machine. Same fail-closed-on-load doctrine as #2911.
 
+**VRRP virtual-address count must fit one advertisement (#6779):** RFC 5798
+§5.2.4 makes an advertisement's "Count IPvX Addr" a single byte, so one advert
+carries at most 255 addresses of a family — 254 for IPv6, where §6.1 reserves
+the first slot for the mandatory link-local address `pkg/vrrp`
+`sendPacketIPv6` prepends. `pkg/vrrp` `Marshal` REFUSES an out-of-range count
+rather than truncating it (#5090), and `sendAdvert` discards that error at
+`slog.Debug`, so an oversized set made EVERY advert fail — **after**
+`becomeMaster` had already claimed the VIPs and published MASTER. The node then
+owned the addresses while emitting nothing: the peer stopped hearing a master,
+promoted itself, and both answered for the same addresses; with the same config
+synced to both nodes, the addresses were stranded with no advertising owner.
+`validateVRRPVIPCountStrict`
+(`compiler_validate_strict_vrrp_vipcount.go`) rejects such a set at commit,
+covering BOTH VIP sources: the explicit `vrrp-group ... virtual-address` list,
+and the RETH-derived instances where a redundancy-group interface's own unit
+addresses BECOME the advertised set (`CollectRethInstances`) — a gate walking
+only `unit.VRRPGroups` would miss the RETH path entirely. It mirrors
+`CollectRethInstances`' early return, so `no-reth-vrrp` / `private-rg-election`
+(no synthesized RETH VRRP instance) is not rejected. The tolerant load/peer-sync
+path downgrades to a warning (`lenientVRRPVIPCount`, #1960 no-brick); the
+`pkg/vrrp` runtime guards independently refuse to build the instance
+(`UpdateInstances`) and refuse to claim MASTER (`becomeMaster`), so a
+leniently-loaded oversized set is held out of the election rather than seated as
+a silent non-advertiser. The cap is spelled in both packages
+(`MaxVRRPVirtualAddressesIPv4/IPv6` here, `MaxConfiguredVIPs` there) because
+`pkg/vrrp` imports `pkg/config` and not the reverse; they are bound by a
+behavioural agreement test in `pkg/vrrp` that measures what the real `Marshal`
+accepts rather than pinning either side to a literal. Same doctrine as #4826.
+
 **No-match default-policy is fail-closed (#3065):** the sibling of #3043
 for the implicit fallback. When a flow matches NO zone-pair, global, or
 default policy, the verdict is `SecurityConfig.DefaultPolicy`. Because the

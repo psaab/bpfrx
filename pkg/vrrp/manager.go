@@ -458,6 +458,24 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 				"valid_range", fmt.Sprintf("%d..%d", MinVRID, MaxVRID))
 			continue
 		}
+		// #6779 defensive advert-capacity guard, same doctrine as the VRID guard
+		// above. A VIP set carrying more addresses of one family than the u8
+		// "Count IPvX Addr" field can express makes every Marshal for that
+		// family fail — and sendAdvert discards that error at
+		// slog.Debug. Building the instance anyway would put a node in the
+		// election that claims VIPs and never advertises: the peer times out and
+		// promotes too (dual-master), or the VIP is stranded. The config commit
+		// gate (validateVRRPVIPCountStrict, pkg/config) rejects such a set, but
+		// the tolerant load / HA-sync path downgrades it to a warning (#1960
+		// no-brick), so refuse to build the instance rather than seat a silent
+		// non-advertiser.
+		if err := checkAdvertCapacity(inst.VirtualAddresses); err != nil {
+			slog.Warn("vrrp: skipping instance whose virtual addresses cannot "+
+				"produce a legal advertisement",
+				"interface", inst.Interface, "group_id", inst.GroupID,
+				"vip_count", len(inst.VirtualAddresses), "err", err)
+			continue
+		}
 		key := instanceKey{iface: inst.Interface, groupID: inst.GroupID, family: inst.Family}
 		if _, exists := desiredMap[key]; exists {
 			return fmt.Errorf(

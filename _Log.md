@@ -104476,3 +104476,32 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cluster/sync_config_queue_full_6778_test.go`,
   `pkg/cluster/sync_config_health_6387_test.go`, `docs/sync-protocol.md`,
   `docs/session-sync-architecture.md`
+
+## 2026-08-22 — #6779 an oversized VIP set advertises nothing after claiming ownership
+
+- **Timestamp**: 2026-08-22
+- **Action**: Closed the ordering hole where `becomeMaster` claimed the VIP set
+  and published MASTER *before* `sendAdvert`, which discards a `Marshal`
+  failure at `slog.Debug`. A VIP set larger than the advertisement's one-byte
+  address count (255, or 254 for IPv6 where the mandatory link-local prepend
+  consumes a slot) therefore produced an owner that advertised nothing — the
+  peer promoted too (dual-master), or the VIPs were stranded. Added a
+  commit-time gate (`validateVRRPVIPCountStrict`, lenient-opt registered per
+  the #1960 no-brick contract) covering BOTH VIP sources — explicit
+  `vrrp-group` and the RETH-derived instances whose unit addresses become the
+  advertised set — plus runtime guards in `UpdateInstances` (#4573 doctrine)
+  and `becomeMaster` (#5082 doctrine). `sendAdvert` and the guard now share one
+  `splitVIPsByFamily` so the builder and the validator cannot count
+  differently, and a behavioural agreement test measures what the real
+  `Marshal` accepts instead of pinning either side to a literal. The EMPTY-VIP
+  case was measured and deliberately excluded: it is a distinct, non-colliding
+  defect with a 22-test blast radius.
+- **File(s)**: `pkg/vrrp/advert_capacity.go` (new), `pkg/vrrp/packet.go`,
+  `pkg/vrrp/instance.go`, `pkg/vrrp/instance_send.go`, `pkg/vrrp/manager.go`,
+  `pkg/vrrp/advert_capacity_gate_6779_test.go` (new),
+  `pkg/vrrp/advert_capacity_agreement_6779_test.go` (new),
+  `pkg/config/compiler_validate_strict_vrrp_vipcount.go` (new),
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
+  `pkg/config/README.md`
