@@ -1011,7 +1011,27 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 				isVRRPReth = rethCfg.RedundancyGroup > 0 && clusterNodeID >= 0
 			}
 		} else {
-			isVRRPReth = ifCfg.RedundancyGroup > 0 && clusterNodeID >= 0
+			// #6781: an interface with no `redundant-parent` is a member of no
+			// redundant pair, and an interface that OWNS one was already skipped
+			// above (the skip keys on RethToPhysical, i.e. on some port naming
+			// it as their redundant-parent). So reaching here with
+			// RedundancyGroup > 0 is exactly the shape #6781 is about:
+			// `redundant-ether-options redundancy-group` on an interface that is
+			// neither a member nor an owner.
+			//
+			// Treating it as a VRRP-backed reth REPLACED the operator's
+			// configured address with a 169.254.<rg>.<node>/32 link-local below
+			// and handed the real address to VRRP as a VIP. In VRRP mode that
+			// demoted a plain L3 interface's address to one that exists only
+			// while MASTER; under `no-reth-vrrp` the direct collector skipped
+			// the interface too, so the address was stripped here and installed
+			// by NOBODY, on both nodes. It also armed the RETH virtual-MAC
+			// recovery search below for a MAC this interface can never carry.
+			//
+			// Commit now rejects the shape (validateRethRedundancyGroupStrict);
+			// this keeps a tolerantly-loaded config that still carries it from
+			// losing the address.
+			isVRRPReth = false
 		}
 
 		linuxName := config.LinuxIfName(ifName)

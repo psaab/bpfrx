@@ -173,15 +173,27 @@ func CollectRethInstances(cfg *config.Config, localPriority map[int]int) []*Inst
 	}
 	sort.Strings(names)
 
+	// #6781: RG ownership comes from the shared structural predicate, not from
+	// a bare RedundancyGroup > 0. Built once for the whole walk.
+	rgOwners := cfg.RethRGOwners()
+
 	var instances []*Instance
 	for _, name := range names {
 		ifc := cfg.Interfaces.Interfaces[name]
 		// #6780: skip a present-but-nil interface, matching CollectInstances
 		// above and every RETH-ownership walk in pkg/daemon.
-		if ifc == nil || ifc.RedundancyGroup <= 0 {
+		if ifc == nil {
 			continue
 		}
-		rgID := ifc.RedundancyGroup
+		rgID, owns := rgOwners[name]
+		// RG 0 is the control-plane group; no RETH VRRP instance is
+		// synthesized for it, and an unset redundancy-group also reads as 0.
+		// The `> 0` term lives here rather than in the shared predicate
+		// because the direct collector below is legitimately queried for
+		// group 0 (see Config.RethRGOwners).
+		if !owns || rgID <= 0 {
+			continue
+		}
 
 		pri := localPriority[rgID]
 		if pri == 0 {
@@ -267,17 +279,24 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 	rethToPhys := cfg.RethToPhysical()
 
 	result := make(map[string][]string)
+	// #6781: the same structural ownership predicate the VRRP-backed collector
+	// uses. This replaces a `strings.HasPrefix(name, "reth")` filter whose
+	// stated purpose — "skip fabric, control, and management interfaces that
+	// default to RedundancyGroup 0" — is already served by the predicate (those
+	// interfaces own no group), but which ALSO excluded a structurally valid
+	// redundant pair whose owner is not spelled "reth*", leaving that group
+	// with no VIPs installed at all.
+	rgOwners := cfg.RethRGOwners()
+
 	for _, name := range sortedIfNames(cfg) {
 		ifc := cfg.Interfaces.Interfaces[name]
 		// #6780: skip a present-but-nil interface — this is the direct
 		// (no-reth-vrrp / private-rg-election) ownership mode's collector, and
 		// it carried the same raw deref as the VRRP-mode one above.
-		if ifc == nil || ifc.RedundancyGroup != rgID {
+		if ifc == nil {
 			continue
 		}
-		// Only include actual RETH interfaces — skip fabric, control,
-		// and management interfaces that default to RedundancyGroup 0.
-		if !strings.HasPrefix(name, "reth") {
+		if owns, ok := rgOwners[name]; !ok || owns != rgID {
 			continue
 		}
 

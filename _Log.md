@@ -104622,3 +104622,26 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/shutdown_latch_6787_test.go,
   pkg/daemon/daemon_run_shutdown.go,
   pkg/daemon/shutdown_dhcp_stop_6787_test.go, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-08-22 — #6781 one predicate for RETH redundancy-group ownership
+
+- **Timestamp**: 2026-08-22
+- **Action**: Reproduced both ownership readings from real compiled configs
+  before choosing a survivor, and found BOTH wrong in opposite directions: the
+  VRRP-backed collector's bare `RedundancyGroup > 0` claimed a non-reth
+  interface (turning its own address into a MASTER-only VIP), while the direct
+  collector's `reth`-name filter dropped a structurally valid pair not spelled
+  `reth*` (leaving that group with no VIPs). Under `no-reth-vrrp` the two
+  combined with networkd's link-local substitution to strip a non-reth
+  interface's address on both nodes with nobody installing it back. Added
+  `Config.RethRGOwners` as the shared structural-or-nominal predicate, routed
+  both collectors through it, stopped networkd treating a non-reth as a VRRP
+  reth member, and added a commit gate with a lenient opt.
+- **File(s)**: `pkg/config/reth_rg_owner.go` (new),
+  `pkg/config/compiler_validate_strict_reth_rg.go` (new),
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_routing_rib_rpm.go`,
+  `pkg/vrrp/vrrp.go`, `pkg/dataplane/compiler_iface.go`,
+  `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
+  `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
+  `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
