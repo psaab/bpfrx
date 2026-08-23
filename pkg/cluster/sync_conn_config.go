@@ -194,13 +194,13 @@ func (s *SessionSync) fireConfigApplyGraceExpiry(epoch uint64) {
 // noteConfigApplySuccess clears the config-sync health streak on a successful
 // apply (#6387). It cancels the grace-expiry timer, resets the streak, and
 // bumps the epoch so an in-flight timer callback becomes a no-op. It then
-// clears the node-global CF annotation UNCONDITIONALLY — NOT gated on this
-// instance's configApplyHealthRaised. A comms transport change tears down this
+// clears the node-global CF annotation without consulting THIS instance's
+// configApplyHealthRaised flag. A comms transport change tears down this
 // SessionSync but KEEPS the cluster Manager (daemon stopClusterComms), so a CF
 // raised by a PRIOR SessionSync instance would otherwise stay stuck forever:
 // the replacement instance records the applied generation but, gated on its own
 // never-set flag, would never clear the manager. An idempotent clear is cheap,
-// so the first successful apply on ANY instance re-converges the annotation.
+// so a caught-up successful apply on ANY instance re-converges the annotation.
 // Called from the single-consumer configApplyLoop; guarded by configApplyMu.
 //
 // #6778: the clear is gated on the applied generation having CAUGHT UP with the
