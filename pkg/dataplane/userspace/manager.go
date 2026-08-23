@@ -194,11 +194,22 @@ type Manager struct {
 	// buildFabricSnapshots when unset (so bare &Manager{} literals still work).
 	fabricSnapshotBuilder func(*config.Config) []FabricSnapshot
 	lastIngressIfaces     []uint32
-	lastRSTv4             []netip.Addr
-	lastRSTv6             []netip.Addr
-	lastRSTAttempt        time.Time
-	lastRSTInstallOK      bool
-	lastSnapshotHash      [32]byte // content hash of last published snapshot (excludes volatile fields)
+	// ingressInventoryAdopted records whether this Manager has reconciled
+	// lastIngressIfaces against the rows actually present in the PINNED
+	// userspace_ingress_ifaces map (#6784). It is false on a freshly
+	// constructed Manager, which is exactly the daemon-restart case: the map
+	// is PinByName-pinned at /sys/fs/bpf/xpf and its rows outlive the process,
+	// but lastIngressIfaces does not — so without one adoption pass the reap
+	// loop in syncIngressIfaceMapLocked scans an EMPTY inventory and deletes
+	// nothing, leaving rows this process never wrote and cannot name. Set once
+	// per Manager, after a successful enumeration; within a process the
+	// inventory is then maintained exactly as #6537 established.
+	ingressInventoryAdopted bool
+	lastRSTv4               []netip.Addr
+	lastRSTv6               []netip.Addr
+	lastRSTAttempt          time.Time
+	lastRSTInstallOK        bool
+	lastSnapshotHash        [32]byte // content hash of last published snapshot (excludes volatile fields)
 	// #1866 D3: canonical summary of the WG endpoint set in the last
 	// successfully published snapshot, for publish-boundary transition
 	// logging (logWgEndpointSetTransitionLocked).
