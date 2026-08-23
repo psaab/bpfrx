@@ -1002,7 +1002,7 @@ impl Nat64State {
         // no-previous cold path where the frag-association generation guard is
         // not exercised. The production reconcile path uses
         // `from_snapshots_with_previous` with the real `snapshot.generation`.
-        Self::from_snapshots_with_previous(snaps, None, 0)
+        Self::from_snapshots_with_previous(snaps, None, 0, 0)
     }
 
     /// #4518: build the NAT64 state, PRESERVING live translated-port
@@ -1036,10 +1036,14 @@ impl Nat64State {
     /// stamped onto every fragment association installed while this state is
     /// live, so associations minted under a prior generation are invalidated on
     /// lookup after a commit changes deny/NAT64 rules.
+    /// `now_ns` is the caller's MONOTONIC clock, threaded to the #6765
+    /// retained-address re-seed. Callers that cannot reach one (tests that do
+    /// not exercise a pool change) pass 0.
     pub(crate) fn from_snapshots_with_previous(
         snaps: &[NAT64RuleSnapshot],
         previous: Option<&Nat64State>,
         generation: u64,
+        now_ns: u64,
     ) -> Self {
         let mut prefixes = Vec::with_capacity(snaps.len());
         // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
@@ -1132,7 +1136,54 @@ impl Nat64State {
             let port_allocator = previous
                 .and_then(|prev| prev.reuse_allocator(&prefix_bytes, &pool_v4))
                 .unwrap_or_else(|| {
-                    PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH)
+                    let fresh =
+                        PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH);
+                    // #6765: the comment above is right that stale reservations
+                    // must not be replayed against a DIFFERENT pool — the
+                    // counters and the occupancy bitmap are pool-position
+                    // indexed. But a pool that RETAINS an address is not a
+                    // different pool for that address, and a fresh allocator
+                    // reissues its port-offset 0 to a new flow while a
+                    // pre-reload session still owns it. Carry the retained
+                    // addresses' live ownership across, REMAPPED to their new
+                    // indices, rather than replaying raw positions.
+                    //
+                    // A fully-disjoint pool yields an empty map and re-seeds
+                    // nothing, which is the reset
+                    // `nat64_4518_pool_change_resets_allocator` pins.
+                    if let Some(prev_prefix) = previous.and_then(|prev| {
+                        prev.prefixes
+                            .iter()
+                            .find(|p| p.prefix_bytes == prefix_bytes)
+                    }) {
+                        let map = crate::nat::retained_pool_index_map_v4(
+                            &prev_prefix.pool_v4,
+                            &pool_v4,
+                        );
+                        if !map.is_empty() {
+                            let outcome = fresh.reseed_retained_from(
+                                &prev_prefix.port_allocator,
+                                &map,
+                                now_ns,
+                            );
+                            if outcome.reseeded > 0
+                                || outcome.skipped_out_of_range > 0
+                                || outcome.refused > 0
+                            {
+                                eprintln!(
+                                    "xpf nat64: pool for rule {:?} changed: carried {} live \
+                                     translation(s) onto {} retained address(es); {} not \
+                                     carried (port outside the range), {} refused (#6765)",
+                                    snap.name,
+                                    outcome.reseeded,
+                                    map.len(),
+                                    outcome.skipped_out_of_range,
+                                    outcome.refused,
+                                );
+                            }
+                        }
+                    }
+                    fresh
                 });
             // #4559: build the mode-2 (NAPT64) deterministic block-allocation
             // params when the referenced source pool carried `port deterministic`

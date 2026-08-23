@@ -1,11 +1,24 @@
 package configstore
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
 )
+
+// ErrExceedsLimit is returned (wrapped) when a bounded read refuses a source
+// for being over its ceiling. It exists so callers can identify THIS refusal
+// structurally with errors.Is rather than by matching an error string.
+//
+// #7469: the #6753 tests originally distinguished the bounded read's refusal
+// from the store's post-materialisation "config too large" rejection by
+// checking for the substring "limit". Both messages are maintained
+// independently, so rewording either one silently changed the verdict — and
+// rewording the STORE's to contain "limit" would have made the test pass
+// against the very code #6753 fixed, with no change to any #6753 file.
+var ErrExceedsLimit = errors.New("exceeds size limit")
 
 // ReadBounded reads at most max+1 bytes from r and rejects a source that
 // exceeds max, allocating no more than max+1 bytes REGARDLESS of how much data
@@ -20,7 +33,7 @@ func ReadBounded(r io.Reader, max int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(data)) > max {
-		return nil, fmt.Errorf("exceeds %d byte limit", max)
+		return nil, fmt.Errorf("%w: %d byte ceiling", ErrExceedsLimit, max)
 	}
 	return data, nil
 }
@@ -36,6 +49,15 @@ func ReadBounded(r io.Reader, max int64) ([]byte, error) {
 // descriptor closes the window: the allocation is bounded by the limit, not by
 // what Stat claimed, and reaching the (max+1)-th byte proves the file is
 // over-cap. A non-regular file (dir/device/FIFO) is refused up front.
+//
+// The IsRegular check MUST precede the read, and the ordering is load-bearing
+// rather than stylistic (#7469). On a pipe, O_NONBLOCK silently turns a
+// would-be 24-byte read into a 0-byte read with err == nil — a truncation that
+// reports success. Refusing every non-regular path before any read is the only
+// thing that keeps this function from returning a silently short payload, and
+// it is exported, so a caller reordering these two steps would reintroduce
+// that. O_NONBLOCK being a no-op for regular files is the half that is NOT the
+// risk.
 //
 // #6753: the open uses O_NONBLOCK. Opening a FIFO for reading BLOCKS until a
 // writer appears, so a plain os.Open hangs before Stat can classify the path

@@ -4251,7 +4251,7 @@ fn nat64_4518_allocator_survives_config_reload() {
     // Config reload with the SAME pool: the allocator (and its live tuple
     // ownership + monotonic cursor) must carry over.
     let state2 =
-        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&state1), 1);
+        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&state1), 1, 0);
 
     // No-collision proof FIRST (before any flow-A touch, so a reverted fresh
     // allocator cannot be masked by flow A re-consuming the low port): a NEW
@@ -4300,6 +4300,7 @@ fn nat64_4518_pool_change_resets_allocator() {
         &[single_addr_prefix_alt_pool()],
         Some(&state1),
         1,
+        0,
     );
     let (sb, pb) = state3
         .allocate_source(0, crate::ip_proto::PROTO_TCP, c2, dst_v4, 5000, 443, 2)
@@ -4331,7 +4332,7 @@ fn nat64_4518_pool_change_resets_allocator() {
 fn nat64_4518_new_rule_has_no_previous_to_reuse() {
     let empty = Nat64State::default();
     let state =
-        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&empty), 1);
+        Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&empty), 1, 0);
     let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
     let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let (snat, port) = state

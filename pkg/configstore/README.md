@@ -1307,6 +1307,14 @@ itself:
   `os.Open` hangs before any size check can run. That is a distinct defect from
   the size cap and a size-only fix does not address it.
 
+Identify the over-cap refusal with `errors.Is(err, ErrExceedsLimit)`, never by
+matching the message. The store's own post-materialisation rejection is a
+*different* refusal produced by independently-maintained wording, so a
+substring test silently changes verdict when either message is reworded — and
+rewording the store's to contain the matched word makes such a test pass
+against unfixed code (#7469). Callers must wrap with `%w`, not `%v`: `%v`
+flattens the chain and breaks `errors.Is` at that surface only.
+
 Both CLI surfaces (`pkg/cli` local, `cmd/cli` remote) and `cmd/xpfd` call the
 same implementation. They previously did not, and #4883-D records the cost of
 that shape at a neighbouring site: the local and remote CLI diverged, and the

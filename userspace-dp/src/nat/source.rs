@@ -474,6 +474,64 @@ impl SourceNatAggregateUse {
 /// rule that passes the `allocator_key()` gate (`pool_mode && total_pool > 0
 /// && pool_failure.is_none()`). `total_pool` is the EXPANDED address count
 /// (v4 + v6); `port_low`/`port_high` are the snapshot-defaulted range.
+/// #6765: a previous generation's pool, kept so a PARTIAL-OVERLAP change can
+/// carry live port ownership onto the addresses it retains. Held by pool NAME,
+/// because the exact-match `SourceNatPoolAllocatorKey` cannot answer this
+/// question — a changed address list is exactly what makes that key miss.
+struct PreviousPool {
+    addresses_v4: Vec<Ipv4Addr>,
+    addresses_v6: Vec<Ipv6Addr>,
+    allocator: PortAllocator,
+}
+
+/// Map PREVIOUS pool-address indices to their index in the NEW pool, for the
+/// addresses present in both.
+///
+/// The index model is positional and shared with the allocator: v4 addresses
+/// occupy `0..v4.len()`, and a v6 address at position `i` is index
+/// `v4.len() + i` (see `SourceNatRule::allocator_key` / the v6_offset arithmetic
+/// on the match path). Both sides are re-derived here rather than assumed equal,
+/// because the whole point is that the two lists differ.
+///
+/// Returns an empty map when nothing is retained — a fully-disjoint swap, which
+/// must keep resetting.
+/// v4-only wrapper for NAT64, whose pools carry no v6 addresses. It calls the
+/// SAME formula rather than restating the positional rule — a second copy of
+/// "which previous index is this address now at" is exactly the drift that makes
+/// a position-indexed carry-over unsafe.
+pub(crate) fn retained_pool_index_map_v4(
+    prev_v4: &[Ipv4Addr],
+    new_v4: &[Ipv4Addr],
+) -> FxHashMap<usize, usize> {
+    let prev = PreviousPool {
+        addresses_v4: prev_v4.to_vec(),
+        addresses_v6: Vec::new(),
+        allocator: PortAllocator::new(0, 0, 0),
+    };
+    retained_pool_index_map(&prev, new_v4, &[])
+}
+
+pub(crate) fn retained_pool_index_map(
+    prev: &PreviousPool,
+    new_v4: &[Ipv4Addr],
+    new_v6: &[Ipv6Addr],
+) -> FxHashMap<usize, usize> {
+    let mut map = FxHashMap::default();
+    let prev_v4_len = prev.addresses_v4.len();
+    let new_v4_len = new_v4.len();
+    for (new_i, addr) in new_v4.iter().enumerate() {
+        if let Some(prev_i) = prev.addresses_v4.iter().position(|a| a == addr) {
+            map.insert(prev_i, new_i);
+        }
+    }
+    for (new_i, addr) in new_v6.iter().enumerate() {
+        if let Some(prev_i) = prev.addresses_v6.iter().position(|a| a == addr) {
+            map.insert(prev_v4_len + prev_i, new_v4_len + new_i);
+        }
+    }
+    map
+}
+
 struct PendingPoolAllocator {
     port_low: u16,
     port_high: u16,
@@ -493,6 +551,63 @@ impl PendingPoolAllocator {
                 self.port_high,
             ) as u64,
         }
+    }
+}
+
+/// #6765: carry live port ownership onto the addresses a changed pool RETAINS.
+///
+/// A no-op unless the previous generation had an UNAMBIGUOUS pool of this name
+/// whose address list overlaps the new one. A fully-disjoint swap yields an
+/// empty index map and re-seeds nothing, which is the reset the existing
+/// `nat64_4518_pool_change_resets_allocator` behaviour depends on.
+///
+/// What could not be carried is logged ONCE per pool per apply — a config-apply
+/// event, not a per-packet path. A silent drop here would be the same class of
+/// defect as the reissue this exists to prevent.
+fn reseed_retained_pool(
+    pool_name: &str,
+    allocator: &PortAllocator,
+    previous_pools: &FxHashMap<String, Option<PreviousPool>>,
+    rule: &SourceNatRule,
+    now_ns: u64,
+) {
+    let Some(slot) = previous_pools.get(pool_name) else {
+        return;
+    };
+    let Some(prev) = slot.as_ref() else {
+        // Ambiguous: this name resolved to more than one address list in the
+        // previous generation. Carrying from an arbitrary one of them could
+        // move ownership between pools, so carry nothing and say so.
+        eprintln!(
+            "xpf-dp: source-nat pool {pool_name:?} changed but the previous generation had \
+             more than one address list under that name; live translations are NOT carried \
+             onto retained addresses (#6765)"
+        );
+        return;
+    };
+    let map = retained_pool_index_map(prev, &rule.pool_addresses_v4, &rule.pool_addresses_v6);
+    if map.is_empty() {
+        return;
+    }
+    let outcome = allocator.reseed_retained_from(&prev.allocator, &map, now_ns);
+    if outcome.skipped_out_of_range > 0 || outcome.skipped_address_only > 0 || outcome.refused > 0 {
+        eprintln!(
+            "xpf-dp: source-nat pool {pool_name:?} changed: carried {} live translation(s) onto \
+             {} retained address(es); {} not carried (port outside the new range), {} \
+             address-only token(s) skipped, {} refused (#6765)",
+            outcome.reseeded,
+            map.len(),
+            outcome.skipped_out_of_range,
+            outcome.skipped_address_only,
+            outcome.refused,
+        );
+    } else if outcome.reseeded > 0 {
+        eprintln!(
+            "xpf-dp: source-nat pool {pool_name:?} changed: carried {} live translation(s) onto \
+             {} retained address(es) (#6765)",
+            outcome.reseeded,
+            map.len(),
+        );
     }
 }
 
@@ -548,7 +663,9 @@ fn resolve_pool_allocators(
     out: &mut [SourceNatRule],
     pendings: &[Option<PendingPoolAllocator>],
     previous_allocators: &FxHashMap<SourceNatPoolAllocatorKey, PortAllocator>,
+    previous_pools: &FxHashMap<String, Option<PreviousPool>>,
     budget: &SourceNatAggregateBudget,
+    now_ns: u64,
 ) {
     let mut pool_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
     let mut refused_keys = FxHashMap::<SourceNatPoolAllocatorKey, ()>::default();
@@ -610,6 +727,23 @@ fn resolve_pool_allocators(
                     pending.total_pool,
                     pending.port_low,
                     pending.port_high,
+                );
+                // #6765: a FRESH allocator over a pool that RETAINS addresses
+                // would reissue `(retained_addr, port_low)` — the occupancy
+                // bitmap that was the sole ownership token is all-zero and the
+                // cursor starts at 0. Carry the retained addresses' live port
+                // ownership across before publishing.
+                //
+                // Only reached on this arm, so the two cases that must keep
+                // resetting are untouched by construction: an exact-key match
+                // returns above (full Arc share), and a cold start has no
+                // `previous` at all, so `previous_pools` is empty.
+                reseed_retained_pool(
+                    &key.pool_name,
+                    &allocator,
+                    previous_pools,
+                    rule,
+                    now_ns,
                 );
                 pool_allocators.insert(key, allocator.clone());
                 rule.pool_allocator = allocator;
@@ -975,15 +1109,27 @@ pub(super) fn expand_pool_address(
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<SourceNatRule> {
-    parse_source_nat_rules_with_previous(snaps, None, &NatCounterStore::default())
+    parse_source_nat_rules_with_previous(snaps, None, &NatCounterStore::default(), 0)
 }
 
+/// `now_ns` is the caller's MONOTONIC clock, threaded through to the #6765
+/// retained-address re-seed (`reseed_retained_from` -> `reserve_flow`, which
+/// re-arms a persistent lease's idle expiry on the eviction path). The
+/// production call site is `afxdp::forwarding_build`, which has
+/// `monotonic_nanos()`; tests that do not exercise the re-seed pass 0.
 pub(crate) fn parse_source_nat_rules_with_previous(
     snaps: &[SourceNATRuleSnapshot],
     previous: Option<&[SourceNatRule]>,
     nat_counters: &NatCounterStore,
+    now_ns: u64,
 ) -> Vec<SourceNatRule> {
-    parse_source_nat_rules_inner(snaps, previous, nat_counters, &SOURCE_NAT_AGGREGATE_BUDGET)
+    parse_source_nat_rules_inner(
+        snaps,
+        previous,
+        nat_counters,
+        &SOURCE_NAT_AGGREGATE_BUDGET,
+        now_ns,
+    )
 }
 
 /// Test-only entry with an injectable aggregate budget: the production budget
@@ -998,7 +1144,7 @@ pub(crate) fn parse_source_nat_rules_with_budget(
     nat_counters: &NatCounterStore,
     budget: &SourceNatAggregateBudget,
 ) -> Vec<SourceNatRule> {
-    parse_source_nat_rules_inner(snaps, previous, nat_counters, budget)
+    parse_source_nat_rules_inner(snaps, previous, nat_counters, budget, 0)
 }
 
 fn parse_source_nat_rules_inner(
@@ -1006,6 +1152,7 @@ fn parse_source_nat_rules_inner(
     previous: Option<&[SourceNatRule]>,
     nat_counters: &NatCounterStore,
     budget: &SourceNatAggregateBudget,
+    now_ns: u64,
 ) -> Vec<SourceNatRule> {
     // Persistent SNAT allocator state is helper-local runtime state. A
     // compatible in-process refresh may reuse the previous allocator below,
@@ -1015,12 +1162,41 @@ fn parse_source_nat_rules_inner(
     let mut out = Vec::with_capacity(snaps.len());
     let mut pendings: Vec<Option<PendingPoolAllocator>> = Vec::with_capacity(snaps.len());
     let mut previous_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
+    // #6765: the PARTIAL-OVERLAP index, keyed by pool NAME rather than by the
+    // whole address list. `previous_allocators` above is the exact-match reuse
+    // path and is unchanged; this one exists to answer a different question —
+    // "was there a previous allocator for this same pool whose address list has
+    // since changed?" — which the exact key can never answer, because a changed
+    // list is precisely what makes it miss.
+    //
+    // A pool name that resolved to MORE THAN ONE distinct address list in the
+    // previous generation is ambiguous, and re-seeding from an arbitrary one of
+    // them would carry ownership from a pool the operator may not have meant.
+    // Such a name is recorded as ambiguous and re-seeds nothing.
+    let mut previous_pools = FxHashMap::<String, Option<PreviousPool>>::default();
     if let Some(prev_rules) = previous {
         for prev in prev_rules {
             if let Some(key) = prev.allocator_key() {
                 previous_allocators
                     .entry(key)
                     .or_insert_with(|| prev.pool_allocator.clone());
+            }
+            if prev.pool_name.is_empty() || !prev.pool_mode {
+                continue;
+            }
+            let candidate = PreviousPool {
+                addresses_v4: prev.pool_addresses_v4.clone(),
+                addresses_v6: prev.pool_addresses_v6.clone(),
+                allocator: prev.pool_allocator.clone(),
+            };
+            match previous_pools.get_mut(&prev.pool_name) {
+                None => {
+                    previous_pools.insert(prev.pool_name.clone(), Some(candidate));
+                }
+                Some(Some(existing))
+                    if existing.addresses_v4 == candidate.addresses_v4
+                        && existing.addresses_v6 == candidate.addresses_v6 => {}
+                Some(slot) => *slot = None,
             }
         }
     }
@@ -1209,7 +1385,14 @@ fn parse_source_nat_rules_inner(
         );
         out.push(rule);
     }
-    resolve_pool_allocators(&mut out, &pendings, &previous_allocators, budget);
+    resolve_pool_allocators(
+        &mut out,
+        &pendings,
+        &previous_allocators,
+        &previous_pools,
+        budget,
+        now_ns,
+    );
     out
 }
 
