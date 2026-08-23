@@ -1499,6 +1499,24 @@ the **same UID-file format** as the account registry:
   credential. Because the applies are idempotent (`chpasswd` reads
   `/etc/shadow`; the key write compares content), a transient marker failure
   simply defers to the next commit.
+- **…and the claim is WITHDRAWN when the mutation fails (#6797).** Marker-first
+  alone has the mirror hazard: if the mutation then fails, the marker outlives
+  it and asserts ownership of a credential xpf never wrote. That matters more
+  than it sounds, because the markers gate a **revocation**, not a write — the
+  key marker gates `os.Remove(authorized_keys)`, the password marker gates the
+  D2 lock. A stale claim therefore does not lose something of ours; it **deletes
+  an operator's pre-existing key file**, or **locks an account whose password
+  xpf never set**.
+
+  Reversing the order would only trade overclaim for underclaim, so the apply
+  path claims ownership through `claimOwnership` / `rollback`
+  (`login_password.go`): the claim records whether the marker **already** named
+  this exact account, and on mutation failure it withdraws the marker only if
+  **this pass created it**. A claim an earlier apply legitimately made is
+  preserved — withdrawing that one would orphan a credential xpf really owns.
+  Applied at all three marker-first sites: the user key write, the user password
+  `chpasswd`, and the root key write. The `useradd` path is unaffected — it is
+  marker-**after** by construction (xpf genuinely created the account).
 - **Union enumeration.** `reconcileAbsentLoginUsers` deprovisions the
   **union** of all three roots (`provisionedNames`), so a pre-existing
   account xpf only added an SSH key to (key marker, no registry entry) is
