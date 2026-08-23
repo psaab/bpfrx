@@ -119,6 +119,55 @@ after HA failover. To make that **structural**, not flag-defended:
   goroutine's `openConn()` BEFORE its main loop, NOT under `m.mu` (see "Bind
   retry runs unlocked" below). The tombstone (held) still provides mutual
   exclusion for the start.
+- **A failed FINAL goodbye is returned AND retained (#6777).** The graceful
+  withdrawal path gets exactly two chances to put a lifetime-0 RA on the wire:
+  the owner's own emit in `finishShutdown`, and — if that failed, leaving
+  `goodbyeEmitted` false — `finishDrainDecision`'s standalone backstop on a
+  fresh conn. Before #6777 a failure of that LAST chance was logged and then
+  erased: the same pass set `goodbyeClaimed`, deleted the tombstone and dropped
+  the sender, and `finishDrainDecision` returned only the replacement-start
+  error. `Withdraw()` returned a hard-coded `nil`, so all three production call
+  sites (`applyServicesReconcile`'s RA-removal branch, daemon shutdown, and the
+  VRRP BACKUP transition) carried an `if err := d.ra.Withdraw(); err != nil`
+  branch that was unreachable. Worse, the daemon's own retry driver
+  (`reconcileClusterRAServices`) advances `lastRAReconcileHash` **only on a
+  successful apply** — so a swallowed failure was latched as converged and the
+  every-2s pass never retried. Operators saw a clean withdrawal while the stale
+  IPv6 default-router identity lived on hosts for up to Router Lifetime (default
+  1800s).
+
+  Both halves are now fixed. `finishDrainDecision` returns the goodbye error
+  separately from the start error; `releaseDrain` joins them; `Withdraw()` and
+  `Apply`'s empty-config branch aggregate across interfaces. And the failure
+  leaves **retry debt** in `Manager.goodbyeOwed`, because surfacing alone is not
+  enough — once the tombstone and sender are gone a later pass has nothing left
+  to act on. `Apply` re-attempts every owed goodbye whose interface is not in the
+  desired set (through `WithdrawOnce`, so a retry takes the same claim-and-hold
+  tombstone and can never open a second conn), and returns non-nil while any debt
+  survives — which is what keeps the reconcile digest un-advanced so the periodic
+  pass re-drives it. The debt is the graceful-path twin of the one-shot
+  `WithdrawOnce` debt #5093 introduced.
+
+  Three rules keep the debt from becoming a liability of its own:
+  - **A vanished netdev records nothing.** `sendOneGoodbye` wraps a missing
+    interface as `errGoodbyeIfaceMissing`; there is no link to emit on and no
+    host behind it left to hear a goodbye, so retaining it would make a
+    legitimately removed interface a permanent `Apply` error and suppress the
+    node's whole RA reconcile digest. Only a bind failure or `errGoodbyeWrite`
+    is retained — the transient shapes the debt exists for.
+  - **It is bounded** (`maxGoodbyeRetries`). An interface that can never accept
+    the goodbye is given up on with a single Warn rather than re-applying and
+    logging every 2s forever.
+  - **It is dropped when the router comes back.** A debt whose interface
+    reappears in the desired set is dropped rather than retried — emitting it
+    would withdraw the router the new sender is advertising. That drop lives in
+    exactly ONE place (`retryOwedGoodbyes`), not also in `startLocked`: every
+    path that starts a sender does so from an interface that is in `desired`, so
+    a second clear there would be a redundant copy of one invariant, and a
+    divergence between two copies of "a sender implies no debt" is always a bug.
+    A debt recorded by the CURRENT `Apply` is held over to the next pass
+    (`recordedEpoch`) instead of being retried microseconds after the backstop
+    already failed on a fresh conn.
 - **Draining tombstone — one live conn per interface, including replaces.**
   Every transition that removes OR replaces a sender installs a
   per-interface DRAINING tombstone under the manager mutex BEFORE releasing

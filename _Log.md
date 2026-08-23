@@ -104318,3 +104318,21 @@ prose edit above them added. No diff falls in the new test body.
     pkg/configstore/bounded_read_6753_test.go,
     pkg/cli/load_bounded_read_6753_test.go, cmd/cli/main.go,
     cmd/cli/load_bounded_read_7469_test.go (new), pkg/configstore/README.md
+
+## 2026-08-22 — #6777 graceful RA withdrawal: final goodbye failure surfaced + retry debt
+
+- **Timestamp**: 2026-08-22
+- **Action**: Graceful RA withdrawal discarded the final lifetime-0 goodbye
+  failure and erased the state a retry needed. `finishDrainDecision` logged the
+  standalone-backstop failure, set `goodbyeClaimed`, deleted the tombstone and
+  returned only the replacement-start error; `Manager.Withdraw` returned a
+  hard-coded `nil`, making the `if err := d.ra.Withdraw(); err != nil` branch at
+  all three production call sites unreachable. Because
+  `reconcileClusterRAServices` advances `lastRAReconcileHash` only on a
+  successful apply, the swallowed failure was latched as converged and the 2s
+  pass never retried — the stale IPv6 default-router identity survived on hosts
+  until Router Lifetime expiry. Fix propagates the goodbye error out through
+  `releaseDrain` to `Withdraw`/`Apply`, and retains bounded retry debt
+  (`Manager.goodbyeOwed`) that `Apply` re-drives via `WithdrawOnce`.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go,
+  pkg/ra/goodbye_retry_debt_6777_test.go, pkg/ra/README.md, _Log.md
