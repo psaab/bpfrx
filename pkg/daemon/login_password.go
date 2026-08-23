@@ -61,6 +61,14 @@ const (
 // (marker-first atomicity, fail-visible) and gate the corresponding REVOCATION;
 // the account registry is unchanged in format and location so the factory-reset
 // teardown (pkg/grpcapi zeroize) that enumerates it is untouched.
+//
+// #6797 — marker-first alone OVERCLAIMS. Because the markers gate a REVOCATION
+// rather than a write, a marker that outlives a FAILED mutation does not lose
+// something of ours, it deletes an operator's pre-existing authorized_keys or
+// locks an account whose password xpf never set. The apply path therefore
+// claims ownership through claimOwnership/rollback, which withdraws a claim
+// THIS pass created when the mutation fails while preserving one an earlier
+// apply legitimately made.
 var provisionedUsersDir = "/var/lib/xpf/provisioned-users"
 
 // provisionedPasswordsDir and provisionedKeysDir are the resource-specific
@@ -282,6 +290,63 @@ func hasProvenanceMarker(dir, name string, curUID int) bool {
 	return true
 }
 
+// ownershipClaim records a marker-first ownership claim so a FAILED credential
+// mutation can undo it (#6797).
+//
+// #5841 writes the resource marker BEFORE the mutation it claims, deliberately:
+// a marker written afterwards can fail after the credential has already
+// changed, leaving a live credential xpf can no longer lock or clean (the
+// UNDERCLAIM). But marker-first has the mirror hazard — if the mutation then
+// fails, the marker outlives it and asserts ownership of a credential xpf never
+// wrote (the OVERCLAIM). That is worse than it sounds, because the markers do
+// not gate a WRITE, they gate a REVOCATION: the key marker gates
+// `os.Remove(authorized_keys)` and the password marker gates the declarative
+// D2 lock. A stale claim therefore does not lose something of ours — it DELETES
+// an operator's pre-existing key file, or locks an account whose password xpf
+// never set.
+//
+// Reversing the order would just trade one for the other. The fix is to make
+// the claim undoable: remember whether the marker ALREADY recorded this exact
+// account, and on mutation failure remove it only if THIS pass created it. A
+// pre-existing genuine claim is preserved (no new underclaim); a claim invented
+// moments ago by a mutation that then failed is withdrawn.
+type ownershipClaim struct {
+	dir, name string
+	// preExisting is true when the marker already recorded this UID before the
+	// claim, i.e. an earlier apply legitimately owned the credential. Its
+	// rollback is a no-op — withdrawing it would orphan a credential xpf really
+	// does own.
+	preExisting bool
+}
+
+// claimOwnership records name's UID in dir and returns a claim that can be
+// rolled back. The write error is returned unchanged so every existing
+// fail-visible caller keeps its behaviour.
+func claimOwnership(dir, name string, uid int) (ownershipClaim, error) {
+	// hasProvenanceMarker's inline cleanup of a mismatched/corrupt marker is
+	// harmless here: such a marker is not this account's prior ownership, so
+	// preExisting=false is the correct reading and the write below replaces it.
+	c := ownershipClaim{dir: dir, name: name, preExisting: hasProvenanceMarker(dir, name, uid)}
+	return c, writeProvenanceMarker(dir, name, uid)
+}
+
+// rollback withdraws a claim this pass created, after the credential mutation
+// it was claiming has FAILED. It is a no-op for a claim that already existed.
+//
+// Best-effort by construction: the alternative to a failed removal is leaving
+// the overclaim in place, which is what this exists to prevent, and the caller
+// is already reporting the mutation failure that triggered it.
+func (c ownershipClaim) rollback() {
+	if c.preExisting || c.dir == "" {
+		return
+	}
+	if err := removeProvenanceMarker(c.dir, c.name); err != nil {
+		slog.Warn("could not withdraw ownership marker after a failed credential "+
+			"mutation; xpf may later revoke a credential it does not own",
+			"dir", c.dir, "name", c.name, "err", err)
+	}
+}
+
 // removeProvenanceMarker drops name's marker in dir (ENOENT is not an error).
 func removeProvenanceMarker(dir, name string) error {
 	if err := os.Remove(markerPathIn(dir, name)); err != nil && !os.IsNotExist(err) {
@@ -324,9 +389,13 @@ func xpfProvisioned(name string, curUID int) bool {
 
 // --- password-ownership marker (xpf set the /etc/shadow password) ----------
 
-// markPasswordProvisioned records that xpf set name's /etc/shadow password.
-// Written marker-first, before `chpasswd -e`. Gates the declarative D2
-// password lock. #5841.
+// markPasswordProvisioned records that xpf set name's /etc/shadow password,
+// gating the declarative D2 password lock (#5841).
+//
+// The PRODUCTION apply path does not call this directly — it goes through
+// claimOwnership(provisionedPasswordsDir(), ...) so a chpasswd that then fails
+// can withdraw the claim (#6797). This remains the plain write primitive, used
+// by tests to seed "xpf already owns this" fixtures.
 func markPasswordProvisioned(name string, uid int) error {
 	return writeProvenanceMarker(provisionedPasswordsDir(), name, uid)
 }
@@ -339,10 +408,14 @@ func passwordProvisioned(name string, curUID int) bool {
 
 // --- SSH-key-ownership marker (xpf wrote authorized_keys) ------------------
 
-// markKeyProvisioned records that xpf wrote name's authorized_keys. Written
-// marker-first, before the authorized_keys write. Gates the key-file removal
-// on directive/user removal so an operator-installed key file xpf never wrote
-// is left untouched. #5841.
+// markKeyProvisioned records that xpf wrote name's authorized_keys, gating the
+// key-file removal on directive/user removal so an operator-installed key file
+// xpf never wrote is left untouched (#5841).
+//
+// The PRODUCTION apply path does not call this directly — it goes through
+// claimOwnership(provisionedKeysDir(), ...) so a key write that then fails can
+// withdraw the claim (#6797). This remains the plain write primitive, used by
+// tests to seed "xpf already owns this" fixtures.
 func markKeyProvisioned(name string, uid int) error {
 	return writeProvenanceMarker(provisionedKeysDir(), name, uid)
 }
