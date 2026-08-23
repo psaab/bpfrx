@@ -104702,3 +104702,28 @@ prose edit above them added. No diff falls in the new test body.
   every cell. Added the queue-behind-a-commit interleave, a loop-body cell with
   a shortened interval, and a comment-stripped source check on the start site.
 - **File(s)**: pkg/daemon/ra_dead_sender_retry_6793_test.go, _Log.md
+
+## 2026-08-22 — #6792 DNS ownership failures were warning-only
+
+- **Timestamp**: 2026-08-22
+- **Action**: `dnsReconciler.reconcile` logged all three failure points (mask,
+  stale drop-in removal, managed-file write) at WARN and returned nothing;
+  `reconcileDNSLocked` returned nothing, so a commit could report success while
+  leaving a dual resolver or a stale `/etc/resolv.conf`. Its two siblings in
+  `applyTailReconciles` (`applyLo0Filter`, `applyHostInboundFilter`) already
+  fail the commit closed — DNS was the only reconciler there whose error could
+  not propagate. Now accumulates and returns; joined into the commit result.
+  Accumulate-not-return-early preserves the deliberate "still own resolv.conf
+  after a mask failure" behaviour, and both SUCCESS early returns carry the
+  accumulated error.
+- **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, docs/dns-ownership.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6792 round 2 — the mutation matrix found a GREEN cell: removing
+  `dnsErr` from `applyTailReconciles`' tail `errors.Join` left the whole suite
+  green. The reconcile can return errors all day and the commit still succeeds
+  if nothing joins them, and that join IS the fix. Added a `reconcileDNSFn`
+  seam and two cells driving the REAL `applyTailReconciles` (#5696 precedent),
+  paired so "always returns an error" also fails.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dns.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, _Log.md
