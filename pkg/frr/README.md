@@ -47,6 +47,50 @@ community classification, `renderComposedRouteMap`, and the `-xpf-redist`
 alias guard. The detailed rendering semantics documented in the
 `policy_render.go` row below apply wherever each function now lives:
 
+### BGP neighbor identity is a single FRR token (#6796)
+
+`n.Address` is rendered RAW at 24 sites in `protocols_render.go` — unlike every
+operand around it (`update-source`, `description`, `password` all go through
+`sanitizeFRRValue`). FRR's command lexer has **no quoted-string and no
+rest-of-line token: it splits on whitespace**, so an identity carrying a space
+or a newline SPANS MULTIPLE FRR STATEMENTS. An address of
+`1.1.1.1 remote-as 65000\n neighbor 2.2.2.2` renders a valid first statement
+followed by an attacker-chosen second one — arbitrary FRR configuration,
+including peerings the operator never wrote, injected through a config value.
+
+**`sanitizeFRRValue` is deliberately NOT the tool here.** It maps control bytes
+to a SPACE, and space is exactly the separator FRR tokenizes on: replacing a
+newline with a space still splits the token, and a plain embedded space is not a
+control byte at all, so it passes through untouched. A sanitizer whose
+replacement character is the sink's delimiter cannot make a value safe for that
+sink.
+
+The belt is `validBGPNeighborAddress` (`render_validate.go`), applied at the
+`validNeighbors` construction — the SINGLE exclusion set the declaration loop,
+the address-family activation loop and the BFD accumulator all iterate. That
+placement is deliberate: a per-site guard would have to be repeated 24 times and
+could diverge, and a neighbor declared-but-not-activated (or activated-but-not-
+declared, or carrying a `bfd` peer without a declaration) makes vtysh reject the
+**whole** managed section. It also covers the "reused raw by BGP and BFD" half of
+the issue for free.
+
+**The test is token COUNT, not address form.** FRR's grammar is
+`neighbor <A.B.C.D|X:X::X:X|WORD>`, and this tree already commits configs whose
+neighbor is a hostname — the first version of this fix required a bare IP and was
+caught by a pre-existing parser test peering with `peer.example.com`.
+Over-rejection in routing config is an outage.
+
+Commit / commit-check stay strict (`validateBGPNeighborAddressStrict`,
+`pkg/config`), with `lenientBGPNeighborAddress` registered per #1960 so a
+tolerantly-loaded or peer-synced config still boots. The two predicates must
+accept exactly the same set: a stricter commit gate tells operators a working
+config is invalid, a stricter belt silently drops a committed peering, and
+neither divergence produces an error anywhere.
+`TestNeighborTokenGateAgreesWithTheRenderBelt6796` asserts the agreement by
+reading both function bodies rather than pinning either to a literal — the first
+version had BOTH wrong in the same direction, so trusting either side would have
+encoded the mistake.
+
 | File | Owns |
 |---|---|
 | `manager.go` | `Manager` struct + lifecycle (`New`, `ApplyFull`, `Clear`, `writeManagedSection`, `reload`), top-level types (`InstanceConfig`, `DHCPRoute`, `FullConfig`), package constants, and the zero-value-safe `executor()` accessor. The legacy `Apply`/`ApplyWithInstances` partial constructors were deleted (#1827 AGY F1, PR #1843): they bypassed `assembleFRRConfig` and would have wiped an active failover overlay. |
