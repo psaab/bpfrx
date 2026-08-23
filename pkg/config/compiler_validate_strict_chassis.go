@@ -131,6 +131,26 @@ func validateChassisClusterStrict(cfg *Config) error {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return nil
 	}
+	// #6772: the dead-peer timeout is `time.Duration(threshold) * interval`
+	// (pkg/cluster/heartbeat.go), and failover.go doubles it for the transfer
+	// grace. Each field is individually bounded — interval by MaxDurationMillis,
+	// threshold at >= 1 — but nothing bounded their PRODUCT, and time.Duration
+	// is int64 nanoseconds.
+	//
+	// An overflowed product does not merely become large: it wraps NEGATIVE,
+	// and a negative timeout reads as already-expired. The peer is declared
+	// lost on the first check, on both nodes, which is the exact inversion of
+	// the liveness guard the threshold exists to provide — the same failure
+	// MaxDurationSeconds' comment describes for ip-monitoring hold-down.
+	//
+	// Checked as a PRODUCT rather than by capping threshold alone: a cap safe
+	// at a 1 ms interval overflows at a large one, so any single-field bound
+	// would be either useless or arbitrary. This rejects exactly the
+	// combinations that cannot be represented.
+	if err := validateHeartbeatTimeoutProduct(cfg.Chassis.Cluster); err != nil {
+		return err
+	}
+
 	rgs := cfg.Chassis.Cluster.RedundancyGroups
 
 	if len(rgs) > MaxHeartbeatRedundancyGroups {
@@ -283,6 +303,62 @@ func validateChassisClusterStrict(cfg *Config) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// validateHeartbeatTimeoutProduct rejects a heartbeat interval/threshold pair
+// whose dead-peer timeout cannot be represented as a time.Duration (#6772).
+//
+// The runtime computes `time.Duration(threshold) * interval` and, for the
+// transfer grace, `2 * time.Duration(threshold) * interval + slack`. The
+// doubled form is checked because it overflows FIRST, so a pair that passes the
+// plain timeout can still invert the grace.
+//
+// Zero means "use the default" for both fields at runtime, so a zero is left
+// alone here rather than substituted — the defaults are small and cannot
+// overflow, and substituting them would make this validator disagree with the
+// runtime about what the config says.
+// DefaultHeartbeatIntervalMillis and DefaultHeartbeatThreshold mirror the
+// runtime's substitutions for an unset heartbeat field
+// (cluster.DefaultHeartbeatInterval / cluster.DefaultHeartbeatThreshold).
+//
+// They are duplicated rather than imported because pkg/cluster imports
+// pkg/config, so the dependency cannot run the other way. The duplication is
+// bound by an agreement test in pkg/cluster, which CAN see both — a divergence
+// here is always a bug, so it is asserted rather than trusted.
+const (
+	DefaultHeartbeatIntervalMillis = int64(100)
+	DefaultHeartbeatThreshold      = int64(5)
+)
+
+func validateHeartbeatTimeoutProduct(cc *ClusterConfig) error {
+	if cc == nil {
+		return nil
+	}
+	interval, threshold := int64(cc.HeartbeatInterval), int64(cc.HeartbeatThreshold)
+	// An unset field is not "no value" — the runtime substitutes its own
+	// default (group_state.go only assigns when > 0), so an unset interval
+	// paired with a huge threshold still overflows at run time. Model what the
+	// runtime does rather than skipping: skipping accepted exactly that pair.
+	if interval <= 0 {
+		interval = DefaultHeartbeatIntervalMillis
+	}
+	if threshold <= 0 {
+		threshold = DefaultHeartbeatThreshold
+	}
+	// Work in milliseconds and compare against the ms-denominated ceiling, so
+	// the check itself cannot overflow while testing for overflow.
+	if threshold > MaxDurationMillis/(2*interval) {
+		return fmt.Errorf("chassis cluster: heartbeat-threshold %d with "+
+			"heartbeat-interval %dms yields a dead-peer timeout that overflows "+
+			"time.Duration (int64 nanoseconds) and wraps NEGATIVE — a negative "+
+			"timeout reads as already-expired, so both nodes declare the peer "+
+			"lost on the first check, inverting the liveness guard the threshold "+
+			"exists to provide. Reduce heartbeat-threshold or heartbeat-interval "+
+			"(the product, doubled for the failover transfer grace, must stay "+
+			"under %dms)",
+			threshold, interval, MaxDurationMillis)
 	}
 	return nil
 }
