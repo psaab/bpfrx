@@ -418,15 +418,26 @@ func classifyNetdev(name, devReal string, devErr error) (pci string, keep bool) 
 // (factory) MAC, running MAC, and link state. Sorted by PCI address, then
 // kernel name, for stable output (non-PCI NICs share an empty PCI address, so
 // the name tiebreak keeps their order deterministic).
+// sysClassNetDir and linkByName are seams so the enumerator's own wiring is
+// testable (#6786). Without them the ONLY way to observe that a failed
+// per-NIC read sets IdentityUnread is on live hardware, so every test would
+// have to construct PresentNIC by hand — which binds Resolve's handling of the
+// flag while leaving the code that SETS it covered by nothing. Production
+// values are the real sysfs path and netlink.
+var (
+	sysClassNetDir = "/sys/class/net"
+	linkByName     = netlink.LinkByName
+)
+
 func EnumeratePresentNICs() ([]PresentNIC, error) {
-	entries, err := os.ReadDir("/sys/class/net")
+	entries, err := os.ReadDir(sysClassNetDir)
 	if err != nil {
 		return nil, err
 	}
 	var nics []PresentNIC
 	for _, e := range entries {
 		name := e.Name()
-		devReal, derr := filepath.EvalSymlinks(filepath.Join("/sys/class/net", name, "device"))
+		devReal, derr := filepath.EvalSymlinks(filepath.Join(sysClassNetDir, name, "device"))
 		pci, keep := classifyNetdev(name, devReal, derr)
 		if !keep {
 			continue
@@ -441,7 +452,7 @@ func EnumeratePresentNICs() ([]PresentNIC, error) {
 		// make a real NIC vanish from `show chassis device-map candidates`); what
 		// changes is that its identity is marked UNKNOWN so a MAC-pinned entry
 		// refuses instead of binding blind.
-		if link, err := netlink.LinkByName(name); err == nil {
+		if link, err := linkByName(name); err == nil {
 			a := link.Attrs()
 			nic.RunningMAC = a.HardwareAddr.String()
 			if len(a.PermHWAddr) != 0 {

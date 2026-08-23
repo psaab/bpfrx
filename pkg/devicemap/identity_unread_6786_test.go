@@ -1,10 +1,15 @@
 package devicemap
 
 import (
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/vishvananda/netlink"
 )
 
 // pinnedEntry is a device-map entry that pins BOTH a PCI address and a MAC —
@@ -183,4 +188,104 @@ func TestCandidateDisplayDistinguishesUnknownFromNone6786(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeSysClassNet builds a hermetic /sys/class/net-shaped tree containing one
+// entry per name, each with a `device` symlink (which is what marks a netdev as
+// backed by real hardware) pointing at a real directory so EvalSymlinks
+// resolves. It points the enumerator's sysfs seam at it.
+func fakeSysClassNet(t *testing.T, names ...string) {
+	t.Helper()
+	root := t.TempDir()
+	hw := filepath.Join(root, "hw")
+	if err := os.MkdirAll(hw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		nd := filepath.Join(root, n)
+		if err := os.MkdirAll(nd, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(hw, filepath.Join(nd, "device")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	saved := sysClassNetDir
+	sysClassNetDir = root
+	t.Cleanup(func() { sysClassNetDir = saved })
+}
+
+// TestEnumeratorRecordsIdentityReadFailure6786 binds the WIRING, which the
+// resolver tests above cannot reach.
+//
+// Every other test in this file constructs PresentNIC by hand, so they pin how
+// Resolve TREATS IdentityUnread while leaving the code that SETS it covered by
+// nothing — and that code is the actual defect: the discarded `err` from the
+// per-NIC read. Deleting the assignment would leave every hand-built fixture
+// green. These two cells run the real EnumeratePresentNICs against a hermetic
+// sysfs tree with the netlink read stubbed, so the flag's producer is bound to
+// the same property its consumers rely on.
+//
+// The PAIR is what proves it: the failing read must set the flag, and the
+// SUCCEEDING read must clear it. A cell that only checked the failure case
+// would stay green under a fix that hard-codes IdentityUnread = true, which
+// would refuse every MAC-pinned entry on every box.
+func TestEnumeratorRecordsIdentityReadFailure6786(t *testing.T) {
+	t.Run("read-fails-marks-unread", func(t *testing.T) {
+		fakeSysClassNet(t, "enp9s0")
+		saved := linkByName
+		linkByName = func(string) (netlink.Link, error) {
+			return nil, errors.New("injected: netlink LinkByName failure")
+		}
+		t.Cleanup(func() { linkByName = saved })
+
+		nics, err := EnumeratePresentNICs()
+		if err != nil {
+			t.Fatalf("EnumeratePresentNICs: %v", err)
+		}
+		if len(nics) != 1 {
+			t.Fatalf("got %d NICs, want 1 (the NIC is present in sysfs and must NOT be dropped — "+
+				"dropping it would make a real NIC vanish from `candidates`)", len(nics))
+		}
+		if !nics[0].IdentityUnread {
+			t.Error("a FAILED per-NIC identity read must set IdentityUnread. Leaving it false makes " +
+				"the failure indistinguishable from hardware that simply has no permanent MAC, " +
+				"which is what silently disabled the card-swap refusal (#6786)")
+		}
+		if nics[0].PermMAC != "" {
+			t.Errorf("a failed read must not invent a permanent MAC, got %q", nics[0].PermMAC)
+		}
+	})
+
+	t.Run("read-succeeds-leaves-known", func(t *testing.T) {
+		fakeSysClassNet(t, "enp9s0")
+		mac, err := net.ParseMAC("aa:bb:cc:dd:ee:01")
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved := linkByName
+		linkByName = func(name string) (netlink.Link, error) {
+			return &netlink.Device{LinkAttrs: netlink.LinkAttrs{
+				Name:         name,
+				PermHWAddr:   mac,
+				HardwareAddr: mac,
+			}}, nil
+		}
+		t.Cleanup(func() { linkByName = saved })
+
+		nics, err := EnumeratePresentNICs()
+		if err != nil {
+			t.Fatalf("EnumeratePresentNICs: %v", err)
+		}
+		if len(nics) != 1 {
+			t.Fatalf("got %d NICs, want 1", len(nics))
+		}
+		if nics[0].IdentityUnread {
+			t.Error("a SUCCESSFUL identity read must leave IdentityUnread false — hard-coding it " +
+				"true would refuse every MAC-pinned device-map entry on every box")
+		}
+		if nics[0].PermMAC != "aa:bb:cc:dd:ee:01" {
+			t.Errorf("PermMAC = %q, want the permanent MAC the read returned", nics[0].PermMAC)
+		}
+	})
 }
