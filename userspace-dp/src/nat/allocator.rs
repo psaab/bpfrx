@@ -168,6 +168,24 @@ pub(crate) const MAX_NAT_HOLDER_WORKERS: u32 = 128;
 /// rather than silently truncating a holder bit at runtime.
 const _: () = assert!(u128::BITS == MAX_NAT_HOLDER_WORKERS);
 
+/// #6765: what a `reseed_retained_from` pass carried and what it could not.
+/// Returned rather than logged inside the allocator so the caller can report it
+/// once per apply with the pool name attached — and so a drop is never silent,
+/// which is the same class of defect the re-seed exists to fix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReseedOutcome {
+    /// Live allocations re-seeded onto a retained address.
+    pub(super) reseeded: usize,
+    /// Skipped: the port falls outside the NEW port range (range narrowed).
+    pub(super) skipped_out_of_range: usize,
+    /// Skipped: an address-only (`port no-translation`) token, which holds no
+    /// port bit and is outside the port-reissue defect.
+    pub(super) skipped_address_only: usize,
+    /// `reserve_flow` refused — the tuple is already owned in the new
+    /// allocator. Expected to be zero on a freshly built allocator.
+    pub(super) refused: usize,
+}
+
 /// #6211 F2: which worker is taking or dropping a reservation.
 ///
 /// `Untracked` reproduces the pre-#6211-F2 contract exactly — a reserve sets no
@@ -2032,6 +2050,134 @@ impl PortAllocator {
     /// allocation path never drains — unbounded standby memory growth under
     /// synced-session churn. Matches the non-HA deterministic release contract
     /// (#4559): a deterministic-only pool never grows the recycle queue.
+    /// #6765: carry live port ownership across a PARTIAL-OVERLAP pool change.
+    ///
+    /// THE DEFECT. The allocator carry-over is keyed on the whole address list
+    /// (`SourceNatPoolAllocatorKey`), so adding or removing ONE address from a
+    /// pool of ten misses the reuse lookup and builds a fresh allocator for the
+    /// WHOLE pool — including every RETAINED address. `AddressOccupancy::new`
+    /// is all-zero with `cursor: 0` and the set bit is the sole ownership
+    /// token, so the next new flow on a retained address is issued
+    /// `(retained_addr, port_low)` — a tuple a pre-change live session may still
+    /// hold, with the bit that would have blocked it now zeroed. Two sessions on
+    /// one translated tuple is reply mis-delivery: traffic to the wrong host.
+    ///
+    /// WHY THIS SHAPE. The obvious fix — loosen the key and share the allocator
+    /// when the pools overlap — is NOT available: `occupancy` is a `Vec` indexed
+    /// by pool-address POSITION, so a changed list changes the indices and reuse
+    /// would misindex. And the rebuild site holds the previous rules but NOT the
+    /// session table, so the carry has to come from the previous allocator's own
+    /// live state. That is exactly what the HA session-import path already does
+    /// through `reserve_flow` — seed an allocator with a tuple someone else owns
+    /// — so the mechanism is audited and exercised; only the caller is new.
+    ///
+    /// `index_map` maps a PREVIOUS pool-address index to its index in THIS
+    /// allocator, for the addresses present in both pools. The caller owns that
+    /// mapping because only it knows the address lists; this method owns the
+    /// walk, so `live_by_flow` stays private to this module.
+    ///
+    /// Bounds, deliberately narrow:
+    ///   - only addresses in `index_map` (retained) are re-seeded;
+    ///   - only ports inside THIS allocator's range — a narrowed port range
+    ///     cannot re-seed everything, and what is dropped is RETURNED to the
+    ///     caller to log rather than silently discarded;
+    ///   - `address_only` allocations hold no port bit (their token is the
+    ///     `address_only_owners` reverse identity, not the occupancy bitmap), so
+    ///     they are outside the port-reissue defect and are counted, not
+    ///     re-seeded. Carrying them is the same class of question as the
+    ///     persistent leases and is tracked separately.
+    ///
+    /// Runs at config-apply only. It does not touch `claim()` and adds no
+    /// per-packet work.
+    pub(super) fn reseed_retained_from(
+        &self,
+        prev: &PortAllocator,
+        index_map: &FxHashMap<usize, usize>,
+        now_ns: u64,
+    ) -> ReseedOutcome {
+        let mut out = ReseedOutcome::default();
+        if index_map.is_empty() {
+            return out;
+        }
+        // Snapshot the previous live set and RELEASE its lock before touching
+        // this allocator's, so the two mutexes are never held at once.
+        let carried: Vec<(SourceNatFlowKey, LiveAllocation)> = {
+            let prev_live = prev.lock_live();
+            prev_live
+                .live_by_flow
+                .iter()
+                .filter(|(_, a)| index_map.contains_key(&a.addr_index))
+                .map(|(f, a)| (*f, *a))
+                .collect()
+        };
+        for (flow, alloc) in carried {
+            let Some(&new_index) = index_map.get(&alloc.addr_index) else {
+                continue;
+            };
+            if alloc.address_only {
+                out.skipped_address_only += 1;
+                continue;
+            }
+            if !self.port_in_range(new_index, alloc.translated.port) {
+                out.skipped_out_of_range += 1;
+                continue;
+            }
+            // Preserve the holder set: an HA-synced flow is reserved once per
+            // WORKER (#6211 F2) and the port must not be freed until the LAST
+            // one lets go. Re-seeding with a single untracked holder would let
+            // the first release free a port the other N-1 still forward
+            // through. Untracked (holders == 0) is a LOCAL allocation and
+            // re-seeds once.
+            let mut reserved = false;
+            if alloc.holders == 0 {
+                reserved = self.reserve_flow(
+                    flow,
+                    alloc.translated,
+                    new_index,
+                    alloc.deterministic,
+                    now_ns,
+                    NatHolder::Untracked,
+                );
+            } else {
+                for worker in 0..MAX_NAT_HOLDER_WORKERS {
+                    if alloc.holders & (1u128 << worker) == 0 {
+                        continue;
+                    }
+                    reserved |= self.reserve_flow(
+                        flow,
+                        alloc.translated,
+                        new_index,
+                        alloc.deterministic,
+                        now_ns,
+                        NatHolder::Worker(worker),
+                    );
+                }
+            }
+            if reserved {
+                out.reseeded += 1;
+            } else {
+                out.refused += 1;
+            }
+        }
+        out
+    }
+
+    /// True when `port` falls inside the configured range of the pool address
+    /// at `index`. Read off that address's own `AddressOccupancy` rather than a
+    /// shared field, because the range lives per-address — asking the wrong
+    /// address would be the same class of positional mistake the whole re-seed
+    /// exists to avoid. A zero-range occupancy (unset/invalid
+    /// `port_low`/`port_high`) admits nothing.
+    fn port_in_range(&self, index: usize, port: u16) -> bool {
+        let Some(occ) = self.shared.occupancy.get(index) else {
+            return false;
+        };
+        if occ.range == 0 {
+            return false;
+        }
+        matches!((port as u32).checked_sub(occ.port_low as u32), Some(o) if o < occ.range)
+    }
+
     pub(super) fn reserve_flow(
         &self,
         flow: SourceNatFlowKey,
