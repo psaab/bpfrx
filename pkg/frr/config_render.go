@@ -124,6 +124,19 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 	if sr.NextTable != "" {
 		return "" // handled via ip rule in routing package
 	}
+	// #6795: final operand-validity belt. Destination is a RAW STRING from the
+	// parser, and it is interpolated into every `ip route` line this function
+	// emits. A malformed value fails the WHOLE frr-reload — one vtysh
+	// add-batch exits non-zero on any CMD_WARNING_CONFIG_FAILED — so a single
+	// bad route takes every other route on the box with it; a value carrying
+	// whitespace additionally splits into extra operands or an extra statement.
+	// Commit validates it, but the tolerant load / HA config-sync paths only
+	// warn (#1960 no-brick), so the renderer is the last place to stop it.
+	// Skipping THIS route is the fail-closed answer: the alternative is losing
+	// the entire managed section.
+	if !validFRRRoutePrefix(sr.Destination) {
+		return ""
+	}
 	isV6 := strings.Contains(sr.Destination, ":")
 	prefix := "ip"
 	if isV6 {
@@ -207,6 +220,21 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 			}
 		}
 
+		// #6795: the same belt on the next-hop operands. Address and ifName are
+		// raw strings assembled from config, RETH resolution and a `.vlan`
+		// suffix; either can reach here malformed on the tolerant load /
+		// peer-sync path. An unparseable gateway fails the frr-reload; one
+		// carrying whitespace splits into extra operands or an extra statement.
+		// Dropping the individual NEXT-HOP (not the whole route) is the right
+		// granularity: a `next-hop [ a b ]` ECMP list with one bad member should
+		// still install the good ones, and the no-next-hop case below already
+		// renders nothing rather than a Null0 blackhole (#3872).
+		if nh.Address != "" && !validFRRNextHopAddress(nh.Address) {
+			continue
+		}
+		if ifName != "" && !validFRRInterfaceOperand(ifName) {
+			continue
+		}
 		var nexthop string
 		switch {
 		case nh.Address != "" && ifName != "":
@@ -247,6 +275,13 @@ func renderGenerateRoutes(b *strings.Builder, fc *FullConfig) {
 		return
 	}
 	for _, gr := range fc.GenerateRoutes {
+		// #6795: same belt. A generate-route renders a blackhole, so a
+		// malformed prefix here fails the frr-reload and takes every route with
+		// it — and a blackhole is the one route shape where a mangled operand
+		// could silently widen what is dropped.
+		if !validFRRRoutePrefix(gr.Prefix) {
+			continue
+		}
 		if strings.Contains(gr.Prefix, ":") {
 			fmt.Fprintf(b, "ipv6 route %s blackhole\n", gr.Prefix)
 		} else {
