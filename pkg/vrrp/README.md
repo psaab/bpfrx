@@ -655,6 +655,16 @@ path (#1960). A `reth*` with no members yet is deliberately NOT rejected — it 
 an incompletely-wired declaration that both modes accepted before, and
 narrowing it is not what #6781 is about.
 
+**All eight readers now share it.** Besides the two ownership collectors and
+networkd generation, the five `pkg/daemon` readers that decide RG membership for
+stable RETH link-local add/remove, the direct-mode GARP / router-LL burst, DHCP
+RG-scoping and BACKUP blackhole routes each carried their own name test. Left
+alone they would have given a structurally valid pair VIPs from both ownership
+modes and then no GARP, no stable link-local and no blackhole routes — VRRP
+mastering an interface nothing else manages. `rethInterfacesMatchingRG`'s own
+doc comment (#6520) already states the rule: *"Deriving the two from one walker
+is not a style preference: a divergence between them is ALWAYS a bug."*
+
 Bound by two tests, because a behavioural one alone is probe-bounded:
 `reth_rg_parity_6781_test.go` asserts the two modes reach the same conclusion on
 both shapes plus a control, and `reth_rg_ssot_6781_test.go` asserts they still

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 	"syscall"
 	"time"
 
@@ -277,11 +276,16 @@ func (d *Daemon) addStableRethLinkLocal(rgID int) {
 	stableLL := cluster.StableRethLinkLocal(clusterID, rgID)
 	rethToPhys := cfg.RethToPhysical()
 
+	rgOwners := cfg.RethRGOwners() // #6781
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		if ifc == nil || ifc.RedundancyGroup != rgID {
+		if ifc == nil {
 			continue
 		}
-		if !strings.HasPrefix(ifName, "reth") {
+		// #6781: RG ownership from the shared predicate. The name test this
+		// replaces excluded a structurally valid redundant pair not spelled
+		// reth*, so its group got VIPs from both ownership modes but no stable
+		// link-local — VRRP mastering an interface nothing else manages.
+		if owns, ok := rgOwners[ifName]; !ok || owns != rgID {
 			continue
 		}
 		// Skip interfaces with an explicitly configured link-local address —
@@ -344,11 +348,16 @@ func (d *Daemon) removeStableRethLinkLocal(rgID int) {
 	stableLL := cluster.StableRethLinkLocal(clusterID, rgID)
 	rethToPhys := cfg.RethToPhysical()
 
+	rgOwners := cfg.RethRGOwners() // #6781
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		if ifc == nil || ifc.RedundancyGroup != rgID {
+		if ifc == nil {
 			continue
 		}
-		if !strings.HasPrefix(ifName, "reth") {
+		// #6781: RG ownership from the shared predicate. The name test this
+		// replaces excluded a structurally valid redundant pair not spelled
+		// reth*, so its group got VIPs from both ownership modes but no stable
+		// link-local — VRRP mastering an interface nothing else manages.
+		if owns, ok := rgOwners[ifName]; !ok || owns != rgID {
 			continue
 		}
 		physName := ifc.Name
@@ -612,8 +621,12 @@ func (d *Daemon) directSendGARPs(rgID int) {
 		stableLL := cluster.StableRethLinkLocal(cfg.Chassis.Cluster.ClusterID, rgID)
 		rethToPhys := cfg.RethToPhysical()
 		seen := make(map[string]bool)
+		rgOwners := cfg.RethRGOwners() // #6781
 		for ifName, ifc := range cfg.Interfaces.Interfaces {
-			if ifc == nil || ifc.RedundancyGroup != rgID || !strings.HasPrefix(ifName, "reth") {
+			if ifc == nil {
+				continue
+			}
+			if owns, ok := rgOwners[ifName]; !ok || owns != rgID { // #6781
 				continue
 			}
 			// Use configured link-local if present, otherwise stable LL.
