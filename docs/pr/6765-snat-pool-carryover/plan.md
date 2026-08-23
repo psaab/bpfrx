@@ -1,6 +1,8 @@
 # #6765 — changed SNAT/NAT64 pools reissue live translated tuples on retained addresses
 
-**Status: PLAN.** No implementation. This touches the NAT allocator (hot-path
+**Status: IMPLEMENTED** (the plan below is kept as the record of what was decided and why; see the PR for the landed shape).
+
+Originally: PLAN, no implementation. This touches the NAT allocator (hot-path
 data structures) and both config-apply rebuild paths, so it is a boundary change
 and gets a plan first.
 
