@@ -10,7 +10,6 @@ package userspace
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -140,8 +139,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 		return err
 	}
 	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
-		m.recordSessionMirrorFailureLocked(err)
-		slog.Debug("userspace: session mirror failed", "err", err)
+		m.noteSyncedMirrorFailureLocked(err)
 		compErr := m.restoreBPFSessionV4Locked(key, prior, hadPrior)
 		return errors.Join(
 			fmt.Errorf("mirror synced v4 session to userspace helper: %w", err),
@@ -278,8 +276,7 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 		return err
 	}
 	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
-		m.recordSessionMirrorFailureLocked(err)
-		slog.Debug("userspace: session mirror failed", "err", err)
+		m.noteSyncedMirrorFailureLocked(err)
 		compErr := m.restoreBPFSessionV6Locked(key, prior, hadPrior)
 		return errors.Join(
 			fmt.Errorf("mirror synced v6 session to userspace helper: %w", err),

@@ -1867,7 +1867,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
             nat.rewrite_src_port,
             now_ns,
             holder,
-        )
+        ) == SyncedReserveOutcome::Reserved
     {
         return true;
     }
@@ -1883,6 +1883,10 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // exactly what shipped before this fix, so no configuration can come out
     // of #6211 with FEWER reservations than it had. Pass 1 can only move a
     // reservation to a better-justified allocator, never remove one.
+    // #7581: PASS 2's answer decides. `NothingToReserve` — no rule's pool owns
+    // the translated address, the shape interface-mode source NAT always
+    // produces — is NOT a refusal, and is answered exactly like the
+    // `rewrite_src == None` early return above.
     reserve_synced_on_first_pool_owner(
         rules.iter(),
         flow,
@@ -1891,6 +1895,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
         now_ns,
         holder,
     )
+    .may_publish()
 }
 
 /// #6211: reserve the synced translation on the first rule in `rules` whose
@@ -1899,6 +1904,46 @@ fn reserve_synced_source_nat_allocation_with_holder(
 /// differ ONLY in which rules they are offered — the reservation semantics
 /// (pool-mode gate, address-index math, address-only vs port-bearing arm,
 /// per-rule fall-through) cannot drift between them.
+/// The outcome of a synced-translation reservation attempt (#7581).
+///
+/// `reserve_synced_on_first_pool_owner` used to return a bare `bool`, which
+/// collapsed two opposite situations into one `false`:
+///
+///   * a candidate rule's pool OWNS the translated address and its allocator
+///     DECLINED — a genuine collision, and the case #6600 exists to refuse; and
+///   * NO candidate owns the translated address at all, so there is nothing to
+///     reserve.
+///
+/// The second is not a refusal. It is the same situation as a decision with no
+/// `rewrite_src`, which the caller has always answered `true` to. Interface-mode
+/// source NAT is exactly this case — the translated address is the egress
+/// interface's own address, no rule is `pool_mode`, and no allocator has
+/// anything to hand out — so every peer-synced import under interface-mode SNAT
+/// read as a collision. `upsert_synced_session` refuses before
+/// `publish_shared_session`, so since #6600 those sessions reached neither the
+/// standby's shared `synced` map nor its worker tables, and the promoted node
+/// had no state for them after a failover. It was invisible because the Go side
+/// kept its BPF mirror row, which is what `show security flow session` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncedReserveOutcome {
+    /// A pool-owning candidate accepted the reservation.
+    Reserved,
+    /// A pool-owning candidate DECLINED — a different live allocation owns the
+    /// translated identity (#6600). The import must be refused.
+    Refused,
+    /// No candidate rule's pool owns the translated address, so no allocator
+    /// has anything to reserve. Not a refusal.
+    NothingToReserve,
+}
+
+impl SyncedReserveOutcome {
+    /// Whether the caller may publish the synced session. Only `Refused`
+    /// blocks it.
+    pub(crate) fn may_publish(self) -> bool {
+        !matches!(self, SyncedReserveOutcome::Refused)
+    }
+}
+
 fn reserve_synced_on_first_pool_owner<'a>(
     rules: impl Iterator<Item = &'a SourceNatRule>,
     flow: SourceNatFlowKey,
@@ -1909,7 +1954,11 @@ fn reserve_synced_on_first_pool_owner<'a>(
     // #6211 F2: the worker taking this reservation, so a fan-out to N workers
     // records N holders on ONE allocator record.
     holder: NatHolder,
-) -> bool {
+) -> SyncedReserveOutcome {
+    // #7581: `saw_candidate` records whether ANY rule's pool actually owned the
+    // translated address. Without it, "no owner" and "every owner declined"
+    // both fell out of the loop as the same value.
+    let mut saw_candidate = false;
     for rule in rules {
         if !rule.pool_mode {
             continue;
@@ -1930,12 +1979,13 @@ fn reserve_synced_on_first_pool_owner<'a>(
             if !in_pool {
                 continue;
             }
+            saw_candidate = true;
             if rule
                 .pool_allocator
                 .reserve_address_only(flow, rewrite_src, holder)
                 .is_ok()
             {
-                return true;
+                return SyncedReserveOutcome::Reserved;
             }
             continue;
         };
@@ -1954,6 +2004,7 @@ fn reserve_synced_on_first_pool_owner<'a>(
         let Some(addr_index) = addr_index else {
             continue;
         };
+        saw_candidate = true;
         // #5178: tag the reservation deterministic iff this rule runs a
         // deterministic CGNAT (mode 1) pool, so its release uses
         // `free_no_recycle` and the standby's recycle queue does not grow under
@@ -1970,10 +2021,14 @@ fn reserve_synced_on_first_pool_owner<'a>(
             now_ns,
             holder,
         ) {
-            return true;
+            return SyncedReserveOutcome::Reserved;
         }
     }
-    false
+    if saw_candidate {
+        SyncedReserveOutcome::Refused
+    } else {
+        SyncedReserveOutcome::NothingToReserve
+    }
 }
 
 /// #4381: allocate a UNIQUE translated `(pool v4 address, L4 port/identifier)`

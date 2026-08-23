@@ -8,7 +8,10 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // MaxControlRequestBytes is the maximum serialized size, in bytes, of a
@@ -69,6 +72,15 @@ const (
 // resp.OK=false for this one request) is NOT wrapped with this sentinel, so the
 // batch keeps going: the helper is alive and only this request was refused.
 var errSessionHelperUnreachable = errors.New("session helper unreachable")
+
+// syncedImportRefusedPrefix is the machine-readable token the helper prefixes
+// onto a SEMANTIC synced-import refusal (SYNCED_IMPORT_REFUSED_PREFIX in
+// userspace-dp/src/afxdp/ha/session_import.rs). The two spellings must agree;
+// TestSyncedImportRefusedPrefixMatchesTheHelper asserts the AGREEMENT by
+// reading the Rust constant rather than pinning either side to a literal, so a
+// rename on either side reds instead of silently reclassifying every refusal as
+// a transport failure.
+const syncedImportRefusedPrefix = "synced-import-refused:"
 
 // sessionSyncDialTimeout and sessionSyncRoundtripDeadline bound a single
 // session-socket round-trip so a hung helper fails one mirror request in a few
@@ -256,6 +268,23 @@ func (m *Manager) requestSessionSyncLocked(req ControlRequest) error {
 	if !resp.OK {
 		if resp.Error == "" {
 			resp.Error = "unknown helper error"
+		}
+		// #6785: discriminate a SEMANTIC refusal from a transport failure. Both
+		// arrive as an error, but they mean opposite things about helper health:
+		// a transport failure says the session socket is sick and must gate
+		// takeover-readiness (#5247), while a refusal is the correct answer from
+		// a HEALTHY helper — the peer sent a stale generation, this node is at
+		// its own import ceiling, or the translated tuple could not be reserved.
+		// Treating a refusal as a mirror failure would latch a working standby
+		// "not takeover-ready" the first time a peer oversubscribed it, which is
+		// a worse failure than the split truth this reporting exists to fix.
+		//
+		// Matched on the helper's stable machine-readable prefix, never on the
+		// human-readable remainder, so the sentence can be reworded without
+		// silently reclassifying a refusal as a transport failure.
+		if strings.HasPrefix(resp.Error, syncedImportRefusedPrefix) {
+			return fmt.Errorf("%w: %s", dataplane.ErrSyncedImportRefused,
+				strings.TrimPrefix(resp.Error, syncedImportRefusedPrefix))
 		}
 		return errors.New(resp.Error)
 	}

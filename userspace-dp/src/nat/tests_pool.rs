@@ -7605,3 +7605,121 @@ fn retained_index_map_remaps_positions_not_replays_them_6765() {
     // Fully disjoint: nothing to carry.
     assert!(crate::nat::retained_pool_index_map_v4(&[a, b], &[c]).is_empty());
 }
+
+// #7581 — the synced reservation must not read "nothing to reserve" as a
+// refusal.
+//
+// `reserve_synced_on_first_pool_owner` returned a bare `bool`, so two opposite
+// situations produced the same `false`: a pool-owning candidate that DECLINED
+// (a real collision, what #6600 exists to refuse) and NO candidate owning the
+// translated address at all. Interface-mode source NAT is permanently the
+// second case — the translated address is the egress interface's own address,
+// no rule is `pool_mode`, and no allocator has anything to hand out — so every
+// peer-synced import under interface-mode SNAT read as a collision and
+// `upsert_synced_session` refused it BEFORE `publish_shared_session`. Since
+// #6600 those sessions reached neither the standby's shared `synced` map nor
+// its worker tables.
+//
+// This is a PAIRED cell on purpose. A lone "no pool returns true" assertion is
+// satisfied by deleting the refusal path outright, which reopens #6600 — so the
+// same call site is driven with a genuine collision and must still refuse.
+#[test]
+fn synced_reserve_distinguishes_no_pool_from_a_refusal_7581() {
+    // (a) INTERFACE MODE: no pool anywhere, translated address is the egress
+    // interface's own address. Nothing owns it, so nothing can reserve it —
+    // and that must not block the import.
+    let iface_rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-iface".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // Guard the fixture's own premise: if the parse ever produced a pool-mode
+    // rule here, this cell would be exercising the wrong arm and would pass for
+    // the wrong reason.
+    assert!(
+        iface_rules.iter().all(|r| !r.pool_mode),
+        "fixture must be interface-mode (no pool_mode rule), got {:?}",
+        iface_rules.iter().map(|r| r.pool_mode).collect::<Vec<_>>()
+    );
+
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let iface_nat = NatDecision {
+        // The egress interface address — deliberately NOT a pool member.
+        rewrite_src: Some("172.16.80.8".parse().unwrap()),
+        rewrite_src_port: Some(42650),
+        ..NatDecision::default()
+    };
+    assert!(
+        reserve_synced_source_nat_allocation_untracked(
+            &iface_rules,
+            &key,
+            iface_nat,
+            false,
+            Some(("lan", "wan")),
+            0,
+        ),
+        "an interface-mode synced import has NOTHING to reserve — no rule's \
+         pool owns the egress address — and must not be read as a collision. \
+         Refusing it stops the standby publishing the session at all, so a \
+         promoted node has no state for the flow (#7581)"
+    );
+
+    // (b) POOL MODE, GENUINE COLLISION: the same call site must still refuse
+    // when a pool-owning candidate declines. Without this leg, (a) is satisfied
+    // by removing the refusal entirely and #6600 silently reopens.
+    let pool_rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-pool".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pool-lan".to_string(),
+        pool_addresses: vec!["203.0.113.10/32".to_string()],
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let pool_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    // A DIFFERENT live local flow already owns the translated identity.
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(
+        pool_rules[0].pool_allocator.reserve_flow(
+            squatter,
+            TranslatedTuple {
+                ip: "203.0.113.10".parse().unwrap(),
+                port: 20000,
+            },
+            0,
+            false,
+            0,
+            NatHolder::Untracked,
+        ),
+        "fixture: the squatting local flow must take the identity first, or the \
+         refusal leg below cannot happen"
+    );
+
+    assert!(
+        !reserve_synced_source_nat_allocation_untracked(
+            &pool_rules,
+            &key,
+            pool_nat,
+            false,
+            Some(("lan", "wan")),
+            0,
+        ),
+        "a pool-owning candidate that DECLINES is a genuine collision and must \
+         still refuse the import — the standby would otherwise advertise a \
+         translation it does not own (#6600)"
+    );
+}
