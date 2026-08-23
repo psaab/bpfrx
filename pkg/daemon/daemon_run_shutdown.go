@@ -179,6 +179,41 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 		}
 	}
 
+	// #6787: STOP THE KEA UNITS BEFORE RELINQUISHING OWNERSHIP.
+	//
+	// Everything below this point hands the segment to the peer: the RA
+	// goodbye, the VIP removal, VRRP's priority-0 burst, and the heartbeat
+	// stop. None of them touched the DHCP server, and Kea runs as SEPARATE
+	// systemd units that outlive xpfd. So an orderly HA shutdown promoted the
+	// peer — which starts ITS Kea on the same segment — while this node's Kea
+	// kept answering: duplicate OFFERs, and two lease databases handing out
+	// addresses from one pool with neither aware of the other. The units also
+	// survived the whole xpfd downtime, so the condition persisted until the
+	// operator noticed.
+	//
+	// Placed BEFORE the withdrawal, not after, so there is never a moment when
+	// both nodes serve. Synchronous, because ApplyAsync's mailbox is drained by
+	// a worker goroutine and a stop enqueued during shutdown races process exit
+	// — a fix that is present and does nothing looks exactly like a fix that
+	// works. Manager.Shutdown also LATCHES, so a VRRP MASTER transition racing
+	// this window cannot re-arm the units with a newer generation.
+	//
+	// CLUSTER MODE ONLY. In standalone there is no peer to hand the segment to,
+	// and Kea deliberately survives an xpfd restart today; stopping it here
+	// would turn every daemon restart into a DHCP outage. haMode is the
+	// discriminator, not `hitless`: VRRP sends its priority-0 burst even on a
+	// hitless HA restart, so the peer takes over and this node must stop
+	// serving either way.
+	if haMode && d.dhcpServer != nil {
+		if err := d.dhcpServer.Shutdown(); err != nil {
+			slog.Warn("shutdown: failed to stop the DHCP server units — this "+
+				"node may keep answering DHCP while the peer serves the same "+
+				"segment", "err", err)
+		} else {
+			slog.Info("shutdown: DHCP server stopped before relinquishing ownership")
+		}
+	}
+
 	// Withdraw RA senders (sends goodbye RAs with lifetime=0) before VRRP
 	// stop so hosts immediately stop using this node as a default router.
 	if d.ra != nil {

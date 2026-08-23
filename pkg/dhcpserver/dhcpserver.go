@@ -156,6 +156,20 @@ type Manager struct {
 	// errored: the newest state was ATTEMPTED, and replaying an older
 	// state over a failed newer one would regress desired state.
 	lastAppliedGen uint64
+	// shuttingDown latches at daemon shutdown (#6787). Once set, EVERY
+	// applier — sync Apply, ApplyClusterCommit, and the async worker —
+	// coerces its desired state to nil, so no late caller can restart Kea
+	// after the node has begun relinquishing ownership.
+	//
+	// A latch rather than a second stop call, because the hazard is a race,
+	// not a missed step: `Shutdown` runs BEFORE the priority-0 withdrawal so
+	// this node stops serving before the peer starts, which leaves a window in
+	// which a VRRP MASTER transition can still enqueue an ApplyAsync with a
+	// HIGHER generation and re-arm the units. The supersession guard cannot
+	// help there — the racing request is genuinely newer. Coercing rather than
+	// REFUSING keeps the reconcile idempotent and convergent: a late applier
+	// still runs, and still lands on "stopped".
+	shuttingDown atomic.Bool
 	// staleApplySkips counts apply bodies skipped as superseded
 	// (observable by tests; useful telemetry if exported later).
 	staleApplySkips atomic.Uint64
@@ -320,6 +334,16 @@ func (m *Manager) apply(gen uint64, cfg *config.DHCPServerConfig, restartInactiv
 		return nil
 	}
 
+	// #6787: once shutdown has latched, the only legal desired state is
+	// "stopped". A VRRP MASTER transition racing the shutdown allocates a
+	// NEWER generation than Shutdown's own apply, so the supersession guard
+	// above cannot stop it re-arming Kea after this node has begun
+	// relinquishing ownership — which is precisely how both nodes end up
+	// serving DHCP on one segment.
+	if m.shuttingDown.Load() {
+		cfg = nil
+	}
+
 	var errs []error
 
 	want4 := cfg != nil && cfg.DHCPLocalServer != nil && len(cfg.DHCPLocalServer.Groups) > 0
@@ -395,6 +419,34 @@ func (m *Manager) ClaimApplyRetry(now time.Time) bool {
 	}
 	m.lastRetryClaim = now
 	return true
+}
+
+// Shutdown performs the authoritative DHCP-server stop for daemon shutdown
+// (#6787) and is the ONLY stop on that path — before it, an orderly HA
+// shutdown withdrew VRRP ownership, cleared rg_active, and stopped the
+// heartbeat while leaving the Kea units RUNNING. The peer promoted and started
+// its own Kea, so both nodes served DHCP on the same segment: duplicate
+// OFFERs, and two lease databases handing out the same addresses with neither
+// aware of the other.
+//
+// It is SYNCHRONOUS on purpose. ApplyAsync's mailbox is drained by a worker
+// goroutine, so a stop enqueued during shutdown races process exit and is
+// simply lost — the failure mode is "the fix is present and does nothing",
+// which looks identical to working. The commit path already has a synchronous
+// applier for exactly this reason.
+//
+// It also LATCHES (see shuttingDown). Shutdown runs before the priority-0
+// withdrawal so this node stops serving before the peer starts serving, and
+// that ordering leaves a window in which a VRRP MASTER transition can enqueue
+// an apply with a NEWER generation. Stopping without latching would let that
+// window re-arm the units after the stop had "succeeded".
+//
+// The error is returned rather than logged so a caller can report a Kea that
+// refused to stop; the units are separate systemd services, so a failure here
+// means they are still serving and the operator needs to know.
+func (m *Manager) Shutdown() error {
+	m.shuttingDown.Store(true)
+	return m.apply(m.applyGen.Add(1), nil, true)
 }
 
 // ApplyAsync enqueues an authoritative Apply for cfg and returns
