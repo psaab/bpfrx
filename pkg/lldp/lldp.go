@@ -260,7 +260,20 @@ func New() *Manager {
 // the new one, and every wg.Add(1) all happen atomically with respect to a
 // racing Stop (#5121). The internal teardown uses stopLocked() (not Stop) to
 // avoid re-acquiring the non-reentrant lifecycleMu.
-func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
+// #6794: Apply is PARTIAL and reports it. Each configured interface is brought
+// up independently and a failure skips just that one — so a "successful" call
+// can leave part of the generation dark. It returns the interfaces that failed
+// NAME RESOLUTION, which is the recoverable half: the NIC is simply not there
+// yet (renamed later by a .link file, created later as a VLAN/tunnel, or not
+// yet up). A caller that guards on unchanged config MUST consult this, or the
+// reconcile that would have recovered those interfaces is skipped forever.
+//
+// A socket-setup failure (CAP_NET_RAW, bind) is deliberately NOT reported here:
+// it is logged and the interface is skipped, but it does not self-heal within a
+// process the way an absent NIC does, so surfacing it as retry debt would make
+// every later commit rebuild the whole generation — wiping the neighbor table
+// on a condition that will not change.
+func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) (unresolved []string) {
 	m.lifecycleMu.Lock()
 	defer m.lifecycleMu.Unlock()
 
@@ -268,7 +281,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 	m.stopLocked()
 
 	if cfg == nil || cfg.Disable || len(cfg.Interfaces) == 0 {
-		return
+		return nil
 	}
 
 	lldpCtx, cancel := context.WithCancel(ctx)
@@ -303,6 +316,12 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 		if err != nil {
 			slog.Warn("LLDP: interface not found", "interface", lldpIf.Name,
 				"kernel", kernelName, "err", err)
+			// #6794: REPORTED, not just logged. This is the recoverable
+			// failure — the interface simply is not there yet (renamed later,
+			// created later, brought up later) — so the caller needs to know
+			// this generation is incomplete, or its unchanged-config guard
+			// will skip the reconcile that would have fixed it.
+			unresolved = append(unresolved, lldpIf.Name)
 			continue
 		}
 
@@ -336,12 +355,25 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 		slog.Info("LLDP started", "interface", lldpIf.Name, "interval", interval)
 	}
 
+	sort.Strings(unresolved)
+
 	// Start neighbor expiry goroutine.
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		m.expiryLoop(lldpCtx)
 	}()
+	return unresolved
+}
+
+// InterfaceResolvable reports whether a configured LLDP interface name resolves
+// to a kernel interface right now (#6794). It is the same lookup Apply performs
+// — the SAME name conversion and the SAME seam — so a caller deciding whether a
+// previously-unresolved interface has appeared cannot disagree with the code
+// that will act on that decision.
+func InterfaceResolvable(name string) bool {
+	_, err := interfaceByNameFn(config.LinuxIfName(name))
+	return err == nil
 }
 
 // Stop halts all LLDP goroutines and clears the neighbor table. It holds
