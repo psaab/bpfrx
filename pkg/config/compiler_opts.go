@@ -1824,6 +1824,27 @@ type compileOpts struct {
 	// and its ifindex identifies no zone (fail-closed).
 	// Same doctrine as lenientIfNameCollision.
 	lenientRethMember bool
+
+	// lenientRethRGOwnership (#6781) downgrades the RETH
+	// redundancy-group ownership gate (validateRethRedundancyGroupStrict)
+	// from a hard compile error to a cfg.Warnings entry. An interface
+	// carrying `redundant-ether-options redundancy-group <N>` that no port
+	// names as its `gigether-options redundant-parent` is not a
+	// redundant-ethernet interface, and the three consumers of that stanza
+	// disagreed about it: networkd generation replaced the operator's
+	// address with a link-local /32, the VRRP-backed owner claimed the real
+	// address as a VIP that exists only while MASTER, and the direct owner
+	// (no-reth-vrrp / private-rg-election) skipped it — so in direct mode the
+	// address was stripped and installed by nobody, on both nodes. The strict
+	// commit / commit-check path hard-rejects so the operator error is
+	// visible; the tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config an older binary accepted
+	// still BOOTS (#1960 fail-closed-on-load class). The runtime resolves
+	// ownership through the shared structural predicate
+	// (Config.RethRGOwners), so a leniently-loaded config keeps the
+	// interface as a plain L3 interface with its address rather than
+	// half-applying a redundancy group. Same doctrine as lenientRethMember.
+	lenientRethRGOwnership bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2457,6 +2478,7 @@ func lenientCompileOpts() compileOpts {
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
 		lenientRethMember:                      true,
+		lenientRethRGOwnership:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
