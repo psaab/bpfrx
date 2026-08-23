@@ -1023,6 +1023,30 @@ func namedInstances(nodes []*Node) []struct {
 	return result
 }
 
+// instanceValueTail returns an instance node's trailing VALUE tokens — the
+// keys that follow its NAME — for both node shapes namedInstances can hand
+// back (#7568).
+//
+// namedInstances resolves an instance either from a node that carries its own
+// name (Keys=["<keyword>", NAME, ...]) or, for the hierarchical block
+// spelling, from a SUB-node whose keys begin with the name (Keys=[NAME, ...]).
+// Anchoring on the name rather than on a fixed index is what makes a caller
+// correct against both: a fixed Keys[2:] panics on the short shape, and a bare
+// length guard silently drops a compact value that the block shape
+// legitimately carries.
+func instanceValueTail(node *Node, name string) []string {
+	if node == nil {
+		return nil
+	}
+	if len(node.Keys) >= 2 && node.Keys[1] == name {
+		return node.Keys[2:]
+	}
+	if len(node.Keys) >= 1 && node.Keys[0] == name {
+		return node.Keys[1:]
+	}
+	return nil
+}
+
 // parseASNumber parses a BGP AS-number string, returning the value and true
 // ONLY when it is a valid 4-byte AS in [1, 4294967295]. A negative, oversized,
 // non-numeric, or zero value returns ok=false so the caller leaves the field

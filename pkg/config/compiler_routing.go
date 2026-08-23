@@ -678,7 +678,14 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		// compiled NAMED but EMPTY. A filter term scoped by it then silently
 		// stopped matching, on a config that committed clean. Read the
 		// instance node's own trailing keys as well as its children.
-		for _, p := range inst.node.Keys[2:] {
+		// #7568: take the tail relative to the instance NAME, not a fixed
+		// index. namedInstances returns two node shapes and the tail starts
+		// at a different offset in each (see instanceValueTail). Reading
+		// Keys[2:] unconditionally PANICKED on the block spelling
+		// `prefix-list { NAME; }`, and a bare length guard silently drops the
+		// prefix in `prefix-list { NAME 10.0.0.0/8; }` — compiling the list
+		// NAMED BUT EMPTY, which is the #6564 defect in the other shape.
+		for _, p := range instanceValueTail(inst.node, inst.name) {
 			if p != "" {
 				pl.Prefixes = append(pl.Prefixes, p)
 			}
