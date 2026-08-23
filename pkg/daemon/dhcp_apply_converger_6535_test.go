@@ -63,6 +63,34 @@ func (k *keaApplyRecorder) count() int {
 	return k.attempts
 }
 
+// awaitInFlight blocks until want apply attempts have reached the systemctl
+// shell-out.
+//
+// This is a wait on an ASYNC observable, not a retry that papers over a flaky
+// assertion (#7563): ApplyAsync hands the request to a worker goroutine, so
+// "has the apply started" is a question with a real answer that simply is not
+// available yet when reconcileRGState returns. The defect this guards — an
+// edge that enqueues NOTHING — still fails, loudly, at the deadline; it is
+// only the scheduler's head start that is no longer being measured.
+func (k *keaApplyRecorder) awaitInFlight(t *testing.T, want int) {
+	t.Helper()
+	if !waitUntil(t, 10*time.Second, func() bool { return k.count() >= want }) {
+		t.Fatalf("no Kea apply reached systemctl within 10s of the RG transition "+
+			"edge (attempts=%d): the edge enqueued no apply at all, so the node "+
+			"never starts serving DHCP after taking the RG", k.count())
+	}
+	// The over-count half of the original `count() != 1`. It is retained
+	// deliberately but is NOT reachable today: a second apply serialises on
+	// the manager's mutex behind the one blocked in the shell-out, so it
+	// cannot be observed here. No mutation cell reds it, and that is stated
+	// rather than implied — it is defence-in-depth against the manager
+	// losing that serialisation, not a guard with a proof behind it.
+	if n := k.count(); n != want {
+		t.Fatalf("%d Kea applies reached systemctl, want exactly %d: the RG "+
+			"transition edge fired more than once", n, want)
+	}
+}
+
 // quiesce waits until the attempt count stops moving, i.e. the async apply
 // worker has drained its mailbox.
 func (k *keaApplyRecorder) quiesce(t *testing.T) int {
@@ -147,12 +175,22 @@ func TestFailedKeaApplyIsRetriedByReconcileConverger(t *testing.T) {
 	// Pass A: the RG transition edge fires and enqueues the Kea apply, which
 	// is still blocked inside systemctl when the pass returns.
 	d.reconcileRGState()
-	if got := rec.count(); got != 1 {
-		t.Fatalf("fixture: want exactly 1 Kea apply in flight after the edge pass, got %d", got)
-	}
+	// The edge pass ENQUEUES the apply on the manager's async worker and
+	// returns; the systemctl shell-out happens on that worker goroutine.
+	// Sampling the count at the instant the pass returns therefore reads the
+	// SCHEDULER, not the converger — on a loaded box the worker has not been
+	// scheduled yet and 0 is the correct answer to the wrong question
+	// (#7563). Wait for the observable this fixture actually needs: the first
+	// apply reaching the shell-out, where it blocks on rec.release.
+	rec.awaitInFlight(t, 1)
 
 	close(rec.release)
 	settled := rec.quiesce(t)
+	// NOTE: settled is NOT 1. One apply drives several systemctl calls (per
+	// family, stop and restart), so the shell-out total after the pass is a
+	// legitimately variable number and asserting it exactly would trade one
+	// load-sensitive assertion for another. What IS pinned is the relative
+	// movement across passes B and C below.
 	if !d.ApplyFailedForTestingDHCP() {
 		t.Fatalf("fixture: %d apply attempt(s) ran but the manager did not record a failure", settled)
 	}

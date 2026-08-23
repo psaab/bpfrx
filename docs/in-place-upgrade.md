@@ -1641,6 +1641,32 @@ use:
   a half-finished destroy+launch is worse than letting it finish — it is
   recorded, and the caller `die()`s fail-closed BEFORE rejoin, the same
   response the boot-poll loop already gives.
+- **Unverified-primary detection during the boot poll (#6759).** The recreate
+  wipes the node, which erases the drain applied before it — the drain lived on
+  the disk that was replaced. The identity gate (#5075: live `xpf-version` ==
+  the AUTHENTICATED manifest's, and `/etc/xpf/node-id` == the assigned cluster
+  node-id) runs AFTERWARDS, so between bringup and gate-pass the node is
+  un-drained with unvalidated identity. The boot poll now also reads the node's
+  RG state and, if the recreated node is PRIMARY before the gate passes, fails
+  closed with the leases HELD — the same stance the loop already takes for a
+  version/node-id mismatch.
+
+  **This DETECTS the exposure; it does not close it.** The election happens
+  during the recreated node's own bringup (`daemon_run_bringup.go` runs
+  `UpdateConfig`, which elects on the single-node path) long before any driver
+  command lands. Closing it needs a hold that survives the disk wipe, and the
+  kernel-roll's mechanism cannot supply one:
+  `holdSecondaryIfKernelCandidateArmed` keys on the on-node kernel journal, and
+  a clean ENOENT is folded to "never armed" with no hold. A reboot preserves
+  that journal so ENOENT truly means "never armed"; a recreate destroys it, so
+  ENOENT means "the evidence was wiped" — and nothing on the node can tell those
+  apart. That is NOT a defect in `kernel_selfrecover.go`: the distinction is
+  correct for the path it was written for and has no way to be right for this
+  one. The design options are recorded on #7559.
+
+  Scope: `election.go`'s fresh-boot guard already keeps a NON-preempt RG with a
+  reachable peer at SECONDARY, so the exposure is `preempt`-configured RGs and
+  boots where the peer is not visible at first election.
   Because `die()` is a `SystemExit`, `kernel-roll`'s `finally` still runs
   after a fence-abort — and its own best-effort restore-forwarding rejoin
   IS a pair mutation. So the fence records the loss (a `lost_lease` flag,

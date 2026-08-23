@@ -32,8 +32,9 @@ var screenIDSFamily = map[string]bool{
 
 // dupBlock is one detected duplicate authored hierarchical named block.
 type dupBlock struct {
-	kind string // human category, e.g. "interface" / "screen ids-option"
-	name string // the duplicated name
+	kind   string // human category, e.g. "interface" / "screen ids-option"
+	name   string // the duplicated name
+	effect dupContainerEffect
 }
 
 // validateDuplicateNamedBlockAST rejects (strict) or warns (lenient) when the
@@ -114,7 +115,7 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 			}
 			if seenGroup[name] {
 				if !reportedGroup[name] {
-					dups = append(dups, dupBlock{"group", name})
+					dups = append(dups, dupBlock{"group", name, dupEffectLastWins})
 					reportedGroup[name] = true
 				}
 			} else {
@@ -149,7 +150,7 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 			}
 			if seenIf[name] {
 				if !reportedIf[name] {
-					dups = append(dups, dupBlock{"interface", name})
+					dups = append(dups, dupBlock{"interface", name, dupEffectLastWins})
 					reportedIf[name] = true
 				}
 			} else {
@@ -158,11 +159,47 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		}
 	}
 
-	// 3. security { screen { ids-option <name> { … } } } — duplicate profile
-	// names AND duplicate same-family blocks within one profile. Union across
-	// every top-level `security` stanza and every `screen` block therein.
-	seenProfile := map[string]bool{}
-	reportedProfile := map[string]bool{}
+	// 3. Table-driven named containers (namedDupRules). This replaces two
+	// hand-written copies of the same walk (screen ids-option, login user) and
+	// carries the six #6768 rows on the same code path, so a container added to
+	// the registry is covered by the strict gate, the lenient warning, and the
+	// #6455 group-expanded re-run without any of the three being edited.
+	// Union across every top-level stanza and every intermediate container
+	// therein, matching what the hand-written walks did.
+	for _, rule := range namedDupRules {
+		seen := map[string]bool{}
+		reported := map[string]bool{}
+		for _, child := range tree.Children {
+			if child.Name() != rule.stanza {
+				continue
+			}
+			holders := []*Node{child}
+			if rule.inner != "" {
+				holders = child.FindChildren(rule.inner)
+			}
+			for _, holder := range holders {
+				for _, inst := range namedInstances(holder.FindChildren(rule.keyword)) {
+					if inst.name == "" {
+						recordEmpty(rule.kind)
+						continue
+					}
+					if seen[inst.name] {
+						if !reported[inst.name] {
+							dups = append(dups, dupBlock{rule.kind, inst.name, rule.effect})
+							reported[inst.name] = true
+						}
+						continue
+					}
+					seen[inst.name] = true
+				}
+			}
+		}
+	}
+
+	// 3b. Duplicate ids-option FAMILY block within ONE profile. This is not a
+	// named container — the duplicate is the family keyword itself — so it
+	// keeps its own walk. compileScreen reads each family with FindChild, so a
+	// repeat is first-sibling-only, not last-writer-wins.
 	for _, child := range tree.Children {
 		if child.Name() != "security" {
 			continue
@@ -170,18 +207,8 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		for _, screen := range child.FindChildren("screen") {
 			for _, inst := range namedInstances(screen.FindChildren("ids-option")) {
 				if inst.name == "" {
-					recordEmpty("screen ids-option")
-					continue
+					continue // already recorded by the table walk above
 				}
-				if seenProfile[inst.name] {
-					if !reportedProfile[inst.name] {
-						dups = append(dups, dupBlock{"screen ids-option", inst.name})
-						reportedProfile[inst.name] = true
-					}
-				} else {
-					seenProfile[inst.name] = true
-				}
-				// Duplicate family block WITHIN this ids-option instance.
 				famSeen := map[string]bool{}
 				famReported := map[string]bool{}
 				for _, fam := range inst.node.Children {
@@ -192,54 +219,52 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 					if famSeen[fn] {
 						if !famReported[fn] {
 							dups = append(dups, dupBlock{
-								kind: fmt.Sprintf("screen ids-option %q family", inst.name),
-								name: fn,
+								kind:   fmt.Sprintf("screen ids-option %q family", inst.name),
+								name:   fn,
+								effect: dupEffectFirstWins,
 							})
 							famReported[fn] = true
 						}
-					} else {
-						famSeen[fn] = true
+						continue
 					}
+					famSeen[fn] = true
 				}
 			}
 		}
 	}
 
-	// 4. system { login { user <name> { … } } } — #6992. compileSystemLogin
-	// now folds a duplicated user name into ONE entry with per-leaf
-	// last-authored-wins (compiler_system.go), matching what the FLAT spelling
-	// already produces, so the container qualifies for this gate on the same
-	// terms as the three above: the earlier block's uid / class / keys
-	// disappear silently.
-	//
-	// Before that fold both blocks survived and two readers picked DIFFERENT
-	// ones — pkg/cli configuredClass takes the first block with a non-empty
-	// class, pkg/daemon applySystemLogin provisions from the last — so an SSH
-	// key authored under a VIEW-only block could authenticate into a
-	// super-user CLI. The fold removes the divergence; this gate is what stops
-	// the operator being silently held to whichever block the merge kept.
-	//
-	// Union across every top-level `system` stanza and every `login` block
-	// therein, matching the screen walk above.
-	seenUser := map[string]bool{}
-	reportedUser := map[string]bool{}
-	for _, child := range tree.Children {
-		if child.Name() != "system" {
-			continue
+	// 4. Singleton containers (singletonDupRules) — #6768. These carry no name,
+	// so the duplicate IS the keyword. compileServices reads each with
+	// FindChild, so every block after the first is silently ignored in full.
+	for _, rule := range singletonDupRules {
+		want := make(map[string]bool, len(rule.keywords))
+		for _, k := range rule.keywords {
+			want[k] = true
 		}
-		for _, login := range child.FindChildren("login") {
-			for _, inst := range namedInstances(login.FindChildren("user")) {
-				if inst.name == "" {
-					recordEmpty("login user")
-					continue
-				}
-				if seenUser[inst.name] {
-					if !reportedUser[inst.name] {
-						dups = append(dups, dupBlock{"login user", inst.name})
-						reportedUser[inst.name] = true
+		seen := map[string]bool{}
+		reported := map[string]bool{}
+		for _, child := range tree.Children {
+			if child.Name() != rule.stanza {
+				continue
+			}
+			holders := []*Node{child}
+			if rule.inner != "" {
+				holders = child.FindChildren(rule.inner)
+			}
+			for _, holder := range holders {
+				for _, c := range holder.Children {
+					name := c.Name()
+					if !want[name] || c.IsLeaf {
+						continue
 					}
-				} else {
-					seenUser[inst.name] = true
+					if seen[name] {
+						if !reported[name] {
+							dups = append(dups, dupBlock{rule.kind, name, dupEffectFirstWins})
+							reported[name] = true
+						}
+						continue
+					}
+					seen[name] = true
 				}
 			}
 		}
@@ -262,19 +287,18 @@ func validateDuplicateNamedBlockAST(tree *ConfigTree, lenient bool) ([]string, e
 		// unchanged when no empty name is present.
 		if len(dups) > 0 {
 			d := dups[0]
-			return nil, fmt.Errorf("duplicate %s %q: a repeated hierarchical block is "+
-				"silently reduced to last-writer-wins, dropping the earlier block's "+
-				"configuration — author it once (flat `set` merges repeated "+
-				"statements automatically) (#5180)", d.kind, d.name)
+			return nil, fmt.Errorf("duplicate %s %q: %s — author it once (flat `set` "+
+				"merges repeated statements automatically) (#5180)",
+				d.kind, d.name, dupEffectStrict(d.effect))
 		}
 		return nil, emptyNameError(emptyKinds[0])
 	}
 
 	warnings := make([]string, 0, len(dups)+len(emptyKinds))
 	for _, d := range dups {
-		warnings = append(warnings, fmt.Sprintf("duplicate %s %q: only the LAST "+
-			"hierarchical block is kept (earlier block dropped) — author it once "+
-			"to avoid silently losing config (#5180)", d.kind, d.name))
+		warnings = append(warnings, fmt.Sprintf("duplicate %s %q: %s — author it "+
+			"once to avoid silently losing config (#5180)",
+			d.kind, d.name, dupEffectLenient(d.effect)))
 	}
 	for _, k := range emptyKinds {
 		warnings = append(warnings, emptyNameWarning(k))
@@ -293,4 +317,126 @@ func groupDefinitionName(g *Node) string {
 		return g.Keys[1]
 	}
 	return g.Keys[0]
+}
+
+// dupContainerEffect names WHAT a duplicate costs for one container, so the
+// operator message states the truth for that container instead of a single
+// blanket sentence. The three shapes differ, and saying "the earlier block is
+// dropped" about a first-sibling-only read would be exactly backwards.
+type dupContainerEffect int
+
+const (
+	// dupEffectLastWins: the compiler stores by name into a map, so the LAST
+	// authored block replaces the earlier one wholesale.
+	dupEffectLastWins dupContainerEffect = iota
+	// dupEffectFirstWins: the compiler reads the container with FindChild —
+	// the FIRST sibling only — so every LATER block is silently ignored.
+	dupEffectFirstWins
+	// dupEffectSplitInstances: the compiler loops over every instance with
+	// per-instance local state, so neither block is dropped but neither sees
+	// the other's settings; children authored under one block do not inherit
+	// what was authored under the other.
+	dupEffectSplitInstances
+)
+
+// namedDupRule describes one NAMED container to check for duplicate
+// hierarchical siblings: `<stanza> { [<inner> {] <keyword> <name> { … } [}] }`.
+//
+// The four original #5180 checks were four hand-written copies of this walk.
+// Two of them (screen ids-option, login user) are exactly this shape and are
+// now table rows; `groups` and `interfaces` keep bespoke walks because their
+// name extraction and skip rules genuinely differ (a merged two-key head, and
+// the non-interface keyword allowlist). A divergence between copies of one walk
+// is always a bug, so the copies that CAN be single-sourced are.
+type namedDupRule struct {
+	stanza  string // top-level stanza, e.g. "security"
+	inner   string // optional intermediate container, "" if none
+	keyword string // the named container keyword, e.g. "stream"
+	kind    string // human category used in the message and the empty-name report
+	effect  dupContainerEffect
+}
+
+// singletonDupRule describes an UNNAMED container that may legitimately be
+// authored only once: `<stanza> { [<inner> {] <keyword> { … } [}] }`. The
+// compiler reads it with FindChild, so a repeat is not last-writer-wins — every
+// later block is silently ignored.
+type singletonDupRule struct {
+	stanza   string
+	inner    string
+	keywords []string
+	kind     string
+}
+
+// namedDupRules and singletonDupRules are the registry this gate walks. Adding
+// a container is one row; the walk itself exists once.
+//
+// #6768 added the six rows below the original two. They were derived from the
+// stated predicate — a container that can be authored twice as a hierarchical
+// sibling and whose compile silently loses configuration the FLAT spelling
+// would have merged — not from the three effects the issue happened to name.
+// Each was measured at master before it was added; see
+// duplicate_container_6768_test.go, which reproduces the loss for every row.
+var namedDupRules = []namedDupRule{
+	{stanza: "security", inner: "screen", keyword: "ids-option", kind: "screen ids-option", effect: dupEffectLastWins},
+	{stanza: "system", inner: "login", keyword: "user", kind: "login user", effect: dupEffectLastWins},
+
+	// #6768. `security log stream <n>` and `profile <n>` are stored as
+	// Streams[name] / Profiles[name] (compiler_security_log.go), so a second
+	// block replaces the first — measured: a stream authored with
+	// `transport { protocol tls; }` in the first block and `severity info` in
+	// the second compiles to severity=info and NO transport at all, which is
+	// the TLS syslog transport silently reverting to plain UDP.
+	{stanza: "security", inner: "log", keyword: "stream", kind: "security log stream", effect: dupEffectLastWins},
+	{stanza: "security", inner: "log", keyword: "profile", kind: "security log profile", effect: dupEffectLastWins},
+
+	// #6768. `protocols bgp group <n>` is compiled by a loop with per-instance
+	// local state (compiler_protocols.go: groupExport, peerAS, … are declared
+	// inside the namedInstances range), so two blocks do not merge — measured:
+	// `group g { peer-as 65001; export P; }` plus `group g { neighbor N; }`
+	// compiles N with peerAS=0 and export=[]. The export policy the operator
+	// authored never reaches the neighbour, and only the peer-as half warns.
+	{stanza: "protocols", inner: "bgp", keyword: "group", kind: "bgp group", effect: dupEffectSplitInstances},
+}
+
+var singletonDupRules = []singletonDupRule{
+	// #6768. compileServices reads each of these with FindChild — the FIRST
+	// sibling only — so a second block is silently ignored in full. Measured:
+	// `services { flow-monitoring { version9 … } flow-monitoring { version-ipfix
+	// … } }` compiles the v9 half and drops the IPFIX half entirely, with zero
+	// warnings. `application-identification` is excluded deliberately: it is a
+	// presence flag, so a repeat loses nothing.
+	{stanza: "services", keywords: []string{"flow-monitoring", "rpm", "ip-monitoring"}, kind: "services container"},
+}
+
+// dupEffectStrict / dupEffectLenient render what a duplicate actually costs for
+// one container. The original single sentence said the EARLIER block is
+// dropped, which is true for a last-writer-wins map store and exactly backwards
+// for a FindChild first-sibling-only read — a wrong message here is a wrong
+// diagnosis, not a wording nit, because it sends the operator to delete the
+// wrong block.
+func dupEffectStrict(e dupContainerEffect) string {
+	switch e {
+	case dupEffectFirstWins:
+		return "the compiler reads only the FIRST block, so every later block is " +
+			"silently ignored in full"
+	case dupEffectSplitInstances:
+		return "each block is compiled independently with its own state, so " +
+			"settings authored in one block do not reach children authored in the " +
+			"other — the config is silently split, not merged"
+	default:
+		return "a repeated hierarchical block is silently reduced to " +
+			"last-writer-wins, dropping the earlier block's configuration"
+	}
+}
+
+func dupEffectLenient(e dupContainerEffect) string {
+	switch e {
+	case dupEffectFirstWins:
+		return "only the FIRST hierarchical block is read (every later block ignored)"
+	case dupEffectSplitInstances:
+		return "each hierarchical block compiles independently, so neither sees the " +
+			"other's settings"
+	default:
+		return "only the LAST hierarchical block is kept (earlier block dropped)"
+	}
 }
