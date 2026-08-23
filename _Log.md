@@ -104520,6 +104520,90 @@ prose edit above them added. No diff falls in the new test body.
   reservation tri-state; only a pool-owning decline blocks the publish.
 - **File(s)**: userspace-dp/src/nat/source.rs,
   userspace-dp/src/nat/tests_pool.rs, docs/session-sync-architecture.md, _Log.md
+
+## 2026-08-22 — #6785 HA import capacity refusal reported as success
+
+- **Timestamp**: 2026-08-22
+- **Action**: `upsert_synced_session` returned `()`; its three semantic refusal
+  paths (#2170 stale generation, #5674 import cap, #6600 reserve) each bumped a
+  counter and returned silently, so the control handler answered `ok=true`, Go
+  recorded a success, and Go's BPF mirror row stayed behind for a session the
+  helper never took. Added `SyncedImportOutcome` + `SYNCED_IMPORT_REFUSED_PREFIX`
+  in Rust; the handler now answers `ok=false` with a reason token. Go classifies
+  the token into `dataplane.ErrSyncedImportRefused`, which drives the EXISTING
+  #5305 rollback but deliberately does NOT set the sticky mirror-failure flag
+  (that gates takeover-readiness, #5247, and a refusal comes from a healthy
+  helper). Refusals are counted separately as health debt and rendered in
+  `show chassis cluster information` when non-zero.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/handlers/sync_session.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/server/tests.rs,
+  pkg/dataplane/dataplane.go, pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go,
+  pkg/cluster/sync.go, pkg/cluster/sync_conn_gen.go, pkg/cluster/status.go,
+  pkg/cluster/synced_import_refusal_6785_test.go, docs/ha-failover-status.md,
+  _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6785 round 2 — the mutation matrix found a GREEN cell: making a
+  semantic refusal set the sticky mirror-failure flag left the whole suite
+  green, because the only cells that could see it need CAP_BPF and SKIP on an
+  unprivileged runner. Extracted the classification into one shared
+  `noteSyncedMirrorFailureLocked` (the V4/V6 copies were a divergence waiting to
+  happen) and bound it with an unprivileged paired table plus a
+  comment-stripped single-sourcing check.
+- **File(s)**: pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go, _Log.md
+
+## 2026-08-22 — #6780 nil config slots on the RETH ownership path
+
+- **Timestamp**: 2026-08-22
+- **Action**: Measured the issue's claim before fixing. All three slot types do
+  panic the collectors (nil-RG affects the VRRP mode only, since the direct mode
+  never reads `RedundancyGroups` — 5 of 6 cells, not 6), but the panic is NOT
+  reachable: each container has exactly one compiler write site and each stores
+  a freshly-allocated pointer, persistence decodes the AST and recompiles, HA
+  config-sync ships TEXT, and nothing deserializes a `*config.Config`. The
+  "#3494/#5068 tolerant path admits nils" premise cited at ~12 sites is
+  circular. Enforced the invariant at the source with a new compiler canary,
+  guarded the two RETH ownership-mode collectors plus the RG-membership walks
+  they share the path with, and corrected the reachability claim in the docs
+  instead of repeating it.
+- **File(s)**: `pkg/vrrp/vrrp.go`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_ha_vip.go`, `pkg/config/interfaces_iter.go`,
+  `pkg/config/nil_slot_invariant_6780_test.go` (new),
+  `pkg/vrrp/reth_nil_slot_6780_test.go` (new),
+  `pkg/daemon/reth_rg_nil_slot_6780_test.go` (new), `pkg/vrrp/README.md`
+
+## 2026-08-22 — #6784 adopt the pinned ingress-classifier rows on a fresh manager
+
+- **Timestamp**: 2026-08-22
+- **Action**: `syncIngressIfaceMapLocked` reaped stale `userspace_ingress_ifaces`
+  rows by scanning `m.lastIngressIfaces`, an in-process inventory that is nil on
+  a freshly constructed Manager. The map is `PinByName`-pinned, so its rows
+  outlive xpfd and the first sync after a daemon restart deleted nothing. Added
+  `adoptIngressInventoryLocked`: enumerate the pinned map ONCE per Manager,
+  union into the inventory (never dropping a #6537 retry debt), record only on a
+  successful enumeration, and treat an enumeration failure as fatal so the
+  caller drives `userspace_ctrl` to `Enabled=0`. Adoption takes only rows the
+  shim ACTS on (value != 0): a 0-valued row reads exactly like an absent one to
+  the shim, and keying on that keeps adoption correct on a dense map instead of
+  assuming a HashMap — the #6537 delete-failure fixture deliberately uses an
+  Array, and an unfiltered enumeration adopted all 16 dense slots and broke it.
+- **Measured, refining the issue**: only ONE of the classifier syncs had this
+  hole. `syncLocalAddressMapsLocked` and `syncInterfaceNATAddressMapsLocked`
+  already prune by iterating the MAP, and `userspace_heartbeat` already sweeps
+  its Array's own capacity (#6702) — so no sweep-and-recreate was needed and no
+  empty-classifier window was opened. `userspace_bindings` shares the nil-
+  inventory shape (`clearAllBindingRowsLocked` at bootstrap) but its stale rows
+  are unreachable once the ingress gate is repaired, and its Array is 1,048,576
+  rows so a blanket sweep is not viable; corrected the `heartbeatZeroSlotBound`
+  comment that leaned on the bindings clear being effective on a fresh manager.
+- **File(s)**: `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/maps_sync_ingress_adopt_6784_test.go`,
+  `docs/afxdp-packet-processing.md`, `_Log.md`
 ## 2026-08-22 — #6786 fail closed when a NIC identity read fails
 
 - **Timestamp**: 2026-08-22

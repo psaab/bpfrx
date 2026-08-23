@@ -214,6 +214,47 @@ Standby node:
   → session is forwarding-ready in the helper's session table
 ```
 
+#### Import refusals and the split-truth rollback (#6785)
+
+The standby's install is transactional (#5305): the daemon snapshots the BPF
+session row, writes it, mirrors to the helper, and RESTORES the snapshot if the
+mirror fails — so a failed install never leaves a row for a session the helper
+does not hold.
+
+The helper can refuse an import for three SEMANTIC reasons, none of which are
+faults:
+
+| refusal | reason | issue |
+|---|---|---|
+| `stale-generation` | the stored entry is NEWER than the incoming one | #2170 |
+| `capacity` | the aggregate synced-import entry ceiling is full | #5674 |
+| `reserve` | the translated NAT tuple could not be reserved for this import | #6600 |
+
+Before #6785 all three returned `ok = true`, so the daemon recorded a success
+and left its BPF row behind — the exact split truth the transactional install
+exists to prevent, on the one failure class it could not observe. The helper now
+answers `ok = false` with a `synced-import-refused:<reason>` token, and the
+existing rollback runs.
+
+**A refusal is NOT a mirror failure, and the two must not be conflated.** A
+transport failure means the helper session socket is sick and gates HA
+takeover-readiness (#5247). A refusal comes from a HEALTHY helper answering
+correctly — the peer sent something stale, or this node is at its own ceiling.
+Gating takeover on a refusal would keep a working standby from ever taking over
+once a peer oversubscribed it, which is worse than the divergence being fixed.
+So a refusal:
+
+- rolls back the local BPF row (no split truth),
+- does **not** set the sticky session-mirror-failure flag,
+- does **not** count toward the session-sync `Errors` total,
+- counts into `Imports refused by helper`, rendered by
+  `show chassis cluster information` only when non-zero.
+
+That counter is health **debt**, not an error: the local state is consistent, but
+the PEER believes it synced a session this node does not hold, and only the
+peer's next full sync closes the gap. A persistently non-zero count means the
+peer is oversubscribing this node.
+
 ### Failover Flow (Target)
 
 ```

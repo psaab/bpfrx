@@ -667,6 +667,41 @@ also holds its group without advertising, but it claims no addresses, so there
 is nothing for a second master to collide over. It is a distinct defect tracked
 separately.
 
+### RETH ownership modes and nil config slots (#6780)
+
+A RETH redundancy group's ownership is resolved by one of TWO collectors,
+depending on cluster mode — both in `vrrp.go`, both walking the same interface
+tree:
+
+| Mode | Collector | Selected when |
+|---|---|---|
+| VRRP-backed | `CollectRethInstances` | default (RETH VRRP instances synthesized) |
+| Direct | `RethVIPsForRG` | `no-reth-vrrp` or `private-rg-election` |
+
+Both dereferenced interface, unit, and (VRRP mode) redundancy-group map values
+raw, so a present-but-nil slot would nil-deref on the HA ownership path. Their
+in-file sibling `CollectInstances` already skipped nil interfaces and units, and
+6 of the 8 RETH-ownership walks in `pkg/daemon` already skipped nil interfaces —
+these two collectors were the outliers. They now skip nil slots too, as does
+`rethInterfacesMatchingRG` (`pkg/daemon`), the third reading of RG membership.
+
+**Reachability — stated honestly.** This is NOT a fix for a reachable panic. The
+compiler cannot currently emit such a slot: each container has exactly one write
+site and each stores a freshly-allocated pointer, persistence decodes the AST
+(`*ConfigTree`) and recompiles, HA config-sync ships config TEXT, and nothing
+deserializes a `*config.Config`. The widely-cited claim that "the tolerant /
+HA-sync path may carry a nil entry (#3494/#5068)" traces to a circular chain —
+#5068 cites the #3494 test, whose own header says "The strict compiler never
+emits these nils" — and every nil slot in the repository is injected
+synthetically by a test.
+
+That invariant is now ENFORCED at the source by
+`TestCompilerNeverEmitsNilConfigSlots` (`pkg/config`), which is where the class
+can actually be prevented. The consumer-side guards are defence in depth behind
+it: they cost nothing, are provably inert on every reachable config (the branch
+is never taken), and make the highest-consequence path degrade rather than
+panic if a future config ingress breaks the invariant.
+
 ### Receiver goroutine model
 
 When AF_PACKET opens (`afPacketFD >= 0`), a single `receiverAfPacket()`

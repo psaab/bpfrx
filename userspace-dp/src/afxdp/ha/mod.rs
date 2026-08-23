@@ -10,6 +10,9 @@ use super::*;
 mod state;
 mod export;
 mod session_import;
+// #6785: the typed synced-import outcome and its refusal-token prefix are read
+// by the control handler, so they must escape this private module.
+pub use session_import::{SyncedImportOutcome, SYNCED_IMPORT_REFUSED_PREFIX};
 mod tunnel_purge;
 
 pub(crate) use self::export::{AllSessionsExport, OwnerRgExportWait};

@@ -2,10 +2,26 @@ package config
 
 // Nil-safe interface/unit iterators for read-only presenters (#5813).
 //
-// The lenient load / HA config-sync path admits PRESENT-BUT-NIL InterfaceConfig
-// and InterfaceUnit map values (a key with a nil pointer value — #3494/#5068):
-// a peer-synced or tolerantly-loaded config can carry a `cfg.Interfaces.
-// Interfaces["ge-0/0/0"] = nil` slot, or an `ifc.Units[7] = nil` slot. Every
+// REACHABILITY, corrected in #6780. The comments here and at ~12 call sites
+// state that the lenient load / HA config-sync path ADMITS present-but-nil
+// InterfaceConfig / InterfaceUnit map values (#3494/#5068). That premise was
+// never demonstrated and is, as of #6780, believed to be FALSE: each container
+// has exactly one compiler write site and each stores a freshly-allocated
+// pointer, persistence decodes the AST (*ConfigTree) and recompiles, HA
+// config-sync ships config TEXT, and nothing deserializes a *Config. The
+// invariant is now enforced by TestCompilerNeverEmitsNilConfigSlots
+// (nil_slot_invariant_6780_test.go) rather than assumed in either direction.
+//
+// These helpers are retained: they are correct, free, and make a consumer
+// degrade rather than panic if a future config ingress ever breaks that
+// invariant. What changed is the JUSTIFICATION — they are defence in depth
+// behind an enforced invariant, not a fix for a reachable panic. Do not cite
+// them as evidence that nil slots occur; that circularity (#5068 citing the
+// #3494 test, whose own header says "The strict compiler never emits these
+// nils") is what #6780 unwound.
+//
+// A peer-synced or tolerantly-loaded config would carry such a slot as a
+// `cfg.Interfaces.Interfaces["ge-0/0/0"] = nil`, or an `ifc.Units[7] = nil`. Every
 // read-only presenter that walks the interface tree — the CLI/gRPC/REST session
 // egress-interface map builders, interface displays, completers — must SKIP
 // those nil slots, not dereference them: a raw `for _, ifc := range … { for _,
