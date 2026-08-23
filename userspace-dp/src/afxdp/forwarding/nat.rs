@@ -47,6 +47,7 @@ pub(in crate::afxdp) fn match_source_nat_for_flow(
     let egress = forwarding.egress.get(&egress_ifindex)?;
     let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
     match_source_nat(
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         &scope,
         from_zone,
@@ -110,6 +111,8 @@ pub(in crate::afxdp) fn match_source_nat_for_flow_result_at(
     // #3096: resolve the interface / routing-instance scope for this flow.
     let scope = nat_scope_ctx_for_flow(forwarding, ingress_ifindex, egress_ifindex);
     crate::nat::match_source_nat_result_for_tuple(
+        // #6751: interface-mode SNAT mints its translated identity here.
+        &forwarding.iface_nat_allocators,
         &forwarding.source_nat_rules,
         &scope,
         from_zone,

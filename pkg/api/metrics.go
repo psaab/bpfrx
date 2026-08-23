@@ -420,6 +420,13 @@ type xpfCollector struct {
 	// authoritative collision watch; covers seed installs the per-worker
 	// counter cannot see).
 	userspaceNatReverseKeySharedDisplacements *prometheus.Desc
+	// #6751 PR 2/3: the interface-mode SNAT identity registry's three
+	// outcomes — PAT'd collisions, identity exhaustion, registry-cap
+	// exhaustion.
+	userspaceInterfaceSNATPATCollisions      *prometheus.Desc
+	userspaceInterfaceSNATIdentityExhaustion *prometheus.Desc
+	userspaceInterfaceSNATSyncConflictDrops  *prometheus.Desc
+	userspaceInterfaceSNATRegistryCap        *prometheus.Desc
 	// #1807: worker-command-queue poison recoveries — nonzero means a
 	// helper worker panic poisoned a command queue and it was recovered
 	// (committed-prefix + clear_poison policy) instead of going deaf.
@@ -856,6 +863,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceDnatPublishErrors
 	ch <- c.userspaceSyncedImportCapDrops
 	ch <- c.userspaceNatReverseKeySharedDisplacements
+	ch <- c.userspaceInterfaceSNATPATCollisions
+	ch <- c.userspaceInterfaceSNATIdentityExhaustion
+	ch <- c.userspaceInterfaceSNATSyncConflictDrops
+	ch <- c.userspaceInterfaceSNATRegistryCap
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceSharedSessionPoisonRecoveries
 	ch <- c.userspaceGreDecapEcnIllegalDrops

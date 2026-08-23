@@ -4683,6 +4683,23 @@ fn nat_reverse_key_collision_counter_zero_without_collision() {
 // The multimap keeps BOTH colliding forward handles in one bucket and
 // `find_forward_nat_match` validates each candidate against the full reply
 // tuple. These tests are RED on the pre-#4399 single-value implementation.
+//
+// #6751 SCOPE NOTE — read the two-host interface-SNAT fixtures below as
+// DEFENCE IN DEPTH, not as an accepted outcome. Interface-mode SNAT no longer
+// ADMITS the byte-identical reverse tuple: the admission mint
+// (`allocate_interface_identity`, nat/allocator.rs) reserves the translated
+// reverse identity and PATs the later collider, so a live pair of internal
+// hosts on one source port to one server can no longer reach these installs
+// through the packet path. These tests install DIRECTLY into the table,
+// bypassing admission, and they stay green deliberately: the non-bijective
+// classes admission does not remove (DNAT-to-shared-backend, NAT64,
+// non-bijective static NAT, and the `port no-translation` pairs the allocator
+// admits on purpose) still land here, and the interface-mode fixture remains
+// the cheapest shape in which to exercise the multimap. What they assert is
+// that the index resolves DETERMINISTICALLY under an ambiguous tuple — NOT
+// that the reply reaches the right internal host, which no index can decide
+// once the tuple is ambiguous. That is why #6751 had to be fixed at
+// admission.
 
 fn small_bucket_len(table: &SessionTable, reverse_key: &SessionKey) -> usize {
     table

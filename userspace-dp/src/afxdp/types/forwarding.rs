@@ -304,6 +304,23 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) session_opening_overrides: FastMap<u16, u64>,
     pub(in crate::afxdp) policy: PolicyState,
     pub(in crate::afxdp) source_nat_rules: Vec<SourceNatRule>,
+    /// #6751: the interface-mode source-NAT translated-identity registry.
+    ///
+    /// NODE-LIFETIME, not per-build. Held as an `Arc` and CARRIED OVER by
+    /// `build_forwarding_state_*` from the `previous` state (both production
+    /// build sites pass `Some(&self.forwarding)`), for the same reason
+    /// `time_exceeded_buckets` is an `Arc` — the shared state must survive
+    /// `ForwardingState::clone()` and every apply. Rebuilding it on commit
+    /// would discard the occupancy of every live interface-SNAT session and
+    /// let the next flow preserve a source port that is still on the wire,
+    /// which is exactly the ambiguity #6751 closes.
+    ///
+    /// Reached by the MINT path (`match_source_nat_result_for_tuple`) and by
+    /// the RELEASE path (`release_source_nat_allocation*`) — the latter
+    /// explicitly rather than through `source_nat_rules`, because a release
+    /// must still find the registry after a commit that removed every
+    /// source-NAT rule.
+    pub(in crate::afxdp) iface_nat_allocators: std::sync::Arc<crate::nat::InterfaceNatAllocators>,
     pub(in crate::afxdp) static_nat: StaticNatTable,
     pub(in crate::afxdp) dnat_table: DnatTable,
     pub(in crate::afxdp) nat64: Nat64State,

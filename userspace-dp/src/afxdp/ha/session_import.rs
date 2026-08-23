@@ -117,6 +117,7 @@ impl crate::afxdp::Coordinator {
             &entry.metadata,
         );
         if !crate::nat::reserve_synced_source_nat_allocation_untracked(
+            &self.forwarding.iface_nat_allocators,
             &self.forwarding.source_nat_rules,
             &entry.key,
             entry.decision.nat,
@@ -134,6 +135,7 @@ impl crate::afxdp::Coordinator {
             now_ns,
         ) {
             crate::nat::release_source_nat_allocation(
+                &self.forwarding.iface_nat_allocators,
                 &self.forwarding.source_nat_rules,
                 &entry.key,
                 entry.decision.nat,

@@ -239,6 +239,11 @@ pub(crate) fn run() -> Result<(), String> {
             dnat_publish_errors_total: 0,
             synced_import_cap_drops_total: 0,
             nat_reverse_key_shared_displacements_total: 0,
+            // #6751 PR 2/3: interface-mode SNAT identity registry counters.
+            interface_snat_pat_collisions_total: 0,
+            interface_snat_identity_exhaustion_total: 0,
+            interface_snat_sync_identity_conflict_drops_total: 0,
+            interface_snat_registry_cap_exhaustion_total: 0,
             worker_command_queue_poison_recoveries: 0,
             shared_session_poison_recoveries: 0,
             gre_decap_ecn_illegal_drops_total: 0,

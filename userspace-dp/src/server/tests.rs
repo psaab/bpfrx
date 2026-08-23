@@ -11,7 +11,8 @@
 use super::helpers::{
     bindings_settled, build_synced_session_entry, clear_pre_persist_lock_probe,
     forwarding_unsupported_error, parse_session_sync_mac, reconcile_status_bindings,
-    set_bindings_forwarding_armed, should_run_afxdp, take_pre_persist_lock_free, write_state,
+    refresh_status, set_bindings_forwarding_armed, should_run_afxdp, take_pre_persist_lock_free,
+    write_state,
 };
 use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
@@ -4053,5 +4054,64 @@ fn sync_session_upsert_reports_a_semantic_refusal_on_the_wire_6785() {
         ),
         "the wire error must name WHICH refusal happened — an operator cannot \
          tell a capacity problem from a stale peer otherwise"
+    );
+}
+
+/// #6751 PR 2/3: `refresh_status` must PROJECT each interface-mode SNAT
+/// registry counter onto its OWN status field.
+///
+/// The accessor and the counter can both be correct while the projection is
+/// missing or cross-wired, and nothing else in the tree would notice: the
+/// Prometheus test feeds `ProcessStatus` directly, and the wire test feeds
+/// `serde`. This is the one seam that binds the helper the coordinator exposes
+/// to the field the Go side reads.
+///
+/// Three DISTINCT increments, so a projection wired to the wrong member of the
+/// trio fails rather than coincidentally matching. Read as deltas because the
+/// counters are cumulative process-globals shared with every other test in the
+/// binary (the same posture `NAT_REVERSE_KEY_SHARED_DISPLACEMENTS` tests take);
+/// `make test-rust` runs `--test-threads=1`, so no sibling can move them
+/// between the read and the refresh.
+#[test]
+fn refresh_status_projects_interface_snat_registry_counters_6751() {
+    use std::sync::atomic::Ordering;
+
+    let state = new_state(ProcessStatus::default());
+    let mut guard = state.lock().expect("server state");
+
+    let before_pat = crate::nat::INTERFACE_SNAT_PAT_COLLISIONS.load(Ordering::Relaxed);
+    let before_identity = crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION.load(Ordering::Relaxed);
+    let before_cap = crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION.load(Ordering::Relaxed);
+    let before_sync =
+        crate::nat::INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS.load(Ordering::Relaxed);
+
+    crate::nat::INTERFACE_SNAT_PAT_COLLISIONS.fetch_add(3, Ordering::Relaxed);
+    crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION.fetch_add(5, Ordering::Relaxed);
+    crate::nat::INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION.fetch_add(7, Ordering::Relaxed);
+    crate::nat::INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS.fetch_add(11, Ordering::Relaxed);
+
+    refresh_status(&mut guard);
+
+    assert_eq!(
+        guard.status.interface_snat_pat_collisions_total,
+        before_pat + 3,
+        "the PAT-collision counter must reach its own status field"
+    );
+    assert_eq!(
+        guard.status.interface_snat_identity_exhaustion_total,
+        before_identity + 5,
+        "the identity-exhaustion counter must reach its own status field"
+    );
+    assert_eq!(
+        guard.status.interface_snat_registry_cap_exhaustion_total,
+        before_cap + 7,
+        "the registry-cap counter must reach its own status field"
+    );
+    assert_eq!(
+        guard
+            .status
+            .interface_snat_sync_identity_conflict_drops_total,
+        before_sync + 11,
+        "the sync-import conflict counter must reach its own status field"
     );
 }

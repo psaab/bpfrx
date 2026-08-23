@@ -122,6 +122,20 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // the per-worker counter cannot see).
     state.status.nat_reverse_key_shared_displacements_total =
         state.afxdp.nat_reverse_key_shared_displacements_total();
+    // #6751 PR 2/3: the interface-mode SNAT identity registry's three
+    // outcomes — the PAT'd collisions this fix creates, and the two distinct
+    // fail-closed exhaustion modes it can hit.
+    state.status.interface_snat_pat_collisions_total =
+        state.afxdp.interface_snat_pat_collisions_total();
+    state.status.interface_snat_identity_exhaustion_total =
+        state.afxdp.interface_snat_identity_exhaustion_total();
+    state
+        .status
+        .interface_snat_sync_identity_conflict_drops_total = state
+        .afxdp
+        .interface_snat_sync_identity_conflict_drops_total();
+    state.status.interface_snat_registry_cap_exhaustion_total =
+        state.afxdp.interface_snat_registry_cap_exhaustion_total();
     // #1807: worker-command-queue poison recoveries (committed-prefix +
     // clear_poison policy in afxdp/worker_queue.rs). Nonzero = a worker
     // panic poisoned a command queue and it was recovered.
@@ -579,6 +593,24 @@ mod status_wiring_tests {
             .join("\n")
     }
 
+    /// #6751: drop ALL whitespace before matching.
+    ///
+    /// The scan looks for `state.afxdp.<name>()` as a CONTIGUOUS substring,
+    /// and rustfmt breaks that chain across lines as soon as the assignment's
+    /// left-hand side gets long — which a descriptive counter name reaches
+    /// easily. The gate then reports a correctly-wired counter as unwired, and
+    /// the cheapest way to make that complaint go away is to rename the
+    /// counter or add it to `UNSURFACED` — i.e. the false alarm pushes authors
+    /// toward the two edits that would ALSO silence a genuine miss. Matching
+    /// on the whitespace-free text makes the gate answer the question it means
+    /// to ask, and can only be satisfied by the accessor actually being
+    /// called. Not theoretical: the wrapped assignment for
+    /// `interface_snat_sync_identity_conflict_drops_total` in the refresh
+    /// above is what forced this, and deleting that line still reds the gate.
+    fn squeeze(src: &str) -> String {
+        src.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     /// Accessor names declared as `pub fn <name>_total(&self) -> u64`.
     fn accessors(src: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -602,7 +634,7 @@ mod status_wiring_tests {
     #[test]
     fn every_counter_accessor_is_wired_into_process_status() {
         let coord = code_only(&read("src/afxdp/coordinator/status.rs"));
-        let refresh = code_only(&read("src/server/helpers/status.rs"));
+        let refresh = squeeze(&code_only(&read("src/server/helpers/status.rs")));
 
         let accs = accessors(&coord);
         assert!(

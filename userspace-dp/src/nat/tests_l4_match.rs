@@ -42,6 +42,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
     let mut counter = None;
     // In-range destination port -> translated.
     let hit = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -66,6 +67,7 @@ fn source_nat_match_destination_port_constrains_flow_3429() {
     );
     // Out-of-range destination port -> NO match (pre-fix this over-matched).
     let miss = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -110,6 +112,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
     let mut counter = None;
     // Exempt port -> matched as a no-op (off) rule.
     let on_port = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -134,6 +137,7 @@ fn source_nat_match_destination_port_constrains_off_exemption_3429() {
     );
     // Different port -> the off rule must NOT swallow it.
     let other_port = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -183,6 +187,7 @@ fn source_nat_match_application_constrains_protocol_and_port_3429() {
     let lookup = |proto: u8, dport: u16| {
         let mut counter = None;
         match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -252,6 +257,7 @@ fn source_nat_match_application_constrains_source_port_3491() {
     let lookup = |sport: u16, dport: u16| {
         let mut counter = None;
         match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -305,6 +311,7 @@ fn source_nat_app_source_port_never_match_sentinel_3491() {
     let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
     let mut counter = None;
     let lookup = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -343,6 +350,7 @@ fn source_nat_unconstrained_rule_still_matches_any_l4_3429() {
     }]);
     let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -376,6 +384,7 @@ fn source_nat_l4_constrained_rule_fails_closed_on_unknown_tuple_3429() {
     }]);
     let egress_v4 = Some("172.16.80.8".parse::<Ipv4Addr>().unwrap());
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -415,6 +424,7 @@ fn source_nat_never_match_port_sentinel_matches_nothing_3429() {
     for dport in [1u16, 80, 443, 20001, 65535] {
         let mut counter = None;
         let r = match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -455,6 +465,7 @@ fn source_nat_app_protocol_never_vs_any_3429() {
     let lookup = |rules: &[_], proto: u8| {
         let mut counter = None;
         match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             rules,
             &NatScopeCtx::default(),
             "lan",

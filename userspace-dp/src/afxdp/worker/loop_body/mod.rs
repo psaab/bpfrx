@@ -1596,6 +1596,7 @@ fn reap_expired_sessions(
 ) {
     for expired_entry in expired_entries {
         release_source_nat_allocation_for_worker(
+            &forwarding.iface_nat_allocators,
             &forwarding.source_nat_rules,
             &expired_entry.key,
             expired_entry.decision.nat,

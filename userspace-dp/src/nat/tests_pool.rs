@@ -46,6 +46,7 @@ fn pool_snat_single_address_rewrites_src_and_port() {
     }]);
     let mut counter = None;
     let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -99,6 +100,7 @@ fn pool_snat_portless_protocols_translate_ip_only_no_port() {
         }]);
         let mut counter = None;
         let d = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -189,6 +191,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
         let query_id = 0x1234u16;
         let mut counter = None;
         let da = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -208,6 +211,7 @@ fn pool_snat_translates_icmp_query_id_distinct_per_host() {
             &mut counter,
         ));
         let db = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -318,6 +322,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
         let query_id = 0u16;
         let mut counter = None;
         let da = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -337,6 +342,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
             &mut counter,
         ));
         let db = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -384,6 +390,7 @@ fn pool_snat_translates_icmp_query_id_zero_distinct_per_host() {
         // This pins that the gate is `icmp_identifier_present`, not the id value.
         let mut counter2 = None;
         let non_query = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -434,6 +441,7 @@ fn pool_snat_icmp_without_query_id_is_address_only() {
     }]);
     let mut counter = None;
     let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -489,6 +497,7 @@ fn pool_snat_no_translation_preserves_source_port() {
     }]);
     let mut counter = None;
     let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -551,6 +560,7 @@ fn addr_only_lookup(
 ) -> SourceNatLookup {
     let mut counter = None;
     match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         rules,
         &NatScopeCtx::default(),
         "lan",
@@ -669,7 +679,14 @@ fn pool_snat_no_translation_token_released_on_teardown_5269() {
     // port from the flow key (the decision left `rewrite_src_port` unset) and
     // clears the reverse-identity token.
     let key_a = session_key_from_src("10.0.1.100", 12345, "8.8.8.8", 443);
-    release_source_nat_allocation(&rules, &key_a, a, false, 1);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key_a,
+        a,
+        false,
+        1,
+    );
     assert_eq!(
         rules[0].pool_allocator.debug_address_only_owners().len(),
         0,
@@ -890,6 +907,7 @@ fn pool_snat_unknown_tuple_distinct_from_real_hopopt_5687() {
     // port, and mints NO reverse-identity token (there is no real reverse flow).
     let ru = make_rules();
     let unknown = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &ru,
         &NatScopeCtx::default(),
         "lan",
@@ -1154,6 +1172,7 @@ fn notrans_persistent_lookup(
 ) -> SourceNatLookup {
     let mut counter = None;
     match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         rules,
         &NatScopeCtx::default(),
         "lan",
@@ -1253,6 +1272,7 @@ fn notrans_persistent_refcount_release_and_expiry_6041() {
     // Release flow A: refcount 2 -> 1, lease stays (address still pinned), its
     // token cleared; an active lease is NOT in the expiry index.
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443),
         a,
@@ -1273,6 +1293,7 @@ fn notrans_persistent_refcount_release_and_expiry_6041() {
 
     // Release flow B: refcount 1 -> 0, lease goes idle and is indexed for expiry.
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key_from_src("10.0.1.100", 40000, "9.9.9.9", 80),
         b,
@@ -1486,6 +1507,7 @@ fn pool_snat_multiple_addresses_round_robin() {
     let mut seen_addrs = std::collections::HashSet::new();
     for _ in 0..6 {
         let d = match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -1550,6 +1572,7 @@ fn pool_snat_subnet_expands_full_cidr_range() {
     for i in 0..64u8 {
         let src = format!("10.0.1.{}", i);
         let d = match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -1625,6 +1648,7 @@ fn pool_snat_overbroad_prefix_marks_invalid() {
     }]);
     assert!(rules[0].pool_addresses_v4.is_empty());
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -1682,6 +1706,7 @@ fn per_uplink_pool_selected_by_to_zone() {
     let rules = per_uplink_pool_rules();
     // Same flow, resolved egress in uplink A's zone -> pool A.
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "trust",
@@ -1697,6 +1722,7 @@ fn per_uplink_pool_selected_by_to_zone() {
     // Identical flow after a route flip: resolved egress now sits in
     // uplink B's zone -> pool B, with no rule-set change.
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "trust",
@@ -1717,6 +1743,7 @@ fn per_uplink_pool_no_match_outside_uplink_zones() {
     // borrow either uplink's pool.
     assert_eq!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "trust",
@@ -1818,6 +1845,7 @@ fn tuple_snat_lookup_from_src(
 ) -> SourceNatLookup {
     let mut counter = None;
     match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         rules,
         &NatScopeCtx::default(),
         "lan",
@@ -2206,6 +2234,7 @@ fn pool_snat_persistent_reassigns_after_timeout() {
         1_000_000_000,
     ));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(12345, "8.8.8.8", 53),
         first,
@@ -2222,6 +2251,7 @@ fn pool_snat_persistent_reassigns_after_timeout() {
     ));
     assert_eq!(first.rewrite_src_port, reused.rewrite_src_port);
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(12345, "1.1.1.1", 443),
         reused,
@@ -2246,7 +2276,14 @@ fn pool_snat_persistent_compatible_refresh_preserves_lease_state() {
     let snapshot = persistent_pool_snapshot(300, 40000, 40001, vec!["203.0.113.10"], false);
     let rules = parse_source_nat_rules(&[snapshot.clone()]);
     let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
-    release_source_nat_allocation(&rules, &session_key(12345, "8.8.8.8", 53), first, false, 2);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(12345, "8.8.8.8", 53),
+        first,
+        false,
+        2,
+    );
 
     let before = source_nat_pool_statuses(&rules);
     assert_eq!(before[0].live_flows, 0);
@@ -2286,7 +2323,14 @@ fn pool_snat_persistent_helper_restart_resets_lease_state() {
     let snapshot = persistent_pool_snapshot(300, 40000, 40001, vec!["203.0.113.10"], false);
     let rules = parse_source_nat_rules(&[snapshot.clone()]);
     let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
-    release_source_nat_allocation(&rules, &session_key(12345, "8.8.8.8", 53), first, false, 2);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(12345, "8.8.8.8", 53),
+        first,
+        false,
+        2,
+    );
 
     let before = source_nat_pool_statuses(&rules);
     assert_eq!(before[0].live_flows, 0);
@@ -2379,6 +2423,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
     ]);
 
     let first = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -2399,6 +2444,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
     let second = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -2462,6 +2508,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
     ]);
 
     let first = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -2482,6 +2529,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
     let second = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -2524,7 +2572,14 @@ fn pool_snat_release_after_failed_session_install_frees_tuple() {
     }]);
 
     let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
-    release_source_nat_allocation(&rules, &session_key(10000, "8.8.8.8", 53), first, false, 2);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        first,
+        false,
+        2,
+    );
 
     let second = expect_snat_decision(tuple_snat_lookup(&rules, 10001, "1.1.1.1", 53, 3));
     assert_eq!(second.rewrite_src, first.rewrite_src);
@@ -2536,7 +2591,14 @@ fn pool_snat_persistent_rollback_removes_fresh_lease() {
     let rules = persistent_pool_rules(300, 40000, 40000);
     let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
 
-    rollback_source_nat_allocation(&rules, &session_key(10000, "8.8.8.8", 53), first, false, 2);
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        first,
+        false,
+        2,
+    );
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 0);
@@ -2557,7 +2619,14 @@ fn pool_snat_persistent_rollback_keeps_lease_reused_by_another_flow() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    rollback_source_nat_allocation(&rules, &session_key(10000, "8.8.8.8", 53), first, false, 3);
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        first,
+        false,
+        3,
+    );
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 1);
@@ -2583,8 +2652,22 @@ fn pool_snat_persistent_rollback_preserves_lease_after_reuser_release() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    release_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), second, false, 3);
-    rollback_source_nat_allocation(&rules, &session_key(10000, "8.8.8.8", 53), first, false, 4);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        second,
+        false,
+        3,
+    );
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        first,
+        false,
+        4,
+    );
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 0);
@@ -2612,8 +2695,22 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    rollback_source_nat_allocation(&rules, &session_key(10000, "8.8.8.8", 53), first, false, 3);
-    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), second, false, 4);
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "8.8.8.8", 53),
+        first,
+        false,
+        3,
+    );
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        second,
+        false,
+        4,
+    );
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 0);
@@ -2634,6 +2731,7 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     let timeout_ns = 300 * NS_PER_SEC;
     let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         original,
@@ -2657,8 +2755,22 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    release_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 5);
-    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 6);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        6,
+    );
 
     let fresh_expiry = 6 + timeout_ns;
     let status = source_nat_pool_statuses(&rules);
@@ -2690,6 +2802,7 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
     let timeout_ns = 300 * NS_PER_SEC;
     let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         original,
@@ -2710,8 +2823,22 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    release_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 5);
-    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 6);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        6,
+    );
 
     let fresh_expiry = 6 + timeout_ns;
     {
@@ -2738,6 +2865,7 @@ fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
     let timeout_ns = 300 * NS_PER_SEC;
     let original = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         original,
@@ -2751,8 +2879,22 @@ fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 5);
-    rollback_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 6);
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "1.1.1.1", 53),
+        first,
+        false,
+        5,
+    );
+    rollback_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &session_key(10000, "9.9.9.9", 53),
+        second,
+        false,
+        6,
+    );
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 0);
@@ -2781,6 +2923,7 @@ fn pool_snat_release_uses_rewritten_dnat_destination_key() {
     nat.rewrite_dst = Some(translated_dst);
 
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "198.51.100.5", 443),
         nat,
@@ -2803,6 +2946,7 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
         let decision =
             expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, now_ns));
         release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
             &rules,
             &session_key(10000, "8.8.8.8", 53),
             decision,
@@ -2825,6 +2969,7 @@ fn pool_snat_expiry_invariant_rejects_stale_global_entry() {
     let rules = persistent_pool_rules(300, 40000, 40000);
     let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         decision,
@@ -2852,6 +2997,7 @@ fn pool_snat_expiry_invariant_rejects_stale_per_address_entry() {
     let rules = persistent_pool_rules(300, 40000, 40000);
     let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         decision,
@@ -2884,6 +3030,7 @@ fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
     );
     let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         decision,
@@ -2933,6 +3080,7 @@ fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
     };
 
     release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &session_key(10000, "8.8.8.8", 53),
         decision,
@@ -2968,6 +3116,7 @@ fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
         let decision =
             expect_snat_decision(tuple_snat_lookup(&rules, src_port, "8.8.8.8", 53, now_ns));
         release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
             &rules,
             &session_key(src_port, "8.8.8.8", 53),
             decision,
@@ -3033,6 +3182,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
             now_ns,
         ));
         release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
             &rules,
             &session_key_from_src(&src_addr_0, src_port, "8.8.8.8", 53),
             decision,
@@ -3052,6 +3202,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
             now_ns,
         ));
         release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
             &rules,
             &session_key_from_src(&src_addr_1, src_port, "8.8.4.4", 53),
             decision,
@@ -3130,6 +3281,7 @@ fn pool_snat_wrong_family_pool_fails_closed_before_later_rule() {
     ]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3164,6 +3316,7 @@ fn pool_snat_wrong_family_pool_fails_closed_when_no_later_rule_matches() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3197,6 +3350,7 @@ fn pool_snat_missing_pool_snapshot_fails_closed() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3228,6 +3382,7 @@ fn pool_snat_empty_pool_fails_closed_instead_of_no_match() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3262,6 +3417,7 @@ fn pool_snat_invalid_port_range_fails_closed() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3296,6 +3452,7 @@ fn pool_snat_invalid_pool_address_fails_closed() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3330,6 +3487,7 @@ fn pool_snat_partially_invalid_pool_address_fails_closed() {
     }]);
 
     let lookup = match_source_nat_result(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3374,6 +3532,7 @@ fn pool_snat_address_persistent_sticks_source_to_pool_address() {
 
     for want_port in 40000..40004 {
         let d = match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -3426,8 +3585,18 @@ fn pool_snat_address_persistent_sticks_each_source_independently() {
         let mut addresses_for_src = std::collections::HashSet::new();
         for dst_host in 1..=20 {
             let dst = IpAddr::V4(Ipv4Addr::new(8, 8, 8, dst_host));
-            let d = match_source_nat(&rules, &NatScopeCtx::default(), "lan", "wan", src, dst, None, None)
-                .expect("sticky source should match");
+            let d = match_source_nat(
+                &InterfaceNatAllocators::default(),
+                &rules,
+                &NatScopeCtx::default(),
+                "lan",
+                "wan",
+                src,
+                dst,
+                None,
+                None,
+            )
+            .expect("sticky source should match");
             addresses_for_src.insert(d.rewrite_src.expect("pool address"));
         }
         assert_eq!(
@@ -3522,6 +3691,7 @@ fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
 
     for (src, dst, src_port, want_src) in cases {
         let decision = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -3657,6 +3827,7 @@ fn pool_snat_port_range_wrapping() {
     let mut ports = Vec::new();
     for _ in 0..6 {
         let d = match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "lan",
@@ -3732,6 +3903,7 @@ fn pool_snat_v6_single_address() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let decision = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3763,6 +3935,7 @@ fn pool_snat_default_port_range() {
         ..SourceNATRuleSnapshot::default()
     }]);
     let d = match_source_nat(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -3792,6 +3965,7 @@ fn pool_snat_zone_mismatch_returns_none() {
     }]);
     assert!(
         match_source_nat(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "dmz", // wrong from_zone
@@ -4057,6 +4231,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
 
     // Non-first fragment: refused without allocating.
     let frag = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -4083,6 +4258,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
 
     // First/atomic fragment (non_first_fragment=false): still allocates.
     let first = match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "lan",
@@ -4145,7 +4321,15 @@ fn synced_session_reserves_nat_pool_port_4388() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+    );
 
     // The reservation is visible as an occupied translated tuple.
     assert!(
@@ -4187,7 +4371,14 @@ fn synced_session_reserves_nat_pool_port_4388() {
     // Deleting the synced session releases the reservation (mirror of the
     // standby teardown: `handle_delete_synced` / reap call
     // `release_source_nat_allocation`).
-    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+    );
     assert!(
         !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
         "releasing the synced session must free its reserved pool port"
@@ -4270,14 +4461,29 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(3584),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&det_rules, &det_key, det_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &det_rules,
+        &det_key,
+        det_nat,
+        false,
+        None,
+        0,
+    );
     assert!(
         det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
         "synced deterministic reservation must occupy its pool port"
     );
 
     // Standard teardown (reap / delete-sync) releases the reservation.
-    release_source_nat_allocation(&det_rules, &det_key, det_nat, false, 2_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &det_rules,
+        &det_key,
+        det_nat,
+        false,
+        2_000,
+    );
     assert!(
         !det_rules[0].pool_allocator.debug_is_port_occupied(0, 3584),
         "release must free the deterministic reservation's bit"
@@ -4314,8 +4520,23 @@ fn synced_deterministic_reservation_not_recycled_5178() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, None, 0);
-    release_source_nat_allocation(&rr_rules, &rr_key, rr_nat, false, 2_000);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rr_rules,
+        &rr_key,
+        rr_nat,
+        false,
+        None,
+        0,
+    );
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rr_rules,
+        &rr_key,
+        rr_nat,
+        false,
+        2_000,
+    );
     // Unchanged by the fix: a round-robin reservation recycles on release so the
     // freed port is reused oldest-first (#3011). This must stay GREEN both before
     // and after #5178 — the fix must not suppress recycling for round-robin pools.
@@ -4351,6 +4572,7 @@ fn synced_session_without_nat_reserves_nothing_4388() {
     let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     // No translation carried on the synced decision.
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         NatDecision::default(),
@@ -4390,7 +4612,15 @@ fn synced_session_foreign_pool_addr_skips_reserve_4388() {
         rewrite_src_port: Some(10000),
         ..NatDecision::default()
     };
-    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        foreign_nat,
+        false,
+        None,
+        0,
+    );
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4424,7 +4654,15 @@ fn synced_reverse_entry_reserves_nothing_4388() {
         ..NatDecision::default()
     };
     // is_reverse = true: the reserve is a no-op.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        true,
+        None,
+        0,
+    );
 
     assert_eq!(
         rules[0].pool_allocator.debug_occupied_count(),
@@ -4464,7 +4702,15 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+    );
 
     // THE FAIL-ON-REVERT ASSERTION (mint): the standby minted the reverse-
     // identity token for the synced flow. On revert the map is empty.
@@ -4525,7 +4771,14 @@ fn synced_address_only_session_reserves_reverse_identity_token_5338() {
 
     // Teardown of the synced session (standby reap / delete-sync) frees the token
     // via the SAME `release_source_nat_allocation` path — no new delete site.
-    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 1_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        1_000,
+    );
     assert_eq!(
         rules[0].pool_allocator.debug_address_only_owners().len(),
         0,
@@ -4607,6 +4860,7 @@ fn synced_reservation_follows_active_zone_match_6211() {
     // The active matched its rule by zone: this session came in on `lan` and
     // left via `wan`, so it was translated under rules[1] (`snat-lan`).
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -4660,7 +4914,14 @@ fn synced_reservation_follows_active_zone_match_6211() {
     // The standard teardown still frees it — the reservation went in through
     // the shared `reserve_synced_on_first_pool_owner` body, so
     // `release_source_nat_allocation`'s own first-pool-owner scan finds it.
-    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+    );
     assert!(
         !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
         "releasing the synced session must free the reservation it took"
@@ -4709,6 +4970,7 @@ fn synced_address_only_token_follows_active_zone_match_6211() {
     };
 
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -4761,6 +5023,7 @@ fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
 
     // Upsert #1: the zone pair resolves -> pass 1 -> the `lan->wan` rule.
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -4770,7 +5033,15 @@ fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
     );
     // Upsert #2 (same live session re-synced) AFTER a zone delete/renumber, so
     // the pair no longer resolves -> pass 2 -> the `dmz->wan` rule.
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+    );
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 20000)
@@ -4779,7 +5050,14 @@ fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
          allocator (they are independent, so idempotence does not apply)"
     );
 
-    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+    );
 
     assert!(
         !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
@@ -4812,12 +5090,35 @@ fn synced_release_sweep_does_not_free_an_unrelated_flow_6211() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &mine, mine_nat, false, Some(("lan", "wan")), 0);
-    reserve_synced_source_nat_allocation(&rules, &other, other_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &mine,
+        mine_nat,
+        false,
+        Some(("lan", "wan")),
+        0,
+    );
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &other,
+        other_nat,
+        false,
+        None,
+        0,
+    );
     assert!(rules[1].pool_allocator.debug_is_port_occupied(0, 20000));
     assert!(rules[0].pool_allocator.debug_is_port_occupied(0, 20050));
 
-    release_source_nat_allocation(&rules, &mine, mine_nat, false, 2_000);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &mine,
+        mine_nat,
+        false,
+        2_000,
+    );
 
     assert!(
         !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
@@ -4850,7 +5151,15 @@ fn synced_reservation_without_zone_pair_falls_back_to_first_pool_match_6211() {
         ..NatDecision::default()
     };
 
-    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        None,
+        0,
+    );
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
@@ -4879,6 +5188,7 @@ fn synced_reservation_unmatched_zone_pair_still_reserves_6211() {
 
     // No local rule is scoped `mgmt -> wan`.
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -4919,7 +5229,15 @@ fn synced_reservation_single_rule_is_zone_pair_invariant_6211() {
 
     for zones in [None, Some(("lan", "wan"))] {
         let rules = parse_source_nat_rules(&snapshot);
-        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones, 0);
+        reserve_synced_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &synced_key,
+            synced_nat,
+            false,
+            zones,
+            0,
+        );
         assert!(
             rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
             "single-rule reservation must be identical for zones = {zones:?}"
@@ -4972,7 +5290,15 @@ fn synced_reservation_non_overlapping_pools_is_zone_pair_invariant_6211() {
 
     for zones in [None, Some(("lan", "wan"))] {
         let rules = parse_source_nat_rules(&snapshot);
-        reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, zones, 0);
+        reserve_synced_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &synced_key,
+            synced_nat,
+            false,
+            zones,
+            0,
+        );
         assert!(
             rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
             "the only pool owning 203.0.113.20 must hold it for zones = {zones:?}"
@@ -5037,6 +5363,7 @@ fn synced_reservation_ignores_unconfirmable_interface_scope_6211() {
     };
 
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -5104,6 +5431,7 @@ fn synced_reservation_narrows_on_l4_match_6211() {
     };
 
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -5179,6 +5507,7 @@ fn synced_reservation_narrows_on_post_dnat_destination_6211() {
     };
 
     reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -5262,6 +5591,7 @@ fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
     let alloc = |src: &str, dst: &str, sport: u16| -> (Ipv4Addr, u16) {
         let mut counter = None;
         let d = expect_snat_decision(match_source_nat_result_for_tuple(
+            &InterfaceNatAllocators::default(),
             &rules,
             &NatScopeCtx::default(),
             "subs",
@@ -5480,7 +5810,14 @@ fn deterministic_cgnat_no_translation_token_released_on_teardown_5341() {
     // port from the flow key (the decision left `rewrite_src_port` unset) and
     // clears the reverse-identity token.
     let key_a = session_key_from_src("100.64.0.5", 12345, "8.8.8.8", 443);
-    release_source_nat_allocation(&rules, &key_a, a, false, 1);
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key_a,
+        a,
+        false,
+        1,
+    );
     assert_eq!(
         rules[0].pool_allocator.debug_address_only_owners().len(),
         0,
@@ -5573,6 +5910,7 @@ fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
     );
     let mut counter = None;
     let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         &rules,
         &NatScopeCtx::default(),
         "subs",
@@ -6615,6 +6953,7 @@ fn synced_reservation_survives_first_worker_retire_6211_f2() {
 
     // The same synced entry installed on two workers — what the fan-out does.
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6624,6 +6963,7 @@ fn synced_reservation_survives_first_worker_retire_6211_f2() {
         0,
     );
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6639,7 +6979,15 @@ fn synced_reservation_survives_first_worker_retire_6211_f2() {
 
     // Worker 0 reaps its replica (post-failover: RSS moved the traffic to
     // worker 1, so worker 0's copy idles out first).
-    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+        0,
+    );
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
@@ -6663,6 +7011,7 @@ fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
     let synced_nat = holder_synced_nat_6211_f2();
 
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6672,6 +7021,7 @@ fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
         0,
     );
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6681,8 +7031,24 @@ fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
         1,
     );
 
-    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
-    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_001, 1);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+        0,
+    );
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_001,
+        1,
+    );
 
     assert!(
         !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
@@ -6711,6 +7077,7 @@ fn synced_reservation_refresh_by_one_worker_does_not_accumulate_holders_6211_f2(
     // One worker, refreshed repeatedly — every re-sync of a live session.
     for _ in 0..8 {
         reserve_synced_source_nat_allocation_for_worker(
+            &InterfaceNatAllocators::default(),
             &rules,
             &synced_key,
             synced_nat,
@@ -6727,7 +7094,15 @@ fn synced_reservation_refresh_by_one_worker_does_not_accumulate_holders_6211_f2(
 
     // ONE retire, because there is exactly ONE holder however many times it
     // refreshed.
-    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 3);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+        3,
+    );
 
     assert!(
         !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
@@ -6766,6 +7141,7 @@ fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
     };
 
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6775,6 +7151,7 @@ fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
         0,
     );
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &synced_key,
         synced_nat,
@@ -6789,7 +7166,15 @@ fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
         "precondition: both workers hold ONE address-only reverse-identity token"
     );
 
-    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        2_000,
+        0,
+    );
 
     assert_eq!(
         rules[0].pool_allocator.debug_address_only_owners().len(),
@@ -6912,6 +7297,7 @@ fn local_pool_allocation_6522(
 ) -> NatDecision {
     let mut counter = None;
     expect_snat_decision(match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         rules,
         &NatScopeCtx::default(),
         "lan",
@@ -6957,13 +7343,28 @@ fn local_allocation_survives_sibling_replica_reaps_6522() {
     // SIBLING worker (never worker 0 — `peer_worker_commands` excludes self).
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, 1_000, sibling,
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            None,
+            1_000,
+            sibling,
         );
     }
 
     // Every replica ages out with nothing refreshing it and reaps.
     for sibling in 1..6u32 {
-        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+        release_source_nat_allocation_for_worker(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            2_000,
+            sibling,
+        );
     }
 
     assert!(
@@ -6989,11 +7390,34 @@ fn local_allocation_frees_when_the_owning_worker_reaps_6522() {
 
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, 1_000, sibling,
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            None,
+            1_000,
+            sibling,
         );
-        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+        release_source_nat_allocation_for_worker(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            2_000,
+            sibling,
+        );
     }
-    release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_001, 0);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        decision,
+        false,
+        2_001,
+        0,
+    );
 
     assert!(
         !rules[0].pool_allocator.debug_is_port_occupied(0, port),
@@ -7019,7 +7443,15 @@ fn foreign_worker_release_does_not_free_a_local_allocation_6522() {
     let port = decision.rewrite_src_port.expect("translated port");
     let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
 
-    release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, 3);
+    release_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        decision,
+        false,
+        2_000,
+        3,
+    );
 
     assert!(
         rules[0].pool_allocator.debug_is_port_occupied(0, port),
@@ -7065,11 +7497,26 @@ fn local_address_only_token_survives_sibling_replica_reaps_6522() {
     let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
     for sibling in 1..6u32 {
         reserve_synced_source_nat_allocation_for_worker(
-            &rules, &key, decision, false, None, 1_000, sibling,
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            None,
+            1_000,
+            sibling,
         );
     }
     for sibling in 1..6u32 {
-        release_source_nat_allocation_for_worker(&rules, &key, decision, false, 2_000, sibling);
+        release_source_nat_allocation_for_worker(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            decision,
+            false,
+            2_000,
+            sibling,
+        );
     }
 
     assert_eq!(
@@ -7155,6 +7602,7 @@ fn snat_lookup_6528(
 ) -> SourceNatLookup {
     let mut counter = None;
     match_source_nat_result_for_tuple(
+        &InterfaceNatAllocators::default(),
         rules,
         &NatScopeCtx::default(),
         from_zone,
@@ -7233,6 +7681,7 @@ fn synced_eviction_of_address_only_keeps_unrelated_pat_port_6528() {
     let key = session_key_from_src("10.0.1.50", pat_port, "9.9.9.9", 443);
     let other_port = if pat_port == 40000 { 40001 } else { 40000 };
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &key,
         synced_pat_decision_6528(other_port),
@@ -7281,6 +7730,7 @@ fn synced_eviction_of_address_only_clears_its_token_6528() {
 
     let key = session_key_from_src("10.0.1.50", 40005, "9.9.9.9", 443);
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &key,
         synced_pat_decision_6528(40009),
@@ -7326,6 +7776,7 @@ fn synced_eviction_drops_the_persistent_lease_refcount_6528() {
 
     let key = session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443);
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &key,
         synced_pat_decision_6528(40009),
@@ -7377,6 +7828,7 @@ fn synced_eviction_keeps_a_persistent_pat_lease_port_6528() {
     let key = session_key_from_src("10.0.1.100", 40000, "8.8.8.8", 443);
     let synced_port = if port == 40009 { 40008 } else { 40009 };
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &key,
         synced_pat_decision_6528(synced_port),
@@ -7412,6 +7864,7 @@ fn synced_eviction_still_frees_a_plain_pat_port_6528() {
     let key = session_key_from_src("10.0.2.50", 55555, "8.8.8.8", 443);
     let synced_port = if port == 40009 { 40008 } else { 40009 };
     reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
         &rules,
         &key,
         synced_pat_decision_6528(synced_port),
@@ -7654,6 +8107,7 @@ fn synced_reserve_distinguishes_no_pool_from_a_refusal_7581() {
     };
     assert!(
         reserve_synced_source_nat_allocation_untracked(
+            &InterfaceNatAllocators::default(),
             &iface_rules,
             &key,
             iface_nat,
@@ -7711,6 +8165,7 @@ fn synced_reserve_distinguishes_no_pool_from_a_refusal_7581() {
 
     assert!(
         !reserve_synced_source_nat_allocation_untracked(
+            &InterfaceNatAllocators::default(),
             &pool_rules,
             &key,
             pool_nat,

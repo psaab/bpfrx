@@ -125,6 +125,7 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
         // (`release_source_nat_allocation`) on reap or delete-sync.
         if entry.origin.is_peer_synced() && !metadata.is_reverse {
             reserve_synced_source_nat_allocation_for_worker(
+                &forwarding.iface_nat_allocators,
                 &forwarding.source_nat_rules,
                 &key,
                 entry.decision.nat,
