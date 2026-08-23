@@ -104270,3 +104270,12 @@ prose edit above them added. No diff falls in the new test body.
   scripts/deploy/test_xpf_deploy_recreate_keepalive_6762.py (new),
   docs/in-place-upgrade.md
 
+
+## 2026-08-22 — #6771 duplicate event trigger siblings take the last value
+- **Timestamp**: 2026-08-22
+- **Action**: `within … trigger` read siblings with FindChild (first-wins), so a
+  later `trigger on N` was silently dropped where Junos replaces. Applied
+  #6714's FindChildren rule — the same fix two cases below in the same switch —
+  to `trigger`, `on` and `until`.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/event_trigger_duplicate_6771_test.go

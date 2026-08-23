@@ -2110,7 +2110,24 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 						w.Seconds = n
 					}
 				}
-				if trigNode := child.FindChild("trigger"); trigNode != nil {
+				// #6771: FindChildrEN on BOTH levels, and LAST wins — the same
+				// rule #6714 applied to `then change-configuration commands`
+				// two cases below, for the same reason. The hierarchical parser
+				// keeps repeated same-keyed statements as SIBLINGS
+				// (parseStatements), and SetPath does the same for a repeated
+				// flat `set`: `trigger on 3` followed by `trigger on 9` yields
+				// TWO leaf children under one `trigger` node (measured).
+				//
+				// FindChild returned the FIRST, so the later value was silently
+				// dropped and the operator got 3 where Junos — which REPLACES a
+				// single-valued leaf on a later set — gives 9. It committed
+				// clean with zero warnings.
+				//
+				// No warning is emitted for the duplicate: re-setting a leaf is
+				// ordinary operator behaviour and every override would trip it.
+				// Taking the last value IS the Junos semantic, so honouring it
+				// is the whole fix.
+				for _, trigNode := range child.FindChildren("trigger") {
 					// trigger on N or trigger until N
 					for i := 1; i < len(trigNode.Keys)-1; i++ {
 						switch trigNode.Keys[i] {
@@ -2124,15 +2141,17 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 							}
 						}
 					}
-					// Also check children
-					if onNode := trigNode.FindChild("on"); onNode != nil {
+					// Also check children. Every sibling is read and the LAST
+					// assignment stands, so a re-set overrides rather than
+					// being discarded (#6771).
+					for _, onNode := range trigNode.FindChildren("on") {
 						if v := nodeVal(onNode); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
 								w.TriggerOn = n
 							}
 						}
 					}
-					if untilNode := trigNode.FindChild("until"); untilNode != nil {
+					for _, untilNode := range trigNode.FindChildren("until") {
 						if v := nodeVal(untilNode); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
 								w.TriggerUntil = n
