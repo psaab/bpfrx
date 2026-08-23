@@ -1026,14 +1026,63 @@ future writer:
   reconcile pass to arm.
 
 Bound honestly: ordering between two unsynchronised `rg_active` writers is not
-something the state machine can resolve — if a concurrent event-handler apply
-stamps `applied` after the fence's write, the retry is disarmed again. What
-`InvalidateApplied` guarantees is that the machine never *silently* believes a
-convergence it did not observe. Guards:
-`TestFenceRearmsReconcileRetry` (end-to-end through two real reconcile passes)
-and `TestInvalidateAppliedRearmsAnySecondWriter` /
+something the state machine can resolve. What `InvalidateApplied` guarantees is
+that the machine never *silently* believes a convergence it did not observe.
+Guards: `TestFenceRearmsReconcileRetry` (end-to-end through two real reconcile
+passes) and `TestInvalidateAppliedRearmsAnySecondWriter` /
 `TestInvalidateAppliedKeepsStructInvariant` (the generic second-writer
 contract), all in `rg_state_fence_rearm_6530_test.go`.
+
+### A completing apply must not erase a debt armed while it was in flight (#6799)
+
+This section used to end by conceding that *"if a concurrent event-handler apply
+stamps `applied` after the fence's write, the retry is disarmed again"*. That
+concession was the defect, and #6799 closes it.
+
+The reconcile loop captured a transition under `s.mu`, dropped the lock, ran
+`SetRGActive` off-lock — an IPC round-trip to the Rust helper — and then recorded
+the result with an **unguarded `MarkApplied(tr.Active)`**. A fence landing inside
+that window armed the debt and the completing apply erased it: `applied` becomes
+the value written, which now equals `active`, so `applyPending` is cleared.
+
+**The erasure is permanent, not transient.** `reconcileLocked` only *sets*
+`applyPending` when `applied != active`, and after the erasure they agree — so
+nothing re-arms it, `tr.Changed || s.NeedsApply()` never fires again, and
+forwarding stays wherever the out-of-band writer left it. That is #6530's
+"fenced-then-recovered primary stays dark forever", reopened.
+
+**The epoch cannot detect it, which is why the fix is keyed elsewhere.**
+`InvalidateApplied` deliberately does not bump the epoch, and even if it did, the
+desired-value fallback would accept the record anyway. So the state machine
+carries an **invalidation counter**: `InvalidateApplied` bumps it, `rgTransition`
+carries the value observed when the transition was produced, and a record is
+refused when it moved.
+
+Two further things #6799 changed, both of which were latent hazards rather than
+the reported bug:
+
+- **One decision, one lock hold.** `recordRGActiveAppliedIfCurrentOrStable` took
+  *three* separate holds (`ApplyIfCurrent`, then `CurrentDesired`, then
+  `MarkApplied`), so the state it decided on could move between the decision and
+  the act. It is now a thin wrapper over `rgStateMachine.RecordApplied`, which
+  decides and acts under a single hold — the same no-cached-boolean discipline
+  `pkg/ra`'s `finishDrainDecision` settled on.
+- **One recorder for all six sites.** Four cluster/VRRP event handlers already
+  used the guarded helper; the two reconcile-loop arms called raw `MarkApplied`.
+  All six now route through `RecordApplied`, and the shared body
+  (`markAppliedLocked`) makes the #757 log-once gate reset structurally identical
+  rather than pinned by a duplicate test. `ApplyIfCurrent` was removed once it
+  had no production caller, and its two tests moved onto `RecordApplied` rather
+  than being deleted.
+
+The reconcile arms also treat a REFUSED record as "not converged": the activation
+arm only raises `setLocalFailoverCommitReady` inside the accepted branch, because
+that flag gates a **peer failover commit** (`waitLocalFailoverCommitReady` →
+`cluster.requestPeerFailover`) and must never be raised off a convergence the
+machine declined. Lowering it stays unconditional — lowering readiness is always
+safe. Guards: `rg_apply_invalidate_race_6799_test.go`, whose wiring cell lands
+the fence *inside* the in-flight `SetRGActive` (the #6530 test fences between
+passes, which is sequential and cannot reach this window).
 
 **Where the wiring lives (#6428).** `startClusterComms` was a 602-line
 constructor; the sub-constructions were extracted verbatim into thirteen focused

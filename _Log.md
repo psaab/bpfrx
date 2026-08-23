@@ -104912,3 +104912,27 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/lldp/apply_partial_6794_test.go`, `pkg/daemon/daemon.go`,
   `pkg/daemon/daemon_apply_tail.go`,
   `pkg/daemon/lldp_recovery_6794_test.go`, `pkg/lldp/README.md`, `_Log.md`
+
+## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
+
+- **Timestamp**: 2026-08-23
+- **Action**: `reconcileRGState` captured a transition under `s.mu`, dropped the
+  lock, ran `SetRGActive` off-lock, then recorded with an unguarded
+  `MarkApplied(tr.Active)`. A cluster fence landing in that window armed the
+  retry debt (`InvalidateApplied`, #6530) and the completing apply erased it.
+  Added an invalidation counter to `rgStateMachine`, carried on `rgTransition`,
+  checked by a new `RecordApplied` that decides and acts under ONE lock hold;
+  routed all six apply sites through it.
+- **Claim verdict**: "epoch-stale" is only PARTLY right — the epoch cannot
+  detect this (InvalidateApplied deliberately does not bump it, and the
+  desired-value fallback would accept anyway), so the epoch is not a sufficient
+  key. "temporarily erase retry debt" UNDERSTATES it: the erasure is permanent,
+  because reconcileLocked only sets applyPending when applied != active.
+- **The reader**: `!s.NeedsApply()` gates `setLocalFailoverCommitReady`, which
+  feeds `waitLocalFailoverCommitReady` → `cluster.requestPeerFailover`. The
+  activation arm now raises it only inside the accepted branch.
+- **Removed `ApplyIfCurrent`** (no production caller after the consolidation) and
+  MOVED its two tests onto `RecordApplied` rather than deleting them.
+- **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
+  `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`

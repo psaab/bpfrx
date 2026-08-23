@@ -97,16 +97,14 @@ func (d *Daemon) localFailoverCommitIsReady(rgID int) bool {
 	return d.localFailoverCommitReady[rgID]
 }
 
+// recordRGActiveAppliedIfCurrentOrStable records a completed rg_active write
+// against the transition that produced it. #6799: it is now a thin wrapper over
+// rgStateMachine.RecordApplied so EVERY apply path — the four cluster/VRRP event
+// handlers and the two reconcile-loop arms — reaches ONE decision made under a
+// single lock hold. It used to take three separate holds and had no way to see
+// that another writer had re-armed the retry debt mid-apply.
 func recordRGActiveAppliedIfCurrentOrStable(s *rgStateMachine, tr rgTransition, active bool) bool {
-	if s.ApplyIfCurrent(tr) {
-		return true
-	}
-	current, _ := s.CurrentDesired()
-	if current != active {
-		return false
-	}
-	s.MarkApplied(active)
-	return true
+	return s.RecordApplied(tr, active)
 }
 
 // #5250 (A7-b1 F4): every wait here is ABORTABLE on daemon stop. It used to
@@ -1127,11 +1125,23 @@ func (d *Daemon) reconcileRGState() {
 						slog.Warn("reconcile: failed to update rg_active",
 							"rg", rgID, "active", true, "err", err)
 					}
-				} else {
-					s.MarkApplied(true)
+				} else if recordRGActiveAppliedIfCurrentOrStable(s, tr, true) {
+					// #6799: the record is CONDITIONAL. This arm used to call
+					// MarkApplied unconditionally on a value captured before the
+					// lock dropped, so a fence that re-armed the retry debt while
+					// SetRGActive was in flight had its debt erased and the RG
+					// never re-drove. The readiness flag below is inside the
+					// accepted branch for the same reason: it gates a PEER
+					// FAILOVER COMMIT (waitLocalFailoverCommitReady), so it must
+					// never be raised off a convergence the machine refused.
 					if noRethVRRP && clusterPri && !s.NeedsApply() {
 						d.setLocalFailoverCommitReady(rgID, true)
 					}
+				} else {
+					slog.Warn("reconcile: rg_active write completed but the state machine REFUSED "+
+						"to record it (another writer re-armed the retry, or the desired state "+
+						"moved); leaving the retry armed so the next pass re-drives",
+						"rg", rgID, "active", true)
 				}
 			} else {
 				// Deactivation ordering: blackholes FIRST, then
@@ -1144,8 +1154,17 @@ func (d *Daemon) reconcileRGState() {
 							"rg", rgID, "active", false, "err", err)
 					}
 				} else {
-					s.MarkApplied(false)
+					// The deactivation readiness flag is cleared unconditionally:
+					// lowering readiness is always safe, and must not depend on
+					// whether the convergence record was accepted (#6799).
 					d.setLocalFailoverCommitReady(rgID, false)
+					if !recordRGActiveAppliedIfCurrentOrStable(s, tr, false) {
+						slog.Warn("reconcile: rg_active write completed but the state machine "+
+							"REFUSED to record it (another writer re-armed the retry, or the "+
+							"desired state moved); leaving the retry armed so the next pass "+
+							"re-drives",
+							"rg", rgID, "active", false)
+					}
 				}
 			}
 		}
