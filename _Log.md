@@ -29493,6 +29493,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
     Prometheus list) and fairness-regimes.md (observability pointer).
   - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
     pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
+  userspace-dp/src/server/helpers/status.rs (#6641 gate repair),
     pkg/dataplane/userspace/format/cos.go,
     pkg/dataplane/userspace/format/cos_test.go,
     pkg/dataplane/userspace/protocol.go, docs/cos-validation-notes.md,
@@ -104819,7 +104820,10 @@ prose edit above them added. No diff falls in the new test body.
   `SyncedReserveOutcome` stays the tri-state vocabulary (Reserved / Refused /
   NothingToReserve). FOUR additive status counters + Prometheus mirrors, one
   per failure mode (PAT collision, identity exhaustion, sync-import identity
-  conflict, registry cap) so an operator can tell the remedies apart.
+  conflict, registry cap) so an operator can tell the remedies apart. Also
+  repaired the #6641 status-wiring gate, which matched `state.afxdp.<name>()`
+  as a contiguous substring and therefore went wrong the moment rustfmt
+  wrapped a long assignment: it now matches on whitespace-free text.
   OUT OF SCOPE (PR 3/3): §5.7 cross-domain overlap foreclosure with DRAIN, and
   the composed-DNAT destination-PORT residual (the record keys on the RAW
   destination port, which is the shipped pool-mode address-only shape).

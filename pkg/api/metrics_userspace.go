@@ -760,11 +760,9 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.NatReverseKeySharedDisplacementsTotal),
 	)
 
-	// #6751 PR 2/3: the interface-mode SNAT identity registry. Emitted
-	// unconditionally for the same reason — a published 0 on the PAT
-	// counter is the informative reading (no two flows contended for one
-	// translated identity), and a 0 on either exhaustion counter is a real
-	// "nothing failed closed" signal rather than an absent series.
+	// #6751 PR 2/3: interface-mode SNAT identity registry. Emitted
+	// unconditionally: a published 0 is the informative reading (no two
+	// flows contended, nothing failed closed), not an absent series.
 	ch <- prometheus.MustNewConstMetric(
 		c.userspaceInterfaceSNATPATCollisions,
 		prometheus.CounterValue,
