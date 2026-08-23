@@ -1825,7 +1825,7 @@ type compileOpts struct {
 	// Same doctrine as lenientIfNameCollision.
 	lenientRethMember bool
 
-	// lenientRethRedundancyGroup (#6781) downgrades the RETH
+	// lenientRethRGOwnership (#6781) downgrades the RETH
 	// redundancy-group ownership gate (validateRethRedundancyGroupStrict)
 	// from a hard compile error to a cfg.Warnings entry. An interface
 	// carrying `redundant-ether-options redundancy-group <N>` that no port
@@ -1844,7 +1844,7 @@ type compileOpts struct {
 	// (Config.RethRGOwners), so a leniently-loaded config keeps the
 	// interface as a plain L3 interface with its address rather than
 	// half-applying a redundancy group. Same doctrine as lenientRethMember.
-	lenientRethRedundancyGroup bool
+	lenientRethRGOwnership bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -2478,7 +2478,7 @@ func lenientCompileOpts() compileOpts {
 		lenientRethVRRPGroupID:                 true,
 		lenientIfNameCollision:                 true,
 		lenientRethMember:                      true,
-		lenientRethRedundancyGroup:             true,
+		lenientRethRGOwnership:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,

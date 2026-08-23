@@ -650,7 +650,7 @@ structural/nominal test already excludes those, which is what the old name
 filter was really providing.
 
 `validateRethRedundancyGroupStrict` (`pkg/config`) rejects the offending shape
-at commit, with `lenientRethRedundancyGroup` for the tolerant load / peer-sync
+at commit, with `lenientRethRGOwnership` for the tolerant load / peer-sync
 path (#1960). A `reth*` with no members yet is deliberately NOT rejected — it is
 an incompletely-wired declaration that both modes accepted before, and
 narrowing it is not what #6781 is about.

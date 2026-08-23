@@ -280,7 +280,7 @@ func runUniformGatesRoutingRibRPM(tree *ConfigTree, cfg *Config, opts compileOpt
 	// the redundant-parent declarations themselves are coherent. Same doctrine
 	// as lenientRethMember.
 	if err := validateRethRedundancyGroupStrict(cfg); err != nil {
-		if opts.lenientRethRedundancyGroup {
+		if opts.lenientRethRGOwnership {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("reth redundancy-group (downgraded to warning on tolerant path): %v", err))
 		} else {

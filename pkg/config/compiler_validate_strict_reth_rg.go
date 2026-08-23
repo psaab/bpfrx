@@ -42,7 +42,7 @@ import (
 // failed commit with no operator workaround.
 //
 // On the tolerant load / peer-sync paths the call site downgrades this to a
-// warning (opts.lenientRethRedundancyGroup) so an already-persisted or
+// warning (opts.lenientRethRGOwnership) so an already-persisted or
 // peer-synced config an older binary accepted still BOOTS (#1960 no-brick); the
 // runtime consumers independently resolve ownership through the shared
 // structural predicate (Config.RethRGOwners), so a leniently-loaded config
