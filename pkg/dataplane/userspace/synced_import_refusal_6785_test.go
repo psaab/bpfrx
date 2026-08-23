@@ -3,6 +3,7 @@ package userspace
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -313,5 +314,110 @@ func TestUnreachableHelperIsNotARefusal6785(t *testing.T) {
 	if !errors.Is(err, errSessionHelperUnreachable) {
 		t.Fatalf("transport failure lost its errSessionHelperUnreachable "+
 			"classification: %v", err)
+	}
+}
+
+// TestSyncedMirrorFailureAccounting6785 binds the health decision itself, with
+// NO BPF maps involved — and it exists because the two rollback cells above
+// SKIP without CAP_BPF.
+//
+// That skip is not cosmetic. A mutation that made a semantic refusal set the
+// sticky mirror-failure flag ran GREEN across the whole suite, because the only
+// cells that could see it were skipped. A guard that skips is indistinguishable
+// from a guard that passes, so the decision is now reachable on its own.
+//
+// It is a PAIRED table: the same function, three error shapes, and the flag must
+// move in opposite directions. The refusal row alone would be satisfied by an
+// implementation that never sets the flag at all — which silently deletes the
+// #5247 takeover gate.
+func TestSyncedMirrorFailureAccounting6785(t *testing.T) {
+	cases := []struct {
+		name            string
+		err             error
+		wantMirrorFail  bool
+		wantRefusalsAdd uint64
+	}{
+		{
+			name:            "semantic-refusal",
+			err:             fmt.Errorf("%w: capacity", dataplane.ErrSyncedImportRefused),
+			wantMirrorFail:  false,
+			wantRefusalsAdd: 1,
+		},
+		{
+			name:            "transport-failure",
+			err:             fmt.Errorf("%w: dial session socket", errSessionHelperUnreachable),
+			wantMirrorFail:  true,
+			wantRefusalsAdd: 0,
+		},
+		{
+			name:            "plain-helper-error",
+			err:             errors.New("session table write failed"),
+			wantMirrorFail:  true,
+			wantRefusalsAdd: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New()
+			m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
+
+			m.noteSyncedMirrorFailureLocked(tc.err)
+
+			if m.sessionMirrorFailed != tc.wantMirrorFail {
+				t.Fatalf("sessionMirrorFailed = %v, want %v — this flag gates HA "+
+					"takeover-readiness (#5247): true on a refusal keeps a healthy "+
+					"standby from ever taking over once a peer oversubscribes it, "+
+					"and false on a real failure deletes the gate",
+					m.sessionMirrorFailed, tc.wantMirrorFail)
+			}
+			if got := m.syncedImportRefusals.Load(); got != tc.wantRefusalsAdd {
+				t.Fatalf("syncedImportRefusals = %d, want %d", got, tc.wantRefusalsAdd)
+			}
+		})
+	}
+}
+
+// TestSyncedMirrorFailureAccountingIsSingleSourced6785 pins that both cluster
+// install entry points route their failure accounting through the ONE helper
+// above, rather than carrying their own copy of the classification.
+//
+// This is a source check, and it is deliberate: the behavioural cells for V6
+// need BPF maps and skip here, so "V6 classifies the same way" is currently
+// unprovable behaviourally on an unprivileged runner. A divergence between the
+// two copies is always a bug — an IPv6-only misclassification would disarm HA
+// takeover on exactly the deployments least likely to notice — so the agreement
+// is bound structurally instead of left unbound.
+//
+// Comments are stripped before matching: the doc comment on the helper names
+// both functions, and a gate satisfiable by its own documentation proves
+// nothing.
+func TestSyncedMirrorFailureAccountingIsSingleSourced6785(t *testing.T) {
+	src, err := os.ReadFile("manager_sessions.go")
+	if err != nil {
+		t.Fatalf("read manager_sessions.go: %v", err)
+	}
+	var code strings.Builder
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			code.WriteString("\n")
+			continue
+		}
+		code.WriteString(line)
+		code.WriteString("\n")
+	}
+	body := code.String()
+
+	if n := strings.Count(body, "m.noteSyncedMirrorFailureLocked(err)"); n != 2 {
+		t.Fatalf("noteSyncedMirrorFailureLocked is called %d times, want exactly "+
+			"2 (the v4 and v6 cluster installs) — a path that accounts its own "+
+			"mirror failure has its own copy of the #5247 classification", n)
+	}
+	// The classification must not ALSO appear inline: a call plus a surviving
+	// inline copy is the divergence this guards against.
+	if n := strings.Count(body, "m.recordSessionMirrorFailureLocked("); n != 0 {
+		t.Fatalf("recordSessionMirrorFailureLocked is called %d times directly "+
+			"from manager_sessions.go, want 0 — the cluster install paths must "+
+			"go through noteSyncedMirrorFailureLocked so the refusal "+
+			"classification cannot be bypassed", n)
 	}
 }

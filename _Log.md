@@ -104455,3 +104455,13 @@ prose edit above them added. No diff falls in the new test body.
   pkg/cluster/sync.go, pkg/cluster/sync_conn_gen.go, pkg/cluster/status.go,
   pkg/cluster/synced_import_refusal_6785_test.go, docs/ha-failover-status.md,
   _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6785 round 2 — the mutation matrix found a GREEN cell: making a
+  semantic refusal set the sticky mirror-failure flag left the whole suite
+  green, because the only cells that could see it need CAP_BPF and SKIP on an
+  unprivileged runner. Extracted the classification into one shared
+  `noteSyncedMirrorFailureLocked` (the V4/V6 copies were a divergence waiting to
+  happen) and bound it with an unprivileged paired table plus a
+  comment-stripped single-sourcing check.
+- **File(s)**: pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go, _Log.md

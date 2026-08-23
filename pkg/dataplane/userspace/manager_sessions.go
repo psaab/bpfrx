@@ -10,7 +10,6 @@ package userspace
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -140,28 +139,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 		return err
 	}
 	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
-		// #6785: a SEMANTIC refusal (stale generation / import cap / translated
-		// tuple) is the correct answer from a HEALTHY helper, not a sick socket.
-		// It still has to compensate — the helper did not take the session, so
-		// the BPF row written above is split truth — but it must NOT set the
-		// sticky mirror-failure flag, which gates HA takeover-readiness (#5247).
-		// Latching a working standby "not takeover-ready" the first time a peer
-		// oversubscribed it would be a worse failure than the one being fixed.
-		//
-		// The success path below is deliberately NOT taken either. The flag
-		// means "a mirror last succeeded", and a refusal is not a mirror; the
-		// round trip proves the socket answered, but clearing a sticky failure
-		// on the strength of a refused write would let a helper that refuses
-		// everything read as recovered.
-		refused := errors.Is(err, dataplane.ErrSyncedImportRefused)
-		if refused {
-			m.syncedImportRefusals.Add(1)
-			slog.Debug("userspace: helper refused a synced session import; "+
-				"rolling back the BPF mirror", "err", err)
-		} else {
-			m.recordSessionMirrorFailureLocked(err)
-			slog.Debug("userspace: session mirror failed", "err", err)
-		}
+		m.noteSyncedMirrorFailureLocked(err)
 		compErr := m.restoreBPFSessionV4Locked(key, prior, hadPrior)
 		return errors.Join(
 			fmt.Errorf("mirror synced v4 session to userspace helper: %w", err),
@@ -298,28 +276,7 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 		return err
 	}
 	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
-		// #6785: a SEMANTIC refusal (stale generation / import cap / translated
-		// tuple) is the correct answer from a HEALTHY helper, not a sick socket.
-		// It still has to compensate — the helper did not take the session, so
-		// the BPF row written above is split truth — but it must NOT set the
-		// sticky mirror-failure flag, which gates HA takeover-readiness (#5247).
-		// Latching a working standby "not takeover-ready" the first time a peer
-		// oversubscribed it would be a worse failure than the one being fixed.
-		//
-		// The success path below is deliberately NOT taken either. The flag
-		// means "a mirror last succeeded", and a refusal is not a mirror; the
-		// round trip proves the socket answered, but clearing a sticky failure
-		// on the strength of a refused write would let a helper that refuses
-		// everything read as recovered.
-		refused := errors.Is(err, dataplane.ErrSyncedImportRefused)
-		if refused {
-			m.syncedImportRefusals.Add(1)
-			slog.Debug("userspace: helper refused a synced session import; "+
-				"rolling back the BPF mirror", "err", err)
-		} else {
-			m.recordSessionMirrorFailureLocked(err)
-			slog.Debug("userspace: session mirror failed", "err", err)
-		}
+		m.noteSyncedMirrorFailureLocked(err)
 		compErr := m.restoreBPFSessionV6Locked(key, prior, hadPrior)
 		return errors.Join(
 			fmt.Errorf("mirror synced v6 session to userspace helper: %w", err),
