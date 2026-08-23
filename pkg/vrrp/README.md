@@ -608,6 +608,69 @@ Guarded by `TestSendPacketIPv6PrependsVirtualRouterLinkLocal` /
 `TestSendPacketIPv6LinkLocalFirstWithMultipleVIPs`, which re-parse the captured
 advert and assert address[0] is the link-local and the Count field includes it.
 
+### Which interfaces own a redundancy group (#6781)
+
+Both ownership modes ask the same question — "does this interface own RG N?" —
+and before #6781 they answered it differently, each with its own reading:
+
+| Reading | Used by | Blind spot |
+|---|---|---|
+| `RedundancyGroup > 0` alone | `CollectRethInstances` (VRRP-backed) | claims an interface that is not a reth at all |
+| + `strings.HasPrefix(name, "reth")` | `RethVIPsForRG` (direct) | drops a structurally valid pair not spelled `reth*` |
+
+**Both were wrong, in opposite directions**, and both shapes committed cleanly:
+
+- `ge-0/0/5 redundant-ether-options redundancy-group 1`, nothing naming it as a
+  `redundant-parent`. VRRP-backed synthesized an instance on it whose "VIPs"
+  were the interface's OWN configured addresses — so they existed only while
+  MASTER and were deleted on BACKUP. networkd generation
+  (`pkg/dataplane/compiler_iface.go`) independently replaced that address with a
+  `169.254.<rg>.<node>/32` link-local. Under `no-reth-vrrp` the direct collector
+  skipped the interface, so the address was stripped and installed by **nobody,
+  on both nodes**.
+- `bond0` with `ge-0/0/1 gigether-options redundant-parent bond0` — a
+  structurally valid redundant pair not spelled `reth*`. VRRP-backed resolved it
+  correctly; the direct collector returned nothing, leaving that group with no
+  VIPs at all.
+
+`Config.RethRGOwners` (`pkg/config/reth_rg_owner.go`) is now the single source
+of truth. An interface owns the group it carries when it is a
+redundant-ethernet interface **structurally** (some port names it as their
+`redundant-parent`) **or nominally** (spelled `reth*`). That is deliberately the
+UNION of the two old readings minus their shared blind spot: it excludes only
+the shape that was actively wrong and includes the shape one mode was dropping,
+so nothing either mode previously owned stops being owned — in HA ownership code
+a newly-excluded interface is an outage.
+
+The `> 0` test lives at the CALLER, not in the predicate: the VRRP-backed
+collector synthesizes instances only for groups above 0, while the direct
+collector is legitimately queried FOR group 0. What an RG-0 query needs
+protecting from is every unconfigured interface defaulting to 0 — and the
+structural/nominal test already excludes those, which is what the old name
+filter was really providing.
+
+`validateRethRedundancyGroupStrict` (`pkg/config`) rejects the offending shape
+at commit, with `lenientRethRGOwnership` for the tolerant load / peer-sync
+path (#1960). A `reth*` with no members yet is deliberately NOT rejected — it is
+an incompletely-wired declaration that both modes accepted before, and
+narrowing it is not what #6781 is about.
+
+**All eight readers now share it.** Besides the two ownership collectors and
+networkd generation, the five `pkg/daemon` readers that decide RG membership for
+stable RETH link-local add/remove, the direct-mode GARP / router-LL burst, DHCP
+RG-scoping and BACKUP blackhole routes each carried their own name test. Left
+alone they would have given a structurally valid pair VIPs from both ownership
+modes and then no GARP, no stable link-local and no blackhole routes — VRRP
+mastering an interface nothing else manages. `rethInterfacesMatchingRG`'s own
+doc comment (#6520) already states the rule: *"Deriving the two from one walker
+is not a style preference: a divergence between them is ALWAYS a bug."*
+
+Bound by two tests, because a behavioural one alone is probe-bounded:
+`reth_rg_parity_6781_test.go` asserts the two modes reach the same conclusion on
+both shapes plus a control, and `reth_rg_ssot_6781_test.go` asserts they still
+read it from one place (neither collector may compare `.RedundancyGroup` or
+name-test for `"reth"` itself).
+
 ### Advert capacity — per-family VIP cardinality (#6779)
 
 RFC 5798 §5.2.4 makes an advertisement's "Count IPvX Addr" a single byte, so
