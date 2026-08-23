@@ -104931,6 +104931,13 @@ prose edit above them added. No diff falls in the new test body.
 - **The reader**: `!s.NeedsApply()` gates `setLocalFailoverCommitReady`, which
   feeds `waitLocalFailoverCommitReady` → `cluster.requestPeerFailover`. The
   activation arm now raises it only inside the accepted branch.
+- **Matrix found an unbound branch**: reverting the DEACTIVATION arm to a raw
+  `MarkApplied` left the whole suite green — the activation cell cannot see it,
+  since each arm records its own result. Added a deactivation fixture (an RG the
+  cluster does not own, so the desired state is false deterministically). Its
+  first draft was also order-dependent — `reconcileRGState` iterates RG ids in
+  MAP order, so an unrelated RG's activation could consume a "first write" hook
+  — so the in-flight hook is keyed on (rgID, active).
 - **Removed `ApplyIfCurrent`** (no production caller after the consolidation) and
   MOVED its two tests onto `RecordApplied` rather than deleting them.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,

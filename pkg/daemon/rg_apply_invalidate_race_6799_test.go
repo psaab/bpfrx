@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -192,16 +193,31 @@ func TestRecordAppliedRefusesWhenDesiredMovedAway6799(t *testing.T) {
 // the reconcile loop leaves open — between capturing the transition and
 // recording the result. Deterministic: no goroutines, no sleeps.
 type midApplyFenceHA struct {
-	mu         sync.Mutex
-	writes     []rgActiveWrite
-	duringOnce func()
+	mu sync.Mutex
+	// during is called while a write is in flight, and is KEYED on the write.
+	// reconcileRGState iterates its RG ids in map order, so a fixture whose
+	// hook fires on "the first write" is order-dependent: an unrelated RG's
+	// activation can consume it. Keying on (rgID, active) makes the cell
+	// deterministic regardless of iteration order.
+	during map[rgActiveWrite]func()
+	writes []rgActiveWrite
+}
+
+func (h *midApplyFenceHA) fireOn(w rgActiveWrite, fn func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.during == nil {
+		h.during = make(map[rgActiveWrite]func())
+	}
+	h.during[w] = fn
 }
 
 func (h *midApplyFenceHA) SetRGActive(_ context.Context, rgID int, active bool) error {
+	w := rgActiveWrite{rgID: rgID, active: active}
 	h.mu.Lock()
-	h.writes = append(h.writes, rgActiveWrite{rgID: rgID, active: active})
-	fire := h.duringOnce
-	h.duringOnce = nil
+	h.writes = append(h.writes, w)
+	fire := h.during[w]
+	delete(h.during, w)
 	h.mu.Unlock()
 	if fire != nil {
 		fire()
@@ -289,9 +305,9 @@ func TestReconcilePassDoesNotEraseAFenceThatLandedMidApply6799(t *testing.T) {
 	// The fence lands while the FIRST rg_active write is in flight: it writes
 	// rg_active=false out of band and re-arms the retry debt, exactly as
 	// fenceAllRedundancyGroups does (#6530).
-	rec.duringOnce = func() {
+	rec.fireOn(rgActiveWrite{rgID: 1, active: true}, func() {
 		d.getOrCreateRGState(1).InvalidateApplied()
-	}
+	})
 
 	d.reconcileRGState()
 
@@ -335,7 +351,7 @@ func TestReconcilePassStillConvergesWithoutAFence6799(t *testing.T) {
 	cm := cluster.NewManager(0, 1)
 	cm.UpdateConfig(store.ActiveConfig().Chassis.Cluster)
 
-	rec := &midApplyFenceHA{} // no duringOnce hook: nothing contests the apply
+	rec := &midApplyFenceHA{} // no in-flight hook: nothing contests the apply
 	d := &Daemon{
 		rgStates: make(map[int]*rgStateMachine),
 		cluster:  cm,
@@ -352,5 +368,85 @@ func TestReconcilePassStillConvergesWithoutAFence6799(t *testing.T) {
 		t.Error("an UNCONTESTED reconcile apply must record convergence; leaving the retry armed " +
 			"makes every 2s tick re-drive SetRGActive forever and holds the failover-readiness " +
 			"gate low (#6799)")
+	}
+}
+
+// TestReconcileDeactivationDoesNotEraseAFenceThatLandedMidApply6799 is the
+// DEACTIVATION half of the wiring, and it exists because the matrix proved the
+// activation cell could not see it: reverting the deactivation arm to a raw
+// MarkApplied left the entire suite GREEN.
+//
+// reconcileRGState forks on tr.Active — activation writes rg_active then removes
+// blackholes; deactivation injects blackholes then clears rg_active — and each
+// arm records its own result. A fixture whose RG is always wanted ACTIVE never
+// enters the second arm, so that arm's guard is mutation-invisible no matter how
+// thorough the first arm's coverage is.
+//
+// The RG here is one the cluster does NOT own (it is absent from the cluster
+// config, so IsLocalPrimary reports false), which makes the desired state false
+// deterministically — a peerless node promotes itself for every RG it IS
+// configured for, so a low priority does not produce a secondary. The RG is
+// still discovered by the pass because reconcileRGState collects IDs from
+// d.rgStates as well as from cluster and VRRP state. The retry is primed to
+// stand in for an earlier out-of-band write, so the arm actually runs: with
+// desired and applied both false from the zero value, tr.Changed and NeedsApply
+// are both false and nothing would be applied at all.
+//
+// FAIL-ON-REVERT: restoring `s.MarkApplied(false)` in the deactivation arm
+// erases the debt and NeedsApply goes false.
+func TestReconcileDeactivationDoesNotEraseAFenceThatLandedMidApply6799(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system dataplane-type userspace",
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster authentication-key test-cluster-psk-6799",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set interfaces reth1 redundant-ether-options redundancy-group 1",
+		"set interfaces reth1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth1",
+	})
+
+	cm := cluster.NewManager(0, 1)
+	cm.UpdateConfig(store.ActiveConfig().Chassis.Cluster)
+
+	// RG 7 is deliberately NOT in the cluster config.
+	const unownedRG = 7
+	if cm.IsLocalPrimary(unownedRG) {
+		t.Fatal("fixture: the cluster must not own RG7, or the reconcile takes the ACTIVATION arm " +
+			"and this cell silently duplicates the activation test")
+	}
+
+	rec := &midApplyFenceHA{}
+	d := &Daemon{
+		rgStates: make(map[int]*rgStateMachine),
+		cluster:  cm,
+		store:    store,
+		vrrpMgr:  vrrp.NewManager(),
+		// Only the DEACTIVATION arm reaches tryPrepareUserspaceRGDemotion, so
+		// this map is unnecessary for the activation cell and required here —
+		// itself a small demonstration that the two arms are different code.
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
+	}
+	d.setDataplane(&midApplyFenceDP{Manager: dataplane.New(), ha: rec})
+
+	// Prime the retry so the deactivation arm runs at all, and register RG7 so
+	// the pass discovers it.
+	d.getOrCreateRGState(unownedRG).InvalidateApplied()
+
+	// A second writer arms the debt again while SetRGActive(false) is in flight.
+	rec.fireOn(rgActiveWrite{rgID: unownedRG, active: false}, func() {
+		d.getOrCreateRGState(unownedRG).InvalidateApplied()
+	})
+
+	d.reconcileRGState()
+
+	if got := rec.countOf(rgActiveWrite{rgID: unownedRG, active: false}); got == 0 {
+		t.Fatalf("fixture: the reconcile pass never took the DEACTIVATION arm (writes=%v); the "+
+			"cell would be vacuous", rec.take())
+	}
+	if !d.getOrCreateRGState(unownedRG).NeedsApply() {
+		t.Fatal("the completing DEACTIVATION erased the retry debt a second writer armed while it " +
+			"was in flight. Both reconcile arms record their own result, so the activation cell " +
+			"cannot see this one (#6799)")
 	}
 }
