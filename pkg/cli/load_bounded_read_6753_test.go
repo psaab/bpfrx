@@ -1,9 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -33,8 +33,13 @@ func TestHandleLoadBoundsTheReadItself_6753(t *testing.T) {
 	if err == nil {
 		t.Fatal("handleLoad must refuse a file past MaxConfigSize at the READ, not after materialising it (#6753)")
 	}
-	if !strings.Contains(err.Error(), "limit") {
-		t.Fatalf("the refusal must come from the bounded read and name the limit, got %q", err)
+	// #7469: identify the refusal STRUCTURALLY. Substring-matching "limit"
+	// separated this from the store's post-materialisation "config too large"
+	// rejection only by accident of wording: rewording the STORE's message to
+	// contain "limit" would have made this assertion pass against the very
+	// code #6753 fixed, without touching any #6753 file.
+	if !errors.Is(err, configstore.ErrExceedsLimit) {
+		t.Fatalf("the refusal must come from the bounded read (errors.Is ErrExceedsLimit), got %q", err)
 	}
 }
 
@@ -52,8 +57,7 @@ func TestHandleLoadStillAcceptsANormalFile_6753(t *testing.T) {
 		t.Fatalf("configstore.New: %v", err)
 	}
 	c := New(st, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	if err := c.handleLoad([]string{"override", path}); err != nil &&
-		strings.Contains(err.Error(), "limit") {
+	if err := c.handleLoad([]string{"override", path}); errors.Is(err, configstore.ErrExceedsLimit) {
 		t.Fatalf("a normal config must not be refused by the size bound, got %q", err)
 	}
 }

@@ -575,7 +575,11 @@ func (c *ctl) handleLoad(args []string) error {
 		// #6753: bound the READ, not just the post-read length.
 		data, err := configstore.ReadBoundedConfigFile(source)
 		if err != nil {
-			return fmt.Errorf("load: %v", err)
+			// #7469: %w, not %v — %v flattens the chain, so errors.Is
+			// against configstore.ErrExceedsLimit fails on this surface while
+			// succeeding on the local CLI. The shared helper was unified; the
+			// error handling around it was not.
+			return fmt.Errorf("load: %w", err)
 		}
 		content = string(data)
 	}
