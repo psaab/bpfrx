@@ -104707,6 +104707,12 @@ prose edit above them added. No diff falls in the new test body.
   `onDHCPAddressChange`'s non-apply work (`nudgeSurfaceADDNSReconcile`,
   `applyMgmtVRFRoutes` netlink writes, `reconcileDNSFromDHCP`); the quiesce does
   not cover the feed / config-poll appliers.
+- **Matrix found an unbound guard**: deleting the PRE-acquire fence test left
+  the suite green — the post-acquire test covers safety on its own. It is not
+  redundant for LIVENESS though: `beginBackgroundApply` acquires with
+  `context.Background()`, so without it a late applier parks forever on a held
+  semaphore during teardown. Bound with a cell that holds the semaphore and
+  never releases it.
 - **Bug caught by my own test**: the first `Quiesce` took `recompileWG.Add(1)`
   at arm time, so a STOPPED timer never called `Done` and `Wait` deadlocked.
   Moved Add into the timer func under the same mutex as the latch re-test

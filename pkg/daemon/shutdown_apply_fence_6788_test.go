@@ -234,3 +234,51 @@ func TestRunShutdownSequenceQuiescesDHCPClient6788(t *testing.T) {
 			"route and DNS work outside the apply path that the apply fence does not cover (#6788)")
 	}
 }
+
+// TestFencedApplierDoesNotParkOnHeldSemaphore6788 binds the property the
+// PRE-acquire fence test uniquely provides. The post-acquire test alone is
+// enough for SAFETY — a fenced applier that gets the semaphore hands it back
+// without applying, which the cells above prove — so a matrix that only asks
+// "did an apply run" reports the pre-acquire check as redundant. It is not
+// redundant for LIVENESS.
+//
+// beginBackgroundApply acquires with context.Background(), which never cancels.
+// Without the pre-acquire test, a background applier that wakes while something
+// else holds applySem parks there indefinitely, on a daemon that is trying to
+// exit. Late callbacks are exactly the callers here — a DHCP lease-change
+// debounce firing during teardown — so the fast path is what keeps a shutting
+// down process from accumulating goroutines blocked on a lock they will never
+// be allowed to use.
+//
+// The semaphore is deliberately NEVER released in this test: the applier must
+// return anyway.
+//
+// FAIL-ON-REVERT: deleting the pre-acquire fence test makes this block until
+// the deadline and go RED.
+func TestFencedApplierDoesNotParkOnHeldSemaphore6788(t *testing.T) {
+	d, applies := fenceTestDaemon(t)
+
+	// Something else holds the apply lock and will not give it back.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	d.fenceBackgroundApplies()
+
+	done := make(chan struct{})
+	go func() {
+		d.applyConfig(&config.Config{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a fenced background applier PARKED on a held applySem instead of returning. " +
+			"beginBackgroundApply acquires with context.Background(), which never cancels, so " +
+			"without the pre-acquire fence test a late DHCP/feed callback blocks forever on a " +
+			"daemon that is trying to exit (#6788)")
+	}
+	if got := applies.Load(); got != 0 {
+		t.Errorf("no apply may run, got %d", got)
+	}
+}
