@@ -759,6 +759,107 @@ func validateSamplingInstanceConflictsStrict(cfg *Config) error {
 // config authored by a pre-guard version still BOOTS — #1960; the snapshot
 // clamp keeps the running dataplane safe). Mirrors
 // validateSamplingInstanceConflictsStrict.
+// validateFlowExportSecondsStrict hard-rejects a `services flow-monitoring`
+// template `seconds` knob whose value cannot be converted to a duration
+// (#6769).
+//
+// The compiler stores `template-refresh-rate`, `flow-active-timeout` and
+// `flow-inactive-timeout` with a bare `strconv.Atoi` and NO range check, and
+// the consumer computes `time.Duration(n) * time.Second`. For a large enough
+// n that multiply overflows int64 and WRAPS. The wrapped value can be small and
+// POSITIVE, which is the dangerous half: `templateRefreshInterval` only rejects
+// `<= 0`, so it is accepted and `time.NewTicker` fires on it.
+//
+// Because gcd(1e9, 2^64) = 512, the wrapped residues are multiples of 512 ns and
+// the smallest positive one is exactly 512 ns —
+// `template-refresh-rate seconds 20211507185753197` produces a 512 ns template
+// ticker, and 18446744074 produces 290 ms. The exporter then re-emits its
+// templates thousands of times a second at every collector.
+//
+// The ceiling is the existing MaxDurationSeconds (math.MaxInt64 / 1e9 =
+// 9223372036) — the honest runtime-derived bound this codebase already uses for
+// second-denominated leaves, NOT a new policy cap ("no schema-only caps", Codex
+// review on PR #1845).
+//
+// Three layers, one constant. `setSchema` types the leaves (#1979 Layer B), so
+// strict operator commit rejects before the compiler runs; this gate is the
+// compiler-side defense-in-depth for the paths SchemaValidate does not cover
+// (tolerant load / peer-sync / direct CompileConfig callers), exactly mirroring
+// validateSamplingInputRateStrict (#5244); and `secondsToDuration`
+// (pkg/flowexport) falls back at the consumer, so a running exporter is safe
+// regardless. This gate exists so an operator finds out at COMMIT rather than
+// discovering the knob was silently defaulted.
+//
+// Not an ambiguity — unlike the #6735 packed-tail shape, a seconds value has
+// exactly one reading and it is simply out of range, so rejecting names the
+// fault precisely rather than guessing between two intents.
+func validateFlowExportSecondsStrict(cfg *Config) error {
+	fm := cfg.Services.FlowMonitoring
+	if fm == nil {
+		return nil
+	}
+	type namedSeconds struct {
+		template string
+		leaf     string
+		value    int
+	}
+	var found []namedSeconds
+	collect := func(version string, name string, refresh, active, inactive int) {
+		for _, item := range []struct {
+			leaf  string
+			value int
+		}{
+			{"template-refresh-rate", refresh},
+			{"flow-active-timeout", active},
+			{"flow-inactive-timeout", inactive},
+		} {
+			if int64(item.value) > MaxDurationSeconds || item.value < 0 {
+				found = append(found, namedSeconds{
+					template: version + " template " + name,
+					leaf:     item.leaf,
+					value:    item.value,
+				})
+			}
+		}
+	}
+	if v9 := fm.Version9; v9 != nil {
+		names := make([]string, 0, len(v9.Templates))
+		for name := range v9.Templates {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if t := v9.Templates[name]; t != nil {
+				collect("version9", name, t.TemplateRefreshRate, t.FlowActiveTimeout, t.FlowInactiveTimeout)
+			}
+		}
+	}
+	if ipfix := fm.VersionIPFIX; ipfix != nil {
+		names := make([]string, 0, len(ipfix.Templates))
+		for name := range ipfix.Templates {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if t := ipfix.Templates[name]; t != nil {
+				collect("version-ipfix", name, t.TemplateRefreshRate, t.FlowActiveTimeout, t.FlowInactiveTimeout)
+			}
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	f := found[0]
+	return fmt.Errorf("services flow-monitoring %s: %s is %d seconds, outside the "+
+		"accepted range 0-%d (0 = use the default). Past that ceiling `time.Duration(n) "+
+		"* time.Second` overflows int64 and WRAPS, and the wrapped value can be small "+
+		"and positive — 20211507185753197 yields a 512ns template ticker, which floods "+
+		"every collector with template re-exports. The exporter falls back to the "+
+		"default for such a value, so the number you configured would be silently "+
+		"ignored either way",
+		f.template, f.leaf, f.value, MaxDurationSeconds)
+}
+
 func validateSamplingInputRateStrict(cfg *Config) error {
 	if cfg == nil || cfg.ForwardingOptions.Sampling == nil {
 		return nil

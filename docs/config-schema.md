@@ -10032,6 +10032,25 @@ the value sits in a single typed slot:
     ActiveTimeout/InactiveTimeout). The parallel `version-ipfix` pair is typed
     identically for UX parity even though it does NOT reach the wire
     (`buildFlowExportSnapshot` reads `fm.Version9` only).
+  - `services flow-monitoring version9 template <t> template-refresh-rate
+    seconds` (and the `version-ipfix` twin) — `ValidateInteger(0,
+    MaxDurationSeconds)` (**#6769**). This leaf was the one UNTYPED member of
+    the trio: its two siblings above already carried a validator, so a refresh
+    rate large enough to overflow `time.Duration(n) * time.Second` reached
+    `pkg/flowexport`, wrapped, and became a sub-second template ticker. Because
+    `gcd(1e9, 2^64) = 512` the wrapped residues are multiples of 512 ns and the
+    smallest positive one is exactly 512 ns — `seconds 20211507185753197`
+    produced a 512 ns ticker, re-exporting templates thousands of times a second
+    at every collector, and the consumer's only guard (`templateRefreshInterval`
+    rejecting `<= 0`) does not see a positive wrap. The ceiling is the
+    runtime-derived overflow point already used elsewhere in this file, NOT a
+    new policy cap ("no schema-only caps"). Two companion layers share the same
+    constant: `validateFlowExportSecondsStrict` (`pkg/config`,
+    compiler-side defense-in-depth for the tolerant load / peer-sync path and
+    direct `CompileConfig` callers, strict-reject / lenient-warn per #1960,
+    mirroring #5244) and `flowexport.secondsToDuration`, which falls back to the
+    default for an out-of-range value so a running exporter is safe even on a
+    config admitted leniently.
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
     `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)

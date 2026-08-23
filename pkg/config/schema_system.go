@@ -724,8 +724,18 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>",
 					valueType: ValueInteger, valueDesc: "Inactive flow export timeout in seconds (0..4294967295)",
 					valueExamples: []string{"15"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				// #6769: typed at MaxDurationSeconds. This leaf was the one
+				// untyped member of the trio — its two siblings above already
+				// carry ValidateInteger — so a `seconds` value large enough to
+				// overflow `time.Duration(n) * time.Second` reached
+				// pkg/flowexport, wrapped, and became a SUB-SECOND template
+				// ticker (20211507185753197 -> 512ns) that re-exports templates
+				// thousands of times a second at every collector. The ceiling is
+				// the runtime-derived overflow point, not a policy cap.
 				"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
-					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
+					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "Template refresh interval in seconds (0..9223372036; 0 = default 60)",
+						valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
 				}},
 			}},
 		}},
@@ -743,8 +753,18 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>",
 					valueType: ValueInteger, valueDesc: "Inactive flow export timeout in seconds (0..4294967295)",
 					valueExamples: []string{"15"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				// #6769: typed at MaxDurationSeconds. This leaf was the one
+				// untyped member of the trio — its two siblings above already
+				// carry ValidateInteger — so a `seconds` value large enough to
+				// overflow `time.Duration(n) * time.Second` reached
+				// pkg/flowexport, wrapped, and became a SUB-SECOND template
+				// ticker (20211507185753197 -> 512ns) that re-exports templates
+				// thousands of times a second at every collector. The ceiling is
+				// the runtime-derived overflow point, not a policy cap.
 				"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
-					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
+					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "Template refresh interval in seconds (0..9223372036; 0 = default 60)",
+						valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
 				}},
 				"ipv4-template": {desc: "IPv4 flow record template options", children: map[string]*schemaNode{
 					"export-extension": {desc: "Export extension (accepted; not applied to IPFIX records)", args: 1, placeholder: "<extension>", children: nil},
