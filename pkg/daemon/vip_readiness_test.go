@@ -10,12 +10,40 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
+
+// takeoverReadyDP is a minimal userspace dataplane stand-in that reports
+// takeover-ready.
+//
+// #6782 moved the two TakeoverReadinessForRG fixtures' RETH from
+// redundancy-group 0 to 1, because a reth in RG0 no longer commits (RG0 is the
+// chassis-cluster control-plane group — see cluster.Manager.DataGroupIDs — so a
+// reth assigned to it reads as NON-redundant downstream and its address lands on
+// both nodes). That renumbering matters to the fixture: userspaceRGConfigured
+// exempts `rgID <= 0`, so the old RG0 fixtures never reached the userspace
+// takeover gate at all, while a real DATA redundancy group does. Publishing a
+// ready backend here keeps each test isolating the property it actually names —
+// that takeover readiness does not consult cluster sync readiness — rather than
+// reporting not-ready for an unrelated absent backend.
+type takeoverReadyDP struct{ *dataplane.Manager }
+
+func newTakeoverReadyDP() *takeoverReadyDP {
+	return &takeoverReadyDP{Manager: dataplane.New()}
+}
+
+// Mode reports a forwarding-capable userspace mode so the blackhole-route
+// helpers take their early return and the test never touches netlink.
+func (r *takeoverReadyDP) Mode() dpuserspace.DataplaneMode {
+	return dpuserspace.ModeUserspaceCompat
+}
+
+func (r *takeoverReadyDP) TakeoverReady() (bool, []string) { return true, nil }
 
 // testLink implements netlink.Link for testing.
 type testLink struct {
@@ -356,8 +384,14 @@ func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster node 0",
 		"set chassis cluster no-reth-vrrp",
-		"set chassis cluster redundancy-group 0 node 0 priority 200",
-		"set interfaces reth0 redundant-ether-options redundancy-group 0",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		// #6782: the RETH sits in redundancy-group 1, not 0. RG0 is reserved for
+		// control-plane ownership (see cluster.Manager.DataGroupIDs), so a RETH in
+		// group 0 reads as NON-redundant everywhere downstream and its address is
+		// configured on both nodes — that now hard-rejects at commit. The group
+		// NUMBER is incidental to what this test pins (takeover readiness does not
+		// consult cluster sync readiness); do not renumber it back to 0.
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set interfaces reth0 unit 0 family inet address 10.0.1.1/24",
 		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
 	})
@@ -379,15 +413,16 @@ func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 	if d.cluster.IsSyncReady() {
 		t.Fatal("sync should start not ready for this regression test")
 	}
+	d.setDataplane(newTakeoverReadyDP())
 
 	d.reconcileRGState()
 
-	state := d.cluster.GroupState(0)
+	state := d.cluster.GroupState(1)
 	if state == nil {
-		t.Fatal("expected RG 0 state")
+		t.Fatal("expected RG 1 state")
 	}
 	if !state.Ready {
-		t.Fatalf("expected RG 0 ready, got reasons: %v", state.ReadinessReasons)
+		t.Fatalf("expected RG 1 ready, got reasons: %v", state.ReadinessReasons)
 	}
 	for _, reason := range state.ReadinessReasons {
 		if strings.Contains(reason, "session sync not ready") {
@@ -414,8 +449,14 @@ func TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102(t 
 		"set chassis cluster authentication-key test-cluster-psk-7102",
 		"set chassis cluster node 0",
 		"set chassis cluster private-rg-election",
-		"set chassis cluster redundancy-group 0 node 0 priority 200",
-		"set interfaces reth0 redundant-ether-options redundancy-group 0",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		// #6782: the RETH sits in redundancy-group 1, not 0. RG0 is reserved for
+		// control-plane ownership (see cluster.Manager.DataGroupIDs), so a RETH in
+		// group 0 reads as NON-redundant everywhere downstream and its address is
+		// configured on both nodes — that now hard-rejects at commit. The group
+		// NUMBER is incidental to what this test pins (takeover readiness does not
+		// consult cluster sync readiness); do not renumber it back to 0.
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
 		"set interfaces reth0 unit 0 family inet address 10.0.1.1/24",
 		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
 	})
@@ -446,15 +487,16 @@ func TestTakeoverReadinessForRG_PrivateRGElectionIgnoresClusterSyncReady_7102(t 
 	if d.cluster.IsSyncReady() {
 		t.Fatal("sync must start NOT ready for this test to mean anything")
 	}
+	d.setDataplane(newTakeoverReadyDP())
 
 	d.reconcileRGState()
 
-	state := d.cluster.GroupState(0)
+	state := d.cluster.GroupState(1)
 	if state == nil {
-		t.Fatal("expected RG 0 state")
+		t.Fatal("expected RG 1 state")
 	}
 	if !state.Ready {
-		t.Fatalf("RG 0 not ready with session sync not ready: %v — promotion in "+
+		t.Fatalf("RG 1 not ready with session sync not ready: %v — promotion in "+
 			"private-rg-election mode is NOT sync-gated at HEAD (the gate was deleted "+
 			"in 0781f7a60). If this now reds because #110 restored the gate, update "+
 			"cluster.SetSyncReady's doc comment, the Manager.syncReady field comment "+

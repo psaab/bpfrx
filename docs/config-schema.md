@@ -236,6 +236,89 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
+### RETH `redundancy-group` token fail-open (#6782)
+
+`interfaces <name> redundant-ether-options redundancy-group <id>` is an
+UNTYPED schema leaf (`schema_interfaces.go`: `args: 1`, no `valueType`, no
+`validator`), so `SchemaValidate` never inspects the token. `compileInterfaces`
+then reads it as
+
+```go
+if v, err := strconv.Atoi(nodeVal(rgNode)); err == nil {
+    ifc.RedundancyGroup = v
+}
+```
+
+— the parse error is DISCARDED, so a non-numeric / fractional / int64-overflow
+token leaves the group at its `0` default, and a NEGATIVE token parses
+successfully and is stored verbatim.
+
+The consequence is not cosmetic. Every downstream consumer decides "is this a
+RETH?" with `redundancy-group > 0`: `pkg/dataplane/compiler_iface.go` sets
+`isReth` and `isVRRPReth` that way. With a non-positive group the interface is
+treated as ORDINARY — the `169.254.<group>.<node+1>/32` link-local substitution
+does not fire, and the reth's real service address is written onto the physical
+device with `KeepAddresses:false`. **Both nodes run the same synced
+configuration, so BOTH configure that address** — a duplicate-address /
+split-brain condition on the data path, from a config that commits silently.
+
+`validateRethRedundancyGroupTokensAST` (`compiler_reth_rg_token.go`, an AST
+pre-walk gate in `runPreWalkGates`) closes it: strict-reject at commit /
+commit-check, warn on the tolerant load / peer-sync path
+(`lenientRethRedundancyGroup`). It runs on the raw AST for the same reason
+`validateChassisClusterIdentitiesAST` (#5694) does — once the typed
+`InterfaceConfig` exists, a malformed token has already collapsed to `0` and is
+indistinguishable from a reth with no `redundant-ether-options` stanza at all.
+
+Accepted range is `1..255`:
+
+- The floor is 1 because **group 0 is the chassis-cluster CONTROL-PLANE group**,
+  not a data-plane one — `cluster.Manager.DataGroupIDs` already documents and
+  enforces exactly that ("RG0 is reserved for control-plane ownership and is
+  omitted"). A reth in group 0 is a contradiction by the codebase's own
+  definition.
+- The ceiling is 255 because the group id is the THIRD OCTET of the derived
+  link-local address, and it is also the ceiling
+  `MaxHeartbeatRedundancyGroupID` already places on the group declarations, so
+  no id above it can name a declared group.
+
+This is a DIFFERENT, looser bound than `MaxRethRedundancyGroupID` (155), which
+exists for the RFC 5798 VRID range and is enforced by
+`validateRethVRRPGroupIDStrict` ONLY when a reth-derived VRRP instance is
+actually synthesized — that gate returns early under `no-reth-vrrp` /
+`private-rg-election`, and **private-rg-election is the compiler DEFAULT**
+(`compiler_system.go`), so on a default cluster config it never runs. The
+link-local substitution is not mode-gated, so the octet ceiling has to be
+enforced independently. The two compose: in a VRRP mode the stricter 155
+applies, otherwise this 255 does.
+
+**The tolerant path suppresses, it does not merely warn.** Warning and then
+installing the address anyway would make the lenient path the bug, so
+`suppressInvalidRethAddresses` (`compiler_interfaces.go`) additionally strips
+the affected reth's unit addresses — and those of any interface inheriting from
+it via `RedundantParent`, which would otherwise reintroduce exactly what was
+removed. The node still BOOTS as #1960 requires; it simply offers no service on
+that interface until the group is repaired. The group id is deliberately left
+as written: it is what the operator has to fix, and rewriting it here would
+erase the evidence and let a later strict commit-check pass on a config that is
+still wrong.
+
+**Deliberately out of scope**, each measured rather than assumed:
+
+- A reth with NO `redundant-ether-options` stanza is an ABSENT token, not an
+  invalid one. Several in-tree configs legitimately touch a reth without
+  redeclaring its group as a partial/overlay fragment
+  (`test/incus/sqm-cookbook-config.set` sets an ADDRESS that way), so requiring
+  presence would reject them. Separate policy question.
+- A positive id naming no DECLARED `chassis cluster redundancy-group` does not
+  trigger this fail-open at all — it still reads as RG-scoped and still takes
+  the link-local substitution — so rejecting it would be a new restriction
+  rather than a fix.
+
+Pinned by `compiler_reth_rg_token_6782_test.go`, which tests the range from both
+sides (1 and 255 must commit; 0 and 256 must not) and asserts the tolerant-path
+suppression together with its positive control.
+
 ### firewall-filter term rule-expansion count overflow (#5456)
 
 This is a `uint32`-overflow fix plus an **advisory warning** — NOT a strict
