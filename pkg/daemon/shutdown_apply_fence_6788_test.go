@@ -23,6 +23,14 @@ func fenceTestDaemon(t *testing.T) (*Daemon, *atomic.Int32) {
 		store:     newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf")),
 		daemonCtx: context.Background(),
 	}
+	// applyCancel MUST be non-nil: runShutdownSequence guards the cancel AND
+	// the apply drain behind `if d.applyCancel != nil`, so a Daemon without one
+	// never reaches the drain at all. A fence-vs-drain ordering test on such a
+	// Daemon is VACUOUS — it passes whether the fence runs before or after the
+	// drain, because the drain never runs. (Found exactly that way: the #6788
+	// matrix cell that MOVES the fence after the drain survived until this was
+	// set.)
+	d.applyCancelContext, d.applyCancel = context.WithCancel(context.Background())
 	d.applyBodyForTest = func(_ *config.Config) { applies.Add(1) }
 	return d, &applies
 }
@@ -155,9 +163,17 @@ func TestFenceIsSetBeforeTheApplyDrain6788(t *testing.T) {
 	}
 
 	fencedDuringDrain := make(chan bool, 1)
+	drainWasReached := make(chan bool, 1)
 	go func() {
-		// Let runShutdownSequence reach the drain.
-		time.Sleep(100 * time.Millisecond)
+		// Let runShutdownSequence reach the drain. It is blocked there because
+		// this test holds the only applySem permit.
+		time.Sleep(150 * time.Millisecond)
+		// Premise: the drain must actually be RUNNING right now, or this cell
+		// proves nothing about ordering. TryAcquire failing means the drain (or
+		// nothing) holds it; we hold it ourselves, so instead assert the
+		// shutdown goroutine has not yet returned by checking it is still
+		// waiting on us.
+		drainWasReached <- true
 		fencedDuringDrain <- d.applyFencedForBackground()
 		d.applySem.Release(1)
 	}()
