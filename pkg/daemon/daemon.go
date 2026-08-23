@@ -960,6 +960,14 @@ type Daemon struct {
 	lastRAReconcileHash string
 	raApplyFn           func([]*config.RAInterfaceConfig) error
 
+	// raHasDeadSendersFn overrides the dead-sender probe (#6793). Nil means use
+	// d.ra.HasDeadSenders. It exists because the reassert loop's contract —
+	// "re-drive the apply if and only if a sender is DEAD" — cannot be
+	// exercised against a real ra.Manager without an interface whose ndp.Listen
+	// genuinely fails, and a fixture that manufactured that would be asserting
+	// the bind failure rather than the retry ownership.
+	raHasDeadSendersFn func() bool
+
 	// startupActiveAnnounce tracks whether the one-shot active-side
 	// neighbor refresh has been sent for each RG on this daemon run.
 	// This covers restart/redeploy of an already-active direct-mode RG,

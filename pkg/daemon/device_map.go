@@ -254,6 +254,15 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 				"(topology changed). Refusing to bind to avoid hijacking the wrong NIC; re-pin "+
 				"the device-map.",
 				"logical", b.Entry.LogicalName, "pci", b.Entry.PCIAddr, "mac", b.Entry.MAC)
+		case b.Status == devicemap.BindRefusedIdentityUnknown:
+			// #6786: distinct from the topology-change refusal above — the card
+			// may be entirely correct; its identity just could not be read, so
+			// the pinned MAC could not be verified against it.
+			slog.Error("device-map: entry REFUSED — the NIC at this identity could not be read, so "+
+				"its permanent MAC is UNKNOWN and the pinned MAC cannot be verified. Refusing to "+
+				"bind an unverified NIC into a pinned logical name; retry once the interface is "+
+				"readable.",
+				"logical", b.Entry.LogicalName, "pci", b.Entry.PCIAddr, "mac", b.Entry.MAC)
 		case b.Status == devicemap.BindRefusedDupName:
 			// #6546: more than one entry claims this logical name. Binding
 			// either one would rename a nondeterministically-chosen NIC to it
@@ -489,6 +498,19 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 			return fmt.Sprintf("device-map entry %q refuses to bind: more than one entry claims "+
 				"this logical name, so binding either would rename an arbitrary NIC to it. "+
 				"Remove the duplicate entry before committing.", b.Entry.LogicalName)
+		}
+		// #6786: an UNREADABLE identity is not a topology change. Nothing is
+		// known to be wrong with the card — the permanent MAC simply could not
+		// be read, so the pinned MAC could not be verified. Telling this
+		// operator to "re-pin the entry" sends them to a fix that changes
+		// nothing (the same wrong-remedy trap #6546 named), and would have them
+		// re-pin against a MAC they cannot currently read.
+		if b.Status == devicemap.BindRefusedIdentityUnknown {
+			return fmt.Sprintf("device-map entry %q refuses to bind: the NIC at its pinned identity "+
+				"could not be read, so its permanent MAC is UNKNOWN and the pinned MAC cannot be "+
+				"verified. Binding it would rename a NIC whose identity was never checked. Retry "+
+				"once the interface is readable; do NOT re-pin against an unreadable MAC.",
+				b.Entry.LogicalName)
 		}
 		if b.Status.Refused() {
 			return fmt.Sprintf("device-map entry %q refuses to bind: a different card is present "+

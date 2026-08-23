@@ -104622,6 +104622,86 @@ prose edit above them added. No diff falls in the new test body.
   pkg/dhcpserver/shutdown_latch_6787_test.go,
   pkg/daemon/daemon_run_shutdown.go,
   pkg/daemon/shutdown_dhcp_stop_6787_test.go, pkg/dhcpserver/README.md, _Log.md
+## 2026-08-22 — #6786 fail closed when a NIC identity read fails
+
+## 2026-08-22 — #6782 invalid RETH redundancy-group committed as a both-node address
+
+- **Timestamp**: 2026-08-22
+- **Action**: `redundant-ether-options redundancy-group` is an untyped schema
+  leaf and `compileInterfaces` reads it with Atoi-then-discard-the-error, so a
+  non-numeric token collapsed to 0 and a negative one was stored verbatim.
+  Downstream every consumer asks `redundancy-group > 0` (`isReth` /
+  `isVRRPReth` in `pkg/dataplane/compiler_iface.go`), so the interface read as
+  ORDINARY: the `169.254.RG.NODE/32` substitution did not fire and the reth's
+  service address was written to the physical device on BOTH nodes. Measured
+  every value class first — 0, negative, non-numeric, fractional, int64
+  overflow, above-cap and undeclared-but-positive ALL committed clean on both
+  the strict and tolerant paths. Added `validateRethRedundancyGroupTokensAST`,
+  an AST pre-walk gate (strict reject / lenient warn via
+  `lenientRethRedundancyGroup`) accepting 1..255 — floor 1 because RG0 is the
+  control-plane group by `cluster.Manager.DataGroupIDs`' own definition,
+  ceiling 255 because the id is the third octet of the derived link-local. The
+  1..155 VRID bound stays owned by `validateRethVRRPGroupIDStrict`, which
+  correctly returns early under the default `private-rg-election`. The tolerant
+  path additionally SUPPRESSES the reth's addresses (and its members'), because
+  warning and then installing on both nodes anyway would make the lenient path
+  the bug. Deliberately not extended to a missing stanza (measured: in-tree
+  overlay fragments rely on it) or to an undeclared positive id (does not
+  trigger the fail-open).
+- **File(s)**: `pkg/config/compiler_reth_rg_token.go`,
+  `pkg/config/compiler_interfaces.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_prewalk.go`,
+  `pkg/config/compiler_reth_rg_token_6782_test.go`,
+  `pkg/daemon/vip_readiness_test.go`, `docs/config-schema.md`
+
+- **Timestamp**: 2026-08-22
+- **Action**: `EnumeratePresentNICs` read each NIC's identity under
+  `if link, err := netlink.LinkByName(name); err == nil` with the error
+  DISCARDED, so a failed read left `PermMAC == ""` — the same value MAC-less
+  hardware produces. `Resolve`'s card-swap refusal is conditioned on
+  `PermMAC != ""`, so a failed read silently DISABLED it and bound the entry as
+  `BindBoundPCIOnly`. Added `PresentNIC.IdentityUnread`, a new
+  `BindRefusedIdentityUnknown` status (with its own operator remedy), and a
+  narrow refusal that fires only for entries pinning a `mac`.
+- **Scoping (the outage the naive fix would cause)**: the refusal does NOT
+  apply to PCI-only entries — their identity came from sysfs and was read
+  successfully. Widening it would let one transient netlink failure refuse every
+  mapped interface including management. Verified the fail-closed direction is
+  safe here: at commit the operator is still connected and nothing is mutated;
+  at boot the #5490 re-check retains the CURRENT interface naming.
+- **False green caught in my own test**: the first commit-preflight assertion
+  checked for the word "identity" and passed while the generic card-swap message
+  ("at its pinned identity") was returned — the wording it was meant to exclude.
+  Fixed by asserting the correct wording is PRESENT and the card-swap remedy
+  ABSENT, and by giving the new status its own message.
+- **File(s)**: `pkg/devicemap/devicemap.go`, `pkg/daemon/device_map.go`,
+  `pkg/grpcapi/server_show_device_map.go`, `pkg/cli/cli_show_cluster.go`,
+  `pkg/devicemap/identity_unread_6786_test.go`,
+  `pkg/daemon/device_map_identity_unread_6786_test.go`,
+  `docs/bare-metal-device-map.md`, `_Log.md`
+
+## 2026-08-22 — #6793 dead RA sender had no retry owner
+
+- **Timestamp**: 2026-08-22
+- **Action**: A sender's conn open is asynchronous, so a bind failure leaves the
+  sender dead with `startLocked` having reported success. `Apply`'s #2865 branch
+  rebuilds a dead sender, but standalone applies RA only from a config apply
+  (`reconcileRGStateLoop` is cluster-only) and the cluster reconcile is
+  digest-gated — a dead sender moves no digest. Added
+  `ra.Manager.HasDeadSenders()`/`DeadSenderInterfaces()`, a digest bypass in
+  `reconcileClusterRAServices`, and an always-on `raDeadSenderReassertLoop`
+  mirroring `proxyARPReassertLoop` (applySem before the config read, #4001).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/dead_sender_probe_6793_test.go,
+  pkg/daemon/daemon_ra_reconcile.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/ra_dead_sender_retry_6793_test.go, pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-08-22
+- **Action**: #6793 round 2 — two mutation cells came back GREEN. Removing the
+  INNER dead-sender re-check (the one after applySem) was invisible because the
+  outer check still short-circuited the healthy fixture; and nothing bound the
+  loop's START in Run, so a daemon that never launched the retry owner passed
+  every cell. Added the queue-behind-a-commit interleave, a loop-body cell with
+  a shortened interval, and a comment-stripped source check on the start site.
+- **File(s)**: pkg/daemon/ra_dead_sender_retry_6793_test.go, _Log.md
 
 ## 2026-08-22 — #6781 one predicate for RETH redundancy-group ownership
 
