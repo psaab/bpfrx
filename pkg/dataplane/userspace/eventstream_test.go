@@ -1240,6 +1240,41 @@ func TestEventStreamDataplaneEventRawCallbackPreferred(t *testing.T) {
 	}
 }
 
+// waitFrameApplied blocks until the dispatcher has FINISHED frame seq.
+//
+// #7563: the dispatcher invokes the raw/decoded callback BEFORE it accounts
+// the frame — both in dispatchOrQueueDataplaneFrame and in the pending-flush
+// path — and advances lastAppliedSeq after both. A test that observes the
+// callback and then reads a counter is therefore racing the accounting: the
+// callback has fired by construction, the Add(1) has not. On an idle box the
+// dispatcher goroutine wins that race every time and the read looks
+// deterministic; under a loaded `go test ./...` it does not. That is exactly
+// why TestEventStreamSessionCloseRTFlowRoutesToRawCallback failed only under
+// full-tree parallel load and passed on re-run of the same tree.
+//
+// lastAppliedSeq is this package's existing completion signal for that
+// question — eventstream_fullresync_prevseq_5362_test.go already waits on it
+// the same way — and it is advanced by the SAME goroutine after the
+// accounting, so a counter read taken once it covers the frame happens-after
+// the Add(1).
+//
+// This is a wait on a real observable, not a retry: a frame that never
+// applies still fails, naming the watermark it never reached.
+func waitFrameApplied(t *testing.T, es *EventStream, seq uint64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if es.lastAppliedSeq.Load() >= seq {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("frame seq=%d never reached the applied watermark (last_applied=%d): "+
+				"the dispatcher never finished the frame", seq, es.lastAppliedSeq.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestEventStreamSessionCloseRTFlowRoutesToRawCallback proves the #2460
 // EventFrameTypeSessionClose (type 14) frame is accepted by the event-stream
 // frame dispatcher and routed to the raw dataplane-event callback (the path
@@ -1333,6 +1368,9 @@ func TestEventStreamSessionCloseRTFlowRoutesToRawCallback(t *testing.T) {
 		t.Fatal("session-close RT_FLOW frame did not reach the raw callback")
 	}
 
+	// The raw callback above fires BEFORE the frame is accounted, so read the
+	// counter only once the dispatcher has finished the frame (#7563).
+	waitFrameApplied(t, es, 11)
 	if got := es.SessionCloseEvents.Load(); got != 1 {
 		t.Fatalf("SessionCloseEvents = %d, want 1", got)
 	}
@@ -1561,6 +1599,17 @@ func TestEventStreamRawDataplaneEventsFeedSyslogFanout(t *testing.T) {
 			t.Fatalf("timed out waiting for raw callback %d", i+1)
 		}
 	}
+	// Same #7563 race as the session-close test: draining the raw-callback
+	// channel proves every callback fired, NOT that every frame was accounted.
+	// The last frame's Add(1) trails its callback, so wait for the watermark
+	// to cover the highest seq written above before reading the counters.
+	var maxSeq uint64
+	for _, frame := range frames {
+		if frame.seq > maxSeq {
+			maxSeq = frame.seq
+		}
+	}
+	waitFrameApplied(t, es, maxSeq)
 	if got := es.PolicyDenyEvents.Load(); got != 1 {
 		t.Fatalf("PolicyDenyEvents = %d, want 1", got)
 	}

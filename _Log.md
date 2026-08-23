@@ -104280,6 +104280,61 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/compiler_services.go,
   pkg/config/event_trigger_duplicate_6771_test.go
 
+## 2026-08-22 — #7563 load-sensitive test assertions
+
+- **Timestamp**: 2026-08-22
+- **Action**: Removed the scheduler-observing assertions from three tests that
+  failed only under full-tree parallel `go test ./...` and passed on re-run of
+  the same tree. Each was reproduced DETERMINISTICALLY first by injecting the
+  scheduling perturbation a loaded box supplies for free, then fixed, then
+  re-run under the same perturbation. A fourth instance
+  (`TestEventStreamRawDataplaneEventsFeedSyslogFanout`) was found by census and
+  is not in the issue.
+- **File(s)**: `pkg/ddns/fake_dns_portpair_6709_test.go`,
+  `pkg/ddns/README.md`, `pkg/daemon/dhcp_apply_converger_6535_test.go`,
+  `pkg/dataplane/userspace/eventstream_test.go`,
+  `docs/engineering-style.md`
+
+## 2026-08-22 — #6772/#6773 bound two typed leaves at their runtime domains
+- **Timestamp**: 2026-08-22
+- **Action**: #6773 DDNS ttl was min-only while reaching a uint32 DNS RR header
+  (2^32 wraps to 0, "do not cache"); bounded at MaxDNSTTLSeconds. #6772
+  heartbeat-threshold is MULTIPLIED by heartbeat-interval into a time.Duration
+  and neither field alone can be capped usefully, so the PRODUCT (doubled, as
+  failover.go computes it) is validated at strict commit.
+- **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
+  pkg/config/compiler_validate_strict_chassis.go,
+  pkg/config/numeric_bounds_6772_6773_test.go
+
+- **Timestamp**: 2026-08-23 00:45 UTC
+  - **Action**: #7469 — replace the #6753 bounded-read string discriminator with
+    an exported ErrExceedsLimit sentinel wrapped via %w, so the refusal is
+    identified structurally. Fixed cmd/cli's `%v` wrap, which flattened the
+    chain and would have made errors.Is succeed on the local CLI and silently
+    fail on the remote one. Added the cmd/cli wiring tests that #6753 omitted.
+    Documented that the IsRegular check must precede the read, because
+    O_NONBLOCK turns a pipe read into a 0-byte read with err == nil.
+  - **File(s)**: pkg/configstore/bounded_read.go,
+    pkg/configstore/bounded_read_6753_test.go,
+    pkg/cli/load_bounded_read_6753_test.go, cmd/cli/main.go,
+    cmd/cli/load_bounded_read_7469_test.go (new), pkg/configstore/README.md
+
+- **Timestamp**: 2026-08-22
+  **Action**: #6769 — bound the `services flow-monitoring` template `seconds`
+  knobs at `MaxDurationSeconds`. `template-refresh-rate seconds` was the one
+  untyped member of the trio, so a value large enough to overflow
+  `time.Duration(n) * time.Second` reached pkg/flowexport, wrapped, and became a
+  512 ns template ticker (gcd(1e9, 2^64) = 512). Three layers, one constant:
+  typed setSchema leaf, compiler-side `validateFlowExportSecondsStrict`
+  (strict-reject / lenient-warn, #1960), and `flowexport.secondsToDuration`
+  falling back at the consumer.
+  **File(s)**: pkg/config/schema_system.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates_sampling_appset.go,
+  pkg/config/compiler_opts.go, pkg/flowexport/manager.go,
+  pkg/config/flow_export_seconds_overflow_6769_test.go,
+  pkg/flowexport/template_seconds_overflow_6769_test.go, docs/config-schema.md
+
 - **Timestamp**: 2026-08-22
   **Action**: #6768 — turn the #5180 duplicate-named-block gate into a registry
   and add six containers derived from the predicate "a container authorable

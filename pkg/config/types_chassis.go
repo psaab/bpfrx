@@ -100,10 +100,13 @@ type ClusterConfig struct {
 	// cluster stanza but no explicit `node` leaf must NOT be treated as
 	// "node 0" when reconciling against the /etc/xpf/node-id file, or an
 	// absent leaf on a node-1 box would false-reject as a mismatch.
-	NodeIDSet           bool
-	RethCount           int
-	HeartbeatInterval   int    // milliseconds, 0=default(1000)
-	HeartbeatThreshold  int    // missed heartbeats before lost, 0=default(3)
+	NodeIDSet bool
+	RethCount int
+	// #6772: both defaults corrected. The runtime substitutes
+	// cluster.DefaultHeartbeatInterval (100ms) and
+	// cluster.DefaultHeartbeatThreshold (5); these comments said 1000 and 3.
+	HeartbeatInterval   int    // milliseconds, 0 = runtime default (100)
+	HeartbeatThreshold  int    // missed heartbeats before lost, 0 = runtime default (5)
 	ControlInterface    string // interface for heartbeat traffic (e.g. "hb0")
 	PeerAddress         string // peer node's control link IP (e.g. "10.99.0.2")
 	FabricInterface     string // interface for session/config sync (e.g. "fab0")
