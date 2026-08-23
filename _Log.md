@@ -104505,3 +104505,32 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_uniformgates_cluster_zone.go`,
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
+
+## 2026-08-22 — #6784 adopt the pinned ingress-classifier rows on a fresh manager
+
+- **Timestamp**: 2026-08-22
+- **Action**: `syncIngressIfaceMapLocked` reaped stale `userspace_ingress_ifaces`
+  rows by scanning `m.lastIngressIfaces`, an in-process inventory that is nil on
+  a freshly constructed Manager. The map is `PinByName`-pinned, so its rows
+  outlive xpfd and the first sync after a daemon restart deleted nothing. Added
+  `adoptIngressInventoryLocked`: enumerate the pinned map ONCE per Manager,
+  union into the inventory (never dropping a #6537 retry debt), record only on a
+  successful enumeration, and treat an enumeration failure as fatal so the
+  caller drives `userspace_ctrl` to `Enabled=0`. Adoption takes only rows the
+  shim ACTS on (value != 0): a 0-valued row reads exactly like an absent one to
+  the shim, and keying on that keeps adoption correct on a dense map instead of
+  assuming a HashMap — the #6537 delete-failure fixture deliberately uses an
+  Array, and an unfiltered enumeration adopted all 16 dense slots and broke it.
+- **Measured, refining the issue**: only ONE of the classifier syncs had this
+  hole. `syncLocalAddressMapsLocked` and `syncInterfaceNATAddressMapsLocked`
+  already prune by iterating the MAP, and `userspace_heartbeat` already sweeps
+  its Array's own capacity (#6702) — so no sweep-and-recreate was needed and no
+  empty-classifier window was opened. `userspace_bindings` shares the nil-
+  inventory shape (`clearAllBindingRowsLocked` at bootstrap) but its stale rows
+  are unreachable once the ingress gate is repaired, and its Array is 1,048,576
+  rows so a blanket sweep is not viable; corrected the `heartbeatZeroSlotBound`
+  comment that leaned on the bindings clear being effective on a fresh manager.
+- **File(s)**: `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/maps_sync_ingress_adopt_6784_test.go`,
+  `docs/afxdp-packet-processing.md`, `_Log.md`
