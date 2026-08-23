@@ -86,6 +86,9 @@ mod frame;
 #[path = "gre.rs"]
 mod gre;
 mod ha;
+// #6785: the control handler needs the synced-import outcome type and its
+// refusal-token prefix.
+pub use ha::{SyncedImportOutcome, SYNCED_IMPORT_REFUSED_PREFIX};
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;

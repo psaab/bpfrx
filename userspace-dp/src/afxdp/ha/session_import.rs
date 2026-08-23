@@ -1,5 +1,57 @@
 use crate::afxdp::*;
 
+/// The outcome of an HA synced-session import (#6785).
+///
+/// `upsert_synced_session` used to return `()`. It has three SEMANTIC refusal
+/// paths — a stale generation (#2170), the aggregate import cap (#5674), and a
+/// translated-tuple reservation refusal (#6600) — and each one `return`ed
+/// silently after bumping a counter. The control handler therefore answered
+/// `ok = true`, so Go's `SetClusterSyncedSessionV4`/`V6` reported success and
+/// LEFT its BPF mirror row in place for a session the helper had refused. That
+/// is exactly the split truth #5305's transactional install exists to prevent —
+/// its rollback machinery was already built and simply never reached, because
+/// the only failure it could observe was an IPC error.
+///
+/// Reporting the refusal is therefore the whole fix on the helper side: the Go
+/// compensation already exists.
+///
+/// The distinction between `Rejected*` and an IPC/transport failure matters on
+/// the Go side and must not be collapsed. A transport failure means the session
+/// socket is unhealthy and gates takeover-readiness (#5247); a semantic refusal
+/// is an EXPECTED answer from a healthy helper (the peer sent something stale,
+/// or this node is at its own ceiling) and marking the mirror unhealthy for it
+/// would block failover on a node that is working correctly. Go discriminates on
+/// the `SYNCED_IMPORT_REFUSED_PREFIX` token below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncedImportOutcome {
+    /// The entry was published (new key, or a replace of an existing one).
+    Applied,
+    /// #2170: a strictly-older generation than the stored entry.
+    RejectedStaleGeneration,
+    /// #5674: the aggregate synced-import entry ceiling is full.
+    RejectedCapacity,
+    /// #6600: the translated NAT tuple could not be reserved for this import.
+    RejectedReserve,
+}
+
+/// The machine-readable prefix every semantic refusal carries in the control
+/// response's `error` field. Go matches on THIS, not on the human-readable
+/// remainder, so the sentence can be reworded without silently reclassifying a
+/// refusal as a transport failure.
+pub const SYNCED_IMPORT_REFUSED_PREFIX: &str = "synced-import-refused:";
+
+impl SyncedImportOutcome {
+    /// The stable reason token, or `None` when the import applied.
+    pub fn refusal_reason(self) -> Option<&'static str> {
+        match self {
+            SyncedImportOutcome::Applied => None,
+            SyncedImportOutcome::RejectedStaleGeneration => Some("stale-generation"),
+            SyncedImportOutcome::RejectedCapacity => Some("capacity"),
+            SyncedImportOutcome::RejectedReserve => Some("reserve"),
+        }
+    }
+}
+
 impl crate::afxdp::Coordinator {
     /// #5674: this appliance's aggregate synced-session ENTRY ceiling. The
     /// LOGICAL ceiling is `worker_count * DEFAULT_MAX_SESSIONS` (each worker
@@ -57,6 +109,7 @@ impl crate::afxdp::Coordinator {
     /// per-prefix allocator), so a session can be admissible to one and not the
     /// other. Leaving a half-taken reservation behind would be a leak no worker
     /// ever releases, because no session gets published to reap.
+
     fn reserve_synced_translation(&self, entry: &SyncedSessionEntry) -> bool {
         let now_ns = monotonic_nanos();
         let zones = crate::afxdp::session_glue::synced_source_nat_zone_pair(
@@ -92,7 +145,7 @@ impl crate::afxdp::Coordinator {
         true
     }
 
-    pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
+    pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) -> SyncedImportOutcome {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
         // #5154: read the stored entry AND the map length under ONE RECOVERED
@@ -138,7 +191,7 @@ impl crate::afxdp::Coordinator {
             self.sessions
                 .install_stale_ignored
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return SyncedImportOutcome::RejectedStaleGeneration;
         }
         // #5674: aggregate synced-import admission bound. Locally-created
         // sessions are capped per worker at `DEFAULT_MAX_SESSIONS`
@@ -199,7 +252,7 @@ impl crate::afxdp::Coordinator {
                 self.sessions
                     .import_cap_drops
                     .fetch_add(1, Ordering::Relaxed);
-                return;
+                return SyncedImportOutcome::RejectedCapacity;
             }
         }
         let reverse_entry = if !entry.metadata.is_reverse {
@@ -252,7 +305,7 @@ impl crate::afxdp::Coordinator {
             self.sessions
                 .import_reserve_refused
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return SyncedImportOutcome::RejectedReserve;
         }
         publish_shared_session(
             &self.sessions.synced,
@@ -364,6 +417,7 @@ impl crate::afxdp::Coordinator {
                 pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
             }
         }
+        SyncedImportOutcome::Applied
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
@@ -515,7 +569,7 @@ impl crate::afxdp::Coordinator {
             policy_counter_idx: 0,
             policy_counter: None,
         };
-        self.upsert_synced_session(SyncedSessionEntry {
+        let _ = self.upsert_synced_session(SyncedSessionEntry {
             key,
             decision: SessionDecision {
                 resolution,
