@@ -104679,3 +104679,19 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/devicemap/identity_unread_6786_test.go`,
   `pkg/daemon/device_map_identity_unread_6786_test.go`,
   `docs/bare-metal-device-map.md`, `_Log.md`
+
+## 2026-08-22 — #6792 DNS ownership failures were warning-only
+
+- **Timestamp**: 2026-08-22
+- **Action**: `dnsReconciler.reconcile` logged all three failure points (mask,
+  stale drop-in removal, managed-file write) at WARN and returned nothing;
+  `reconcileDNSLocked` returned nothing, so a commit could report success while
+  leaving a dual resolver or a stale `/etc/resolv.conf`. Its two siblings in
+  `applyTailReconciles` (`applyLo0Filter`, `applyHostInboundFilter`) already
+  fail the commit closed — DNS was the only reconciler there whose error could
+  not propagate. Now accumulates and returns; joined into the commit result.
+  Accumulate-not-return-early preserves the deliberate "still own resolv.conf
+  after a mask failure" behaviour, and both SUCCESS early returns carry the
+  accumulated error.
+- **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/dns_ownership_failclosed_6792_test.go, docs/dns-ownership.md, _Log.md

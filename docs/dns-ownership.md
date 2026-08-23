@@ -96,6 +96,52 @@ branch. The stanza is accepted but emits a commit-check warning; the
 runtime still owns `/etc/resolv.conf` directly with resolved
 disabled+masked. There is exactly one DNS owner.
 
+## Failure handling (#6792)
+
+Every step of the reconcile — disable+mask `systemd-resolved`, remove stale
+resolved drop-ins, write the managed `/etc/resolv.conf` — used to log at WARN
+and continue, and neither `reconcile` nor `reconcileDNSLocked` returned
+anything, so nothing could propagate. **A commit reported success while leaving
+one of two states the operator did not ask for:**
+
+- **dual resolver** — the disable+mask failed, `systemd-resolved` keeps running,
+  and xpf still writes `/etc/resolv.conf`. xpf's own networkd `.network` files
+  carry `UseDNS=yes`, so a surviving resolved is independently fed DHCP
+  nameservers;
+- **stale `/etc/resolv.conf`** — the write failed *after* the mask and drop-in
+  removal had already run, so resolved is gone and the file is not current.
+
+There is no retry, no ticker and no metric behind either, so an unreported
+failure persisted until the next commit happened to succeed.
+
+The reconcile now ACCUMULATES its failures and returns them.
+`applyTailReconciles` joins the result into the commit error alongside
+`lo0Err` / `hostInboundErr` — its two siblings in that same function, which
+already fail the commit closed (#3392, #3333). `reconcileDNS` sat between them
+as a bare statement and was the only reconciler there whose error could not
+propagate.
+
+Two properties are deliberately preserved:
+
+- **Accumulate, do not return early.** The pre-#6792 control flow is correct: a
+  mask failure still writes `/etc/resolv.conf`, because a static file wins over
+  an inactive stub. Returning at the first failure would make a systemd hiccup
+  *also* cost the resolver file. Only the reporting changed.
+- **The two SUCCESS early returns still carry accumulated errors.** The boot
+  empty-merge policy and the idempotence skip both run *after* the mask and
+  drop-in steps. Returning a bare `nil` there would report success for exactly
+  the steady-state pass where nothing else changed and a mask failure was the
+  only news — i.e. every pass on a converged system.
+
+`disableMaskResolved` was already idempotent and quiet — it returns success on a
+systemd-less host, when the unit is already `masked`, and when it is
+`not-found` — so a non-nil error genuinely means the desired end state was not
+reached. Failing the commit on it does not affect hosts without resolved.
+
+The DHCP-lease callback (`reconcileDNSFromDHCP`) logs instead of returning:
+there is no commit to fail, the end state is the same, and the next commit or
+lease change re-drives the idempotent reconcile.
+
 ## Operator notes
 
 - To inspect: `cat /etc/resolv.conf` (a real file beginning with

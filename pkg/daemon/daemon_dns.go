@@ -194,7 +194,23 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 // declarative "clear DNS" and the managed file is written so removing
 // all name-servers / expiring the last lease actually clears the
 // resolver instead of leaking stale servers.
-func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepairOnly bool) {
+func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepairOnly bool) error {
+	// #6792: every failure below is ACCUMULATED and returned rather than left
+	// at WARN. Each one leaves the host in a resolver state the operator did
+	// not ask for — a live systemd-resolved alongside xpf's managed file (and
+	// xpf's own networkd .network files carry UseDNS=yes, so a surviving
+	// resolved is independently fed DHCP nameservers), or a stale
+	// /etc/resolv.conf whose write failed AFTER the mask and drop-in removal
+	// already ran. A commit reported success either way, and there is no
+	// retry, no ticker and no metric behind it.
+	//
+	// Accumulate rather than return early: the pre-#6792 control flow is
+	// deliberate — a mask failure still writes resolv.conf, because a static
+	// file wins over an inactive stub — and returning at the first failure
+	// would make a systemd hiccup ALSO skip the resolver write. So the
+	// sequence is unchanged; only its reporting is.
+	var errs []error
+
 	// Always converge resolved off + remove stale drop-ins, regardless of
 	// whether resolv.conf needs rewriting, so a previously-installed
 	// drop-in / running resolved is cleaned up even on an idempotent pass.
@@ -203,10 +219,12 @@ func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepair
 		// owner. Still own resolv.conf (a static file wins over an
 		// inactive stub), but surface the failure loudly.
 		slog.Warn("DNS: failed to disable+mask systemd-resolved; it may remain a second resolver owner", "err", err)
+		errs = append(errs, fmt.Errorf("disable+mask systemd-resolved: %w", err))
 	}
 	for _, p := range []string{r.legacyResolvedDropin, r.xpfResolvedDropin} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			slog.Warn("DNS: failed to remove stale resolved drop-in", "path", p, "err", err)
+			errs = append(errs, fmt.Errorf("remove stale resolved drop-in %s: %w", p, err))
 		}
 	}
 
@@ -224,24 +242,26 @@ func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepair
 	// file. Keyed on the nameserver set, not in.Empty(), so a
 	// domain-name/domain-search-only config does not blank a good file.
 	if len(in.NameServers) == 0 && bootEmptyRepairOnly && !isSymlink && !missing && lerr == nil {
-		return
+		return errors.Join(errs...)
 	}
 
 	// Idempotence: if the target is already a regular file with identical
 	// content, skip the rewrite (and the restart churn it would imply).
 	if !isSymlink && lerr == nil {
 		if cur, err := os.ReadFile(r.resolvConfPath); err == nil && string(cur) == content {
-			return
+			return errors.Join(errs...)
 		}
 	}
 
 	if err := r.atomicWrite(content); err != nil {
 		slog.Warn("DNS: failed to write managed /etc/resolv.conf", "path", r.resolvConfPath, "err", err)
-		return
+		errs = append(errs, fmt.Errorf("write managed %s: %w", r.resolvConfPath, err))
+		return errors.Join(errs...)
 	}
 	slog.Info("DNS: reconciled managed /etc/resolv.conf",
 		"servers", in.NameServers, "domain", in.DomainName, "search", in.DomainSearch,
 		"replaced_symlink", isSymlink)
+	return errors.Join(errs...)
 }
 
 // atomicWrite replaces resolvConfPath with content via
@@ -348,13 +368,13 @@ func disableMaskResolved() error {
 // start) so an empty merge does not blank a pre-existing good file; a
 // later commit / DHCP change passes false so clearing DNS truly clears
 // the file.
-func (d *Daemon) reconcileDNSLocked(cfg *config.Config, bootEmptyRepairOnly bool) {
+func (d *Daemon) reconcileDNSLocked(cfg *config.Config, bootEmptyRepairOnly bool) error {
 	var leases []*dhcp.Lease
 	if d.dhcp != nil {
 		leases = d.dhcp.Leases()
 	}
 	in := mergeDNSInput(cfg, leases)
-	newDNSReconciler().reconcile(in, bootEmptyRepairOnly)
+	return newDNSReconciler().reconcile(in, bootEmptyRepairOnly)
 }
 
 // reconcileDNSFromDHCP is the DHCP-callback entry point. It acquires
@@ -373,5 +393,15 @@ func (d *Daemon) reconcileDNSFromDHCP() {
 	}
 	defer d.applySem.Release(1)
 	cfg := d.store.ActiveConfig()
-	d.reconcileDNSLocked(cfg, false)
+	// #6792: no commit to fail here — this is a lease-change callback, not an
+	// operator action — so the failure is logged rather than returned. It is
+	// logged at WARN with the same wording the commit path surfaces, because
+	// the end state is identical (a second resolver owner, or a stale
+	// resolv.conf) and an operator reading the log after a DHCP change needs
+	// the same signal a commit would have given them. The next commit or lease
+	// change re-drives the reconcile, which is idempotent.
+	if err := d.reconcileDNSLocked(cfg, false); err != nil {
+		slog.Warn("DNS: reconcile after a DHCP change did not reach the "+
+			"declared resolver state", "err", err)
+	}
 }
