@@ -104218,6 +104218,59 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/ast_groups.go,
   pkg/config/group_expand_budget_6767_test.go
 
+## 2026-08-22 — #6759 detect an unverified-primary after image recreate
+- **Timestamp**: 2026-08-22
+- **Action**: Read the cluster side first and reported the boundary before
+  coding (as agreed). Finding: the kernel-roll already solves the analogous
+  problem via holdSecondaryIfKernelCandidateArmed, but it keys on the ON-NODE
+  kernel journal and folds a clean ENOENT to "never armed" — a reboot preserves
+  that journal so ENOENT is truthful, a recreate DESTROYS it so ENOENT means
+  "the evidence was wiped", and nothing on the node can distinguish them. The
+  mechanism is correct for its path and structurally unavailable to image-roll.
+  Shipped the bounded increment only: the boot poll reads the node RG state and
+  fails closed (leases held) if the recreated node is PRIMARY before the #5075
+  identity gate passes. Code states explicitly that this DETECTS and does not
+  CLOSE — the election happens at bringup before any driver command lands.
+- **Scoped honestly**: election.go's fresh-boot guard already protects a
+  NON-preempt RG with a reachable peer; the exposure is preempt RGs and boots
+  where the peer is not visible at first election.
+- **Successor filed (#7559)** with the three candidate designs and their real
+  costs (peer authority / day-0 seeded hold / default-hold), since closing it
+  needs a signal surviving a disk wipe and that is a design decision.
+- **Cite note**: within this ONE issue the Go-side cites still landed in roughly
+  the right code while the xpf-deploy.py ones were stale — staleness varies
+  within a single evidence list, so verify each cite independently.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_unverified_primary_6759.py (new),
+## 2026-08-22 — #6762 renew the roll lease DURING the recreate hook
+- **Timestamp**: 2026-08-22
+- **Action**: _fence_before_mutate extends both leases to one fresh TTL and
+  returns; the recreate hook that follows is an arbitrary operator script with
+  no duration bound, and nothing renewed while it ran. A hook outliving the TTL
+  let the peer lease expire — the SOLE reservation once the recreate wipes the
+  node's /var/lib — so a successor could acquire both leases and start a
+  concurrent roll mid-recreate. Added _run_with_lease_keepalive (Popen + poll,
+  renewing every max(5, ttl//3)); the recreate call site passes a peer-lease
+  keepalive and die()s fail-closed if a loss was recorded. A mid-hook loss does
+  NOT kill the hook (a half-done destroy+launch is worse) — it is recorded and
+  reported before rejoin.
+- **Foreground polling, not a background thread**: the renewal path shells out
+  through the same runner as the main flow, and a second thread would add a
+  concurrency surface to the one code path whose job is preventing two drivers
+  touching one pair.
+- **Own bug caught by my own test**: the interval floor was `max(1, int(...))`,
+  which silently floors sub-second intervals to 1s and made the tick test see 0
+  renewals. The floor exists to prevent a busy-loop, not to mandate whole
+  seconds — now `max(0.05, float(...))`; production passes max(5, ttl//3) so it
+  never binds.
+- **Scope note**: the drain (_node_exec) is also an unbounded remote mutation
+  and is NOT covered here — it is a blocking call with no poll point. Reported
+  as remaining rather than silently included.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_recreate_keepalive_6762.py (new),
+  docs/in-place-upgrade.md
+
+
 ## 2026-08-22 — #6771 duplicate event trigger siblings take the last value
 - **Timestamp**: 2026-08-22
 - **Action**: `within … trigger` read siblings with FindChild (first-wins), so a

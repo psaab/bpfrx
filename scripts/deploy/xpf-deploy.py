@@ -2269,6 +2269,43 @@ def _node_cluster_node_id(runner, backend, node):
         return None
 
 
+def _node_is_primary_for_any_rg(runner, backend, node, node_id):
+    """Does `node` currently hold PRIMARY for any redundancy group? (#6759)
+
+    Parses `show chassis cluster status` with the SAME contract the rest of the
+    tooling uses: inside a `Redundancy group: N ` block, a node row's FIRST
+    field is the node token and the state is a field on that row
+    (test/incus/deploy-lib.sh, scripts/userspace-ha-validation.sh). Matching on
+    exact FIELDS rather than a substring is deliberate — #4009 was a
+    rolling-deploy bug caused by a non-node line being read as a node row, and
+    it steered a deploy into restarting the PRIMARY first.
+
+    Returns None when the state cannot be read (xpfd not answering yet, cluster
+    not configured, transport blip). None is NOT "not primary": the caller must
+    not turn an unreadable state into a pass — it simply has no observation
+    this tick and tries again on the next one.
+    """
+    if node_id is None:
+        return None
+    out = _node_exec(runner, backend, node,
+                     ["cli", "-c", "show chassis cluster status"], check=False)
+    if not out or "Redundancy group" not in out:
+        return None
+    want = f"node{node_id}"
+    in_rg = False
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Redundancy group"):
+            in_rg = True
+            continue
+        if not in_rg:
+            continue
+        fields = stripped.split()
+        if len(fields) >= 2 and fields[0] == want and "primary" in fields:
+            return True
+    return False
+
+
 def _recreated_node_matches(live_versions, want_version, live_node_id, want_node_id):
     """#5075 identity+version gate for a node recreated from the new image.
     Returns (ok: bool, reason: str).
@@ -2615,7 +2652,20 @@ def cmd_image_roll(args):
             # what actually blocks a successor from acquiring both leases.
             _fence_before_mutate(runner, backend, [(node, nid), (peer, nid)],
                                  holder, lease_ttl, f"image-recreate {node}")
-            _recreate_node_from_image(runner, backend, node, args)
+            # #6762: keep the PEER lease renewed for the whole duration of the
+            # hook, not just up to its start. The peer lease is the sole
+            # reservation once the recreate wipes this node's /var/lib.
+            recreate_lost = _recreate_node_from_image(
+                runner, backend, node, args,
+                keepalive=lambda: _keepalive_leases(
+                    runner, backend, [(peer, nid)], holder, lease_ttl),
+                keepalive_interval=max(5, lease_ttl // 3))
+            if recreate_lost:
+                die(f"{recreate_lost}: LOST the roll lease while the recreate hook "
+                    f"for {node} was running — another orchestrator reclaimed the "
+                    f"pair reservation. The hook was allowed to finish (interrupting "
+                    f"a half-done recreate is worse), but STOPPING before rejoin; "
+                    f"investigate the half-rolled cluster.")
 
             # 3. poll until the node is back AS THE EXPECTED NODE ON THE NEW
             #    IMAGE. #5075: accepting ANY responding xpfd (the pre-fix
@@ -2662,6 +2712,30 @@ def cmd_image_roll(args):
                     pv, want_ver, live_nid, want_nid)
                 if back:
                     break
+                # #6759: the recreate WIPED this node, which erased the drain
+                # that was applied before it — and the identity gate above has
+                # NOT passed yet, so we do not know this is the right node
+                # running the right image. If it is nevertheless already
+                # PRIMARY, an unverified node is carrying traffic. Fail closed
+                # with the leases HELD, the same stance this loop already takes
+                # for a version/node-id mismatch.
+                #
+                # THIS DOES NOT CLOSE THE WINDOW, and must not be read as a
+                # guard. The election happens during the recreated node's own
+                # bringup (daemon_run_bringup.go runs UpdateConfig, which
+                # elects on the single-node path) — long before any driver
+                # command reaches it. By the time this check can observe
+                # anything, the election has already happened. It DETECTS the
+                # exposure and stops the roll; it cannot prevent it. Closing it
+                # needs a signal that survives the disk wipe, which the
+                # kernel-roll's on-node journal cannot provide here — see the
+                # successor issue.
+                if _node_is_primary_for_any_rg(runner, backend, node, live_nid):
+                    die(f"{node} is PRIMARY for a redundancy group but has NOT passed "
+                        f"the image/identity gate ({last_reason}). The recreate wiped "
+                        f"the drain applied before it, so an UNVERIFIED node is "
+                        f"carrying traffic. STOPPING with the never-both-down leases "
+                        f"HELD — investigate before rejoining (#6759).")
             if not back:
                 die(f"{node} did NOT come back as the expected node on the new "
                     f"image within {boot_deadline}s after image recreate: "
@@ -2713,11 +2787,35 @@ def cmd_image_roll(args):
     return 0
 
 
-def _recreate_node_from_image(runner, backend, node, args):
+def _recreate_node_from_image(runner, backend, node, args, keepalive=None,
+                             keepalive_interval=None):
     """Recreate ONE node from the new image. Delegates to the operator-supplied
     recreate hook (a script that does the backend-specific destroy+launch+day-0),
     because the recreate mechanics differ per environment (incus launch, libvirt
-    redefine, bare-metal re-flash). The hook gets XPF_ROLL_NODE in the env."""
+    redefine, bare-metal re-flash). The hook gets XPF_ROLL_NODE in the env.
+
+    LEASE RENEWAL RUNS *DURING* THE HOOK (#6762). The caller passes `keepalive`,
+    a zero-argument callable returning the name of a target whose lease is
+    provably LOST (else None); it is invoked every `keepalive_interval` seconds
+    while the hook runs.
+
+    Why this is not covered by the fence before it: `_fence_before_mutate`
+    extends the leases to ONE fresh TTL and returns. The hook is an ARBITRARY
+    operator script doing destroy+launch+day-0 — an image pull, a cloud API
+    wait, a bare-metal re-flash — with no bound on its duration, and while it
+    ran NOTHING renewed. A hook that outlives the TTL let the still-up peer's
+    lease expire, and that peer lease is the SOLE remaining reservation once the
+    recreate wipes the node's own /var/lib. A successor could then acquire both
+    node leases and begin a concurrent roll on a pair this driver was in the
+    middle of recreating. The comment on that fence names the risk — #5545
+    flagged the recreate as "potentially outlasting a short TTL" — and a single
+    extension answers "the phase boundary", not "the phase".
+
+    A LOSS DETECTED MID-HOOK DOES NOT KILL THE HOOK. The node is already being
+    destroyed; interrupting a half-finished recreate is worse than letting it
+    finish. The loss is recorded and reported by the caller, which fails closed
+    BEFORE rejoining — the same response the boot-poll loop already gives.
+    """
     hook = args.recreate_hook
     if not hook:
         die(f"image-roll needs --recreate-hook <script> to recreate {node} from "
@@ -2726,9 +2824,53 @@ def _recreate_node_from_image(runner, backend, node, args):
             f"mechanics stay environment-specific.")
     env = dict(os.environ, XPF_ROLL_NODE=node, XPF_ROLL_BACKEND=backend)
     print(f"   recreating {node} via {hook}...")
-    r = subprocess.run([hook, node], env=env)
-    if r.returncode != 0:
-        die(f"recreate hook for {node} failed (rc={r.returncode}); STOPPING.")
+    if keepalive is None:
+        # No reservation to keep alive (dry-run / single-node paths).
+        r = subprocess.run([hook, node], env=env)
+        rc = r.returncode
+        lost = None
+    else:
+        rc, lost = _run_with_lease_keepalive([hook, node], env, keepalive,
+                                             keepalive_interval)
+    if rc != 0:
+        die(f"recreate hook for {node} failed (rc={rc}); STOPPING.")
+    return lost
+
+
+def _run_with_lease_keepalive(argv, env, keepalive, interval):
+    """Run `argv` to completion while calling `keepalive()` every `interval`
+    seconds. Returns (returncode, lost_target_or_None) (#6762).
+
+    Polling in the FOREGROUND rather than renewing from a background thread:
+    the renewal path shells out through the same runner the main flow uses, and
+    a second thread driving it concurrently would be a new concurrency surface
+    on the one code path whose whole job is to prevent two drivers touching one
+    pair. A poll loop has no such surface.
+
+    The first loss is remembered and reporting continues — renewal keeps being
+    attempted so a transient blip that later recovers is not mistaken for a
+    permanent loss, and the caller decides what a recorded loss means."""
+    # The floor guards against a zero/negative interval busy-looping on
+    # proc.wait(timeout=0); it is deliberately NOT a whole second. Production
+    # passes max(5, lease_ttl // 3), so the floor never binds there — it exists
+    # only so a caller cannot spin, and keeping it sub-second lets the unit
+    # tests exercise several ticks without sleeping for seconds.
+    interval = max(0.05, float(interval or 10))
+    proc = subprocess.Popen(argv, env=env)
+    lost = None
+    while True:
+        try:
+            rc = proc.wait(timeout=interval)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if lost is None:
+            lost = keepalive()
+            if lost:
+                print(f"   WARNING: lost the roll lease on {lost} while the recreate "
+                      f"hook is still running; letting it finish, then STOPPING "
+                      f"before rejoin (#6762)")
+    return rc, lost
 
 
 def main():
