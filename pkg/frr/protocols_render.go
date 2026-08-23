@@ -241,6 +241,20 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			if n.PeerAS == 0 {
 				continue
 			}
+			// #6796: the address is rendered RAW at every site below, so a
+			// value carrying whitespace SPANS MULTIPLE FRR TOKENS and injects
+			// attacker-chosen configuration (`1.1.1.1 remote-as 65000\n
+			// neighbor 2.2.2.2` becomes a valid first line plus a second
+			// statement). Excluding it HERE rather than guarding each render
+			// site is deliberate: this set is already the single exclusion
+			// point the declaration loop, the address-family activation loop
+			// and the BFD accumulator all share, so a per-site guard would
+			// have to be repeated 24 times and could diverge — and a neighbor
+			// declared-but-not-activated, or activated-but-not-declared, makes
+			// vtysh reject the WHOLE managed section.
+			if !validBGPNeighborAddress(n.Address) {
+				continue
+			}
 			validNeighbors = append(validNeighbors, n)
 		}
 	}

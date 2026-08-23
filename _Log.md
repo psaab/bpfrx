@@ -104796,3 +104796,23 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
   `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
   `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
+
+## 2026-08-22 — #6796 BGP neighbor identity could span multiple FRR tokens
+
+- **Timestamp**: 2026-08-22
+- **Action**: `n.Address` was rendered RAW at 24 frr.conf sites while every
+  neighbouring operand was sanitized. FRR's lexer splits on whitespace with no
+  quoted-string token, so an identity carrying a space/newline rendered as
+  MULTIPLE statements — arbitrary FRR config injected through a config value,
+  reaching both the BGP neighbor lines and the BFD peer accumulator. Added
+  `validBGPNeighborAddress` at the shared `validNeighbors` exclusion point
+  (covers all 24 sites and BFD at once) plus a strict commit gate
+  `validateBGPNeighborAddressStrict` with `lenientBGPNeighborAddress` per
+  #1960. First version required a bare IP and was caught OVER-REJECTING by a
+  pre-existing parser test peering with `peer.example.com`; corrected to
+  single-token-ness, which is the actual property.
+- **File(s)**: pkg/frr/render_validate.go, pkg/frr/protocols_render.go,
+  pkg/frr/bgp_neighbor_token_6796_test.go,
+  pkg/config/compiler_validate_strict_routing.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/bgp_neighbor_token_6796_test.go, pkg/frr/README.md, _Log.md
