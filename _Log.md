@@ -104505,3 +104505,33 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_uniformgates_cluster_zone.go`,
   `pkg/config/vrrp_vip_count_6779_test.go` (new), `pkg/vrrp/README.md`,
   `pkg/config/README.md`
+
+## 2026-08-22 — #6782 invalid RETH redundancy-group committed as a both-node address
+
+- **Timestamp**: 2026-08-22
+- **Action**: `redundant-ether-options redundancy-group` is an untyped schema
+  leaf and `compileInterfaces` reads it with Atoi-then-discard-the-error, so a
+  non-numeric token collapsed to 0 and a negative one was stored verbatim.
+  Downstream every consumer asks `redundancy-group > 0` (`isReth` /
+  `isVRRPReth` in `pkg/dataplane/compiler_iface.go`), so the interface read as
+  ORDINARY: the `169.254.RG.NODE/32` substitution did not fire and the reth's
+  service address was written to the physical device on BOTH nodes. Measured
+  every value class first — 0, negative, non-numeric, fractional, int64
+  overflow, above-cap and undeclared-but-positive ALL committed clean on both
+  the strict and tolerant paths. Added `validateRethRedundancyGroupTokensAST`,
+  an AST pre-walk gate (strict reject / lenient warn via
+  `lenientRethRedundancyGroup`) accepting 1..255 — floor 1 because RG0 is the
+  control-plane group by `cluster.Manager.DataGroupIDs`' own definition,
+  ceiling 255 because the id is the third octet of the derived link-local. The
+  1..155 VRID bound stays owned by `validateRethVRRPGroupIDStrict`, which
+  correctly returns early under the default `private-rg-election`. The tolerant
+  path additionally SUPPRESSES the reth's addresses (and its members'), because
+  warning and then installing on both nodes anyway would make the lenient path
+  the bug. Deliberately not extended to a missing stanza (measured: in-tree
+  overlay fragments rely on it) or to an undeclared positive id (does not
+  trigger the fail-open).
+- **File(s)**: `pkg/config/compiler_reth_rg_token.go`,
+  `pkg/config/compiler_interfaces.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_prewalk.go`,
+  `pkg/config/compiler_reth_rg_token_6782_test.go`,
+  `pkg/daemon/vip_readiness_test.go`, `docs/config-schema.md`

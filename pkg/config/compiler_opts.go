@@ -353,6 +353,22 @@ type compileOpts struct {
 	// Same doctrine as lenientReservedProposalSetNames.
 	lenientChassisClusterIdentities bool
 
+	// lenientRethRedundancyGroup (#6782) downgrades the RETH redundancy-group
+	// token gate (validateRethRedundancyGroupTokensAST) from a hard compile
+	// error to a cfg.Warnings entry on the tolerant load / peer-sync paths. A
+	// `redundant-ether-options redundancy-group` token that is present but not a
+	// usable data-plane group (0, negative, non-numeric, or above the
+	// link-local octet ceiling) reads as "not RG-scoped" everywhere downstream,
+	// so the reth's service address is configured as an ordinary static address
+	// on BOTH nodes. Commit / commit-check stay strict so a new operator edit is
+	// rejected; an already-persisted or peer-synced config an older binary
+	// accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine. Unlike the sibling lenient gates the warning is NOT the whole
+	// tolerant behaviour: compileInterfaces additionally SUPPRESSES that reth's
+	// unit addresses, because booting into the duplicate-address condition this
+	// gate exists to prevent would make the lenient path the bug.
+	lenientRethRedundancyGroup bool
+
 	// lenientChassisMonitorWeight (#6588) downgrades the redundancy-group
 	// monitor weight gate (validateMonitorWeightTokensAST) from a hard compile
 	// error to a cfg.Warnings entry on the tolerant load / peer-sync paths. A
@@ -2343,6 +2359,7 @@ func lenientCompileOpts() compileOpts {
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
 		lenientChassisClusterIdentities:        true,
+		lenientRethRedundancyGroup:             true,
 		lenientChassisMonitorWeight:            true,
 		lenientChassisRGStatementArity:         true,
 		lenientLoginPackedStatements:           true,
