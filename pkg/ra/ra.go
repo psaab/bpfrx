@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -156,6 +157,57 @@ type goodbyeDebt struct {
 // log every 2s forever. After this many further attempts the debt is dropped
 // with a single Warn — we tried, we said so, we stop.
 const maxGoodbyeRetries = 3
+
+// HasDeadSenders reports whether any live sender's ASYNCHRONOUS conn open
+// failed, so it will never emit an RA (#2865's dead-sender state, #6793).
+//
+// It exists because a dead sender has no retry owner of its own. `openConn`
+// runs in the owner goroutine with a bounded bind retry (~2s, for a link-local
+// that has not settled yet); when that retry is exhausted the owner exits and
+// the sender stays in `m.senders` marked dead. `Apply`'s changed-config branch
+// knows how to rebuild it — the #2865 "rebuilding dead sender (initial conn
+// open failed)" path — but only when something calls `Apply` again, and nothing
+// does:
+//
+//   - STANDALONE: RA is applied from `applyServicesReconcile`, which runs only
+//     on a config apply. `reconcileRGStateLoop` is cluster-only. So a boot-time
+//     bind failure leaves the interface with NO router advertisements until an
+//     operator happens to commit — hosts on that segment get no default route,
+//     silently, on a node that reports a successful commit.
+//   - CLUSTER: `reconcileClusterRAServices` runs every 2s but is DIGEST-GATED,
+//     and a dead sender does not move the desired-set digest. So its "a
+//     transient boot-time bind failure recovers on the next reconcile with NO
+//     config change" promise did not hold either.
+//
+// Cheap by construction: it is a map walk over live senders and `dead()` is a
+// non-blocking channel probe, so the always-on caller costs nothing on the
+// common path where every sender opened.
+func (m *Manager) HasDeadSenders() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.senders {
+		if s.dead() {
+			return true
+		}
+	}
+	return false
+}
+
+// DeadSenderInterfaces returns the interfaces whose sender is dead, sorted, for
+// logging. Separate from HasDeadSenders so the hot always-on probe allocates
+// nothing.
+func (m *Manager) DeadSenderInterfaces() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var names []string
+	for name, s := range m.senders {
+		if s.dead() {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
 
 // New creates a new RA manager.
 func New() *Manager {
