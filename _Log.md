@@ -104994,6 +104994,7 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
+<<<<<<< HEAD
 
 - **Timestamp**: 2026-08-23
 - **Action**: #5841 writes the resource ownership markers BEFORE the credential
@@ -105009,7 +105010,24 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
+=======
+>>>>>>> origin/master
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
+
+- **Timestamp**: 2026-08-23
+- **Action**: #5841 writes the resource ownership markers BEFORE the credential
+  mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
+  nothing withdrew the marker when the mutation then failed. Because the
+  markers gate a REVOCATION rather than a write, the stale claim makes xpf
+  later delete an operator's pre-existing authorized_keys or lock an account
+  whose password xpf never set. Added `claimOwnership`/`rollback`, which
+  withdraws only a claim the current pass created and preserves one an earlier
+  apply legitimately made, and applied it at all three marker-first sites (user
+  key write, user password chpasswd, root key write). The useradd path is
+  marker-after already and unchanged.
+- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
+  `docs/system-login.md`
 
 - **Timestamp**: 2026-08-23
 - **Action**: `reconcileRGState` captured a transition under `s.mu`, dropped the
