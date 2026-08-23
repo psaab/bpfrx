@@ -567,6 +567,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.raDeadSenderReassertLoop(ctx)
 	}()
 
+	// #6791: the always-on retry owner for a fabric IPVLAN overlay whose
+	// creation failed. Started unconditionally, alongside the proxy-ARP and RA
+	// re-asserts and for the same reason: BOTH standalone and cluster nodes
+	// create fab0/fab1 only from a config apply, whose in-line retry gives up
+	// after five seconds, so a boot-time netlink failure (a parent NIC still
+	// being renamed after a power cycle) otherwise left the node with no
+	// cluster heartbeat and no session-sync transport until an operator
+	// happened to commit. It also covers the deferred (OnXSKBound) overlays,
+	// which are created after the apply has returned and so cannot report
+	// failure to the commit at all. The gate is one netlink name lookup per
+	// configured fab device, so it costs nothing on a healthy node and nothing
+	// at all on a config with no fabric interfaces.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.fabricIPVLANReassertLoop(ctx)
+	}()
+
 	// #1387 inc-2: start the always-on DHCP dynamic-DNS reconcile loop. It
 	// is constructed UNCONDITIONALLY (idle when disabled) so an
 	// enabled→disabled commit can still withdraw published records; the loop

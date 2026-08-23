@@ -1943,6 +1943,38 @@ never lock an operator out of a remote box it manages.
   applyRoutingRules fails-closed-and-complete via a `RuleList`-failing
   `NewManagerWithRuleOpsForTest` fake, clean-config stays-success, and the
   `applyTailReconciles` commit-join wiring proof).
+  **Fabric IPVLAN fail-closed + retry owner (#6791, mirroring #5310/#5696/#5844/#5700
+  on the propagation half and #6793 on the recovery half):** `applyFabricIPVLAN`
+  returned NOTHING. It retried `ensureFabricIPVLAN` five times at 1s, then logged
+  `CRITICAL: fabric IPVLAN creation failed after retries — cluster heartbeat will
+  not work` and `continue`d — so the commit reported SUCCESS on a node with no
+  `fab0`/`fab1`, i.e. no cluster heartbeat and no session-sync transport. The
+  evidence was an ASYMMETRY, not a judgement call: in `applyConfigLocked` its
+  neighbours are captured and joined (`mgmtRouteErr := …`, `ifaceErr := …`) while
+  `d.applyFabricIPVLAN(cfg)` was a bare statement — the only reconciler in that
+  sequence whose error could not propagate. It now returns
+  `errors.Join(fabricErrs...)`, captured as `fabricErr` and threaded into the tail
+  join. Safe to surface because `ensureFabricIPVLAN` returns an error ONLY when
+  there is no usable overlay: address failures are warn-only inside it and it uses
+  the idempotent `AddrReplace`, and an already-correct overlay returns nil — so
+  there is no benign already-exists that could newly fail a healthy commit.
+  Separately, `fabricIPVLANReassertLoop` is the persistent recovery owner the
+  overlay never had: `applyFabricIPVLAN` runs only from a config apply on BOTH
+  standalone and cluster nodes, so a netlink failure outlasting those five seconds
+  (a parent NIC still being renamed after a power cycle) left the fabric absent
+  until an operator happened to commit. It is also the only owner that can cover
+  the DEFERRED (`OnXSKBound`) overlays, which are created after the apply has
+  returned and so cannot report failure to the commit at all. Started
+  unconditionally in `Run` alongside `proxyARPReassertLoop` /
+  `raDeadSenderReassertLoop`, it takes `applySem` BEFORE reading `ActiveConfig`
+  (#4001) and re-checks its gate inside the semaphore; the gate is one netlink name
+  lookup per configured `fab*` device (present AND admin-up), so it is free on a
+  healthy node and a complete no-op on a config with no fabric interfaces. Tests:
+  `fabric_ipvlan_failclosed_6791_test.go` (producing half returns-and-names the
+  failure with a healthy-path control; the `applyTailReconciles` commit-join WIRING
+  proof; gate quiet-when-up / fires-when-down; the re-assert re-creates; and a
+  loop-START cell asserting `Run` launches it unconditionally).
+
   **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
   `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and
   returned only the #2926-C1 ctx-cancellation, even though `reconcileVRFs`'s
