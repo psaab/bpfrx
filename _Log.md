@@ -104430,3 +104430,28 @@ prose edit above them added. No diff falls in the new test body.
   agreement corpus could not cover without turning a wrap into a hung suite.
 - **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_test.go,
   pkg/dataplane/userspace/port_expansion_ceiling_6783_test.go, _Log.md
+
+## 2026-08-22 — #6785 HA import capacity refusal reported as success
+
+- **Timestamp**: 2026-08-22
+- **Action**: `upsert_synced_session` returned `()`; its three semantic refusal
+  paths (#2170 stale generation, #5674 import cap, #6600 reserve) each bumped a
+  counter and returned silently, so the control handler answered `ok=true`, Go
+  recorded a success, and Go's BPF mirror row stayed behind for a session the
+  helper never took. Added `SyncedImportOutcome` + `SYNCED_IMPORT_REFUSED_PREFIX`
+  in Rust; the handler now answers `ok=false` with a reason token. Go classifies
+  the token into `dataplane.ErrSyncedImportRefused`, which drives the EXISTING
+  #5305 rollback but deliberately does NOT set the sticky mirror-failure flag
+  (that gates takeover-readiness, #5247, and a refusal comes from a healthy
+  helper). Refusals are counted separately as health debt and rendered in
+  `show chassis cluster information` when non-zero.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/handlers/sync_session.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/server/tests.rs,
+  pkg/dataplane/dataplane.go, pkg/dataplane/userspace/process_control.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_sessions.go,
+  pkg/dataplane/userspace/synced_import_refusal_6785_test.go,
+  pkg/cluster/sync.go, pkg/cluster/sync_conn_gen.go, pkg/cluster/status.go,
+  pkg/cluster/synced_import_refusal_6785_test.go, docs/ha-failover-status.md,
+  _Log.md

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"log/slog"
 	"sync/atomic"
 
@@ -553,6 +554,17 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
 			s.OnForwardSessionInstalled()
 		}
+	} else if errors.Is(err, dataplane.ErrSyncedImportRefused) {
+		// #6785: the helper REFUSED this import on semantic grounds and Go has
+		// already rolled its BPF mirror row back, so there is no split truth and
+		// no sick socket — do not bump Errors or fire the mirror-failure warning,
+		// which would make an oversubscribed-but-healthy standby read as a flaky
+		// mirror. Count it as its own debt instead: the peer still believes it
+		// synced a session this node does not hold.
+		s.stats.ImportsRefusedByHelper.Add(1)
+		slog.Debug("cluster sync: helper refused a synced-session import; the "+
+			"local mirror was rolled back and the peer holds a session this node does not",
+			"af", "v4", "err", err)
 	} else {
 		s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, err)
 	}
@@ -589,6 +601,17 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
 			s.OnForwardSessionInstalled()
 		}
+	} else if errors.Is(err, dataplane.ErrSyncedImportRefused) {
+		// #6785: the helper REFUSED this import on semantic grounds and Go has
+		// already rolled its BPF mirror row back, so there is no split truth and
+		// no sick socket — do not bump Errors or fire the mirror-failure warning,
+		// which would make an oversubscribed-but-healthy standby read as a flaky
+		// mirror. Count it as its own debt instead: the peer still believes it
+		// synced a session this node does not hold.
+		s.stats.ImportsRefusedByHelper.Add(1)
+		slog.Debug("cluster sync: helper refused a synced-session import; the "+
+			"local mirror was rolled back and the peer holds a session this node does not",
+			"af", "v6", "err", err)
 	} else {
 		s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, err)
 	}

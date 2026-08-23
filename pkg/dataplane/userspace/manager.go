@@ -241,8 +241,23 @@ type Manager struct {
 	appliedSnapshot     appliedSnapshot
 	sessionMirrorFailed bool
 	sessionMirrorErr    string
-	deferWorkers        bool // skip worker spawn until NotifyLinkCycle
-	xskBoundNotified    bool // OnXSKBound fired at most once
+
+	// syncedImportRefusals counts HA synced-session imports the helper REFUSED
+	// on semantic grounds (#6785) — a stale install generation, the aggregate
+	// import ceiling, or a translated-tuple reservation refusal. Each one rolls
+	// back this node's BPF mirror row, so the counter is the health DEBT the
+	// rollback leaves behind: the peer believes it synced a session this node
+	// does not hold, and only the peer's next full sync closes that gap.
+	//
+	// It is deliberately NOT the sticky sessionMirrorFailed flag. That flag
+	// gates HA takeover-readiness (#5247) and means the session socket is sick;
+	// a refusal comes from a HEALTHY helper answering correctly. Counting it
+	// separately keeps the refusal visible without making a standby that a peer
+	// oversubscribed look unfit to take over. Atomic because it is read by the
+	// status path without m.mu.
+	syncedImportRefusals atomic.Uint64
+	deferWorkers         bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified     bool // OnXSKBound fired at most once
 	// pendingWorkerArm records "generation debt" from a deferred-MAC
 	// re-apply that failed to publish (#5134). After a live RETH
 	// virtual-MAC change with no link cycle, the first apply publishes a

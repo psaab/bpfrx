@@ -469,6 +469,13 @@ func (m *Manager) FormatInformation() string {
 		if syncStats.ConfigsApplyFailed > 0 {
 			fmt.Fprintf(&b, "  Configs apply-failed:  %d\n", syncStats.ConfigsApplyFailed)
 		}
+		// #6785: surface the helper's semantic import refusals. Rendered only
+		// when non-zero, unlike the peer boot incarnation: zero is the ordinary
+		// state and carries no diagnostic value, whereas a non-zero count means
+		// the peer believes it synced sessions this node does not hold.
+		if syncStats.ImportsRefusedByHelper > 0 {
+			fmt.Fprintf(&b, "  Imports refused by helper: %d\n", syncStats.ImportsRefusedByHelper)
+		}
 		// #5084: the peer boot incarnation, rendered ALWAYS rather than only
 		// when non-empty. "none" is the operationally interesting value — it
 		// means the fence is in its fail-open state against this peer — and a
