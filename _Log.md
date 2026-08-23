@@ -104930,3 +104930,11 @@ prose edit above them added. No diff falls in the new test body.
   pkg/nftables/netlink_lo0.go, pkg/daemon/daemon_nft.go,
   pkg/daemon/daemon_nft_netlink.go,
   pkg/daemon/daemon_nft_netlink_parity_test.go, pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-08-23
+- **Action**: #6804 round 2 — three mutation cells came back GREEN, all fixture
+  gaps: no zero-bit-length case (so treating 0 as "no constraint" was
+  invisible), no oversized-width case (so capping to 4 — the #3406 fail-open —
+  was invisible), and every value already inside its mask, so pre-masking was a
+  no-op on both sides and skipping it still agreed. Added all three shapes plus
+  an assertion that a following deny term survives an unrepresentable one.
+- **File(s)**: pkg/daemon/daemon_nft_netlink_parity_test.go, _Log.md

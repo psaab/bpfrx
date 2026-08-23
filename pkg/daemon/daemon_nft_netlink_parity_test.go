@@ -140,6 +140,20 @@ func runNftNetlinkParityInner(t *testing.T) {
 			{"sub-byte-12-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 12, Value: 0x0abc, Mask: 0x0fff}},
 			{"byte-aligned-8-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 9, BitLength: 8, Value: 0x11, Mask: 0xff}},
 			{"full-32-bits", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 12, BitLength: 32, Value: 0x0a000001, Mask: 0xffffffff}},
+			// Zero bit-length: the userspace snapshot builder DEFAULTS it to 4
+			// (32-bit). Without this row, an implementation that treated 0 as
+			// "no constraint" would render the term with no narrowing at all —
+			// the exact widening this issue is about — and every other row would
+			// still pass.
+			{"zero-bit-length-defaults-to-32", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 12, BitLength: 0, Value: 0x0a000001, Mask: 0xffffffff}},
+			// Value carrying bits OUTSIDE the mask. Every row above has the
+			// value already inside its mask, so pre-masking is a NO-OP on both
+			// sides and a renderer that skipped it would still agree — the
+			// fixture varies the right axis but samples only the point where it
+			// cannot fail. nft compares the MASKED load, so an unmasked expected
+			// value never matches: a silent never-match, which is a different
+			// fail direction from the widening but just as quiet.
+			{"value-outside-mask-is-pre-masked", config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 9, BitLength: 8, Value: 0xff11, Mask: 0x0f}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				fm := tc.fm
@@ -171,27 +185,73 @@ func runNftNetlinkParityInner(t *testing.T) {
 	// tcp-flags' `meta l4proto 6`, so a term whose only predicate was the
 	// flex-match would deny ALL host-inbound traffic.
 	t.Run("lo0_unrepresentable_flex_match_matches_nothing", func(t *testing.T) {
-		cfg := &config.Config{}
-		cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
-			"flexbad": {Terms: []*config.FirewallFilterTerm{
-				{
+		for _, tc := range []struct {
+			name string
+			term *config.FirewallFilterTerm
+		}{
+			{
+				// #5823: more than one named range.
+				name: "multi-range",
+				term: &config.FirewallFilterTerm{
 					Name:                "multi-range",
 					Protocols:           []string{"tcp"},
 					FlexMatchRangeNames: []string{"r1", "r2"},
 					FlexMatch:           &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff},
 					Action:              "accept",
 				},
-				{Name: "deny-rest", Action: "discard"},
-			}},
+			},
+			{
+				// An unparseable numeric token: strict commit rejects it, the
+				// tolerant load only warns (#1960), so it reaches the mirror.
+				name: "unknown-token",
+				term: &config.FirewallFilterTerm{
+					Name:             "unknown-token",
+					Protocols:        []string{"tcp"},
+					UnknownFlexMatch: []string{"byte-offset=not-a-number"},
+					FlexMatch:        &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff},
+					Action:           "accept",
+				},
+			},
+			{
+				// Width OUTSIDE 1..4 bytes. The commit gate bounds bit-length to
+				// 1..32, so 40 bits arrives only on a corrupt / version-drifted
+				// tolerant-load snapshot — and CAPPING it to 4 would compare only
+				// the truncated window and BROADEN the match (the #3406
+				// fail-open), so it must be unrepresentable, not clamped.
+				name: "oversized-width",
+				term: &config.FirewallFilterTerm{
+					Name:      "oversized-width",
+					Protocols: []string{"tcp"},
+					FlexMatch: &config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 40, Value: 1, Mask: 0xff},
+					Action:    "accept",
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := &config.Config{}
+				cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+					"flexbad": {Terms: []*config.FirewallFilterTerm{
+						tc.term,
+						{Name: "deny-rest", Action: "discard"},
+					}},
+				}
+				nftDeleteTableBestEffort(xnft.Lo0TableName)
+				oracle := buildLo0FilterPayload(cfg, "flexbad", "")
+				if strings.Contains(oracle, "@nh,") {
+					t.Fatalf("an UNREPRESENTABLE flex-match still rendered a "+
+						"payload match:\n%s", oracle)
+				}
+				// The later term must survive: "matches nothing" means the term
+				// contributes no enforcement, NOT that the filter is emptied.
+				if !strings.Contains(oracle, "drop") {
+					t.Fatalf("the following deny term did not render, so the "+
+						"unrepresentable term swallowed the rest of the "+
+						"filter:\n%s", oracle)
+				}
+				spec := toNftLo0Spec(cfg, "flexbad", "")
+				parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
+			})
 		}
-		nftDeleteTableBestEffort(xnft.Lo0TableName)
-		oracle := buildLo0FilterPayload(cfg, "flexbad", "")
-		if strings.Contains(oracle, "@nh,") {
-			t.Fatalf("an UNREPRESENTABLE flex-match still rendered a payload "+
-				"match:\n%s", oracle)
-		}
-		spec := toNftLo0Spec(cfg, "flexbad", "")
-		parityCheck(t, xnft.Lo0TableName, oracle, func() error { _, err := inst.InstallLo0(spec); return err })
 	})
 
 	t.Run("lo0_unrepresentable_port_fails_closed", func(t *testing.T) {
