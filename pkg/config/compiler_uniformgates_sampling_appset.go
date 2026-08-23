@@ -70,6 +70,24 @@ func runUniformGatesSamplingAppSet(tree *ConfigTree, cfg *Config, opts compileOp
 	// snapshot builder clamps rate <= 0 -> 1, so the running dataplane is
 	// safe). `0` stays valid (sample every packet). Mirrors
 	// validateSamplingInstanceConflictsStrict.
+	// #6769: flow-export template `seconds` knobs are stored by the compiler
+	// with a bare strconv.Atoi and no range check, and the consumer converts
+	// with `time.Duration(n) * time.Second`, which OVERFLOWS int64 for a large
+	// enough value and can wrap to a sub-second interval — a template-export
+	// flood at every collector. Strict on commit / commit-check; lenient on
+	// load / peer-sync (warn — #1960; `flowexport.secondsToDuration` falls back
+	// to the default independently, so the running exporter is safe either way
+	// and this gate is about the operator being TOLD rather than silently
+	// getting the default).
+	if err := validateFlowExportSecondsStrict(cfg); err != nil {
+		if opts.lenientFlowExportSeconds {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("flow-export template seconds (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	if err := validateSamplingInputRateStrict(cfg); err != nil {
 		if opts.lenientSamplingInputRate {
 			cfg.Warnings = append(cfg.Warnings,

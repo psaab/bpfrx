@@ -692,6 +692,62 @@ Deliberately NOT applied to `system login class`: #6838 already made the class
 cohort reader-independent by folding permissions across the whole same-named
 set, and a merge here would fight that design.
 
+### Duplicate containers beyond the original four (#6768)
+
+The #5180 gate started as four hand-written copies of one walk. #6768 turned
+the walk into a registry — `namedDupRules` / `singletonDupRules` in
+`pkg/config/dup_named_blocks.go` — so adding a container is one row and the
+strict gate, the lenient warning, and the #6455 group-expanded re-run all pick
+it up without any of the three being edited. `groups` and `interfaces` keep
+bespoke walks: their name extraction (a merged two-key head) and skip rules
+(the non-interface keyword allowlist) genuinely differ, and folding them into
+the table would mean inventing hooks for two callers.
+
+The rows added were derived from a PREDICATE, not from the effects the issue
+named: *a container that can be authored more than once as a hierarchical
+sibling, and whose compile silently loses configuration the FLAT `set` spelling
+would have merged.* `tree.SetPath` collapses a repeated flat statement onto one
+node, so a duplicate CONTAINER sibling is reachable only from the hierarchical
+shape — which is exactly the dual-AST-equivalence invariant #5180 exists to
+enforce. Six sites matched, in three distinct loss modes:
+
+| container | loss mode | measured effect |
+|---|---|---|
+| `security log stream <n>` | last-writer-wins (`Streams[name] = stream`) | a stream authored `transport { protocol tls; }` in the first block and `severity info` in the second compiles with severity=info and NO transport — a TLS syslog stream silently reverts to plain syslog |
+| `security log profile <n>` | last-writer-wins (`Profiles[name] = p`) | `stream-name` and `default-profile` from the first block both vanish; the profile is left bound to nothing |
+| `protocols bgp group <n>` | split instances (per-instance locals) | `group g { peer-as 65001; export P; }` + `group g { neighbor N; }` compiles N with `peerAS=0` and `export=[]`; only the peer-as half warns |
+| `services flow-monitoring` | first-wins (`FindChild`) | the whole second block is ignored — a `version-ipfix` half authored after a `version9` half never exists |
+| `services rpm` | first-wins (`FindChild`) | every probe in the second block disappears |
+| `services ip-monitoring` | first-wins (`FindChild`) | every policy in the second block disappears, with zero warnings |
+
+Three of the six are the effects the issue named; the other three came from the
+predicate. `services application-identification` is deliberately excluded — it
+is a presence flag, so a repeat loses nothing, and a gate that rejected every
+repeated sibling would break configurations that are fine.
+
+Two side notes worth keeping:
+
+- The message is now per-container. The original single sentence said the
+  EARLIER block is dropped, which is true for a last-writer-wins map store and
+  exactly backwards for a `FindChild` first-sibling-only read; it would have
+  sent an operator to delete the surviving block. `dupEffectStrict` /
+  `dupEffectLenient` render the truth for each mode. The pre-existing
+  ids-option FAMILY check was mislabelled the same way and is corrected to
+  first-wins, which is what `compileScreen` actually does.
+- A duplicate can BLIND another gate. With the BGP blocks duplicated the export
+  policy never reaches the neighbour, so the existing undefined-`policy-statement`
+  cross-reference gate has nothing to check and stays silent; the same config
+  authored once is correctly rejected when the policy is undefined.
+
+**Gate only, no fold.** #6992 folded `system login user` because two READERS
+picked different blocks — a credential authored under a VIEW-only block could
+authenticate into a super-user CLI — and a fold was the only way to remove that
+divergence. There is no divergent reader here; the loss is a plain silent drop,
+the shape `groups` / `interfaces` / `screen ids-option` are already handled
+with, so the gate alone is the matching remedy. Strict rejects on commit /
+commit-check; the tolerant load / peer-sync path warns and boots (#1960), where
+the historical result is preserved unchanged.
+
 ### Duplicate NAT rule name (#5649, C181-M18)
 
 NAT rule-sets are ordered, first-match tables keyed by rule name, so a rule's
@@ -10032,6 +10088,25 @@ the value sits in a single typed slot:
     ActiveTimeout/InactiveTimeout). The parallel `version-ipfix` pair is typed
     identically for UX parity even though it does NOT reach the wire
     (`buildFlowExportSnapshot` reads `fm.Version9` only).
+  - `services flow-monitoring version9 template <t> template-refresh-rate
+    seconds` (and the `version-ipfix` twin) — `ValidateInteger(0,
+    MaxDurationSeconds)` (**#6769**). This leaf was the one UNTYPED member of
+    the trio: its two siblings above already carried a validator, so a refresh
+    rate large enough to overflow `time.Duration(n) * time.Second` reached
+    `pkg/flowexport`, wrapped, and became a sub-second template ticker. Because
+    `gcd(1e9, 2^64) = 512` the wrapped residues are multiples of 512 ns and the
+    smallest positive one is exactly 512 ns — `seconds 20211507185753197`
+    produced a 512 ns ticker, re-exporting templates thousands of times a second
+    at every collector, and the consumer's only guard (`templateRefreshInterval`
+    rejecting `<= 0`) does not see a positive wrap. The ceiling is the
+    runtime-derived overflow point already used elsewhere in this file, NOT a
+    new policy cap ("no schema-only caps"). Two companion layers share the same
+    constant: `validateFlowExportSecondsStrict` (`pkg/config`,
+    compiler-side defense-in-depth for the tolerant load / peer-sync path and
+    direct `CompileConfig` callers, strict-reject / lenient-warn per #1960,
+    mirroring #5244) and `flowexport.secondsToDuration`, which falls back to the
+    default for an out-of-range value so a running exporter is safe even on a
+    config admitted leniently.
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
     `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)

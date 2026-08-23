@@ -738,6 +738,7 @@ fn source_nat_unparseable_match_prefix_surfaces_and_keeps_valid() {
         }],
         None,
         &counters,
+        0,
     );
     // (1) The valid prefix still translates its source.
     let hit = match_source_nat(
@@ -778,6 +779,7 @@ fn source_nat_all_valid_reports_no_parse_errors() {
         }],
         None,
         &counters,
+        0,
     );
     assert_eq!(
         counters.parse_errors(),

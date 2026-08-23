@@ -497,7 +497,7 @@ fn production_entry_enforces_the_real_pool_count_budget_6812() {
 
     // The PRODUCTION entry — no injectable budget. This is the whole point.
     let rules =
-        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default());
+        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default(), 0);
 
     // --- PRECONDITION 1: the production path was actually entered and
     // returned a rule per snapshot. A fixture that never reached
@@ -560,7 +560,7 @@ fn production_entry_admits_a_config_at_the_real_pool_count_budget_6812() {
     let snaps = one_address_pool_snaps_6812(at);
 
     let rules =
-        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default());
+        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default(), 0);
 
     assert_eq!(
         rules.len(),
@@ -677,7 +677,7 @@ fn production_entry_admits_a_healthy_pool_after_failed_pools_6812() {
 
     // The PRODUCTION entry at the REAL budget — an injected budget would not
     // reach the 1024-pool boundary this scenario turns on.
-    let rules = parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default());
+    let rules = parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default(), 0);
     assert_eq!(
         rules.len(),
         n_bad + 1,

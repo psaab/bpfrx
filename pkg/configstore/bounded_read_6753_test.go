@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,8 +33,10 @@ func TestReadBoundedConfigFileRejectsOversizeWithoutMaterialising_6753(t *testin
 	if data != nil {
 		t.Fatalf("a refused read must yield no payload, got %d bytes", len(data))
 	}
-	if !strings.Contains(err.Error(), "limit") {
-		t.Fatalf("error must name the limit, got %q", err)
+	// #7469: structural, not substring. This assertion previously matched the
+	// word "limit", which couples the verdict to wording maintained elsewhere.
+	if !errors.Is(err, ErrExceedsLimit) {
+		t.Fatalf("an over-cap refusal must wrap ErrExceedsLimit, got %q", err)
 	}
 }
 
