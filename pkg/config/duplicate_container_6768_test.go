@@ -242,6 +242,22 @@ func TestUnregisteredContainerRepeatStillAccepted_6768(t *testing.T) {
 	if _, err := CompileConfig(tree); err != nil {
 		t.Fatalf("CompileConfig rejected a repeated presence flag, which loses nothing: %v", err)
 	}
+
+	// And a REGISTERED container repeated as an empty leaf. The singleton walk
+	// skips `c.IsLeaf` deliberately: two empty `flow-monitoring;` statements
+	// carry no configuration, so neither can lose any, and rejecting them would
+	// be a false positive on a config that is merely redundant. Without this
+	// cell the guard is unbound — the mutation matrix removed it and every
+	// other cell stayed green, because the presence-flag fixture above uses a
+	// keyword that is not in the registry at all and so never reaches it.
+	leafTree := parseHier5180(t, `services {
+    flow-monitoring;
+    flow-monitoring;
+}`)
+	if _, err := CompileConfig(leafTree); err != nil {
+		t.Fatalf("CompileConfig rejected two EMPTY flow-monitoring statements, which "+
+			"cannot lose configuration: %v", err)
+	}
 }
 
 // TestEveryDuplicateContainerRuleHasAFixture_6768 binds the REGISTRY to the
