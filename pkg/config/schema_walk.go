@@ -402,6 +402,19 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		if err := validateTypedLeaf(node, childSchema, path, siblings, vc); err != nil {
 			return err
 		}
+		// #6774: for a blockValue leaf written in the BLOCK spelling
+		// (`default-policy { deny-all; }`) the single child is the VALUE —
+		// already validated by validateTypedLeaf just above — not a modifier.
+		// Without this the modifier loop below rejects it as
+		// `unknown modifier "deny-all"`, because the leaf declares no
+		// children. This mirrors the multi-leaf branch earlier in this
+		// function, where block children are likewise values and that path
+		// therefore replaces the modifier loop too.
+		if childSchema.blockValue && len(node.Keys) == 1 {
+			if _, ok := singleBlockValue(node); ok {
+				return nil
+			}
+		}
 		// Validate modifier CHILDREN. The flat-set grouping and hierarchical
 		// blocks both nest trailing modifier tokens as children
 		// (`transmit-rate 1g { exact; }` → child Keys=["exact"];
@@ -735,6 +748,26 @@ func consumeNodeKeys(keys []string, childSchema *schemaNode) (int, *schemaNode) 
 	return consumed, childSchema
 }
 
+// singleBlockValue returns the lone value token of a hierarchical block-form
+// leaf — `keyword { value; }` parses to a node with no trailing keys and one
+// childless child whose sole key is the value (#6774).
+//
+// It is deliberately strict. More than one child, a child carrying more than
+// one token, or a child carrying its own block all return false, so the leaf
+// falls through to the ordinary "missing value" rejection rather than silently
+// binding the first token of an ambiguous block — which is exactly what the
+// compiler would then discard.
+func singleBlockValue(node *Node) (string, bool) {
+	if len(node.Children) != 1 {
+		return "", false
+	}
+	c := node.Children[0]
+	if c == nil || len(c.Keys) != 1 || len(c.Children) != 0 || c.Keys[0] == "" {
+		return "", false
+	}
+	return c.Keys[0], true
+}
+
 // validateTypedLeaf validates the value token(s) of a typed leaf.
 //
 // Value/modifier tokens come from node.Keys[1:] (flat-set + hierarchical
@@ -759,6 +792,22 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 	path := append(append([]string(nil), parentPath...), leafName)
 	values := node.Keys[1:]
 	check := leafSchema.checkValue(vc)
+
+	// #6774: the hierarchical BLOCK spelling `keyword { value; }`, for the
+	// leaves that opt in via blockValue. Junos displays a choice container
+	// (`default-policy`) that way, and the compiler reads it deliberately, so
+	// without this the strict commit path rejects canonical Junos that the
+	// compiler compiles correctly and the tolerated load path applies.
+	//
+	// EXACTLY ONE child carrying EXACTLY ONE token is accepted. Two children
+	// is NOT "the first one wins": the compiler reads Children[0] and
+	// silently discards the rest, so `default-policy { deny-all; permit-all; }`
+	// does not do what it reads as and must still be rejected.
+	if len(values) == 0 && leafSchema.blockValue {
+		if v, ok := singleBlockValue(node); ok {
+			values = []string{v}
+		}
+	}
 
 	if len(values) == 0 {
 		return typedLeafErrorf(path, "missing value")
