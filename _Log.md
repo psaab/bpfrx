@@ -104796,3 +104796,28 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
   `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
   `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
+
+## 2026-08-22 — #6794 LLDP recovers a dark interface on unchanged config
+
+- **Timestamp**: 2026-08-22
+- **Action**: `reconcileLLDP` recorded `d.lldpApplied = want` BEFORE calling
+  `d.lldpMgr.Apply`, and `Apply` was void while bringing each interface up
+  INDEPENDENTLY (a lookup failure logs + `continue`s). So a partial generation
+  was indistinguishable from a converged one, and every later reconcile with the
+  same config took the early return — recovery needed a `protocols lldp` edit or
+  a daemon restart. `Apply` now returns the interfaces that failed NAME
+  resolution; the caller records it AFTER the apply and `lldpRecoveryDue`
+  re-tests exactly those names.
+- **Why not "retry whenever incomplete"**: `Apply` `Stop()`s the whole
+  generation first (closes every socket, wipes the neighbor table), so a
+  permanently-absent interface (a config typo) would rebuild LLDP on every
+  unrelated commit — the #2372 finding-6 churn the guard exists to prevent. The
+  retry gates on the WORLD changing (a previously-unresolved name now resolves),
+  not on time or a counter.
+- **Socket-failure residual, stated deliberately**: a `newIfSession` failure
+  (CAP_NET_RAW/bind) is logged and skipped but NOT reported as retry debt — it
+  does not self-heal within a process, so retrying it would churn.
+- **File(s)**: `pkg/lldp/lldp.go`, `pkg/lldp/test_seams.go`,
+  `pkg/lldp/apply_partial_6794_test.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_apply_tail.go`,
+  `pkg/daemon/lldp_recovery_6794_test.go`, `pkg/lldp/README.md`, `_Log.md`

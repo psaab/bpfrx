@@ -416,6 +416,15 @@ type Daemon struct {
 	lldpMgr          *lldp.Manager
 	lldpApplied      *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
 	lldpApplyInit    bool             // true once reconcileLLDP has run at least once
+	// lldpUnresolved is the set of configured LLDP interfaces the LAST
+	// Manager.Apply could not resolve to a kernel interface (#6794). Apply is
+	// partial — it brings each interface up independently and skips the ones it
+	// cannot find — so this is what makes an INCOMPLETE generation
+	// distinguishable from a converged one. Written AFTER the apply, from the
+	// apply's own return, and read by lldpRecoveryDue to decide whether an
+	// unchanged-config reconcile should nevertheless re-apply. Mutated under
+	// applySem like the two fields above.
+	lldpUnresolved []string
 	// scheduler is the live policy-window scheduler. It is an atomic.Pointer so
 	// the metrics collector can read it lock-free for the
 	// xpf_scheduler_republish_fail_closed SSOT gauge

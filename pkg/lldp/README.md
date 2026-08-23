@@ -11,11 +11,32 @@ frame flood cannot exhaust memory (#4044).
 - `Neighbor` — `lldp.go`. Chassis ID, port ID, TTL, system name and
   description.
 - `New()` — `lldp.go`.
-- `Apply(ctx context.Context, cfg *LLDPConfig)` — `lldp.go`. Reconcile-shaped:
-  `Stop()`s the current generation before starting the new one, so calling it
-  repeatedly is idempotent. A nil/disabled/empty config stops the service.
-  Holds `lifecycleMu` across the whole transition so a concurrent `Stop()`
-  cannot interleave (see **Apply/Stop concurrency** below).
+- `Apply(ctx context.Context, cfg *LLDPConfig) (unresolved []string)` —
+  `lldp.go`. Reconcile-shaped: `Stop()`s the current generation before starting
+  the new one, so calling it repeatedly is idempotent. A nil/disabled/empty
+  config stops the service. Holds `lifecycleMu` across the whole transition so a
+  concurrent `Stop()` cannot interleave (see **Apply/Stop concurrency** below).
+
+  **Apply is PARTIAL, and says so (#6794).** Each configured interface is
+  brought up independently and a failure skips just that one, so a call that
+  "succeeded" can leave part of the generation dark. It returns the interfaces
+  that failed NAME RESOLUTION — the recoverable half, where the NIC simply is
+  not there yet (renamed a moment later by a `.link` file, created later as a
+  VLAN/tunnel, or not yet up). It used to return nothing at all, which is what
+  let the daemon's unchanged-config guard record an incomplete generation as
+  converged and skip every reconcile that would have fixed it; recovery then
+  needed a `protocols lldp` edit or a daemon restart. A SOCKET-setup failure
+  (CAP_NET_RAW, bind) is deliberately NOT reported: it is logged and the
+  interface skipped, but it does not self-heal within a process the way an
+  absent NIC does, so surfacing it as retry debt would rebuild the whole
+  generation on every later commit — wiping the neighbor table over a condition
+  that will not change.
+- `InterfaceResolvable(name string) bool` — `lldp.go` (#6794). Whether a
+  configured interface name resolves to a kernel interface right now. Uses the
+  SAME name conversion and the SAME lookup seam as `Apply`, deliberately: the
+  daemon's recovery guard reads this to decide whether a previously-unresolved
+  interface has appeared, and the apply acts on it, so a divergence between the
+  two would mean either no recovery or endless re-`Apply`.
 - `Stop()` — `lldp.go`. Holds `lifecycleMu`, then tears the generation down via
   the internal `stopLocked`.
 - `Running()` — `lldp.go`. Reports whether a live generation has at least one
