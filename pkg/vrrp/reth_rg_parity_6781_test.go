@@ -158,3 +158,49 @@ func TestRethRGOwnersIsTheDiscriminator(t *testing.T) {
 			"NOT own a group; owners=%v", owners)
 	}
 }
+
+// TestCollectRethInstancesSkipsGroupZero pins the `> 0` guard that lives at the
+// CALLER rather than in the shared predicate (see Config.RethRGOwners).
+//
+// RG 0 is the control-plane group and an UNSET redundancy-group also reads as
+// 0, so a reth carrying neither must get no VRRP instance. Without the guard
+// every reth with an unset group would be handed VRID 100 (RethVRRPGroupIDBase
+// + 0) and start advertising — while the direct collector, which is
+// legitimately queried FOR group 0, must still answer for that same reth. The
+// two needs differ, which is exactly why the term is not in the predicate.
+//
+// FAIL-ON-REVERT: drop `|| rgID <= 0` from CollectRethInstances and this reds.
+func TestCollectRethInstancesSkipsGroupZero(t *testing.T) {
+	cfg := compileRethCfg(t, append(rethParityBase(),
+		// A structurally real reth with NO redundancy-group line: rgID 0.
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth0",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+	))
+
+	// Precondition: the shared predicate DOES own it (at group 0), so the
+	// assertion below is about the caller's guard and not about the predicate
+	// having quietly dropped the interface.
+	owners := cfg.RethRGOwners()
+	if rg, ok := owners["reth0"]; !ok || rg != 0 {
+		t.Fatalf("fixture: reth0 should be owned at group 0, got rg=%d ok=%v "+
+			"(owners=%v)", rg, ok, owners)
+	}
+
+	if insts := CollectRethInstances(cfg, map[int]int{0: 200}); len(insts) != 0 {
+		var got []string
+		for _, i := range insts {
+			got = append(got, i.Interface)
+		}
+		t.Errorf("CollectRethInstances synthesized %d instance(s) %v for "+
+			"redundancy-group 0; RG 0 is the control-plane group and an unset "+
+			"group reads as 0, so no RETH VRRP instance may be created for it",
+			len(insts), got)
+	}
+
+	// The direct collector, by contrast, must still answer for group 0 — the
+	// asymmetry the caller-side guard exists to preserve.
+	if vips := RethVIPsForRG(cfg, 0); len(vips) == 0 {
+		t.Errorf("RethVIPsForRG(0) returned nothing; the direct mode is " +
+			"legitimately queried for group 0 and must still resolve the reth")
+	}
+}
