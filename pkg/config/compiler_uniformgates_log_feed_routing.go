@@ -295,6 +295,24 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	// already-persisted or peer-synced config still boots — #1960; the render
 	// path now skips an invalid router-id so it never reaches frr.conf). Runs
 	// on the fully-compiled *Config. Mirrors validateBGPNeighborPeerASStrict.
+	// #6796: the BGP neighbor ADDRESS is rendered raw at every frr.conf site,
+	// and FRR's lexer splits on whitespace with no quoted-string token — so an
+	// address carrying spaces or newlines renders as MULTIPLE statements and
+	// injects configuration the operator never wrote. Strict on commit /
+	// commit-check (hard reject naming the neighbor); lenient on load /
+	// peer-sync (warn so an already-persisted config still boots — #1960; the
+	// renderer skips a non-IP neighbor so it never reaches frr.conf). Placed
+	// beside validateBGPNeighborPeerASStrict, whose renderer exclusion set it
+	// shares.
+	if err := validateBGPNeighborAddressStrict(cfg); err != nil {
+		if opts.lenientBGPNeighborAddress {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("bgp neighbor address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	if err := validateRouterIDStrict(cfg); err != nil {
 		if opts.lenientRouterID {
 			cfg.Warnings = append(cfg.Warnings,

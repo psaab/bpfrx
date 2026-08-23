@@ -1566,6 +1566,21 @@ type compileOpts struct {
 	// and a leniently-loaded bad neighbor is inert. Same doctrine as
 	// lenientRoutingExportRef.
 	lenientBGPNeighborPeerAS bool
+	// lenientBGPNeighborAddress (#6796) downgrades the BGP neighbor-address
+	// gate (validateBGPNeighborAddressStrict) from a hard compile error to a
+	// cfg.Warnings entry. The address is rendered RAW into frr.conf at 24
+	// sites, and FRR's command lexer splits on whitespace with no
+	// quoted-string token — so an address carrying spaces or newlines renders
+	// as MULTIPLE statements and injects configuration the operator never
+	// wrote. The strict commit / commit-check path hard-rejects so the bad
+	// value is operator-visible, naming the neighbor and its group; the
+	// tolerant load / peer-sync paths warn so an already-persisted or
+	// peer-synced config carrying such a neighbor still BOOTS (#1960
+	// fail-closed-on-load class) — the render path skips a neighbor whose
+	// address is not a bare IP, so it never reaches frr.conf and a leniently
+	// loaded bad address is inert. Same doctrine as lenientBGPNeighborPeerAS,
+	// whose renderer-side exclusion set this shares.
+	lenientBGPNeighborAddress bool
 	// lenientRouterID (#2980) downgrades the OSPF/OSPFv3/BGP router-id gate
 	// (validateRouterIDStrict) from a hard compile error to a cfg.Warnings
 	// entry. router-id is parsed as a raw string with no validation, so a
@@ -2460,6 +2475,7 @@ func lenientCompileOpts() compileOpts {
 		lenientRPMHTTPGetScheme:                true,
 		lenientRPMRoutingInstance:              true,
 		lenientBGPNeighborPeerAS:               true,
+		lenientBGPNeighborAddress:              true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
 		lenientBridgeDomainVlanID:              true,
