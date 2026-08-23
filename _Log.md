@@ -104280,6 +104280,21 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: pkg/config/compiler_services.go,
   pkg/config/event_trigger_duplicate_6771_test.go
 
+## 2026-08-22 — #7563 load-sensitive test assertions
+
+- **Timestamp**: 2026-08-22
+- **Action**: Removed the scheduler-observing assertions from three tests that
+  failed only under full-tree parallel `go test ./...` and passed on re-run of
+  the same tree. Each was reproduced DETERMINISTICALLY first by injecting the
+  scheduling perturbation a loaded box supplies for free, then fixed, then
+  re-run under the same perturbation. A fourth instance
+  (`TestEventStreamRawDataplaneEventsFeedSyslogFanout`) was found by census and
+  is not in the issue.
+- **File(s)**: `pkg/ddns/fake_dns_portpair_6709_test.go`,
+  `pkg/ddns/README.md`, `pkg/daemon/dhcp_apply_converger_6535_test.go`,
+  `pkg/dataplane/userspace/eventstream_test.go`,
+  `docs/engineering-style.md`
+
 ## 2026-08-22 — #6772/#6773 bound two typed leaves at their runtime domains
 - **Timestamp**: 2026-08-22
 - **Action**: #6773 DDNS ttl was min-only while reaching a uint32 DNS RR header
