@@ -47,6 +47,58 @@ community classification, `renderComposedRouteMap`, and the `-xpf-redist`
 alias guard. The detailed rendering semantics documented in the
 `policy_render.go` row below apply wherever each function now lives:
 
+### Non-protocol route operands have a final validity belt (#6795)
+
+The `ip route` / `ipv6 route` renderers — static routes
+(`generateStaticRouteInTable`) and generate-routes (`renderGenerateRoutes`) —
+interpolate RAW STRINGS from the parser: `sr.Destination`, `nh.Address`,
+`ifName`, `gr.Prefix`. The protocol renderers already have belts
+(`validRouterID` #2980, `validClusterID` / `validBGPOrigin` #4919); these did
+not.
+
+The blast radius is what makes it matter: a malformed operand fails the **whole**
+frr-reload — one `vtysh -f` add-batch exits non-zero on any
+`CMD_WARNING_CONFIG_FAILED` — so one bad route takes **every other route on the
+box** with it. A value carrying whitespace additionally splits into extra
+operands, or adds a statement outright. Commit validates these, but the tolerant
+load / HA config-sync paths only warn (#1960 no-brick), so the renderer is the
+last place to stop it.
+
+Three predicates in `render_validate.go`:
+
+| operand | predicate | accepts |
+|---|---|---|
+| destination / generate prefix | `validFRRRoutePrefix` | CIDR **or** a bare address |
+| gateway | `validFRRNextHopAddress` | a bare address only |
+| interface | `validFRRInterfaceOperand` | one token |
+
+`validFRRRoutePrefix` accepts a maskless host route deliberately: the
+destination is a raw string and a host route may reach here without a mask, and
+**dropping a route form that renders today is an outage**. The belt exists to
+keep UNRENDERABLE operands out of `frr.conf`, not to re-litigate the accepted
+grammar. `validFRRInterfaceOperand` is a token test rather than a name-charset
+test for the same reason.
+
+**Granularity is deliberate.** A bad DESTINATION drops the route; a bad
+NEXT-HOP drops only that next-hop. A `next-hop [ a b ]` ECMP list with one
+malformed member must still install the good ones — dropping the whole route
+would turn a typo in one gateway into a blackhole for the prefix, and the
+no-next-hop path already renders NOTHING rather than a `Null0` (#3872), so a
+whole-route drop is silently fail-wide.
+
+**The DHCP-learned routes deliberately get no belt.** They look like the
+highest-risk operands — they come from a DHCP server on the wire — but they are
+not raw strings: `lease.Gateway` is a `netip.Addr` and `cr.Destination` a
+`netip.Prefix`, both `String()`-ed, and those types cannot stringify to anything
+containing whitespace. `TestDHCPRouteOperandsAreStructurallySafe6795` records
+that measurement so the question is re-asked if either field is ever widened to
+a string.
+
+Not covered here: the `vrf <name>` clause still goes through `sanitizeFRRValue`
+(#5557). That sanitizer maps control bytes to a space — the sink's own separator
+— so it is the weaker belt described under #6796, but the routing-instance name
+is validated at commit and is out of this issue's scope.
+
 ### BGP neighbor identity is a single FRR token (#6796)
 
 `n.Address` is rendered RAW at 24 sites in `protocols_render.go` — unlike every
