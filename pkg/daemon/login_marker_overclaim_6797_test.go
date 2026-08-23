@@ -199,3 +199,68 @@ func TestOwnershipClaimRollbackSemantics_6797(t *testing.T) {
 		t.Error("rollback did not withdraw a claim over a UID-mismatched marker")
 	}
 }
+
+// breakKeyFileWrite lets the .ssh DIRECTORY be created normally but makes the
+// authorized_keys write itself fail: the target path is a DIRECTORY, so
+// WriteFileDurable's rename over it fails.
+//
+// This is a distinct branch from breakSSHDir. applySystemLogin rolls the claim
+// back at BOTH the mkdir failure and the write failure, and a fixture that only
+// ever fails at mkdir leaves the write-failure rollback mutation-invisible —
+// measured: deleting it left the suite green.
+func breakKeyFileWrite(t *testing.T, keysFile string) {
+	t.Helper()
+	if err := os.MkdirAll(keysFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFailedKeyFileWriteDoesNotClaim covers the WRITE-failure branch of the
+// user key path (breakSSHDir above covers the mkdir branch).
+//
+// FAIL-ON-REVERT: remove the keyClaim.rollback() at the WriteFileDurable
+// failure and this reds.
+func TestFailedKeyFileWriteDoesNotClaim_6797(t *testing.T) {
+	keysFile := stageEmptiedKeysEnv(t, "helen", 1008)
+	breakKeyFileWrite(t, keysFile)
+
+	d := &Daemon{}
+	d.applySystemLogin(loginCfg(&config.LoginUser{
+		Name:    "helen",
+		Class:   "operator",
+		SSHKeys: []string{"ssh-ed25519 AAAA helen-from-config"},
+	}))
+
+	if keyProvisioned("helen", 1008) {
+		t.Fatalf("a FAILED authorized_keys WRITE left a key-ownership marker; " +
+			"the mkdir-failure rollback is not enough on its own (#6797)")
+	}
+}
+
+// TestFailedRootKeyWriteDoesNotClaim covers the ROOT key path, which has its
+// own marker-first block and its own rollback.
+//
+// Root is the highest-consequence case: a stale root key claim authorises
+// removing /root/.ssh/authorized_keys, and if that file is the operator's own
+// out-of-band root key, revoking it can lock them out of the box entirely.
+//
+// FAIL-ON-REVERT: remove the rootKeyClaim.rollback() at the root
+// WriteFileDurable failure and this reds.
+func TestFailedRootKeyWriteDoesNotClaim_6797(t *testing.T) {
+	_, rootKeys := stageRootAuthEnv(t, "*")
+
+	// The .ssh dir creates fine; the key file path is a DIRECTORY so the write
+	// fails at the rename.
+	if err := os.MkdirAll(rootKeys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{}
+	_ = d.applyRootAuth(rootAuthCfg("", "ssh-ed25519 AAAAROOT root@host"))
+
+	if keyProvisioned("root", 0) {
+		t.Fatalf("a FAILED root authorized_keys write left a key-ownership " +
+			"marker; a later empty key list would then remove root's key file " +
+			"— including an operator-installed one (#6797)")
+	}
+}
