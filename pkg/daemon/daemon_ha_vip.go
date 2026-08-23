@@ -299,6 +299,9 @@ func (d *Daemon) addStableRethLinkLocal(rgID int) {
 		for unitNum := range ifc.Units {
 			if unitNum > 0 && rethUnitHasIPv6(ifc, unitNum) {
 				unit := ifc.Units[unitNum]
+				if unit == nil { // #6780
+					continue
+				}
 				subIface := linuxName
 				if unit.VlanID > 0 {
 					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
@@ -357,6 +360,9 @@ func (d *Daemon) removeStableRethLinkLocal(rgID int) {
 		for unitNum := range ifc.Units {
 			if unitNum > 0 {
 				unit := ifc.Units[unitNum]
+				if unit == nil { // #6780
+					continue
+				}
 				subIface := linuxName
 				if unit.VlanID > 0 {
 					subIface = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
@@ -636,6 +642,9 @@ func (d *Daemon) directSendGARPs(rgID int) {
 			}
 			// Send on each VLAN sub-interface.
 			for _, unit := range ifc.Units {
+				if unit == nil { // #6780
+					continue
+				}
 				if unit.VlanID > 0 {
 					subIface := fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
 					if !seen[subIface] {
