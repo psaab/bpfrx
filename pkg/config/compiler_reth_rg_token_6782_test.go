@@ -340,3 +340,71 @@ func TestRethRGTokenProblemClassifier6782(t *testing.T) {
 		}
 	}
 }
+
+// TestSuppressionIsScopedToTheOffendingReth6782 is the shape the sibling test
+// above CANNOT reach, and the matrix proved it: dropping the
+// `invalid[ifc.RedundantParent]` term from the member loop survived every other
+// cell.
+//
+// The reason is that a fixture containing ONLY a valid reth never enters the
+// member loop at all — suppressInvalidRethAddresses returns early on an empty
+// `invalid` set — so the guard is shadowed by the early return and its deletion
+// is invisible. The discriminating shape needs BOTH a reth whose group is
+// unusable AND a healthy reth, each with its own member: only then does the
+// term decide anything.
+//
+// Over-suppression here is not a cosmetic bug. Clearing a HEALTHY reth's member
+// addresses on a tolerant load would black-hole a working cluster on the very
+// path whose whole purpose (#1960) is to keep a node serving.
+func TestSuppressionIsScopedToTheOffendingReth6782(t *testing.T) {
+	lines := []string{
+		"set chassis cluster cluster-id 1",
+		`set chassis cluster authentication-key "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2Rl"`,
+		"set chassis cluster node 0",
+		"set chassis cluster redundancy-group 1 node 0 priority 200",
+		"set chassis cluster redundancy-group 2 node 0 priority 200",
+		// The offender.
+		"set interfaces reth0 redundant-ether-options redundancy-group 0",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.61.1/24",
+		// The healthy neighbour, which must be left completely alone.
+		"set interfaces reth1 redundant-ether-options redundancy-group 2",
+		"set interfaces reth1 unit 0 family inet address 10.0.62.1/24",
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.62.1/24",
+	}
+	cfg, err := CompileConfigLenient(rethRGTree(t, lines))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	countAddrs := func(name string) int {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc == nil {
+			t.Fatalf("fixture broken: %s must compile, got %v", name, ifaceNames6782(cfg))
+		}
+		n := 0
+		for _, u := range ifc.Units {
+			n += len(u.Addresses)
+		}
+		return n
+	}
+	// The offender and its member are stripped.
+	if got := countAddrs("reth0"); got != 0 {
+		t.Fatalf("reth0 has an unusable group; its addresses must be suppressed, got %d", got)
+	}
+	if got := countAddrs("ge-0/0/0"); got != 0 {
+		t.Fatalf("ge-0/0/0 inherits from the offending reth; its addresses must be "+
+			"suppressed, got %d", got)
+	}
+	// The healthy neighbour keeps everything. This is the assertion the
+	// single-reth fixtures could not make.
+	if got := countAddrs("reth1"); got == 0 {
+		t.Fatal("reth1's group is VALID — suppressing its addresses would black-hole a " +
+			"healthy interface on the tolerant load path")
+	}
+	if got := countAddrs("ge-0/0/1"); got == 0 {
+		t.Fatal("ge-0/0/1 inherits from a VALID reth — the member loop must be scoped " +
+			"to members of the OFFENDING reth, not every member on the box")
+	}
+}
