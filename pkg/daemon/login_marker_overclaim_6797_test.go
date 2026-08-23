@@ -264,3 +264,80 @@ func TestFailedRootKeyWriteDoesNotClaim_6797(t *testing.T) {
 			"— including an operator-installed one (#6797)")
 	}
 }
+
+// installFailingChpasswd puts a chpasswd on PATH that always exits non-zero,
+// so the user-password apply reaches its failure branch. The user key/password
+// fixtures stub runCommandTimeout, but chpasswd goes through
+// runCommandStdinTimeout, which execs the real binary from PATH.
+func installFailingChpasswd(t *testing.T) {
+	t.Helper()
+	binDir := t.TempDir()
+	script := "#!/bin/sh\ncat >/dev/null\necho 'chpasswd: refused' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "chpasswd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+}
+
+// TestFailedChpasswdDoesNotClaimPassword covers the PASSWORD path, whose
+// consumer is the declarative D2 lock rather than a file removal.
+//
+// The chain: an operator already has their own password on the account, the
+// config adds an encrypted-password directive, chpasswd FAILS, and the marker
+// persists. When the directive is later removed, the D2 branch reads that
+// marker as proof xpf set the password and LOCKS the account — an operator
+// locked out of a password xpf never set.
+//
+// FAIL-ON-REVERT: remove the pwClaim/acctClaim rollbacks at the chpasswd
+// failure and this reds.
+func TestFailedChpasswdDoesNotClaimPassword_6797(t *testing.T) {
+	stageEmptiedKeysEnv(t, "ivan", 1009)
+	installFailingChpasswd(t)
+
+	d := &Daemon{}
+	d.applySystemLogin(loginCfg(&config.LoginUser{
+		Name:              "ivan",
+		Class:             "operator",
+		EncryptedPassword: config.Secret("$6$salt$xpfhash"),
+	}))
+
+	if passwordProvisioned("ivan", 1009) {
+		t.Errorf("a FAILED chpasswd left a password-ownership marker; removing " +
+			"the directive later would LOCK an account whose password xpf " +
+			"never set (#6797)")
+	}
+	if xpfProvisioned("ivan", 1009) {
+		t.Errorf("a FAILED chpasswd left an account-registry marker; xpf claims " +
+			"to manage an account it never provisioned (#6797)")
+	}
+}
+
+// TestPreExistingPasswordClaimSurvivesAFailedChpasswd is the password-side
+// TIGHTENING control, mirroring the key-side one: a claim an EARLIER apply
+// legitimately made must survive a later failed chpasswd, or xpf loses the
+// ability to D2-lock a password it really did set.
+func TestPreExistingPasswordClaimSurvivesAFailedChpasswd_6797(t *testing.T) {
+	stageEmptiedKeysEnv(t, "judy", 1010)
+	installFailingChpasswd(t)
+
+	// An earlier apply set judy's password.
+	if err := markPasswordProvisioned("judy", 1010); err != nil {
+		t.Fatal(err)
+	}
+	if err := markProvisioned("judy", 1010); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{}
+	d.applySystemLogin(loginCfg(&config.LoginUser{
+		Name:              "judy",
+		Class:             "operator",
+		EncryptedPassword: config.Secret("$6$salt$rotated"),
+	}))
+
+	if !passwordProvisioned("judy", 1010) {
+		t.Error("a failed password ROTATION withdrew a claim an earlier apply " +
+			"legitimately made; xpf can no longer lock a password it set — the " +
+			"#5841 underclaim, reintroduced (#6797)")
+	}
+}
