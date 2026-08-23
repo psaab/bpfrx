@@ -104796,6 +104796,62 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
   `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
   `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
+## 2026-08-22 — #6789 bootstrap lifeline refuses on an incomplete addressing snapshot
+
+- **Timestamp**: 2026-08-22
+- **Action**: `interfaceAddrSnapshot` returned empty slices on a `LinkByName`
+  failure and discarded the `AddrList` error; the writer's
+  `isDHCPManaged(x) || (len(v4)==0 && len(v6)==0)` then took the DHCP branch, so
+  a statically-addressed mgmt NIC got a `DHCP=yes` .network and was renamed
+  (link cycle) — a lockout on a box reachable only over that NIC. Replaced both
+  helpers with one typed `snapshotLifelineAddrs` returning an error, added
+  injectable netlink seams, and made `setupBootstrapLifeline` abort BEFORE the
+  .link write, rename and reload.
+- **The two helpers failed in OPPOSITE directions**: `isDHCPManaged` is
+  documented to fail toward static (safe); `interfaceAddrSnapshot` failed toward
+  empty, which defeated it through the OR. They were two netlink walks over one
+  state; now one.
+- **Scoping (caught by a pre-existing test)**: the first version refused
+  unconditionally and reddened `TestSetupBootstrapLifelineAppliance` — the
+  #7114 appliance factory boot has NO default route and no addressing by design,
+  and DHCP is the image's contract. The refusal is now scoped to a lifeline
+  chosen by DEFAULT ROUTE (positive evidence of live addressing); a route-dump
+  failure is fatal only for a family the snapshot has addresses in.
+- **Second, more dangerous defect in the same issue (selection half)**:
+  `detectLifelineInterface` discarded the `RouteList` error and returned
+  `("", false)` — indistinguishable from "no default route" — and the caller
+  branches on exactly that: `applianceFactory := routeIface == "" &&
+  d.applianceFactoryBoot()`. On an appliance box a netlink error therefore
+  flipped selection to "claim the FIRST ENUMERATED NIC" and renamed it
+  (`renameInterface` = LinkSetDown/LinkSetName/LinkSetUp, i.e. the NIC cycle).
+  Now returns an error; the caller refuses when the route state is UNKNOWN.
+  Guard keys on the observation FAILING, never on an empty routeIface (keying on
+  empty would strand every factory image console-only). A found+resolved route
+  is positive identification and survives a partial error.
+- **File(s)**: `pkg/daemon/bootstrap.go`,
+  `pkg/daemon/lifeline_snapshot_failclosed_6789_test.go`,
+  `pkg/daemon/bootstrap_appliance_factory_7114_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-22 — #6796 BGP neighbor identity could span multiple FRR tokens
+
+- **Timestamp**: 2026-08-22
+- **Action**: `n.Address` was rendered RAW at 24 frr.conf sites while every
+  neighbouring operand was sanitized. FRR's lexer splits on whitespace with no
+  quoted-string token, so an identity carrying a space/newline rendered as
+  MULTIPLE statements — arbitrary FRR config injected through a config value,
+  reaching both the BGP neighbor lines and the BFD peer accumulator. Added
+  `validBGPNeighborAddress` at the shared `validNeighbors` exclusion point
+  (covers all 24 sites and BFD at once) plus a strict commit gate
+  `validateBGPNeighborAddressStrict` with `lenientBGPNeighborAddress` per
+  #1960. First version required a bare IP and was caught OVER-REJECTING by a
+  pre-existing parser test peering with `peer.example.com`; corrected to
+  single-token-ness, which is the actual property.
+- **File(s)**: pkg/frr/render_validate.go, pkg/frr/protocols_render.go,
+  pkg/frr/bgp_neighbor_token_6796_test.go,
+  pkg/config/compiler_validate_strict_routing.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/bgp_neighbor_token_6796_test.go, pkg/frr/README.md, _Log.md
 
 ## 2026-08-22 — #6794 LLDP recovers a dark interface on unchanged config
 
