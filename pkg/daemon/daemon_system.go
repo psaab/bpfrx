@@ -1486,7 +1486,12 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 			// Fail VISIBLE: if the durable marker cannot be written, skip the
 			// key write and retry next apply rather than leave a
 			// written-but-unmarked key grant (the underclaim).
-			if err := markKeyProvisioned(user.Name, uid); err != nil {
+			// #6797: hold the claim so a FAILED key write can withdraw it. The
+			// key marker gates os.Remove(authorized_keys) below, so a marker
+			// left behind by a write that never happened makes a later
+			// directive removal delete an operator's pre-existing key file.
+			keyClaim, err := claimOwnership(provisionedKeysDir(), user.Name, uid)
+			if err != nil {
 				slog.Warn("skipping authorized_keys apply: cannot record key ownership marker",
 					"user", user.Name, "err", err)
 				// Fail-visible for the #5874 closeout: the key write was skipped,
@@ -1502,6 +1507,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 			// just-created .ssh directory (Codex r1, fsatomic README).
 			if err := fsatomic.MkdirAllDurable(sshDir, 0700); err != nil {
 				slog.Warn("failed to create .ssh dir", "user", user.Name, "dir", sshDir, "err", err)
+				keyClaim.rollback() // #6797: no key file was written
 				fail(fmt.Errorf("create .ssh dir for %s: %w", user.Name, err))
 				continue
 			}
@@ -1534,6 +1540,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 				if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(uid, gid)); err != nil {
 					slog.Warn("failed to write authorized_keys",
 						"user", user.Name, "err", err)
+					keyClaim.rollback() // #6797: the key file was not written
 					fail(fmt.Errorf("write authorized_keys for %s: %w", user.Name, err))
 					continue
 				}
@@ -1767,8 +1774,15 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 		// an unresolved account (the fail-open missing-entry case) still runs
 		// chpasswd, which fails for a nonexistent user, so no live credential is
 		// ever left unmarked.
+		// #6797: hold both claims so a FAILED chpasswd can withdraw whichever
+		// of them THIS pass created. The password marker gates the declarative
+		// D2 lock below, so a marker left behind by a chpasswd that never
+		// succeeded makes a later directive removal LOCK an account whose
+		// password xpf never set — the operator's own password.
+		var pwClaim, acctClaim ownershipClaim
 		if uidOK {
-			if err := markPasswordProvisioned(user.Name, curUID); err != nil {
+			var err error
+			if pwClaim, err = claimOwnership(provisionedPasswordsDir(), user.Name, curUID); err != nil {
 				slog.Warn("skipping password apply: cannot record password ownership marker",
 					"user", user.Name, "err", err)
 				// Fail-visible for the #5874 closeout: chpasswd was skipped, so
@@ -1776,9 +1790,10 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 				fail(fmt.Errorf("mark password provisioned %s: %w", user.Name, err))
 				break
 			}
-			if err := markProvisioned(user.Name, curUID); err != nil {
+			if acctClaim, err = claimOwnership(provisionedUsersDir, user.Name, curUID); err != nil {
 				slog.Warn("skipping password apply: cannot record account marker",
 					"user", user.Name, "err", err)
+				pwClaim.rollback() // the password mutation will not run
 				fail(fmt.Errorf("mark provisioned %s: %w", user.Name, err))
 				break
 			}
@@ -1787,6 +1802,11 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to set user password",
 				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+			// #6797: the shadow password did NOT change, so withdraw the
+			// ownership this pass claimed for it. A claim an EARLIER apply
+			// legitimately made is preserved — rollback is a no-op for it.
+			pwClaim.rollback()
+			acctClaim.rollback()
 			fail(fmt.Errorf("set password for %s: %w", user.Name, err))
 		} else {
 			// The password + account markers were already recorded marker-first
@@ -2130,7 +2150,12 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 		// enumerated by the factory-reset teardown (#5520) for a keys-only
 		// root-authentication. Fail VISIBLE: skip the key write if either
 		// durable marker cannot be recorded, retry next apply.
-		if err := markKeyProvisioned("root", 0); err != nil {
+		// #6797: hold both claims so a FAILED root key write can withdraw
+		// whichever THIS pass created. The key marker gates the root
+		// authorized_keys removal below, so a stale claim deletes an
+		// operator-installed root key file xpf never wrote.
+		rootKeyClaim, err := claimOwnership(provisionedKeysDir(), "root", 0)
+		if err != nil {
 			slog.Warn("skipping root authorized_keys apply: cannot record key ownership marker", "err", err)
 			// Fail-visible for the #5874 closeout: root's key write was skipped,
 			// so root SSH keys did NOT converge. The naked return yields the
@@ -2138,8 +2163,10 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 			fail(fmt.Errorf("mark root key provisioned: %w", err))
 			return
 		}
-		if err := markProvisioned("root", 0); err != nil {
+		rootAcctClaim, err := claimOwnership(provisionedUsersDir, "root", 0)
+		if err != nil {
 			slog.Warn("skipping root authorized_keys apply: cannot record account marker", "err", err)
+			rootKeyClaim.rollback() // the key write will not run
 			fail(fmt.Errorf("mark root provisioned: %w", err))
 			return
 		}
@@ -2148,6 +2175,8 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 		// (Codex r1).
 		if err := fsatomic.MkdirAllDurable(rootSSHDir, 0700); err != nil {
 			slog.Warn("failed to create /root/.ssh dir", "err", err)
+			rootKeyClaim.rollback() // #6797: no key file was written
+			rootAcctClaim.rollback()
 			// naked return: yields the accumulated named result, not the
 			// block-shadowed err from the `if err := ...` binding.
 			fail(fmt.Errorf("create /root/.ssh dir: %w", err))
@@ -2162,6 +2191,8 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 			// uid 0) and keeps the install correctly-owned at rename.
 			if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(0, 0)); err != nil {
 				slog.Warn("failed to write root authorized_keys", "err", err)
+				rootKeyClaim.rollback() // #6797: the key file was not written
+				rootAcctClaim.rollback()
 				fail(fmt.Errorf("write root authorized_keys: %w", err))
 				return
 			}
