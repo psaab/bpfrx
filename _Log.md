@@ -104702,3 +104702,28 @@ prose edit above them added. No diff falls in the new test body.
   every cell. Added the queue-behind-a-commit interleave, a loop-body cell with
   a shortened interval, and a comment-stripped source check on the start site.
 - **File(s)**: pkg/daemon/ra_dead_sender_retry_6793_test.go, _Log.md
+
+## 2026-08-22 — #6789 bootstrap lifeline refuses on an incomplete addressing snapshot
+
+- **Timestamp**: 2026-08-22
+- **Action**: `interfaceAddrSnapshot` returned empty slices on a `LinkByName`
+  failure and discarded the `AddrList` error; the writer's
+  `isDHCPManaged(x) || (len(v4)==0 && len(v6)==0)` then took the DHCP branch, so
+  a statically-addressed mgmt NIC got a `DHCP=yes` .network and was renamed
+  (link cycle) — a lockout on a box reachable only over that NIC. Replaced both
+  helpers with one typed `snapshotLifelineAddrs` returning an error, added
+  injectable netlink seams, and made `setupBootstrapLifeline` abort BEFORE the
+  .link write, rename and reload.
+- **The two helpers failed in OPPOSITE directions**: `isDHCPManaged` is
+  documented to fail toward static (safe); `interfaceAddrSnapshot` failed toward
+  empty, which defeated it through the OR. They were two netlink walks over one
+  state; now one.
+- **Scoping (caught by a pre-existing test)**: the first version refused
+  unconditionally and reddened `TestSetupBootstrapLifelineAppliance` — the
+  #7114 appliance factory boot has NO default route and no addressing by design,
+  and DHCP is the image's contract. The refusal is now scoped to a lifeline
+  chosen by DEFAULT ROUTE (positive evidence of live addressing); a route-dump
+  failure is fatal only for a family the snapshot has addresses in.
+- **File(s)**: `pkg/daemon/bootstrap.go`,
+  `pkg/daemon/lifeline_snapshot_failclosed_6789_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
