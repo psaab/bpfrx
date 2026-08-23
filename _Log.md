@@ -104796,3 +104796,23 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/vrrp/reth_rg_parity_6781_test.go` (new),
   `pkg/vrrp/reth_rg_ssot_6781_test.go` (new),
   `pkg/config/reth_rg_gate_6781_test.go` (new), `pkg/vrrp/README.md`
+
+## 2026-08-22 — #6791 fabric IPVLAN fails closed and gains a retry owner
+
+- **Timestamp**: 2026-08-22
+- **Action**: `applyFabricIPVLAN` returned nothing: it logged "CRITICAL ...
+  cluster heartbeat will not work" after exhausting its five in-line retries
+  and the commit still reported success. The evidence was the asymmetry at the
+  call site — its neighbours are captured and joined, it was a bare statement.
+  Made it return an error, captured it as `fabricErr` and threaded it into the
+  tail `errors.Join`. Safe to surface because `ensureFabricIPVLAN` errors only
+  when there is no usable overlay (address failures are warn-only, AddrReplace
+  is idempotent, an already-correct overlay returns nil). Added
+  `fabricIPVLANReassertLoop`, started unconditionally in `Run`, as the
+  persistent recovery owner for a failure outlasting those retries and for the
+  deferred OnXSKBound overlays whose failure cannot reach the commit at all.
+- **File(s)**: `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_apply_tail.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_fabric_reassert.go` (new),
+  `pkg/daemon/fabric_ipvlan_failclosed_6791_test.go` (new),
+  `pkg/daemon/README.md`

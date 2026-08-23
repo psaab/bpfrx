@@ -39,7 +39,7 @@ import (
 // lo0Err/hostInboundErr originate in step 9.5. The returned errors.Join
 // preserves the explicit operand order
 // (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error) error {
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error, fabricErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	var vrrpErr error
 	vrrpInstances := vrrp.CollectInstances(cfg)
@@ -362,7 +362,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, vrrpErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr, vrrpErr)
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
