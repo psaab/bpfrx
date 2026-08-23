@@ -341,3 +341,61 @@ func TestPreExistingPasswordClaimSurvivesAFailedChpasswd_6797(t *testing.T) {
 			"#5841 underclaim, reintroduced (#6797)")
 	}
 }
+
+// TestFailedRootSSHDirDoesNotClaim covers the root MKDIR-failure branch, which
+// is a separate rollback site from the root write-failure branch above.
+//
+// FAIL-ON-REVERT: remove the rootKeyClaim/rootAcctClaim rollbacks at the
+// MkdirAllDurable failure and this reds.
+func TestFailedRootSSHDirDoesNotClaim_6797(t *testing.T) {
+	stageRootAuthEnv(t, "*")
+
+	// rootSSHDir itself is a regular FILE, so MkdirAllDurable fails.
+	if err := os.WriteFile(rootSSHDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{}
+	_ = d.applyRootAuth(rootAuthCfg("", "ssh-ed25519 AAAAROOT root@host"))
+
+	if keyProvisioned("root", 0) {
+		t.Errorf("a FAILED /root/.ssh creation left a root key-ownership " +
+			"marker (#6797)")
+	}
+	if xpfProvisioned("root", 0) {
+		t.Errorf("a FAILED /root/.ssh creation left a root account-registry " +
+			"marker (#6797)")
+	}
+}
+
+// TestAccountMarkerFailureWithdrawsThePasswordClaim covers the rollback that
+// fires when the SECOND claim of a pair cannot be recorded.
+//
+// The password claim succeeds, the account-registry claim then fails, and the
+// apply gives up before chpasswd. The password claim must be withdrawn: no
+// mutation happened, so nothing may be left asserting xpf set this password.
+//
+// FAIL-ON-REVERT: remove the pwClaim.rollback() in the account-marker failure
+// branch and this reds.
+func TestAccountMarkerFailureWithdrawsThePasswordClaim_6797(t *testing.T) {
+	stageEmptiedKeysEnv(t, "karl", 1011)
+
+	// The password marker root works; the ACCOUNT registry root is a regular
+	// FILE, so its MkdirAllDurable fails.
+	if err := os.WriteFile(provisionedUsersDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{}
+	d.applySystemLogin(loginCfg(&config.LoginUser{
+		Name:              "karl",
+		Class:             "operator",
+		EncryptedPassword: config.Secret("$6$salt$xpfhash"),
+	}))
+
+	if passwordProvisioned("karl", 1011) {
+		t.Errorf("the password claim survived an aborted apply: the account " +
+			"marker could not be written, so chpasswd never ran, yet xpf still " +
+			"claims to own this password (#6797)")
+	}
+}
