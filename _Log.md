@@ -104555,3 +104555,23 @@ prose edit above them added. No diff falls in the new test body.
   comment-stripped single-sourcing check.
 - **File(s)**: pkg/dataplane/userspace/manager_sessions.go,
   pkg/dataplane/userspace/synced_import_refusal_6785_test.go, _Log.md
+
+## 2026-08-22 — #6780 nil config slots on the RETH ownership path
+
+- **Timestamp**: 2026-08-22
+- **Action**: Measured the issue's claim before fixing. All three slot types do
+  panic the collectors (nil-RG affects the VRRP mode only, since the direct mode
+  never reads `RedundancyGroups` — 5 of 6 cells, not 6), but the panic is NOT
+  reachable: each container has exactly one compiler write site and each stores
+  a freshly-allocated pointer, persistence decodes the AST and recompiles, HA
+  config-sync ships TEXT, and nothing deserializes a `*config.Config`. The
+  "#3494/#5068 tolerant path admits nils" premise cited at ~12 sites is
+  circular. Enforced the invariant at the source with a new compiler canary,
+  guarded the two RETH ownership-mode collectors plus the RG-membership walks
+  they share the path with, and corrected the reachability claim in the docs
+  instead of repeating it.
+- **File(s)**: `pkg/vrrp/vrrp.go`, `pkg/daemon/daemon_ha.go`,
+  `pkg/daemon/daemon_ha_vip.go`, `pkg/config/interfaces_iter.go`,
+  `pkg/config/nil_slot_invariant_6780_test.go` (new),
+  `pkg/vrrp/reth_nil_slot_6780_test.go` (new),
+  `pkg/daemon/reth_rg_nil_slot_6780_test.go` (new), `pkg/vrrp/README.md`
