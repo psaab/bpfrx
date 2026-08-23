@@ -85,6 +85,25 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 			tcpFailClosed = true
 		}
 	}
+	// #6804: fail-closed for an unrepresentable flexible-match-range.
+	//
+	// The direction is NOT the tcp-flags drop, and mirroring userspace is what
+	// decides that. Userspace poisons such a term to FlexMatchStart::Unsupported
+	// so flex_matches() returns false and the term matches NOTHING — later terms
+	// still run (pkg/dataplane/userspace/filters.go). The kernel equivalent of
+	// "matches nothing" is to emit NO RULE for the term.
+	//
+	// A drop would be wrong here in a way it is not for tcp-flags: a tcp-flags
+	// constraint only ever matches TCP, so #5512 can scope its drop with
+	// `meta l4proto 6`. A flexible-match-range has no such natural narrowing, so
+	// a term whose ONLY predicate was the flex-match would render a bare `drop`
+	// and deny ALL host-inbound traffic — turning a fail-open into a lockout.
+	if t.FlexMatchUnrepresentable || (t.FlexMatch != nil && !flexMatchRepresentable(*t.FlexMatch)) {
+		slog.Warn("lo0 netlink mirror: unrepresentable flexible-match-range; the "+
+			"term matches NOTHING (mirroring the userspace fail-closed) so its "+
+			"narrowing is never silently dropped", "term", t.Name)
+		return
+	}
 	// addPorts resolves one port-token list and appends its transport-port match.
 	// An unrepresentable token FAILS the plan CLOSED (a.p.fail), exactly as the
 	// nft oracle does: the oracle emits the raw token and `nft -f -` REJECTS it,
@@ -143,6 +162,11 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 			} else {
 				a.fragV4()
 			}
+		}
+		// #6804: emit the flexible-match-range narrowing. Skipped when failing
+		// closed, exactly like tcp-flags — the drop below covers the term.
+		if !tcpFailClosed && t.FlexMatch != nil {
+			a.flexMatch(*t.FlexMatch)
 		}
 	}
 	applyMods := func(a *ruleAsm) {

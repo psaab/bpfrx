@@ -2238,6 +2238,48 @@ never lock an operator out of a remote box it manages.
   reverted arm emits `meta l4proto 6 accept`, the widen) and
   `TestLo0FilterPayloadUnrepresentableTCPFlagsParses` (the emission parses under
   `nft -c -f -`, proving it never fails the whole ruleset).
+
+  **flexible-match-range is MIRRORED, and an unrepresentable one matches
+  NOTHING (#6804):** before this the lo0 mirror had no handling for
+  `from flexible-match-range` at ALL — the netlink spec (`Lo0FilterTerm`) had no
+  field for it, so the predicate was dropped at that boundary and the term
+  rendered WITHOUT its narrowing. An `accept` term meant to admit only packets
+  whose header bytes match a pattern admitted every packet it scoped: the same
+  control-plane fail-OPEN #5512 fixed for tcp-flags, on the chain that is the
+  PRIMARY enforcement for host traffic.
+
+  A representable predicate now renders as nft's raw payload match,
+  `@nh,<byteOffset*8>,<byteLen*8> & <mask> == <value>` — `layer-3` match-start
+  (the only start point the compiler emits) is the network-header base. The load
+  is whole BYTES because nft loads byte-aligned; a sub-byte bit length is carried
+  by the MASK, exactly as the userspace matcher does it, and the expected value
+  is pre-masked on both sides (nft compares the masked load, so a value with bits
+  outside the mask would never match — a silent never-match is a different fail
+  direction but just as quiet).
+
+  An UNREPRESENTABLE predicate — more than one named range (#5823), an
+  unparseable numeric token (`UnknownFlexMatch`), or a load width outside 1..4
+  bytes — makes the term match NOTHING (no rule emitted), so later terms still
+  run. That mirrors userspace, which poisons the term to
+  `FlexMatchStart::Unsupported` so `flex_matches()` returns false. It is
+  deliberately NOT the #5512 tcp-flags drop: a tcp-flags constraint only ever
+  matches TCP so that drop can be scoped with `meta l4proto 6`, whereas a
+  flexible-match-range has no natural narrowing — a term whose ONLY predicate was
+  the flex-match would render a bare `drop` and deny ALL host-inbound traffic,
+  turning a fail-open into a lockout.
+
+  The width rules mirror the userspace snapshot builder exactly: a zero
+  bit-length defaults to 4 (32-bit), and an oversized width is NOT capped to 4 —
+  capping would compare only the truncated window and BROADEN the match (the
+  #3406 fail-open), so it is reported unrepresentable instead.
+
+  Pinned by `TestNftNetlinkParity/lo0_flexible_match_range` (three widths,
+  including a sub-byte 12-bit case, diffed between the nft-parsed oracle and the
+  real netlink install) and
+  `TestNftNetlinkParity/lo0_unrepresentable_flex_match_matches_nothing`. The
+  parity case is what makes the two renderers' agreement real rather than
+  asserted — both go through the actual `nft` parser and the actual netlink
+  install.
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
