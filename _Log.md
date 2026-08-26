@@ -106317,3 +106317,6 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compact_block_equivalence_2419_test.go,
     pkg/config/testdata/compact_block_divergences_2419.txt,
     docs/config-schema.md
+  - **Action**: #2419 gate — floors so the control maps cannot be silently
+    emptied (found by mutation cell M6)
+  - **File(s)**: pkg/config/compact_block_equivalence_2419_test.go

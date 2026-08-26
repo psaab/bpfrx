@@ -352,6 +352,31 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 			"tested population into the skip buckets; the census stops measuring them.",
 			wantChecked, res.checked)
 	}
+	// Anti-vacuity for the control maps themselves.
+	//
+	// Deleting an entry from any of them is SILENT: the site stays in the
+	// inventory, the equality comparison above still passes, and the control
+	// simply stops checking it. A control that can be emptied without anything
+	// noticing is not a control. These are minimums, not exact counts, so
+	// adding an anchor never needs a second edit here -- but draining one out
+	// does.
+	if len(filedFixed) < 3 {
+		t.Errorf("filedFixed holds %d anchors, want at least 3 (#6818, #6821, #6822). "+
+			"An entry was removed, and the site it named is no longer checked in "+
+			"either direction.", len(filedFixed))
+	}
+	if len(filedStillOpen) < 2 {
+		t.Errorf("filedStillOpen holds %d anchors, want at least 2 from DIFFERENT "+
+			"compiler files. With fewer, a fault confined to one file can silence "+
+			"the whole known-true half of the control.", len(filedStillOpen))
+	}
+	if len(filedByDesign) < 4 {
+		t.Errorf("filedByDesign holds %d entries, want at least 4 (the `system login "+
+			"user ... authentication` leaves). A dropped entry turns a deliberate "+
+			"divergence back into an ordinary inventory line, which is exactly the "+
+			"confusion this category exists to prevent.", len(filedByDesign))
+	}
+
 	// Positive control, both directions.
 	//
 	// A one-directional control cannot distinguish a working instrument from one
