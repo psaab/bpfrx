@@ -374,11 +374,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		//     <proto>`. It has NO route-map to reference, so it must keep
 		//     going through resolveRedistribute. Rendering it as
 		//     `neighbor X route-map connected out` would point at a
-		//     non-existent route-map, which FRR resolves to PERMIT-ALL —
-		//     advertising the entire table (a NEW leak). So we classify
-		//     each token by the SAME policy-statement-exists predicate the
-		//     commit-time validator uses (checkRedist/checkPolicyRef in
-		//     pkg/config) and split the two render paths.
+		//     non-existent route-map. So we classify each token by the SAME
+		//     policy-statement-exists predicate the commit-time validator uses
+		//     (checkRedist/checkPolicyRef in pkg/config) and split the two
+		//     render paths.
+		//
+		//     #6807 CORRECTION: this comment used to say an undefined
+		//     route-map "resolves to PERMIT-ALL — advertising the entire
+		//     table". FRR does the OPPOSITE (RMAP_DENY on a failed
+		//     route_map_lookup_by_name, stable/10.6). The split is still
+		//     right — a bare protocol token is a redistribute verb, not a
+		//     policy — but its consequence is a withdrawal, not a leak.
 		//
 		// Coexistence (Junos most-specific-wins) applies ONLY among the
 		// policy-statement-name route-map-out exports: a per-neighbor
@@ -421,10 +427,16 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// route-map below references a route-map that generatePolicyOptions
 		// actually emits. A bare/undefined ref is REJECTED at commit
 		// (validateRoutingExportReferencesStrict, strict) and SKIPPED here
-		// on the lenient load/HA-sync path: rendering `route-map <token> in`
-		// for a non-existent route-map would resolve to PERMIT-ALL in FRR
-		// and silently accept every inbound advertisement — the #2473
-		// dangling-route-map leak, INBOUND direction. Every DEFINED entry is
+		// on the lenient load/HA-sync path.
+		//
+		// #6807 CORRECTION: the skip's stated reason — that `route-map <token>
+		// in` for a non-existent route-map "would resolve to PERMIT-ALL in FRR
+		// and silently accept every inbound advertisement" — is backwards. FRR
+		// stable/10.6 bgp_input_modifier returns RMAP_DENY for an unresolvable
+		// name; it is the ABSENT attachment this skip produces that accepts
+		// everything. Behaviour unchanged here (that decision is #7625); the
+		// claim is corrected so nobody
+		// reasons from it. Every DEFINED entry is
 		// preserved as an ordered CHAIN and composed in order (#5277); the
 		// pre-#5277 code kept only the last, silently dropping a leading inbound
 		// filter so prohibited routes were accepted.
@@ -510,9 +522,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// Outbound filter. The effective export CHAIN (neighbor's own
 				// list, else the global default) is pre-filtered to DEFINED
 				// policy-statements (filterDefinedPolicies), so bare/undefined
-				// refs never render a dangling `route-map out` = FRR permit-all
-				// OUTBOUND (#2473/#2539) — bare tokens stay on the redistribute
-				// path. A single-policy chain references the standalone
+				// refs never render a dangling `route-map out` (#2473/#2539) —
+				// bare tokens stay on the redistribute path. (#6807: a dangling
+				// out-ref would DENY, not permit as this said; the definition
+				// side is what #6807 fixes.) A single-policy chain references the standalone
 				// route-map (byte-identical to pre-#5277); a chain of >= 2
 				// references the composed route-map that preserves the ordered
 				// Junos policy chain (#5277) instead of dropping all but the
@@ -533,9 +546,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				//
 				// Inbound filter (#2490/#5277). Same chain composition as the
 				// outbound path: the effective import chain is defined-filtered
-				// (no dangling permit-all in-line), single-policy references the
-				// standalone route-map, and a chain of >= 2 references the
-				// composed route-map preserving the ordered inbound policy chain.
+				// (no dangling in-line), single-policy references the standalone
+				// route-map, and a chain of >= 2 references the composed
+				// route-map preserving the ordered inbound policy chain.
 				if rm := bgpRouteMapRef(bgpNeighborImportChain(n, globalImportChain, policyOptions)); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}

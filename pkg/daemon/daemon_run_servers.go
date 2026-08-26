@@ -329,6 +329,19 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return d.frr.ReloadDegraded()
 		},
+		// #6807: how many route-maps the last rendered managed section
+		// replaced with a bounded explicit DENY because the policy would
+		// overflow FRR's sequence ceiling. Non-zero is an ongoing route
+		// WITHDRAWAL on every BGP neighbor carrying such an attachment —
+		// FRR denies a route-map name it cannot resolve — and before this
+		// the only signal was one slog.Warn at render time, which nothing
+		// alerts on.
+		FRRQuarantinedRouteMapsFn: func() []string {
+			if d.frr == nil {
+				return nil
+			}
+			return d.frr.QuarantinedRouteMaps()
+		},
 		// #4899: 1 while the last DHCP-lease-change IPsec rebind
 		// failed and swanctl local_addrs are still bound to a stale
 		// lease address (the retry loop has not reconverged), so the
