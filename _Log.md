@@ -106141,3 +106141,60 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/ipsec/swanctl_value_grammar_6833_test.go` (new),
   `pkg/networkd/networkd.go`,
   `pkg/networkd/unit_value_grammar_6833_test.go` (new), `_Log.md`
+
+## 2026-08-26 — #6811 family is part of the flow-export group key
+
+- **Timestamp**: 2026-08-26
+- **Action**: Stop a single sampling instance carrying BOTH address families from
+  cross-fanning each family's flows to the other family's collectors
+  (opus-review-001 root R72).
+- **The collapse**: `SamplingInstance` keeps `FamilyInet`/`FamilyInet6` separate,
+  but `collectInstanceVersionCollectors` merged them into ONE slice and reduced
+  family to two per-INSTANCE booleans. `CollectorConfig` had no family field,
+  `groupCollectorsByTemplate` keyed on template alone, and `ServesFamily` was
+  evaluated per instance — so with both families configured both booleans were
+  true, the gate passed for either family, and `flowExportCallback` fanned the
+  record to EVERY group of that instance.
+- **Why nothing caught it**: the strict validator explicitly PERMITS one instance
+  holding both families, the #2462 isolation tests use family-DISJOINT instances
+  (where the instance-level gate IS sufficient), and the template tests use a
+  single family. No test configured the shape that breaks. R72's Refutation says
+  exactly this, which is why reading it first was worth more than the Evidence.
+- **Fix**: family becomes part of the identity at BUILD time — `CollectorConfig.IsV6`,
+  family in the dedup key, and `collectorGroupKey{Template, IsV6}` replacing the
+  template-only group key. Then one comparison at send time
+  (`GroupIsV6 != sd.IsIPv6`) inside the fan-out, at BOTH sites.
+- **Why family belongs in the KEY, not a per-record filter**: R72's HPC note says
+  family partitioning must not add a per-record collector search. Keying on
+  family makes every group single-family by construction, so the hot path is a
+  gate against a precomputed flag. Filtering conns per record would put a
+  collector scan on the export path for every flow.
+- **The subtlety that shaped the fix**: `ServesInet`/`ServesInet6` had to stay
+  per-INSTANCE. They gate the single sampling DECISION and must run BEFORE
+  `ShouldExport`, or a record of a family the instance does not serve would
+  consume a 1-in-N slot and change the sampling denominator. `GroupIsV6` gates
+  the fan-out only. Collapsing the two would either re-open the cross-fan or
+  silently alter the sample rate — a cell pins the distinction.
+- **Dedup key gained family**: the same address under both families is two
+  destinations-with-family, not one duplicate. Without it, a collector the
+  operator pointed at both families would silently stop receiving one.
+- **A pre-existing test went RED and was right to**: the #3745
+  distinct-source-address tests build their two collectors by putting one address
+  under BOTH families, then asserted on `BuildExportConfig(...).Collectors`, which
+  returns only the FIRST group. The #3745 property (both retained, distinct
+  sources) is unchanged — the assertion now counts across groups and additionally
+  pins two DISTINCT source addresses, so it tests the dedup rather than the
+  grouping. Also corrected `BuildExportConfig`/`BuildIPFIXExportConfig` doc
+  comments, which had become false ("the FIRST template group") — a comment is a
+  claim (#7629).
+- **6 cells**: 5 resolver (`pkg/flowexport`) + 1 send-path (`pkg/daemon`). The
+  daemon cell is independent and load-bearing: deleting the per-group gate leaves
+  every resolver cell green while the bug is fully restored. It also asserts the
+  inet group DID export, so the cell cannot pass against a build that exports
+  nothing. Controls: a single-family instance still produces exactly one group
+  with #2462 attribution intact.
+- **File(s)**: `pkg/flowexport/manager.go`,
+  `pkg/flowexport/family_fanout_6811_test.go` (new),
+  `pkg/flowexport/exporter_test.go`, `pkg/flowexport/README.md`,
+  `pkg/daemon/daemon_flowexport.go`,
+  `pkg/daemon/daemon_flowexport_family_fanout_6811_test.go` (new), `_Log.md`
