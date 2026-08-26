@@ -375,6 +375,22 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// The management interfaces (fxp*/fab*/em*) exist by this phase, so the bind
 	// is transient-free (unlike the pre-networkd best-effort bind and the
 	// routing-instance tunnel-member binds in applyVRFReconcile).
+	// #6805: the routing-instance member re-bind belongs at the SAME point and
+	// for the same reason — the devices exist by this phase. Step 0a runs before
+	// applyInterfaceReconcile creates tunnel/xfrmi devices, so a list-only
+	// routing-instance member was legitimately "not found" there and nothing else
+	// bound it: the tunnel manager's case-2 arm only observes, because 0a owns
+	// list binds. The result was a tunnel forwarding in the DEFAULT table on a
+	// first apply that reported success.
+	//
+	// Unlike the management re-bind below, this one stays best-effort at WARN and
+	// is NOT joined into networkdErr: a routing-instance `interface` list can
+	// legitimately name an interface that is genuinely absent on this chassis,
+	// and failing the commit on that would reject configs that are correct for
+	// the fleet. The management set cannot be absent by this phase, which is
+	// exactly why that one is surfaced and this one is not.
+	d.rebindRoutingInstanceMembers(cfg)
+
 	if mgmtSet := d.mgmtVRFIfaceSet(); d.routing != nil && len(mgmtSet) > 0 {
 		if err := d.rebindManagementVRFIfaces(); err != nil {
 			networkdErr = errors.Join(networkdErr, err)

@@ -653,6 +653,25 @@ when the existing kernel link is genuinely incompatible:
   prune (above) shares `unbindVRFClaimLocked` — closing the pre-#5120 gap
   where WG bound its VRF directly with no unbind branch and left `wgN`
   mastered to a stale VRF after an RI change or tunnel removal.
+  - **The list bind now happens TWICE per apply (#6805), and it has to.**
+    "0a owns list binds" is the contract this veto is written against —
+    `reconcileVRFClaimLocked` case 2 only OBSERVES, it never binds — but step 0a
+    runs BEFORE `applyInterfaceReconcile` creates the tunnel/xfrmi devices, so on
+    a FIRST apply the owner ran before the thing it owns existed. 0a warned "not
+    found", the observation found a link with no master and took no claim, and
+    the tunnel came up **outside its VRF, in the default table**, on a commit
+    that reported success — until some later apply happened to run 0a while the
+    device existed. `Daemon.rebindRoutingInstanceMembers` re-drives the SAME loop
+    at the post-networkd point where the devices are real (beside
+    `rebindManagementVRFIfaces`). The veto is on UNBIND and is unchanged; the bug
+    was the ordering, so the fix is a second pass rather than a bind moved into
+    the tunnel manager. Both passes call ONE function
+    (`Daemon.bindRoutingInstanceMembers`), because a second loop that drifted
+    would leave this veto guarding a different set than the one being bound —
+    and that divergence is always a bug, never a legitimate difference. The late
+    pass stays best-effort at WARN like 0a: a routing-instance `interface` list
+    can legitimately name an interface genuinely absent on this chassis, and
+    failing the commit on that would reject configs correct for the fleet.
 - **Keepalives** (BOTH the anchor and the legacy branch, #4071): runners
   are reconciled by normalized identity `(remote, source, interval,
   retry<=0→3)` and survive unrelated applies; `LinkSetUp` is SKIPPED

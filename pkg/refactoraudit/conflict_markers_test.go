@@ -60,7 +60,20 @@ func TestNoUnresolvedConflictMarkers(t *testing.T) {
 	if err != nil {
 		t.Skipf("git ls-files unavailable (%v); the sweep needs a git checkout", err)
 	}
-	files := strings.Split(strings.TrimRight(string(out), "\x00"), "\x00")
+	// DEDUPE. `git ls-files` returns one row per STAGE for an unmerged path, so
+	// during a conflicted merge the very file this gate is about appears three
+	// times and every finding in it is reported three times over. That is exactly
+	// the moment the output most needs to be readable, and a tripled finding list
+	// reads like three separate defects.
+	seenPath := map[string]bool{}
+	var files []string
+	for _, f := range strings.Split(strings.TrimRight(string(out), "\x00"), "\x00") {
+		if f == "" || seenPath[f] {
+			continue
+		}
+		seenPath[f] = true
+		files = append(files, f)
+	}
 	if len(files) < 100 {
 		// A sweep that enumerated almost nothing is a PASS that proves nothing —
 		// the failure mode where the gate goes green because it looked at an

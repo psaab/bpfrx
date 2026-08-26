@@ -105640,3 +105640,103 @@ prose edit above them added. No diff falls in the new test body.
   Verified after writing that `theirs` is a prefix of the result.
 - **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
   `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6852: retire networkd.Manager.Clear, moving its tests onto Apply(nil)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Delete `networkd.Manager.Clear` and move its contract tests onto
+  `Apply(nil)`.
+- **Why retire rather than wire**, which is the decision #5718 deliberately left
+  open: `Apply(nil)` already carries every contract `Clear` owned — the
+  `10-xpf-*` stale sweep, the #4900 aggregation that FAILS the commit when a
+  managed file cannot be removed, and the #4954 re-activation on
+  `debtOwed := reloadDebtOutstanding()`, which subsumes `Clear`'s empty-glob
+  debt-discharge branch.
+- **That is measured, not asserted.** `Clear`'s own four-step #5718 A7-b01-C001
+  fail-on-revert was MOVED onto `Apply(nil)` and passes UNCHANGED — reload fails
+  → error; second call with an empty glob must re-run the reload from the debt
+  rather than return nil; recovery discharges it; a further call with no files
+  and no debt must not shell out. Converting the test first and running it BEFORE
+  deleting anything kept two questions separate: "does Apply(nil) carry the
+  contract" and "did the deletion break something".
+- **Wiring it would have been actively WORSE**, which is the part that settles
+  it. `Clear` globbed and removed EVERY `10-xpf-*` file including the
+  `SetProtectedResolver` lifeline files that `Apply(nil)` deliberately preserves.
+  Any teardown that called `Clear` would have taken management down with the
+  managed config — so the method was not merely uncalled, it was unsafe to call.
+- **No coverage lost, checked rather than assumed**: `TestClear_RemoveFailureReturnsError`
+  was a line-for-line twin of the `Apply(nil)` #4900 cell immediately above it
+  (same `blockedStaleEntry` fixture, same assertion), so deleting it leaves that
+  property owned by a named cell. Deleting the LAST owner of a property would
+  have been a silent decommission; this is not.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/applynil_reload_debt_5718_test.go` (renamed from
+  `clear_reload_debt_5718_test.go`), `pkg/networkd/stale_remove_4900_test.go`,
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`,
+  `_Log.md`
+
+## 2026-08-26 — #6805: a list-only routing-instance member was never bound on first apply
+
+- **Timestamp**: 2026-08-26
+- **Action**: Re-drive the step-0a routing-instance member bind after the
+  tunnel/xfrmi devices exist, from one shared implementation.
+- **Why**: "0a owns list binds" is the documented contract — the tunnel manager's
+  `reconcileVRFClaimLocked` case 2 only OBSERVES a list-only member and has an
+  explicit veto against unbinding one. But step 0a runs BEFORE
+  `applyInterfaceReconcile` creates the devices, so the owner ran before the
+  thing it owns existed. On a FIRST apply: 0a warns "not found" (deliberately
+  best-effort, #5700), the tunnel manager observes a link with no master and
+  takes no claim, nothing else binds it — and the tunnel comes up OUTSIDE its
+  VRF, forwarding in the default table, on a commit that reported success. It
+  stayed there until some later apply happened to run 0a while the device
+  existed.
+- **The bug is the ORDERING, not the veto.** The veto is on UNBIND and is
+  correct: a stanza→list move must not strip a live 0a bind. Nothing about it
+  requires the first apply to leave the member unbound. So the fix is a second
+  pass at the point where the devices are real, not a bind moved into the tunnel
+  manager.
+- **Precedent, and its comment named this gap**: `rebindManagementVRFIfaces` is
+  the authoritative post-networkd bind for management interfaces, and its own
+  comment says the management set is transient-free "unlike the pre-networkd
+  best-effort bind and the routing-instance tunnel-member binds in
+  applyVRFReconcile". That parenthetical was the issue.
+- **ONE implementation, two call sites**: the tunnel manager's veto is written
+  against "whatever 0a binds", so a second loop that drifted would leave the veto
+  guarding a different set than the one being bound. That divergence is always a
+  bug, never legitimate, so the two passes share
+  `Daemon.bindRoutingInstanceMembers` rather than being kept in step by hand —
+  and a cell asserts the two passes select the SAME name set rather than pinning
+  either to a literal.
+- **The late pass stays best-effort at WARN, deliberately.** A routing-instance
+  `interface` list can legitimately name an interface genuinely absent on this
+  chassis; surfacing that into commit truth would reject configs correct for the
+  fleet — a different, worse defect. The #5700 boundary is unmoved and a cell
+  pins it.
+- **Fixture**: the device is ABSENT for the early pass and PRESENT for the late
+  one. A fixture that pre-creates it cannot see the defect at all — 0a would bind
+  it and every cell passes with the whole fix deleted. The cell asserts the early
+  pass did NOT bind, so it cannot go vacuous.
+- **File(s)**: `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/ri_member_late_bind_6805_test.go` (new), `pkg/routing/README.md`,
+  `_Log.md`
+
+## 2026-08-26 — the #7614 marker gate caught its own author, and a stage-dedup bug
+
+- **Timestamp**: 2026-08-26
+- **Action**: Dedupe `git ls-files` output in
+  `pkg/refactoraudit/conflict_markers_test.go`.
+- **How it surfaced**: while gating #6805 I chained `git merge origin/master`
+  into the gate with `&&` and piped the merge's output through `tail -3`. The
+  pipe LAUNDERED the merge's exit status, so the `&&` saw success, the gate ran
+  on a conflicted tree, and `git add -A` would have committed the markers — the
+  exact sequence that put six of them on master earlier today, and which I had
+  already written down as a rule. The gate added hours before caught it, on its
+  author, before it reached master. That is the whole argument for the gate.
+- **The bug it exposed in the gate itself**: `git ls-files` returns ONE ROW PER
+  STAGE for an unmerged path, so during a conflicted merge the very file the
+  gate is about appears three times and every finding in it is reported three
+  times over — 3 real markers rendered as 9 findings. Exactly the moment the
+  output most needs to be readable, and a tripled list reads like three separate
+  defects. Deduped by path.
+- **File(s)**: `pkg/refactoraudit/conflict_markers_test.go`, `_Log.md`
