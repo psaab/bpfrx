@@ -84,35 +84,60 @@ func TestWildcardIsNotAMappingRow6830(t *testing.T) {
 	}
 }
 
-// TestFacilityMisfiledIdentifiesTodaysGap6830 is the cell that states the
-// defect as a fact rather than as prose, and it is deliberately written to fail
-// the day the mapping is applied.
+// TestNothingInTheTableIsMisfiled6830 is what the gap cell BECAME when the
+// contract decision was taken and the emit path started using the table.
 //
-// Every name below is valid Junos that this box currently emits as something
-// else. When #6830's contract decision is taken and the emit path starts using
-// the table, THIS TEST GOES RED — and that is its job: the flip must be a
-// deliberate edit here, not a silent divergence.
-func TestFacilityMisfiledIdentifiesTodaysGap6830(t *testing.T) {
-	misfiledToday := []string{
-		"authorization", "conflict-log", "dfc", "firewall",
-		"ftp", "interactive-commands", "kernel", "ntp", "pfe",
-	}
-	for _, name := range misfiledToday {
+// It used to list the nine names this box emitted as something else and assert
+// each was misfiled, deliberately written to go RED the day the mapping was
+// applied so the flip could not be silent. The flip has landed. Asserting the
+// gap still exists would now pin the defect, so the cell is INVERTED rather
+// than deleted: no name in the documented vocabulary may be misfiled.
+//
+// That is a stronger property than the list it replaces, and it needs no
+// maintenance: it quantifies over the table, so a row ADDED without wiring, or
+// a wiring regression on any existing row, reds here naming the facility. The
+// old list had to be hand-edited every time the table grew.
+func TestNothingInTheTableIsMisfiled6830(t *testing.T) {
+	checked := 0
+	for _, name := range junosFacilityNames6830(t) {
 		emitted, junos, misfiled := FacilityMisfiled(name)
-		if !misfiled {
-			t.Errorf("FacilityMisfiled(%q) reports no gap. If the emit path now applies "+
-				"the documented mapping, that is the #6830 contract change landing — "+
-				"remove %q from this list in the SAME commit, so the flip is deliberate",
-				name, name)
-			continue
+		if misfiled {
+			t.Errorf("%q is emitted as %d but Junos documents %d. Either ParseFacility "+
+				"stopped consulting the table, or a row was added to it without the "+
+				"emit path following — the #6830 defect, on this name.",
+				name, emitted, junos)
 		}
-		if emitted != FacilityLocal0 {
-			t.Errorf("%q currently emits %d, expected the local0 default", name, emitted)
-		}
-		if junos == FacilityLocal0 {
-			t.Errorf("%q maps to local0 per the table, so it is not misfiled at all", name)
-		}
+		checked++
 	}
+	// ANTI-VACUITY. A helper returning no names would report "nothing is
+	// misfiled", which is indistinguishable from a healthy result and is
+	// exactly how this class of check fails.
+	if checked < 12 {
+		t.Fatalf("only %d facility names were checked; the documented table has 12 rows, "+
+			"so this assertion is not reaching them", checked)
+	}
+}
+
+// junosFacilityNames6830 lists the table's keys.
+//
+// It names them explicitly rather than ranging the production map, so the
+// population cannot silently shrink with the thing it is measuring, and it
+// fails if any listed name has left the table.
+func junosFacilityNames6830(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	for _, name := range []string{
+		"change-log", "conflict-log", "dfc", "firewall",
+		"interactive-commands", "pfe",
+		"authorization", "daemon", "ftp", "kernel", "ntp", "user",
+	} {
+		if _, ok := JunosRemoteFacility(name); !ok {
+			t.Fatalf("%q is no longer a row in the documented table; if it was removed "+
+				"deliberately, Table 3 says otherwise", name)
+		}
+		out = append(out, name)
+	}
+	return out
 }
 
 // TestCorrectlyMappedNamesAreNotReportedMisfiled6830 is the PAIRED control.
@@ -135,30 +160,64 @@ func TestCorrectlyMappedNamesAreNotReportedMisfiled6830(t *testing.T) {
 	}
 }
 
-// TestJunosSpellingsAreNotRecognizedByParseFacility6830 records the sharpest
-// edge of the defect: the two most obvious facilities in the vocabulary.
+// TestJunosSpellingsResolveToTheirBSDFacility6830 records the sharpest edge of
+// the defect, now as the fixed behaviour.
 //
-// Junos writes `authorization` and `kernel`; ParseFacility recognizes the BSD
-// spellings `auth` and `kern`. So an operator configuring this box as the Junos
-// clone it is gets local0 for authentication and kernel records — the two
-// buckets a security collector is most likely to be watching.
-func TestJunosSpellingsAreNotRecognizedByParseFacility6830(t *testing.T) {
+// Junos writes `authorization` and `kernel`; this box recognized only the BSD
+// spellings `auth` and `kern`, so an operator configuring it as the Junos clone
+// it is got local0 for authentication and kernel records — the two buckets a
+// security collector is most likely watching.
+//
+// The cell used to assert those Junos spellings resolve to local0, as a
+// tripwire. They now resolve, so it asserts the AGREEMENT instead: the two
+// spellings of one facility must produce the same code. Pinning either side to
+// a literal would encode which spelling is trusted, and the whole defect was
+// that the two disagreed.
+func TestJunosSpellingsResolveToTheirBSDFacility6830(t *testing.T) {
 	for junosName, bsdName := range map[string]string{
 		"authorization": "auth",
 		"kernel":        "kern",
+		"user":          "user",
+		"daemon":        "daemon",
 	} {
-		if got := ParseFacility(junosName); got != FacilityLocal0 {
-			t.Errorf("ParseFacility(%q) = %d — if this now resolves, the #6830 contract "+
-				"change has landed and this cell must be updated with it", junosName, got)
-		}
-		if ParseFacility(bsdName) == FacilityLocal0 {
+		junos, bsd := ParseFacility(junosName), ParseFacility(bsdName)
+		if bsd == FacilityLocal0 && bsdName != "local0" {
 			t.Errorf("ParseFacility(%q) collapsed to local0; the BSD spelling is the one "+
 				"this box has always recognized", bsdName)
+			continue
 		}
-		if want, _ := JunosRemoteFacility(junosName); want != ParseFacility(bsdName) {
-			t.Errorf("the table maps %q to %d but the BSD spelling %q parses to %d — the "+
-				"two spellings of one facility must agree",
-				junosName, want, bsdName, ParseFacility(bsdName))
+		if junos != bsd {
+			t.Errorf("ParseFacility(%q) = %d but ParseFacility(%q) = %d — two spellings "+
+				"of one facility disagree, which is the #6830 defect itself",
+				junosName, junos, bsdName, bsd)
 		}
+		if want, ok := JunosRemoteFacility(junosName); !ok || want != junos {
+			t.Errorf("the table maps %q to %d (present=%v) but the emit path produces %d",
+				junosName, want, ok, junos)
+		}
+	}
+}
+
+// TestJunosNamesAreReportedKnown6830 pins the other half of the flip: a
+// documented facility must no longer be reported as an unmapped substitution.
+//
+// Without this, the emit path would file the record correctly while the caller
+// still warned that it had substituted local0 — a warning that is false the
+// moment the mapping lands, and the fastest way to train an operator to ignore
+// the one warning that still means something.
+func TestJunosNamesAreReportedKnown6830(t *testing.T) {
+	for _, name := range junosFacilityNames6830(t) {
+		code, known := ParseFacilityChecked(name)
+		if !known {
+			t.Errorf("ParseFacilityChecked(%q) reports UNKNOWN, but the emit path now "+
+				"maps it to %d. The substitution warning would fire on a config that is "+
+				"handled correctly.", name, code)
+		}
+	}
+	// Paired control: a name in neither vocabulary must still be unknown, or
+	// the predicate has degraded to "everything is fine".
+	if _, known := ParseFacilityChecked("nonsense"); known {
+		t.Error("ParseFacilityChecked reports a nonsense name as known; the substitution " +
+			"warning can no longer fire on a real typo")
 	}
 }

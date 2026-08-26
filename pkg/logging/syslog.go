@@ -991,6 +991,15 @@ func ParseFacilityChecked(name string) (int, bool) {
 		"change-log":
 		return ParseFacility(name), true
 	default:
+		// #6830: every documented Junos facility is now MAPPED, so it is
+		// `known` here too. Without this the emit path would file the record
+		// correctly while the caller still warned that it had substituted
+		// local0 — a warning that is false the moment the mapping lands, and
+		// the fastest way to train an operator to ignore the one warning that
+		// still means something.
+		if _, ok := junosRemoteFacility[name]; ok {
+			return ParseFacility(name), true
+		}
 		return FacilityLocal0, false
 	}
 }
@@ -1020,13 +1029,14 @@ func ParseFacilityChecked(name string) (int, bool) {
 // box as the Junos clone it is therefore gets local0 for the two most obvious
 // facilities in the vocabulary.
 //
-// THIS FUNCTION DOES NOT CHANGE THE WIRE. Nothing calls it from the emit path.
-// It exists so the diagnostic can tell an operator what Junos WOULD send —
-// which is actionable today — while the decision to actually change what
-// leaves the box stays open (#6830): for a name that is silently local0 today,
-// emitting the documented facility MOVES records for any collector already
-// bucketing them on local0. That is an upgrade-visible contract change and is
-// deliberately not made here.
+// THIS TABLE IS NOW THE WIRE. ParseFacility consults it first, so a documented
+// Junos facility leaves the box under the code Junos would use (#6830).
+//
+// It shipped one round earlier as data only, feeding a diagnostic that told an
+// operator what Junos WOULD send while the contract decision stayed open. That
+// ordering was deliberate and is the migration path: anyone whose collector
+// buckets an affected name on local0 was warned, by name, before the records
+// moved.
 var junosRemoteFacility = map[string]int{
 	// Table 3 — Junos-specific names with a localX stand-in.
 	"change-log":           FacilityLocal6,
@@ -1102,6 +1112,25 @@ func FacilityIsWildcard(name string) bool { return name == "any" }
 // substitution — this form cannot distinguish an unmapped name from an
 // authored local0.
 func ParseFacility(name string) int {
+	// #6830: the documented Junos table is consulted FIRST.
+	//
+	// Before this, nine of the thirteen Junos facility names fell through to
+	// local0 — including `authorization` and `kernel`, the two buckets a
+	// security collector is most likely watching. An operator who writes
+	// `authorization` has told the box, in Junos, to file authentication
+	// records under `auth`; emitting local0 was not a conservative default, it
+	// was the box failing to mean what its own configuration language says.
+	// `change-log -> local6` was already implemented below, so the intended
+	// contract was half-expressed in the tree: an unfinished table, not a
+	// considered choice.
+	//
+	// This MOVES records for a collector already bucketing an affected name on
+	// local0. That is upgrade-visible, and it is why the misfiled diagnostic
+	// (#6830, FacilityMisfiled) shipped first: it fires before the flip for
+	// anyone affected, names the facility, and says what will change.
+	if code, ok := junosRemoteFacility[name]; ok {
+		return code
+	}
 	switch name {
 	case "kern":
 		return FacilityKern

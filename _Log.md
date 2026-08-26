@@ -106356,3 +106356,11 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+  - **Action**: #6830 takeover — take the contract decision and wire the
+    documented Junos facility table into the emit path; invert the tripwires
+  - **File(s)**: pkg/logging/syslog.go,
+    pkg/logging/junos_facility_mapping_6830_test.go,
+    pkg/logging/parse_facility_checked_5797_test.go,
+    pkg/daemon/daemon_system.go,
+    pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/cli/syslog_facility_checked_6829_test.go

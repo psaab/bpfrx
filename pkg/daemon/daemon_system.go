@@ -1100,22 +1100,28 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 				// one; conflating the two sent an operator looking for a
 				// mapping bug when they had a spelling mistake, and vice
 				// versa.
-				if emitted, junos, misfiled := logging.FacilityMisfiled(raw); misfiled {
-					slog.Warn("system syslog: MISFILED facility — this is a valid Junos "+
-						"facility that Junos forwards under a different code than this "+
-						"box currently emits, so records arrive correctly delivered but "+
-						"attributed to the wrong facility; a collector bucketing on "+
-						"facility files them in the wrong bucket (#6830)",
-						"host", host.Address, "facility", raw,
-						"emitted_code", emitted, "junos_code", junos)
-				} else {
-					slog.Warn("system syslog: unrecognized facility name; local0 selected — "+
-						"this name is not in the Junos `[edit system syslog]` vocabulary "+
-						"either, so it is most likely a typo. If this host's client is "+
-						"installed, its records will carry a facility the configuration "+
-						"does not name (#5797)",
-						"host", host.Address, "facility", raw, "using", "local0")
-				}
+				// #6830: the MISFILED arm is gone because it can no longer be
+				// reached. It described a name that IS in the documented Junos
+				// vocabulary but which this box emitted under a different code
+				// — and ParseFacility now consults that table first, so the
+				// two agree by construction. Keeping a warning whose input
+				// cannot occur would be dead code that no test can exercise
+				// without a seam invented for it.
+				//
+				// The property it protected did not go away, it moved: pkg/logging's
+				// TestNothingInTheTableIsMisfiled6830 asserts, over the whole
+				// table, that the emit path and the documented mapping agree —
+				// so a row added without wiring, or a wiring regression, reds
+				// there rather than warning here.
+				//
+				// What reaches this branch now is a name in NEITHER vocabulary:
+				// a typo, where local0 is a substitution for something that
+				// means nothing.
+				slog.Warn("system syslog: unrecognized facility name; local0 selected — "+
+					"this name is not in the Junos `[edit system syslog]` vocabulary, so "+
+					"it is most likely a typo. If this host's client is installed, its "+
+					"records will carry a facility the configuration does not name (#5797)",
+					"host", host.Address, "facility", raw, "using", "local0")
 			}
 			facility = f
 

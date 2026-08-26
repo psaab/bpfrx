@@ -38,6 +38,25 @@ var parseFacilityMappingTable = map[string]int{
 	"local6":     FacilityLocal6,
 	"local7":     FacilityLocal7,
 	"change-log": FacilityLocal6,
+
+	// #6830: the documented Junos facility→wire mapping is now part of the
+	// emit path, so these names belong in the set every table-driven test in
+	// this package treats as "specially mapped".
+	//
+	// Transcribed here INDEPENDENTLY of the production map, deliberately: this
+	// table is the expectation and reading the map it checks would pin
+	// nothing. The values come from Juniper's Table 3, "Default Facilities for
+	// Messages Directed to a Remote Destination", plus its rule that a name it
+	// does not list defaults to the same local facility name.
+	"conflict-log":         FacilityLocal5,
+	"dfc":                  FacilityLocal1,
+	"firewall":             FacilityLocal3,
+	"interactive-commands": FacilityLocal7,
+	"pfe":                  FacilityLocal4,
+	"authorization":        FacilityAuth,
+	"ftp":                  FacilityFTP,
+	"kernel":               FacilityKern,
+	"ntp":                  FacilityNTP,
 }
 
 // #5797 invariant 7, visibility half.
@@ -97,13 +116,19 @@ func unmappedCorpus() []string {
 		}
 	}
 
-	// Junos facility names the mapper does not know. These are the ones that
-	// matter: they are VALID configuration, they are what #5797's own worked
-	// example uses, and today they silently become local0.
-	add("authorization", "kernel", "interactive-commands", "conflict-log",
-		"pfe", "security", "firewall", "external", "dfc", "ntp", "dcd")
-	// BSD facilities outside the mapped set.
-	add("mail", "ftp", "cron", "authpriv", "lpr", "news", "uucp")
+	// Junos facility names the mapper does not know.
+	//
+	// #6830 moved most of this line into the MAPPED set: authorization,
+	// kernel, interactive-commands, conflict-log, pfe, firewall, dfc, ntp and
+	// ftp are now emitted under the code Junos documents, so asserting they
+	// report UNMAPPED would pin the defect this corpus was written to expose.
+	// What remains here is the genuinely unmapped remainder — names that are
+	// valid Junos configuration and still have no documented wire facility.
+	add("security", "external", "dcd")
+	// BSD facilities outside the mapped set. `ftp` left this line for the same
+	// reason: Table 3's "unlisted names default to the same local facility
+	// name" rule makes it a real mapping, not an unmapped BSD spelling.
+	add("mail", "cron", "authpriv", "lpr", "news", "uucp")
 	// `any` is a selector wildcard for the rsyslog-backed file/user
 	// destinations, not a numeric facility a host client can stamp on a record
 	// — so it must report unmapped here even though it is valid configuration
@@ -127,6 +152,11 @@ func unmappedCorpus() []string {
 // Reverting ParseFacilityChecked to `return ParseFacility(name), true` makes
 // every name in the corpus claim to be known, and the daemon's warning — the
 // only signal that a substitution happened — goes silent.
+//
+// #6830 narrowed the corpus rather than the assertion. Nine Junos names moved
+// out of it because they are now MAPPED; the property is unchanged, and the
+// paired TestJunosNamesAreReportedKnown6830 asserts the other side of that
+// move, so no name fell out of coverage — it changed which cell owns it.
 func TestParseFacilityCheckedReportsUnmapped_5797(t *testing.T) {
 	corpus := unmappedCorpus()
 	if len(corpus) < 200 {
