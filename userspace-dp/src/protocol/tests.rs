@@ -2620,3 +2620,99 @@ fn session_sync_request_policy_fields_roundtrip_3301() {
         "missing inactivity_timeout defaults to 0"
     );
 }
+
+// --- #6855: the SYN-cookie master key must never render in Debug ---------
+
+/// #4484 L-7 named `ConfigSnapshot` and `ControlRequest` as the carriers of a
+/// latent Debug leak. #4757 fixed a THIRD struct (`ForwardingState`) and the
+/// two named ones kept `#[derive(Debug)]` over the plaintext hex key.
+///
+/// Latent, not active: the only `{:?}` over these types was in a test. The
+/// exposure is that any future `slog`/`tracing`/`dbg!` line formatting a
+/// `ControlRequest` -- the obvious thing to add while debugging a control-socket
+/// problem, which is exactly when someone reaches for it -- writes the key to
+/// the journal. Journald is not a secret store, and this key is HA-WIDE: both
+/// chassis derive the same one from the root secret plus cluster-id.
+#[test]
+fn syn_cookie_master_key_is_redacted_in_config_snapshot_debug_6855() {
+    const KEY: &str = "0badc0ffee0badc0ffee0badc0ffee42";
+    let snap = ConfigSnapshot {
+        syn_cookie_master_key: KEY.to_string().into(),
+        ..Default::default()
+    };
+    let rendered = format!("{snap:?}");
+    assert!(
+        !rendered.contains(KEY),
+        "ConfigSnapshot Debug rendered the SYN-cookie master key: {rendered}"
+    );
+    assert!(
+        rendered.contains("<redacted>"),
+        "the key field must render as <redacted> so a reader can tell a key IS set; got: {rendered}"
+    );
+}
+
+/// The transitive half. `ControlRequest` embeds `Option<ConfigSnapshot>`, so it
+/// inherits the leak -- and it is the type someone actually formats when
+/// debugging the control socket.
+#[test]
+fn syn_cookie_master_key_is_redacted_in_control_request_debug_6855() {
+    const KEY: &str = "0badc0ffee0badc0ffee0badc0ffee42";
+    let req = ControlRequest {
+        snapshot: Some(ConfigSnapshot {
+            syn_cookie_master_key: KEY.to_string().into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let rendered = format!("{req:?}");
+    assert!(
+        !rendered.contains(KEY),
+        "ControlRequest Debug rendered the SYN-cookie master key transitively: {rendered}"
+    );
+}
+
+/// PAIRED CONTROL, in two directions.
+///
+/// Without the first half, a `Debug` that printed "<redacted>" unconditionally
+/// -- or printed nothing at all -- would satisfy the assertions above while
+/// telling an operator nothing. Without the second, a wrapper whose `Debug`
+/// happened to be empty for every value would also pass.
+///
+/// "There is no key" and "there is a key I will not show you" are different
+/// facts, and the first is the one someone debugging a control-socket problem
+/// actually needs.
+#[test]
+fn syn_cookie_master_key_debug_distinguishes_unset_from_set_6855() {
+    let unset = SynCookieMasterKeyHex::default();
+    assert_eq!(
+        format!("{unset:?}"),
+        "<unset>",
+        "an empty key must render as <unset>, not as <redacted>: an operator \
+         chasing a missing key needs to know it is missing"
+    );
+
+    let set = SynCookieMasterKeyHex::from("deadbeef".to_string());
+    assert_eq!(format!("{set:?}"), "<redacted>");
+}
+
+/// The wrapper must not change the WIRE. `#[serde(transparent)]` means it
+/// serializes and deserializes exactly as the bare `String` did, so a peer
+/// running an older binary is unaffected -- a wire change at an unchanged
+/// version number is two readers at one version.
+#[test]
+fn syn_cookie_master_key_wire_format_is_unchanged_6855() {
+    const KEY: &str = "0badc0ffee0badc0ffee0badc0ffee42";
+
+    // The wrapper serializes as a bare JSON string, not as an object.
+    let wrapped = SynCookieMasterKeyHex::from(KEY.to_string());
+    let json = serde_json::to_string(&wrapped).expect("serialize");
+    assert_eq!(json, format!("\"{KEY}\""), "the wrapper must be transparent on the wire");
+
+    // And round-trips from that same bare string.
+    let back: SynCookieMasterKeyHex = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(&*back, KEY);
+
+    // Read sites see a plain &str through Deref, unchanged.
+    let as_str: &str = &wrapped;
+    assert_eq!(as_str, KEY);
+}

@@ -106306,3 +106306,9 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6855 — redact the SYN-cookie master key in ConfigSnapshot and
+    ControlRequest Debug via a newtype (the two carriers #4484 L-7 named)
+  - **File(s)**: userspace-dp/src/protocol/snapshot.rs,
+    userspace-dp/src/protocol/tests.rs
