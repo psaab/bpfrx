@@ -585,6 +585,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.fabricIPVLANReassertLoop(ctx)
 	}()
 
+	// #6800: the always-on retry owner for an xpf-managed service
+	// configuration file whose RUNTIME reload failed after the file itself
+	// converged (rsyslog drop-ins, chrony sources/threshold). Started
+	// unconditionally, alongside the three re-asserts above and for the same
+	// reason: both appliers run only from a config apply and gate their reload
+	// on "did the on-disk file set change", so a failed reload was erased by
+	// the convergence that preceded it and never retried — the daemon kept
+	// serving the previous ruleset until an unrelated syslog/NTP edit or a
+	// reboot. The gate is three booleans under one mutex, so the loop costs
+	// nothing on a node that owes nothing.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.serviceReloadDebtReassertLoop(ctx)
+	}()
+
 	// #1387 inc-2: start the always-on DHCP dynamic-DNS reconcile loop. It
 	// is constructed UNCONDITIONALLY (idle when disabled) so an
 	// enabled→disabled commit can still withdraw published records; the loop

@@ -1008,6 +1008,14 @@ type Daemon struct {
 	// the bind failure rather than the retry ownership.
 	raHasDeadSendersFn func() bool
 
+	// svcReloadDebt retains the runtime reload still owed for an xpf-managed
+	// service configuration file whose reload failed after the file itself
+	// converged (#6800). The managed-file appliers gate their reload on "did
+	// the on-disk set change", which is what keeps a steady-state commit from
+	// bouncing rsyslog/chrony — but it also meant a FAILED reload was erased by
+	// the very convergence that preceded it. See daemon_service_reload_debt.go.
+	svcReloadDebt serviceReloadDebt
+
 	// startupActiveAnnounce tracks whether the one-shot active-side
 	// neighbor refresh has been sent for each RG on this daemon run.
 	// This covers restart/redeploy of an already-active direct-mode RG,
