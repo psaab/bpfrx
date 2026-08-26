@@ -124,12 +124,33 @@ func (d *Daemon) reassertMgmtListenersOnce(ctx context.Context) {
 	if d.store != nil {
 		cfg = d.store.ActiveConfig()
 	}
-	slog.Warn("management listener is not serving; re-driving the management " +
-		"reconcile (#6803) — an unexpected serve exit used to stay down until " +
-		"an operator committed, on a box whose management API had just died")
+	// TRANSITION at Warn, TICKS at Debug. A node whose management bind can never
+	// succeed — the address permanently taken by another process, say — is a
+	// PERMANENT down condition, and this owner re-drives it every 30s for the
+	// life of the daemon. Logging the same Warn on every tick would put ~2900
+	// identical lines a day into the journal and drown the real diagnostics,
+	// which is the failure mode the project's logging rules were written after.
+	// The first tick of a down-streak is the event worth seeing.
+	if d.mgmtReassertNoticed.CompareAndSwap(false, true) {
+		slog.Warn("management listener is not serving; re-driving the management " +
+			"reconcile (#6803) — an unexpected serve exit used to stay down until " +
+			"an operator committed, on a box whose management API had just died")
+	} else {
+		slog.Debug("management listener still not serving; re-driving the reconcile")
+	}
 	if err := mgmtReassertApply(d, cfg); err != nil {
 		// Retained-listener fail-safe: a failed rebind keeps whatever is still
 		// live. Log and let the next tick retry — that IS the retry owner.
 		slog.Error("management listener re-assert failed; will retry", "err", err)
+		return
+	}
+	// Converged: re-arm the transition log so a LATER death is reported again
+	// rather than silently swallowed by the streak flag. Re-armed only on a
+	// reconcile that actually brought the listener back — a reconcile that
+	// returned nil while the listener is still down is not a recovery.
+	if !d.mgmtListenerDown() {
+		if d.mgmtReassertNoticed.Swap(false) {
+			slog.Info("management listener re-bound at its configured endpoint (#6803)")
+		}
 	}
 }

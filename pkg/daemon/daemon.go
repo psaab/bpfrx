@@ -709,6 +709,13 @@ type Daemon struct {
 	// ordered operations in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
 
+	// mgmtReassertNoticed is the #6803 owner's down-STREAK flag: set on the first
+	// tick of a management-listener outage, cleared when one is re-bound. It
+	// exists only to keep the log honest — a permanently-unbindable endpoint is
+	// re-driven every 30s for the life of the daemon, and a Warn on every tick
+	// would bury the real diagnostics under ~2900 identical lines a day.
+	mgmtReassertNoticed atomic.Bool
+
 	// hostInboundCoveredAddrs is the set of firewall-local DESTINATION addresses
 	// (keyed "<fam>|<addr>", fam '4'/'6') that the currently-RETAINED host-inbound
 	// enforcement (the last successfully-loaded real table OR address-scoped

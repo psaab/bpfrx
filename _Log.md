@@ -105069,6 +105069,7 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
 
+<<<<<<< HEAD
 ## 2026-08-26 — #6803: a management listener that dies is now rebound at the same endpoint
 
 - **Timestamp**: 2026-08-26
@@ -105118,3 +105119,43 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/mgmt_listener_reassert_6803_test.go`,
   `pkg/api/reconcile_http_dead_leg_6803_test.go`, `pkg/daemon/README.md`,
   `pkg/api/README.md`, `_Log.md`
+=======
+## 2026-08-26 — CLAUDE.md: a Required Reading index
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add a `## Required Reading` section to the project `CLAUDE.md`,
+  between "Working Style" and "Logging Rules".
+- **Why**: `CLAUDE.md` already told a reader to read `docs/engineering-style.md`
+  and to update module docs in the same change, but the other standing
+  documents — `~/.claude/RTK.md`, `AGENTS.md`, `COMMITAGENT.md`,
+  `docs/config-schema.md` — were nowhere named, so an agent had no way to
+  discover them except by tripping over the rule they encode. `RTK.md` is the
+  sharpest omission: a hook silently rewrites most shell commands through the
+  `rtk` token-optimizing proxy, and a reader who does not know that also does
+  not know `rtk proxy <cmd>` exists to get UNFILTERED output back for the cases
+  where the filtered form has dropped the decisive line.
+- **Shape**: a table of file → when to read it → what it governs, so the entry
+  is actionable at dispatch time rather than a bare list of filenames. Closes
+  with the point that sub-agents inherit the file but not the reasoning, so a
+  dispatch brief should name the specific documents its task touches.
+- **File(s)**: `CLAUDE.md`, `_Log.md`
+>>>>>>> origin/master
+
+## 2026-08-26 — #6803 follow-up: dampen the re-assert owner's per-tick logging
+
+- **Timestamp**: 2026-08-26
+- **Action**: Log the management-listener outage Warn on the FIRST tick of a down
+  streak only, Debug thereafter, and re-arm on recovery.
+- **Why**: caught reviewing my own PR. A node whose management bind can never
+  succeed — the address permanently taken by another process — is re-driven
+  every 30s for the life of the daemon, and the original code logged the same
+  Warn every tick: ~2900 identical lines a day, the exact failure the project's
+  logging rules were written after. The sibling `sleepFabricBackoff` (#5047)
+  already states the rule in its own comment: transitions at Info/Warn, ticks at
+  Debug.
+- **The re-arm is the load-bearing half**: a streak flag that never clears trades
+  a noisy journal for a SILENT one, because a later, genuinely new outage would
+  then be logged at Debug and be invisible. It is cleared only on a reconcile
+  that actually brought the listener back, not on one that merely returned nil.
+- **File(s)**: `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`, `_Log.md`

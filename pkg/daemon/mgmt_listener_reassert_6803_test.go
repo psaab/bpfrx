@@ -383,3 +383,66 @@ func TestReassertLoopTicks6803(t *testing.T) {
 	}
 	t.Fatal("mgmtListenerReassertLoop never re-drove the dead management listener")
 }
+
+// TestDownStreakLogsOnceAndReArms6803 pins the log-dampening contract.
+//
+// A node whose management bind can never succeed is re-driven every 30s for the
+// life of the daemon. Logging the same Warn on every tick puts ~2900 identical
+// lines a day into the journal, which is the exact failure the project's logging
+// rules were written after ("HA watchdog sync was flooding … drowned real
+// diagnostics"). So: Warn on the FIRST tick of a down streak, Debug thereafter.
+//
+// The re-arm half is the part that is easy to get wrong and expensive to miss. A
+// streak flag that never clears means a LATER, genuinely new outage is logged at
+// Debug and effectively invisible — trading a noisy journal for a silent one.
+// This asserts the flag is armed while down, cleared on recovery, and re-armable.
+func TestDownStreakLogsOnceAndReArms6803(t *testing.T) {
+	const addr = "127.0.0.1:8080"
+	reg := newFakeReg()
+	d, m := bootMgmt6803(t, reg, addr)
+
+	if d.mgmtReassertNoticed.Load() {
+		t.Fatal("the down-streak flag is armed on a healthy node")
+	}
+
+	// First outage: the flag arms, and stays armed across a tick that cannot
+	// recover (the fake refuses the re-bind).
+	killLeg6803(t, m, reg, addr)
+	reg.mu.Lock()
+	reg.failAddr[addr] = true
+	reg.mu.Unlock()
+	d.reassertMgmtListenersOnce(context.Background())
+	if !d.mgmtReassertNoticed.Load() {
+		t.Fatal("the first tick of an outage did not arm the streak flag, so every " +
+			"later tick would log the same Warn again")
+	}
+	d.reassertMgmtListenersOnce(context.Background())
+	if !d.mgmtReassertNoticed.Load() {
+		t.Fatal("the streak flag cleared while the listener was STILL down; the " +
+			"Warn would repeat on every 30s tick")
+	}
+
+	// Recovery clears it.
+	reg.mu.Lock()
+	reg.failAddr[addr] = false
+	reg.mu.Unlock()
+	d.reassertMgmtListenersOnce(context.Background())
+	if !m.srv.HTTPServing() {
+		t.Fatal("the re-assert did not recover the listener once the bind stopped failing")
+	}
+	if d.mgmtReassertNoticed.Load() {
+		t.Fatal("the streak flag stayed armed after recovery, so a LATER outage " +
+			"would be logged at Debug and be effectively invisible")
+	}
+
+	// …and re-arms for a genuinely new outage. Without this the cell is
+	// satisfied by a flag that clears unconditionally, which is no dampening.
+	killLeg6803(t, m, reg, addr)
+	reg.mu.Lock()
+	reg.failAddr[addr] = true
+	reg.mu.Unlock()
+	d.reassertMgmtListenersOnce(context.Background())
+	if !d.mgmtReassertNoticed.Load() {
+		t.Fatal("a NEW outage after a recovery did not re-arm the streak flag")
+	}
+}
