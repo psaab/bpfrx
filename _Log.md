@@ -105068,3 +105068,23 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — CLAUDE.md: a Required Reading index
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add a `## Required Reading` section to the project `CLAUDE.md`,
+  between "Working Style" and "Logging Rules".
+- **Why**: `CLAUDE.md` already told a reader to read `docs/engineering-style.md`
+  and to update module docs in the same change, but the other standing
+  documents — `~/.claude/RTK.md`, `AGENTS.md`, `COMMITAGENT.md`,
+  `docs/config-schema.md` — were nowhere named, so an agent had no way to
+  discover them except by tripping over the rule they encode. `RTK.md` is the
+  sharpest omission: a hook silently rewrites most shell commands through the
+  `rtk` token-optimizing proxy, and a reader who does not know that also does
+  not know `rtk proxy <cmd>` exists to get UNFILTERED output back for the cases
+  where the filtered form has dropped the decisive line.
+- **Shape**: a table of file → when to read it → what it governs, so the entry
+  is actionable at dispatch time rather than a bare list of filenames. Closes
+  with the point that sub-agents inherit the file but not the reasoning, so a
+  dispatch brief should name the specific documents its task touches.
+- **File(s)**: `CLAUDE.md`, `_Log.md`
