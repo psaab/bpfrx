@@ -31,6 +31,27 @@ project has settled on — hot-path allocation rules, review severity,
 compile-time invariants, PR discipline, and the project-specific
 gotchas that repeatedly bite (deploy wipes CoS, iperf3 target, etc.).
 
+## Required Reading
+
+Read these BEFORE starting work, not after getting stuck. They are the
+contract; a PR that violates one of them gets sent back regardless of
+whether the code is correct.
+
+| File | Read it when | What it governs |
+|------|--------------|-----------------|
+| `docs/engineering-style.md` | before ANY non-trivial code or PR review | hot-path allocation rules, review severity, compile-time invariants, PR discipline, shared-cluster protocol, the project gotchas that repeatedly bite (deploy wipes CoS, iperf3 target, etc.) |
+| `~/.claude/RTK.md` | before running shell commands in bulk | the `rtk` token-optimizing CLI proxy. A hook transparently rewrites most commands (`git status` → `rtk git status`), but the meta commands (`rtk gain`, `rtk discover`, `rtk proxy <cmd>`) must be invoked directly. Use `rtk proxy <cmd>` when you need UNFILTERED output for debugging — filtered output has dropped the line you are looking for more than once. |
+| `AGENTS.md` | before splitting work across agents | orchestrator / architect / implementor role boundaries, worktree assignment, overlap prevention, and the rule that agents keep working until they hit a real stopping point |
+| `COMMITAGENT.md` | before driving a stacked branch series | stack ownership, narrow helper roles, and the commit/stack discipline |
+| `README.md` | when touching a public-facing surface | what the product claims to do; a behaviour change that contradicts it is a docs bug too |
+| `docs/config-schema.md` | before adding a config-mode leaf | `setSchema` typed leaves, multi-value leaves, bracketed-list collapse (#2419 class) |
+| the module's own `README.md` / `docs/*.md` | in the SAME change as the code | updating them is part of the contract, not follow-up work. If none is needed, say why in the review notes. |
+
+Sub-agents inherit this file automatically, but NOT the reasoning behind
+it. When dispatching a lane, name the specific documents its task
+touches — a brief that says "read engineering-style.md" is followed; one
+that assumes the agent already did is not.
+
 ## Logging Rules
 - Maintain a log of all major actions in `_Log.md`.
 - Use YAML or Markdown bullet points for structure:

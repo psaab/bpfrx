@@ -490,6 +490,20 @@ func (s *Server) HTTPSServing() bool {
 	return s.httpsLeg.serving()
 }
 
+// HTTPServing reports whether the HTTP leg is bound and still serving. It is the
+// exact counterpart of HTTPSServing and exists for the same reason (#6803): the
+// reconciler's converged-fingerprint records what the last SUCCESSFUL reconcile
+// bound, which is not evidence that the socket is still up. An unexpected serve
+// exit marks the leg dead and leaves it INSTALLED (listenerLeg.dead — it cannot
+// be removed under lifeMu without deadlocking a shutdown that races the exit),
+// so a fingerprint-only gate matches on every later commit and never rebinds.
+// #6827 round 6 gave HTTPS this question; the HTTP leg never got it.
+func (s *Server) HTTPServing() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpLeg.serving()
+}
+
 // ReconcileHTTP make-before-break rebinds ONLY the HTTP listener to addr (#5866),
 // leaving the HTTPS leg untouched. A same-addr call is a no-op. The new listener
 // is bound and serving BEFORE the old is retired (no unreachable HTTP window). A
@@ -501,7 +515,12 @@ func (s *Server) ReconcileHTTP(addr string) error {
 	if addr == "" {
 		return fmt.Errorf("api: refusing to reconcile the HTTP listener to an empty bind address")
 	}
-	if s.httpLeg != nil && s.httpLeg.srv.Addr == addr {
+	// The same-address short circuit requires the leg to still be SERVING, the
+	// way ReconcileHTTPS's does (#6803). Without the serving() half, a leg whose
+	// serve loop exited unexpectedly — dead, but still installed — satisfied the
+	// address compare, so a rebind to the same endpoint returned nil having done
+	// nothing and the management API stayed down until a daemon restart.
+	if s.httpLeg.serving() && s.httpLeg.srv.Addr == addr {
 		return nil
 	}
 	plan := s.planHTTPLeg(addr)

@@ -680,6 +680,44 @@ explicit-config test seam.
     `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` (daemon, end to end from
     `reconcileWebManagement`) and `TestReconcileHTTPSReplacesADeadLeg_6827`
     (`pkg/api`).
+  - **The HTTP leg never got that fix** (#6803). Round 6 repaired the HTTPS arm
+    and stopped. The HTTP arm still gated on the converged fingerprint alone
+    (`next.Addr != m.cur.addr`), and `api.Server.ReconcileHTTP`'s same-address
+    short circuit still tested a non-nil pointer rather than `serving()` — the
+    two defects round 6 named, on the other leg. So an HTTP serve loop that
+    terminated unexpectedly left the REST/management API down for the life of
+    the process on an UNCHANGED configuration, exactly as HTTPS did before round
+    6. The HTTP arm now also fires when `next.Addr != "" && !m.srv.HTTPServing()`
+    — gated on a non-empty desired address so it stays strictly additive, since
+    `ReconcileHTTP` refuses an empty bind and the #6827 over-reach guard
+    `a_failed_boot_then_an_empty_bind_binds_nothing` pins that direction — and
+    `ReconcileHTTP`'s no-op now asks `s.httpLeg.serving()`, mirroring
+    `ReconcileHTTPS`. New accessor `api.Server.HTTPServing()` is the exact
+    counterpart of `HTTPSServing()`.
+  - **…and nothing CALLED the reconcile** (#6803). Both gate fixes are only
+    reachable from `applyConfigLocked`, the sole caller of
+    `reconcileWebManagement`, so recovery still waited on an operator committing
+    — from a box whose management API had just died, which is the box they can no
+    longer reach to commit from. `mgmtListenerReassertLoop`
+    (`mgmt_listener_reassert.go`) is the owner: started unconditionally in `Run`
+    beside `proxyARPReassertLoop` / `raDeadSenderReassertLoop` (#6793) /
+    `fabricIPVLANReassertLoop` (#6791) / `hostInboundConntrackReassertLoop`
+    (#6802), 30s, taking `applySem` before acting (#4001) and re-checking the
+    gate INSIDE the semaphore because the commit it queued behind may already
+    have rebound the listener. Its gate is
+    `effectiveHTTPListener().State == StateFailed` — deliberately the SAME
+    question `show system services` answers, so the box can never report a dead
+    listener nothing is retrying, or retry one it reports healthy. Pinned by
+    `mgmt_listener_reassert_6803_test.go` (dead-leg rebind on an UNCHANGED
+    config, paired against a healthy leg that must NOT be bounced; the gate
+    tracks the operator view; the owner re-binds with no commit; the
+    inside-the-semaphore re-check; the loop ticks; and a loop-START cell) and
+    `pkg/api/reconcile_http_dead_leg_6803_test.go`.
+
+    Not covered by #6803: the PRIMARY (loopback) gRPC listener has the same hole
+    — `Run` logs a serve error and the goroutine exits with nothing re-binding —
+    while the FABRIC gRPC listener beside it has had a backoff supervisor since
+    #5047. Filed separately.
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),

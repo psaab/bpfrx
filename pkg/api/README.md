@@ -1871,6 +1871,19 @@ the drop fails loudly instead of going quietly vacuous.
     uniform unavailable/error contract (#3464, below) so a degraded
     interface-counter bridge is no longer handled divergently across surfaces.
 
+    **`ReconcileHTTP` asks `serving()`, not just the address** (#6803).
+    `ReconcileHTTPS`'s same-address arm has tested `httpsLeg.serving()` since
+    #6827 round 6; `ReconcileHTTP`'s tested a non-nil pointer. An unexpected
+    serve exit marks a leg dead and leaves it INSTALLED, so the address compare
+    matched a corpse and a rebind to the same endpoint returned `nil` having done
+    nothing — the HTTP management API was unrecoverable on an unchanged
+    configuration for the life of the process. `HTTPServing()` is the new exact
+    counterpart of `HTTPSServing()`, and it is what both this no-op and the
+    daemon-side `reconcileTo` gate now ask. Pinned by
+    `reconcile_http_dead_leg_6803_test.go`, paired against the over-reach
+    direction: a HEALTHY same-address leg must still be a no-op, or the
+    management socket is rebuilt on every commit and every 30s re-assert tick.
+
   Pinned by `stats_counter_error_test.go` +
   `zones_policies_counter_error_test.go` (REST + Prometheus),
   `pkg/grpcapi/global_stats_counter_error_test.go` (incl. the late-read
