@@ -216,3 +216,58 @@ func (n *swanctlNode) requireSetting(t swanctlTB, key, want string) {
 		t.Errorf("%s.%s = %q, want %q", n.name, key, got, want)
 	}
 }
+
+// settingMembers splits a comma-joined setting value (swanctl's proposal
+// lists) into its members.
+//
+// It exists because containment on a member token is doubly unsound: `3des-sha1`
+// is a substring of `3des-sha1-modp1024`, so a Phase-2 assertion written as
+// Contains(doc, "3des-sha1") is satisfied by the PHASE-1 line and passes even if
+// esp_proposals is missing entirely. Membership in the split value of a named
+// setting cannot be satisfied by a different line or a longer token.
+func (n *swanctlNode) settingMembers(t swanctlTB, key string) []string {
+	t.Helper()
+	raw := n.setting(t, key)
+	parts := strings.Split(raw, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
+// requireMembers asserts every want is a member of the comma-joined value of
+// key -- an exact token match, not a substring of a longer one.
+func (n *swanctlNode) requireMembers(t swanctlTB, key string, want ...string) {
+	t.Helper()
+	got := n.settingMembers(t, key)
+	have := map[string]bool{}
+	for _, g := range got {
+		have[g] = true
+	}
+	for _, w := range want {
+		if !have[w] {
+			t.Errorf("%s.%s = %v, missing member %q", n.name, key, got, w)
+		}
+	}
+}
+
+// hasNoSettingAnywhere asserts no section in the whole tree declares key.
+//
+// This is how a test says "an injected directive never became a live setting",
+// and it is strictly stronger than scanning for a line that trims to the exact
+// injected text: it fires whatever VALUE the injection carried, and at whatever
+// nesting depth the render placed it.
+func (n *swanctlNode) hasNoSettingAnywhere(t swanctlTB, key string) {
+	t.Helper()
+	var walk func(*swanctlNode, string)
+	walk = func(node *swanctlNode, path string) {
+		if vals, ok := node.settings[key]; ok {
+			t.Errorf("setting %q became live at %s = %v; nothing in this fixture "+
+				"renders that key, so it can only have been injected", key, path, vals)
+		}
+		for _, name := range node.order {
+			walk(node.children[name], path+"."+name)
+		}
+	}
+	walk(n, n.name)
+}

@@ -106315,3 +106315,11 @@ prose edit above them added. No diff falls in the new test body.
     pkg/ipsec/endpoint_render_5630_test.go,
     pkg/ipsec/trafficselector_render_4098_test.go,
     pkg/ipsec/childname_collision_5122_test.go
+  - **Action**: #6824 — convert the remaining issue-numbered ipsec render
+    regression tests off `strings.Contains`
+  - **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
+    pkg/ipsec/proposalset_ah_hb167_test.go,
+    pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go

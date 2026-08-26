@@ -301,15 +301,11 @@ func TestGenerateConfig_JunosGCM(t *testing.T) {
 			"gcm": {Name: "gcm", EncryptionAlg: "aes-256-gcm", DHGroup: 14},
 		},
 	}
-	got := m.generateConfig(cfg)
-	if !strings.Contains(got, "esp_proposals = aes256gcm16-modp2048") {
-		t.Errorf("expected ICV-suffixed GCM esp_proposals, got:\n%s", got)
-	}
-	// The bare alias (valid strongSwan, but not the canonical spelling
-	// we now emit) must no longer appear.
-	if strings.Contains(got, "aes256gcm-modp2048") {
-		t.Errorf("rendered the bare aes256gcm alias instead of the canonical aes256gcm16:\n%s", got)
-	}
+	// #6824: an exact match at the child SA's esp_proposals subsumes both old
+	// checks -- the bare `aes256gcm-modp2048` alias cannot equal the canonical
+	// spelling, so the separate negative needle is no longer needed to say so.
+	childSA_3904(t, m.generateConfig(cfg), "tun1").
+		requireSetting(t, "esp_proposals", "aes256gcm16-modp2048")
 }
 
 // TestEscapeSwanctlQuoted unit-tests the swanctl double-quoted-string
@@ -357,13 +353,10 @@ func TestGenerateConfig_PSKWithQuote(t *testing.T) {
 		Proposals: map[string]*config.IPsecProposal{},
 	}
 	got := m.generateConfig(cfg)
-	if !strings.Contains(got, `secret = "pa\"ss"`) {
-		t.Errorf("expected escaped quoted PSK, got:\n%s", got)
-	}
-	// The corrupting unescaped form must NOT appear.
-	if strings.Contains(got, `secret = "pa"ss"`) {
-		t.Errorf("rendered the corrupted unescaped PSK:\n%s", got)
-	}
+	// #6824: an exact match on the secret setting subsumes the separate
+	// "corrupted form absent" needle -- the unescaped spelling cannot equal
+	// the escaped one.
+	secretSetting_6824(t, got, "ike-site-a", `"pa\"ss"`)
 	assertBalancedSecretQuotes(t, got)
 }
 
@@ -383,10 +376,7 @@ func TestGenerateConfig_PSKWithBackslash(t *testing.T) {
 		},
 		Proposals: map[string]*config.IPsecProposal{},
 	}
-	got := m.generateConfig(cfg)
-	if !strings.Contains(got, `secret = "pa\\ss"`) {
-		t.Errorf("expected doubled backslash in PSK, got:\n%s", got)
-	}
+	secretSetting_6824(t, m.generateConfig(cfg), "ike-site-a", `"pa\\ss"`)
 }
 
 // TestGenerateConfig_PSKTrailingBackslash is the adversarial corner a PSK
@@ -407,9 +397,7 @@ func TestGenerateConfig_PSKTrailingBackslash(t *testing.T) {
 		Proposals: map[string]*config.IPsecProposal{},
 	}
 	got := m.generateConfig(cfg)
-	if !strings.Contains(got, `secret = "pass\\"`) {
-		t.Errorf("expected trailing backslash doubled, got:\n%s", got)
-	}
+	secretSetting_6824(t, got, "ike-site-a", `"pass\\"`)
 	assertBalancedSecretQuotes(t, got)
 }
 
@@ -435,13 +423,12 @@ func TestGenerateConfig_IdentityWithCommaQuoted(t *testing.T) {
 			},
 		},
 	}
-	got := m.generateConfig(cfg)
-	if !strings.Contains(got, `id = "CN=fw, O=acme"`) {
-		t.Errorf("expected quoted DN identity, got:\n%s", got)
-	}
-	if !strings.Contains(got, `id = "peer\"name"`) {
-		t.Errorf("expected quoted+escaped remote identity, got:\n%s", got)
-	}
+	// #6824: `id` is emitted in BOTH the local{} and remote{} auth rounds, so
+	// containment could not say which round carried which identity -- the two
+	// old needles would both have passed with the values swapped.
+	conn := parseSwanctlDoc(t, m.generateConfig(cfg)).at(t, "connections", "tun")
+	conn.at(t, "local").requireSetting(t, "id", `"CN=fw, O=acme"`)
+	conn.at(t, "remote").requireSetting(t, "id", `"peer\"name"`)
 }
 
 // secretBlock is a parsed `secrets { ike-<name> { ... } }` entry.
@@ -455,44 +442,34 @@ type secretBlock struct {
 // value and the ordered id-<n> selector values (surrounding quotes
 // stripped). It is deliberately small: the rendered secrets are simple
 // enough that a leading/trailing double-quote trim recovers the value.
-func parseSecretBlocks(cfg string) map[string]secretBlock {
+func parseSecretBlocks(t *testing.T, cfg string) map[string]secretBlock {
+	t.Helper()
+	// #6824: built on the shared document parser rather than a second bespoke
+	// line scanner. The old version tracked `inSecrets` and flushed on a bare
+	// "}", so a nesting change anywhere above could silently reassign blocks;
+	// resolving secrets{} as a path cannot.
 	out := map[string]secretBlock{}
-	inSecrets := false
-	cur := ""
-	var blk secretBlock
-	flush := func() {
-		if cur != "" {
-			out[cur] = blk
-		}
-		cur = ""
-		blk = secretBlock{}
+	unquote := func(v string) string { return strings.Trim(v, `"`) }
+	doc := parseSwanctlDoc(t, cfg)
+	sec, ok := doc.children["secrets"]
+	if !ok {
+		return out
 	}
-	unquote := func(s string) string { return strings.Trim(strings.TrimSpace(s), `"`) }
-	for _, line := range strings.Split(cfg, "\n") {
-		t := strings.TrimSpace(line)
-		switch {
-		case t == "secrets {":
-			inSecrets = true
-		case !inSecrets:
-			// outside the secrets block — ignore.
-		case strings.HasPrefix(t, "ike-") && strings.HasSuffix(t, "{"):
-			flush()
-			cur = strings.TrimSpace(strings.TrimSuffix(t, "{"))
-		case cur != "" && strings.HasPrefix(t, "secret = "):
-			blk.secret = unquote(strings.TrimPrefix(t, "secret = "))
-		case cur != "" && strings.HasPrefix(t, "id-"):
-			if idx := strings.Index(t, "= "); idx >= 0 {
-				blk.ids = append(blk.ids, unquote(t[idx+2:]))
+	for _, name := range sec.order {
+		node := sec.children[name]
+		blk := secretBlock{}
+		if vals, ok := node.settings["secret"]; ok && len(vals) == 1 {
+			blk.secret = unquote(vals[0])
+		}
+		for _, k := range node.settingNames() {
+			if strings.HasPrefix(k, "id-") {
+				for _, v := range node.settings[k] {
+					blk.ids = append(blk.ids, unquote(v))
+				}
 			}
-		case t == "}" && cur != "":
-			// close the ike-<name> block.
-			flush()
-		case t == "}" && cur == "":
-			// close the secrets block.
-			inSecrets = false
 		}
+		out[name] = blk
 	}
-	flush()
 	return out
 }
 
@@ -524,7 +501,7 @@ func TestGenerateConfig_PSKIDSelectors_TwoVPNs(t *testing.T) {
 			"gw-b": {Name: "gw-b", Address: "203.0.113.2", LocalAddress: "198.51.100.10"},
 		},
 	}
-	blocks := parseSecretBlocks(m.generateConfig(cfg))
+	blocks := parseSecretBlocks(t, m.generateConfig(cfg))
 
 	a, ok := blocks["ike-vpn-a"]
 	if !ok {
@@ -582,7 +559,7 @@ func TestGenerateConfig_PSKIDSelectors_ExplicitIDs(t *testing.T) {
 			},
 		},
 	}
-	blocks := parseSecretBlocks(m.generateConfig(cfg))
+	blocks := parseSecretBlocks(t, m.generateConfig(cfg))
 	blk, ok := blocks["ike-vpn"]
 	if !ok {
 		t.Fatalf("missing ike-vpn secret block")
@@ -611,7 +588,7 @@ func TestGenerateConfig_PSKIDSelectors_SingleVPN(t *testing.T) {
 			"solo": {Gateway: "10.0.2.1", PSK: "onlysecret", BindInterface: "st0.0"},
 		},
 	}
-	blocks := parseSecretBlocks(m.generateConfig(cfg))
+	blocks := parseSecretBlocks(t, m.generateConfig(cfg))
 	blk, ok := blocks["ike-solo"]
 	if !ok {
 		t.Fatalf("missing ike-solo secret block")
@@ -645,7 +622,7 @@ func TestGenerateConfig_PSKIDSelectors_ResponderAnyAndCert(t *testing.T) {
 		},
 	}
 	got := m.generateConfig(cfg)
-	blocks := parseSecretBlocks(got)
+	blocks := parseSecretBlocks(t, got)
 
 	rw, ok := blocks["ike-roadwarrior"]
 	if !ok {
@@ -654,11 +631,15 @@ func TestGenerateConfig_PSKIDSelectors_ResponderAnyAndCert(t *testing.T) {
 	if len(rw.ids) != 0 {
 		t.Errorf("responder-only %%any peer should emit no id selector, got %v", rw.ids)
 	}
-	if strings.Contains(got, `%any`) && strings.Contains(got, "id-") {
-		// Belt: a literal id = "%any" would defeat the scoping and match all.
-		if containsStr(rw.ids, "%any") {
-			t.Errorf("emitted a literal %%any id selector")
-		}
+	// Belt: a literal id = "%any" would defeat the scoping and match all.
+	//
+	// #6824: this was previously guarded by
+	// `Contains(got, "%any") && Contains(got, "id-")` -- a condition about the
+	// document as a whole gating a check about THIS block's selectors. A
+	// render that dropped the %any sentinel elsewhere would skip the belt
+	// entirely. The inner check is the claim; assert it unconditionally.
+	if containsStr(rw.ids, "%any") {
+		t.Errorf("emitted a literal %%any id selector")
 	}
 	if _, ok := blocks["ike-cert-vpn"]; ok {
 		t.Errorf("cert VPN with no PSK must not emit a secret block")
@@ -807,4 +788,15 @@ func assertProposalIntegValid(t *testing.T, proposal string) {
 	if integ := parts[1]; !strongSwanIntegKeywords[integ] {
 		t.Fatalf("proposal %q carries integrity token %q that strongSwan does not accept — charon would reject the whole proposal", proposal, integ)
 	}
+}
+
+// secretSetting_6824 asserts secrets.<block>.secret renders exactly want,
+// INCLUDING its surrounding quotes.
+//
+// Containment on `secret = "..."` could not distinguish the secrets block from
+// any other place the renderer might emit the same bytes, and could not reject a
+// value with something appended.
+func secretSetting_6824(t *testing.T, doc, block, want string) {
+	t.Helper()
+	parseSwanctlDoc(t, doc).at(t, "secrets", block).requireSetting(t, "secret", want)
 }
