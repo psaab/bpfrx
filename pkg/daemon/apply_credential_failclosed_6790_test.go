@@ -25,12 +25,17 @@ package daemon
 // `_ =`) reds that cell and only that cell.
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
@@ -328,5 +333,132 @@ func TestApplyTailRunsEveryCredentialOwnerDespiteAnEarlierFailure6790(t *testing
 		t.Fatalf("the LATER (root-auth) owner did not run, or its failure was "+
 			"dropped, after an earlier credential reconcile failed — "+
 			"fail-closed must not become fail-fast: %v", err)
+	}
+}
+
+// --- #1960 no-brick / peer-sync classification -----------------------------
+//
+// Joining five more operands into applyTailReconciles' result changes what
+// applyConfigLocked RETURNS, and two callers classify that return rather than
+// just reporting it:
+//
+//   - applyAndSyncCommitted (#4034) skips the push to the standby, and
+//   - syncAndApply (#5564) DISCARDS the peer-promoted config,
+//
+// but ONLY for the two error classes applyErrSkipsPeerSync names: a
+// required-protocol-gate error (dataplane disarmed, #2138) or a context
+// cancel/deadline (#2926 daemon-stop abort). Every other error is the
+// non-fatal best-effort class that must keep syncing, because the config is
+// already committed + active and the dataplane armed — skipping the sync there
+// is what #4034 fixed.
+//
+// A credential reconcile failure is a LOCAL, node-specific, transient
+// condition (this node's sshd refused, this node's /etc/passwd was briefly
+// unreadable). It says nothing about whether the CONFIG is good, so it must
+// land in the non-fatal class or a standby would refuse a peer-synced config
+// and the nodes would diverge — the #1960 no-brick contract.
+//
+// These cells pin that classification against the REAL errors the five
+// reconcilers produce, not hand-built ones.
+
+// TestCredentialFailuresDoNotSkipThePeerSync6790 is the #1960 no-brick pin.
+func TestCredentialFailuresDoNotSkipThePeerSync6790(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, f *credentialTailFixture6790)
+	}{
+		{"system-login", func(t *testing.T, f *credentialTailFixture6790) {
+			f.cfg.System.Login = &config.LoginConfig{Users: []*config.LoginUser{{Name: "admin", Class: "super-user"}}}
+			runCommandTimeout = func(string, ...string) ([]byte, error) {
+				return []byte("simulated: refused"), os.ErrPermission
+			}
+		}},
+		{"sudoers", func(t *testing.T, f *credentialTailFixture6790) {
+			f.cfg.System.Login = &config.LoginConfig{Users: []*config.LoginUser{{Name: "admin", Class: "super-user"}}}
+			sudoersDir = filepath.Join(f.root, "sudoers-missing")
+		}},
+		{"absent-login-users", func(t *testing.T, f *credentialTailFixture6790) {
+			if err := os.MkdirAll(provisionedUsersDir, 0o700); err != nil {
+				t.Fatalf("seed the account registry: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(provisionedUsersDir, "ghost"), []byte("4242"), 0o600); err != nil {
+				t.Fatalf("seed the ghost marker: %v", err)
+			}
+			passwdPath = filepath.Join(f.root, "passwd-as-dir")
+			if err := os.MkdirAll(passwdPath, 0o755); err != nil {
+				t.Fatalf("seed an unreadable passwd: %v", err)
+			}
+		}},
+		{"ssh-config", func(t *testing.T, f *credentialTailFixture6790) {
+			f.cfg.System.Services = &config.SystemServicesConfig{
+				SSH: &config.SSHServiceConfig{RootLogin: "deny"},
+			}
+			sshdValidateCmd = func() ([]byte, error) {
+				return []byte("simulated: bad configuration option"), os.ErrInvalid
+			}
+		}},
+		{"root-auth", func(t *testing.T, f *credentialTailFixture6790) {
+			f.cfg.System.RootAuthentication = &config.RootAuthConfig{
+				SSHKeys: []string{"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI6790 test@xpf"},
+			}
+			breakMarkerRoots6790(t, f.root)
+		}},
+		{"external-command-timeout", func(t *testing.T, f *credentialTailFixture6790) {
+			// The one shape that could plausibly carry a context error: an
+			// apply-path command killed by externalCommandTimeout. Produced by
+			// running a REAL command under an expired context rather than by
+			// asserting what Go returns — exec reports `signal: killed` as an
+			// *exec.ExitError, NOT a context error, and if that ever changed
+			// this cell would catch it.
+			f.cfg.System.Login = &config.LoginConfig{Users: []*config.LoginUser{{Name: "admin", Class: "super-user"}}}
+			runCommandTimeout = func(string, ...string) ([]byte, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, "sleep", "5")
+				cmd.WaitDelay = time.Second
+				return cmd.CombinedOutput()
+			}
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCredentialTailFixture6790(t)
+			tc.setup(t, f)
+
+			err := f.tail()
+			if err == nil {
+				t.Fatalf("precondition: the %s reconcile did not fail, so this cell "+
+					"cannot classify anything", tc.name)
+			}
+			if applyErrSkipsPeerSync(err) {
+				t.Fatalf("a %s credential reconcile failure is classified FATAL by "+
+					"applyErrSkipsPeerSync, so applyAndSyncCommitted would skip the "+
+					"push to the standby and syncAndApply would DISCARD a "+
+					"peer-promoted config. A local, node-specific credential "+
+					"failure must never brick a peer sync (#1960). err=%v", tc.name, err)
+			}
+		})
+	}
+}
+
+// TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790 is the PAIRED
+// positive control for the cells above. Without it, "credential failures are
+// not classified fatal" is satisfied by an applyErrSkipsPeerSync that returns
+// false for everything — which would break the #4034/#2138 fail-closed
+// suppression the classifier exists for.
+func TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790(t *testing.T) {
+	if !applyErrSkipsPeerSync(context.Canceled) {
+		t.Error("context.Canceled is no longer classified fatal — a daemon-stop " +
+			"abort would now push a half-applied config to the standby (#2926)")
+	}
+	if !applyErrSkipsPeerSync(fmt.Errorf("wrapped: %w", context.DeadlineExceeded)) {
+		t.Error("a wrapped context.DeadlineExceeded is no longer classified fatal")
+	}
+	gate := fmt.Errorf("apply: %w", dpuserspace.ErrPolicySchedulerProtocolIncompatible)
+	if !applyErrSkipsPeerSync(gate) {
+		t.Error("a required-protocol-gate error is no longer classified fatal — a " +
+			"config that DISARMS the dataplane would now be pushed to the " +
+			"standby too (#2138/#4034)")
 	}
 }

@@ -1595,6 +1595,63 @@ real `applyTailReconciles` with one owner injected to fail per cell, plus
 a healthy control and a both-ends cell proving an early failure does not
 skip a later owner.
 
+### What a credential failure does to each apply caller (#1960 no-brick)
+
+`applyTailReconciles`' return reaches `applyConfigLocked`, which has five
+call sites. Two of them CLASSIFY the error rather than just reporting it,
+so the question that matters is whether a credential failure can make a
+node reject a config:
+
+| call site | what a non-nil return does now | config promoted? |
+|---|---|---|
+| `daemon_apply.go:182` `applyActiveConfigResult` | the feed manager (#5646) does not advance its published-hash, so the next identical refetch retries | yes — unchanged |
+| `daemon_apply.go:191` `applyConfigUnderSem` (boot / DHCP callback / feed / config-poll / rollback) | `slog.Warn` + return; `MarkActiveApplied()` is SKIPPED | yes — unchanged |
+| `daemon_apply_commit.go:254` `applyAndSyncCommitted` (operator commit) | the operator's commit reports failure; the peer push still happens; `MarkActiveApplied()` skipped | yes — `Store.Commit` promoted it upstream |
+| `daemon_apply_commit.go:522` `syncAndApply` (**peer-sync recv**) | the error is returned to `handleConfigSync`, which logs it and returns it so the config high-water does NOT advance and the primary re-pushes | yes — `SyncApply` promoted it BEFORE the apply |
+| `daemon_apply_commit.go:766` commit-confirmed auto-rollback | `slog.Error` only (background timer, no return path); the rollback target is applied unconditionally | yes — `PromoteRollback` already ran |
+
+The peer-sync path is `syncAndApply`, and it does **not** reject. Both it
+and `applyAndSyncCommitted` route the error through
+`applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+required-protocol-gate error (dataplane DISARMED, #2138) and a context
+cancel/deadline (the #2926 daemon-stop abort). Everything else is the
+non-fatal best-effort class that **must** keep syncing, because the config
+is already committed + active and the dataplane armed; suppressing the
+sync there is the divergence #4034 fixed. In `syncAndApply` the same
+classifier decides whether to DISCARD the peer-promoted config, and on the
+non-fatal branch it sets `armedActive = true` and returns the error
+alongside the live config.
+
+So a credential reconcile failure on a standby:
+
+- does **not** roll back or reject the peer-synced config — it stays
+  active and armed;
+- does **not** suppress the primary→standby push on the commit side;
+- **does** leave the applied-digest unstamped, so the primary's next
+  re-push re-enters `syncAndApply` and RETRIES instead of taking
+  `handleConfigSync`'s converged shortcut (#4957/#6296).
+
+That is a retry, not a brick, and it is the same behaviour
+`networkdErr`, `dhcpServerErr`, `hostInboundErr`, `lo0Err` and `dnsErr`
+have had in this join since #3333/#3392/#4034/#6792 — the #4034 and #5564
+comments name "host-inbound/lo0 nft, networkd" as precisely this class.
+
+No `lenient*` compile opt is needed or possible: `pkg/config/compiler_opts.go`
+"carries per-call compilation policy", and every flag in it downgrades the
+severity of a COMPILE-time validator. These are RECONCILE-time failures
+raised after compilation, inside `applyConfigLocked`; there is no compile
+gate to downgrade, and the tolerant path already does not reject.
+
+One shape was measured rather than assumed: an apply-path command killed
+by `externalCommandTimeout` returns `*exec.ExitError` ("signal: killed"),
+which does **not** satisfy `errors.Is(err, context.DeadlineExceeded)` even
+when wrapped and joined — so a `useradd` that times out cannot masquerade
+as the #2926 abort class and suppress a peer sync.
+`TestCredentialFailuresDoNotSkipThePeerSync6790` pins all five owners plus
+that timeout shape, against the REAL errors the reconcilers produce, and
+`TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790` is its paired
+positive control so the classifier cannot degrade to "nothing is fatal".
+
 ## Idempotency
 
 The password apply reads `/etc/shadow` directly and skips `chpasswd`

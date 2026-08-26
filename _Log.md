@@ -1,3 +1,33 @@
+## 2026-08-26 — #6790 follow-up: the #1960 no-brick classification is now pinned
+
+- **Timestamp**: 2026-08-26
+- **Action**: Review question on PR #7604: does joining five more operands
+  into `applyTailReconciles`' result make a standby REJECT a peer-synced
+  config? Enumerated all five `applyConfigLocked` call sites. Answer: no.
+  The peer-sync path is `syncAndApply` (`daemon_apply_commit.go:522`), and
+  both it and `applyAndSyncCommitted` route the error through
+  `applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+  required-protocol-gate error (#2138) and a context cancel/deadline
+  (#2926). Everything else keeps the config active + armed and keeps
+  syncing; that is the class #4034 created and it already contains
+  networkdErr / dhcpServerErr / hostInboundErr / lo0Err / dnsErr. A
+  credential failure only leaves the applied-digest unstamped, so the
+  primary re-pushes and the standby RETRIES — a retry, not a brick.
+  Did not assume the one shape that could have broken it: MEASURED that a
+  command killed by `externalCommandTimeout` returns `*exec.ExitError`
+  ("signal: killed") and does NOT satisfy `errors.Is(.., DeadlineExceeded)`
+  even wrapped and joined, so a `useradd` timeout cannot masquerade as the
+  #2926 abort class and suppress a peer sync. Pinned the whole
+  classification with 6 subtests over the REAL reconciler errors plus a
+  paired positive control, so the classifier cannot silently degrade to
+  "nothing is fatal". No `lenient*` compile opt is needed or possible:
+  `compileOpts` downgrades COMPILE-time validators, and these are
+  reconcile-time failures raised after compilation.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 9 cells green. Repo-wide `go build ./... && go test
+  -count=1 ./...` rc 0. Mutation matrix re-run at the new head.
+
 ## 2026-08-26 — #6790: the normal apply joins the five credential-reconcile failures
 
 - **Timestamp**: 2026-08-26
