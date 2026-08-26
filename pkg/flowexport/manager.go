@@ -81,8 +81,18 @@ type ExportConfig struct {
 	// collectors must not export an IPv6 flow. An instance that configured
 	// neither (no flow-servers for this version) produces no ExportConfig at
 	// all, so both true-everywhere defaults are never observed.
-	ServesInet     bool
-	ServesInet6    bool
+	ServesInet  bool
+	ServesInet6 bool
+	// GroupIsV6 is the address family of THIS group's collectors (#6811).
+	//
+	// It is deliberately NOT the same thing as ServesInet/ServesInet6, which
+	// stay per-INSTANCE and keep their #2462 meaning ("does this instance serve
+	// this family at all"). The instance-level flags gate the single sampling
+	// DECISION — a record of a family the instance does not serve must not
+	// consume a 1-in-N slot — while GroupIsV6 gates which groups that decision
+	// then fans out to. Collapsing the two would either re-open the cross-fan or
+	// change the sampling denominator.
+	GroupIsV6      bool
 	V9TemplateOpts V9TemplateOptions // optional v9 template field control
 	// IncludeFlowDir is the resolved `export-extension flow-dir` knob for THIS
 	// template group (#3270). When set, the NetFlow v9 / IPFIX template
@@ -110,10 +120,19 @@ type CollectorConfig struct {
 	Address       string // "host:port"
 	SourceAddress string // local bind address (empty = auto)
 	// Template is the per-flow-server template the collector referenced
-	// ("" = none → default group). It is the grouping key for #2461 and is
+	// ("" = none → default group). It is HALF the grouping key for #2461 and is
 	// NOT serialized into the dialed connection; it only steers which
 	// ExportConfig (template context) the collector is placed under.
 	Template string `json:"-"`
+	// IsV6 records the address family the flow-server was configured under
+	// (#6811). Before it, family was collapsed to two per-INSTANCE booleans the
+	// moment the two families were merged into one collector slice, so an
+	// instance carrying `family inet { flow-server A }` AND
+	// `family inet6 { flow-server B }` had both booleans true and exported IPv4
+	// flows to B and IPv6 flows to A. Carrying family per collector is what lets
+	// the grouping partition it back out at BUILD time, so the hot path stays a
+	// gate on a precomputed group rather than a per-record collector search.
+	IsV6 bool `json:"-"`
 }
 
 // resolveFlowServerVersion returns the export protocol a single
@@ -228,6 +247,7 @@ func collectInstanceVersionCollectors(inst *config.SamplingInstance, version str
 				Address:       addr,
 				SourceAddress: srcAddr,
 				Template:      tmpl,
+				IsV6:          fe.isV6,
 			})
 			if fe.isV6 {
 				servesInet6 = true
@@ -377,23 +397,51 @@ func sortedInstanceNames(fo *config.ForwardingOptionsConfig) []string {
 	return names
 }
 
-// groupCollectorsByTemplate partitions the deduplicated collector list into
-// one slice per referenced template name, returning the group keys sorted
-// deterministically. The empty-string key holds collectors that referenced
-// no template (the default group). Determinism (#2461): the group order and
-// the per-group collector order are stable across process restarts, killing
-// the Go-map-iteration nondeterminism that let a collector silently flip
-// between templates.
-func groupCollectorsByTemplate(collectors []CollectorConfig) ([]string, map[string][]CollectorConfig) {
-	groups := make(map[string][]CollectorConfig)
+// collectorGroupKey is the grouping identity of an ExportConfig: the template
+// a collector referenced AND the address family it was configured under
+// (#2461 + #6811).
+//
+// Family belongs in the key because it is what makes the hot path a GATE
+// rather than a SEARCH. With family in the key every group is single-family by
+// construction, so the per-record work is one comparison against a precomputed
+// group flag; keeping template-only groups and filtering conns per record
+// would put a collector scan on the export path for every flow.
+type collectorGroupKey struct {
+	Template string
+	IsV6     bool
+}
+
+// groupCollectorsByTemplateAndFamily partitions the deduplicated collector list
+// into one slice per (template, address-family) pair, returning the group keys
+// sorted deterministically. The empty Template holds collectors that referenced
+// no template (the default group).
+//
+// Determinism (#2461): the group order and the per-group collector order are
+// stable across process restarts, killing the Go-map-iteration nondeterminism
+// that let a collector silently flip between templates. IsV6 is the secondary
+// sort key so the ordering stays total.
+//
+// #6811: this used to key on template alone. Both families were merged into one
+// collector slice before grouping, so a single instance configured with
+// `family inet { flow-server A }` and `family inet6 { flow-server B }` produced
+// ONE group holding A and B, and every export to that group reached both — IPv4
+// records to the IPv6-only collector and vice versa.
+func groupCollectorsByTemplateAndFamily(collectors []CollectorConfig) ([]collectorGroupKey, map[collectorGroupKey][]CollectorConfig) {
+	groups := make(map[collectorGroupKey][]CollectorConfig)
 	for _, c := range collectors {
-		groups[c.Template] = append(groups[c.Template], c)
+		k := collectorGroupKey{Template: c.Template, IsV6: c.IsV6}
+		groups[k] = append(groups[k], c)
 	}
-	keys := make([]string, 0, len(groups))
+	keys := make([]collectorGroupKey, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Template != keys[j].Template {
+			return keys[i].Template < keys[j].Template
+		}
+		return !keys[i].IsV6 && keys[j].IsV6
+	})
 	for _, k := range keys {
 		cs := groups[k]
 		sort.Slice(cs, func(i, j int) bool {
@@ -458,8 +506,9 @@ func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOp
 		}
 		rate := inst.InputRate
 		shared := &atomic.Uint64{} // per-INSTANCE counter (#2462)
-		keys, groups := groupCollectorsByTemplate(collectors)
-		for _, name := range keys {
+		keys, groups := groupCollectorsByTemplateAndFamily(collectors)
+		for _, key := range keys {
+			name := key.Template
 			ctx := defaultCtx
 			if name != "" {
 				tmpl, ok := defined[name]
@@ -471,9 +520,10 @@ func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOp
 				ctx = v9TemplateContext(tmpl)
 			}
 			out = append(out, &ExportConfig{
-				Collectors:          groups[name],
+				Collectors:          groups[key],
 				InstanceName:        instName,
 				TemplateName:        name,
+				GroupIsV6:           key.IsV6,
 				FlowActiveTimeout:   ctx.activeTimeout,
 				FlowInactiveTimeout: ctx.inactiveTimeout,
 				TemplateRefreshRate: ctx.refreshRate,
@@ -521,8 +571,9 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 		}
 		rate := inst.InputRate
 		shared := &atomic.Uint64{} // per-INSTANCE counter (#2462)
-		keys, groups := groupCollectorsByTemplate(collectors)
-		for _, name := range keys {
+		keys, groups := groupCollectorsByTemplateAndFamily(collectors)
+		for _, key := range keys {
+			name := key.Template
 			ctx := defaultCtx
 			if name != "" {
 				tmpl, ok := defined[name]
@@ -532,9 +583,10 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 				ctx = ipfixTemplateContext(tmpl)
 			}
 			out = append(out, &ExportConfig{
-				Collectors:          groups[name],
+				Collectors:          groups[key],
 				InstanceName:        instName,
 				TemplateName:        name,
+				GroupIsV6:           key.IsV6,
 				FlowActiveTimeout:   ctx.activeTimeout,
 				FlowInactiveTimeout: ctx.inactiveTimeout,
 				TemplateRefreshRate: ctx.refreshRate,
@@ -550,11 +602,16 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 }
 
 // BuildExportConfig resolves config types into a single NetFlow v9
-// ExportConfig. It returns the FIRST template group (deterministically the
-// default/empty-template group, else the lowest template name) and is
-// retained for callers that want a single aggregate config; the daemon uses
+// ExportConfig. It returns the FIRST group (deterministically the
+// default/empty-template group, else the lowest template name; and within a
+// template, inet before inet6) and is retained for TESTS that want a single
+// aggregate config — it has no production callers. The daemon uses
 // ResolveV9TemplateGroups so each collector gets its referenced template
 // (#2461). Returns nil if no flow export is configured.
+//
+// #6811: groups are keyed on template AND address family, so for a
+// multi-family instance this returns only ONE family's collectors. A caller
+// that needs every collector must iterate ResolveV9TemplateGroups.
 func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
 	groups := ResolveV9TemplateGroups(svc, fo)
 	if len(groups) == 0 {
@@ -563,7 +620,8 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 	return groups[0]
 }
 
-// BuildIPFIXExportConfig is the IPFIX equivalent of BuildExportConfig.
+// BuildIPFIXExportConfig is the IPFIX equivalent of BuildExportConfig,
+// including the #6811 single-family caveat.
 func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
 	groups := ResolveIPFIXTemplateGroups(svc, fo)
 	if len(groups) == 0 {
@@ -939,5 +997,13 @@ func estimateSessionDuration(pkts uint64, proto uint8) time.Duration {
 }
 
 func collectorKey(c CollectorConfig) string {
-	return c.Address + "\x00" + c.SourceAddress + "\x00" + c.Template
+	// #6811: family is part of the identity. The same address+source+template
+	// configured under BOTH families is two distinct destinations-with-family,
+	// not one duplicate: collapsing them would silently drop one family's
+	// export to a collector the operator explicitly configured for both.
+	fam := "4"
+	if c.IsV6 {
+		fam = "6"
+	}
+	return c.Address + "\x00" + c.SourceAddress + "\x00" + c.Template + "\x00" + fam
 }
