@@ -105563,3 +105563,37 @@ prose edit above them added. No diff falls in the new test body.
   Verified after writing that `theirs` is a prefix of the result.
 - **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
   `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6852: retire networkd.Manager.Clear, moving its tests onto Apply(nil)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Delete `networkd.Manager.Clear` and move its contract tests onto
+  `Apply(nil)`.
+- **Why retire rather than wire**, which is the decision #5718 deliberately left
+  open: `Apply(nil)` already carries every contract `Clear` owned — the
+  `10-xpf-*` stale sweep, the #4900 aggregation that FAILS the commit when a
+  managed file cannot be removed, and the #4954 re-activation on
+  `debtOwed := reloadDebtOutstanding()`, which subsumes `Clear`'s empty-glob
+  debt-discharge branch.
+- **That is measured, not asserted.** `Clear`'s own four-step #5718 A7-b01-C001
+  fail-on-revert was MOVED onto `Apply(nil)` and passes UNCHANGED — reload fails
+  → error; second call with an empty glob must re-run the reload from the debt
+  rather than return nil; recovery discharges it; a further call with no files
+  and no debt must not shell out. Converting the test first and running it BEFORE
+  deleting anything kept two questions separate: "does Apply(nil) carry the
+  contract" and "did the deletion break something".
+- **Wiring it would have been actively WORSE**, which is the part that settles
+  it. `Clear` globbed and removed EVERY `10-xpf-*` file including the
+  `SetProtectedResolver` lifeline files that `Apply(nil)` deliberately preserves.
+  Any teardown that called `Clear` would have taken management down with the
+  managed config — so the method was not merely uncalled, it was unsafe to call.
+- **No coverage lost, checked rather than assumed**: `TestClear_RemoveFailureReturnsError`
+  was a line-for-line twin of the `Apply(nil)` #4900 cell immediately above it
+  (same `blockedStaleEntry` fixture, same assertion), so deleting it leaves that
+  property owned by a named cell. Deleting the LAST owner of a property would
+  have been a silent decommission; this is not.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/applynil_reload_debt_5718_test.go` (renamed from
+  `clear_reload_debt_5718_test.go`), `pkg/networkd/stale_remove_4900_test.go`,
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`,
+  `_Log.md`
