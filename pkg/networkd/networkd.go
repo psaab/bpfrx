@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/rendersafe"
 )
 
 // networkctlTimeout bounds every networkctl shell-out. Apply runs on
@@ -651,82 +652,6 @@ func warnIfAllRPFilterOverrides(tunName string) {
 		"tun", tunName, "all_rp_filter", val, "issue", 2378)
 }
 
-// Clear removes all xpf-managed networkd files and reloads.
-//
-// NO PRODUCTION CALLER (#5718 fold). Clear has been exported and uncalled
-// since it was introduced with this package — `git log -S` finds no caller in
-// the repository's history, and the daemon's only uses of its Manager are
-// SetProtectedResolver and Apply (pkg/daemon/daemon_run_bringup.go,
-// daemon_apply_dataplane.go). It is exercised solely by this package's tests,
-// so its behaviour — including the activation-debt contract below — is pinned
-// by construction rather than by a consumer. Treat that as a live gap, not as
-// an endorsement: an exported method with no consumer accretes contracts
-// nothing validates end to end. Either wire the teardown path that wants it or
-// retire it; tracked separately so this PR does not change the API surface.
-//
-// #5718 A7-b01-C001: Clear participates in the #4954 reload-debt contract that
-// Apply owns. Removing the files is only half the job — until `networkctl
-// reload` succeeds the kernel still runs the config those files installed. The
-// pre-#5718 shape recorded no debt on reload failure and short-circuited on an
-// empty glob, so the SECOND Clear found nothing to remove, returned nil, and
-// reported a success it had not achieved while the removed addresses / VRFs /
-// renames stayed live. Clear now records the debt on failure and, on the empty
-// glob, discharges any outstanding debt by re-running the idempotent reload
-// instead of assuming "no files" means "nothing to activate".
-func (m *Manager) Clear() error {
-	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
-	if len(matches) == 0 {
-		if !reloadDebtOutstanding() {
-			return nil
-		}
-		// Files are already gone but a prior activation never landed. Retry
-		// the reload rather than reporting a clear that the kernel never saw.
-		slog.Info("networkd clear re-running deferred reload after a prior failed reload")
-		epoch := reloadDebtEpoch()
-		if err := runNetworkctl("reload"); err != nil {
-			noteReloadFailed()
-			return fmt.Errorf("networkctl reload: %w", err)
-		}
-		noteReloadSucceeded(epoch)
-		restoreSlowPathRPFilter()
-		return nil
-	}
-
-	var removeErrs []error
-	for _, path := range matches {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			slog.Warn("failed to remove networkd file", "path", path, "err", err)
-			removeErrs = append(removeErrs, fmt.Errorf("remove %s: %w", filepath.Base(path), err))
-		}
-	}
-
-	epoch := reloadDebtEpoch()
-	if err := runNetworkctl("reload"); err != nil {
-		// The files are off disk but the kernel never re-read them; the next
-		// Clear/Apply MUST retry the activation instead of seeing an empty
-		// glob (or unchanged files) and returning a false success.
-		noteReloadFailed()
-		return fmt.Errorf("networkctl reload: %w", err)
-	}
-	noteReloadSucceeded(epoch)
-	restoreSlowPathRPFilter()
-	// #4900: a managed file that could not be removed must fail the Clear — a
-	// surviving 10-xpf-* unit re-applies removed host config (address / VRF /
-	// bond / bridge / rename) on the next reload or boot. The reload above still
-	// ran best-effort so whatever WAS removed takes effect, but the operator is
-	// not told the clear succeeded when it did not.
-	if len(removeErrs) > 0 {
-		return fmt.Errorf("networkd: %d managed file(s) failed to remove: %w",
-			len(removeErrs), errors.Join(removeErrs...))
-	}
-	slog.Info("cleared xpf networkd files", "removed", len(matches))
-	return nil
-}
-
-// FindExternallyManaged scans the given networkd directory for non-xpf
-// .network files and returns the set of interface names they match. This
-// protects the management interface (and any other externally configured
-// interface) from being modified or brought down by xpf.
 func FindExternallyManaged(dir string) map[string]bool {
 	result := make(map[string]bool)
 	entries, err := os.ReadDir(dir)
@@ -759,32 +684,35 @@ func (m *Manager) findExternallyManaged() map[string]bool {
 	return FindExternallyManaged(m.networkDir)
 }
 
-// sanitizeUnitValue strips ASCII control characters — the C0 set
-// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
-// space — from a free-text config value before it is interpolated into
-// a generated systemd unit line. Render-side belt for #1798: a
-// description like "lan\nDHCP=ipv4" must not be able to inject extra
-// directives into a .network/.netdev/.link unit even if the
-// commit-time validation layer were bypassed (e.g. an old persisted
-// value reaching the renderer ahead of the load-time sanitizer).
+// sanitizeUnitValue replaces every ASCII control byte (C0, 0x00-0x1F, which
+// includes newline, plus DEL 0x7F) with a SPACE before the value is interpolated
+// into a generated systemd unit line. Render-side belt for #1798: a description
+// like "lan\nDHCP=ipv4" must not be able to inject extra directives into a
+// .network/.netdev/.link unit even if the commit-time validation layer were
+// bypassed (e.g. an old persisted value reaching the renderer ahead of the
+// load-time sanitizer).
+//
+// # The consuming grammar, and why a space is the right substitute here (#6833)
+//
+// A systemd unit file is `Key=Value` one per line. The load-bearing byte for an
+// interpolated value is therefore the NEWLINE, which ends the directive and lets
+// the remainder be read as a new one. That is the byte #1798 named and it is
+// genuinely the live one here.
+//
+// A space is safe because this belt is applied to `Description=` and ONLY to
+// `Description=`, which systemd treats as free text. That is not incidental — it
+// is what makes the substitution correct, and it is pinned by
+// TestUnitValueSanitizerIsAppliedOnlyToDescription_6833.
+//
+// It would NOT be safe on several `[Match]` keys, which are WHITESPACE-SEPARATED
+// LISTS: `OriginalName=` accepts a list of patterns, so a space inside one value
+// would make a single .link file match several kernel interfaces — the
+// substitution manufacturing the very delimiter the belt exists to prevent (the
+// #6829 shape, where the space and not the newline was the live byte). Any future
+// call site on such a key must re-derive the substitute rather than reuse this
+// function; the inventory test above is what forces that.
 func sanitizeUnitValue(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-	b := []byte(s)
-	for i := range b {
-		if b[i] < 0x20 || b[i] == 0x7f {
-			b[i] = ' '
-		}
-	}
-	return string(b)
+	return rendersafe.ReplaceControlBytes(s, ' ')
 }
 
 func (m *Manager) generateNetdev(ifc InterfaceConfig) string {

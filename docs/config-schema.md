@@ -1264,6 +1264,81 @@ both config orderings, lenient-warn, deterministic-winner, namespace-aware
 absent-collision, non-colliding-commits), the strict-reject + lenient-warn cases
 RED on revert of the gate wiring.
 
+## Compact vs block stanza spellings (the #2419 sub-leaf contract)
+
+The bracketed-list contract below is about a **leaf** that carries several
+values. This section is about the neighbouring case that bit four security
+stanzas: a **container** whose sub-leaf is written on the container's own line.
+
+For a plain keyword stanza with `(name, value)` sub-leaves, the same operator
+intent has two legal spellings:
+
+```
+authentication { encrypted-password "$6$..."; }     # BLOCK
+authentication encrypted-password "$6$...";          # COMPACT
+```
+
+They produce different trees:
+
+```
+BLOCK    Keys=[authentication]                             children=1
+           └─ Keys=[encrypted-password $6$...]  IsLeaf
+COMPACT  Keys=[authentication encrypted-password $6$...]   children=0
+```
+
+So a compiler stanza that iterates only `prop.Children` and dispatches on child
+names reads the block spelling and **silently drops** the compact one. That is
+#2419 applied to sub-leaves rather than to list values, and it is where #6817
+(a login credential), #6818 (OSPF interface authentication), #6821 (a
+security-log TLS profile) and #6822 (an SNMPv3 password) all live. Each fails
+toward LESS security on a commit that reports success, and `SchemaValidate`
+accepts the compact spelling, so this is the normal commit path — not the
+tolerant-load path.
+
+Three things to know before working on this class:
+
+1. **The flat-set path is NOT the source of the compact shape.**
+   `ParseSetCommand` + `SetPath` produces the BLOCK tree — `authentication` as a
+   container with an `encrypted-password` child, bit-identical to the block
+   spelling. The compact tree comes from the HIERARCHICAL parser on
+   hand-authored or `load merge`d text, and from tools that render flat paths
+   into partial braces. A test that compares "flat-set vs block" is comparing
+   block against block: vacuously equal for every leaf and green everywhere.
+2. **Only a PLAIN KEYWORD stanza is compactable.** Collapsing a NAMED INSTANCE
+   (`interfaces ge-0/0/0`, `user ops`, `stream audit`) does not produce the
+   compact spelling of the same intent — the name is part of the node's identity
+   and the result is a node the compiler cannot recognise as that instance at
+   all. A census that compacts named instances over-reports by roughly a factor
+   of two.
+3. **Bracketed multi-value lists are schema LEAVES, not containers.**
+   `from protocol [ tcp udp ]` legitimately collapses onto `Keys` (see the next
+   section). Any fix for this class must key on the schema's container/leaf
+   distinction, or it will destroy every bracket list in the fleet.
+
+`pkg/config/compact_block_equivalence_2419_test.go` is the gate for the class:
+it walks `setSchema`, builds both spellings for every sub-leaf under a plain
+stanza, compiles both, and requires the typed configs to be equal. Sites that
+fail today are recorded in
+`pkg/config/testdata/compact_block_divergences_2419.txt` as an expected-failure
+inventory, so a NEW compact-blind reader reds the suite and a fixed site that
+is not removed from the file reds it too.
+
+Two properties of that gate are load-bearing and easy to lose:
+
+- **The vacuity guard.** A cell only counts once changing the VALUE is shown to
+  change the compiled config. Without it a site whose fixture observes nothing
+  reports a pass, and the census silently stops being a census.
+- **The positive control.** The four filed instances are asserted present by
+  construction. The first version of this instrument found two of them; an
+  instrument that quietly stops finding known-true sites reports "clean" for
+  exactly the reason the textual sweeps did.
+
+The inventory's `# checked:` header is a coverage RATCHET: sites must not drain
+out of the tested population into the skip buckets. The "not observable" skips
+are UNRULED, not clean — each is a site whose synthesized fixture was too thin
+to see the value (as #6821 was until a required-sibling `host` line was added),
+so the census is a floor.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,

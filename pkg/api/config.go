@@ -230,7 +230,16 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 	// pending work — the empty-session commit path previously let a stateless
 	// REST caller smuggle another operator's staged edits into an applied
 	// commit. Mirrors the gRPC Commit gate (pkg/grpcapi/server_config.go).
-	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
+	// #6808: mint the commit AUTHORITY under the same store-lock acquisition
+	// that verifies the holder, and carry it into the callback. The previous
+	// form verified the holder here and then invoked a callback carrying NO
+	// identity, so the lock could turn over in between — the holder exits,
+	// disconnects, or is reclaimed on its idle lease, another session enters and
+	// stages different edits — and this already-authorized commit would promote
+	// the NEW holder's candidate. The authority is re-verified against the live
+	// holder epoch at promotion, under the store lock.
+	authority, err := s.store.AuthorizeCommit(sessionID)
+	if err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -253,7 +262,7 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "commit handler not wired")
 		return
 	}
-	compiled, err := s.commitFn(r.Context(), "")
+	compiled, err := s.commitFn(r.Context(), authority, "")
 	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -497,7 +506,16 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 	}
 	// #5870: only the config-lock holder may commit the shared candidate.
 	// Mirrors the gRPC CommitConfirmed gate.
-	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
+	// #6808: mint the commit AUTHORITY under the same store-lock acquisition
+	// that verifies the holder, and carry it into the callback. The previous
+	// form verified the holder here and then invoked a callback carrying NO
+	// identity, so the lock could turn over in between — the holder exits,
+	// disconnects, or is reclaimed on its idle lease, another session enters and
+	// stages different edits — and this already-authorized commit would promote
+	// the NEW holder's candidate. The authority is re-verified against the live
+	// holder epoch at promotion, under the store lock.
+	authority, err := s.store.AuthorizeCommit(sessionID)
+	if err != nil {
 		writeConfigMutationError(w, err)
 		return
 	}
@@ -505,7 +523,7 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, "commit-confirmed handler not wired")
 		return
 	}
-	compiled, err := s.commitConfirmedFn(r.Context(), req.Minutes)
+	compiled, err := s.commitConfirmedFn(r.Context(), authority, req.Minutes)
 	if err != nil {
 		switch {
 		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

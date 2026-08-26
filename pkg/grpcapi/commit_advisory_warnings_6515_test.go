@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -54,13 +55,13 @@ func hostInboundNarrowingStore(t *testing.T) *Server {
 	}
 	return &Server{
 		store: store,
-		commitFn: func(_ context.Context, comment string) (*config.Config, error) {
+		commitFn: func(_ context.Context, _ configstore.CommitAuthority, comment string) (*config.Config, error) {
 			if comment != "" {
 				return store.CommitWithDescription(comment)
 			}
 			return store.Commit()
 		},
-		commitConfirmedFn: func(_ context.Context, minutes int) (*config.Config, error) {
+		commitConfirmedFn: func(_ context.Context, _ configstore.CommitAuthority, minutes int) (*config.Config, error) {
 			return store.CommitConfirmed(minutes)
 		},
 	}

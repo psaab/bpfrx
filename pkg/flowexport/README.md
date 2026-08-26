@@ -845,10 +845,11 @@ IPFIX:
 - `IPFIXExporter.ExportSessionClose(rec, evt)` — emit one record.
 
 Shared:
-- `ExportConfig` — `manager.go`. Resolved per-template-group config: the
-  collectors that referenced one template, that template's timeouts /
-  field options, plus the family-shared sampling state (#2461 — see
-  "Per-flow-server template binding" below).
+- `ExportConfig` — `manager.go`. Resolved per-group config: the collectors that
+  referenced one template **and share one address family** (#2461 + #6811), that
+  template's timeouts / field options, plus the instance-shared sampling state
+  (see "Per-flow-server template binding" below and "Family is part of the group
+  key (#6811)").
 - `ResolveV9TemplateGroups(...) []*ExportConfig` /
   `ResolveIPFIXTemplateGroups(...)` — `manager.go`. The per-template-group
   resolvers the daemon uses (#2461).
@@ -1081,3 +1082,58 @@ moment any caller sampled off the copy (#2224).
   `"%s:%d"` / `addr+":0"` left an IPv6 literal unbracketed and
   unparseable, so IPv6 collectors silently never dialed (#2183). IPv4
   addresses are unaffected.
+
+
+## Family is part of the group key (#6811)
+
+A sampling instance may legitimately carry BOTH address families —
+`family inet { flow-server A }` and `family inet6 { flow-server B }` under one
+instance — and the strict commit validator explicitly permits it (it rejects only
+two DIFFERENT instances claiming the same `(version, family)`).
+
+That shape used to cross-fan. `collectInstanceVersionCollectors` merged both
+families into ONE collector slice and collapsed family into two per-INSTANCE
+booleans (`servesInet` / `servesInet6`); `CollectorConfig` carried no family;
+grouping keyed on template alone; and `ServesFamily` was evaluated per instance.
+With both families configured both booleans were true, so the gate passed for
+either family and the daemon fanned the record to **every** group of the
+instance. IPv4 records reached the IPv6-only collector and IPv6 records reached
+the IPv4-only one.
+
+Nothing caught it because nothing configured the shape: the #2462 isolation tests
+use family-DISJOINT instances (where the instance-level gate IS sufficient) and
+the template tests use a single family.
+
+The fix partitions family at BUILD time and gates on it at send time:
+
+| Layer | Before | After |
+|---|---|---|
+| `CollectorConfig` | `Address`, `SourceAddress`, `Template` | + `IsV6` |
+| dedup key | address + source + template | + family |
+| group key | template | `collectorGroupKey{Template, IsV6}` |
+| `ExportConfig` | `ServesInet`/`ServesInet6` (per instance) | + `GroupIsV6` (per group) |
+| `flowExportCallback` | instance gate, then fan to every group | instance gate, then **per-group family gate** |
+
+**Family is in the group key so the hot path stays a gate, not a search.** Every
+group is single-family by construction, so the per-record cost is one comparison
+against a precomputed flag. Keeping template-only groups and filtering
+connections per record would put a collector scan on the export path for every
+flow.
+
+**`ServesInet`/`ServesInet6` deliberately stay per-INSTANCE.** They keep their
+#2462 meaning — *does this instance serve this family at all* — and gate the
+single sampling DECISION, which must run before `ShouldExport` so a record of an
+unserved family never consumes a 1-in-N slot. `GroupIsV6` gates which groups that
+decision then fans out to. Collapsing the two would either re-open the cross-fan
+or change the sampling denominator.
+
+**The same collector under both families is kept twice, not deduped.** Family is
+part of a collector's identity, so `10.0.0.1:2055` configured under both families
+is two destinations-with-family; collapsing them would silently stop exporting
+one family to a collector the operator explicitly configured for both.
+
+Note that `BuildExportConfig` / `BuildIPFIXExportConfig` return only the FIRST
+group, so for a multi-family instance they now return a single family's
+collectors. They have no production callers — the daemon uses the resolvers — but
+a test reaching for "the" ExportConfig of a multi-family instance must iterate
+`ResolveV9TemplateGroups` instead.

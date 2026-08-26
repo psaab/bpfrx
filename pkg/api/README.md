@@ -1111,8 +1111,15 @@ the drop fails loudly instead of going quietly vacuous.
   interface. `WriteTimeout` is deliberately left UNSET (0/unlimited): the SSE
   event/log streams (`/api/v1/events/stream`, `/api/v1/logs/stream`) are
   long-lived and a full metrics/session-table scrape is a large slow response —
-  a `WriteTimeout` would sever them; the response side is bounded by per-handler
-  context deadlines instead. Separately, every REST MUTATION handler decodes its
+  a `WriteTimeout` would sever them. **#6809 correction:** this used to add
+  "the response side is bounded by per-handler context deadlines instead",
+  which does not hold as written — a context deadline bounds a handler's WORK,
+  not a write already blocked in the kernel because the peer stopped reading.
+  Cancelling a context releases what the handler owns downstream (a child
+  process, a lock) while the goroutine stays parked in `Write`. Only
+  `http.ResponseController.SetWriteDeadline` ends that. A streaming endpoint
+  therefore has to arrange its own per-write deadline; see the BGP route stream
+  below. Separately, every REST MUTATION handler decodes its
   body through `decodeJSONBody`, which wraps `r.Body` in
   `http.MaxBytesReader(maxRequestBodyBytes)` (16 MiB) and returns **HTTP 413** on
   overflow instead of buffering a multi-gigabyte POST to an OOM-kill (config
@@ -1757,7 +1764,45 @@ the drop fails loudly instead of going quietly vacuous.
   the CLI for the complete table. Operators needing the full RIB use
   `show route protocol bgp`. The cap/truncation contract is pinned by
   `bgp_routes_cap_5056_test.go`; the streaming/non-buffering + wire-format
-  invariants by `bgp_routes_stream_4708_test.go`. The session
+  invariants by `bgp_routes_stream_4708_test.go`.
+
+  **A slow reader is a different hazard from a disconnected one (#6809).**
+  Every bound above is a bound on PROGRESS. A client that stays CONNECTED and
+  stops reading produces neither a disconnect nor a write error: the socket
+  buffers fill, `bw.Flush()` parks in the kernel, the stream callback never
+  returns, and the `cancel`/`Close`/reap that would kill vtysh all sit AFTER
+  the scan loop. Handler goroutine, vtysh child, pipe and connection stayed
+  pinned indefinitely. Three bounds now apply, and they are not
+  interchangeable:
+
+  - **`bgpStreamWriteDeadline` (30s, per write)** — the PROGRESS budget, and
+    the load-bearing one: it is the only thing that can unpin a goroutine
+    already blocked in a write. Armed by `deadlineArmingWriter`, which sits
+    between `bufio` and the `ResponseWriter` so *every* socket write is
+    covered. Arming at the handler's explicit flush points is not enough and
+    the regression cell catches it — `bufio` auto-flushes when its 4 KiB
+    buffer fills, so ~17 real writes happen between two consecutive 1024-route
+    flush boundaries, and those block first. Each write gets a FRESH window, so
+    a legitimately large table on a slow-but-progressing link still completes.
+  - **`bgpStreamTotalBudget` (10m, per request)** — the ELAPSED backstop,
+    derived from `r.Context()` and handed to `StreamBGPRoutes` so
+    `exec.CommandContext` kills and reaps vtysh. It catches a client that
+    dribbles just enough to reset the write window forever. On a
+    `ResponseWriter` that cannot carry a write deadline it frees the CHILD but
+    **not** this goroutine — a partial bound, stated as such.
+  - **`ribStreamLimiter` (2 concurrent)** — a bounded stream is still a vtysh
+    child, so an unbounded NUMBER of them still accumulates. Non-blocking
+    `Acquire`: over-cap requests get **429 + `Retry-After`** rather than
+    queueing, because a queued request holds the same connection it would hold
+    while streaming. Local to REST on purpose — the gRPC/CLI `show route
+    protocol bgp` paths call the BUFFERED `GetBGPRoutes`, which completes
+    before any client sees a byte and cannot be pinned by a reader, so there is
+    no second surface to share a budget with.
+
+  Pinned by `bgp_slow_reader_pin_6809_test.go`, whose fixture is a `net.Conn`
+  that accepts a fixed prefix and then parks the writer exactly as a full send
+  buffer does — including a negative-control cell proving the fixture can
+  genuinely pin, so the passing cell means something. The session
   handlers (`/sessions`, `/sessions/summary`, `/sessions/zone-pair`) share a
   per-batch sampler (`newRequestCancelSampler`, `sessionWalkCancelInterval`
   = 1024): each `IterateSessions`/`IterateSessionsV6` callback returns
@@ -1959,6 +2004,43 @@ the drop fails loudly instead of going quietly vacuous.
     degraded / config-only boot, where per-zone volume is least available. So
     `collectZoneCounters` runs before the `dp == nil || !dp.IsLoaded()` early
     return, alongside `collectPBRStatus` and the host-inbound families.
+
+    **`xpf_zone_counters_overflow_active` disambiguates it (#6845).** The
+    sentinel above is three-way ambiguous BY CONSTRUCTION — pre-#3651 helper,
+    slot-capacity overflow (traffic genuinely missed), or an idle zone — and only
+    the middle case needs action. The bit that separates it was already on the
+    wire (`ProcessStatus.ZoneCounterOverflowActive`, from
+    `userspace-dp/src/afxdp/zone_counters.rs`) and was read by **nothing**: no
+    CLI, no REST, no gRPC, no Prometheus. This 0/1 gauge publishes it.
+
+    **Its absence semantics are the OPPOSITE of the sibling gauge's, and that is
+    the design.** `xpf_zone_counters_unpopulated_zones` is config-derived, so it
+    is emitted above the dataplane gate and keeps reporting the full configured
+    zone count through a degraded boot. Overflow is a property of the RUNNING
+    helper's slot table: with no helper there is no slot table and nothing to
+    overflow, so a `0` would be a false all-clear about a machine nothing asked.
+    It is therefore emitted from `collectUserspaceStatus` — **only on a scrape
+    that actually read a status**. Absent means "no helper to ask"; `0` means
+    "the helper reported no overflow".
+
+    Not an error, and it must never touch `xpf_counter_read_errors_total`: an
+    overflowed zone degrades to "not known" on every read surface rather than
+    publishing a false zero, so no surface reports wrong numbers. What overflow
+    costs is the ability to tell **why**, which is what this restores.
+
+    `show security zones` consumes the same flag: on the unpopulated branch it
+    names capacity exhaustion specifically instead of listing three causes the
+    operator cannot choose between. It fails to the ambiguous line on any status
+    error — telling someone to reduce their zone count when the real cause was an
+    idle zone is worse than saying "cannot tell".
+
+    **REST deliberately does NOT carry it.** `/security/zones` returns a bare
+    `[]ZoneInfo` with no response envelope, so a response-level field would mean
+    changing the response from an array to an object — a breaking API shape change
+    that should be decided on its own merits, not ridden in on an observability
+    fix. Per-zone placement was rejected too: overflow is a property of the slot
+    TABLE, and the helper does not report which zones lost their slots, so a
+    per-zone flag would be an invention.
 
     Consequence: **the gauge's cause set is strictly wider than
     `ErrCounterNotPopulated`'s.** The sentinel has exactly three meanings; the

@@ -65,6 +65,165 @@
   per-service gates instead, with a paired one-owes/one-quiet cell in both
   directions.
 
+## 2026-08-26 — #6810: a queue-full drop no longer consumes a threshold crossing
+
+- **Timestamp**: 2026-08-26
+- **Action**: `evaluateEvent` arms the #3756 edge latch under `e.mu` and
+  returns; `HandleEvent` classifies and enqueues afterwards, OUTSIDE that lock,
+  and `enqueue` returned nothing — so a dropped action was indistinguishable
+  from an admitted one at the call site. Not a delayed remediation but a LOST
+  one: `withinMatches` suppresses every later at/above-threshold event while the
+  latch is armed and re-arms only when a clause drops BELOW threshold, which for
+  a sustained fault never happens. 64 distinct other policies saturating the
+  queue therefore permanently consumed the crossing.
+  `enqueue` now returns an admission verdict; `HandleEvent` calls
+  `releaseEdgeLatch` on false, carrying the same semantic-revision ABA guard
+  `armCooldown` uses (#5311) so a predecessor's failure cannot clear a
+  successor generation's latch. A SUPERSEDED placement counts as admitted — the
+  newer equivalent action is queued, which is exactly what the latch asserts.
+  Went past R71's enumeration: `HandleEvent` has THREE post-latch abandonment
+  paths, not one. Deliberately did NOT roll back the other two, and pinned that
+  as an executable decision — a `classifyPlan` rejection is DETERMINISTIC, so
+  re-arming would re-reject on every event (unbounded churn for a remediation
+  that can never run), and an empty op list had no remediation to lose. Only the
+  queue-full drop is transient, i.e. the only one where retrying succeeds.
+- **File(s)**: `pkg/eventengine/engine.go`,
+  `pkg/eventengine/engine_latch_before_admission_6810_test.go` (new),
+  `pkg/eventengine/README.md`, `docs/refactoring-audit-accepted.txt`, `_Log.md`
+- **Modularity**: the 63 LOC tipped `engine.go` 1477 -> 1540, crossing the soft
+  1500 `[WATCH]` floor. Recorded as a deliberate deferral with its reason rather
+  than split inline: the whole diff lives in `enqueue`/`HandleEvent`, so a
+  verbatim move would carry the fix inside it and make "new or moved?"
+  unanswerable on a change about a subtle ordering property. Under the 200-LOC
+  "split first" cue and the soft floor, not the hard 2000. None of the three
+  documented "When NOT to refactor" cases actually applies, so it is an ISSUE
+  (#7636) rather than a permanent acceptance.
+- **Validation**: cells drive the REAL `HandleEvent` — every pre-existing
+  edge-latch test calls `evaluateEvent` directly and is structurally blind to
+  the seam the defect lives in. Includes the 64-distinct-policy saturation test
+  R71 asks for, with a precondition asserting the drop actually happened; a
+  PAIRED control proving an ADMITTED sustained level still fires exactly once
+  (otherwise the rollback would degrade `trigger on` from edge- to
+  level-triggered, re-introducing what #3756 M1 removed); and a stale-revision
+  cell proving the ABA guard holds.
+
+## 2026-08-26 — #6809: a connected non-reader no longer pins the BGP stream
+
+- **Timestamp**: 2026-08-26
+- **Action**: `/api/routing/bgp?type=routes` had bounds on PROGRESS only —
+  `maxBGPRoutes` caps bytes, `StreamBGPRoutes` caps memory, the #5232 check
+  aborts on DISCONNECT. None bound the handler while BLOCKED. A client that
+  stays connected and stops reading fills the socket buffers, `bw.Flush()`
+  parks in the kernel, the callback never returns, and the cancel/close/reap
+  that kills vtysh all sit AFTER the scan loop: handler goroutine, vtysh child,
+  pipe and connection pinned indefinitely. `WriteTimeout` is 0 process-wide for
+  SSE, so no global backstop either.
+  Added three bounds, deliberately not interchangeable: a per-write deadline
+  (the only thing that can unpin a goroutine already blocked in a write), an
+  elapsed backstop derived from `r.Context()` and handed to `StreamBGPRoutes`
+  so `exec.CommandContext` reaps vtysh, and a 2-slot non-blocking limiter so a
+  bounded stream cannot become an unbounded NUMBER of vtysh children.
+  MY FIRST FIX WAS WRONG AND THE TEST CAUGHT IT. I armed the deadline next to
+  the explicit 1024-route flushes; `bufio` auto-flushes when its 4 KiB buffer
+  fills, so ~17 real socket writes happen between two consecutive flush
+  boundaries and those block first. The slow-reader cell failed with the fix
+  in place. Restructured to a `deadlineArmingWriter` between `bufio` and the
+  `ResponseWriter`, which makes the coverage structural rather than a matter of
+  remembering every flush site — including the closing flush a sub-1024-route
+  table reaches without entering the periodic branch at all.
+  Corrected a false claim in `server.go` and `pkg/api/README.md`: "the response
+  side is bounded by per-handler context deadlines" does not hold as written —
+  a context deadline bounds a handler's WORK, not a write blocked in the
+  kernel. R70 flagged the same sentence.
+- **File(s)**: `pkg/api/routing.go`, `pkg/api/server.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: the fixture models the hazard rather than approximating it —
+  a `net.Conn` that accepts a fixed prefix and then parks the writer until the
+  write deadline, forever if none is armed. Deterministic fail-on-revert, no
+  socket-buffer-size guessing. Includes a NEGATIVE CONTROL proving the fixture
+  can genuinely pin (deadlines unsupported + a distant backstop → the handler
+  must still be running), without which the passing cell proves nothing, and a
+  paired control proving a real reader still gets the whole table under tight
+  budgets.
+
+## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
+
+- **Timestamp**: 2026-08-26
+- **Action**: R68's HPC/invariant note asks for more than a deterministic
+  deny — "operators also need apply failure/health rather than silent accepted
+  outage". The r1 fix made the deny explicit and visible in `show route-map`
+  but left the only proactive signal as one `slog.Warn` at render time, which
+  nothing alerts on: a total route withdrawal on a BGP session looked exactly
+  like a healthy box to every dashboard. Added `Manager.QuarantinedRouteMaps()`
+  (rebuilt per `buildManagedSection`, so reducing the policy and re-committing
+  CLEARS it — a stale alert gets muted, and a muted alert is how the next real
+  one is missed) and the `xpf_frr_route_maps_quarantined` gauge, wired exactly
+  like the #1880 `xpf_frr_reload_degraded` sibling.
+  A COUNT, not a boolean: one oversized policy quarantines both its own name
+  and its `-xpf-redist` alias, so a 0/1 gauge would under-report every dual-use
+  incident. Publishes an explicit 0 when healthy (an alert on `> 0` cannot tell
+  "nothing quarantined" from "the series stopped reporting") but is ABSENT when
+  no FRR hook is wired (a hardcoded 0 from a process that never consulted FRR
+  is a false all-clear).
+- **File(s)**: `pkg/frr/manager.go`, `pkg/frr/policy_render.go`,
+  `pkg/frr/README.md`, `pkg/api/metrics.go`, `pkg/api/server.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/metrics_frr_routemap_quarantine_6807_test.go` (new),
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go`,
+  `pkg/daemon/daemon_run_servers.go`, `_Log.md`
+- **Validation**: producer side bound (render records both names; a later
+  healthy render clears them; a fresh manager reports nothing, so "records it"
+  cannot pass on a manager that reports unconditionally); consumer side bound
+  on a pedantic registry across three points — healthy/one/two — plus the
+  unwired-is-absent cell.
+
+## 2026-08-26 — #6807: an oversized policy's attachment now resolves to an explicit deny
+
+- **Timestamp**: 2026-08-26
+- **Action**: `generatePolicyOptions` (#5701) and `renderComposedRouteMap`
+  (#5732) skip an over-ceiling policy's expansion so a `route-map ... 70000`
+  line cannot poison the whole vtysh-batched frr-reload. Correct — but they
+  emitted NOTHING, while BGP rendering emits `neighbor <ip> route-map <name>
+  in|out` independently off the policy's presence in `PolicyStatements`. The
+  attachment outlived its definition.
+  The repo asserted in 8 production comments, 3 tests and 4 README passages
+  that FRR resolves a dangling route-map to PERMIT-ALL. VERIFIED FALSE against
+  FRR stable/10.6 `bgpd/bgp_route.c` — the deployed line (`vtysh -c 'show
+  version'` on loss:xpf-userspace-fw0 reports FRRouting 10.6.0):
+  `bgp_input_modifier`/`bgp_output_modifier` return `RMAP_DENY` when
+  `route_map_lookup_by_name` fails. A NAMED-but-undefined map denies; only an
+  ABSENT attachment permits. So the pre-fix behaviour silently withdrew every
+  route on the attached neighbors, on the tolerant/peer-sync/rollback path.
+  Both sites now emit a bounded explicit `route-map <name> deny 10` (one
+  sequence — can never approach the ceiling), plus the `-xpf-redist` alias
+  under the same rule since `resolveRedistribute` may reference either name.
+  Chose deny over dropping the attachment: dropping it means no policy at all,
+  i.e. Junos BGP default-accept advertising everything the policy existed to
+  filter — fail-OPEN on an authorization decision. Failing the render is
+  unavailable (#1960 no-brick). Outcome unchanged; now deliberate, visible in
+  `show route-map`, and independent of FRR's undefined-map semantics.
+  Corrected every permit-all claim in place. Deliberately did NOT change the
+  #2473/#2490/#2539 undefined-reference guards, whose drop PRODUCES the
+  permit-all they were written to prevent — that is a behaviour choice about
+  configs that should not exist; filed as #7625, comments corrected so nobody
+  re-derives intent from the old sentence.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/protocols_render.go`,
+  `pkg/frr/bgp_policy_chain.go`, `pkg/frr/frr_test.go`,
+  `pkg/frr/policy_routemap_seqbound_5701_test.go`,
+  `pkg/frr/policy_composed_chain_seqbound_5732_test.go`,
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go` (new),
+  `pkg/frr/README.md`, `_Log.md`
+- **Validation**: 5 new cells hold the invariant as a PROPERTY over the whole
+  rendered managed section — every route-map name referenced by a `neighbor
+  ... route-map` or `redistribute ... route-map` attachment must be defined in
+  the same section — with a negative control proving the detector finds a
+  planted dangle, and a paired control proving an in-bounds policy still
+  renders its real expansion rather than being quarantined too. The two
+  pre-existing seqbound cells moved with the code: their "renders NOTHING"
+  assertion became the strictly stronger "exactly one header, and it is the
+  bounded deny", so the #5701/#5732 property (no expansion) is still asserted.
+
 ## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
 
 - **Timestamp**: 2026-08-26
@@ -105630,3 +105789,534 @@ prose edit above them added. No diff falls in the new test body.
   Verified after writing that `theirs` is a prefix of the result.
 - **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
   `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6852: retire networkd.Manager.Clear, moving its tests onto Apply(nil)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Delete `networkd.Manager.Clear` and move its contract tests onto
+  `Apply(nil)`.
+- **Why retire rather than wire**, which is the decision #5718 deliberately left
+  open: `Apply(nil)` already carries every contract `Clear` owned — the
+  `10-xpf-*` stale sweep, the #4900 aggregation that FAILS the commit when a
+  managed file cannot be removed, and the #4954 re-activation on
+  `debtOwed := reloadDebtOutstanding()`, which subsumes `Clear`'s empty-glob
+  debt-discharge branch.
+- **That is measured, not asserted.** `Clear`'s own four-step #5718 A7-b01-C001
+  fail-on-revert was MOVED onto `Apply(nil)` and passes UNCHANGED — reload fails
+  → error; second call with an empty glob must re-run the reload from the debt
+  rather than return nil; recovery discharges it; a further call with no files
+  and no debt must not shell out. Converting the test first and running it BEFORE
+  deleting anything kept two questions separate: "does Apply(nil) carry the
+  contract" and "did the deletion break something".
+- **Wiring it would have been actively WORSE**, which is the part that settles
+  it. `Clear` globbed and removed EVERY `10-xpf-*` file including the
+  `SetProtectedResolver` lifeline files that `Apply(nil)` deliberately preserves.
+  Any teardown that called `Clear` would have taken management down with the
+  managed config — so the method was not merely uncalled, it was unsafe to call.
+- **No coverage lost, checked rather than assumed**: `TestClear_RemoveFailureReturnsError`
+  was a line-for-line twin of the `Apply(nil)` #4900 cell immediately above it
+  (same `blockedStaleEntry` fixture, same assertion), so deleting it leaves that
+  property owned by a named cell. Deleting the LAST owner of a property would
+  have been a silent decommission; this is not.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/applynil_reload_debt_5718_test.go` (renamed from
+  `clear_reload_debt_5718_test.go`), `pkg/networkd/stale_remove_4900_test.go`,
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`,
+  `_Log.md`
+
+## 2026-08-26 — #6805: a list-only routing-instance member was never bound on first apply
+
+- **Timestamp**: 2026-08-26
+- **Action**: Re-drive the step-0a routing-instance member bind after the
+  tunnel/xfrmi devices exist, from one shared implementation.
+- **Why**: "0a owns list binds" is the documented contract — the tunnel manager's
+  `reconcileVRFClaimLocked` case 2 only OBSERVES a list-only member and has an
+  explicit veto against unbinding one. But step 0a runs BEFORE
+  `applyInterfaceReconcile` creates the devices, so the owner ran before the
+  thing it owns existed. On a FIRST apply: 0a warns "not found" (deliberately
+  best-effort, #5700), the tunnel manager observes a link with no master and
+  takes no claim, nothing else binds it — and the tunnel comes up OUTSIDE its
+  VRF, forwarding in the default table, on a commit that reported success. It
+  stayed there until some later apply happened to run 0a while the device
+  existed.
+- **The bug is the ORDERING, not the veto.** The veto is on UNBIND and is
+  correct: a stanza→list move must not strip a live 0a bind. Nothing about it
+  requires the first apply to leave the member unbound. So the fix is a second
+  pass at the point where the devices are real, not a bind moved into the tunnel
+  manager.
+- **Precedent, and its comment named this gap**: `rebindManagementVRFIfaces` is
+  the authoritative post-networkd bind for management interfaces, and its own
+  comment says the management set is transient-free "unlike the pre-networkd
+  best-effort bind and the routing-instance tunnel-member binds in
+  applyVRFReconcile". That parenthetical was the issue.
+- **ONE implementation, two call sites**: the tunnel manager's veto is written
+  against "whatever 0a binds", so a second loop that drifted would leave the veto
+  guarding a different set than the one being bound. That divergence is always a
+  bug, never legitimate, so the two passes share
+  `Daemon.bindRoutingInstanceMembers` rather than being kept in step by hand —
+  and a cell asserts the two passes select the SAME name set rather than pinning
+  either to a literal.
+- **The late pass stays best-effort at WARN, deliberately.** A routing-instance
+  `interface` list can legitimately name an interface genuinely absent on this
+  chassis; surfacing that into commit truth would reject configs correct for the
+  fleet — a different, worse defect. The #5700 boundary is unmoved and a cell
+  pins it.
+- **Fixture**: the device is ABSENT for the early pass and PRESENT for the late
+  one. A fixture that pre-creates it cannot see the defect at all — 0a would bind
+  it and every cell passes with the whole fix deleted. The cell asserts the early
+  pass did NOT bind, so it cannot go vacuous.
+- **File(s)**: `pkg/daemon/daemon_apply_interfaces.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/ri_member_late_bind_6805_test.go` (new), `pkg/routing/README.md`,
+  `_Log.md`
+
+## 2026-08-26 — the #7614 marker gate caught its own author, and a stage-dedup bug
+
+- **Timestamp**: 2026-08-26
+- **Action**: Dedupe `git ls-files` output in
+  `pkg/refactoraudit/conflict_markers_test.go`.
+- **How it surfaced**: while gating #6805 I chained `git merge origin/master`
+  into the gate with `&&` and piped the merge's output through `tail -3`. The
+  pipe LAUNDERED the merge's exit status, so the `&&` saw success, the gate ran
+  on a conflicted tree, and `git add -A` would have committed the markers — the
+  exact sequence that put six of them on master earlier today, and which I had
+  already written down as a rule. The gate added hours before caught it, on its
+  author, before it reached master. That is the whole argument for the gate.
+- **The bug it exposed in the gate itself**: `git ls-files` returns ONE ROW PER
+  STAGE for an unmerged path, so during a conflicted merge the very file the
+  gate is about appears three times and every finding in it is reported three
+  times over — 3 real markers rendered as 9 findings. Exactly the moment the
+  output most needs to be readable, and a tripled list reads like three separate
+  defects. Deduped by path.
+- **File(s)**: `pkg/refactoraudit/conflict_markers_test.go`, `_Log.md`
+
+## 2026-08-26 — #6806 lo0 mirror drops unresolvable protocol / ICMP narrowing
+
+- **Timestamp**: 2026-08-26
+- **Action**: Make the kernel lo0 mirror fail CLOSED on a `from protocol` /
+  `from icmp-type` / `from icmp-code` token that will not resolve, instead of
+  dropping the predicate and installing a wider term than the operator wrote.
+- **Root cause**: both lo0 renderers resolved these two dimensions PER TOKEN and
+  skipped the failures. All-unresolvable emptied the slice, the `len(...) > 0`
+  guard emitted no predicate at all, and the term matched every protocol / every
+  ICMP type in its scope (an `accept` widened, a `discard` stopped denying).
+  Partially-unresolvable built the rule from a narrowed subset — wrong in the
+  other direction. Strict commit rejects these tokens, so the live ingress is the
+  tolerant load / peer-sync / mixed-version path (#1960), which is exactly where
+  the userspace mirror hands the raw token to the Rust filter compiler and it
+  rejects the whole snapshot. Kernel widening while userspace refuses the same
+  filter is the mode-dependent fail-open.
+- **Two channels, not one fix**: protocol reaches the builder as a RAW string
+  (the builder can detect it, like `filterFamilyAddrs`); icmp-type/code reach it
+  ALREADY RESOLVED as `[]int`, so an unresolvable token leaves no trace in the
+  DTO and needs a marker. Added `Lo0FilterTerm.ICMPTypeUnrepresentable` /
+  `ICMPCodeUnrepresentable`, populated in `toNftLo0Term` from the config's
+  `UnknownICMPTypes` / `UnknownICMPCodes`, named to match the userspace wire
+  fields. A fix that only hardened the resolver closes protocol and leaves ICMP
+  wide open.
+- **Direction, and a stale comment that argued against it**: #5512/#6804 chose
+  PER-TERM fail-closed on the grounds that "a rejected table leaves NO host
+  filter = fail-OPEN". That was true when written and is not true now — #6476
+  added the cold-boot fail-closed fence and #6489/#6492 key it on `lo0Enforced`
+  and rebuild it from the CURRENT snapshot, so a failed lo0 install either
+  retains the prior real filter or installs the fence. Plan-failure is therefore
+  the safe direction, matching ports/DSCP (#6405) and addresses (#6512) in the
+  same two functions and matching userspace's whole-snapshot rejection. The
+  daemon_nft.go comment claiming protocol was dropped "mirroring the tcp-flags
+  lowering" was wrong twice over: tcp-flags does not drop its predicate, and
+  dropping a narrowing token is never the safe direction. Corrected in place.
+- **What parity CI could not see**: before the fix BOTH renderers dropped the
+  token, so they AGREED perfectly while both were fail-open. The T1 ruleset
+  parity gate compares the two mirrors against each other and is blind to a
+  defect they share. The new agreement cell asserts the PROPERTY (neither mirror
+  loses the refusal evidence) rather than equality between them.
+- **File(s)**: `pkg/nftables/netlink_lo0.go`, `pkg/nftables/netlink_spec.go`,
+  `pkg/nftables/netlink_lo0_proto_icmp_6806_test.go` (new),
+  `pkg/daemon/daemon_nft.go`, `pkg/daemon/daemon_nft_netlink.go`,
+  `pkg/daemon/lo0_proto_icmp_failclosed_6806_test.go` (new),
+  `pkg/nftables/README.md`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — engineering-style: a comment is a claim; an agreement test cannot see a shared defect
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add three review-discipline rules to
+  `docs/engineering-style.md` ("Reviewing (adversarial by design)").
+- **Why now**: each rule is generalised from a defect that landed in ONE review
+  batch, not from principle.
+  1. **Three stale load-bearing comments**, all true when written and false at
+     head: `daemon_apply_tail.go`'s "every step below still RUNS (no early
+     return)"; `netlink_lo0.go`'s "a rejected table leaves NO host filter =
+     fail-OPEN" (true before #6476's cold-boot fence, false after — checking the
+     code rather than the comment is what unblocked #6806's correct direction);
+     and `daemon_nft.go`'s "mirroring the tcp-flags lowering", which was wrong
+     when written because tcp-flags does not drop its predicate. A comment that
+     justifies a DIRECTION is the dangerous kind: the reader takes the direction
+     and never re-derives the reason, which was verified once and never again.
+  2. **The #6806 lo0 parity gate was structurally blind.** Both mirrors dropped
+     an unresolvable token, so they AGREED perfectly while both were fail-open,
+     and the gate was green throughout. "Assert the agreement, never pin one to a
+     literal" is right for DRIFT — and drift is not the only defect. Each side
+     also owes a property independently.
+  3. **A tool-gated leg that SKIPs is a green that measured nothing** — report
+     tests-collected, not `ok`.
+- **Related, and the same shape at a larger scale**: #6807's review had DISPROVEN
+  the repo's FRR permit-all model while the repo's comments and tests still
+  asserted it, so a reader re-deriving from the title had a confidently wrong
+  prior with every local check agreeing. A stale comment and a refuted-but-still-
+  asserted consequence are one defect at two scales.
+- **Annotate stale comments as historical rather than deleting them** — the next
+  reader needs to know it WAS true, not merely that it is gone.
+- **File(s)**: `docs/engineering-style.md`, `_Log.md`
+
+## 2026-08-26 — #6798 follow-up: correct two claims #6790 falsified, now on master
+
+- **Timestamp**: 2026-08-26
+- **Action**: #7605 merged (`f8c1bb105`) at head `5705bdb99` while the re-derive
+  round was still in flight, so two corrections the re-derive found did NOT make
+  the merge and are live on master. This lands them.
+- **The escape**: this is the exact class being swept on master today — a
+  sentence true when written and false at merge — and it escaped INTO master
+  inside the #6798 change itself. The assertions were always correct; only the
+  prose explaining them rotted. Worth noting that re-deriving found it and the
+  merge race, not the analysis, is what let it through.
+- **(1) A now-false doc comment on the end-to-end cell.** It read: "on the normal
+  apply path every one of those returns is deliberately discarded ... The SINGLE
+  caller that CONSUMES them is the #5874/M35 daemon-stop cancel closeout." #6790
+  (#7604) made `applyTailReconciles` capture those returns, so there are TWO
+  consumers and both halves are false. Rewritten to name both, with an explicit
+  note that the sentence was falsified by #6790 — so the next reader sees the
+  dependency rather than re-deriving it.
+- **(2) An unqualified "is neither fatal class".** `exec.CommandContext` has TWO
+  deadline shapes: a context expiring BEFORE fork/exec makes `Start` return a
+  BARE `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot
+  distinguish from a #2926 daemon-stop abort and classes FATAL. Restated as
+  "neither class in these errors' ORDINARY failure shapes", with the
+  misclassified shape named and scoped: pre-existing and WIDER than #6798
+  (`nftApplyPayload` at 5s and the DNS `systemctl` calls already reach the same
+  classifier), reachable only with a short injected deadline under load and not
+  in production at 15s, tracked in #7618 and tripwired by
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`. What #6798 adds
+  cannot reach it: `os.ReadFile`/`os.ReadDir` yield EACCES/EIO/EISDIR/ENOTDIR,
+  never a context error.
+- **No production code changes** — comments and docs only. The 14/14 mutation
+  matrix measured at `b166d8229` (identical production files) stands; nothing in
+  this delta can move it.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6845: surface ZoneCounterOverflowActive, which nothing read
+
+- **Timestamp**: 2026-08-26
+- **Action**: Publish `xpf_zone_counters_overflow_active` and consume the flag in
+  `show security zones`.
+- **Why**: `ProcessStatus.ZoneCounterOverflowActive` was decoded by the Go
+  control plane and read by NOTHING — no CLI, no REST, no gRPC, no Prometheus.
+  The Rust helper has 63 assignable per-zone slots and sets the flag when it
+  exhausts them; zones past capacity are never registered, so their traffic is
+  silently uncounted.
+- **This is an observability gap, not a correctness bug, and the distinction
+  matters for how it was fixed**: an overflowed zone is never registered with
+  `ZoneCounterStore`, so it reads `ErrCounterNotPopulated` and every surface
+  renders an explicit "not available". Nothing publishes a false 0. What is
+  missing is the ability to tell WHY — `unpopulated` is three-way ambiguous by
+  construction (pre-#3651 helper / overflow / idle zone), and only the middle
+  case needs action.
+- **Absence semantics are the OPPOSITE of the sibling gauge's, deliberately.**
+  `xpf_zone_counters_unpopulated_zones` is config-derived and emitted ABOVE the
+  dataplane gate so it keeps reporting through a degraded boot. Overflow is a
+  property of the RUNNING helper's slot table: with no helper there is nothing to
+  overflow, so a 0 would be a false all-clear about a machine nothing asked.
+  Emitted from `collectUserspaceStatus`, which returns early on a nil status —
+  absent = "no helper to ask", 0 = "the helper said no overflow".
+- **The CLI fails to the AMBIGUOUS line on any status error.** It replaces a
+  truthful three-cause message with a specific one-cause message, so a wrong
+  `true` would send an operator to reduce their zone count when the real cause
+  might be an idle zone. "Cannot say" must fall back to honest ambiguity.
+- **REST deliberately not carried, and why**: `/security/zones` returns a bare
+  `[]ZoneInfo` with no envelope, so a response-level field means changing an
+  array response to an object — a breaking shape change that deserves its own
+  decision rather than riding in on an observability fix. Per-zone placement was
+  rejected too: the helper does not report WHICH zones lost slots, so a per-zone
+  flag would be an invention.
+- **Test note**: the cells drive `collectUserspaceStatus` (the real entry point,
+  including its nil-status early return that produces the absence contract),
+  not `emitZoneCounterOverflow` — driving the emitter directly would bind the
+  function and miss the gate, which is the wiring half. A PLAIN registry is used
+  because the pedantic one would demand declaring ~70 sibling descriptors by
+  hand; the Describe ⊇ Collect contract stays owned by
+  `metrics_descriptor_coverage_test.go`'s whole-collector canary (#1726),
+  verified still passing.
+- **The modularity gate caught me and I moved the code rather than accepting
+  it.** `pkg/api/metrics_userspace.go` sat at 1999 LOC; my emitter pushed it to
+  2023 and `TestTouchedFileCrossedModularityThreshold` redded. Moving the emitter
+  to its own file still left 2000 — the single CALL line was enough to cross —
+  so the call moved to `metrics.go` (1345 LOC, ample headroom), beside the other
+  top-level status-derived collectors. `metrics_userspace.go` is back at 1999
+  and no acceptance entry was spent on a one-line crossing.
+- **That relocation improved the design rather than dodging the gate**: the
+  emitter now takes `*ProcessStatus` and returns early on nil, so the
+  absence contract is STATED in the emitter and directly tested, instead of
+  being inherited from `collectUserspaceStatus`'s early return where a later
+  refactor could drop it silently. It also forced the wiring cell — a cell that
+  calls the emitter cannot see whether Collect does, and that is the
+  decoded-but-unread defect one layer up.
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_zone.go`,
+  `pkg/api/metrics_userspace.go`, `pkg/api/metrics_zone_overflow.go` (new),
+  `pkg/cli/cli_show_security_zones.go`,
+  `pkg/api/metrics_zone_overflow_6845_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+
+## 2026-08-26 — #6808 bind the commit to the holder that authorized it
+
+- **Timestamp**: 2026-08-26
+- **Action**: Close the holder-turnover substitution (opus-review-001 root R69):
+  the commit paths verified the config-lock holder and then promoted through a
+  callback carrying NO identity, so the lock could turn over in between and the
+  in-flight commit would promote the NEW holder's candidate under the ORIGINAL
+  holder's authorization.
+- **Re-derivation widened the scope past the title.** R69 says "REST commit";
+  the identical gate-then-unscoped-callback shape is at FOUR sites — REST
+  commit/commit-confirmed (`pkg/api/config.go:233,500`) and gRPC
+  Commit/CommitConfirmed (`pkg/grpcapi/server_config.go:253,295`). Fixing only
+  REST would close two of four doors on one authorization defect, and the
+  threading is shared plumbing, so splitting would land an intermediate state
+  where two call sites pass a zero authority — the fail-open-by-omission the
+  explicit parameter exists to prevent.
+- **gRPC has a NON-ADVERSARIAL trigger**: `configLockStatsHandler.HandleConn`
+  auto-releases the lock on `ConnEnd` from a separate goroutine with no
+  coordination with an in-flight commit. Its comment claims the release is
+  "guarded ... by the store's holder check" — true of a DIFFERENT hazard
+  (releasing someone else's lock) and silent about releasing the committer's own
+  lock mid-commit. An ordinary disconnect reaches the substitution.
+- **Reading R69's Refutation, not just its Evidence, changed the fix.** The
+  natural read from the title is "generation binding is missing". Generation
+  binding is present AND correct; it answers a different question and takes no
+  session id. A turnover completing before `CompileCandidateGen` — during the
+  `applySem.Acquire` wait, where a busy daemon actually waits — yields a
+  perfectly consistent generation pair describing B's candidate. Worse, since
+  `commitWithGenBinding` RETRIES `ErrCandidateGenerationConflict` by design, a
+  turnover reported as a generation conflict would make the retry loop perform
+  the substitution automatically. Hence a DISTINCT `ErrConfigHolderTurnover`
+  sentinel, with a cell pinning the two apart.
+- **The zero value is invalid, not a bypass** (review strengthening, and the
+  part most likely to be got wrong). Letting `CommitAuthority{}` mean "internal
+  committer" would put the god-mode capability at exactly the value a forgotten
+  field produces: the explicit parameter would catch OMISSION (compile error)
+  while silently admitting a wrong-but-compiling zero that reads as deliberate.
+  Internal committers now state it with `InternalCommitter()`; the store rejects
+  the zero with `ErrCommitAuthorityMissing`.
+- **Explicit parameter, not a Context value**: an absent ctx value is
+  indistinguishable from a deliberate one and degrades silently to a bypass on
+  an authorization path. The signature change makes omission a compile error —
+  which is exactly how the four defect sites surfaced during the change.
+- **`EnsureConfigHolder` DELETED, its test MOVED.** Once all four commit paths
+  used `AuthorizeCommit` it had zero production callers, and its doc comment
+  ("the exported gate used by the commit-family gRPC RPCs") had become false.
+  Leaving a weaker twin beside the fixed gate is how this class regresses.
+  `TestEnsureConfigHolder` moved to `TestAuthorizeCommitHolderGate` — the #5059
+  property did not change, but the function enforcing it did, and a test left on
+  the old symbol would stay green while guarding nothing.
+- **Rejected alternative, recorded**: pin the holder for the commit's duration
+  so turnover cannot happen. Smaller, no signature change — but it breaks the
+  #5849 auto-release contract: a dropped connection whose commit is pinned finds
+  `sess.released.Do` already consumed and the lock wedged until the #4476 lease
+  TTL. Recovering that needs deferred-release machinery, which spends the
+  simplicity that made it attractive.
+- **Designed around a known asymmetry**: `ExitConfigure()` clears
+  `exclusiveHolder` but not `configHolder`, safe today only because
+  `ensureHolderLocked` short-circuits on `!s.configDir`. An epoch keyed off
+  `configHolder` alone would have inherited that. Bumping the epoch on that path
+  makes it safe without depending on the short-circuit. Filing separately.
+- **14 cells**: 6 enforcement (`pkg/configstore`), 4 REST wiring (`pkg/api`),
+  4 gRPC wiring (`pkg/grpcapi`). The wiring cells matter independently — a
+  handler passing `InternalCommitter()` still COMPILES and restores the defect
+  in full, so they assert the authority the handler PASSES, not the store's
+  reaction to it. Controls assert an unchanged holder still commits AND actually
+  promotes (a control checking only status/err would pass against a fixture that
+  never reached promotion), and that an explicit internal committer is still
+  accepted (else "refuse everything" passes every refusal cell — a configuration
+  outage strictly worse than the defect).
+- **File(s)**: `pkg/configstore/commit_authority.go` (new),
+  `pkg/configstore/commit_authority_6808_test.go` (new),
+  `pkg/configstore/store.go`, `pkg/configstore/store_lock.go`,
+  `pkg/configstore/store_commit.go`,
+  `pkg/configstore/config_lock_holder_5059_test.go`,
+  `pkg/api/config.go`, `pkg/api/server.go`,
+  `pkg/api/config_holder_turnover_6808_test.go` (new),
+  `pkg/grpcapi/server_config.go`, `pkg/grpcapi/server.go`,
+  `pkg/grpcapi/config_holder_turnover_6808_test.go` (new),
+  `pkg/daemon/daemon_apply_commit.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/daemon_apply_tail.go`, `pkg/configstore/README.md`,
+  plus mechanical test migrations, `_Log.md`
+
+## 2026-08-26 — engineering-style: gofmt -w on a directory is a scope hazard here
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add "format the files you TOUCHED, never a directory" to
+  `docs/engineering-style.md`'s reviewing section.
+- **Why**: `gofmt -w pkg/daemon` reformatted 12 pre-existing unformatted files a
+  lane had never touched, silently widening its diff. The underlying fact is
+  repo-specific and worth stating: master CARRIES unformatted files, so
+  `gofmt -w <dir>` is not idempotent with respect to your change here, and a
+  widened diff is how an unrelated change rides in unreviewed.
+- **Includes the recovery**, since the lane worked it out under time pressure:
+  for each modified `.go`, if its diff adds none of your change's identifiers,
+  `git checkout HEAD -- <file>`.
+- **Found by**: the lane driving #6808, caught in `git status` rather than at
+  review.
+- **File(s)**: `docs/engineering-style.md`, `_Log.md`
+
+## 2026-08-26 — #6833: one primitive, two justifications, and inventory guards
+
+- **Timestamp**: 2026-08-26
+- **Action**: Move the duplicated control-byte belt into `pkg/rendersafe`, and
+  give each consumer a wrapper that names ITS grammar plus an inventory guard.
+- **I diverged from the issue's fix direction #1, deliberately.** It says "one
+  shared helper, in one place", and direction #2 says each call site must name
+  "the specific byte class that is load-bearing for it". Those pull apart: a
+  single shared function cannot carry two justifications, and a function whose
+  doc names two grammars is exactly what invites the relaxation the issue warns
+  about. Resolved as ONE grammar-agnostic primitive
+  (`rendersafe.ReplaceControlBytes(s, repl)`, documented as NOT a security
+  boundary on its own) plus TWO thin per-consumer wrappers. The body exists once
+  — so the dangerous edit can only be made once — while the justification lives
+  at each call site, which is what direction #2 actually asks for.
+- **The substitute is now the caller's parameter**, not hardcoded. That is the
+  mechanical expression of "the safe substitute is a per-consumer fact"; a
+  primitive that hardcoded a space would pull the decision back inside.
+- **Checked, not assumed, that a space is safe at every CURRENT call site**:
+  `sanitizeUnitValue` is applied to `Description=` and only `Description=` (free
+  text); swanctl's unquoted interpolations are comma-separated list keys, not
+  whitespace-separated, and the quoted ones additionally pass through
+  `escapeSwanctlQuoted`. So both belts are correct as written — the issue's
+  `OriginalName=` hazard is real but NOT reachable through `sanitizeUnitValue`,
+  because it is not applied there.
+- **Which makes the real risk a FUTURE call site, so that is what is guarded.**
+  Each package gains an inventory cell asserting which keys the belt is applied
+  to. Adding `sanitizeUnitValue` to a whitespace-separated `[Match]` key, or
+  `sanitizeSwanctlValue` to an unrecorded swanctl key, REDS with a message saying
+  what to re-derive. Verified by probe: both fire on exactly that shape and pass
+  once reverted. The point is not to forbid new call sites but to make the
+  derivation unavoidable.
+- **The primitive's own test is exhaustive over 0x00-0xFF rather than sampled**,
+  because the failure it guards is a future edit NARROWING the class ("surely
+  0x0B is harmless") and a sampled test is what such an edit slips past. Plus a
+  cell asserting the UTF-8 claim the doc makes, which reds if the class were
+  widened to "any byte >= 0x7F".
+- **File(s)**: `pkg/rendersafe/rendersafe.go` (new),
+  `pkg/rendersafe/rendersafe_test.go` (new), `pkg/ipsec/policy.go`,
+  `pkg/ipsec/swanctl_value_grammar_6833_test.go` (new),
+  `pkg/networkd/networkd.go`,
+  `pkg/networkd/unit_value_grammar_6833_test.go` (new), `_Log.md`
+
+## 2026-08-26 — #6811 family is part of the flow-export group key
+
+- **Timestamp**: 2026-08-26
+- **Action**: Stop a single sampling instance carrying BOTH address families from
+  cross-fanning each family's flows to the other family's collectors
+  (opus-review-001 root R72).
+- **The collapse**: `SamplingInstance` keeps `FamilyInet`/`FamilyInet6` separate,
+  but `collectInstanceVersionCollectors` merged them into ONE slice and reduced
+  family to two per-INSTANCE booleans. `CollectorConfig` had no family field,
+  `groupCollectorsByTemplate` keyed on template alone, and `ServesFamily` was
+  evaluated per instance — so with both families configured both booleans were
+  true, the gate passed for either family, and `flowExportCallback` fanned the
+  record to EVERY group of that instance.
+- **Why nothing caught it**: the strict validator explicitly PERMITS one instance
+  holding both families, the #2462 isolation tests use family-DISJOINT instances
+  (where the instance-level gate IS sufficient), and the template tests use a
+  single family. No test configured the shape that breaks. R72's Refutation says
+  exactly this, which is why reading it first was worth more than the Evidence.
+- **Fix**: family becomes part of the identity at BUILD time — `CollectorConfig.IsV6`,
+  family in the dedup key, and `collectorGroupKey{Template, IsV6}` replacing the
+  template-only group key. Then one comparison at send time
+  (`GroupIsV6 != sd.IsIPv6`) inside the fan-out, at BOTH sites.
+- **Why family belongs in the KEY, not a per-record filter**: R72's HPC note says
+  family partitioning must not add a per-record collector search. Keying on
+  family makes every group single-family by construction, so the hot path is a
+  gate against a precomputed flag. Filtering conns per record would put a
+  collector scan on the export path for every flow.
+- **The subtlety that shaped the fix**: `ServesInet`/`ServesInet6` had to stay
+  per-INSTANCE. They gate the single sampling DECISION and must run BEFORE
+  `ShouldExport`, or a record of a family the instance does not serve would
+  consume a 1-in-N slot and change the sampling denominator. `GroupIsV6` gates
+  the fan-out only. Collapsing the two would either re-open the cross-fan or
+  silently alter the sample rate — a cell pins the distinction.
+- **Dedup key gained family**: the same address under both families is two
+  destinations-with-family, not one duplicate. Without it, a collector the
+  operator pointed at both families would silently stop receiving one.
+- **A pre-existing test went RED and was right to**: the #3745
+  distinct-source-address tests build their two collectors by putting one address
+  under BOTH families, then asserted on `BuildExportConfig(...).Collectors`, which
+  returns only the FIRST group. The #3745 property (both retained, distinct
+  sources) is unchanged — the assertion now counts across groups and additionally
+  pins two DISTINCT source addresses, so it tests the dedup rather than the
+  grouping. Also corrected `BuildExportConfig`/`BuildIPFIXExportConfig` doc
+  comments, which had become false ("the FIRST template group") — a comment is a
+  claim (#7629).
+- **6 cells**: 5 resolver (`pkg/flowexport`) + 1 send-path (`pkg/daemon`). The
+  daemon cell is independent and load-bearing: deleting the per-group gate leaves
+  every resolver cell green while the bug is fully restored. It also asserts the
+  inet group DID export, so the cell cannot pass against a build that exports
+  nothing. Controls: a single-family instance still produces exactly one group
+  with #2462 attribution intact.
+- **File(s)**: `pkg/flowexport/manager.go`,
+  `pkg/flowexport/family_fanout_6811_test.go` (new),
+  `pkg/flowexport/exporter_test.go`, `pkg/flowexport/README.md`,
+  `pkg/daemon/daemon_flowexport.go`,
+  `pkg/daemon/daemon_flowexport_family_fanout_6811_test.go` (new), `_Log.md`
+
+## 2026-08-26 — #2419 compact/block equivalence gate (cohort #6817/#6818/#6821/#6822)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add the generative gate that ENUMERATES the #2419 compact-leaf
+  class, plus a checked-in expected-failure inventory of the 194 sites that fail
+  it today. No production change — the normalizer that drives the inventory to
+  zero is a separate, deliberately unfolded change.
+- **The class**: a compiler stanza that iterates only `prop.Children` reads the
+  BLOCK spelling `stanza { leaf value; }` and silently drops the COMPACT
+  spelling `stanza leaf value;`, which puts the value on the stanza's own
+  `Keys[1:]`. `SchemaValidate` ACCEPTS the compact spelling, so this is the
+  normal commit path, not the tolerant-load path: the commit reports success and
+  the credential is gone.
+- **Why the instrument had to be generative**: two textual predicates were tried
+  on the issues. The first over-counted (80 readers, 68 "blind" — a `case`
+  handling the flat shape one line above the loop was flagged); the second
+  matched 11 candidates and NONE of the three known-true sites, because a
+  ±14-line lookback cannot scope itself to a `case` block. False positives AND
+  false negatives, with output indistinguishable from clean.
+- **THE PRESCRIBED INSTRUMENT WAS ALSO VACUOUS, and that is the main finding.**
+  The brief said to compare the flat-set spelling against the block spelling.
+  `ParseSetCommand` + `SetPath` produces the BLOCK tree — verified by dumping it
+  — so that comparison is block-against-block: equal for every leaf, green
+  everywhere, census of zero. The compact tree comes from the HIERARCHICAL
+  parser on hand-authored / `load merge`d text. Corrected before building.
+- **Three bugs in my own instrument, all found by the positive control**: it
+  found 2 of the 4 known-true sites on the first run. (a) args were rendered as
+  their own nesting level (`user { ops { } }` not `user ops { }`) — hid #6822;
+  (b) fixtures lacked REQUIRED SIBLINGS (`compiler_security_log.go` registers a
+  stream only when `Host != ""`) — hid #6821; (c) NAMED INSTANCES were being
+  compacted, which produces a node the compiler cannot recognise as that
+  instance — roughly 150 phantom divergences. 4/4 after the fixes; that control
+  is what makes the census believable.
+- **Census**: 792 sites enumerated, 326 checked under the vacuity guard, **194
+  divergent**. Skips: 346 under `groups` (schema re-host), 96 not observable, 15
+  parse/compile, 9 unsynthesizable. The honest count is ">= 194 divergent, 96
+  unruled" — the not-observable skips are candidates nobody has ruled out, not
+  clean sites. Hand-verified beyond the filed four: `protocols bgp export`
+  compiles an EMPTY export list, and a GRE tunnel loses BOTH source and
+  destination.
+- **Gate design**: the divergent set must EQUAL the inventory (a new
+  compact-blind reader reds; a fixed site left in the file also reds, so it
+  cannot rot into an allowlist); the checked-cell count is a RATCHET so sites
+  cannot drain into the skip buckets; the four filed instances are asserted
+  present by construction.
+- **Mutation matrix**: 9 cells. The ratchet is a PAIRED cell — the same
+  violation reds with the guard present and passes with it removed, which is
+  what proves the guard is what catches it. One cell (P1) initially "failed"
+  as a syntax break my build-break detector missed; detector widened and the
+  cell rewritten as a one-token change.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go` (new),
+  `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
+  `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
+  `docs/config-schema.md`, `_Log.md`

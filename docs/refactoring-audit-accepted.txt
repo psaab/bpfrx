@@ -21,3 +21,4 @@
 # has landed, every later branch measures the file as already over the
 # floor and no longer crosses it, so an entry may be pruned as soon as it
 # stops describing a live decision. It is a decision record, not state.
+[WATCH] pkg/eventengine/engine.go #6810 added 63 LOC (mostly the admission-verdict and latch-rollback rationale) and tipped it 1477 -> 1540. The file SHOULD be split — queue admission (enqueue/supersede/counters) and evaluation (evaluateEvent/withinMatches/pruneWindow) are two cohesive units — but not inside this PR: the change is a lost-remediation fix whose whole diff lives in enqueue and HandleEvent, so a verbatim code move would carry the fix with it and make "is this line new or moved?" unanswerable in review. Under the 200-LOC "split first" cue, and the soft 1500 floor rather than the hard 2000. Deferred as its own refactor, tracked in #7636.

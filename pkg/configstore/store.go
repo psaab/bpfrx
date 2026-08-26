@@ -217,6 +217,16 @@ type Store struct {
 	configHolder string    // unique session ID of the config lock holder
 	configLockAt time.Time // when the lock was acquired
 
+	// holderEpoch advances on every config-lock ACQUISITION and RELEASE, so a
+	// commit authorized for one holder can detect that the lock turned over
+	// before it reached promotion (#6808). It is deliberately separate from
+	// candidateGen, which tracks candidate CONTENT: a turnover can leave
+	// content-consistent state (B enters and stages edits, bumping candidateGen
+	// in ways A's in-flight commit re-reads consistently), and configLockAt is a
+	// wall-clock stamp that cannot distinguish a still-held lock from a
+	// released-and-retaken one. Only a counter keyed to acquisition can.
+	holderEpoch uint64
+
 	// Cluster read-only mode: secondary nodes reject config mutations
 	clusterReadOnly bool
 

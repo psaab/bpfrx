@@ -113,6 +113,11 @@ type xpfCollector struct {
 	zonePacketsTotal             *prometheus.Desc
 	zoneBytesTotal               *prometheus.Desc
 	zoneCountersUnpopulatedZones *prometheus.Desc
+	// #6845: 0/1 — 1 while the helper's per-zone hot-path slot table has
+	// OVERFLOWED, so some configured zones are not being counted at all.
+	// Emitted only when a helper status was actually read, so its ABSENCE means
+	// "no helper to ask" rather than "no overflow" — see the descriptor.
+	zoneCountersOverflowActive *prometheus.Desc
 
 	// Policy counters. policyCountersUnpublishedRules is the policy analogue of
 	// zoneCountersUnpopulatedZones: the explicit "no counter published for this
@@ -204,6 +209,11 @@ type xpfCollector struct {
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
+	// #6807: gauge — how many route-maps the last rendered FRR managed
+	// section replaced with the bounded explicit deny because their
+	// expansion would overflow FRR's sequence ceiling. Non-zero is an
+	// ongoing route withdrawal on every neighbor carrying one.
+	frrRouteMapsQuarantined *prometheus.Desc
 	// #4899: 0/1 gauge — 1 while the last DHCP-lease-change IPsec rebind
 	// failed and swanctl local_addrs are still bound to a stale lease
 	// address (the retry loop has not yet reconverged).
@@ -725,6 +735,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.zonePacketsTotal
 	ch <- c.zoneBytesTotal
 	ch <- c.zoneCountersUnpopulatedZones
+	ch <- c.zoneCountersOverflowActive
 	ch <- c.policyHitsTotal
 	ch <- c.policyCountersUnpublishedRules
 	ch <- c.filterHitsTotal
@@ -777,6 +788,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
+	ch <- c.frrRouteMapsQuarantined
 	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
@@ -1089,6 +1101,15 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, v)
 	}
 
+	// #6807: quarantined route-maps. Reported UNCONDITIONALLY when the hook
+	// is wired — a 0 must be published on a healthy box, or an alert on
+	// `> 0` can never distinguish "no quarantine" from "the exporter stopped
+	// reporting this series".
+	if c.srv.frrQuarantinedRouteMapsFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.frrRouteMapsQuarantined,
+			prometheus.GaugeValue, float64(len(c.srv.frrQuarantinedRouteMapsFn())))
+	}
+
 	// #4899: IPsec DHCP-lease-change rebind-pending is a control-plane
 	// signal (the daemon re-renders swanctl even in config-only mode) —
 	// emit it BEFORE the dataplane gate so a stale-local_addrs tunnel that
@@ -1337,6 +1358,10 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSurfaceADDNSMetrics(ch)
 	c.collectSystemMetrics(ch)
 	c.collectUserspaceStatus(ch, userspaceStatus)
+	// #6845: a top-level status-derived signal, emitted only when a status was
+	// actually read — see emitZoneCounterOverflow for why its absence and its 0
+	// mean different things.
+	c.emitZoneCounterOverflow(ch, userspaceStatus)
 }
 
 // #709: emit per-bucket counter samples. Bucket index maps to a

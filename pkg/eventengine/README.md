@@ -383,6 +383,42 @@ Junos reading in `withinMatches` (`engine.go`):
   `TestEdgeTriggerOn_*_3756`. Only a policy carrying a `trigger on` clause
   latches (`policyHasTriggerOn`); a no-within or `trigger until` policy is
   unaffected.
+- **The latch is rolled back when the action it authorized is never admitted
+  (#6810).** `evaluateEvent` arms the latch under `e.mu` and returns;
+  `HandleEvent` classifies and enqueues afterwards, OUTSIDE that lock. `enqueue`
+  used to return nothing, so a dropped action was indistinguishable from an
+  admitted one at the call site — and the consequence was not a delayed
+  remediation but a LOST one: `withinMatches` suppresses every later
+  at/above-threshold event while the latch is armed and re-arms only when a
+  clause's count drops BELOW its threshold, which for the sustained fault a
+  policy exists to remediate never happens. A transient saturation of the 64-slot
+  queue by 64 DISTINCT other policies therefore permanently consumed the
+  crossing.
+
+  `enqueue` now returns an admission verdict and `HandleEvent` calls
+  `releaseEdgeLatch` when it is false, restoring the invariant the latch
+  expresses — *this crossing already fired* — for a crossing that did not. A
+  **superseded** placement counts as admitted: the newer equivalent action is
+  queued, which is what the latch asserts. The rollback carries the same
+  semantic-revision ABA guard `armCooldown` uses (#5311): if a successor
+  generation was installed (or the policy removed) while the action was being
+  classified and rejected, its latch belongs to the successor and a
+  predecessor's failure must not clear it. A concurrent event landing between
+  the drop and the rollback is still suppressed, so the cost is a delay to the
+  next event rather than a consumed crossing.
+
+  **Two sibling paths deliberately do NOT roll back**, and the distinction is
+  transient-vs-deterministic. A `classifyPlan` rejection (malformed/unknown
+  command) fails identically every time, so re-arming would re-evaluate and
+  re-reject on every subsequent event — unbounded churn for a remediation that
+  can never run; it is counted (`rejected`) and logged once instead. An empty op
+  list had no remediation to lose. Only the queue-full drop is transient, i.e.
+  the only one where retrying succeeds. Pinned as an executable decision by
+  `TestClassifyRejectAndEmptyPlanKeepTheLatch6810` so the scope is not mistaken
+  for an oversight later. Regression-locked by
+  `engine_latch_before_admission_6810_test.go`, which drives the real
+  `HandleEvent` — every pre-existing edge-latch test calls `evaluateEvent`
+  directly and is structurally blind to this seam.
 - **`trigger until N` fires through the INCLUSIVE N-th event**, then stops
   (Junos "trigger UNTIL the event has been received N times" — the N-th
   occurrence is the last that fires). The current event is appended to the

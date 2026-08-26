@@ -563,14 +563,22 @@ func (e *Engine) HandleEvent(ev rpm.Event) {
 		// evaluate (#3750) so the worker can revalidate it against live engine
 		// state before committing, plus the triggering-event context (#3754)
 		// for the remediation commit's audit description.
-		e.enqueue(plannedAction{
+		if !e.enqueue(plannedAction{
 			policyName: tp.pol.Name,
 			semRev:     tp.semRev,
 			event:      ev.Name,
 			testOwner:  ev.TestOwner,
 			testName:   ev.TestName,
 			ops:        ops,
-		})
+		}) {
+			// #6810: the action was NOT admitted, so this crossing did not
+			// fire. evaluateEvent already armed the edge latch for it; leaving
+			// it armed makes withinMatches suppress every later at/above-
+			// threshold event until some clause drops below its threshold —
+			// which, for the sustained fault the remediation exists to fix,
+			// never happens. Roll it back so the next event retries.
+			e.releaseEdgeLatch(tp.pol.Name, ev.Name, tp.semRev)
+		}
 	}
 }
 
@@ -646,7 +654,17 @@ func (e *Engine) Stats() Stats {
 // otherwise a second producer could take a slot supersede freed while draining
 // and force supersede to drop an already-accepted survivor. See the enqueueMu
 // field comment for the lock-ordering rationale.
-func (e *Engine) enqueue(a plannedAction) {
+// enqueue returns whether the action was ADMITTED — i.e. whether an equivalent
+// action for this policy is now queued for the worker. It returns false only
+// when nothing will run: a genuine capacity drop, or a shutdown fast-exit.
+//
+// #6810: the verdict exists because the caller has already armed the edge latch
+// for this crossing by the time it gets here. Before this, enqueue returned
+// nothing, so a dropped action was indistinguishable from an admitted one at
+// the call site and the latch stayed armed over a remediation that never ran.
+// A superseded placement still counts as admitted: the newer equivalent action
+// IS queued, which is exactly what the latch is asserting.
+func (e *Engine) enqueue(a plannedAction) bool {
 	e.enqueueMu.Lock()
 	defer e.enqueueMu.Unlock()
 	// Fast exit during shutdown: don't churn the queue for an action the worker
@@ -655,11 +673,11 @@ func (e *Engine) enqueue(a plannedAction) {
 	// consumer left to drain it.
 	select {
 	case <-e.stopCh:
-		return
+		return false
 	default:
 	}
 	if e.supersede(a) {
-		return
+		return true
 	}
 	// supersede could not place `a`: the queue is full of OTHER policies'
 	// actions and there was no same-policy entry to evict. This is the only
@@ -667,6 +685,51 @@ func (e *Engine) enqueue(a plannedAction) {
 	e.counters.droppedQueueFull.Add(1)
 	slog.Warn("event-options: action queue full, dropping remediation",
 		"policy", a.policyName)
+	return false
+}
+
+// releaseEdgeLatch clears the #3756 edge latch that evaluateEvent armed for one
+// crossing, when the action that crossing authorized was never admitted (#6810).
+//
+// evaluateEvent arms the latch under e.mu and returns; HandleEvent classifies
+// and enqueues afterwards, outside that lock. If the queue is full of OTHER
+// policies' actions the remediation is dropped — and because withinMatches
+// suppresses every later at/above-threshold event while the latch is armed, and
+// only re-arms when a clause's count falls BELOW its threshold, a transient
+// queue saturation permanently consumed the crossing. For a sustained fault the
+// level never drops, so the configured remediation simply never ran.
+//
+// Rolling the latch back restores the invariant the latch is supposed to
+// express: "this crossing already fired". A crossing whose action was dropped
+// did not fire.
+//
+// authRev is the policy's semantic revision as of the evaluate that armed the
+// latch, and the guard is the same ABA defence armCooldown uses (#5311): if a
+// successor generation was installed (or the policy removed) while this action
+// was being classified and rejected, its latch state belongs to the successor
+// and must not be cleared by a predecessor's failure. Identity check and clear
+// happen in ONE critical section under e.mu so a concurrent Apply cannot swap
+// the runtime between them.
+//
+// Lock order is safe by construction: the caller has already released
+// enqueueMu (enqueue returns before this runs), so e.mu is never taken while
+// enqueueMu is held.
+//
+// A concurrent event that lands between the drop and this rollback is still
+// suppressed by the armed latch — the window is one classify+enqueue — so the
+// crossing costs at most a delay to the next event rather than being consumed
+// outright, which is the whole of the defect.
+func (e *Engine) releaseEdgeLatch(name, eventName, authRev string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.semRev[name] != authRev {
+		// Successor generation installed, or the policy removed, while this
+		// action was rejected. Its latch is not ours to clear.
+		return
+	}
+	if rt := e.runtime[name]; rt != nil {
+		rt.onLatched[eventName] = false
+	}
 }
 
 // supersede non-blockingly rebuilds the queue, replacing any existing

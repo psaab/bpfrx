@@ -538,6 +538,22 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 			// template enabled `export-extension flow-dir` actually encode it.
 			sd.Direction = lead.FlowDirection(rec.InZone, rec.OutZone)
 			for k := i; k < j; k++ {
+				// #6811: fan out only to the groups of THIS address family.
+				// Groups are single-family by construction (the resolver keys
+				// them on template AND family), so this is one comparison
+				// against a precomputed flag — not a per-record collector
+				// search. Before it, the instance-level ServesFamily gate above
+				// was the ONLY family check, and an instance carrying both
+				// families passed it for either family and then fanned to EVERY
+				// group — IPv4 records to IPv6-only collectors and vice versa.
+				//
+				// The instance-level gate stays: it must run BEFORE
+				// ShouldExport so a record of a family this instance does not
+				// serve never consumes a 1-in-N sampling slot. Moving family
+				// entirely down here would change the sampling denominator.
+				if b.groups[k].ec.GroupIsV6 != sd.IsIPv6 {
+					continue
+				}
 				b.groups[k].exp.ExportSessionClose(rec, sd)
 			}
 		}
@@ -590,6 +606,22 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 			// #3270: see flowExportCallback.
 			sd.Direction = lead.FlowDirection(rec.InZone, rec.OutZone)
 			for k := i; k < j; k++ {
+				// #6811: fan out only to the groups of THIS address family.
+				// Groups are single-family by construction (the resolver keys
+				// them on template AND family), so this is one comparison
+				// against a precomputed flag — not a per-record collector
+				// search. Before it, the instance-level ServesFamily gate above
+				// was the ONLY family check, and an instance carrying both
+				// families passed it for either family and then fanned to EVERY
+				// group — IPv4 records to IPv6-only collectors and vice versa.
+				//
+				// The instance-level gate stays: it must run BEFORE
+				// ShouldExport so a record of a family this instance does not
+				// serve never consumes a 1-in-N sampling slot. Moving family
+				// entirely down here would change the sampling denominator.
+				if b.groups[k].ec.GroupIsV6 != sd.IsIPv6 {
+					continue
+				}
 				b.groups[k].exp.ExportSessionClose(rec, sd)
 			}
 		}

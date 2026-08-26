@@ -9,15 +9,23 @@ import (
 )
 
 // TestRenderComposedRouteMap_SkipsOversizedChain_5732 proves the #5732
-// render-side belt: renderComposedRouteMap renders NOTHING for a composed BGP
-// policy chain whose members' summed route-map sequence count exceeds the FRR
-// ceiling, so a leniently-loaded / peer-synced oversized chain (the strict
-// commit gate only warns there, #1960) cannot emit a `route-map` line past seq
-// 65535 and poison the reload. A normal chain still renders.
+// render-side belt: renderComposedRouteMap does NOT render the expansion of a
+// composed BGP policy chain whose members' summed route-map sequence count
+// exceeds the FRR ceiling, so a leniently-loaded / peer-synced oversized chain
+// (the strict commit gate only warns there, #1960) cannot emit a `route-map`
+// line past seq 65535 and poison the reload. A normal chain still renders.
+//
+// #6807 UPDATED THE SHAPE, NOT THE PROPERTY: the belt used to return the empty
+// string, and this cell asserted exactly that. The empty return was the bug —
+// the neighbor's `route-map <composedName> out` is emitted regardless, and FRR
+// DENIES a name it cannot resolve. The belt now returns a bounded explicit deny
+// under composedName, so the assertion moves from "renders nothing" to the
+// stronger "renders exactly one header, the bounded deny".
 //
 // FAIL-ON-REVERT: dropping the config.ComposedChainSequenceCount >
-// config.MaxRouteMapSequences skip makes renderComposedRouteMap emit a route-map
-// with sequences past 65535, so the "must be empty" assertion fires RED.
+// config.MaxRouteMapSequences branch makes renderComposedRouteMap emit a
+// route-map with sequences past 65535, so the exactly-one-header assertion
+// fires RED.
 func TestRenderComposedRouteMap_SkipsOversizedChain_5732(t *testing.T) {
 	// Two members that individually pass the per-policy ceiling but SUM over it.
 	half := config.MaxRouteMapSequences/2 + 100 // each ~3376 <= 6552; sum ~6752 > 6552
@@ -45,9 +53,20 @@ func TestRenderComposedRouteMap_SkipsOversizedChain_5732(t *testing.T) {
 		t.Fatalf("composed A+B must exceed the ceiling")
 	}
 
-	got := New().renderComposedRouteMap(po, "A-B"+config.ReservedChainSuffix, []string{"A", "B"})
-	if strings.TrimSpace(got) != "" {
-		t.Fatalf("oversized composed chain must render NOTHING (skipped), got:\n%s", got)
+	composedName := "A-B" + config.ReservedChainSuffix
+	got := New().renderComposedRouteMap(po, composedName, []string{"A", "B"})
+	// #5732: the oversized EXPANSION is absent — exactly one header line, so no
+	// member's sequences were rendered.
+	headers := routeMapHeaders6807(got, composedName)
+	if len(headers) != 1 {
+		t.Fatalf("oversized composed chain must render exactly ONE route-map line "+
+			"(the bounded #6807 quarantine deny), got %d:\n%v\nfull:\n%s",
+			len(headers), headers, got)
+	}
+	// #6807: and it is the bounded explicit deny, so the neighbor's surviving
+	// `route-map <composedName> out` resolves deliberately instead of dangling.
+	if want := fmt.Sprintf("route-map %s deny %d", composedName, quarantineDenySeq); headers[0] != want {
+		t.Fatalf("oversized composed chain must render %q, got %q", want, headers[0])
 	}
 
 	// A normal short chain still renders a composed route-map.

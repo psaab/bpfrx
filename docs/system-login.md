@@ -1786,15 +1786,31 @@ path (`syncAndApply`) the config stays **active and armed** and the failure is
 surfaced rather than swallowed. No `lenient*` option in
 `pkg/config/compiler_opts.go` is owed.
 
-One caveat, deliberately scoped: #7618 records that a **command** deadline (a
-short per-command context, e.g. `chpasswd` via `runCommandStdinTimeout`) is
-currently misclassified by that same classifier as a daemon-stop abort, and
-`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` pins the current
-wrong behaviour. That does **not** extend to what #6798 adds: these errors
-originate in `os.ReadFile` / `os.ReadDir` and carry `EACCES`/`EIO`/`EISDIR`/
-`ENOTDIR`, never a `context.DeadlineExceeded`, so they cannot reach the
-misclassified branch. The credential reconcilers' *command* failures were
-already in that population before #6798.
+One caveat, and it must not be dropped when this paragraph is quoted: the
+"neither class" statement holds for these errors' **ordinary failure shapes**,
+not unconditionally. #7618 records that `exec.CommandContext` has **two**
+deadline shapes — if the context expires *before* fork/exec, `Start` returns a
+**bare `context.DeadlineExceeded`**, which `applyErrSkipsPeerSync` cannot
+distinguish from a #2926 daemon-stop abort and therefore classes FATAL, taking
+`syncAndApply`'s `return nil, applyErr` arm with `armedActive` false.
+
+That shape is **pre-existing and wider than #6798**: `runCommandStdinTimeout`
+(`pkg/daemon/exec_timeout.go`) builds a fresh `context.WithTimeout(
+context.Background(), externalCommandTimeout)` on the line immediately before
+`exec.CommandContext`, so reaching the bare-`ctx.Err()` arm needs the goroutine
+descheduled for the entire timeout between two adjacent statements — reachable
+in a loaded test with a short injected deadline, not in production at 15s. The
+same exposure already reaches the same classifier through `nftApplyPayload`
+(5s) and the DNS `systemctl` calls, which predate both #6790 and #6798. It is
+tripwired by `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`, which
+asserts the CURRENT (wrong) classification so the fix must invert the test and
+that section together.
+
+What #6798 **adds** does not reach it at all: these errors originate in
+`os.ReadFile` / `os.ReadDir` and carry `EACCES`/`EIO`/`EISDIR`/`ENOTDIR`, never
+a `context.DeadlineExceeded`. The credential reconcilers' *command* failures
+(`chpasswd`) were already in that population before #6798 — this change neither
+widens nor narrows it.
 
 There is **no `show` surface** that renders credential-ownership state, so the
 #6534 "a fail-closed exclusion owes a show-surface annotation" rule does not

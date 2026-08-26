@@ -95,10 +95,27 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 				// security zones` prints real byte counts for slotted zones and
 				// "not implemented" for overflowed ones, pointing the operator
 				// at the wrong cause.
-				fmt.Println("  Traffic statistics: not available " +
-					"(no per-zone volume published for this zone: helper predates " +
-					"per-zone accounting, the zone exceeded the dataplane's " +
-					"hot-path slot capacity, or the zone is idle)")
+				// #6845: when the helper reports its slot table has OVERFLOWED,
+				// say so instead of listing three causes the operator has no way
+				// to choose between. Overflow is the only one of the three that
+				// needs action — traffic is genuinely being missed — and the bit
+				// that identifies it is already on the wire
+				// (ProcessStatus.ZoneCounterOverflowActive) and was read by
+				// nothing. The generic line stays for the other two causes,
+				// because with no overflow they remain genuinely ambiguous and
+				// naming one would be a guess.
+				if zoneCounterOverflowActive(c) {
+					fmt.Println("  Traffic statistics: not available " +
+						"(the dataplane's per-zone hot-path slot capacity is " +
+						"EXHAUSTED, so this zone's traffic is not being counted " +
+						"at all; reduce the number of configured zones or accept " +
+						"that zones past the capacity go uncounted)")
+				} else {
+					fmt.Println("  Traffic statistics: not available " +
+						"(no per-zone volume published for this zone: helper predates " +
+						"per-zone accounting, the zone exceeded the dataplane's " +
+						"hot-path slot capacity, or the zone is idle)")
+				}
 			case errIn == nil && errOut == nil:
 				fmt.Println("  Traffic statistics:")
 				fmt.Printf("    Input:  %d packets, %d bytes\n",
@@ -220,4 +237,27 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 		}
 	}
 	return nil
+}
+
+// zoneCounterOverflowActive reports whether the helper says its per-zone
+// hot-path slot table has overflowed (#6845).
+//
+// Fails to FALSE on any error, deliberately: the caller uses it to REPLACE a
+// truthful three-cause message with a specific one-cause message, so a wrong
+// true would tell the operator to go reduce their zone count when the real cause
+// might be an idle zone. An unreachable helper means "cannot say", and "cannot
+// say" must fall back to the honest ambiguous line rather than guess.
+//
+// The status read is per-invocation of `show security zones` and only on the
+// branch that has already decided the zone is unpopulated, so it costs nothing on
+// the healthy path.
+func zoneCounterOverflowActive(c *CLI) bool {
+	if c == nil {
+		return false
+	}
+	status, err := c.userspaceDataplaneStatus()
+	if err != nil {
+		return false
+	}
+	return status.ZoneCounterOverflowActive
 }

@@ -60,18 +60,6 @@ func (s *Store) ensureHolderLocked(sessionID string) error {
 	return fmt.Errorf("%w", ErrConfigLockedByOther)
 }
 
-// EnsureConfigHolder atomically verifies that sessionID owns the config lock,
-// returning ErrConfigLockedByOther otherwise (#5059). It is the exported gate
-// used by the commit-family gRPC RPCs (Commit/CommitConfirmed) whose mutation
-// runs through a daemon callback rather than a single store method, so they
-// cannot thread the holder through an *As variant. sessionID == "" bypasses
-// (internal/system caller), matching ensureHolderLocked.
-func (s *Store) EnsureConfigHolder(sessionID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ensureHolderLocked(sessionID)
-}
-
 // configLockLeaseTTL bounds how long a config lock may sit idle — with no edit
 // activity — before a new entrant may reclaim it. #4476: the REST config-enter
 // path (POST /api/v1/config/enter) is stateless and has NO disconnect hook,
@@ -123,6 +111,9 @@ func (s *Store) reclaimStaleLockLocked() bool {
 	s.dirty = false
 	s.exclusiveHolder = ""
 	s.configHolder = ""
+	// #6808: the config lock changed hands — advance the holder epoch so a
+	// commit authorized under the previous holder cannot promote here.
+	s.holderEpoch++
 	s.editPath = nil
 	return true
 }
@@ -169,6 +160,9 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 	s.dirty = false
 	s.exclusiveHolder = ""
 	s.configHolder = sessionID
+	// #6808: the config lock changed hands — advance the holder epoch so a
+	// commit authorized under the previous holder cannot promote here.
+	s.holderEpoch++
 	s.configLockAt = time.Now()
 	s.editPath = nil
 	return nil
@@ -194,6 +188,9 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 	s.dirty = false
 	s.configHolder = ""
 	s.exclusiveHolder = holder
+	// #6808: the config lock changed hands — advance the holder epoch so a
+	// commit authorized under the previous holder cannot promote here.
+	s.holderEpoch++
 	s.configLockAt = time.Now()
 	s.editPath = nil
 	return nil
@@ -241,6 +238,9 @@ func (s *Store) ExitConfigureSession(sessionID string) bool {
 	s.dirty = false
 	s.exclusiveHolder = ""
 	s.configHolder = ""
+	// #6808: the config lock changed hands — advance the holder epoch so a
+	// commit authorized under the previous holder cannot promote here.
+	s.holderEpoch++
 	s.editPath = nil
 	return true
 }
@@ -261,6 +261,9 @@ func (s *Store) ForceExitConfigure() {
 	s.dirty = false
 	s.exclusiveHolder = ""
 	s.configHolder = ""
+	// #6808: the config lock changed hands — advance the holder epoch so a
+	// commit authorized under the previous holder cannot promote here.
+	s.holderEpoch++
 	s.editPath = nil
 }
 
@@ -283,6 +286,16 @@ func (s *Store) IsExclusiveLocked() bool {
 }
 
 // ExitConfigure exits configuration mode, discarding the candidate.
+//
+// NOTE (#6808): this clears exclusiveHolder but deliberately leaves
+// configHolder set — an asymmetry with ExitConfigureSession/ForceExitConfigure
+// that predates this change and is tracked separately. It is not exploitable
+// today only because ensureHolderLocked short-circuits on !s.configDir, i.e.
+// its safety rests on that short-circuit rather than on the field being clean.
+// The holder-epoch bump below is what makes this path safe for #6808 WITHOUT
+// depending on that: leaving config mode advances the epoch, so a commit
+// authorized before it fails verification regardless of the stale configHolder
+// string an epoch keyed off configHolder alone would have trusted.
 func (s *Store) ExitConfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,6 +304,8 @@ func (s *Store) ExitConfigure() {
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
+	// #6808: the config lock was released — advance the holder epoch.
+	s.holderEpoch++
 	s.editPath = nil
 }
 
