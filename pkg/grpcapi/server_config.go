@@ -250,7 +250,16 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	// a commit from a non-holder session before it can confirm/apply another
 	// session's pending work. Empty session (unit tests / internal) bypasses.
 	sessionID := connSessionID(ctx)
-	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
+	// #6808: mint the commit AUTHORITY under the same store-lock acquisition
+	// that verifies the holder, and carry it into the callback, so a lock
+	// turnover between this gate and promotion is detected instead of
+	// substituting the new holder's candidate. On gRPC the turnover needs no
+	// adversary: configLockStatsHandler.HandleConn auto-releases the lock on
+	// ConnEnd from a separate goroutine with no coordination with an in-flight
+	// commit, so an ordinary disconnect while this commit waits on the apply
+	// semaphore is enough.
+	authority, err := s.store.AuthorizeCommit(sessionID)
+	if err != nil {
 		return nil, configMutationStatus(err)
 	}
 
@@ -272,7 +281,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	if s.commitFn == nil {
 		return nil, status.Errorf(codes.Internal, "commit handler not wired")
 	}
-	compiled, err := s.commitFn(ctx, req.Comment)
+	compiled, err := s.commitFn(ctx, authority, req.Comment)
 	if err != nil {
 		// #5742: classify structurally — a non-fatal tail-reconcile / ordinary
 		// apply error (the daemon returns the committed config alongside it) is
@@ -292,13 +301,22 @@ func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.C
 
 func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
 	// #5059: only the config-lock holder may commit the shared candidate.
-	if err := s.store.EnsureConfigHolder(connSessionID(ctx)); err != nil {
+	// #6808: mint the commit AUTHORITY under the same store-lock acquisition
+	// that verifies the holder, and carry it into the callback, so a lock
+	// turnover between this gate and promotion is detected instead of
+	// substituting the new holder's candidate. On gRPC the turnover needs no
+	// adversary: configLockStatsHandler.HandleConn auto-releases the lock on
+	// ConnEnd from a separate goroutine with no coordination with an in-flight
+	// commit, so an ordinary disconnect while this commit waits on the apply
+	// semaphore is enough.
+	authority, err := s.store.AuthorizeCommit(connSessionID(ctx))
+	if err != nil {
 		return nil, configMutationStatus(err)
 	}
 	if s.commitConfirmedFn == nil {
 		return nil, status.Errorf(codes.Internal, "commit-confirmed handler not wired")
 	}
-	compiled, err := s.commitConfirmedFn(ctx, int(req.Minutes))
+	compiled, err := s.commitConfirmedFn(ctx, authority, int(req.Minutes))
 	if err != nil {
 		// #5742: same structural classification as Commit — commitConfirmedAndApply
 		// shares applyAndSyncCommitted, so a non-fatal tail error carries the

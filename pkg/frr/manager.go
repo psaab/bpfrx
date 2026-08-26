@@ -50,6 +50,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"sort"
 )
 
 const (
@@ -121,6 +122,25 @@ type Manager struct {
 	// xpf_frr_reload_degraded Prometheus gauge.
 	degraded atomic.Bool
 
+	// quarantinedMu guards quarantined. Leaf lock: never taken while any
+	// other manager lock is held, and never held across an exec.
+	quarantinedMu sync.Mutex
+	// quarantined is the set of route-map names the LAST rendered managed
+	// section replaced with the #6807 bounded explicit deny, because their
+	// real expansion would overflow FRR's sequence ceiling (#5701/#5732).
+	//
+	// It exists because the outage this fix makes deliberate is still an
+	// OUTAGE: every route on a neighbor carrying one of these attachments is
+	// withdrawn until the policy is reduced. R68's invariant note is the
+	// reason it is a gauge and not only a log line — "operators also need
+	// apply failure/health rather than silent accepted outage". A single
+	// slog.Warn at render time is not something anyone alerts on.
+	//
+	// Rebuilt from scratch on every buildManagedSection so it always
+	// describes the CURRENT rendered section: a commit that reduces the
+	// policy clears it without needing a separate clear path.
+	quarantined map[string]struct{}
+
 	// retryMu guards the degraded-retry episode fields below. Lock
 	// order: reloadMu → retryMu (retryMu is a leaf).
 	retryMu      sync.Mutex
@@ -179,6 +199,40 @@ func (m *Manager) DisableDegradedRetry() {
 // xpf_frr_reload_degraded Prometheus gauge (0/1, no labels).
 func (m *Manager) ReloadDegraded() bool {
 	return m.degraded.Load()
+}
+
+// QuarantinedRouteMaps returns the sorted names of route-maps the last rendered
+// managed section replaced with the #6807 bounded explicit deny. Non-empty means
+// a policy is too large to render and every route on the neighbors carrying its
+// attachments is being DENIED. Exported for the xpf_frr_route_maps_quarantined
+// Prometheus gauge so the withdrawal is alertable rather than a single log line.
+func (m *Manager) QuarantinedRouteMaps() []string {
+	m.quarantinedMu.Lock()
+	defer m.quarantinedMu.Unlock()
+	out := make([]string, 0, len(m.quarantined))
+	for n := range m.quarantined {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resetQuarantined clears the quarantine set at the start of a render so the
+// set always describes the section actually produced.
+func (m *Manager) resetQuarantined() {
+	m.quarantinedMu.Lock()
+	m.quarantined = nil
+	m.quarantinedMu.Unlock()
+}
+
+// noteQuarantined records that name was replaced by the bounded explicit deny.
+func (m *Manager) noteQuarantined(name string) {
+	m.quarantinedMu.Lock()
+	if m.quarantined == nil {
+		m.quarantined = make(map[string]struct{})
+	}
+	m.quarantined[name] = struct{}{}
+	m.quarantinedMu.Unlock()
 }
 
 // Stop cancels the manager lifetime context — killing any in-flight
@@ -444,6 +498,9 @@ func collectAllBGPAcceptDefault(fc *FullConfig) map[string]bool {
 // fc.ConsistentHash side effect still happens here (ApplyFull's only
 // caller invokes it before commit).
 func (m *Manager) buildManagedSection(fc *FullConfig) string {
+	// #6807: the quarantine set describes the section this call produces, so
+	// clear it before rendering rather than accumulating across applies.
+	m.resetQuarantined()
 	var b strings.Builder
 	b.WriteString("! xpf managed config - do not edit\n")
 	b.WriteString("!\n")

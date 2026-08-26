@@ -9,6 +9,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -118,7 +119,7 @@ func TestClusterIdentityDay2ChangeRejected(t *testing.T) {
 	}
 
 	d := &Daemon{store: store, applySem: semaphore.NewWeighted(1), cluster: running}
-	_, capErr := d.commitAndApply(context.Background(), "change cluster-id", peerSyncNever)
+	_, capErr := d.commitAndApply(context.Background(), configstore.InternalCommitter(), "change cluster-id", peerSyncNever)
 	if capErr == nil || !errors.Is(capErr, errClusterIdentityRequiresRestart) {
 		t.Fatalf("commitAndApply of a day-2 cluster-id change must be rejected with the "+
 			"identity-restart sentinel; got %v", capErr)
