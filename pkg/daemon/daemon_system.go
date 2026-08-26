@@ -1091,9 +1091,36 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 			// facility on purpose — warning about it is a false alarm on a
 			// correct config.
 			if !known && !logging.FacilityIsWildcard(raw) {
-				slog.Warn("system syslog: unmapped facility name; local0 selected — if this "+
-					"host's client is installed, its records will carry a facility the "+
-					"configuration does not name (#5797)",
+				// #6830: say WHICH facility is wrong and what the right answer
+				// is, not just that a substitution happened. Junos publishes
+				// the mapping, so for a real Junos facility name the warning
+				// can name the target — which is the difference between an
+				// operator knowing something is off and knowing what to do.
+				// A name in neither vocabulary is a typo and is reported as
+				// one; conflating the two sent an operator looking for a
+				// mapping bug when they had a spelling mistake, and vice
+				// versa.
+				// #6830: the MISFILED arm is gone because it can no longer be
+				// reached. It described a name that IS in the documented Junos
+				// vocabulary but which this box emitted under a different code
+				// — and ParseFacility now consults that table first, so the
+				// two agree by construction. Keeping a warning whose input
+				// cannot occur would be dead code that no test can exercise
+				// without a seam invented for it.
+				//
+				// The property it protected did not go away, it moved: pkg/logging's
+				// TestNothingInTheTableIsMisfiled6830 asserts, over the whole
+				// table, that the emit path and the documented mapping agree —
+				// so a row added without wiring, or a wiring regression, reds
+				// there rather than warning here.
+				//
+				// What reaches this branch now is a name in NEITHER vocabulary:
+				// a typo, where local0 is a substitution for something that
+				// means nothing.
+				slog.Warn("system syslog: unrecognized facility name; local0 selected — "+
+					"this name is not in the Junos `[edit system syslog]` vocabulary, so "+
+					"it is most likely a typo. If this host's client is installed, its "+
+					"records will carry a facility the configuration does not name (#5797)",
 					"host", host.Address, "facility", raw, "using", "local0")
 			}
 			facility = f

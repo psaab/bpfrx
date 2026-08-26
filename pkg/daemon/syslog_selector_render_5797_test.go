@@ -516,12 +516,31 @@ func TestApplySystemSyslogWarnsOnUnmappedFacility_5797(t *testing.T) {
 		return buf.String()
 	}
 
-	// A Junos facility name the runtime cannot map: the substitution to local0
-	// must be reported.
-	for _, facility := range []string{"authorization", "kernel", "interactive-commands", "typo"} {
+	// A facility name the runtime cannot map: the substitution to local0 must be
+	// reported.
+	//
+	// #6830 SPLIT THE MESSAGE, NOT THE PROPERTY. This used to pin the literal
+	// "unmapped facility name" for every case. The warning now discriminates a
+	// real Junos facility this box misfiles from a name in neither vocabulary,
+	// because those need different operator actions — so the assertion moves
+	// from one literal to "warned, named the facility, and CLASSIFIED it
+	// correctly", which is strictly stronger than what it replaced.
+	for _, tc := range []struct {
+		facility string
+	}{
+		// #6830 wired the documented Junos table into the emit path, so
+		// `authorization` / `kernel` / `interactive-commands` are now MAPPED and
+		// no longer warn -- that is the fix, not a regression. What still
+		// reaches this warning is a name in NEITHER vocabulary, plus the Junos
+		// names that have no documented wire facility at all.
+		{"security"},
+		{"external"},
+		{"typo"},
+	} {
+		facility := tc.facility
 		t.Run("unmapped/"+facility, func(t *testing.T) {
 			got := apply(t, facility)
-			if !strings.Contains(got, "unmapped facility name") {
+			if !strings.Contains(got, "unrecognized facility name") {
 				t.Errorf("host facility %q silently became local0 with no warning; records leave "+
 					"under a facility the configuration never names (#5797). captured:\n%s",
 					facility, got)
@@ -529,11 +548,36 @@ func TestApplySystemSyslogWarnsOnUnmappedFacility_5797(t *testing.T) {
 			if !strings.Contains(got, facility) {
 				t.Errorf("the warning must name the unmapped facility %q. captured:\n%s", facility, got)
 			}
+			// #6830 collapsed this classification, and the collapse is the fix.
+			//
+			// The MISFILED arm described a name IN the documented Junos
+			// vocabulary that this box emitted under a different code.
+			// ParseFacility now consults that table first, so the two agree by
+			// construction and the arm has no reachable input. Every name that
+			// still reaches this warning is in neither vocabulary, or is Junos
+			// with no documented wire facility -- a probable typo either way,
+			// which is the one arm that remains.
+			//
+			// The property the MISFILED arm protected did not disappear, it
+			// moved to where it can actually be asserted: pkg/logging's
+			// TestNothingInTheTableIsMisfiled6830 quantifies over the whole
+			// table, so a row added without wiring reds there.
+			if !strings.Contains(got, "unrecognized facility name") {
+				t.Errorf("%q must be reported as a probable typo (#6830). captured:\n%s",
+					facility, got)
+			}
 		})
 	}
 
 	// Negative control: a mapped name must not warn.
-	for _, facility := range []string{"daemon", "local0", "change-log", "auth"} {
+	// #6830 added the nine documented Junos names to this control: they are now
+	// mapped, so a correct config using them must stay quiet. Without them the
+	// control would not cover the names the flip actually moved.
+	for _, facility := range []string{
+		"daemon", "local0", "change-log", "auth",
+		"authorization", "kernel", "interactive-commands", "conflict-log",
+		"dfc", "firewall", "ftp", "ntp", "pfe",
+	} {
 		t.Run("mapped/"+facility, func(t *testing.T) {
 			if got := apply(t, facility); strings.Contains(got, "unmapped facility name") {
 				t.Errorf("host facility %q is mapped by ParseFacility but warned as unmapped; a "+
@@ -584,7 +628,7 @@ func TestApplySystemSyslogWarnsWhenClientDialFails_6829(t *testing.T) {
 			Address: "192.0.2.10",
 			// On no local interface, so the bind fails and the client is nil.
 			SourceAddress: "192.0.2.1",
-			Facilities:    []config.SyslogFacility{{Facility: "authorization", Severity: "info"}},
+			Facilities:    []config.SyslogFacility{{Facility: "security", Severity: "info"}},
 		}},
 	}
 	d.applySystemSyslog(cfg)
@@ -596,13 +640,16 @@ func TestApplySystemSyslogWarnsWhenClientDialFails_6829(t *testing.T) {
 		t.Fatalf("premise broken: the client was expected to FAIL construction so the "+
 			"ordering matters; captured:\n%s", got)
 	}
-	if !strings.Contains(got, "unmapped facility name") {
+	// #6830: `security` is in the Junos vocabulary but has no documented wire
+	// facility, so it takes the unrecognized arm. The property under test is
+	// unchanged -- the classification must not sit behind the dial.
+	if !strings.Contains(got, "unrecognized facility name") {
 		t.Errorf("the unmapped-facility warning was lost because the client could not be "+
 			"constructed — classification must not sit behind the dial (#6829). The "+
 			"operator with an unreachable collector is the one who most needs to be "+
 			"told their facility name is wrong. captured:\n%s", got)
 	}
-	if !strings.Contains(got, "authorization") {
+	if !strings.Contains(got, "security") {
 		t.Errorf("the warning must still name the unmapped facility. captured:\n%s", got)
 	}
 
@@ -675,7 +722,7 @@ func TestApplySystemSyslogFacilityReachesClient_6829(t *testing.T) {
 	})
 
 	t.Run("unmapped facility lands on the documented substitution", func(t *testing.T) {
-		if got := apply(t, "authorization").Facility; got != logging.FacilityLocal0 {
+		if got := apply(t, "security").Facility; got != logging.FacilityLocal0 {
 			t.Errorf("installed client Facility = %d, want FacilityLocal0 (%d) — the warning "+
 				"promises records leave under local0, so that must be what is installed",
 				got, logging.FacilityLocal0)
@@ -783,7 +830,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 	}
 
 	t.Run("unmapped facility warns", func(t *testing.T) {
-		got, er := apply(t, "authorization")
+		got, er := apply(t, "security")
 		// #6829 F2: bind the VALUE on the audit stream — the site this file
 		// calls the worst in the daemon to misroute silently. It has the same
 		// compute/assign split as the host path, so a log-only assertion cannot
@@ -814,7 +861,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 			t.Errorf("the security/audit stream silently mapped an unmappable facility to "+
 				"local0 with no warning — this is the audit path (#5797/#6829). captured:\n%s", got)
 		}
-		if !strings.Contains(got, "authorization") {
+		if !strings.Contains(got, "security") {
 			t.Errorf("the warning must name the unmapped facility. captured:\n%s", got)
 		}
 	})
@@ -838,7 +885,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"audit": {
 				Name: "audit", Host: "no-such-host.invalid.", Port: 514,
-				Facility: "authorization", Severity: "info",
+				Facility: "security", Severity: "info",
 			},
 		}
 		er := logging.NewEventReader(nil, nil)
@@ -854,7 +901,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 				"never told the facility is ALSO unmappable — the one diagnosis that does "+
 				"not need the network up (#6829). captured:\n%s", got)
 		}
-		if !strings.Contains(got, "authorization") {
+		if !strings.Contains(got, "security") {
 			t.Errorf("the warning must name the unmapped facility. captured:\n%s", got)
 		}
 	})
@@ -872,7 +919,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 		cfg := &config.Config{}
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"unmappable": {Name: "unmappable", Host: "192.0.2.10", Port: 514,
-				Facility: "authorization", Severity: "info"},
+				Facility: "security", Severity: "info"},
 			"mapped": {Name: "mapped", Host: "192.0.2.11", Port: 514,
 				Facility: "auth", Severity: "info"},
 		}
