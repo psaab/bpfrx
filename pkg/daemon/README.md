@@ -1798,6 +1798,26 @@ never lock an operator out of a remote box it manages.
       intentionally discarded (`_ =`) — next-boot convergence still covers a
       transient failure there; only the daemon-stop cancel, where next-boot
       convergence does not happen, collects and fails on them.
+    - **Unreadable ownership inventories now reach this closeout (#6798).**
+      The reconcilers above could only report failures they could SEE, and an
+      ownership read that failed was invisible to them: `hasProvenanceMarker`
+      collapsed every `os.ReadFile` error to the same `false` a genuine `ENOENT`
+      produces, `provisionedNames` skipped an unreadable root with a bare
+      `continue`, and `reconcileSudoers` discarded its `ReadDir` error outright
+      (`entries, _ :=`). Each gate then read "could not tell" as "not ours,
+      skip" and returned **nil**, so the closeout — whose entire job is to catch
+      an unconverged host-auth state — was handed a clean result over a removed
+      administrator's still-live password, `authorized_keys`, and passwordless
+      sudo grant. The reads now distinguish **absent** (a determination) from
+      **unreadable** (proves nothing) and return the latter, so
+      `summarizeHostAuthCloseout` attributes it to the owning reconciler
+      (`system-login`, `sudoers`, `absent-login-users`, `root-auth`) and the
+      cancel fails visibly. The gates report **without revoking** — acting on a
+      marker xpf cannot read is #6797's overclaim from the other side, and for
+      root's `authorized_keys` a total lockout — and markers are **retained**, so
+      the debt survives for the next apply instead of being abandoned. See
+      `docs/system-login.md` §"Unreadable ownership inventories are not empty
+      ones (#6798)".
   - **Early signal capture — startup is abortable (#5807).** The shutdown
     signal context is captured at the **TOP of `Run`** (`startupSignalContext`),
     BEFORE the mutating startup phases (config load + bootstrap → interface

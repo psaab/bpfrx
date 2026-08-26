@@ -65,7 +65,7 @@ func TestFailedKeyWriteDoesNotClaimOperatorKeys_6797(t *testing.T) {
 		SSHKeys: []string{"ssh-ed25519 AAAA carol-from-config"},
 	}))
 
-	if keyProvisioned("carol", 1003) {
+	if ownedKey(t, "carol", 1003) {
 		t.Fatalf("a FAILED authorized_keys write left a key-ownership marker "+
 			"(%s). xpf now claims a key file it never wrote, and the emptied-key "+
 			"reconcile will delete the operator's own (#6797)",
@@ -122,7 +122,7 @@ func TestPreExistingKeyClaimSurvivesAFailedRewrite_6797(t *testing.T) {
 	if err := os.WriteFile(keysFile, []byte("ssh-ed25519 AAAA dave-from-xpf\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !keyProvisioned("dave", 1004) {
+	if !ownedKey(t, "dave", 1004) {
 		t.Fatal("test setup: dave should start with a genuine key claim")
 	}
 
@@ -136,7 +136,7 @@ func TestPreExistingKeyClaimSurvivesAFailedRewrite_6797(t *testing.T) {
 		SSHKeys: []string{"ssh-ed25519 AAAA dave-rotated"},
 	}))
 
-	if !keyProvisioned("dave", 1004) {
+	if !ownedKey(t, "dave", 1004) {
 		t.Fatal("a failed REWRITE withdrew a key claim an earlier apply " +
 			"legitimately made; xpf can no longer revoke a key file it owns — " +
 			"the #5841 underclaim, reintroduced (#6797)")
@@ -154,14 +154,14 @@ func TestOwnershipClaimRollbackSemantics_6797(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasProvenanceMarker(dir, "erin", 1005) {
+	if !ownedMarker(t, dir, "erin", 1005) {
 		t.Fatal("claimOwnership did not write the marker")
 	}
 	if fresh.preExisting {
 		t.Error("a first-time claim must not report preExisting")
 	}
 	fresh.rollback()
-	if hasProvenanceMarker(dir, "erin", 1005) {
+	if ownedMarker(t, dir, "erin", 1005) {
 		t.Error("rollback did not withdraw a claim created by this pass")
 	}
 
@@ -177,7 +177,7 @@ func TestOwnershipClaimRollbackSemantics_6797(t *testing.T) {
 		t.Error("a re-claim of an already-owned credential must report preExisting")
 	}
 	again.rollback()
-	if !hasProvenanceMarker(dir, "frank", 1006) {
+	if !ownedMarker(t, dir, "frank", 1006) {
 		t.Error("rollback withdrew a pre-existing claim; that orphans a " +
 			"credential xpf really owns (#5841 underclaim)")
 	}
@@ -195,7 +195,7 @@ func TestOwnershipClaimRollbackSemantics_6797(t *testing.T) {
 		t.Error("a marker for a different UID must not count as prior ownership")
 	}
 	stale.rollback()
-	if hasProvenanceMarker(dir, "gina", 1007) {
+	if ownedMarker(t, dir, "gina", 1007) {
 		t.Error("rollback did not withdraw a claim over a UID-mismatched marker")
 	}
 }
@@ -231,7 +231,7 @@ func TestFailedKeyFileWriteDoesNotClaim_6797(t *testing.T) {
 		SSHKeys: []string{"ssh-ed25519 AAAA helen-from-config"},
 	}))
 
-	if keyProvisioned("helen", 1008) {
+	if ownedKey(t, "helen", 1008) {
 		t.Fatalf("a FAILED authorized_keys WRITE left a key-ownership marker; " +
 			"the mkdir-failure rollback is not enough on its own (#6797)")
 	}
@@ -258,7 +258,7 @@ func TestFailedRootKeyWriteDoesNotClaim_6797(t *testing.T) {
 	d := &Daemon{}
 	_ = d.applyRootAuth(rootAuthCfg("", "ssh-ed25519 AAAAROOT root@host"))
 
-	if keyProvisioned("root", 0) {
+	if ownedKey(t, "root", 0) {
 		t.Fatalf("a FAILED root authorized_keys write left a key-ownership " +
 			"marker; a later empty key list would then remove root's key file " +
 			"— including an operator-installed one (#6797)")
@@ -301,12 +301,12 @@ func TestFailedChpasswdDoesNotClaimPassword_6797(t *testing.T) {
 		EncryptedPassword: config.Secret("$6$salt$xpfhash"),
 	}))
 
-	if passwordProvisioned("ivan", 1009) {
+	if ownedPassword(t, "ivan", 1009) {
 		t.Errorf("a FAILED chpasswd left a password-ownership marker; removing " +
 			"the directive later would LOCK an account whose password xpf " +
 			"never set (#6797)")
 	}
-	if xpfProvisioned("ivan", 1009) {
+	if ownedAccount(t, "ivan", 1009) {
 		t.Errorf("a FAILED chpasswd left an account-registry marker; xpf claims " +
 			"to manage an account it never provisioned (#6797)")
 	}
@@ -335,7 +335,7 @@ func TestPreExistingPasswordClaimSurvivesAFailedChpasswd_6797(t *testing.T) {
 		EncryptedPassword: config.Secret("$6$salt$rotated"),
 	}))
 
-	if !passwordProvisioned("judy", 1010) {
+	if !ownedPassword(t, "judy", 1010) {
 		t.Error("a failed password ROTATION withdrew a claim an earlier apply " +
 			"legitimately made; xpf can no longer lock a password it set — the " +
 			"#5841 underclaim, reintroduced (#6797)")
@@ -358,11 +358,11 @@ func TestFailedRootSSHDirDoesNotClaim_6797(t *testing.T) {
 	d := &Daemon{}
 	_ = d.applyRootAuth(rootAuthCfg("", "ssh-ed25519 AAAAROOT root@host"))
 
-	if keyProvisioned("root", 0) {
+	if ownedKey(t, "root", 0) {
 		t.Errorf("a FAILED /root/.ssh creation left a root key-ownership " +
 			"marker (#6797)")
 	}
-	if xpfProvisioned("root", 0) {
+	if ownedAccount(t, "root", 0) {
 		t.Errorf("a FAILED /root/.ssh creation left a root account-registry " +
 			"marker (#6797)")
 	}
@@ -393,7 +393,7 @@ func TestAccountMarkerFailureWithdrawsThePasswordClaim_6797(t *testing.T) {
 		EncryptedPassword: config.Secret("$6$salt$xpfhash"),
 	}))
 
-	if passwordProvisioned("karl", 1011) {
+	if ownedPassword(t, "karl", 1011) {
 		t.Errorf("the password claim survived an aborted apply: the account " +
 			"marker could not be written, so chpasswd never ran, yet xpf still " +
 			"claims to own this password (#6797)")
