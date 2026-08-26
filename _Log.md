@@ -105066,8 +105066,6 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
-<<<<<<< HEAD
-
 - **Timestamp**: 2026-08-23
 - **Action**: #5841 writes the resource ownership markers BEFORE the credential
   mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
@@ -105082,8 +105080,6 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
-=======
->>>>>>> origin/master
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
 
 - **Timestamp**: 2026-08-23
@@ -105141,7 +105137,6 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
 
-<<<<<<< HEAD
 ## 2026-08-26 — #6803: a management listener that dies is now rebound at the same endpoint
 
 - **Timestamp**: 2026-08-26
@@ -105191,7 +105186,7 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/mgmt_listener_reassert_6803_test.go`,
   `pkg/api/reconcile_http_dead_leg_6803_test.go`, `pkg/daemon/README.md`,
   `pkg/api/README.md`, `_Log.md`
-=======
+
 ## 2026-08-26 — CLAUDE.md: a Required Reading index
 
 - **Timestamp**: 2026-08-26
@@ -105211,7 +105206,6 @@ prose edit above them added. No diff falls in the new test body.
   with the point that sub-agents inherit the file but not the reasoning, so a
   dispatch brief should name the specific documents its task touches.
 - **File(s)**: `CLAUDE.md`, `_Log.md`
->>>>>>> origin/master
 
 ## 2026-08-26 — #6803 follow-up: dampen the re-assert owner's per-tick logging
 
@@ -105231,3 +105225,36 @@ prose edit above them added. No diff falls in the new test body.
   that actually brought the listener back, not on one that merely returned nil.
 - **File(s)**: `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon.go`,
   `pkg/daemon/mgmt_listener_reassert_6803_test.go`, `_Log.md`
+
+## 2026-08-26 — `_Log.md` carried six committed conflict markers; add a repo-wide sweep
+
+- **Timestamp**: 2026-08-26
+- **Action**: Union-resolve two merge-conflict blocks that were COMMITTED into
+  `_Log.md` on master, and add `pkg/refactoraudit/conflict_markers_test.go` so a
+  marker can never sit in a tracked file again.
+- **Why**: master carried six marker lines across two blocks. Both arrived the
+  same way — a `git merge` conflicted, the conflict was not checked, and a
+  `git add -A` staged the marker-laden file. One of the two had an EMPTY
+  "theirs" side, so an entire #6797 log entry sat inside a conflict block. I
+  authored the second block myself, in the #6803 dampening commit, by doing
+  exactly that.
+- **Why nothing caught it**: `_Log.md` is prose. No compiler, linter or test
+  reads it, so a marker is invisible to `go test ./...`. A marker in a SOURCE
+  file breaks the build loudly — the real exposure is docs, prose, configs,
+  fixtures and goldens, which is where one can sit indefinitely.
+- **The sweep**: over `git ls-files`, not a filesystem walk — this repo keeps
+  ~140 git worktrees under `.claude/wt-*` and a walk would descend into every
+  one, scanning other branches' trees. Anchored at line start, because an
+  unanchored search false-positives on prose ABOUT markers, which `_Log.md` is
+  full of. `=======` counts only when the line is EXACTLY seven equals, since
+  Markdown uses it as a setext underline and an ASCII rule.
+- **The needles are assembled at runtime**, not written as literals: a gate that
+  greps for a string must not contain that string, or it is the permanent first
+  hit of its own sweep and the only way to stay green is an exemption that also
+  hides real markers.
+- **Two anti-vacuity floors** (`len(files) >= 100`, `scanned >= 100`) plus a
+  sensitivity control that drives the same predicate over a synthetic conflicted
+  document and over the prose forms that must stay quiet. Verified paired: run
+  against the PRE-FIX `_Log.md` the gate REDs; against the fixed one it passes,
+  sweeping 7007 tracked text files.
+- **File(s)**: `_Log.md`, `pkg/refactoraudit/conflict_markers_test.go` (new)
