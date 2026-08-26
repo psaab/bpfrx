@@ -105261,3 +105261,23 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/daemon_apply_dataplane.go`,
   `pkg/daemon/ri_member_late_bind_6805_test.go` (new), `pkg/routing/README.md`,
   `_Log.md`
+
+## 2026-08-26 — the #7614 marker gate caught its own author, and a stage-dedup bug
+
+- **Timestamp**: 2026-08-26
+- **Action**: Dedupe `git ls-files` output in
+  `pkg/refactoraudit/conflict_markers_test.go`.
+- **How it surfaced**: while gating #6805 I chained `git merge origin/master`
+  into the gate with `&&` and piped the merge's output through `tail -3`. The
+  pipe LAUNDERED the merge's exit status, so the `&&` saw success, the gate ran
+  on a conflicted tree, and `git add -A` would have committed the markers — the
+  exact sequence that put six of them on master earlier today, and which I had
+  already written down as a rule. The gate added hours before caught it, on its
+  author, before it reached master. That is the whole argument for the gate.
+- **The bug it exposed in the gate itself**: `git ls-files` returns ONE ROW PER
+  STAGE for an unmerged path, so during a conflicted merge the very file the
+  gate is about appears three times and every finding in it is reported three
+  times over — 3 real markers rendered as 9 findings. Exactly the moment the
+  output most needs to be readable, and a tripled list reads like three separate
+  defects. Deduped by path.
+- **File(s)**: `pkg/refactoraudit/conflict_markers_test.go`, `_Log.md`
