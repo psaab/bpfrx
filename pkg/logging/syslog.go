@@ -82,6 +82,12 @@ const (
 	FacilityLocal5 = 21
 	FacilityLocal6 = 22
 	FacilityLocal7 = 23
+	// #6830: RFC 5424 §6.2.1 facility codes for the two Junos facility names
+	// whose documented remote-destination facility is themselves and which had
+	// no constant here. Declared with the table below; NOT yet emitted — see
+	// JunosRemoteFacility for why the wire is unchanged.
+	FacilityFTP = 11
+	FacilityNTP = 12
 )
 
 // SyslogClient sends syslog messages over UDP, TCP, or TLS.
@@ -987,6 +993,89 @@ func ParseFacilityChecked(name string) (int, bool) {
 	default:
 		return FacilityLocal0, false
 	}
+}
+
+// junosRemoteFacility is the DOCUMENTED Junos facility→wire mapping for
+// messages directed to a remote destination (#6830).
+//
+// This is a LOOKUP, not a judgement. Junos publishes it, and the two rules
+// together cover the whole `[edit system syslog]` vocabulary:
+//
+//  1. "Table 3: Default Facilities for Messages Directed to a Remote
+//     Destination" lists the six Junos-SPECIFIC facilities whose names a
+//     standard syslogd cannot interpret, each with a localX stand-in:
+//     change-log→local6, conflict-log→local5, dfc→local1, firewall→local3,
+//     interactive-commands→local7, pfe→local4.
+//  2. "For facilities that are not listed, the default alternative name is
+//     the same as the local facility name" — so authorization, daemon, ftp,
+//     kernel, ntp and user go out as themselves.
+//
+// The repository already implemented ONE row of this table, `change-log` →
+// local6 in ParseFacility, which is exactly Table 3's value. The table was
+// consulted once and never finished; the remaining names fall through
+// ParseFacility's `default:` to local0.
+//
+// NOTE THE SPELLINGS. Junos writes `authorization` and `kernel`; ParseFacility
+// recognizes the BSD spellings `auth` and `kern`. An operator configuring this
+// box as the Junos clone it is therefore gets local0 for the two most obvious
+// facilities in the vocabulary.
+//
+// THIS FUNCTION DOES NOT CHANGE THE WIRE. Nothing calls it from the emit path.
+// It exists so the diagnostic can tell an operator what Junos WOULD send —
+// which is actionable today — while the decision to actually change what
+// leaves the box stays open (#6830): for a name that is silently local0 today,
+// emitting the documented facility MOVES records for any collector already
+// bucketing them on local0. That is an upgrade-visible contract change and is
+// deliberately not made here.
+var junosRemoteFacility = map[string]int{
+	// Table 3 — Junos-specific names with a localX stand-in.
+	"change-log":           FacilityLocal6,
+	"conflict-log":         FacilityLocal5,
+	"dfc":                  FacilityLocal1,
+	"firewall":             FacilityLocal3,
+	"interactive-commands": FacilityLocal7,
+	"pfe":                  FacilityLocal4,
+	// Not listed in Table 3 — "the default alternative name is the same as the
+	// local facility name".
+	"authorization": FacilityAuth,
+	"daemon":        FacilityDaemon,
+	"ftp":           FacilityFTP,
+	"kernel":        FacilityKern,
+	"ntp":           FacilityNTP,
+	"user":          FacilityUser,
+}
+
+// JunosRemoteFacility reports the facility Junos would put on the wire for a
+// `[edit system syslog]` facility name directed to a remote destination, and
+// whether name is in that vocabulary at all (#6830).
+//
+// It distinguishes the two cases the current diagnostic cannot tell apart:
+//
+//   - a real Junos facility this box does not yet map (junos=true) — the
+//     operator wrote valid Junos and the records are misfiled;
+//   - a name in neither vocabulary (junos=false) — a typo, where local0 is a
+//     substitution for something that means nothing.
+//
+// `any` is deliberately absent: it names no facility (see FacilityIsWildcard).
+func JunosRemoteFacility(name string) (int, bool) {
+	code, ok := junosRemoteFacility[name]
+	return code, ok
+}
+
+// FacilityMisfiled reports that name is a valid Junos syslog facility whose
+// records this box currently forwards under a DIFFERENT facility than Junos
+// would (#6830), and returns the two codes.
+//
+// It is the predicate the operator diagnostic keys on, so a name xpf already
+// maps correctly (change-log, daemon, user) never warns, and a typo is
+// reported as a typo rather than as a mapping gap.
+func FacilityMisfiled(name string) (emitted, junos int, misfiled bool) {
+	want, isJunos := JunosRemoteFacility(name)
+	if !isJunos {
+		return ParseFacility(name), 0, false
+	}
+	got := ParseFacility(name)
+	return got, want, got != want
 }
 
 // FacilityIsWildcard reports whether name is the Junos "all facilities"

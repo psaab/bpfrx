@@ -1091,10 +1091,31 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 			// facility on purpose — warning about it is a false alarm on a
 			// correct config.
 			if !known && !logging.FacilityIsWildcard(raw) {
-				slog.Warn("system syslog: unmapped facility name; local0 selected — if this "+
-					"host's client is installed, its records will carry a facility the "+
-					"configuration does not name (#5797)",
-					"host", host.Address, "facility", raw, "using", "local0")
+				// #6830: say WHICH facility is wrong and what the right answer
+				// is, not just that a substitution happened. Junos publishes
+				// the mapping, so for a real Junos facility name the warning
+				// can name the target — which is the difference between an
+				// operator knowing something is off and knowing what to do.
+				// A name in neither vocabulary is a typo and is reported as
+				// one; conflating the two sent an operator looking for a
+				// mapping bug when they had a spelling mistake, and vice
+				// versa.
+				if emitted, junos, misfiled := logging.FacilityMisfiled(raw); misfiled {
+					slog.Warn("system syslog: MISFILED facility — this is a valid Junos "+
+						"facility that Junos forwards under a different code than this "+
+						"box currently emits, so records arrive correctly delivered but "+
+						"attributed to the wrong facility; a collector bucketing on "+
+						"facility files them in the wrong bucket (#6830)",
+						"host", host.Address, "facility", raw,
+						"emitted_code", emitted, "junos_code", junos)
+				} else {
+					slog.Warn("system syslog: unrecognized facility name; local0 selected — "+
+						"this name is not in the Junos `[edit system syslog]` vocabulary "+
+						"either, so it is most likely a typo. If this host's client is "+
+						"installed, its records will carry a facility the configuration "+
+						"does not name (#5797)",
+						"host", host.Address, "facility", raw, "using", "local0")
+				}
 			}
 			facility = f
 

@@ -479,18 +479,51 @@ func TestApplySystemSyslogWarnsOnUnmappedFacility_5797(t *testing.T) {
 		return buf.String()
 	}
 
-	// A Junos facility name the runtime cannot map: the substitution to local0
-	// must be reported.
-	for _, facility := range []string{"authorization", "kernel", "interactive-commands", "typo"} {
+	// A facility name the runtime cannot map: the substitution to local0 must be
+	// reported.
+	//
+	// #6830 SPLIT THE MESSAGE, NOT THE PROPERTY. This used to pin the literal
+	// "unmapped facility name" for every case. The warning now discriminates a
+	// real Junos facility this box misfiles from a name in neither vocabulary,
+	// because those need different operator actions — so the assertion moves
+	// from one literal to "warned, named the facility, and CLASSIFIED it
+	// correctly", which is strictly stronger than what it replaced.
+	for _, tc := range []struct {
+		facility string
+		// junos is true for a name in the Junos `[edit system syslog]`
+		// vocabulary that this box does not yet map to Junos's wire facility.
+		junos bool
+	}{
+		{"authorization", true},
+		{"kernel", true},
+		{"interactive-commands", true},
+		{"typo", false},
+	} {
+		facility := tc.facility
 		t.Run("unmapped/"+facility, func(t *testing.T) {
 			got := apply(t, facility)
-			if !strings.Contains(got, "unmapped facility name") {
+			if !strings.Contains(got, "MISFILED facility") &&
+				!strings.Contains(got, "unrecognized facility name") {
 				t.Errorf("host facility %q silently became local0 with no warning; records leave "+
 					"under a facility the configuration never names (#5797). captured:\n%s",
 					facility, got)
 			}
 			if !strings.Contains(got, facility) {
 				t.Errorf("the warning must name the unmapped facility %q. captured:\n%s", facility, got)
+			}
+			// #6830: the classification itself. Telling an operator "unmapped"
+			// when they wrote valid Junos sends them looking for a typo, and
+			// telling them "misfiled" when they made one sends them looking for
+			// a mapping bug. Each wastes the operator in the opposite
+			// direction, so the discrimination is the point.
+			if tc.junos && !strings.Contains(got, "MISFILED facility") {
+				t.Errorf("%q is a valid Junos syslog facility this box misfiles, but the "+
+					"warning does not say so — an operator who wrote correct Junos is "+
+					"told they made a typo (#6830). captured:\n%s", facility, got)
+			}
+			if !tc.junos && !strings.Contains(got, "unrecognized facility name") {
+				t.Errorf("%q is in NEITHER vocabulary and must be reported as a probable "+
+					"typo, not as a mapping gap (#6830). captured:\n%s", facility, got)
 			}
 		})
 	}
@@ -559,7 +592,10 @@ func TestApplySystemSyslogWarnsWhenClientDialFails_6829(t *testing.T) {
 		t.Fatalf("premise broken: the client was expected to FAIL construction so the "+
 			"ordering matters; captured:\n%s", got)
 	}
-	if !strings.Contains(got, "unmapped facility name") {
+	// #6830: `authorization` is a real Junos facility, so it takes the MISFILED
+	// arm; the property under test is unchanged (the classification must not sit
+	// behind the dial).
+	if !strings.Contains(got, "MISFILED facility") {
 		t.Errorf("the unmapped-facility warning was lost because the client could not be "+
 			"constructed — classification must not sit behind the dial (#6829). The "+
 			"operator with an unreachable collector is the one who most needs to be "+
