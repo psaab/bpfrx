@@ -354,11 +354,19 @@ func (m *Manager) flushStaleBPFStateOnCtrlEnableLocked() {
 	// the userspace helper's own session table (Rust SessionTable +
 	// shared_sessions) is authoritative.
 	//
-	// session_value layout: State[1]+Flags[1]+TCPState[1]+
-	// IsReverse[1]+AppTimeout[4]+SessionID[8]+Created[8].
-	// Created is at byte offset 16. The value is seconds since
-	// boot (bpf_ktime_get_coarse_ns / 1e9). ctrlDisabledAt is
-	// nanoseconds, so convert to seconds for comparison.
+	// #6816: the `Created` offset is DERIVED from the Go struct that mirrors the
+	// C ABI (dataplane.SessionValueCreatedOffset), not written down here.
+	//
+	// It used to be the literal 16, justified by an in-comment sum
+	// "State(1)+Flags(1)+TCPState(1)+IsReverse(1)+AppTimeout(4)+SessionID(8)=16"
+	// that was wrong twice over: `Flags` has been a uint16 since #5460, and the
+	// struct carries three explicit padding gaps (#6082) the sum omits. SessionID
+	// is at 16 and Created at 24 — so this read a SESSION ID and compared it
+	// against a seconds-since-boot cutoff, and the "keep synced sessions" branch
+	// decided on a number that is not a timestamp.
+	//
+	// The value is seconds since boot (bpf_ktime_get_coarse_ns / 1e9);
+	// ctrlDisabledAt is nanoseconds, so convert to seconds for comparison.
 	cutoffSec := m.ctrlDisabledAt / 1_000_000_000
 	for _, mapName := range []string{"sessions", "sessions_v6"} {
 		if ctMap := m.bpfShim.Map(mapName); ctMap != nil {
@@ -374,13 +382,13 @@ func (m *Manager) flushStaleBPFStateOnCtrlEnableLocked() {
 					break
 				}
 				copy(key, nextKey)
-				// Read session value to check Created timestamp.
-				// Created is at byte offset 16:
-				//   State(1) + Flags(1) + TCPState(1) + IsReverse(1)
-				//   + AppTimeout(4) + SessionID(8) = 16
+				// Read session value to check the Created timestamp, at the
+				// offset the ABI struct actually puts it at (#6816).
 				if cutoffSec > 0 {
-					if err := ctMap.Lookup(key, val); err == nil && len(val) >= 24 {
-						created := binary.NativeEndian.Uint64(val[16:24])
+					end := dataplane.SessionValueCreatedOffset + 8
+					if err := ctMap.Lookup(key, val); err == nil && len(val) >= end {
+						created := binary.NativeEndian.Uint64(
+							val[dataplane.SessionValueCreatedOffset:end])
 						if created > 0 && created <= cutoffSec {
 							kept++
 							continue // synced session — keep it
