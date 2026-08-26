@@ -106326,3 +106326,6 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6824 — convert the 68 `strings.Contains` render assertions in
     ipsec_test.go to structural checks
   - **File(s)**: pkg/ipsec/ipsec_test.go
+  - **Action**: #6824 — add the AST guard that fails on new swanctl-syntax
+    containment needles, with its own sensitivity control
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go (new)
