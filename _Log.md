@@ -26,7 +26,7 @@
   Corrected every permit-all claim in place. Deliberately did NOT change the
   #2473/#2490/#2539 undefined-reference guards, whose drop PRODUCES the
   permit-all they were written to prevent — that is a behaviour choice about
-  configs that should not exist; filed separately, comments corrected so nobody
+  configs that should not exist; filed as #7625, comments corrected so nobody
   re-derives intent from the old sentence.
 - **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/protocols_render.go`,
   `pkg/frr/bgp_policy_chain.go`, `pkg/frr/frr_test.go`,

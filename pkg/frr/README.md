@@ -290,8 +290,8 @@ The `#2473`/`#2490`/`#2539` guards drop a reference to an **undefined**
 permit-all — the leak those guards were written to prevent. Their behaviour
 is **unchanged** here: whether an undefined reference should deny is a
 behaviour choice about configs that should not exist, distinct from #6807's
-case where the policy IS authored and the RENDERER omitted it. Tracked
-separately; the comments at those sites now state the real direction so no
+case where the policy IS authored and the RENDERER omitted it. Tracked as
+**#7625**; the comments at those sites now state the real direction so no
 one re-derives intent from the old sentence.
 
 ## Gotchas

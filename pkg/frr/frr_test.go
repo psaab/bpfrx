@@ -843,7 +843,7 @@ func TestGenerateProtocols_BGPImportMostSpecificWins(t *testing.T) {
 // backwards. bgp_input_modifier returns RMAP_DENY for an unresolvable name
 // (stable/10.6), so the dangling in-line would DENY all inbound, and it is the
 // absent attachment this guard produces that accepts everything. The guard's
-// BEHAVIOUR is deliberately unchanged (see filterDefinedPolicies); only the
+// BEHAVIOUR is deliberately unchanged (that decision is #7625); only the
 // claim is corrected. Do not "fix" the direction from the old sentence.
 // Fail-on-revert: dropping the isDefinedPolicyStatement guard makes the
 // dangling in-line appear.

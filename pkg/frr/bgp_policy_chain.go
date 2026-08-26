@@ -68,7 +68,8 @@ func hasNonEmptyPolicy(names []string) bool {
 // claim: dropping the reference is what yields permit-all, and emitting it
 // would deny. The drop is LEFT AS IS here — changing it is a behaviour choice
 // for an undefined (never-authored) policy, tracked separately — but do not
-// re-derive intent from the old sentence. #6807 fixes the sibling case where
+// re-derive intent from the old sentence. Tracked as #7625. #6807 fixes the
+// sibling case where
 // the policy IS authored and the RENDERER omitted it (an over-ceiling
 // expansion): there the name is now defined by a bounded explicit deny rather
 // than left to dangle.

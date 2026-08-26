@@ -434,8 +434,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// and silently accept every inbound advertisement" — is backwards. FRR
 		// stable/10.6 bgp_input_modifier returns RMAP_DENY for an unresolvable
 		// name; it is the ABSENT attachment this skip produces that accepts
-		// everything. Behaviour unchanged here (see filterDefinedPolicies for
-		// why that is a separate decision); the claim is corrected so nobody
+		// everything. Behaviour unchanged here (that decision is #7625); the
+		// claim is corrected so nobody
 		// reasons from it. Every DEFINED entry is
 		// preserved as an ordered CHAIN and composed in order (#5277); the
 		// pre-#5277 code kept only the last, silently dropping a leading inbound
