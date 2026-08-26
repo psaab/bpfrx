@@ -240,3 +240,56 @@ func readDaemonSourceFile6805(t *testing.T, name string) string {
 	}
 	return string(b)
 }
+
+// TestStep0aStillBindsAnExistingMember6805 keeps the EARLY pass load-bearing.
+//
+// It exists because the mutation matrix found it was not: deleting step 0a's
+// call left the whole package green, since the late pass re-drives the same loop
+// in the same apply and every other cell here is satisfied by that.
+//
+// 0a is not redundant, and the reason is the CLAIM rather than the bind. The
+// tunnel manager's observation (`reconcileVRFClaimLocked` case 2, via
+// `observeListClaimLocked`) runs during `applyInterfaceReconcile` — BETWEEN 0a
+// and the late pass — and takes the `appliedRI` claim only when the link's
+// master already IS `vrf-<RIListMember>`. For a member that ALREADY EXISTS at
+// 0a time (a physical NIC, or a tunnel from a previous apply), 0a is what puts
+// that master there in time to be observed. Without it the observation finds no
+// master, no claim is recorded, and a later "config wants no RI" has nothing to
+// identity-gate its unbind against.
+//
+// So the two passes are not interchangeable even though they call one function:
+// 0a is early enough to be observed, the late pass is late enough to see
+// devices 0a could not. This cell pins the first half; M1's wiring cell pins the
+// second.
+//
+// FAIL-ON-REVERT: delete the d.bindRoutingInstanceMembers(cfg) call from
+// applyVRFReconcile and this reds, while every other cell in the file stays
+// green — which is exactly what the matrix measured before it was added.
+func TestStep0aStillBindsAnExistingMember6805(t *testing.T) {
+	ops := &bindRecorderOps{reconcileFakeLinkOps: newReconcileFakeLinkOps()}
+	d := &Daemon{routing: routing.NewManagerWithLinkOpsForTest(ops)}
+	cfg := listOnlyCfg6805()
+
+	// The member ALREADY EXISTS — a physical NIC, or a tunnel from a previous
+	// apply. This is the case 0a owns and the late pass cannot substitute for,
+	// because the tunnel manager's observation runs between them.
+	addLink6805(ops, "gr-0-0-0")
+
+	if _, vrfErr := d.applyVRFReconcile(context.Background(), cfg); vrfErr != nil {
+		t.Fatalf("applyVRFReconcile vrfErr = %v, want nil", vrfErr)
+	}
+
+	var bound bool
+	for _, b := range ops.recorded() {
+		if b == "gr-0-0-0->vrf-blue" {
+			bound = true
+		}
+	}
+	if !bound {
+		t.Fatalf("step 0a did not bind a member that already exists; the tunnel "+
+			"manager's observation runs BEFORE the late pass, so it would find no "+
+			"master, record no appliedRI claim, and leave a later config-wants-no-RI "+
+			"unbind with nothing to identity-gate against (#6805). binds seen: %v",
+			ops.recorded())
+	}
+}
