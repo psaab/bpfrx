@@ -1968,6 +1968,39 @@ never lock an operator out of a remote box it manages.
   `TestNftDeleteTable*IdempotentAddDelete` payload-shape tests) — do NOT delete
   them while the parity CI depends on them; production no longer calls them.
 
+- **A narrowing token that will not resolve must never be DROPPED from an
+  lo0 term (#6806).** Both lo0 renderers — the netlink builder
+  (`pkg/nftables/netlink_lo0.go`) and the `buildLo0FilterPayload` text
+  oracle below — used to resolve `from protocol` and `from icmp-type` /
+  `icmp-code` per token and skip the ones that failed. An ALL-unresolvable
+  list emptied the slice, the `len(...) > 0` guard emitted no predicate, and
+  the term matched every protocol / every ICMP type in its scope; a
+  PARTIALLY-unresolvable list built the rule from a narrowed subset, so a
+  `discard` term stopped denying what it could not resolve. Both now fail
+  closed: the netlink builder errors the plan, and the oracle keeps the raw
+  token so `nft -f -` rejects the ruleset — the posture ports/DSCP (#6405)
+  and addresses (#6512) already had.
+
+  Two things about this are easy to get wrong on the next pass:
+
+  - **The two dimensions arrive by different channels.** Protocol reaches
+    the builder as a RAW string, so the builder detects it. ICMP reaches it
+    already RESOLVED to `[]int`, so an unresolvable token leaves NO trace
+    and needs the `ICMPTypeUnrepresentable` / `ICMPCodeUnrepresentable`
+    markers carried by `toNftLo0Term`. A fix that only hardened the
+    resolver would have closed protocol and left ICMP wide open.
+  - **Renderer AGREEMENT is not the property to test.** Before the fix both
+    renderers dropped the token, so they agreed perfectly while both were
+    fail-open — an equality/parity check between them could never have
+    caught this, and the T1 parity CI did not. What must hold is that
+    neither mirror loses the refusal evidence at its own boundary.
+
+  Reachable only from the tolerant load / peer-sync / mixed-version paths
+  (#1960) — strict commit rejects these tokens — which is exactly where the
+  userspace mirror hands the raw token to the Rust filter compiler and it
+  refuses the whole snapshot. A kernel term that widens while userspace
+  refuses the same filter is a mode-dependent fail-open.
+
 - lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
   <name>`) lock down host-bound/control-plane traffic via an nftables table
   `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` installs the table via the

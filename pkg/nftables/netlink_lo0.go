@@ -75,6 +75,27 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 		return
 	}
 
+	// #6806: an `icmp-type` / `icmp-code` token the compiler could not resolve to
+	// a byte is recorded on config.FirewallFilterTerm.UnknownICMPTypes /
+	// UnknownICMPCodes and carried here as these markers. Unlike an unresolvable
+	// protocol or address the raw token does NOT reach this builder — ICMPTypes /
+	// ICMPCodes carry only the RESOLVED bytes — so the marker is the only way the
+	// mirror can see it, exactly like the #6463 AddressUnrepresentable channel.
+	//
+	// Without it, an all-unresolvable list left the resolved slice empty, the
+	// `len(t.ICMPTypes) > 0` guard in applyMatches emitted no predicate, and the
+	// term matched EVERY ICMP type in its scope. The userspace mirror sets the
+	// identically-named ICMPTypeUnrepresentable / ICMPCodeUnrepresentable
+	// (pkg/dataplane/userspace/filters.go) and the Rust filter compiler fails the
+	// whole snapshot closed, so failing the plan here is what keeps the two
+	// dataplanes from enforcing different policy on the same config (#3406).
+	if t.ICMPTypeUnrepresentable || t.ICMPCodeUnrepresentable {
+		p.fail(fmt.Errorf("lo0 filter term %q: unrepresentable icmp-type/icmp-code "+
+			"(type_unrepresentable=%t code_unrepresentable=%t)",
+			t.Name, t.ICMPTypeUnrepresentable, t.ICMPCodeUnrepresentable))
+		return
+	}
+
 	// applyMatches appends every match predicate (in oracle order) to a rule
 	// assembler; it does NOT append the tcp-flags predicate when fail-closed.
 	tcpFailClosed := false
@@ -127,8 +148,16 @@ func buildLo0TermNetlink(p *nlPlan, t Lo0FilterTerm, f nlFamily) {
 		if len(dstAddrs) > 0 {
 			a.daddr(f, dstAddrs, t.DstExcept)
 		}
-		if protos := lo0Protocols(t.Protocols); len(protos) > 0 {
-			a.l4protoSet(protos)
+		if len(t.Protocols) > 0 {
+			// #6806: an unresolvable protocol token fails the plan CLOSED, the
+			// same posture as ports (#6405), DSCP (#6405) and addresses (#6512)
+			// immediately around it. Dropping the predicate widened the term.
+			protos, err := lo0Protocols(t.Protocols)
+			if err != nil {
+				a.p.fail(fmt.Errorf("lo0 filter term %q protocol: %w", t.Name, err))
+			} else if len(protos) > 0 {
+				a.l4protoSet(protos)
+			}
 		}
 		addPorts(a, t.SourcePorts, "sport", false)
 		addPorts(a, t.DestinationPorts, "dport", false)
@@ -326,17 +355,38 @@ func filterFamilyAddrs(f nlFamily, addrs []string) ([]string, error) {
 }
 
 // lo0Protocols mirrors the #3436 numeric protocol lowering: resolve each Junos
-// protocol token through appid.ProtocolNumber, dropping unresolvable tokens.
-func lo0Protocols(tokens []string) []uint8 {
+// protocol token through appid.ProtocolNumber.
+//
+// #6801-sibling / #6806: an unresolvable token returns a non-nil error so the
+// caller FAILS THE PLAN CLOSED, exactly like lo0DSCPs and parsePortTokens.
+// It used to be DROPPED with a warning, which is the fail-open this closes:
+//
+//   - ALL tokens unresolvable -> the resolved slice is empty -> the caller's
+//     `len(protos) > 0` guard emits NO l4proto predicate at all, so a term
+//     written to admit one protocol admits EVERY protocol in its scope.
+//   - SOME tokens unresolvable -> the rule is built from a NARROWED subset of
+//     what the operator authored, which is wrong in the other direction for a
+//     discard/reject term (traffic on the dropped protocol is no longer denied
+//     and falls through).
+//
+// A token outside the SSOT cannot reach a committed config — the strict gate
+// (validateFilterMatchValuesStrict) rejects it — but it reaches here from the
+// tolerant load / peer-sync / mixed-version paths (#1960), which is exactly
+// where the two dataplanes must not diverge: the userspace mirror hands the
+// RAW token to the Rust filter compiler, which rejects the whole snapshot and
+// keeps its last-good policy (pkg/dataplane/userspace/filters.go). Silently
+// widening the kernel term while userspace refuses the same filter is the
+// mode-dependent fail-open this issue is about.
+func lo0Protocols(tokens []string) ([]uint8, error) {
 	out := make([]uint8, 0, len(tokens))
 	for _, tok := range tokens {
-		if n, ok := appid.ProtocolNumber(tok); ok {
-			out = append(out, n)
-		} else {
-			slog.Warn("dropping unresolvable protocol from lo0 netlink term", "protocol", tok)
+		n, ok := appid.ProtocolNumber(tok)
+		if !ok {
+			return nil, fmt.Errorf("unresolvable protocol %q", tok)
 		}
+		out = append(out, n)
 	}
-	return out
+	return out, nil
 }
 
 // lo0DSCPs mirrors nftDSCPValue: resolve each DSCP token to a numeric codepoint
