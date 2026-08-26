@@ -567,6 +567,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.raDeadSenderReassertLoop(ctx)
 	}()
 
+	// #6803: the always-on retry owner for a management listener whose serve
+	// loop exited unexpectedly. Started unconditionally, alongside the proxy-ARP
+	// and RA re-assert loops and for the same reason: the ONLY caller of
+	// reconcileWebManagement is applyConfigLocked, so before this the endpoint
+	// came back only when an operator happened to commit — on a box whose
+	// management API had just died, which is the box they can no longer reach to
+	// commit from. The gate is a state read on the reconciler, so the loop is
+	// free on a node whose listeners are healthy and a no-op with no reconciler
+	// at all.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.mgmtListenerReassertLoop(ctx)
+	}()
+
 	// #6791: the always-on retry owner for a fabric IPVLAN overlay whose
 	// creation failed. Started unconditionally, alongside the proxy-ARP and RA
 	// re-asserts and for the same reason: BOTH standalone and cluster nodes

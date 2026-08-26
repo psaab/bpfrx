@@ -466,7 +466,23 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 
 	// HTTP leg: make-before-break rebind ONLY if the HTTP bind changed. Advance
 	// the converged fingerprint only on success (retry debt on failure).
-	if next.Addr != m.cur.addr {
+	//
+	// The `!HTTPServing()` disjunct is the HTTP counterpart of the HTTPS
+	// liveness check below, and it was missing (#6803). The fingerprint records
+	// what the last SUCCESSFUL reconcile bound; it is not evidence the socket is
+	// still up. An unexpected serve exit marks the leg dead and leaves it
+	// installed, so `next.Addr != m.cur.addr` was FALSE on every later commit,
+	// ReconcileHTTP was never called, and the REST/management API stayed down
+	// until a daemon restart even though the operator's configuration never
+	// changed — the identical defect #6827 round 6 fixed for HTTPS, on the leg
+	// that fix did not touch.
+	//
+	// The liveness disjunct is gated on a NON-EMPTY desired address so this stays
+	// strictly ADDITIVE: the original `next.Addr != m.cur.addr` arm is untouched
+	// (an empty desired address still reaches ReconcileHTTP and still surfaces its
+	// refusal), and the new arm only fires where something was actually asked to
+	// serve. Not-serving is a defect only when a bind was requested.
+	if next.Addr != m.cur.addr || (next.Addr != "" && !m.srv.HTTPServing()) {
 		// Record the attempted bind so `show system services` reports the address
 		// a boot-failed listener is retrying, not the one it failed at boot (#6401).
 		m.lastHTTPAttempt = next.Addr
