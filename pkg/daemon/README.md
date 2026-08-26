@@ -2239,11 +2239,30 @@ never lock an operator out of a remote box it manages.
   inside-the-semaphore re-read; loop ticks + ctx cancel; a loop-START cell
   asserting `Run` launches it unconditionally; and the accessor + metric-wiring
   cells below).
+  **sshd is the third instance, and the one the "already covered" reading
+  misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's
+  `revertDropIn` restores the prior content on a failed reload, so the file no
+  longer matches desired and the next apply rewrites and reloads. The REMOVAL
+  path has nothing to revert TO — the drop-in is DELETED, the reload then fails,
+  and every later apply reads `hadDropIn == false` and returns before reaching a
+  reload. sshd keeps enforcing the xpf policy the operator REMOVED, which may be
+  MORE permissive than the base-image default (`PermitRootLogin`, ciphers,
+  MACs), until a manual restart or a reboot. The removal gate is now
+  `!hadDropIn && !d.sshdReloadOwed()`, both reload sites record their outcome
+  (an update-path SUCCESS discharges a removal debt — sshd has re-read its
+  configuration either way), and the re-assert re-validates with `sshd -t`
+  before the SIGHUP exactly as the apply path does (#4311), leaving the debt
+  OUTSTANDING when validation fails because nothing was reloaded.
+  R61 also flagged chrony's SHARED 15s context: one hung `chronyc reload
+  sources` consumed the whole budget, so all four threshold fallbacks ran
+  against an already-expired context — 15s of apply latency buying no
+  convergence on either leg. The sources leg now has its own
+  `chronySourcesReloadTimeout` inside the aggregate, so it cannot starve them.
   Operator visibility, mirroring #6802: `ManagedServiceReloadOwed` /
   `ManagedServiceReloadFailures` are wired into the REST/metrics server
   (`daemon_run_servers.go`) as `xpf_managed_service_reload_pending` and
   `xpf_managed_service_reload_failures_total`, both labelled by `service`
-  (`rsyslog`, `chrony-sources`, `chrony-threshold`) because the legs fail
+  (`rsyslog`, `chrony-sources`, `chrony-threshold`, `sshd`) because the legs fail
   independently and a collapsed gauge would not say WHICH reload never landed.
   The counter earns its place beside the gauge: a count that CLIMBS while the
   gauge stays 1 means the retry owner is running but not converging (a masked or

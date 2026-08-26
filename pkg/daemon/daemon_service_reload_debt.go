@@ -17,6 +17,8 @@ import (
 //   - applySyslogFiles     -> reconcileSyslogDropins  -> systemctl restart rsyslog
 //   - applySystemNTP       -> reconcileManagedFile    -> chronyc reload sources /
 //                                                        systemctl reload chrony
+//   - applySSHConfig       -> remove the sshd drop-in -> systemctl reload sshd
+//                             (the REMOVAL branch only — see below)
 //
 // The gate is correct for the steady state — it is what stops every commit from
 // bouncing rsyslog — but before this change it also ERASED the debt created by a
@@ -49,6 +51,16 @@ import (
 // the threshold file, re-deriving the request from apply #2's own change flags
 // would run the threshold leg alone and silently drop the sources debt. Both
 // call sites therefore fold the retained debt INTO the request they issue.
+//
+// sshd is the third instance and the one most easily missed, because half of it
+// is already correct. applySSHConfig's UPDATE path reverts the drop-in to its
+// prior content when the reload fails (#2062), so the file does NOT stay
+// converged and the next apply rewrites-and-reloads on its own — that half has
+// a retry owner. The REMOVAL path has nothing to revert TO: the drop-in is
+// deleted, the reload then fails, and the next apply reads `hadDropIn == false`
+// and returns before reaching a reload. sshd keeps enforcing the xpf policy the
+// operator DELETED — a `PermitRootLogin`, cipher or MAC setting that may be more
+// permissive than the base-image default — until a manual restart or a reboot.
 
 // serviceReloadDebt is the retained "a runtime reload is still owed" record for
 // the xpf-managed service configuration files. The zero value is "nothing
@@ -65,6 +77,10 @@ type serviceReloadDebt struct {
 	// chronyThreshold: /etc/chrony/conf.d/xpf-threshold.conf is on disk but no
 	// chrony reload/restart has succeeded since it was written.
 	chronyThreshold bool
+	// sshdReload: the xpf sshd drop-in has been removed (or rewritten) but
+	// `systemctl reload sshd` has not succeeded since, so the running sshd is
+	// still enforcing the previous drop-in.
+	sshdReload bool
 
 	// Monotonic per-leg failure counts. A gauge stuck at 1 says "not converged";
 	// these say whether the retry owner is RUNNING and failing (count climbing)
@@ -72,6 +88,7 @@ type serviceReloadDebt struct {
 	rsyslogFailures         uint64
 	chronySourcesFailures   uint64
 	chronyThresholdFailures uint64
+	sshdFailures            uint64
 }
 
 // Managed-service identifiers used as the `service` label on the two
@@ -82,6 +99,7 @@ const (
 	svcReloadRsyslog         = "rsyslog"
 	svcReloadChronySources   = "chrony-sources"
 	svcReloadChronyThreshold = "chrony-threshold"
+	svcReloadSSHD            = "sshd"
 )
 
 // noteRsyslogRestartResult records the outcome of one `systemctl restart
@@ -152,6 +170,7 @@ func (d *Daemon) ManagedServiceReloadOwed() map[string]bool {
 		svcReloadRsyslog:         d.svcReloadDebt.rsyslogRestart,
 		svcReloadChronySources:   d.svcReloadDebt.chronySources,
 		svcReloadChronyThreshold: d.svcReloadDebt.chronyThreshold,
+		svcReloadSSHD:            d.svcReloadDebt.sshdReload,
 	}
 }
 
@@ -168,7 +187,29 @@ func (d *Daemon) ManagedServiceReloadFailures() map[string]uint64 {
 		svcReloadRsyslog:         d.svcReloadDebt.rsyslogFailures,
 		svcReloadChronySources:   d.svcReloadDebt.chronySourcesFailures,
 		svcReloadChronyThreshold: d.svcReloadDebt.chronyThresholdFailures,
+		svcReloadSSHD:            d.svcReloadDebt.sshdFailures,
 	}
+}
+
+// noteSSHDReloadResult records the outcome of one `systemctl reload sshd`. A
+// failure LATCHES the debt; a success DISCHARGES it — including a debt an
+// EARLIER removal left behind, because a successful reload means the running
+// sshd has re-read the current on-disk configuration whichever apply path drove
+// it.
+func (d *Daemon) noteSSHDReloadResult(err error) {
+	d.svcReloadDebt.mu.Lock()
+	defer d.svcReloadDebt.mu.Unlock()
+	d.svcReloadDebt.sshdReload = err != nil
+	if err != nil {
+		d.svcReloadDebt.sshdFailures++
+	}
+}
+
+// sshdReloadOwed reports whether an sshd reload is still owed.
+func (d *Daemon) sshdReloadOwed() bool {
+	d.svcReloadDebt.mu.Lock()
+	defer d.svcReloadDebt.mu.Unlock()
+	return d.svcReloadDebt.sshdReload
 }
 
 // serviceReloadDebtOutstanding reports whether ANY managed-service reload is
@@ -179,7 +220,8 @@ func (d *Daemon) serviceReloadDebtOutstanding() bool {
 	defer d.svcReloadDebt.mu.Unlock()
 	return d.svcReloadDebt.rsyslogRestart ||
 		d.svcReloadDebt.chronySources ||
-		d.svcReloadDebt.chronyThreshold
+		d.svcReloadDebt.chronyThreshold ||
+		d.svcReloadDebt.sshdReload
 }
 
 // rsyslogRestartFn is the rsyslog runtime-restart entry point. Both owners —
@@ -266,6 +308,27 @@ func (d *Daemon) reassertServiceReloadDebtOnce(ctx context.Context) {
 				"err", err, "output", strings.TrimSpace(string(out)))
 		} else {
 			slog.Info("rsyslog restart re-asserted")
+		}
+	}
+
+	// sshd is VALIDATED before the reload, exactly as the apply path does
+	// (#4311): a reload is a SIGHUP, and re-execing into a config that fails
+	// `sshd -t` can drop the listener — an SSH lockout on an appliance. A
+	// validation failure deliberately leaves the debt OUTSTANDING rather than
+	// discharging it: nothing was reloaded, so nothing is paid.
+	if d.sshdReloadOwed() {
+		slog.Warn("sshd reload still owed from an earlier apply — retrying " +
+			"(the drop-in is gone but sshd has not re-read its configuration)")
+		if out, err := sshdValidateCmd(); err != nil {
+			slog.Error("sshd config validation failed; not reloading — will retry",
+				"err", err, "output", strings.TrimSpace(string(out)))
+		} else if out, err := sshdReloadCmd(); err != nil {
+			d.noteSSHDReloadResult(err)
+			slog.Error("sshd reload re-assert failed; will retry",
+				"err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			d.noteSSHDReloadResult(nil)
+			slog.Info("sshd reload re-asserted")
 		}
 	}
 

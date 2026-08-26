@@ -353,6 +353,75 @@ func TestChronyThresholdLegReportsItsOwnOutcome6800(t *testing.T) {
 	}
 }
 
+// TestChronySourcesLegCannotStarveTheThresholdFallbacks6800 binds the sources
+// leg's OWN deadline.
+//
+// Before this, one 15s context covered `chronyc reload sources` and all four
+// threshold fallbacks. A single hung chronyc consumed the whole budget, so
+// every fallback ran against an already-expired context and failed instantly —
+// 15 seconds of apply latency buying no convergence on either leg, and a
+// threshold reload that was never really attempted. (opus-review-001 R61 raised
+// this alongside the erased debt.)
+//
+// Two assertions, because they fail for different reasons. The DEADLINE check
+// is instant and reds the moment the sources leg goes back to sharing the
+// aggregate context. The BEHAVIOURAL check drives the actual starvation: the
+// sources stub burns its whole budget, and the fallbacks must still find time
+// left on the clock.
+func TestChronySourcesLegCannotStarveTheThresholdFallbacks6800(t *testing.T) {
+	origRun, origTimeout := chronyRunCmd, chronySourcesReloadTimeout
+	t.Cleanup(func() { chronyRunCmd, chronySourcesReloadTimeout = origRun, origTimeout })
+	chronySourcesReloadTimeout = 20 * time.Millisecond
+
+	type call struct {
+		name     string
+		deadline time.Time
+		expired  bool
+	}
+	var calls []call
+	chronyRunCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		dl, _ := ctx.Deadline()
+		c := call{name: name, deadline: dl, expired: ctx.Err() != nil}
+		if name == "chronyc" {
+			// Simulate a hung chronyc: consume the ENTIRE budget it was given.
+			<-ctx.Done()
+			c.expired = true
+			calls = append(calls, c)
+			return nil, ctx.Err()
+		}
+		calls = append(calls, c)
+		return nil, errors.New("simulated systemctl failure")
+	}
+
+	out := reloadChronyRuntime(true, true)
+
+	if len(calls) != 5 {
+		t.Fatalf("got %d commands, want 5 (chronyc + four systemctl fallbacks): %v",
+			len(calls), calls)
+	}
+	if calls[0].name != "chronyc" {
+		t.Fatalf("first command = %q, want chronyc", calls[0].name)
+	}
+	for _, c := range calls[1:] {
+		if !c.deadline.After(calls[0].deadline) {
+			t.Errorf("fallback %q shares the sources leg's deadline (%v vs %v); a "+
+				"hung chronyc then consumes the whole aggregate budget and every "+
+				"fallback runs against an expired context — the threshold reload "+
+				"is never really attempted (#6800, R61)",
+				c.name, c.deadline, calls[0].deadline)
+		}
+		if c.expired {
+			t.Errorf("fallback %q ran against an ALREADY-EXPIRED context after the "+
+				"sources leg burned its budget; bounding the sources leg "+
+				"separately is what guarantees the fallbacks a share", c.name)
+		}
+	}
+	if !out.sourcesFailed || !out.thresholdFailed {
+		t.Errorf("outcome = %+v; both legs failed here, and both must be reported "+
+			"so the retry owner replays them", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // chrony: the debt is retained per-leg and REPLAYED, not re-derived
 // ---------------------------------------------------------------------------

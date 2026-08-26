@@ -26,6 +26,19 @@
   apply path also writes (a restart issued outside the semaphore can load a
   half-converged drop-in set mid-reconcile and latch a success for it) and
   re-reading the debt inside it.
+  The recovered opus-review-001 §R61 (restored to `docs/reviews/recovered/`
+  mid-branch) named a THIRD site this branch had explicitly written off:
+  `applySSHConfig`. Its UPDATE path really is covered — #2062 reverts the
+  drop-in on a failed reload, so the file stops matching desired and the next
+  apply retries — but the REMOVAL path has nothing to revert to. The drop-in is
+  deleted, the reload fails, and every later apply reads `hadDropIn == false`
+  and returns before any reload, so sshd keeps enforcing the policy the operator
+  REMOVED (possibly more permissive than the base-image default) until a manual
+  restart. Added as a fourth leg, with the re-assert re-validating via `sshd -t`
+  before the SIGHUP (#4311) and leaving the debt outstanding when validation
+  fails. R61's second point — chrony's SHARED 15s context letting one hung
+  `chronyc` starve all four threshold fallbacks — is fixed by giving the sources
+  leg its own bounded budget inside the aggregate.
   Operator visibility was added in the same change rather than deferred, after
   #6802 landed the identical pattern with a wired metric pair: an exported
   accessor with no production caller is its own defect here (#6852), and a
@@ -40,6 +53,7 @@
   `pkg/api/server.go`, `pkg/api/metrics.go`,
   `pkg/api/metrics_descriptors_controlplane.go`,
   `pkg/daemon/service_reload_debt_6800_test.go` (new),
+  `pkg/daemon/sshd_reload_debt_6800_test.go` (new),
   `pkg/api/metrics_managed_service_reload_6800_test.go` (new),
   `pkg/daemon/README.md`
 - **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0.
