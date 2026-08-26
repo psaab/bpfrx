@@ -1,3 +1,106 @@
+## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
+
+- **Timestamp**: 2026-08-26
+- **Action**: The r2 peer-sync cell drove a REAL command against a short
+  deadline to prove a command timeout is not a context error. It passed
+  unloaded and FAILED under a loaded full-package run —
+  `err="context deadline exceeded"`. The claim was not wrong so much as
+  INCOMPLETE: `exec.CommandContext` has two deadline shapes. Process started
+  then killed -> `*exec.ExitError` ("signal: killed"), safe. Context expired
+  BEFORE fork/exec -> `Start` returns `ctx.Err()` and the caller gets a bare
+  `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot tell from
+  the #2926 daemon-stop abort. Which one you get is decided by machine load,
+  so the cell was sampling the scheduler (the #7563 shape) — corrected my own
+  earlier "measured rather than assumed" claim, which had measured only the
+  unloaded branch.
+  Fixed the cell by CONSTRUCTION rather than by retry: build the ExitError
+  shape by Start-then-cancel, so the deadline race cannot occur. 5 repeat
+  runs green.
+  The misclassification itself is PRE-EXISTING and wider than #6790 —
+  `nftApplyPayload` (5s -> lo0Err/hostInboundErr, #3392/#3333) and the DNS
+  systemctl calls (-> dnsErr, #6792) reach the same classifier the same way.
+  Filed #7618 rather than fixing inline: the fix changes behaviour for five
+  operands that predate this PR. Left
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserting the
+  CURRENT wrong classification so the fix reds a named cell instead of
+  silently passing.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: full `pkg/daemon` green; 5x repeat of the previously flaky
+  cell green; repo-wide gate re-run at the merged head.
+
+## 2026-08-26 — #6790 follow-up: the #1960 no-brick classification is now pinned
+
+- **Timestamp**: 2026-08-26
+- **Action**: Review question on PR #7604: does joining five more operands
+  into `applyTailReconciles`' result make a standby REJECT a peer-synced
+  config? Enumerated all five `applyConfigLocked` call sites. Answer: no.
+  The peer-sync path is `syncAndApply` (`daemon_apply_commit.go:522`), and
+  both it and `applyAndSyncCommitted` route the error through
+  `applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+  required-protocol-gate error (#2138) and a context cancel/deadline
+  (#2926). Everything else keeps the config active + armed and keeps
+  syncing; that is the class #4034 created and it already contains
+  networkdErr / dhcpServerErr / hostInboundErr / lo0Err / dnsErr. A
+  credential failure only leaves the applied-digest unstamped, so the
+  primary re-pushes and the standby RETRIES — a retry, not a brick.
+  Did not assume the one shape that could have broken it: MEASURED that a
+  command killed by `externalCommandTimeout` returns `*exec.ExitError`
+  ("signal: killed") and does NOT satisfy `errors.Is(.., DeadlineExceeded)`
+  even wrapped and joined, so a `useradd` timeout cannot masquerade as the
+  #2926 abort class and suppress a peer sync. Pinned the whole
+  classification with 6 subtests over the REAL reconciler errors plus a
+  paired positive control, so the classifier cannot silently degrade to
+  "nothing is fatal". No `lenient*` compile opt is needed or possible:
+  `compileOpts` downgrades COMPILE-time validators, and these are
+  reconcile-time failures raised after compilation.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 9 cells green. Repo-wide `go build ./... && go test
+  -count=1 ./...` rc 0. Mutation matrix re-run at the new head.
+
+## 2026-08-26 — #6790: the normal apply joins the five credential-reconcile failures
+
+- **Timestamp**: 2026-08-26
+- **Action**: `applyTailReconciles` ran the five host-credential reconcilers as
+  `_ = d.applySystemLogin/reconcileSudoers/reconcileAbsentLoginUsers/
+  applySSHConfig/applyRootAuth(cfg)`. #5874 had already made all five RETURN
+  their accumulated failures, but only the daemon-stop cancel closeout
+  collected them — the ordinary commit path threw them away, so
+  `delete system login user bob` reported SUCCESS while bob's password and
+  `authorized_keys` were still live, a demoted operator kept a stale NOPASSWD
+  grant, a reverted sshd drop-in kept the pre-commit `PermitRootLogin`, and
+  root's key set never converged. Captured all five and joined them into the
+  tail `errors.Join`, matching the three siblings in the SAME function that
+  already fail closed (`applyLo0Filter` #3392, `applyHostInboundFilter` #3333,
+  `reconcileDNSLocked` #6792).
+  Rejected the standing justification rather than assuming it: "the next boot
+  re-renders login/sudoers/SSH/root-auth so a transient failure converges" is
+  a RENDERING argument applied to a REVOCATION. Nothing retries before the
+  reboot (no dirty-retry owner, no ticker, no metric), the same commit already
+  advanced the durable config, and the green commit was the operator's only
+  signal. Fail-closed, NOT fail-fast: no early return was added, so an sshd
+  failure still cannot skip root-auth — bound by its own cell.
+  Also corrected three now-false doc claims that said the normal apply path
+  ignores these returns (`daemon_system.go` applySystemLogin,
+  `login_password.go` reconcileAbsentLoginUsers + deprovisionLoginUser) and the
+  `applyHostAuthorizationCloseout` comment that implied the cancel path was
+  still the only collector.
+- **File(s)**: `pkg/daemon/daemon_apply_tail.go`, `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/login_password.go`,
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 7 new cells drive the REAL `applyTailReconciles` with exactly
+  ONE owner injected to fail (id/useradd refused; unwritable sudoers dir;
+  unreadable `/etc/passwd` for a marked-but-removed account; `sshd -t`
+  rejecting; an ENOTDIR marker root) plus a healthy PAIRED control and a
+  two-failure cell. Each keys on a substring unique to its owner, so dropping
+  that owner's operand from the join reds that cell alone. Mutation matrix:
+  5/5 per-owner reverts to `_ =` red their named cell, and the control stays
+  green. Repo-wide `go build ./... && go test -count=1 ./...` rc 0. No
+  cluster/VRRP/session-sync/failover code touched, so no `make test-failover`
+  is owed.
+
 ## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
 
 - **Timestamp**: 2026-08-22
@@ -105181,6 +105284,40 @@ prose edit above them added. No diff falls in the new test body.
 - **Verified paired**: against the pre-fix `_Log.md` the gate reds naming all
   three; against the fixed one it passes over 1946 entries.
 - **File(s)**: `_Log.md`, `pkg/refactoraudit/log_duplicate_entry_test.go` (new)
+
+## 2026-08-26 — #7610: step 8 measured the 3 Gb/s shaped port against a 23 Gbit/s bar
+
+- **Timestamp**: 2026-08-26
+- **Action**: Point `docs/engineering-style.md` step 8's throughput row at port
+  5211, explain why the ports are not interchangeable, and add
+  `pkg/refactoraudit/step8_iperf_port_test.go` to bind the doc and the CoS
+  fixture to each other.
+- **Why**: the row instructed every lane to apply
+  `test/incus/cos-iperf-config.set` and then measure `iperf3 … -p 5203` against
+  `≥ 23 Gbit/s`. In that fixture THE PORT IS THE CLASS: `bandwidth-output`
+  term 3 maps 5203 → `iperf-3g` → `scheduler-3g`, `transmit-rate 3.0g exact`.
+  So the row said "shape this to 3 Gb/s, then fail the change if it does not
+  reach 23". A lane following it literally reads a correctly working shaper as
+  an 8x regression — measured on a healthy fw0: 5203 → 2.86 Gbit/s, 5211 → 23.1
+  Gbit/s.
+- **The "no regression vs previous run" clause made it worse, not better**:
+  every previous run of the same wrong port also reported ~3 Gbit/s, so the
+  false reading looked corroborated by history.
+- **The gate binds the AGREEMENT, not a literal.** Pinning the doc to "5211"
+  would encode which side I trust; a fixture renumber would then leave the test
+  green and the doc wrong again. The invariant is "the port step 8 names must
+  resolve, IN THE FIXTURE, to a class with no explicit transmit-rate", which
+  survives a renumber. The row is located by CONTENT (an iperf3 check against
+  the documented target) and the gate refuses to guess if there is not exactly
+  one.
+- **Verified paired**: against the pre-fix doc the gate REDs naming
+  `iperf-3g`/`scheduler-3g`/`3.0g`; against the fixed doc it resolves 5211 to
+  `iperf-uncapped` with no rate and passes. A sensitivity control drives the
+  real parsers over a synthetic fixture in both directions.
+- **Found by**: the #6790 lane, which measured both ports back-to-back on a
+  real box rather than trusting the doc.
+- **File(s)**: `docs/engineering-style.md`,
+  `pkg/refactoraudit/step8_iperf_port_test.go` (new), `_Log.md`
 
 ## 2026-08-26 — #6801 released-NIC RSS/coalescence teardown
 

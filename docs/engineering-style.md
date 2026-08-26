@@ -96,9 +96,26 @@ the mechanics, so this section is sequencing only.
    | What changed | Deploy | Validation | Pass criteria |
    |---|---|---|---|
    | Any change | `make test-deploy` (standalone) | ping between zones | 0% loss |
-   | Any change | `make cluster-deploy` (loss userspace cluster) + re-apply CoS (`./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0` — deploy wipes CoS) | `iperf3 -P 16 -t 30 -p 5203` → 172.16.80.200 | ≥ 23 Gbit/s, no regression vs previous run |
+   | Any change | `make cluster-deploy` (loss userspace cluster) + re-apply CoS (`./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0` — deploy wipes CoS) | `iperf3 -P 16 -t 30 -p 5211` → 172.16.80.200 | ≥ 23 Gbit/s, no regression vs previous run |
    | Admission / DSCP / scheduler / queueing | above + re-apply CoS (`./test/incus/apply-cos-config.sh <target>`) | `show class-of-service interface` | targeted counter (`flow_share`, `buffer`, `ecn_marked`) moves in the predicted direction — see [`cos-validation-notes.md`](cos-validation-notes.md) |
    | NAT / screens / filter / VLAN / IPsec | above | exercise that feature end-to-end from a test host | session / hit counters advance; negative case drops |
+
+   **Use 5211, not 5203, for the throughput row — and the two are not
+   interchangeable (#7610).** The same row tells you to apply
+   `test/incus/cos-iperf-config.set` first, and in that fixture the port IS the
+   class: `bandwidth-output` term 3 maps **5203 → `iperf-3g` → `scheduler-3g`,
+   `transmit-rate 3.0g exact`**, while term 11 maps **5211 → `iperf-uncapped`**.
+   Measured back-to-back on a healthy fw0: **5203 → 2.86 Gbit/s, 5211 → 23.1
+   Gbit/s**. This row asked for 5203 against a ≥ 23 Gbit/s bar until #7610, so a
+   lane following it literally read a *correctly working shaper* as an 8x
+   throughput regression — and the criterion "no regression vs previous run" made
+   that reading look confirmed, because every previous run of the same wrong port
+   reported the same ~3 Gbit/s. Ports 5200-5211 each select a different
+   forwarding class; check `cos-iperf-config.set` before substituting one.
+
+   5203 is the right port when you are validating the **shaper** rather than the
+   dataplane: there the pass criterion is ≈ 3 Gbit/s, and a result near 23 means
+   the shaper is NOT engaging.
    | HA / VRRP / session sync / fabric | `make cluster-deploy` | `make test-failover` + `make test-ha-crash` | 0 / very low packet loss across failover/failback, both nodes converge |
 
    When a validation lane can't be run in the test env, say so
