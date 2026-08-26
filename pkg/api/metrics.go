@@ -208,6 +208,15 @@ type xpfCollector struct {
 	// address (the retry loop has not yet reconverged).
 	ipsecRebindPending *prometheus.Desc
 
+	// #6802: 0/1 gauge — 1 while a host-inbound kernel-conntrack revocation
+	// has FAILED and not yet been re-driven. While set, direct-kernel
+	// connections to a service the operator has REMOVED may still be riding
+	// the host-inbound chain's leading `ct state established,related accept`,
+	// i.e. the failure is fail-OPEN. hostInboundConntrackRevocationFailures is
+	// the monotonic count of those failures.
+	hostInboundConntrackRevocationPending  *prometheus.Desc
+	hostInboundConntrackRevocationFailures *prometheus.Desc
+
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
 	// a schedule window: a permit still forwarding, or a scheduled block
@@ -762,6 +771,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
 	ch <- c.schedulerRepublishFailClosed
+	ch <- c.hostInboundConntrackRevocationPending
+	ch <- c.hostInboundConntrackRevocationFailures
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1078,6 +1089,25 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.ipsecRebindPending,
 			prometheus.GaugeValue, v)
+	}
+
+	// #6802: host-inbound conntrack revocation is a control-plane signal (the
+	// daemon rebuilds the kernel host-inbound table and reconciles conntrack
+	// even in config-only mode) — emit it BEFORE the dataplane gate so a
+	// now-denied host service that is still reachable over an established
+	// kernel connection stays visible even when the dataplane is not loaded.
+	if c.srv.hostInboundConntrackRevocationOwedFn != nil {
+		v := 0.0
+		if c.srv.hostInboundConntrackRevocationOwedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.hostInboundConntrackRevocationPending,
+			prometheus.GaugeValue, v)
+	}
+	if c.srv.hostInboundConntrackFlushFailuresFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundConntrackRevocationFailures,
+			prometheus.CounterValue,
+			float64(c.srv.hostInboundConntrackFlushFailuresFn()))
 	}
 
 	// #3780: scheduler republish-failure is a control-plane signal (the
