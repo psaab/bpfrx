@@ -234,6 +234,19 @@ type Config struct {
 	// Backs the xpf_ipsec_rebind_pending gauge (0/1, no labels). Optional;
 	// if nil, the gauge is not emitted.
 	IPsecRebindPendingFn func() bool
+	// HostInboundConntrackRevocationOwedFn reports whether a host-inbound
+	// kernel-conntrack revocation failed and has not yet been re-driven
+	// (#6802). While true, an established direct-kernel connection to a
+	// now-REMOVED host service may still be authorized by the host-inbound
+	// chain's leading established/related accept. Backs the
+	// xpf_host_inbound_conntrack_revocation_pending gauge (0/1, no labels).
+	// Optional; if nil, the gauge is not emitted.
+	HostInboundConntrackRevocationOwedFn func() bool
+	// HostInboundConntrackFlushFailuresFn reports the monotonic count of
+	// host-inbound conntrack revocation failures (#6802), retries included.
+	// Backs the xpf_host_inbound_conntrack_revocation_failures_total counter.
+	// Optional; if nil, the counter is not emitted.
+	HostInboundConntrackFlushFailuresFn func() uint64
 	// SchedulerRepublishFailedFn reports whether the most recent
 	// scheduler-driven policy republish failed and has not yet converged
 	// (#3780). A scheduler window transition republishes enforcement; a
@@ -384,43 +397,45 @@ type Server struct {
 	peerLookupFn func(client, server net.Addr) authz.PeerIdentity
 	// peerLocalityFn is Config.PeerLocalityFn; nil means
 	// authz.PeerCouldBeLocalNow (#5561).
-	peerLocalityFn                   func(client, server net.Addr) bool
-	store                            *configstore.Store
-	dp                               apiRuntimeDataPlane
-	eventBuf                         *logging.EventBuffer
-	gc                               *conntrack.GC
-	routing                          *routing.Manager
-	frr                              *frr.Manager
-	ipsec                            *ipsec.Manager
-	dhcp                             *dhcp.Manager
-	vrrpMgr                          *vrrp.Manager
-	commitFn                         func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn                func(ctx context.Context, minutes int) (*config.Config, error)
-	compileHealthFn                  func() CompileHealthSnapshot
-	bootstrapImportFn                func() BootstrapImportSnapshot
-	configPersistDegradedFn          func() bool
-	rollbackHistoryDegradedFn        func() bool
-	neighborPhaseAgeFn               func() map[string]float64
-	frrReloadDegradedFn              func() bool
-	ipsecRebindPendingFn             func() bool
-	schedulerRepublishFailedFn       func() bool
-	schedulerRepublishStaleSecondsFn func() float64
-	schedulerRepublishFailClosedFn   func() bool
-	ipmonStatusFn                    func() []ipmon.PolicyStatus
-	ipmonActuationFailuresFn         func() uint64
-	eventActionStatsFn               func() eventengine.Stats
-	rpmPinFailedFn                   func() float64
-	feedsFn                          func() map[string]feeds.FeedInfo
-	ddnsStatsFn                      func() *dhcpserver.DDNSStats
-	surfaceAStatsFn                  func() *ddns.SurfaceAStats
-	flowCollectorHealthFn            func() []flowexport.ExporterCollectorHealth
-	flowExportBatchStatsFn           func() []flowexport.ExporterBatchStats
-	feedOverlayFn                    func() map[string][]string
-	policySchedActiveFn              func() (map[string]bool, bool)
-	haActiveFn                       func() bool
-	nodeIDFn                         func() int
-	clusterSessionFn                 func() ClusterSessionService
-	startTime                        time.Time
+	peerLocalityFn                       func(client, server net.Addr) bool
+	store                                *configstore.Store
+	dp                                   apiRuntimeDataPlane
+	eventBuf                             *logging.EventBuffer
+	gc                                   *conntrack.GC
+	routing                              *routing.Manager
+	frr                                  *frr.Manager
+	ipsec                                *ipsec.Manager
+	dhcp                                 *dhcp.Manager
+	vrrpMgr                              *vrrp.Manager
+	commitFn                             func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn                    func(ctx context.Context, minutes int) (*config.Config, error)
+	compileHealthFn                      func() CompileHealthSnapshot
+	bootstrapImportFn                    func() BootstrapImportSnapshot
+	configPersistDegradedFn              func() bool
+	rollbackHistoryDegradedFn            func() bool
+	neighborPhaseAgeFn                   func() map[string]float64
+	frrReloadDegradedFn                  func() bool
+	ipsecRebindPendingFn                 func() bool
+	hostInboundConntrackRevocationOwedFn func() bool
+	hostInboundConntrackFlushFailuresFn  func() uint64
+	schedulerRepublishFailedFn           func() bool
+	schedulerRepublishStaleSecondsFn     func() float64
+	schedulerRepublishFailClosedFn       func() bool
+	ipmonStatusFn                        func() []ipmon.PolicyStatus
+	ipmonActuationFailuresFn             func() uint64
+	eventActionStatsFn                   func() eventengine.Stats
+	rpmPinFailedFn                       func() float64
+	feedsFn                              func() map[string]feeds.FeedInfo
+	ddnsStatsFn                          func() *dhcpserver.DDNSStats
+	surfaceAStatsFn                      func() *ddns.SurfaceAStats
+	flowCollectorHealthFn                func() []flowexport.ExporterCollectorHealth
+	flowExportBatchStatsFn               func() []flowexport.ExporterBatchStats
+	feedOverlayFn                        func() map[string][]string
+	policySchedActiveFn                  func() (map[string]bool, bool)
+	haActiveFn                           func() bool
+	nodeIDFn                             func() int
+	clusterSessionFn                     func() ClusterSessionService
+	startTime                            time.Time
 }
 
 // Management HTTP/HTTPS server timeouts (M-6). Both http.Server literals used
@@ -471,42 +486,44 @@ const (
 // NewServer creates a new API server.
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		store:                            cfg.Store,
-		dp:                               cfg.DP,
-		eventBuf:                         cfg.EventBuf,
-		gc:                               cfg.GC,
-		routing:                          cfg.Routing,
-		frr:                              cfg.FRR,
-		ipsec:                            cfg.IPsec,
-		dhcp:                             cfg.DHCP,
-		vrrpMgr:                          cfg.VRRPMgr,
-		commitFn:                         cfg.CommitFn,
-		commitConfirmedFn:                cfg.CommitConfirmedFn,
-		compileHealthFn:                  cfg.CompileHealthFn,
-		bootstrapImportFn:                cfg.BootstrapImportFn,
-		configPersistDegradedFn:          cfg.ConfigPersistDegradedFn,
-		rollbackHistoryDegradedFn:        cfg.RollbackHistoryDegradedFn,
-		neighborPhaseAgeFn:               cfg.NeighborPhaseAgeFn,
-		frrReloadDegradedFn:              cfg.FRRReloadDegradedFn,
-		ipsecRebindPendingFn:             cfg.IPsecRebindPendingFn,
-		schedulerRepublishFailedFn:       cfg.SchedulerRepublishFailedFn,
-		schedulerRepublishStaleSecondsFn: cfg.SchedulerRepublishStaleSecondsFn,
-		schedulerRepublishFailClosedFn:   cfg.SchedulerRepublishFailClosedFn,
-		ipmonStatusFn:                    cfg.IPMonStatusFn,
-		ipmonActuationFailuresFn:         cfg.IPMonActuationFailuresFn,
-		eventActionStatsFn:               cfg.EventActionStatsFn,
-		rpmPinFailedFn:                   cfg.RPMPinFailedFn,
-		feedsFn:                          cfg.FeedsFn,
-		ddnsStatsFn:                      cfg.DDNSStatsFn,
-		surfaceAStatsFn:                  cfg.SurfaceAStatsFn,
-		flowCollectorHealthFn:            cfg.FlowCollectorHealthFn,
-		flowExportBatchStatsFn:           cfg.FlowExportBatchStatsFn,
-		feedOverlayFn:                    cfg.FeedOverlayFn,
-		policySchedActiveFn:              cfg.PolicySchedulerActiveStateFn,
-		haActiveFn:                       cfg.HAActiveFn,
-		nodeIDFn:                         cfg.NodeIDFn,
-		clusterSessionFn:                 cfg.ClusterSessionFn,
-		startTime:                        time.Now(),
+		store:                                cfg.Store,
+		dp:                                   cfg.DP,
+		eventBuf:                             cfg.EventBuf,
+		gc:                                   cfg.GC,
+		routing:                              cfg.Routing,
+		frr:                                  cfg.FRR,
+		ipsec:                                cfg.IPsec,
+		dhcp:                                 cfg.DHCP,
+		vrrpMgr:                              cfg.VRRPMgr,
+		commitFn:                             cfg.CommitFn,
+		commitConfirmedFn:                    cfg.CommitConfirmedFn,
+		compileHealthFn:                      cfg.CompileHealthFn,
+		bootstrapImportFn:                    cfg.BootstrapImportFn,
+		configPersistDegradedFn:              cfg.ConfigPersistDegradedFn,
+		rollbackHistoryDegradedFn:            cfg.RollbackHistoryDegradedFn,
+		neighborPhaseAgeFn:                   cfg.NeighborPhaseAgeFn,
+		frrReloadDegradedFn:                  cfg.FRRReloadDegradedFn,
+		ipsecRebindPendingFn:                 cfg.IPsecRebindPendingFn,
+		hostInboundConntrackRevocationOwedFn: cfg.HostInboundConntrackRevocationOwedFn,
+		hostInboundConntrackFlushFailuresFn:  cfg.HostInboundConntrackFlushFailuresFn,
+		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
+		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
+		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,
+		ipmonStatusFn:                        cfg.IPMonStatusFn,
+		ipmonActuationFailuresFn:             cfg.IPMonActuationFailuresFn,
+		eventActionStatsFn:                   cfg.EventActionStatsFn,
+		rpmPinFailedFn:                       cfg.RPMPinFailedFn,
+		feedsFn:                              cfg.FeedsFn,
+		ddnsStatsFn:                          cfg.DDNSStatsFn,
+		surfaceAStatsFn:                      cfg.SurfaceAStatsFn,
+		flowCollectorHealthFn:                cfg.FlowCollectorHealthFn,
+		flowExportBatchStatsFn:               cfg.FlowExportBatchStatsFn,
+		feedOverlayFn:                        cfg.FeedOverlayFn,
+		policySchedActiveFn:                  cfg.PolicySchedulerActiveStateFn,
+		haActiveFn:                           cfg.HAActiveFn,
+		nodeIDFn:                             cfg.NodeIDFn,
+		clusterSessionFn:                     cfg.ClusterSessionFn,
+		startTime:                            time.Now(),
 	}
 	// #5866: seed the live auth snapshot; the middleware reads it atomically per
 	// request so ReplaceAuth can swap credentials without rebinding the listener.

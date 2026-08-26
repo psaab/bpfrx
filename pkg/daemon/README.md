@@ -680,6 +680,44 @@ explicit-config test seam.
     `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` (daemon, end to end from
     `reconcileWebManagement`) and `TestReconcileHTTPSReplacesADeadLeg_6827`
     (`pkg/api`).
+  - **The HTTP leg never got that fix** (#6803). Round 6 repaired the HTTPS arm
+    and stopped. The HTTP arm still gated on the converged fingerprint alone
+    (`next.Addr != m.cur.addr`), and `api.Server.ReconcileHTTP`'s same-address
+    short circuit still tested a non-nil pointer rather than `serving()` — the
+    two defects round 6 named, on the other leg. So an HTTP serve loop that
+    terminated unexpectedly left the REST/management API down for the life of
+    the process on an UNCHANGED configuration, exactly as HTTPS did before round
+    6. The HTTP arm now also fires when `next.Addr != "" && !m.srv.HTTPServing()`
+    — gated on a non-empty desired address so it stays strictly additive, since
+    `ReconcileHTTP` refuses an empty bind and the #6827 over-reach guard
+    `a_failed_boot_then_an_empty_bind_binds_nothing` pins that direction — and
+    `ReconcileHTTP`'s no-op now asks `s.httpLeg.serving()`, mirroring
+    `ReconcileHTTPS`. New accessor `api.Server.HTTPServing()` is the exact
+    counterpart of `HTTPSServing()`.
+  - **…and nothing CALLED the reconcile** (#6803). Both gate fixes are only
+    reachable from `applyConfigLocked`, the sole caller of
+    `reconcileWebManagement`, so recovery still waited on an operator committing
+    — from a box whose management API had just died, which is the box they can no
+    longer reach to commit from. `mgmtListenerReassertLoop`
+    (`mgmt_listener_reassert.go`) is the owner: started unconditionally in `Run`
+    beside `proxyARPReassertLoop` / `raDeadSenderReassertLoop` (#6793) /
+    `fabricIPVLANReassertLoop` (#6791) / `hostInboundConntrackReassertLoop`
+    (#6802), 30s, taking `applySem` before acting (#4001) and re-checking the
+    gate INSIDE the semaphore because the commit it queued behind may already
+    have rebound the listener. Its gate is
+    `effectiveHTTPListener().State == StateFailed` — deliberately the SAME
+    question `show system services` answers, so the box can never report a dead
+    listener nothing is retrying, or retry one it reports healthy. Pinned by
+    `mgmt_listener_reassert_6803_test.go` (dead-leg rebind on an UNCHANGED
+    config, paired against a healthy leg that must NOT be bounced; the gate
+    tracks the operator view; the owner re-binds with no commit; the
+    inside-the-semaphore re-check; the loop ticks; and a loop-START cell) and
+    `pkg/api/reconcile_http_dead_leg_6803_test.go`.
+
+    Not covered by #6803: the PRIMARY (loopback) gRPC listener has the same hole
+    — `Run` logs a serve error and the goroutine exits with nothing re-binding —
+    while the FABRIC gRPC listener beside it has had a backoff supervisor since
+    #5047. Filed separately.
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
@@ -2099,6 +2137,39 @@ never lock an operator out of a remote box it manages.
   failure with a healthy-path control; the `applyTailReconciles` commit-join WIRING
   proof; gate quiet-when-up / fires-when-down; the re-assert re-creates; and a
   loop-START cell asserting `Run` launches it unconditionally).
+
+  **Host-inbound conntrack revocation retry (#6802, the same recovery shape):**
+  `flushDeniedHostInboundConntrack` (the #5566 reconcile) deletes established
+  kernel conntrack entries for host services the operator has just removed,
+  because those entries would otherwise ride the host-inbound chain's leading
+  `ct state established,related accept`. A delete failure therefore fails **OPEN**
+  — the now-denied service keeps being served on its existing connections. It is
+  deliberately still NOT a commit failure (the nft table is applied, so new
+  connections are enforced, and rolling back over a transient conntrack error
+  would discard correct enforcement); what #6802 added is everything else, since
+  before it the flush returned nothing, set no flag, bumped no counter, published
+  no metric, and no ticker re-ran it. The flush now returns a bool, and
+  `noteHostInboundConntrackFlush` retains the **exact** failed request as debt —
+  not a set re-derived at retry time, which would attempt a different revocation
+  than the one that failed, and the two diverge precisely when a commit landed in
+  between. `hostInboundConntrackReassertLoop` is the owner, started
+  unconditionally in `Run` beside the three loops above, 30s, gated on a single
+  atomic pointer load; it takes `applySem` before acting (#4001) and re-reads the
+  debt INSIDE the semaphore, because the commit it queued behind may already have
+  flushed successfully. A success clears the debt: the filter is built from the
+  desired set, so a current revocation subsumes an older one.
+  `HostInboundConntrackRevocationOwed` / `HostInboundConntrackFlushFailures` are
+  wired into the REST/metrics server (`daemon_run_servers.go`) as
+  `xpf_host_inbound_conntrack_revocation_pending` and
+  `…_failures_total`; an accessor with no production caller would leave the
+  operator exactly as blind as before (the #6852 shape). Tests:
+  `host_inbound_conntrack_retry_6802_test.go` (paired outcome cell on the delete
+  seam, which had no failing fixture at all before; debt retain/clear; the retry
+  re-drives the OWED request; the inside-the-semaphore re-check; the loop ticks; a
+  loop-START cell; and a WIRING cell for the two metric assignments) plus
+  `pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go` (both series track
+  their fn, and are OMITTED rather than published as `0` when unwired — the #6828
+  absent-vs-zero distinction).
 
   **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
   `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and

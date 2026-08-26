@@ -92977,73 +92977,6 @@ Every RED above is an assertion failure, not a build break.
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
 
-## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
-
-- **Timestamp**: 2026-08-05
-- **Action**: Two findings from reviewing the #5078 branch, plus the doc
-  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
-  RED-on-revert that could not fire — flipping its only precondition
-  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
-  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
-  regardless of `peerAuthSeen`. It was a duplicate of
-  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
-  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
-  sync-side downgrade guard it was named for was itself dead —
-  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
-  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
-  not flag unused methods, so it compiled green. Deleted, along with
-  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
-  the interface), the fake's implementation, and the now-meaningless
-  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
-  package doc and the `pkg/cluster/README.md` PR-C section still described
-  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
-  sync downgrade guard, and a two-method provider wiring.
-- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
-  removed — still exported, still consumed by the gRPC fabric listener
-  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
-  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
-  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
-  so deleting the sync pair cannot disarm it;
-  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
-  `TestControlLinkAuthStatus` still pass.
-- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
-  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
-  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
-  the same property and additionally covers key ROTATION. A second test
-  for one property is noise.
-- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
-  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
-  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
-- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
-  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
-  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
-
-## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
-
-- **Timestamp**: 2026-08-05
-- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
-  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
-  struct test could not see it: adding `|| keyChanged` there, with
-  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
-  the permanent deadlock with a green suite. New test observes
-  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
-  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
-  grace in syncAuthDecision", which does NOT fail it (the arm discards the
-  accept bit); it actually binds the arm returning nil. F3 — matrix comment
-  still described the deleted migration window as current and named the
-  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
-  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
-  failure default of every error path. README — procedure 2 can itself
-  produce the keyed-primary/unkeyed-secondary deadlock if the connection
-  drops mid-rollout.
-- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
-  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
-  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
-  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
-- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
-  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
-  pkg/cluster/README.md, _Log.md
-
 ## 2026-08-07 — #6706 r11 fold: the `system login` packed gate saw one of three levels
 
 - **Timestamp**: 2026-08-07
@@ -104994,8 +104927,6 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
-<<<<<<< HEAD
-
 - **Timestamp**: 2026-08-23
 - **Action**: #5841 writes the resource ownership markers BEFORE the credential
   mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
@@ -105010,25 +104941,7 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
-=======
->>>>>>> origin/master
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
-
-- **Timestamp**: 2026-08-23
-- **Action**: #5841 writes the resource ownership markers BEFORE the credential
-  mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
-  nothing withdrew the marker when the mutation then failed. Because the
-  markers gate a REVOCATION rather than a write, the stale claim makes xpf
-  later delete an operator's pre-existing authorized_keys or lock an account
-  whose password xpf never set. Added `claimOwnership`/`rollback`, which
-  withdraws only a claim the current pass created and preserves one an earlier
-  apply legitimately made, and applied it at all three marker-first sites (user
-  key write, user password chpasswd, root key write). The useradd path is
-  marker-after already and unchanged.
-- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
-  `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
-  `docs/system-login.md`
-
 - **Timestamp**: 2026-08-23
 - **Action**: `reconcileRGState` captured a transition under `s.mu`, dropped the
   lock, ran `SetRGActive` off-lock, then recorded with an unguarded
@@ -105068,6 +104981,206 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — #6803: a management listener that dies is now rebound at the same endpoint
+
+- **Timestamp**: 2026-08-26
+- **Action**: Give the HTTP management leg the liveness question #6827 round 6
+  gave HTTPS, in both places round 6 fixed it for HTTPS, and add the always-on
+  owner that makes either fix reachable without an operator commit.
+- **Why**: an unexpected management-listener serve exit was OBSERVABLE and never
+  RECONCILED. Observable: the leg is marked dead, `EffectiveHTTPAddr` stops
+  reporting it, `show system services` renders the HTTP listener Failed. Never
+  reconciled, for three independent reasons, each of which alone keeps the
+  endpoint down:
+  1. `api.Server.ReconcileHTTP` short-circuited a same-address call on a
+     non-nil pointer rather than on `serving()`. A dead leg stays INSTALLED (it
+     cannot be unlinked without `lifeMu`, which deadlocks a shutdown racing the
+     exit), so the compare matched a corpse and the rebind returned nil having
+     done nothing. `ReconcileHTTPS` has asked `serving()` since #6827 round 6.
+  2. `reconcileTo`'s HTTP arm gated on the converged FINGERPRINT alone. The
+     fingerprint records what the last SUCCESSFUL reconcile bound; it is not
+     evidence the socket is up. The HTTPS arm carries `|| (next.TLS &&
+     !m.srv.HTTPSServing())`; the HTTP arm carried nothing.
+  3. The only caller of `reconcileWebManagement` is `applyConfigLocked`, so even
+     with both gates fixed the endpoint came back only when an operator
+     committed — from a box whose management API had just died.
+- **Shape**: (1) `api.Server.HTTPServing()`, the exact counterpart of
+  `HTTPSServing()`; `ReconcileHTTP`'s no-op now asks it. (2) the HTTP arm fires
+  on `next.Addr != m.cur.addr || (next.Addr != "" && !m.srv.HTTPServing())` —
+  the non-empty guard keeps the change strictly ADDITIVE, because
+  `ReconcileHTTP` refuses an empty bind and the existing #6827 over-reach guard
+  `a_failed_boot_then_an_empty_bind_binds_nothing` pins that direction.
+  (3) `mgmtListenerReassertLoop` in a new `mgmt_listener_reassert.go`, mirroring
+  #6791/#6793/#6802: unconditional in `Run`, 30s, `applySem` before acting
+  (#4001), gate re-checked inside the semaphore.
+- **Gate identity**: the owner's gate is
+  `effectiveHTTPListener().State == StateFailed` — the SAME question `show
+  system services` answers, on purpose. A second private predicate could
+  disagree with the operator view, and then the box either reports a dead
+  listener nothing retries or retries one it reports healthy.
+- **Every cell is PAIRED**, because all three fixes WIDEN a trigger and the
+  over-reach failure is real: a rebind that fires on a healthy leg bounces the
+  management socket on every commit and every 30s tick.
+- **Found while re-deriving, filed separately**: the PRIMARY (loopback) gRPC
+  listener has the same hole — `Run` logs a serve error and the goroutine exits
+  with nothing re-binding — while the FABRIC gRPC listener beside it has had a
+  bounded-backoff supervisor since #5047.
+- **File(s)**: `pkg/api/listener.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`,
+  `pkg/api/reconcile_http_dead_leg_6803_test.go`, `pkg/daemon/README.md`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-26 — CLAUDE.md: a Required Reading index
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add a `## Required Reading` section to the project `CLAUDE.md`,
+  between "Working Style" and "Logging Rules".
+- **Why**: `CLAUDE.md` already told a reader to read `docs/engineering-style.md`
+  and to update module docs in the same change, but the other standing
+  documents — `~/.claude/RTK.md`, `AGENTS.md`, `COMMITAGENT.md`,
+  `docs/config-schema.md` — were nowhere named, so an agent had no way to
+  discover them except by tripping over the rule they encode. `RTK.md` is the
+  sharpest omission: a hook silently rewrites most shell commands through the
+  `rtk` token-optimizing proxy, and a reader who does not know that also does
+  not know `rtk proxy <cmd>` exists to get UNFILTERED output back for the cases
+  where the filtered form has dropped the decisive line.
+- **Shape**: a table of file → when to read it → what it governs, so the entry
+  is actionable at dispatch time rather than a bare list of filenames. Closes
+  with the point that sub-agents inherit the file but not the reasoning, so a
+  dispatch brief should name the specific documents its task touches.
+- **File(s)**: `CLAUDE.md`, `_Log.md`
+
+## 2026-08-26 — #6803 follow-up: dampen the re-assert owner's per-tick logging
+
+- **Timestamp**: 2026-08-26
+- **Action**: Log the management-listener outage Warn on the FIRST tick of a down
+  streak only, Debug thereafter, and re-arm on recovery.
+- **Why**: caught reviewing my own PR. A node whose management bind can never
+  succeed — the address permanently taken by another process — is re-driven
+  every 30s for the life of the daemon, and the original code logged the same
+  Warn every tick: ~2900 identical lines a day, the exact failure the project's
+  logging rules were written after. The sibling `sleepFabricBackoff` (#5047)
+  already states the rule in its own comment: transitions at Info/Warn, ticks at
+  Debug.
+- **The re-arm is the load-bearing half**: a streak flag that never clears trades
+  a noisy journal for a SILENT one, because a later, genuinely new outage would
+  then be logged at Debug and be invisible. It is cleared only on a reconcile
+  that actually brought the listener back, not on one that merely returned nil.
+- **File(s)**: `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`, `_Log.md`
+
+## 2026-08-26 — `_Log.md` carried six committed conflict markers; add a repo-wide sweep
+
+- **Timestamp**: 2026-08-26
+- **Action**: Union-resolve two merge-conflict blocks that were COMMITTED into
+  `_Log.md` on master, and add `pkg/refactoraudit/conflict_markers_test.go` so a
+  marker can never sit in a tracked file again.
+- **Why**: master carried six marker lines across two blocks. Both arrived the
+  same way — a `git merge` conflicted, the conflict was not checked, and a
+  `git add -A` staged the marker-laden file. One of the two had an EMPTY
+  "theirs" side, so an entire #6797 log entry sat inside a conflict block. I
+  authored the second block myself, in the #6803 dampening commit, by doing
+  exactly that.
+- **Why nothing caught it**: `_Log.md` is prose. No compiler, linter or test
+  reads it, so a marker is invisible to `go test ./...`. A marker in a SOURCE
+  file breaks the build loudly — the real exposure is docs, prose, configs,
+  fixtures and goldens, which is where one can sit indefinitely.
+- **The sweep**: over `git ls-files`, not a filesystem walk — this repo keeps
+  ~140 git worktrees under `.claude/wt-*` and a walk would descend into every
+  one, scanning other branches' trees. Anchored at line start, because an
+  unanchored search false-positives on prose ABOUT markers, which `_Log.md` is
+  full of. `=======` counts only when the line is EXACTLY seven equals, since
+  Markdown uses it as a setext underline and an ASCII rule.
+- **The needles are assembled at runtime**, not written as literals: a gate that
+  greps for a string must not contain that string, or it is the permanent first
+  hit of its own sweep and the only way to stay green is an exemption that also
+  hides real markers.
+- **Two anti-vacuity floors** (`len(files) >= 100`, `scanned >= 100`) plus a
+  sensitivity control that drives the same predicate over a synthetic conflicted
+  document and over the prose forms that must stay quiet. Verified paired: run
+  against the PRE-FIX `_Log.md` the gate REDs; against the fixed one it passes,
+  sweeping 7007 tracked text files.
+- **File(s)**: `_Log.md`, `pkg/refactoraudit/conflict_markers_test.go` (new)
+
+## 2026-08-26 — #6802: a retry owner for a failed host-inbound conntrack revocation
+
+- **Timestamp**: 2026-08-26
+- **Action**: Give the #5566 host-inbound kernel-conntrack reconcile a return
+  value, retry debt, a persistent retry owner, and two Prometheus series.
+- **Why**: the flush deletes established kernel conntrack entries for host
+  services the operator has just REMOVED, because those entries would otherwise
+  ride the host-inbound chain's leading `ct state established,related accept`. So
+  a delete failure fails **OPEN** — the now-denied service keeps being served on
+  every existing connection. The in-code rationale for not failing the commit is
+  sound and is retained (the nft table is applied, so new connections are
+  enforced, and rolling the commit back over a transient conntrack error would
+  discard correct enforcement). The defect was that it was not anything ELSE
+  either: no return value, no dirty flag, no counter, no metric, and no ticker
+  re-ran it. Every ticker under `pkg/daemon` was enumerated — DDNS, RPM, HA
+  fabric, HA, IPsec rebind, DHCP lease sync, neighbor, proxy-ARP, archive,
+  kernel self-recover — and none re-drives `applyConfig`,
+  `applyHostInboundFilter` or the flush, so the only re-attempt was the next
+  externally-triggered apply, itself gated on `InstallHostInbound` succeeding.
+- **Shape**: mirrors #6793 / #6791. `flushDeniedHostInboundConntrack` returns a
+  bool; `noteHostInboundConntrackFlush` retains the EXACT failed request as debt
+  (not a set re-derived at retry time — that would attempt a different revocation
+  than the one that failed, and the two diverge precisely when a commit landed in
+  between) and bumps a counter; `hostInboundConntrackReassertLoop` is started
+  unconditionally in `Run` at 30s, takes `applySem` before acting (#4001), and
+  re-reads the debt INSIDE the semaphore because the commit it queued behind may
+  already have flushed successfully. A one-family failure still sweeps the other
+  family; the failure is carried out in the return value rather than swallowed.
+- **Wired, not merely exported**: `HostInboundConntrackRevocationOwed` /
+  `HostInboundConntrackFlushFailures` reach `daemon_run_servers.go` as
+  `xpf_host_inbound_conntrack_revocation_pending` and `…_failures_total`,
+  mirroring the `IPsecRebindPendingFn` (#4899) precedent. An accessor with no
+  production caller is the #6852 shape and would have left the operator exactly
+  as blind as before. Both series are OMITTED rather than published as `0` when
+  unwired (the #6828 absent-vs-zero distinction).
+- **Test gaps this closed**: the pre-existing #5566 stub always returned
+  `(0, nil)`, so no test exercised the delete-ERROR path at all. Added a loop-START
+  cell after #6793 shipped without one — every other cell drives the retry
+  function directly, so a `Run` that never launched the owner passes all of them.
+- **File(s)**: `pkg/daemon/host_inbound_conntrack_flush.go`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/daemon_nft.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/server.go`,
+  `pkg/daemon/host_inbound_conntrack_retry_6802_test.go`,
+  `pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go`,
+  `pkg/daemon/README.md`, `docs/host-inbound-service-matrix.md`, `_Log.md`
+
+## 2026-08-26 — `_Log.md`: three duplicated entries from bad union merges, and the gate that sees them
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove three duplicated entry bodies and add
+  `pkg/refactoraudit/log_duplicate_entry_test.go`.
+- **Why the marker sweep was not enough**: the #7614 sweep catches a conflict
+  that was never RESOLVED. It cannot catch one that was resolved WRONGLY, which
+  leaves no marker behind and is syntactically fine Markdown. Three were live:
+  - **#6797's whole body copied under the #6799 heading**, so the record of
+    #6799 read as a description of a different change while #6799's own body sat
+    below it looking like a continuation. Reported by the #6790 lane; I had
+    resolved the markers around it in #7614 without noticing the body itself was
+    wrong.
+  - a **doubled #5078 follow-ups entry** (byte-identical, twice).
+  - a **truncated copy of a #6865 gate-fold entry** (1533B) beside its full
+    version (21656B).
+- **Two predicates, because one cannot see the other**: exact equality catches a
+  whole entry copied twice; PREFIX CONTAINMENT catches the shape a bad union
+  merge actually produces, where both sides end up concatenated under ONE
+  heading so the survivor's body is the loser's body followed by its own. Those
+  nest rather than match. Equality alone found 1 of the 3; containment found all
+  3.
+- **The control had the assertion the wrong way round**, and fixing it was the
+  point: the "genuinely different" fixture was `body + suffix`, which IS
+  containment by construction — it asserted the gate stays QUIET on exactly the
+  shape it exists to catch. Replaced with a genuinely unrelated body.
+- **Verified paired**: against the pre-fix `_Log.md` the gate reds naming all
+  three; against the fixed one it passes over 1946 entries.
+- **File(s)**: `_Log.md`, `pkg/refactoraudit/log_duplicate_entry_test.go` (new)
 
 ## 2026-08-26 — #6801 released-NIC RSS/coalescence teardown
 

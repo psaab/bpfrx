@@ -335,6 +335,13 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// operator sees a tunnel that cannot re-establish instead of a
 		// silently-dropped reload error.
 		IPsecRebindPendingFn: d.IPsecRebindPending,
+		// #6802: surface a FAILED host-inbound conntrack revocation. The
+		// failure is fail-open — a now-denied host service stays reachable
+		// over its established kernel connection — and before #6802 it left
+		// no trace at all, so an operator had no way to see that a service
+		// they had just removed was still being served.
+		HostInboundConntrackRevocationOwedFn: d.HostInboundConntrackRevocationOwed,
+		HostInboundConntrackFlushFailuresFn:  d.HostInboundConntrackFlushFailures,
 		// #3780: surface scheduler republish-failure so
 		// xpf_scheduler_republish_failed reads 1 (and
 		// xpf_scheduler_republish_stale_seconds climbs) while a
