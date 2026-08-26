@@ -56,6 +56,34 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"1 means the retry owner is running but not converging.",
 		nil, nil,
 	)
+	// #6800: an xpf-managed service configuration file converges on disk and the
+	// applier then gates its RUNTIME reload on "did the on-disk set change".
+	// That gate erased the debt of a FAILED reload — the file was already
+	// converged, so every later apply saw no change and skipped the reload — and
+	// the node kept serving the previous ruleset with no signal anywhere. These
+	// two series are that missing signal; the retry owner is the other half.
+	c.managedServiceReloadPending = prometheus.NewDesc(
+		"xpf_managed_service_reload_pending",
+		"1 while an xpf-managed service configuration file has converged on "+
+			"disk but the RUNTIME reload that would load it has not succeeded "+
+			"(#6800). Labelled by service: `rsyslog` means the managed "+
+			"/etc/rsyslog.d drop-ins are on disk but rsyslog has not re-read "+
+			"them, so records may still be flowing to a destination the "+
+			"operator REMOVED; `chrony-sources` and `chrony-threshold` mean "+
+			"chrony is still running the previous server set or "+
+			"logchange/maxchange. The daemon re-drives the owed reload "+
+			"autonomously every 30s; 0 once it succeeds.",
+		[]string{"service"}, nil,
+	)
+	c.managedServiceReloadFailures = prometheus.NewDesc(
+		"xpf_managed_service_reload_failures_total",
+		"Total failed runtime-reload attempts per xpf-managed service (#6800). "+
+			"Counts retries too, so a value that climbs while "+
+			"xpf_managed_service_reload_pending stays 1 means the retry owner "+
+			"is running but not converging — a masked or failed unit, say — "+
+			"rather than a single transient failure already paid.",
+		[]string{"service"}, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+

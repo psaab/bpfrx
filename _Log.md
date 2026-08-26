@@ -26,10 +26,21 @@
   apply path also writes (a restart issued outside the semaphore can load a
   half-converged drop-in set mid-reconcile and latch a success for it) and
   re-reading the debt inside it.
+  Operator visibility was added in the same change rather than deferred, after
+  #6802 landed the identical pattern with a wired metric pair: an exported
+  accessor with no production caller is its own defect here (#6852), and a
+  retry owner nobody can see is the blindness the owner exists to end.
+  `ManagedServiceReloadOwed` / `ManagedServiceReloadFailures` reach the
+  REST/metrics server as `xpf_managed_service_reload_pending` and
+  `xpf_managed_service_reload_failures_total`, labelled by `service` because the
+  three legs fail independently.
 - **File(s)**: `pkg/daemon/daemon_service_reload_debt.go` (new),
   `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon.go`,
-  `pkg/daemon/daemon_run.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/api/server.go`, `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
   `pkg/daemon/service_reload_debt_6800_test.go` (new),
+  `pkg/api/metrics_managed_service_reload_6800_test.go` (new),
   `pkg/daemon/README.md`
 - **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0.
   20-cell mutation matrix, 20/20 RED, one reverted production line per cell,

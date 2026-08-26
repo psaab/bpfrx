@@ -2139,8 +2139,26 @@ never lock an operator out of a remote box it manages.
   per-leg outcome pairs; the two SYMMETRIC "owed leg survives an apply that
   changed the other file" cells; a same-config cell binding that the fold
   precedes the early return; the re-assert replaying the EXACT owed leg; the
-  inside-the-semaphore re-read; loop ticks + ctx cancel; and a loop-START cell
-  asserting `Run` launches it unconditionally).
+  per-service gates via a paired one-owes/one-quiet cell; the
+  inside-the-semaphore re-read; loop ticks + ctx cancel; a loop-START cell
+  asserting `Run` launches it unconditionally; and the accessor + metric-wiring
+  cells below).
+  Operator visibility, mirroring #6802: `ManagedServiceReloadOwed` /
+  `ManagedServiceReloadFailures` are wired into the REST/metrics server
+  (`daemon_run_servers.go`) as `xpf_managed_service_reload_pending` and
+  `xpf_managed_service_reload_failures_total`, both labelled by `service`
+  (`rsyslog`, `chrony-sources`, `chrony-threshold`) because the legs fail
+  independently and a collapsed gauge would not say WHICH reload never landed.
+  The counter earns its place beside the gauge: a count that CLIMBS while the
+  gauge stays 1 means the retry owner is running but not converging (a masked or
+  failed unit), which the gauge alone cannot distinguish from one transient
+  failure already paid. Both series are OMITTED rather than published as `0`
+  when the fn is unwired (the #6828 absent-vs-zero distinction), and an accessor
+  with no production caller would leave the operator exactly as blind as before
+  (the #6852 shape) — hence the source-level wiring cell. Pinned by
+  `pkg/api/metrics_managed_service_reload_6800_test.go` through a PEDANTIC
+  registry, which is what makes a missing `Describe` entry a hard error rather
+  than a silent production degradation.
 
   **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
   `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and

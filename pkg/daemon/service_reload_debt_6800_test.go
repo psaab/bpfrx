@@ -808,6 +808,115 @@ func TestServiceReloadDebtLoopTicks6800(t *testing.T) {
 	}
 }
 
+// TestManagedServiceReloadAccessorsTrackTheDebt6800 binds the two EXPORTED
+// accessors to the debt they report on, per service.
+//
+// They are the operator-visible half of the fix. Without them the retry owner
+// is invisible: a node can re-drive a failing `systemctl restart rsyslog` for
+// hours while every dashboard shows a firewall that committed cleanly.
+//
+// The failure COUNTER is asserted separately from the pending flag because they
+// answer different questions — a gauge stuck at 1 says "not converged", a count
+// that climbs alongside it says the retry owner is running and still failing —
+// and a counter wired to the flag would collapse the two.
+func TestManagedServiceReloadAccessorsTrackTheDebt6800(t *testing.T) {
+	d, _, setFail := syslogDaemon6800(t)
+	_, _, setOutcome := chronyDaemon6800(t)
+
+	if owed := d.ManagedServiceReloadOwed(); owed[svcReloadRsyslog] ||
+		owed[svcReloadChronySources] || owed[svcReloadChronyThreshold] {
+		t.Fatalf("a fresh daemon must owe nothing, got %v", owed)
+	}
+
+	// rsyslog fails, chrony SOURCES fails, chrony THRESHOLD succeeds. All three
+	// legs are exercised in one pass, and the succeeding one is what keeps this
+	// from passing against an accessor that reports everything owed.
+	setFail(errors.New("simulated restart failure"))
+	d.applySyslogFiles(syslogFileCfg6800("audit"))
+	setOutcome(chronyReloadOutcome{sourcesFailed: true})
+	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
+
+	owed := d.ManagedServiceReloadOwed()
+	if !owed[svcReloadRsyslog] || !owed[svcReloadChronySources] {
+		t.Errorf("owed = %v; the two failed reloads must be reported", owed)
+	}
+	if owed[svcReloadChronyThreshold] {
+		t.Errorf("owed = %v; the threshold leg SUCCEEDED, so reporting it owed "+
+			"would page an operator for a reload that already landed", owed)
+	}
+
+	fails := d.ManagedServiceReloadFailures()
+	if fails[svcReloadRsyslog] != 1 {
+		t.Errorf("rsyslog failures = %d, want 1", fails[svcReloadRsyslog])
+	}
+	if fails[svcReloadChronySources] != 1 {
+		t.Errorf("chrony-sources failures = %d, want 1", fails[svcReloadChronySources])
+	}
+	if fails[svcReloadChronyThreshold] != 0 {
+		t.Errorf("chrony-threshold failures = %d, want 0 — that leg never failed, "+
+			"and a counter that moves for a successful reload is noise an "+
+			"operator will learn to ignore", fails[svcReloadChronyThreshold])
+	}
+
+	// A retry that fails again must CLIMB the counters while the flags stay 1 —
+	// that pairing is the whole point of publishing both series.
+	d.applySem = semaphore.NewWeighted(1)
+	d.reassertServiceReloadDebtOnce(context.Background())
+	fails = d.ManagedServiceReloadFailures()
+	if fails[svcReloadRsyslog] != 2 || fails[svcReloadChronySources] != 2 {
+		t.Errorf("failures after a second failed attempt = %v, want 2 apiece — "+
+			"a flat counter beside a pending gauge of 1 cannot distinguish a "+
+			"retry owner that is running-but-not-converging from one that is "+
+			"wedged", fails)
+	}
+	if o := d.ManagedServiceReloadOwed(); !o[svcReloadRsyslog] || !o[svcReloadChronySources] {
+		t.Errorf("owed = %v; the retry failed, so both debts stay outstanding", o)
+	}
+
+	// A success DISCHARGES the flags but must NOT rewind the counters: the
+	// failures really happened, and a counter that resets on recovery hides
+	// exactly the flapping it exists to show.
+	setFail(nil)
+	setOutcome(chronyReloadOutcome{})
+	d.reassertServiceReloadDebtOnce(context.Background())
+	if o := d.ManagedServiceReloadOwed(); o[svcReloadRsyslog] || o[svcReloadChronySources] {
+		t.Errorf("owed = %v after a successful retry, want everything discharged", o)
+	}
+	if f := d.ManagedServiceReloadFailures(); f[svcReloadRsyslog] < 2 ||
+		f[svcReloadChronySources] < 2 {
+		t.Errorf("failures = %v after recovery, want the monotonic counts "+
+			"preserved (>=2) — a counter that rewinds on success hides the "+
+			"flapping it exists to show", f)
+	}
+}
+
+// TestDaemonWiresManagedServiceReloadMetrics6800 binds the WIRING of those
+// accessors into the REST/metrics server.
+//
+// An exported accessor that nothing calls satisfies nothing: it is the #6852
+// shape, and the accessor cell above would stay green with the operator still
+// blind. startHTTPServer builds the api.Config inline and launches a goroutine,
+// so it cannot be driven from a unit test; the assignment is asserted at the
+// source with comments stripped, the same instrument the loop-start cell uses.
+//
+// FAIL-ON-REVERT: drop either assignment from daemon_run_servers.go and this
+// reds, while every behavioural cell in this file stays green.
+func TestDaemonWiresManagedServiceReloadMetrics6800(t *testing.T) {
+	src := stripLineComments6791(readDaemonSource(t, "daemon_run_servers.go"))
+
+	for _, want := range []string{
+		"ManagedServiceReloadOwedFn:     d.ManagedServiceReloadOwed",
+		"ManagedServiceReloadFailuresFn: d.ManagedServiceReloadFailures",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("daemon does not wire %q into the REST/metrics server; the "+
+				"accessor has no production caller, so a managed service still "+
+				"running the previous ruleset is invisible to an operator "+
+				"(#6800, and the #6852 no-production-caller shape)", want)
+		}
+	}
+}
+
 // TestRunStartsTheServiceReloadDebtReassertLoop6800 binds the WIRING.
 //
 // Every cell above stays green if Run never starts the loop — which IS half the

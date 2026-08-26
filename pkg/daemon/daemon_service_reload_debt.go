@@ -65,7 +65,24 @@ type serviceReloadDebt struct {
 	// chronyThreshold: /etc/chrony/conf.d/xpf-threshold.conf is on disk but no
 	// chrony reload/restart has succeeded since it was written.
 	chronyThreshold bool
+
+	// Monotonic per-leg failure counts. A gauge stuck at 1 says "not converged";
+	// these say whether the retry owner is RUNNING and failing (count climbing)
+	// or wedged (count flat) — the distinction #6802 made for its own debt.
+	rsyslogFailures         uint64
+	chronySourcesFailures   uint64
+	chronyThresholdFailures uint64
 }
+
+// Managed-service identifiers used as the `service` label on the two
+// #6800 metric series, and as the keys of the two exported accessors. Named
+// constants so the daemon-side accessor and any consumer cannot drift on a
+// string literal.
+const (
+	svcReloadRsyslog         = "rsyslog"
+	svcReloadChronySources   = "chrony-sources"
+	svcReloadChronyThreshold = "chrony-threshold"
+)
 
 // noteRsyslogRestartResult records the outcome of one `systemctl restart
 // rsyslog`. A failure LATCHES the debt; a success DISCHARGES it. Both
@@ -76,6 +93,9 @@ func (d *Daemon) noteRsyslogRestartResult(err error) {
 	d.svcReloadDebt.mu.Lock()
 	defer d.svcReloadDebt.mu.Unlock()
 	d.svcReloadDebt.rsyslogRestart = err != nil
+	if err != nil {
+		d.svcReloadDebt.rsyslogFailures++
+	}
 }
 
 // rsyslogRestartOwed reports whether a rsyslog restart is still owed.
@@ -107,6 +127,48 @@ func (d *Daemon) noteChronyReloadResult(out chronyReloadOutcome) {
 	defer d.svcReloadDebt.mu.Unlock()
 	d.svcReloadDebt.chronySources = out.sourcesFailed
 	d.svcReloadDebt.chronyThreshold = out.thresholdFailed
+	if out.sourcesFailed {
+		d.svcReloadDebt.chronySourcesFailures++
+	}
+	if out.thresholdFailed {
+		d.svcReloadDebt.chronyThresholdFailures++
+	}
+}
+
+// ManagedServiceReloadOwed reports, per managed service, whether a runtime
+// reload is still owed (#6800). It is the operator-visible half of the fix:
+// without it a node can re-drive a failing `systemctl restart rsyslog` for
+// hours while every dashboard shows a firewall that committed cleanly, which is
+// the same blindness the retry owner was added to end.
+//
+// Returned as a map because the debt is genuinely per-leg — the two chrony legs
+// drive different commands and fail independently — and collapsing them would
+// tell an operator that "chrony" is unhappy without saying which reload never
+// landed.
+func (d *Daemon) ManagedServiceReloadOwed() map[string]bool {
+	d.svcReloadDebt.mu.Lock()
+	defer d.svcReloadDebt.mu.Unlock()
+	return map[string]bool{
+		svcReloadRsyslog:         d.svcReloadDebt.rsyslogRestart,
+		svcReloadChronySources:   d.svcReloadDebt.chronySources,
+		svcReloadChronyThreshold: d.svcReloadDebt.chronyThreshold,
+	}
+}
+
+// ManagedServiceReloadFailures reports the monotonic per-service count of
+// failed reload attempts (#6800), including retries. A count that climbs while
+// the matching pending gauge stays 1 means the retry owner is running but not
+// converging — a masked or failed unit, say — which is operationally a very
+// different situation from a single transient failure that was paid on the next
+// tick, and the gauge alone cannot distinguish them.
+func (d *Daemon) ManagedServiceReloadFailures() map[string]uint64 {
+	d.svcReloadDebt.mu.Lock()
+	defer d.svcReloadDebt.mu.Unlock()
+	return map[string]uint64{
+		svcReloadRsyslog:         d.svcReloadDebt.rsyslogFailures,
+		svcReloadChronySources:   d.svcReloadDebt.chronySourcesFailures,
+		svcReloadChronyThreshold: d.svcReloadDebt.chronyThresholdFailures,
+	}
 }
 
 // serviceReloadDebtOutstanding reports whether ANY managed-service reload is

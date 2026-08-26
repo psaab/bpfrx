@@ -342,6 +342,16 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// they had just removed was still being served.
 		HostInboundConntrackRevocationOwedFn: d.HostInboundConntrackRevocationOwed,
 		HostInboundConntrackFlushFailuresFn:  d.HostInboundConntrackFlushFailures,
+		// #6800: surface the managed-service reload debt so
+		// xpf_managed_service_reload_pending reads 1 (and
+		// xpf_managed_service_reload_failures_total climbs) while a service
+		// whose configuration file has already converged on disk is still
+		// running the PREVIOUS ruleset. Without this the retry owner is
+		// invisible: a node can re-drive a failing `systemctl restart rsyslog`
+		// for hours while every dashboard shows a firewall that committed
+		// cleanly, which is the blindness the retry owner exists to end.
+		ManagedServiceReloadOwedFn:     d.ManagedServiceReloadOwed,
+		ManagedServiceReloadFailuresFn: d.ManagedServiceReloadFailures,
 		// #3780: surface scheduler republish-failure so
 		// xpf_scheduler_republish_failed reads 1 (and
 		// xpf_scheduler_republish_stale_seconds climbs) while a
