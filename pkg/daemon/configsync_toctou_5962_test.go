@@ -28,6 +28,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // setRG0Ownership drives a live cluster.Manager across the RG0-authority
@@ -64,7 +65,7 @@ func TestOperatorCommitResolvesPeerSyncAtPushTime(t *testing.T) {
 		d, calls := newSyncProbeDaemon(t, cl)
 		d.applyBodyForTest = func(_ *config.Config) { setRG0Ownership(t, cl, true) }
 
-		if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+		if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 			t.Fatalf("commitAndApplyOperator: %v", err)
 		}
 		if *calls != 1 {
@@ -81,7 +82,7 @@ func TestOperatorCommitResolvesPeerSyncAtPushTime(t *testing.T) {
 		d, calls := newSyncProbeDaemon(t, cl)
 		d.applyBodyForTest = func(_ *config.Config) { setRG0Ownership(t, cl, false) }
 
-		if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+		if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 			t.Fatalf("commitAndApplyOperator: %v", err)
 		}
 		if *calls != 0 {
@@ -96,7 +97,7 @@ func TestOperatorCommitResolvesPeerSyncAtPushTime(t *testing.T) {
 	// always pushed would pass the promotion case above.
 	t.Run("stable owner: pushes once (control)", func(t *testing.T) {
 		d, calls := newSyncProbeDaemon(t, clusterOwningRG0(t))
-		if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+		if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 			t.Fatalf("commitAndApplyOperator: %v", err)
 		}
 		if *calls != 1 {
@@ -106,7 +107,7 @@ func TestOperatorCommitResolvesPeerSyncAtPushTime(t *testing.T) {
 
 	t.Run("stable non-owner: never pushes (control)", func(t *testing.T) {
 		d, calls := newSyncProbeDaemon(t, clusterNotOwningRG0(t))
-		if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+		if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 			t.Fatalf("commitAndApplyOperator: %v", err)
 		}
 		if *calls != 0 {

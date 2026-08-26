@@ -40,6 +40,46 @@
   level-triggered, re-introducing what #3756 M1 removed); and a stale-revision
   cell proving the ABA guard holds.
 
+## 2026-08-26 — #6809: a connected non-reader no longer pins the BGP stream
+
+- **Timestamp**: 2026-08-26
+- **Action**: `/api/routing/bgp?type=routes` had bounds on PROGRESS only —
+  `maxBGPRoutes` caps bytes, `StreamBGPRoutes` caps memory, the #5232 check
+  aborts on DISCONNECT. None bound the handler while BLOCKED. A client that
+  stays connected and stops reading fills the socket buffers, `bw.Flush()`
+  parks in the kernel, the callback never returns, and the cancel/close/reap
+  that kills vtysh all sit AFTER the scan loop: handler goroutine, vtysh child,
+  pipe and connection pinned indefinitely. `WriteTimeout` is 0 process-wide for
+  SSE, so no global backstop either.
+  Added three bounds, deliberately not interchangeable: a per-write deadline
+  (the only thing that can unpin a goroutine already blocked in a write), an
+  elapsed backstop derived from `r.Context()` and handed to `StreamBGPRoutes`
+  so `exec.CommandContext` reaps vtysh, and a 2-slot non-blocking limiter so a
+  bounded stream cannot become an unbounded NUMBER of vtysh children.
+  MY FIRST FIX WAS WRONG AND THE TEST CAUGHT IT. I armed the deadline next to
+  the explicit 1024-route flushes; `bufio` auto-flushes when its 4 KiB buffer
+  fills, so ~17 real socket writes happen between two consecutive flush
+  boundaries and those block first. The slow-reader cell failed with the fix
+  in place. Restructured to a `deadlineArmingWriter` between `bufio` and the
+  `ResponseWriter`, which makes the coverage structural rather than a matter of
+  remembering every flush site — including the closing flush a sub-1024-route
+  table reaches without entering the periodic branch at all.
+  Corrected a false claim in `server.go` and `pkg/api/README.md`: "the response
+  side is bounded by per-handler context deadlines" does not hold as written —
+  a context deadline bounds a handler's WORK, not a write blocked in the
+  kernel. R70 flagged the same sentence.
+- **File(s)**: `pkg/api/routing.go`, `pkg/api/server.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: the fixture models the hazard rather than approximating it —
+  a `net.Conn` that accepts a fixed prefix and then parks the writer until the
+  write deadline, forever if none is armed. Deterministic fail-on-revert, no
+  socket-buffer-size guessing. Includes a NEGATIVE CONTROL proving the fixture
+  can genuinely pin (deadlines unsupported + a distant backstop → the handler
+  must still be running), without which the passing cell proves nothing, and a
+  paired control proving a real reader still gets the whole table under tight
+  budgets.
+
 ## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
 
 - **Timestamp**: 2026-08-26
@@ -105958,3 +105998,86 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cli/cli_show_security_zones.go`,
   `pkg/api/metrics_zone_overflow_6845_test.go` (new), `pkg/api/README.md`,
   `_Log.md`
+
+## 2026-08-26 — #6808 bind the commit to the holder that authorized it
+
+- **Timestamp**: 2026-08-26
+- **Action**: Close the holder-turnover substitution (opus-review-001 root R69):
+  the commit paths verified the config-lock holder and then promoted through a
+  callback carrying NO identity, so the lock could turn over in between and the
+  in-flight commit would promote the NEW holder's candidate under the ORIGINAL
+  holder's authorization.
+- **Re-derivation widened the scope past the title.** R69 says "REST commit";
+  the identical gate-then-unscoped-callback shape is at FOUR sites — REST
+  commit/commit-confirmed (`pkg/api/config.go:233,500`) and gRPC
+  Commit/CommitConfirmed (`pkg/grpcapi/server_config.go:253,295`). Fixing only
+  REST would close two of four doors on one authorization defect, and the
+  threading is shared plumbing, so splitting would land an intermediate state
+  where two call sites pass a zero authority — the fail-open-by-omission the
+  explicit parameter exists to prevent.
+- **gRPC has a NON-ADVERSARIAL trigger**: `configLockStatsHandler.HandleConn`
+  auto-releases the lock on `ConnEnd` from a separate goroutine with no
+  coordination with an in-flight commit. Its comment claims the release is
+  "guarded ... by the store's holder check" — true of a DIFFERENT hazard
+  (releasing someone else's lock) and silent about releasing the committer's own
+  lock mid-commit. An ordinary disconnect reaches the substitution.
+- **Reading R69's Refutation, not just its Evidence, changed the fix.** The
+  natural read from the title is "generation binding is missing". Generation
+  binding is present AND correct; it answers a different question and takes no
+  session id. A turnover completing before `CompileCandidateGen` — during the
+  `applySem.Acquire` wait, where a busy daemon actually waits — yields a
+  perfectly consistent generation pair describing B's candidate. Worse, since
+  `commitWithGenBinding` RETRIES `ErrCandidateGenerationConflict` by design, a
+  turnover reported as a generation conflict would make the retry loop perform
+  the substitution automatically. Hence a DISTINCT `ErrConfigHolderTurnover`
+  sentinel, with a cell pinning the two apart.
+- **The zero value is invalid, not a bypass** (review strengthening, and the
+  part most likely to be got wrong). Letting `CommitAuthority{}` mean "internal
+  committer" would put the god-mode capability at exactly the value a forgotten
+  field produces: the explicit parameter would catch OMISSION (compile error)
+  while silently admitting a wrong-but-compiling zero that reads as deliberate.
+  Internal committers now state it with `InternalCommitter()`; the store rejects
+  the zero with `ErrCommitAuthorityMissing`.
+- **Explicit parameter, not a Context value**: an absent ctx value is
+  indistinguishable from a deliberate one and degrades silently to a bypass on
+  an authorization path. The signature change makes omission a compile error —
+  which is exactly how the four defect sites surfaced during the change.
+- **`EnsureConfigHolder` DELETED, its test MOVED.** Once all four commit paths
+  used `AuthorizeCommit` it had zero production callers, and its doc comment
+  ("the exported gate used by the commit-family gRPC RPCs") had become false.
+  Leaving a weaker twin beside the fixed gate is how this class regresses.
+  `TestEnsureConfigHolder` moved to `TestAuthorizeCommitHolderGate` — the #5059
+  property did not change, but the function enforcing it did, and a test left on
+  the old symbol would stay green while guarding nothing.
+- **Rejected alternative, recorded**: pin the holder for the commit's duration
+  so turnover cannot happen. Smaller, no signature change — but it breaks the
+  #5849 auto-release contract: a dropped connection whose commit is pinned finds
+  `sess.released.Do` already consumed and the lock wedged until the #4476 lease
+  TTL. Recovering that needs deferred-release machinery, which spends the
+  simplicity that made it attractive.
+- **Designed around a known asymmetry**: `ExitConfigure()` clears
+  `exclusiveHolder` but not `configHolder`, safe today only because
+  `ensureHolderLocked` short-circuits on `!s.configDir`. An epoch keyed off
+  `configHolder` alone would have inherited that. Bumping the epoch on that path
+  makes it safe without depending on the short-circuit. Filing separately.
+- **14 cells**: 6 enforcement (`pkg/configstore`), 4 REST wiring (`pkg/api`),
+  4 gRPC wiring (`pkg/grpcapi`). The wiring cells matter independently — a
+  handler passing `InternalCommitter()` still COMPILES and restores the defect
+  in full, so they assert the authority the handler PASSES, not the store's
+  reaction to it. Controls assert an unchanged holder still commits AND actually
+  promotes (a control checking only status/err would pass against a fixture that
+  never reached promotion), and that an explicit internal committer is still
+  accepted (else "refuse everything" passes every refusal cell — a configuration
+  outage strictly worse than the defect).
+- **File(s)**: `pkg/configstore/commit_authority.go` (new),
+  `pkg/configstore/commit_authority_6808_test.go` (new),
+  `pkg/configstore/store.go`, `pkg/configstore/store_lock.go`,
+  `pkg/configstore/store_commit.go`,
+  `pkg/configstore/config_lock_holder_5059_test.go`,
+  `pkg/api/config.go`, `pkg/api/server.go`,
+  `pkg/api/config_holder_turnover_6808_test.go` (new),
+  `pkg/grpcapi/server_config.go`, `pkg/grpcapi/server.go`,
+  `pkg/grpcapi/config_holder_turnover_6808_test.go` (new),
+  `pkg/daemon/daemon_apply_commit.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/daemon_apply_tail.go`, `pkg/configstore/README.md`,
+  plus mechanical test migrations, `_Log.md`

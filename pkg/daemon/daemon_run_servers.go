@@ -8,6 +8,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/fwdstatus"
@@ -67,39 +68,43 @@ func (d *Daemon) effectiveListeners() sysservices.Listeners {
 // transport is what lets a single-transport regression turn a single test case
 // RED instead of staying silent.
 
-func (d *Daemon) grpcCommitFn() func(context.Context, string) (*config.Config, error) {
-	return func(ctx context.Context, comment string) (*config.Config, error) {
-		return d.commitAndApplyOperator(ctx, comment)
+func (d *Daemon) grpcCommitFn() func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
+	return func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error) {
+		return d.commitAndApplyOperator(ctx, authority, comment)
 	}
 }
 
-func (d *Daemon) grpcCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
-	return func(ctx context.Context, minutes int) (*config.Config, error) {
-		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+func (d *Daemon) grpcCommitConfirmedFn() func(context.Context, configstore.CommitAuthority, int) (*config.Config, error) {
+	return func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error) {
+		return d.commitConfirmedAndApplyOperator(ctx, authority, minutes)
 	}
 }
 
-func (d *Daemon) restCommitFn() func(context.Context, string) (*config.Config, error) {
-	return func(ctx context.Context, comment string) (*config.Config, error) {
-		return d.commitAndApplyOperator(ctx, comment)
+func (d *Daemon) restCommitFn() func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
+	return func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error) {
+		return d.commitAndApplyOperator(ctx, authority, comment)
 	}
 }
 
-func (d *Daemon) restCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
-	return func(ctx context.Context, minutes int) (*config.Config, error) {
-		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+func (d *Daemon) restCommitConfirmedFn() func(context.Context, configstore.CommitAuthority, int) (*config.Config, error) {
+	return func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error) {
+		return d.commitConfirmedAndApplyOperator(ctx, authority, minutes)
 	}
 }
 
+// shellCommitFn is the in-process shell CLI's commit seam. The local shell
+// carries no config-lock session id, so it commits as an EXPLICIT internal
+// committer (#6808) rather than by omitting the authority — "this caller has no
+// holder" must be a written statement, not a zero value.
 func (d *Daemon) shellCommitFn() func(context.Context, string) (*config.Config, error) {
 	return func(ctx context.Context, comment string) (*config.Config, error) {
-		return d.commitAndApplyOperator(ctx, comment)
+		return d.commitAndApplyOperator(ctx, configstore.InternalCommitter(), comment)
 	}
 }
 
 func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Config, error) {
 	return func(ctx context.Context, minutes int) (*config.Config, error) {
-		return d.commitConfirmedAndApplyOperator(ctx, minutes)
+		return d.commitConfirmedAndApplyOperator(ctx, configstore.InternalCommitter(), minutes)
 	}
 }
 

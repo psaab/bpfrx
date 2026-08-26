@@ -66,8 +66,13 @@ func TestStoreMutatorHolderEnforcement(t *testing.T) {
 	}
 }
 
-// TestEnsureConfigHolder covers the exported gate the commit-family RPCs use.
-func TestEnsureConfigHolder(t *testing.T) {
+// TestAuthorizeCommitHolderGate covers the exported gate the commit-family RPCs
+// use. It MOVED here from TestEnsureConfigHolder when #6808 replaced
+// EnsureConfigHolder with AuthorizeCommit: the #5059 property (only the holder
+// may reach a commit; the internal caller bypasses) did not change, but the
+// function that enforces it did. Leaving the test on the old symbol would have
+// kept it green while guarding a function no commit path calls any more.
+func TestAuthorizeCommitHolderGate(t *testing.T) {
 	store, err := New(filepath.Join(t.TempDir(), "xpf.conf"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -75,13 +80,28 @@ func TestEnsureConfigHolder(t *testing.T) {
 	if err := store.EnterConfigureSession("owner"); err != nil {
 		t.Fatalf("EnterConfigureSession: %v", err)
 	}
-	if err := store.EnsureConfigHolder("intruder"); !errors.Is(err, ErrConfigLockedByOther) {
-		t.Errorf("EnsureConfigHolder(non-holder) = %v, want ErrConfigLockedByOther", err)
+	if _, err := store.AuthorizeCommit("intruder"); !errors.Is(err, ErrConfigLockedByOther) {
+		t.Errorf("AuthorizeCommit(non-holder) = %v, want ErrConfigLockedByOther", err)
 	}
-	if err := store.EnsureConfigHolder("owner"); err != nil {
-		t.Errorf("EnsureConfigHolder(holder) = %v, want nil", err)
+	auth, err := store.AuthorizeCommit("owner")
+	if err != nil {
+		t.Errorf("AuthorizeCommit(holder) = %v, want nil", err)
 	}
-	if err := store.EnsureConfigHolder(""); err != nil {
-		t.Errorf("EnsureConfigHolder(internal) = %v, want nil", err)
+	// #6808: the holder's authority must be BOUND, not internal — an authority
+	// that came back internal would satisfy every promotion check and silently
+	// restore the pre-#6808 behaviour.
+	if auth.IsInternal() {
+		t.Error("AuthorizeCommit(holder) returned an INTERNAL authority; the holder's " +
+			"commit would then bypass the turnover check entirely (#6808)")
+	}
+	if auth.SessionID() != "owner" {
+		t.Errorf("AuthorizeCommit(holder).SessionID() = %q, want \"owner\"", auth.SessionID())
+	}
+	internal, err := store.AuthorizeCommit("")
+	if err != nil {
+		t.Errorf("AuthorizeCommit(internal) = %v, want nil", err)
+	}
+	if !internal.IsInternal() {
+		t.Error("AuthorizeCommit(\"\") did not yield an internal authority")
 	}
 }

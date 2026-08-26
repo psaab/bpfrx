@@ -123,8 +123,8 @@ type Config struct {
 	// can't interleave their commit→apply pairs. Returns ctx.Err()
 	// if the request is canceled before the semaphore is acquired
 	// (handlers translate to DeadlineExceeded/Canceled).
-	CommitFn          func(ctx context.Context, comment string) (*config.Config, error)
-	CommitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
+	CommitFn          func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	CommitConfirmedFn func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	// ZeroizeFn runs a factory-reset (zeroize) wipe under the daemon's apply
 	// gate (#5281). It acquires the same apply semaphore commit/sync serialize
 	// on, enters a TERMINAL reset generation so no concurrent or subsequent
@@ -198,8 +198,8 @@ type Server struct {
 	surfaceADDNSStatusFn  func() []ddnspkg.SurfaceAStatusView
 	surfaceADDNSForceFn   func(force bool) (bool, string)
 	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
-	commitFn              func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn     func(ctx context.Context, minutes int) (*config.Config, error)
+	commitFn              func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	commitConfirmedFn     func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	zeroizeFn             func(ctx context.Context, wipe func() error) error
 	vrrpMgr               *vrrp.Manager
 	raMgr                 *ra.Manager

@@ -61,7 +61,7 @@ func TestCommitRejectsRetiredEBPF(t *testing.T) {
 	store := newGRPCEBPFRejectStore(t)
 	s := &Server{
 		store: store,
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			return store.Commit()
 		},
 	}
@@ -89,7 +89,7 @@ func TestCommitConfirmedRejectsRetiredEBPF(t *testing.T) {
 	store := newGRPCEBPFRejectStore(t)
 	s := &Server{
 		store: store,
-		commitConfirmedFn: func(context.Context, int) (*config.Config, error) {
+		commitConfirmedFn: func(context.Context, configstore.CommitAuthority, int) (*config.Config, error) {
 			return store.CommitConfirmed(10)
 		},
 	}

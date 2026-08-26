@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -47,7 +48,7 @@ func TestConfigLockHolderEnforced_TwoClients(t *testing.T) {
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	s := &Server{
 		store: store,
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			return store.Commit()
 		},
 	}

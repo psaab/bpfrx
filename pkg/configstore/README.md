@@ -344,6 +344,84 @@ identity that participates in the config-lock gate (#5870/#6197, see
 "Config-lock ownership gate"). Generation binding remains necessary for
 same-session/internal concurrent callers.
 
+## Authority-bound commit: holder turnover (#6808)
+
+Generation binding answers *"is the candidate CONTENT the one that was
+examined?"*. It does **not** answer *"is the SESSION that was authorized to
+commit still the one holding the lock?"* — `CommitWithDescriptionGen` /
+`CommitConfirmedGen` take no session id at all. Those are different questions
+and neither implies the other.
+
+The gap that opened: the REST and gRPC commit paths verified the config-lock
+holder and then invoked a daemon callback carrying **no identity**
+(`s.commitFn(ctx, comment)`). Between the two, the lock could turn over — the
+holder exits, disconnects, or is reclaimed on its idle lease (#4476), and
+another session enters and stages different edits — and the in-flight commit
+would snapshot and promote the **new** holder's candidate under the **original**
+holder's authorization.
+
+Generation binding does not close it, and the retry loop makes it worse. A
+turnover that completes *before* the daemon's `CompileCandidateGen` — i.e. while
+the commit waits on the apply semaphore, which is where a busy daemon actually
+waits — yields a perfectly *consistent* generation pair, describing the new
+holder's candidate. And because `commitWithGenBinding` retries
+`ErrCandidateGenerationConflict` by design, a turnover reported as a generation
+conflict would make the retry re-snapshot and promote the new holder's work
+automatically.
+
+The fix binds the **authority**, checked under the same `s.mu` acquisition as
+the generation:
+
+- **`holderEpoch`** — a counter advanced on every config-lock ACQUISITION and
+  RELEASE (`EnterConfigureSession`, `EnterConfigureExclusive`,
+  `ExitConfigureSession`, `ExitConfigure`, `ForceExitConfigure`,
+  `reclaimStaleLockLocked`). It is distinct from `candidateGen`, which tracks
+  candidate *content*, and from `configLockAt`, a wall-clock stamp that cannot
+  distinguish a still-held lock from a released-and-retaken one. A same-session
+  re-entry does **not** advance it: the lock never changed hands.
+- **`AuthorizeCommit(sessionID) (CommitAuthority, error)`** — verifies the
+  holder and mints the authority under **one** lock acquisition. Two calls would
+  leave a window in which the lock turns over between "you are the holder" and
+  "here is the epoch you hold it at" — the same defect one level down. It
+  replaces `EnsureConfigHolder`, which had no remaining callers once every
+  commit path was converted.
+- **`CommitWithDescriptionGenAs` / `CommitConfirmedGenAs`** — verify the
+  authority AND the generation under one `s.mu`, immediately before promotion.
+- **`ErrConfigHolderTurnover`** — a sentinel deliberately DISTINCT from
+  `ErrCandidateGenerationConflict`, because the correct reaction is opposite: a
+  generation conflict means "re-examine and retry"; a turnover means "the
+  authority that permitted this commit is gone", and retrying would perform the
+  substitution.
+
+### The zero value is invalid, not a bypass
+
+`CommitAuthority`'s zero value is **rejected** with `ErrCommitAuthorityMissing`.
+An internal/system committer (HA config-sync apply, event engine, in-process
+shell CLI, tests) must say so explicitly with `InternalCommitter()`.
+
+This is the point of the design, not an ornament. Letting the zero value mean
+"internal committer, skip the check" would put the god-mode capability at exactly
+the value a forgotten field or a `CommitAuthority{}` written in good faith
+already produces. The explicit parameter would then catch *omission* — it would
+not compile — while silently admitting a **wrong-but-compiling zero** that reads
+as deliberate in review. Splitting "this caller legitimately has no holder" from
+"nobody said" makes the first a written statement and the second an error.
+
+The authority travels as an explicit **parameter**, not on a `Context`, for the
+same reason: an absent context value is indistinguishable from a deliberate one
+and would degrade silently to a bypass on an authorization path.
+
+### Scope
+
+The identical gate-then-unscoped-callback shape existed at **four** sites, not
+the two the issue title names: REST commit and commit-confirmed
+(`pkg/api/config.go`) and gRPC `Commit`/`CommitConfirmed`
+(`pkg/grpcapi/server_config.go`). gRPC additionally has a **non-adversarial**
+trigger — `configLockStatsHandler.HandleConn` auto-releases the lock on
+`ConnEnd` from a separate goroutine with no coordination with an in-flight
+commit, so an ordinary disconnect reaches the substitution with no attacker
+timing.
+
 ## Persist-failure semantics (#1799)
 
 A `db.WriteActive` failure used to be non-fatal everywhere (one-shot

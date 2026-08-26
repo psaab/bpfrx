@@ -98,7 +98,7 @@ func TestRESTConfigCommitRejectedWhenOtherSessionHoldsCandidate(t *testing.T) {
 	var commitCalled bool
 	s := &Server{
 		store: store,
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			commitCalled = true
 			return store.Commit()
 		},

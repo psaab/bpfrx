@@ -120,8 +120,37 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 // daemon pre-flighted against live hardware is exactly the one promoted, or the
 // commit conflicts — never a silent substitution.
 func (s *Store) CommitWithDescriptionGen(description string, expectedGen uint64) (*config.Config, error) {
+	return s.CommitWithDescriptionGenAs(InternalCommitter(), description, expectedGen)
+}
+
+// CommitWithDescriptionGenAs is CommitWithDescriptionGen additionally bound to
+// the AUTHORITY the commit was granted under (#6808).
+//
+// It verifies BOTH tokens under one acquisition of s.mu, immediately before
+// promotion, because they answer different questions and neither implies the
+// other:
+//
+//   - expectedGen answers "is the candidate CONTENT the one that was examined?"
+//   - authority answers "is the SESSION that was authorized to commit still the
+//     one holding the lock?"
+//
+// A holder turnover that completes before the caller's snapshot produces a
+// perfectly consistent generation pair — describing the NEW holder's candidate.
+// Only the authority check rejects that.
+//
+// On turnover it returns ErrConfigHolderTurnover, NOT
+// ErrCandidateGenerationConflict, so it can never be swept into the caller's
+// generation-conflict retry: retrying would re-snapshot the new holder's
+// candidate and promote it under the old holder's authorization, which is
+// precisely the substitution being closed.
+func (s *Store) CommitWithDescriptionGenAs(
+	authority CommitAuthority, description string, expectedGen uint64,
+) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.verifyCommitAuthorityLocked(authority); err != nil {
+		return nil, err
+	}
 	if s.candidateGen != expectedGen {
 		return nil, fmt.Errorf("%w (examined generation %d, current %d)",
 			ErrCandidateGenerationConflict, expectedGen, s.candidateGen)
@@ -383,8 +412,26 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 // free) candidate generation is sufficient to keep both the promoted candidate
 // and the stashed rollback target bound to what was examined.
 func (s *Store) CommitConfirmedGen(minutes int, expectedGen uint64) (*config.Config, error) {
+	return s.CommitConfirmedGenAs(InternalCommitter(), minutes, expectedGen)
+}
+
+// CommitConfirmedGenAs is CommitConfirmedGen additionally bound to the commit
+// AUTHORITY (#6808) — the commit-confirmed analogue of
+// CommitWithDescriptionGenAs, with the same both-tokens-under-one-lock
+// discipline and the same distinct turnover sentinel.
+//
+// Commit-confirmed is the higher-consequence half: promoting another holder's
+// candidate ALSO arms an auto-rollback timer against it, so a substituted
+// commit-confirmed both applies work its author never approved and schedules a
+// revert the authorized operator does not know is pending.
+func (s *Store) CommitConfirmedGenAs(
+	authority CommitAuthority, minutes int, expectedGen uint64,
+) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.verifyCommitAuthorityLocked(authority); err != nil {
+		return nil, err
+	}
 	if s.candidateGen != expectedGen {
 		return nil, fmt.Errorf("%w (examined generation %d, current %d)",
 			ErrCandidateGenerationConflict, expectedGen, s.candidateGen)

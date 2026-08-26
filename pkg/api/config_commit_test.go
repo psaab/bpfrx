@@ -62,7 +62,7 @@ func TestConfigCommitHandlerRejectsRetiredEBPF(t *testing.T) {
 	store := newAPIEBPFRejectStore(t)
 	s := &Server{
 		store: store,
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			return store.Commit()
 		},
 	}
@@ -85,7 +85,7 @@ func TestConfigCommitConfirmedHandlerRejectsRetiredEBPF(t *testing.T) {
 	store := newAPIEBPFRejectStore(t)
 	s := &Server{
 		store: store,
-		commitConfirmedFn: func(context.Context, int) (*config.Config, error) {
+		commitConfirmedFn: func(context.Context, configstore.CommitAuthority, int) (*config.Config, error) {
 			return store.CommitConfirmed(10)
 		},
 	}
