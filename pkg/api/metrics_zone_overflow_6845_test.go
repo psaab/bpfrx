@@ -1,6 +1,8 @@
 package api
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -78,11 +80,8 @@ func TestZoneCounterOverflowGaugeAbsentWithNoStatus6845(t *testing.T) {
 
 // gatherZoneOverflow6845 drives the real collector path.
 //
-// A PLAIN registry, not a pedantic one, and the reason is worth recording:
-// collectUserspaceStatus fans out to ~70 other metric families, so a pedantic
-// registry demands this cell declare every one of their descriptors just to ask
-// about one gauge — and a Describe list maintained by hand to satisfy a registry
-// is a second inventory that drifts.
+// A PLAIN registry, not a pedantic one: a hand-maintained Describe list written
+// to satisfy a registry is a second inventory that drifts.
 //
 // The Describe ⊇ Collect contract is NOT dropped, it is owned elsewhere:
 // metrics_descriptor_coverage_test.go runs the REAL Collect through a pedantic
@@ -111,10 +110,14 @@ func gatherZoneOverflow6845(t *testing.T, status *dpuserspace.ProcessStatus) (fl
 	return 0, false
 }
 
-// zoneOverflowOnlyCollector6845 exercises collectUserspaceStatus — the REAL
-// entry point, including its nil-status early return, which is what produces the
-// absence contract. Driving emitZoneCounterOverflow directly would bind the
-// emitter and miss the gate, which is the wiring half of the defect.
+// zoneOverflowOnlyCollector6845 drives emitZoneCounterOverflow with the same
+// *ProcessStatus the production Collect hands it, including nil — which is where
+// the absence contract lives, in the emitter itself rather than inherited from a
+// sibling's early return.
+//
+// The WIRING half — that Collect actually calls it — is bound separately by
+// TestCollectStillCallsTheOverflowEmitter6845 below, because a cell that calls
+// the emitter cannot see whether anything else does.
 type zoneOverflowOnlyCollector6845 struct {
 	c      *xpfCollector
 	status *dpuserspace.ProcessStatus
@@ -125,5 +128,57 @@ func (z *zoneOverflowOnlyCollector6845) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (z *zoneOverflowOnlyCollector6845) Collect(ch chan<- prometheus.Metric) {
-	z.c.collectUserspaceStatus(ch, z.status)
+	z.c.emitZoneCounterOverflow(ch, z.status)
+}
+
+// TestCollectStillCallsTheOverflowEmitter6845 is the WIRING cell.
+//
+// Every cell above calls emitZoneCounterOverflow directly, so a Collect that
+// stopped calling it would pass all of them while the series vanished from every
+// scrape — the decoded-but-unread state this issue exists to fix, one layer up.
+// Collect cannot be driven from a unit test without a loaded dataplane, so the
+// call is asserted at the source with comments stripped.
+//
+// FAIL-ON-REVERT: delete the c.emitZoneCounterOverflow(ch, userspaceStatus) line
+// from Collect and this reds.
+func TestCollectStillCallsTheOverflowEmitter6845(t *testing.T) {
+	src := stripComments6845(readAPISource6845(t, "metrics.go"))
+	const call = "c.emitZoneCounterOverflow(ch, userspaceStatus)"
+	if !strings.Contains(src, call) {
+		t.Fatalf("Collect does not call emitZoneCounterOverflow; " +
+			"xpf_zone_counters_overflow_active is emitted by nothing, which is " +
+			"exactly the decoded-but-unread state #6845 fixes")
+	}
+	// It must sit AFTER the status fetch, or it would be handed a nil status on
+	// every scrape and the gauge would be permanently absent — indistinguishable
+	// from "no helper", and wrong on a healthy box.
+	fetch := strings.Index(src, "userspaceStatus := fetchUserspaceStatus(dp)")
+	if fetch < 0 {
+		t.Fatal("could not find the status fetch to order against")
+	}
+	if strings.Index(src, call) < fetch {
+		t.Error("emitZoneCounterOverflow is called BEFORE the status is fetched, " +
+			"so it would always receive nil and the gauge would never be emitted")
+	}
+}
+
+func readAPISource6845(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
+}
+
+func stripComments6845(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
 }

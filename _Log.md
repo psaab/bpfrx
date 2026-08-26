@@ -105820,7 +105820,22 @@ prose edit above them added. No diff falls in the new test body.
   hand; the Describe ⊇ Collect contract stays owned by
   `metrics_descriptor_coverage_test.go`'s whole-collector canary (#1726),
   verified still passing.
+- **The modularity gate caught me and I moved the code rather than accepting
+  it.** `pkg/api/metrics_userspace.go` sat at 1999 LOC; my emitter pushed it to
+  2023 and `TestTouchedFileCrossedModularityThreshold` redded. Moving the emitter
+  to its own file still left 2000 — the single CALL line was enough to cross —
+  so the call moved to `metrics.go` (1345 LOC, ample headroom), beside the other
+  top-level status-derived collectors. `metrics_userspace.go` is back at 1999
+  and no acceptance entry was spent on a one-line crossing.
+- **That relocation improved the design rather than dodging the gate**: the
+  emitter now takes `*ProcessStatus` and returns early on nil, so the
+  absence contract is STATED in the emitter and directly tested, instead of
+  being inherited from `collectUserspaceStatus`'s early return where a later
+  refactor could drop it silently. It also forced the wiring cell — a cell that
+  calls the emitter cannot see whether Collect does, and that is the
+  decoded-but-unread defect one layer up.
 - **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_zone.go`,
-  `pkg/api/metrics_userspace.go`, `pkg/cli/cli_show_security_zones.go`,
+  `pkg/api/metrics_userspace.go`, `pkg/api/metrics_zone_overflow.go` (new),
+  `pkg/cli/cli_show_security_zones.go`,
   `pkg/api/metrics_zone_overflow_6845_test.go` (new), `pkg/api/README.md`,
   `_Log.md`

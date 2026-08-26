@@ -1306,6 +1306,10 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSurfaceADDNSMetrics(ch)
 	c.collectSystemMetrics(ch)
 	c.collectUserspaceStatus(ch, userspaceStatus)
+	// #6845: a top-level status-derived signal, emitted only when a status was
+	// actually read — see emitZoneCounterOverflow for why its absence and its 0
+	// mean different things.
+	c.emitZoneCounterOverflow(ch, userspaceStatus)
 }
 
 // #709: emit per-bucket counter samples. Bucket index maps to a
