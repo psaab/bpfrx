@@ -428,6 +428,17 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 //
 // So the chain is unchanged in substance and narrower in premise: what the
 // commit path now rejects, the tolerant path still admits.
+//
+// WHAT THIS TEST DOES AND DOES NOT PROVE. It calls config.CompileConfig, not
+// Store.compileTreeLenient, so it does not itself demonstrate the tolerant
+// ingress — an earlier revision claimed otherwise in its name and comment, and
+// a regression routing Load through STRICT compilation would have left it
+// green. What it proves is the half it actually drives: the value compiles, it
+// reaches the render function, and the belt drops it. The tolerant-ingress half
+// is proved where it happens, by
+// pkg/configstore's TestLoadToleratesAnInjectableSyslogFacility_6844, which
+// drives the real Store.Load and asserts the node still boots with an active
+// config.
 func TestSyslogRenderUnsafeFacilityIsLoadReachable_5797(t *testing.T) {
 	const injecting = "daemon;*.* /tmp/pwn"
 

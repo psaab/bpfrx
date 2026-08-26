@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -22,25 +23,37 @@ import (
 // #6844 rule newly reaches.
 func collectWildcardTypedLeafKeyValidators(t *testing.T) []string {
 	t.Helper()
-	var out []string
-	seen := map[*schemaNode]bool{}
+	out := map[string]bool{}
+	// Cycle guard keyed on (node, path) rather than on the node alone.
+	//
+	// A pointer-only `seen` map suppressed the SECOND route to a shared node,
+	// and the schema shares nodes heavily: `groups <name>` re-hosts the whole
+	// tree, so every top-level subtree has both a direct and a group-hosted
+	// route. Whichever sorted first won and the other was never reported. That
+	// makes the inventory blind to a genuine alias, which is the one thing an
+	// inventory of "every site the rule reaches" must not be.
+	visited := map[string]bool{}
 	var walk func(n *schemaNode, path []string)
 	walk = func(n *schemaNode, path []string) {
-		if n == nil || seen[n] {
+		if n == nil {
 			return
 		}
-		seen[n] = true
+		key := fmt.Sprintf("%p|%s", n, strings.Join(path, " "))
+		if visited[key] {
+			return
+		}
+		visited[key] = true
 		if w := n.wildcard; w != nil {
-			if w.isTypedLeaf() && w.keyValidator != nil {
-				// `groups <wildcard>` re-hosts the whole configuration tree, and
-				// the schema SHARES those nodes rather than copying them, so a
-				// node is reached first via whichever path sorts earlier --
-				// `groups` before `system`. Strip that prefix so the inventory
-				// names the site an operator would recognise; the underlying
-				// node, and therefore the gate, is the same one either way.
+			// The EXACT shape walkSchemaNode's typed-leaf branch reaches. The
+			// runtime condition is `isTypedLeaf() && (validator != nil ||
+			// treeValidator != nil)` -- a leaf with a keyValidator but NO value
+			// validator never enters that branch at all, so listing it here
+			// would overstate the blast radius.
+			if w.isTypedLeaf() && w.keyValidator != nil &&
+				(w.validator != nil || w.treeValidator != nil) {
 				p := strings.Join(path, " ")
 				p = strings.TrimPrefix(p, "groups <wildcard> ")
-				out = append(out, p+" <wildcard-key>")
+				out[p+" <wildcard-key>"] = true
 			}
 			walk(w, append(append([]string(nil), path...), "<wildcard>"))
 		}
@@ -54,8 +67,51 @@ func collectWildcardTypedLeafKeyValidators(t *testing.T) []string {
 		}
 	}
 	walk(setSchema, nil)
-	sort.Strings(out)
-	return out
+	res := make([]string, 0, len(out))
+	for k := range out {
+		res = append(res, k)
+	}
+	sort.Strings(res)
+	return res
+}
+
+// TestWildcardTypedLeafKeyValidatorRuleIsWired_6844 is the behavioural half.
+//
+// The inventory above reads schema METADATA. It passes with the walker hunk
+// reverted, because nothing in it asks whether walkSchemaNode actually invokes
+// the validator — an inventory of sites a rule "reaches" that cannot tell
+// whether the rule runs.
+//
+// This drives each inventoried destination through the real gate. The file
+// destination is already covered by the rejection cells; host and user were
+// not, and a revert that broke only those would have shown up nowhere.
+func TestWildcardTypedLeafKeyValidatorRuleIsWired_6844(t *testing.T) {
+	for _, dest := range []struct{ stanza, src string }{
+		{"file", `system { syslog { file audit { "daemon;auth" info; } } }`},
+		{"host", `system { syslog { host 192.0.2.10 { "daemon;auth" info; } } }`},
+		{"user", `system { syslog { user root { "daemon;auth" info; } } }`},
+	} {
+		t.Run(dest.stanza, func(t *testing.T) {
+			p := NewParser(dest.src)
+			tree, errs := p.Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse: %v", errs)
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			err = SchemaValidate(tree, cfg)
+			if err == nil {
+				t.Fatalf("the %s destination ACCEPTED an injectable facility. The typed-leaf "+
+					"identity rule in walkSchemaNode is not running for this destination, "+
+					"and the metadata inventory cannot see that.", dest.stanza)
+			}
+			if !strings.Contains(err.Error(), "syslog facility") {
+				t.Errorf("%s rejected, but not by the facility gate: %v", dest.stanza, err)
+			}
+		})
+	}
 }
 
 // TestWildcardTypedLeafKeyValidatorInventory_6844 pins the blast radius.

@@ -106321,3 +106321,13 @@ prose edit above them added. No diff falls in the new test body.
     render belt is still load-bearing on the tolerant load path
   - **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
     pkg/daemon/daemon_system.go
+  - **Action**: #6844 — act on the Codex review: single-source the selector
+    predicate so commit-accepts == render-writes, de-vacuum the fixtures, fix
+    the inventory dedup/predicate, prove the tolerant path at configstore
+  - **File(s)**: pkg/config/schema_validators_system.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go,
+    pkg/daemon/syslog_gate_render_agreement_6844_test.go (new),
+    pkg/configstore/syslog_facility_lenient_6844_test.go (new),
+    pkg/daemon/syslog_selector_render_5797_test.go, docs/config-schema.md

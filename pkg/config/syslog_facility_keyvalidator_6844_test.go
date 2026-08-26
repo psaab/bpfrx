@@ -45,36 +45,83 @@ func schemaValidateSrc(t *testing.T, src string) error {
 // Every fixture here is the ISSUE's own reachable case or a near neighbour: an
 // ordinary commit, no tolerant load, no peer sync.
 func TestSyslogFacilityKeyRejectsInjectableNames_6844(t *testing.T) {
+	// ONE byte class per cell.
+	//
+	// The first cut used a single compound fixture -- `daemon;*.* /tmp/pwn` --
+	// which combines ';', '*', '.', a space and '/'. Any ONE of those being
+	// admitted left the cell green, because the others still rejected it. A
+	// compound mutation cannot localise, and neither can a compound fixture:
+	// it proves the whole string is rejected and says nothing about which byte
+	// did it.
 	cases := []struct {
 		name     string
 		facility string
 		why      string
 	}{
 		{
-			name:     "rsyslog selector injection",
-			facility: `daemon;*.* /tmp/pwn`,
-			why:      "the issue's own example: a second selector line smuggled through the facility",
+			name:     "semicolon alone",
+			facility: "daemon;auth",
+			why:      "the rsyslog selector separator: a second selector smuggled in",
 		},
 		{
-			name:     "embedded whitespace",
-			facility: `daemon extra`,
-			why:      "a space splits the rendered selector",
+			name:     "space alone",
+			facility: "daemon auth",
+			why:      "a space separates an rsyslog selector from its ACTION field",
 		},
 		{
-			name:     "leading wildcard",
-			facility: `*`,
-			why:      "'*' is rsyslog selector punctuation; Junos spells the wildcard `any`",
+			name:     "period alone",
+			facility: "daemon.info",
+			why: "the facility/priority separator; the renderer drops this, so " +
+				"admitting it is the commit-succeeds-destination-disappears class",
 		},
 		{
-			name:     "over-long name",
-			facility: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-			why: "the length bound; without this cell that branch is never executed and " +
-				"deleting it leaves the suite green",
+			name:     "underscore alone",
+			facility: "daemon_info",
+			why:      "not in the render belt's alphabet, so it would commit and then not render",
 		},
 		{
-			name:     "path separator",
-			facility: `../../etc/passwd`,
-			why:      "the facility is formatted into a rendered drop-in body",
+			name:     "slash alone",
+			facility: "daemon/auth",
+			why:      "a path separator reaching a rendered drop-in body",
+		},
+		{
+			name:     "colon alone",
+			facility: "daemon:514",
+			why:      "rsyslog action punctuation",
+		},
+		{
+			name:     "leading hyphen",
+			facility: "-daemon",
+			why: "a leading '-' is a legacy HOSTNAME-FILTER directive: it changes what " +
+				"the FOLLOWING selectors mean, not just this line (#6829 B1)",
+		},
+		{
+			name:     "bare hyphen",
+			facility: "-",
+			why:      "the degenerate case of the leading-hyphen directive",
+		},
+		{
+			name:     "empty list member",
+			facility: "auth,,authpriv",
+			why: "malformed rsyslog; accepting it lets the size of the accepted set " +
+				"stop being a function of the bytes in it",
+		},
+		{
+			name:     "trailing comma",
+			facility: "auth,",
+			why:      "same, at the end of the list",
+		},
+		{
+			name:     "wildcard as a list member",
+			facility: "*,auth",
+			why: "'*' is accepted only as the WHOLE token; as a member it is degenerate " +
+				"and outside the atom alphabet",
+		},
+		{
+			name:     "over the length bound",
+			facility: "a" + strings.Repeat("b", maxSyslogFacilityLen),
+			why: "exactly one character past the bound -- a fixture far past it is " +
+				"satisfied by any bound between the longest accepted name and itself",
 		},
 	}
 	for _, c := range cases {
@@ -112,6 +159,16 @@ func TestSyslogFacilityKeyAcceptsRealNames_6844(t *testing.T) {
 		"security", "user",
 		"kern", "auth", "syslog",
 		"local0", "local7",
+		// rsyslog-native selector syntax in the FACILITY position. Both commit
+		// on this box today, both are documented in pkg/logging/README.md, and
+		// both are asserted to render (`auth,authpriv.info`, `*.info`). A gate
+		// that rejected them would not be conservative -- it would warn a
+		// strict-commit-clean, rsyslog-valid destination away on upgrade.
+		"auth,authpriv", "auth,authpriv,daemon", "*",
+		// Exactly at the length bound, so the bound is pinned from BOTH sides:
+		// with only an over-long rejection, any bound from the longest accepted
+		// name up to that length satisfies the suite.
+		"a" + strings.Repeat("b", maxSyslogFacilityLen-1),
 	} {
 		t.Run(facility, func(t *testing.T) {
 			src := `system { syslog { file audit { ` + facility + ` info; } } }`
