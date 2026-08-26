@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // factoryReset must Acquire applySem BEFORE wiping, enter the terminal reset
@@ -63,10 +64,10 @@ func TestFactoryResetGatesAndEntersResetGeneration(t *testing.T) {
 	// (3) In the reset generation, a racing commit / HA-sync must be REJECTED
 	// before it persists (which would re-create the erased .configdb SSOT). The
 	// guard sits before any nil-store access, so these return cleanly.
-	if _, err := d.commitAndApply(context.Background(), "", peerSyncNever); !errors.Is(err, errDaemonResetting) {
+	if _, err := d.commitAndApply(context.Background(), configstore.InternalCommitter(), "", peerSyncNever); !errors.Is(err, errDaemonResetting) {
 		t.Fatalf("commitAndApply must be rejected during a factory reset; got %v", err)
 	}
-	if _, err := d.commitConfirmedAndApply(context.Background(), 1, peerSyncNever); !errors.Is(err, errDaemonResetting) {
+	if _, err := d.commitConfirmedAndApply(context.Background(), configstore.InternalCommitter(), 1, peerSyncNever); !errors.Is(err, errDaemonResetting) {
 		t.Fatalf("commitConfirmedAndApply must be rejected during a factory reset; got %v", err)
 	}
 	if _, err := d.syncAndApply(context.Background(), "", nil); !errors.Is(err, errDaemonResetting) {

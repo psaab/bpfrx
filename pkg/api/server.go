@@ -156,8 +156,8 @@ type Config struct {
 	// two concurrent committers can't interleave their commit→apply
 	// pairs. Returns ctx.Err() if the request is canceled before the
 	// semaphore is acquired (handlers translate to 408/503).
-	CommitFn          func(ctx context.Context, comment string) (*config.Config, error)
-	CommitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
+	CommitFn          func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	CommitConfirmedFn func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	// CompileHealthFn surfaces dataplane compile state via /health (#758).
 	// Returning a snapshot with EverSucceeded=false and FailureCount>0
 	// makes /health return 503 so operators see the degraded state
@@ -413,8 +413,8 @@ type Server struct {
 	ipsec                                *ipsec.Manager
 	dhcp                                 *dhcp.Manager
 	vrrpMgr                              *vrrp.Manager
-	commitFn                             func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn                    func(ctx context.Context, minutes int) (*config.Config, error)
+	commitFn                             func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	commitConfirmedFn                    func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	compileHealthFn                      func() CompileHealthSnapshot
 	bootstrapImportFn                    func() BootstrapImportSnapshot
 	configPersistDegradedFn              func() bool

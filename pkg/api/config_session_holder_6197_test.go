@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 const testRESTConfigSessionID = "rest-00000000000000000000000000000001"
@@ -67,7 +68,7 @@ func TestRESTConfigSessionsAreMutuallyExcluded(t *testing.T) {
 	commitCalled := false
 	s := &Server{
 		store: store,
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			commitCalled = true
 			return store.Commit()
 		},
