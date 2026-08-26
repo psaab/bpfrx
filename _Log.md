@@ -106374,3 +106374,8 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compiler_validate_warn_nat_iface_addr.go`,
   `test/incus/xpf-cluster-fw0.conf`, `test/incus/xpf-test.conf`,
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6751 PR 3a takeover — turn shippedNATConfigs from a floor into
+    a census so a NEW NAT config cannot land ungated
+  - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go

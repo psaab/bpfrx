@@ -205,8 +205,87 @@ func TestShippedConfigsHaveNoCrossDomainNATOverlap_6751(t *testing.T) {
 	}
 	// Guard the guard: an empty or silently-shrunk list would pass this test
 	// while gating nothing at all.
+	//
+	// This overlaps the read-error branch above -- that branch `continue`s
+	// before `checked++`, so a missing file already reds twice. Kept anyway:
+	// the two say different things (this one catches a list that shrank between
+	// the range and here), and a redundant guard costs nothing where a missing
+	// one costs a silently ungated config.
 	if checked != len(shippedNATConfigs) {
 		t.Fatalf("only %d of %d shipped configs were checked", checked, len(shippedNATConfigs))
+	}
+	assertShippedNATConfigListIsComplete_6751(t)
+}
+
+// assertShippedNATConfigListIsComplete_6751 turns the list above from a FLOOR
+// into a census.
+//
+// The list handles a config being renamed AWAY -- the read error names it. It
+// cannot see one being ADDED, which is the direction that matters: a ninth
+// `.conf` landing in docs/ or test/incus/ with a source-NAT stanza is gated by
+// nothing, `go test ./pkg/config/` stays green, and the list looks complete
+// because it is a list. That is the same failure this test's own doc comment is
+// about -- a validator's reach is not what it can detect, it is what it is
+// actually pointed at -- so leaving the additive direction open would repeat it.
+//
+// The population is DERIVED and compared against the explicit list rather than
+// replacing it. The list stays the readable statement of intent that a reviewer
+// can eyeball; the comparison makes a divergence in either direction fail.
+func assertShippedNATConfigListIsComplete_6751(t *testing.T) {
+	t.Helper()
+
+	var globbed []string
+	for _, dir := range []string{"../../docs", "../../test/incus"} {
+		matches, err := filepath.Glob(filepath.Join(dir, "*.conf"))
+		if err != nil {
+			t.Fatalf("glob %s: %v", dir, err)
+		}
+		globbed = append(globbed, matches...)
+	}
+
+	// ANTI-VACUITY. These paths are relative to the test's working directory,
+	// so a glob that silently matches nothing -- a moved package, a changed
+	// layout -- would make both sets empty, the comparison hold, and this pass
+	// having checked nothing. That failure mode is live precisely because the
+	// paths are relative.
+	if len(globbed) < len(shippedNATConfigs) {
+		t.Fatalf("the glob found %d .conf files, fewer than the %d already listed. "+
+			"The relative paths are not resolving from the test's working directory, "+
+			"so this comparison would hold vacuously.", len(globbed), len(shippedNATConfigs))
+	}
+
+	// Only files that actually carry a source-NAT stanza are in scope; a config
+	// with no NAT at all has nothing for this gate to say.
+	withNAT := map[string]bool{}
+	for _, rel := range globbed {
+		raw, err := os.ReadFile(rel)
+		if err != nil {
+			t.Errorf("read %s: %v", rel, err)
+			continue
+		}
+		if strings.Contains(string(raw), "source-nat") {
+			withNAT[filepath.Clean(rel)] = true
+		}
+	}
+	listed := map[string]bool{}
+	for _, rel := range shippedNATConfigs {
+		listed[filepath.Clean(rel)] = true
+	}
+
+	for rel := range withNAT {
+		if !listed[rel] {
+			t.Errorf("%s carries a source-NAT stanza and is NOT in shippedNATConfigs, so "+
+				"nothing gates it. Add it — a config that is never compiled by this "+
+				"package is exactly how xpf-test.conf shipped the defect this test was "+
+				"written for.", rel)
+		}
+	}
+	for rel := range listed {
+		if !withNAT[rel] {
+			t.Errorf("shippedNATConfigs lists %s, but it no longer carries a source-NAT "+
+				"stanza (or has moved). Update the list rather than leaving a name that "+
+				"gates nothing.", rel)
+		}
 	}
 }
 
