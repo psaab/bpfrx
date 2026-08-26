@@ -105031,6 +105031,24 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
+<<<<<<< HEAD
+
+- **Timestamp**: 2026-08-23
+- **Action**: #5841 writes the resource ownership markers BEFORE the credential
+  mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
+  nothing withdrew the marker when the mutation then failed. Because the
+  markers gate a REVOCATION rather than a write, the stale claim makes xpf
+  later delete an operator's pre-existing authorized_keys or lock an account
+  whose password xpf never set. Added `claimOwnership`/`rollback`, which
+  withdraws only a claim the current pass created and preserves one an earlier
+  apply legitimately made, and applied it at all three marker-first sites (user
+  key write, user password chpasswd, root key write). The useradd path is
+  marker-after already and unchanged.
+- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
+  `docs/system-login.md`
+=======
+>>>>>>> origin/master
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
 
 - **Timestamp**: 2026-08-23
@@ -105064,6 +105082,11 @@ prose edit above them added. No diff falls in the new test body.
 - **The reader**: `!s.NeedsApply()` gates `setLocalFailoverCommitReady`, which
   feeds `waitLocalFailoverCommitReady` → `cluster.requestPeerFailover`. The
   activation arm now raises it only inside the accepted branch.
+- **Persistence, not the instant**: the debt cell now drives further reconcile
+  passes and asserts the debt is STILL owed — checking `NeedsApply()` immediately
+  after the race proves only the transient, and the defect is that the debt never
+  comes BACK. Paired with an assertion that a genuine accepted apply DOES clear
+  it, so "never clears" cannot pass either.
 - **Matrix found an unbound branch**: reverting the DEACTIVATION arm to a raw
   `MarkApplied` left the whole suite green — the activation cell cannot see it,
   since each arm records its own result. Added a deactivation fixture (an RG the
@@ -105082,3 +105105,23 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — CLAUDE.md: a Required Reading index
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add a `## Required Reading` section to the project `CLAUDE.md`,
+  between "Working Style" and "Logging Rules".
+- **Why**: `CLAUDE.md` already told a reader to read `docs/engineering-style.md`
+  and to update module docs in the same change, but the other standing
+  documents — `~/.claude/RTK.md`, `AGENTS.md`, `COMMITAGENT.md`,
+  `docs/config-schema.md` — were nowhere named, so an agent had no way to
+  discover them except by tripping over the rule they encode. `RTK.md` is the
+  sharpest omission: a hook silently rewrites most shell commands through the
+  `rtk` token-optimizing proxy, and a reader who does not know that also does
+  not know `rtk proxy <cmd>` exists to get UNFILTERED output back for the cases
+  where the filtered form has dropped the decisive line.
+- **Shape**: a table of file → when to read it → what it governs, so the entry
+  is actionable at dispatch time rather than a bare list of filenames. Closes
+  with the point that sub-agents inherit the file but not the reasoning, so a
+  dispatch brief should name the specific documents its task touches.
+- **File(s)**: `CLAUDE.md`, `_Log.md`
