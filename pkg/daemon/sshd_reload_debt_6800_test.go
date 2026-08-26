@@ -37,8 +37,29 @@ func sshdDebtDaemon6800(t *testing.T) (*Daemon, *sshdSeamRecorder) {
 
 // managedSSHCfg6800 is a config with an xpf-managed ssh setting, so
 // buildSSHDConfig renders a drop-in.
+//
+// The value is the Junos spelling `deny`, NOT the sshd spelling `yes`.
+// buildSSHDConfig maps allow/deny/deny-password and returns "" for anything
+// else — so `RootLogin: "yes"` renders NOTHING, collapses to the no-managed-
+// settings case, and sends applySSHConfig down the REMOVAL branch. A fixture
+// built that way cannot enter the update path at all, which is how the
+// update-path cell below first went green against a mutation that deleted the
+// very line it exists to bind.
 func managedSSHCfg6800() *config.Config {
-	return sshConfig(&config.SSHServiceConfig{RootLogin: "yes"})
+	return sshConfig(&config.SSHServiceConfig{RootLogin: "deny"})
+}
+
+// assertRendersADropIn6800 guards the fixture premise directly rather than
+// trusting the mapping above to stay correct: if buildSSHDConfig ever stops
+// rendering for this config, every update-path cell silently starts exercising
+// the removal branch instead.
+func assertRendersADropIn6800(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	if buildSSHDConfig(cfg.System.Services.SSH) == "" {
+		t.Fatal("fixture premise broken: this config renders NO drop-in, so " +
+			"applySSHConfig takes the REMOVAL branch and no update-path " +
+			"assertion below can mean anything")
+	}
 }
 
 // TestSSHDRemovalReloadFailureLatchesTheDebt6800 is the PAIRED outcome cell:
@@ -180,8 +201,16 @@ func TestSSHDUpdatePathSuccessDischargesARemovalDebt6800(t *testing.T) {
 
 	// The operator now re-adds ssh settings; the write+reload succeeds.
 	r.reloadErr = nil
-	if err := d.applySSHConfig(managedSSHCfg6800()); err != nil {
+	cfg := managedSSHCfg6800()
+	assertRendersADropIn6800(t, cfg)
+	writesBefore := r.writeN
+	if err := d.applySSHConfig(cfg); err != nil {
 		t.Fatalf("update apply: %v", err)
+	}
+	if r.writeN == writesBefore {
+		t.Fatal("fixture premise broken: the update apply wrote no drop-in, so it " +
+			"took the removal branch and this cell would pass on the removal " +
+			"path's outcome record rather than the update path's")
 	}
 	if d.sshdReloadOwed() {
 		t.Fatal("a SUCCESSFUL update-path reload must discharge the removal debt: " +
