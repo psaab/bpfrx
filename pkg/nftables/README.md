@@ -180,5 +180,44 @@ those types into the self-contained spec structs in `netlink_spec.go`.
   entry is never the fix here. Wrong-family literals and the `any`/empty
   placeholders are still dropped — those match the userspace matcher.
   Pinned by `netlink_lo0_addrs_6512_test.go`.
+- lo0 filter PROTOCOL and ICMP-TYPE/CODE complete that posture (#6806).
+  They were the last two narrowing dimensions still resolved with a
+  per-token DROP, and they reach the builder by DIFFERENT channels — which
+  is why one fix could not cover both:
+  - **protocol** arrives as a RAW string in `Lo0FilterTerm.Protocols`, so
+    the builder detects the bad token itself. `lo0Protocols` now returns an
+    error instead of warning-and-skipping, exactly like `lo0DSCPs`.
+  - **icmp-type / icmp-code** arrive ALREADY RESOLVED as `[]int`, so an
+    unresolvable token leaves no trace in the DTO at all and the builder is
+    structurally unable to see it. `Lo0FilterTerm.ICMPTypeUnrepresentable`
+    / `ICMPCodeUnrepresentable` are the marker channel (populated in
+    `toNftLo0Term` from `config.FirewallFilterTerm.UnknownICMPTypes` /
+    `UnknownICMPCodes`), named to match the userspace wire fields so the
+    two mirrors of one config term grep as one contract.
+  Both directions of the old drop were wrong: ALL tokens unresolvable
+  emptied the slice, the `len(...) > 0` guard emitted NO predicate, and the
+  term matched every protocol / every ICMP type in its scope; SOME
+  unresolvable built the rule from a NARROWED subset, so a `discard` term
+  stopped denying what it could not resolve. Strict commit rejects these
+  tokens, so the live ingress is the tolerant load / peer-sync /
+  mixed-version path (#1960) — the one where the userspace mirror hands the
+  raw token to the Rust filter compiler, which rejects the whole snapshot
+  and keeps its last-good policy. A kernel term that silently widens while
+  userspace refuses the same filter is the mode-dependent fail-open.
+  Pinned by `netlink_lo0_proto_icmp_6806_test.go` (builder half) and
+  `pkg/daemon/lo0_proto_icmp_failclosed_6806_test.go` (reachability, text
+  oracle, and the two-renderer agreement).
+- **Why plan-failure is the safe direction on lo0, and why one comment says
+  otherwise.** #5512 (tcp-flags) and #6804 (flexible-match-range) chose
+  PER-TERM fail-closed instead, reasoning that "nft loads the lo0 table
+  atomically and a rejected table leaves NO host filter = fail-OPEN". That
+  was true when #5512 was written and is not true now: #6476 added the
+  cold-boot fail-closed fence, and #6489/#6492 key it on `lo0Enforced` and
+  rebuild it from the CURRENT snapshot. So a failed lo0 install today
+  either retains a real prior filter (steady state) or installs the fence
+  (cold boot) — never nothing. Read that #5512 comment as a historical
+  claim, not a live constraint. The per-term shapes remain correct for
+  their own reasons (a tcp-flags drop can be scoped to `meta l4proto 6`; a
+  flex-match one cannot, so it would be a lockout).
 - Table name `xpf_dp_rst`, family `INet` (covers both IPv4 and IPv6 in
   one table — don't split it without rethinking the atomic batch).

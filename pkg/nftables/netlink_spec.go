@@ -97,6 +97,30 @@ type Lo0FilterTerm struct {
 	TCPFlags          []string
 	IsFragment        bool
 
+	// ICMPTypeUnrepresentable / ICMPCodeUnrepresentable mark a term carrying a
+	// `from icmp-type` / `from icmp-code` token the compiler could not resolve
+	// to a byte in 0..255 — a symbolic name with no mapping, or a numeric value
+	// out of range (config.FirewallFilterTerm.UnknownICMPTypes /
+	// UnknownICMPCodes, #3205/#3406).
+	//
+	// A marker is REQUIRED here, unlike protocol and address: ICMPTypes /
+	// ICMPCodes above are already-resolved bytes, so an unresolvable token
+	// leaves no trace in this DTO at all and the builder cannot re-derive it
+	// (contrast filterFamilyAddrs and lo0Protocols, which see the raw string and
+	// detect the bad token themselves). This is the same channel #6463 opened
+	// for AddressUnrepresentable.
+	//
+	// Names deliberately match the userspace wire fields
+	// (dpuserspace.FilterTermSnapshot.ICMPTypeUnrepresentable /
+	// ICMPCodeUnrepresentable) so the two mirrors of the same config term are
+	// greppable as one contract.
+	//
+	// Strict commit rejects these tokens; the tolerant load / peer-sync paths
+	// only warn (#1960), so the mirror must still decide. It fails the netlink
+	// plan CLOSED — see buildLo0TermNetlink (#6806).
+	ICMPTypeUnrepresentable bool
+	ICMPCodeUnrepresentable bool
+
 	// FlexMatch carries a `from flexible-match-range` predicate (#6804). Before
 	// it existed the lo0 mirror had NO field for it at all, so the predicate was
 	// dropped at this boundary and the term rendered WITHOUT its narrowing — an

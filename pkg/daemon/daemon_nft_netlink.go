@@ -212,7 +212,16 @@ func toNftLo0Term(term *config.FirewallFilterTerm, pl map[string]*config.PrefixL
 		DSCPs:             term.DSCPs,
 		ICMPTypes:         term.ICMPTypes,
 		ICMPCodes:         term.ICMPCodes,
-		TCPFlags:          term.TCPFlags,
+		// #6806: ICMPTypes/ICMPCodes above are the RESOLVED bytes only, so an
+		// unresolvable `from icmp-type` / `icmp-code` token vanishes at this
+		// boundary unless its marker is carried too. Without these two lines the
+		// mirror rendered the term with NO ICMP predicate — matching every ICMP
+		// type in its scope — while the userspace mirror set the identically
+		// named wire fields and failed the snapshot closed. Mirrors the
+		// FlexMatchUnrepresentable line below (#6804).
+		ICMPTypeUnrepresentable: len(term.UnknownICMPTypes) > 0,
+		ICMPCodeUnrepresentable: len(term.UnknownICMPCodes) > 0,
+		TCPFlags:                term.TCPFlags,
 		// #6804: carry the flexible-match-range so the kernel mirror renders the
 		// term's narrowing. Before this the spec had no field for it, so the
 		// predicate was dropped at this boundary and the term rendered WIDER
