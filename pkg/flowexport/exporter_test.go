@@ -398,12 +398,31 @@ func TestBuildExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.T) {
 		},
 	}
 
-	ec := BuildExportConfig(v9Svc(), fo)
-	if ec == nil {
-		t.Fatal("expected non-nil ExportConfig")
+	// #6811: this fixture creates its two collectors by putting the same
+	// address under BOTH families with different source-addresses, so they now
+	// land in two (template, family) groups rather than one. The #3745 property
+	// under test is unchanged — both collectors are RETAINED, neither deduped
+	// away — so the assertion counts across groups instead of pinning one
+	// group's length, which would have been asserting the grouping, not the
+	// dedup.
+	groups := ResolveV9TemplateGroups(v9Svc(), fo)
+	if len(groups) == 0 {
+		t.Fatal("expected at least one ExportConfig")
 	}
-	if len(ec.Collectors) != 2 {
-		t.Fatalf("expected 2 collectors, got %d", len(ec.Collectors))
+	total := 0
+	srcs := map[string]bool{}
+	for _, g := range groups {
+		total += len(g.Collectors)
+		for _, c := range g.Collectors {
+			srcs[c.SourceAddress] = true
+		}
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 collectors across all groups, got %d", total)
+	}
+	if len(srcs) != 2 {
+		t.Fatalf("expected 2 DISTINCT source addresses, got %d (%v) — the per-collector "+
+			"source-address override was deduped away (#3745)", len(srcs), srcs)
 	}
 }
 
@@ -637,12 +656,31 @@ func TestBuildIPFIXExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.
 		},
 	}
 
-	ec := BuildIPFIXExportConfig(svc, fo)
-	if ec == nil {
-		t.Fatal("expected non-nil ExportConfig")
+	// #6811: this fixture creates its two collectors by putting the same
+	// address under BOTH families with different source-addresses, so they now
+	// land in two (template, family) groups rather than one. The #3745 property
+	// under test is unchanged — both collectors are RETAINED, neither deduped
+	// away — so the assertion counts across groups instead of pinning one
+	// group's length, which would have been asserting the grouping, not the
+	// dedup.
+	groups := ResolveIPFIXTemplateGroups(svc, fo)
+	if len(groups) == 0 {
+		t.Fatal("expected at least one ExportConfig")
 	}
-	if len(ec.Collectors) != 2 {
-		t.Fatalf("expected 2 collectors, got %d", len(ec.Collectors))
+	total := 0
+	srcs := map[string]bool{}
+	for _, g := range groups {
+		total += len(g.Collectors)
+		for _, c := range g.Collectors {
+			srcs[c.SourceAddress] = true
+		}
+	}
+	if total != 2 {
+		t.Fatalf("expected 2 collectors across all groups, got %d", total)
+	}
+	if len(srcs) != 2 {
+		t.Fatalf("expected 2 DISTINCT source addresses, got %d (%v) — the per-collector "+
+			"source-address override was deduped away (#3745)", len(srcs), srcs)
 	}
 }
 
