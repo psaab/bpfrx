@@ -106307,6 +106307,50 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
 
+- **Timestamp**: 2026-08-26
+  - **Action**: #6824 — add a structural swanctl document checker and convert
+    the first render tests off `strings.Contains`
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go (new),
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go (new),
+    pkg/ipsec/endpoint_render_5630_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/ipsec/childname_collision_5122_test.go
+  - **Action**: #6824 — convert the remaining issue-numbered ipsec render
+    regression tests off `strings.Contains`
+  - **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
+    pkg/ipsec/proposalset_ah_hb167_test.go,
+    pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — convert the 68 `strings.Contains` render assertions in
+    ipsec_test.go to structural checks
+  - **File(s)**: pkg/ipsec/ipsec_test.go
+  - **Action**: #6824 — add the AST guard that fails on new swanctl-syntax
+    containment needles, with its own sensitivity control
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go (new)
+  - **Action**: #6824 self-review — the AST guard missed an inline render call
+    as the containment subject; parser section-vs-setting ambiguity documented
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — act on the Codex hostile review: nine findings, all
+    real, including a false claim in the guard's own doc comment
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go,
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go,
+    pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go
+  - **Action**: #6824 — act on the Codex RE-review: refuse ambiguous parser
+    shapes instead of guessing; restore the deleted negatives with faithful
+    (prefix/substring) semantics; teach the guard helpers, package-level vars
+    and closures
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go,
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go,
+    pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/ipsec_test.go, pkg/ipsec/swanctl_render_test.go,
+    pkg/ipsec/dhcp_rebind_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go
 ## 2026-08-26 — #6751 PR 3a: interface egress joins the cross-domain NAT owner set
 
 - **Timestamp**: 2026-08-26

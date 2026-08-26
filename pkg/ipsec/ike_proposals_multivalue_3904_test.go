@@ -1,7 +1,6 @@
 package ipsec
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -45,15 +44,13 @@ func TestGenerateConfig_MultiIKEProposals(t *testing.T) {
 			"esp-a": {Name: "esp-a", EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha-256", DHGroup: 14},
 		},
 	}
-	got := m.generateConfig(cfg)
-	want := "proposals = aes256-sha256-modp2048,aes128-sha256-modp1536"
-	if !strings.Contains(got, want) {
-		t.Errorf("expected both IKE proposals comma-joined (%q), got:\n%s", want, got)
-	}
-	// The second proposal alone would be dropped by the pre-#3904 scalar read.
-	if !strings.Contains(got, "aes128-sha256-modp1536") {
-		t.Errorf("second IKE proposal missing from swanctl output (crypto narrowing):\n%s", got)
-	}
+	// #6824: equality at connections.tun1.proposals subsumes both old checks.
+	// The second needle existed because containment on the joined string could
+	// not say the join was the WHOLE value -- an exact match at a known path
+	// says it, and additionally rejects a third proposal silently appearing.
+	parseSwanctlDoc(t, m.generateConfig(cfg)).
+		at(t, "connections", "tun1").
+		requireSetting(t, "proposals", "aes256-sha256-modp2048,aes128-sha256-modp1536")
 }
 
 // TestGenerateConfig_MultiESPProposals asserts both ESP proposals in a
@@ -72,14 +69,10 @@ func TestGenerateConfig_MultiESPProposals(t *testing.T) {
 			"esp-b": {Name: "esp-b", EncryptionAlg: "aes-128-cbc", AuthAlg: "hmac-sha-256", DHGroup: 5},
 		},
 	}
-	got := m.generateConfig(cfg)
-	want := "esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp1536"
-	if !strings.Contains(got, want) {
-		t.Errorf("expected both ESP proposals comma-joined (%q), got:\n%s", want, got)
-	}
-	if !strings.Contains(got, "aes128-sha256-modp1536") {
-		t.Errorf("second ESP proposal missing from swanctl output (crypto narrowing):\n%s", got)
-	}
+	// #6824: the ESP proposals belong to the CHILD SA, not the connection --
+	// a distinction containment could not draw.
+	childSA_3904(t, m.generateConfig(cfg), "tun1").
+		requireSetting(t, "esp_proposals", "aes256-sha256-modp2048,aes128-sha256-modp1536")
 }
 
 // TestGenerateConfig_MultiESPProposalsPFS asserts the policy-level PFS group
@@ -99,9 +92,20 @@ func TestGenerateConfig_MultiESPProposalsPFS(t *testing.T) {
 			"esp-b": {Name: "esp-b", EncryptionAlg: "aes-128-cbc", AuthAlg: "hmac-sha-256"},
 		},
 	}
-	got := m.generateConfig(cfg)
-	want := "esp_proposals = aes256-sha256-ecp256,aes128-sha256-ecp256"
-	if !strings.Contains(got, want) {
-		t.Errorf("expected PFS group applied to both ESP proposals (%q), got:\n%s", want, got)
+	childSA_3904(t, m.generateConfig(cfg), "tun1").
+		requireSetting(t, "esp_proposals", "aes256-sha256-ecp256,aes128-sha256-ecp256")
+}
+
+// childSA_3904 resolves the single child-SA section of a connection, failing if
+// the render produced anything other than exactly one. "Exactly one" is itself
+// part of the claim: a second child section would carry its own esp_proposals,
+// and a containment assertion could not tell which one it had matched.
+func childSA_3904(t *testing.T, doc, conn string) *swanctlNode {
+	t.Helper()
+	kids := parseSwanctlDoc(t, doc).at(t, "connections", conn, "children")
+	if len(kids.order) != 1 {
+		t.Fatalf("connection %q rendered %d child SA sections (%v), want exactly 1\n%s",
+			conn, len(kids.order), kids.childNames(), kids)
 	}
+	return kids.at(t, kids.order[0])
 }
