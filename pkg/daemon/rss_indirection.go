@@ -227,20 +227,42 @@ func restoreDefaultRSSIndirection(allowed []string, execer rssExecutor) {
 		if execer.readDriver(iface) != mlx5Driver {
 			continue
 		}
-		out, err := execer.runEthtool("-X", iface, "default")
-		if err != nil {
-			if isExecNotFound(err) {
-				slog.Warn("linksetup: ethtool binary not found, cannot restore default rss indirection",
-					"iface", iface)
-				return
-			}
-			slog.Warn("linksetup: ethtool -X default failed",
-				"iface", iface, "err", err,
-				"output", strings.TrimSpace(string(out)))
-			continue
+		err := restoreDefaultRSSIndirectionOne(iface, execer)
+		if err != nil && isExecNotFound(err) {
+			// ethtool is missing for the whole process, not just this
+			// NIC — abandon the sweep instead of logging once per
+			// interface (unchanged from the pre-#6801 inline loop).
+			return
 		}
-		slog.Info("linksetup: restored default rss indirection", "iface", iface)
 	}
+}
+
+// restoreDefaultRSSIndirectionOne runs `ethtool -X <iface> default` on a
+// single interface and REPORTS the outcome (#6801).
+//
+// Split out of restoreDefaultRSSIndirection's loop so the
+// released-interface teardown can release ownership only on success and
+// retain a failure as retry debt. The caller is responsible for the
+// mlx5 driver guard, exactly as it was when this body was inline.
+//
+// Idempotent: restoring an already-default table is a no-op ethtool
+// call, which is why this is a safe restore action for an interface
+// whose pre-xpfd table was never captured.
+func restoreDefaultRSSIndirectionOne(iface string, execer rssExecutor) error {
+	out, err := execer.runEthtool("-X", iface, "default")
+	if err != nil {
+		if isExecNotFound(err) {
+			slog.Warn("linksetup: ethtool binary not found, cannot restore default rss indirection",
+				"iface", iface)
+			return err
+		}
+		slog.Warn("linksetup: ethtool -X default failed",
+			"iface", iface, "err", err,
+			"output", strings.TrimSpace(string(out)))
+		return err
+	}
+	slog.Info("linksetup: restored default rss indirection", "iface", iface)
+	return nil
 }
 
 // applyRSSIndirectionOne applies the weight-vector to a single mlx5 iface.
