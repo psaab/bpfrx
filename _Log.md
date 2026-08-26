@@ -93080,73 +93080,6 @@ Every RED above is an assertion failure, not a build break.
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
 
-## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
-
-- **Timestamp**: 2026-08-05
-- **Action**: Two findings from reviewing the #5078 branch, plus the doc
-  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
-  RED-on-revert that could not fire — flipping its only precondition
-  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
-  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
-  regardless of `peerAuthSeen`. It was a duplicate of
-  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
-  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
-  sync-side downgrade guard it was named for was itself dead —
-  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
-  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
-  not flag unused methods, so it compiled green. Deleted, along with
-  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
-  the interface), the fake's implementation, and the now-meaningless
-  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
-  package doc and the `pkg/cluster/README.md` PR-C section still described
-  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
-  sync downgrade guard, and a two-method provider wiring.
-- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
-  removed — still exported, still consumed by the gRPC fabric listener
-  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
-  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
-  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
-  so deleting the sync pair cannot disarm it;
-  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
-  `TestControlLinkAuthStatus` still pass.
-- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
-  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
-  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
-  the same property and additionally covers key ROTATION. A second test
-  for one property is noise.
-- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
-  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
-  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
-- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
-  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
-  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
-
-## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
-
-- **Timestamp**: 2026-08-05
-- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
-  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
-  struct test could not see it: adding `|| keyChanged` there, with
-  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
-  the permanent deadlock with a green suite. New test observes
-  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
-  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
-  grace in syncAuthDecision", which does NOT fail it (the arm discards the
-  accept bit); it actually binds the arm returning nil. F3 — matrix comment
-  still described the deleted migration window as current and named the
-  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
-  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
-  failure default of every error path. README — procedure 2 can itself
-  produce the keyed-primary/unkeyed-secondary deadlock if the connection
-  drops mid-rollout.
-- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
-  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
-  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
-  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
-- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
-  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
-  pkg/cluster/README.md, _Log.md
-
 ## 2026-08-07 — #6706 r11 fold: the `system login` packed gate saw one of three levels
 
 - **Timestamp**: 2026-08-07
@@ -105112,22 +105045,6 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
-
-- **Timestamp**: 2026-08-23
-- **Action**: #5841 writes the resource ownership markers BEFORE the credential
-  mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
-  nothing withdrew the marker when the mutation then failed. Because the
-  markers gate a REVOCATION rather than a write, the stale claim makes xpf
-  later delete an operator's pre-existing authorized_keys or lock an account
-  whose password xpf never set. Added `claimOwnership`/`rollback`, which
-  withdraws only a claim the current pass created and preserves one an earlier
-  apply legitimately made, and applied it at all three marker-first sites (user
-  key write, user password chpasswd, root key write). The useradd path is
-  marker-after already and unchanged.
-- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
-  `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
-  `docs/system-login.md`
-
 - **Timestamp**: 2026-08-23
 - **Action**: `reconcileRGState` captured a transition under `s.mu`, dropped the
   lock, ran `SetRGActive` off-lock, then recorded with an unguarded
@@ -105337,3 +105254,67 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/host_inbound_conntrack_retry_6802_test.go`,
   `pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go`,
   `pkg/daemon/README.md`, `docs/host-inbound-service-matrix.md`, `_Log.md`
+
+## 2026-08-26 — `_Log.md`: three duplicated entries from bad union merges, and the gate that sees them
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove three duplicated entry bodies and add
+  `pkg/refactoraudit/log_duplicate_entry_test.go`.
+- **Why the marker sweep was not enough**: the #7614 sweep catches a conflict
+  that was never RESOLVED. It cannot catch one that was resolved WRONGLY, which
+  leaves no marker behind and is syntactically fine Markdown. Three were live:
+  - **#6797's whole body copied under the #6799 heading**, so the record of
+    #6799 read as a description of a different change while #6799's own body sat
+    below it looking like a continuation. Reported by the #6790 lane; I had
+    resolved the markers around it in #7614 without noticing the body itself was
+    wrong.
+  - a **doubled #5078 follow-ups entry** (byte-identical, twice).
+  - a **truncated copy of a #6865 gate-fold entry** (1533B) beside its full
+    version (21656B).
+- **Two predicates, because one cannot see the other**: exact equality catches a
+  whole entry copied twice; PREFIX CONTAINMENT catches the shape a bad union
+  merge actually produces, where both sides end up concatenated under ONE
+  heading so the survivor's body is the loser's body followed by its own. Those
+  nest rather than match. Equality alone found 1 of the 3; containment found all
+  3.
+- **The control had the assertion the wrong way round**, and fixing it was the
+  point: the "genuinely different" fixture was `body + suffix`, which IS
+  containment by construction — it asserted the gate stays QUIET on exactly the
+  shape it exists to catch. Replaced with a genuinely unrelated body.
+- **Verified paired**: against the pre-fix `_Log.md` the gate reds naming all
+  three; against the fixed one it passes over 1946 entries.
+- **File(s)**: `_Log.md`, `pkg/refactoraudit/log_duplicate_entry_test.go` (new)
+
+## 2026-08-26 — #7610: step 8 measured the 3 Gb/s shaped port against a 23 Gbit/s bar
+
+- **Timestamp**: 2026-08-26
+- **Action**: Point `docs/engineering-style.md` step 8's throughput row at port
+  5211, explain why the ports are not interchangeable, and add
+  `pkg/refactoraudit/step8_iperf_port_test.go` to bind the doc and the CoS
+  fixture to each other.
+- **Why**: the row instructed every lane to apply
+  `test/incus/cos-iperf-config.set` and then measure `iperf3 … -p 5203` against
+  `≥ 23 Gbit/s`. In that fixture THE PORT IS THE CLASS: `bandwidth-output`
+  term 3 maps 5203 → `iperf-3g` → `scheduler-3g`, `transmit-rate 3.0g exact`.
+  So the row said "shape this to 3 Gb/s, then fail the change if it does not
+  reach 23". A lane following it literally reads a correctly working shaper as
+  an 8x regression — measured on a healthy fw0: 5203 → 2.86 Gbit/s, 5211 → 23.1
+  Gbit/s.
+- **The "no regression vs previous run" clause made it worse, not better**:
+  every previous run of the same wrong port also reported ~3 Gbit/s, so the
+  false reading looked corroborated by history.
+- **The gate binds the AGREEMENT, not a literal.** Pinning the doc to "5211"
+  would encode which side I trust; a fixture renumber would then leave the test
+  green and the doc wrong again. The invariant is "the port step 8 names must
+  resolve, IN THE FIXTURE, to a class with no explicit transmit-rate", which
+  survives a renumber. The row is located by CONTENT (an iperf3 check against
+  the documented target) and the gate refuses to guess if there is not exactly
+  one.
+- **Verified paired**: against the pre-fix doc the gate REDs naming
+  `iperf-3g`/`scheduler-3g`/`3.0g`; against the fixed doc it resolves 5211 to
+  `iperf-uncapped` with no rate and passes. A sensitivity control drives the
+  real parsers over a synthetic fixture in both directions.
+- **Found by**: the #6790 lane, which measured both ports back-to-back on a
+  real box rather than trusting the doc.
+- **File(s)**: `docs/engineering-style.md`,
+  `pkg/refactoraudit/step8_iperf_port_test.go` (new), `_Log.md`
