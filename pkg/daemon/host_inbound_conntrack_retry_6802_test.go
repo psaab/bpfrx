@@ -226,8 +226,8 @@ func TestRetryRechecksTheDebtInsideTheSemaphore6802(t *testing.T) {
 	}
 }
 
-// TestRetryLoopTicks6802 binds the loop BODY, and TestRunStartsTheConntrackRetryLoop6802
-// (below) binds its START. They fail for different reasons: this reds if the
+// TestRetryLoopTicks6802 binds the loop BODY, and
+// TestRunStartsHostInboundConntrackReassertLoop6802 (below) binds its START. They fail for different reasons: this reds if the
 // ticker is wired to the wrong function, that one reds if Run never launches it.
 func TestRetryLoopTicks6802(t *testing.T) {
 	calls := installConntrackDeleteStub(t, errors.New("still failing"))
@@ -331,5 +331,48 @@ func TestDaemonWiresHostInboundConntrackMetrics6802(t *testing.T) {
 				"conntrack revocation is still invisible to an operator (#6802, "+
 				"and the #6852 no-production-caller shape)", want)
 		}
+	}
+}
+
+// TestApplyHostInboundFilterRecordsTheFlushOutcome6802 is the CALL-SITE half of
+// the wiring binding, and it exists because nothing else in this file can see it.
+//
+// Every behavioural cell above calls noteHostInboundConntrackFlush directly, so
+// they all stay green if applyHostInboundFilter goes back to calling
+// flushDeniedHostInboundConntrack and DISCARDING its return — which is the whole
+// fix undone, with the debt never armed on the one path that arms it in
+// production. That is the repeated "bind the wiring, not the function it calls"
+// failure; the #6791 fabric fix hit the identical shape.
+//
+// applyHostInboundFilter cannot be driven from a unit test (it needs a real nft
+// install path), so the wiring is asserted at the source with comments stripped.
+//
+// FAIL-ON-REVERT: change the call site back to a bare
+// `d.flushDeniedHostInboundConntrack(views, unzonedV4, unzonedV6, wgListenPorts)`
+// and this reds while every other cell in the file stays green.
+func TestApplyHostInboundFilterRecordsTheFlushOutcome6802(t *testing.T) {
+	src := stripLineComments6791(readDaemonSource(t, "daemon_nft.go"))
+
+	const note = "d.noteHostInboundConntrackFlush("
+	i := strings.Index(src, note)
+	if i < 0 {
+		t.Fatalf("applyHostInboundFilter does not record the flush outcome; a " +
+			"failed host-inbound conntrack revocation arms no debt on the one " +
+			"path that arms it in production, so the retry owner never runs " +
+			"(#6802)")
+	}
+	// The recorded outcome must be the flush's OWN return value. A call that
+	// passed a constant, or recorded an outcome derived from something else,
+	// would arm or clear the debt without reference to whether the revocation
+	// actually happened.
+	end := strings.Index(src[i:], "\n\tslog.")
+	if end < 0 {
+		end = len(src) - i
+	}
+	if !strings.Contains(src[i:i+end], "d.flushDeniedHostInboundConntrack(") {
+		t.Errorf("the outcome recorded by applyHostInboundFilter does not come " +
+			"from flushDeniedHostInboundConntrack's return value; the debt would " +
+			"be armed or cleared independently of whether the revocation " +
+			"succeeded (#6802)")
 	}
 }
