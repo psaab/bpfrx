@@ -1766,6 +1766,37 @@ the drop fails loudly instead of going quietly vacuous.
   `bgp_routes_cap_5056_test.go`; the streaming/non-buffering + wire-format
   invariants by `bgp_routes_stream_4708_test.go`.
 
+  **SSE streams carry the same bound, on a different axis (#7632).**
+  `writeSSEEvent` wrote straight to the `ResponseWriter` and **discarded every
+  write error**, and `WriteTimeout` is 0 process-wide, so a subscriber that
+  stays CONNECTED and stops reading parked the handler in `Write` indefinitely
+  while holding a subscriber slot. Both stream handlers
+  (`/api/v1/events/stream`, `/api/v1/logs/stream`) now write through
+  `sseStream`, which wraps the `ResponseWriter` in the same
+  `deadlineArmingWriter` the BGP route stream uses and **returns** the first
+  write error; both loops treat that error as terminal.
+
+  **Per-write, never elapsed** — this is where SSE differs from the RIB dump and
+  the difference is load-bearing. An event feed on a quiet firewall is
+  *supposed* to sit silent for long stretches; that is its normal operating
+  state, not a symptom. An elapsed budget would sever exactly the healthy case.
+  A per-write deadline bounds a write that has BEGUN and says nothing about the
+  gap between events. `TestIdleSSEStreamIsNotSevered7632` pins it, and reds if
+  anyone adds an elapsed budget here by analogy with `bgpStreamTotalBudget`.
+
+  **The error return is not separable from the deadline.** Adding the deadline
+  alone would have been worse than the pin: the write would fail instantly on
+  every subsequent event while the loop kept consuming the subscription,
+  marshalling and discarding — a goroutine that never exits and silently drops
+  the feed, where before it at least blocked and applied backpressure.
+
+  Note one pre-existing behaviour #7632 did **not** change: net/http does not
+  send response headers until the first `Write` or `Flush`, and `setSSEHeaders`
+  only sets header VALUES — so a client connecting to a feed with no traffic
+  blocks waiting for headers nobody has sent. A browser `EventSource` on an idle
+  firewall hangs rather than establishing the stream. Out of scope here;
+  recorded because the test harness has to work around it.
+
   **A slow reader is a different hazard from a disconnected one (#6809).**
   Every bound above is a bound on PROGRESS. A client that stays CONNECTED and
   stops reading produces neither a disconnect nor a write error: the socket

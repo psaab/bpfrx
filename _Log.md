@@ -1,3 +1,39 @@
+## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
+
+- **Timestamp**: 2026-08-26
+- **Action**: The SSE sibling of #6809. `writeSSEEvent` wrote straight to the
+  `ResponseWriter` and DISCARDED every write error, and `WriteTimeout` is 0
+  process-wide for exactly these streams — so a subscriber that stays CONNECTED
+  and stops reading parked the handler in `Write` indefinitely while holding a
+  subscriber slot. Both handlers now write through `sseStream`, reusing the
+  `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
+  first write error, which both loops treat as terminal.
+  TWO HALVES, NOT ONE: adding the deadline WITHOUT the error return would have
+  been worse than the pin — the write would fail instantly on every later event
+  while the loop kept consuming the subscription, marshalling and discarding, a
+  goroutine that never exits and silently drops the feed where before it at
+  least blocked and applied backpressure.
+  PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
+  from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
+  an elapsed budget would sever the healthy case. A per-write deadline bounds a
+  write that has BEGUN and says nothing about the gap between events.
+  Found a pre-existing behaviour while building the harness and did NOT fix it:
+  net/http sends no response headers until the first Write/Flush, and
+  `setSSEHeaders` only sets header VALUES — so a client connecting to a quiet
+  feed blocks in `http.Get` waiting for headers nobody sent. A browser
+  EventSource on an idle firewall hangs rather than establishing the stream.
+  Recorded in the README and in the harness comment; out of scope here.
+- **File(s)**: `pkg/api/sse.go`,
+  `pkg/api/sse_slow_reader_pin_7632_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: reused #6809's `stalledConn6809`/`stalledListener6809` — a
+  net.Conn that parks the writer exactly as a full send buffer does — rather
+  than rebuilding an instrument for the same class. Includes the NEGATIVE
+  CONTROL proving the fixture can genuinely pin (deadlines unsupported → the
+  handler must still be running), the SSE-specific idle cell that reds if
+  anyone adds an elapsed budget by analogy with `bgpStreamTotalBudget`, and a
+  paired healthy-reader control.
+
 ## 2026-08-26 — #7640: a leniently-admitted malformed NAT rule is now visible
 
 - **Timestamp**: 2026-08-26

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -17,7 +18,100 @@ func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Connection", "keep-alive")
 }
 
+// --- #7632: bounding a SLOW SSE READER -------------------------------------
+//
+// An SSE stream writes straight to the ResponseWriter and flushes, and
+// http.Server runs with WriteTimeout deliberately 0 process-wide so these
+// long-lived streams are not severed. So a subscriber that stays CONNECTED and
+// stops reading fills the socket buffers and parks this handler goroutine in
+// Write indefinitely, holding a subscriber slot with it — the same mechanism
+// #6809 bounded on the BGP route stream.
+//
+// A per-handler CONTEXT deadline does not help: it bounds a handler's work, not
+// a write already blocked in the kernel. Only a socket write deadline ends
+// that. See the corrected note in server.go's timeout block.
+//
+// WHY A PER-WRITE DEADLINE AND *NOT* AN ELAPSED BUDGET. An SSE stream is
+// SUPPOSED to sit idle with no data for long stretches — that is the normal
+// operating state of an event feed on a quiet firewall, not a symptom. An
+// elapsed budget would sever exactly the healthy case. A per-write deadline
+// bounds a write that has BEGUN and says nothing about the gap between events,
+// so idling is untouched and only a peer that has stopped draining is cut.
+// This is the axis on which SSE genuinely differs from the RIB dump, where a
+// total budget was a sensible backstop.
+//
+// THE ERROR RETURN IS NOT SEPARABLE FROM THE DEADLINE. writeSSEEvent used to
+// discard every write error. Adding the deadline WITHOUT propagating it would
+// have made things worse, not better: the write would fail instantly on every
+// subsequent event while the loop kept consuming from the subscription,
+// marshalling, and discarding — a goroutine that never exits and silently drops
+// the feed, where today it at least blocks and applies backpressure. Both
+// halves ship together for that reason.
+
+// sseWriteDeadline bounds a SINGLE downstream SSE write. A subscriber that
+// cannot accept one small event within this window is not reading. Generous by
+// design: an SSE event is a few hundred bytes and fits in any socket buffer
+// instantly unless the peer has stopped draining. A package var so a test can
+// compress it without a real slow reader.
+//
+// Deliberately NOT shared with bgpStreamWriteDeadline (routing.go): the two
+// endpoints have different traffic shapes and a shared knob would couple a
+// change to one into the other.
+var sseWriteDeadline = 30 * time.Second
+
+// sseStream is one SSE response: a deadline-arming writer over the
+// ResponseWriter plus its flusher. It single-sources the deadline, the flush
+// and the error return for both stream handlers, so neither can drift into
+// discarding a write failure again.
+type sseStream struct {
+	w io.Writer
+	f http.Flusher
+}
+
+// newSSEStream wraps w so every SSE write arms a fresh write deadline first.
+// It reuses deadlineArmingWriter (routing.go, #6809): arming at the WRITE
+// rather than at a call site makes the coverage structural, which is what
+// #6809's own first attempt got wrong.
+func newSSEStream(w http.ResponseWriter, d time.Duration) *sseStream {
+	st := &sseStream{w: &deadlineArmingWriter{
+		w:  w,
+		rc: http.NewResponseController(w),
+		d:  d,
+	}}
+	if f, ok := w.(http.Flusher); ok {
+		st.f = f
+	}
+	return st
+}
+
+// writeEvent writes a single SSE event and RETURNS the first write error.
+// A non-nil return is terminal for the stream: the peer is not reading, and
+// continuing would drain the subscription into a connection that cannot take
+// it.
+func (s *sseStream) writeEvent(id, event, data string) error {
+	if _, err := fmt.Fprintf(s.w, "id: %s\n", id); err != nil {
+		return err
+	}
+	if event != "" {
+		if _, err := fmt.Fprintf(s.w, "event: %s\n", event); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+	if s.f != nil {
+		s.f.Flush()
+	}
+	return nil
+}
+
 // writeSSEEvent writes a single SSE event to the response.
+//
+// #7632: retained as the unbounded form for callers that are NOT a long-lived
+// stream — it has no write deadline and discards errors, which is only safe
+// where the response ends immediately afterwards. A streaming handler must use
+// sseStream.
 func writeSSEEvent(w http.ResponseWriter, id string, event string, data string) {
 	fmt.Fprintf(w, "id: %s\n", id)
 	if event != "" {
@@ -57,6 +151,8 @@ func (s *Server) eventStreamHandler(w http.ResponseWriter, r *http.Request) {
 
 	setSSEHeaders(w)
 
+	// #7632: bound a subscriber that stays connected and stops reading.
+	stream := newSSEStream(w, sseWriteDeadline)
 	var seq uint64
 	ctx := r.Context()
 	for {
@@ -72,7 +168,12 @@ func (s *Server) eventStreamHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			writeSSEEvent(w, fmt.Sprintf("%d", seq), rec.Type, string(data))
+			// #7632: a write failure is TERMINAL. Continuing would drain the
+			// subscription into a connection that cannot take it, holding a
+			// subscriber slot while silently discarding the feed.
+			if err := stream.writeEvent(fmt.Sprintf("%d", seq), rec.Type, string(data)); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -110,6 +211,8 @@ func (s *Server) logStreamHandler(w http.ResponseWriter, r *http.Request) {
 
 	setSSEHeaders(w)
 
+	// #7632: same bound as the event stream.
+	stream := newSSEStream(w, sseWriteDeadline)
 	var seq uint64
 	ctx := r.Context()
 	for {
@@ -134,7 +237,10 @@ func (s *Server) logStreamHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			writeSSEEvent(w, fmt.Sprintf("%d", seq), "log", string(data))
+			// #7632: terminal on a write failure — see eventStreamHandler.
+			if err := stream.writeEvent(fmt.Sprintf("%d", seq), "log", string(data)); err != nil {
+				return
+			}
 		}
 	}
 }
