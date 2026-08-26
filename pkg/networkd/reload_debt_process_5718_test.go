@@ -230,15 +230,17 @@ func TestReloadDebt_ConcurrentSuccessCannotClearALaterFailure_5718(t *testing.T)
 	}
 	t.Cleanup(func() { runNetworkctl = orig })
 
-	// Setup: land owner B's files so its Clear has something to remove.
+	// Setup: land owner B's files so its teardown has something to remove.
 	if err := mB.Apply(ifaces); err != nil {
 		t.Fatalf("setup Apply for owner B should succeed: %v", err)
 	}
 
-	// T1..T5: B clears; A's failing Apply runs inside B's reload window.
+	// T1..T5: B tears down; A's failing Apply runs inside B's reload window.
+	// #6852 retired Clear; Apply(nil) is the teardown, and it sweeps the same
+	// managed files and runs the same reload.
 	phase = "B"
-	if err := mB.Clear(); err != nil {
-		t.Fatalf("owner B's Clear reload succeeds, so Clear must succeed: %v", err)
+	if err := mB.Apply(nil); err != nil {
+		t.Fatalf("owner B's teardown reload succeeds, so it must succeed: %v", err)
 	}
 	if !aApplyRan {
 		t.Fatal("setup: owner A's Apply must have run inside owner B's reload window")

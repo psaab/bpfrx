@@ -82,21 +82,13 @@ func TestApply_StaleRemoveFailureFailsEvenWithNoOtherChange(t *testing.T) {
 	}
 }
 
-// TestClear_RemoveFailureReturnsError is the #4900 fail-on-revert for Clear:
-// a managed file that cannot be removed must fail the Clear, not warn-and-succeed.
-func TestClear_RemoveFailureReturnsError(t *testing.T) {
-	stubNetworkctl(t)
-	dir := t.TempDir()
-	m := NewInDir(dir)
-
-	blockedStaleEntry(t, dir, filePrefix+"old.network")
-
-	err := m.Clear()
-	if err == nil {
-		t.Fatal("Clear must fail when a managed file cannot be removed " +
-			"(got nil — a surviving 10-xpf-* unit re-applies removed host config)")
-	}
-	if !strings.Contains(err.Error(), "remove") {
-		t.Errorf("Clear error should name the remove failure: %v", err)
-	}
-}
+// The #4900 fail-on-revert for the teardown path used to be duplicated here
+// against Clear, with the same fixture and the same assertion as the Apply(nil)
+// cell above. #6852 retired Clear, and the twin went with it rather than being
+// left as a test of a method that no longer exists.
+//
+// Deleting it costs no coverage, and that is checked rather than assumed: the
+// cell above uses the identical blockedStaleEntry fixture and asserts the
+// identical property, so the #4900 contract is still owned by a named cell. A
+// retirement that deleted the LAST owner of a property would be a silent
+// decommission; this one is not.

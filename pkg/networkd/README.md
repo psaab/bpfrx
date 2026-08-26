@@ -17,8 +17,9 @@ Triggers `networkctl reload` only when files actually changed.
 - `NewInDir(dir)` — `networkd.go`. Test/offline renderer constructor that
   writes xpf-managed files under a caller-provided directory instead of
   `/etc/systemd/network`.
-- `Apply(...)` — `networkd.go`.
-- `Clear()` — `networkd.go`.
+- `Apply(...)` — `networkd.go`. Also the TEARDOWN entry point: `Apply(nil)`
+  sweeps every managed file and reloads (#2988). There is no separate `Clear`;
+  see the retirement note below (#6852).
 - `FindExternallyManaged(dir string) map[string]bool` — `networkd.go`. Detects networkd files
   the daemon doesn't own.
 
@@ -108,7 +109,7 @@ Standard library only.
   a "successful" commit, and if no other generated file changed, `Apply`
   returned nil with no reload — so the surviving `.network`/`.netdev`
   re-applied the removed config on the next reload or boot (route leak /
-  management surprise). `Apply` and `Clear` now aggregate stale-remove
+  management surprise). `Apply` aggregates stale-remove
   failures alongside the write errors (still best-effort every delete,
   still reloading whatever DID change) and return a joined error, so a
   stale unit that cannot be removed FAILS THE COMMIT. Distinct from #2987
@@ -128,15 +129,17 @@ Standard library only.
   (warn-only, Apply still returns nil) but is likewise retried from the
   `Manager`'s `reconfigurePending` set until it succeeds. Distinct from
   #2987 (write-error-fails-commit) and the stale-file sweep.
-  **`Clear()` owes the same debt (#5718 A7-b01-C001).** Removing the
+  **The TEARDOWN owes the same debt (#5718 A7-b01-C001).** Removing the
   managed files deactivates nothing until the reload lands, so a failed
-  reload in `Clear` records the debt too. The empty-glob case is
-  therefore NOT an unconditional `return nil`: with debt outstanding the
-  files are already gone but the kernel never re-read them, so `Clear`
-  re-runs the idempotent reload and reports failure until it succeeds.
-  Without this the SECOND `Clear` found nothing to remove and reported a
-  success it had not achieved while the removed addresses / VRFs / bonds
-  / renames stayed live.
+  reload on the teardown path records the debt too, and the no-change
+  case is NOT an unconditional `return nil`: with debt outstanding the
+  files are already gone but the kernel never re-read them, so the next
+  call re-runs the idempotent reload and reports failure until it
+  succeeds. Without this the SECOND teardown found nothing to remove and
+  reported a success it had not achieved while the removed addresses /
+  VRFs / bonds / renames stayed live. `Apply` carries this via its
+  `debtOwed := reloadDebtOutstanding()` re-activation, so `Apply(nil)`
+  inherits it (#6852).
 - **The reload debt has ONE holder and EVERY reload owner records into
   it (#5718 fold F2).** The debt is process-scoped (`reloadDebt` in
   `networkd.go`), not a `Manager` field, because `networkctl reload` acts
@@ -214,13 +217,27 @@ Standard library only.
   because a reader just told the debt has "ONE holder" and is
   "process-scoped" can reasonably read that as a durability claim, and it
   is not one.
-- **`Manager.Clear()` has no production caller (#5718 fold).** It has
-  been exported and uncalled since this package was introduced (`git
-  log -S` finds no caller in history); the daemon uses only
-  `SetProtectedResolver` and `Apply`. Its contracts above are therefore
-  pinned by this package's tests alone, with no end-to-end consumer.
-  That is a live gap to close by wiring the teardown path that wants it
-  or retiring the method — not an endorsement of the current shape.
+- **`Manager.Clear()` was RETIRED (#6852).** It had been exported and
+  uncalled since this package was introduced (`git log -S` found no
+  caller in history); the daemon uses only `SetProtectedResolver` and
+  `Apply`. #5718 left the choice open — wire it or retire it — and the
+  answer is retire, for a reason stronger than "nothing calls it":
+
+  `Apply(nil)` already carries every contract `Clear` owned. It runs the
+  `10-xpf-*` stale sweep, aggregates remove failures and fails the
+  commit (#4900), and re-activates whenever files changed OR prior
+  reload debt is outstanding (#4954) — which subsumes `Clear`'s
+  empty-glob debt-discharge branch. That is not asserted, it is
+  measured: `Clear`'s own four-step fail-on-revert
+  (`applynil_reload_debt_5718_test.go`) was MOVED onto `Apply(nil)` and
+  passes unchanged. A retirement whose tests were deleted rather than
+  moved would have proved only that nobody was looking.
+
+  Wiring it would have been actively WORSE. `Clear` globbed and removed
+  every `10-xpf-*` file including the `SetProtectedResolver` lifeline
+  ones, which `Apply(nil)` deliberately preserves. Any teardown that
+  called `Clear` would have taken the management lifeline down with the
+  managed config.
 - **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
   managed interface removed) still runs the `10-xpf-*` stale-file sweep
   and requests a reload so old addresses/bonds/bridges/renames don't
