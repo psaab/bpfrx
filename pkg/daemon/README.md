@@ -1293,6 +1293,82 @@ Any interface not declared in the active config is brought down and given
 `ActivationPolicy=always-down` in networkd — EXCEPT the #1922 protected set
 (see below).
 
+### NIC tuning ownership + released-interface teardown (#6801)
+
+Two per-interface knobs are written to the mlx5 NICs the userspace
+dataplane binds AF_XDP on:
+
+- the **RSS indirection table** (`rss_indirection.go`, D3 / #785) — hash
+  outputs are concentrated onto queues `0..workers-1`;
+- **interrupt coalescence** (`coalescence.go`, #801 Step-0) — adaptive
+  off, `rx-usecs`/`tx-usecs` pinned.
+
+Both take their target set from ONE allowlist,
+`dpuserspace.UserspaceBoundLinuxInterfaces(cfg)`, recomputed from the
+**new** compiled config on every reconcile — so both were blind to an
+allowlist that SHRANK. Binding `{ge-0-0-1, ge-0-0-2}` and then committing
+a config that binds only `ge-0-0-1` left `ge-0-0-2` with xpf's
+concentrated RSS table and adaptive-off/pinned-usecs coalescence: every
+loop walked the new set, so nothing ever visited the released name. The
+coalescence capture was reverted only at daemon shutdown; the RSS table
+was never reverted at all. A NIC handed back to the host stack or to
+another dataplane stayed limited to the old AF_XDP queue subset.
+
+`released_nic_tunables.go` closes that with a level-triggered
+`owned - current` teardown, run from `applyStep0TunablesWith` (which
+executes at boot AND on every commit):
+
+| Step | Function | What it does |
+|------|----------|--------------|
+| release | `releaseUnboundNICTunables` | For each owned interface absent from the current allowlist: `ethtool -X <if> default` + restore the captured pre-xpfd coalescence, then drop ownership |
+| claim | `claimNICTunableOwnership` | Union the current allowlist's mlx5 members into the owned set |
+
+Ownership is two records, unioned, because the knobs diverge on error
+paths: `priorHostTunables.rssOwned` (a set — the restore is the
+idempotent `ethtool -X default`, so no prior table has to be captured)
+and `priorHostTunables.mlx5Adaptive` (the coalescence capture, which
+exists only when the `ethtool -c` probe parsed).
+
+Invariants worth keeping:
+
+- **Ownership is released only after the restore write SUCCEEDS.** A
+  failed `ethtool` keeps the interface owned, so the next reconcile
+  recomputes the same released set and retries. No timer is needed —
+  a released name stays outside the allowlist until it is re-bound.
+  Same shape as the #5114 host-scope retry debt.
+- **An empty allowlist is NOT, by itself, a withdrawal.**
+  `UserspaceBoundLinuxInterfaces` degrades to nil when its snapshot build
+  fails (#2514), and `applyTailReconciles` still runs the tunable step on
+  a commit whose dataplane apply failed. Treating "no names" as "release
+  everything" would let a transient derivation error rip the tuning off
+  NICs the dataplane is still forwarding on, and `ethtool -X ... default`
+  mid-traffic re-steers in-flight flows onto different RX queues. The
+  withdrawal trigger is therefore the CONFIG signal — `userspaceDP ==
+  false`, a pure config read with no error path — never an empty list.
+  With userspace-dp still enabled and an empty list, ownership is
+  retained untouched, mirroring the refusal `applyRSSIndirection` and
+  `applyCoalescence` already make.
+- **A released name that is no longer an mlx5 netdev drops ownership
+  without an ethtool call.** Unplugged, renamed by a `.link` change, or
+  rebound to another driver — the ring/coalescence configuration went
+  with it. This honors the "never invoke ethtool on a non-mlx5 netdev"
+  guard (#797 H1) and stops retry debt growing without bound on a NIC
+  that can never accept the restore.
+- **The claim is config-derived, deliberately a superset** of "actually
+  reprogrammed this reconcile". Over-claiming costs at most one extra
+  idempotent `ethtool -X <if> default` on release — the same call the
+  rss-indirection kill switch already issues on exactly this set.
+  Under-claiming is the defect: a NIC xpf tunes but never records can
+  never be handed back.
+
+Not covered: restoring the default RSS table on **daemon stop**.
+`restoreStep0TunablesOnShutdown` reverts coalescence, host-scope knobs
+and neigh `retrans_time_ms`, but not `rssOwned` — that is a separate
+lifecycle question (a second bounded `ethtool` round-trip per owned NIC
+on a shutdown path already capped by `TimeoutStopSec=20`, plus a changed
+restart profile). #6801 scopes itself to interfaces that leave xpf's
+ownership while the daemon keeps running.
+
 ## Bootstrap mode + management lifeline (#1922)
 
 `bootstrap.go` implements the SAFE-BOOTSTRAP daemon state so the daemon can
@@ -1722,6 +1798,26 @@ never lock an operator out of a remote box it manages.
       intentionally discarded (`_ =`) — next-boot convergence still covers a
       transient failure there; only the daemon-stop cancel, where next-boot
       convergence does not happen, collects and fails on them.
+    - **Unreadable ownership inventories now reach this closeout (#6798).**
+      The reconcilers above could only report failures they could SEE, and an
+      ownership read that failed was invisible to them: `hasProvenanceMarker`
+      collapsed every `os.ReadFile` error to the same `false` a genuine `ENOENT`
+      produces, `provisionedNames` skipped an unreadable root with a bare
+      `continue`, and `reconcileSudoers` discarded its `ReadDir` error outright
+      (`entries, _ :=`). Each gate then read "could not tell" as "not ours,
+      skip" and returned **nil**, so the closeout — whose entire job is to catch
+      an unconverged host-auth state — was handed a clean result over a removed
+      administrator's still-live password, `authorized_keys`, and passwordless
+      sudo grant. The reads now distinguish **absent** (a determination) from
+      **unreadable** (proves nothing) and return the latter, so
+      `summarizeHostAuthCloseout` attributes it to the owning reconciler
+      (`system-login`, `sudoers`, `absent-login-users`, `root-auth`) and the
+      cancel fails visibly. The gates report **without revoking** — acting on a
+      marker xpf cannot read is #6797's overclaim from the other side, and for
+      root's `authorized_keys` a total lockout — and markers are **retained**, so
+      the debt survives for the next apply instead of being abandoned. See
+      `docs/system-login.md` §"Unreadable ownership inventories are not empty
+      ones (#6798)".
   - **Early signal capture — startup is abortable (#5807).** The shutdown
     signal context is captured at the **TOP of `Run`** (`startupSignalContext`),
     BEFORE the mutating startup phases (config load + bootstrap → interface

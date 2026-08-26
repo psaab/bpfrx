@@ -51,6 +51,109 @@
   per-service gates instead, with a paired one-owes/one-quiet cell in both
   directions.
 
+## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
+
+- **Timestamp**: 2026-08-26
+- **Action**: The r2 peer-sync cell drove a REAL command against a short
+  deadline to prove a command timeout is not a context error. It passed
+  unloaded and FAILED under a loaded full-package run —
+  `err="context deadline exceeded"`. The claim was not wrong so much as
+  INCOMPLETE: `exec.CommandContext` has two deadline shapes. Process started
+  then killed -> `*exec.ExitError` ("signal: killed"), safe. Context expired
+  BEFORE fork/exec -> `Start` returns `ctx.Err()` and the caller gets a bare
+  `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot tell from
+  the #2926 daemon-stop abort. Which one you get is decided by machine load,
+  so the cell was sampling the scheduler (the #7563 shape) — corrected my own
+  earlier "measured rather than assumed" claim, which had measured only the
+  unloaded branch.
+  Fixed the cell by CONSTRUCTION rather than by retry: build the ExitError
+  shape by Start-then-cancel, so the deadline race cannot occur. 5 repeat
+  runs green.
+  The misclassification itself is PRE-EXISTING and wider than #6790 —
+  `nftApplyPayload` (5s -> lo0Err/hostInboundErr, #3392/#3333) and the DNS
+  systemctl calls (-> dnsErr, #6792) reach the same classifier the same way.
+  Filed #7618 rather than fixing inline: the fix changes behaviour for five
+  operands that predate this PR. Left
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserting the
+  CURRENT wrong classification so the fix reds a named cell instead of
+  silently passing.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: full `pkg/daemon` green; 5x repeat of the previously flaky
+  cell green; repo-wide gate re-run at the merged head.
+
+## 2026-08-26 — #6790 follow-up: the #1960 no-brick classification is now pinned
+
+- **Timestamp**: 2026-08-26
+- **Action**: Review question on PR #7604: does joining five more operands
+  into `applyTailReconciles`' result make a standby REJECT a peer-synced
+  config? Enumerated all five `applyConfigLocked` call sites. Answer: no.
+  The peer-sync path is `syncAndApply` (`daemon_apply_commit.go:522`), and
+  both it and `applyAndSyncCommitted` route the error through
+  `applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+  required-protocol-gate error (#2138) and a context cancel/deadline
+  (#2926). Everything else keeps the config active + armed and keeps
+  syncing; that is the class #4034 created and it already contains
+  networkdErr / dhcpServerErr / hostInboundErr / lo0Err / dnsErr. A
+  credential failure only leaves the applied-digest unstamped, so the
+  primary re-pushes and the standby RETRIES — a retry, not a brick.
+  Did not assume the one shape that could have broken it: MEASURED that a
+  command killed by `externalCommandTimeout` returns `*exec.ExitError`
+  ("signal: killed") and does NOT satisfy `errors.Is(.., DeadlineExceeded)`
+  even wrapped and joined, so a `useradd` timeout cannot masquerade as the
+  #2926 abort class and suppress a peer sync. Pinned the whole
+  classification with 6 subtests over the REAL reconciler errors plus a
+  paired positive control, so the classifier cannot silently degrade to
+  "nothing is fatal". No `lenient*` compile opt is needed or possible:
+  `compileOpts` downgrades COMPILE-time validators, and these are
+  reconcile-time failures raised after compilation.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 9 cells green. Repo-wide `go build ./... && go test
+  -count=1 ./...` rc 0. Mutation matrix re-run at the new head.
+
+## 2026-08-26 — #6790: the normal apply joins the five credential-reconcile failures
+
+- **Timestamp**: 2026-08-26
+- **Action**: `applyTailReconciles` ran the five host-credential reconcilers as
+  `_ = d.applySystemLogin/reconcileSudoers/reconcileAbsentLoginUsers/
+  applySSHConfig/applyRootAuth(cfg)`. #5874 had already made all five RETURN
+  their accumulated failures, but only the daemon-stop cancel closeout
+  collected them — the ordinary commit path threw them away, so
+  `delete system login user bob` reported SUCCESS while bob's password and
+  `authorized_keys` were still live, a demoted operator kept a stale NOPASSWD
+  grant, a reverted sshd drop-in kept the pre-commit `PermitRootLogin`, and
+  root's key set never converged. Captured all five and joined them into the
+  tail `errors.Join`, matching the three siblings in the SAME function that
+  already fail closed (`applyLo0Filter` #3392, `applyHostInboundFilter` #3333,
+  `reconcileDNSLocked` #6792).
+  Rejected the standing justification rather than assuming it: "the next boot
+  re-renders login/sudoers/SSH/root-auth so a transient failure converges" is
+  a RENDERING argument applied to a REVOCATION. Nothing retries before the
+  reboot (no dirty-retry owner, no ticker, no metric), the same commit already
+  advanced the durable config, and the green commit was the operator's only
+  signal. Fail-closed, NOT fail-fast: no early return was added, so an sshd
+  failure still cannot skip root-auth — bound by its own cell.
+  Also corrected three now-false doc claims that said the normal apply path
+  ignores these returns (`daemon_system.go` applySystemLogin,
+  `login_password.go` reconcileAbsentLoginUsers + deprovisionLoginUser) and the
+  `applyHostAuthorizationCloseout` comment that implied the cancel path was
+  still the only collector.
+- **File(s)**: `pkg/daemon/daemon_apply_tail.go`, `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/login_password.go`,
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 7 new cells drive the REAL `applyTailReconciles` with exactly
+  ONE owner injected to fail (id/useradd refused; unwritable sudoers dir;
+  unreadable `/etc/passwd` for a marked-but-removed account; `sshd -t`
+  rejecting; an ENOTDIR marker root) plus a healthy PAIRED control and a
+  two-failure cell. Each keys on a substring unique to its owner, so dropping
+  that owner's operand from the join reds that cell alone. Mutation matrix:
+  5/5 per-owner reverts to `_ =` red their named cell, and the control stays
+  green. Repo-wide `go build ./... && go test -count=1 ./...` rc 0. No
+  cluster/VRRP/session-sync/failover code touched, so no `make test-failover`
+  is owed.
+
 ## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
 
 - **Timestamp**: 2026-08-22
@@ -105234,3 +105337,282 @@ prose edit above them added. No diff falls in the new test body.
 - **Verified paired**: against the pre-fix `_Log.md` the gate reds naming all
   three; against the fixed one it passes over 1946 entries.
 - **File(s)**: `_Log.md`, `pkg/refactoraudit/log_duplicate_entry_test.go` (new)
+
+## 2026-08-26 — #7610: step 8 measured the 3 Gb/s shaped port against a 23 Gbit/s bar
+
+- **Timestamp**: 2026-08-26
+- **Action**: Point `docs/engineering-style.md` step 8's throughput row at port
+  5211, explain why the ports are not interchangeable, and add
+  `pkg/refactoraudit/step8_iperf_port_test.go` to bind the doc and the CoS
+  fixture to each other.
+- **Why**: the row instructed every lane to apply
+  `test/incus/cos-iperf-config.set` and then measure `iperf3 … -p 5203` against
+  `≥ 23 Gbit/s`. In that fixture THE PORT IS THE CLASS: `bandwidth-output`
+  term 3 maps 5203 → `iperf-3g` → `scheduler-3g`, `transmit-rate 3.0g exact`.
+  So the row said "shape this to 3 Gb/s, then fail the change if it does not
+  reach 23". A lane following it literally reads a correctly working shaper as
+  an 8x regression — measured on a healthy fw0: 5203 → 2.86 Gbit/s, 5211 → 23.1
+  Gbit/s.
+- **The "no regression vs previous run" clause made it worse, not better**:
+  every previous run of the same wrong port also reported ~3 Gbit/s, so the
+  false reading looked corroborated by history.
+- **The gate binds the AGREEMENT, not a literal.** Pinning the doc to "5211"
+  would encode which side I trust; a fixture renumber would then leave the test
+  green and the doc wrong again. The invariant is "the port step 8 names must
+  resolve, IN THE FIXTURE, to a class with no explicit transmit-rate", which
+  survives a renumber. The row is located by CONTENT (an iperf3 check against
+  the documented target) and the gate refuses to guess if there is not exactly
+  one.
+- **Verified paired**: against the pre-fix doc the gate REDs naming
+  `iperf-3g`/`scheduler-3g`/`3.0g`; against the fixed doc it resolves 5211 to
+  `iperf-uncapped` with no rate and passes. A sensitivity control drives the
+  real parsers over a synthetic fixture in both directions.
+- **Found by**: the #6790 lane, which measured both ports back-to-back on a
+  real box rather than trusting the doc.
+- **File(s)**: `docs/engineering-style.md`,
+  `pkg/refactoraudit/step8_iperf_port_test.go` (new), `_Log.md`
+
+## 2026-08-26 — #6801 released-NIC RSS/coalescence teardown
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hand a NIC's RSS indirection table and interrupt coalescence back
+  when it LEAVES the userspace-dp interface allowlist, instead of leaving xpf's
+  tuning live on a released NIC until daemon shutdown.
+- **Root cause**: both reconcilers derive their target set from one allowlist,
+  `dpuserspace.UserspaceBoundLinuxInterfaces(cfg)`, recomputed from the NEW
+  compiled config on every reconcile — so both are blind to a SHRINKING
+  allowlist. `{ge-0-0-1, ge-0-0-2}` → `{ge-0-0-1}` walks only the new set;
+  nothing ever visits the released name. The coalescence capture was reverted
+  only at daemon stop; the RSS table was never reverted at all.
+- **Fix**: `released_nic_tunables.go` adds a level-triggered `owned - current`
+  teardown wired into `applyStep0TunablesWith` (boot + every commit), ahead of
+  the claim and the re-apply, mirroring the managed→unmapped teardown
+  `device_map.go` runs before `networkd.Apply`. Ownership is the union of the
+  new `priorHostTunables.rssOwned` set and the existing `mlx5Adaptive` capture
+  map; it is dropped only after the restore write SUCCEEDS (#5114 retry-debt
+  shape), so a failed `ethtool` is retried on the next reconcile.
+- **The middle row**: an EMPTY allowlist is not, by itself, a withdrawal.
+  `UserspaceBoundLinuxInterfaces` degrades to nil when its snapshot build fails
+  (#2514) and `applyTailReconciles` still runs the tunable step on a commit
+  whose dataplane apply FAILED — so "no names" as "release everything" would rip
+  the tuning off NICs the dataplane is still forwarding on, and
+  `ethtool -X ... default` mid-traffic re-steers in-flight flows onto different
+  RX queues. The withdrawal trigger is the config signal (`userspaceDP ==
+  false`), never an empty list. Without that guard the fix is a regression, and
+  a fixture that only ever shrinks a non-empty list cannot see it.
+- **Interface disappearance**: a released name that is no longer an mlx5 netdev
+  drops ownership WITHOUT an ethtool call — honors the #797 H1 "never ethtool a
+  non-mlx5 netdev" guard and stops retry debt growing without bound on a NIC
+  that can never accept the restore.
+- **Out of scope, reported as a follow-up**: `restoreStep0TunablesOnShutdown`
+  still does not restore the default RSS table on daemon stop (it does revert
+  coalescence, host-scope knobs and neigh retrans). Separate lifecycle question
+  — a second bounded ethtool round-trip per owned NIC on a path already capped
+  by `TimeoutStopSec=20`, plus a changed restart profile.
+- **Mutation matrix**: 10 cells, each reverting ONE production line/guard, each
+  with a full-package `go test -count=1 ./pkg/daemon/` and no `-run` filter;
+  every cell named a RED, none escaped, none build-broke. Fixtures run two reconciles and move an interface out of the
+  binding set between them — a fixture whose allowlist never shrinks cannot see
+  the teardown at all. The pre-xpfd probe uses rx-usecs 42 / tx-usecs 43, values
+  xpf never writes, so a restore assertion cannot be satisfied by an apply.
+- **Docs**: `pkg/daemon/README.md` gains "NIC tuning ownership +
+  released-interface teardown (#6801)" (the module doc — all the code is in
+  `pkg/daemon`). `docs/userspace-dataplane-architecture.md` gains the
+  allowlist-EXIT contract next to the existing D3/RSS allowlist block, since
+  that doc is where the allowlist's meaning is defined and "what happens when a
+  netdev leaves it" was the gap. NOT touched, with reasons:
+  `pkg/dataplane/README.md` (carries no RSS/D3/coalescence surface at all —
+  `grep -n 'rss\|coalesc\|D3'` is empty), root `README.md` (same), and
+  `docs/config-schema.md` (no config-mode leaf added or changed — the teardown
+  is keyed on the EXISTING `system dataplane` knobs).
+- **File(s)**: `pkg/daemon/released_nic_tunables.go` (new),
+  `pkg/daemon/released_nic_tunables_6801_test.go` (new),
+  `pkg/daemon/host_tunables.go`, `pkg/daemon/host_tunables_daemon.go`,
+  `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+## 2026-08-26 — #6816: the ctrl-enable cleanup read a session ID as a timestamp
+
+- **Timestamp**: 2026-08-26
+- **Action**: Derive the session-value `Created` offset from the ABI struct and
+  fix the initial-control cleanup that had it wrong.
+- **Why**: `pkg/dataplane/userspace/helper_status_apply.go` decoded `Created`
+  from bytes `[16:24]` of the raw BPF map value, justified by an in-comment sum
+  `State(1)+Flags(1)+TCPState(1)+IsReverse(1)+AppTimeout(4)+SessionID(8)=16`.
+  That sum is wrong twice over: `Flags` has been a `uint16` since #5460, and the
+  struct carries three explicit padding gaps (#6082) it omits entirely.
+  `SessionID` is at 16; `Created` is at 24. So on every ctrl enable the
+  keep-or-delete decision for synced sessions compared a SESSION ID against a
+  seconds-since-boot cutoff — a decision made on a number that is not a
+  timestamp, with no error and no log to show for it.
+- **The issue's cite had rotted**: it named `maps_sync.go:609`, which is now an
+  unrelated per-CPU stats loop. The code moved to `helper_status_apply.go` in
+  the #6429 split. Re-derived by searching for the decode itself rather than
+  trusting the line number.
+- **Fix shape — derive, do not re-type**: `SessionValueCreatedOffset` /
+  `SessionValueSessionIDOffset` are exported from `bpf_session_value.go` via
+  `unsafe.Offsetof`. The offset and the layout MUST agree, and a derived value
+  cannot disagree; a literal can, and this one did for as long as it took two ABI
+  changes to move the field out from under it.
+- **Test shape**: asserting `SessionValueCreatedOffset == 24` would be a
+  tautology against `unsafe.Offsetof` — it can only fail if the compiler is
+  wrong. The cells assert the DISCRIMINATOR instead: that Created and SessionID
+  are different offsets, that decoding at the exported offset returns the value
+  the struct stored (paired both ways, so two offsets both pointing at Created
+  cannot satisfy it), and that bytes `[16:24]` decode to the SESSION ID — which
+  records the defect's mechanism as an executable fact, and reds if a future
+  layout change makes the old narrative stale.
+- **File(s)**: `pkg/dataplane/bpf_session_value.go`,
+  `pkg/dataplane/userspace/helper_status_apply.go`,
+  `pkg/dataplane/session_value_offsets_6816_test.go` (new),
+  `pkg/dataplane/README.md`, `_Log.md`
+
+## 2026-08-26 — #6798 credential revocation fail-closed on unreadable ownership inventories
+
+- **Timestamp**: 2026-08-26
+- **Action**: Make every ownership-inventory read distinguish ABSENT from
+  UNREADABLE, so credential revocation stops reporting convergence over an
+  inventory it could not read (opus-review-001 root R58, High).
+- **The collapse**: three reads answered "did xpf provision this?" with a value
+  that could not tell "no" from "could not tell". `os.ReadFile(<marker>)` returned
+  a bare `false` on EACCES/EIO/EISDIR exactly as it did on ENOENT;
+  `provisionedNames` did `continue` on any `ReadDir` error; `reconcileSudoers`
+  discarded its error outright with `entries, _ :=`. Every revocation gate read
+  that value as "not ours, skip" and returned nil — SUCCESS — while a removed
+  admin's password, `authorized_keys`, and passwordless sudo grant stayed live.
+  The #5874 closeout, which exists to observe exactly this monotonic-revocation
+  gap, saw nothing to report.
+- **Worst shape**: `reconcileAbsentLoginUsers` read `names := provisionedNames();
+  if len(names) == 0 { return nil }`. A wholly unreadable inventory yields NO
+  names, which that early return treated as "nothing was ever provisioned" —
+  bit-identical to a fresh install.
+- **Both directions matter**: the fix reports WITHOUT revoking. Revoking on an
+  unproven marker is #6797's overclaim from the other side, and for root's
+  `authorized_keys` it is a total lockout. So each gate leaves the credential
+  untouched AND declines to converge. Markers are retained: dropping one on an
+  unreadable read is PERMANENT abandonment, since the account is no longer
+  enumerated once the root reads again (#5493's discipline at a new site).
+- **`hasProvenanceMarker` deleted, not wrapped**: leaving a bool-only twin beside
+  the fixed reader is how this class regresses. Its four test call sites moved to
+  `readProvenanceMarker` via `ownedMarker`/`ownedAccount`/`ownedPassword`/
+  `ownedKey`, which `t.Fatal` on a read error rather than returning false — a
+  helper that repeated the collapse would let a fixture whose root became
+  unreadable pass while proving nothing.
+- **`claimOwnership` fail-closed**: an unreadable marker now counts as
+  PRE-EXISTING. `preExisting` gates only `rollback()`, which REMOVES the marker,
+  i.e. releases ownership; withdrawing a claim that may be genuine orphans a live
+  credential xpf can never revoke (#5841 underclaim).
+- **Shadowing hazard caught in review**: `reconcileSudoers` has a NAMED return
+  `err`, so a function-scope `entries, err := os.ReadDir(...)` ASSIGNS to it
+  rather than shadowing — an absent `/etc/sudoers.d` would have returned a bogus
+  ENOENT failure on every apply forever. Uses `readErr`.
+- **Fixtures are uid-independent**: unreadability is staged as EISDIR (marker
+  path is a directory) and ENOTDIR (root path is a file), never `chmod 000` —
+  the suite may run as root, where permission bits are bypassed and the fixture
+  would silently become readable, i.e. a false green. Both helpers assert the
+  fixture actually errors and is not an ENOENT, so no assertion built on them is
+  vacuous.
+- **Paired controls**: each ReadDir cell has an ABSENT twin pinning `nil`, so the
+  degenerate "always error" mutation also REDS — without it, a reconciler that
+  failed on every fresh install would satisfy the guard.
+- **#1960**: runtime reconcile only, no commit-time gate added, so no matching
+  `lenient*` opt is owed.
+- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `pkg/daemon/login_password_test.go`,
+  `pkg/daemon/login_marker_overclaim_6797_test.go`,
+  `pkg/daemon/login_resource_ownership_5841_test.go`,
+  `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6798 follow-up: bind the closeout consequence + module docs
+
+- **Timestamp**: 2026-08-26
+- **Action**: Re-read the new CLAUDE.md "Required Reading" contract
+  (`docs/engineering-style.md`, `AGENTS.md`, module READMEs) and closed the gaps
+  it exposed in the #6798 change.
+- **The gap that mattered**: the nine cells proved each reconciler RETURNS an
+  error, which is only half of R58's invariant ("retain debt and PREVENT A
+  SUCCESSFUL CLOSEOUT"). Traced the callers: `applyTailReconciles` DISCARDS all
+  four returns (`_ = d.reconcileSudoers(cfg)`), so on the normal apply path the
+  fix is log-only by design (#2926 next-boot convergence). The single consumer
+  is the #5874/M35 daemon-stop cancel closeout via `hostAuthCloseoutOwners` —
+  exactly the case where next-boot convergence does NOT happen. Nothing bound
+  that end to end, so the fix could have reported into a void at the one site
+  R58 names.
+- **Added `TestHostAuthCloseoutSurfacesUnreadableInventory_6798`**: drives the
+  REAL `reconcileAbsentLoginUsers` through `runHostAuthCloseoutOwners` +
+  `summarizeHostAuthCloseout` with the other six owners stubbed to no-ops, so a
+  green cannot come from an unrelated owner failing. Asserts the closeout error
+  names BOTH the owner (`absent-login-users`) and the reason
+  (`read ownership inventory`). Verified RED on reverting either M3 or M4
+  (2005 tests collected per cell).
+- **The control caught a real fixture bug of mine**: the three marker roots are
+  SIBLINGS derived from `filepath.Dir(provisionedUsersDir)`, so the control's
+  first form still resolved `provisionedKeysDir()` to the same unreadable file
+  and redded for the fixture's reason. The control needs a fresh PARENT, not a
+  fresh leaf — without that control the cell would have passed while proving
+  nothing about a clean inventory.
+- **#1960 re-verified by tracing, not asserting**: all four returns are `_ =`
+  discarded on the apply tail, so no commit can be rejected by this change and
+  no `lenient*` opt is owed. Previously claimed; now proven from the call sites.
+- **#6534 checked and does NOT apply**: that rule governs a snapshot builder
+  DROPPING a config object while `show` still renders it as enforced. No `show`
+  surface renders credential-ownership state, and this change makes a silent
+  failure VISIBLE rather than dropping a rendered object. Recorded in the doc.
+- **Docs**: `pkg/daemon/README.md` — the #5874 closeout bullet enumerates which
+  failures it collects, and this adds a class, so it gains the #6798 paragraph.
+  `docs/system-login.md` — new "Where the operator sees it" subsection drawing
+  the apply-tail (discarded, log-only) vs cancel-closeout (collected, fails the
+  cancel) distinction, plus the #6534 non-applicability note.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `pkg/daemon/README.md`, `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6798 x #6790 composition: restate the no-brick premise, bind it
+
+- **Timestamp**: 2026-08-26
+- **Action**: #6790 merged (PR #7604) and `applyTailReconciles` now CAPTURES the
+  five host-credential returns into the commit result instead of discarding
+  them. #6798's errors therefore became commit-failing. Restated the #1960
+  argument on a premise that survives that, and bound it with a test.
+- **The dead premise**: the PR, the commit message, AND `docs/system-login.md`
+  all said "the apply tail discards these returns, so no commit can be
+  rejected". True when measured, FALSE the moment #7604 landed. A premise about
+  to stop being true is worse than none — a reader checks it, finds it false,
+  and distrusts the conclusion it supported.
+- **The durable premise**: the no-brick guarantee rests on the SHAPE OF THE
+  REJECTION SET, not on any caller discarding a return. `applyErrSkipsPeerSync`
+  (`daemon_apply_commit.go`) closes it over exactly two fatal classes — a
+  required-protocol-gate error (dataplane DISARMED) and a context
+  cancel/deadline from a daemon-stop abort — and its own comment states every
+  other error still syncs "because the config is committed + active and the
+  dataplane armed". An inventory-read failure is neither class. Verified at
+  source, not taken from the review.
+- **Bound it**: `TestUnreadableInventoryErrorDoesNotSkipPeerSync_6798` feeds the
+  REAL error from `reconcileAbsentLoginUsers` (not a synthetic `errors.New`,
+  which would prove only that the classifier rejects strings) and asserts it
+  does NOT skip peer sync. Two positive controls assert `context.Canceled` and
+  `context.DeadlineExceeded` still DO — without them the main assertion is
+  satisfied by a classifier returning false for everything, which is exactly
+  the mutation that WOULD brick, by pushing a dataplane-disarming config to the
+  standby.
+- **#7618 caveat, scoped deliberately**: #6790's section records that a COMMAND
+  deadline (short per-command context, e.g. `chpasswd`) is currently
+  misclassified as a daemon-stop abort, pinned by
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`. That does NOT
+  extend to what #6798 adds: these errors come from `os.ReadFile`/`os.ReadDir`
+  and carry EACCES/EIO/EISDIR/ENOTDIR, never a `context.DeadlineExceeded`, so
+  they cannot reach the misclassified branch. The reconcilers' COMMAND failures
+  were already in that population before #6798.
+- **Doc conflict resolved by rewriting, not by picking a side**: `#6790` and
+  `#6798` both added a section at the same anchor. Kept both, ordered #6790
+  first (it establishes that these errors fail the commit) then #6798 (what
+  counts as a failure), and REWROTE the two #6798 paragraphs #6790 falsified —
+  "Where the operator sees it" now says the tail CAPTURES, and the #1960
+  paragraph became "Why this does not brick a tolerant load or peer sync".
+- **`_Log.md` union, new form**: `theirs + ours_tail` guarded by
+  `assert ours.startswith(base)` (True). `theirs.startswith(base)` is False —
+  master deleted 87 lines mid-file across three regions (#7614/#7616), so the
+  old `base + ours_tail + theirs_tail` would have reintroduced every one.
+  Verified after writing that `theirs` is a prefix of the result.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `docs/system-login.md`, `_Log.md`

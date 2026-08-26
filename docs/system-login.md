@@ -1339,6 +1339,13 @@ The path is scoped and fail-closed:
   `authorized_keys` removal failure, the marker is **retained** so the
   next apply retries — a credential is never forgotten while it may still
   be live.
+- On an **ownership marker** read error (or an unreadable marker **root**
+  during enumeration) the deprovision is **skipped**, the markers are
+  **retained**, and the failure is **returned** (#6798). An unreadable
+  marker is not proof the credential is not ours: acting on it would revoke
+  an operator's credential, while silently skipping it reported convergence
+  for a removal that never happened. See "Unreadable ownership inventories
+  are not empty ones (#6798)" below.
 - `root` is never deprovisioned **by this login-user path** — it is
   reconciled separately by `applyRootAuth` (see "Root credentials are
   revoked on removal (#5276)" below).
@@ -1529,6 +1536,271 @@ the **same UID-file format** as the account registry:
 - **Marker override seam.** The two resource roots are computed as siblings
   of `provisionedUsersDir`, so pointing that one package var at a throwaway
   tree relocates all three roots together in tests.
+
+## A failed credential reconcile FAILS THE COMMIT (#6790)
+
+Every reconciler on this page runs from the apply tail
+(`applyTailReconciles`, `pkg/daemon/daemon_apply_tail.go`, steps 11–13):
+
+| step | reconciler | owns |
+|------|------------|------|
+| 11   | `applySystemLogin`         | OS accounts, per-user password, `authorized_keys` |
+| 11b  | `reconcileSudoers`         | `/etc/sudoers.d/xpf-<user>` NOPASSWD grants |
+| 11c  | `reconcileAbsentLoginUsers`| revocation for users removed from config |
+| 12   | `applySSHConfig`           | the sshd drop-in (`PermitRootLogin`, ciphers, …) |
+| 13   | `applyRootAuth`            | root's `/etc/shadow` password + `/root/.ssh/authorized_keys` |
+
+All five were called as `_ = d.<reconciler>(cfg)`. #5874 had already made
+them **return** their accumulated failures, but only the daemon-stop
+cancel closeout (`applyHostAuthorizationCloseout`) collected those
+returns. On the ordinary commit path the returns were **discarded**, so
+a commit reported **success** while:
+
+- the configured operator's account was never created, or their
+  `authorized_keys` was never installed;
+- a super-user's sudo grant was never written — or, on the revoke side,
+  a **demoted** operator's stale NOPASSWD grant was never removed;
+- a **removed** `system login user` kept a live password and
+  `authorized_keys` (the deprovision fails closed and retains its
+  markers to retry, but nothing told the operator the revocation had not
+  happened);
+- the sshd drop-in failed validation and was reverted, so sshd kept the
+  **pre-commit** `PermitRootLogin` posture;
+- root's password or `authorized_keys` did not converge to the committed
+  `system root-authentication`.
+
+Since #6790 the tail **captures** all five returns and joins them into
+the commit result, exactly as its siblings in the same function already
+do — `applyLo0Filter` (#3392), `applyHostInboundFilter` (#3333) and
+`reconcileDNSLocked` (#6792). The prior justification, "the next boot
+re-renders these from the active config so a transient failure
+converges" (the #2926 next-boot contract), does not hold here:
+
+- These are **revocations**, not renderings. The credential stays live
+  until the next reboot — unbounded on an appliance — and there is no
+  dirty-retry owner, ticker, or metric between now and then.
+- The same commit **advances the durable config**, so the next boot
+  renders from a config that already says the user is gone while the box
+  still grants them access.
+- A green commit is the operator's only signal that
+  `delete system login user bob` took effect, and it was unconditional.
+
+Fail-closed, **not** fail-fast: every step still runs, so an sshd reload
+failure never skips root-auth reconciliation. Only the commit *result*
+changes. The config itself is already promoted at this point (as with
+every other tail failure), so the operator sees a failed commit against
+an advanced config and re-commits to retry — the same semantics
+`networkd`/`nft`/DNS failures have had for several releases.
+
+The void-returning steps around them (`applySystemNTP`, `applyHostname`,
+`applySyslogFiles`, …) are deliberately **not** included: those really do
+re-render from the active config on the next apply or boot and carry no
+revocation semantics.
+
+Cells: `pkg/daemon/apply_credential_failclosed_6790_test.go` drives the
+real `applyTailReconciles` with one owner injected to fail per cell, plus
+a healthy control and a both-ends cell proving an early failure does not
+skip a later owner.
+
+### What a credential failure does to each apply caller (#1960 no-brick)
+
+`applyTailReconciles`' return reaches `applyConfigLocked`, which has five
+call sites. Two of them CLASSIFY the error rather than just reporting it,
+so the question that matters is whether a credential failure can make a
+node reject a config:
+
+| call site | what a non-nil return does now | config promoted? |
+|---|---|---|
+| `daemon_apply.go:182` `applyActiveConfigResult` | the feed manager (#5646) does not advance its published-hash, so the next identical refetch retries | yes — unchanged |
+| `daemon_apply.go:191` `applyConfigUnderSem` (boot / DHCP callback / feed / config-poll / rollback) | `slog.Warn` + return; `MarkActiveApplied()` is SKIPPED | yes — unchanged |
+| `daemon_apply_commit.go:254` `applyAndSyncCommitted` (operator commit) | the operator's commit reports failure; the peer push still happens; `MarkActiveApplied()` skipped | yes — `Store.Commit` promoted it upstream |
+| `daemon_apply_commit.go:522` `syncAndApply` (**peer-sync recv**) | the error is returned to `handleConfigSync`, which logs it and returns it so the config high-water does NOT advance and the primary re-pushes | yes — `SyncApply` promoted it BEFORE the apply |
+| `daemon_apply_commit.go:766` commit-confirmed auto-rollback | `slog.Error` only (background timer, no return path); the rollback target is applied unconditionally | yes — `PromoteRollback` already ran |
+
+The peer-sync path is `syncAndApply`, and it does **not** reject. Both it
+and `applyAndSyncCommitted` route the error through
+`applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+required-protocol-gate error (dataplane DISARMED, #2138) and a context
+cancel/deadline (the #2926 daemon-stop abort). Everything else is the
+non-fatal best-effort class that **must** keep syncing, because the config
+is already committed + active and the dataplane armed; suppressing the
+sync there is the divergence #4034 fixed. In `syncAndApply` the same
+classifier decides whether to DISCARD the peer-promoted config, and on the
+non-fatal branch it sets `armedActive = true` and returns the error
+alongside the live config.
+
+So a credential reconcile failure on a standby:
+
+- does **not** roll back or reject the peer-synced config — it stays
+  active and armed;
+- does **not** suppress the primary→standby push on the commit side;
+- **does** leave the applied-digest unstamped, so the primary's next
+  re-push re-enters `syncAndApply` and RETRIES instead of taking
+  `handleConfigSync`'s converged shortcut (#4957/#6296).
+
+That is a retry, not a brick, and it is the same behaviour
+`networkdErr`, `dhcpServerErr`, `hostInboundErr`, `lo0Err` and `dnsErr`
+have had in this join since #3333/#3392/#4034/#6792 — the #4034 and #5564
+comments name "host-inbound/lo0 nft, networkd" as precisely this class.
+
+No `lenient*` compile opt is needed or possible: `pkg/config/compiler_opts.go`
+"carries per-call compilation policy", and every flag in it downgrades the
+severity of a COMPILE-time validator. These are RECONCILE-time failures
+raised after compilation, inside `applyConfigLocked`; there is no compile
+gate to downgrade, and the tolerant path already does not reject.
+
+`TestCredentialFailuresDoNotSkipThePeerSync6790` pins all five owners
+against the REAL errors the reconcilers produce, and
+`TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790` is its paired
+positive control so the classifier cannot degrade to "nothing is fatal".
+
+#### One pre-existing gap, inherited not introduced (#7618)
+
+`exec.CommandContext` has **two** error shapes at a deadline, and only one
+of them is safe here:
+
+- the process **started** and was killed at the deadline → `*exec.ExitError`
+  ("signal: killed"), which is not a context error → correctly non-fatal;
+- the context expired **before fork/exec completed** → `Start` returns
+  `ctx.Err()`, so the caller gets a **bare `context.DeadlineExceeded`** →
+  `applyErrSkipsPeerSync` cannot tell it from the #2926 daemon-stop abort
+  and classifies it FATAL, suppressing the push (or discarding a
+  peer-promoted config).
+
+Which shape you get depends on whether fork/exec wins the race with the
+deadline — i.e. on machine load. This was observed for real: the cell that
+originally drove a live command against a short deadline passed unloaded
+and failed under a loaded full-package run.
+
+The gap is **not** specific to the credential reconcilers. Every apply-path
+command runner builds its own short context — `nftApplyPayload` (5s,
+feeding `lo0Err`/`hostInboundErr` since #3392/#3333) and `daemon_dns.go`'s
+`systemctl disable/mask` (feeding `dnsErr` since #6792) — so the same
+misclassification already reaches the same classifier through operands that
+predate #6790. #6790 adds members to an already-exposed population rather
+than creating the exposure, and fixing the classifier changes behaviour for
+those older operands, so it is tracked separately as #7618.
+
+Until then it is a tripwire, not folklore:
+`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserts the
+CURRENT (wrong) classification, so the fix reds a named cell and must
+invert it and this section together.
+
+## Unreadable ownership inventories are not empty ones (#6798)
+
+Every ownership read above answers one question — *did xpf provision this?* —
+and until #6798 it answered with a value that could not distinguish **"no"**
+from **"could not tell"**:
+
+| Read | Absent (a determination) | Unreadable (proves nothing) | Collapsed to |
+|---|---|---|---|
+| `os.ReadFile(<marker>)` | `ENOENT` — not ours | `EACCES` / `EIO` / `EISDIR` | `false` |
+| `os.ReadDir(<marker root>)` | `ENOENT` — nothing provisioned | `EACCES` / `ENOTDIR` | no names |
+| `os.ReadDir(/etc/sudoers.d)` | `ENOENT` — no grants exist | `EACCES` / `ENOTDIR` | `entries, _ :=` |
+
+Because both spellings arrived as the same value, every revocation gate read
+"could not tell" as **"not ours, skip"** and then returned `nil` — reporting
+**convergence**. A removed administrator kept their password, `authorized_keys`,
+and passwordless sudo grant while the apply reported success, and the #5874
+cancellation closeout (which exists to observe exactly this
+monotonic-revocation gap) saw nothing to report. `reconcileAbsentLoginUsers`
+made it worst: an entirely unreadable inventory yields **no names**, which its
+`len(names) == 0` early return treated as *"nothing was ever provisioned"* —
+indistinguishable from a fresh install.
+
+The governing invariant is now: **only proven absence may release ownership
+work.** Unknown ownership retains the debt and never converges.
+
+- **`readProvenanceMarker` returns `(bool, error)`.** Only `ENOENT` is absence
+  (`false, nil`); every other read error is returned. A UID mismatch or a
+  corrupt marker stays a *determination* (`false, nil`) — the bytes were read,
+  they simply are not this account's — and is still cleaned inline. There is
+  deliberately **no** bool-only wrapper: one would reintroduce the collapse.
+- **Report, but never revoke.** On an unreadable marker each gate keeps
+  ownership `false` and **skips the revocation**, then returns the error.
+  Revoking on an unproven claim is #6797's overclaim from the other side, and
+  for `root`'s `authorized_keys` it is a total lockout. So the gates are
+  fail-closed in **both** directions: the credential is untouched *and* the
+  apply does not converge. Applied at `applySystemLogin`'s emptied-key branch,
+  `reconcileUserPassword`'s `pwLock` branch, `applyRootAuth`'s revoke arm, and
+  `deprovisionLoginUser`.
+- **`provisionedNames` returns `(names, error)` and keeps sweeping.** An
+  unreadable root is reported, but the roots that *did* read still contribute
+  their names — revoking what we can see is strictly better than revoking
+  nothing, and the returned error carries the debt.
+  `reconcileAbsentLoginUsers` joins it into its accumulated error instead of
+  returning `nil` on the empty set.
+- **`reconcileSudoers` reports its `ReadDir` failure.** An absent
+  `/etc/sudoers.d` stays a clean `nil` (no drop-in can exist in a directory
+  that does not), but an unreadable one is accumulated — otherwise the
+  revocation sweep iterates nothing and a demoted admin keeps passwordless
+  root.
+- **`claimOwnership` treats an unreadable marker as PRE-EXISTING.** `preExisting`
+  gates only `rollback()`, which *removes* the marker — i.e. it releases
+  ownership. Unable to prove xpf did not already own the credential, it must not
+  withdraw: dropping a genuine claim orphans a live credential xpf can then
+  never lock or revoke (the #5841 underclaim). The cost of erring this way is
+  at most a stale marker, which the next apply reconciles.
+- **Retry debt is retained.** Markers are never dropped on an unreadable read.
+  Dropping one would be permanent abandonment: once the root is readable again
+  the account is no longer enumerated, so its credentials stay live forever.
+  This is the same three-state discipline #5493 applied to an unreadable
+  `/etc/passwd` — *unknown → retry*, never *absent → abandon*.
+
+### Where the operator sees it
+
+The four reconcilers that report an unreadable inventory (`applySystemLogin`,
+`reconcileSudoers`, `reconcileAbsentLoginUsers`, `applyRootAuth`) are reached
+from **two** callers, and since #6790 *both* of them surface the failure:
+
+- **The normal apply tail** (`applyTailReconciles`, steps 11–13) **captures**
+  these returns and joins them into the commit result — see "A failed
+  credential reconcile FAILS THE COMMIT (#6790)" above. Before #6790 they were
+  discarded (`_ = d.reconcileSudoers(cfg)`) on the #2926 next-boot-convergence
+  argument, so a commit over an unreadable inventory reported success. It now
+  fails, naming the account and the unreadable path.
+- **The #5874/M35 daemon-stop cancel closeout** (`hostAuthCloseoutOwners`)
+  collects them too, and that is the case where next-boot convergence does
+  *not* happen — the daemon is stopping and staying stopped.
+  `summarizeHostAuthCloseout` names the owning reconciler, so a cancel that
+  previously reported **clean** over an unreadable inventory now fails visibly
+  with e.g. `host-auth closeout owner "absent-login-users": read ownership
+  inventory /var/lib/xpf/provisioned-keys: ... not a directory`.
+
+That second path is the invariant R58 names — *unknown ownership inventory
+state must retain debt and prevent a successful closeout* — and it is bound by
+`TestHostAuthCloseoutSurfacesUnreadableInventory_6798`.
+
+### Why this does not brick a tolerant load or peer sync (#1960)
+
+#6798 adds no commit-time gate of its own; what makes its errors commit-failing
+is #6790's capture above. The no-brick guarantee therefore rests on the **shape
+of the rejection set**, not on any caller discarding a return:
+`applyErrSkipsPeerSync` (`pkg/daemon/daemon_apply_commit.go`) closes that set
+over exactly two fatal classes — a required-protocol-gate error
+(`compileErrorMustAbortApply`, which leaves the dataplane **disarmed**) and a
+context cancellation/deadline from a daemon-stop abort. Every *other* error
+still syncs, "because the config is committed + active and the dataplane
+armed". An inventory-read failure is neither class, so on the peer-sync receive
+path (`syncAndApply`) the config stays **active and armed** and the failure is
+surfaced rather than swallowed. No `lenient*` option in
+`pkg/config/compiler_opts.go` is owed.
+
+One caveat, deliberately scoped: #7618 records that a **command** deadline (a
+short per-command context, e.g. `chpasswd` via `runCommandStdinTimeout`) is
+currently misclassified by that same classifier as a daemon-stop abort, and
+`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` pins the current
+wrong behaviour. That does **not** extend to what #6798 adds: these errors
+originate in `os.ReadFile` / `os.ReadDir` and carry `EACCES`/`EIO`/`EISDIR`/
+`ENOTDIR`, never a `context.DeadlineExceeded`, so they cannot reach the
+misclassified branch. The credential reconcilers' *command* failures were
+already in that population before #6798.
+
+There is **no `show` surface** that renders credential-ownership state, so the
+#6534 "a fail-closed exclusion owes a show-surface annotation" rule does not
+apply here: nothing in `show` claims these credentials are revoked, and this
+change makes a previously *silent* failure *visible* rather than dropping an
+object the operator can still see rendered as enforced.
 
 ## Idempotency
 

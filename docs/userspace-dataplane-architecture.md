@@ -577,6 +577,27 @@ Cross-plane parity is guarded by `replan_queues_binds_vlan_unit_on_parent_netdev
 `snapshot_allowlist_test.go`). Changing one plane's rule without the other
 turns these RED.
 
+**Leaving the allowlist is a contract, not just an absence (#6801).** The
+allowlist is not only a permission to bind — it is also what authorises xpf to
+reshape the NIC: the D3 RSS indirection table (`pkg/daemon/rss_indirection.go`)
+and interrupt coalescence (`pkg/daemon/coalescence.go`) are applied to its mlx5
+members. Both reconcilers walk only the CURRENT allowlist, so until #6801 a
+netdev DROPPED from it kept xpf's concentrated RSS table and its adaptive-off /
+pinned-usecs coalescence — the coalescence capture was reverted only at daemon
+shutdown, and the RSS table was never reverted at all. A NIC handed back to the
+host stack or to another dataplane stayed limited to the old AF_XDP queue
+subset.
+
+The operator-visible contract is now symmetric: **a netdev that leaves the
+userspace-dp allowlist gets its default RSS indirection table and its pre-xpf
+coalescence back on the same commit.** Withdrawal is keyed on the CONFIG signal
+(the userspace dataplane being disabled), never on an empty derived list —
+`UserspaceBoundLinuxInterfaces` degrades to nil on a snapshot-build error
+(#2514), and treating "no names" as "release everything" would rip the tuning
+off NICs the dataplane is still forwarding on. Mechanism, ownership records and
+retry-debt semantics: `pkg/daemon/README.md`, "NIC tuning ownership +
+released-interface teardown (#6801)".
+
 #### Session Table (`session.rs`)
 
 Per-worker hash table using a SEEDED `FxHasher` (`FxSeededState`, fast

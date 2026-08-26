@@ -264,30 +264,50 @@ func writeProvenanceMarker(dir, name string, uid int) error {
 	return fsatomic.WriteFileDurable(markerPathIn(dir, name), []byte(strconv.Itoa(uid)), 0o600)
 }
 
-// hasProvenanceMarker reports whether dir records name as xpf-owned for the
-// account that currently has UID curUID. It returns true ONLY if the marker
+// readProvenanceMarker reports whether dir records name as xpf-owned for the
+// account that currently has UID curUID. It reports true ONLY if the marker
 // exists AND its recorded UID equals curUID. A marker whose UID no longer
 // matches (account deleted/recreated out of band with a different UID) or is
 // corrupt is opportunistically removed — no separate GC pass — and reports
 // false, so a revoke decision never touches an out-of-band account. #1944 §5.4.
-func hasProvenanceMarker(dir, name string, curUID int) bool {
+//
+// #6798: it carries the ABSENT/UNREADABLE distinction a bare bool cannot. It
+// replaced a bool-only hasProvenanceMarker that collapsed EVERY os.ReadFile
+// error — ENOENT, EACCES, EIO, ENOTDIR — into the same `false`. A genuinely
+// ABSENT marker proves the resource is not xpf's (owned false, err nil); an
+// UNREADABLE one proves NOTHING, yet produced the identical `false`, and every
+// revocation gate read that false as "not ours, skip". The credential then
+// survived a deprovision that reported success.
+//
+// The returned ownership stays FALSE on a read error, deliberately: the caller
+// must not revoke a credential it cannot prove it owns — that is #6797's
+// overclaim from the other direction. What changes is that the caller can now
+// tell "proven not ours" from "could not tell" and report the latter instead of
+// converging on it. There is deliberately NO bool-only wrapper: one would
+// reintroduce the exact collapse this closes.
+func readProvenanceMarker(dir, name string, curUID int) (bool, error) {
 	path := markerPathIn(dir, name)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		if os.IsNotExist(err) {
+			return false, nil // genuinely not ours
+		}
+		return false, fmt.Errorf("read ownership marker %s: %w", path, err)
 	}
 	recorded, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
-		// Corrupt marker — treat as not-ours and clean it up.
+		// Corrupt marker — treat as not-ours and clean it up. This IS a
+		// determination (the bytes were read; they are not a UID), so it is not
+		// an unreadable-inventory error.
 		_ = os.Remove(path)
-		return false
+		return false, nil
 	}
 	if recorded != curUID {
 		// Stale marker for a different (recreated) account: clean inline.
 		_ = os.Remove(path)
-		return false
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // ownershipClaim records a marker-first ownership claim so a FAILED credential
@@ -323,10 +343,26 @@ type ownershipClaim struct {
 // rolled back. The write error is returned unchanged so every existing
 // fail-visible caller keeps its behaviour.
 func claimOwnership(dir, name string, uid int) (ownershipClaim, error) {
-	// hasProvenanceMarker's inline cleanup of a mismatched/corrupt marker is
+	// readProvenanceMarker's inline cleanup of a mismatched/corrupt marker is
 	// harmless here: such a marker is not this account's prior ownership, so
 	// preExisting=false is the correct reading and the write below replaces it.
-	c := ownershipClaim{dir: dir, name: name, preExisting: hasProvenanceMarker(dir, name, uid)}
+	//
+	// #6798: an UNREADABLE marker is treated as PRE-EXISTING, not absent. The
+	// only thing preExisting gates is rollback(), which REMOVES the marker —
+	// i.e. it releases ownership. "Only proven absence may release ownership
+	// work": if we cannot read the marker we cannot prove xpf did not already
+	// own this credential, and withdrawing a real marker orphans a live
+	// credential xpf can then never lock or revoke (the #5841 underclaim).
+	// Erring toward preExisting=true costs at most a stale marker, which the
+	// next apply re-reads and reconciles.
+	owned, readErr := readProvenanceMarker(dir, name, uid)
+	if readErr != nil {
+		slog.Warn("cannot read ownership marker before claiming it; treating "+
+			"as pre-existing so a failed mutation does not withdraw a claim "+
+			"xpf may already hold", "dir", dir, "name", name, "err", readErr)
+		owned = true
+	}
+	c := ownershipClaim{dir: dir, name: name, preExisting: owned}
 	return c, writeProvenanceMarker(dir, name, uid)
 }
 
@@ -383,8 +419,8 @@ func markProvisioned(name string, uid int) error {
 // xpfProvisioned reports whether the account registry records name for UID
 // curUID (marker present AND UID matches; a mismatch/corrupt marker is cleaned
 // inline). #1944 §5.4.
-func xpfProvisioned(name string, curUID int) bool {
-	return hasProvenanceMarker(provisionedUsersDir, name, curUID)
+func xpfProvisioned(name string, curUID int) (bool, error) {
+	return readProvenanceMarker(provisionedUsersDir, name, curUID)
 }
 
 // --- password-ownership marker (xpf set the /etc/shadow password) ----------
@@ -402,8 +438,8 @@ func markPasswordProvisioned(name string, uid int) error {
 
 // passwordProvisioned reports whether xpf set name's password for UID curUID.
 // #5841.
-func passwordProvisioned(name string, curUID int) bool {
-	return hasProvenanceMarker(provisionedPasswordsDir(), name, curUID)
+func passwordProvisioned(name string, curUID int) (bool, error) {
+	return readProvenanceMarker(provisionedPasswordsDir(), name, curUID)
 }
 
 // --- SSH-key-ownership marker (xpf wrote authorized_keys) ------------------
@@ -422,8 +458,8 @@ func markKeyProvisioned(name string, uid int) error {
 
 // keyProvisioned reports whether xpf wrote name's authorized_keys for UID
 // curUID. #5841.
-func keyProvisioned(name string, curUID int) bool {
-	return hasProvenanceMarker(provisionedKeysDir(), name, curUID)
+func keyProvisioned(name string, curUID int) (bool, error) {
+	return readProvenanceMarker(provisionedKeysDir(), name, curUID)
 }
 
 // provisionedNames returns the UNION of account names that appear in any of the
@@ -431,12 +467,25 @@ func keyProvisioned(name string, curUID int) bool {
 // for. reconcileAbsentLoginUsers deprovisions each name in this set that is no
 // longer in config, so a pre-existing account xpf only added an SSH key to
 // (key marker, no account registry entry) is still revoked when removed. #5841.
-func provisionedNames() map[string]struct{} {
+func provisionedNames() (map[string]struct{}, error) {
+	var readErr error
 	out := make(map[string]struct{})
 	for _, dir := range []string{provisionedUsersDir, provisionedPasswordsDir(), provisionedKeysDir()} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue // absent/unreadable root contributes no names
+			// #6798: an ABSENT root is legitimately empty — a fresh install has
+			// provisioned nothing, so it contributes no names and that is a
+			// determination. An UNREADABLE root contributes no names either,
+			// but that is not the same fact: the inventory is INCOMPLETE, and
+			// silently truncating it makes the revocation sweep skip accounts
+			// whose only marker lived there. Report it; keep sweeping the roots
+			// that DO read, because revoking what we can see is strictly better
+			// than revoking nothing.
+			if !os.IsNotExist(err) {
+				readErr = errors.Join(readErr, fmt.Errorf(
+					"read ownership inventory %s: %w", dir, err))
+			}
+			continue
 		}
 		for _, e := range entries {
 			if e.IsDir() {
@@ -445,7 +494,7 @@ func provisionedNames() map[string]struct{} {
 			out[e.Name()] = struct{}{}
 		}
 	}
-	return out
+	return out, readErr
 }
 
 // homeBaseDir is the parent directory of per-user home directories. It is a
@@ -501,14 +550,23 @@ func managedAuthorizedKeysPath(name string) string {
 // It stays best-effort per account but ACCUMULATES each deprovision failure
 // into the returned error so the #5874 cancel closeout can see that a removed
 // user's credentials were NOT actually revoked (a monotonic-revocation gap).
-// The normal apply path ignores the return — the next boot retries deprovision
-// from the active config.
+// #6790: the NORMAL apply path joins this return into the commit result as
+// well. `delete system login user bob` acknowledged as SUCCESS while bob's
+// password and authorized_keys are still live is the exact failure this
+// reconciler exists to prevent, and nothing retries before the next boot.
 func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
-	names := provisionedNames()
-	if len(names) == 0 {
-		// No markers yet (fresh install) or unreadable — nothing xpf
-		// provisioned, so nothing to revoke.
-		return nil
+	// #6798: an unreadable inventory root is NOT "nothing provisioned". The
+	// previous form collapsed both into len(names)==0 and returned nil —
+	// SUCCESS — so a removed operator kept their password and authorized_keys
+	// while the reconcile reported convergence, and the #5874 closeout (which
+	// exists to catch exactly this class) saw nothing to report. Surface the
+	// read failure and still revoke every account the readable roots DID name.
+	names, invErr := provisionedNames()
+	if invErr != nil {
+		slog.Error("ownership inventory could not be fully read; a removed "+
+			"account's credentials may NOT have been revoked",
+			"err", invErr)
+		retErr = errors.Join(retErr, invErr)
 	}
 
 	// The set of usernames still declared in config; these are kept.
@@ -545,7 +603,8 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 // It stays best-effort but ACCUMULATES each failure into the returned error so
 // the #5874 cancel closeout can observe that a removed account's credentials
 // were NOT actually revoked; a naked return yields the accumulated retErr, not
-// a block-local err. The normal apply path ignores the return.
+// a block-local err. Since #6790 the normal apply path joins it into the
+// commit result too, so a failed revocation fails the commit.
 func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	curUID, found, err := lookupUIDErr(name)
@@ -580,9 +639,23 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	// Resolve per-resource ownership for the account CURRENTLY at curUID. Each
 	// check cleans a UID-mismatched/corrupt marker inline (out-of-band
 	// recreate), so a false here also means "not ours".
-	ownsPassword := passwordProvisioned(name, curUID)
-	ownsKey := keyProvisioned(name, curUID)
-	ownsAccount := xpfProvisioned(name, curUID)
+	ownsPassword, pwErr := passwordProvisioned(name, curUID)
+	ownsKey, keyErr := keyProvisioned(name, curUID)
+	ownsAccount, acctErr := xpfProvisioned(name, curUID)
+	if ownErr := errors.Join(pwErr, keyErr, acctErr); ownErr != nil {
+		// #6798: a marker that could not be READ proves nothing. Before this,
+		// all three reads failing produced three falses, matched the
+		// "nothing owned" branch below, and returned nil — SUCCESS — leaving
+		// the removed account's password and authorized_keys live. Keep the
+		// markers (so the next apply retries) and report, WITHOUT revoking:
+		// acting on unproven ownership is #6797's overclaim from the other
+		// side.
+		slog.Error("cannot determine credential ownership for a removed login "+
+			"user; NOT revoking, and NOT reporting convergence",
+			"user", name, "err", ownErr)
+		fail(fmt.Errorf("determine ownership for removed user %s: %w", name, ownErr))
+		return retErr
+	}
 	if !ownsPassword && !ownsKey && !ownsAccount {
 		// Nothing xpf-owned for the current account (markers absent, or a UID
 		// mismatch already cleaned inline). NEVER touch a non-xpf / out-of-band

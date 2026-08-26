@@ -575,6 +575,17 @@ type priorHostTunables struct {
 	// that path; restore does nothing on it. Stored as a string so the
 	// exact byte form the kernel served is round-tripped on restore.
 	neighRetrans map[string]string
+	// rssOwned is the set of mlx5 interfaces whose RSS indirection
+	// table xpfd may have moved away from the kernel default (#6801).
+	// Unlike the maps above this holds no captured VALUE: the restore
+	// action is `ethtool -X <iface> default`, the same idempotent call
+	// the rss-indirection kill switch issues, so the pre-xpfd table
+	// never has to be reconstructed. Membership is the ownership claim
+	// — see claimNICTunableOwnership for why it is deliberately a
+	// superset of "reprogrammed on this reconcile", and
+	// releaseUnboundNICTunables for the `owned - current` teardown that
+	// consumes it.
+	rssOwned map[string]struct{}
 }
 
 // mlx5CoalesceState captures the four fields xpfd writes via ethtool -C.
@@ -595,6 +606,7 @@ func newPriorHostTunables() *priorHostTunables {
 		governors:    map[string]string{},
 		mlx5Adaptive: map[string]mlx5CoalesceState{},
 		neighRetrans: map[string]string{},
+		rssOwned:     map[string]struct{}{},
 	}
 }
 
@@ -651,6 +663,20 @@ func (p *priorHostTunables) captureMlx5Coalesce(iface string, s mlx5CoalesceStat
 		return
 	}
 	p.mlx5Adaptive[iface] = s
+}
+
+// claimRSSOwnership records that xpfd holds the RSS indirection table of
+// iface (#6801). Idempotent. Lazily allocates the set so a capture
+// struct built by an older newPriorHostTunables caller (tests predating
+// the field) does not panic.
+func (p *priorHostTunables) claimRSSOwnership(iface string) {
+	if p == nil || iface == "" {
+		return
+	}
+	if p.rssOwned == nil {
+		p.rssOwned = map[string]struct{}{}
+	}
+	p.rssOwned[iface] = struct{}{}
 }
 
 // restoreHostTunables writes every captured tunable back to the kernel.
@@ -804,8 +830,11 @@ func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) map[string]
 
 // restoreMlx5Coalesce emits one `ethtool -C <iface> adaptive-rx ...
 // adaptive-tx ... rx-usecs ... tx-usecs ...` matching the pre-xpfd
-// capture. Errors logged, never returned.
-func restoreMlx5Coalesce(iface string, s mlx5CoalesceState, execer rssExecutor) {
+// capture. Errors are logged here and ALSO returned (#6801): the
+// released-interface teardown releases ownership of a capture only after
+// its restore write succeeds, so it needs the outcome, while the
+// shutdown and full-restore callers keep ignoring it (best-effort).
+func restoreMlx5Coalesce(iface string, s mlx5CoalesceState, execer rssExecutor) error {
 	adaptRX := "off"
 	if s.adaptiveRX {
 		adaptRX = "on"
@@ -825,15 +854,16 @@ func restoreMlx5Coalesce(iface string, s mlx5CoalesceState, execer rssExecutor) 
 		if isExecNotFound(err) {
 			slog.Warn("linksetup: host tunable restore — ethtool missing for mlx5 coalesce restore",
 				"iface", iface)
-			return
+			return err
 		}
 		slog.Warn("linksetup: host tunable restore — ethtool -C failed",
 			"iface", iface, "err", err,
 			"output", strings.TrimSpace(string(out)))
-		return
+		return err
 	}
 	slog.Info("linksetup: coalescence restored to pre-xpfd value",
 		"iface", iface, "adaptive_rx", s.adaptiveRX,
 		"adaptive_tx", s.adaptiveTX,
 		"rx_usecs", s.rxUsecs, "tx_usecs", s.txUsecs)
+	return nil
 }

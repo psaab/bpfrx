@@ -1433,12 +1433,12 @@ func reconcileSyslogDropins(confDir, prefix string, desired map[string]string) b
 // from config. It stays best-effort — a per-user failure is logged and the
 // loop continues to the next user — but it now also ACCUMULATES those
 // failures into the returned error so a caller that needs to know whether the
-// reconcile actually converged (the #5874 cancel closeout) can see them. On
-// the normal apply path the return is intentionally ignored: the next boot
-// re-renders login from the active config, so a transient failure converges
-// (the #2926 next-boot contract). Pure defensive skips (an invalid username
-// refused before any mutation) are NOT accumulated — they are the safe
-// outcome, not an incomplete reconcile.
+// reconcile actually converged (the #5874 cancel closeout) can see them.
+// #6790: the NORMAL apply path now joins this return into the commit result
+// too — a commit that could not create the account or install its
+// authorized_keys must not report success. Pure defensive skips (an invalid
+// username refused before any mutation) are NOT accumulated — they are the
+// safe outcome, not an incomplete reconcile.
 func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 	fail := func(e error) { err = errors.Join(err, e) }
 	if cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
@@ -1621,7 +1621,21 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 			// (#5841): a user whose PASSWORD xpf set but whose keys it never
 			// wrote has no key marker, so an operator-installed authorized_keys
 			// is left untouched (the overclaim this closes).
-			if uid, ok := lookupUID(user.Name); ok && keyProvisioned(user.Name, uid) {
+			uid, uidOK := lookupUID(user.Name)
+			ownsKeys, ownErr := false, error(nil)
+			if uidOK {
+				ownsKeys, ownErr = keyProvisioned(user.Name, uid)
+			}
+			if ownErr != nil {
+				// #6798: an unreadable key marker proves nothing. Do NOT remove
+				// the file (that would revoke on unproven ownership), but do not
+				// report convergence either — the emptied key list has NOT been
+				// honoured, and the next apply retries.
+				slog.Error("cannot determine SSH-key ownership; NOT revoking keys "+
+					"and NOT reporting convergence", "user", user.Name, "err", ownErr)
+				fail(fmt.Errorf("determine key ownership for %s: %w", user.Name, ownErr))
+			}
+			if uidOK && ownsKeys {
 				keysFile := managedAuthorizedKeysPath(user.Name)
 				switch err := os.Remove(keysFile); {
 				case err == nil:
@@ -1725,7 +1739,26 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) (err error) {
 	}
 
 	// Revoke: remove any xpf-managed drop-in that is no longer desired.
-	entries, _ := os.ReadDir(sudoersDir)
+	//
+	// #6798: the ReadDir error used to be discarded. An ABSENT sudoers.d is a
+	// determination — no drop-in can exist in a directory that does not, so
+	// there is nothing to revoke and nil is correct. An UNREADABLE one
+	// (EACCES/EIO/ENOTDIR) is NOT: it yields the same empty slice, the sweep
+	// below iterates nothing, and reconcileSudoers returns nil — SUCCESS —
+	// while a demoted or deleted admin's xpf-<user> NOPASSWD grant is still
+	// live on disk. Report it so the #5874 closeout sees the revocation debt.
+	//
+	// NOTE: readErr, not err — `err` is this function's NAMED RETURN, and a
+	// function-scope `entries, err :=` would ASSIGN ENOENT to it (no shadowing
+	// at this block level), making a host with no /etc/sudoers.d report a
+	// bogus reconcile failure forever.
+	entries, readErr := os.ReadDir(sudoersDir)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		slog.Error("cannot read sudoers directory; a demoted or removed "+
+			"super-user's passwordless sudo grant may NOT have been revoked",
+			"dir", sudoersDir, "err", readErr)
+		fail(fmt.Errorf("read sudoers inventory %s: %w", sudoersDir, readErr))
+	}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasPrefix(name, sudoersPrefix) {
@@ -1877,7 +1910,20 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 	case pwLock:
 		// Only lock the exact account whose PASSWORD xpf provisioned (password
 		// marker) — never an account xpf touched solely for its SSH key (#5841).
-		if !uidOK || !passwordProvisioned(user.Name, curUID) {
+		ownsPassword, ownErr := false, error(nil)
+		if uidOK {
+			ownsPassword, ownErr = passwordProvisioned(user.Name, curUID)
+		}
+		if ownErr != nil {
+			// #6798: never LOCK on unproven ownership (that is the #6797
+			// overclaim), but never report the declarative lock converged
+			// either.
+			slog.Error("cannot determine password ownership; NOT locking and "+
+				"NOT reporting convergence", "user", user.Name, "err", ownErr)
+			fail(fmt.Errorf("determine password ownership for %s: %w", user.Name, ownErr))
+			break
+		}
+		if !uidOK || !ownsPassword {
 			break
 		}
 		stdin := strings.NewReader(user.Name + ":!\n")
@@ -2258,7 +2304,15 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 			}
 			slog.Info("root SSH keys applied", "keys", len(keys))
 		}
-	} else if keyProvisioned("root", 0) {
+	} else if rootOwnsKeys, rootOwnErr := keyProvisioned("root", 0); rootOwnErr != nil {
+		// #6798: an unreadable root key marker proves nothing. Do NOT remove
+		// root's authorized_keys on unproven ownership — if it is the
+		// operator's own out-of-band key that is a total lockout — but do not
+		// report the emptied key list as converged either.
+		slog.Error("cannot determine root SSH-key ownership; NOT revoking root "+
+			"keys and NOT reporting convergence", "err", rootOwnErr)
+		fail(fmt.Errorf("determine root key ownership: %w", rootOwnErr))
+	} else if rootOwnsKeys {
 		// Empty/absent key list AND xpf wrote root's keys: revoke the xpf-managed
 		// root authorized_keys so removing the keys from config actually disables
 		// key-based root login. The KEY marker gate leaves an operator-installed
