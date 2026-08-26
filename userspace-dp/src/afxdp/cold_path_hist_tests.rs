@@ -733,6 +733,14 @@ fn snapshot_returns_none_on_perpetually_odd_gen() {
 ///
 /// The floor keeps a fast machine from spinning the writer into a busy loop;
 /// the multiplier is what guarantees the margin on a slow or loaded one.
+/// Minimum coherent snapshots out of 1000 for the concurrency test to mean
+/// anything (#7650). This is an ANTI-VACUITY floor, not a tuning knob: without
+/// it the test would pass having observed nothing, because every snapshot can
+/// legitimately return `None` under retry exhaustion. Lowering it is how the
+/// test gets "fixed" into uselessness, so it is pinned by
+/// `coherence_floor_is_pinned_7650` rather than left as a bare literal.
+const COHERENCE_FLOOR: u64 = 100;
+
 fn writer_throttle_for_read_cost(read_cost: std::time::Duration) -> std::time::Duration {
     /// How many reader passes must fit inside one even-window.
     const WINDOW_MARGIN: u32 = 8;
@@ -767,6 +775,70 @@ fn publish_atomic_ops_tracks_the_actual_surface_7650() {
          if that has fallen back under 10k the surface changed shape and the \
          seqlock even-window sizing in this file needs re-deriving (#7650)"
     );
+}
+
+#[test]
+fn coherence_floor_is_pinned_7650() {
+    // 10% of the 1000 snapshots the reader takes. The number is the CLAIM that
+    // the test saw enough to mean something; the correct response to it failing
+    // is to widen the seqlock's even-window, never to lower this.
+    assert_eq!(
+        COHERENCE_FLOOR, 100,
+        "the anti-vacuity floor was changed. If the concurrency test is failing \
+         here, the reader could not complete a snapshot pass inside the writer's \
+         even-window often enough — widen the window \
+         (writer_throttle_for_read_cost) or explain why a reader pass became so \
+         expensive. Lowering the floor leaves a test that runs, passes, and \
+         measures nothing (#7650)"
+    );
+}
+
+/// The helper tests above prove `writer_throttle_for_read_cost` computes the
+/// right window, and prove nothing about whether the concurrency test USES it.
+/// Every one of them stays green against a fixture that measures nothing and
+/// sleeps a hardcoded 100 µs — which is exactly the pre-#7650 code.
+///
+/// So scan the fixture's own source for the three wirings. Comments are
+/// stripped first: this file's prose names all three identifiers, and a gate
+/// satisfiable by its own documentation proves nothing.
+#[test]
+fn concurrency_fixture_is_wired_to_the_measured_window_7650() {
+    let src = include_str!("cold_path_hist_tests.rs");
+    let code: String = src
+        .lines()
+        .map(|l| if l.trim_start().starts_with("//") { "" } else { l })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (needle, why) in [
+        (
+            "std::thread::sleep(writer_sleep)",
+            "the writer must sleep the MEASURED window; a hardcoded literal is \
+             the #1635 drift that made the coherence floor unreachable",
+        ),
+        (
+            "writer_throttle_for_read_cost(read_cost)",
+            "the window must be derived from the measured pass cost, not from a \
+             constant — otherwise the helper is dead code and the fixture is \
+             back to assuming",
+        ),
+        (
+            "let read_cost = probe_start.elapsed() / PROBE_ITERS",
+            "the read cost must actually be MEASURED on this machine; a fixed \
+             stand-in re-introduces the assumption the measurement replaces",
+        ),
+        (
+            "atomics.snapshot().is_some()",
+            "the uncontended precondition must remain: if a snapshot cannot be \
+             coherent with NO writer running, the seqlock is broken and the \
+             concurrency result below is uninterpretable",
+        ),
+    ] {
+        assert!(
+            code.contains(needle),
+            "concurrency fixture no longer contains `{needle}` — {why} (#7650)"
+        );
+    }
 }
 
 #[test]
@@ -927,7 +999,7 @@ fn snapshot_under_concurrent_writer_never_tears() {
     // even-window versus the reader's pass cost (and of how loaded the machine
     // is), not of the lock.
     assert!(
-        coherent_snapshots >= 100,
+        coherent_snapshots >= COHERENCE_FLOOR,
         "OBSERVABILITY PRECONDITION FAILED, NOT A TEAR: only \
          {coherent_snapshots}/1000 snapshots were coherent \
          ({retry_exhausted_snapshots} exhausted their retry budget). The \
