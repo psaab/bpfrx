@@ -203,6 +203,11 @@ type xpfCollector struct {
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
+	// #6807: gauge — how many route-maps the last rendered FRR managed
+	// section replaced with the bounded explicit deny because their
+	// expansion would overflow FRR's sequence ceiling. Non-zero is an
+	// ongoing route withdrawal on every neighbor carrying one.
+	frrRouteMapsQuarantined *prometheus.Desc
 	// #4899: 0/1 gauge — 1 while the last DHCP-lease-change IPsec rebind
 	// failed and swanctl local_addrs are still bound to a stale lease
 	// address (the retry loop has not yet reconverged).
@@ -767,6 +772,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
+	ch <- c.frrRouteMapsQuarantined
 	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
@@ -1075,6 +1081,15 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
 			prometheus.GaugeValue, v)
+	}
+
+	// #6807: quarantined route-maps. Reported UNCONDITIONALLY when the hook
+	// is wired — a 0 must be published on a healthy box, or an alert on
+	// `> 0` can never distinguish "no quarantine" from "the exporter stopped
+	// reporting this series".
+	if c.srv.frrQuarantinedRouteMapsFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.frrRouteMapsQuarantined,
+			prometheus.GaugeValue, float64(len(c.srv.frrQuarantinedRouteMapsFn())))
 	}
 
 	// #4899: IPsec DHCP-lease-change rebind-pending is a control-plane

@@ -227,6 +227,12 @@ type Config struct {
 	// xpf_frr_reload_degraded gauge (0/1, no labels). Optional; if nil,
 	// the gauge is not emitted.
 	FRRReloadDegradedFn func() bool
+
+	// FRRQuarantinedRouteMapsFn returns the route-map names the last rendered
+	// FRR managed section replaced with the #6807 bounded explicit deny. Its
+	// LENGTH feeds the xpf_frr_route_maps_quarantined gauge. Optional; if nil
+	// the gauge is not published.
+	FRRQuarantinedRouteMapsFn func() []string
 	// IPsecRebindPendingFn reports whether the last DHCP-lease-change IPsec
 	// rebind failed and has not yet reconverged — swanctl local_addrs are
 	// bound to a stale lease address while set, so the tunnel cannot
@@ -415,6 +421,7 @@ type Server struct {
 	rollbackHistoryDegradedFn            func() bool
 	neighborPhaseAgeFn                   func() map[string]float64
 	frrReloadDegradedFn                  func() bool
+	frrQuarantinedRouteMapsFn            func() []string
 	ipsecRebindPendingFn                 func() bool
 	hostInboundConntrackRevocationOwedFn func() bool
 	hostInboundConntrackFlushFailuresFn  func() uint64
@@ -518,6 +525,7 @@ func NewServer(cfg Config) *Server {
 		rollbackHistoryDegradedFn:            cfg.RollbackHistoryDegradedFn,
 		neighborPhaseAgeFn:                   cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:                  cfg.FRRReloadDegradedFn,
+		frrQuarantinedRouteMapsFn:            cfg.FRRQuarantinedRouteMapsFn,
 		ipsecRebindPendingFn:                 cfg.IPsecRebindPendingFn,
 		hostInboundConntrackRevocationOwedFn: cfg.HostInboundConntrackRevocationOwedFn,
 		hostInboundConntrackFlushFailuresFn:  cfg.HostInboundConntrackFlushFailuresFn,

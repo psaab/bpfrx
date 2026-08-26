@@ -38,6 +38,83 @@
   paired control proving a real reader still gets the whole table under tight
   budgets.
 
+## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
+
+- **Timestamp**: 2026-08-26
+- **Action**: R68's HPC/invariant note asks for more than a deterministic
+  deny — "operators also need apply failure/health rather than silent accepted
+  outage". The r1 fix made the deny explicit and visible in `show route-map`
+  but left the only proactive signal as one `slog.Warn` at render time, which
+  nothing alerts on: a total route withdrawal on a BGP session looked exactly
+  like a healthy box to every dashboard. Added `Manager.QuarantinedRouteMaps()`
+  (rebuilt per `buildManagedSection`, so reducing the policy and re-committing
+  CLEARS it — a stale alert gets muted, and a muted alert is how the next real
+  one is missed) and the `xpf_frr_route_maps_quarantined` gauge, wired exactly
+  like the #1880 `xpf_frr_reload_degraded` sibling.
+  A COUNT, not a boolean: one oversized policy quarantines both its own name
+  and its `-xpf-redist` alias, so a 0/1 gauge would under-report every dual-use
+  incident. Publishes an explicit 0 when healthy (an alert on `> 0` cannot tell
+  "nothing quarantined" from "the series stopped reporting") but is ABSENT when
+  no FRR hook is wired (a hardcoded 0 from a process that never consulted FRR
+  is a false all-clear).
+- **File(s)**: `pkg/frr/manager.go`, `pkg/frr/policy_render.go`,
+  `pkg/frr/README.md`, `pkg/api/metrics.go`, `pkg/api/server.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/metrics_frr_routemap_quarantine_6807_test.go` (new),
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go`,
+  `pkg/daemon/daemon_run_servers.go`, `_Log.md`
+- **Validation**: producer side bound (render records both names; a later
+  healthy render clears them; a fresh manager reports nothing, so "records it"
+  cannot pass on a manager that reports unconditionally); consumer side bound
+  on a pedantic registry across three points — healthy/one/two — plus the
+  unwired-is-absent cell.
+
+## 2026-08-26 — #6807: an oversized policy's attachment now resolves to an explicit deny
+
+- **Timestamp**: 2026-08-26
+- **Action**: `generatePolicyOptions` (#5701) and `renderComposedRouteMap`
+  (#5732) skip an over-ceiling policy's expansion so a `route-map ... 70000`
+  line cannot poison the whole vtysh-batched frr-reload. Correct — but they
+  emitted NOTHING, while BGP rendering emits `neighbor <ip> route-map <name>
+  in|out` independently off the policy's presence in `PolicyStatements`. The
+  attachment outlived its definition.
+  The repo asserted in 8 production comments, 3 tests and 4 README passages
+  that FRR resolves a dangling route-map to PERMIT-ALL. VERIFIED FALSE against
+  FRR stable/10.6 `bgpd/bgp_route.c` — the deployed line (`vtysh -c 'show
+  version'` on loss:xpf-userspace-fw0 reports FRRouting 10.6.0):
+  `bgp_input_modifier`/`bgp_output_modifier` return `RMAP_DENY` when
+  `route_map_lookup_by_name` fails. A NAMED-but-undefined map denies; only an
+  ABSENT attachment permits. So the pre-fix behaviour silently withdrew every
+  route on the attached neighbors, on the tolerant/peer-sync/rollback path.
+  Both sites now emit a bounded explicit `route-map <name> deny 10` (one
+  sequence — can never approach the ceiling), plus the `-xpf-redist` alias
+  under the same rule since `resolveRedistribute` may reference either name.
+  Chose deny over dropping the attachment: dropping it means no policy at all,
+  i.e. Junos BGP default-accept advertising everything the policy existed to
+  filter — fail-OPEN on an authorization decision. Failing the render is
+  unavailable (#1960 no-brick). Outcome unchanged; now deliberate, visible in
+  `show route-map`, and independent of FRR's undefined-map semantics.
+  Corrected every permit-all claim in place. Deliberately did NOT change the
+  #2473/#2490/#2539 undefined-reference guards, whose drop PRODUCES the
+  permit-all they were written to prevent — that is a behaviour choice about
+  configs that should not exist; filed as #7625, comments corrected so nobody
+  re-derives intent from the old sentence.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/protocols_render.go`,
+  `pkg/frr/bgp_policy_chain.go`, `pkg/frr/frr_test.go`,
+  `pkg/frr/policy_routemap_seqbound_5701_test.go`,
+  `pkg/frr/policy_composed_chain_seqbound_5732_test.go`,
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go` (new),
+  `pkg/frr/README.md`, `_Log.md`
+- **Validation**: 5 new cells hold the invariant as a PROPERTY over the whole
+  rendered managed section — every route-map name referenced by a `neighbor
+  ... route-map` or `redistribute ... route-map` attachment must be defined in
+  the same section — with a negative control proving the detector finds a
+  planted dangle, and a paired control proving an in-bounds policy still
+  renders its real expansion rather than being quarantined too. The two
+  pre-existing seqbound cells moved with the code: their "renders NOTHING"
+  assertion became the strictly stronger "exactly one header, and it is the
+  bounded deny", so the #5701/#5732 property (no expansion) is still asserted.
+
 ## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
 
 - **Timestamp**: 2026-08-26
@@ -105749,3 +105826,71 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/daemon_nft.go`, `pkg/daemon/daemon_nft_netlink.go`,
   `pkg/daemon/lo0_proto_icmp_failclosed_6806_test.go` (new),
   `pkg/nftables/README.md`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — engineering-style: a comment is a claim; an agreement test cannot see a shared defect
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add three review-discipline rules to
+  `docs/engineering-style.md` ("Reviewing (adversarial by design)").
+- **Why now**: each rule is generalised from a defect that landed in ONE review
+  batch, not from principle.
+  1. **Three stale load-bearing comments**, all true when written and false at
+     head: `daemon_apply_tail.go`'s "every step below still RUNS (no early
+     return)"; `netlink_lo0.go`'s "a rejected table leaves NO host filter =
+     fail-OPEN" (true before #6476's cold-boot fence, false after — checking the
+     code rather than the comment is what unblocked #6806's correct direction);
+     and `daemon_nft.go`'s "mirroring the tcp-flags lowering", which was wrong
+     when written because tcp-flags does not drop its predicate. A comment that
+     justifies a DIRECTION is the dangerous kind: the reader takes the direction
+     and never re-derives the reason, which was verified once and never again.
+  2. **The #6806 lo0 parity gate was structurally blind.** Both mirrors dropped
+     an unresolvable token, so they AGREED perfectly while both were fail-open,
+     and the gate was green throughout. "Assert the agreement, never pin one to a
+     literal" is right for DRIFT — and drift is not the only defect. Each side
+     also owes a property independently.
+  3. **A tool-gated leg that SKIPs is a green that measured nothing** — report
+     tests-collected, not `ok`.
+- **Related, and the same shape at a larger scale**: #6807's review had DISPROVEN
+  the repo's FRR permit-all model while the repo's comments and tests still
+  asserted it, so a reader re-deriving from the title had a confidently wrong
+  prior with every local check agreeing. A stale comment and a refuted-but-still-
+  asserted consequence are one defect at two scales.
+- **Annotate stale comments as historical rather than deleting them** — the next
+  reader needs to know it WAS true, not merely that it is gone.
+- **File(s)**: `docs/engineering-style.md`, `_Log.md`
+
+## 2026-08-26 — #6798 follow-up: correct two claims #6790 falsified, now on master
+
+- **Timestamp**: 2026-08-26
+- **Action**: #7605 merged (`f8c1bb105`) at head `5705bdb99` while the re-derive
+  round was still in flight, so two corrections the re-derive found did NOT make
+  the merge and are live on master. This lands them.
+- **The escape**: this is the exact class being swept on master today — a
+  sentence true when written and false at merge — and it escaped INTO master
+  inside the #6798 change itself. The assertions were always correct; only the
+  prose explaining them rotted. Worth noting that re-deriving found it and the
+  merge race, not the analysis, is what let it through.
+- **(1) A now-false doc comment on the end-to-end cell.** It read: "on the normal
+  apply path every one of those returns is deliberately discarded ... The SINGLE
+  caller that CONSUMES them is the #5874/M35 daemon-stop cancel closeout." #6790
+  (#7604) made `applyTailReconciles` capture those returns, so there are TWO
+  consumers and both halves are false. Rewritten to name both, with an explicit
+  note that the sentence was falsified by #6790 — so the next reader sees the
+  dependency rather than re-deriving it.
+- **(2) An unqualified "is neither fatal class".** `exec.CommandContext` has TWO
+  deadline shapes: a context expiring BEFORE fork/exec makes `Start` return a
+  BARE `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot
+  distinguish from a #2926 daemon-stop abort and classes FATAL. Restated as
+  "neither class in these errors' ORDINARY failure shapes", with the
+  misclassified shape named and scoped: pre-existing and WIDER than #6798
+  (`nftApplyPayload` at 5s and the DNS `systemctl` calls already reach the same
+  classifier), reachable only with a short injected deadline under load and not
+  in production at 15s, tracked in #7618 and tripwired by
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`. What #6798 adds
+  cannot reach it: `os.ReadFile`/`os.ReadDir` yield EACCES/EIO/EISDIR/ENOTDIR,
+  never a context error.
+- **No production code changes** — comments and docs only. The 14/14 mutation
+  matrix measured at `b166d8229` (identical production files) stands; nothing in
+  this delta can move it.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `docs/system-login.md`, `_Log.md`
