@@ -568,16 +568,19 @@ func TestReassertIsANoOpWhenNothingIsOwed6800(t *testing.T) {
 	}
 }
 
-// TestReassertRechecksTheDebtInsideTheSemaphore6800 binds the INNER gate.
+// TestReassertRechecksTheDebtInsideTheSemaphore6800 binds the INNER gate — the
+// per-service `d.rsyslogRestartOwed()` read taken UNDER applySem.
 //
 // The check before applySem is only an optimisation: it avoids queueing behind
-// a commit for nothing. The inner one is the correctness gate — a tick that
-// blocked behind an in-flight commit may find the commit ALREADY re-issued the
-// reload and discharged the debt, and restarting rsyslog again then is a
-// gratuitous bounce of a healthy logging pipeline.
+// a commit for nothing, and its answer is stale by the time the tick is let
+// through. The inner one is the correctness gate — a tick that blocked behind
+// an in-flight commit may find the commit ALREADY re-issued the restart and
+// discharged the debt, and restarting rsyslog again then is a gratuitous bounce
+// of a healthy logging pipeline.
 //
-// The mutation that survives without this cell removes only the inner re-read;
-// the outer check still short-circuits the quiet case, so
+// The mutation that survives without this cell drops only the inner read (the
+// re-assert restarts unconditionally once it holds the semaphore); the outer
+// check still short-circuits the quiet case, so
 // TestReassertIsANoOpWhenNothingIsOwed6800 stays green.
 func TestReassertRechecksTheDebtInsideTheSemaphore6800(t *testing.T) {
 	d, restarts, failWith := syslogDaemon6800(t)
@@ -658,6 +661,64 @@ func TestReassertWaitsForTheApplySemaphore6800(t *testing.T) {
 	if !d.rsyslogRestartOwed() {
 		t.Fatal("a re-assert that never ran must leave the debt outstanding")
 	}
+}
+
+// TestReassertDrivesOnlyTheServiceThatOwesAReload6800 is the PAIRED
+// per-service cell: one service owes, the other does not, in both directions.
+//
+// The outer gate answers "does ANYTHING owe a reload", so it cannot tell the
+// two apart. Without a gate per service, an owed rsyslog restart would drag a
+// perfectly healthy chrony into a `systemctl restart chrony` (and vice versa) —
+// a reload issued for a leg that never failed, which is the same gratuitous
+// bounce the steady-state gate exists to prevent, just reached from the loop.
+func TestReassertDrivesOnlyTheServiceThatOwesAReload6800(t *testing.T) {
+	t.Run("rsyslog-owed-chrony-quiet", func(t *testing.T) {
+		d, restarts, failWith := syslogDaemon6800(t)
+		_, calls, _ := chronyDaemon6800(t)
+		d.applySem = semaphore.NewWeighted(1)
+
+		*failWith = errors.New("simulated restart failure")
+		d.applySyslogFiles(syslogFileCfg6800("audit"))
+		before := *restarts
+		*failWith = nil
+
+		d.reassertServiceReloadDebtOnce(context.Background())
+
+		if *restarts != before+1 {
+			t.Fatalf("the owed rsyslog restart was not re-driven (%d, want 1)",
+				*restarts-before)
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("the re-assert reloaded chrony %d times while only rsyslog "+
+				"owed one, want 0 — each service must gate on its OWN debt, or an "+
+				"rsyslog failure drags a healthy chrony through `systemctl restart "+
+				"chrony` every 30s (#6800)", len(*calls))
+		}
+	})
+
+	t.Run("chrony-owed-rsyslog-quiet", func(t *testing.T) {
+		d, restarts, _ := syslogDaemon6800(t)
+		_, calls, outcome := chronyDaemon6800(t)
+		d.applySem = semaphore.NewWeighted(1)
+
+		*outcome = chronyReloadOutcome{thresholdFailed: true}
+		d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
+		before := len(*calls)
+		*outcome = chronyReloadOutcome{}
+
+		d.reassertServiceReloadDebtOnce(context.Background())
+
+		if len(*calls) != before+1 {
+			t.Fatalf("the owed chrony reload was not re-driven (%d, want 1)",
+				len(*calls)-before)
+		}
+		if *restarts != 0 {
+			t.Fatalf("the re-assert restarted rsyslog %d times while only chrony "+
+				"owed a reload, want 0 — each service must gate on its OWN debt, or "+
+				"a chrony failure bounces a healthy logging pipeline every 30s "+
+				"(#6800)", *restarts)
+		}
+	})
 }
 
 // TestServiceReloadDebtLoopTicks6800 binds the loop plumbing: the ticker

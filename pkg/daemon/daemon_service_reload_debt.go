@@ -173,11 +173,15 @@ func (d *Daemon) serviceReloadDebtReassertLoop(ctx context.Context) {
 // then latch a success for it. Blocking behind the in-flight commit means the
 // restart always loads a fully converged file set.
 //
-// The debt is deliberately re-read INSIDE the semaphore. The pre-check outside
-// it is only an optimisation to avoid queueing behind a commit for nothing; a
-// commit that lands in between may already have re-run the reload and
-// discharged the debt, and restarting rsyslog again then would be a gratuitous
-// bounce of a healthy logging pipeline.
+// The per-service gates below are deliberately read INSIDE the semaphore, and
+// they are the only gates that decide anything. The serviceReloadDebtOutstanding
+// pre-check is an optimisation OUTSIDE the semaphore — it avoids queueing behind
+// a commit for nothing — and its answer is stale by the time the tick is let
+// through: a commit that landed in between may already have re-run the reload
+// and discharged the debt, and restarting rsyslog again then would be a
+// gratuitous bounce of a healthy logging pipeline. Each service therefore
+// re-reads its OWN debt under the semaphore, which also keeps one service's
+// outstanding reload from dragging the other's healthy one along.
 func (d *Daemon) reassertServiceReloadDebtOnce(ctx context.Context) {
 	if !d.serviceReloadDebtOutstanding() {
 		return // cheap path: nothing owed
@@ -189,9 +193,6 @@ func (d *Daemon) reassertServiceReloadDebtOnce(ctx context.Context) {
 		return // ctx cancelled (daemon shutdown) — do not reload.
 	}
 	defer d.applySem.Release(1)
-	if !d.serviceReloadDebtOutstanding() {
-		return // a commit discharged it while we queued
-	}
 
 	if d.rsyslogRestartOwed() {
 		slog.Warn("rsyslog restart still owed from an earlier apply — retrying " +
