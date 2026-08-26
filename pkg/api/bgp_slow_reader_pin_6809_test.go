@@ -24,7 +24,9 @@ package api
 // the harness is genuinely capable of pinning.
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +37,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/diagcmd"
+	"github.com/psaab/xpf/pkg/frr"
 )
 
 // --- a connection that stops accepting bytes, like a full send buffer -------
@@ -350,4 +353,92 @@ func tail6809(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// --- the elapsed backstop, bound by what it can actually be observed to do ---
+
+// ctxCapturingExecutor6809 records the context StreamBGPRoutes hands to
+// VtyshStream. That context is what exec.CommandContext binds the vtysh child
+// to, so its cancellation IS the child's death — the one observable the elapsed
+// backstop actually produces.
+type ctxCapturingExecutor6809 struct {
+	fakeBGPExecutor
+	got chan context.Context
+}
+
+func (e *ctxCapturingExecutor6809) VtyshStream(ctx context.Context, cmd string) (io.ReadCloser, func() error, error) {
+	select {
+	case e.got <- ctx:
+	default:
+	}
+	return e.fakeBGPExecutor.VtyshStream(ctx, cmd)
+}
+
+// TestElapsedBackstopReapsVtyshWhenWriteDeadlinesAreUnsupported6809 binds the
+// budget the write deadline cannot cover.
+//
+// This cell exists because the mutation matrix caught its absence: deleting the
+// elapsed backstop left the whole package GREEN. Every other cell here either
+// depends on the write deadline (which the backstop does not affect) or
+// deliberately parks the handler forever, so none of them could see it go.
+//
+// The property is deliberately NOT "the handler returns". With write deadlines
+// unsupported the handler genuinely cannot be unpinned — nothing short of a
+// socket deadline interrupts a blocked write — and a cell asserting otherwise
+// would be asserting something false. What the backstop does is cancel the
+// context the vtysh child is bound to, so the CHILD, its pipe and the RIB dump
+// are freed on a bounded schedule even while the goroutine stays parked. That
+// is a partial bound, and this asserts exactly the part that is real.
+//
+// FAIL-ON-REVERT: replace the context.WithTimeout with a bare WithCancel and
+// nothing cancels this context (the handler is blocked, so neither deferred
+// cancel runs) — the wait below times out.
+func TestElapsedBackstopReapsVtyshWhenWriteDeadlinesAreUnsupported6809(t *testing.T) {
+	restoreW, restoreT := bgpStreamWriteDeadline, bgpStreamTotalBudget
+	bgpStreamWriteDeadline = 100 * time.Millisecond
+	bgpStreamTotalBudget = 500 * time.Millisecond
+	t.Cleanup(func() { bgpStreamWriteDeadline, bgpStreamTotalBudget = restoreW, restoreT })
+
+	exec := &ctxCapturingExecutor6809{
+		fakeBGPExecutor: fakeBGPExecutor{vtyshOut: bigBGPTable6809(20000)},
+		got:             make(chan context.Context, 1),
+	}
+	srv := &Server{frr: frr.NewForTest(t.TempDir()+"/frr.conf", exec)}
+
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	// deadlineUnsupported: the write deadline is off the table, so the elapsed
+	// backstop is the ONLY bound left and this cell is measuring it alone.
+	sl := &stalledListener6809{Listener: base, budget: 32 * 1024, deadlineUnsupported: true}
+	ts := &httptest.Server{
+		Listener: sl,
+		Config:   &http.Server{Handler: http.HandlerFunc(srv.bgpHandler)},
+	}
+	ts.Start()
+	defer func() { sl.releaseAll(); ts.Close() }()
+
+	dialAndRequestWithoutReading6809(t, ts.Listener.Addr().String())
+
+	var streamCtx context.Context
+	select {
+	case streamCtx = <-exec.got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("vtysh was never started, so this cell cannot observe the child's " +
+			"lifetime")
+	}
+
+	select {
+	case <-streamCtx.Done():
+		// The vtysh child's context was cancelled on schedule:
+		// exec.CommandContext kills and reaps it, freeing the process, its pipe
+		// and the RIB dump, even though this request's goroutine is still
+		// parked in a write nothing can interrupt.
+	case <-time.After(10 * time.Second):
+		t.Fatal("the vtysh child's context was never cancelled — with a connected " +
+			"non-reader and no usable write deadline, the child, its pipe and " +
+			"the full RIB dump stay live for as long as the client holds the " +
+			"connection open (#6809)")
+	}
 }
