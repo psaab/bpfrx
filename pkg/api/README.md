@@ -1960,6 +1960,43 @@ the drop fails loudly instead of going quietly vacuous.
     `collectZoneCounters` runs before the `dp == nil || !dp.IsLoaded()` early
     return, alongside `collectPBRStatus` and the host-inbound families.
 
+    **`xpf_zone_counters_overflow_active` disambiguates it (#6845).** The
+    sentinel above is three-way ambiguous BY CONSTRUCTION — pre-#3651 helper,
+    slot-capacity overflow (traffic genuinely missed), or an idle zone — and only
+    the middle case needs action. The bit that separates it was already on the
+    wire (`ProcessStatus.ZoneCounterOverflowActive`, from
+    `userspace-dp/src/afxdp/zone_counters.rs`) and was read by **nothing**: no
+    CLI, no REST, no gRPC, no Prometheus. This 0/1 gauge publishes it.
+
+    **Its absence semantics are the OPPOSITE of the sibling gauge's, and that is
+    the design.** `xpf_zone_counters_unpopulated_zones` is config-derived, so it
+    is emitted above the dataplane gate and keeps reporting the full configured
+    zone count through a degraded boot. Overflow is a property of the RUNNING
+    helper's slot table: with no helper there is no slot table and nothing to
+    overflow, so a `0` would be a false all-clear about a machine nothing asked.
+    It is therefore emitted from `collectUserspaceStatus` — **only on a scrape
+    that actually read a status**. Absent means "no helper to ask"; `0` means
+    "the helper reported no overflow".
+
+    Not an error, and it must never touch `xpf_counter_read_errors_total`: an
+    overflowed zone degrades to "not known" on every read surface rather than
+    publishing a false zero, so no surface reports wrong numbers. What overflow
+    costs is the ability to tell **why**, which is what this restores.
+
+    `show security zones` consumes the same flag: on the unpopulated branch it
+    names capacity exhaustion specifically instead of listing three causes the
+    operator cannot choose between. It fails to the ambiguous line on any status
+    error — telling someone to reduce their zone count when the real cause was an
+    idle zone is worse than saying "cannot tell".
+
+    **REST deliberately does NOT carry it.** `/security/zones` returns a bare
+    `[]ZoneInfo` with no response envelope, so a response-level field would mean
+    changing the response from an array to an object — a breaking API shape change
+    that should be decided on its own merits, not ridden in on an observability
+    fix. Per-zone placement was rejected too: overflow is a property of the slot
+    TABLE, and the helper does not report which zones lost their slots, so a
+    per-zone flag would be an invention.
+
     Consequence: **the gauge's cause set is strictly wider than
     `ErrCounterNotPopulated`'s.** The sentinel has exactly three meanings; the
     gauge has those plus every pre-read membership branch. The authoritative
