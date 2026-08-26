@@ -19,6 +19,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"golang.org/x/sync/semaphore"
@@ -285,6 +286,82 @@ func TestReassertRedrivesTheOwedSSHDReload6800(t *testing.T) {
 				"beyond the one the apply already recorded", f[svcReloadSSHD])
 		}
 	})
+}
+
+// TestSSHDReloadRetryStillFailsTheCommit6800 pins the INTERACTION with #6790,
+// which landed on master while this branch was open.
+//
+// #6790 captures applySSHConfig's error as `sshConfigErr` and joins it into the
+// commit result (daemon_apply_tail.go). Before #6800, a second apply after a
+// failed removal-reload took `if !hadDropIn { return nil }` and the commit
+// SUCCEEDED while sshd was still enforcing the removed policy. Now the debt
+// re-drives the reload, so if it fails AGAIN the commit fails again.
+//
+// That is a deliberate behaviour change and it is recorded here rather than
+// discovered later: it is the same fail-closed discipline #6790 applied to the
+// credential reconcilers, and the alternative — reporting success while sshd
+// enforces a policy the operator deleted — is exactly the lie #6790 set out to
+// end. The newly-failing population is precisely "nodes with an unpaid sshd
+// reload"; a node with no drop-in and no debt still returns early untouched
+// (TestSSHDUnchangedApplyWithNoDebtDoesNotReload6800 is that control).
+func TestSSHDReloadRetryStillFailsTheCommit6800(t *testing.T) {
+	d, r := sshdDebtDaemon6800(t)
+	r.present = []byte("PermitRootLogin yes\n")
+	r.reloadErr = errors.New("simulated: Unit ssh.service is masked")
+
+	if err := d.applySSHConfig(sshConfig(nil)); err == nil {
+		t.Fatal("setup: the first failed removal-reload must fail the commit (#6790)")
+	}
+	if r.present != nil {
+		t.Fatal("setup: the drop-in must be gone")
+	}
+
+	// The unit is still masked. The retry runs and fails, so the commit must
+	// keep failing rather than reporting a convergence that did not happen.
+	err := d.applySSHConfig(sshConfig(nil))
+	if err == nil {
+		t.Fatal("a retried sshd reload that FAILS AGAIN must still fail the " +
+			"commit: applySSHConfig's error is joined into the commit result " +
+			"(#6790), and sshd is still enforcing the policy the operator " +
+			"deleted. Reporting success here is the pre-#6800 silence with an " +
+			"extra step")
+	}
+	if !d.sshdReloadOwed() {
+		t.Error("the retry failed, so the debt must stay outstanding for the loop")
+	}
+}
+
+// TestServiceReloadFailuresDoNotFailTheCommit6800 pins the OTHER half of that
+// interaction, and it is the one nothing else can see.
+//
+// The rsyslog and chrony debt design depends on those reloads NOT failing the
+// commit: the retry owner pays them, and a transient `systemctl restart`
+// failure must not reject an otherwise-correct configuration. That holds today
+// only because applySyslogFiles and applySystemNTP are VOID and the apply tail
+// calls them as bare statements — the asymmetry daemon_apply_tail.go's own
+// comment draws against the credential reconcilers #6790 now joins.
+//
+// Nothing else binds it. Give either function an error return and join it, and
+// every behavioural cell in this package stays green while a masked rsyslog
+// unit starts rejecting commits. The apply tail cannot be driven from a unit
+// test, so this is asserted at the source with comments stripped — the same
+// instrument the loop-start and metric-wiring cells use.
+func TestServiceReloadFailuresDoNotFailTheCommit6800(t *testing.T) {
+	src := stripLineComments6791(readDaemonSource(t, "daemon_apply_tail.go"))
+
+	for _, want := range []string{
+		"\n\td.applySyslogFiles(cfg)\n",
+		"\n\td.applySystemNTP(cfg)\n",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("the apply tail no longer calls %q as a bare statement. If its "+
+				"result is now captured and joined into the commit (the #6790 shape), "+
+				"a transient `systemctl restart rsyslog` or `chronyc reload sources` "+
+				"failure REJECTS an otherwise-correct commit — and the #6800 debt "+
+				"plus retry owner exist precisely so it does not have to (#6800)",
+				strings.TrimSpace(want))
+		}
+	}
 }
 
 // TestReassertLeavesSSHDAloneWhenNothingIsOwed6800 is the per-service gate for
