@@ -214,6 +214,75 @@ stop running — no failure, just unvalidated config again.
 `TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
 cannot rot into a tripwire that never fires.
 
+### The rule reaches TYPED LEAVES too (#6844)
+
+#6834 installed the wildcard-identity check in `walkSchemaNode`'s **container**
+branch. The **typed-leaf** branch returns before that point, so a wildcard node
+that is a typed leaf validated its VALUE and never its identity.
+
+`system syslog <dest> <facility> <severity>` is exactly that shape — the
+facility is the wildcard key, the severity is the value. The severity has been
+enum-gated since #2008; the facility accepted anything, so
+
+```
+set system syslog file audit "daemon;*.* /tmp/pwn" info
+```
+
+passed `SchemaValidate` and committed. #6829 belts the RENDER site, so nothing
+injected reaches rendered rsyslog configuration — but the commit path told the
+operator nothing and their configuration silently did not do what it said.
+
+The typed-leaf branch now runs the same `!exactMatch` identity check, and
+`exactMatch` is hoisted above it: still one computation, now three readers.
+
+`ValidateSyslogFacility` **delegates to the render belt's own predicate**
+(`config.SyslogSelectorFacilitySafe`) rather than carrying its own alphabet.
+`pkg/daemon` imports `pkg/config`, so the rule lives here and the belt calls it —
+what the commit path ACCEPTS and what the render path WRITES are one set by
+construction.
+
+That matters because the first cut did carry its own alphabet, and it was wrong
+in both directions at once: it rejected `auth,authpriv` and bare `*` (rsyslog-native,
+documented, render-asserted, so valid configs would have stopped committing) while
+admitting `.` and `_`, which the belt drops — leaving the
+"commit succeeds, destination disappears" class the gate exists to close still
+open. `TestCommitGateAndRenderBeltAcceptTheSameFacilities_6844` binds the
+agreement over a derived corpus, with anti-vacuity floors in both directions and
+the only two licensed disagreements (empty, and the length bound) named so a
+third cannot hide among them.
+
+It is not membership of a facility enum, deliberately. The Junos vocabulary already lives in `pkg/logging`, and
+`pkg/logging` imports `pkg/config` (`trace.go`), so the two cannot be
+single-sourced without a new leaf package. Two independently maintained copies
+drift, and the drift is silent in the direction that REJECTS a valid operator
+config the renderer maps correctly — worse than accepting an unknown but
+well-formed name, which #6830 already diagnoses at render, by name. The alphabet
+matches `syslogNameRE`'s because the facility is formatted into the same
+rendered drop-in body.
+
+No new lenient opt is needed. The #1319 split already bounds it: `SchemaValidate`
+is strict only on the operator-driven commit path, and `Store.compileTreeLenient`
+downgrades a violation to a warning on the tolerant `Load` / `SyncApply` ingress,
+so a persisted or peer-synced config still boots (#1960). A cell pins that
+boundary by asserting the COMPILER still accepts the value — if the rejection
+migrated into `CompileConfig` it would become unconditional and blackout-boot the
+node.
+
+The strictness boundary is proved rather than asserted:
+`pkg/configstore`'s `TestLoadToleratesAnInjectableSyslogFacility_6844` drives the
+real `Store.Load` and requires the node to boot with an active config, paired
+with a commit-check cell that requires the same value to be rejected. Without the
+pair, "Load tolerates it" is satisfied by a build where nothing rejects it
+anywhere — the pre-#6844 state.
+
+`TestWildcardTypedLeafKeyValidatorInventory_6844` enumerates every leaf the new
+rule reaches — the three system-syslog destinations and nothing else today — so
+adding a `keyValidator` to a wildcard typed leaf is a deliberate edit rather than
+a config that quietly stops committing. It reads schema METADATA, so it cannot
+see whether the rule actually RUNS —
+`TestWildcardTypedLeafKeyValidatorRuleIsWired_6844` drives all three destinations
+through the real gate and is the half that reds when the walker hunk is reverted.
+
 ### `interfaces <name>` is the first typed wildcard identity
 
 The interface name is interpolated into four sites in the generated systemd
@@ -745,6 +814,52 @@ the standby lenient-load the vulnerable independent allocators — the same
 divergent-commit fail-open #5876 closes for the other source-NAT gates. Run
 strict there (`lenient=false`), it rejects the node1-only overlap at a node0
 commit.
+
+**Interface-mode SNAT egress addresses are a THIRD owner domain (#6751 §5.7).**
+Interface mode draws no pool — it translates onto the egress interface's own
+address — so before #6751 the owner set enumerated only source-NAT pools and
+NAT64, and a pool containing an interface's own address met no gate at all. The
+two allocators are keyed independently, so both could mint the same
+`(address, port)` and the reverse index could not disambiguate: the #5144
+misdelivery, on the arm #5144 never covered.
+
+The candidate egress addresses are derived per rule-set from its TO-side scope
+(`interfaceSNATEgressAddresses`, `compiler_nat_iface_egress.go`), mirroring the
+dataplane's `scope_matches` (`userspace-dp/src/nat/source.rs`) treatment of an
+empty scope field as a WILDCARD:
+
+| rule-set to-scope | candidate addresses |
+|---|---|
+| `to-interface` | that interface's addresses |
+| `to-routing-instance` | that instance's interfaces' addresses |
+| `to-zone` | that zone's interfaces' addresses |
+| none | **every** dataplane interface's addresses |
+
+The last row replaces the earlier `maps_sync.go` precedent, which collected only
+non-empty `ToZone` and returned NOTHING for an unscoped rule-set — understating
+the candidate set precisely where it is widest, i.e. failing OPEN on the
+broadest possible input. Owners are **deduped by address**: several
+interface-mode rule-sets egressing one WAN interface occupy ONE address, and one
+owner per rule would make them overlap each other and false-reject correct
+multi-zone configs. A `then source-nat off` rule mints nothing and contributes
+no candidate.
+
+**Whole-address statics on an interface egress (#6751 §5.7).** A whole-address,
+port-preserving static mapping whose external address is also an interface-SNAT
+egress emits the SAME external tuple as interface SNAT itself. The #5837
+first-packet-inert advisory (`compiler_validate_warn_nat_iface_addr.go`)
+suppresses itself when interface SNAT owns the address — correct about
+inertness, and it left this case with NO diagnostic at all. That suppression is
+NARROWED, not removed: the inert advisory stays suppressed and
+`staticOnInterfaceEgressCollisions` emits the collision instead — strict
+REJECTS, tolerant load / peer-sync WARNS (#1960). A MAPPED-PORT static
+(`match destination-port` / `mapped-port`) emits a distinct external port and is
+deliberately NOT flagged; reserving its emitted port is the runtime half's job.
+
+Config-time only. Addresses resolved at RUNTIME (DHCP, netlink) are foreclosed
+by the snapshot-builder half of §5.7, which needs the DRAIN discipline behind it
+— marking a pool unusable with nothing draining would strand every live session
+on it.
 
 This is the commit-time DETECTION half of #5144 (material choice **S1**: reject
 independently-owned overlap). It does NOT introduce the deferred packet-path

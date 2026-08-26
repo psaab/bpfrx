@@ -196,7 +196,7 @@ func TestSyslogRenderSafeTokensReachOutput_5797(t *testing.T) {
 //
 // Both spellings are strict-commit-clean: `auth,authpriv` and `*` pass
 // SchemaValidate (measured — the facility is the schema's unvalidated wildcard
-// KEY, see TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 for the same
+// KEY, see TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 for the same
 // chain driven end to end) and compile verbatim. Before any belt existed both
 // rendered a working drop-in. A belt that dropped them therefore did not
 // harden the render path, it deleted a working destination on upgrade — the
@@ -401,18 +401,45 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 	})
 }
 
-// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 is the reachability
-// chain, and the reason the file/user belts are load-bearing rather than
-// defence-in-depth. It drives the REAL operator path — parse the set command,
-// SchemaValidate it, CompileConfig it — and shows an injecting facility
-// arriving at the render function from an ordinary commit, then being dropped.
+// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 is the reachability chain,
+// and the reason the file/user belts are load-bearing rather than
+// defence-in-depth.
 //
-// Deliberate coupling: the SchemaValidate assertion is `must pass`. If a future
-// change adds a key validator to the `<facility> <severity>` wildcard, this
-// test fails — that is the intent. It forces whoever adds that gate to
-// re-derive whether the render belt is still needed instead of deleting it on
-// the assumption that the schema already covers this.
-func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
+// # Why this test changed name and premise (#6844)
+//
+// It used to assert that SchemaValidate ACCEPTS an injecting facility, as a
+// deliberate tripwire: "if a future change adds a key validator to the
+// `<facility> <severity>` wildcard, this test fails -- that is the intent. It
+// forces whoever adds that gate to re-derive whether the render belt is still
+// needed instead of deleting it on the assumption that the schema already
+// covers this."
+//
+// #6844 added that gate, the tripwire fired, and here is the re-derivation.
+//
+// The belt is STILL the only line of defence, because the new gate is not
+// unconditional. SchemaValidate is strict only on the operator-driven commit /
+// commit-check path; Store.compileTreeLenient downgrades a violation to a
+// WARNING on the tolerant Load / SyncApply ingress, deliberately, so a persisted
+// config written by an older binary does not blackout-boot the node and an
+// un-upgraded cluster primary does not alarm-loop HA config sync (#1319/#1960).
+// An injecting facility written before the gate existed therefore still LOADS,
+// still compiles, and still arrives at the render function -- which is exactly
+// the path this test drives.
+//
+// So the chain is unchanged in substance and narrower in premise: what the
+// commit path now rejects, the tolerant path still admits.
+//
+// WHAT THIS TEST DOES AND DOES NOT PROVE. It calls config.CompileConfig, not
+// Store.compileTreeLenient, so it does not itself demonstrate the tolerant
+// ingress — an earlier revision claimed otherwise in its name and comment, and
+// a regression routing Load through STRICT compilation would have left it
+// green. What it proves is the half it actually drives: the value compiles, it
+// reaches the render function, and the belt drops it. The tolerant-ingress half
+// is proved where it happens, by
+// pkg/configstore's TestLoadToleratesAnInjectableSyslogFacility_6844, which
+// drives the real Store.Load and asserts the node still boots with an active
+// config.
+func TestSyslogRenderUnsafeFacilityIsLoadReachable_5797(t *testing.T) {
 	const injecting = "daemon;*.* /tmp/pwn"
 
 	tree := &config.ConfigTree{}
@@ -424,15 +451,25 @@ func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
 		t.Fatalf("SetPath: %v", err)
 	}
 
-	if err := config.SchemaValidate(tree, nil); err != nil {
-		t.Fatalf("the `<facility> <severity>` wildcard now rejects %q at commit-check: %v\n"+
-			"That is a NEW gate. Re-derive whether the syslogDropinContents belt is still the "+
-			"only line of defence before relying on it or removing it (#5797).", injecting, err)
+	// The COMMIT path rejects it (#6844). Pinned here rather than merely
+	// assumed: if that gate is ever removed, this fails and says so, and the
+	// tripwire the original test installed keeps working in the other
+	// direction.
+	if err := config.SchemaValidate(tree, nil); err == nil {
+		t.Fatalf("SchemaValidate ACCEPTED %q. The #6844 facility key gate is gone, so an "+
+			"ORDINARY commit can once again land an injecting selector -- the render belt "+
+			"below is then the only thing standing between it and a written drop-in.",
+			injecting)
 	}
 
+	// The TOLERANT path still admits it: the compiler is unchanged, and
+	// Store.compileTreeLenient downgrades the schema violation to a warning.
+	// This is the reachability premise the belt exists for.
 	cfg, err := config.CompileConfig(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfig: %v\nThe rejection has migrated out of SchemaValidate and "+
+			"into the compiler, which makes it unconditional and blackout-boots a node "+
+			"carrying a config an older binary accepted (#1960).", err)
 	}
 	if len(cfg.System.Syslog.Files) != 1 || cfg.System.Syslog.Files[0].Facility != injecting {
 		t.Fatalf("compiled facility = %+v, want the verbatim %q — the reachability premise of "+
@@ -440,8 +477,8 @@ func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
 	}
 
 	if body, ok := renderedFor(cfg, renderPrefix+"audit.conf"); ok {
-		t.Errorf("a commit-clean config wrote an rsyslog drop-in built from %q (#5797):\n%s",
-			injecting, body)
+		t.Errorf("a config reaching render via the tolerant load path wrote an rsyslog "+
+			"drop-in built from %q (#5797):\n%s", injecting, body)
 	}
 }
 
@@ -479,12 +516,31 @@ func TestApplySystemSyslogWarnsOnUnmappedFacility_5797(t *testing.T) {
 		return buf.String()
 	}
 
-	// A Junos facility name the runtime cannot map: the substitution to local0
-	// must be reported.
-	for _, facility := range []string{"authorization", "kernel", "interactive-commands", "typo"} {
+	// A facility name the runtime cannot map: the substitution to local0 must be
+	// reported.
+	//
+	// #6830 SPLIT THE MESSAGE, NOT THE PROPERTY. This used to pin the literal
+	// "unmapped facility name" for every case. The warning now discriminates a
+	// real Junos facility this box misfiles from a name in neither vocabulary,
+	// because those need different operator actions — so the assertion moves
+	// from one literal to "warned, named the facility, and CLASSIFIED it
+	// correctly", which is strictly stronger than what it replaced.
+	for _, tc := range []struct {
+		facility string
+	}{
+		// #6830 wired the documented Junos table into the emit path, so
+		// `authorization` / `kernel` / `interactive-commands` are now MAPPED and
+		// no longer warn -- that is the fix, not a regression. What still
+		// reaches this warning is a name in NEITHER vocabulary, plus the Junos
+		// names that have no documented wire facility at all.
+		{"security"},
+		{"external"},
+		{"typo"},
+	} {
+		facility := tc.facility
 		t.Run("unmapped/"+facility, func(t *testing.T) {
 			got := apply(t, facility)
-			if !strings.Contains(got, "unmapped facility name") {
+			if !strings.Contains(got, "unrecognized facility name") {
 				t.Errorf("host facility %q silently became local0 with no warning; records leave "+
 					"under a facility the configuration never names (#5797). captured:\n%s",
 					facility, got)
@@ -492,11 +548,36 @@ func TestApplySystemSyslogWarnsOnUnmappedFacility_5797(t *testing.T) {
 			if !strings.Contains(got, facility) {
 				t.Errorf("the warning must name the unmapped facility %q. captured:\n%s", facility, got)
 			}
+			// #6830 collapsed this classification, and the collapse is the fix.
+			//
+			// The MISFILED arm described a name IN the documented Junos
+			// vocabulary that this box emitted under a different code.
+			// ParseFacility now consults that table first, so the two agree by
+			// construction and the arm has no reachable input. Every name that
+			// still reaches this warning is in neither vocabulary, or is Junos
+			// with no documented wire facility -- a probable typo either way,
+			// which is the one arm that remains.
+			//
+			// The property the MISFILED arm protected did not disappear, it
+			// moved to where it can actually be asserted: pkg/logging's
+			// TestNothingInTheTableIsMisfiled6830 quantifies over the whole
+			// table, so a row added without wiring reds there.
+			if !strings.Contains(got, "unrecognized facility name") {
+				t.Errorf("%q must be reported as a probable typo (#6830). captured:\n%s",
+					facility, got)
+			}
 		})
 	}
 
 	// Negative control: a mapped name must not warn.
-	for _, facility := range []string{"daemon", "local0", "change-log", "auth"} {
+	// #6830 added the nine documented Junos names to this control: they are now
+	// mapped, so a correct config using them must stay quiet. Without them the
+	// control would not cover the names the flip actually moved.
+	for _, facility := range []string{
+		"daemon", "local0", "change-log", "auth",
+		"authorization", "kernel", "interactive-commands", "conflict-log",
+		"dfc", "firewall", "ftp", "ntp", "pfe",
+	} {
 		t.Run("mapped/"+facility, func(t *testing.T) {
 			if got := apply(t, facility); strings.Contains(got, "unmapped facility name") {
 				t.Errorf("host facility %q is mapped by ParseFacility but warned as unmapped; a "+
@@ -547,7 +628,7 @@ func TestApplySystemSyslogWarnsWhenClientDialFails_6829(t *testing.T) {
 			Address: "192.0.2.10",
 			// On no local interface, so the bind fails and the client is nil.
 			SourceAddress: "192.0.2.1",
-			Facilities:    []config.SyslogFacility{{Facility: "authorization", Severity: "info"}},
+			Facilities:    []config.SyslogFacility{{Facility: "security", Severity: "info"}},
 		}},
 	}
 	d.applySystemSyslog(cfg)
@@ -559,13 +640,16 @@ func TestApplySystemSyslogWarnsWhenClientDialFails_6829(t *testing.T) {
 		t.Fatalf("premise broken: the client was expected to FAIL construction so the "+
 			"ordering matters; captured:\n%s", got)
 	}
-	if !strings.Contains(got, "unmapped facility name") {
+	// #6830: `security` is in the Junos vocabulary but has no documented wire
+	// facility, so it takes the unrecognized arm. The property under test is
+	// unchanged -- the classification must not sit behind the dial.
+	if !strings.Contains(got, "unrecognized facility name") {
 		t.Errorf("the unmapped-facility warning was lost because the client could not be "+
 			"constructed — classification must not sit behind the dial (#6829). The "+
 			"operator with an unreachable collector is the one who most needs to be "+
 			"told their facility name is wrong. captured:\n%s", got)
 	}
-	if !strings.Contains(got, "authorization") {
+	if !strings.Contains(got, "security") {
 		t.Errorf("the warning must still name the unmapped facility. captured:\n%s", got)
 	}
 
@@ -638,7 +722,7 @@ func TestApplySystemSyslogFacilityReachesClient_6829(t *testing.T) {
 	})
 
 	t.Run("unmapped facility lands on the documented substitution", func(t *testing.T) {
-		if got := apply(t, "authorization").Facility; got != logging.FacilityLocal0 {
+		if got := apply(t, "security").Facility; got != logging.FacilityLocal0 {
 			t.Errorf("installed client Facility = %d, want FacilityLocal0 (%d) — the warning "+
 				"promises records leave under local0, so that must be what is installed",
 				got, logging.FacilityLocal0)
@@ -746,7 +830,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 	}
 
 	t.Run("unmapped facility warns", func(t *testing.T) {
-		got, er := apply(t, "authorization")
+		got, er := apply(t, "security")
 		// #6829 F2: bind the VALUE on the audit stream — the site this file
 		// calls the worst in the daemon to misroute silently. It has the same
 		// compute/assign split as the host path, so a log-only assertion cannot
@@ -777,7 +861,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 			t.Errorf("the security/audit stream silently mapped an unmappable facility to "+
 				"local0 with no warning — this is the audit path (#5797/#6829). captured:\n%s", got)
 		}
-		if !strings.Contains(got, "authorization") {
+		if !strings.Contains(got, "security") {
 			t.Errorf("the warning must name the unmapped facility. captured:\n%s", got)
 		}
 	})
@@ -801,7 +885,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"audit": {
 				Name: "audit", Host: "no-such-host.invalid.", Port: 514,
-				Facility: "authorization", Severity: "info",
+				Facility: "security", Severity: "info",
 			},
 		}
 		er := logging.NewEventReader(nil, nil)
@@ -817,7 +901,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 				"never told the facility is ALSO unmappable — the one diagnosis that does "+
 				"not need the network up (#6829). captured:\n%s", got)
 		}
-		if !strings.Contains(got, "authorization") {
+		if !strings.Contains(got, "security") {
 			t.Errorf("the warning must name the unmapped facility. captured:\n%s", got)
 		}
 	})
@@ -835,7 +919,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 		cfg := &config.Config{}
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"unmappable": {Name: "unmappable", Host: "192.0.2.10", Port: 514,
-				Facility: "authorization", Severity: "info"},
+				Facility: "security", Severity: "info"},
 			"mapped": {Name: "mapped", Host: "192.0.2.11", Port: 514,
 				Facility: "auth", Severity: "info"},
 		}
@@ -912,7 +996,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 // output; it changes what the surrounding configuration MEANS. That is the
 // construct substitution this belt exists to prevent, and it is reachable
 // through the schema's unvalidated wildcard facility KEY (same chain as
-// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797).
+// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797).
 //
 // The bare `-` is the same defect with nothing after it.
 //
