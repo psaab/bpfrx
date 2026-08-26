@@ -112,6 +112,11 @@ type xpfCollector struct {
 	zonePacketsTotal             *prometheus.Desc
 	zoneBytesTotal               *prometheus.Desc
 	zoneCountersUnpopulatedZones *prometheus.Desc
+	// #6845: 0/1 — 1 while the helper's per-zone hot-path slot table has
+	// OVERFLOWED, so some configured zones are not being counted at all.
+	// Emitted only when a helper status was actually read, so its ABSENCE means
+	// "no helper to ask" rather than "no overflow" — see the descriptor.
+	zoneCountersOverflowActive *prometheus.Desc
 
 	// Policy counters. policyCountersUnpublishedRules is the policy analogue of
 	// zoneCountersUnpopulatedZones: the explicit "no counter published for this
@@ -715,6 +720,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.zonePacketsTotal
 	ch <- c.zoneBytesTotal
 	ch <- c.zoneCountersUnpopulatedZones
+	ch <- c.zoneCountersOverflowActive
 	ch <- c.policyHitsTotal
 	ch <- c.policyCountersUnpublishedRules
 	ch <- c.filterHitsTotal

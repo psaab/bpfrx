@@ -105777,3 +105777,50 @@ prose edit above them added. No diff falls in the new test body.
   this delta can move it.
 - **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
   `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6845: surface ZoneCounterOverflowActive, which nothing read
+
+- **Timestamp**: 2026-08-26
+- **Action**: Publish `xpf_zone_counters_overflow_active` and consume the flag in
+  `show security zones`.
+- **Why**: `ProcessStatus.ZoneCounterOverflowActive` was decoded by the Go
+  control plane and read by NOTHING — no CLI, no REST, no gRPC, no Prometheus.
+  The Rust helper has 63 assignable per-zone slots and sets the flag when it
+  exhausts them; zones past capacity are never registered, so their traffic is
+  silently uncounted.
+- **This is an observability gap, not a correctness bug, and the distinction
+  matters for how it was fixed**: an overflowed zone is never registered with
+  `ZoneCounterStore`, so it reads `ErrCounterNotPopulated` and every surface
+  renders an explicit "not available". Nothing publishes a false 0. What is
+  missing is the ability to tell WHY — `unpopulated` is three-way ambiguous by
+  construction (pre-#3651 helper / overflow / idle zone), and only the middle
+  case needs action.
+- **Absence semantics are the OPPOSITE of the sibling gauge's, deliberately.**
+  `xpf_zone_counters_unpopulated_zones` is config-derived and emitted ABOVE the
+  dataplane gate so it keeps reporting through a degraded boot. Overflow is a
+  property of the RUNNING helper's slot table: with no helper there is nothing to
+  overflow, so a 0 would be a false all-clear about a machine nothing asked.
+  Emitted from `collectUserspaceStatus`, which returns early on a nil status —
+  absent = "no helper to ask", 0 = "the helper said no overflow".
+- **The CLI fails to the AMBIGUOUS line on any status error.** It replaces a
+  truthful three-cause message with a specific one-cause message, so a wrong
+  `true` would send an operator to reduce their zone count when the real cause
+  might be an idle zone. "Cannot say" must fall back to honest ambiguity.
+- **REST deliberately not carried, and why**: `/security/zones` returns a bare
+  `[]ZoneInfo` with no envelope, so a response-level field means changing an
+  array response to an object — a breaking shape change that deserves its own
+  decision rather than riding in on an observability fix. Per-zone placement was
+  rejected too: the helper does not report WHICH zones lost slots, so a per-zone
+  flag would be an invention.
+- **Test note**: the cells drive `collectUserspaceStatus` (the real entry point,
+  including its nil-status early return that produces the absence contract),
+  not `emitZoneCounterOverflow` — driving the emitter directly would bind the
+  function and miss the gate, which is the wiring half. A PLAIN registry is used
+  because the pedantic one would demand declaring ~70 sibling descriptors by
+  hand; the Describe ⊇ Collect contract stays owned by
+  `metrics_descriptor_coverage_test.go`'s whole-collector canary (#1726),
+  verified still passing.
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_zone.go`,
+  `pkg/api/metrics_userspace.go`, `pkg/cli/cli_show_security_zones.go`,
+  `pkg/api/metrics_zone_overflow_6845_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`

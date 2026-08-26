@@ -117,6 +117,46 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// per_zone_counters_available:false for (pkg/api/security.go zonesHandler),
 	// so the two surfaces cannot drift apart silently; the coherence is pinned
 	// by TestZoneUnpopulatedGaugeMatchesRESTAvailability.
+	// #6845: the one bit that disambiguates xpf_zone_counters_unpopulated_zones.
+	//
+	// That gauge is three-way ambiguous BY CONSTRUCTION — a zone reads
+	// unpopulated when the helper predates the per-zone populate path (#3651),
+	// when the zone OVERFLOWED the helper's 63-slot capacity so its traffic is
+	// genuinely being missed, or when the zone is simply idle and nothing is
+	// wrong at all. The first and third need no action; the second is an
+	// operational problem, and the bit separating them was already on the wire
+	// (ProcessStatus.ZoneCounterOverflowActive, from
+	// userspace-dp/src/afxdp/zone_counters.rs) and thrown away by every Go
+	// surface.
+	//
+	// ABSENCE and 0 mean different things here, deliberately, and differently
+	// from the sibling gauge above. That one is CONFIG-derived and is emitted
+	// above the dataplane gate, so it reads the full configured zone count in a
+	// degraded boot. This one is a property of the RUNNING helper's slot table:
+	// with no helper there is no slot table and no overflow to report, so it is
+	// emitted only on a scrape that actually read a status. Absent = "no helper
+	// to ask"; 0 = "the helper reported no overflow". A hardcoded 0 in the
+	// no-helper case would be a false all-clear.
+	//
+	// Not an error, and it must never touch xpf_counter_read_errors_total: an
+	// overflowed zone degrades to "not known" on every read surface rather than
+	// publishing a false zero, so nothing is misreported. What overflow costs is
+	// the ABILITY TO TELL WHY, which is what this gauge restores.
+	c.zoneCountersOverflowActive = prometheus.NewDesc(
+		"xpf_zone_counters_overflow_active",
+		"1 while the userspace helper's per-zone hot-path counter slot table has "+
+			"overflowed, so some configured security zones are not counted at "+
+			"all and their traffic volume is silently missing. The helper has "+
+			"63 assignable slots (slot 0 reserved of 64) and assigns them in "+
+			"sorted zone-id order, so zones past that capacity are never "+
+			"registered and read as unpopulated. Use with "+
+			"xpf_zone_counters_unpopulated_zones: that gauge cannot say WHY a "+
+			"zone is unpopulated (pre-#3651 helper, overflow, or simply idle), "+
+			"and this one distinguishes the case that needs action. Emitted only "+
+			"when a helper status was read this scrape -- its absence means "+
+			"there was no helper to ask, not that there is no overflow.",
+		nil, nil,
+	)
 	c.zoneCountersUnpopulatedZones = prometheus.NewDesc(
 		"xpf_zone_counters_unpopulated_zones",
 		"Number of configured security zones whose per-zone traffic counters "+
