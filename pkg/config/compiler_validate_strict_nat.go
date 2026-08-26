@@ -2958,6 +2958,55 @@ func validateStaticNATSingleTargetStrict(cfg *Config) error {
 // — never reaches two fields, because the packed branch of compileNATSource /
 // compileNATDestination reads `t.Keys[1]` alone and drops the rest. Those
 // spellings resolve to one field, count one, and commit. Tracked as #7033.
+// natTerminalActionCardinalityOffenders enumerates EVERY NAT rule the strict
+// cardinality gate objects to, in the same sorted-rule-set order
+// validateNATTerminalActionCardinalityStrict walks (#7640).
+//
+// It exists alongside that validator rather than inside it because the two
+// answer different questions. The validator reports the FIRST offender and
+// stops — deliberately, so a commit gets one deterministic, actionable error
+// rather than a wall. A gauge and an operator annotation need ALL of them.
+//
+// Both read the SAME per-rule predicate, natThenTerminalActionCount, which is
+// what keeps them from disagreeing about what "offending" means: a change to
+// the cardinality rule moves both, and TestLenientNATOffendersMatchTheGate_7640
+// binds that agreement rather than trusting it.
+func natTerminalActionCardinalityOffenders(cfg *Config) []LenientNATTerminalActionRule {
+	if cfg == nil {
+		return nil
+	}
+	var out []LenientNATTerminalActionRule
+	collect := func(kind string, rulesets []*NATRuleSet) {
+		sorted := append([]*NATRuleSet(nil), rulesets...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i] == nil || sorted[j] == nil {
+				return sorted[i] != nil
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		for _, rs := range sorted {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule == nil {
+					continue
+				}
+				if n := natThenTerminalActionCount(rule.Then); n != 1 {
+					out = append(out, LenientNATTerminalActionRule{
+						Kind: kind, RuleSet: rs.Name, Rule: rule.Name, Actions: n,
+					})
+				}
+			}
+		}
+	}
+	collect("source", cfg.Security.NAT.Source)
+	if cfg.Security.NAT.Destination != nil {
+		collect("destination", cfg.Security.NAT.Destination.RuleSets)
+	}
+	return out
+}
+
 func natThenTerminalActionCount(then NATThen) int {
 	n := 0
 	if then.Interface {
