@@ -105069,6 +105069,57 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
 
+<<<<<<< HEAD
+## 2026-08-26 — #6803: a management listener that dies is now rebound at the same endpoint
+
+- **Timestamp**: 2026-08-26
+- **Action**: Give the HTTP management leg the liveness question #6827 round 6
+  gave HTTPS, in both places round 6 fixed it for HTTPS, and add the always-on
+  owner that makes either fix reachable without an operator commit.
+- **Why**: an unexpected management-listener serve exit was OBSERVABLE and never
+  RECONCILED. Observable: the leg is marked dead, `EffectiveHTTPAddr` stops
+  reporting it, `show system services` renders the HTTP listener Failed. Never
+  reconciled, for three independent reasons, each of which alone keeps the
+  endpoint down:
+  1. `api.Server.ReconcileHTTP` short-circuited a same-address call on a
+     non-nil pointer rather than on `serving()`. A dead leg stays INSTALLED (it
+     cannot be unlinked without `lifeMu`, which deadlocks a shutdown racing the
+     exit), so the compare matched a corpse and the rebind returned nil having
+     done nothing. `ReconcileHTTPS` has asked `serving()` since #6827 round 6.
+  2. `reconcileTo`'s HTTP arm gated on the converged FINGERPRINT alone. The
+     fingerprint records what the last SUCCESSFUL reconcile bound; it is not
+     evidence the socket is up. The HTTPS arm carries `|| (next.TLS &&
+     !m.srv.HTTPSServing())`; the HTTP arm carried nothing.
+  3. The only caller of `reconcileWebManagement` is `applyConfigLocked`, so even
+     with both gates fixed the endpoint came back only when an operator
+     committed — from a box whose management API had just died.
+- **Shape**: (1) `api.Server.HTTPServing()`, the exact counterpart of
+  `HTTPSServing()`; `ReconcileHTTP`'s no-op now asks it. (2) the HTTP arm fires
+  on `next.Addr != m.cur.addr || (next.Addr != "" && !m.srv.HTTPServing())` —
+  the non-empty guard keeps the change strictly ADDITIVE, because
+  `ReconcileHTTP` refuses an empty bind and the existing #6827 over-reach guard
+  `a_failed_boot_then_an_empty_bind_binds_nothing` pins that direction.
+  (3) `mgmtListenerReassertLoop` in a new `mgmt_listener_reassert.go`, mirroring
+  #6791/#6793/#6802: unconditional in `Run`, 30s, `applySem` before acting
+  (#4001), gate re-checked inside the semaphore.
+- **Gate identity**: the owner's gate is
+  `effectiveHTTPListener().State == StateFailed` — the SAME question `show
+  system services` answers, on purpose. A second private predicate could
+  disagree with the operator view, and then the box either reports a dead
+  listener nothing retries or retries one it reports healthy.
+- **Every cell is PAIRED**, because all three fixes WIDEN a trigger and the
+  over-reach failure is real: a rebind that fires on a healthy leg bounces the
+  management socket on every commit and every 30s tick.
+- **Found while re-deriving, filed separately**: the PRIMARY (loopback) gRPC
+  listener has the same hole — `Run` logs a serve error and the goroutine exits
+  with nothing re-binding — while the FABRIC gRPC listener beside it has had a
+  bounded-backoff supervisor since #5047.
+- **File(s)**: `pkg/api/listener.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`,
+  `pkg/api/reconcile_http_dead_leg_6803_test.go`, `pkg/daemon/README.md`,
+  `pkg/api/README.md`, `_Log.md`
+=======
 ## 2026-08-26 — CLAUDE.md: a Required Reading index
 
 - **Timestamp**: 2026-08-26
@@ -105088,3 +105139,23 @@ prose edit above them added. No diff falls in the new test body.
   with the point that sub-agents inherit the file but not the reasoning, so a
   dispatch brief should name the specific documents its task touches.
 - **File(s)**: `CLAUDE.md`, `_Log.md`
+>>>>>>> origin/master
+
+## 2026-08-26 — #6803 follow-up: dampen the re-assert owner's per-tick logging
+
+- **Timestamp**: 2026-08-26
+- **Action**: Log the management-listener outage Warn on the FIRST tick of a down
+  streak only, Debug thereafter, and re-arm on recovery.
+- **Why**: caught reviewing my own PR. A node whose management bind can never
+  succeed — the address permanently taken by another process — is re-driven
+  every 30s for the life of the daemon, and the original code logged the same
+  Warn every tick: ~2900 identical lines a day, the exact failure the project's
+  logging rules were written after. The sibling `sleepFabricBackoff` (#5047)
+  already states the rule in its own comment: transitions at Info/Warn, ticks at
+  Debug.
+- **The re-arm is the load-bearing half**: a streak flag that never clears trades
+  a noisy journal for a SILENT one, because a later, genuinely new outage would
+  then be logged at Debug and be invisible. It is cleared only on a reconcile
+  that actually brought the listener back, not on one that merely returned nil.
+- **File(s)**: `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`, `_Log.md`
