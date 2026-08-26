@@ -547,13 +547,23 @@ func TestReconcileSudoersReportsUnreadableDir_6798(t *testing.T) {
 // state must retain debt and PREVENT A SUCCESSFUL CLOSEOUT".
 //
 // The nine cells above prove each reconciler RETURNS an error. That is only
-// half the property, because on the normal apply path every one of those
-// returns is deliberately discarded (`_ = d.reconcileAbsentLoginUsers(cfg)` in
-// applyTailReconciles — the #2926 next-boot convergence contract). The single
-// caller that CONSUMES them is the #5874/M35 daemon-stop cancel closeout, which
-// is precisely the moment next-boot convergence does NOT happen. If the error
-// did not reach it, the fix would report into a void at the one site that
-// matters.
+// half the property: a return is not a consequence until something consumes it.
+// There are TWO consumers, and this cell binds the second.
+//
+//   - The apply tail (`applyTailReconciles`, steps 11–13) captures these
+//     returns and joins them into the commit result. That is #6790's doing, not
+//     #6798's — before it, all five were `_ = d.<reconciler>(cfg)` on the #2926
+//     next-boot-convergence argument, and a commit over an unreadable inventory
+//     reported success.
+//   - The #5874/M35 daemon-stop cancel closeout collects them too, and that is
+//     the case where next-boot convergence does NOT happen, because the daemon
+//     is stopping and staying stopped. It is the site R58's invariant is
+//     literally about, and nothing else in this file reaches it.
+//
+// This comment previously said the returns went nowhere on the normal path and
+// that the closeout was the SINGLE consumer. Both were true when written and
+// were falsified by #6790 landing — recorded here because the sentence, not the
+// assertion, is what rots.
 //
 // Only "absent-login-users" is a real reconciler here; the other six owners are
 // clean no-ops, so a green cannot come from some unrelated owner failing — the
@@ -644,6 +654,17 @@ func TestHostAuthCloseoutSurfacesUnreadableInventory_6798(t *testing.T) {
 // applyErrSkipsPeerSync `return false` unconditionally would satisfy the main
 // assertion vacuously — and that mutation is precisely the one that WOULD
 // brick, by pushing a dataplane-disarming config to the standby.
+//
+// Scope, stated precisely rather than as a blanket "credential errors are never
+// fatal": what this pins is the ORDINARY failure shape of an inventory read.
+// #7618 records that exec.CommandContext returns a BARE
+// context.DeadlineExceeded when its context expires before fork/exec, which
+// this same classifier cannot tell from a #2926 daemon-stop abort. That shape
+// is pre-existing and wider than #6798 (nftApplyPayload at 5s and the DNS
+// systemctl calls already reach it), and it cannot arise from what #6798 adds:
+// os.ReadFile / os.ReadDir yield EACCES/EIO/EISDIR/ENOTDIR, never a context
+// error. So this cell deliberately asserts over the inventory-read class only,
+// and does NOT claim the reconcilers can never produce a misclassified error.
 //
 // FAIL-ON-REVERT: this cell reds if applyErrSkipsPeerSync is ever widened to
 // swallow a generic subsystem error (main assertion) or narrowed so a real
