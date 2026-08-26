@@ -463,10 +463,17 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
 // appear. That pair distinguishes "the gate suppresses a working mechanism"
 // from "there is no mechanism".
 //
+// #6860 has since been FIXED, and the second subtest is inverted rather than
+// deleted: the gate now asks has_screen_state() (something to enforce OR
+// something to report) instead of has_profiles() (something to enforce). The
+// recorded gap became the assertion that it is closed, plus a negative control
+// that an EMPTY state still short-circuits -- without which widening the gate to
+// an unconditional true would satisfy everything else here.
+//
 // RED on revert: make the missing-profile None branch drop instead of pass and
-// the first subtest fails; "fix" has_profiles to count missing zones without
-// re-checking this and the second subtest fails, flagging that the recorded gap
-// changed.
+// the first subtest fails; revert the gate to has_profiles() and the #6860
+// subtest fails; widen has_screen_state() to always-true and the negative
+// control fails.
 #[test]
 fn unresolved_screen_profile_zone_continues_to_policy_5806() {
     let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
@@ -560,33 +567,46 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
         "the runtime WARN must fire when the stage actually runs for the zone"
     );
 
-    // The recorded gap: with NO resolved profile anywhere, has_profiles() is
-    // false, stage_screen_check returns before the missing-profile branch, and
-    // the WARN never fires at all.
+    // #6860, FIXED. This subtest recorded the gap and is now inverted.
+    //
+    // With NO resolved profile anywhere -- the exact tolerant-load shape that
+    // strands a reference -- has_profiles() is still false, and that is
+    // correct: it answers "is there anything to ENFORCE?". The stage gate no
+    // longer asks it. It asks has_screen_state(), which is true when there is
+    // something to enforce OR something to REPORT, so the rate-limited runtime
+    // WARN now fires in the one configuration it was written for.
     let mut only_missing = missing_only_screen();
     assert!(
         !only_missing.has_profiles(),
-        "#5806: has_profiles() counts RESOLVED profiles only — an unresolved          reference alone does not arm the screen stage"
+        "has_profiles() counts RESOLVED profiles only — an unresolved reference \
+         alone must not claim there is something to enforce"
+    );
+    assert!(
+        only_missing.has_screen_state(),
+        "#6860: an unresolved reference IS screen state — there is something to \
+         report, which is what the stage gate must now ask about"
     );
     let (continued, warns) = run(&mut only_missing);
     assert!(
         continued,
-        "the short-circuit path must also continue to policy"
+        "the unresolved-reference path must still continue to policy: #6860 makes \
+         the stage RUN, and running it must not start dropping packets a zone \
+         with no enforceable profile should carry"
     );
     assert_eq!(
-        warns, 0,
-        "#6860 GAP (pinned, not fixed here): when every screen definition is \
-         absent — the exact tolerant-load shape that strands a reference — the \
-         has_profiles() short-circuit means the rate-limited runtime WARN cannot \
-         fire at all"
+        warns, 1,
+        "#6860: with every screen definition absent, the runtime WARN must fire. \
+         A zone the operator believes is screened and which screens NOTHING is \
+         exactly the state this warning exists for, and it is reachable only \
+         through the tolerant paths — strict commit rejects a dangling reference"
     );
 
-    // ...and prove that zero is the GATE, not an absent mechanism. Arm
-    // has_profiles() on the SAME state by adding a resolved profile for an
-    // UNRELATED zone; the `lan` reference is untouched. The identical packet now
-    // warns. Delete the missing-profile threading, or make
-    // update_missing_profiles a no-op, and this is 0 too — which is what makes
-    // the assertion above meaningful rather than a restatement of the default.
+    // The gate is the DIFFERENCE, not the mechanism. Arming has_profiles() on
+    // the SAME state -- adding a resolved profile for an UNRELATED zone, `lan`
+    // untouched -- must still warn exactly once. Before #6860 this pair
+    // distinguished "the gate suppresses a working mechanism" from "there is no
+    // mechanism"; it now guards the other direction, that widening the gate did
+    // not double-count.
     let mut armed = FxHashMap::default();
     armed.insert(
         "other".to_string(),
@@ -598,13 +618,32 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
     only_missing.update_profiles(armed);
     assert!(
         only_missing.has_profiles(),
-        "adding a resolved profile must arm the gate"
+        "adding a resolved profile must arm has_profiles()"
     );
     let (_, warns_armed) = run(&mut only_missing);
     assert_eq!(
         warns_armed, 1,
-        "with the gate armed, the SAME unresolved `lan` reference must warn — \
-         otherwise the zero above proves nothing about the threading"
+        "the SAME unresolved `lan` reference must warn exactly once with the \
+         resolved profile present too — one warn per packet, not one per gate"
+    );
+
+    // NEGATIVE CONTROL for the widened gate. An EMPTY state -- nothing resolved,
+    // nothing missing -- must still short-circuit. Without this, widening the
+    // gate to `true` unconditionally would satisfy every assertion above while
+    // running the screen stage for every packet on a box with no screen
+    // configuration at all.
+    let mut empty = ScreenState::new();
+    assert!(
+        !empty.has_screen_state(),
+        "#6860: an empty screen state must NOT arm the stage — the widened gate \
+         must still be false when there is nothing to enforce and nothing to report"
+    );
+    let (continued_empty, warns_empty) = run(&mut empty);
+    assert!(continued_empty, "an empty screen state must continue to policy");
+    assert_eq!(
+        warns_empty, 0,
+        "an empty screen state has no unresolved reference, so there is nothing \
+         to warn about"
     );
 }
 

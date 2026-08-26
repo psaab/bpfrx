@@ -106306,3 +106306,10 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6860 — gate stage_screen_check on has_screen_state so the
+    missing-profile WARN fires when NO screen profile resolves
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_stages_tests.rs, docs/feature-coverage.md
