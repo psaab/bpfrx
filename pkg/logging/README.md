@@ -259,6 +259,47 @@ connectionless and exempt:
   as the schema's wildcard KEY and validates only the severity VALUE, so
   every spelling commits clean.
 
+  **The mapping is documented, not a judgement call (#6830).** Junos
+  publishes the facility→wire table for messages directed to a remote
+  destination, in two rules that together cover the whole `[edit system
+  syslog]` vocabulary: *Table 3, Default Facilities for Messages Directed to
+  a Remote Destination* lists the six Junos-SPECIFIC names with a `localX`
+  stand-in, and *"for facilities that are not listed, the default alternative
+  name is the same as the local facility name"* covers the rest.
+
+  | Junos name | Junos wire facility | this box emits today | |
+  |---|---|---|---|
+  | `change-log` | `local6` | `local6` | ✅ |
+  | `daemon` | `daemon` | `daemon` | ✅ |
+  | `user` | `user` | `user` | ✅ |
+  | `authorization` | `auth` | `local0` | ❌ |
+  | `conflict-log` | `local5` | `local0` | ❌ |
+  | `dfc` | `local1` | `local0` | ❌ |
+  | `firewall` | `local3` | `local0` | ❌ |
+  | `ftp` | `ftp` | `local0` | ❌ |
+  | `interactive-commands` | `local7` | `local0` | ❌ |
+  | `kernel` | `kern` | `local0` | ❌ |
+  | `ntp` | `ntp` | `local0` | ❌ |
+  | `pfe` | `local4` | `local0` | ❌ |
+
+  The repository already implemented **one row** of that table — `change-log`
+  → `local6` in `ParseFacility` is exactly Table 3's value. The table was
+  consulted once and never finished. So #6830's first question ("the mapping
+  itself, per unmapped Junos name") is a **lookup**: every name in the
+  vocabulary has a documented answer, including the three the issue flags as
+  possibly having none (`interactive-commands`, `conflict-log`, `pfe` — all
+  three are Table 3 rows).
+
+  `JunosRemoteFacility` and `FacilityMisfiled` carry that table and report the
+  gap. **They are NOT wired into the emit path**: for a name that is silently
+  `local0` today, emitting the documented facility MOVES records for any
+  collector already bucketing them there, which is an upgrade-visible contract
+  change and the one part of #6830 that is a genuine decision. What they do
+  change is the diagnostic — it can now name the target facility, so an
+  operator is told *what Junos would send* rather than only that something was
+  substituted, and a real Junos name is distinguished from a typo (those need
+  opposite operator actions).
+
   As of #6829 ALL THREE `ParseFacility` call sites that install a client use
   the checked form and warn: `applySystemSyslog` (host streams), the
   security/audit stream wiring in `daemon_system.go`, and the CLI commit

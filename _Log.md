@@ -1,3 +1,93 @@
+## 2026-08-26 — #6830 round 2: `ntp` was an INVENTED row, and it was on the wire
+
+- **Timestamp**: 2026-08-26
+- **Action**: Reviewing the commit that wired the mapping into `ParseFacility`, I
+  found a defect in MY OWN table from round 1. `ntp` is not a configurable Junos
+  `[edit system syslog]` facility. Table 2 ("Facility Codes Reported in Priority
+  Information") carries the NTP code with NO Junos facility name against it, and
+  the documented rule is that a code whose second column is empty "cannot be
+  included in a statement at the [edit system syslog] hierarchy level".
+  I had taken `ntp` from a PROSE SUMMARY of the vocabulary; the authoritative
+  table excludes it. The two sources conflict on exactly one name, and that name
+  is the one I could not substantiate — so xpf was inventing a wire facility for
+  a name Junos itself rejects, which is the "picked by implementation
+  convenience" #6830 exists to avoid. Removed the row; `ntp` falls through to
+  local0 and the unmapped diagnostic, which is the correct handling for a name
+  with no documented wire facility. `FacilityNTP` stays (RFC 5424 assigns 12 to
+  the NTP subsystem — a real code we are simply not entitled to map to).
+  WHY MY OWN TEST DID NOT CATCH IT: `TestJunosRemoteFacilityMatchesTheDocumented
+  Table6830` asserts no-invented-rows against an independent TRANSCRIPTION — but
+  I transcribed it from the same prose I derived the production map from. The
+  "read the map you are checking pins nothing" failure, one level up, at the
+  documentation. Independence of the transcription is necessary and not
+  sufficient; the SOURCE has to be the authoritative one.
+  Also corrected a false claim in the round-1 unmapped-corpus comment: `security`,
+  `external` and `dcd` are described there as "valid Junos configuration with no
+  documented wire facility". Verified against the documentation — `security`
+  names a different hierarchy (`[edit security log]`), and `external`/`dcd` do
+  not appear in the configurable set at all. They are names Junos does not
+  accept here, which is why local0 is right for them, but the stated reason
+  would have licensed a future reader to invent mappings.
+  Hardened the anti-vacuity floor while I was there: it was the literal `12`,
+  which is a second place the table's size lives, so removing a row reds the
+  cell for the wrong reason and the obvious repair is to edit the number. Floor
+  and name list are now DERIVED from the independent transcription.
+- **File(s)**: `pkg/logging/syslog.go`,
+  `pkg/logging/junos_facility_mapping_6830_test.go`,
+  `pkg/logging/parse_facility_checked_5797_test.go`, `_Log.md`
+- **Validation**: full `pkg/logging`, `pkg/daemon` and `pkg/cli` green; repo-wide
+  gate re-run at the corrected head.
+
+## 2026-08-26 — #6830: the Junos facility mapping is a documented lookup, not a judgement
+
+- **Timestamp**: 2026-08-26
+- **Action**: #6830 asks which facility each unmapped Junos name should carry,
+  flagging `interactive-commands`, `conflict-log` and `pfe` as possibly having
+  no sensible BSD equivalent. They do have one: Junos publishes the table.
+  Verified against Juniper's documentation rather than recalled — *Table 3,
+  Default Facilities for Messages Directed to a Remote Destination*
+  (change-log->local6, conflict-log->local5, dfc->local1, firewall->local3,
+  interactive-commands->local7, pfe->local4) plus "for facilities that are not
+  listed, the default alternative name is the same as the local facility name"
+  (authorization->auth, daemon, ftp, kernel->kern, ntp, user). Together those
+  two rules cover the entire `[edit system syslog]` vocabulary, so the first of
+  the issue's three questions is a LOOKUP with zero judgement left in it.
+  The repo had already implemented ONE row — `change-log` -> local6 in
+  ParseFacility is exactly Table 3's value — so the table was consulted once
+  and never finished. 9 of the 13 names are wrong today.
+  Sharpest edge: Junos writes `authorization` and `kernel`; ParseFacility
+  recognizes the BSD spellings `auth`/`kern`. An operator configuring this box
+  as the Junos clone it is gets local0 for authentication and kernel records,
+  the two buckets a security collector is most likely watching.
+  Also established that only ONE surface is exposed: `security log stream ...
+  facility` IS enum-validated against exactly the recognized set, so no
+  substitution is reachable there. `system syslog <dest> <facility> <severity>`
+  models the facility as the schema's wildcard KEY with no keyValidator (only
+  the severity VALUE is validated), so every spelling commits clean. That is
+  the whole reachable surface.
+  Shipped the DECISION-NEUTRAL half: the table as data
+  (`JunosRemoteFacility`/`FacilityMisfiled`), NOT wired into the emit path, and
+  a diagnostic that now names the target facility and distinguishes a real
+  Junos name this box misfiles from a name in neither vocabulary. Those need
+  opposite operator actions, and conflating them sent an operator looking for a
+  typo when they had a mapping gap, or vice versa. The wire is unchanged: what
+  leaves the box for a name that is silently local0 today is the one part that
+  is a genuine contract decision (#6830 Q3), and it stays open.
+- **File(s)**: `pkg/logging/syslog.go`,
+  `pkg/logging/junos_facility_mapping_6830_test.go` (new),
+  `pkg/logging/README.md`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`, `_Log.md`
+- **Validation**: the documented table is transcribed INDEPENDENTLY in the test
+  rather than read from the production map — a test that reads the map it
+  checks pins nothing — and asserts both directions (no missing row, no
+  invented row). `TestFacilityMisfiledIdentifiesTodaysGap6830` is deliberately
+  written to go RED the day the emit path applies the mapping, with a failure
+  message saying to update it in the SAME commit, so the contract flip is a
+  deliberate edit rather than a silent divergence. The pre-existing #5797/#6829
+  cells pinned the literal "unmapped facility name"; they MOVED with the code
+  to "warned, named the facility, and classified it correctly", which is
+  strictly stronger than the literal they replaced.
+
 ## 2026-08-26 — #7640: a leniently-admitted malformed NAT rule is now visible
 
 - **Timestamp**: 2026-08-26
@@ -106385,3 +106475,11 @@ prose edit above them added. No diff falls in the new test body.
     pkg/daemon/syslog_gate_render_agreement_6844_test.go (new),
     pkg/configstore/syslog_facility_lenient_6844_test.go (new),
     pkg/daemon/syslog_selector_render_5797_test.go, docs/config-schema.md
+  - **Action**: #6830 takeover — take the contract decision and wire the
+    documented Junos facility table into the emit path; invert the tripwires
+  - **File(s)**: pkg/logging/syslog.go,
+    pkg/logging/junos_facility_mapping_6830_test.go,
+    pkg/logging/parse_facility_checked_5797_test.go,
+    pkg/daemon/daemon_system.go,
+    pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/cli/syslog_facility_checked_6829_test.go
