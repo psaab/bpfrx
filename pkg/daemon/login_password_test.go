@@ -8,6 +8,40 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// ownedMarker/ownedAccount/ownedPassword/ownedKey adapt the #6798 (bool, error)
+// marker readers for tests that assert ownership in a boolean context.
+//
+// They deliberately FAIL the test on a read error instead of returning false.
+// Every one of these call sites is asserting a DETERMINATION — "the marker is
+// genuinely absent" or "the marker is genuinely ours" — and a reader that
+// silently reported an unreadable marker as `false` is precisely the collapse
+// #6798 closes. A test helper that repeated it would let a fixture whose marker
+// root became unreadable pass while proving nothing.
+func ownedMarker(t *testing.T, dir, name string, curUID int) bool {
+	t.Helper()
+	owned, err := readProvenanceMarker(dir, name, curUID)
+	if err != nil {
+		t.Fatalf("readProvenanceMarker(%s, %s, %d): unexpected read error, so "+
+			"this assertion proves nothing: %v", dir, name, curUID, err)
+	}
+	return owned
+}
+
+func ownedAccount(t *testing.T, name string, curUID int) bool {
+	t.Helper()
+	return ownedMarker(t, provisionedUsersDir, name, curUID)
+}
+
+func ownedPassword(t *testing.T, name string, curUID int) bool {
+	t.Helper()
+	return ownedMarker(t, provisionedPasswordsDir(), name, curUID)
+}
+
+func ownedKey(t *testing.T, name string, curUID int) bool {
+	t.Helper()
+	return ownedMarker(t, provisionedKeysDir(), name, curUID)
+}
+
 // TestPasswordAction is the central #1944 safety-invariant table test
 // (§7.6): fail-OPEN toward applying a real password, fail-CLOSED (noop) on
 // a read error in the lock branch so a transient /etc/shadow read failure
@@ -71,16 +105,16 @@ func TestProvenanceMarkerUIDKeyed(t *testing.T) {
 	t.Cleanup(func() { provisionedUsersDir = old })
 
 	// No marker → not provisioned.
-	if xpfProvisioned("op", 1001) {
-		t.Error("xpfProvisioned with no marker = true, want false")
+	if ownedAccount(t, "op", 1001) {
+		t.Error("account marker with no marker = true, want false")
 	}
 
 	// markProvisioned then matching UID → provisioned.
 	if err := markProvisioned("op", 1001); err != nil {
 		t.Fatalf("markProvisioned: %v", err)
 	}
-	if !xpfProvisioned("op", 1001) {
-		t.Error("xpfProvisioned(op,1001) = false after mark, want true")
+	if !ownedAccount(t, "op", 1001) {
+		t.Error("account marker for (op,1001) = false after mark, want true")
 	}
 
 	// Re-mark with same UID then UID mismatch (out-of-band recreate with a
@@ -88,8 +122,8 @@ func TestProvenanceMarkerUIDKeyed(t *testing.T) {
 	if err := markProvisioned("op", 1001); err != nil {
 		t.Fatalf("markProvisioned: %v", err)
 	}
-	if xpfProvisioned("op", 2002) {
-		t.Error("xpfProvisioned(op,2002) on UID mismatch = true, want false")
+	if ownedAccount(t, "op", 2002) {
+		t.Error("account marker for (op,2002) on UID mismatch = true, want false")
 	}
 	if _, err := os.Stat(markerPath("op")); !os.IsNotExist(err) {
 		t.Error("stale marker not removed on UID mismatch")
@@ -99,16 +133,16 @@ func TestProvenanceMarkerUIDKeyed(t *testing.T) {
 	if err := markProvisioned("op", 1001); err != nil {
 		t.Fatalf("markProvisioned: %v", err)
 	}
-	if !xpfProvisioned("op", 1001) {
-		t.Error("xpfProvisioned(op,1001) on rejoin = false, want true")
+	if !ownedAccount(t, "op", 1001) {
+		t.Error("account marker for (op,1001) on rejoin = false, want true")
 	}
 
 	// Corrupt marker → not provisioned, cleaned.
 	if err := os.WriteFile(markerPath("op"), []byte("not-a-number"), 0o600); err != nil {
 		t.Fatalf("write corrupt marker: %v", err)
 	}
-	if xpfProvisioned("op", 1001) {
-		t.Error("xpfProvisioned with corrupt marker = true, want false")
+	if ownedAccount(t, "op", 1001) {
+		t.Error("account marker with corrupt marker = true, want false")
 	}
 	if _, err := os.Stat(markerPath("op")); !os.IsNotExist(err) {
 		t.Error("corrupt marker not removed")
