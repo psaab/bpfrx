@@ -121,29 +121,27 @@ func TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives(t *testing.T) {
 	m := New()
 	out := m.generateConfig(cfg)
 
-	// Healthy tunnel: connection block present, with a non-empty Phase-1
-	// proposals line carrying the configured crypto. Match the four-space-
-	// indented connection-level "\n    proposals = aes256" specifically:
-	// a bare substring "proposals = aes256" would FALSE-PASS off the child
-	// "        esp_proposals = aes256..." line even if the Phase-1
-	// "    proposals = " line were missing (mirror of the negative guard in
-	// TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine).
-	if !strings.Contains(out, "tun-good {") {
-		t.Errorf("healthy tunnel tun-good missing from render:\n%s", out)
-	}
-	if !strings.Contains(out, "\n    proposals = aes256") {
-		t.Errorf("healthy tunnel missing a non-empty Phase-1 proposals line:\n%s", out)
+	doc := parseSwanctlDoc(t, out)
+
+	// Healthy tunnel: connection section present, with a non-empty Phase-1
+	// proposals line carrying the configured crypto.
+	//
+	// #6824: this previously had to match the four-space-indented
+	// "\n    proposals = aes256" to avoid FALSE-PASSING off the child
+	// "        esp_proposals = aes256..." line -- an assertion about
+	// INDENTATION standing in for one about nesting. Reading the setting at
+	// connections.tun-good states it directly, and the child section's
+	// esp_proposals cannot satisfy it at any indentation.
+	good := doc.at(t, "connections", "tun-good")
+	if p := good.setting(t, "proposals"); !strings.HasPrefix(p, "aes256") {
+		t.Errorf("connections.tun-good.proposals = %q, want it to carry aes256", p)
 	}
 
-	// Broken tunnel: connection block must NOT be emitted (no proposal-less
+	// Broken tunnel: connection section must NOT be emitted (no proposal-less
 	// connection that would negotiate with strongSwan defaults).
-	if strings.Contains(out, "tun-bad {") {
-		t.Errorf("broken-chain tunnel tun-bad was rendered; it must be skipped:\n%s", out)
-	}
+	doc.at(t, "connections").hasNoChild(t, "tun-bad")
 	// And its secret must not be orphaned in the secrets block.
-	if strings.Contains(out, "ike-tun-bad {") {
-		t.Errorf("broken-chain tunnel tun-bad secret was emitted; must be skipped:\n%s", out)
-	}
+	doc.at(t, "secrets").hasNoChild(t, "ike-tun-bad")
 }
 
 // A no-policy gateway renders a normal connection WITHOUT a proposals line
@@ -159,13 +157,25 @@ func TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine(t *testing.T) {
 	}
 	m := New()
 	out := m.generateConfig(cfg)
-	if !strings.Contains(out, "tun1 {") {
-		t.Errorf("no-policy tunnel tun1 missing from render:\n%s", out)
+	conn := parseSwanctlDoc(t, out).at(t, "connections", "tun1")
+	// The IKE-level (Phase 1) proposals line is intentionally absent.
+	//
+	// #6824: the guard used to be spelled as the four-space-indented
+	// "\n    proposals = " to keep it from matching the child section's
+	// "        esp_proposals = " line. Asking whether THIS section declares
+	// the key removes the dependence on the renderer's indentation, and stays
+	// correct if the indent ever changes.
+	conn.hasNoSetting(t, "proposals")
+	// The child SA still carries its own esp_proposals; the absence above is
+	// about Phase 1 only, and this pins that the two are not confused.
+	//
+	// `len(conn.children) == 0` was VACUOUS here: conn.children holds local,
+	// remote AND children, so it is non-empty even when the children{} block
+	// carries no child SA at all, and stays non-empty if that block disappears.
+	// The claim is about the child SAs, so resolve children{} and count THOSE.
+	kids := conn.at(t, "children")
+	if len(kids.order) == 0 {
+		t.Errorf("no-policy tunnel rendered a children{} block with no child SA:\n%s", kids)
 	}
-	// The IKE-level (Phase 1) proposals line is intentionally absent. Guard
-	// against the connection-level "    proposals = " (four-space indent),
-	// distinct from the child "        esp_proposals = " line.
-	if strings.Contains(out, "\n    proposals = ") {
-		t.Errorf("no-policy tunnel must not emit an IKE proposals line:\n%s", out)
-	}
+	kids.at(t, kids.order[0]).setting(t, "esp_proposals")
 }
