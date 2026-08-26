@@ -80,13 +80,26 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			case "source-address":
 				stream.SourceAddress = nodeVal(prop)
 			case "transport":
-				// #6821: packedBodyChildren, not prop.Children. The compact
-				// spelling `transport tls-profile secure-logs;` puts the value
-				// on this stanza's own Keys, so a Children-only loop ran zero
-				// times and the stream shipped audit records over an
-				// unprotected transport with no error and no warning.
-				for _, tc := range packedBodyChildren(prop,
-					schemaForPath("security", "log", "stream", "transport")) {
+				// Children-only, deliberately, unlike the #6818 sibling.
+				//
+				// #6821 asks for the compact `transport protocol tls;` spelling
+				// to compile. It must NOT until the strict gate validates a
+				// container's packed tail, because today it does not: the block
+				// spelling `transport { protocol tpc; }` is rejected by the
+				// enum, and the compact `transport protocol tpc;` is ACCEPTED
+				// -- the walker ignores leftover Keys on a container by design
+				// (compiler-faithful: the compiler did not read them either).
+				// Compiling them here without teaching the gate to validate
+				// them turns "not compiled" into "compiled, unvalidated", and
+				// the daemon then silently omits the stream. For a compact
+				// `tls-profile` it is worse: the block spelling is REJECTED at
+				// commit (#3350, no profile resolution exists), and compiling
+				// the compact one walks straight past that rejection into a
+				// stream that ignores the named profile.
+				//
+				// The gate and the compiler have to move together here. Tracked
+				// separately; see the #6821 note in docs/config-schema.md.
+				for _, tc := range prop.Children {
 					switch tc.Name() {
 					case "protocol":
 						stream.Transport.Protocol = nodeVal(tc)

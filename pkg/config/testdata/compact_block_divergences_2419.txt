@@ -127,6 +127,8 @@ security ipsec vpn xpfarg vpn-monitor source-interface
 security log format
 security log mode
 security log source-interface
+security log stream xpfarg transport protocol
+security log stream xpfarg transport tls-profile
 security nat destination pool
 security nat destination rule-set xpfarg rule xpfarg match application
 security nat destination rule-set xpfarg rule xpfarg match destination-address

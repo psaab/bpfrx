@@ -181,7 +181,6 @@ const inventoryPath = "testdata/compact_block_divergences_2419.txt"
 // control with both directions can tell the two apart.
 var filedFixed = map[string]string{
 	"protocols ospf area xpfarg interface xpfarg authentication simple-password":         "#6818",
-	"security log stream xpfarg transport tls-profile":                                   "#6821",
 	"snmp v3 usm local-engine user xpfarg authentication-sha256 authentication-password": "#6822",
 }
 
@@ -205,6 +204,16 @@ var filedFixed = map[string]string{
 // longer exists: it is neither silent (commit names it, load warns) nor
 // accidental.
 var filedByDesign = map[string]string{
+	// #6821 is filed and REAL, but compiling the compact spelling is blocked on
+	// the strict gate learning to validate a container's packed tail. Today the
+	// block spelling `transport { protocol tpc; }` is rejected by the enum and
+	// the compact `transport protocol tpc;` is accepted, so compiling the
+	// compact form would turn "not compiled" into "compiled, unvalidated" --
+	// and for `tls-profile` it would walk past the deliberate #3350 commit
+	// rejection into a stream that silently ignores the named profile.
+	"security log stream xpfarg transport protocol":    "#6821 -> blocked on packed-tail validation",
+	"security log stream xpfarg transport tls-profile": "#6821 -> blocked on packed-tail validation",
+
 	"system login user xpfarg authentication encrypted-password": "#6817 -> resolved by #6662",
 	"system login user xpfarg authentication ssh-ed25519":        "#6817 -> resolved by #6662",
 	"system login user xpfarg authentication ssh-rsa":            "#6817 -> resolved by #6662",
@@ -235,19 +244,32 @@ type censusResult struct {
 	divergent []string
 	checked   int
 	skipped   map[string]int
+	// state records the outcome for EVERY site the census considered:
+	// "equivalent", "divergent", or a skip reason.
+	//
+	// Without it, "not in the divergent set" conflates three different things
+	// -- the site was equivalent, the site was skipped, or the site does not
+	// exist under that spelling at all. The filedFixed control asserted only
+	// absence from the divergent set, so an anchor whose fixture stopped
+	// PARSING, or whose key was quietly misspelled, passed as "fixed". That is
+	// a check failing to a value indistinguishable from healthy.
+	state map[string]string
 }
 
 func runCompactBlockCensus(t *testing.T) censusResult {
 	t.Helper()
-	res := censusResult{skipped: map[string]int{}}
+	res := censusResult{skipped: map[string]int{}, state: map[string]string{}}
 	for _, s := range collectCompactSites() {
+		siteKey := strings.Join(s.container, " ") + " " + s.leaf
 		if len(s.container) > 0 && strings.HasPrefix(s.container[0], "groups") {
 			res.skipped["under groups (schema re-host, duplicate coverage)"]++
+			res.state[siteKey] = "skipped: under groups"
 			continue
 		}
 		v1, v2, ok := synthPair(s.node)
 		if !ok {
 			res.skipped["no two distinct synthesizable values"]++
+			res.state[siteKey] = "skipped: no two distinct synthesizable values"
 			continue
 		}
 		parent := s.container[:len(s.container)-1]
@@ -260,6 +282,7 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		cb1, cb2, cc := compileText(t, blockV1), compileText(t, blockV2), compileText(t, compact)
 		if cb1 == nil || cb2 == nil || cc == nil {
 			res.skipped["a spelling did not parse or compile"]++
+			res.state[siteKey] = "skipped: a spelling did not parse or compile"
 			continue
 		}
 		// VACUITY GUARD. If changing the VALUE does not change the compiled
@@ -269,11 +292,15 @@ func runCompactBlockCensus(t *testing.T) censusResult {
 		// UNRULED candidate, not a clean site.
 		if cfgEqual(cb1, cb2) {
 			res.skipped["leaf value not observable in the typed config"]++
+			res.state[siteKey] = "skipped: leaf value not observable"
 			continue
 		}
 		res.checked++
 		if !cfgEqual(cb1, cc) {
-			res.divergent = append(res.divergent, strings.Join(s.container, " ")+" "+s.leaf)
+			res.divergent = append(res.divergent, siteKey)
+			res.state[siteKey] = "divergent"
+		} else {
+			res.state[siteKey] = "equivalent"
 		}
 	}
 	sort.Strings(res.divergent)
@@ -360,8 +387,8 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 	// noticing is not a control. These are minimums, not exact counts, so
 	// adding an anchor never needs a second edit here -- but draining one out
 	// does.
-	if len(filedFixed) < 3 {
-		t.Errorf("filedFixed holds %d anchors, want at least 3 (#6818, #6821, #6822). "+
+	if len(filedFixed) < 2 {
+		t.Errorf("filedFixed holds %d anchors, want at least 2 (#6818, #6822). "+
 			"An entry was removed, and the site it named is no longer checked in "+
 			"either direction.", len(filedFixed))
 	}
@@ -370,9 +397,10 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 			"compiler files. With fewer, a fault confined to one file can silence "+
 			"the whole known-true half of the control.", len(filedStillOpen))
 	}
-	if len(filedByDesign) < 4 {
-		t.Errorf("filedByDesign holds %d entries, want at least 4 (the `system login "+
-			"user ... authentication` leaves). A dropped entry turns a deliberate "+
+	if len(filedByDesign) < 6 {
+		t.Errorf("filedByDesign holds %d entries, want at least 6 (four `system login "+
+			"user ... authentication` leaves plus the two #6821 transport leaves). "+
+			"A dropped entry turns a deliberate "+
 			"divergence back into an ordinary inventory line, which is exactly the "+
 			"confusion this category exists to prevent.", len(filedByDesign))
 	}
@@ -383,6 +411,11 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 	// that has silently started reporting every site as divergent (or as clean).
 	// Anchoring known-FIXED and known-OPEN sites separately does.
 	for site, issue := range filedStillOpen {
+		if got := res.state[site]; got != "divergent" && got != "" {
+			t.Errorf("#2419 POSITIVE CONTROL: %s (%s) is %s. A known-true anchor that "+
+				"drifted into a skip bucket stops proving anything while still not "+
+				"appearing as a failure.", site, issue, got)
+		}
 		if !inGot[site] {
 			t.Errorf("#2419 POSITIVE CONTROL: the instrument no longer finds %s (%s), "+
 				"a site verified BY HAND to be compact-blind at this commit. An "+
@@ -391,11 +424,27 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 		}
 	}
 	for site, issue := range filedFixed {
-		if inGot[site] {
+		// Require the state to be OBSERVED as equivalent. Asserting only
+		// "absent from the divergent set" let an anchor pass by being SKIPPED
+		// (a fixture that stopped parsing, a value that stopped being
+		// observable) or by not existing at all — a misspelled key is absent
+		// from every set, so the size floors alone do not catch it either.
+		switch got := res.state[site]; got {
+		case "equivalent":
+		case "divergent":
 			t.Errorf("#2419 POSITIVE CONTROL: the instrument reports %s (%s) as still "+
 				"compact-blind, but it was FIXED. Either the fix regressed, or the "+
 				"instrument has started calling everything divergent — which would make "+
 				"the inventory comparison above pass for the wrong reason.", site, issue)
+		case "":
+			t.Errorf("#2419 POSITIVE CONTROL: %s (%s) was never CONSIDERED by the census. "+
+				"The anchor key does not name a real site — it is absent from the "+
+				"divergent set for the wrong reason, and would have passed as 'fixed'.",
+				site, issue)
+		default:
+			t.Errorf("#2419 POSITIVE CONTROL: %s (%s) was %s, not evaluated. A skipped "+
+				"site is UNRULED, not fixed; passing it as fixed is exactly the check "+
+				"that fails to a value indistinguishable from healthy.", site, issue, got)
 		}
 	}
 	// Deliberate divergences must STAY divergent. This is not a duplicate of the

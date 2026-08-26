@@ -35,15 +35,35 @@ discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
 **Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
 `node.Children` directly** when compiling a stanza that accepts a packed body.
 
-Three further instances were fixed this way (#6818, #6821, #6822), and all three
-failed in the security-relevant direction with **zero warnings on the strict
-commit path**:
+Two further instances were fixed this way (#6818, #6822), both failing in the
+security-relevant direction with **zero warnings on the strict commit path**:
 
 | issue | stanza | what the compact spelling dropped |
 |---|---|---|
 | #6818 | `protocols ospf area <a> interface <i> authentication` | `AuthType`/`AuthKey` — the adjacency forms UNAUTHENTICATED |
-| #6821 | `security log stream <s> transport` | `protocol tls` — audit records ship over plain transport |
 | #6822 | `snmp v3 usm local-engine user <u> authentication-* / privacy-*` | the passwords, while the PROTOCOL still set — the user is registered as requiring SHA-256 and AES-128 with empty credentials |
+
+**A packed tail and a nested block can appear on ONE node**, contrary to what
+`packedBodyChildren`'s comment used to claim. `authentication md5 7 { key "x"; }`
+parses as `Keys=["authentication","md5","7"]` with `Children=[["key","x"]]`.
+Returning the two as SIBLINGS is wrong in the silent direction: OSPF compiled
+`AuthType=md5` with an **empty key**. They spell one path, so the nested block is
+now attached UNDER the deepest packed node.
+
+**#6821 is deliberately NOT fixed here, and the reason generalises.** The strict
+gate ignores leftover `Keys` on a container by design — compiler-faithful, since
+the compiler did not read them either. That equivalence breaks the moment a
+compiler starts reading them. Today `transport { protocol tpc; }` is rejected by
+the enum and `transport protocol tpc;` is **accepted**; compiling the compact
+form without teaching the gate to validate it turns "not compiled" into
+"compiled, unvalidated", and the daemon then silently omits the stream. For
+`tls-profile` it is worse: the block spelling is rejected at commit (#3350, no
+profile resolution exists) and the compact one would walk straight past that.
+
+So the rule is: **a compiler may only start reading a packed tail at a site
+where the gate validates the same expansion.** #6818's leaves have no enum to
+bypass (a bogus child is inert in both spellings today), which is why that one
+lands and #6821 does not.
 
 #6822 is the one that does not use `packedBodyChildren`: its protocol comes from
 the reader's `case` label rather than from a value, so the reader needs the whole
@@ -58,7 +78,14 @@ path it warns and leaves the stanza inert so a peer-synced config behaves exactl
 as the binary that accepted it behaved (#1960). Compiling it there would change
 RBAC across an HA sync between nodes on different binaries. The #2419 inventory
 records this in a `filedByDesign` category so the entry is not mistaken for one
-awaiting a fix.
+awaiting a fix. #6821's two leaves sit in the same category with their own
+reason: filed and real, blocked on packed-tail validation.
+
+A group applying a stanza in the compact spelling over an existing same-name
+peer drops the group's value (#7648). That is a property of the group merge
+rather than of any compiler, and it predates these fixes — but #6822 changes its
+consequence for SNMPv3 from "nothing configured" to "authentication selected
+without a key".
 
 ### Why it is schema-driven
 

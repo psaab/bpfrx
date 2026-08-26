@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// compact_leaf_credentials_test.go -- #6818 / #6821 / #6822.
+// compact_leaf_credentials_test.go -- #6818 / #6822.
 //
 // Three instances of the #2419 dual-AST-shape class, each a SILENT downgrade of
 // a security control. In every case the block spelling compiled correctly and
@@ -110,32 +110,6 @@ func TestOSPFInterfaceMD5CompactSpelling_6818(t *testing.T) {
 	}
 }
 
-// TestSecurityLogTransportCompactSpelling_6821 pins that a security-log
-// stream's TLS profile survives the compact spelling.
-//
-// With TLSProfile empty the stream ships audit records over an unprotected
-// transport. The operator configured TLS; the box did not use it; nothing said
-// so.
-func TestSecurityLogTransportCompactSpelling_6821(t *testing.T) {
-	// The leaf under test is `protocol`, not `tls-profile`. tls-profile is
-	// already rejected at commit on its own grounds -- xpf has no TLS profile
-	// definition to resolve the name against, so the stanza is fail-closed
-	// before this class ever applies. `protocol` strict-compiles with ZERO
-	// warnings and is where the silent drop actually lived.
-	compact, block := compileBothSpellings(t,
-		`security { log { mode stream; stream audit { host 192.0.2.10; transport protocol tls; } } }`,
-		`security { log { mode stream; stream audit { host 192.0.2.10; transport { protocol tls; } } } }`)
-
-	for name, cfg := range map[string]*Config{"compact": compact, "block": block} {
-		st := secLogStream6821(t, cfg, "audit", name)
-		if st.Transport.Protocol != "tls" {
-			t.Errorf("%s spelling: Transport.Protocol = %q, want \"tls\" -- the stream "+
-				"falls back to plain transport and ships audit records unprotected",
-				name, st.Transport.Protocol)
-		}
-	}
-}
-
 // TestSNMPv3CredentialCompactSpelling_6822 pins that an SNMPv3 user's auth and
 // privacy passwords survive the compact spelling.
 //
@@ -219,12 +193,3 @@ func ospfIface6818(t *testing.T, cfg *Config, spelling string) *OSPFInterface {
 }
 
 // secLogStream6821 resolves a security-log stream by name.
-func secLogStream6821(t *testing.T, cfg *Config, name, spelling string) *SyslogStream {
-	t.Helper()
-	st := cfg.Security.Log.Streams[name]
-	if st == nil {
-		t.Fatalf("%s spelling: security-log stream %q missing entirely (streams: %d)",
-			spelling, name, len(cfg.Security.Log.Streams))
-	}
-	return st
-}

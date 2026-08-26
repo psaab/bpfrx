@@ -1816,8 +1816,26 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 			// so the reader below needs the whole key run, not a rebuilt child
 			// tree -- and parseSNMPv3UserKeys already consumes exactly that run.
 			if len(prop.Keys) >= 3 {
-				parseSNMPv3UserKeys(prop.Keys, user)
-				continue
+				// Route ONLY the exact credential shape, and do NOT skip the
+				// switch below.
+				//
+				// `len(Keys) >= 3` alone is not a discriminator: extra container
+				// keys survive schema walking, so
+				//   authentication-sha256 ignored ignored { authentication-password "good"; }
+				// matched it, parseSNMPv3UserKeys recognised SHA-256 but not
+				// `ignored`, left the password empty, and an unconditional
+				// `continue` then skipped the real password CHILD the switch
+				// would have compiled. That registers the user as requiring
+				// SHA-256 with an EMPTY credential -- which is the #6822 defect
+				// itself, reintroduced on a different shape.
+				//
+				// Falling through also fixes the precedence: a node can carry a
+				// packed tail AND a real child, and the child is the canonical
+				// block spelling, so it must win.
+				switch prop.Keys[1] {
+				case "authentication-password", "privacy-password":
+					parseSNMPv3UserKeys(prop.Keys, user)
+				}
 			}
 			switch prop.Name() {
 			case "authentication-md5":

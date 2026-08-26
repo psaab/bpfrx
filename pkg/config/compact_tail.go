@@ -125,14 +125,26 @@ func packedBodyChildren(node *Node, schema *schemaNode) []*Node {
 		cur = refined
 	}
 
-	// A packed body and a nested body are alternative spellings, not additive,
-	// so a node carrying both is not something the parser produces. Append
-	// rather than replace anyway: dropping real children would be a silent
-	// loss, which is the very failure this helper exists to end.
 	if len(node.Children) == 0 {
 		return []*Node{head}
 	}
-	return append(append([]*Node(nil), node.Children...), head)
+	// The parser DOES produce both, contrary to what this comment used to
+	// claim. `authentication md5 7 { key "secret"; }` parses as
+	// Keys=["authentication","md5","7"] with Children=[Keys=["key","secret"]] --
+	// a packed tail AND a nested block on one node.
+	//
+	// Returning them as SIBLINGS is wrong, and wrong in the silent direction.
+	// The two halves spell ONE path: `authentication { md5 7 { key "secret" } }`.
+	// Side by side, the caller sees an md5 node with no key and a stray `key`
+	// node at the wrong level -- OSPF compiled AuthType=md5 with an EMPTY key,
+	// and `transport protocol tcp { protocol tls; }` let the synthesized `tcp`
+	// overwrite the real `tls` child, silently downgrading an audit stream from
+	// TLS to plaintext.
+	//
+	// The nested block belongs UNDER the deepest packed node, which is what the
+	// grammar means and what consumeNodeKeys has already located for us.
+	last.Children = append([]*Node(nil), node.Children...)
+	return []*Node{head}
 }
 
 // nodeChildren is node.Children with a nil-node guard.
