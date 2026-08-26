@@ -93,11 +93,13 @@ func TestGenerateConfig_GCMNoAuth(t *testing.T) {
 	// for an AEAD cipher (the caller takes the gcmPRF branch, not
 	// normalizeAuthAlg), so the strongSwan integrity keyword must be absent.
 	//
-	// #6824: an exact match subsumes the separate absence needle -- a value
-	// carrying an integrity token cannot equal aes256gcm128-modp2048 -- and
-	// unlike that needle it is not satisfied by the Phase-1 line.
-	childSA_3904(t, m.generateConfig(cfg), "tun1").
-		requireSetting(t, "esp_proposals", "aes256gcm128-modp2048")
+	// #6824: equality at the child SA pins the value that MUST be there. The
+	// original also claimed the integrity token appears NOWHERE, which equality
+	// at one path does NOT subsume -- nothing stops another section carrying it
+	// -- so that half is restored as a document-wide absence.
+	got := m.generateConfig(cfg)
+	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256gcm128-modp2048")
+	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "aes256-sha256-modp2048")
 }
 
 func TestXfrmiIfID(t *testing.T) {
@@ -302,10 +304,13 @@ func TestGenerateConfig_DanglingProposalNoPFSFailsClosed(t *testing.T) {
 			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 0, Proposals: []string{"does-not-exist"}},
 		},
 	}
-	// #6824: an exact match subsumes the "not default" needle, and replaces a
-	// trailing "\n" that was standing in for "the value ends here".
-	childSA_3904(t, m.generateConfig(cfg), "tun1").
-		requireSetting(t, "esp_proposals", "aes256-sha256")
+	// #6824: equality replaces a trailing "\n" that stood in for "the value
+	// ends here". The "not esp_proposals = default" half is a DOCUMENT-WIDE
+	// claim and is kept as one: equality at this path says nothing about a
+	// `default` appearing under another connection.
+	got := m.generateConfig(cfg)
+	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256-sha256")
+	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "default")
 }
 
 // TestResolveESPSettings_NoPolicyStaysDefault is the (D) regression: a VPN
@@ -337,8 +342,10 @@ func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 14, Proposals: []string{"does-not-exist"}},
 		},
 	}
-	childSA_3904(t, m.generateConfig(cfg), "tun1").
-		requireSetting(t, "esp_proposals", "aes256-sha256-modp2048")
+	got := m.generateConfig(cfg)
+	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256-sha256-modp2048")
+	// PFS must not have silently dropped to the default set ANYWHERE.
+	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "default")
 }
 
 // readSAFixture loads a captured `swanctl --list-sas` golden fixture. The
@@ -817,9 +824,13 @@ func TestGenerateConfig_NATTraversal_Enable(t *testing.T) {
 	// #6824: the old `encap = no` needle was value-specific, so a render that
 	// emitted `encap = yes` (also wrong here -- nothing should be emitted)
 	// passed. Absence of the KEY is the actual claim.
-	conn := parseSwanctlDoc(t, m.generateConfig(cfg)).at(t, "connections", "tun")
-	conn.hasNoSetting(t, "encap")
-	conn.hasNoSetting(t, "forceencaps")
+	// Document-wide, as the original needles were. Scoping an absence to one
+	// path is a weaker claim than the one being replaced, even when the fixture
+	// renders a single connection today.
+	doc := parseSwanctlDoc(t, m.generateConfig(cfg))
+	doc.at(t, "connections", "tun")
+	doc.hasNoSettingAnywhere(t, "encap")
+	doc.hasNoSettingAnywhere(t, "forceencaps")
 }
 
 func TestGenerateConfig_NATTraversal_Default(t *testing.T) {
@@ -837,9 +848,10 @@ func TestGenerateConfig_NATTraversal_Default(t *testing.T) {
 	}
 	// #6824: `Contains(got, "encap")` also matched `forceencaps`, so this
 	// could never distinguish the two keys. Assert both absences explicitly.
-	conn := parseSwanctlDoc(t, m.generateConfig(cfg)).at(t, "connections", "tun")
-	conn.hasNoSetting(t, "encap")
-	conn.hasNoSetting(t, "forceencaps")
+	doc := parseSwanctlDoc(t, m.generateConfig(cfg))
+	doc.at(t, "connections", "tun")
+	doc.hasNoSettingAnywhere(t, "encap")
+	doc.hasNoSettingAnywhere(t, "forceencaps")
 }
 
 func TestGenerateConfig_NoNATTraversal_Legacy(t *testing.T) {
@@ -921,9 +933,9 @@ func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
 			"tun": {Gateway: "gw"},
 		},
 	}
-	parseSwanctlDoc(t, m.generateConfig(cfg)).
-		at(t, "connections", "tun").
-		hasNoSetting(t, "aggressive")
+	doc := parseSwanctlDoc(t, m.generateConfig(cfg))
+	doc.at(t, "connections", "tun")
+	doc.hasNoSettingAnywhere(t, "aggressive")
 }
 
 func TestGenerateConfig_DFBit(t *testing.T) {
@@ -957,7 +969,10 @@ func TestGenerateConfig_DFBit(t *testing.T) {
 			// copy_df is a CHILD SA setting; the old needles found it anywhere.
 			child := childSA_3904(t, m.generateConfig(cfg), "tun")
 			if tt.want == "" {
-				child.hasNoSetting(t, "copy_df")
+				// Document-wide: the old notWant column asked whether the token
+				// appeared at all, and narrowing that to the child SA would let
+				// a stray copy_df elsewhere through.
+				parseSwanctlDoc(t, m.generateConfig(cfg)).hasNoSettingAnywhere(t, "copy_df")
 				return
 			}
 			child.requireSetting(t, "copy_df", tt.want)
@@ -978,7 +993,9 @@ func TestGenerateConfig_EstablishTunnels(t *testing.T) {
 
 	// on-traffic should NOT produce start_action
 	cfg.VPNs["tun"].EstablishTunnels = "on-traffic"
-	childSA_3904(t, m.generateConfig(cfg), "tun").hasNoSetting(t, "start_action")
+	offDoc := m.generateConfig(cfg)
+	childSA_3904(t, offDoc, "tun")
+	parseSwanctlDoc(t, offDoc).hasNoSettingAnywhere(t, "start_action")
 }
 
 func TestGenerateConfig_IKELifetime(t *testing.T) {
@@ -1131,7 +1148,9 @@ func TestGenerateConfig_DPDBareAndTuningForms(t *testing.T) {
 
 	t.Run("no DPD stanza emits no dpd", func(t *testing.T) {
 		out := m.generateConfig(compileFromSet(t, base))
-		parseSwanctlDoc(t, out).at(t, "connections", "tun1").hasNoSetting(t, "dpd_delay")
+		doc := parseSwanctlDoc(t, out)
+		doc.at(t, "connections", "tun1")
+		doc.hasNoSettingAnywhere(t, "dpd_delay")
 	})
 }
 

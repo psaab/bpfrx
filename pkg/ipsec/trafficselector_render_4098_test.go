@@ -47,19 +47,18 @@ func TestRenderTrafficSelectorSanitizesInjection(t *testing.T) {
 	// whether an injected setting appears anywhere; what actually matters is
 	// whether it became a SETTING of the child section -- which is what
 	// strongSwan would act on. Parsing says so directly.
-	child := parseSwanctlDoc(t, got).at(t, "connections", "tun1", "children", "tun1-ts1")
+	doc := parseSwanctlDoc(t, got)
 
-	// The injected settings must not exist as settings at all. Before the fix
-	// the materialized newline split the local_ts value, so `updown` and
-	// `esp_proposals` parsed as real keys in this section.
-	child.hasNoSetting(t, "updown")
-	if vals, ok := child.settings["esp_proposals"]; ok {
-		for _, v := range vals {
-			if strings.HasPrefix(v, "null-null") {
-				t.Errorf("injected esp_proposals override became a real setting: %q", v)
-			}
-		}
-	}
+	// The injected settings must not exist as settings ANYWHERE. Scoping this
+	// to the expected child section would pass on a render that emitted a
+	// SIBLING child carrying `updown = /tmp/pwn.sh` -- a live child-SA location
+	// where charon executes it as root, which is the whole reason this test
+	// exists. The old line scan covered the whole document and the first
+	// structural conversion narrowed it; that was a real loss of power.
+	doc.hasNoSettingAnywhere(t, "updown")
+	doc.hasNoSettingValueAnywhere(t, "esp_proposals", "null-null")
+
+	child := doc.at(t, "connections", "tun1", "children", "tun1-ts1")
 
 	// The sanitized value stays on the local_ts line (newline -> space), so
 	// the tunnel still carries the operator's selector prefix — the belt does

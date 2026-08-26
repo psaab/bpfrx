@@ -168,7 +168,14 @@ func TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine(t *testing.T) {
 	conn.hasNoSetting(t, "proposals")
 	// The child SA still carries its own esp_proposals; the absence above is
 	// about Phase 1 only, and this pins that the two are not confused.
-	if len(conn.children) == 0 {
-		t.Errorf("no-policy tunnel rendered no child section at all:\n%s", conn)
+	//
+	// `len(conn.children) == 0` was VACUOUS here: conn.children holds local,
+	// remote AND children, so it is non-empty even when the children{} block
+	// carries no child SA at all, and stays non-empty if that block disappears.
+	// The claim is about the child SAs, so resolve children{} and count THOSE.
+	kids := conn.at(t, "children")
+	if len(kids.order) == 0 {
+		t.Errorf("no-policy tunnel rendered a children{} block with no child SA:\n%s", kids)
 	}
+	kids.at(t, kids.order[0]).setting(t, "esp_proposals")
 }

@@ -26,7 +26,14 @@ import (
 // What it asserts instead are properties of OUR OWN RENDERER, which we control
 // and can state exactly: brace nesting balances, every setting sits at a known
 // path, one key per line, no duplicate key within a section, no duplicate
-// section within a parent. Those are facts about generateConfig, not claims
+// section within a parent. One thing they are NOT: byte-exact. Both the line
+// and the two halves of a setting are trimmed, so trailing whitespace on a
+// value is normalised away and an equality assertion here does not reject it,
+// where a needle ending in "\n" did. That is a deliberate trade -- the old
+// needles were pinning the renderer's whitespace, not its structure -- but it
+// is a real difference and not a strengthening.
+//
+// Those are facts about generateConfig, not claims
 // about strongSwan. Conformance to the real parser is a separate and stronger
 // property that needs the package installed, and remains worth doing.
 
@@ -55,22 +62,24 @@ type swanctlNode struct {
 
 // parseSwanctlDoc parses a rendered document into a section tree.
 //
-// One ambiguity is worth stating rather than discovering: a line is classified
-// as a section opener before it is classified as a setting, so a SETTING whose
-// value ends in an open brace (`local_ts = 10.0.0.0/24 {`, reachable only via an
-// unsanitized injected value) is read as a section named
-// `local_ts = 10.0.0.0/24`. The reverse ordering has a mirror-image flaw: a
-// section whose NAME contains an equals sign would be read as a setting. Both
-// orderings fail LOUDLY -- the bogus section leaves the document unbalanced and
-// the end-of-parse check fires -- so the choice is about which message is
-// clearer, not about whether the defect escapes. Neither shape is reachable
-// from a validated config; both are what the sanitize belts exist to prevent.
+// Two line shapes are ambiguous, and the first cut of this parser got both
+// wrong in a way that did NOT fail loudly, contrary to what its comment claimed:
 //
-// It recognises exactly the line shapes the renderer emits -- `name {`, `}`,
-// `key = value`, comments, blanks. Anything else FAILS rather than being
-// skipped: a line this parser does not recognise is one the renderer emitted
-// that no structural test describes, and silently ignoring it is precisely how a
-// structural check decays back into a containment check.
+//   - a SETTING whose value ends in an open brace (`local_ts = 10.0.0.0/24 {`)
+//     read as a section opener, and
+//   - a SECTION whose name begins '#' (a connection named "#b") skipped as a
+//     comment.
+//
+// Either alone unbalances the document and the end-of-parse check fires. TOGETHER
+// they CANCEL: the phantom open from the first is closed by the real brace of the
+// second, the stack balances, and the tree silently lacks a section the renderer
+// emitted -- so hasNoChild("#b") passes on a document that contains it. Both
+// values are reachable from authored quoted tokens (pkg/config/schema_security.go,
+// copied through compiler_ipsec.go, rendered at policy.go); sanitizeSwanctlValue
+// strips control bytes, not braces or hashes.
+//
+// Both are now classified on content rather than on a single suffix: a section
+// opener carries no '=', and a comment is neither a section opener nor a setting.
 func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 	t.Helper()
 	root := &swanctlNode{name: "<root>", settings: map[string][]string{}, children: map[string]*swanctlNode{}}
@@ -78,7 +87,16 @@ func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 
 	for i, raw := range strings.Split(doc, "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" {
+			continue
+		}
+		// A comment is a line starting '#' that is NOT also a section opener or
+		// a setting. Without those two exclusions a SECTION whose name begins
+		// '#' (a connection named "#b" -- reachable, see the doc comment) is
+		// skipped silently, and its real closing brace then cancels an
+		// unrelated fake open. The document balances and the tree is wrong with
+		// no error at all.
+		if strings.HasPrefix(line, "#") && !strings.HasSuffix(line, "{") && !strings.Contains(line, "=") {
 			continue
 		}
 		cur := stack[len(stack)-1]
@@ -90,7 +108,13 @@ func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 			}
 			stack = stack[:len(stack)-1]
 
-		case strings.HasSuffix(line, "{"):
+		// A section opener carries no '='. A line that ends in an open brace AND
+		// contains one is a SETTING whose value happens to end in a brace
+		// (`local_ts = 10.0.0.0/24 {`, reachable from an authored quoted token:
+		// sanitizeSwanctlValue strips control bytes, not braces). Classifying it
+		// as a section opened a phantom nesting level that a later real close
+		// could cancel, leaving a balanced document and a silently wrong tree.
+		case strings.HasSuffix(line, "{") && !strings.Contains(line, "="):
 			name := strings.TrimSpace(strings.TrimSuffix(line, "{"))
 			if name == "" {
 				t.Fatalf("line %d: section opened with no name:\n%s", i+1, doc)
@@ -109,6 +133,16 @@ func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 			k, v = strings.TrimSpace(k), strings.TrimSpace(v)
 			if k == "" {
 				t.Fatalf("line %d: setting with an empty key:\n%s", i+1, doc)
+			}
+			if _, dup := cur.settings[k]; dup {
+				// Stated as a parse invariant in this file's doc comment, so it
+				// must fire HERE. Detecting it only when setting() happens to
+				// be called leaves a path-only test green on a document with a
+				// duplicated, unqueried key -- which is the containment defect
+				// with extra steps.
+				t.Errorf("line %d: section %q declares %q more than once (%v, now %q); "+
+					"which one applies is left to the parser", i+1, cur.name, k,
+					cur.settings[k], v)
 			}
 			cur.settings[k] = append(cur.settings[k], v)
 
@@ -275,6 +309,33 @@ func (n *swanctlNode) hasNoSettingAnywhere(t swanctlTB, key string) {
 		if vals, ok := node.settings[key]; ok {
 			t.Errorf("setting %q became live at %s = %v; nothing in this fixture "+
 				"renders that key, so it can only have been injected", key, path, vals)
+		}
+		for _, name := range node.order {
+			walk(node.children[name], path+"."+name)
+		}
+	}
+	walk(n, n.name)
+}
+
+// hasNoSettingValueAnywhere asserts no section in the tree declares key with
+// this exact value.
+//
+// It exists because several converted assertions replaced a WHOLE-DOCUMENT
+// negative ("esp_proposals = default appears nowhere") with equality at one
+// path. Those are not the same claim: the parser has no schema forbidding the
+// same key under a different connection, so a correct setting at the asserted
+// path plus a forbidden one elsewhere passes the equality and would have failed
+// the old needle. Where the original claim was document-wide, the replacement
+// has to be too.
+func (n *swanctlNode) hasNoSettingValueAnywhere(t swanctlTB, key, forbidden string) {
+	t.Helper()
+	var walk func(*swanctlNode, string)
+	walk = func(node *swanctlNode, path string) {
+		for _, v := range node.settings[key] {
+			if v == forbidden {
+				t.Errorf("%s = %q at %s; that value must appear NOWHERE in the "+
+					"document, not merely not at the path under test", key, forbidden, path)
+			}
 		}
 		for _, name := range node.order {
 			walk(node.children[name], path+"."+name)

@@ -104,6 +104,15 @@ func TestStructuralCheckerCatchesWhatContainmentCannot_6824(t *testing.T) {
 // fires from setting() rather than from the parse, and it is the single case
 // most invisible to containment: the key is present, twice.
 func TestStructuralCheckerCatchesADuplicateSetting_6824(t *testing.T) {
+	// Duplicate rejection is claimed as a PARSE invariant, so it must fire
+	// without setting() being called at all -- otherwise a path-only test stays
+	// green on a document with a duplicated, unqueried key.
+	dupOnly := "connections {\n  tun {\n    remote_addrs = 1.1.1.1\n    remote_addrs = 2.2.2.2\n  }\n}\n"
+	if rejected, _ := checkerRejects(dupOnly, nil); !rejected {
+		t.Error("parsing alone accepted a duplicated setting; the invariant is only " +
+			"enforced when setting() happens to be called, which a path-only test does not do")
+	}
+
 	doc := "connections {\n  tun {\n    remote_addrs = 1.1.1.1\n    remote_addrs = 2.2.2.2\n  }\n}\n"
 	if !strings.Contains(doc, "remote_addrs = 1.1.1.1") {
 		t.Fatal("fixture does not contain the value a containment assertion would look for")
@@ -164,5 +173,50 @@ func TestStructuralCheckerDistinguishesNestingFromContainment_6824(t *testing.T)
 			"that is exactly the class strings.Contains cannot see")
 	} else {
 		t.Logf("rejected as expected: %s", why)
+	}
+}
+
+// TestStructuralCheckerResolvesTheCancellingShapes_6824 is the cancellation case,
+// and it asserts CORRECTNESS rather than rejection.
+//
+// Two ambiguous line shapes -- a setting whose value ends in an open brace, and
+// a section whose name begins '#' -- each unbalance the document on their own,
+// so the end-of-parse check catches either alone. Together they CANCEL: the
+// phantom open from the first is closed by the real brace of the second, the
+// stack balances, and the tree silently loses the section the renderer emitted.
+// A test asking only "was it rejected?" would go green on the broken parser
+// precisely because the document balanced.
+//
+// So this asserts what the tree must CONTAIN. Before the fix, connections."#b"
+// was absent and hasNoChild("#b") passed on a document that contains it.
+func TestStructuralCheckerResolvesTheCancellingShapes_6824(t *testing.T) {
+	doc := "connections {\n  !a {\n    local_ts = 10.0.0.0/24 {\n  }\n" +
+		"  #b {\n    remote_addrs = 1.1.1.1\n  }\n}\n"
+
+	root := parseSwanctlDoc(t, doc)
+	conns := root.at(t, "connections")
+
+	// The brace-terminated VALUE stayed a setting and did not open a section.
+	a := conns.at(t, "!a")
+	if got := a.setting(t, "local_ts"); got != "10.0.0.0/24 {" {
+		t.Errorf("!a.local_ts = %q, want %q -- a value ending in a brace was read as "+
+			"a section opener", got, "10.0.0.0/24 {")
+	}
+	if len(a.order) != 0 {
+		t.Errorf("!a opened %v; a setting must not create a nesting level", a.childNames())
+	}
+
+	// The hash-named SECTION survived and was not eaten as a comment. This is
+	// the half that makes the failure silent: without it hasNoChild("#b")
+	// passes on a document that plainly contains #b.
+	b := conns.at(t, "#b")
+	b.requireSetting(t, "remote_addrs", "1.1.1.1")
+
+	// And a real comment is still a comment.
+	root2 := parseSwanctlDoc(t, "# xpf managed config - do not edit\nconnections {\n}\n")
+	root2.at(t, "connections")
+	if names := root2.childNames(); len(names) != 1 {
+		t.Errorf("top-level sections = %v, want exactly [connections]; the comment "+
+			"exclusions must not turn an ordinary comment into a section", names)
 	}
 }

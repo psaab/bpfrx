@@ -106333,3 +106333,11 @@ prose edit above them added. No diff falls in the new test body.
     as the containment subject; parser section-vs-setting ambiguity documented
   - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go,
     pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — act on the Codex hostile review: nine findings, all
+    real, including a false claim in the guard's own doc comment
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go,
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go,
+    pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go

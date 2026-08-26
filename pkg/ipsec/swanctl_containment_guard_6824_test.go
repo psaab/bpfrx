@@ -35,14 +35,26 @@ import (
 //
 // The needle must be a STRING LITERAL at the call site. A table-driven test
 // whose expectations live in a struct column -- `strings.Contains(got, c.want)`
-// -- is invisible to it, and several of the assertions converted for #6824 were
-// exactly that shape. Run against the pre-conversion tree (de6b8c85d) this
-// detector flagged 75 sites out of roughly 100; the rest were table columns.
-// So a clean run means "no literal syntax needle", not "no containment
-// assertion anywhere", and this guard is a ratchet against the common case
-// rather than a proof of the general one. Resolving a table column back to its
-// literals would need type-checked constant propagation, which is a much larger
-// instrument than the defect warrants.
+// -- is invisible to it, as is any needle built at runtime, and several of the
+// assertions converted for #6824 were exactly those shapes.
+//
+// Measured rather than asserted: against the pre-conversion tree (de6b8c85d)
+// this detector flags 76 sites; that tree contained 123 strings.Contains calls
+// in pkg/ipsec test files in total, of which many are legitimate assertions on
+// error strings and parsed fields rather than on rendered documents. So a clean
+// run means "no literal syntax needle", NOT "no containment assertion anywhere",
+// and this guard is a ratchet against the common case rather than a proof of the
+// general one.
+//
+// An earlier version of this comment claimed the entire non-flagged remainder
+// was table columns. That was wrong, and the way it was wrong is worth keeping:
+// the detector was also missing plain literal needles that ended `" {\n"`
+// rather than `" {"` -- four of them existed in the base tree -- so the number
+// was describing the detector's blind spot as if it were a property of the code
+// being measured.
+//
+// Resolving a table column back to its literals would need type-checked constant
+// propagation, a much larger instrument than this defect warrants.
 
 // containmentFinding is one flagged assertion.
 type containmentFinding struct {
@@ -58,10 +70,14 @@ type containmentFinding struct {
 // It is a free function over an *ast.File rather than a method on the test so
 // the guard's own sensitivity control can drive it with synthetic source.
 func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFinding {
-	// Idents bound to a rendered document. Tracked by name only: test bodies
-	// are small and shadowing a render variable with a non-render one of the
-	// same name inside one file would be perverse, and erring toward flagging
-	// is the safe direction for a guard.
+	// Idents bound to a rendered document, tracked PER FUNCTION.
+	//
+	// A file-wide name set produces routine false positives: `got` is a common
+	// name, and one test binding it to a render made every other function's
+	// `strings.Contains(got, "load-all = yes")` -- a legitimate error-message
+	// assertion -- a violation. A standing gate that flags unrelated work is
+	// worse than one with a known blind spot, because the cost lands on someone
+	// who did nothing wrong.
 	rendered := map[string]bool{}
 	isRenderCall := func(e ast.Expr) bool {
 		call, ok := e.(*ast.CallExpr)
@@ -93,62 +109,121 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 			}
 		}
 	}
-	ast.Inspect(f, func(n ast.Node) bool {
-		switch s := n.(type) {
-		case *ast.AssignStmt:
-			noteAssign(s.Lhs, s.Rhs)
-		}
-		return true
-	})
+	collect := func(scope ast.Node) {
+		ast.Inspect(scope, func(n ast.Node) bool {
+			switch s := n.(type) {
+			case *ast.AssignStmt:
+				noteAssign(s.Lhs, s.Rhs)
+			case *ast.ValueSpec:
+				// `var got = m.generateConfig(cfg)` binds exactly as `:=` does
+				// and was invisible while only AssignStmt was inspected.
+				lhs := make([]ast.Expr, 0, len(s.Names))
+				for _, id := range s.Names {
+					lhs = append(lhs, id)
+				}
+				noteAssign(lhs, s.Values)
+			}
+			return true
+		})
+	}
 
 	var out []containmentFinding
-	ast.Inspect(f, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) != 2 {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Contains" {
-			return true
-		}
-		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "strings" {
-			return true
-		}
-		// The subject may be a bound identifier OR the render call inline --
-		// `strings.Contains(m.generateConfig(cfg), "a = b")` is the same defect
-		// and was missed by an Ident-only check.
-		switch subj := call.Args[0].(type) {
-		case *ast.Ident:
-			if !rendered[subj.Name] {
+	inspectCalls := func(scope ast.Node) {
+		ast.Inspect(scope, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) != 2 {
 				return true
 			}
-		case *ast.CallExpr:
-			if !isRenderCall(subj) {
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Contains" {
 				return true
 			}
-		default:
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "strings" {
+				return true
+			}
+			// The subject may be a bound identifier OR the render call inline --
+			// `strings.Contains(m.generateConfig(cfg), "a = b")` is the same defect
+			// and was missed by an Ident-only check.
+			switch subj := call.Args[0].(type) {
+			case *ast.Ident:
+				if !rendered[subj.Name] {
+					return true
+				}
+			case *ast.CallExpr:
+				if !isRenderCall(subj) {
+					return true
+				}
+			default:
+				return true
+			}
+			lit, ok := call.Args[1].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			needle, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				return true
+			}
+			// Trim before classifying: `"tun1-ts1 {\n"` and `"  good {\n"` are
+			// section-opener needles that a bare HasSuffix(" {") misses, and four
+			// such sites existed in the pre-conversion tree.
+			trimmed := strings.TrimRight(needle, " \t\r\n")
+			if !strings.Contains(needle, " = ") && !strings.HasSuffix(trimmed, "{") {
+				// A bare token: a leak guard, not a structural claim.
+				return true
+			}
+			out = append(out, containmentFinding{
+				file:   filepath.Base(fset.Position(call.Pos()).Filename),
+				line:   fset.Position(call.Pos()).Line,
+				needle: needle,
+			})
 			return true
-		}
-		lit, ok := call.Args[1].(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			return true
-		}
-		needle, err := strconv.Unquote(lit.Value)
-		if err != nil {
-			return true
-		}
-		if !strings.Contains(needle, " = ") && !strings.HasSuffix(needle, " {") {
-			// A bare token: a leak guard, not a structural claim.
-			return true
-		}
-		out = append(out, containmentFinding{
-			file:   filepath.Base(fset.Position(call.Pos()).Filename),
-			line:   fset.Position(call.Pos()).Line,
-			needle: needle,
 		})
+	}
+
+	// One function at a time, so a render binding in one test cannot make a
+	// same-named local in another test look like a rendered document. Package
+	// level (a var block holding a render call) is walked once as its own
+	// scope; nothing outside a function makes containment assertions.
+	for _, d := range f.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		rendered = map[string]bool{}
+		collect(fn)
+		inspectCalls(fn)
+	}
+	return out
+}
+
+// countRenderCalls counts actual generateConfig/renderConfig CALL expressions.
+//
+// The floor below used to grep the file text for "generateConfig(", which
+// matched comments and string literals -- including this guard's own synthetic
+// snippets, so the file counted itself. Ten empty test files and five comments
+// satisfied both floors with no render call anywhere. Counting call nodes makes
+// the floor measure the thing it claims to.
+func countRenderCalls(f *ast.File) int {
+	n := 0
+	ast.Inspect(f, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name := ""
+		switch fn := call.Fun.(type) {
+		case *ast.SelectorExpr:
+			name = fn.Sel.Name
+		case *ast.Ident:
+			name = fn.Name
+		}
+		if name == "generateConfig" || name == "renderConfig" {
+			n++
+		}
 		return true
 	})
-	return out
+	return n
 }
 
 // TestNoSwanctlSyntaxInContainmentNeedles_6824 is the standing guard.
@@ -170,11 +245,7 @@ func TestNoSwanctlSyntaxInContainmentNeedles_6824(t *testing.T) {
 			t.Fatalf("parse %s: %v", e.Name(), err)
 		}
 		scanned++
-		src, err := os.ReadFile(e.Name())
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		if strings.Contains(string(src), "generateConfig(") || strings.Contains(string(src), "renderConfig(") {
+		if countRenderCalls(f) > 0 {
 			withRender++
 		}
 		findings = append(findings, findSwanctlContainment(fset, f)...)
@@ -188,8 +259,8 @@ func TestNoSwanctlSyntaxInContainmentNeedles_6824(t *testing.T) {
 			"reaching the package it is meant to cover", scanned)
 	}
 	if withRender < 5 {
-		t.Fatalf("only %d test files render a swanctl document; the guard has "+
-			"nothing to guard and would pass whatever those files said", withRender)
+		t.Fatalf("only %d test files make a real render CALL; the guard has nothing "+
+			"to guard and would pass whatever those files said", withRender)
 	}
 
 	for _, f := range findings {
@@ -202,6 +273,40 @@ func TestNoSwanctlSyntaxInContainmentNeedles_6824(t *testing.T) {
 			"\tUse parseSwanctlDoc + at()/setting()/requireSetting()/hasNoSetting()/"+
 			"hasNoChild() from swanctl_doc_6824_test.go instead. See #6824.",
 			f.file, f.line, f.needle)
+	}
+}
+
+// TestGuardScopesRenderVariablesPerFunction_6824 is the false-POSITIVE control.
+//
+// The detector used to collect render-variable names file-wide, so one test
+// binding the very common name `got` to a render made every other function's
+// `strings.Contains(got, ...)` a violation -- including legitimate
+// error-message assertions. A standing gate that flags unrelated work is worse
+// than one with a known blind spot, because the cost lands on someone who did
+// nothing wrong.
+func TestGuardScopesRenderVariablesPerFunction_6824(t *testing.T) {
+	src := `package ipsec
+
+import "strings"
+
+func rendersSomething() {
+	got := m.generateConfig(cfg)
+	_ = got
+}
+
+func assertsAnErrorMessage() {
+	got := doThing().Error()
+	_ = strings.Contains(got, "load-all = yes")
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "probe_test.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic source: %v", err)
+	}
+	if got := findSwanctlContainment(fset, f); len(got) != 0 {
+		t.Errorf("flagged %d finding(s) in a file where the only syntax needle is an "+
+			"error-message assertion in a DIFFERENT function: %+v", len(got), got)
 	}
 }
 
@@ -219,6 +324,18 @@ func TestContainmentGuardSensitivity_6824(t *testing.T) {
 		body string
 		want int
 	}{
+		{
+			name: "section opener needle with a trailing newline",
+			body: `got := m.generateConfig(cfg)
+	_ = strings.Contains(got, "tun1-ts1 {\n")`,
+			want: 1,
+		},
+		{
+			name: "var-declared render subject",
+			body: `var got = m.generateConfig(cfg)
+	_ = strings.Contains(got, "remote_addrs = 1.1.1.1")`,
+			want: 1,
+		},
 		{
 			name: "render call inline as the subject",
 			body: `_ = strings.Contains(m.generateConfig(cfg), "remote_addrs = 1.1.1.1")`,

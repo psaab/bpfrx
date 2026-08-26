@@ -112,7 +112,12 @@ func TestPrepareConfigReResolvesDHCPLocalAddress(t *testing.T) {
 
 	// Simulate a DHCP renew to a new lease address.
 	renewed := dhcpBoundConfig("wan0.0", "", "203.0.113.42/24", true)
-	localAddrs_6824(t, m.renderMust(t, PrepareConfig(renewed)), "203.0.113.42")
+	renewedDoc := m.renderMust(t, PrepareConfig(renewed))
+	localAddrs_6824(t, renewedDoc, "203.0.113.42")
+	// The stale address must be gone from the WHOLE document. Equality at the
+	// connection does not say that: a stale local_addrs under any other section
+	// would satisfy it, and the deleted needle would have caught that.
+	parseSwanctlDoc(t, renewedDoc).hasNoSettingValueAnywhere(t, "local_addrs", "198.51.100.7")
 }
 
 // renderMust renders the swanctl config for prepared, failing the test on
