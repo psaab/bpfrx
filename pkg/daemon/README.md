@@ -2024,6 +2024,39 @@ never lock an operator out of a remote box it manages.
   proof; gate quiet-when-up / fires-when-down; the re-assert re-creates; and a
   loop-START cell asserting `Run` launches it unconditionally).
 
+  **Host-inbound conntrack revocation retry (#6802, the same recovery shape):**
+  `flushDeniedHostInboundConntrack` (the #5566 reconcile) deletes established
+  kernel conntrack entries for host services the operator has just removed,
+  because those entries would otherwise ride the host-inbound chain's leading
+  `ct state established,related accept`. A delete failure therefore fails **OPEN**
+  — the now-denied service keeps being served on its existing connections. It is
+  deliberately still NOT a commit failure (the nft table is applied, so new
+  connections are enforced, and rolling back over a transient conntrack error
+  would discard correct enforcement); what #6802 added is everything else, since
+  before it the flush returned nothing, set no flag, bumped no counter, published
+  no metric, and no ticker re-ran it. The flush now returns a bool, and
+  `noteHostInboundConntrackFlush` retains the **exact** failed request as debt —
+  not a set re-derived at retry time, which would attempt a different revocation
+  than the one that failed, and the two diverge precisely when a commit landed in
+  between. `hostInboundConntrackReassertLoop` is the owner, started
+  unconditionally in `Run` beside the three loops above, 30s, gated on a single
+  atomic pointer load; it takes `applySem` before acting (#4001) and re-reads the
+  debt INSIDE the semaphore, because the commit it queued behind may already have
+  flushed successfully. A success clears the debt: the filter is built from the
+  desired set, so a current revocation subsumes an older one.
+  `HostInboundConntrackRevocationOwed` / `HostInboundConntrackFlushFailures` are
+  wired into the REST/metrics server (`daemon_run_servers.go`) as
+  `xpf_host_inbound_conntrack_revocation_pending` and
+  `…_failures_total`; an accessor with no production caller would leave the
+  operator exactly as blind as before (the #6852 shape). Tests:
+  `host_inbound_conntrack_retry_6802_test.go` (paired outcome cell on the delete
+  seam, which had no failing fixture at all before; debt retain/clear; the retry
+  re-drives the OWED request; the inside-the-semaphore re-check; the loop ticks; a
+  loop-START cell; and a WIRING cell for the two metric assignments) plus
+  `pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go` (both series track
+  their fn, and are OMITTED rather than published as `0` when unwired — the #6828
+  absent-vs-zero distinction).
+
   **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
   `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and
   returned only the #2926-C1 ctx-cancellation, even though `reconcileVRFs`'s

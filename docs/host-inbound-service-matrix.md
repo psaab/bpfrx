@@ -577,16 +577,69 @@ catch-all instead of short-circuiting on the established-accept. Properties:
 - **Global exemptions preserved.** ESP/AH (proto 50/51), ICMP ND/PMTUD/error, and
   the configured WireGuard listen port (#5582) are never flushed, mirroring the
   chain's global accepts. ICMP echo conntrack is short-lived and left to age out.
-- **Best effort.** The nft table is already applied, so enforcement for NEW
-  connections holds regardless; a conntrack-subsystem flush failure is logged, not
-  surfaced as a commit failure (failing the commit would roll back correct
-  enforcement over a transient error). It only leaves PRE-EXISTING flows on their
-  old authorization — the pre-fix behavior.
+- **Not a commit failure — but it IS retried and IS visible (#6802).** The nft
+  table is already applied, so enforcement for NEW connections holds regardless,
+  and failing the commit would roll back correct enforcement over a transient
+  conntrack-subsystem error. That rationale is unchanged. What #6802 corrected is
+  the rest of it: before #6802 the flush returned nothing, set no dirty flag,
+  bumped no counter, published no metric, and no ticker re-ran it — every ticker
+  under `pkg/daemon` was enumerated and none re-drives `applyConfig`,
+  `applyHostInboundFilter` or the flush, so the only re-attempt was the next
+  externally-triggered apply. See "Revocation failure is retried" below.
 
 Kernel netfilter conntrack on this appliance tracks only host-terminated /
 kernel-forwarded flows (transit forwarding runs through userspace-dp's own session
 table), so the swept table is small. Fail-on-revert proofs:
 `pkg/daemon/host_inbound_conntrack_flush_5566_test.go`.
+
+### Revocation failure is retried, counted, and published (#6802)
+
+The failure direction is what made "best effort" a defect rather than a
+tradeoff. A stale entry rides the chain's **leading**
+`ct state established,related accept`, so a failed revocation fails **OPEN**: a
+host service the operator has just REMOVED keeps being served on every
+already-established direct-kernel connection. Before #6802 that persisted until
+the flow closed or timed out, with nothing to notice it and nothing to re-drive
+it.
+
+`flushDeniedHostInboundConntrack` now returns whether every family's delete
+succeeded, and the call site records the outcome as **retry debt**:
+
+- **The debt retains the exact request** — the `views` / `unzonedV4` /
+  `unzonedV6` / `wgListenPorts` the failed flush was called with — not a set
+  re-derived at retry time. A retry that re-derived from the current config would
+  attempt a *different* revocation than the one that failed, and the two diverge
+  exactly when a commit landed in between.
+- **A failure of one family does not abandon the other.** The loop `continue`s so
+  the second family is still swept; the failure is carried out in the return
+  value rather than swallowed.
+- **`hostInboundConntrackReassertLoop` is the retry owner**, started
+  unconditionally in `Run` alongside `proxyARPReassertLoop`,
+  `raDeadSenderReassertLoop` (#6793) and `fabricIPVLANReassertLoop` (#6791), at
+  the same 30s cadence. The gate is a single atomic pointer load, so it is free
+  on a node whose revocations have all succeeded. Like its siblings it takes
+  `applySem` **before** acting (#4001) — an in-flight apply must not race a
+  revocation against a half-applied host-inbound set — and re-reads the debt
+  **inside** the semaphore, because the commit it queued behind may already have
+  flushed successfully.
+- **A later successful flush clears the debt.** The filter is built from the
+  desired set, so a current successful revocation subsumes an older failed one;
+  retaining stale debt would make the owner re-drive a revocation whose target no
+  longer exists.
+
+Operator-visible surface — both emitted even when the dataplane is not loaded,
+because the daemon rebuilds the kernel table in config-only mode too:
+
+| Series | Meaning |
+|---|---|
+| `xpf_host_inbound_conntrack_revocation_pending` | `1` while a revocation has failed and not yet been re-driven. While set, a now-denied host service may still be reachable on an established kernel connection. |
+| `xpf_host_inbound_conntrack_revocation_failures_total` | Every failed attempt, retries included. Climbing while the gauge stays `1` means the retry owner is running but not converging. |
+
+Both are omitted entirely — not published as `0` — on a server that has not wired
+the accessors, so an unwired node cannot be mistaken for a converged one (the
+#6828 absent-vs-zero distinction). Fail-on-revert proofs:
+`pkg/daemon/host_inbound_conntrack_retry_6802_test.go` and
+`pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go`.
 
 ## Fail-closed invariant for a nil / configured=false known zone (#3705)
 

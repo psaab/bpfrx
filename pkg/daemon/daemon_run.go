@@ -567,6 +567,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.raDeadSenderReassertLoop(ctx)
 	}()
 
+	// #6802: the always-on retry owner for a FAILED host-inbound conntrack
+	// revocation. Started unconditionally, alongside the proxy-ARP and RA
+	// re-assert loops and for the same reason: no ticker under pkg/daemon
+	// re-runs applyConfig / applyHostInboundFilter / the flush, so before this
+	// the only re-attempt was the next externally-triggered apply. The gate is a
+	// single atomic pointer load, so the loop is free on a node whose
+	// revocations have all succeeded.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.hostInboundConntrackReassertLoop(ctx)
+	}()
+
 	// #6791: the always-on retry owner for a fabric IPVLAN overlay whose
 	// creation failed. Started unconditionally, alongside the proxy-ARP and RA
 	// re-asserts and for the same reason: BOTH standalone and cluster nodes

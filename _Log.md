@@ -105068,3 +105068,51 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — #6802: a retry owner for a failed host-inbound conntrack revocation
+
+- **Timestamp**: 2026-08-26
+- **Action**: Give the #5566 host-inbound kernel-conntrack reconcile a return
+  value, retry debt, a persistent retry owner, and two Prometheus series.
+- **Why**: the flush deletes established kernel conntrack entries for host
+  services the operator has just REMOVED, because those entries would otherwise
+  ride the host-inbound chain's leading `ct state established,related accept`. So
+  a delete failure fails **OPEN** — the now-denied service keeps being served on
+  every existing connection. The in-code rationale for not failing the commit is
+  sound and is retained (the nft table is applied, so new connections are
+  enforced, and rolling the commit back over a transient conntrack error would
+  discard correct enforcement). The defect was that it was not anything ELSE
+  either: no return value, no dirty flag, no counter, no metric, and no ticker
+  re-ran it. Every ticker under `pkg/daemon` was enumerated — DDNS, RPM, HA
+  fabric, HA, IPsec rebind, DHCP lease sync, neighbor, proxy-ARP, archive,
+  kernel self-recover — and none re-drives `applyConfig`,
+  `applyHostInboundFilter` or the flush, so the only re-attempt was the next
+  externally-triggered apply, itself gated on `InstallHostInbound` succeeding.
+- **Shape**: mirrors #6793 / #6791. `flushDeniedHostInboundConntrack` returns a
+  bool; `noteHostInboundConntrackFlush` retains the EXACT failed request as debt
+  (not a set re-derived at retry time — that would attempt a different revocation
+  than the one that failed, and the two diverge precisely when a commit landed in
+  between) and bumps a counter; `hostInboundConntrackReassertLoop` is started
+  unconditionally in `Run` at 30s, takes `applySem` before acting (#4001), and
+  re-reads the debt INSIDE the semaphore because the commit it queued behind may
+  already have flushed successfully. A one-family failure still sweeps the other
+  family; the failure is carried out in the return value rather than swallowed.
+- **Wired, not merely exported**: `HostInboundConntrackRevocationOwed` /
+  `HostInboundConntrackFlushFailures` reach `daemon_run_servers.go` as
+  `xpf_host_inbound_conntrack_revocation_pending` and `…_failures_total`,
+  mirroring the `IPsecRebindPendingFn` (#4899) precedent. An accessor with no
+  production caller is the #6852 shape and would have left the operator exactly
+  as blind as before. Both series are OMITTED rather than published as `0` when
+  unwired (the #6828 absent-vs-zero distinction).
+- **Test gaps this closed**: the pre-existing #5566 stub always returned
+  `(0, nil)`, so no test exercised the delete-ERROR path at all. Added a loop-START
+  cell after #6793 shipped without one — every other cell drives the retry
+  function directly, so a `Run` that never launched the owner passes all of them.
+- **File(s)**: `pkg/daemon/host_inbound_conntrack_flush.go`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/daemon_nft.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/server.go`,
+  `pkg/daemon/host_inbound_conntrack_retry_6802_test.go`,
+  `pkg/api/metrics_hostinbound_conntrack_revoke_6802_test.go`,
+  `pkg/daemon/README.md`, `docs/host-inbound-service-matrix.md`, `_Log.md`
