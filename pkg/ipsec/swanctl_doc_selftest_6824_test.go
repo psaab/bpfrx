@@ -176,47 +176,69 @@ func TestStructuralCheckerDistinguishesNestingFromContainment_6824(t *testing.T)
 	}
 }
 
-// TestStructuralCheckerResolvesTheCancellingShapes_6824 is the cancellation case,
-// and it asserts CORRECTNESS rather than rejection.
+// TestStructuralCheckerRefusesAmbiguousShapes_6824 is the cancellation case,
+// and it went through two wrong answers before this one.
 //
-// Two ambiguous line shapes -- a setting whose value ends in an open brace, and
-// a section whose name begins '#' -- each unbalance the document on their own,
-// so the end-of-parse check catches either alone. Together they CANCEL: the
-// phantom open from the first is closed by the real brace of the second, the
-// stack balances, and the tree silently loses the section the renderer emitted.
-// A test asking only "was it rejected?" would go green on the broken parser
-// precisely because the document balanced.
+// Two line shapes cannot be told apart from the line alone: one starting '#'
+// and ending '{', and one containing '=' and ending '{'. The first version of
+// the parser GUESSED at each, and the guesses cancelled -- a fake open from one
+// closed by a real brace from the other, leaving a balanced document and a tree
+// missing a section the renderer emitted.
 //
-// So this asserts what the tree must CONTAIN. Before the fix, connections."#b"
-// was absent and hasNoChild("#b") passed on a document that contains it.
-func TestStructuralCheckerResolvesTheCancellingShapes_6824(t *testing.T) {
-	doc := "connections {\n  !a {\n    local_ts = 10.0.0.0/24 {\n  }\n" +
-		"  #b {\n    remote_addrs = 1.1.1.1\n  }\n}\n"
-
-	root := parseSwanctlDoc(t, doc)
-	conns := root.at(t, "connections")
-
-	// The brace-terminated VALUE stayed a setting and did not open a section.
-	a := conns.at(t, "!a")
-	if got := a.setting(t, "local_ts"); got != "10.0.0.0/24 {" {
-		t.Errorf("!a.local_ts = %q, want %q -- a value ending in a brace was read as "+
-			"a section opener", got, "10.0.0.0/24 {")
+// The second version guessed BETTER (a section opener carries no '='; a comment
+// is neither a section nor a setting) and was still wrong, because reversing
+// which half is misread reproduces the cancellation exactly:
+//
+//	connections {
+//	  # metadata {          <- read as a section, since it ends in a brace
+//	  vpn=prod {            <- read as a setting, since it contains '='
+//	    remote_addrs = 1.1.1.1
+//	  }
+//	}
+//
+// A parser that guesses can cancel its guesses. A parser that REFUSES cannot,
+// which is why both shapes are now hard failures. Neither is reachable from
+// this renderer, so refusing costs nothing and removes the whole class.
+func TestStructuralCheckerRefusesAmbiguousShapes_6824(t *testing.T) {
+	for _, c := range []struct{ name, doc, why string }{
+		{
+			name: "setting whose value ends in a brace",
+			doc:  "connections {\n  a {\n    local_ts = 10.0.0.0/24 {\n  }\n}\n",
+			why:  "section-or-setting",
+		},
+		{
+			name: "comment that also opens a section",
+			doc:  "connections {\n  # metadata {\n}\n",
+			why:  "comment-or-section",
+		},
+		{
+			name: "the CANCELLING pair, in the order that defeated the second version",
+			doc: "connections {\n  # metadata {\n  vpn=prod {\n" +
+				"    remote_addrs = 1.1.1.1\n  }\n}\n",
+			why: "both halves together: the braces balance, so only a refusal catches it",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			rejected, why := checkerRejects(c.doc, nil)
+			if !rejected {
+				t.Errorf("the checker ACCEPTED an ambiguous shape (%s). Guessing at these "+
+					"is how two misreads cancel into a balanced document with a wrong "+
+					"tree.", c.why)
+			} else {
+				t.Logf("refused as expected: %s", why)
+			}
+		})
 	}
-	if len(a.order) != 0 {
-		t.Errorf("!a opened %v; a setting must not create a nesting level", a.childNames())
-	}
 
-	// The hash-named SECTION survived and was not eaten as a comment. This is
-	// the half that makes the failure silent: without it hasNoChild("#b")
-	// passes on a document that plainly contains #b.
-	b := conns.at(t, "#b")
-	b.requireSetting(t, "remote_addrs", "1.1.1.1")
-
-	// And a real comment is still a comment.
-	root2 := parseSwanctlDoc(t, "# xpf managed config - do not edit\nconnections {\n}\n")
-	root2.at(t, "connections")
-	if names := root2.childNames(); len(names) != 1 {
-		t.Errorf("top-level sections = %v, want exactly [connections]; the comment "+
-			"exclusions must not turn an ordinary comment into a section", names)
+	// PAIRED CONTROL. The refusals above are satisfied by a parser that rejects
+	// everything, which would be useless in the other direction and identical
+	// in a pass/fail table. An ordinary comment and an ordinary section must
+	// still parse.
+	root := parseSwanctlDoc(t, "# xpf managed config - do not edit\n\nconnections {\n"+
+		"  tun {\n    remote_addrs = 203.0.113.1\n  }\n}\n")
+	root.at(t, "connections", "tun").requireSetting(t, "remote_addrs", "203.0.113.1")
+	if names := root.childNames(); len(names) != 1 {
+		t.Errorf("top-level sections = %v, want exactly [connections]; the refusals must "+
+			"not turn an ordinary comment into a section", names)
 	}
 }

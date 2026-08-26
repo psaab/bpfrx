@@ -99,7 +99,7 @@ func TestGenerateConfig_GCMNoAuth(t *testing.T) {
 	// -- so that half is restored as a document-wide absence.
 	got := m.generateConfig(cfg)
 	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256gcm128-modp2048")
-	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "aes256-sha256-modp2048")
+	parseSwanctlDoc(t, got).hasNoValueSubstringAnywhere(t, "sha256-modp2048")
 }
 
 func TestXfrmiIfID(t *testing.T) {
@@ -310,7 +310,7 @@ func TestGenerateConfig_DanglingProposalNoPFSFailsClosed(t *testing.T) {
 	// `default` appearing under another connection.
 	got := m.generateConfig(cfg)
 	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256-sha256")
-	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "default")
+	parseSwanctlDoc(t, got).hasNoSettingValuePrefixAnywhere(t, "esp_proposals", "default")
 }
 
 // TestResolveESPSettings_NoPolicyStaysDefault is the (D) regression: a VPN
@@ -345,7 +345,7 @@ func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 	got := m.generateConfig(cfg)
 	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256-sha256-modp2048")
 	// PFS must not have silently dropped to the default set ANYWHERE.
-	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "default")
+	parseSwanctlDoc(t, got).hasNoSettingValuePrefixAnywhere(t, "esp_proposals", "default")
 }
 
 // readSAFixture loads a captured `swanctl --list-sas` golden fixture. The
@@ -787,9 +787,11 @@ func TestGenerateConfig_NATTraversal_Disable(t *testing.T) {
 			"tun": {Gateway: "gw", PSK: "key"},
 		},
 	}
-	conn := parseSwanctlDoc(t, m.generateConfig(cfg)).at(t, "connections", "tun")
-	conn.requireSetting(t, "encap", "no")
-	conn.hasNoSetting(t, "forceencaps")
+	doc := parseSwanctlDoc(t, m.generateConfig(cfg))
+	doc.at(t, "connections", "tun").requireSetting(t, "encap", "no")
+	// Document-wide, as the deleted needle was: a SIBLING connection carrying
+	// forceencaps would have failed the old check and passes a path-scoped one.
+	doc.hasNoSettingAnywhere(t, "forceencaps")
 }
 
 func TestGenerateConfig_NATTraversal_Force(t *testing.T) {
@@ -967,7 +969,16 @@ func TestGenerateConfig_DFBit(t *testing.T) {
 				},
 			}
 			// copy_df is a CHILD SA setting; the old needles found it anywhere.
-			child := childSA_3904(t, m.generateConfig(cfg), "tun")
+			rendered := m.generateConfig(cfg)
+			child := childSA_3904(t, rendered, "tun")
+			// The deleted notWant column rejected the OPPOSITE value anywhere in
+			// the document, not merely at this path. Equality below pins what
+			// must be here; this pins that the other value is nowhere.
+			opposite := map[string]string{"yes": "no", "no": "yes"}[tt.want]
+			if opposite != "" {
+				parseSwanctlDoc(t, rendered).
+					hasNoSettingValuePrefixAnywhere(t, "copy_df", opposite)
+			}
 			if tt.want == "" {
 				// Document-wide: the old notWant column asked whether the token
 				// appeared at all, and narrowing that to the child SA would let

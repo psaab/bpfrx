@@ -306,7 +306,7 @@ func TestGenerateConfig_JunosGCM(t *testing.T) {
 	// speak for a `aes256gcm-modp2048` emitted under some other section.
 	got := m.generateConfig(cfg)
 	childSA_3904(t, got, "tun1").requireSetting(t, "esp_proposals", "aes256gcm16-modp2048")
-	parseSwanctlDoc(t, got).hasNoSettingValueAnywhere(t, "esp_proposals", "aes256gcm-modp2048")
+	parseSwanctlDoc(t, got).hasNoValueSubstringAnywhere(t, "aes256gcm-modp2048")
 }
 
 // TestEscapeSwanctlQuoted unit-tests the swanctl double-quoted-string

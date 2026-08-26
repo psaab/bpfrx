@@ -56,7 +56,12 @@ func TestRenderTrafficSelectorSanitizesInjection(t *testing.T) {
 	// exists. The old line scan covered the whole document and the first
 	// structural conversion narrowed it; that was a real loss of power.
 	doc.hasNoSettingAnywhere(t, "updown")
-	doc.hasNoSettingValueAnywhere(t, "esp_proposals", "null-null")
+	// The deleted check was `HasPrefix(trimmed, "esp_proposals = null-null")` --
+	// a line prefix on a NAMED key, not a bare token. A bare-substring form is
+	// wrong here in the over-reject direction: the sanitized remote_ts value
+	// legitimately contains the injected text, collapsed onto one line, which
+	// is exactly what the belt is supposed to do to it.
+	doc.hasNoSettingValuePrefixAnywhere(t, "esp_proposals", "null-null")
 
 	child := doc.at(t, "connections", "tun1", "children", "tun1-ts1")
 

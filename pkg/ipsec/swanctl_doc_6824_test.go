@@ -90,13 +90,35 @@ func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 		if line == "" {
 			continue
 		}
-		// A comment is a line starting '#' that is NOT also a section opener or
-		// a setting. Without those two exclusions a SECTION whose name begins
-		// '#' (a connection named "#b" -- reachable, see the doc comment) is
-		// skipped silently, and its real closing brace then cancels an
-		// unrelated fake open. The document balances and the tree is wrong with
-		// no error at all.
-		if strings.HasPrefix(line, "#") && !strings.HasSuffix(line, "{") && !strings.Contains(line, "=") {
+		// AMBIGUOUS SHAPES ARE REFUSED, NOT CLASSIFIED.
+		//
+		// Two line shapes cannot be told apart from the line alone: one
+		// starting '#' and ending '{' (a comment, or a section whose name
+		// begins '#'), and one containing '=' and ending '{' (a setting whose
+		// value ends in a brace, or a section whose name contains '=').
+		//
+		// The first cut of this parser guessed at each, and the guesses
+		// CANCELLED: a fake open from one was closed by a real brace from the
+		// other, the stack balanced, and the tree silently lacked a section the
+		// renderer emitted. Fixing the guesses only moved the pair -- reversing
+		// which half is misread reproduces the cancellation exactly.
+		//
+		// Neither shape is reachable from this renderer (generateConfig emits
+		// one fixed header comment and section names come from config object
+		// names). So the honest response is to fail on them rather than to pick
+		// an interpretation: a parser that guesses can cancel its guesses, and a
+		// parser that refuses cannot.
+		if strings.HasSuffix(line, "{") && strings.HasPrefix(line, "#") {
+			t.Fatalf("line %d: %q both opens a section and looks like a comment. This "+
+				"parser refuses ambiguous shapes rather than guessing -- two guesses "+
+				"can cancel and leave a balanced document with a wrong tree:\n%s",
+				i+1, line, doc)
+		}
+		if strings.HasSuffix(line, "{") && strings.Contains(line, "=") {
+			t.Fatalf("line %d: %q both opens a section and looks like a setting. Same "+
+				"refusal as above; see the doc comment:\n%s", i+1, line, doc)
+		}
+		if strings.HasPrefix(line, "#") {
 			continue
 		}
 		cur := stack[len(stack)-1]
@@ -108,13 +130,7 @@ func parseSwanctlDoc(t swanctlTB, doc string) *swanctlNode {
 			}
 			stack = stack[:len(stack)-1]
 
-		// A section opener carries no '='. A line that ends in an open brace AND
-		// contains one is a SETTING whose value happens to end in a brace
-		// (`local_ts = 10.0.0.0/24 {`, reachable from an authored quoted token:
-		// sanitizeSwanctlValue strips control bytes, not braces). Classifying it
-		// as a section opened a phantom nesting level that a later real close
-		// could cancel, leaving a balanced document and a silently wrong tree.
-		case strings.HasSuffix(line, "{") && !strings.Contains(line, "="):
+		case strings.HasSuffix(line, "{"):
 			name := strings.TrimSpace(strings.TrimSuffix(line, "{"))
 			if name == "" {
 				t.Fatalf("line %d: section opened with no name:\n%s", i+1, doc)
@@ -317,24 +333,50 @@ func (n *swanctlNode) hasNoSettingAnywhere(t swanctlTB, key string) {
 	walk(n, n.name)
 }
 
-// hasNoSettingValueAnywhere asserts no section in the tree declares key with
-// this exact value.
+// hasNoSettingValuePrefixAnywhere asserts no section declares key with a value
+// STARTING with forbidden.
 //
-// It exists because several converted assertions replaced a WHOLE-DOCUMENT
-// negative ("esp_proposals = default appears nowhere") with equality at one
-// path. Those are not the same claim: the parser has no schema forbidding the
-// same key under a different connection, so a correct setting at the asserted
-// path plus a forbidden one elsewhere passes the equality and would have failed
-// the old needle. Where the original claim was document-wide, the replacement
-// has to be too.
-func (n *swanctlNode) hasNoSettingValueAnywhere(t swanctlTB, key, forbidden string) {
+// This is the faithful structural form of a deleted
+// `strings.Contains(doc, "<key> = <forbidden>")` needle. Exact equality is NOT
+// faithful: the renderer emits comma-joined lists, so
+// `esp_proposals = default,aes256` contains the old needle and FAILED it, while
+// an equality check passes. Five restorations were written as equality and were
+// all weaker than the checks they replaced for exactly that reason.
+func (n *swanctlNode) hasNoSettingValuePrefixAnywhere(t swanctlTB, key, forbidden string) {
 	t.Helper()
 	var walk func(*swanctlNode, string)
 	walk = func(node *swanctlNode, path string) {
 		for _, v := range node.settings[key] {
-			if v == forbidden {
-				t.Errorf("%s = %q at %s; that value must appear NOWHERE in the "+
-					"document, not merely not at the path under test", key, forbidden, path)
+			if strings.HasPrefix(v, forbidden) {
+				t.Errorf("%s = %q at %s, which begins with the forbidden %q. The needle "+
+					"this replaced matched the rendered LINE, so a comma list starting "+
+					"with the forbidden value failed it too.", key, v, path, forbidden)
+			}
+		}
+		for _, name := range node.order {
+			walk(node.children[name], path+"."+name)
+		}
+	}
+	walk(n, n.name)
+}
+
+// hasNoValueSubstringAnywhere asserts no setting value anywhere CONTAINS substr.
+//
+// The faithful form of a deleted bare-token needle -- one that named no key, so
+// it matched the token anywhere in the document, including as a member of a
+// comma list. `Contains(doc, "sha256-modp2048")` is that shape: an equality
+// check on one key misses `esp_proposals = aes128-sha256-modp2048` entirely.
+func (n *swanctlNode) hasNoValueSubstringAnywhere(t swanctlTB, substr string) {
+	t.Helper()
+	var walk func(*swanctlNode, string)
+	walk = func(node *swanctlNode, path string) {
+		for _, k := range node.settingNames() {
+			for _, v := range node.settings[k] {
+				if strings.Contains(v, substr) {
+					t.Errorf("%s.%s = %q contains the forbidden %q; the needle this "+
+						"replaced named no key, so it matched the token ANYWHERE "+
+						"including inside a comma list", path, k, v, substr)
+				}
 			}
 		}
 		for _, name := range node.order {

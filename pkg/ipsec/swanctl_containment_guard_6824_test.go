@@ -79,20 +79,51 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 	// worse than one with a known blind spot, because the cost lands on someone
 	// who did nothing wrong.
 	rendered := map[string]bool{}
-	isRenderCall := func(e ast.Expr) bool {
+	// Render producers: the two render entry points, PLUS any function in this
+	// file that returns one of them.
+	//
+	// `renderMust` is exactly that shape -- it wraps renderConfig and every
+	// DHCP assertion went through it -- so an Ident-only match saw none of
+	// them. A guard blind to the helper the tests actually use is blind to the
+	// tests it is meant to guard.
+	producers := map[string]bool{"generateConfig": true, "renderConfig": true}
+	calleeName := func(e ast.Expr) string {
 		call, ok := e.(*ast.CallExpr)
 		if !ok {
-			return false
+			return ""
 		}
-		name := ""
 		switch fn := call.Fun.(type) {
 		case *ast.SelectorExpr:
-			name = fn.Sel.Name
+			return fn.Sel.Name
 		case *ast.Ident:
-			name = fn.Name
+			return fn.Name
 		}
-		return name == "generateConfig" || name == "renderConfig"
+		return ""
 	}
+	// Fixed point, so a helper wrapping a helper is also a producer.
+	for changed := true; changed; {
+		changed = false
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || producers[fn.Name.Name] {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				ret, ok := n.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				for _, r := range ret.Results {
+					if producers[calleeName(r)] {
+						producers[fn.Name.Name] = true
+						changed = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	isRenderCall := func(e ast.Expr) bool { return producers[calleeName(e)] }
 	noteAssign := func(lhs, rhs []ast.Expr) {
 		for i, l := range lhs {
 			id, ok := l.(*ast.Ident)
@@ -109,8 +140,15 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 			}
 		}
 	}
-	collect := func(scope ast.Node) {
-		ast.Inspect(scope, func(n ast.Node) bool {
+	collect := func(sc ast.Node) {
+		ast.Inspect(sc, func(n ast.Node) bool {
+			// Same rule as inspectCalls: a nested literal is its own scope, so
+			// a binding made inside one must not leak to its SIBLINGS. Without
+			// this, a render bound in one t.Run closure reached every other
+			// closure in the same function and made their locals look rendered.
+			if _, ok := n.(*ast.FuncLit); ok && n != sc {
+				return false
+			}
 			switch s := n.(type) {
 			case *ast.AssignStmt:
 				noteAssign(s.Lhs, s.Rhs)
@@ -128,8 +166,15 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 	}
 
 	var out []containmentFinding
-	inspectCalls := func(scope ast.Node) {
-		ast.Inspect(scope, func(n ast.Node) bool {
+	inspectCalls := func(sc ast.Node) {
+		ast.Inspect(sc, func(n ast.Node) bool {
+			// Do NOT descend into a nested function literal: it is walked as its
+			// own scope, and walking it twice reports every finding inside it
+			// twice.
+			if lit, ok := n.(*ast.FuncLit); ok && n != sc {
+				_ = lit
+				return false
+			}
 			call, ok := n.(*ast.CallExpr)
 			if !ok || len(call.Args) != 2 {
 				return true
@@ -181,18 +226,56 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 		})
 	}
 
-	// One function at a time, so a render binding in one test cannot make a
-	// same-named local in another test look like a rendered document. Package
-	// level (a var block holding a render call) is walked once as its own
-	// scope; nothing outside a function makes containment assertions.
+	// PACKAGE-LEVEL declarations first, and they persist across every scope
+	// below: a file-level `var got = m.generateConfig(cfg)` is visible to every
+	// function, so scoping it away made it invisible to the guard.
+	pkgLevel := map[string]bool{}
 	for _, d := range f.Decls {
-		fn, ok := d.(*ast.FuncDecl)
-		if !ok {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
 			continue
 		}
 		rendered = map[string]bool{}
-		collect(fn)
-		inspectCalls(fn)
+		collect(gd)
+		for k := range rendered {
+			pkgLevel[k] = true
+		}
+	}
+
+	// Then one scope at a time. A scope is a FuncDecl or a function LITERAL --
+	// sibling t.Run closures are separate scopes, so a rendered `got` in one
+	// cannot make an unrelated error-message `got` in the next a false
+	// positive. Nesting is handled by walking outward-in: an inner literal
+	// starts from its enclosing scope's bindings, which is what Go's own
+	// scoping does.
+	var scope func(n ast.Node, outer map[string]bool)
+	scope = func(n ast.Node, outer map[string]bool) {
+		rendered = map[string]bool{}
+		for k := range outer {
+			rendered[k] = true
+		}
+		collect(n)
+		here := map[string]bool{}
+		for k := range rendered {
+			here[k] = true
+		}
+		inspectCalls(n)
+
+		ast.Inspect(n, func(m ast.Node) bool {
+			lit, ok := m.(*ast.FuncLit)
+			if !ok || m == n {
+				return true
+			}
+			scope(lit, here)
+			return false
+		})
+	}
+	for _, d := range f.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		scope(fn, pkgLevel)
 	}
 	return out
 }
@@ -276,6 +359,98 @@ func TestNoSwanctlSyntaxInContainmentNeedles_6824(t *testing.T) {
 	}
 }
 
+// TestGuardSeesPackageLevelAndNestedScopes_6824 covers the three provenance
+// cases a per-FuncDecl walk missed.
+//
+// Each is an ordinary shape in this package's tests, and each produced ZERO
+// findings before: a render bound by a HELPER (renderMust wraps renderConfig,
+// and every DHCP assertion went through it), a render bound at PACKAGE level,
+// and a violation inside a t.Run CLOSURE.
+func TestGuardSeesPackageLevelAndNestedScopes_6824(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		src  string
+		want int
+	}{
+		{
+			name: "package-level render binding",
+			src: `package ipsec
+
+import "strings"
+
+var got = m.generateConfig(cfg)
+
+func probe() {
+	_ = strings.Contains(got, "remote_addrs = 1.1.1.1")
+}
+`,
+			want: 1,
+		},
+		{
+			name: "violation inside a closure, render bound outside it",
+			src: `package ipsec
+
+import "strings"
+
+func probe(t *testing.T) {
+	got := m.generateConfig(cfg)
+	t.Run("x", func(t *testing.T) {
+		_ = strings.Contains(got, "remote_addrs = 1.1.1.1")
+	})
+}
+`,
+			want: 1,
+		},
+		{
+			name: "sibling closures do NOT collide",
+			src: `package ipsec
+
+import "strings"
+
+func probe(t *testing.T) {
+	t.Run("renders", func(t *testing.T) {
+		got := m.generateConfig(cfg)
+		_ = got
+	})
+	t.Run("asserts an error", func(t *testing.T) {
+		got := doThing().Error()
+		_ = strings.Contains(got, "load-all = yes")
+	})
+}
+`,
+			want: 0,
+		},
+		{
+			name: "a violation is reported ONCE, not once per enclosing scope",
+			src: `package ipsec
+
+import "strings"
+
+func probe(t *testing.T) {
+	got := m.generateConfig(cfg)
+	t.Run("a", func(t *testing.T) {
+		t.Run("b", func(t *testing.T) {
+			_ = strings.Contains(got, "remote_addrs = 1.1.1.1")
+		})
+	})
+}
+`,
+			want: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "probe_test.go", c.src, 0)
+			if err != nil {
+				t.Fatalf("parse synthetic source: %v", err)
+			}
+			if got := findSwanctlContainment(fset, f); len(got) != c.want {
+				t.Errorf("found %d finding(s), want %d: %+v", len(got), c.want, got)
+			}
+		})
+	}
+}
+
 // TestGuardScopesRenderVariablesPerFunction_6824 is the false-POSITIVE control.
 //
 // The detector used to collect render-variable names file-wide, so one test
@@ -322,8 +497,21 @@ func TestContainmentGuardSensitivity_6824(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
-		want int
+		// extra is appended after the probe function, for a cell that needs a
+		// helper DEFINED -- the producer fixed point can only recognise a
+		// wrapper it can see.
+		extra string
+		want  int
 	}{
+		{
+			name: "render produced by a HELPER that wraps renderConfig",
+			body: `got := renderMust(cfg)
+	_ = strings.Contains(got, "local_addrs = 1.1.1.1")`,
+			extra: `
+func renderMust(cfg *Config) string { return m.renderConfig(cfg) }
+`,
+			want: 1,
+		},
 		{
 			name: "section opener needle with a trailing newline",
 			body: `got := m.generateConfig(cfg)
@@ -382,7 +570,7 @@ func TestContainmentGuardSensitivity_6824(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			src := "package ipsec\n\nimport \"strings\"\n\nfunc probe() {\n\t" + c.body + "\n}\n"
+			src := "package ipsec\n\nimport \"strings\"\n\nfunc probe() {\n\t" + c.body + "\n}\n" + c.extra
 			fset := token.NewFileSet()
 			f, err := parser.ParseFile(fset, "probe_test.go", src, 0)
 			if err != nil {
