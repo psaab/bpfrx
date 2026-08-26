@@ -105182,6 +105182,40 @@ prose edit above them added. No diff falls in the new test body.
   three; against the fixed one it passes over 1946 entries.
 - **File(s)**: `_Log.md`, `pkg/refactoraudit/log_duplicate_entry_test.go` (new)
 
+## 2026-08-26 — #7610: step 8 measured the 3 Gb/s shaped port against a 23 Gbit/s bar
+
+- **Timestamp**: 2026-08-26
+- **Action**: Point `docs/engineering-style.md` step 8's throughput row at port
+  5211, explain why the ports are not interchangeable, and add
+  `pkg/refactoraudit/step8_iperf_port_test.go` to bind the doc and the CoS
+  fixture to each other.
+- **Why**: the row instructed every lane to apply
+  `test/incus/cos-iperf-config.set` and then measure `iperf3 … -p 5203` against
+  `≥ 23 Gbit/s`. In that fixture THE PORT IS THE CLASS: `bandwidth-output`
+  term 3 maps 5203 → `iperf-3g` → `scheduler-3g`, `transmit-rate 3.0g exact`.
+  So the row said "shape this to 3 Gb/s, then fail the change if it does not
+  reach 23". A lane following it literally reads a correctly working shaper as
+  an 8x regression — measured on a healthy fw0: 5203 → 2.86 Gbit/s, 5211 → 23.1
+  Gbit/s.
+- **The "no regression vs previous run" clause made it worse, not better**:
+  every previous run of the same wrong port also reported ~3 Gbit/s, so the
+  false reading looked corroborated by history.
+- **The gate binds the AGREEMENT, not a literal.** Pinning the doc to "5211"
+  would encode which side I trust; a fixture renumber would then leave the test
+  green and the doc wrong again. The invariant is "the port step 8 names must
+  resolve, IN THE FIXTURE, to a class with no explicit transmit-rate", which
+  survives a renumber. The row is located by CONTENT (an iperf3 check against
+  the documented target) and the gate refuses to guess if there is not exactly
+  one.
+- **Verified paired**: against the pre-fix doc the gate REDs naming
+  `iperf-3g`/`scheduler-3g`/`3.0g`; against the fixed doc it resolves 5211 to
+  `iperf-uncapped` with no rate and passes. A sensitivity control drives the
+  real parsers over a synthetic fixture in both directions.
+- **Found by**: the #6790 lane, which measured both ports back-to-back on a
+  real box rather than trusting the doc.
+- **File(s)**: `docs/engineering-style.md`,
+  `pkg/refactoraudit/step8_iperf_port_test.go` (new), `_Log.md`
+
 ## 2026-08-26 — #6805: a list-only routing-instance member was never bound on first apply
 
 - **Timestamp**: 2026-08-26
