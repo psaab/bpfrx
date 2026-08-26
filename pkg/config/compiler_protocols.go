@@ -123,7 +123,14 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							}
 						}
 					case "authentication":
-						for _, authChild := range prop.Children {
+						// #6818: packedBodyChildren, not prop.Children. The
+						// compact spelling `authentication simple-password
+						// "secret";` puts the value on this stanza's own Keys,
+						// so a Children-only loop ran zero times, AuthType and
+						// AuthKey stayed empty, and the adjacency formed
+						// UNAUTHENTICATED with no error and no warning.
+						for _, authChild := range packedBodyChildren(prop,
+							schemaForPath("protocols", "ospf", "area", "interface", "authentication")) {
 							switch authChild.Name() {
 							case "md5":
 								iface.AuthType = "md5"

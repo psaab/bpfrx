@@ -80,7 +80,13 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			case "source-address":
 				stream.SourceAddress = nodeVal(prop)
 			case "transport":
-				for _, tc := range prop.Children {
+				// #6821: packedBodyChildren, not prop.Children. The compact
+				// spelling `transport tls-profile secure-logs;` puts the value
+				// on this stanza's own Keys, so a Children-only loop ran zero
+				// times and the stream shipped audit records over an
+				// unprotected transport with no error and no warning.
+				for _, tc := range packedBodyChildren(prop,
+					schemaForPath("security", "log", "stream", "transport")) {
 					switch tc.Name() {
 					case "protocol":
 						stream.Transport.Protocol = nodeVal(tc)

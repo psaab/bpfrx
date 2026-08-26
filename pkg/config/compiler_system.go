@@ -210,6 +210,16 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					case "class":
 						user.Class = nodeVal(prop)
 					case "authentication":
+						// Children-only is CORRECT here, unlike the sibling
+						// sites fixed for #6818/#6821/#6822. The compact
+						// spelling `authentication encrypted-password "$6$..."`
+						// is REJECTED at commit by the #6662 packed-login-body
+						// gate, which names the rewrite; on the tolerant load /
+						// peer-sync path it is a warning and the stanza stays
+						// inert, deliberately, so a peer-synced config behaves
+						// exactly as the older binary made it behave (#1960).
+						// Compiling the value here would silently reverse that
+						// decision and change RBAC on the HA sync path.
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
 							case "encrypted-password":
@@ -1787,6 +1797,28 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 			userChildren = child.Children[0].Children
 		}
 		for _, prop := range userChildren {
+			// #6822: the compact spelling
+			//   authentication-sha256 authentication-password "s3cret";
+			// flattens the credential onto this node's own Keys, where the
+			// FindChild reads below cannot see it. The result was NOT a skipped
+			// user -- the protocol comes from the case label, so the user was
+			// registered as requiring SHA-256 and AES-128 with EMPTY passwords.
+			//
+			// parseSNMPv3UserKeys already reads exactly this key shape for the
+			// flat-set path. Route the compact block form through the same
+			// function rather than duplicating its table: a second copy is a
+			// second thing to keep in step, and a divergence here is a silent
+			// credential loss either way.
+			//
+			// packedBodyChildren (compact_tail.go) is the general expander and
+			// is used for the #6818/#6821 siblings. It is the wrong tool HERE:
+			// the protocol is carried by the case LABEL rather than by a value,
+			// so the reader below needs the whole key run, not a rebuilt child
+			// tree -- and parseSNMPv3UserKeys already consumes exactly that run.
+			if len(prop.Keys) >= 3 {
+				parseSNMPv3UserKeys(prop.Keys, user)
+				continue
+			}
 			switch prop.Name() {
 			case "authentication-md5":
 				user.AuthProtocol = "md5"

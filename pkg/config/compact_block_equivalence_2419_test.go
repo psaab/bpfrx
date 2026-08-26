@@ -165,16 +165,70 @@ func collectCompactSites() []compactSite {
 // suite, and a site that gets FIXED without updating the file reds it too.
 const inventoryPath = "testdata/compact_block_divergences_2419.txt"
 
-// filedInstances is the POSITIVE CONTROL. The first version of this instrument
-// found only 2 of these 4 — args rendered as their own nesting level hid one,
-// and a fixture missing a required sibling hid the other. An instrument that
-// silently stops finding known-true sites reports "clean" for the same reason
-// the textual sweeps did, so the four are asserted present by construction.
-var filedInstances = map[string]string{
-	"system login user xpfarg authentication encrypted-password":                         "#6817",
+// filedFixed is HALF of the positive control: sites that were filed as
+// compact-blind, were verified by hand, and have since been FIXED. The
+// instrument must now find them EQUIVALENT.
+//
+// These four were the original control. The first version of this instrument
+// found only 2 of the 4 — args rendered as their own nesting level hid one, and
+// a fixture missing a required sibling hid the other — which is why they were
+// asserted present by construction rather than trusted.
+//
+// Fixing them would ordinarily END the control, and an instrument with no
+// known-true anchor reports "clean" for the same reason the textual sweeps did.
+// So they change SIDES rather than leaving: an instrument that cannot see a
+// repaired site is as broken as one that cannot see a defective one, and only a
+// control with both directions can tell the two apart.
+var filedFixed = map[string]string{
 	"protocols ospf area xpfarg interface xpfarg authentication simple-password":         "#6818",
 	"security log stream xpfarg transport tls-profile":                                   "#6821",
 	"snmp v3 usm local-engine user xpfarg authentication-sha256 authentication-password": "#6822",
+}
+
+// filedByDesign is the category the inventory did not previously distinguish:
+// sites that diverge DELIBERATELY, where compiling the compact spelling would
+// reverse a decision someone made on purpose.
+//
+// Without this, a stale inventory line and a considered design decision look
+// identical -- both are "a site that diverges" -- and the next person to work
+// through the list has no way to tell that fixing one of them undoes #6662.
+//
+// `system login user ... authentication <leaf>` is the whole of it today. The
+// compact spelling is REJECTED at commit by the #6662 packed-login-body gate,
+// which names the rewrite. On the tolerant load / peer-sync path it is a
+// warning and the stanza stays inert -- deliberately, so a peer-synced config
+// behaves exactly as the binary that accepted it behaved (#1960). Compiling the
+// value there would change RBAC across an HA sync, silently, on nodes that
+// disagree about the binary version.
+//
+// So #6817, filed as "silently drops the credential", describes a state that no
+// longer exists: it is neither silent (commit names it, load warns) nor
+// accidental.
+var filedByDesign = map[string]string{
+	"system login user xpfarg authentication encrypted-password": "#6817 -> resolved by #6662",
+	"system login user xpfarg authentication ssh-ed25519":        "#6817 -> resolved by #6662",
+	"system login user xpfarg authentication ssh-rsa":            "#6817 -> resolved by #6662",
+	"system login user xpfarg authentication ssh-dsa":            "#6817 -> resolved by #6662",
+}
+
+// filedStillOpen is the OTHER half: sites verified BY HAND to be compact-blind
+// at this commit, which the instrument must still find.
+//
+// Membership here is not "it appears in the inventory" — the inventory is what
+// this control exists to check. Each was confirmed by reading the compiler:
+// each reads only prop.Children (or FindChild, which searches only children) for
+// a value the compact spelling puts on the stanza's own Keys.
+var filedStillOpen = map[string]string{
+	// compiler_interfaces.go:118-127 -- a FindChild chain
+	// (aeoNode -> lacp -> periodic). FindChild searches only children, so the
+	// compact `lacp periodic fast;` leaves the value on the lacp node's own
+	// Keys and LACPPeriodic stays empty.
+	"interfaces xpfname aggregated-ether-options lacp periodic": "compiler_interfaces.go:125",
+	// compiler_class_of_service.go:228-229 -- FindChild("classifiers") then
+	// FindChildren("dscp"), both child-only. Chosen from a DIFFERENT compiler
+	// file than the anchor above so a fault confined to one file cannot
+	// silence the whole control.
+	"class-of-service interfaces xpfarg classifiers dscp": "compiler_class_of_service.go:229",
 }
 
 type censusResult struct {
@@ -298,12 +352,36 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 			"tested population into the skip buckets; the census stops measuring them.",
 			wantChecked, res.checked)
 	}
-	// Positive control.
-	for site, issue := range filedInstances {
+	// Positive control, both directions.
+	//
+	// A one-directional control cannot distinguish a working instrument from one
+	// that has silently started reporting every site as divergent (or as clean).
+	// Anchoring known-FIXED and known-OPEN sites separately does.
+	for site, issue := range filedStillOpen {
 		if !inGot[site] {
-			t.Errorf("#2419 POSITIVE CONTROL: the instrument no longer finds %s (%s). "+
-				"An instrument that stops finding known-true sites reports clean for the "+
+			t.Errorf("#2419 POSITIVE CONTROL: the instrument no longer finds %s (%s), "+
+				"a site verified BY HAND to be compact-blind at this commit. An "+
+				"instrument that stops finding known-true sites reports clean for the "+
 				"same reason a textual sweep does.", site, issue)
+		}
+	}
+	for site, issue := range filedFixed {
+		if inGot[site] {
+			t.Errorf("#2419 POSITIVE CONTROL: the instrument reports %s (%s) as still "+
+				"compact-blind, but it was FIXED. Either the fix regressed, or the "+
+				"instrument has started calling everything divergent — which would make "+
+				"the inventory comparison above pass for the wrong reason.", site, issue)
+		}
+	}
+	// Deliberate divergences must STAY divergent. This is not a duplicate of the
+	// filedStillOpen loop: those are sites awaiting a fix, these are sites where
+	// a fix would be a REGRESSION, and a reader working down the inventory needs
+	// to be told which is which before they "fix" one.
+	for site, issue := range filedByDesign {
+		if !inGot[site] {
+			t.Errorf("#2419: %s (%s) now compiles the compact spelling, but it is "+
+				"divergent BY DESIGN. Compiling it reverses the decision recorded at "+
+				"that entry — re-read it before removing this line.", site, issue)
 		}
 	}
 }

@@ -71,7 +71,6 @@ protocols isis level
 protocols isis net
 protocols lldp hold-multiplier
 protocols lldp transmit-interval
-protocols ospf area xpfarg interface xpfarg authentication simple-password
 protocols ospf export
 protocols ospf router-id
 protocols ospf3 export
@@ -87,7 +86,6 @@ routing-instances xpfname protocols isis export
 routing-instances xpfname protocols isis is-type
 routing-instances xpfname protocols isis level
 routing-instances xpfname protocols isis net
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg authentication simple-password
 routing-instances xpfname protocols ospf3 export
 routing-instances xpfname protocols ospf3 router-id
 routing-options autonomous-system
@@ -129,8 +127,6 @@ security ipsec vpn xpfarg vpn-monitor source-interface
 security log format
 security log mode
 security log source-interface
-security log stream xpfarg transport protocol
-security log stream xpfarg transport tls-profile
 security nat destination pool
 security nat destination rule-set xpfarg rule xpfarg match application
 security nat destination rule-set xpfarg rule xpfarg match destination-address
@@ -168,11 +164,6 @@ security zones security-zone xpfarg interfaces xpfname host-inbound-traffic prot
 security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services
 services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds
 services flow-monitoring version9 template xpfarg template-refresh-rate seconds
-snmp v3 usm local-engine user xpfarg authentication-md5 authentication-password
-snmp v3 usm local-engine user xpfarg authentication-sha authentication-password
-snmp v3 usm local-engine user xpfarg authentication-sha256 authentication-password
-snmp v3 usm local-engine user xpfarg privacy-aes128 privacy-password
-snmp v3 usm local-engine user xpfarg privacy-des privacy-password
 system archival configuration archive-sites
 system archival configuration transfer-interval
 system dataplane binary

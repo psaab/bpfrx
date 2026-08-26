@@ -35,6 +35,31 @@ discard (#6685), and a filter term whose `from` was dropped matches EVERYTHING
 **Use `packedBodyChildren` / `packedBody` (`compact_tail.go`) instead of reading
 `node.Children` directly** when compiling a stanza that accepts a packed body.
 
+Three further instances were fixed this way (#6818, #6821, #6822), and all three
+failed in the security-relevant direction with **zero warnings on the strict
+commit path**:
+
+| issue | stanza | what the compact spelling dropped |
+|---|---|---|
+| #6818 | `protocols ospf area <a> interface <i> authentication` | `AuthType`/`AuthKey` — the adjacency forms UNAUTHENTICATED |
+| #6821 | `security log stream <s> transport` | `protocol tls` — audit records ship over plain transport |
+| #6822 | `snmp v3 usm local-engine user <u> authentication-* / privacy-*` | the passwords, while the PROTOCOL still set — the user is registered as requiring SHA-256 and AES-128 with empty credentials |
+
+#6822 is the one that does not use `packedBodyChildren`: its protocol comes from
+the reader's `case` label rather than from a value, so the reader needs the whole
+key run rather than a rebuilt child tree. `parseSNMPv3UserKeys` already consumes
+exactly that run for the flat-`set` path, so the compact block form is routed
+through the same function rather than growing a second copy of its table.
+
+**Not every divergence is a defect.** `system login user <u> authentication`
+(#6817) reads `node.Children` deliberately: the compact spelling is rejected at
+commit by the #6662 packed-login-body gate, and on the tolerant load / peer-sync
+path it warns and leaves the stanza inert so a peer-synced config behaves exactly
+as the binary that accepted it behaved (#1960). Compiling it there would change
+RBAC across an HA sync between nodes on different binaries. The #2419 inventory
+records this in a `filedByDesign` category so the entry is not mistaken for one
+awaiting a fix.
+
 ### Why it is schema-driven
 
 The packed tail does NOT expand uniformly, which is why a split on whitespace is

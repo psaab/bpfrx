@@ -106306,3 +106306,14 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6818/#6821/#6822 — compile the compact spelling of OSPF
+    interface authentication, security-log transport and SNMPv3 credentials;
+    classify #6817 as divergent by design (#6662)
+  - **File(s)**: pkg/config/compiler_protocols.go,
+    pkg/config/compiler_security_log.go, pkg/config/compiler_system.go,
+    pkg/config/compact_leaf_credentials_test.go (new),
+    pkg/config/compact_block_equivalence_2419_test.go,
+    pkg/config/testdata/compact_block_divergences_2419.txt,
+    docs/config-schema.md
