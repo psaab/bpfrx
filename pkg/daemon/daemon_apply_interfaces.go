@@ -231,30 +231,21 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) (ctx
 	// cfg.TunnelNameMap() (#1904) so a unit>0 entry like gr-0/0/0.1
 	// binds the real per-unit device (gr-0-0-0u1), not the literal
 	// ".1" name.
-	if d.routing != nil {
-		tunMap := cfg.TunnelNameMap()
-		for _, ri := range cfg.RoutingInstances {
-			if ri.InstanceType == "forwarding" {
-				continue
-			}
-			for _, ifaceName := range ri.Interfaces {
-				linuxName := riMemberLinuxName(tunMap, ifaceName)
-				// #5700: deliberately best-effort (WARN, not surfaced). This runs
-				// BEFORE applyInterfaceReconcile creates tunnel/xfrmi devices, so a
-				// routing-instance member that is a later-created tunnel is legitimately
-				// "not found" here — an EXPECTED transient absence that must NOT be
-				// promoted into a permanent commit failure. Only the VRF DEVICE setup
-				// (ReconcileVRFs, surfaced above as vrfErr) and the authoritative
-				// post-networkd management re-bind (rebindManagementVRFIfaces) are
-				// load-bearing and transient-free.
-				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
-					slog.Warn("failed to bind interface to VRF",
-						"interface", ifaceName, "linux", linuxName,
-						"instance", ri.Name, "err", err)
-				}
-			}
-		}
-	}
+	//
+	// #5700: deliberately best-effort (WARN, not surfaced). This runs BEFORE
+	// applyInterfaceReconcile creates tunnel/xfrmi devices, so a routing-instance
+	// member that is a later-created tunnel is legitimately "not found" here — an
+	// EXPECTED transient absence that must NOT be promoted into a permanent
+	// commit failure.
+	//
+	// #6805: and because it is legitimately absent here, this pass alone left it
+	// UNBOUND. The tunnel manager will not bind a list-only member either — its
+	// case-2 arm only OBSERVES, because "0a owns list binds" — so on a FIRST
+	// apply the tunnel came up outside its VRF, in the default table, and stayed
+	// there until some later apply happened to run this loop while the device
+	// existed. rebindRoutingInstanceMembers re-drives the SAME loop after the
+	// devices exist; see its comment.
+	d.bindRoutingInstanceMembers(cfg)
 
 	// 0b. Bind management interfaces (fxp*/fab*/em*) to vrf-mgmt, but
 	// only if ReconcileVRFs actually got vrf-mgmt into the managed set.
@@ -322,6 +313,70 @@ func (d *Daemon) rebindManagementVRFIfaces() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// bindRoutingInstanceMembers binds every non-forwarding routing-instance's
+// `interface` list members to their VRF.
+//
+// ONE implementation, deliberately, called from BOTH the pre-networkd step-0a
+// pass and the post-device late re-bind (#6805). The two passes must agree on
+// exactly which names they bind: the tunnel manager's unbind VETO
+// (reconcileVRFClaimLocked case 2) is written against "whatever 0a binds", and a
+// second loop that drifted from this one would make that veto guard a different
+// set than the one being bound. Name normalization goes through
+// riMemberLinuxName (#1884) and cfg.TunnelNameMap() (#1904) so a unit>0 entry
+// like gr-0/0/0.1 binds the real per-unit device (gr-0-0-0u1), not the literal
+// ".1" name.
+//
+// Best-effort at WARN in both passes. A routing-instance `interface` list can
+// legitimately name an interface that is genuinely absent on this chassis, so
+// promoting a bind failure to a commit failure here would reject configs that
+// are correct for the fleet — a different defect from the one #6805 fixes.
+func (d *Daemon) bindRoutingInstanceMembers(cfg *config.Config) {
+	if d.routing == nil || cfg == nil {
+		return
+	}
+	tunMap := cfg.TunnelNameMap()
+	for _, ri := range cfg.RoutingInstances {
+		if ri.InstanceType == "forwarding" {
+			continue
+		}
+		for _, ifaceName := range ri.Interfaces {
+			linuxName := riMemberLinuxName(tunMap, ifaceName)
+			if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
+				slog.Warn("failed to bind interface to VRF",
+					"interface", ifaceName, "linux", linuxName,
+					"instance", ri.Name, "err", err)
+			}
+		}
+	}
+}
+
+// rebindRoutingInstanceMembers is the #6805 late pass: the step-0a bind, re-run
+// after the tunnel / xfrmi devices actually exist.
+//
+// Step 0a is the designated owner of routing-instance list binds — the tunnel
+// manager's `reconcileVRFClaimLocked` case 2 refuses to bind a list-only member
+// and only OBSERVES whether the link's master is already its VRF, with an
+// explicit "0a owns list binds" veto against unbinding. But 0a runs BEFORE
+// applyInterfaceReconcile creates those devices, so on a FIRST apply the owner
+// ran before the thing it owns existed: 0a warned "not found", the tunnel
+// manager observed a link with no master and took no claim, and the tunnel came
+// up OUTSIDE its VRF — forwarding in the default table on a commit that reported
+// success, until some later apply happened to run 0a while the device existed.
+//
+// The veto is on UNBIND and stays correct; nothing about it requires the first
+// apply to leave the member unbound. The bug was the ordering, so the fix is a
+// second pass at the point where the devices are real, not a bind moved into the
+// tunnel manager.
+//
+// Idempotent: BindInterfaceToVRF is LinkByName + LinkSetMaster with no manager
+// state, so re-driving it on an already-bound member is a cheap no-op. That is
+// why the whole loop is re-run rather than narrowed to "only the tunnels" —
+// narrowing would need a second notion of which members are late-created, and
+// that is exactly the kind of second list that drifts from the first.
+func (d *Daemon) rebindRoutingInstanceMembers(cfg *config.Config) {
+	d.bindRoutingInstanceMembers(cfg)
 }
 
 // applyInterfaceReconcile creates/reconciles the interface-level network
