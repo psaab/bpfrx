@@ -106099,6 +106099,49 @@ prose edit above them added. No diff falls in the new test body.
   review.
 - **File(s)**: `docs/engineering-style.md`, `_Log.md`
 
+## 2026-08-26 — #6833: one primitive, two justifications, and inventory guards
+
+- **Timestamp**: 2026-08-26
+- **Action**: Move the duplicated control-byte belt into `pkg/rendersafe`, and
+  give each consumer a wrapper that names ITS grammar plus an inventory guard.
+- **I diverged from the issue's fix direction #1, deliberately.** It says "one
+  shared helper, in one place", and direction #2 says each call site must name
+  "the specific byte class that is load-bearing for it". Those pull apart: a
+  single shared function cannot carry two justifications, and a function whose
+  doc names two grammars is exactly what invites the relaxation the issue warns
+  about. Resolved as ONE grammar-agnostic primitive
+  (`rendersafe.ReplaceControlBytes(s, repl)`, documented as NOT a security
+  boundary on its own) plus TWO thin per-consumer wrappers. The body exists once
+  — so the dangerous edit can only be made once — while the justification lives
+  at each call site, which is what direction #2 actually asks for.
+- **The substitute is now the caller's parameter**, not hardcoded. That is the
+  mechanical expression of "the safe substitute is a per-consumer fact"; a
+  primitive that hardcoded a space would pull the decision back inside.
+- **Checked, not assumed, that a space is safe at every CURRENT call site**:
+  `sanitizeUnitValue` is applied to `Description=` and only `Description=` (free
+  text); swanctl's unquoted interpolations are comma-separated list keys, not
+  whitespace-separated, and the quoted ones additionally pass through
+  `escapeSwanctlQuoted`. So both belts are correct as written — the issue's
+  `OriginalName=` hazard is real but NOT reachable through `sanitizeUnitValue`,
+  because it is not applied there.
+- **Which makes the real risk a FUTURE call site, so that is what is guarded.**
+  Each package gains an inventory cell asserting which keys the belt is applied
+  to. Adding `sanitizeUnitValue` to a whitespace-separated `[Match]` key, or
+  `sanitizeSwanctlValue` to an unrecorded swanctl key, REDS with a message saying
+  what to re-derive. Verified by probe: both fire on exactly that shape and pass
+  once reverted. The point is not to forbid new call sites but to make the
+  derivation unavoidable.
+- **The primitive's own test is exhaustive over 0x00-0xFF rather than sampled**,
+  because the failure it guards is a future edit NARROWING the class ("surely
+  0x0B is harmless") and a sampled test is what such an edit slips past. Plus a
+  cell asserting the UTF-8 claim the doc makes, which reds if the class were
+  widened to "any byte >= 0x7F".
+- **File(s)**: `pkg/rendersafe/rendersafe.go` (new),
+  `pkg/rendersafe/rendersafe_test.go` (new), `pkg/ipsec/policy.go`,
+  `pkg/ipsec/swanctl_value_grammar_6833_test.go` (new),
+  `pkg/networkd/networkd.go`,
+  `pkg/networkd/unit_value_grammar_6833_test.go` (new), `_Log.md`
+
 ## 2026-08-26 — #2419 compact/block equivalence gate (cohort #6817/#6818/#6821/#6822)
 
 - **Timestamp**: 2026-08-26
