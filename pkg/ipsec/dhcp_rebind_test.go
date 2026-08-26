@@ -1,7 +1,6 @@
 package ipsec
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -102,21 +101,23 @@ func TestHasDHCPBoundGateway(t *testing.T) {
 func TestPrepareConfigReResolvesDHCPLocalAddress(t *testing.T) {
 	m := &Manager{configDir: t.TempDir()}
 
+	// #6824: an exact match on the connection's local_addrs subsumes the
+	// separate "stale address absent" needle. That third check existed only
+	// because containment cannot say a value is the WHOLE value -- with the
+	// setting read at a known path, a render that kept the old address either
+	// fails the equality or declares local_addrs twice, and setting() rejects
+	// a duplicated key outright.
 	old := dhcpBoundConfig("wan0.0", "", "198.51.100.7/24", true)
-	got := m.renderMust(t, PrepareConfig(old))
-	if !strings.Contains(got, "local_addrs = 198.51.100.7") {
-		t.Fatalf("first render missing original local_addrs:\n%s", got)
-	}
+	localAddrs_6824(t, m.renderMust(t, PrepareConfig(old)), "198.51.100.7")
 
 	// Simulate a DHCP renew to a new lease address.
 	renewed := dhcpBoundConfig("wan0.0", "", "203.0.113.42/24", true)
-	got = m.renderMust(t, PrepareConfig(renewed))
-	if !strings.Contains(got, "local_addrs = 203.0.113.42") {
-		t.Fatalf("re-render did not pick up the new lease address:\n%s", got)
-	}
-	if strings.Contains(got, "local_addrs = 198.51.100.7") {
-		t.Fatalf("re-render retained the stale lease address:\n%s", got)
-	}
+	renewedDoc := m.renderMust(t, PrepareConfig(renewed))
+	localAddrs_6824(t, renewedDoc, "203.0.113.42")
+	// The stale address must be gone from the WHOLE document. Equality at the
+	// connection does not say that: a stale local_addrs under any other section
+	// would satisfy it, and the deleted needle would have caught that.
+	parseSwanctlDoc(t, renewedDoc).hasNoValueSubstringAnywhere(t, "198.51.100.7")
 }
 
 // renderMust renders the swanctl config for prepared, failing the test on
@@ -128,4 +129,19 @@ func (m *Manager) renderMust(t *testing.T, prepared *config.IPsecConfig) string 
 		t.Fatalf("renderConfig: %v", err)
 	}
 	return got
+}
+
+// localAddrs_6824 asserts the single rendered connection's local_addrs is
+// exactly want.
+//
+// It resolves the connection by taking the document's only child of
+// connections{}, so the assertion does not silently depend on a section name
+// the fixture never states.
+func localAddrs_6824(t *testing.T, doc, want string) {
+	t.Helper()
+	conns := parseSwanctlDoc(t, doc).at(t, "connections")
+	if len(conns.order) != 1 {
+		t.Fatalf("expected exactly one connection, got %v\n%s", conns.childNames(), conns)
+	}
+	conns.at(t, conns.order[0]).requireSetting(t, "local_addrs", want)
 }
