@@ -41,6 +41,21 @@ import (
 // 30s matches the other always-on self-heal loops.
 var mgmtListenerReassertInterval = 30 * time.Second
 
+// mgmtReassertApply is the reconcile seam for the #6803 owner, in the same
+// spirit as conntrackDeleteFilters and nftApplyPayload: a package var so a test
+// can observe WHETHER the owner re-drove a reconcile, not merely what the
+// listener ended up as. Production code must never mutate it.
+//
+// It exists because the re-drive is IDEMPOTENT. Asking "was the listener rebound"
+// cannot distinguish an owner that correctly skipped a redundant reconcile from
+// one that ran a full reconcile for nothing — a reconcile against an
+// already-healthy leg changes no listener, so the #4001 inside-the-semaphore
+// re-check was invisible to an outcome-shaped assertion and survived its
+// mutation cell. The call itself is the observable.
+var mgmtReassertApply = func(d *Daemon, cfg *config.Config) error {
+	return d.reconcileWebManagement(cfg)
+}
+
 // mgmtListenerReassertLoop re-drives the management reconcile while a listener
 // the configuration asked for is not serving.
 //
@@ -112,7 +127,7 @@ func (d *Daemon) reassertMgmtListenersOnce(ctx context.Context) {
 	slog.Warn("management listener is not serving; re-driving the management " +
 		"reconcile (#6803) — an unexpected serve exit used to stay down until " +
 		"an operator committed, on a box whose management API had just died")
-	if err := d.reconcileWebManagement(cfg); err != nil {
+	if err := mgmtReassertApply(d, cfg); err != nil {
 		// Retained-listener fail-safe: a failed rebind keeps whatever is still
 		// live. Log and let the next tick retry — that IS the retry owner.
 		slog.Error("management listener re-assert failed; will retry", "err", err)

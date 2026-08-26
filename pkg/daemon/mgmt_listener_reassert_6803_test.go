@@ -24,12 +24,14 @@ package daemon
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/api"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/sysservices"
 )
 
@@ -264,6 +266,19 @@ func TestReassertRechecksTheGateInsideTheSemaphore6803(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 
+	// Count RECONCILE CALLS, not listener outcomes. The re-drive is idempotent —
+	// a reconcile against an already-healthy leg rebinds nothing — so an
+	// outcome-shaped assertion cannot tell a correctly-skipped reconcile from a
+	// full one run for nothing, and deleting the inner re-check left exactly that
+	// assertion GREEN. The call is the observable.
+	var reconciles atomic.Int64
+	prev := mgmtReassertApply
+	mgmtReassertApply = func(dd *Daemon, cfg *config.Config) error {
+		reconciles.Add(1)
+		return prev(dd, cfg)
+	}
+	t.Cleanup(func() { mgmtReassertApply = prev })
+
 	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -284,16 +299,27 @@ func TestReassertRechecksTheGateInsideTheSemaphore6803(t *testing.T) {
 	d.applySem.Release(1)
 	<-done
 
+	if n := reconciles.Load(); n != 0 {
+		t.Fatalf("the re-assert ran %d management reconcile(s) after the commit it "+
+			"queued behind had already brought the listener back — re-checking the "+
+			"gate INSIDE the semaphore is what prevents that (#6803/#4001)", n)
+	}
 	reg.mu.Lock()
 	afterReassert := reg.byAddr[addr]
 	reg.mu.Unlock()
-	if afterReassert != afterCommit {
-		t.Fatal("the re-assert rebound the listener again after the commit it queued " +
-			"behind had already brought it back — re-checking INSIDE the semaphore " +
-			"is what prevents that (#6803/#4001)")
+	if afterReassert != afterCommit || !afterCommit.isOpen() {
+		t.Fatal("the listener the commit rebound was disturbed by the re-assert")
 	}
-	if !afterCommit.isOpen() {
-		t.Fatal("the listener the commit rebound was closed by the re-assert")
+
+	// POSITIVE CONTROL. Without it "ran 0 reconciles" is satisfied by an owner
+	// that never reconciles at all, and the whole cell would be vacuous — the
+	// gate under test is a SKIP, so it has to be shown skipping something that
+	// otherwise happens.
+	killLeg6803(t, m, reg, addr)
+	d.reassertMgmtListenersOnce(context.Background())
+	if n := reconciles.Load(); n != 1 {
+		t.Fatalf("with the listener genuinely down the owner ran %d reconcile(s), "+
+			"want 1 — the skip above proves nothing if the owner never reconciles", n)
 	}
 }
 
