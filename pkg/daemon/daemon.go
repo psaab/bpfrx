@@ -709,6 +709,28 @@ type Daemon struct {
 	// ordered operations in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
 
+	// hostInboundConntrackDebt is the #6802 retry debt: a conntrack revocation
+	// that FAILED, so stale kernel entries for now-denied host services may
+	// still be riding the chain's leading `ct state established,related accept`.
+	//
+	// Deliberately not a commit failure. The nft table is already applied so
+	// enforcement for NEW connections holds, and failing the commit would roll
+	// back correct enforcement over a transient conntrack-subsystem error — that
+	// rationale predates #6802 and is unchanged. What #6802 adds is everything
+	// else: before it there was no return value, no dirty flag, no counter, no
+	// metric and no periodic reconcile, so the failure left no trace and the only
+	// re-attempt was the next externally-triggered apply.
+	//
+	// It stores the exact arguments the failed flush was called with, because a
+	// retry must re-drive the SAME desired set: re-deriving it from the current
+	// config would silently retry a different revocation than the one that
+	// failed, and the two differ precisely when a commit landed in between.
+	hostInboundConntrackDebt atomic.Pointer[hostInboundConntrackFlushRequest]
+	// hostInboundConntrackFlushFailures counts revocation failures (#6802). It is
+	// the operator-visible signal the pre-#6802 code had none of; a rising value
+	// means now-denied host-inbound flows may still be authorized.
+	hostInboundConntrackFlushFailures atomic.Uint64
+
 	// mgmtReassertNoticed is the #6803 owner's down-STREAK flag: set on the first
 	// tick of a management-listener outage, cleared when one is re-bound. It
 	// exists only to keep the log honest — a permanently-unbindable endpoint is

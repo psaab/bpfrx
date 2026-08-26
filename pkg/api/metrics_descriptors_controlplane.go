@@ -31,6 +31,31 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"local_addrs reconverge on the current lease.",
 		nil, nil,
 	)
+	// #6802: a failed host-inbound conntrack revocation is deliberately NOT a
+	// commit failure — the nft table is already applied, so enforcement for NEW
+	// connections holds, and rolling the commit back over a transient conntrack
+	// error would discard correct enforcement. But before #6802 it was not
+	// anything ELSE either: no return value, no dirty flag, no counter, no
+	// metric and no retry owner. These two series are that missing signal.
+	c.hostInboundConntrackRevocationPending = prometheus.NewDesc(
+		"xpf_host_inbound_conntrack_revocation_pending",
+		"1 while a host-inbound kernel-conntrack revocation has failed and "+
+			"has not yet been re-driven (#6802). The failure is fail-OPEN: an "+
+			"established direct-kernel connection to a service the operator "+
+			"has REMOVED keeps riding the host-inbound chain's leading "+
+			"`ct state established,related accept`, so a now-denied host "+
+			"service stays reachable on that connection. The daemon re-drives "+
+			"the owed revocation autonomously every 30s; 0 once it succeeds.",
+		nil, nil,
+	)
+	c.hostInboundConntrackRevocationFailures = prometheus.NewDesc(
+		"xpf_host_inbound_conntrack_revocation_failures_total",
+		"Total host-inbound kernel-conntrack revocation failures (#6802). "+
+			"Counts every failed attempt including retries, so a value that "+
+			"climbs while xpf_host_inbound_conntrack_revocation_pending stays "+
+			"1 means the retry owner is running but not converging.",
+		nil, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+

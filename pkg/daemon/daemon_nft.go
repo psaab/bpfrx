@@ -662,7 +662,19 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// local-delivery per-hit re-eval/teardown. Best effort (see the function doc):
 	// enforcement for NEW connections is already in place, so a flush failure never
 	// fails the commit.
-	d.flushDeniedHostInboundConntrack(views, unzonedV4, unzonedV6, wgListenPorts)
+	// #6802: record the outcome as retry DEBT. Still not a commit failure — the
+	// rationale above holds — but before #6802 a failure left no return value, no
+	// dirty flag, no counter and no retry owner, so a now-denied host-inbound
+	// flow kept its old authorization until it closed or timed out, with nothing
+	// to notice or re-drive it.
+	ctReq := hostInboundConntrackFlushRequest{
+		views:         views,
+		unzonedV4:     unzonedV4,
+		unzonedV6:     unzonedV6,
+		wgListenPorts: wgListenPorts,
+	}
+	d.noteHostInboundConntrackFlush(ctReq,
+		d.flushDeniedHostInboundConntrack(views, unzonedV4, unzonedV6, wgListenPorts))
 	slog.Info("host-inbound filter applied", "zones", len(views),
 		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
 		"junos_host_deny_programs", len(programs))

@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"context"
 	"log/slog"
 	"net/netip"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -284,17 +286,39 @@ func buildHostInboundConntrackFlushFilter(views []dpuserspace.ZoneHostInboundVie
 // PRE-EXISTING flows on their old authorization (the pre-fix behavior), so it is
 // logged rather than surfaced as a commit failure — failing the commit would roll
 // back correct enforcement over a transient conntrack-subsystem error.
-func (d *Daemon) flushDeniedHostInboundConntrack(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) {
+// #6802: it returns whether every family's delete SUCCEEDED. A failure is still
+// not a commit failure — the rationale above is sound and unchanged — but before
+// #6802 it was not anything else either: no return value, no dirty flag, no
+// counter, no metric, and no periodic reconcile re-ran it. Every ticker under
+// pkg/daemon was enumerated and none re-drives applyConfig,
+// applyHostInboundFilter or this flush, so the only re-attempt was the next
+// externally-triggered apply — itself gated on InstallHostInbound succeeding.
+//
+// The failure direction is what makes that a defect rather than a tradeoff: the
+// stale entry rides the chain's leading `ct state established,related accept`,
+// so a now-DENIED host-inbound flow keeps working. It fails OPEN, and it stayed
+// open until the flow closed or timed out.
+//
+// The caller records the outcome as retry DEBT and an always-on owner re-drives
+// it (hostInboundConntrackReassertLoop), which is the same shape #6793 used for
+// a dead RA sender: surface the failure, keep the state a retry needs, and let a
+// cheap always-on gate re-drive it.
+func (d *Daemon) flushDeniedHostInboundConntrack(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) bool {
 	filter := buildHostInboundConntrackFlushFilter(views, unzonedV4, unzonedV6, wgListenPorts)
 	if filter == nil {
-		return
+		return true
 	}
 	var flushed uint
+	ok := true
 	for _, family := range []netlink.InetFamily{unix.AF_INET, unix.AF_INET6} {
 		n, err := conntrackDeleteFilters(family, filter)
 		if err != nil {
 			slog.Warn("host-inbound conntrack reconcile failed: existing direct-kernel connections to a now-denied host service may retain OLD authorization until they close or time out",
 				"family", family, "err", err)
+			// Keep going: the OTHER family's stale entries are independent and
+			// still worth flushing. `continue` here is deliberate, not a
+			// swallow — the failure is carried out in the return value.
+			ok = false
 			continue
 		}
 		flushed += n
@@ -303,4 +327,113 @@ func (d *Daemon) flushDeniedHostInboundConntrack(views []dpuserspace.ZoneHostInb
 		slog.Info("host-inbound conntrack reconcile: flushed now-denied kernel conntrack entries so stale direct-kernel host connections are re-evaluated against the current host-inbound set",
 			"flushed", flushed)
 	}
+	return ok
+}
+
+// hostInboundConntrackFlushRequest is the exact desired set a flush was called
+// with (#6802). The retry owner re-drives THIS, not a freshly-derived set: a
+// retry that re-derived the set from the current config would silently attempt a
+// different revocation than the one that failed, and the two differ exactly when
+// a commit landed in between — which is when getting it wrong matters most.
+type hostInboundConntrackFlushRequest struct {
+	views         []dpuserspace.ZoneHostInboundView
+	unzonedV4     []string
+	unzonedV6     []string
+	wgListenPorts []uint16
+}
+
+// noteHostInboundConntrackFlush records the outcome of a revocation attempt
+// (#6802): on failure it retains the request as retry debt and counts it; on
+// success it clears any debt, because a later successful flush over the CURRENT
+// desired set has already revoked everything an older failed one would have.
+//
+// Clearing on success is safe for that reason and not merely convenient: the
+// filter is built from the desired set, and a superset revocation subsumes an
+// earlier one. Retaining stale debt after a good flush would make the owner
+// re-drive a revocation whose target no longer exists.
+func (d *Daemon) noteHostInboundConntrackFlush(req hostInboundConntrackFlushRequest, ok bool) {
+	if ok {
+		d.hostInboundConntrackDebt.Store(nil)
+		return
+	}
+	d.hostInboundConntrackFlushFailures.Add(1)
+	r := req
+	d.hostInboundConntrackDebt.Store(&r)
+	slog.Warn("host-inbound conntrack revocation failed; retaining retry debt " +
+		"so an always-on owner re-drives it — until it succeeds, a now-denied " +
+		"host-inbound flow may still be authorized by the chain's leading " +
+		"established/related accept (#6802)")
+}
+
+// hostInboundConntrackReassertInterval is the cadence of the #6802 retry owner.
+// A stale entry means a denied service is still reachable, so recovery wants to
+// be prompt; but the retry is a conntrack dump+delete, so it must not run at the
+// 2s cadence of the cluster reconcile. 30s matches proxyARPReassertInterval and
+// raDeadSenderReassertInterval, the other always-on self-heal loops.
+var hostInboundConntrackReassertInterval = 30 * time.Second
+
+// hostInboundConntrackReassertLoop is the retry owner a failed revocation did
+// not have (#6802).
+//
+// Every ticker under pkg/daemon was enumerated when this issue was measured —
+// DDNS, RPM, HA fabric, HA, IPsec rebind, DHCP lease sync, neighbor, proxy-ARP,
+// archive, kernel self-recover — and NONE re-runs applyConfig,
+// applyHostInboundFilter or the flush. So the only re-attempt was the next
+// externally-triggered apply, itself gated on InstallHostInbound succeeding.
+//
+// Always-on and mode-agnostic, mirroring proxyARPReassertLoop: free on the
+// common path because the gate is a single atomic pointer load, so it costs
+// nothing on a node whose revocations have all succeeded.
+func (d *Daemon) hostInboundConntrackReassertLoop(ctx context.Context) {
+	t := time.NewTicker(hostInboundConntrackReassertInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.retryHostInboundConntrackFlushOnce(ctx)
+		}
+	}
+}
+
+// retryHostInboundConntrackFlushOnce re-drives one owed revocation.
+//
+// It takes applySem before acting, for the #4001 reason the proxy-ARP loop
+// gives: an apply may be mid-flight, and re-driving a revocation against a
+// half-applied host-inbound set could revoke flows the in-flight apply is about
+// to re-admit. The debt is re-read INSIDE the semaphore because the commit this
+// tick queued behind may already have flushed successfully and cleared it —
+// re-driving then would be a conntrack dump for nothing.
+func (d *Daemon) retryHostInboundConntrackFlushOnce(ctx context.Context) {
+	if d.hostInboundConntrackDebt.Load() == nil {
+		return
+	}
+	if d.applySem == nil {
+		return
+	}
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return
+	}
+	defer d.applySem.Release(1)
+	req := d.hostInboundConntrackDebt.Load()
+	if req == nil {
+		return
+	}
+	slog.Info("host-inbound conntrack revocation: re-driving a failed flush (#6802)")
+	ok := d.flushDeniedHostInboundConntrack(req.views, req.unzonedV4, req.unzonedV6, req.wgListenPorts)
+	d.noteHostInboundConntrackFlush(*req, ok)
+}
+
+// HostInboundConntrackFlushFailures reports the #6802 revocation failure count
+// for the metrics collector.
+func (d *Daemon) HostInboundConntrackFlushFailures() uint64 {
+	return d.hostInboundConntrackFlushFailures.Load()
+}
+
+// HostInboundConntrackRevocationOwed reports whether a revocation is still owed
+// (#6802) — the operator-facing form of "a now-denied host-inbound flow may
+// still be authorized".
+func (d *Daemon) HostInboundConntrackRevocationOwed() bool {
+	return d.hostInboundConntrackDebt.Load() != nil
 }
