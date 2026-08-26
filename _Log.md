@@ -106351,6 +106351,15 @@ prose edit above them added. No diff falls in the new test body.
     pkg/ipsec/ipsec_test.go, pkg/ipsec/swanctl_render_test.go,
     pkg/ipsec/dhcp_rebind_test.go,
     pkg/ipsec/trafficselector_render_4098_test.go
+  - **Action**: #6855 — redact the SYN-cookie master key in ConfigSnapshot and
+    ControlRequest Debug via a newtype (the two carriers #4484 L-7 named)
+  - **File(s)**: userspace-dp/src/protocol/snapshot.rs,
+    userspace-dp/src/protocol/tests.rs
+  - **Action**: #6860 — gate stage_screen_check on has_screen_state so the
+    missing-profile WARN fires when NO screen profile resolves
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_stages_tests.rs, docs/feature-coverage.md
   - **Action**: #6844 — key-validate the system-syslog facility wildcard; extend
     the #6834 wildcard-identity rule to typed leaves
   - **File(s)**: pkg/config/schema_walk.go, pkg/config/schema_system.go,

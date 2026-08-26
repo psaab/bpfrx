@@ -490,7 +490,13 @@ pub(super) fn stage_screen_check(
     counters: &mut BatchCounters,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<ScreenCheckOutcome> {
-    if !screen.has_profiles() {
+    // #6860: has_screen_state, not has_profiles. The latter consults only the
+    // RESOLVED profile map, so when a zone references a profile and none
+    // resolves anywhere, this returned before either missing-profile WARN
+    // branch could run -- the warning never fired in the one configuration it
+    // exists for. A zone silently screening NOTHING is precisely what an
+    // operator needs told.
+    if !screen.has_screen_state() {
         return StageOutcome::Continue(ScreenCheckOutcome::Pass);
     }
     // #4155: a fabric-redirected packet (stage 9 set FABRIC_INGRESS_FLAG on
@@ -831,6 +837,12 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     counters: &mut BatchCounters,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<SynCookieAckOutcome> {
+    // has_profiles is CORRECT here, unlike the #6860 change in
+    // stage_screen_check above. This stage only ENFORCES -- it validates a
+    // SYN-cookie ACK against a zone's resolved profile and emits no
+    // missing-profile diagnostic -- so an unresolved reference gives it nothing
+    // to do. Widening this gate would run the stage on every packet in a state
+    // where it can only fall through, for no signal.
     if !screen.has_profiles() {
         return StageOutcome::Continue(SynCookieAckOutcome::Pass);
     }
