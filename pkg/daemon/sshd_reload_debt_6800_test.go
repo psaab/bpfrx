@@ -65,6 +65,13 @@ func TestSSHDRemovalReloadFailureLatchesTheDebt6800(t *testing.T) {
 		if owed := d.ManagedServiceReloadOwed(); !owed[svcReloadSSHD] {
 			t.Errorf("owed = %v; the sshd debt must be operator-visible", owed)
 		}
+		// The COUNTER is asserted separately from the flag: they answer
+		// different questions, and a counter wired to the flag would collapse
+		// them. A gauge stuck at 1 says "not converged"; a count that climbs
+		// beside it says the retry owner is running and still failing.
+		if f := d.ManagedServiceReloadFailures(); f[svcReloadSSHD] != 1 {
+			t.Errorf("sshd failures = %d, want 1", f[svcReloadSSHD])
+		}
 	})
 
 	t.Run("successful-reload-owes-nothing", func(t *testing.T) {
@@ -77,6 +84,11 @@ func TestSSHDRemovalReloadFailureLatchesTheDebt6800(t *testing.T) {
 		if d.sshdReloadOwed() {
 			t.Fatal("a SUCCESSFUL reload must leave nothing owed — a latched debt " +
 				"would make the re-assert SIGHUP a healthy sshd every 30s forever")
+		}
+		if f := d.ManagedServiceReloadFailures(); f[svcReloadSSHD] != 0 {
+			t.Errorf("sshd failures = %d after a clean removal, want 0 — a counter "+
+				"that moves for a successful reload is noise an operator will "+
+				"learn to ignore", f[svcReloadSSHD])
 		}
 	})
 }
@@ -207,6 +219,13 @@ func TestReassertRedrivesTheOwedSSHDReload6800(t *testing.T) {
 		if d.sshdReloadOwed() {
 			t.Error("a successful re-assert must discharge the debt")
 		}
+		// The monotonic count is NOT rewound by recovery: the failure really
+		// happened, and a counter that resets hides the flapping it exists to
+		// show.
+		if f := d.ManagedServiceReloadFailures(); f[svcReloadSSHD] != 1 {
+			t.Errorf("sshd failures = %d after recovery, want the count from the "+
+				"failed apply preserved (1)", f[svcReloadSSHD])
+		}
 	})
 
 	t.Run("validation-fails-so-nothing-is-reloaded-or-discharged", func(t *testing.T) {
@@ -230,6 +249,11 @@ func TestReassertRedrivesTheOwedSSHDReload6800(t *testing.T) {
 		if !d.sshdReloadOwed() {
 			t.Error("a validation failure reloaded nothing, so the debt must stay " +
 				"outstanding — discharging it would silently abandon the retry")
+		}
+		if f := d.ManagedServiceReloadFailures(); f[svcReloadSSHD] != 1 {
+			t.Errorf("sshd failures = %d, want 1 — a validation failure is not a "+
+				"reload ATTEMPT, so it must not inflate the reload failure count "+
+				"beyond the one the apply already recorded", f[svcReloadSSHD])
 		}
 	})
 }
