@@ -1,3 +1,49 @@
+## 2026-08-26 — #6807: an oversized policy's attachment now resolves to an explicit deny
+
+- **Timestamp**: 2026-08-26
+- **Action**: `generatePolicyOptions` (#5701) and `renderComposedRouteMap`
+  (#5732) skip an over-ceiling policy's expansion so a `route-map ... 70000`
+  line cannot poison the whole vtysh-batched frr-reload. Correct — but they
+  emitted NOTHING, while BGP rendering emits `neighbor <ip> route-map <name>
+  in|out` independently off the policy's presence in `PolicyStatements`. The
+  attachment outlived its definition.
+  The repo asserted in 8 production comments, 3 tests and 4 README passages
+  that FRR resolves a dangling route-map to PERMIT-ALL. VERIFIED FALSE against
+  FRR stable/10.6 `bgpd/bgp_route.c` — the deployed line (`vtysh -c 'show
+  version'` on loss:xpf-userspace-fw0 reports FRRouting 10.6.0):
+  `bgp_input_modifier`/`bgp_output_modifier` return `RMAP_DENY` when
+  `route_map_lookup_by_name` fails. A NAMED-but-undefined map denies; only an
+  ABSENT attachment permits. So the pre-fix behaviour silently withdrew every
+  route on the attached neighbors, on the tolerant/peer-sync/rollback path.
+  Both sites now emit a bounded explicit `route-map <name> deny 10` (one
+  sequence — can never approach the ceiling), plus the `-xpf-redist` alias
+  under the same rule since `resolveRedistribute` may reference either name.
+  Chose deny over dropping the attachment: dropping it means no policy at all,
+  i.e. Junos BGP default-accept advertising everything the policy existed to
+  filter — fail-OPEN on an authorization decision. Failing the render is
+  unavailable (#1960 no-brick). Outcome unchanged; now deliberate, visible in
+  `show route-map`, and independent of FRR's undefined-map semantics.
+  Corrected every permit-all claim in place. Deliberately did NOT change the
+  #2473/#2490/#2539 undefined-reference guards, whose drop PRODUCES the
+  permit-all they were written to prevent — that is a behaviour choice about
+  configs that should not exist; filed separately, comments corrected so nobody
+  re-derives intent from the old sentence.
+- **File(s)**: `pkg/frr/policy_render.go`, `pkg/frr/protocols_render.go`,
+  `pkg/frr/bgp_policy_chain.go`, `pkg/frr/frr_test.go`,
+  `pkg/frr/policy_routemap_seqbound_5701_test.go`,
+  `pkg/frr/policy_composed_chain_seqbound_5732_test.go`,
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go` (new),
+  `pkg/frr/README.md`, `_Log.md`
+- **Validation**: 5 new cells hold the invariant as a PROPERTY over the whole
+  rendered managed section — every route-map name referenced by a `neighbor
+  ... route-map` or `redistribute ... route-map` attachment must be defined in
+  the same section — with a negative control proving the detector finds a
+  planted dangle, and a paired control proving an in-bounds policy still
+  renders its real expansion rather than being quarantined too. The two
+  pre-existing seqbound cells moved with the code: their "renders NOTHING"
+  assertion became the strictly stronger "exactly one header, and it is the
+  bounded deny", so the #5701/#5732 property (no expansion) is still asserted.
+
 ## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
 
 - **Timestamp**: 2026-08-26

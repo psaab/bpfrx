@@ -57,8 +57,21 @@ func hasNonEmptyPolicy(names []string) bool {
 // resolve to a DEFINED policy-statement. Bare protocol tokens and undefined
 // refs are dropped: a bare export token takes the redistribute path (#2473),
 // and an undefined ref must never render a dangling `route-map <name> in|out`
-// which FRR resolves to PERMIT-ALL (#2473/#2490/#2539). The surviving slice is
-// the ordered Junos policy CHAIN the renderer composes (#5277).
+// (#2473/#2490/#2539). The surviving slice is the ordered Junos policy CHAIN
+// the renderer composes (#5277).
+//
+// #6807 CORRECTION — read this before reasoning about the drop. The #2473/#2490
+// comments said a dangling route-map resolves to PERMIT-ALL. It does not. FRR
+// stable/10.6 bgpd/bgp_route.c returns RMAP_DENY when route_map_lookup_by_name
+// fails (bgp_input_modifier, bgp_output_modifier); only an ABSENT attachment
+// permits. So the direction of this drop is the opposite of what those comments
+// claim: dropping the reference is what yields permit-all, and emitting it
+// would deny. The drop is LEFT AS IS here — changing it is a behaviour choice
+// for an undefined (never-authored) policy, tracked separately — but do not
+// re-derive intent from the old sentence. #6807 fixes the sibling case where
+// the policy IS authored and the RENDERER omitted it (an over-ceiling
+// expansion): there the name is now defined by a bounded explicit deny rather
+// than left to dangle.
 func filterDefinedPolicies(names []string, po *config.PolicyOptionsConfig) []string {
 	out := make([]string, 0, len(names))
 	for _, n := range names {

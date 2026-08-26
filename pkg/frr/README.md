@@ -202,6 +202,98 @@ also carries operator content:
   two begin markers and a corrupt block that FRR reload rejects. Anchoring
   keeps `end >= start`, so the slice can never duplicate.
 
+## An undefined route-map name DENIES (#6807) — the repo said the opposite
+
+**FRR does not permit-all on a dangling route-map reference. It denies.**
+This page, eight production comments and three tests all asserted the
+opposite for years; every one of those claims is corrected in place and
+this section is the reference.
+
+FRR `stable/10.6` `bgpd/bgp_route.c` — the deployed line
+(`vtysh -c 'show version'` on the test cluster reports FRRouting 10.6.0):
+
+```c
+bgp_input_modifier:   rmap = route_map_lookup_by_name(rmap_name);
+                      if (!rmap) return RMAP_DENY;
+
+bgp_output_modifier:  if (!rmap_name) return RMAP_PERMIT;
+                      rmap = route_map_lookup_by_name(rmap_name);
+                      if (rmap == NULL) return RMAP_DENY;
+```
+
+Read the two arms carefully, because the distinction is the whole point:
+
+| state | FRR result |
+|---|---|
+| **no** `route-map` attached to the neighbor/AF | **permit** (`RMAP_PERMIT`) |
+| attachment **names** a map that does not exist | **deny** (`RMAP_DENY`) |
+
+So the failure directions are the reverse of the intuition the old comments
+encoded:
+
+- **Omitting the ATTACHMENT** = no policy = permit-all = fail **open**.
+- **Omitting the DEFINITION** while keeping the attachment = deny-all =
+  fail **closed**, but as a silent, total withdrawal.
+
+### What #6807 fixed
+
+`generatePolicyOptions` (#5701) and `renderComposedRouteMap` (#5732) skip a
+policy whose Cartesian expansion would exceed FRR's route-map sequence
+ceiling, because a `route-map <name> permit 70000` line makes FRR reject the
+command and **poisons the whole vtysh-batched `frr-reload`** — not just that
+policy. That skip is correct and is unchanged.
+
+What was wrong is that the skip emitted **nothing**, while BGP rendering
+emits the attachment independently off the policy's presence in
+`PolicyStatements`. The result was a live `neighbor <ip> route-map <name>
+in|out` naming a map FRR could not resolve → **every route on those
+neighbors withdrawn**, with one `slog.Warn` as the only signal, on a path
+(`tolerant load / peer-sync / rollback`, #1960) that exists precisely so a
+node can come up.
+
+Both sites now emit a **bounded explicit deny** under the referenced name:
+
+```
+route-map <name> deny 10
+exit
+```
+
+One sequence, so it can never approach the ceiling the skip exists to respect.
+The redistribute alias (`<name>-xpf-redist`) is quarantined under the same
+rule when `policyNeedsRedistAlias` holds, because `resolveRedistribute`
+references whichever of the two names applies.
+
+### Why deny and not "drop the attachment too"
+
+Dropping the attachment is the only other option that renders, and it means
+**no policy at all** — Junos BGP default-accept, advertising or accepting
+every route the operator's policy existed to filter. That is fail-open on an
+authorization decision, the direction this project does not take (cf. #3333
+lo0/host-inbound, #3392, #6790). Failing the render outright is not available
+either: this path serves the tolerant/peer-sync/rollback config that must not
+brick (#1960).
+
+So the OUTCOME is unchanged (deny). Three things change:
+
+1. it is **deliberate** rather than an accident of FRR's undefined-map
+   behaviour;
+2. it is **visible** — `show route-map <name>` shows an explicit deny instead
+   of nothing, which is the difference between diagnosing a total route
+   withdrawal in minutes and in hours;
+3. it is **stable** — a later change that "cleans up the dangling reference"
+   can no longer silently convert the deny into a permit.
+
+### Known asymmetry, deliberately left alone
+
+The `#2473`/`#2490`/`#2539` guards drop a reference to an **undefined**
+(never-authored) policy. Under the corrected semantics that drop *produces*
+permit-all — the leak those guards were written to prevent. Their behaviour
+is **unchanged** here: whether an undefined reference should deny is a
+behaviour choice about configs that should not exist, distinct from #6807's
+case where the policy IS authored and the RENDERER omitted it. Tracked
+separately; the comments at those sites now state the real direction so no
+one re-derives intent from the old sentence.
+
 ## Gotchas
 
 - Static routes have RETH names (`reth0`) but FRR wants the physical
@@ -328,8 +420,9 @@ also carries operator content:
   Strict on commit/commit-check; lenient (warn) on load/HA-sync (#1960).
   This closes the render-side fail-open paths that previously turned a typo
   into broken or silent config: a BGP group/neighbor export renders
-  `route-map <name> out`, where a missing route-map resolves to permit-all
-  (silently advertises everything); and `resolveECMP` returns 0 max-paths
+  `route-map <name> out`, where a missing route-map is unresolvable
+  (see the #6807 correction below — FRR **denies**, withdrawing the peer's
+  routes; this text previously said permit-all); and `resolveECMP` returns 0 max-paths
   for a missing forwarding-table policy (silently disables
   ECMP/consistent-hash). Those render fallbacks remain as
   belt-and-suspenders for a config that reaches the renderer via the
@@ -470,8 +563,9 @@ also carries operator content:
     firewall's redistribution shorthand and KEEPS rendering as
     `redistribute <proto>` via `resolveRedistribute`. A bare token has no
     route-map to reference; rendering it as `neighbor X route-map
-    connected out` would point at a non-existent route-map, which FRR
-    resolves to PERMIT-ALL — advertising the entire table (a leak). The
+    connected out` would point at a non-existent route-map (#6807: FRR
+    **denies** an unresolvable name — this text previously said
+    PERMIT-ALL/leak; the split is still correct, the consequence was not). The
     split keeps the bare-token redistribute correct while the
     policy-statement path filters advertisements.
 
@@ -493,9 +587,12 @@ also carries operator content:
   `globalExport` is already restricted to defined policy-statements, but a
   per-neighbor `export` (parseable as of #2490) can carry a bare token or an
   undefined ref that slipped the strict validator on the lenient load/HA-sync
-  path. The guard skips it (fail-closed) instead of emitting a dangling
-  `route-map out` = FRR permit-all OUTBOUND. Bare tokens never reach here as a
-  defined name, so the bare-token→redistribute path is unchanged.
+  path. The guard skips it instead of emitting a dangling `route-map out`
+  (#6807: a dangling out-ref is FRR **deny**, not permit-all — so the skip is
+  the fail-OPEN direction, not the fail-closed one it was described as.
+  Behaviour unchanged; see the correction section below). Bare tokens never
+  reach here as a defined name, so the bare-token→redistribute path is
+  unchanged.
 - **`protocols bgp ... import <policy>` renders inbound `route-map in`
   (#2490).** BGP neighbors/groups now carry an `Import []string` symmetric
   to `Export`. A global `protocols bgp import`, a group `import`, and a
@@ -512,11 +609,11 @@ also carries operator content:
   undefined/bare-token ref is REJECTED at commit (`checkPolicyRef` in
   `validateRoutingExportReferencesStrict`, strict) and SKIPPED on the lenient
   load/HA-sync path (the render guards with `isDefinedPolicyStatement` before
-  emitting `route-map <name> in`). Rendering a dangling `route-map <token>
-  in` would resolve to PERMIT-ALL in FRR — accepting every inbound
-  advertisement and defeating the operator's filter (the #2473 leak, inbound
-  side). The referenced route-map is the same block `generatePolicyOptions`
-  already emits for the policy-statement.
+  emitting `route-map <name> in`). (#6807: rendering a dangling `route-map
+  <token> in` would resolve to **RMAP_DENY** in FRR, not PERMIT-ALL as this
+  previously said — it is the skip that accepts everything. Behaviour
+  unchanged; see the correction section below.) The referenced route-map is the
+  same block `generatePolicyOptions` already emits for the policy-statement.
 - **Ordered import/export policy CHAINS are composed, not collapsed to the
   last (#5277).** A Junos import/export policy LIST `[ A B C ]` is a CHAIN:
   each policy is evaluated in order, the first terminal action (`accept`/

@@ -369,9 +369,12 @@ func TestGenerateProtocols_ISIS(t *testing.T) {
 // is this firewall's redistribution shorthand and MUST render as
 // `redistribute <proto>`. It has NO route-map to reference: rendering it as
 // `neighbor X route-map connected out` would point at a non-existent
-// route-map, which FRR resolves to PERMIT-ALL → the entire BGP table is
-// advertised to the peer (a NEW leak the over-general route-map-out fix
-// would have introduced). Fail-on-revert: routing ALL bgp.Export through
+// route-map. (#6807 CORRECTION: this said FRR resolves that to PERMIT-ALL and
+// advertises the entire table. It does not — bgp_output_modifier returns
+// RMAP_DENY for a name it cannot resolve, so the dangling ref WITHDRAWS the
+// peer's routes. The classification this cell guards is still correct: a bare
+// protocol token is a redistribute verb and has no policy to reference. Only
+// the stated consequence was wrong.) Fail-on-revert: routing ALL bgp.Export through
 // route-map-out makes `route-map connected out` appear with no defining
 // route-map → the assert-no-dangling-route-map check below fails.
 func TestGenerateProtocols_BGPExportBareToken(t *testing.T) {
@@ -833,9 +836,17 @@ func TestGenerateProtocols_BGPImportMostSpecificWins(t *testing.T) {
 // of the #2473 lesson on the INBOUND direction. An import ref that is NOT a
 // defined policy-statement (a bare token, or a name that slipped the strict
 // validator on a lenient load/HA-sync path) must NEVER render a dangling
-// `route-map <token> in` — FRR resolves an undefined route-map to PERMIT-ALL,
-// silently accepting every inbound advertisement. Fail-on-revert: dropping
-// the isDefinedPolicyStatement guard makes the dangling in-line appear.
+// `route-map <token> in`.
+//
+// #6807 CORRECTION: the original rationale — "FRR resolves an undefined
+// route-map to PERMIT-ALL, silently accepting every inbound advertisement" — is
+// backwards. bgp_input_modifier returns RMAP_DENY for an unresolvable name
+// (stable/10.6), so the dangling in-line would DENY all inbound, and it is the
+// absent attachment this guard produces that accepts everything. The guard's
+// BEHAVIOUR is deliberately unchanged (see filterDefinedPolicies); only the
+// claim is corrected. Do not "fix" the direction from the old sentence.
+// Fail-on-revert: dropping the isDefinedPolicyStatement guard makes the
+// dangling in-line appear.
 func TestGenerateProtocols_BGPImportUndefinedNoDangling(t *testing.T) {
 	m := New()
 	// nil policyOptions: no policy-statements defined, so the import ref is
@@ -858,8 +869,10 @@ func TestGenerateProtocols_BGPImportUndefinedNoDangling(t *testing.T) {
 // undefined per-neighbor export ref rather than emit a dangling
 // `route-map <token> out`. A per-neighbor export is parseable as of #2490; on
 // the lenient load/HA-sync path the strict reject is downgraded to a warning,
-// so an undefined ref can reach the renderer. A dangling `route-map out`
-// resolves to PERMIT-ALL in FRR — the entire table advertised to the peer.
+// so an undefined ref can reach the renderer. (#6807 CORRECTION: a dangling
+// `route-map out` resolves to RMAP_DENY in FRR, not permit-all — the peer's
+// routes are withdrawn, not leaked. Behaviour here is unchanged; only the
+// claim is corrected.)
 // Fail-on-revert: dropping the isDefinedPolicyStatement guard on the export
 // emit sites makes the dangling out-line appear. Bare protocol tokens still
 // take the redistribute path (the #2473 classification), so this guard only

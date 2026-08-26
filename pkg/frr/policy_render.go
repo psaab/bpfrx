@@ -69,6 +69,60 @@ func redistFailClosedRouteMap(name string) string {
 	return name + config.ReservedRedistSuffix
 }
 
+// quarantineDenySeq is the single sequence number the #6807 quarantine
+// route-map occupies. One sequence, always — it can never approach the FRR
+// ceiling the quarantine exists to stay under.
+const quarantineDenySeq = 10
+
+// renderQuarantineDenyRouteMap emits a bounded, EXPLICIT deny route-map under
+// name, for a policy whose real expansion cannot be rendered (#6807).
+//
+// The problem it solves: generatePolicyOptions and renderComposedRouteMap SKIP
+// a policy whose Cartesian expansion would overflow FRR's route-map sequence
+// ceiling (#5701/#5732), because emitting a `route-map <name> permit 70000`
+// line makes FRR reject the command and poisons the WHOLE vtysh-batched
+// frr-reload. That skip is correct. But BGP rendering emits the ATTACHMENT
+// (`neighbor <ip> route-map <name> in|out`) independently, off the policy's
+// presence in PolicyStatements — so the attachment survived while its
+// definition did not.
+//
+// The surviving attachment is NOT harmless, and it is not permit-all. FRR
+// stable/10.6 bgpd/bgp_route.c:
+//
+//	bgp_input_modifier:   rmap = route_map_lookup_by_name(rmap_name);
+//	                      if (!rmap) return RMAP_DENY;
+//	bgp_output_modifier:  if (!rmap_name) return RMAP_PERMIT;
+//	                      rmap = route_map_lookup_by_name(rmap_name);
+//	                      if (rmap == NULL) return RMAP_DENY;
+//
+// An attachment naming an UNDEFINED map denies every route it covers; only an
+// ABSENT attachment permits. So the pre-#6807 behaviour was a silent deny-all
+// on the affected neighbors — a routing outage — while the code comments here
+// asserted the opposite (permit-all).
+//
+// Why an explicit deny rather than dropping the attachment: dropping it is the
+// only alternative that renders, and it means NO policy at all — Junos BGP
+// default-accept, i.e. advertising or accepting every route the operator's
+// policy existed to filter. That is fail-OPEN on an authorization decision,
+// which is the direction this project does not take (cf. #3333, #3392, #6790).
+// Failing the whole render is not available either: this path exists precisely
+// for the tolerant load / peer-sync / rollback config (#1960), which must not
+// brick.
+//
+// So the outcome is unchanged (deny) and three things change: it is
+// DELIBERATE, it is VISIBLE (an operator running `show route-map <name>` sees
+// an explicit deny instead of nothing, which is the difference between
+// diagnosing this in minutes and in hours), and it no longer depends on FRR's
+// undefined-map semantics staying what they are today. It is also immune to a
+// future "clean up the dangling reference" change silently converting the deny
+// into a permit.
+func renderQuarantineDenyRouteMap(name string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "route-map %s deny %d\n", name, quarantineDenySeq)
+	b.WriteString("exit\n")
+	return b.String()
+}
+
 // redistAliasCollision is the render-side defense-in-depth for #5116. For every
 // policy-statement that generates a fail-closed redistribute alias
 // (policyNeedsRedistAlias), it checks whether that derived alias name
@@ -295,13 +349,37 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 		// vtysh-batched frr-reload, not just this policy. The strict commit gate
 		// (config.validatePolicyRouteMapSequenceBoundStrict) rejects it; this
 		// belt covers the tolerant load / peer-sync / rollback path (#1960)
-		// where that gate only warns: SKIP the oversized policy so the rest of
-		// the managed section still reloads (a dangling `route-map <name> in/out`
-		// FRR resolves to permit-all, but that is strictly better than a poisoned
-		// reload, and the operator has the commit-time diagnostic).
+		// where that gate only warns: do not render the oversized EXPANSION, so
+		// the rest of the managed section still reloads.
+		//
+		// #6807: the expansion is still skipped, but the NAME is no longer left
+		// undefined. BGP rendering emits `neighbor <ip> route-map <name> in|out`
+		// independently of this loop (off the policy's presence in
+		// PolicyStatements), so skipping outright left a live attachment naming
+		// a map FRR cannot resolve — which FRR DENIES (bgp_input_modifier /
+		// bgp_output_modifier return RMAP_DENY on a failed
+		// route_map_lookup_by_name; verified against stable/10.6, the deployed
+		// line). Every route on the attached neighbors was silently withdrawn
+		// while the comment here claimed permit-all. Emit a bounded explicit
+		// deny instead: same outcome, but deliberate, visible in `show
+		// route-map`, and independent of FRR's undefined-map behaviour. See
+		// renderQuarantineDenyRouteMap for why deny and not "drop the
+		// attachment".
 		if n := config.RouteMapSequenceCount(ps); n > config.MaxRouteMapSequences {
-			slog.Warn("skipping oversized route-map policy: expansion would overflow FRR sequence numbers and poison the reload",
+			slog.Warn("oversized route-map policy: expansion would overflow FRR sequence numbers "+
+				"and poison the reload; rendering an explicit DENY under this name instead — "+
+				"routes matched by its attachments are withdrawn until the policy is reduced",
 				"policy", name, "sequences", n, "max", config.MaxRouteMapSequences)
+			b.WriteString(renderQuarantineDenyRouteMap(name))
+			b.WriteString("!\n")
+			// The redistribute alias is derived from the SAME policy, so it is
+			// oversized too and resolveRedistribute may still reference it.
+			// Quarantine it under the same rule; its normal trailing action is
+			// already `deny`, so this is its fail-closed intent unchanged.
+			if policyNeedsRedistAlias(name, ps, bgpAcceptDefault) {
+				b.WriteString(renderQuarantineDenyRouteMap(redistFailClosedRouteMap(name)))
+				b.WriteString("!\n")
+			}
 			continue
 		}
 		// Base route-map: Junos BGP default-accept (#2998) vs the fail-closed
@@ -856,16 +934,23 @@ func (m *Manager) renderComposedRouteMap(po *config.PolicyOptionsConfig, compose
 	// frr-reload. The strict commit gate
 	// (config.validateBGPComposedChainSequenceBoundStrict) rejects it; this belt
 	// covers the tolerant load / peer-sync / rollback path (#1960) where that
-	// gate only warns: render NOTHING for the oversized chain (its neighbor
-	// `route-map <composedName> out` then dangles → FRR permit-all, strictly
-	// better than a poisoned reload — the same tradeoff generatePolicyOptions
-	// takes for an over-ceiling single policy, #5701). The gate and this belt
-	// consult the SAME config.ComposedChainSequenceCount predicate, so they can
-	// never disagree on what overflows.
+	// gate only warns: do not render the oversized EXPANSION. The gate and this
+	// belt consult the SAME config.ComposedChainSequenceCount predicate, so they
+	// can never disagree on what overflows.
+	//
+	// #6807: return a bounded explicit DENY under composedName rather than the
+	// empty string. The neighbor's `route-map <composedName> in|out` is emitted
+	// by BGP rendering regardless of what this function returns, so an empty
+	// return left that attachment naming an unresolvable map — which FRR denies
+	// (RMAP_DENY on a failed route_map_lookup_by_name, stable/10.6), not
+	// permits as the previous comment claimed. Same tradeoff as the
+	// single-policy site (#5701); see renderQuarantineDenyRouteMap.
 	if n := config.ComposedChainSequenceCount(po.PolicyStatements, chain); n > config.MaxRouteMapSequences {
-		slog.Warn("skipping oversized composed BGP policy-chain route-map: expansion would overflow FRR sequence numbers and poison the reload",
+		slog.Warn("oversized composed BGP policy-chain route-map: expansion would overflow FRR "+
+			"sequence numbers and poison the reload; rendering an explicit DENY under this name "+
+			"instead — routes on neighbors carrying this chain are withdrawn until it is reduced",
 			"route-map", composedName, "sequences", n, "max", config.MaxRouteMapSequences)
-		return ""
+		return renderQuarantineDenyRouteMap(composedName)
 	}
 	var b strings.Builder
 	seq := 10
