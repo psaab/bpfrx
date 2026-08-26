@@ -105663,3 +105663,49 @@ prose edit above them added. No diff falls in the new test body.
   output most needs to be readable, and a tripled list reads like three separate
   defects. Deduped by path.
 - **File(s)**: `pkg/refactoraudit/conflict_markers_test.go`, `_Log.md`
+
+## 2026-08-26 — #6806 lo0 mirror drops unresolvable protocol / ICMP narrowing
+
+- **Timestamp**: 2026-08-26
+- **Action**: Make the kernel lo0 mirror fail CLOSED on a `from protocol` /
+  `from icmp-type` / `from icmp-code` token that will not resolve, instead of
+  dropping the predicate and installing a wider term than the operator wrote.
+- **Root cause**: both lo0 renderers resolved these two dimensions PER TOKEN and
+  skipped the failures. All-unresolvable emptied the slice, the `len(...) > 0`
+  guard emitted no predicate at all, and the term matched every protocol / every
+  ICMP type in its scope (an `accept` widened, a `discard` stopped denying).
+  Partially-unresolvable built the rule from a narrowed subset — wrong in the
+  other direction. Strict commit rejects these tokens, so the live ingress is the
+  tolerant load / peer-sync / mixed-version path (#1960), which is exactly where
+  the userspace mirror hands the raw token to the Rust filter compiler and it
+  rejects the whole snapshot. Kernel widening while userspace refuses the same
+  filter is the mode-dependent fail-open.
+- **Two channels, not one fix**: protocol reaches the builder as a RAW string
+  (the builder can detect it, like `filterFamilyAddrs`); icmp-type/code reach it
+  ALREADY RESOLVED as `[]int`, so an unresolvable token leaves no trace in the
+  DTO and needs a marker. Added `Lo0FilterTerm.ICMPTypeUnrepresentable` /
+  `ICMPCodeUnrepresentable`, populated in `toNftLo0Term` from the config's
+  `UnknownICMPTypes` / `UnknownICMPCodes`, named to match the userspace wire
+  fields. A fix that only hardened the resolver closes protocol and leaves ICMP
+  wide open.
+- **Direction, and a stale comment that argued against it**: #5512/#6804 chose
+  PER-TERM fail-closed on the grounds that "a rejected table leaves NO host
+  filter = fail-OPEN". That was true when written and is not true now — #6476
+  added the cold-boot fail-closed fence and #6489/#6492 key it on `lo0Enforced`
+  and rebuild it from the CURRENT snapshot, so a failed lo0 install either
+  retains the prior real filter or installs the fence. Plan-failure is therefore
+  the safe direction, matching ports/DSCP (#6405) and addresses (#6512) in the
+  same two functions and matching userspace's whole-snapshot rejection. The
+  daemon_nft.go comment claiming protocol was dropped "mirroring the tcp-flags
+  lowering" was wrong twice over: tcp-flags does not drop its predicate, and
+  dropping a narrowing token is never the safe direction. Corrected in place.
+- **What parity CI could not see**: before the fix BOTH renderers dropped the
+  token, so they AGREED perfectly while both were fail-open. The T1 ruleset
+  parity gate compares the two mirrors against each other and is blind to a
+  defect they share. The new agreement cell asserts the PROPERTY (neither mirror
+  loses the refusal evidence) rather than equality between them.
+- **File(s)**: `pkg/nftables/netlink_lo0.go`, `pkg/nftables/netlink_spec.go`,
+  `pkg/nftables/netlink_lo0_proto_icmp_6806_test.go` (new),
+  `pkg/daemon/daemon_nft.go`, `pkg/daemon/daemon_nft_netlink.go`,
+  `pkg/daemon/lo0_proto_icmp_failclosed_6806_test.go` (new),
+  `pkg/nftables/README.md`, `pkg/daemon/README.md`, `_Log.md`

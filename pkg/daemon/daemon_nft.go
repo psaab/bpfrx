@@ -2075,17 +2075,39 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// lenient/peer-sync path, mirrors a DIFFERENT protocol than userspace. The
 	// numeric form is unconditionally nft-safe and resolves to the SAME protocol
 	// number the Rust matcher uses. A token outside the SSOT cannot reach a
-	// committed config (the gate rejects it); a leniently-loaded one is dropped
-	// with a warning rather than emitted as unloadable nft (mirroring the
-	// tcp-flags lowering below).
+	// committed config (the gate rejects it); a leniently-loaded one is kept
+	// VERBATIM so the nft load fails CLOSED (#6806).
+	//
+	// It previously said the token was "dropped with a warning ... mirroring the
+	// tcp-flags lowering below". Both halves of that were wrong. The tcp-flags
+	// lowering does NOT drop its predicate — #5512 made it fail the TERM closed
+	// with a scoped drop — and dropping a protocol predicate is the fail-open
+	// that #6405/#6512 removed from the port, DSCP and address paths in this very
+	// function. A dropped narrowing token is never the safe direction.
 	if len(term.Protocols) > 0 {
 		protos := make([]string, 0, len(term.Protocols))
 		for _, p := range term.Protocols {
 			if n, ok := appid.ProtocolNumber(p); ok {
 				protos = append(protos, strconv.Itoa(int(n)))
 			} else {
-				slog.Warn("dropping unresolvable protocol from lo0 filter term",
+				// #6806: keep the raw token VERBATIM so `nft -f -` REJECTS the
+				// whole ruleset and the prior generation is retained — the same
+				// fail-closed posture this oracle already has for an
+				// unresolvable port / DSCP token (#6405) and a malformed address
+				// (#6512), and what keeps it in agreement with lo0Protocols in
+				// pkg/nftables/netlink_lo0.go, the production builder, which
+				// errors on the same token.
+				//
+				// It used to be DROPPED with a warning. That was fail-OPEN in
+				// both directions: an all-unresolvable list emitted NO l4proto
+				// predicate (the term matched every protocol in its scope), and
+				// a partially-unresolvable one built the rule from a NARROWED
+				// subset, so a discard/reject term stopped denying the protocol
+				// it could not resolve.
+				slog.Warn("lo0 kernel nftables mirror: unresolvable protocol kept "+
+					"VERBATIM so the nft load fails closed rather than widening the term",
 					"term", term.Name, "protocol", p)
+				protos = append(protos, p)
 			}
 		}
 		if len(protos) == 1 {
@@ -2158,16 +2180,30 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// dropped ALL ICMP (fail-closed over-broad), an `accept` term admitted ALL
 	// ICMP (fail-open). Render type and code as independent predicates so a
 	// code-only term matches the same packets in nft as in userspace.
-	if len(term.ICMPTypes) > 0 || len(term.ICMPCodes) > 0 {
+	//
+	// #6806: a token the compiler could NOT resolve to a byte lives on
+	// term.UnknownICMPTypes / UnknownICMPCodes, not in the int slices above, so
+	// rendering only the resolved bytes dropped it. An all-unresolvable list left
+	// both int slices empty and emitted no ICMP predicate at all, so the term
+	// matched EVERY ICMP type in its scope — an `accept` term admitting all ICMP
+	// (fail-open), a `discard` term dropping all ICMP (over-broad). Render the
+	// raw tokens alongside the resolved bytes so `nft -f -` REJECTS the whole
+	// ruleset and the prior generation is retained, matching the port / DSCP /
+	// address posture and the netlink builder's ICMPTypeUnrepresentable /
+	// ICMPCodeUnrepresentable fail-closed.
+	if len(term.ICMPTypes) > 0 || len(term.ICMPCodes) > 0 ||
+		len(term.UnknownICMPTypes) > 0 || len(term.UnknownICMPCodes) > 0 {
 		icmpFamily := "icmp"
 		if family == "ip6" {
 			icmpFamily = "icmpv6"
 		}
-		if len(term.ICMPTypes) > 0 {
-			parts = append(parts, icmpFamily+" type "+nftIntSet(term.ICMPTypes))
+		if len(term.ICMPTypes) > 0 || len(term.UnknownICMPTypes) > 0 {
+			parts = append(parts, icmpFamily+" type "+
+				nftIntSetWithRaw(term.ICMPTypes, term.UnknownICMPTypes))
 		}
-		if len(term.ICMPCodes) > 0 {
-			parts = append(parts, icmpFamily+" code "+nftIntSet(term.ICMPCodes))
+		if len(term.ICMPCodes) > 0 || len(term.UnknownICMPCodes) > 0 {
+			parts = append(parts, icmpFamily+" code "+
+				nftIntSetWithRaw(term.ICMPCodes, term.UnknownICMPCodes))
 		}
 	}
 
@@ -2510,6 +2546,39 @@ func nftIntSet(vals []int) string {
 	strs := make([]string, len(vals))
 	for i, v := range vals {
 		strs[i] = strconv.Itoa(v)
+	}
+	return "{ " + strings.Join(strs, ", ") + " }"
+}
+
+// nftIntSetWithRaw renders the resolved ICMP bytes together with any raw token
+// the compiler could NOT resolve (#6806).
+//
+// The raw token is deliberately emitted verbatim into the nft right-hand side.
+// It is not valid nft, and that is the point: `nft -f -` loads the lo0 table
+// atomically, so an invalid token REJECTS the whole ruleset and the prior
+// generation stays installed — the fail-closed posture this oracle already has
+// for an unresolvable port / DSCP token (#6405) and a malformed address
+// literal (#6512). Rendering only the resolved bytes would silently widen the
+// term instead, which is the #6806 fail-open.
+//
+// A cold boot has no prior generation to retain, and that case is covered:
+// applyLo0Filter installs the #6476 cold-boot fail-closed fence whenever an
+// install fails with no real filter enforced (#6489/#6492 keep the fence keyed
+// on lo0Enforced and rebuilt from the CURRENT snapshot).
+//
+// With no unresolved tokens this is exactly nftIntSet, so a term that resolves
+// cleanly renders byte-identically to before.
+func nftIntSetWithRaw(vals []int, raw []string) string {
+	if len(raw) == 0 {
+		return nftIntSet(vals)
+	}
+	strs := make([]string, 0, len(vals)+len(raw))
+	for _, v := range vals {
+		strs = append(strs, strconv.Itoa(v))
+	}
+	strs = append(strs, raw...)
+	if len(strs) == 1 {
+		return strs[0]
 	}
 	return "{ " + strings.Join(strs, ", ") + " }"
 }
