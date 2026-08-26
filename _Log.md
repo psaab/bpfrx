@@ -105741,3 +105741,39 @@ prose edit above them added. No diff falls in the new test body.
 - **Annotate stale comments as historical rather than deleting them** — the next
   reader needs to know it WAS true, not merely that it is gone.
 - **File(s)**: `docs/engineering-style.md`, `_Log.md`
+
+## 2026-08-26 — #6798 follow-up: correct two claims #6790 falsified, now on master
+
+- **Timestamp**: 2026-08-26
+- **Action**: #7605 merged (`f8c1bb105`) at head `5705bdb99` while the re-derive
+  round was still in flight, so two corrections the re-derive found did NOT make
+  the merge and are live on master. This lands them.
+- **The escape**: this is the exact class being swept on master today — a
+  sentence true when written and false at merge — and it escaped INTO master
+  inside the #6798 change itself. The assertions were always correct; only the
+  prose explaining them rotted. Worth noting that re-deriving found it and the
+  merge race, not the analysis, is what let it through.
+- **(1) A now-false doc comment on the end-to-end cell.** It read: "on the normal
+  apply path every one of those returns is deliberately discarded ... The SINGLE
+  caller that CONSUMES them is the #5874/M35 daemon-stop cancel closeout." #6790
+  (#7604) made `applyTailReconciles` capture those returns, so there are TWO
+  consumers and both halves are false. Rewritten to name both, with an explicit
+  note that the sentence was falsified by #6790 — so the next reader sees the
+  dependency rather than re-deriving it.
+- **(2) An unqualified "is neither fatal class".** `exec.CommandContext` has TWO
+  deadline shapes: a context expiring BEFORE fork/exec makes `Start` return a
+  BARE `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot
+  distinguish from a #2926 daemon-stop abort and classes FATAL. Restated as
+  "neither class in these errors' ORDINARY failure shapes", with the
+  misclassified shape named and scoped: pre-existing and WIDER than #6798
+  (`nftApplyPayload` at 5s and the DNS `systemctl` calls already reach the same
+  classifier), reachable only with a short injected deadline under load and not
+  in production at 15s, tracked in #7618 and tripwired by
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`. What #6798 adds
+  cannot reach it: `os.ReadFile`/`os.ReadDir` yield EACCES/EIO/EISDIR/ENOTDIR,
+  never a context error.
+- **No production code changes** — comments and docs only. The 14/14 mutation
+  matrix measured at `b166d8229` (identical production files) stands; nothing in
+  this delta can move it.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `docs/system-login.md`, `_Log.md`
