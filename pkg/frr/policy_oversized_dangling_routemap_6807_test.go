@@ -219,52 +219,81 @@ func TestOversizedComposedChainLeavesNoDanglingAttachment6807(t *testing.T) {
 	}
 }
 
-// TestOversizedRedistributePolicyLeavesNoDanglingAlias6807 covers the second
-// attachment site. `resolveRedistribute` emits `redistribute <proto> route-map
-// <NAME>` where NAME is the policy itself, or its fail-closed `-xpf-redist`
-// alias when policyNeedsRedistAlias holds. An oversized policy makes the alias
-// oversized too, so the quarantine has to cover whichever name is referenced.
+// TestOversizedRedistributePolicyLeavesNoDanglingAlias6807 covers the SECOND
+// attachment site and the second quarantined name.
+//
+// `resolveRedistribute` emits `redistribute <proto> route-map <NAME>` where
+// NAME is the policy itself, OR its fail-closed `-xpf-redist` alias when
+// policyNeedsRedistAlias holds. An oversized policy makes the alias oversized
+// too, so the quarantine has to cover whichever name is referenced.
+//
+// The fixture is the #4481 DUAL-USE shape, and it has to be: policyNeedsRedistAlias
+// requires the policy to ALSO be a BGP route-map in/out with no explicit
+// default (bgpAcceptDefault), so a redistribute-only fixture never reaches the
+// alias branch at all. An earlier version of this cell was OSPF-export-only and
+// was consequently mutation-BLIND — deleting the alias quarantine left the
+// whole suite green, because the branch it guards never executed.
+//
+// The precondition below is what keeps that from happening again silently.
 func TestOversizedRedistributePolicyLeavesNoDanglingAlias6807(t *testing.T) {
-	// `from protocol connected` gives resolveRedistribute a source protocol, so
-	// the redistribute line is actually emitted.
 	big := oversizedPolicy6807("BIG")
-	big.Terms[0].FromProtocols = []string{"connected"}
+	// `from protocol static` gives resolveRedistribute a source protocol, so a
+	// redistribute line is actually emitted.
+	big.Terms[0].FromProtocols = []string{"static"}
+	// No explicit DefaultAction: with a BGP in/out use site that is what makes
+	// policyNeedsRedistAlias true.
+	big.DefaultAction = ""
 
-	fc := &FullConfig{
-		PolicyOptions: &config.PolicyOptionsConfig{
-			PolicyStatements: map[string]*config.PolicyStatement{"BIG": big},
-			PrefixLists:      map[string]*config.PrefixList{},
-			Communities:      map[string]*config.CommunityDef{},
-			ASPaths:          map[string]*config.ASPathDef{},
-		},
-		OSPF: &config.OSPFConfig{RouterID: "1.1.1.1", Export: []string{"BIG"}},
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{"BIG": big},
+		PrefixLists:      map[string]*config.PrefixList{},
+		Communities:      map[string]*config.CommunityDef{},
+		ASPaths:          map[string]*config.ASPathDef{},
 	}
+	fc := &FullConfig{
+		PolicyOptions: po,
+		// BGP applies BIG inbound -> BIG lands in bgpAcceptDefault.
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: []string{"BIG"}},
+			},
+		},
+		// OSPF exports the SAME policy -> redistribute route-map, via the alias.
+		OSPF: &config.OSPFConfig{Areas: []*config.OSPFArea{{ID: "0.0.0.0"}}, Export: []string{"BIG"}},
+	}
+
+	// PRECONDITION, not decoration: unless the alias branch is actually taken,
+	// this cell cannot observe the line it exists to guard.
+	if !policyNeedsRedistAlias("BIG", big, collectAllBGPAcceptDefault(fc)) {
+		t.Fatal("fixture does not reach the redistribute-ALIAS branch " +
+			"(policyNeedsRedistAlias is false), so this cell is blind to the " +
+			"alias quarantine it claims to test")
+	}
+
 	got := New().buildManagedSection(fc)
 
-	// Fatal, NOT Skip: the fixture is deterministic, so a missing redistribute
-	// line means this cell has stopped exercising the attachment site it exists
-	// for — and a skip reports the same green as a pass.
-	refs := reRedistRouteMap6807.FindAllStringSubmatch(got, -1)
-	if len(refs) == 0 {
-		t.Fatalf("fixture emitted no `redistribute <proto> route-map <name>` "+
-			"attachment, so this cell no longer covers the redistribute site:\n%s", got)
+	alias := redistFailClosedRouteMap("BIG")
+	if n := countRouteMapRefs6807(got, alias); n == 0 {
+		t.Fatalf("fixture emitted no `redistribute ... route-map %s` attachment, "+
+			"so this cell no longer covers the alias site:\n%s", alias, got)
 	}
 	if d := danglingRouteMapRefs6807(got); len(d) != 0 {
-		t.Fatalf("the managed section references undefined route-map(s) %v from a "+
-			"redistribute attachment (#6807):\n%s", d, got)
+		t.Fatalf("the managed section references undefined route-map(s) %v — with "+
+			"an oversized policy BOTH the base name and its -xpf-redist alias "+
+			"need a definition, or FRR denies what they are attached to "+
+			"(#6807):\n%s", d, got)
 	}
-	// Whichever name resolveRedistribute chose — the policy itself, or its
-	// `-xpf-redist` fail-closed alias — it must be defined by the bounded
-	// quarantine deny, since BOTH derive from the same over-ceiling policy.
-	for _, m := range refs {
-		headers := routeMapHeaders6807(got, m[1])
+	// Both names resolve, and both to the bounded explicit deny.
+	for _, name := range []string{"BIG", alias} {
+		headers := routeMapHeaders6807(got, name)
 		if len(headers) != 1 {
-			t.Fatalf("redistribute references route-map %q, which must be defined by "+
-				"exactly one bounded header, got %d: %v", m[1], len(headers), headers)
+			t.Fatalf("route-map %q must be defined by exactly one bounded header, "+
+				"got %d: %v", name, len(headers), headers)
 		}
-		if want := fmt.Sprintf("route-map %s deny %d", m[1], quarantineDenySeq); headers[0] != want {
-			t.Fatalf("redistribute reference %q must resolve to the bounded explicit "+
-				"deny %q, got %q", m[1], want, headers[0])
+		if want := fmt.Sprintf("route-map %s deny %d", name, quarantineDenySeq); headers[0] != want {
+			t.Fatalf("route-map %q must resolve to the bounded explicit deny %q, got %q",
+				name, want, headers[0])
 		}
 	}
 }
