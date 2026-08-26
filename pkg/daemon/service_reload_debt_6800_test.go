@@ -37,7 +37,12 @@ import (
 // syslogDaemon6800 points the rsyslog drop-in reconcile at a temp dir and
 // installs a restart spy. It returns the daemon, a pointer to the restart
 // count, and a pointer to the error the spy returns (flip it between applies).
-func syslogDaemon6800(t *testing.T) (d *Daemon, restarts *int, failWith *error) {
+// Both counters are read through mutex-guarded ACCESSORS rather than returned
+// as pointers: the re-assert loop calls the spy from its own goroutine, so a
+// raw `*restarts` read in the test body is a data race (`-race` reports it),
+// and a racy read is exactly the "reading of the machine rather than of the
+// subject" shape docs/engineering-style.md #7563 warns about.
+func syslogDaemon6800(t *testing.T) (d *Daemon, restarts func() int, setFail func(error)) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -48,17 +53,43 @@ func syslogDaemon6800(t *testing.T) (d *Daemon, restarts *int, failWith *error) 
 	var mu sync.Mutex
 	n := 0
 	var fail error
+	var onCall func()
 	origFn := rsyslogRestartFn
 	rsyslogRestartFn = func() ([]byte, error) {
 		mu.Lock()
-		defer mu.Unlock()
 		n++
-		return nil, fail
+		err, hook := fail, onCall
+		mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		return nil, err
 	}
 	t.Cleanup(func() { rsyslogRestartFn = origFn })
 
-	return &Daemon{}, &n, &fail
+	d = &Daemon{}
+	restarts = func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+	setFail = func(e error) {
+		mu.Lock()
+		defer mu.Unlock()
+		fail = e
+	}
+	syslogSpyHook6800 = func(h func()) {
+		mu.Lock()
+		defer mu.Unlock()
+		onCall = h
+	}
+	return d, restarts, setFail
 }
+
+// syslogSpyHook6800 installs a callback the rsyslog spy runs (outside its own
+// lock) on every restart. It is how the interleave cell below observes that the
+// re-assert is provably INSIDE the semaphore, instead of racing a sleep.
+var syslogSpyHook6800 func(func())
 
 // syslogFileCfg6800 builds a config with one `system syslog file` destination.
 func syslogFileCfg6800(name string) *config.Config {
@@ -74,7 +105,7 @@ func syslogFileCfg6800(name string) *config.Config {
 // chronyDaemon6800 points the two managed chrony files at a temp dir and
 // installs a reload spy that records the exact (sources, threshold) request it
 // was issued. The returned outcome pointer decides what the spy reports back.
-func chronyDaemon6800(t *testing.T) (d *Daemon, calls *[][2]bool, outcome *chronyReloadOutcome) {
+func chronyDaemon6800(t *testing.T) (d *Daemon, calls func() [][2]bool, setOutcome func(chronyReloadOutcome)) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -95,7 +126,18 @@ func chronyDaemon6800(t *testing.T) (d *Daemon, calls *[][2]bool, outcome *chron
 	}
 	t.Cleanup(func() { chronyReloadFn = origFn })
 
-	return &Daemon{}, &got, &out
+	d = &Daemon{}
+	calls = func() [][2]bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([][2]bool(nil), got...)
+	}
+	setOutcome = func(o chronyReloadOutcome) {
+		mu.Lock()
+		defer mu.Unlock()
+		out = o
+	}
+	return d, calls, setOutcome
 }
 
 // ntpCfg6800 builds a `system ntp` config with the given servers and threshold.
@@ -125,14 +167,14 @@ func ntpCfg6800(servers []string, threshold int) *config.Config {
 // bounce a healthy rsyslog every 30s forever after one transient failure —
 // turning the retry owner into a new outage.
 func TestSyslogRestartOutcomeLatchesAndDischargesTheDebt6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
 	cfg := syslogFileCfg6800("audit")
 
-	*failWith = errors.New("simulated: Job for rsyslog.service failed")
+	setFail(errors.New("simulated: Job for rsyslog.service failed"))
 	d.applySyslogFiles(cfg)
-	if *restarts != 1 {
+	if restarts() != 1 {
 		t.Fatalf("setup: the first apply must issue the restart (writes a new "+
-			"drop-in, so changed=true); got %d restarts", *restarts)
+			"drop-in, so changed=true); got %d restarts", restarts())
 	}
 	if !d.rsyslogRestartOwed() {
 		t.Fatal("a FAILED `systemctl restart rsyslog` must latch the restart debt. " +
@@ -141,7 +183,7 @@ func TestSyslogRestartOutcomeLatchesAndDischargesTheDebt6800(t *testing.T) {
 			"rsyslog is still serving the previous ruleset (#6800)")
 	}
 
-	*failWith = nil
+	setFail(nil)
 	d.applySyslogFiles(cfg)
 	if d.rsyslogRestartOwed() {
 		t.Fatal("a SUCCESSFUL restart must DISCHARGE the debt — leaving it latched " +
@@ -162,10 +204,10 @@ func TestSyslogRestartOutcomeLatchesAndDischargesTheDebt6800(t *testing.T) {
 // identical desired set must report NO change, or apply #2 would have restarted
 // for an ordinary content change and this cell would prove nothing.
 func TestSteadyStateApplyRetriesTheOwedSyslogRestart6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
 	cfg := syslogFileCfg6800("audit")
 
-	*failWith = errors.New("simulated restart failure")
+	setFail(errors.New("simulated restart failure"))
 	d.applySyslogFiles(cfg)
 
 	// Premise: the drop-in set is now CONVERGED, so a further reconcile with
@@ -182,16 +224,16 @@ func TestSteadyStateApplyRetriesTheOwedSyslogRestart6800(t *testing.T) {
 			"than for the retained debt")
 	}
 
-	*failWith = nil
-	before := *restarts
+	setFail(nil)
+	before := restarts()
 	d.applySyslogFiles(cfg)
-	if *restarts != before+1 {
+	if restarts() != before+1 {
 		t.Fatalf("a steady-state apply issued %d restarts (want %d): the managed "+
 			"drop-ins converged on disk, so `changed` is false and only the "+
 			"retained debt can re-drive the restart. Without it rsyslog keeps "+
 			"serving the PREVIOUS ruleset — records still flowing to a removed "+
 			"destination — until an unrelated syslog edit or a reboot (#6800)",
-			*restarts-before, 1)
+			restarts()-before, 1)
 	}
 	if d.rsyslogRestartOwed() {
 		t.Fatal("the re-issued restart succeeded, so the debt must be discharged")
@@ -206,21 +248,21 @@ func TestSteadyStateApplyRetriesTheOwedSyslogRestart6800(t *testing.T) {
 // the logging pipeline on every single commit — the exact behaviour the
 // `changed` gate exists to prevent.
 func TestSteadyStateApplyWithNoDebtDoesNotRestartRsyslog6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
 	cfg := syslogFileCfg6800("audit")
 
-	*failWith = nil
+	setFail(nil)
 	d.applySyslogFiles(cfg) // converges + restarts once, successfully
-	if *restarts != 1 {
-		t.Fatalf("setup: want 1 restart from the first apply, got %d", *restarts)
+	if restarts() != 1 {
+		t.Fatalf("setup: want 1 restart from the first apply, got %d", restarts())
 	}
 
 	d.applySyslogFiles(cfg)
 	d.applySyslogFiles(cfg)
-	if *restarts != 1 {
+	if restarts() != 1 {
 		t.Fatalf("a converged, debt-free apply restarted rsyslog (%d total, want 1) "+
 			"— the `changed` gate must still suppress the steady state (#6800)",
-			*restarts)
+			restarts())
 	}
 }
 
@@ -325,29 +367,29 @@ func TestChronyThresholdLegReportsItsOwnOutcome6800(t *testing.T) {
 // would keep polling the OLD server set forever. The apply must fold the
 // retained leg in.
 func TestOwedChronySourcesLegSurvivesAThresholdOnlyApply6800(t *testing.T) {
-	d, calls, outcome := chronyDaemon6800(t)
+	d, calls, setOutcome := chronyDaemon6800(t)
 
-	*outcome = chronyReloadOutcome{sourcesFailed: true}
+	setOutcome(chronyReloadOutcome{sourcesFailed: true})
 	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 0))
-	if len(*calls) != 1 || (*calls)[0] != [2]bool{true, false} {
-		t.Fatalf("setup: apply #1 must request the sources leg only, got %v", *calls)
+	if len(calls()) != 1 || (calls())[0] != [2]bool{true, false} {
+		t.Fatalf("setup: apply #1 must request the sources leg only, got %v", calls())
 	}
 	if s, th := d.chronyReloadOwed(); !s || th {
 		t.Fatalf("setup: want debt (sources=true, threshold=false), got (%v, %v)", s, th)
 	}
 
 	// Apply #2: same servers (sources file converged), NEW threshold.
-	*outcome = chronyReloadOutcome{}
+	setOutcome(chronyReloadOutcome{})
 	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
-	if len(*calls) != 2 {
-		t.Fatalf("apply #2 issued %d reloads, want 2", len(*calls))
+	if len(calls()) != 2 {
+		t.Fatalf("apply #2 issued %d reloads, want 2", len(calls()))
 	}
-	if (*calls)[1] != [2]bool{true, true} {
+	if (calls())[1] != [2]bool{true, true} {
 		t.Fatalf("apply #2 requested %v, want [sources=true threshold=true]: the "+
 			"owed SOURCES leg must be folded into the request. Re-deriving it "+
 			"from this apply's own change flags drops it — the sources file is "+
 			"already converged, so nothing else can see that chrony never "+
-			"re-read it (#6800)", (*calls)[1])
+			"re-read it (#6800)", (calls())[1])
 	}
 	if s, th := d.chronyReloadOwed(); s || th {
 		t.Fatalf("both legs succeeded, so the debt must be discharged; got (%v, %v)", s, th)
@@ -359,27 +401,27 @@ func TestOwedChronySourcesLegSurvivesAThresholdOnlyApply6800(t *testing.T) {
 // single cell covering one direction stays green when the other direction's
 // fold is reverted.
 func TestOwedChronyThresholdLegSurvivesASourcesOnlyApply6800(t *testing.T) {
-	d, calls, outcome := chronyDaemon6800(t)
+	d, calls, setOutcome := chronyDaemon6800(t)
 
-	*outcome = chronyReloadOutcome{thresholdFailed: true}
+	setOutcome(chronyReloadOutcome{thresholdFailed: true})
 	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
-	if len(*calls) != 1 || (*calls)[0] != [2]bool{true, true} {
-		t.Fatalf("setup: apply #1 must request both legs, got %v", *calls)
+	if len(calls()) != 1 || (calls())[0] != [2]bool{true, true} {
+		t.Fatalf("setup: apply #1 must request both legs, got %v", calls())
 	}
 	if s, th := d.chronyReloadOwed(); s || !th {
 		t.Fatalf("setup: want debt (sources=false, threshold=true), got (%v, %v)", s, th)
 	}
 
 	// Apply #2: NEW server list, same threshold (threshold file converged).
-	*outcome = chronyReloadOutcome{}
+	setOutcome(chronyReloadOutcome{})
 	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1", "10.0.0.2"}, 120))
-	if len(*calls) != 2 {
-		t.Fatalf("apply #2 issued %d reloads, want 2", len(*calls))
+	if len(calls()) != 2 {
+		t.Fatalf("apply #2 issued %d reloads, want 2", len(calls()))
 	}
-	if (*calls)[1] != [2]bool{true, true} {
+	if (calls())[1] != [2]bool{true, true} {
 		t.Fatalf("apply #2 requested %v, want [sources=true threshold=true]: the "+
 			"owed THRESHOLD leg must be folded into the request (#6800)",
-			(*calls)[1])
+			(calls())[1])
 	}
 }
 
@@ -392,25 +434,25 @@ func TestOwedChronyThresholdLegSurvivesASourcesOnlyApply6800(t *testing.T) {
 // both files are converged, both change flags are false, and the early return
 // is the thing that would swallow the retry.
 func TestSteadyStateNTPApplyRetriesTheOwedChronyReload6800(t *testing.T) {
-	d, calls, outcome := chronyDaemon6800(t)
+	d, calls, setOutcome := chronyDaemon6800(t)
 	cfg := ntpCfg6800([]string{"10.0.0.1"}, 120)
 
-	*outcome = chronyReloadOutcome{sourcesFailed: true, thresholdFailed: true}
+	setOutcome(chronyReloadOutcome{sourcesFailed: true, thresholdFailed: true})
 	d.applySystemNTP(cfg)
-	if len(*calls) != 1 {
-		t.Fatalf("setup: want 1 reload from the first apply, got %d", len(*calls))
+	if len(calls()) != 1 {
+		t.Fatalf("setup: want 1 reload from the first apply, got %d", len(calls()))
 	}
 
-	*outcome = chronyReloadOutcome{}
+	setOutcome(chronyReloadOutcome{})
 	d.applySystemNTP(cfg)
-	if len(*calls) != 2 {
+	if len(calls()) != 2 {
 		t.Fatalf("a steady-state apply issued %d reloads, want 2: both managed "+
 			"chrony files are converged so both change flags are false, and only "+
 			"the retained debt — folded in BEFORE the no-change early return — "+
-			"can re-drive the reload (#6800)", len(*calls))
+			"can re-drive the reload (#6800)", len(calls()))
 	}
-	if (*calls)[1] != [2]bool{true, true} {
-		t.Fatalf("the retry requested %v, want both owed legs replayed", (*calls)[1])
+	if (calls())[1] != [2]bool{true, true} {
+		t.Fatalf("the retry requested %v, want both owed legs replayed", (calls())[1])
 	}
 	if s, th := d.chronyReloadOwed(); s || th {
 		t.Fatalf("the retry succeeded, so the debt must be discharged; got (%v, %v)", s, th)
@@ -422,21 +464,21 @@ func TestSteadyStateNTPApplyRetriesTheOwedChronyReload6800(t *testing.T) {
 // chrony` is one of the fallbacks, so a gate that fired every commit would
 // periodically bounce time sync.
 func TestSteadyStateNTPApplyWithNoDebtDoesNotReload6800(t *testing.T) {
-	d, calls, outcome := chronyDaemon6800(t)
+	d, calls, setOutcome := chronyDaemon6800(t)
 	cfg := ntpCfg6800([]string{"10.0.0.1"}, 120)
 
-	*outcome = chronyReloadOutcome{}
+	setOutcome(chronyReloadOutcome{})
 	d.applySystemNTP(cfg)
-	if len(*calls) != 1 {
-		t.Fatalf("setup: want 1 reload from the first apply, got %d", len(*calls))
+	if len(calls()) != 1 {
+		t.Fatalf("setup: want 1 reload from the first apply, got %d", len(calls()))
 	}
 
 	d.applySystemNTP(cfg)
 	d.applySystemNTP(cfg)
-	if len(*calls) != 1 {
+	if len(calls()) != 1 {
 		t.Fatalf("a converged, debt-free apply reloaded chrony (%d total, want 1) "+
 			"— the change gate must still suppress the steady state (#6800)",
-			len(*calls))
+			len(calls()))
 	}
 }
 
@@ -450,7 +492,7 @@ func TestSteadyStateNTPApplyWithNoDebtDoesNotReload6800(t *testing.T) {
 // dropped and chrony keeps the removed sources loaded — the deleted-destination
 // shape #5111 fixed for rsyslog, reached through the reload instead of the file.
 func TestSteadyStateDisabledNTPApplyRetriesTheOwedChronyReload6800(t *testing.T) {
-	d, calls, outcome := chronyDaemon6800(t)
+	d, calls, setOutcome := chronyDaemon6800(t)
 
 	// Seed the files a previously-enabled apply would have left behind.
 	if err := os.WriteFile(chronySourcesPath, []byte("server 10.0.0.1 iburst\n"), 0644); err != nil {
@@ -463,34 +505,34 @@ func TestSteadyStateDisabledNTPApplyRetriesTheOwedChronyReload6800(t *testing.T)
 	cfg := ntpCfg6800(nil, 0)
 	cfg.System.DisabledProcesses = []string{"ntp"}
 
-	*outcome = chronyReloadOutcome{sourcesFailed: true, thresholdFailed: true}
+	setOutcome(chronyReloadOutcome{sourcesFailed: true, thresholdFailed: true})
 	d.applySystemNTP(cfg)
-	if len(*calls) != 1 || (*calls)[0] != [2]bool{true, true} {
+	if len(calls()) != 1 || (calls())[0] != [2]bool{true, true} {
 		t.Fatalf("setup: the disabling apply must remove both files and request "+
-			"both legs, got %v", *calls)
+			"both legs, got %v", calls())
 	}
 	if _, err := os.Stat(chronySourcesPath); !os.IsNotExist(err) {
 		t.Fatalf("setup: the managed sources file must be removed, stat err = %v", err)
 	}
 
-	*outcome = chronyReloadOutcome{}
+	setOutcome(chronyReloadOutcome{})
 	d.applySystemNTP(cfg)
-	if len(*calls) != 2 {
+	if len(calls()) != 2 {
 		t.Fatalf("a steady-state DISABLED apply issued %d reloads, want 2: the "+
 			"managed files are already gone so both change flags are false, and "+
 			"only the retained debt can re-drive the reload that tells chrony to "+
-			"drop the removed sources (#6800)", len(*calls))
+			"drop the removed sources (#6800)", len(calls()))
 	}
-	if (*calls)[1] != [2]bool{true, true} {
-		t.Fatalf("the retry requested %v, want both owed legs replayed", (*calls)[1])
+	if (calls())[1] != [2]bool{true, true} {
+		t.Fatalf("the retry requested %v, want both owed legs replayed", (calls())[1])
 	}
 
 	// PAIRED negative: now that the debt is discharged, a further disabled apply
 	// must not touch chrony at all.
 	d.applySystemNTP(cfg)
-	if len(*calls) != 2 {
+	if len(calls()) != 2 {
 		t.Fatalf("a converged, debt-free DISABLED apply reloaded chrony (%d total, "+
-			"want 2) — the change gate must still suppress the steady state", len(*calls))
+			"want 2) — the change gate must still suppress the steady state", len(calls()))
 	}
 }
 
@@ -506,35 +548,35 @@ func TestSteadyStateDisabledNTPApplyRetriesTheOwedChronyReload6800(t *testing.T)
 // re-drives either reload, so without this loop the recovery window is "until
 // the operator next edits syslog or NTP" — potentially never.
 func TestReassertRedrivesOwedReloadsAndDischargesThem6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
-	chronyD, calls, outcome := chronyDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
+	chronyD, calls, setOutcome := chronyDaemon6800(t)
 	_ = chronyD // the chrony seams are package-level; drive them through d
 	d.applySem = semaphore.NewWeighted(1)
 
 	// Latch both debts through the apply path, so the fixture owes exactly what
 	// a failed apply would owe.
-	*failWith = errors.New("simulated restart failure")
+	setFail(errors.New("simulated restart failure"))
 	d.applySyslogFiles(syslogFileCfg6800("audit"))
-	*outcome = chronyReloadOutcome{sourcesFailed: true}
+	setOutcome(chronyReloadOutcome{sourcesFailed: true})
 	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 0))
 	if !d.serviceReloadDebtOutstanding() {
 		t.Fatal("setup: both debts must be outstanding before the re-assert")
 	}
-	restartsAfterApply, callsAfterApply := *restarts, len(*calls)
+	restartsAfterApply, callsAfterApply := restarts(), len(calls())
 
-	*failWith = nil
-	*outcome = chronyReloadOutcome{}
+	setFail(nil)
+	setOutcome(chronyReloadOutcome{})
 	d.reassertServiceReloadDebtOnce(context.Background())
 
-	if *restarts != restartsAfterApply+1 {
+	if restarts() != restartsAfterApply+1 {
 		t.Fatalf("the re-assert issued %d rsyslog restarts, want 1 — a boot-time "+
 			"apply whose restart failed has no further apply coming, so this loop "+
-			"is the only retry owner (#6800)", *restarts-restartsAfterApply)
+			"is the only retry owner (#6800)", restarts()-restartsAfterApply)
 	}
-	if len(*calls) != callsAfterApply+1 {
-		t.Fatalf("the re-assert issued %d chrony reloads, want 1", len(*calls)-callsAfterApply)
+	if len(calls()) != callsAfterApply+1 {
+		t.Fatalf("the re-assert issued %d chrony reloads, want 1", len(calls())-callsAfterApply)
 	}
-	if got := (*calls)[len(*calls)-1]; got != [2]bool{true, false} {
+	if got := (calls())[len(calls())-1]; got != [2]bool{true, false} {
 		t.Fatalf("the re-assert requested %v, want [sources=true threshold=false]: "+
 			"it must REPLAY the exact owed leg, not re-derive a request. Reloading "+
 			"the threshold too would gratuitously `systemctl restart chrony` for a "+
@@ -560,64 +602,68 @@ func TestReassertIsANoOpWhenNothingIsOwed6800(t *testing.T) {
 	}
 	d.reassertServiceReloadDebtOnce(context.Background())
 
-	if *restarts != 0 || len(*calls) != 0 {
+	if restarts() != 0 || len(calls()) != 0 {
 		t.Fatalf("a debt-free re-assert touched the services (%d rsyslog restarts, "+
 			"%d chrony reloads, want 0/0) — a 30s unconditional bounce of the "+
 			"logging and time-sync pipelines would be worse than the bug (#6800)",
-			*restarts, len(*calls))
+			restarts(), len(calls()))
 	}
 }
 
-// TestReassertRechecksTheDebtInsideTheSemaphore6800 binds the INNER gate — the
-// per-service `d.rsyslogRestartOwed()` read taken UNDER applySem.
+// TestReassertRechecksTheDebtInsideTheSemaphore6800 binds the INNER gate: the
+// per-service debt read taken UNDER applySem, after the tick has queued.
 //
-// The check before applySem is only an optimisation: it avoids queueing behind
-// a commit for nothing, and its answer is stale by the time the tick is let
-// through. The inner one is the correctness gate — a tick that blocked behind
-// an in-flight commit may find the commit ALREADY re-issued the restart and
-// discharged the debt, and restarting rsyslog again then is a gratuitous bounce
-// of a healthy logging pipeline.
+// The check before applySem is only an optimisation — it avoids queueing behind
+// a commit for nothing — and its answer is STALE by the time the tick is let
+// through. A tick that blocked behind an in-flight commit may find the commit
+// already re-issued the reload and discharged the debt; reloading again then is
+// a gratuitous bounce of a healthy service.
 //
-// The mutation that survives without this cell drops only the inner read (the
-// re-assert restarts unconditionally once it holds the semaphore); the outer
-// check still short-circuits the quiet case, so
-// TestReassertIsANoOpWhenNothingIsOwed6800 stays green.
+// The construction is deliberately NOT "start a goroutine, discharge, release".
+// That version depends on the tick reaching its outer gate before the main
+// goroutine discharges — a reading of the scheduler, not of the subject
+// (docs/engineering-style.md #7563). Here the ordering is enforced by the
+// fixture: BOTH debts are outstanding, the re-assert drives rsyslog FIRST, and
+// the rsyslog spy blocks. When it fires, the tick is provably inside the
+// semaphore and past its own outer gate. The "commit" then discharges the
+// CHRONY debt and lets the tick continue. If the chrony leg trusted the outer
+// snapshot instead of re-reading under the semaphore, it would reload a chrony
+// whose debt was already paid.
 func TestReassertRechecksTheDebtInsideTheSemaphore6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, _, setFail := syslogDaemon6800(t)
+	_, calls, setOutcome := chronyDaemon6800(t)
 	d.applySem = semaphore.NewWeighted(1)
 
-	*failWith = errors.New("simulated restart failure")
+	// Latch BOTH debts through the apply path.
+	setFail(errors.New("simulated restart failure"))
 	d.applySyslogFiles(syslogFileCfg6800("audit"))
+	setOutcome(chronyReloadOutcome{sourcesFailed: true})
+	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 0))
 	if !d.rsyslogRestartOwed() {
-		t.Fatal("setup: the restart debt must be outstanding")
+		t.Fatal("setup: the rsyslog debt must be outstanding")
 	}
-	before := *restarts
-
-	// Hold applySem, as an in-flight commit would.
-	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
-		t.Fatalf("Acquire: %v", err)
+	if s, th := d.chronyReloadOwed(); !s || th {
+		t.Fatalf("setup: want chrony debt (sources=true, threshold=false), got (%v, %v)", s, th)
 	}
+	callsBefore := len(calls())
 
-	started := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		close(started)
-		d.reassertServiceReloadDebtOnce(context.Background())
-		close(done)
-	}()
-	<-started
+	// The rsyslog spy is the synchronisation point: it runs INSIDE the
+	// semaphore, so a commit simulated from it is a commit that lands while the
+	// tick is queued on its remaining work.
+	setFail(nil)
+	syslogSpyHook6800(func() {
+		d.noteChronyReloadResult(chronyReloadOutcome{}) // a commit paid the chrony debt
+	})
+	t.Cleanup(func() { syslogSpyHook6800(nil) })
 
-	// The tick is now blocked on the semaphore (or about to be). Simulate the
-	// commit having re-issued the restart successfully, then let the tick in.
-	d.noteRsyslogRestartResult(nil)
-	d.applySem.Release(1)
-	<-done
+	d.reassertServiceReloadDebtOnce(context.Background())
 
-	if *restarts != before {
-		t.Fatalf("the re-assert restarted rsyslog %d times after the commit it "+
-			"queued behind had already discharged the debt, want 0 — re-reading "+
-			"the debt INSIDE the semaphore is what stops a gratuitous bounce of a "+
-			"healthy logging pipeline (#6800)", *restarts-before)
+	if got := len(calls()) - callsBefore; got != 0 {
+		t.Fatalf("the re-assert reloaded chrony %d times after a commit had "+
+			"already discharged that debt, want 0 — the outer gate's answer is "+
+			"stale once the tick queues, so each service must RE-READ its debt "+
+			"inside the semaphore or a healthy chrony gets a gratuitous "+
+			"`systemctl restart chrony` (#6800)", got)
 	}
 }
 
@@ -633,15 +679,15 @@ func TestReassertRechecksTheDebtInsideTheSemaphore6800(t *testing.T) {
 // /etc/rsyslog.d/10-xpf-*, so the restart would load a HALF-CONVERGED drop-in
 // set and then latch a success for it (#4001, #6800).
 func TestReassertWaitsForTheApplySemaphore6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
 	d.applySem = semaphore.NewWeighted(1)
 
-	*failWith = errors.New("simulated restart failure")
+	setFail(errors.New("simulated restart failure"))
 	d.applySyslogFiles(syslogFileCfg6800("audit"))
 	if !d.rsyslogRestartOwed() {
 		t.Fatal("setup: the restart debt must be outstanding")
 	}
-	before := *restarts
+	before := restarts()
 
 	// A commit takes the semaphore and does not give it back.
 	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
@@ -652,11 +698,11 @@ func TestReassertWaitsForTheApplySemaphore6800(t *testing.T) {
 	defer cancel()
 	d.reassertServiceReloadDebtOnce(ctx)
 
-	if *restarts != before {
+	if restarts() != before {
 		t.Fatalf("the re-assert restarted rsyslog %d times while a commit held "+
 			"applySem, want 0 — it must queue behind the in-flight apply, or the "+
 			"restart can load a half-converged drop-in set and latch a success "+
-			"for it (#4001, #6800)", *restarts-before)
+			"for it (#4001, #6800)", restarts()-before)
 	}
 	if !d.rsyslogRestartOwed() {
 		t.Fatal("a re-assert that never ran must leave the debt outstanding")
@@ -673,50 +719,50 @@ func TestReassertWaitsForTheApplySemaphore6800(t *testing.T) {
 // bounce the steady-state gate exists to prevent, just reached from the loop.
 func TestReassertDrivesOnlyTheServiceThatOwesAReload6800(t *testing.T) {
 	t.Run("rsyslog-owed-chrony-quiet", func(t *testing.T) {
-		d, restarts, failWith := syslogDaemon6800(t)
+		d, restarts, setFail := syslogDaemon6800(t)
 		_, calls, _ := chronyDaemon6800(t)
 		d.applySem = semaphore.NewWeighted(1)
 
-		*failWith = errors.New("simulated restart failure")
+		setFail(errors.New("simulated restart failure"))
 		d.applySyslogFiles(syslogFileCfg6800("audit"))
-		before := *restarts
-		*failWith = nil
+		before := restarts()
+		setFail(nil)
 
 		d.reassertServiceReloadDebtOnce(context.Background())
 
-		if *restarts != before+1 {
+		if restarts() != before+1 {
 			t.Fatalf("the owed rsyslog restart was not re-driven (%d, want 1)",
-				*restarts-before)
+				restarts()-before)
 		}
-		if len(*calls) != 0 {
+		if len(calls()) != 0 {
 			t.Fatalf("the re-assert reloaded chrony %d times while only rsyslog "+
 				"owed one, want 0 — each service must gate on its OWN debt, or an "+
 				"rsyslog failure drags a healthy chrony through `systemctl restart "+
-				"chrony` every 30s (#6800)", len(*calls))
+				"chrony` every 30s (#6800)", len(calls()))
 		}
 	})
 
 	t.Run("chrony-owed-rsyslog-quiet", func(t *testing.T) {
 		d, restarts, _ := syslogDaemon6800(t)
-		_, calls, outcome := chronyDaemon6800(t)
+		_, calls, setOutcome := chronyDaemon6800(t)
 		d.applySem = semaphore.NewWeighted(1)
 
-		*outcome = chronyReloadOutcome{thresholdFailed: true}
+		setOutcome(chronyReloadOutcome{thresholdFailed: true})
 		d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
-		before := len(*calls)
-		*outcome = chronyReloadOutcome{}
+		before := len(calls())
+		setOutcome(chronyReloadOutcome{})
 
 		d.reassertServiceReloadDebtOnce(context.Background())
 
-		if len(*calls) != before+1 {
+		if len(calls()) != before+1 {
 			t.Fatalf("the owed chrony reload was not re-driven (%d, want 1)",
-				len(*calls)-before)
+				len(calls())-before)
 		}
-		if *restarts != 0 {
+		if restarts() != 0 {
 			t.Fatalf("the re-assert restarted rsyslog %d times while only chrony "+
 				"owed a reload, want 0 — each service must gate on its OWN debt, or "+
 				"a chrony failure bounces a healthy logging pipeline every 30s "+
-				"(#6800)", *restarts)
+				"(#6800)", restarts())
 		}
 	})
 }
@@ -728,23 +774,23 @@ func TestReassertDrivesOnlyTheServiceThatOwesAReload6800(t *testing.T) {
 // reasons: this reds if the loop is wired to the wrong function or never
 // ticks; the source check reds if Run never starts it.
 func TestServiceReloadDebtLoopTicks6800(t *testing.T) {
-	d, restarts, failWith := syslogDaemon6800(t)
+	d, restarts, setFail := syslogDaemon6800(t)
 	d.applySem = semaphore.NewWeighted(1)
 
 	orig := serviceReloadDebtReassertInterval
 	serviceReloadDebtReassertInterval = 5 * time.Millisecond
 	t.Cleanup(func() { serviceReloadDebtReassertInterval = orig })
 
-	*failWith = errors.New("simulated restart failure")
+	setFail(errors.New("simulated restart failure"))
 	d.applySyslogFiles(syslogFileCfg6800("audit"))
-	before := *restarts
+	before := restarts()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
 	go func() { d.serviceReloadDebtReassertLoop(ctx); close(loopDone) }()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for *restarts <= before {
+	for restarts() <= before {
 		if time.Now().After(deadline) {
 			cancel()
 			<-loopDone
