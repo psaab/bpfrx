@@ -1784,11 +1784,20 @@ the drop fails loudly instead of going quietly vacuous.
   gap between events. `TestIdleSSEStreamIsNotSevered7632` pins it, and reds if
   anyone adds an elapsed budget here by analogy with `bgpStreamTotalBudget`.
 
-  **The error return is not separable from the deadline.** Adding the deadline
-  alone would have been worse than the pin: the write would fail instantly on
-  every subsequent event while the loop kept consuming the subscription,
-  marshalling and discarding — a goroutine that never exits and silently drops
-  the feed, where before it at least blocked and applied backpressure.
+  **The error return is precautionary, not bound — and that was measured, not
+  assumed.** The obvious claim is that adding the deadline alone would be worse
+  than the pin, with the loop draining the subscription into a dead connection.
+  It is not: with the error deliberately discarded the handler still returns in
+  **254.6 ms** against a 250 ms deadline, against **254.9 ms** with the check,
+  because net/http cancels the request context as soon as a write to the
+  connection fails and the loop exits through its `ctx.Done()` arm anyway.
+
+  The deadline is what fixes the pin. The error check is kept because that exit
+  depends on net/http cancelling on a write error — behaviour, not contract — so
+  a wrapping `ResponseWriter` or a different server that does not do it would
+  leave the loop draining. Removing the check leaves the suite green, which is
+  recorded here rather than papered over: it is defence in depth, and calling it
+  load-bearing would put a false claim into the next reader's reasoning.
 
   Note one pre-existing behaviour #7632 did **not** change: net/http does not
   send response headers until the first `Write` or `Flush`, and `setSSEHeaders`

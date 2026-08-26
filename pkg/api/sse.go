@@ -40,13 +40,30 @@ func setSSEHeaders(w http.ResponseWriter) {
 // This is the axis on which SSE genuinely differs from the RIB dump, where a
 // total budget was a sensible backstop.
 //
-// THE ERROR RETURN IS NOT SEPARABLE FROM THE DEADLINE. writeSSEEvent used to
-// discard every write error. Adding the deadline WITHOUT propagating it would
-// have made things worse, not better: the write would fail instantly on every
-// subsequent event while the loop kept consuming from the subscription,
-// marshalling, and discarding — a goroutine that never exits and silently drops
-// the feed, where today it at least blocks and applies backpressure. Both
-// halves ship together for that reason.
+// THE ERROR RETURN IS PRECAUTIONARY, NOT BOUND — labelled as such because I
+// first claimed the opposite and measured it.
+//
+// The claim was that adding the deadline without propagating the error would be
+// WORSE than the pin: the write failing on every later event while the loop
+// kept draining the subscription and discarding. Measured, it is not. With the
+// deadline armed and the error deliberately discarded, the handler still
+// returns in 254.6ms against a 250ms deadline — indistinguishable from 254.9ms
+// with the check — because net/http cancels the request context as soon as a
+// write to the connection fails, so the loop exits through its ctx.Done() arm
+// regardless.
+//
+// So the deadline is what fixes the pin, and the error return currently changes
+// nothing observable. It is kept for one reason that survives the measurement:
+// that exit depends on net/http cancelling the context on a write error, which
+// is behaviour rather than contract. A wrapping ResponseWriter, or a different
+// server, that does not do it would leave this loop draining the subscription
+// into a dead connection. Checking the error makes the exit local and explicit
+// instead of inherited.
+//
+// Stated this way deliberately: a guard described as load-bearing when it is
+// defence in depth is the kind of claim that survives into someone else's
+// reasoning. The mutation matrix agrees — removing the error check leaves the
+// suite green, and that is recorded rather than papered over.
 
 // sseWriteDeadline bounds a SINGLE downstream SSE write. A subscriber that
 // cannot accept one small event within this window is not reading. Generous by

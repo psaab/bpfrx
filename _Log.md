@@ -8,11 +8,19 @@
   subscriber slot. Both handlers now write through `sseStream`, reusing the
   `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
   first write error, which both loops treat as terminal.
-  TWO HALVES, NOT ONE: adding the deadline WITHOUT the error return would have
-  been worse than the pin — the write would fail instantly on every later event
-  while the loop kept consuming the subscription, marshalling and discarding, a
-  goroutine that never exits and silently drops the feed where before it at
-  least blocked and applied backpressure.
+  I FIRST CLAIMED THE ERROR RETURN WAS LOAD-BEARING, THEN MEASURED IT AND IT IS
+  NOT. The claim was that adding the deadline without propagating the error
+  would be worse than the pin — the loop draining the subscription into a dead
+  connection. The mutation matrix said otherwise (M2/M3 green), so I probed
+  instead of arguing: with the error deliberately discarded the handler returns
+  in 254.6ms against a 250ms deadline, versus 254.9ms with the check.
+  Indistinguishable, because net/http cancels the request context as soon as a
+  write to the connection fails and the loop exits through its ctx.Done() arm
+  regardless. The deadline is what fixes the pin. The error check is kept as
+  DEFENCE IN DEPTH — that exit is net/http behaviour, not contract, so a
+  wrapping ResponseWriter or a different server that does not cancel would leave
+  the loop draining — and it is labelled precautionary in the code, the README
+  and the PR rather than described as the thing preventing a worse failure.
   PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
   from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
   an elapsed budget would sever the healthy case. A per-write deadline bounds a
