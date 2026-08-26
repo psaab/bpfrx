@@ -890,6 +890,62 @@ func TestManagedServiceReloadAccessorsTrackTheDebt6800(t *testing.T) {
 	}
 }
 
+// TestManagedServiceReloadFailureCountsAreIndependentPerLeg6800 is the MIRROR
+// of the cell above, and it exists because that one could not see this.
+//
+// There the chrony THRESHOLD leg succeeds — deliberately, to bind "a leg that
+// worked is not reported owed and does not move its counter". The cost is that
+// the threshold counter is never exercised at its failing point, so deleting
+// its increment changes nothing and the mutation survives. That is a fixture
+// varying the right axis and sampling only the passing point.
+//
+// This one inverts every leg: rsyslog and chrony-sources succeed, chrony
+// THRESHOLD fails. Between the two, each of the three counters is observed at
+// both a failing and a succeeding point.
+func TestManagedServiceReloadFailureCountsAreIndependentPerLeg6800(t *testing.T) {
+	d, _, setFail := syslogDaemon6800(t)
+	_, _, setOutcome := chronyDaemon6800(t)
+
+	setFail(nil) // rsyslog restart SUCCEEDS
+	d.applySyslogFiles(syslogFileCfg6800("audit"))
+	setOutcome(chronyReloadOutcome{thresholdFailed: true}) // only threshold fails
+	d.applySystemNTP(ntpCfg6800([]string{"10.0.0.1"}, 120))
+
+	owed := d.ManagedServiceReloadOwed()
+	if !owed[svcReloadChronyThreshold] {
+		t.Errorf("owed = %v; the failed threshold reload must be reported — "+
+			"chrony is still running the previous logchange/maxchange", owed)
+	}
+	if owed[svcReloadRsyslog] || owed[svcReloadChronySources] {
+		t.Errorf("owed = %v; only the threshold leg failed", owed)
+	}
+
+	fails := d.ManagedServiceReloadFailures()
+	if fails[svcReloadChronyThreshold] != 1 {
+		t.Errorf("chrony-threshold failures = %d, want 1 — each leg keeps its "+
+			"OWN count, or an operator cannot tell which reload is the one that "+
+			"keeps failing", fails[svcReloadChronyThreshold])
+	}
+	if fails[svcReloadRsyslog] != 0 || fails[svcReloadChronySources] != 0 {
+		t.Errorf("failures = %v; neither the rsyslog restart nor the sources "+
+			"reload failed, and a counter that moves for a successful reload is "+
+			"noise an operator will learn to ignore", fails)
+	}
+
+	// And it climbs on a failing retry, independently of the quiet legs.
+	d.applySem = semaphore.NewWeighted(1)
+	d.reassertServiceReloadDebtOnce(context.Background())
+	fails = d.ManagedServiceReloadFailures()
+	if fails[svcReloadChronyThreshold] != 2 {
+		t.Errorf("chrony-threshold failures = %d after a second failed attempt, "+
+			"want 2", fails[svcReloadChronyThreshold])
+	}
+	if fails[svcReloadRsyslog] != 0 || fails[svcReloadChronySources] != 0 {
+		t.Errorf("failures = %v; the re-assert must not touch a leg that owes "+
+			"nothing", fails)
+	}
+}
+
 // TestDaemonWiresManagedServiceReloadMetrics6800 binds the WIRING of those
 // accessors into the REST/metrics server.
 //
