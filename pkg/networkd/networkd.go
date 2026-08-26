@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/rendersafe"
 )
 
 // networkctlTimeout bounds every networkctl shell-out. Apply runs on
@@ -683,32 +684,35 @@ func (m *Manager) findExternallyManaged() map[string]bool {
 	return FindExternallyManaged(m.networkDir)
 }
 
-// sanitizeUnitValue strips ASCII control characters — the C0 set
-// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
-// space — from a free-text config value before it is interpolated into
-// a generated systemd unit line. Render-side belt for #1798: a
-// description like "lan\nDHCP=ipv4" must not be able to inject extra
-// directives into a .network/.netdev/.link unit even if the
-// commit-time validation layer were bypassed (e.g. an old persisted
-// value reaching the renderer ahead of the load-time sanitizer).
+// sanitizeUnitValue replaces every ASCII control byte (C0, 0x00-0x1F, which
+// includes newline, plus DEL 0x7F) with a SPACE before the value is interpolated
+// into a generated systemd unit line. Render-side belt for #1798: a description
+// like "lan\nDHCP=ipv4" must not be able to inject extra directives into a
+// .network/.netdev/.link unit even if the commit-time validation layer were
+// bypassed (e.g. an old persisted value reaching the renderer ahead of the
+// load-time sanitizer).
+//
+// # The consuming grammar, and why a space is the right substitute here (#6833)
+//
+// A systemd unit file is `Key=Value` one per line. The load-bearing byte for an
+// interpolated value is therefore the NEWLINE, which ends the directive and lets
+// the remainder be read as a new one. That is the byte #1798 named and it is
+// genuinely the live one here.
+//
+// A space is safe because this belt is applied to `Description=` and ONLY to
+// `Description=`, which systemd treats as free text. That is not incidental — it
+// is what makes the substitution correct, and it is pinned by
+// TestUnitValueSanitizerIsAppliedOnlyToDescription_6833.
+//
+// It would NOT be safe on several `[Match]` keys, which are WHITESPACE-SEPARATED
+// LISTS: `OriginalName=` accepts a list of patterns, so a space inside one value
+// would make a single .link file match several kernel interfaces — the
+// substitution manufacturing the very delimiter the belt exists to prevent (the
+// #6829 shape, where the space and not the newline was the live byte). Any future
+// call site on such a key must re-derive the substitute rather than reuse this
+// function; the inventory test above is what forces that.
 func sanitizeUnitValue(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-	b := []byte(s)
-	for i := range b {
-		if b[i] < 0x20 || b[i] == 0x7f {
-			b[i] = ' '
-		}
-	}
-	return string(b)
+	return rendersafe.ReplaceControlBytes(s, ' ')
 }
 
 func (m *Manager) generateNetdev(ifc InterfaceConfig) string {

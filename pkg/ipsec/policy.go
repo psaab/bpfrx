@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/rendersafe"
 )
 
 // childSelector is a resolved child SA traffic-selector pair for swanctl
@@ -527,32 +528,36 @@ func childNameDisambiguator(original string) string {
 	return fmt.Sprintf("%08x", uint32(h.Sum64()))
 }
 
-// sanitizeSwanctlValue strips ASCII control characters — the C0 set
-// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
-// space — from a free-text config value (connection name, IKE
-// identity, certificate name, pre-shared key) before it is
-// interpolated into a generated swanctl.conf line. Render-side belt
-// for #1798: an embedded newline must not be able to inject extra
-// swanctl sections/keys even if the commit-time validation layer were
-// bypassed.
+// sanitizeSwanctlValue replaces every ASCII control byte (C0, 0x00-0x1F, which
+// includes newline, plus DEL 0x7F) with a SPACE before the value is interpolated
+// into a generated swanctl.conf line. Render-side belt for #1798.
+//
+// # The consuming grammar, and why a space is the right substitute here (#6833)
+//
+// swanctl.conf is `section { key = value }` with values running to end of line
+// and `#` starting a comment. The load-bearing byte for an interpolated value is
+// therefore the NEWLINE: it ends the current setting and lets the remainder be
+// read as a new key, or as a new section. That is the byte #1798 named and it is
+// genuinely the live one here.
+//
+// A space is safe at every current call site, and that is a checked claim rather
+// than an assumption:
+//
+//   - The UNQUOTED interpolations are `local_addrs`, `remote_addrs`, `proposals`,
+//     `esp_proposals`, `local_ts`, `remote_ts` and section names. The list-valued
+//     ones among these are COMMA-separated in swanctl, not whitespace-separated,
+//     so an injected space produces one malformed value rather than two entries.
+//   - The QUOTED interpolations (`certs`, `id`, `secret`) additionally pass
+//     through escapeSwanctlQuoted, so the quoting protects them independently.
+//
+// If a future call site interpolates into a key whose grammar makes whitespace
+// SIGNIFICANT, this substitution stops being safe and the caller must re-derive
+// it — a space would then manufacture the delimiter the belt exists to prevent
+// (the #6829 shape, where the space and not the newline was the live byte).
+// TestSwanctlSanitizerCallSitesAreUnquotedOrEscaped_6833 pins the current
+// inventory so such a site cannot be added silently.
 func sanitizeSwanctlValue(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-	b := []byte(s)
-	for i := range b {
-		if b[i] < 0x20 || b[i] == 0x7f {
-			b[i] = ' '
-		}
-	}
-	return string(b)
+	return rendersafe.ReplaceControlBytes(s, ' ')
 }
 
 // escapeSwanctlQuoted escapes a string for safe inclusion inside a
