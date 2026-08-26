@@ -341,3 +341,82 @@ func TestNormalPolicyStillRendersItsFullExpansion6807(t *testing.T) {
 		t.Fatalf("the in-bounds policy's term match did not render:\n%s", got)
 	}
 }
+
+// TestQuarantinedRouteMapsIsReportedAndReset6807 binds the producer side of the
+// gauge: rendering must RECORD what it quarantined, and a later healthy render
+// must CLEAR it.
+//
+// The reset leg is the one that matters operationally. Without it the set only
+// ever grows, so an operator who reduces the oversized policy and re-commits
+// keeps being paged for a withdrawal that no longer exists — and the alert
+// becomes noise that gets muted, which is how the next real one is missed.
+func TestQuarantinedRouteMapsIsReportedAndReset6807(t *testing.T) {
+	m := New()
+
+	// A fresh manager has nothing to report — otherwise the "records it"
+	// assertion below would pass on a manager that reports names unconditionally.
+	if got := m.QuarantinedRouteMaps(); len(got) != 0 {
+		t.Fatalf("a manager that has rendered nothing must report no quarantine, got %v", got)
+	}
+
+	big := oversizedPolicy6807("BIG")
+	big.Terms[0].FromProtocols = []string{"static"}
+	big.DefaultAction = ""
+	oversized := &FullConfig{
+		PolicyOptions: &config.PolicyOptionsConfig{
+			PolicyStatements: map[string]*config.PolicyStatement{"BIG": big},
+			PrefixLists:      map[string]*config.PrefixList{},
+			Communities:      map[string]*config.CommunityDef{},
+			ASPaths:          map[string]*config.ASPathDef{},
+		},
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: []string{"BIG"}},
+			},
+		},
+		OSPF: &config.OSPFConfig{Areas: []*config.OSPFArea{{ID: "0.0.0.0"}}, Export: []string{"BIG"}},
+	}
+	m.buildManagedSection(oversized)
+
+	got := m.QuarantinedRouteMaps()
+	// BOTH names: the policy and its -xpf-redist alias, since the oversized
+	// policy makes the alias oversized too. A gauge that counted only the
+	// policy would under-report every dual-use incident.
+	want := []string{"BIG", redistFailClosedRouteMap("BIG")}
+	if len(got) != len(want) {
+		t.Fatalf("QuarantinedRouteMaps() = %v, want %v — the render did not record "+
+			"what it quarantined, so the xpf_frr_route_maps_quarantined gauge "+
+			"reports a healthy box while routes are being withdrawn", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("QuarantinedRouteMaps() = %v, want %v (sorted)", got, want)
+		}
+	}
+
+	// A subsequent HEALTHY render clears it: the set describes the section
+	// actually rendered, not everything ever seen.
+	healthy := &FullConfig{
+		PolicyOptions: &config.PolicyOptionsConfig{
+			PolicyStatements: map[string]*config.PolicyStatement{
+				"OK": {Name: "OK", Terms: []*config.PolicyTerm{{Name: "t1", Action: "accept"}}},
+			},
+			PrefixLists: map[string]*config.PrefixList{},
+			Communities: map[string]*config.CommunityDef{},
+			ASPaths:     map[string]*config.ASPathDef{},
+		},
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Export: []string{"OK"}},
+			},
+		},
+	}
+	m.buildManagedSection(healthy)
+	if got := m.QuarantinedRouteMaps(); len(got) != 0 {
+		t.Fatalf("QuarantinedRouteMaps() = %v after a healthy render, want empty — "+
+			"the operator who reduced the policy and re-committed is still being "+
+			"paged for a withdrawal that no longer exists", got)
+	}
+}

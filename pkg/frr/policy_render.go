@@ -370,6 +370,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 				"and poison the reload; rendering an explicit DENY under this name instead — "+
 				"routes matched by its attachments are withdrawn until the policy is reduced",
 				"policy", name, "sequences", n, "max", config.MaxRouteMapSequences)
+			m.noteQuarantined(name)
 			b.WriteString(renderQuarantineDenyRouteMap(name))
 			b.WriteString("!\n")
 			// The redistribute alias is derived from the SAME policy, so it is
@@ -377,6 +378,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 			// Quarantine it under the same rule; its normal trailing action is
 			// already `deny`, so this is its fail-closed intent unchanged.
 			if policyNeedsRedistAlias(name, ps, bgpAcceptDefault) {
+				m.noteQuarantined(redistFailClosedRouteMap(name))
 				b.WriteString(renderQuarantineDenyRouteMap(redistFailClosedRouteMap(name)))
 				b.WriteString("!\n")
 			}
@@ -950,6 +952,7 @@ func (m *Manager) renderComposedRouteMap(po *config.PolicyOptionsConfig, compose
 			"sequence numbers and poison the reload; rendering an explicit DENY under this name "+
 			"instead — routes on neighbors carrying this chain are withdrawn until it is reduced",
 			"route-map", composedName, "sequences", n, "max", config.MaxRouteMapSequences)
+		m.noteQuarantined(composedName)
 		return renderQuarantineDenyRouteMap(composedName)
 	}
 	var b strings.Builder

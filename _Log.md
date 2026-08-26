@@ -1,3 +1,34 @@
+## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
+
+- **Timestamp**: 2026-08-26
+- **Action**: R68's HPC/invariant note asks for more than a deterministic
+  deny — "operators also need apply failure/health rather than silent accepted
+  outage". The r1 fix made the deny explicit and visible in `show route-map`
+  but left the only proactive signal as one `slog.Warn` at render time, which
+  nothing alerts on: a total route withdrawal on a BGP session looked exactly
+  like a healthy box to every dashboard. Added `Manager.QuarantinedRouteMaps()`
+  (rebuilt per `buildManagedSection`, so reducing the policy and re-committing
+  CLEARS it — a stale alert gets muted, and a muted alert is how the next real
+  one is missed) and the `xpf_frr_route_maps_quarantined` gauge, wired exactly
+  like the #1880 `xpf_frr_reload_degraded` sibling.
+  A COUNT, not a boolean: one oversized policy quarantines both its own name
+  and its `-xpf-redist` alias, so a 0/1 gauge would under-report every dual-use
+  incident. Publishes an explicit 0 when healthy (an alert on `> 0` cannot tell
+  "nothing quarantined" from "the series stopped reporting") but is ABSENT when
+  no FRR hook is wired (a hardcoded 0 from a process that never consulted FRR
+  is a false all-clear).
+- **File(s)**: `pkg/frr/manager.go`, `pkg/frr/policy_render.go`,
+  `pkg/frr/README.md`, `pkg/api/metrics.go`, `pkg/api/server.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/metrics_frr_routemap_quarantine_6807_test.go` (new),
+  `pkg/frr/policy_oversized_dangling_routemap_6807_test.go`,
+  `pkg/daemon/daemon_run_servers.go`, `_Log.md`
+- **Validation**: producer side bound (render records both names; a later
+  healthy render clears them; a fresh manager reports nothing, so "records it"
+  cannot pass on a manager that reports unconditionally); consumer side bound
+  on a pedantic registry across three points — healthy/one/two — plus the
+  unwired-is-absent cell.
+
 ## 2026-08-26 — #6807: an oversized policy's attachment now resolves to an explicit deny
 
 - **Timestamp**: 2026-08-26

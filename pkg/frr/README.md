@@ -283,6 +283,33 @@ So the OUTCOME is unchanged (deny). Three things change:
 3. it is **stable** — a later change that "cleans up the dangling reference"
    can no longer silently convert the deny into a permit.
 
+### The withdrawal is alertable, not just logged
+
+A quarantined policy is still an **outage** — every route on a neighbor
+carrying one of its attachments is withdrawn until the policy is reduced.
+Before #6807 the only signal was one `slog.Warn` at render time, which
+nothing alerts on: a total route withdrawal looked exactly like a healthy
+box to every dashboard.
+
+`Manager.QuarantinedRouteMaps()` returns the sorted names the LAST rendered
+managed section quarantined, and `xpf_frr_route_maps_quarantined` publishes
+its length. **Alert on `> 0`.**
+
+Two properties the metric depends on, both bound by tests:
+
+- The set is **rebuilt from scratch on every `buildManagedSection`**, so an
+  operator who reduces the policy and re-commits stops being paged — an
+  alert that keeps firing after the fix gets muted, and a muted alert is
+  how the next real one is missed.
+- The gauge publishes an explicit **0** on a healthy box rather than going
+  absent, because `xpf_frr_route_maps_quarantined > 0` cannot tell "nothing
+  quarantined" from "this series stopped being reported". It is published
+  only when the FRR hook is actually wired, so a daemon that never consulted
+  FRR reports nothing rather than a confident zero.
+
+One oversized policy can quarantine **two** names — itself and its
+`-xpf-redist` alias — so the gauge is a count, not a boolean.
+
 ### Known asymmetry, deliberately left alone
 
 The `#2473`/`#2490`/`#2539` guards drop a reference to an **undefined**
