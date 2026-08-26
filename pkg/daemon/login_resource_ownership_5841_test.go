@@ -39,7 +39,7 @@ func TestApplySystemLoginPasswordOnlyDoesNotClaimSSHKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Prove the key marker is genuinely absent for the setup.
-	if keyProvisioned("bob", 1002) {
+	if ownedKey(t, "bob", 1002) {
 		t.Fatal("test setup wrote a key marker for bob; the overclaim guard needs it absent")
 	}
 

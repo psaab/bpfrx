@@ -105378,6 +105378,226 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`,
   `docs/userspace-dataplane-architecture.md`, `_Log.md`
 
+## 2026-08-26 — #6816: the ctrl-enable cleanup read a session ID as a timestamp
+
+- **Timestamp**: 2026-08-26
+- **Action**: Derive the session-value `Created` offset from the ABI struct and
+  fix the initial-control cleanup that had it wrong.
+- **Why**: `pkg/dataplane/userspace/helper_status_apply.go` decoded `Created`
+  from bytes `[16:24]` of the raw BPF map value, justified by an in-comment sum
+  `State(1)+Flags(1)+TCPState(1)+IsReverse(1)+AppTimeout(4)+SessionID(8)=16`.
+  That sum is wrong twice over: `Flags` has been a `uint16` since #5460, and the
+  struct carries three explicit padding gaps (#6082) it omits entirely.
+  `SessionID` is at 16; `Created` is at 24. So on every ctrl enable the
+  keep-or-delete decision for synced sessions compared a SESSION ID against a
+  seconds-since-boot cutoff — a decision made on a number that is not a
+  timestamp, with no error and no log to show for it.
+- **The issue's cite had rotted**: it named `maps_sync.go:609`, which is now an
+  unrelated per-CPU stats loop. The code moved to `helper_status_apply.go` in
+  the #6429 split. Re-derived by searching for the decode itself rather than
+  trusting the line number.
+- **Fix shape — derive, do not re-type**: `SessionValueCreatedOffset` /
+  `SessionValueSessionIDOffset` are exported from `bpf_session_value.go` via
+  `unsafe.Offsetof`. The offset and the layout MUST agree, and a derived value
+  cannot disagree; a literal can, and this one did for as long as it took two ABI
+  changes to move the field out from under it.
+- **Test shape**: asserting `SessionValueCreatedOffset == 24` would be a
+  tautology against `unsafe.Offsetof` — it can only fail if the compiler is
+  wrong. The cells assert the DISCRIMINATOR instead: that Created and SessionID
+  are different offsets, that decoding at the exported offset returns the value
+  the struct stored (paired both ways, so two offsets both pointing at Created
+  cannot satisfy it), and that bytes `[16:24]` decode to the SESSION ID — which
+  records the defect's mechanism as an executable fact, and reds if a future
+  layout change makes the old narrative stale.
+- **File(s)**: `pkg/dataplane/bpf_session_value.go`,
+  `pkg/dataplane/userspace/helper_status_apply.go`,
+  `pkg/dataplane/session_value_offsets_6816_test.go` (new),
+  `pkg/dataplane/README.md`, `_Log.md`
+
+## 2026-08-26 — #6798 credential revocation fail-closed on unreadable ownership inventories
+
+- **Timestamp**: 2026-08-26
+- **Action**: Make every ownership-inventory read distinguish ABSENT from
+  UNREADABLE, so credential revocation stops reporting convergence over an
+  inventory it could not read (opus-review-001 root R58, High).
+- **The collapse**: three reads answered "did xpf provision this?" with a value
+  that could not tell "no" from "could not tell". `os.ReadFile(<marker>)` returned
+  a bare `false` on EACCES/EIO/EISDIR exactly as it did on ENOENT;
+  `provisionedNames` did `continue` on any `ReadDir` error; `reconcileSudoers`
+  discarded its error outright with `entries, _ :=`. Every revocation gate read
+  that value as "not ours, skip" and returned nil — SUCCESS — while a removed
+  admin's password, `authorized_keys`, and passwordless sudo grant stayed live.
+  The #5874 closeout, which exists to observe exactly this monotonic-revocation
+  gap, saw nothing to report.
+- **Worst shape**: `reconcileAbsentLoginUsers` read `names := provisionedNames();
+  if len(names) == 0 { return nil }`. A wholly unreadable inventory yields NO
+  names, which that early return treated as "nothing was ever provisioned" —
+  bit-identical to a fresh install.
+- **Both directions matter**: the fix reports WITHOUT revoking. Revoking on an
+  unproven marker is #6797's overclaim from the other side, and for root's
+  `authorized_keys` it is a total lockout. So each gate leaves the credential
+  untouched AND declines to converge. Markers are retained: dropping one on an
+  unreadable read is PERMANENT abandonment, since the account is no longer
+  enumerated once the root reads again (#5493's discipline at a new site).
+- **`hasProvenanceMarker` deleted, not wrapped**: leaving a bool-only twin beside
+  the fixed reader is how this class regresses. Its four test call sites moved to
+  `readProvenanceMarker` via `ownedMarker`/`ownedAccount`/`ownedPassword`/
+  `ownedKey`, which `t.Fatal` on a read error rather than returning false — a
+  helper that repeated the collapse would let a fixture whose root became
+  unreadable pass while proving nothing.
+- **`claimOwnership` fail-closed**: an unreadable marker now counts as
+  PRE-EXISTING. `preExisting` gates only `rollback()`, which REMOVES the marker,
+  i.e. releases ownership; withdrawing a claim that may be genuine orphans a live
+  credential xpf can never revoke (#5841 underclaim).
+- **Shadowing hazard caught in review**: `reconcileSudoers` has a NAMED return
+  `err`, so a function-scope `entries, err := os.ReadDir(...)` ASSIGNS to it
+  rather than shadowing — an absent `/etc/sudoers.d` would have returned a bogus
+  ENOENT failure on every apply forever. Uses `readErr`.
+- **Fixtures are uid-independent**: unreadability is staged as EISDIR (marker
+  path is a directory) and ENOTDIR (root path is a file), never `chmod 000` —
+  the suite may run as root, where permission bits are bypassed and the fixture
+  would silently become readable, i.e. a false green. Both helpers assert the
+  fixture actually errors and is not an ENOENT, so no assertion built on them is
+  vacuous.
+- **Paired controls**: each ReadDir cell has an ABSENT twin pinning `nil`, so the
+  degenerate "always error" mutation also REDS — without it, a reconciler that
+  failed on every fresh install would satisfy the guard.
+- **#1960**: runtime reconcile only, no commit-time gate added, so no matching
+  `lenient*` opt is owed.
+- **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `pkg/daemon/login_password_test.go`,
+  `pkg/daemon/login_marker_overclaim_6797_test.go`,
+  `pkg/daemon/login_resource_ownership_5841_test.go`,
+  `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6798 follow-up: bind the closeout consequence + module docs
+
+- **Timestamp**: 2026-08-26
+- **Action**: Re-read the new CLAUDE.md "Required Reading" contract
+  (`docs/engineering-style.md`, `AGENTS.md`, module READMEs) and closed the gaps
+  it exposed in the #6798 change.
+- **The gap that mattered**: the nine cells proved each reconciler RETURNS an
+  error, which is only half of R58's invariant ("retain debt and PREVENT A
+  SUCCESSFUL CLOSEOUT"). Traced the callers: `applyTailReconciles` DISCARDS all
+  four returns (`_ = d.reconcileSudoers(cfg)`), so on the normal apply path the
+  fix is log-only by design (#2926 next-boot convergence). The single consumer
+  is the #5874/M35 daemon-stop cancel closeout via `hostAuthCloseoutOwners` —
+  exactly the case where next-boot convergence does NOT happen. Nothing bound
+  that end to end, so the fix could have reported into a void at the one site
+  R58 names.
+- **Added `TestHostAuthCloseoutSurfacesUnreadableInventory_6798`**: drives the
+  REAL `reconcileAbsentLoginUsers` through `runHostAuthCloseoutOwners` +
+  `summarizeHostAuthCloseout` with the other six owners stubbed to no-ops, so a
+  green cannot come from an unrelated owner failing. Asserts the closeout error
+  names BOTH the owner (`absent-login-users`) and the reason
+  (`read ownership inventory`). Verified RED on reverting either M3 or M4
+  (2005 tests collected per cell).
+- **The control caught a real fixture bug of mine**: the three marker roots are
+  SIBLINGS derived from `filepath.Dir(provisionedUsersDir)`, so the control's
+  first form still resolved `provisionedKeysDir()` to the same unreadable file
+  and redded for the fixture's reason. The control needs a fresh PARENT, not a
+  fresh leaf — without that control the cell would have passed while proving
+  nothing about a clean inventory.
+- **#1960 re-verified by tracing, not asserting**: all four returns are `_ =`
+  discarded on the apply tail, so no commit can be rejected by this change and
+  no `lenient*` opt is owed. Previously claimed; now proven from the call sites.
+- **#6534 checked and does NOT apply**: that rule governs a snapshot builder
+  DROPPING a config object while `show` still renders it as enforced. No `show`
+  surface renders credential-ownership state, and this change makes a silent
+  failure VISIBLE rather than dropping a rendered object. Recorded in the doc.
+- **Docs**: `pkg/daemon/README.md` — the #5874 closeout bullet enumerates which
+  failures it collects, and this adds a class, so it gains the #6798 paragraph.
+  `docs/system-login.md` — new "Where the operator sees it" subsection drawing
+  the apply-tail (discarded, log-only) vs cancel-closeout (collected, fails the
+  cancel) distinction, plus the #6534 non-applicability note.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `pkg/daemon/README.md`, `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6798 x #6790 composition: restate the no-brick premise, bind it
+
+- **Timestamp**: 2026-08-26
+- **Action**: #6790 merged (PR #7604) and `applyTailReconciles` now CAPTURES the
+  five host-credential returns into the commit result instead of discarding
+  them. #6798's errors therefore became commit-failing. Restated the #1960
+  argument on a premise that survives that, and bound it with a test.
+- **The dead premise**: the PR, the commit message, AND `docs/system-login.md`
+  all said "the apply tail discards these returns, so no commit can be
+  rejected". True when measured, FALSE the moment #7604 landed. A premise about
+  to stop being true is worse than none — a reader checks it, finds it false,
+  and distrusts the conclusion it supported.
+- **The durable premise**: the no-brick guarantee rests on the SHAPE OF THE
+  REJECTION SET, not on any caller discarding a return. `applyErrSkipsPeerSync`
+  (`daemon_apply_commit.go`) closes it over exactly two fatal classes — a
+  required-protocol-gate error (dataplane DISARMED) and a context
+  cancel/deadline from a daemon-stop abort — and its own comment states every
+  other error still syncs "because the config is committed + active and the
+  dataplane armed". An inventory-read failure is neither class. Verified at
+  source, not taken from the review.
+- **Bound it**: `TestUnreadableInventoryErrorDoesNotSkipPeerSync_6798` feeds the
+  REAL error from `reconcileAbsentLoginUsers` (not a synthetic `errors.New`,
+  which would prove only that the classifier rejects strings) and asserts it
+  does NOT skip peer sync. Two positive controls assert `context.Canceled` and
+  `context.DeadlineExceeded` still DO — without them the main assertion is
+  satisfied by a classifier returning false for everything, which is exactly
+  the mutation that WOULD brick, by pushing a dataplane-disarming config to the
+  standby.
+- **#7618 caveat, scoped deliberately**: #6790's section records that a COMMAND
+  deadline (short per-command context, e.g. `chpasswd`) is currently
+  misclassified as a daemon-stop abort, pinned by
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790`. That does NOT
+  extend to what #6798 adds: these errors come from `os.ReadFile`/`os.ReadDir`
+  and carry EACCES/EIO/EISDIR/ENOTDIR, never a `context.DeadlineExceeded`, so
+  they cannot reach the misclassified branch. The reconcilers' COMMAND failures
+  were already in that population before #6798.
+- **Doc conflict resolved by rewriting, not by picking a side**: `#6790` and
+  `#6798` both added a section at the same anchor. Kept both, ordered #6790
+  first (it establishes that these errors fail the commit) then #6798 (what
+  counts as a failure), and REWROTE the two #6798 paragraphs #6790 falsified —
+  "Where the operator sees it" now says the tail CAPTURES, and the #1960
+  paragraph became "Why this does not brick a tolerant load or peer sync".
+- **`_Log.md` union, new form**: `theirs + ours_tail` guarded by
+  `assert ours.startswith(base)` (True). `theirs.startswith(base)` is False —
+  master deleted 87 lines mid-file across three regions (#7614/#7616), so the
+  old `base + ours_tail + theirs_tail` would have reintroduced every one.
+  Verified after writing that `theirs` is a prefix of the result.
+- **File(s)**: `pkg/daemon/login_inventory_read_failclosed_6798_test.go`,
+  `docs/system-login.md`, `_Log.md`
+
+## 2026-08-26 — #6852: retire networkd.Manager.Clear, moving its tests onto Apply(nil)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Delete `networkd.Manager.Clear` and move its contract tests onto
+  `Apply(nil)`.
+- **Why retire rather than wire**, which is the decision #5718 deliberately left
+  open: `Apply(nil)` already carries every contract `Clear` owned — the
+  `10-xpf-*` stale sweep, the #4900 aggregation that FAILS the commit when a
+  managed file cannot be removed, and the #4954 re-activation on
+  `debtOwed := reloadDebtOutstanding()`, which subsumes `Clear`'s empty-glob
+  debt-discharge branch.
+- **That is measured, not asserted.** `Clear`'s own four-step #5718 A7-b01-C001
+  fail-on-revert was MOVED onto `Apply(nil)` and passes UNCHANGED — reload fails
+  → error; second call with an empty glob must re-run the reload from the debt
+  rather than return nil; recovery discharges it; a further call with no files
+  and no debt must not shell out. Converting the test first and running it BEFORE
+  deleting anything kept two questions separate: "does Apply(nil) carry the
+  contract" and "did the deletion break something".
+- **Wiring it would have been actively WORSE**, which is the part that settles
+  it. `Clear` globbed and removed EVERY `10-xpf-*` file including the
+  `SetProtectedResolver` lifeline files that `Apply(nil)` deliberately preserves.
+  Any teardown that called `Clear` would have taken management down with the
+  managed config — so the method was not merely uncalled, it was unsafe to call.
+- **No coverage lost, checked rather than assumed**: `TestClear_RemoveFailureReturnsError`
+  was a line-for-line twin of the `Apply(nil)` #4900 cell immediately above it
+  (same `blockedStaleEntry` fixture, same assertion), so deleting it leaves that
+  property owned by a named cell. Deleting the LAST owner of a property would
+  have been a silent decommission; this is not.
+- **File(s)**: `pkg/networkd/networkd.go`,
+  `pkg/networkd/applynil_reload_debt_5718_test.go` (renamed from
+  `clear_reload_debt_5718_test.go`), `pkg/networkd/stale_remove_4900_test.go`,
+  `pkg/networkd/reload_debt_process_5718_test.go`, `pkg/networkd/README.md`,
+  `_Log.md`
+
 ## 2026-08-26 — #6806 lo0 mirror drops unresolvable protocol / ICMP narrowing
 
 - **Timestamp**: 2026-08-26

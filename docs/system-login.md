@@ -1339,6 +1339,13 @@ The path is scoped and fail-closed:
   `authorized_keys` removal failure, the marker is **retained** so the
   next apply retries — a credential is never forgotten while it may still
   be live.
+- On an **ownership marker** read error (or an unreadable marker **root**
+  during enumeration) the deprovision is **skipped**, the markers are
+  **retained**, and the failure is **returned** (#6798). An unreadable
+  marker is not proof the credential is not ours: acting on it would revoke
+  an operator's credential, while silently skipping it reported convergence
+  for a removal that never happened. See "Unreadable ownership inventories
+  are not empty ones (#6798)" below.
 - `root` is never deprovisioned **by this login-user path** — it is
   reconciled separately by `applyRootAuth` (see "Root credentials are
   revoked on removal (#5276)" below).
@@ -1678,6 +1685,122 @@ Until then it is a tripwire, not folklore:
 `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserts the
 CURRENT (wrong) classification, so the fix reds a named cell and must
 invert it and this section together.
+
+## Unreadable ownership inventories are not empty ones (#6798)
+
+Every ownership read above answers one question — *did xpf provision this?* —
+and until #6798 it answered with a value that could not distinguish **"no"**
+from **"could not tell"**:
+
+| Read | Absent (a determination) | Unreadable (proves nothing) | Collapsed to |
+|---|---|---|---|
+| `os.ReadFile(<marker>)` | `ENOENT` — not ours | `EACCES` / `EIO` / `EISDIR` | `false` |
+| `os.ReadDir(<marker root>)` | `ENOENT` — nothing provisioned | `EACCES` / `ENOTDIR` | no names |
+| `os.ReadDir(/etc/sudoers.d)` | `ENOENT` — no grants exist | `EACCES` / `ENOTDIR` | `entries, _ :=` |
+
+Because both spellings arrived as the same value, every revocation gate read
+"could not tell" as **"not ours, skip"** and then returned `nil` — reporting
+**convergence**. A removed administrator kept their password, `authorized_keys`,
+and passwordless sudo grant while the apply reported success, and the #5874
+cancellation closeout (which exists to observe exactly this
+monotonic-revocation gap) saw nothing to report. `reconcileAbsentLoginUsers`
+made it worst: an entirely unreadable inventory yields **no names**, which its
+`len(names) == 0` early return treated as *"nothing was ever provisioned"* —
+indistinguishable from a fresh install.
+
+The governing invariant is now: **only proven absence may release ownership
+work.** Unknown ownership retains the debt and never converges.
+
+- **`readProvenanceMarker` returns `(bool, error)`.** Only `ENOENT` is absence
+  (`false, nil`); every other read error is returned. A UID mismatch or a
+  corrupt marker stays a *determination* (`false, nil`) — the bytes were read,
+  they simply are not this account's — and is still cleaned inline. There is
+  deliberately **no** bool-only wrapper: one would reintroduce the collapse.
+- **Report, but never revoke.** On an unreadable marker each gate keeps
+  ownership `false` and **skips the revocation**, then returns the error.
+  Revoking on an unproven claim is #6797's overclaim from the other side, and
+  for `root`'s `authorized_keys` it is a total lockout. So the gates are
+  fail-closed in **both** directions: the credential is untouched *and* the
+  apply does not converge. Applied at `applySystemLogin`'s emptied-key branch,
+  `reconcileUserPassword`'s `pwLock` branch, `applyRootAuth`'s revoke arm, and
+  `deprovisionLoginUser`.
+- **`provisionedNames` returns `(names, error)` and keeps sweeping.** An
+  unreadable root is reported, but the roots that *did* read still contribute
+  their names — revoking what we can see is strictly better than revoking
+  nothing, and the returned error carries the debt.
+  `reconcileAbsentLoginUsers` joins it into its accumulated error instead of
+  returning `nil` on the empty set.
+- **`reconcileSudoers` reports its `ReadDir` failure.** An absent
+  `/etc/sudoers.d` stays a clean `nil` (no drop-in can exist in a directory
+  that does not), but an unreadable one is accumulated — otherwise the
+  revocation sweep iterates nothing and a demoted admin keeps passwordless
+  root.
+- **`claimOwnership` treats an unreadable marker as PRE-EXISTING.** `preExisting`
+  gates only `rollback()`, which *removes* the marker — i.e. it releases
+  ownership. Unable to prove xpf did not already own the credential, it must not
+  withdraw: dropping a genuine claim orphans a live credential xpf can then
+  never lock or revoke (the #5841 underclaim). The cost of erring this way is
+  at most a stale marker, which the next apply reconciles.
+- **Retry debt is retained.** Markers are never dropped on an unreadable read.
+  Dropping one would be permanent abandonment: once the root is readable again
+  the account is no longer enumerated, so its credentials stay live forever.
+  This is the same three-state discipline #5493 applied to an unreadable
+  `/etc/passwd` — *unknown → retry*, never *absent → abandon*.
+
+### Where the operator sees it
+
+The four reconcilers that report an unreadable inventory (`applySystemLogin`,
+`reconcileSudoers`, `reconcileAbsentLoginUsers`, `applyRootAuth`) are reached
+from **two** callers, and since #6790 *both* of them surface the failure:
+
+- **The normal apply tail** (`applyTailReconciles`, steps 11–13) **captures**
+  these returns and joins them into the commit result — see "A failed
+  credential reconcile FAILS THE COMMIT (#6790)" above. Before #6790 they were
+  discarded (`_ = d.reconcileSudoers(cfg)`) on the #2926 next-boot-convergence
+  argument, so a commit over an unreadable inventory reported success. It now
+  fails, naming the account and the unreadable path.
+- **The #5874/M35 daemon-stop cancel closeout** (`hostAuthCloseoutOwners`)
+  collects them too, and that is the case where next-boot convergence does
+  *not* happen — the daemon is stopping and staying stopped.
+  `summarizeHostAuthCloseout` names the owning reconciler, so a cancel that
+  previously reported **clean** over an unreadable inventory now fails visibly
+  with e.g. `host-auth closeout owner "absent-login-users": read ownership
+  inventory /var/lib/xpf/provisioned-keys: ... not a directory`.
+
+That second path is the invariant R58 names — *unknown ownership inventory
+state must retain debt and prevent a successful closeout* — and it is bound by
+`TestHostAuthCloseoutSurfacesUnreadableInventory_6798`.
+
+### Why this does not brick a tolerant load or peer sync (#1960)
+
+#6798 adds no commit-time gate of its own; what makes its errors commit-failing
+is #6790's capture above. The no-brick guarantee therefore rests on the **shape
+of the rejection set**, not on any caller discarding a return:
+`applyErrSkipsPeerSync` (`pkg/daemon/daemon_apply_commit.go`) closes that set
+over exactly two fatal classes — a required-protocol-gate error
+(`compileErrorMustAbortApply`, which leaves the dataplane **disarmed**) and a
+context cancellation/deadline from a daemon-stop abort. Every *other* error
+still syncs, "because the config is committed + active and the dataplane
+armed". An inventory-read failure is neither class, so on the peer-sync receive
+path (`syncAndApply`) the config stays **active and armed** and the failure is
+surfaced rather than swallowed. No `lenient*` option in
+`pkg/config/compiler_opts.go` is owed.
+
+One caveat, deliberately scoped: #7618 records that a **command** deadline (a
+short per-command context, e.g. `chpasswd` via `runCommandStdinTimeout`) is
+currently misclassified by that same classifier as a daemon-stop abort, and
+`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` pins the current
+wrong behaviour. That does **not** extend to what #6798 adds: these errors
+originate in `os.ReadFile` / `os.ReadDir` and carry `EACCES`/`EIO`/`EISDIR`/
+`ENOTDIR`, never a `context.DeadlineExceeded`, so they cannot reach the
+misclassified branch. The credential reconcilers' *command* failures were
+already in that population before #6798.
+
+There is **no `show` surface** that renders credential-ownership state, so the
+#6534 "a fail-closed exclusion owes a show-surface annotation" rule does not
+apply here: nothing in `show` claims these credentials are revoked, and this
+change makes a previously *silent* failure *visible* rather than dropping an
+object the operator can still see rendered as enforced.
 
 ## Idempotency
 
