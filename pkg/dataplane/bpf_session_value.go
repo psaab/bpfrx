@@ -357,3 +357,28 @@ func (v bpfSessionValueV6) sessionValue() SessionValueV6 {
 		IngressVlanID:  v.IngressVlanID,
 	}
 }
+
+// SessionValueCreatedOffset / SessionValueSessionIDOffset are the on-map byte
+// offsets of `Created` and `SessionID` in the shared conntrack session value,
+// DERIVED from the struct rather than written down (#6816).
+//
+// They are exported because a consumer outside this package
+// (pkg/dataplane/userspace's initial-control cleanup) decodes those two fields
+// out of a raw []byte read straight from the BPF map, and it had the offset
+// WRONG: it read bytes [16:24] as `Created` on the strength of an in-comment sum
+//
+//	State(1) + Flags(1) + TCPState(1) + IsReverse(1) + AppTimeout(4) + SessionID(8) = 16
+//
+// which is wrong twice over. `Flags` is a uint16 since #5460, and the struct
+// carries three explicit padding gaps (#6082) that the sum omits entirely.
+// SessionID sits at 16 and Created at 24, so the cleanup was reading a session
+// ID and comparing it against a seconds-since-boot cutoff.
+//
+// Deriving them with unsafe.Offsetof is the point: the offset and the layout
+// MUST agree, and a derived value cannot disagree. A literal can — and did, for
+// as long as it took two ABI changes to move the field out from under it. Any
+// future field insertion, padding change or type widen moves these with it.
+var (
+	SessionValueCreatedOffset   = int(unsafe.Offsetof(bpfSessionValue{}.Created))
+	SessionValueSessionIDOffset = int(unsafe.Offsetof(bpfSessionValue{}.SessionID))
+)

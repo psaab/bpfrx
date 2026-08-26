@@ -331,6 +331,27 @@ Guard layers (`build-userspace-xdp.sh`):
    pin is still present, because the new map can only be pinned after the
    stale one is released.
 
+   **Never hand-compute a session-value byte offset (#6816).** The shared
+   conntrack value's Go mirror (`bpfSessionValue`, `bpf_session_value.go`)
+   carries THREE explicit padding gaps (#6082) and a `Flags` field that has
+   been a `uint16` since #5460. A consumer that decodes a field out of a raw
+   `[]byte` map read by adding up the field widths gets a number that is
+   wrong by however much padding it skipped — and it stays wrong silently,
+   because the read succeeds and returns a plausible integer.
+   `pkg/dataplane/userspace`'s initial-control cleanup did exactly that: it
+   read bytes `[16:24]` as `Created`, justified by an in-comment sum
+   `State(1)+Flags(1)+TCPState(1)+IsReverse(1)+AppTimeout(4)+SessionID(8)=16`.
+   `SessionID` is at 16 and `Created` at 24, so on every ctrl enable the
+   keep-or-delete decision for synced sessions was made by comparing a
+   SESSION ID against a seconds-since-boot cutoff.
+   `SessionValueCreatedOffset` / `SessionValueSessionIDOffset` are exported
+   from `bpf_session_value.go`, derived with `unsafe.Offsetof`, and are the
+   only supported way to reach those fields from a raw value. A derived
+   offset cannot disagree with the layout; a literal can, and this one did
+   for as long as it took two ABI changes to move the field out from under
+   it. Guarded by `session_value_offsets_6816_test.go`, which pins the
+   defect's mechanism as well as the fix.
+
    **Whether a restart releases the pin is MODE-DEPENDENT**, and this text
    has been wrong in both directions (#6928). It first said "a reload"
    releases it — nothing does. It then said restarting NEVER releases it and
