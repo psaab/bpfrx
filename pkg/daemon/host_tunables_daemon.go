@@ -114,11 +114,34 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 		prior = newPriorHostTunables()
 	}
 
+	// #6801: hand back every NIC that LEFT the userspace-dp allowlist
+	// before re-applying anything to the set xpfd retains. Both
+	// reconcilers below (and reapplyRSSIndirection on the commit path)
+	// iterate only the CURRENT allowlist, so without this pass a NIC
+	// dropped from the binding set — or the whole set, when userspace-dp
+	// is disabled at runtime and rssAllowed goes empty — kept xpfd's
+	// concentrated RSS table and adaptive-off/pinned-usecs coalescence
+	// until the daemon exited.
+	//
+	// Ordering: released and retained are disjoint by construction
+	// (released = owned - current), so placing this before the claim and
+	// the re-apply is the device_map managed->unmapped precedent — hand
+	// the NIC back first — not a correctness dependency.
+	//
+	// An empty allowlist is NOT a withdrawal while userspace-dp is still
+	// enabled; only the config signal is. See releaseUnboundNICTunables.
+	releaseUnboundNICTunables(prior, rssAllowed, userspaceDP, execer)
+
 	// Coalescence always runs for userspace-dp deploys. Empty
 	// allowlist = no-op inside applyCoalescence. The allowlist is
 	// D3-scoped (UserspaceBoundLinuxInterfaces) so we never touch an
 	// mlx5 interface outside xpfd's zone model.
 	if userspaceDP {
+		// #6801: claim the current allowlist's mlx5 members before the
+		// writes below. Ownership is what the released-NIC teardown
+		// consumes on a later reconcile; a NIC xpfd tunes but never
+		// records is a NIC it can never hand back.
+		claimNICTunableOwnership(prior, rssAllowed, execer)
 		applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, execer, prior)
 		// #1636 option B: lower the kernel neighbor retrans_time_ms so a
 		// dropped ARP/NDP solicit is re-driven ~4× sooner. NOT gated on
@@ -218,6 +241,15 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 //   - Per-interface coalescence (mlx5Adaptive map): captured any time
 //     coalescence ran, which is any userspace-dp start regardless of
 //     the opt-in gate (Codex round-2 fix).
+//
+// NOT covered: the #6801 rssOwned claim. Restoring the default RSS
+// indirection table on daemon stop is a separate lifecycle question from
+// the allowlist-shrink teardown this file implements — it would add a
+// second bounded `ethtool` round-trip per owned NIC to a shutdown path
+// already capped by the unit's TimeoutStopSec=20, and it changes the
+// restart profile (default table on stop, re-concentrated on the next
+// boot). #6801 deliberately scopes itself to interfaces that leave xpf's
+// ownership while the daemon keeps running.
 //
 // Best-effort: never returns an error. Safe to call when no tunable
 // was ever captured (no-op).

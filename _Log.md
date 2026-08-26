@@ -105318,3 +105318,62 @@ prose edit above them added. No diff falls in the new test body.
   real box rather than trusting the doc.
 - **File(s)**: `docs/engineering-style.md`,
   `pkg/refactoraudit/step8_iperf_port_test.go` (new), `_Log.md`
+
+## 2026-08-26 — #6801 released-NIC RSS/coalescence teardown
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hand a NIC's RSS indirection table and interrupt coalescence back
+  when it LEAVES the userspace-dp interface allowlist, instead of leaving xpf's
+  tuning live on a released NIC until daemon shutdown.
+- **Root cause**: both reconcilers derive their target set from one allowlist,
+  `dpuserspace.UserspaceBoundLinuxInterfaces(cfg)`, recomputed from the NEW
+  compiled config on every reconcile — so both are blind to a SHRINKING
+  allowlist. `{ge-0-0-1, ge-0-0-2}` → `{ge-0-0-1}` walks only the new set;
+  nothing ever visits the released name. The coalescence capture was reverted
+  only at daemon stop; the RSS table was never reverted at all.
+- **Fix**: `released_nic_tunables.go` adds a level-triggered `owned - current`
+  teardown wired into `applyStep0TunablesWith` (boot + every commit), ahead of
+  the claim and the re-apply, mirroring the managed→unmapped teardown
+  `device_map.go` runs before `networkd.Apply`. Ownership is the union of the
+  new `priorHostTunables.rssOwned` set and the existing `mlx5Adaptive` capture
+  map; it is dropped only after the restore write SUCCEEDS (#5114 retry-debt
+  shape), so a failed `ethtool` is retried on the next reconcile.
+- **The middle row**: an EMPTY allowlist is not, by itself, a withdrawal.
+  `UserspaceBoundLinuxInterfaces` degrades to nil when its snapshot build fails
+  (#2514) and `applyTailReconciles` still runs the tunable step on a commit
+  whose dataplane apply FAILED — so "no names" as "release everything" would rip
+  the tuning off NICs the dataplane is still forwarding on, and
+  `ethtool -X ... default` mid-traffic re-steers in-flight flows onto different
+  RX queues. The withdrawal trigger is the config signal (`userspaceDP ==
+  false`), never an empty list. Without that guard the fix is a regression, and
+  a fixture that only ever shrinks a non-empty list cannot see it.
+- **Interface disappearance**: a released name that is no longer an mlx5 netdev
+  drops ownership WITHOUT an ethtool call — honors the #797 H1 "never ethtool a
+  non-mlx5 netdev" guard and stops retry debt growing without bound on a NIC
+  that can never accept the restore.
+- **Out of scope, reported as a follow-up**: `restoreStep0TunablesOnShutdown`
+  still does not restore the default RSS table on daemon stop (it does revert
+  coalescence, host-scope knobs and neigh retrans). Separate lifecycle question
+  — a second bounded ethtool round-trip per owned NIC on a path already capped
+  by `TimeoutStopSec=20`, plus a changed restart profile.
+- **Mutation matrix**: 10 cells, each reverting ONE production line/guard, each
+  with a full-package `go test -count=1 ./pkg/daemon/` and no `-run` filter;
+  every cell named a RED, none escaped, none build-broke. Fixtures run two reconciles and move an interface out of the
+  binding set between them — a fixture whose allowlist never shrinks cannot see
+  the teardown at all. The pre-xpfd probe uses rx-usecs 42 / tx-usecs 43, values
+  xpf never writes, so a restore assertion cannot be satisfied by an apply.
+- **Docs**: `pkg/daemon/README.md` gains "NIC tuning ownership +
+  released-interface teardown (#6801)" (the module doc — all the code is in
+  `pkg/daemon`). `docs/userspace-dataplane-architecture.md` gains the
+  allowlist-EXIT contract next to the existing D3/RSS allowlist block, since
+  that doc is where the allowlist's meaning is defined and "what happens when a
+  netdev leaves it" was the gap. NOT touched, with reasons:
+  `pkg/dataplane/README.md` (carries no RSS/D3/coalescence surface at all —
+  `grep -n 'rss\|coalesc\|D3'` is empty), root `README.md` (same), and
+  `docs/config-schema.md` (no config-mode leaf added or changed — the teardown
+  is keyed on the EXISTING `system dataplane` knobs).
+- **File(s)**: `pkg/daemon/released_nic_tunables.go` (new),
+  `pkg/daemon/released_nic_tunables_6801_test.go` (new),
+  `pkg/daemon/host_tunables.go`, `pkg/daemon/host_tunables_daemon.go`,
+  `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
