@@ -1,3 +1,45 @@
+## 2026-08-26 — #6810: a queue-full drop no longer consumes a threshold crossing
+
+- **Timestamp**: 2026-08-26
+- **Action**: `evaluateEvent` arms the #3756 edge latch under `e.mu` and
+  returns; `HandleEvent` classifies and enqueues afterwards, OUTSIDE that lock,
+  and `enqueue` returned nothing — so a dropped action was indistinguishable
+  from an admitted one at the call site. Not a delayed remediation but a LOST
+  one: `withinMatches` suppresses every later at/above-threshold event while the
+  latch is armed and re-arms only when a clause drops BELOW threshold, which for
+  a sustained fault never happens. 64 distinct other policies saturating the
+  queue therefore permanently consumed the crossing.
+  `enqueue` now returns an admission verdict; `HandleEvent` calls
+  `releaseEdgeLatch` on false, carrying the same semantic-revision ABA guard
+  `armCooldown` uses (#5311) so a predecessor's failure cannot clear a
+  successor generation's latch. A SUPERSEDED placement counts as admitted — the
+  newer equivalent action is queued, which is exactly what the latch asserts.
+  Went past R71's enumeration: `HandleEvent` has THREE post-latch abandonment
+  paths, not one. Deliberately did NOT roll back the other two, and pinned that
+  as an executable decision — a `classifyPlan` rejection is DETERMINISTIC, so
+  re-arming would re-reject on every event (unbounded churn for a remediation
+  that can never run), and an empty op list had no remediation to lose. Only the
+  queue-full drop is transient, i.e. the only one where retrying succeeds.
+- **File(s)**: `pkg/eventengine/engine.go`,
+  `pkg/eventengine/engine_latch_before_admission_6810_test.go` (new),
+  `pkg/eventengine/README.md`, `docs/refactoring-audit-accepted.txt`, `_Log.md`
+- **Modularity**: the 63 LOC tipped `engine.go` 1477 -> 1540, crossing the soft
+  1500 `[WATCH]` floor. Recorded as a deliberate deferral with its reason rather
+  than split inline: the whole diff lives in `enqueue`/`HandleEvent`, so a
+  verbatim move would carry the fix inside it and make "new or moved?"
+  unanswerable on a change about a subtle ordering property. Under the 200-LOC
+  "split first" cue and the soft floor, not the hard 2000. None of the three
+  documented "When NOT to refactor" cases actually applies, so it is an ISSUE
+  (#7636) rather than a permanent acceptance.
+- **Validation**: cells drive the REAL `HandleEvent` — every pre-existing
+  edge-latch test calls `evaluateEvent` directly and is structurally blind to
+  the seam the defect lives in. Includes the 64-distinct-policy saturation test
+  R71 asks for, with a precondition asserting the drop actually happened; a
+  PAIRED control proving an ADMITTED sustained level still fires exactly once
+  (otherwise the rollback would degrade `trigger on` from edge- to
+  level-triggered, re-introducing what #3756 M1 removed); and a stale-revision
+  cell proving the ABA guard holds.
+
 ## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
 
 - **Timestamp**: 2026-08-26
