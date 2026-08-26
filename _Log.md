@@ -105112,7 +105112,18 @@ prose edit above them added. No diff falls in the new test body.
   binding set between them — a fixture whose allowlist never shrinks cannot see
   the teardown at all. The pre-xpfd probe uses rx-usecs 42 / tx-usecs 43, values
   xpf never writes, so a restore assertion cannot be satisfied by an apply.
+- **Docs**: `pkg/daemon/README.md` gains "NIC tuning ownership +
+  released-interface teardown (#6801)" (the module doc — all the code is in
+  `pkg/daemon`). `docs/userspace-dataplane-architecture.md` gains the
+  allowlist-EXIT contract next to the existing D3/RSS allowlist block, since
+  that doc is where the allowlist's meaning is defined and "what happens when a
+  netdev leaves it" was the gap. NOT touched, with reasons:
+  `pkg/dataplane/README.md` (carries no RSS/D3/coalescence surface at all —
+  `grep -n 'rss\|coalesc\|D3'` is empty), root `README.md` (same), and
+  `docs/config-schema.md` (no config-mode leaf added or changed — the teardown
+  is keyed on the EXISTING `system dataplane` knobs).
 - **File(s)**: `pkg/daemon/released_nic_tunables.go` (new),
   `pkg/daemon/released_nic_tunables_6801_test.go` (new),
   `pkg/daemon/host_tunables.go`, `pkg/daemon/host_tunables_daemon.go`,
-  `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`, `_Log.md`
+  `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
