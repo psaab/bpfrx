@@ -143,7 +143,7 @@ func (d *Daemon) commitWithGenBinding(
 // cancellation after store.Commit is deliberately ignored (aborting a
 // promoted commit on a still-running daemon would diverge the store from the
 // dataplane). See applyCancelCtx for the full rationale.
-func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer peerSyncPolicy) (*config.Config, error) {
+func (d *Daemon) commitAndApply(ctx context.Context, authority configstore.CommitAuthority, comment string, syncPeer peerSyncPolicy) (*config.Config, error) {
 	// #1922 Item 2 first-takeover gate (OQ-B, blunt resolution). In
 	// bootstrap mode a plain `commit` is refused: the first commit on a
 	// foreign/non-appliance host claims interfaces and can cut off
@@ -222,7 +222,9 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer pe
 			}
 			return d.deviceMapCommitPreflight(cand, nil)
 		},
-		func(gen uint64) (*config.Config, error) { return d.store.CommitWithDescriptionGen(comment, gen) },
+		func(gen uint64) (*config.Config, error) {
+			return d.store.CommitWithDescriptionGenAs(authority, comment, gen)
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -557,7 +559,7 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
-func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer peerSyncPolicy) (*config.Config, error) {
+func (d *Daemon) commitConfirmedAndApply(ctx context.Context, authority configstore.CommitAuthority, minutes int, syncPeer peerSyncPolicy) (*config.Config, error) {
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -611,7 +613,9 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 			}
 			return d.deviceMapCommitPreflight(cand, d.store.ActiveConfig())
 		},
-		func(gen uint64) (*config.Config, error) { return d.store.CommitConfirmedGen(minutes, gen) },
+		func(gen uint64) (*config.Config, error) {
+			return d.store.CommitConfirmedGenAs(authority, minutes, gen)
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -641,15 +645,15 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 // commits with peerSyncNever (commitAndApply directly, see initEventEngine)
 // because each node fires its remediation independently from that node's local
 // RPM events and must not push node-local state to the peer.
-func (d *Daemon) commitAndApplyOperator(ctx context.Context, comment string) (*config.Config, error) {
-	return d.commitAndApply(ctx, comment, peerSyncIfRG0Authority)
+func (d *Daemon) commitAndApplyOperator(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error) {
+	return d.commitAndApply(ctx, authority, comment, peerSyncIfRG0Authority)
 }
 
 // commitConfirmedAndApplyOperator is the commit-confirmed analogue of
 // commitAndApplyOperator: the same transport-independent RG0-ownership peer-sync
 // policy for an operator-initiated `commit confirmed` (#5054).
-func (d *Daemon) commitConfirmedAndApplyOperator(ctx context.Context, minutes int) (*config.Config, error) {
-	return d.commitConfirmedAndApply(ctx, minutes, peerSyncIfRG0Authority)
+func (d *Daemon) commitConfirmedAndApplyOperator(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error) {
+	return d.commitConfirmedAndApply(ctx, authority, minutes, peerSyncIfRG0Authority)
 }
 
 // executeConfirmedRollback is the daemon-owned commit-confirmed timeout

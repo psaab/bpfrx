@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -35,10 +36,10 @@ func newCommitClassServer(t *testing.T, compiled *config.Config, injected error)
 	t.Helper()
 	return &Server{
 		store: newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf")),
-		commitFn: func(context.Context, string) (*config.Config, error) {
+		commitFn: func(context.Context, configstore.CommitAuthority, string) (*config.Config, error) {
 			return compiled, injected
 		},
-		commitConfirmedFn: func(context.Context, int) (*config.Config, error) {
+		commitConfirmedFn: func(context.Context, configstore.CommitAuthority, int) (*config.Config, error) {
 			return compiled, injected
 		},
 	}

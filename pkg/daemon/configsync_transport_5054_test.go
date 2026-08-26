@@ -43,6 +43,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // clusterOwningRG0 builds a cluster.Manager whose local node (0) owns RG0. A
@@ -151,7 +152,7 @@ func newSyncProbeDaemon(t *testing.T, cl *cluster.Manager) (*Daemon, *int) {
 func TestOperatorCommitSyncsPeerWhenRG0Owner(t *testing.T) {
 	d, calls := newSyncProbeDaemon(t, clusterOwningRG0(t))
 
-	if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+	if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 		t.Fatalf("commitAndApplyOperator: %v", err)
 	}
 	if *calls != 1 {
@@ -164,7 +165,7 @@ func TestOperatorCommitSyncsPeerWhenRG0Owner(t *testing.T) {
 func TestOperatorCommitDoesNotSyncWhenStandalone(t *testing.T) {
 	d, calls := newSyncProbeDaemon(t, nil)
 
-	if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+	if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 		t.Fatalf("commitAndApplyOperator: %v", err)
 	}
 	if *calls != 0 {
@@ -177,7 +178,7 @@ func TestOperatorCommitDoesNotSyncWhenStandalone(t *testing.T) {
 func TestOperatorCommitDoesNotSyncWhenNonOwner(t *testing.T) {
 	d, calls := newSyncProbeDaemon(t, clusterNotOwningRG0(t))
 
-	if _, err := d.commitAndApplyOperator(t.Context(), ""); err != nil {
+	if _, err := d.commitAndApplyOperator(t.Context(), configstore.InternalCommitter(), ""); err != nil {
 		t.Fatalf("commitAndApplyOperator: %v", err)
 	}
 	if *calls != 0 {
@@ -195,7 +196,7 @@ func TestEventEngineCommitDoesNotSyncEvenWhenRG0Owner(t *testing.T) {
 	// #5962: peerSyncNever is a POLICY, not a resolved authority answer, so it
 	// stays false however ownership moves — which is the distinction the bool
 	// it replaced could not express.
-	if _, err := d.commitAndApply(t.Context(), "", peerSyncNever); err != nil {
+	if _, err := d.commitAndApply(t.Context(), configstore.InternalCommitter(), "", peerSyncNever); err != nil {
 		t.Fatalf("commitAndApply(false): %v", err)
 	}
 	if *calls != 0 {
@@ -208,7 +209,7 @@ func TestEventEngineCommitDoesNotSyncEvenWhenRG0Owner(t *testing.T) {
 func TestOperatorCommitConfirmedSyncsPeerWhenRG0Owner(t *testing.T) {
 	d, calls := newSyncProbeDaemon(t, clusterOwningRG0(t))
 
-	if _, err := d.commitConfirmedAndApplyOperator(t.Context(), 1); err != nil {
+	if _, err := d.commitConfirmedAndApplyOperator(t.Context(), configstore.InternalCommitter(), 1); err != nil {
 		t.Fatalf("commitConfirmedAndApplyOperator: %v", err)
 	}
 	if *calls != 1 {
@@ -241,8 +242,24 @@ func TestTransportCommitFnWiringSyncsPeerByRG0Ownership(t *testing.T) {
 		name string
 		fn   func(*Daemon) func(context.Context, string) (*config.Config, error)
 	}{
-		{"grpc", (*Daemon).grpcCommitFn},
-		{"rest", (*Daemon).restCommitFn},
+		// #6808: the gRPC/REST seams now take a CommitAuthority (the transport
+		// mints it from the config-lock holder); the local shell has no session
+		// and supplies InternalCommitter() itself. Adapt the two transport seams
+		// to the shell's shape so this table still drives the EXACT wired
+		// closures — the property under test is peer-sync-by-RG0-ownership, which
+		// the authority does not touch.
+		{"grpc", func(d *Daemon) func(context.Context, string) (*config.Config, error) {
+			inner := d.grpcCommitFn()
+			return func(ctx context.Context, comment string) (*config.Config, error) {
+				return inner(ctx, configstore.InternalCommitter(), comment)
+			}
+		}},
+		{"rest", func(d *Daemon) func(context.Context, string) (*config.Config, error) {
+			inner := d.restCommitFn()
+			return func(ctx context.Context, comment string) (*config.Config, error) {
+				return inner(ctx, configstore.InternalCommitter(), comment)
+			}
+		}},
 		{"shell", (*Daemon).shellCommitFn},
 	}
 	for _, tr := range transports {
@@ -270,8 +287,19 @@ func TestTransportCommitConfirmedFnWiringSyncsPeerByRG0Ownership(t *testing.T) {
 		name string
 		fn   func(*Daemon) func(context.Context, int) (*config.Config, error)
 	}{
-		{"grpc", (*Daemon).grpcCommitConfirmedFn},
-		{"rest", (*Daemon).restCommitConfirmedFn},
+		// #6808: same adaptation as the plain-commit table above.
+		{"grpc", func(d *Daemon) func(context.Context, int) (*config.Config, error) {
+			inner := d.grpcCommitConfirmedFn()
+			return func(ctx context.Context, minutes int) (*config.Config, error) {
+				return inner(ctx, configstore.InternalCommitter(), minutes)
+			}
+		}},
+		{"rest", func(d *Daemon) func(context.Context, int) (*config.Config, error) {
+			inner := d.restCommitConfirmedFn()
+			return func(ctx context.Context, minutes int) (*config.Config, error) {
+				return inner(ctx, configstore.InternalCommitter(), minutes)
+			}
+		}},
 		{"shell", (*Daemon).shellCommitConfirmedFn},
 	}
 	for _, tr := range transports {

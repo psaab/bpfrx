@@ -8,6 +8,7 @@ import (
 	"reflect"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/eventengine"
@@ -584,7 +585,10 @@ func (d *Daemon) initEventEngine() {
 		return
 	}
 	d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
-		return d.commitAndApply(ctx, comment, peerSyncNever)
+		// #6808: the event engine is an autonomous system committer with no
+		// config-lock session, so it states that explicitly. It must never be
+		// the zero authority, which is rejected.
+		return d.commitAndApply(ctx, configstore.InternalCommitter(), comment, peerSyncNever)
 	})
 	if d.rpm != nil {
 		d.rpm.SetEventCallback(d.eventEngine.HandleEvent)

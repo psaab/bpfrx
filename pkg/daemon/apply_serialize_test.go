@@ -26,6 +26,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // applyConfig must serialize concurrent callers via d.applySem.
@@ -84,13 +85,13 @@ func TestCommitAndApplyRespectsSemaphore(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := d.commitAndApply(ctx, "", peerSyncNever); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := d.commitAndApply(ctx, configstore.InternalCommitter(), "", peerSyncNever); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("commitAndApply must surface ctx err while semaphore is held; got %v", err)
 	}
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel2()
-	if _, err := d.commitConfirmedAndApply(ctx2, 1, peerSyncNever); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := d.commitConfirmedAndApply(ctx2, configstore.InternalCommitter(), 1, peerSyncNever); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("commitConfirmedAndApply must surface ctx err while semaphore is held; got %v", err)
 	}
 }
