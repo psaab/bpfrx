@@ -106323,3 +106323,6 @@ prose edit above them added. No diff falls in the new test body.
     pkg/ipsec/swanctl_addr_sanitize_6469_test.go,
     pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go,
     pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — convert the 68 `strings.Contains` render assertions in
+    ipsec_test.go to structural checks
+  - **File(s)**: pkg/ipsec/ipsec_test.go
