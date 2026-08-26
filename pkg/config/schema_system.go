@@ -30,6 +30,15 @@ func syslogFacilitySeverityLeaf() *schemaNode {
 		valueDesc:     "syslog severity threshold",
 		valueExamples: []string{"any", "info", "warning", "error"},
 		validator:     ValidateEnum(junosSyslogSeverities),
+		// #6844: the facility NAME is this leaf's wildcard KEY. Without a
+		// keyValidator an arbitrary string -- including one carrying ';',
+		// whitespace or a newline -- passed SchemaValidate and committed, so
+		// the operator got no error and their configuration silently did not
+		// do what it said. The severity VALUE above has been enum-gated since
+		// #2008; this is the other half of the same pair.
+		keyValueType: ValueIdentifier,
+		keyValueDesc: "Junos syslog facility name, or 'any' for all facilities",
+		keyValidator: ValidateSyslogFacility,
 	}
 }
 

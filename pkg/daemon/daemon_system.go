@@ -1218,7 +1218,7 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// SchemaValidate, compiles, and lands here verbatim from an ORDINARY
 			// operator commit. This belt is the only thing between that string
 			// and a written rsyslog directive.
-			// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 pins that
+			// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 pins that
 			// chain end to end.
 			//
 			// This is deliberately a SHAPE check, not a facility-name allowlist.
@@ -2324,52 +2324,12 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 // It deliberately does NOT decide which facility NAMES are honoured; that is
 // the deferred mapping question on #5797.
 func syslogSelectorAtomSafe(atom string) bool {
-	if atom == "" {
-		return false
-	}
-	// LOAD-BEARING: the ordinary SPACE is the byte this guard exists for, not
-	// the control characters it superficially resembles a check for. A newline
-	// cannot reach here (the lexer folds it to a space), while a space alone
-	// separates an rsyslog selector from its action field. Relaxing this to
-	// "printable ASCII" or "no control bytes" would keep rejecting the newline
-	// and start admitting the space — the guard would look intact and stop
-	// guarding anything. TestSyslogSelectorTokenSpaceIsUnsafe_5797 fails on
-	// exactly that edit. #5797.
-	// #6829 B1: the hyphen is legal INSIDE an atom and never at its head.
-	//
-	// `case c == '-'` with no position guard accepted `-host` and the bare `-`.
-	// A facility of `-host` renders as a line beginning `-host.info<TAB>/path`,
-	// and in legacy sysklogd/rsyslog syntax a leading `-hostname` is a
-	// HOSTNAME-FILTER directive, not a facility selector: it scopes every
-	// selector that follows it until the next such directive. So the byte does
-	// not merely appear in the line, it changes what the following lines MEAN —
-	// which is exactly the construct substitution this belt exists to prevent,
-	// reached through the schema's unvalidated wildcard facility key.
-	//
-	// Guarding here rather than at the two callers is deliberate: both
-	// syslogSelectorFacilitySafe (per comma-separated atom) and
-	// syslogSelectorSeveritySafe (on the remainder after modifier stripping)
-	// hand this function one atom, so the precondition is a property of an
-	// ATOM and belongs with the atom. A caller-side guard is one a future
-	// third caller has to remember.
-	//
-	// Internal hyphens stay legal — `interactive-commands` is a real Junos
-	// facility and a real rendered selector.
-	if c := atom[0]; !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
-		return false
-	}
-	for i := 0; i < len(atom); i++ {
-		c := atom[i]
-		switch {
-		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
-		case c >= '0' && c <= '9':
-		case c == '-':
-		default:
-			return false
-		}
-	}
-	return true
+	// #6844: SINGLE-SOURCED into pkg/config. The commit-time facility gate uses
+	// the same predicate, so what the commit path ACCEPTS and what this belt
+	// WRITES cannot diverge. Two copies would drift, and the drift has a name:
+	// a config that commits cleanly and whose destination then silently
+	// disappears at render. The rationale above now lives with the rule.
+	return config.SyslogSelectorAtomSafe(atom)
 }
 
 // syslogSelectorFacilitySafe reports whether a facility token can be
@@ -2422,15 +2382,8 @@ func syslogSelectorAtomSafe(atom string) bool {
 // facility rendered verbatim), and this belt deliberately does not decide
 // facility NAMES.
 func syslogSelectorFacilitySafe(tok string) bool {
-	if tok == "" || tok == "*" {
-		return true
-	}
-	for _, atom := range strings.Split(tok, ",") {
-		if !syslogSelectorAtomSafe(atom) {
-			return false
-		}
-	}
-	return true
+	// #6844: SINGLE-SOURCED into pkg/config — see syslogSelectorAtomSafe above.
+	return config.SyslogSelectorFacilitySafe(tok)
 }
 
 // syslogSelectorSeveritySafe reports whether a severity token can be
