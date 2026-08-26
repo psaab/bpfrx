@@ -19,6 +19,17 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"removal is deferred while set (#1880).",
 		nil, nil,
 	)
+	c.frrRouteMapsQuarantined = prometheus.NewDesc(
+		"xpf_frr_route_maps_quarantined",
+		"Number of route-maps in the last rendered FRR managed section that "+
+			"were replaced with a bounded explicit DENY because the policy's "+
+			"expansion would overflow FRR's sequence ceiling (#5701/#5732/"+
+			"#6807). Non-zero means every route on the BGP neighbors carrying "+
+			"those attachments is being WITHDRAWN — FRR denies a route-map "+
+			"name it cannot otherwise resolve — until the policy is reduced "+
+			"or detached. Alert on > 0.",
+		nil, nil,
+	)
 	c.ipsecRebindPending = prometheus.NewDesc(
 		"xpf_ipsec_rebind_pending",
 		"1 while the last DHCP-lease-change IPsec rebind failed and has "+
