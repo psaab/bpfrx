@@ -106351,6 +106351,40 @@ prose edit above them added. No diff falls in the new test body.
     pkg/ipsec/ipsec_test.go, pkg/ipsec/swanctl_render_test.go,
     pkg/ipsec/dhcp_rebind_test.go,
     pkg/ipsec/trafficselector_render_4098_test.go
+  - **Action**: #6855 — redact the SYN-cookie master key in ConfigSnapshot and
+    ControlRequest Debug via a newtype (the two carriers #4484 L-7 named)
+  - **File(s)**: userspace-dp/src/protocol/snapshot.rs,
+    userspace-dp/src/protocol/tests.rs
+  - **Action**: #6860 — gate stage_screen_check on has_screen_state so the
+    missing-profile WARN fires when NO screen profile resolves
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_stages_tests.rs, docs/feature-coverage.md
+  - **Action**: #6844 — key-validate the system-syslog facility wildcard; extend
+    the #6834 wildcard-identity rule to typed leaves
+  - **File(s)**: pkg/config/schema_walk.go, pkg/config/schema_system.go,
+    pkg/config/schema_validators_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go (new),
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go (new),
+    docs/config-schema.md
+  - **Action**: #6844 — matrix findings: add the untested length-bound cell,
+    state that the !exactMatch guard has no current instance
+  - **File(s)**: pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/schema_walk.go
+  - **Action**: #6844 — a #5797 tripwire fired as designed; re-derived that the
+    render belt is still load-bearing on the tolerant load path
+  - **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/daemon/daemon_system.go
+  - **Action**: #6844 — act on the Codex review: single-source the selector
+    predicate so commit-accepts == render-writes, de-vacuum the fixtures, fix
+    the inventory dedup/predicate, prove the tolerant path at configstore
+  - **File(s)**: pkg/config/schema_validators_system.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go,
+    pkg/daemon/syslog_gate_render_agreement_6844_test.go (new),
+    pkg/configstore/syslog_facility_lenient_6844_test.go (new),
+    pkg/daemon/syslog_selector_render_5797_test.go, docs/config-schema.md
 ## 2026-08-26 — #6751 PR 3a: interface egress joins the cross-domain NAT owner set
 
 - **Timestamp**: 2026-08-26

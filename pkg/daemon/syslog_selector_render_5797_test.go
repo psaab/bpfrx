@@ -196,7 +196,7 @@ func TestSyslogRenderSafeTokensReachOutput_5797(t *testing.T) {
 //
 // Both spellings are strict-commit-clean: `auth,authpriv` and `*` pass
 // SchemaValidate (measured — the facility is the schema's unvalidated wildcard
-// KEY, see TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 for the same
+// KEY, see TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 for the same
 // chain driven end to end) and compile verbatim. Before any belt existed both
 // rendered a working drop-in. A belt that dropped them therefore did not
 // harden the render path, it deleted a working destination on upgrade — the
@@ -401,18 +401,45 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 	})
 }
 
-// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 is the reachability
-// chain, and the reason the file/user belts are load-bearing rather than
-// defence-in-depth. It drives the REAL operator path — parse the set command,
-// SchemaValidate it, CompileConfig it — and shows an injecting facility
-// arriving at the render function from an ordinary commit, then being dropped.
+// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 is the reachability chain,
+// and the reason the file/user belts are load-bearing rather than
+// defence-in-depth.
 //
-// Deliberate coupling: the SchemaValidate assertion is `must pass`. If a future
-// change adds a key validator to the `<facility> <severity>` wildcard, this
-// test fails — that is the intent. It forces whoever adds that gate to
-// re-derive whether the render belt is still needed instead of deleting it on
-// the assumption that the schema already covers this.
-func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
+// # Why this test changed name and premise (#6844)
+//
+// It used to assert that SchemaValidate ACCEPTS an injecting facility, as a
+// deliberate tripwire: "if a future change adds a key validator to the
+// `<facility> <severity>` wildcard, this test fails -- that is the intent. It
+// forces whoever adds that gate to re-derive whether the render belt is still
+// needed instead of deleting it on the assumption that the schema already
+// covers this."
+//
+// #6844 added that gate, the tripwire fired, and here is the re-derivation.
+//
+// The belt is STILL the only line of defence, because the new gate is not
+// unconditional. SchemaValidate is strict only on the operator-driven commit /
+// commit-check path; Store.compileTreeLenient downgrades a violation to a
+// WARNING on the tolerant Load / SyncApply ingress, deliberately, so a persisted
+// config written by an older binary does not blackout-boot the node and an
+// un-upgraded cluster primary does not alarm-loop HA config sync (#1319/#1960).
+// An injecting facility written before the gate existed therefore still LOADS,
+// still compiles, and still arrives at the render function -- which is exactly
+// the path this test drives.
+//
+// So the chain is unchanged in substance and narrower in premise: what the
+// commit path now rejects, the tolerant path still admits.
+//
+// WHAT THIS TEST DOES AND DOES NOT PROVE. It calls config.CompileConfig, not
+// Store.compileTreeLenient, so it does not itself demonstrate the tolerant
+// ingress — an earlier revision claimed otherwise in its name and comment, and
+// a regression routing Load through STRICT compilation would have left it
+// green. What it proves is the half it actually drives: the value compiles, it
+// reaches the render function, and the belt drops it. The tolerant-ingress half
+// is proved where it happens, by
+// pkg/configstore's TestLoadToleratesAnInjectableSyslogFacility_6844, which
+// drives the real Store.Load and asserts the node still boots with an active
+// config.
+func TestSyslogRenderUnsafeFacilityIsLoadReachable_5797(t *testing.T) {
 	const injecting = "daemon;*.* /tmp/pwn"
 
 	tree := &config.ConfigTree{}
@@ -424,15 +451,25 @@ func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
 		t.Fatalf("SetPath: %v", err)
 	}
 
-	if err := config.SchemaValidate(tree, nil); err != nil {
-		t.Fatalf("the `<facility> <severity>` wildcard now rejects %q at commit-check: %v\n"+
-			"That is a NEW gate. Re-derive whether the syslogDropinContents belt is still the "+
-			"only line of defence before relying on it or removing it (#5797).", injecting, err)
+	// The COMMIT path rejects it (#6844). Pinned here rather than merely
+	// assumed: if that gate is ever removed, this fails and says so, and the
+	// tripwire the original test installed keeps working in the other
+	// direction.
+	if err := config.SchemaValidate(tree, nil); err == nil {
+		t.Fatalf("SchemaValidate ACCEPTED %q. The #6844 facility key gate is gone, so an "+
+			"ORDINARY commit can once again land an injecting selector -- the render belt "+
+			"below is then the only thing standing between it and a written drop-in.",
+			injecting)
 	}
 
+	// The TOLERANT path still admits it: the compiler is unchanged, and
+	// Store.compileTreeLenient downgrades the schema violation to a warning.
+	// This is the reachability premise the belt exists for.
 	cfg, err := config.CompileConfig(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfig: %v\nThe rejection has migrated out of SchemaValidate and "+
+			"into the compiler, which makes it unconditional and blackout-boots a node "+
+			"carrying a config an older binary accepted (#1960).", err)
 	}
 	if len(cfg.System.Syslog.Files) != 1 || cfg.System.Syslog.Files[0].Facility != injecting {
 		t.Fatalf("compiled facility = %+v, want the verbatim %q — the reachability premise of "+
@@ -440,8 +477,8 @@ func TestSyslogRenderUnsafeFacilityIsCommitReachable_5797(t *testing.T) {
 	}
 
 	if body, ok := renderedFor(cfg, renderPrefix+"audit.conf"); ok {
-		t.Errorf("a commit-clean config wrote an rsyslog drop-in built from %q (#5797):\n%s",
-			injecting, body)
+		t.Errorf("a config reaching render via the tolerant load path wrote an rsyslog "+
+			"drop-in built from %q (#5797):\n%s", injecting, body)
 	}
 }
 
@@ -912,7 +949,7 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 // output; it changes what the surrounding configuration MEANS. That is the
 // construct substitution this belt exists to prevent, and it is reachable
 // through the schema's unvalidated wildcard facility KEY (same chain as
-// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797).
+// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797).
 //
 // The bare `-` is the same defect with nothing after it.
 //
