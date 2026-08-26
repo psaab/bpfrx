@@ -456,9 +456,24 @@ type Server struct {
 // WriteTimeout is deliberately left UNSET (0 = unlimited): the SSE event/log
 // streams (GET /api/v1/events/stream, /api/v1/logs/stream) are long-lived, and
 // a full metrics or session-table scrape is a large, legitimately slow
-// response. A WriteTimeout would sever those. The response side is bounded by
-// per-handler context deadlines instead, so leaving it unlimited does not
-// reopen a slow-read DoS on the request side.
+// response. A WriteTimeout would sever those.
+//
+// #6809 CORRECTION. This block used to add "the response side is bounded by
+// per-handler context deadlines instead", and that is not true in the way it
+// reads. A context deadline bounds the handler's own WORK; it does not
+// interrupt a write already blocked in the kernel because the peer stopped
+// reading. Cancelling a context frees whatever the handler owns downstream — a
+// child process, a map lock — but the goroutine stays parked in Write until a
+// SOCKET write deadline fires. Only http.ResponseController.SetWriteDeadline
+// (or a global WriteTimeout, which is what SSE rules out) does that.
+//
+// So an endpoint that streams to a client which stays CONNECTED but stops
+// reading needs its own per-write deadline. /api/routing/bgp?type=routes
+// carries one (bgpStreamWriteDeadline, routing.go) because it also pins a
+// vtysh child behind the blocked write. Any future streaming endpoint has to
+// make the same arrangement explicitly; leaving WriteTimeout unset is a
+// deliberate trade that moves the bound to the handler, not a bound that
+// happens automatically.
 const (
 	// apiReadHeaderTimeout bounds the time to read the request headers — the
 	// slow-header slowloris defense, and the pre-auth guard since header read

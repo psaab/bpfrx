@@ -1,3 +1,43 @@
+## 2026-08-26 — #6809: a connected non-reader no longer pins the BGP stream
+
+- **Timestamp**: 2026-08-26
+- **Action**: `/api/routing/bgp?type=routes` had bounds on PROGRESS only —
+  `maxBGPRoutes` caps bytes, `StreamBGPRoutes` caps memory, the #5232 check
+  aborts on DISCONNECT. None bound the handler while BLOCKED. A client that
+  stays connected and stops reading fills the socket buffers, `bw.Flush()`
+  parks in the kernel, the callback never returns, and the cancel/close/reap
+  that kills vtysh all sit AFTER the scan loop: handler goroutine, vtysh child,
+  pipe and connection pinned indefinitely. `WriteTimeout` is 0 process-wide for
+  SSE, so no global backstop either.
+  Added three bounds, deliberately not interchangeable: a per-write deadline
+  (the only thing that can unpin a goroutine already blocked in a write), an
+  elapsed backstop derived from `r.Context()` and handed to `StreamBGPRoutes`
+  so `exec.CommandContext` reaps vtysh, and a 2-slot non-blocking limiter so a
+  bounded stream cannot become an unbounded NUMBER of vtysh children.
+  MY FIRST FIX WAS WRONG AND THE TEST CAUGHT IT. I armed the deadline next to
+  the explicit 1024-route flushes; `bufio` auto-flushes when its 4 KiB buffer
+  fills, so ~17 real socket writes happen between two consecutive flush
+  boundaries and those block first. The slow-reader cell failed with the fix
+  in place. Restructured to a `deadlineArmingWriter` between `bufio` and the
+  `ResponseWriter`, which makes the coverage structural rather than a matter of
+  remembering every flush site — including the closing flush a sub-1024-route
+  table reaches without entering the periodic branch at all.
+  Corrected a false claim in `server.go` and `pkg/api/README.md`: "the response
+  side is bounded by per-handler context deadlines" does not hold as written —
+  a context deadline bounds a handler's WORK, not a write blocked in the
+  kernel. R70 flagged the same sentence.
+- **File(s)**: `pkg/api/routing.go`, `pkg/api/server.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: the fixture models the hazard rather than approximating it —
+  a `net.Conn` that accepts a fixed prefix and then parks the writer until the
+  write deadline, forever if none is armed. Deterministic fail-on-revert, no
+  socket-buffer-size guessing. Includes a NEGATIVE CONTROL proving the fixture
+  can genuinely pin (deadlines unsupported + a distant backstop → the handler
+  must still be running), without which the passing cell proves nothing, and a
+  paired control proving a real reader still gets the whole table under tight
+  budgets.
+
 ## 2026-08-26 — #6807 r2: make the quarantined withdrawal alertable
 
 - **Timestamp**: 2026-08-26

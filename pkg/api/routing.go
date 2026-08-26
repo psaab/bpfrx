@@ -2,13 +2,16 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	"github.com/psaab/xpf/pkg/frr"
 )
 
@@ -25,6 +28,118 @@ import (
 // const) only so tests can drive the truncation path without synthesizing a
 // million-route fixture.
 var maxBGPRoutes = 100000
+
+// --- #6809: bounding a SLOW READER, not a large table ------------------------
+//
+// The route cap above bounds bytes and CPU *after progress*. It bounds nothing
+// while the handler is BLOCKED. An authenticated client that opens
+// /api/routing/bgp?type=routes and then reads slowly — or stops reading without
+// disconnecting — fills the socket buffers, and the periodic `bw.Flush()` in
+// the stream callback blocks in the kernel. That pins four things at once, none
+// of which any existing bound covers:
+//
+//   - the handler goroutine, parked in Flush;
+//   - the vtysh child, which blocks as soon as ITS stdout pipe fills;
+//   - that pipe and the client connection;
+//   - and, before this, an unbounded number of each, because there was no
+//     admission limit on the endpoint.
+//
+// r.Context() cancels on DISCONNECT, which the #5232 check already handles. A
+// still-connected non-reader produces neither a disconnect nor a write error,
+// so nothing fires. http.Server's WriteTimeout is deliberately 0 process-wide
+// (SSE event/log streams must be able to stay open indefinitely — see the const
+// block in server.go), so there is no global backstop either.
+//
+// THE TWO BUDGETS ARE NOT REDUNDANT, and this is the part that is easy to get
+// wrong. Cancelling a context does NOT interrupt a write already blocked in the
+// kernel: a finite context kills vtysh and frees the child + pipe, but the
+// handler goroutine stays parked in Flush forever. Only a socket write deadline
+// unblocks it. Conversely a write deadline alone does not bound a client that
+// dribbles just enough bytes to reset it every window. So:
+//
+//   - bgpStreamWriteDeadline is the PROGRESS budget — it bounds one flush, and
+//     is what actually unpins the goroutine;
+//   - bgpStreamTotalBudget is the ELAPSED backstop — it bounds the whole
+//     request, and catches the dribbling client that resets the write window
+//     forever.
+//
+// Be precise about what the backstop can and cannot do on a ResponseWriter
+// that does NOT support write deadlines: it still kills and reaps the vtysh
+// child, freeing the process, its pipe and the RIB dump, but it CANNOT unpin
+// this goroutine, because nothing short of a socket deadline interrupts a
+// write already blocked in the kernel. That configuration is therefore a
+// partial bound, not a full one, and the write deadline is the load-bearing
+// half. In production the writer is a real *http.response over a TCP conn,
+// which supports deadlines.
+//
+// A per-flush deadline is preferred over a pure elapsed cap as the primary
+// mechanism because it does not punish a LEGITIMATELY large table on a slow
+// but progressing link: each flush gets a fresh window, so a 1M-route dump to
+// a genuine slow consumer completes, while a non-reader fails on the first
+// window.
+
+// bgpStreamWriteDeadline bounds a SINGLE downstream flush. A client that
+// cannot accept one 1024-route chunk within this window is not reading. Vars,
+// not consts, so a test can compress them without a real slow reader.
+var bgpStreamWriteDeadline = 30 * time.Second
+
+// bgpStreamTotalBudget bounds the whole route stream end to end. Generous by
+// design: a full internet table capped at maxBGPRoutes streams out in seconds
+// on any real link, so this only trips on a client engineered to make minimal
+// progress, or where write deadlines are unavailable.
+var bgpStreamTotalBudget = 10 * time.Minute
+
+// maxConcurrentRIBStreams bounds how many full-RIB stream requests may be in
+// flight. Each holds a vtysh child dumping the routing table, which contends
+// with the control plane, so this is deliberately tighter than the diagnostic
+// limiters (#5057's 4). The endpoint is a diagnostic, not a hot path.
+const maxConcurrentRIBStreams = 2
+
+// ribStreamLimiter admits at most maxConcurrentRIBStreams concurrent full-RIB
+// streams, so a handful of slow readers cannot accumulate vtysh children
+// without bound. It reuses the diagcmd fixed-capacity counting semaphore — the
+// same fail-fast idiom the diagnostic and session-walk handlers use: Acquire is
+// non-blocking, so an over-cap request gets an immediate 429 instead of joining
+// an unbounded backlog (which would just move the pin).
+//
+// Unlike sessionWalkLimiter this instance is LOCAL to the REST surface rather
+// than a shared diagcmd process-wide one, and that is deliberate: the gRPC and
+// CLI `show route protocol bgp` paths call the BUFFERED GetBGPRoutes, which
+// runs vtysh to completion before any client sees a byte and therefore cannot
+// be pinned by a slow reader. There is no second surface to share a budget
+// with, so a shared instance would imply a cross-surface bound that does not
+// exist. A package var so a test can swap in a capacity-1 limiter.
+var ribStreamLimiter = diagcmd.NewLimiter(maxConcurrentRIBStreams)
+
+// deadlineArmingWriter arms a fresh write deadline immediately before each
+// underlying write, so no write to the socket can block longer than the
+// progress budget (#6809).
+//
+// It sits BETWEEN bufio and the ResponseWriter deliberately. Arming at the
+// handler's explicit flush points leaves bufio's own capacity-triggered
+// flushes — the majority of the real socket writes — uncovered, and those are
+// the ones that block first. Placing it here makes the property structural
+// rather than a matter of remembering every flush site, including the closing
+// one a sub-1024-route table reaches without ever entering the periodic branch.
+//
+// A writer that cannot carry a deadline (http.ErrNotSupported) is recorded
+// once and not retried per write; the elapsed backstop then bounds the vtysh
+// child, though not this goroutine — see the note above.
+type deadlineArmingWriter struct {
+	w           io.Writer
+	rc          *http.ResponseController
+	d           time.Duration
+	unsupported bool
+}
+
+func (a *deadlineArmingWriter) Write(p []byte) (int, error) {
+	if !a.unsupported {
+		if err := a.rc.SetWriteDeadline(time.Now().Add(a.d)); err != nil {
+			a.unsupported = true
+		}
+	}
+	return a.w.Write(p)
+}
 
 func (s *Server) routesHandler(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.store.ActiveConfig()
@@ -164,7 +279,45 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 		// joined string. The output is capped at maxBGPRoutes with a trailing
 		// truncation notice so the response body stays bounded even for a
 		// pathologically large table.
-		bw := bufio.NewWriter(w)
+		// #6809 admission: one slot per in-flight full-RIB stream. Non-blocking
+		// — an over-cap request is refused immediately rather than queued,
+		// because a queued request holds the same connection it would have held
+		// while streaming.
+		release, err := ribStreamLimiter.Acquire()
+		if err != nil {
+			w.Header().Set("Retry-After", "5")
+			writeError(w, http.StatusTooManyRequests,
+				"BGP route-stream concurrency limit reached; retry shortly")
+			return
+		}
+		defer release()
+
+		// #6809 elapsed backstop. Derived from r.Context() so a real disconnect
+		// still cancels immediately (the #5232 path), and handed to
+		// StreamBGPRoutes so its exec.CommandContext kills and reaps vtysh when
+		// the budget expires. This bounds the CHILD; the write deadline below is
+		// what bounds this goroutine.
+		streamCtx, cancelStream := context.WithTimeout(r.Context(), bgpStreamTotalBudget)
+		defer cancelStream()
+
+		// #6809 progress budget, armed at the WRITE, not at the flush points.
+		//
+		// The obvious placement — arm it next to the periodic bw.Flush() — does
+		// not work, and the slow-reader cell catches it. bufio auto-flushes
+		// whenever its 4 KiB buffer fills, and 1024 routes is ~70 KiB, so the
+		// stream performs roughly seventeen real socket writes between two
+		// consecutive explicit flushes. Those are the writes that block first,
+		// and an arm that only runs at the explicit boundary never covers them.
+		//
+		// Wrapping the ResponseWriter instead makes the coverage structural:
+		// every byte that reaches the socket passes through one place that has
+		// just armed a deadline, whoever decided to flush. It costs one
+		// SetWriteDeadline per underlying write (~per 4 KiB), not per route.
+		bw := bufio.NewWriter(&deadlineArmingWriter{
+			w:  w,
+			rc: http.NewResponseController(w),
+			d:  bgpStreamWriteDeadline,
+		})
 		emitted := 0
 		started := false
 		// emitPrefix lazily writes the 200 status + envelope prefix on the
@@ -182,7 +335,7 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 			// empty (omitempty) — matches encoding/json field order.
 			io.WriteString(bw, `{"success":true,"data":{"output":"`)
 		}
-		truncated, err := s.frr.StreamBGPRoutes(r.Context(), maxBGPRoutes, func(route frr.BGPRoute) error {
+		truncated, err := s.frr.StreamBGPRoutes(streamCtx, maxBGPRoutes, func(route frr.BGPRoute) error {
 			emitPrefix()
 			writeJSONStringFragment(bw, fmt.Sprintf("%-24s %-20s %s\n",
 				route.Network, route.NextHop, route.Path))
@@ -196,12 +349,17 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 				// stops the scan and cancels vtysh upstream. The un-flushed
 				// bufio tail and closing envelope are intentionally dropped:
 				// the connection is gone.
-				if cerr := r.Context().Err(); cerr != nil {
+				// #6809: check the BUDGETED context, not r.Context(). It is
+				// derived from it, so a disconnect still lands here; the
+				// elapsed backstop now does too.
+				if cerr := streamCtx.Err(); cerr != nil {
 					return cerr
 				}
 				// A downstream write failure is also terminal: propagate it so
 				// the scan stops and vtysh is cancelled instead of dumping the
-				// rest of the table into a broken pipe.
+				// rest of the table into a broken pipe. Since #6809 that
+				// includes a write-deadline expiry, which is what converts a
+				// blocked handler into an ordinary terminal write error.
 				if ferr := bw.Flush(); ferr != nil {
 					return ferr
 				}
