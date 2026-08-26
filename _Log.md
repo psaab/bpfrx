@@ -106313,3 +106313,7 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/syslog_facility_keyvalidator_6844_test.go (new),
     pkg/config/wildcard_keyvalidator_inventory_6844_test.go (new),
     docs/config-schema.md
+  - **Action**: #6844 — matrix findings: add the untested length-bound cell,
+    state that the !exactMatch guard has no current instance
+  - **File(s)**: pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/schema_walk.go

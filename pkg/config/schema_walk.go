@@ -401,6 +401,14 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		// Gated on !exactMatch for the same reason as the container rule: on an
 		// exact match the keyword is a schema keyword, not an operator-supplied
 		// identity, and validating it would reject the schema's own vocabulary.
+		//
+		// Stated plainly because a mutation cell measured it: deleting this
+		// guard today changes NOTHING. No named typed leaf currently carries a
+		// keyValidator, so the guard has no instance and no test exercises it.
+		// It is kept as the mirror of the container rule rather than as a
+		// load-bearing check -- adding a keyValidator to a NAMED typed leaf
+		// would otherwise validate the schema's own keyword and reject it. The
+		// inventory test is what surfaces such a leaf when one appears.
 		if !exactMatch && childSchema.keyValidator != nil {
 			if err := validateKeySlot(childSchema, 0, keyword, vc); err != nil {
 				return typedLeafInvalidErrorf(path, keyword, err)

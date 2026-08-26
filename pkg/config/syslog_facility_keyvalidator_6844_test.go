@@ -66,6 +66,12 @@ func TestSyslogFacilityKeyRejectsInjectableNames_6844(t *testing.T) {
 			why:      "'*' is rsyslog selector punctuation; Junos spells the wildcard `any`",
 		},
 		{
+			name:     "over-long name",
+			facility: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			why: "the length bound; without this cell that branch is never executed and " +
+				"deleting it leaves the suite green",
+		},
+		{
 			name:     "path separator",
 			facility: `../../etc/passwd`,
 			why:      "the facility is formatted into a rendered drop-in body",
