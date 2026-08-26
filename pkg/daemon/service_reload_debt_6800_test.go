@@ -440,6 +440,60 @@ func TestSteadyStateNTPApplyWithNoDebtDoesNotReload6800(t *testing.T) {
 	}
 }
 
+// TestSteadyStateDisabledNTPApplyRetriesTheOwedChronyReload6800 binds the fold
+// on the `system processes ntp disable` branch, which has its own copy of it.
+//
+// The sequence is the ordinary one for a disabled NTP stanza: the first apply
+// after the operator disables NTP REMOVES the two managed files (changed=true)
+// and its reload fails; every later apply finds them already absent, so both
+// change flags are false. Without the fold on this branch the owed reload is
+// dropped and chrony keeps the removed sources loaded — the deleted-destination
+// shape #5111 fixed for rsyslog, reached through the reload instead of the file.
+func TestSteadyStateDisabledNTPApplyRetriesTheOwedChronyReload6800(t *testing.T) {
+	d, calls, outcome := chronyDaemon6800(t)
+
+	// Seed the files a previously-enabled apply would have left behind.
+	if err := os.WriteFile(chronySourcesPath, []byte("server 10.0.0.1 iburst\n"), 0644); err != nil {
+		t.Fatalf("seed sources: %v", err)
+	}
+	if err := os.WriteFile(chronyThresholdPath, []byte("logchange 120\n"), 0644); err != nil {
+		t.Fatalf("seed threshold: %v", err)
+	}
+
+	cfg := ntpCfg6800(nil, 0)
+	cfg.System.DisabledProcesses = []string{"ntp"}
+
+	*outcome = chronyReloadOutcome{sourcesFailed: true, thresholdFailed: true}
+	d.applySystemNTP(cfg)
+	if len(*calls) != 1 || (*calls)[0] != [2]bool{true, true} {
+		t.Fatalf("setup: the disabling apply must remove both files and request "+
+			"both legs, got %v", *calls)
+	}
+	if _, err := os.Stat(chronySourcesPath); !os.IsNotExist(err) {
+		t.Fatalf("setup: the managed sources file must be removed, stat err = %v", err)
+	}
+
+	*outcome = chronyReloadOutcome{}
+	d.applySystemNTP(cfg)
+	if len(*calls) != 2 {
+		t.Fatalf("a steady-state DISABLED apply issued %d reloads, want 2: the "+
+			"managed files are already gone so both change flags are false, and "+
+			"only the retained debt can re-drive the reload that tells chrony to "+
+			"drop the removed sources (#6800)", len(*calls))
+	}
+	if (*calls)[1] != [2]bool{true, true} {
+		t.Fatalf("the retry requested %v, want both owed legs replayed", (*calls)[1])
+	}
+
+	// PAIRED negative: now that the debt is discharged, a further disabled apply
+	// must not touch chrony at all.
+	d.applySystemNTP(cfg)
+	if len(*calls) != 2 {
+		t.Fatalf("a converged, debt-free DISABLED apply reloaded chrony (%d total, "+
+			"want 2) — the change gate must still suppress the steady state", len(*calls))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the always-on re-assert loop
 // ---------------------------------------------------------------------------
@@ -561,6 +615,48 @@ func TestReassertRechecksTheDebtInsideTheSemaphore6800(t *testing.T) {
 			"queued behind had already discharged the debt, want 0 — re-reading "+
 			"the debt INSIDE the semaphore is what stops a gratuitous bounce of a "+
 			"healthy logging pipeline (#6800)", *restarts-before)
+	}
+}
+
+// TestReassertWaitsForTheApplySemaphore6800 binds the applySem ACQUISITION,
+// which the inner-gate cell above cannot: that one still passes if the
+// semaphore is never taken and the tick simply runs earlier.
+//
+// The semaphore is held by a "commit" that never releases, and the tick is
+// given a short-lived context. Correct code blocks in Acquire until the context
+// expires and then declines to reload at all. Dropping the Acquire makes the
+// tick fire a `systemctl restart rsyslog` straight into the middle of a commit
+// — reconcileSyslogDropins is mid-way through removing and rewriting
+// /etc/rsyslog.d/10-xpf-*, so the restart would load a HALF-CONVERGED drop-in
+// set and then latch a success for it (#4001, #6800).
+func TestReassertWaitsForTheApplySemaphore6800(t *testing.T) {
+	d, restarts, failWith := syslogDaemon6800(t)
+	d.applySem = semaphore.NewWeighted(1)
+
+	*failWith = errors.New("simulated restart failure")
+	d.applySyslogFiles(syslogFileCfg6800("audit"))
+	if !d.rsyslogRestartOwed() {
+		t.Fatal("setup: the restart debt must be outstanding")
+	}
+	before := *restarts
+
+	// A commit takes the semaphore and does not give it back.
+	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	d.reassertServiceReloadDebtOnce(ctx)
+
+	if *restarts != before {
+		t.Fatalf("the re-assert restarted rsyslog %d times while a commit held "+
+			"applySem, want 0 — it must queue behind the in-flight apply, or the "+
+			"restart can load a half-converged drop-in set and latch a success "+
+			"for it (#4001, #6800)", *restarts-before)
+	}
+	if !d.rsyslogRestartOwed() {
+		t.Fatal("a re-assert that never ran must leave the debt outstanding")
 	}
 }
 
