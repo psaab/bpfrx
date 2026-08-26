@@ -106039,3 +106039,20 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/daemon_apply_commit.go`, `pkg/daemon/daemon_run_servers.go`,
   `pkg/daemon/daemon_apply_tail.go`, `pkg/configstore/README.md`,
   plus mechanical test migrations, `_Log.md`
+
+## 2026-08-26 — engineering-style: gofmt -w on a directory is a scope hazard here
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add "format the files you TOUCHED, never a directory" to
+  `docs/engineering-style.md`'s reviewing section.
+- **Why**: `gofmt -w pkg/daemon` reformatted 12 pre-existing unformatted files a
+  lane had never touched, silently widening its diff. The underlying fact is
+  repo-specific and worth stating: master CARRIES unformatted files, so
+  `gofmt -w <dir>` is not idempotent with respect to your change here, and a
+  widened diff is how an unrelated change rides in unreviewed.
+- **Includes the recovery**, since the lane worked it out under time pressure:
+  for each modified `.go`, if its diff adds none of your change's identifiers,
+  `git checkout HEAD -- <file>`.
+- **Found by**: the lane driving #6808, caught in `git status` rather than at
+  review.
+- **File(s)**: `docs/engineering-style.md`, `_Log.md`
