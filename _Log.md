@@ -106379,3 +106379,6 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6751 PR 3a takeover — turn shippedNATConfigs from a floor into
     a census so a NEW NAT config cannot land ungated
   - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go
+  - **Action**: #6751 3a — name the census selector's deliberate looseness
+    (a comment mention of source-nat pulls a config in) per lane review
+  - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go

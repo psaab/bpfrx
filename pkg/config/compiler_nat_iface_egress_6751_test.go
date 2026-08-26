@@ -256,6 +256,19 @@ func assertShippedNATConfigListIsComplete_6751(t *testing.T) {
 
 	// Only files that actually carry a source-NAT stanza are in scope; a config
 	// with no NAT at all has nothing for this gate to say.
+	//
+	// DELIBERATE LOOSENESS, named here rather than left for a reviewer to find:
+	// this is a text match, so a config mentioning "source-nat" only in a
+	// COMMENT is pulled into the census and must be listed. That is a false
+	// positive in the direction of MORE gating, which is the correct way to be
+	// wrong here -- the cost is one line in the list, where the opposite error
+	// costs a silently ungated config. But it means the list can grow for a
+	// reason that is not a real NAT stanza, and someone hitting that will think
+	// the census is broken. It is not; add the file.
+	//
+	// Compiling each candidate to decide would be exact, and is not worth it:
+	// the gate below already compiles every LISTED config, so an exact selector
+	// would double the work to avoid an over-inclusion that costs nothing.
 	withNAT := map[string]bool{}
 	for _, rel := range globbed {
 		raw, err := os.ReadFile(rel)
