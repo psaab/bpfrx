@@ -105106,9 +105106,9 @@ prose edit above them added. No diff falls in the new test body.
   coalescence, host-scope knobs and neigh retrans). Separate lifecycle question
   — a second bounded ethtool round-trip per owned NIC on a path already capped
   by `TimeoutStopSec=20`, plus a changed restart profile.
-- **Mutation matrix**: 7 production lines reverted one at a time, each with a
-  full-package `go test -count=1 ./pkg/daemon/` and no `-run` filter; every cell
-  named a RED. Fixtures run two reconciles and move an interface out of the
+- **Mutation matrix**: 10 cells, each reverting ONE production line/guard, each
+  with a full-package `go test -count=1 ./pkg/daemon/` and no `-run` filter;
+  every cell named a RED, none escaped, none build-broke. Fixtures run two reconciles and move an interface out of the
   binding set between them — a fixture whose allowlist never shrinks cannot see
   the teardown at all. The pre-xpfd probe uses rx-usecs 42 / tx-usecs 43, values
   xpf never writes, so a restore assertion cannot be satisfied by an apply.
