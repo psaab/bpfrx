@@ -806,7 +806,13 @@ fn concurrency_fixture_is_wired_to_the_measured_window_7650() {
     let src = include_str!("cold_path_hist_tests.rs");
     let code: String = src
         .lines()
-        .map(|l| if l.trim_start().starts_with("//") { "" } else { l })
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
