@@ -104994,8 +104994,6 @@ prose edit above them added. No diff falls in the new test body.
   pkg/api/metrics_userspace.go, pkg/api/metrics_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
 ## 2026-08-23 — #6797 withdraw a credential ownership claim when the mutation fails
-<<<<<<< HEAD
-
 - **Timestamp**: 2026-08-23
 - **Action**: #5841 writes the resource ownership markers BEFORE the credential
   mutation (deliberately, to avoid a mutated-but-unmarked underclaim), but
@@ -105010,8 +105008,6 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/login_password.go`, `pkg/daemon/daemon_system.go`,
   `pkg/daemon/login_marker_overclaim_6797_test.go` (new),
   `docs/system-login.md`
-=======
->>>>>>> origin/master
 ## 2026-08-23 — #6799 a completing apply must not erase a debt armed mid-flight
 
 - **Timestamp**: 2026-08-23
@@ -105068,6 +105064,128 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/daemon/rg_state.go`, `pkg/daemon/daemon_ha.go`,
   `pkg/daemon/rg_apply_invalidate_race_6799_test.go`,
   `pkg/daemon/rg_state_test.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — #6803: a management listener that dies is now rebound at the same endpoint
+
+- **Timestamp**: 2026-08-26
+- **Action**: Give the HTTP management leg the liveness question #6827 round 6
+  gave HTTPS, in both places round 6 fixed it for HTTPS, and add the always-on
+  owner that makes either fix reachable without an operator commit.
+- **Why**: an unexpected management-listener serve exit was OBSERVABLE and never
+  RECONCILED. Observable: the leg is marked dead, `EffectiveHTTPAddr` stops
+  reporting it, `show system services` renders the HTTP listener Failed. Never
+  reconciled, for three independent reasons, each of which alone keeps the
+  endpoint down:
+  1. `api.Server.ReconcileHTTP` short-circuited a same-address call on a
+     non-nil pointer rather than on `serving()`. A dead leg stays INSTALLED (it
+     cannot be unlinked without `lifeMu`, which deadlocks a shutdown racing the
+     exit), so the compare matched a corpse and the rebind returned nil having
+     done nothing. `ReconcileHTTPS` has asked `serving()` since #6827 round 6.
+  2. `reconcileTo`'s HTTP arm gated on the converged FINGERPRINT alone. The
+     fingerprint records what the last SUCCESSFUL reconcile bound; it is not
+     evidence the socket is up. The HTTPS arm carries `|| (next.TLS &&
+     !m.srv.HTTPSServing())`; the HTTP arm carried nothing.
+  3. The only caller of `reconcileWebManagement` is `applyConfigLocked`, so even
+     with both gates fixed the endpoint came back only when an operator
+     committed — from a box whose management API had just died.
+- **Shape**: (1) `api.Server.HTTPServing()`, the exact counterpart of
+  `HTTPSServing()`; `ReconcileHTTP`'s no-op now asks it. (2) the HTTP arm fires
+  on `next.Addr != m.cur.addr || (next.Addr != "" && !m.srv.HTTPServing())` —
+  the non-empty guard keeps the change strictly ADDITIVE, because
+  `ReconcileHTTP` refuses an empty bind and the existing #6827 over-reach guard
+  `a_failed_boot_then_an_empty_bind_binds_nothing` pins that direction.
+  (3) `mgmtListenerReassertLoop` in a new `mgmt_listener_reassert.go`, mirroring
+  #6791/#6793/#6802: unconditional in `Run`, 30s, `applySem` before acting
+  (#4001), gate re-checked inside the semaphore.
+- **Gate identity**: the owner's gate is
+  `effectiveHTTPListener().State == StateFailed` — the SAME question `show
+  system services` answers, on purpose. A second private predicate could
+  disagree with the operator view, and then the box either reports a dead
+  listener nothing retries or retries one it reports healthy.
+- **Every cell is PAIRED**, because all three fixes WIDEN a trigger and the
+  over-reach failure is real: a rebind that fires on a healthy leg bounces the
+  management socket on every commit and every 30s tick.
+- **Found while re-deriving, filed separately**: the PRIMARY (loopback) gRPC
+  listener has the same hole — `Run` logs a serve error and the goroutine exits
+  with nothing re-binding — while the FABRIC gRPC listener beside it has had a
+  bounded-backoff supervisor since #5047.
+- **File(s)**: `pkg/api/listener.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`,
+  `pkg/api/reconcile_http_dead_leg_6803_test.go`, `pkg/daemon/README.md`,
+  `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-26 — CLAUDE.md: a Required Reading index
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add a `## Required Reading` section to the project `CLAUDE.md`,
+  between "Working Style" and "Logging Rules".
+- **Why**: `CLAUDE.md` already told a reader to read `docs/engineering-style.md`
+  and to update module docs in the same change, but the other standing
+  documents — `~/.claude/RTK.md`, `AGENTS.md`, `COMMITAGENT.md`,
+  `docs/config-schema.md` — were nowhere named, so an agent had no way to
+  discover them except by tripping over the rule they encode. `RTK.md` is the
+  sharpest omission: a hook silently rewrites most shell commands through the
+  `rtk` token-optimizing proxy, and a reader who does not know that also does
+  not know `rtk proxy <cmd>` exists to get UNFILTERED output back for the cases
+  where the filtered form has dropped the decisive line.
+- **Shape**: a table of file → when to read it → what it governs, so the entry
+  is actionable at dispatch time rather than a bare list of filenames. Closes
+  with the point that sub-agents inherit the file but not the reasoning, so a
+  dispatch brief should name the specific documents its task touches.
+- **File(s)**: `CLAUDE.md`, `_Log.md`
+
+## 2026-08-26 — #6803 follow-up: dampen the re-assert owner's per-tick logging
+
+- **Timestamp**: 2026-08-26
+- **Action**: Log the management-listener outage Warn on the FIRST tick of a down
+  streak only, Debug thereafter, and re-arm on recovery.
+- **Why**: caught reviewing my own PR. A node whose management bind can never
+  succeed — the address permanently taken by another process — is re-driven
+  every 30s for the life of the daemon, and the original code logged the same
+  Warn every tick: ~2900 identical lines a day, the exact failure the project's
+  logging rules were written after. The sibling `sleepFabricBackoff` (#5047)
+  already states the rule in its own comment: transitions at Info/Warn, ticks at
+  Debug.
+- **The re-arm is the load-bearing half**: a streak flag that never clears trades
+  a noisy journal for a SILENT one, because a later, genuinely new outage would
+  then be logged at Debug and be invisible. It is cleared only on a reconcile
+  that actually brought the listener back, not on one that merely returned nil.
+- **File(s)**: `pkg/daemon/mgmt_listener_reassert.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/mgmt_listener_reassert_6803_test.go`, `_Log.md`
+
+## 2026-08-26 — `_Log.md` carried six committed conflict markers; add a repo-wide sweep
+
+- **Timestamp**: 2026-08-26
+- **Action**: Union-resolve two merge-conflict blocks that were COMMITTED into
+  `_Log.md` on master, and add `pkg/refactoraudit/conflict_markers_test.go` so a
+  marker can never sit in a tracked file again.
+- **Why**: master carried six marker lines across two blocks. Both arrived the
+  same way — a `git merge` conflicted, the conflict was not checked, and a
+  `git add -A` staged the marker-laden file. One of the two had an EMPTY
+  "theirs" side, so an entire #6797 log entry sat inside a conflict block. I
+  authored the second block myself, in the #6803 dampening commit, by doing
+  exactly that.
+- **Why nothing caught it**: `_Log.md` is prose. No compiler, linter or test
+  reads it, so a marker is invisible to `go test ./...`. A marker in a SOURCE
+  file breaks the build loudly — the real exposure is docs, prose, configs,
+  fixtures and goldens, which is where one can sit indefinitely.
+- **The sweep**: over `git ls-files`, not a filesystem walk — this repo keeps
+  ~140 git worktrees under `.claude/wt-*` and a walk would descend into every
+  one, scanning other branches' trees. Anchored at line start, because an
+  unanchored search false-positives on prose ABOUT markers, which `_Log.md` is
+  full of. `=======` counts only when the line is EXACTLY seven equals, since
+  Markdown uses it as a setext underline and an ASCII rule.
+- **The needles are assembled at runtime**, not written as literals: a gate that
+  greps for a string must not contain that string, or it is the permanent first
+  hit of its own sweep and the only way to stay green is an exemption that also
+  hides real markers.
+- **Two anti-vacuity floors** (`len(files) >= 100`, `scanned >= 100`) plus a
+  sensitivity control that drives the same predicate over a synthetic conflicted
+  document and over the prose forms that must stay quiet. Verified paired: run
+  against the PRE-FIX `_Log.md` the gate REDs; against the fixed one it passes,
+  sweeping 7007 tracked text files.
+- **File(s)**: `_Log.md`, `pkg/refactoraudit/conflict_markers_test.go` (new)
 
 ## 2026-08-26 — #6802: a retry owner for a failed host-inbound conntrack revocation
 
