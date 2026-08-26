@@ -106098,3 +106098,58 @@ prose edit above them added. No diff falls in the new test body.
 - **Found by**: the lane driving #6808, caught in `git status` rather than at
   review.
 - **File(s)**: `docs/engineering-style.md`, `_Log.md`
+
+## 2026-08-26 — #2419 compact/block equivalence gate (cohort #6817/#6818/#6821/#6822)
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add the generative gate that ENUMERATES the #2419 compact-leaf
+  class, plus a checked-in expected-failure inventory of the 194 sites that fail
+  it today. No production change — the normalizer that drives the inventory to
+  zero is a separate, deliberately unfolded change.
+- **The class**: a compiler stanza that iterates only `prop.Children` reads the
+  BLOCK spelling `stanza { leaf value; }` and silently drops the COMPACT
+  spelling `stanza leaf value;`, which puts the value on the stanza's own
+  `Keys[1:]`. `SchemaValidate` ACCEPTS the compact spelling, so this is the
+  normal commit path, not the tolerant-load path: the commit reports success and
+  the credential is gone.
+- **Why the instrument had to be generative**: two textual predicates were tried
+  on the issues. The first over-counted (80 readers, 68 "blind" — a `case`
+  handling the flat shape one line above the loop was flagged); the second
+  matched 11 candidates and NONE of the three known-true sites, because a
+  ±14-line lookback cannot scope itself to a `case` block. False positives AND
+  false negatives, with output indistinguishable from clean.
+- **THE PRESCRIBED INSTRUMENT WAS ALSO VACUOUS, and that is the main finding.**
+  The brief said to compare the flat-set spelling against the block spelling.
+  `ParseSetCommand` + `SetPath` produces the BLOCK tree — verified by dumping it
+  — so that comparison is block-against-block: equal for every leaf, green
+  everywhere, census of zero. The compact tree comes from the HIERARCHICAL
+  parser on hand-authored / `load merge`d text. Corrected before building.
+- **Three bugs in my own instrument, all found by the positive control**: it
+  found 2 of the 4 known-true sites on the first run. (a) args were rendered as
+  their own nesting level (`user { ops { } }` not `user ops { }`) — hid #6822;
+  (b) fixtures lacked REQUIRED SIBLINGS (`compiler_security_log.go` registers a
+  stream only when `Host != ""`) — hid #6821; (c) NAMED INSTANCES were being
+  compacted, which produces a node the compiler cannot recognise as that
+  instance — roughly 150 phantom divergences. 4/4 after the fixes; that control
+  is what makes the census believable.
+- **Census**: 792 sites enumerated, 326 checked under the vacuity guard, **194
+  divergent**. Skips: 346 under `groups` (schema re-host), 96 not observable, 15
+  parse/compile, 9 unsynthesizable. The honest count is ">= 194 divergent, 96
+  unruled" — the not-observable skips are candidates nobody has ruled out, not
+  clean sites. Hand-verified beyond the filed four: `protocols bgp export`
+  compiles an EMPTY export list, and a GRE tunnel loses BOTH source and
+  destination.
+- **Gate design**: the divergent set must EQUAL the inventory (a new
+  compact-blind reader reds; a fixed site left in the file also reds, so it
+  cannot rot into an allowlist); the checked-cell count is a RATCHET so sites
+  cannot drain into the skip buckets; the four filed instances are asserted
+  present by construction.
+- **Mutation matrix**: 9 cells. The ratchet is a PAIRED cell — the same
+  violation reds with the guard present and passes with it removed, which is
+  what proves the guard is what catches it. One cell (P1) initially "failed"
+  as a syntax break my build-break detector missed; detector widened and the
+  cell rewritten as a one-token change.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go` (new),
+  `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
+  `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
+  `docs/config-schema.md`, `_Log.md`
