@@ -1,0 +1,215 @@
+# #2419 compact/block equivalence — KNOWN-FAILING INVENTORY
+#
+# Each line is a config site whose COMPACT spelling (`stanza leaf value;`)
+# compiles to a different typed config than its BLOCK spelling
+# (`stanza { leaf value; }`) — i.e. a compiler stanza that reads only
+# prop.Children and silently drops the value.
+#
+# This is an EXPECTED-FAILURE list, not a suppression. The gate in
+# compact_block_equivalence_2419_test.go asserts the divergent set EQUALS
+# this file, so a new compact-blind reader reds the suite and a site fixed
+# without removing its line reds it too.
+#
+# `xpfarg` / `xpfname` are synthesized instance names.
+#
+# checked: 326
+#
+# skipped (leaf value not observable in the typed config): 96
+# skipped (a spelling did not parse or compile): 15
+# skipped (no two distinct synthesizable values): 9
+# skipped (under groups (schema re-host, duplicate coverage)): 346
+#
+applications application-set
+chassis device-map unmapped-interface-policy
+class-of-service interfaces xpfarg classifiers dscp
+class-of-service interfaces xpfarg classifiers ieee-802.1
+class-of-service interfaces xpfarg rewrite-rules dscp
+class-of-service interfaces xpfarg rewrite-rules ieee-802.1
+firewall policer xpfarg if-exceeding bandwidth-limit
+firewall policer xpfarg if-exceeding burst-size-limit
+firewall policer xpfarg then loss-priority
+forwarding-options dhcp-relay server-group
+forwarding-options family inet6 mode
+forwarding-options sampling instance xpfarg family inet output source-address
+forwarding-options sampling instance xpfarg family inet6 output source-address
+forwarding-options sampling instance xpfarg input rate
+interfaces xpfname aggregated-ether-options lacp periodic
+interfaces xpfname aggregated-ether-options link-speed
+interfaces xpfname gigether-options 802.3ad
+interfaces xpfname gigether-options redundant-parent
+interfaces xpfname tunnel destination
+interfaces xpfname tunnel key
+interfaces xpfname tunnel mode
+interfaces xpfname tunnel routing-instance destination
+interfaces xpfname tunnel source
+interfaces xpfname tunnel ttl
+interfaces xpfname tunnel wireguard listen-port
+interfaces xpfname tunnel wireguard private-key
+policy-options policy-statement xpfarg term xpfarg from as-path
+policy-options policy-statement xpfarg term xpfarg from community
+policy-options policy-statement xpfarg term xpfarg from prefix-list
+policy-options policy-statement xpfarg term xpfarg from protocol
+policy-options policy-statement xpfarg term xpfarg then as-path-prepend
+policy-options policy-statement xpfarg term xpfarg then community
+policy-options policy-statement xpfarg term xpfarg then load-balance
+policy-options policy-statement xpfarg term xpfarg then local-preference
+policy-options policy-statement xpfarg term xpfarg then metric
+policy-options policy-statement xpfarg term xpfarg then metric-type
+policy-options policy-statement xpfarg term xpfarg then next-hop
+policy-options policy-statement xpfarg term xpfarg then origin
+policy-options prefix-list
+protocols bgp cluster-id
+protocols bgp export
+protocols bgp import
+protocols bgp local-as
+protocols bgp router-id
+protocols isis authentication-key
+protocols isis authentication-type
+protocols isis export
+protocols isis is-type
+protocols isis level
+protocols isis net
+protocols lldp hold-multiplier
+protocols lldp transmit-interval
+protocols ospf area xpfarg interface xpfarg authentication simple-password
+protocols ospf export
+protocols ospf router-id
+protocols ospf3 export
+protocols ospf3 router-id
+protocols rip authentication-key
+protocols rip authentication-type
+protocols rip neighbor
+protocols rip passive-interface
+protocols rip redistribute
+routing-instances xpfname protocols isis authentication-key
+routing-instances xpfname protocols isis authentication-type
+routing-instances xpfname protocols isis export
+routing-instances xpfname protocols isis is-type
+routing-instances xpfname protocols isis level
+routing-instances xpfname protocols isis net
+routing-instances xpfname protocols ospf area xpfarg interface xpfarg authentication simple-password
+routing-instances xpfname protocols ospf3 export
+routing-instances xpfname protocols ospf3 router-id
+routing-options autonomous-system
+routing-options forwarding-table export
+schedulers scheduler xpfarg daily start-time
+schedulers scheduler xpfarg daily stop-time
+schedulers scheduler xpfarg friday start-time
+schedulers scheduler xpfarg friday stop-time
+schedulers scheduler xpfarg monday start-time
+schedulers scheduler xpfarg monday stop-time
+schedulers scheduler xpfarg saturday start-time
+schedulers scheduler xpfarg saturday stop-time
+schedulers scheduler xpfarg sunday start-time
+schedulers scheduler xpfarg sunday stop-time
+schedulers scheduler xpfarg thursday start-time
+schedulers scheduler xpfarg thursday stop-time
+schedulers scheduler xpfarg tuesday start-time
+schedulers scheduler xpfarg tuesday stop-time
+schedulers scheduler xpfarg wednesday start-time
+schedulers scheduler xpfarg wednesday stop-time
+security dynamic-address address-name xpfarg profile feed-name
+security flow aging early-ageout
+security flow aging high-watermark
+security flow aging low-watermark
+security flow icmp-session timeout
+security flow multicast-session-lifetime
+security flow route-change-timeout
+security flow tcp-session closing-timeout
+security flow tcp-session established-timeout
+security flow tcp-session initial-timeout
+security flow tcp-session time-wait-timeout
+security flow traceoptions file
+security flow traceoptions flag
+security flow udp-session timeout
+security ipsec vpn xpfarg ike gateway
+security ipsec vpn xpfarg ike ipsec-policy
+security ipsec vpn xpfarg vpn-monitor destination-ip
+security ipsec vpn xpfarg vpn-monitor source-interface
+security log format
+security log mode
+security log source-interface
+security log stream xpfarg transport protocol
+security log stream xpfarg transport tls-profile
+security nat destination pool
+security nat destination rule-set xpfarg rule xpfarg match application
+security nat destination rule-set xpfarg rule xpfarg match destination-address
+security nat destination rule-set xpfarg rule xpfarg match destination-address-name
+security nat destination rule-set xpfarg rule xpfarg match destination-port
+security nat destination rule-set xpfarg rule xpfarg match protocol
+security nat destination rule-set xpfarg rule xpfarg match source-address
+security nat destination rule-set xpfarg rule xpfarg match source-address-name
+security nat source rule-set xpfarg rule xpfarg match application
+security nat source rule-set xpfarg rule xpfarg match destination-address
+security nat source rule-set xpfarg rule xpfarg match destination-address-name
+security nat source rule-set xpfarg rule xpfarg match destination-port
+security nat source rule-set xpfarg rule xpfarg match source-address
+security nat source rule-set xpfarg rule xpfarg match source-address-name
+security nat static rule-set xpfarg rule xpfarg match destination-address
+security nat static rule-set xpfarg rule xpfarg match destination-port
+security nat static rule-set xpfarg rule xpfarg match source-address
+security policies default-policy-log
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match application
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match destination-address
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg match source-address
+security policies from-zone xpfarg xpfarg xpfarg policy xpfarg then log
+security policies global policy xpfarg match application
+security policies global policy xpfarg match destination-address
+security policies global policy xpfarg match from-zone
+security policies global policy xpfarg match source-address
+security policies global policy xpfarg match to-zone
+security policies global policy xpfarg then log
+security pre-id-default-policy then log
+security screen ids-option xpfarg limit-session destination-ip-based
+security screen ids-option xpfarg limit-session source-ip-based
+security zones security-zone xpfarg host-inbound-traffic protocols
+security zones security-zone xpfarg host-inbound-traffic system-services
+security zones security-zone xpfarg interfaces xpfname host-inbound-traffic protocols
+security zones security-zone xpfarg interfaces xpfname host-inbound-traffic system-services
+services flow-monitoring version-ipfix template xpfarg template-refresh-rate seconds
+services flow-monitoring version9 template xpfarg template-refresh-rate seconds
+snmp v3 usm local-engine user xpfarg authentication-md5 authentication-password
+snmp v3 usm local-engine user xpfarg authentication-sha authentication-password
+snmp v3 usm local-engine user xpfarg authentication-sha256 authentication-password
+snmp v3 usm local-engine user xpfarg privacy-aes128 privacy-password
+snmp v3 usm local-engine user xpfarg privacy-des privacy-password
+system archival configuration archive-sites
+system archival configuration transfer-interval
+system dataplane binary
+system dataplane claim-host-tunables
+system dataplane coalescence adaptive
+system dataplane coalescence rx-usecs
+system dataplane coalescence tx-usecs
+system dataplane cpu-governor
+system dataplane netdev-budget
+system dataplane poll-mode
+system dataplane ring-entries
+system dataplane shared-umem artifact-file
+system dataplane shared-umem interface
+system dataplane shared-umem mode
+system dataplane shared-umem phase0-artifact-file
+system dataplane state-file
+system dataplane workers
+system domain-search
+system host-name
+system license autoupdate url
+system login user xpfarg authentication encrypted-password
+system login user xpfarg authentication ssh-dsa
+system login user xpfarg authentication ssh-ed25519
+system login user xpfarg authentication ssh-rsa
+system master-password pseudorandom-function
+system name-server
+system ntp server
+system root-authentication encrypted-password
+system root-authentication ssh-dsa
+system root-authentication ssh-ed25519
+system root-authentication ssh-rsa
+system services ssh client-alive-count-max
+system services ssh client-alive-interval
+system services ssh connection-limit
+system services ssh key-exchange
+system services ssh root-login
+system services web-management api-auth api-key
+system services web-management http interface
+system services web-management https interface
+system time-zone
