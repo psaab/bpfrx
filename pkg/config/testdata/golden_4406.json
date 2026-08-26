@@ -1260,7 +1260,8 @@
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -2524,7 +2525,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -3788,7 +3790,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -5053,7 +5056,8 @@
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -6317,7 +6321,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -7581,7 +7586,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -8556,7 +8562,8 @@
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -9530,7 +9537,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -10504,7 +10512,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -11479,7 +11488,8 @@
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -12453,7 +12463,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -13427,7 +13438,8 @@
         "zone \"lan\" host-inbound-traffic: system-services dhcp is configured at the ZONE level, which Junos does not allow — DHCP and BOOTP are the host-inbound services Junos accepts only per interface, because the server must know the incoming interface to send replies. Here the zone-level token authorizes DHCP/BOOTP on reth1 (DHCP server), which Junos would require you to admit interface by interface. Move the token to `interfaces \u003cif\u003e host-inbound-traffic system-services ...` on the interfaces that need it — and note a per-interface stanza REPLACES the zone stanza (#6515), so restate the zone's other tokens there or they stop being admitted on that interface. (#6519 parity deviation; xpf still enforces the zone-level authorization today.)",
         "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -13706,7 +13718,8 @@
         "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -13985,7 +13998,8 @@
         "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -14264,7 +14278,8 @@
         "security flow tcp-mss all-tcp: invalid tcp-mss value: not an integer: \"mss\" (treated as unset/0 by the compiler — a strict commit would reject this)",
         "security flow traceoptions file: trace filename \"/etc/passwd\" must be a bare name, not a path (the file is written under /var/log) (ignored: tracing disabled, not written outside /var/log)",
         "application structure (downgraded to warning on tolerant path): application \"appA\": conflicting duplicate \"protocol\"; a single-valued application leaf (protocol / destination-port / source-port / inactivity-timeout / timeout / icmp-type / icmp-code / alg) may be set only once — a repeat with a different value is last-writer-wins and silently keeps only the LAST value by definition order, so a deny referencing this application covers fewer protocol/port combinations than authored and can fall through to a permit (split conflicting values into separate `term` sub-blocks or separate applications)"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -14614,7 +14629,8 @@
         "policy zone reference (downgraded to warning on tolerant path): security policy from-zone \"trust\" to-zone \"untrust\" references undefined from-zone \"trust\"; define `set security zones security-zone trust` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
         "policy from-zone \"trust\": zone not defined",
         "policy to-zone \"untrust\": zone not defined"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -14949,7 +14965,8 @@
         "policy zone reference (downgraded to warning on tolerant path): security policy from-zone \"trust\" to-zone \"untrust\" references undefined from-zone \"trust\"; define `set security zones security-zone trust` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
         "policy from-zone \"trust\": zone not defined",
         "policy to-zone \"untrust\": zone not defined"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },
@@ -15284,7 +15301,8 @@
         "policy zone reference (downgraded to warning on tolerant path): security policy from-zone \"trust\" to-zone \"untrust\" references undefined from-zone \"trust\"; define `set security zones security-zone trust` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
         "policy from-zone \"trust\": zone not defined",
         "policy to-zone \"untrust\": zone not defined"
-      ]
+      ],
+      "LenientNATTerminalActionRules": null
     },
     "error": ""
   },

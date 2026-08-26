@@ -233,6 +233,13 @@ type Config struct {
 	// LENGTH feeds the xpf_frr_route_maps_quarantined gauge. Optional; if nil
 	// the gauge is not published.
 	FRRQuarantinedRouteMapsFn func() []string
+
+	// NATLenientTerminalActionRulesFn returns the identities of NAT rules in
+	// the ACTIVE config that the tolerant path admitted despite the strict
+	// terminal-action cardinality gate (#7640). Its LENGTH feeds the
+	// xpf_nat_rules_lenient_terminal_action gauge. Optional; if nil the gauge
+	// is not published.
+	NATLenientTerminalActionRulesFn func() []string
 	// IPsecRebindPendingFn reports whether the last DHCP-lease-change IPsec
 	// rebind failed and has not yet reconverged — swanctl local_addrs are
 	// bound to a stale lease address while set, so the tunnel cannot
@@ -431,6 +438,7 @@ type Server struct {
 	neighborPhaseAgeFn                   func() map[string]float64
 	frrReloadDegradedFn                  func() bool
 	frrQuarantinedRouteMapsFn            func() []string
+	natLenientTerminalActionRulesFn      func() []string
 	ipsecRebindPendingFn                 func() bool
 	hostInboundConntrackRevocationOwedFn func() bool
 	hostInboundConntrackFlushFailuresFn  func() uint64
@@ -537,6 +545,7 @@ func NewServer(cfg Config) *Server {
 		neighborPhaseAgeFn:                   cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:                  cfg.FRRReloadDegradedFn,
 		frrQuarantinedRouteMapsFn:            cfg.FRRQuarantinedRouteMapsFn,
+		natLenientTerminalActionRulesFn:      cfg.NATLenientTerminalActionRulesFn,
 		ipsecRebindPendingFn:                 cfg.IPsecRebindPendingFn,
 		hostInboundConntrackRevocationOwedFn: cfg.HostInboundConntrackRevocationOwedFn,
 		hostInboundConntrackFlushFailuresFn:  cfg.HostInboundConntrackFlushFailuresFn,

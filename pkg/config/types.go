@@ -333,6 +333,54 @@ type Config struct {
 	EventOptions      []*EventPolicy
 	BridgeDomains     []*BridgeDomainConfig
 	Warnings          []string // non-fatal validation warnings
+
+	// LenientNATTerminalActionRules records every NAT rule the TOLERANT path
+	// admitted despite validateNATTerminalActionCardinalityStrict rejecting it
+	// (#7640). It is populated ONLY on that path — the strict path returns the
+	// error instead, so a non-empty slice means exactly "this config carries a
+	// rule a commit would have refused".
+	//
+	// It exists because the warning alone has nowhere to go on the paths where
+	// such a rule survives. cfg.Warnings reaches an operator through the commit
+	// RESPONSE (pkg/api/config.go, pkg/grpcapi/server_config.go) and an
+	// apply-time log line (pkg/daemon/daemon_apply.go) — and a tolerant LOAD
+	// (boot, peer-sync, rollback) has no commit response. On exactly those
+	// paths the only trace was one startup log line that nothing alerts on.
+	//
+	// Rebuilt per compile by construction: every CompileConfig produces a fresh
+	// *Config, so fixing the config clears it without a separate clear path.
+	// That matters — an alert that keeps firing after the fix gets muted, and a
+	// muted alert is how the next real one is missed.
+	//
+	// Consumers: the xpf_nat_rules_lenient_terminal_action gauge (pkg/api) and
+	// the per-rule annotation in `show security nat {source,destination} rule
+	// detail` (pkg/natshow). Both read THIS field rather than re-deriving, so a
+	// count, an annotation and the warning can never disagree about which rules
+	// are affected.
+	LenientNATTerminalActionRules []LenientNATTerminalActionRule
+}
+
+// LenientNATTerminalActionRule identifies one NAT rule admitted by the tolerant
+// path despite carrying the wrong number of terminal actions (#7640).
+type LenientNATTerminalActionRule struct {
+	// Kind is "source" or "destination".
+	Kind string
+	// RuleSet and Rule are the authored names, so an operator can go straight
+	// to the offending stanza.
+	RuleSet string
+	Rule    string
+	// Actions is the terminal-action count the gate objected to: 0 (actionless
+	// — the rule installs no translation and, for source NAT, does not stop
+	// rule evaluation) or >= 2 (contradictory — all but one action is
+	// discarded by a fixed precedence the operator did not write).
+	Actions int
+}
+
+// String renders the rule identity for the gauge hook and the operator-facing
+// annotation. Stable and greppable: `source rule-set RS rule R (0 actions)`.
+func (r LenientNATTerminalActionRule) String() string {
+	return fmt.Sprintf("%s rule-set %s rule %s (%d actions)",
+		r.Kind, r.RuleSet, r.Rule, r.Actions)
 }
 
 // IRBToBridge returns a mapping of IRB interface reference (e.g. "irb.0") to

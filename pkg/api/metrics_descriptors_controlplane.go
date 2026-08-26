@@ -30,6 +30,23 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"or detached. Alert on > 0.",
 		nil, nil,
 	)
+	c.natRulesLenientTerminalAction = prometheus.NewDesc(
+		"xpf_nat_rules_lenient_terminal_action",
+		"Number of NAT rules in the ACTIVE config that the tolerant load / "+
+			"peer-sync / rollback path admitted despite the strict "+
+			"terminal-action cardinality gate rejecting them (#5628/#7640). "+
+			"Non-zero means this node is running a rule a commit would refuse: "+
+			"an ACTIONLESS rule installs no translation and (source NAT) does "+
+			"not stop rule evaluation, so matching traffic falls through to any "+
+			"later broader rule; a CONTRADICTORY rule has all but one action "+
+			"discarded by a fixed precedence the operator did not write. The "+
+			"warning that reports this at compile time reaches an operator only "+
+			"through a commit response, which a tolerant LOAD does not have — "+
+			"so before this gauge the surviving rules were invisible for the "+
+			"life of the node. Alert on > 0; `show security nat source rule "+
+			"detail` names them.",
+		nil, nil,
+	)
 	c.ipsecRebindPending = prometheus.NewDesc(
 		"xpf_ipsec_rebind_pending",
 		"1 while the last DHCP-lease-change IPsec rebind failed and has "+

@@ -63,9 +63,17 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 	for _, rs := range dnat.RuleSets {
 		for _, rule := range rs.Rules {
 			ruleIdx++
-			action := "off"
-			if rule.Then.PoolName != "" {
+			// #7640: as in the source renderer, do not claim an action the
+			// rule does not carry. This defaulted to "off", so an ACTIONLESS
+			// destination rule displayed as an explicit exemption the operator
+			// never wrote. The observable disposition happens to match (the
+			// builder skips such a rule), but the display asserted intent.
+			action := "none"
+			switch {
+			case rule.Then.PoolName != "":
 				action = "pool " + rule.Then.PoolName
+			case rule.Then.Off:
+				action = "off"
 			}
 			dstMatch := "0.0.0.0/0"
 			if rule.Match.DestinationAddress != "" {

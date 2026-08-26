@@ -347,6 +347,26 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return d.frr.QuarantinedRouteMaps()
 		},
+		// #7640: NAT rules the tolerant load / peer-sync / rollback path
+		// admitted despite the strict terminal-action cardinality gate. Read
+		// from the ACTIVE config, so it tracks what the node is actually
+		// running and clears the moment a fixed config is committed — an alert
+		// that keeps firing after the fix gets muted, and a muted alert is how
+		// the next real one is missed.
+		NATLenientTerminalActionRulesFn: func() []string {
+			if d.store == nil {
+				return nil
+			}
+			cfg := d.store.ActiveConfig()
+			if cfg == nil {
+				return nil
+			}
+			out := make([]string, 0, len(cfg.LenientNATTerminalActionRules))
+			for _, r := range cfg.LenientNATTerminalActionRules {
+				out = append(out, r.String())
+			}
+			return out
+		},
 		// #4899: 1 while the last DHCP-lease-change IPsec rebind
 		// failed and swanctl local_addrs are still bound to a stale
 		// lease address (the retry loop has not reconverged), so the

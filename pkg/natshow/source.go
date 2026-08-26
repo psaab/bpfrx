@@ -66,11 +66,20 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 	for _, rs := range cfg.Security.NAT.Source {
 		for _, rule := range rs.Rules {
 			ruleIdx++
-			action := "interface"
-			if rule.Then.PoolName != "" {
+			// #7640: render the action the rule ACTUALLY carries. This
+			// defaulted to "interface" whenever neither a pool nor `off` was
+			// set — so an ACTIONLESS rule (one the strict gate rejects, and
+			// which a tolerant load can still admit) displayed an action it
+			// does not have and will not perform. That is the worst possible
+			// output for the one rule shape an operator most needs to find.
+			action := "none"
+			switch {
+			case rule.Then.PoolName != "":
 				action = "pool " + rule.Then.PoolName
-			} else if rule.Then.Off {
+			case rule.Then.Off:
 				action = "off"
+			case rule.Then.Interface:
+				action = "interface"
 			}
 			srcMatch := "0.0.0.0/0"
 			if rule.Match.SourceAddress != "" {
@@ -101,6 +110,7 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 						cfg.Security.NAT.SourcePools[rule.Then.PoolName],
 						rule.Then.PoolName, overBudgetPools)))
 			}
+			noteLenientTerminalAction(w, cfg, "source", rs.Name, rule.Name)
 
 			if rule.Then.PoolName != "" && cfg.Security.NAT.SourcePools != nil {
 				if pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; ok {
