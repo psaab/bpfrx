@@ -106329,3 +106329,7 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6824 — add the AST guard that fails on new swanctl-syntax
     containment needles, with its own sensitivity control
   - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go (new)
+  - **Action**: #6824 self-review — the AST guard missed an inline render call
+    as the containment subject; parser section-vs-setting ambiguity documented
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go

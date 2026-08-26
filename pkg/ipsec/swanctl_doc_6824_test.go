@@ -55,6 +55,17 @@ type swanctlNode struct {
 
 // parseSwanctlDoc parses a rendered document into a section tree.
 //
+// One ambiguity is worth stating rather than discovering: a line is classified
+// as a section opener before it is classified as a setting, so a SETTING whose
+// value ends in an open brace (`local_ts = 10.0.0.0/24 {`, reachable only via an
+// unsanitized injected value) is read as a section named
+// `local_ts = 10.0.0.0/24`. The reverse ordering has a mirror-image flaw: a
+// section whose NAME contains an equals sign would be read as a setting. Both
+// orderings fail LOUDLY -- the bogus section leaves the document unbalanced and
+// the end-of-parse check fires -- so the choice is about which message is
+// clearer, not about whether the defect escapes. Neither shape is reachable
+// from a validated config; both are what the sanitize belts exist to prevent.
+//
 // It recognises exactly the line shapes the renderer emits -- `name {`, `}`,
 // `key = value`, comments, blanks. Anything else FAILS rather than being
 // skipped: a line this parser does not recognise is one the renderer emitted

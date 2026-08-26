@@ -114,8 +114,19 @@ func findSwanctlContainment(fset *token.FileSet, f *ast.File) []containmentFindi
 		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "strings" {
 			return true
 		}
-		subject, ok := call.Args[0].(*ast.Ident)
-		if !ok || !rendered[subject.Name] {
+		// The subject may be a bound identifier OR the render call inline --
+		// `strings.Contains(m.generateConfig(cfg), "a = b")` is the same defect
+		// and was missed by an Ident-only check.
+		switch subj := call.Args[0].(type) {
+		case *ast.Ident:
+			if !rendered[subj.Name] {
+				return true
+			}
+		case *ast.CallExpr:
+			if !isRenderCall(subj) {
+				return true
+			}
+		default:
 			return true
 		}
 		lit, ok := call.Args[1].(*ast.BasicLit)
@@ -208,6 +219,11 @@ func TestContainmentGuardSensitivity_6824(t *testing.T) {
 		body string
 		want int
 	}{
+		{
+			name: "render call inline as the subject",
+			body: `_ = strings.Contains(m.generateConfig(cfg), "remote_addrs = 1.1.1.1")`,
+			want: 1,
+		},
 		{
 			name: "setting needle on a render variable",
 			body: `got := m.generateConfig(cfg)
