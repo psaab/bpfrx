@@ -1530,6 +1530,155 @@ the **same UID-file format** as the account registry:
   of `provisionedUsersDir`, so pointing that one package var at a throwaway
   tree relocates all three roots together in tests.
 
+## A failed credential reconcile FAILS THE COMMIT (#6790)
+
+Every reconciler on this page runs from the apply tail
+(`applyTailReconciles`, `pkg/daemon/daemon_apply_tail.go`, steps 11–13):
+
+| step | reconciler | owns |
+|------|------------|------|
+| 11   | `applySystemLogin`         | OS accounts, per-user password, `authorized_keys` |
+| 11b  | `reconcileSudoers`         | `/etc/sudoers.d/xpf-<user>` NOPASSWD grants |
+| 11c  | `reconcileAbsentLoginUsers`| revocation for users removed from config |
+| 12   | `applySSHConfig`           | the sshd drop-in (`PermitRootLogin`, ciphers, …) |
+| 13   | `applyRootAuth`            | root's `/etc/shadow` password + `/root/.ssh/authorized_keys` |
+
+All five were called as `_ = d.<reconciler>(cfg)`. #5874 had already made
+them **return** their accumulated failures, but only the daemon-stop
+cancel closeout (`applyHostAuthorizationCloseout`) collected those
+returns. On the ordinary commit path the returns were **discarded**, so
+a commit reported **success** while:
+
+- the configured operator's account was never created, or their
+  `authorized_keys` was never installed;
+- a super-user's sudo grant was never written — or, on the revoke side,
+  a **demoted** operator's stale NOPASSWD grant was never removed;
+- a **removed** `system login user` kept a live password and
+  `authorized_keys` (the deprovision fails closed and retains its
+  markers to retry, but nothing told the operator the revocation had not
+  happened);
+- the sshd drop-in failed validation and was reverted, so sshd kept the
+  **pre-commit** `PermitRootLogin` posture;
+- root's password or `authorized_keys` did not converge to the committed
+  `system root-authentication`.
+
+Since #6790 the tail **captures** all five returns and joins them into
+the commit result, exactly as its siblings in the same function already
+do — `applyLo0Filter` (#3392), `applyHostInboundFilter` (#3333) and
+`reconcileDNSLocked` (#6792). The prior justification, "the next boot
+re-renders these from the active config so a transient failure
+converges" (the #2926 next-boot contract), does not hold here:
+
+- These are **revocations**, not renderings. The credential stays live
+  until the next reboot — unbounded on an appliance — and there is no
+  dirty-retry owner, ticker, or metric between now and then.
+- The same commit **advances the durable config**, so the next boot
+  renders from a config that already says the user is gone while the box
+  still grants them access.
+- A green commit is the operator's only signal that
+  `delete system login user bob` took effect, and it was unconditional.
+
+Fail-closed, **not** fail-fast: every step still runs, so an sshd reload
+failure never skips root-auth reconciliation. Only the commit *result*
+changes. The config itself is already promoted at this point (as with
+every other tail failure), so the operator sees a failed commit against
+an advanced config and re-commits to retry — the same semantics
+`networkd`/`nft`/DNS failures have had for several releases.
+
+The void-returning steps around them (`applySystemNTP`, `applyHostname`,
+`applySyslogFiles`, …) are deliberately **not** included: those really do
+re-render from the active config on the next apply or boot and carry no
+revocation semantics.
+
+Cells: `pkg/daemon/apply_credential_failclosed_6790_test.go` drives the
+real `applyTailReconciles` with one owner injected to fail per cell, plus
+a healthy control and a both-ends cell proving an early failure does not
+skip a later owner.
+
+### What a credential failure does to each apply caller (#1960 no-brick)
+
+`applyTailReconciles`' return reaches `applyConfigLocked`, which has five
+call sites. Two of them CLASSIFY the error rather than just reporting it,
+so the question that matters is whether a credential failure can make a
+node reject a config:
+
+| call site | what a non-nil return does now | config promoted? |
+|---|---|---|
+| `daemon_apply.go:182` `applyActiveConfigResult` | the feed manager (#5646) does not advance its published-hash, so the next identical refetch retries | yes — unchanged |
+| `daemon_apply.go:191` `applyConfigUnderSem` (boot / DHCP callback / feed / config-poll / rollback) | `slog.Warn` + return; `MarkActiveApplied()` is SKIPPED | yes — unchanged |
+| `daemon_apply_commit.go:254` `applyAndSyncCommitted` (operator commit) | the operator's commit reports failure; the peer push still happens; `MarkActiveApplied()` skipped | yes — `Store.Commit` promoted it upstream |
+| `daemon_apply_commit.go:522` `syncAndApply` (**peer-sync recv**) | the error is returned to `handleConfigSync`, which logs it and returns it so the config high-water does NOT advance and the primary re-pushes | yes — `SyncApply` promoted it BEFORE the apply |
+| `daemon_apply_commit.go:766` commit-confirmed auto-rollback | `slog.Error` only (background timer, no return path); the rollback target is applied unconditionally | yes — `PromoteRollback` already ran |
+
+The peer-sync path is `syncAndApply`, and it does **not** reject. Both it
+and `applyAndSyncCommitted` route the error through
+`applyErrSkipsPeerSync`, which names exactly two fatal classes — a
+required-protocol-gate error (dataplane DISARMED, #2138) and a context
+cancel/deadline (the #2926 daemon-stop abort). Everything else is the
+non-fatal best-effort class that **must** keep syncing, because the config
+is already committed + active and the dataplane armed; suppressing the
+sync there is the divergence #4034 fixed. In `syncAndApply` the same
+classifier decides whether to DISCARD the peer-promoted config, and on the
+non-fatal branch it sets `armedActive = true` and returns the error
+alongside the live config.
+
+So a credential reconcile failure on a standby:
+
+- does **not** roll back or reject the peer-synced config — it stays
+  active and armed;
+- does **not** suppress the primary→standby push on the commit side;
+- **does** leave the applied-digest unstamped, so the primary's next
+  re-push re-enters `syncAndApply` and RETRIES instead of taking
+  `handleConfigSync`'s converged shortcut (#4957/#6296).
+
+That is a retry, not a brick, and it is the same behaviour
+`networkdErr`, `dhcpServerErr`, `hostInboundErr`, `lo0Err` and `dnsErr`
+have had in this join since #3333/#3392/#4034/#6792 — the #4034 and #5564
+comments name "host-inbound/lo0 nft, networkd" as precisely this class.
+
+No `lenient*` compile opt is needed or possible: `pkg/config/compiler_opts.go`
+"carries per-call compilation policy", and every flag in it downgrades the
+severity of a COMPILE-time validator. These are RECONCILE-time failures
+raised after compilation, inside `applyConfigLocked`; there is no compile
+gate to downgrade, and the tolerant path already does not reject.
+
+`TestCredentialFailuresDoNotSkipThePeerSync6790` pins all five owners
+against the REAL errors the reconcilers produce, and
+`TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790` is its paired
+positive control so the classifier cannot degrade to "nothing is fatal".
+
+#### One pre-existing gap, inherited not introduced (#7618)
+
+`exec.CommandContext` has **two** error shapes at a deadline, and only one
+of them is safe here:
+
+- the process **started** and was killed at the deadline → `*exec.ExitError`
+  ("signal: killed"), which is not a context error → correctly non-fatal;
+- the context expired **before fork/exec completed** → `Start` returns
+  `ctx.Err()`, so the caller gets a **bare `context.DeadlineExceeded`** →
+  `applyErrSkipsPeerSync` cannot tell it from the #2926 daemon-stop abort
+  and classifies it FATAL, suppressing the push (or discarding a
+  peer-promoted config).
+
+Which shape you get depends on whether fork/exec wins the race with the
+deadline — i.e. on machine load. This was observed for real: the cell that
+originally drove a live command against a short deadline passed unloaded
+and failed under a loaded full-package run.
+
+The gap is **not** specific to the credential reconcilers. Every apply-path
+command runner builds its own short context — `nftApplyPayload` (5s,
+feeding `lo0Err`/`hostInboundErr` since #3392/#3333) and `daemon_dns.go`'s
+`systemctl disable/mask` (feeding `dnsErr` since #6792) — so the same
+misclassification already reaches the same classifier through operands that
+predate #6790. #6790 adds members to an already-exposed population rather
+than creating the exposure, and fixing the classifier changes behaviour for
+those older operands, so it is tracked separately as #7618.
+
+Until then it is a tripwire, not folklore:
+`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserts the
+CURRENT (wrong) classification, so the fix reds a named cell and must
+invert it and this section together.
+
 ## Idempotency
 
 The password apply reads `/etc/shadow` directly and skips `chpasswd`
