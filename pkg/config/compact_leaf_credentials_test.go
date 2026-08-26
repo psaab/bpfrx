@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -193,3 +194,53 @@ func ospfIface6818(t *testing.T, cfg *Config, spelling string) *OSPFInterface {
 }
 
 // secLogStream6821 resolves a security-log stream by name.
+
+// TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818 pins the guard on
+// packedBodyChildren's deep attachment.
+//
+// The helper attaches a node's real children UNDER the deepest node of the
+// expanded packed tail, which is what the grammar means for
+// `authentication md5 7 { key "x"; }`. It is NOT what the grammar means when
+// the terminal is a LEAF: `stanza leaf value { body }` describes no nesting the
+// schema has, and attaching there would invent one.
+//
+// Both directions matter, so both are cells. Without the permits-a-body case,
+// a guard that refused every attachment would pass the refusal case and
+// silently reintroduce the empty-MD5-key defect; without the refusal case, the
+// guard could be deleted with nothing noticing.
+func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
+	t.Run("terminal PERMITS a body: the block attaches under it", func(t *testing.T) {
+		// `md5 7` takes a `key` child, so the nested block belongs under it.
+		compact, block := compileBothSpellings(t,
+			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication md5 7 { key "k"; } } } } }`,
+			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication { md5 7 { key "k"; } } } } } }`)
+		for name, cfg := range map[string]*Config{"packed": compact, "nested": block} {
+			iface := ospfIface6818(t, cfg, name)
+			if string(iface.AuthKey) != "k" {
+				t.Errorf("%s: AuthKey = %q, want \"k\" — the guard must not refuse an "+
+					"attachment the grammar allows, or the empty-MD5-key defect returns",
+					name, string(iface.AuthKey))
+			}
+		}
+	})
+
+	t.Run("three-level chain still attaches", func(t *testing.T) {
+		// `from flexible-match-range range r { byte-offset 9; }` expands through
+		// three levels and its terminal does take a body. Chain LENGTH was never
+		// the question; whether the terminal holds a body is.
+		compact, block := compileBothSpellings(t,
+			`firewall { family inet { filter f { term t { from flexible-match-range range r { byte-offset 9; } } } } }`,
+			`firewall { family inet { filter f { term t { from { flexible-match-range { range r { byte-offset 9; } } } } } } }`)
+		if !cfgEqualFirewall6818(compact, block) {
+			t.Error("the packed three-level chain compiled differently from the fully " +
+				"nested spelling; the guard is refusing an attachment the grammar allows")
+		}
+	})
+}
+
+// cfgEqualFirewall6818 compares the compiled firewall section of two configs.
+func cfgEqualFirewall6818(a, b *Config) bool {
+	ja, errA := json.Marshal(a.Firewall)
+	jb, errB := json.Marshal(b.Firewall)
+	return errA == nil && errB == nil && string(ja) == string(jb)
+}

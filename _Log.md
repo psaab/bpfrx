@@ -106329,3 +106329,7 @@ prose edit above them added. No diff falls in the new test body.
     pkg/config/compact_leaf_credentials_test.go,
     pkg/config/testdata/compact_block_divergences_2419.txt,
     docs/config-schema.md
+  - **Action**: #6818 — guard packedBodyChildren's deep attachment on the
+    terminal schema node permitting a body (Codex re-review finding 1)
+  - **File(s)**: pkg/config/compact_tail.go,
+    pkg/config/compact_leaf_credentials_test.go

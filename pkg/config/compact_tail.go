@@ -141,8 +141,25 @@ func packedBodyChildren(node *Node, schema *schemaNode) []*Node {
 	// overwrite the real `tls` child, silently downgrading an audit stream from
 	// TLS to plaintext.
 	//
-	// The nested block belongs UNDER the deepest packed node, which is what the
-	// grammar means and what consumeNodeKeys has already located for us.
+	// The nested block belongs UNDER the deepest packed node -- but only if the
+	// grammar says that node can HOLD one.
+	//
+	// `cur` is the schema the last consumeNodeKeys refined to, i.e. the terminal
+	// node's own schema. If it declares neither children nor a wildcard, it is a
+	// leaf, and `stanza leaf value { body }` is not a shape the grammar
+	// describes. Attaching there would invent a nesting the schema does not
+	// have; returning the real children unexpanded is the same "outside the
+	// modelled grammar, do not guess" answer this function already gives when
+	// resolveSchemaChild comes back nil.
+	//
+	// Verified rather than assumed: the three-level
+	// `from flexible-match-range range r { byte-offset 9; }` chain DOES permit a
+	// body at its terminal, and compiles identically to the fully nested
+	// spelling. Chain length was never the question; whether the terminal takes
+	// a body is.
+	if cur == nil || (len(cur.children) == 0 && cur.wildcard == nil) {
+		return node.Children
+	}
 	last.Children = append([]*Node(nil), node.Children...)
 	return []*Node{head}
 }
