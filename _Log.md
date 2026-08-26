@@ -32,8 +32,13 @@
   `pkg/daemon/service_reload_debt_6800_test.go` (new),
   `pkg/daemon/README.md`
 - **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0.
-  14-cell mutation matrix, one reverted production line per cell, every cell run
-  full-package with no `-run` filter.
+  20-cell mutation matrix, 20/20 RED, one reverted production line per cell,
+  every cell run full-package (`go test -count=1 ./pkg/daemon/`) with no `-run`
+  filter. The first pass reported one SURVIVED cell — the aggregate debt re-read
+  inside the semaphore — which was correct: it was redundant with the
+  per-service gates that follow it. Removed the redundant line and bound the
+  per-service gates instead, with a paired one-owes/one-quiet cell in both
+  directions.
 
 ## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
 
