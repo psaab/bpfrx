@@ -1,3 +1,56 @@
+## 2026-08-26 — #7640: a leniently-admitted malformed NAT rule is now visible
+
+- **Timestamp**: 2026-08-26
+- **Action**: The strict terminal-action cardinality gate (#5628) rejects a NAT
+  rule whose `then` carries other than exactly one action; the tolerant path
+  downgrades that to `cfg.Warnings` (#1960 no-brick). Traced where that warning
+  can actually go: the commit RESPONSE (`pkg/api/config.go`,
+  `pkg/grpcapi/server_config.go`) and an apply-time log line
+  (`pkg/daemon/daemon_apply.go`). A tolerant LOAD — boot, peer-sync, rollback —
+  has no commit response, and those are exactly the paths on which such a rule
+  survives. The node then ran indefinitely carrying a rule a commit would refuse
+  with one startup log line as the only trace.
+  Added `Config.LenientNATTerminalActionRules`, populated ONLY on the lenient
+  branch (so a non-empty slice means precisely "admitted leniently"), plus the
+  `xpf_nat_rules_lenient_terminal_action` gauge and a per-rule annotation in
+  `show security nat {source,destination} rule detail`. Both consumers read the
+  FIELD rather than re-deriving, so a count, an annotation and the warning can
+  never disagree about which rules are affected. Rebuilt per compile by
+  construction (each CompileConfig makes a fresh *Config), so fixing the config
+  clears it with no separate clear path.
+  The enumerator is separate from the gate on purpose — the gate reports the
+  FIRST offender and stops, which is right for a commit error, while the record
+  needs all of them — so they share `natThenTerminalActionCount` and a test
+  binds the agreement over 7 arity shapes rather than trusting it.
+  Found a display defect next to the annotation site and fixed it: the source
+  action string defaulted to `"interface"` whenever neither a pool nor `off` was
+  set, so an ACTIONLESS rule rendered `Action: interface` — an action it does
+  not carry, on exactly the rule shape an operator is trying to find. DNAT
+  defaulted to `"off"` with the same problem. Both now render `none`.
+  DECISION-NEUTRAL by design: this forecloses none of #6823's options A/B/C and
+  is what converts its crux question — how many real configs reach this state —
+  from an estimate into a measurement.
+- **File(s)**: `pkg/config/types.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_uniformgates_firewall_nat2.go`,
+  `pkg/config/nat_lenient_terminal_visibility_7640_test.go` (new),
+  `pkg/config/testdata/golden_4406.json`, `pkg/natshow/natshow.go`,
+  `pkg/natshow/source.go`, `pkg/natshow/dest.go`,
+  `pkg/natshow/nat_lenient_terminal_annotation_7640_test.go` (new),
+  `pkg/api/metrics.go`, `pkg/api/server.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/metrics_nat_lenient_terminal_7640_test.go` (new),
+  `pkg/daemon/daemon_run_servers.go`, `_Log.md`
+- **Golden**: `golden_4406.json` regenerated only AFTER classifying the diff —
+  18 keys added, all `LenientNATTerminalActionRules`, all empty; 0 removed; 0
+  values changed. Benign by the add-only/no-value-change rule, so no behaviour
+  change is being laundered through the regen.
+- **Validation**: gauge bound on a pedantic registry across healthy/one/several
+  plus the unwired-is-absent cell; annotation bound with a paired
+  healthy-not-annotated control and a scoped-to-the-named-rule cell (a
+  tolerantly-loaded config carries good rules too, and annotating those is the
+  same noise as annotating everything).
+
 ## 2026-08-26 — #6810: a queue-full drop no longer consumes a threshold crossing
 
 - **Timestamp**: 2026-08-26

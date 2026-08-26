@@ -208,6 +208,11 @@ type xpfCollector struct {
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
+	// #7640: gauge — NAT rules the tolerant path admitted despite the strict
+	// terminal-action cardinality gate. Non-zero means the node is running a
+	// rule a commit would have refused, on a path with no commit response to
+	// report it.
+	natRulesLenientTerminalAction *prometheus.Desc
 	// #6807: gauge — how many route-maps the last rendered FRR managed
 	// section replaced with the bounded explicit deny because their
 	// expansion would overflow FRR's sequence ceiling. Non-zero is an
@@ -779,6 +784,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
 	ch <- c.frrRouteMapsQuarantined
+	ch <- c.natRulesLenientTerminalAction
 	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
@@ -1087,6 +1093,17 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
 			prometheus.GaugeValue, v)
+	}
+
+	// #7640: NAT rules admitted by the tolerant path despite the strict
+	// terminal-action gate. Reported UNCONDITIONALLY when the hook is wired —
+	// an explicit 0 on a healthy node, so an alert on `> 0` can distinguish
+	// "none admitted" from "the exporter stopped reporting this series". ABSENT
+	// when unwired: a hardcoded 0 from a process that never consulted the
+	// active config is a false all-clear.
+	if c.srv.natLenientTerminalActionRulesFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.natRulesLenientTerminalAction,
+			prometheus.GaugeValue, float64(len(c.srv.natLenientTerminalActionRulesFn())))
 	}
 
 	// #6807: quarantined route-maps. Reported UNCONDITIONALLY when the hook

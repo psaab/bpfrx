@@ -35,6 +35,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/psaab/xpf/pkg/config"
+
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -70,6 +72,52 @@ func noteNotInstalled(w io.Writer, reason string) {
 		return
 	}
 	fmt.Fprintf(w, "    Status:                  NOT INSTALLED — %s\n", reason)
+}
+
+// noteLenientTerminalAction annotates a rule that the TOLERANT config path
+// admitted despite the strict terminal-action cardinality gate rejecting it
+// (#7640).
+//
+// It reads config.Config.LenientNATTerminalActionRules rather than re-deriving
+// the predicate, so the annotation, the xpf_nat_rules_lenient_terminal_action
+// gauge and the compile-time warning can never disagree about which rules are
+// affected.
+//
+// This is the surface that was missing. The warning reaches an operator through
+// the commit RESPONSE and an apply-time log line — and a tolerant LOAD (boot,
+// peer-sync, rollback) has neither. Those are exactly the paths on which such a
+// rule survives, so an operator looking at the rule was the one person
+// guaranteed not to be told.
+//
+// The text names the consequence per arity rather than saying "invalid",
+// because the two arities fail differently and the difference is what an
+// operator has to act on.
+func noteLenientTerminalAction(w io.Writer, cfg *config.Config, kind, ruleSet, rule string) {
+	if cfg == nil {
+		return
+	}
+	for _, r := range cfg.LenientNATTerminalActionRules {
+		if r.Kind != kind || r.RuleSet != ruleSet || r.Rule != rule {
+			continue
+		}
+		var consequence string
+		switch {
+		case r.Actions == 0 && kind == "source":
+			consequence = "it installs no translation and does NOT stop rule " +
+				"evaluation, so matching traffic falls through to any later " +
+				"broader rule"
+		case r.Actions == 0:
+			consequence = "it installs no translation; the rule is not published " +
+				"to the dataplane at all"
+		default:
+			consequence = fmt.Sprintf("it carries %d mutually-exclusive actions; "+
+				"all but one are discarded by a fixed precedence, not by "+
+				"configuration order", r.Actions)
+		}
+		fmt.Fprintf(w, "    Status:                  ADMITTED BY TOLERANT LOAD — "+
+			"a commit would REJECT this rule: %s\n", consequence)
+		return
+	}
 }
 
 // noteNotInstalledStatic is noteNotInstalled at the static-NAT renderers' wider

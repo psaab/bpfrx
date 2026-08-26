@@ -270,6 +270,14 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		if opts.lenientNATTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("NAT terminal-action cardinality (downgraded to warning on tolerant path): %v", err))
+			// #7640: record EVERY offender, not just the one the warning names.
+			// The warning goes to the commit response and an apply-time log
+			// line; a tolerant LOAD (boot, peer-sync, rollback) has neither a
+			// commit response nor anything that survives the log, so without
+			// this the surviving rules are invisible for the life of the node.
+			// Set only here, so a non-empty slice means precisely "admitted
+			// leniently" — the strict branch below returns instead.
+			cfg.LenientNATTerminalActionRules = natTerminalActionCardinalityOffenders(cfg)
 		} else {
 			return err
 		}
