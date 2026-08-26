@@ -106317,3 +106317,7 @@ prose edit above them added. No diff falls in the new test body.
     state that the !exactMatch guard has no current instance
   - **File(s)**: pkg/config/syslog_facility_keyvalidator_6844_test.go,
     pkg/config/schema_walk.go
+  - **Action**: #6844 — a #5797 tripwire fired as designed; re-derived that the
+    render belt is still load-bearing on the tolerant load path
+  - **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/daemon/daemon_system.go

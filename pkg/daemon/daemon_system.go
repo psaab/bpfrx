@@ -1218,7 +1218,7 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// SchemaValidate, compiles, and lands here verbatim from an ORDINARY
 			// operator commit. This belt is the only thing between that string
 			// and a written rsyslog directive.
-			// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 pins that
+			// TestSyslogRenderUnsafeFacilityIsLoadReachable_5797 pins that
 			// chain end to end.
 			//
 			// This is deliberately a SHAPE check, not a facility-name allowlist.
