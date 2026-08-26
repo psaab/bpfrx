@@ -1,7 +1,6 @@
 package ipsec
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -50,19 +49,24 @@ func TestProposalSetStandardRenders_4297(t *testing.T) {
 		"set security ipsec vpn tun1 ike gateway gw1",
 		"set security ipsec vpn tun1 ike ipsec-policy esp-pol",
 	})
-	out := New().generateConfig(prepared)
-	if !strings.Contains(out, "tun1 {") {
-		t.Fatalf("proposal-set standard tunnel missing from render:\n%s", out)
-	}
+	conn := parseSwanctlDoc(t, New().generateConfig(prepared)).at(t, "connections", "tun1")
+
 	// Phase-1: 3des-sha1-modp1024 (group2) and aes128-sha1-modp1024, comma-joined.
-	if !strings.Contains(out, "3des-sha1-modp1024") || !strings.Contains(out, "aes128-sha1-modp1024") {
-		t.Errorf("IKE proposals line missing the standard set members:\n%s", out)
+	conn.requireMembers(t, "proposals", "3des-sha1-modp1024", "aes128-sha1-modp1024")
+
+	// Phase-2: 3des-sha1 and aes128-sha1, on the CHILD section.
+	//
+	// #6824: the old spelling asked whether "3des-sha1" appeared anywhere in
+	// the document -- which the Phase-1 member `3des-sha1-modp1024` satisfies
+	// on its own. That assertion passed whether or not esp_proposals carried
+	// the ESP set, or existed at all. Membership in the split value of
+	// esp_proposals at a known path cannot be satisfied by the Phase-1 line
+	// nor by a longer token that merely starts the same way.
+	kids := conn.at(t, "children")
+	if len(kids.order) != 1 {
+		t.Fatalf("expected exactly one child SA section, got %v\n%s", kids.childNames(), kids)
 	}
-	// Phase-2: 3des-sha1 and aes128-sha1.
-	if !strings.Contains(out, "esp_proposals = ") ||
-		!strings.Contains(out, "3des-sha1") || !strings.Contains(out, "aes128-sha1") {
-		t.Errorf("esp_proposals line missing the standard ESP set members:\n%s", out)
-	}
+	kids.at(t, kids.order[0]).requireMembers(t, "esp_proposals", "3des-sha1", "aes128-sha1")
 }
 
 // V-1: suiteb-gcm-128 renders the RFC 6379 AEAD tokens (aes128gcm16 + ecp256).
@@ -77,13 +81,16 @@ func TestProposalSetSuiteB128Renders_4297(t *testing.T) {
 		"set security ipsec vpn tun1 ike gateway gw1",
 		"set security ipsec vpn tun1 ike ipsec-policy esp-sb",
 	})
-	out := New().generateConfig(prepared)
-	if !strings.Contains(out, "aes128gcm16-prfsha256-ecp256") {
-		t.Errorf("IKE suiteb-gcm-128 proposal token missing:\n%s", out)
+	conn := parseSwanctlDoc(t, New().generateConfig(prepared)).at(t, "connections", "tun1")
+	// #6824: `aes128gcm16-ecp256` is not a substring of
+	// `aes128gcm16-prfsha256-ecp256`, so the two old needles did not collide --
+	// but neither said WHICH line carried its token. Pin the phase.
+	conn.requireMembers(t, "proposals", "aes128gcm16-prfsha256-ecp256")
+	kids := conn.at(t, "children")
+	if len(kids.order) != 1 {
+		t.Fatalf("expected exactly one child SA section, got %v\n%s", kids.childNames(), kids)
 	}
-	if !strings.Contains(out, "aes128gcm16-ecp256") {
-		t.Errorf("ESP suiteb-gcm-128 proposal token missing:\n%s", out)
-	}
+	kids.at(t, kids.order[0]).requireMembers(t, "esp_proposals", "aes128gcm16-ecp256")
 }
 
 // V-2: a VPN whose ipsec-policy resolves to a `protocol ah` proposal is
@@ -111,11 +118,7 @@ func TestRenderConfig_AHProposalSkipsVPN_4298(t *testing.T) {
 			"tun-esp": {Name: "tun-esp", Gateway: "gw-esp", IPsecPolicy: "esp-pol"},
 		},
 	}
-	out := New().generateConfig(cfg)
-	if strings.Contains(out, "tun-ah {") {
-		t.Errorf("AH VPN tun-ah must be skipped (never fabricated ESP):\n%s", out)
-	}
-	if !strings.Contains(out, "tun-esp {") {
-		t.Errorf("healthy ESP VPN tun-esp missing from render:\n%s", out)
-	}
+	conns := parseSwanctlDoc(t, New().generateConfig(cfg)).at(t, "connections")
+	conns.hasNoChild(t, "tun-ah")
+	conns.at(t, "tun-esp")
 }
