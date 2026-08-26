@@ -68,6 +68,35 @@ func TestFenceDebtSurvivesAnInFlightApply6799(t *testing.T) {
 			"nothing re-arms it — the RG never re-drives and forwarding stays wherever the fence " +
 			"left it, which is exactly the failure #6530 was written to prevent (#6799)")
 	}
+
+	// PERSISTENCE, not just the instant. Checking NeedsApply() immediately after
+	// the race proves only that the debt existed at that moment; the defect is
+	// that it never comes BACK. Drive further reconcile passes — the 2s loop's
+	// steady state, same desired value, nothing applied — and the debt must
+	// still be owed, because nothing has successfully converged. A fix that let
+	// the debt lapse on a later tick, or one that only deferred the erasure by a
+	// pass, would satisfy a snapshot assertion and fail here.
+	for i := 0; i < 3; i++ {
+		s.Reconcile(true, nil)
+		if !s.NeedsApply() {
+			t.Fatalf("the retry debt lapsed after %d further reconcile pass(es) with nothing "+
+				"applied. It must persist until an apply is actually ACCEPTED — otherwise the RG "+
+				"stops re-driving while still un-converged (#6799)", i+1)
+		}
+	}
+
+	// And it must not persist FOREVER: a genuine, uncontested apply clears it.
+	// Without this the cell would be satisfied by a fix that simply never
+	// clears applyPending, which would re-drive SetRGActive on every 2s tick
+	// and hold the failover-readiness gate low permanently.
+	fresh := s.Reconcile(true, nil)
+	if !s.RecordApplied(fresh, fresh.Active) {
+		t.Fatal("an uncontested apply on a current transition must be recorded")
+	}
+	if s.NeedsApply() {
+		t.Error("a recorded, uncontested apply must clear the retry debt; a debt that never " +
+			"clears re-drives every tick forever and holds failover readiness low")
+	}
 }
 
 // TestEpochAloneCannotDetectTheFenceRace6799 pins WHY the fix is keyed on the
