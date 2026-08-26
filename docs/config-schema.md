@@ -162,6 +162,75 @@ stop running — no failure, just unvalidated config again.
 `TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
 cannot rot into a tripwire that never fires.
 
+### The rule reaches TYPED LEAVES too (#6844)
+
+#6834 installed the wildcard-identity check in `walkSchemaNode`'s **container**
+branch. The **typed-leaf** branch returns before that point, so a wildcard node
+that is a typed leaf validated its VALUE and never its identity.
+
+`system syslog <dest> <facility> <severity>` is exactly that shape — the
+facility is the wildcard key, the severity is the value. The severity has been
+enum-gated since #2008; the facility accepted anything, so
+
+```
+set system syslog file audit "daemon;*.* /tmp/pwn" info
+```
+
+passed `SchemaValidate` and committed. #6829 belts the RENDER site, so nothing
+injected reaches rendered rsyslog configuration — but the commit path told the
+operator nothing and their configuration silently did not do what it said.
+
+The typed-leaf branch now runs the same `!exactMatch` identity check, and
+`exactMatch` is hoisted above it: still one computation, now three readers.
+
+`ValidateSyslogFacility` **delegates to the render belt's own predicate**
+(`config.SyslogSelectorFacilitySafe`) rather than carrying its own alphabet.
+`pkg/daemon` imports `pkg/config`, so the rule lives here and the belt calls it —
+what the commit path ACCEPTS and what the render path WRITES are one set by
+construction.
+
+That matters because the first cut did carry its own alphabet, and it was wrong
+in both directions at once: it rejected `auth,authpriv` and bare `*` (rsyslog-native,
+documented, render-asserted, so valid configs would have stopped committing) while
+admitting `.` and `_`, which the belt drops — leaving the
+"commit succeeds, destination disappears" class the gate exists to close still
+open. `TestCommitGateAndRenderBeltAcceptTheSameFacilities_6844` binds the
+agreement over a derived corpus, with anti-vacuity floors in both directions and
+the only two licensed disagreements (empty, and the length bound) named so a
+third cannot hide among them.
+
+It is not membership of a facility enum, deliberately. The Junos vocabulary already lives in `pkg/logging`, and
+`pkg/logging` imports `pkg/config` (`trace.go`), so the two cannot be
+single-sourced without a new leaf package. Two independently maintained copies
+drift, and the drift is silent in the direction that REJECTS a valid operator
+config the renderer maps correctly — worse than accepting an unknown but
+well-formed name, which #6830 already diagnoses at render, by name. The alphabet
+matches `syslogNameRE`'s because the facility is formatted into the same
+rendered drop-in body.
+
+No new lenient opt is needed. The #1319 split already bounds it: `SchemaValidate`
+is strict only on the operator-driven commit path, and `Store.compileTreeLenient`
+downgrades a violation to a warning on the tolerant `Load` / `SyncApply` ingress,
+so a persisted or peer-synced config still boots (#1960). A cell pins that
+boundary by asserting the COMPILER still accepts the value — if the rejection
+migrated into `CompileConfig` it would become unconditional and blackout-boot the
+node.
+
+The strictness boundary is proved rather than asserted:
+`pkg/configstore`'s `TestLoadToleratesAnInjectableSyslogFacility_6844` drives the
+real `Store.Load` and requires the node to boot with an active config, paired
+with a commit-check cell that requires the same value to be rejected. Without the
+pair, "Load tolerates it" is satisfied by a build where nothing rejects it
+anywhere — the pre-#6844 state.
+
+`TestWildcardTypedLeafKeyValidatorInventory_6844` enumerates every leaf the new
+rule reaches — the three system-syslog destinations and nothing else today — so
+adding a `keyValidator` to a wildcard typed leaf is a deliberate edit rather than
+a config that quietly stops committing. It reads schema METADATA, so it cannot
+see whether the rule actually RUNS —
+`TestWildcardTypedLeafKeyValidatorRuleIsWired_6844` drives all three destinations
+through the real gate and is the half that reds when the walker hunk is reverted.
+
 ### `interfaces <name>` is the first typed wildcard identity
 
 The interface name is interpolated into four sites in the generated systemd

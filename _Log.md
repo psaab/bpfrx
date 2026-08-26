@@ -106450,6 +106450,31 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: userspace-dp/src/screen/mod.rs,
     userspace-dp/src/afxdp/poll_stages.rs,
     userspace-dp/src/afxdp/poll_stages_tests.rs, docs/feature-coverage.md
+  - **Action**: #6844 — key-validate the system-syslog facility wildcard; extend
+    the #6834 wildcard-identity rule to typed leaves
+  - **File(s)**: pkg/config/schema_walk.go, pkg/config/schema_system.go,
+    pkg/config/schema_validators_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go (new),
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go (new),
+    docs/config-schema.md
+  - **Action**: #6844 — matrix findings: add the untested length-bound cell,
+    state that the !exactMatch guard has no current instance
+  - **File(s)**: pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/schema_walk.go
+  - **Action**: #6844 — a #5797 tripwire fired as designed; re-derived that the
+    render belt is still load-bearing on the tolerant load path
+  - **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/daemon/daemon_system.go
+  - **Action**: #6844 — act on the Codex review: single-source the selector
+    predicate so commit-accepts == render-writes, de-vacuum the fixtures, fix
+    the inventory dedup/predicate, prove the tolerant path at configstore
+  - **File(s)**: pkg/config/schema_validators_system.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go,
+    pkg/daemon/syslog_gate_render_agreement_6844_test.go (new),
+    pkg/configstore/syslog_facility_lenient_6844_test.go (new),
+    pkg/daemon/syslog_selector_render_5797_test.go, docs/config-schema.md
   - **Action**: #6830 takeover — take the contract decision and wire the
     documented Junos facility table into the emit path; invert the tripwires
   - **File(s)**: pkg/logging/syslog.go,
