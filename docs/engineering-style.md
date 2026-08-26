@@ -465,6 +465,15 @@ Rules of thumb:
 - **A tool-gated leg that SKIPs is a green that measured nothing.** Say
   whether it ran. `nft`-dependent parity, cargo legs, cluster smoke:
   report tests-collected, not just `ok`.
+- **Format the files you TOUCHED, never a directory.** `gofmt -w pkg/daemon`
+  reformatted **12 pre-existing unformatted files** a lane had never
+  touched, silently widening its diff. Master carries unformatted files,
+  so `gofmt -w` on a directory is not idempotent with respect to your
+  change in this repo specifically — and a widened diff is how an
+  unrelated change rides in unreviewed. Use `gofmt -w <file>...`. If it
+  has already happened, recover by filtering: for each modified `.go`,
+  if its diff adds none of your change's identifiers,
+  `git checkout HEAD -- <file>`.
 - **Two independent review surfaces.** Codex (hostile, design-level)
   and Copilot (inline, mechanical-detail) catch different classes of
   bugs. Treat them as separate passes; do not skip either. Codex
