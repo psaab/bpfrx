@@ -105423,3 +105423,39 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/host_tunables.go`, `pkg/daemon/host_tunables_daemon.go`,
   `pkg/daemon/rss_indirection.go`, `pkg/daemon/README.md`,
   `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+## 2026-08-26 — #6816: the ctrl-enable cleanup read a session ID as a timestamp
+
+- **Timestamp**: 2026-08-26
+- **Action**: Derive the session-value `Created` offset from the ABI struct and
+  fix the initial-control cleanup that had it wrong.
+- **Why**: `pkg/dataplane/userspace/helper_status_apply.go` decoded `Created`
+  from bytes `[16:24]` of the raw BPF map value, justified by an in-comment sum
+  `State(1)+Flags(1)+TCPState(1)+IsReverse(1)+AppTimeout(4)+SessionID(8)=16`.
+  That sum is wrong twice over: `Flags` has been a `uint16` since #5460, and the
+  struct carries three explicit padding gaps (#6082) it omits entirely.
+  `SessionID` is at 16; `Created` is at 24. So on every ctrl enable the
+  keep-or-delete decision for synced sessions compared a SESSION ID against a
+  seconds-since-boot cutoff — a decision made on a number that is not a
+  timestamp, with no error and no log to show for it.
+- **The issue's cite had rotted**: it named `maps_sync.go:609`, which is now an
+  unrelated per-CPU stats loop. The code moved to `helper_status_apply.go` in
+  the #6429 split. Re-derived by searching for the decode itself rather than
+  trusting the line number.
+- **Fix shape — derive, do not re-type**: `SessionValueCreatedOffset` /
+  `SessionValueSessionIDOffset` are exported from `bpf_session_value.go` via
+  `unsafe.Offsetof`. The offset and the layout MUST agree, and a derived value
+  cannot disagree; a literal can, and this one did for as long as it took two ABI
+  changes to move the field out from under it.
+- **Test shape**: asserting `SessionValueCreatedOffset == 24` would be a
+  tautology against `unsafe.Offsetof` — it can only fail if the compiler is
+  wrong. The cells assert the DISCRIMINATOR instead: that Created and SessionID
+  are different offsets, that decoding at the exported offset returns the value
+  the struct stored (paired both ways, so two offsets both pointing at Created
+  cannot satisfy it), and that bytes `[16:24]` decode to the SESSION ID — which
+  records the defect's mechanism as an executable fact, and reds if a future
+  layout change makes the old narrative stale.
+- **File(s)**: `pkg/dataplane/bpf_session_value.go`,
+  `pkg/dataplane/userspace/helper_status_apply.go`,
+  `pkg/dataplane/session_value_offsets_6816_test.go` (new),
+  `pkg/dataplane/README.md`, `_Log.md`
