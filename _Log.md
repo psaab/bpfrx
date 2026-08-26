@@ -1,3 +1,45 @@
+## 2026-08-26 — #6790: the normal apply joins the five credential-reconcile failures
+
+- **Timestamp**: 2026-08-26
+- **Action**: `applyTailReconciles` ran the five host-credential reconcilers as
+  `_ = d.applySystemLogin/reconcileSudoers/reconcileAbsentLoginUsers/
+  applySSHConfig/applyRootAuth(cfg)`. #5874 had already made all five RETURN
+  their accumulated failures, but only the daemon-stop cancel closeout
+  collected them — the ordinary commit path threw them away, so
+  `delete system login user bob` reported SUCCESS while bob's password and
+  `authorized_keys` were still live, a demoted operator kept a stale NOPASSWD
+  grant, a reverted sshd drop-in kept the pre-commit `PermitRootLogin`, and
+  root's key set never converged. Captured all five and joined them into the
+  tail `errors.Join`, matching the three siblings in the SAME function that
+  already fail closed (`applyLo0Filter` #3392, `applyHostInboundFilter` #3333,
+  `reconcileDNSLocked` #6792).
+  Rejected the standing justification rather than assuming it: "the next boot
+  re-renders login/sudoers/SSH/root-auth so a transient failure converges" is
+  a RENDERING argument applied to a REVOCATION. Nothing retries before the
+  reboot (no dirty-retry owner, no ticker, no metric), the same commit already
+  advanced the durable config, and the green commit was the operator's only
+  signal. Fail-closed, NOT fail-fast: no early return was added, so an sshd
+  failure still cannot skip root-auth — bound by its own cell.
+  Also corrected three now-false doc claims that said the normal apply path
+  ignores these returns (`daemon_system.go` applySystemLogin,
+  `login_password.go` reconcileAbsentLoginUsers + deprovisionLoginUser) and the
+  `applyHostAuthorizationCloseout` comment that implied the cancel path was
+  still the only collector.
+- **File(s)**: `pkg/daemon/daemon_apply_tail.go`, `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/login_password.go`,
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: 7 new cells drive the REAL `applyTailReconciles` with exactly
+  ONE owner injected to fail (id/useradd refused; unwritable sudoers dir;
+  unreadable `/etc/passwd` for a marked-but-removed account; `sshd -t`
+  rejecting; an ENOTDIR marker root) plus a healthy PAIRED control and a
+  two-failure cell. Each keys on a substring unique to its owner, so dropping
+  that owner's operand from the join reds that cell alone. Mutation matrix:
+  5/5 per-owner reverts to `_ =` red their named cell, and the control stays
+  green. Repo-wide `go build ./... && go test -count=1 ./...` rc 0. No
+  cluster/VRRP/session-sync/failover code touched, so no `make test-failover`
+  is owed.
+
 ## 2026-08-22 — #6834: typed wildcard identity slots, and the interface-name gate
 
 - **Timestamp**: 2026-08-22

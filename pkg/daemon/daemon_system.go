@@ -1373,12 +1373,12 @@ func reconcileSyslogDropins(confDir, prefix string, desired map[string]string) b
 // from config. It stays best-effort — a per-user failure is logged and the
 // loop continues to the next user — but it now also ACCUMULATES those
 // failures into the returned error so a caller that needs to know whether the
-// reconcile actually converged (the #5874 cancel closeout) can see them. On
-// the normal apply path the return is intentionally ignored: the next boot
-// re-renders login from the active config, so a transient failure converges
-// (the #2926 next-boot contract). Pure defensive skips (an invalid username
-// refused before any mutation) are NOT accumulated — they are the safe
-// outcome, not an incomplete reconcile.
+// reconcile actually converged (the #5874 cancel closeout) can see them.
+// #6790: the NORMAL apply path now joins this return into the commit result
+// too — a commit that could not create the account or install its
+// authorized_keys must not report success. Pure defensive skips (an invalid
+// username refused before any mutation) are NOT accumulated — they are the
+// safe outcome, not an incomplete reconcile.
 func (d *Daemon) applySystemLogin(cfg *config.Config) (err error) {
 	fail := func(e error) { err = errors.Join(err, e) }
 	if cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {

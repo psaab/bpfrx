@@ -36,9 +36,11 @@ import (
 // vrrpErr originates in step 8 below when runtime identity validation rejects
 // the desired set (#5083); vrfErr is the #5700 VRF-device-setup (ReconcileVRFs)
 // failure and routingRuleErr/mgmtRouteErr are threaded from the caller;
-// lo0Err/hostInboundErr originate in step 9.5. The returned errors.Join
+// lo0Err/hostInboundErr originate in step 9.5, dnsErr in step 9 (#6792), and
+// the five host-credential errors (loginErr/sudoersErr/absentUsersErr/
+// sshConfigErr/rootAuthErr) in steps 11–13 (#6790). The returned errors.Join
 // preserves the explicit operand order
-// (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700).
+// (#1778/#2987/#4433/#5083/#5310/#5679/#5696/#5700/#6790/#6792).
 func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr error, fabricErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	var vrrpErr error
@@ -106,36 +108,63 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	d.applySystemSyslog(cfg)
 
 	// Steps 11–13 are the login/credential reconcilers. They return their
-	// accumulated failures (#5874) so the cancel closeout can surface them,
-	// but on the NORMAL apply path the returns are intentionally DISCARDED:
-	// the tail is best-effort here because the next boot re-renders login /
-	// sudoers / SSH / root-auth from the active config, so a transient failure
-	// converges (the #2926 next-boot contract). Only the daemon-stop cancel
-	// closeout — where next-boot convergence does NOT happen while the daemon
-	// stays intentionally stopped — collects and fails on these.
+	// accumulated failures (#5874) and, since #6790, the NORMAL apply path
+	// CAPTURES those returns and joins them into the commit result — exactly
+	// like their siblings in this same function (applyLo0Filter #3392,
+	// applyHostInboundFilter #3333, reconcileDNSLocked #6792).
+	//
+	// They were previously discarded as `_ =` on the argument that the next
+	// boot re-renders login / sudoers / SSH / root-auth from the active config,
+	// so a transient failure converges (the #2926 next-boot contract). That
+	// argument does not hold for these five owners:
+	//
+	//   - It is a REVOCATION window, not a rendering delay. `delete system
+	//     login user bob` that fails to lock bob's password or remove his
+	//     authorized_keys reported a SUCCESSFUL commit, so the operator
+	//     believes bob is deprovisioned NOW. The credential stays live until
+	//     the next reboot — unbounded on an appliance that is expected to run
+	//     for months — and nothing retries in between: there is no dirty-retry
+	//     owner, no ticker, and no metric for these reconcilers.
+	//   - The same commit is the one that ADVANCES the durable config, so the
+	//     next boot renders from a config that already says bob is gone while
+	//     the box still grants him access. A green commit is the operator's
+	//     only signal, and it was unconditional.
+	//   - The #5874 cancel closeout exists precisely because these five do not
+	//     converge on their own; it made them RETURN their failures but only
+	//     the daemon-stop path collected them. The normal path — the one an
+	//     operator actually uses to revoke access — kept discarding them.
+	//
+	// Fail-closed, same discipline as lo0/host-inbound/DNS: every step below
+	// still RUNS (no early return), so an sshd reload failure never skips
+	// root-auth reconciliation; only the commit RESULT changes.
+	//
+	// Note the asymmetry with the void-returning steps around them
+	// (applySystemNTP, applyHostname, applySyslogFiles, ...): those really do
+	// re-render from the active config on the next apply or boot and hold no
+	// revocation semantics.
 
 	// 11. Apply system login users (create OS accounts, SSH keys)
-	_ = d.applySystemLogin(cfg)
+	loginErr := d.applySystemLogin(cfg)
 
 	// 11b. Reconcile super-user sudo grants against the CURRENT config so a
 	// class downgrade or user removal REVOKES the stale NOPASSWD grant
 	// (#3889). Runs unconditionally — applySystemLogin returns early when
 	// there are no users, which is exactly the "all users removed" case
 	// that must still sweep stale grants.
-	_ = d.reconcileSudoers(cfg)
+	sudoersErr := d.reconcileSudoers(cfg)
 
 	// 11c. Revoke host credentials for any xpf-provisioned login account that
 	// was removed from config (#5128). reconcileSudoers above only revokes the
 	// sudo grant; without this a deprovisioned operator keeps their password
 	// and authorized_keys and can still SSH in. Like reconcileSudoers it MUST
 	// run unconditionally — the "all users removed" case must still revoke.
-	_ = d.reconcileAbsentLoginUsers(cfg)
+	absentUsersErr := d.reconcileAbsentLoginUsers(cfg)
 
 	// 12. Apply SSH service configuration (root-login)
-	_ = d.applySSHConfig(cfg)
+	sshConfigErr := d.applySSHConfig(cfg)
 
 	// 13. Apply root authentication (encrypted-password + SSH keys)
-	_ = d.applyRootAuth(cfg)
+	rootAuthErr := d.applyRootAuth(cfg)
 
 	// 14. Apply syslog file destinations (rsyslog configs)
 	d.applySyslogFiles(cfg)
@@ -360,9 +389,14 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// snapshot republish/FIB-bump failure (#5696 — a stale inter-VRF leak would
 	// otherwise survive on a "successful" commit) through the commit so a step
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
-	// (fail-closed) instead of reporting success. All are joined so none masks the
-	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr, vrrpErr)
+	// (fail-closed) instead of reporting success. #6790 adds the five
+	// host-credential reconcilers (login / sudoers / absent-user revocation /
+	// sshd / root-auth), whose failures were discarded here — a commit that did
+	// not actually revoke a removed operator's password or authorized_keys is
+	// not a successful commit. All are joined so none masks the other.
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr,
+		loginErr, sudoersErr, absentUsersErr, sshConfigErr, rootAuthErr,
+		ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr, vrrpErr)
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).

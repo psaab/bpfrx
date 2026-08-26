@@ -1530,6 +1530,71 @@ the **same UID-file format** as the account registry:
   of `provisionedUsersDir`, so pointing that one package var at a throwaway
   tree relocates all three roots together in tests.
 
+## A failed credential reconcile FAILS THE COMMIT (#6790)
+
+Every reconciler on this page runs from the apply tail
+(`applyTailReconciles`, `pkg/daemon/daemon_apply_tail.go`, steps 11–13):
+
+| step | reconciler | owns |
+|------|------------|------|
+| 11   | `applySystemLogin`         | OS accounts, per-user password, `authorized_keys` |
+| 11b  | `reconcileSudoers`         | `/etc/sudoers.d/xpf-<user>` NOPASSWD grants |
+| 11c  | `reconcileAbsentLoginUsers`| revocation for users removed from config |
+| 12   | `applySSHConfig`           | the sshd drop-in (`PermitRootLogin`, ciphers, …) |
+| 13   | `applyRootAuth`            | root's `/etc/shadow` password + `/root/.ssh/authorized_keys` |
+
+All five were called as `_ = d.<reconciler>(cfg)`. #5874 had already made
+them **return** their accumulated failures, but only the daemon-stop
+cancel closeout (`applyHostAuthorizationCloseout`) collected those
+returns. On the ordinary commit path the returns were **discarded**, so
+a commit reported **success** while:
+
+- the configured operator's account was never created, or their
+  `authorized_keys` was never installed;
+- a super-user's sudo grant was never written — or, on the revoke side,
+  a **demoted** operator's stale NOPASSWD grant was never removed;
+- a **removed** `system login user` kept a live password and
+  `authorized_keys` (the deprovision fails closed and retains its
+  markers to retry, but nothing told the operator the revocation had not
+  happened);
+- the sshd drop-in failed validation and was reverted, so sshd kept the
+  **pre-commit** `PermitRootLogin` posture;
+- root's password or `authorized_keys` did not converge to the committed
+  `system root-authentication`.
+
+Since #6790 the tail **captures** all five returns and joins them into
+the commit result, exactly as its siblings in the same function already
+do — `applyLo0Filter` (#3392), `applyHostInboundFilter` (#3333) and
+`reconcileDNSLocked` (#6792). The prior justification, "the next boot
+re-renders these from the active config so a transient failure
+converges" (the #2926 next-boot contract), does not hold here:
+
+- These are **revocations**, not renderings. The credential stays live
+  until the next reboot — unbounded on an appliance — and there is no
+  dirty-retry owner, ticker, or metric between now and then.
+- The same commit **advances the durable config**, so the next boot
+  renders from a config that already says the user is gone while the box
+  still grants them access.
+- A green commit is the operator's only signal that
+  `delete system login user bob` took effect, and it was unconditional.
+
+Fail-closed, **not** fail-fast: every step still runs, so an sshd reload
+failure never skips root-auth reconciliation. Only the commit *result*
+changes. The config itself is already promoted at this point (as with
+every other tail failure), so the operator sees a failed commit against
+an advanced config and re-commits to retry — the same semantics
+`networkd`/`nft`/DNS failures have had for several releases.
+
+The void-returning steps around them (`applySystemNTP`, `applyHostname`,
+`applySyslogFiles`, …) are deliberately **not** included: those really do
+re-render from the active config on the next apply or boot and carry no
+revocation semantics.
+
+Cells: `pkg/daemon/apply_credential_failclosed_6790_test.go` drives the
+real `applyTailReconciles` with one owner injected to fail per cell, plus
+a healthy control and a both-ends cell proving an early failure does not
+skip a later owner.
+
 ## Idempotency
 
 The password apply reads `/etc/shadow` directly and skips `chpasswd`

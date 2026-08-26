@@ -522,7 +522,10 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 // failure to reconcile a credential to the cancelled/target state was silently
 // DISCARDED and the cancel reported clean. They now return their accumulated
 // failures, this closeout COLLECTS a per-owner outcome and SURFACES every
-// failure, and the "bounded" claim is now an ENFORCED wall-clock budget
+// failure — and since #6790 the ORDINARY (uncancelled) apply joins those same
+// five returns into the commit result too, so the two paths agree that a
+// failed credential reconcile is a failed commit. The "bounded" claim is an
+// ENFORCED wall-clock budget
 // (hostAuthCloseoutBudget) rather than an unbounded best-effort sequence: a
 // wedged reconciler is reported timed-out instead of hanging the daemon-stop
 // path. Still safe to run non-cancellably — no FRR/netlink reload.

@@ -501,8 +501,10 @@ func managedAuthorizedKeysPath(name string) string {
 // It stays best-effort per account but ACCUMULATES each deprovision failure
 // into the returned error so the #5874 cancel closeout can see that a removed
 // user's credentials were NOT actually revoked (a monotonic-revocation gap).
-// The normal apply path ignores the return — the next boot retries deprovision
-// from the active config.
+// #6790: the NORMAL apply path joins this return into the commit result as
+// well. `delete system login user bob` acknowledged as SUCCESS while bob's
+// password and authorized_keys are still live is the exact failure this
+// reconciler exists to prevent, and nothing retries before the next boot.
 func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 	names := provisionedNames()
 	if len(names) == 0 {
@@ -545,7 +547,8 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 // It stays best-effort but ACCUMULATES each failure into the returned error so
 // the #5874 cancel closeout can observe that a removed account's credentials
 // were NOT actually revoked; a naked return yields the accumulated retErr, not
-// a block-local err. The normal apply path ignores the return.
+// a block-local err. Since #6790 the normal apply path joins it into the
+// commit result too, so a failed revocation fails the commit.
 func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	curUID, found, err := lookupUIDErr(name)
