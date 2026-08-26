@@ -694,6 +694,52 @@ divergent-commit fail-open #5876 closes for the other source-NAT gates. Run
 strict there (`lenient=false`), it rejects the node1-only overlap at a node0
 commit.
 
+**Interface-mode SNAT egress addresses are a THIRD owner domain (#6751 §5.7).**
+Interface mode draws no pool — it translates onto the egress interface's own
+address — so before #6751 the owner set enumerated only source-NAT pools and
+NAT64, and a pool containing an interface's own address met no gate at all. The
+two allocators are keyed independently, so both could mint the same
+`(address, port)` and the reverse index could not disambiguate: the #5144
+misdelivery, on the arm #5144 never covered.
+
+The candidate egress addresses are derived per rule-set from its TO-side scope
+(`interfaceSNATEgressAddresses`, `compiler_nat_iface_egress.go`), mirroring the
+dataplane's `scope_matches` (`userspace-dp/src/nat/source.rs`) treatment of an
+empty scope field as a WILDCARD:
+
+| rule-set to-scope | candidate addresses |
+|---|---|
+| `to-interface` | that interface's addresses |
+| `to-routing-instance` | that instance's interfaces' addresses |
+| `to-zone` | that zone's interfaces' addresses |
+| none | **every** dataplane interface's addresses |
+
+The last row replaces the earlier `maps_sync.go` precedent, which collected only
+non-empty `ToZone` and returned NOTHING for an unscoped rule-set — understating
+the candidate set precisely where it is widest, i.e. failing OPEN on the
+broadest possible input. Owners are **deduped by address**: several
+interface-mode rule-sets egressing one WAN interface occupy ONE address, and one
+owner per rule would make them overlap each other and false-reject correct
+multi-zone configs. A `then source-nat off` rule mints nothing and contributes
+no candidate.
+
+**Whole-address statics on an interface egress (#6751 §5.7).** A whole-address,
+port-preserving static mapping whose external address is also an interface-SNAT
+egress emits the SAME external tuple as interface SNAT itself. The #5837
+first-packet-inert advisory (`compiler_validate_warn_nat_iface_addr.go`)
+suppresses itself when interface SNAT owns the address — correct about
+inertness, and it left this case with NO diagnostic at all. That suppression is
+NARROWED, not removed: the inert advisory stays suppressed and
+`staticOnInterfaceEgressCollisions` emits the collision instead — strict
+REJECTS, tolerant load / peer-sync WARNS (#1960). A MAPPED-PORT static
+(`match destination-port` / `mapped-port`) emits a distinct external port and is
+deliberately NOT flagged; reserving its emitted port is the runtime half's job.
+
+Config-time only. Addresses resolved at RUNTIME (DHCP, netlink) are foreclosed
+by the snapshot-builder half of §5.7, which needs the DRAIN discipline behind it
+— marking a pool unusable with nothing draining would strand every live session
+on it.
+
 This is the commit-time DETECTION half of #5144 (material choice **S1**: reject
 independently-owned overlap). It does NOT introduce the deferred packet-path
 global cross-domain allocator (the R2 design, gated on user signoff and

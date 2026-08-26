@@ -106306,3 +106306,71 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-26 — #6751 PR 3a: interface egress joins the cross-domain NAT owner set
+
+- **Timestamp**: 2026-08-26
+- **Action**: First of the approved 3-PR split on #6751 PR 3/3. Config-time half
+  of §5.7: interface-mode SNAT egress addresses become an owner domain in the
+  #5144 external-tuple overlap gate, and the warn-only static/interface
+  suppression is narrowed. No binary move — no cargo leg, no cluster smoke.
+- **Scope call, reported and approved before building**: §5.7 is six mechanisms
+  across two languages, not one increment. Split 3a (Go commit validator) /
+  3b (Go snapshot builder + Rust DRAIN, ATOMIC) / 3c (static occupancy +
+  counters). 3b must stay atomic: landing the builder fail-close without the
+  Rust drain would mark pools unusable with nothing draining behind them,
+  STRANDING every live session on that pool — a worse outage than the defect.
+- **THE VALIDATOR'S FIRST RUN FOUND A LIVE DEFECT IN A SHIPPED CONFIG.**
+  `test/incus/xpf-cluster-fw0.conf` had `nat64-pool` on `172.16.50.6`, which is
+  `reth0.50`'s own address, while `lan-to-wan` does interface-mode SNAT on that
+  interface. The file's own comment NAMES `172.16.50.6` as the colliding tuple —
+  it justifies why `nat64-snat-pool` sits on `.7` — and then leaves `nat64-pool`
+  on `.6`. The author understood the hazard, fixed the pool-vs-pool arm, and
+  missed the pool-vs-interface arm. The comment even asserts "the commit gate
+  now rejects" — a belief in a guarantee that was never true for this arm.
+- **AND A SECOND INSTANCE THE GREEN SUITE COULD NOT SEE.** `xpf-test.conf` had
+  the identical defect one address over (`nat64-pool` on `.5` = `ge-0/0/3.50`'s
+  address, seven interface-mode rules, `ge-0/0/3.50` in zone `wan`). It was NOT
+  flagged — because NO test in `pkg/config` ever compiled that file. `go test
+  ./pkg/config/` was green while a shipped config violated the rule the package
+  had just added. A gate's reach is not what it can detect, it is what it is
+  actually pointed at. `TestShippedConfigsHaveNoCrossDomainNATOverlap_6751` now
+  compiles all eight shipped NAT configs and asserts the count, so a config
+  dropping off the list cannot silently stop being gated.
+- **Not "adjust the fixture until the gate passes"**: the configs are WRONG,
+  their own comments say the shape is wrong, and the validator found it. Both
+  moved to free addresses (`.9`, `.11`) and both comments now name the
+  interface-mode arm explicitly.
+- **The `maps_sync.go` precedent is DEFECTIVE, not merely limited**: it collected
+  only non-empty `ToZone` and returned NOTHING for an unscoped rule-set. An
+  unscoped rule matches every egress, so the empty set understates the candidate
+  set exactly where it is widest — failing OPEN on the broadest input. Replaced
+  by the four-shape derivation mirroring the dataplane's `scope_matches`
+  wildcard-on-empty semantics.
+- **Deduped by address, deliberately**: several interface-mode rule-sets
+  egressing one WAN interface occupy ONE address; one owner per RULE would make
+  them overlap each other and false-reject every real multi-zone config.
+- **Warn suppression NARROWED, not removed**: the #5837 inert advisory is right
+  to suppress itself when interface SNAT owns the address (the translation is
+  not inert) — and that left the unsafe case with no diagnostic at all. The
+  inert advisory stays suppressed; the collision finding takes its place. Strict
+  rejects, tolerant warns (#1960).
+- **Mapped-port statics deliberately NOT flagged** — they emit a distinct
+  external port, so they are not the ambiguity; reserving the emitted port is
+  3b/3c's job. Without that control the detector degenerates into "any static on
+  an interface address" and false-rejects the shipped `8080 -> 80` shape.
+- **Boundary call**: the plan files the four-scope derivation under item 2 (3b),
+  but the strict validator needs it and the to-zone-only precedent is
+  insufficient. 3a carries it, 3b reuses it — pure config→address, no binary
+  move, so it drags neither of 3b's validation lanes forward. Approved.
+- **Process note**: ran `gofmt -w pkg/config/` on the DIRECTORY and reformatted
+  5 untouched files — the exact hazard recorded earlier today, walked into after
+  documenting it. Knowing the rule is not the same as having the habit; the
+  habit is `gofmt -w <file>...`. Caught in `git status`, reverted by filtering
+  each modified `.go` for this change's identifiers.
+- **File(s)**: `pkg/config/compiler_nat_iface_egress.go` (new),
+  `pkg/config/compiler_nat_iface_egress_6751_test.go` (new),
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_validate_warn_nat_iface_addr.go`,
+  `test/incus/xpf-cluster-fw0.conf`, `test/incus/xpf-test.conf`,
+  `docs/config-schema.md`, `_Log.md`
