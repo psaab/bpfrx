@@ -1051,8 +1051,23 @@ var junosRemoteFacility = map[string]int{
 	"daemon":        FacilityDaemon,
 	"ftp":           FacilityFTP,
 	"kernel":        FacilityKern,
-	"ntp":           FacilityNTP,
 	"user":          FacilityUser,
+	// `ntp` is deliberately ABSENT (#6830 round 2). It looked like a row: a
+	// prose summary of the Junos facility vocabulary lists it, and RFC 5424
+	// assigns 12 to the NTP subsystem, so FacilityNTP below is a real code.
+	// But Table 2 ("Facility Codes Reported in Priority Information") carries
+	// the NTP code with NO Junos facility name against it, and the documented
+	// rule is that a code whose second column is empty "cannot be included in
+	// a statement at the [edit system syslog] hierarchy level". So `ntp` is not
+	// configurable Junos, and a row here would be xpf INVENTING a mapping for
+	// a name Junos itself rejects — the "picked by implementation convenience"
+	// this issue exists to avoid. It falls through to local0 and the unmapped
+	// diagnostic, which is the correct handling for a name with no documented
+	// wire facility.
+	//
+	// The two sources conflict on this one name and only this one. That is
+	// precisely why it is out: a mapping we cannot substantiate must not move a
+	// record.
 }
 
 // JunosRemoteFacility reports the facility Junos would put on the wire for a

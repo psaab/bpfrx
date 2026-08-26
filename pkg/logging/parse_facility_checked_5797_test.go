@@ -56,7 +56,6 @@ var parseFacilityMappingTable = map[string]int{
 	"authorization":        FacilityAuth,
 	"ftp":                  FacilityFTP,
 	"kernel":               FacilityKern,
-	"ntp":                  FacilityNTP,
 }
 
 // #5797 invariant 7, visibility half.
@@ -124,10 +123,24 @@ func unmappedCorpus() []string {
 	// report UNMAPPED would pin the defect this corpus was written to expose.
 	// What remains here is the genuinely unmapped remainder — names that are
 	// valid Junos configuration and still have no documented wire facility.
-	add("security", "external", "dcd")
-	// BSD facilities outside the mapped set. `ftp` left this line for the same
-	// reason: Table 3's "unlisted names default to the same local facility
-	// name" rule makes it a real mapping, not an unmapped BSD spelling.
+	// #6830 round 2: `ntp` rejoins this corpus. Table 2 carries the NTP code
+	// with no Junos facility name against it, and an empty second column means
+	// the facility "cannot be included in a statement at the [edit system
+	// syslog] hierarchy level" — so it is not configurable Junos and xpf must
+	// not invent a wire facility for it.
+	//
+	// Note what these four have in common, corrected from the round-1 comment:
+	// they are NOT "valid Junos configuration with no documented wire
+	// facility". Verified against the documentation — `security` names a
+	// different hierarchy (`[edit security log]`), `external` and `dcd` do not
+	// appear in the configurable set at all, and `ntp` is excluded by the
+	// empty-second-column rule. They are simply names Junos does not accept
+	// here, which is why local0 plus the unmapped diagnostic is right for them.
+	add("security", "external", "dcd", "ntp")
+	// BSD facilities outside the mapped set. `ftp` left this line because
+	// Table 2 DOES list it as a configurable Junos facility, so Table 3's
+	// "unlisted names default to the same local facility name" rule makes it a
+	// real mapping rather than an unmapped BSD spelling.
 	add("mail", "cron", "authpriv", "lpr", "news", "uucp")
 	// `any` is a selector wildcard for the rsyslog-backed file/user
 	// destinations, not a numeric facility a host client can stamp on a record

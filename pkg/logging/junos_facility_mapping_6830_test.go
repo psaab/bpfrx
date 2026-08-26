@@ -13,7 +13,10 @@ package logging
 // consulted once and never finished. These cells pin the whole table against
 // the documentation and pin what the box does with it today.
 
-import "testing"
+import (
+	"sort"
+	"testing"
+)
 
 // junosDocumentedRemote is Junos's published mapping for messages directed to a
 // remote destination, transcribed from the two documented rules:
@@ -40,7 +43,6 @@ var junosDocumentedRemote6830 = map[string]int{
 	"daemon":        FacilityDaemon,
 	"ftp":           FacilityFTP,
 	"kernel":        FacilityKern,
-	"ntp":           FacilityNTP,
 	"user":          FacilityUser,
 }
 
@@ -112,9 +114,15 @@ func TestNothingInTheTableIsMisfiled6830(t *testing.T) {
 	// ANTI-VACUITY. A helper returning no names would report "nothing is
 	// misfiled", which is indistinguishable from a healthy result and is
 	// exactly how this class of check fails.
-	if checked < 12 {
-		t.Fatalf("only %d facility names were checked; the documented table has 12 rows, "+
-			"so this assertion is not reaching them", checked)
+	//
+	// The floor is DERIVED from the independent transcription rather than
+	// written as a literal (#6830 round 2). A hardcoded count is a second place
+	// the table's size lives, so removing a row reds this cell for the wrong
+	// reason and the obvious repair is to edit the number — which is how an
+	// anti-vacuity floor quietly stops tracking the thing it guards.
+	if want := len(junosDocumentedRemote6830); checked < want {
+		t.Fatalf("only %d facility names were checked; the documented table has %d rows, "+
+			"so this assertion is not reaching them", checked, want)
 	}
 }
 
@@ -125,18 +133,20 @@ func TestNothingInTheTableIsMisfiled6830(t *testing.T) {
 // fails if any listed name has left the table.
 func junosFacilityNames6830(t *testing.T) []string {
 	t.Helper()
-	var out []string
-	for _, name := range []string{
-		"change-log", "conflict-log", "dfc", "firewall",
-		"interactive-commands", "pfe",
-		"authorization", "daemon", "ftp", "kernel", "ntp", "user",
-	} {
+	// #6830 round 2: iterate the independent transcription rather than a
+	// third hand-written copy of the same names. Three copies of one list is
+	// three places to forget, and the transcription is already the thing every
+	// other cell in this file checks against.
+	out := make([]string, 0, len(junosDocumentedRemote6830))
+	for name := range junosDocumentedRemote6830 {
 		if _, ok := JunosRemoteFacility(name); !ok {
-			t.Fatalf("%q is no longer a row in the documented table; if it was removed "+
-				"deliberately, Table 3 says otherwise", name)
+			t.Fatalf("%q is in the documented transcription but not in the production "+
+				"table; a name Junos documents must not be silently dropped from the "+
+				"emit path", name)
 		}
 		out = append(out, name)
 	}
+	sort.Strings(out) // deterministic order for a deterministic failure
 	return out
 }
 
