@@ -162,6 +162,50 @@ stop running — no failure, just unvalidated config again.
 `TestAliasDetectorFindsARealAlias_6834` plants an alias so the detector itself
 cannot rot into a tripwire that never fires.
 
+### The rule reaches TYPED LEAVES too (#6844)
+
+#6834 installed the wildcard-identity check in `walkSchemaNode`'s **container**
+branch. The **typed-leaf** branch returns before that point, so a wildcard node
+that is a typed leaf validated its VALUE and never its identity.
+
+`system syslog <dest> <facility> <severity>` is exactly that shape — the
+facility is the wildcard key, the severity is the value. The severity has been
+enum-gated since #2008; the facility accepted anything, so
+
+```
+set system syslog file audit "daemon;*.* /tmp/pwn" info
+```
+
+passed `SchemaValidate` and committed. #6829 belts the RENDER site, so nothing
+injected reaches rendered rsyslog configuration — but the commit path told the
+operator nothing and their configuration silently did not do what it said.
+
+The typed-leaf branch now runs the same `!exactMatch` identity check, and
+`exactMatch` is hoisted above it: still one computation, now three readers.
+
+`ValidateSyslogFacility` gates the **shape**, not membership of a facility enum,
+deliberately. The Junos vocabulary already lives in `pkg/logging`, and
+`pkg/logging` imports `pkg/config` (`trace.go`), so the two cannot be
+single-sourced without a new leaf package. Two independently maintained copies
+drift, and the drift is silent in the direction that REJECTS a valid operator
+config the renderer maps correctly — worse than accepting an unknown but
+well-formed name, which #6830 already diagnoses at render, by name. The alphabet
+matches `syslogNameRE`'s because the facility is formatted into the same
+rendered drop-in body.
+
+No new lenient opt is needed. The #1319 split already bounds it: `SchemaValidate`
+is strict only on the operator-driven commit path, and `Store.compileTreeLenient`
+downgrades a violation to a warning on the tolerant `Load` / `SyncApply` ingress,
+so a persisted or peer-synced config still boots (#1960). A cell pins that
+boundary by asserting the COMPILER still accepts the value — if the rejection
+migrated into `CompileConfig` it would become unconditional and blackout-boot the
+node.
+
+`TestWildcardTypedLeafKeyValidatorInventory_6844` enumerates every leaf the new
+rule reaches — the three system-syslog destinations and nothing else today — so
+adding a `keyValidator` to a wildcard typed leaf is a deliberate edit rather than
+a config that quietly stops committing.
+
 ### `interfaces <name>` is the first typed wildcard identity
 
 The interface name is interpolated into four sites in the generated systemd

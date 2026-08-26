@@ -384,7 +384,28 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		return validateTailLeaf(node, childSchema, path, siblings)
 	}
 
+	exactMatch := parent.children != nil && parent.children[keyword] == childSchema
+
+	// exactMatch is computed here rather than at its original site further
+	// down, because the TYPED-LEAF branch below now needs it too and that
+	// branch returns before the old declaration was reached. Same single
+	// computation, three readers (#6844).
 	if childSchema.isTypedLeaf() && (childSchema.validator != nil || childSchema.treeValidator != nil) {
+		// #6844: a typed leaf reached through a WILDCARD has its identity in
+		// the KEYWORD, and that keyword was never key-validated. #6834 closed
+		// the same gap for wildcard CONTAINERS but this branch returns first,
+		// so a wildcard TYPED LEAF -- `system syslog file <name> <facility>
+		// <severity>`, where the facility is the wildcard key and the severity
+		// is the value -- validated its value and not its identity.
+		//
+		// Gated on !exactMatch for the same reason as the container rule: on an
+		// exact match the keyword is a schema keyword, not an operator-supplied
+		// identity, and validating it would reject the schema's own vocabulary.
+		if !exactMatch && childSchema.keyValidator != nil {
+			if err := validateKeySlot(childSchema, 0, keyword, vc); err != nil {
+				return typedLeafInvalidErrorf(path, keyword, err)
+			}
+		}
 		// Multi value-tail leaf (`multi && children == nil`): values can
 		// live in the packed Keys (`name-server 1.1.1.1`, bracketed
 		// lists, `destination-port 20000 to 20003`) AND/OR one-per-child
@@ -451,7 +472,6 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// equality would report "exact" for a wildcard match if one did, silently
 	// disabling the identity gate. TestNoSchemaNodeIsBothChildAndWildcard_6834
 	// walks the whole schema and keeps that true.
-	exactMatch := parent.children != nil && parent.children[keyword] == childSchema
 	if childSchema.isScalarValueLeaf() && exactMatch {
 		return validateScalarValueLeaf(node, childSchema, path)
 	}

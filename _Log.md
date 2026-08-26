@@ -106306,3 +106306,10 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+  - **Action**: #6844 — key-validate the system-syslog facility wildcard; extend
+    the #6834 wildcard-identity rule to typed leaves
+  - **File(s)**: pkg/config/schema_walk.go, pkg/config/schema_system.go,
+    pkg/config/schema_validators_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go (new),
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go (new),
+    docs/config-schema.md

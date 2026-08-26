@@ -350,6 +350,76 @@ func ValidateSyslogUser(raw string, _ *Config) error {
 	return nil
 }
 
+// syslogFacilityRE is the safe shape for a `system syslog <dest> <facility>`
+// facility NAME. It deliberately matches syslogNameRE's alphabet: the facility
+// is formatted into the rsyslog drop-in body as the left half of a
+// `<facility>.<severity>` selector, so it must not carry a selector separator,
+// whitespace, control characters, or rsyslog directive punctuation.
+//
+// The real Junos vocabulary is a closed set (any, authorization, change-log,
+// conflict-log, daemon, dfc, firewall, ftp, interactive-commands, kernel, ntp,
+// pfe, security, user) plus the BSD spellings and local0-local7 that
+// ParseFacility recognises. This validator is deliberately NOT that enum.
+//
+// An enum here would be a second, independently-maintained copy of a vocabulary
+// that already exists in pkg/logging, and pkg/logging imports pkg/config
+// (trace.go), so the two cannot be single-sourced without a new leaf package.
+// Two copies of a vocabulary drift, and the drift is silent in the permissive
+// direction: a facility this gate has not heard of is REJECTED at commit even
+// though the renderer maps it correctly. Rejecting a valid operator config is a
+// worse failure than accepting an unknown-but-well-formed name, which #6830
+// already diagnoses at render with a message naming the facility.
+//
+// So this gates the SHAPE, which is what #6844 is actually about: the injectable
+// value. `daemon;*.* /tmp/pwn` stops being committable; `change-log` and any
+// future Junos facility name still commit.
+var syslogFacilityRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// maxSyslogFacilityLen bounds the facility name. The longest real one,
+// `interactive-commands`, is 20 characters; 64 leaves generous headroom while
+// keeping an absurd value out of a rendered selector line.
+const maxSyslogFacilityLen = 64
+
+// ValidateSyslogFacility gates the `system syslog <dest> <facility> <severity>`
+// facility KEY.
+//
+// The severity half of that pair has been enum-gated since #2008; the facility
+// half was an unvalidated wildcard key, so `set system syslog file audit
+// "daemon;*.* /tmp/pwn" info` passed SchemaValidate and landed in
+// SyslogFileConfig.Facility verbatim (#6844). #6829 belted the render site, so
+// nothing injected reaches rendered rsyslog configuration; this is the other
+// half — the commit path told the operator nothing, and their configuration
+// silently did not do what it said.
+//
+// The sibling `user` destination key one field above has been key-validated
+// since #4303, which settles that the schema layer key-validates where it means
+// to: this was a gap, not a decision.
+//
+// Strictness is bounded by the existing #1319 split rather than by a new lenient
+// opt: SchemaValidate is strict only on the operator-driven commit /
+// commit-check path, and Store.compileTreeLenient downgrades a violation to a
+// warning on the tolerant Load / SyncApply ingress. So a persisted or
+// peer-synced config carrying a name this rejects still BOOTS, per #1960.
+func ValidateSyslogFacility(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing syslog facility")
+	}
+	if len(raw) > maxSyslogFacilityLen {
+		return fmt.Errorf("syslog facility %q is %d characters (max %d)",
+			raw, len(raw), maxSyslogFacilityLen)
+	}
+	if !syslogFacilityRE.MatchString(raw) {
+		return fmt.Errorf("invalid syslog facility %q (must match %s: a letter or "+
+			"digit followed by letters, digits, or . _ - ; no whitespace, control "+
+			"characters, or rsyslog selector punctuation such as ';' or '*'). Junos "+
+			"facility names are `any`, `authorization`, `change-log`, `conflict-log`, "+
+			"`daemon`, `dfc`, `firewall`, `ftp`, `interactive-commands`, `kernel`, "+
+			"`ntp`, `pfe`, `security`, `user`, or a BSD name / local0-local7",
+			raw, syslogFacilityRE.String())
+	}
+	return nil
+}
+
 // zoneNameSegmentRE is the safe shape for one `/`-separated segment of a
 // `system time-zone` value (an IANA tz-database / zoneinfo name). Real zone
 // segments are letters, digits, and the punctuation `_ + -`
