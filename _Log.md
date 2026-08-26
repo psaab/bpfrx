@@ -105709,3 +105709,35 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/daemon/daemon_nft.go`, `pkg/daemon/daemon_nft_netlink.go`,
   `pkg/daemon/lo0_proto_icmp_failclosed_6806_test.go` (new),
   `pkg/nftables/README.md`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-26 — engineering-style: a comment is a claim; an agreement test cannot see a shared defect
+
+- **Timestamp**: 2026-08-26
+- **Action**: Add three review-discipline rules to
+  `docs/engineering-style.md` ("Reviewing (adversarial by design)").
+- **Why now**: each rule is generalised from a defect that landed in ONE review
+  batch, not from principle.
+  1. **Three stale load-bearing comments**, all true when written and false at
+     head: `daemon_apply_tail.go`'s "every step below still RUNS (no early
+     return)"; `netlink_lo0.go`'s "a rejected table leaves NO host filter =
+     fail-OPEN" (true before #6476's cold-boot fence, false after — checking the
+     code rather than the comment is what unblocked #6806's correct direction);
+     and `daemon_nft.go`'s "mirroring the tcp-flags lowering", which was wrong
+     when written because tcp-flags does not drop its predicate. A comment that
+     justifies a DIRECTION is the dangerous kind: the reader takes the direction
+     and never re-derives the reason, which was verified once and never again.
+  2. **The #6806 lo0 parity gate was structurally blind.** Both mirrors dropped
+     an unresolvable token, so they AGREED perfectly while both were fail-open,
+     and the gate was green throughout. "Assert the agreement, never pin one to a
+     literal" is right for DRIFT — and drift is not the only defect. Each side
+     also owes a property independently.
+  3. **A tool-gated leg that SKIPs is a green that measured nothing** — report
+     tests-collected, not `ok`.
+- **Related, and the same shape at a larger scale**: #6807's review had DISPROVEN
+  the repo's FRR permit-all model while the repo's comments and tests still
+  asserted it, so a reader re-deriving from the title had a confidently wrong
+  prior with every local check agreeing. A stale comment and a refuted-but-still-
+  asserted consequence are one defect at two scales.
+- **Annotate stale comments as historical rather than deleting them** — the next
+  reader needs to know it WAS true, not merely that it is gone.
+- **File(s)**: `docs/engineering-style.md`, `_Log.md`

@@ -425,6 +425,46 @@ Rules of thumb:
 - **Trust but verify.** An agent's commit summary describes what it
   intended. Read the diff. Re-run the tests on the updated head before
   approving.
+- **A comment is a CLAIM, not a check — verify it before you rely on
+  it.** A comment that justifies a direction ("we do X because Y") is
+  the most dangerous kind, because a reader takes the direction and
+  never re-derives Y. Y was verified once, at authorship, and never
+  again. Three landed in a single review batch, all true when written
+  and false at head:
+
+  - `daemon_apply_tail.go` asserted "every step below still RUNS (no
+    early return)". A lane whose teardown sits below it checked the
+    code rather than the comment, because if it *had* early-returned the
+    teardown would silently stop running on exactly the commits that
+    fail.
+  - `netlink_lo0.go` justified per-term fail-closed with "a rejected
+    table leaves NO host filter = fail-OPEN". True before #6476 added
+    the cold-boot fence; false after, which is what unblocked the
+    correct plan-failure direction in #6806.
+  - `daemon_nft.go` justified dropping a protocol predicate as
+    "mirroring the tcp-flags lowering" — and tcp-flags does not drop its
+    predicate. Wrong when written.
+
+  So: **when a comment is load-bearing for your change, read the code it
+  describes.** If it is stale, annotate it as historical rather than
+  deleting it — the next reader needs to know it *was* true, not merely
+  that it is gone. Note the failure mode this shares with a refuted
+  finding whose refutation never reached the code: in #6807 the review
+  had *disproven* the repo's FRR permit-all model, and the repo's own
+  comments and tests still asserted it — so a reader had not a neutral
+  prior but a confidently wrong one, with every local check agreeing.
+- **An agreement test cannot see a defect the two sides SHARE.** The
+  #6806 lo0 parity gate compares the netlink installer against the text
+  oracle. Both dropped an unresolvable token, so they agreed perfectly
+  while both were fail-open, and the gate was green the whole time. When
+  two implementations must match, "assert the agreement, never pin one
+  to a literal" is right for drift — but drift is not the only defect.
+  Add a cell asserting the PROPERTY each side owes independently (here:
+  neither mirror may lose the refusal evidence at its own boundary), or
+  the shared blind spot is invisible by construction.
+- **A tool-gated leg that SKIPs is a green that measured nothing.** Say
+  whether it ran. `nft`-dependent parity, cargo legs, cluster smoke:
+  report tests-collected, not just `ok`.
 - **Two independent review surfaces.** Codex (hostile, design-level)
   and Copilot (inline, mechanical-detail) catch different classes of
   bugs. Treat them as separate passes; do not skip either. Codex
