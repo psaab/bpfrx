@@ -26,6 +26,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -403,20 +404,19 @@ func TestCredentialFailuresDoNotSkipThePeerSync6790(t *testing.T) {
 			}
 			breakMarkerRoots6790(t, f.root)
 		}},
-		{"external-command-timeout", func(t *testing.T, f *credentialTailFixture6790) {
-			// The one shape that could plausibly carry a context error: an
-			// apply-path command killed by externalCommandTimeout. Produced by
-			// running a REAL command under an expired context rather than by
-			// asserting what Go returns — exec reports `signal: killed` as an
-			// *exec.ExitError, NOT a context error, and if that ever changed
-			// this cell would catch it.
+		{"external-command-killed-by-timeout", func(t *testing.T, f *credentialTailFixture6790) {
+			// The shape externalCommandTimeout produces in practice: the process
+			// STARTED and was then killed when the 15s context expired, which
+			// exec reports as *exec.ExitError ("signal: killed") — NOT a context
+			// error. Injected as that exact shape rather than produced by racing
+			// a real `sleep` against a short deadline: which of exec's two error
+			// shapes you get depends on whether fork/exec wins the race with the
+			// deadline, so sampling it is a reading of the MACHINE, not of the
+			// subject (#7563). The pre-expired-start shape is pinned separately
+			// by TestACommandDeadlineIsMisclassified6790.
 			f.cfg.System.Login = &config.LoginConfig{Users: []*config.LoginUser{{Name: "admin", Class: "super-user"}}}
 			runCommandTimeout = func(string, ...string) ([]byte, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, "sleep", "5")
-				cmd.WaitDelay = time.Second
-				return cmd.CombinedOutput()
+				return nil, killedByTimeoutErr6790(t)
 			}
 		}},
 	}
@@ -460,5 +460,71 @@ func TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790(t *testing.T) {
 		t.Error("a required-protocol-gate error is no longer classified fatal — a " +
 			"config that DISARMS the dataplane would now be pushed to the " +
 			"standby too (#2138/#4034)")
+	}
+}
+
+// killedByTimeoutErr6790 returns a REAL *exec.ExitError of the shape
+// externalCommandTimeout produces when a started process is killed at the
+// deadline. Built by running a command that is killed deterministically (not by
+// racing a deadline), so the cell using it is a reading of the subject rather
+// than of the scheduler.
+func killedByTimeoutErr6790(t *testing.T) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sleep", "30")
+	cmd.WaitDelay = time.Second
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start the victim process: %v", err)
+	}
+	cancel() // kill AFTER a successful Start -> ExitError, never ctx.Err()
+	err := cmd.Wait()
+	if err == nil {
+		t.Fatal("the victim process was not killed, so this fixture does not " +
+			"carry the shape it claims")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected an *exec.ExitError from a killed process, got %T: %v", err, err)
+	}
+	return fmt.Errorf("create user admin: %w", err)
+}
+
+// TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790 pins a PRE-EXISTING
+// discrimination gap in applyErrSkipsPeerSync that this PR does not fix and
+// does not introduce — see the tracking issue named below.
+//
+// exec.CommandContext has TWO error shapes at a deadline. If the process
+// STARTED, the kill surfaces as *exec.ExitError ("signal: killed") — the cell
+// above. But if the context expires BEFORE fork/exec completes, Start returns
+// ctx.Err() and CombinedOutput hands back a BARE context.DeadlineExceeded.
+//
+// applyErrSkipsPeerSync cannot tell that apart from the #2926 daemon-stop abort
+// it is actually looking for, so it classifies a per-command 15s timeout as
+// FATAL: applyAndSyncCommitted skips the push to the standby and syncAndApply
+// DISCARDS the peer-promoted config. "My useradd took 15s" is not "the daemon
+// is stopping".
+//
+// Tracking issue: #7618.
+//
+// This is NOT new here. Every apply-path command runner builds its own short
+// context — nftApplyPayload (5s, produces lo0Err/hostInboundErr, joined since
+// #3392/#3333) and daemon_dns.go's systemctl disable/mask (produces dnsErr,
+// joined since #6792) — so the same misclassification already reaches the same
+// classifier through operands that predate this change. #6790 adds more members
+// to an already-exposed population; it does not create the exposure. Fixing it
+// means giving the per-command deadline its own sentinel so it is never mistaken
+// for a daemon-stop abort, which changes behaviour for five existing operands
+// and belongs in its own PR.
+//
+// This cell exists so the gap is a tripwire rather than folklore: when that PR
+// lands, THIS test reds and must be inverted in the same change.
+func TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790(t *testing.T) {
+	preExpired := fmt.Errorf("create user admin: %w", context.DeadlineExceeded)
+	if !applyErrSkipsPeerSync(preExpired) {
+		t.Fatal("a bare context.DeadlineExceeded from a pre-expired command start " +
+			"is no longer classified as the daemon-stop abort class. If that is " +
+			"because the per-command deadline now carries its own sentinel, this " +
+			"is the FIX landing — invert this cell and update the #1960 section " +
+			"of docs/system-login.md in the same change.")
 	}
 }

@@ -1642,15 +1642,42 @@ severity of a COMPILE-time validator. These are RECONCILE-time failures
 raised after compilation, inside `applyConfigLocked`; there is no compile
 gate to downgrade, and the tolerant path already does not reject.
 
-One shape was measured rather than assumed: an apply-path command killed
-by `externalCommandTimeout` returns `*exec.ExitError` ("signal: killed"),
-which does **not** satisfy `errors.Is(err, context.DeadlineExceeded)` even
-when wrapped and joined — so a `useradd` that times out cannot masquerade
-as the #2926 abort class and suppress a peer sync.
-`TestCredentialFailuresDoNotSkipThePeerSync6790` pins all five owners plus
-that timeout shape, against the REAL errors the reconcilers produce, and
+`TestCredentialFailuresDoNotSkipThePeerSync6790` pins all five owners
+against the REAL errors the reconcilers produce, and
 `TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790` is its paired
 positive control so the classifier cannot degrade to "nothing is fatal".
+
+#### One pre-existing gap, inherited not introduced (#7618)
+
+`exec.CommandContext` has **two** error shapes at a deadline, and only one
+of them is safe here:
+
+- the process **started** and was killed at the deadline → `*exec.ExitError`
+  ("signal: killed"), which is not a context error → correctly non-fatal;
+- the context expired **before fork/exec completed** → `Start` returns
+  `ctx.Err()`, so the caller gets a **bare `context.DeadlineExceeded`** →
+  `applyErrSkipsPeerSync` cannot tell it from the #2926 daemon-stop abort
+  and classifies it FATAL, suppressing the push (or discarding a
+  peer-promoted config).
+
+Which shape you get depends on whether fork/exec wins the race with the
+deadline — i.e. on machine load. This was observed for real: the cell that
+originally drove a live command against a short deadline passed unloaded
+and failed under a loaded full-package run.
+
+The gap is **not** specific to the credential reconcilers. Every apply-path
+command runner builds its own short context — `nftApplyPayload` (5s,
+feeding `lo0Err`/`hostInboundErr` since #3392/#3333) and `daemon_dns.go`'s
+`systemctl disable/mask` (feeding `dnsErr` since #6792) — so the same
+misclassification already reaches the same classifier through operands that
+predate #6790. #6790 adds members to an already-exposed population rather
+than creating the exposure, and fixing the classifier changes behaviour for
+those older operands, so it is tracked separately as #7618.
+
+Until then it is a tripwire, not folklore:
+`TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserts the
+CURRENT (wrong) classification, so the fix reds a named cell and must
+invert it and this section together.
 
 ## Idempotency
 

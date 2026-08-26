@@ -1,3 +1,34 @@
+## 2026-08-26 — #6790 r3: the timeout cell was reading the MACHINE, and found #7618
+
+- **Timestamp**: 2026-08-26
+- **Action**: The r2 peer-sync cell drove a REAL command against a short
+  deadline to prove a command timeout is not a context error. It passed
+  unloaded and FAILED under a loaded full-package run —
+  `err="context deadline exceeded"`. The claim was not wrong so much as
+  INCOMPLETE: `exec.CommandContext` has two deadline shapes. Process started
+  then killed -> `*exec.ExitError` ("signal: killed"), safe. Context expired
+  BEFORE fork/exec -> `Start` returns `ctx.Err()` and the caller gets a bare
+  `context.DeadlineExceeded`, which `applyErrSkipsPeerSync` cannot tell from
+  the #2926 daemon-stop abort. Which one you get is decided by machine load,
+  so the cell was sampling the scheduler (the #7563 shape) — corrected my own
+  earlier "measured rather than assumed" claim, which had measured only the
+  unloaded branch.
+  Fixed the cell by CONSTRUCTION rather than by retry: build the ExitError
+  shape by Start-then-cancel, so the deadline race cannot occur. 5 repeat
+  runs green.
+  The misclassification itself is PRE-EXISTING and wider than #6790 —
+  `nftApplyPayload` (5s -> lo0Err/hostInboundErr, #3392/#3333) and the DNS
+  systemctl calls (-> dnsErr, #6792) reach the same classifier the same way.
+  Filed #7618 rather than fixing inline: the fix changes behaviour for five
+  operands that predate this PR. Left
+  `TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790` asserting the
+  CURRENT wrong classification so the fix reds a named cell instead of
+  silently passing.
+- **File(s)**: `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `docs/system-login.md`, `_Log.md`
+- **Validation**: full `pkg/daemon` green; 5x repeat of the previously flaky
+  cell green; repo-wide gate re-run at the merged head.
+
 ## 2026-08-26 — #6790 follow-up: the #1960 no-brick classification is now pinned
 
 - **Timestamp**: 2026-08-26
