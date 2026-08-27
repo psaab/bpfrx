@@ -657,14 +657,85 @@ mod dnat_counter_guard_tests_6872 {
         false
     }
 
-    /// Walk outward from `i` and report whether the nearest enclosing block is
-    /// a `fn` (rather than a `mod` or the file itself).
+    /// Does `line` contain `pat` OUTSIDE a string literal?
     ///
-    /// A `static` declared inside a `mod` is indented but is still module
-    /// scope: nameable, shareable, and correct. Only one inside a `fn` body is
-    /// the defect. Indentation alone cannot tell those apart, and the previous
-    /// revision's `line.starts_with(whitespace)` test called both a defect.
+    /// The same guard `is_counter_read` applies one function away, and for the
+    /// same reason: this file scans Rust source that contains Rust source in
+    /// raw strings (its own fixtures), so an occurrence inside a quote is the
+    /// scanner reading a description of code, not code.
+    ///
+    /// Approximate in the same way its sibling is — it asks only whether the
+    /// character before the match is a quote — because the alternative is a
+    /// tokenizer, and the failure this prevents is a fixture line being read as
+    /// a scope boundary.
+    fn contains_unquoted(line: &str, pat: &str) -> bool {
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(pat) {
+            let at = from + rel;
+            if line[..at].chars().last() != Some('"') {
+                return true;
+            }
+            from = at + pat.len();
+        }
+        false
+    }
+
+    /// Walk outward from `i` and report whether ANY enclosing block is a `fn`.
+    ///
+    /// A `static` declared inside a `mod` at file scope is indented but is
+    /// still module scope: nameable, shareable, and correct. Only one reachable
+    /// from a `fn` body is the defect. Indentation alone cannot tell those
+    /// apart, and an early revision's `line.starts_with(whitespace)` test
+    /// called both a defect.
+    ///
+    /// #6872 r2 (close-6801's review, after merge): two false negatives, both
+    /// in the miss-a-real-defect direction.
+    ///
+    /// 1. **A `mod` nested inside a `fn` terminated the walk.** The old code
+    ///    returned `false` on the first enclosing `mod`, so
+    ///    `fn f() { mod m { static L: Mutex<()> ... } }` was called correct.
+    ///    It is not: `L` is `f::m::L`, unnameable from outside `f`, which is
+    ///    this predicate's own definition of the defect. A `mod` is therefore
+    ///    no longer a verdict — the walk continues outward, and only running
+    ///    out of enclosing blocks means module scope. That keeps the
+    ///    file-scope `mod m { static … }` case correct for the right reason:
+    ///    it walks out of `m`, finds no `fn`, and returns false.
+    /// 2. **A `mod` (or `fn`) inside a RAW STRING was read as code.** Same
+    ///    class as the quoted-pattern case `is_counter_read` already guards,
+    ///    and it bit in both directions: a quoted `mod` used to end the walk
+    ///    early (missing a real defect), and a quoted `fn` can still claim one
+    ///    that is not there. Both recognitions now go through
+    ///    `contains_unquoted`.
     fn enclosing_is_fn(lines: &[&str], i: usize) -> bool {
+        // Which lines are RAW-STRING CONTENT rather than code (#6872 r2).
+        //
+        // `contains_unquoted` alone is not enough, and the sensitivity control
+        // proved it: a quoted `mod` at COLUMN 0 is never even offered to that
+        // guard, because the indent filter below skips it first — and worse, it
+        // updates `level` to 0 on the way past, so the real enclosing `fn` at
+        // column 0 is then skipped as "not further out". The line has to be
+        // excluded from the walk entirely, not merely from the keyword match.
+        //
+        // Computed forward from the file start, since "am I inside a string"
+        // cannot be answered by the backward walk. A line-granular `r#"` /
+        // `"#` tracker, which is the shape this file's fixtures actually use;
+        // the scan runs once over one file in a test, so the extra pass is
+        // free.
+        let mut in_raw = vec![false; i + 1];
+        let mut open = false;
+        for (j, l) in lines.iter().enumerate().take(i + 1) {
+            if open {
+                in_raw[j] = true;
+                if l.contains("\"#") {
+                    open = false;
+                }
+                continue;
+            }
+            if l.contains("r#\"") && !l.contains("\"#") {
+                open = true;
+            }
+        }
+
         let mut level = indent_of(lines[i]);
         for j in (0..i).rev() {
             let l = lines[j];
@@ -672,15 +743,20 @@ mod dnat_counter_guard_tests_6872 {
             if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
                 continue;
             }
+            // String content is not a scope boundary and must not move `level`.
+            if in_raw[j] {
+                continue;
+            }
             if indent_of(l) >= level {
                 continue;
             }
-            if t.starts_with("fn ") || t.contains(" fn ") {
+            if contains_unquoted(t, "fn ") {
                 return true;
             }
-            if t.starts_with("mod ") || t.contains(" mod ") {
-                return false;
-            }
+            // A `mod` is NOT a verdict (#6872 r2). Fall through to the outward
+            // step below: an enclosing `fn` further out still makes this lock
+            // function-local, and reaching file scope still makes it module
+            // scope.
             level = indent_of(l);
         }
         false
@@ -900,6 +976,23 @@ mod dnat_counter_guard_tests_6872 {
                 "RwLock",
                 "fn t() {\n    static L: RwLock<()> = RwLock::new(());\n}\n",
             ),
+            // #6872 r2, defect 1: a `mod` nested inside a `fn`. The lock is
+            // `t::m::GUARD` -- unnameable from outside `t`, which is exactly
+            // what this predicate calls the defect. The old walk returned
+            // false at the first enclosing `mod` and never looked further out.
+            (
+                "mod nested INSIDE a fn",
+                "fn t() {\n    mod m {\n        static GUARD: Mutex<()> = Mutex::new(());\n    }\n}\n",
+            ),
+            // #6872 r2, defect 2: a `mod` line that is STRING CONTENT, not
+            // code. Read as code it ended the walk early and the genuinely
+            // function-local lock below it went unflagged. `is_counter_read`
+            // one function away already rejects quoted patterns; the scope
+            // walk now applies the same care.
+            (
+                "a COLUMN-0 quoted `mod` line must not end the walk",
+                "fn t() {\n    let fixture = r#\"\nmod m {\n\"#;\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
+            ),
         ] {
             let lines: Vec<&str> = src.lines().collect();
             assert!(
@@ -921,6 +1014,35 @@ mod dnat_counter_guard_tests_6872 {
             (
                 "a function-local static that is not a lock",
                 "fn t() {\n    static N: u64 = 7;\n}\n",
+            ),
+            // The over-reach control for defect 1's fix. Making `mod` stop
+            // being a verdict must NOT turn every module-scope lock into a
+            // defect: this one is inside two nested `mod`s and no `fn` at all,
+            // so the walk has to run out of blocks and answer false. Without
+            // this, "walk further out" and "always return true" are
+            // indistinguishable.
+            (
+                "module scope inside NESTED mods, no fn anywhere",
+                "mod a {\n    mod b {\n        static GUARD: Mutex<()> = Mutex::new(());\n    }\n}\n",
+            ),
+            // The over-reach control for defect 2's fix: a quoted `fn` must not
+            // CLAIM a function scope that is not there. The quote guard has to
+            // cut both ways or it trades one false negative for a false
+            // positive.
+            (
+                "a COLUMN-0 quoted `fn` line must not invent a function scope",
+                "mod m {\n    let fixture = r#\"\nfn t() {\n\"#;\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
+            ),
+            // The case that requires `contains_unquoted` specifically, as
+            // opposed to the raw-string mask. A SAME-LINE quoted `fn` at an
+            // OUTER indent is examined by the walk (indent 2 < 4), is not
+            // inside a raw string, and would be read as a function header
+            // without the quote guard -- inventing a scope and flagging a
+            // module-scope lock. The mask cannot see this one; the guard is
+            // what answers it.
+            (
+                "a same-line quoted `fn` at an outer indent must not invent a scope",
+                "mod m {\n  let s = \"fn t() {\";\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
             ),
         ] {
             let lines: Vec<&str> = src.lines().collect();

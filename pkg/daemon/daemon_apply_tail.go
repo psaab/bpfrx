@@ -50,7 +50,51 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		localPri := d.cluster.LocalPriorities()
 		vrrpInstances = append(vrrpInstances, vrrp.CollectRethInstances(cfg, localPri)...)
 	}
-	if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
+	if d.vrrpMgr == nil {
+		// #6739 (work item G, the half that is provable on master TODAY).
+		//
+		// Store.Load recovers a STILL-LIVE commit-confirmed window by re-arming
+		// time.AfterFunc(time.Until(deadline)). An ALREADY-EXPIRED window is
+		// handled synchronously in an earlier branch and never reaches that
+		// re-arm, so the remaining duration here is strictly positive — but it
+		// is bounded below only by how close the boot is to the deadline, and
+		// can be arbitrarily small. A box that reboots shortly before its
+		// deadline (`commit confirmed 1` and a ~55s boot) arms a timer with
+		// seconds on it.
+		//
+		// That timer is armed in startup PHASE 1 (loadAndBootstrapConfig); the
+		// rollback executor is registered before the phase list even starts;
+		// and vrrpMgr is not constructed until PHASE 3 (initManagers). Nothing
+		// holds applySem across the phases. So when the remaining duration
+		// elapses before phase 3 completes, the timer goroutine reaches this
+		// line with vrrpMgr still nil and the daemon panics AT BOOT.
+		//
+		// Measured, not argued — and the first mechanism I wrote here was
+		// WRONG: I recorded an unclamped negative duration firing immediately,
+		// then found the synchronous expired-window branch that makes that
+		// impossible. The panic is real (see
+		// TestRecoveredRollbackDoesNotPanicBeforeManagers6739); the route to it
+		// is a race against phases 2-3, not an instantaneous fire.
+		//
+		// Deliberately NOT "skip the update and carry on". This site is already
+		// a fail-closed gate one line below for exactly one reason: reporting a
+		// successful apply while the manager does not hold the requested
+		// instance set claims HA coverage for a family or segment that is not
+		// running. A nil manager holds NO instance set at all, which is the
+		// strongest form of that same condition, so it fails closed too.
+		//
+		// This is deliberately NOT work item G's startup-readiness gate. G
+		// releases recovery at end-of-phase-5, and #6739 records that landing
+		// that without work item H converts this short pre-manager window into
+		// a post-manager bootstrap-with-live-cluster hybrid — a worse state.
+		// Guarding the dereference moves no dispatch point and creates no such
+		// hybrid; it converts a boot panic into a reported apply failure and
+		// leaves G/H/H2 entirely to their unresolved convergence.
+		vrrpErr = errors.New("update VRRP instances: VRRP manager not initialized " +
+			"(apply reached the VRRP reconcile before daemon startup constructed it)")
+		slog.Error("VRRP reconcile ran before the VRRP manager exists; failing the apply "+
+			"closed rather than claiming HA coverage", "issue", "#6739")
+	} else if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
 		slog.Warn("failed to update VRRP instances", "err", err)
 		// Identity/family validation is a fail-closed runtime gate. Returning a
 		// successful commit while the manager retained the old instance set

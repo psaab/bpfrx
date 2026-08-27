@@ -106997,6 +106997,21 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #7679 — raised the #7257 probe's teardown-progress bound from 5s to 30s. The 5s deadline made master RED under `go test ./...` twice; it is itself a fixed wall-clock sample of an asynchronous observable, which is the #7650 defect the file was changed to fix.
   - **File(s)**: pkg/cluster/heartbeat_start_stop_race_7257_test.go
 
+## 2026-08-26 — #6739: guard the pre-manager VRRP deref (work item G's provable half)
+
+- **Timestamp**: 2026-08-26
+- **Action**: A recovered commit-confirmed rollback can reach `applyTailReconciles`
+  before startup phase 3 constructs `d.vrrpMgr`, and the VRRP call site was the
+  only unguarded manager deref there — the daemon panics at boot. Guarded it and
+  failed CLOSED (a nil manager holds no instance set, which is the strongest form
+  of the condition the adjacent fail-closed gate already exists for). Deliberately
+  does NOT implement work item G's startup-readiness gate: #6739 records that
+  landing G without H converts this short pre-manager window into a post-manager
+  bootstrap-with-live-cluster hybrid, so no dispatch point is moved. G/H/H2 remain
+  unimplemented and unconverged.
+- **File(s)**: `pkg/daemon/daemon_apply_tail.go`,
+  `pkg/daemon/recovered_rollback_premanager_6739_test.go`, `_Log.md`
+
 ## 2026-08-26 — #7667: make the retired-leg fixture stop racing the drain
 
 - **Timestamp**: 2026-08-26
