@@ -260,6 +260,15 @@ type Config struct {
 	// Backs the xpf_host_inbound_conntrack_revocation_failures_total counter.
 	// Optional; if nil, the counter is not emitted.
 	HostInboundConntrackFlushFailuresFn func() uint64
+	// ManagedServiceReloadOwedFn reports, per xpf-managed service, whether a
+	// runtime reload is still owed because the on-disk configuration converged
+	// but the reload that would load it failed (#6800). Nil on a server that
+	// does not wire it, in which case the series is OMITTED rather than
+	// published as an authoritative 0.
+	ManagedServiceReloadOwedFn func() map[string]bool
+	// ManagedServiceReloadFailuresFn reports the monotonic per-service count of
+	// failed reload attempts, retries included (#6800). Same nil contract.
+	ManagedServiceReloadFailuresFn func() map[string]uint64
 	// SchedulerRepublishFailedFn reports whether the most recent
 	// scheduler-driven policy republish failed and has not yet converged
 	// (#3780). A scheduler window transition republishes enforcement; a
@@ -433,6 +442,8 @@ type Server struct {
 	ipsecRebindPendingFn                 func() bool
 	hostInboundConntrackRevocationOwedFn func() bool
 	hostInboundConntrackFlushFailuresFn  func() uint64
+	managedServiceReloadOwedFn           func() map[string]bool
+	managedServiceReloadFailuresFn       func() map[string]uint64
 	schedulerRepublishFailedFn           func() bool
 	schedulerRepublishStaleSecondsFn     func() float64
 	schedulerRepublishFailClosedFn       func() bool
@@ -538,6 +549,8 @@ func NewServer(cfg Config) *Server {
 		ipsecRebindPendingFn:                 cfg.IPsecRebindPendingFn,
 		hostInboundConntrackRevocationOwedFn: cfg.HostInboundConntrackRevocationOwedFn,
 		hostInboundConntrackFlushFailuresFn:  cfg.HostInboundConntrackFlushFailuresFn,
+		managedServiceReloadOwedFn:           cfg.ManagedServiceReloadOwedFn,
+		managedServiceReloadFailuresFn:       cfg.ManagedServiceReloadFailuresFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,

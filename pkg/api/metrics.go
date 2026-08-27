@@ -1,6 +1,7 @@
 package api
 
 import (
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -231,6 +232,15 @@ type xpfCollector struct {
 	// the monotonic count of those failures.
 	hostInboundConntrackRevocationPending  *prometheus.Desc
 	hostInboundConntrackRevocationFailures *prometheus.Desc
+
+	// #6800: the xpf-managed service configuration files (rsyslog drop-ins,
+	// chrony sources/threshold) converge on disk and then gate a RUNTIME reload
+	// on "did the on-disk set change". A reload that FAILS after the file
+	// converged used to be erased by that gate, so the daemon kept serving the
+	// previous ruleset with nothing to see. Labelled by `service` because the
+	// legs fail independently and drive different commands.
+	managedServiceReloadPending  *prometheus.Desc
+	managedServiceReloadFailures *prometheus.Desc
 
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
@@ -791,6 +801,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.schedulerRepublishFailClosed
 	ch <- c.hostInboundConntrackRevocationPending
 	ch <- c.hostInboundConntrackRevocationFailures
+	ch <- c.managedServiceReloadPending
+	ch <- c.managedServiceReloadFailures
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1148,6 +1160,31 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(c.srv.hostInboundConntrackFlushFailuresFn()))
 	}
 
+	// #6800: managed-service reload debt. Emitted BEFORE the dataplane gate for
+	// the same reason as the two series above — rsyslog forwarding and chrony
+	// time sync are reconciled in config-only mode too, so a node whose
+	// dataplane never loaded is exactly the node whose stale logging pipeline
+	// most needs to be visible. Keys are sorted so the sample order is stable
+	// across scrapes (Go map iteration is not).
+	if c.srv.managedServiceReloadOwedFn != nil {
+		owed := c.srv.managedServiceReloadOwedFn()
+		for _, svc := range sortedKeys6800(owed) {
+			v := 0.0
+			if owed[svc] {
+				v = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.managedServiceReloadPending,
+				prometheus.GaugeValue, v, svc)
+		}
+	}
+	if c.srv.managedServiceReloadFailuresFn != nil {
+		failures := c.srv.managedServiceReloadFailuresFn()
+		for _, svc := range sortedKeys6800(failures) {
+			ch <- prometheus.MustNewConstMetric(c.managedServiceReloadFailures,
+				prometheus.CounterValue, float64(failures[svc]), svc)
+		}
+	}
+
 	// #3780: scheduler republish-failure is a control-plane signal (the
 	// policy scheduler runs even in config-only mode) — emit it BEFORE
 	// the dataplane gate so stale enforcement past a schedule window
@@ -1378,4 +1415,16 @@ func bucketUpperBoundNs(i int) uint64 {
 
 func policyCounterID(policySetID uint32, ruleIndex int) uint32 {
 	return policySetID*dataplane.MaxRulesPerPolicy + uint32(ruleIndex)
+}
+
+// sortedKeys6800 returns a map's keys in a stable order. Prometheus does not
+// require a sample order, but an unstable one makes a golden scrape diff noise
+// and makes a test that reads "the first sample" quietly nondeterministic.
+func sortedKeys6800[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

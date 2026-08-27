@@ -2224,6 +2224,90 @@ never lock an operator out of a remote box it manages.
   their fn, and are OMITTED rather than published as `0` when unwired — the #6828
   absent-vs-zero distinction).
 
+  **Managed service-file reload debt (#6800, the recovery half of #6791/#6793
+  applied to the two managed-FILE appliers):** `applySyslogFiles` and
+  `applySystemNTP` converge an on-disk service configuration and then gate a
+  RUNTIME reload on "did the on-disk set change" — `reconcileSyslogDropins` ->
+  `systemctl restart rsyslog`, and `reconcileManagedFile` -> `chronyc reload
+  sources` / `systemctl reload chrony`. The gate is what stops a steady-state
+  commit from bouncing rsyslog and chrony, but it also ERASED the debt of a
+  FAILED reload: the write half had already converged the files, so the failing
+  reload was logged and dropped, and every later apply compared desired against
+  the converged set, saw `changed == false`, and skipped the reload. The daemon
+  kept serving the PREVIOUS ruleset — records still flowing to a syslog
+  destination the operator had removed, chrony still polling the old server set
+  — until an unrelated syslog/NTP edit or a reboot, on a node that had reported
+  a successful commit. The failure is transient and ordinary (`systemctl
+  restart` on a unit that is failed/masked or has a queued job, or the 15s exec
+  timeout on a loaded box), which is exactly why a retry owner recovers and a
+  dropped error does not. `serviceReloadDebt` (`daemon_service_reload_debt.go`,
+  a `Daemon` field, zero value = nothing owed) now retains the reload still
+  owed, per SERVICE and — for chrony — per LEG, because the sources and
+  threshold reloads are independent commands: a sources failure followed by a
+  threshold-only edit must replay BOTH, and re-deriving the request from the
+  later apply's own change flags would drop the sources debt. Both call sites
+  fold the retained debt into the request they issue (before the no-change early
+  return) and latch/discharge the outcome; `reloadChronyRuntime` now RETURNS a
+  per-leg `chronyReloadOutcome` instead of returning nothing.
+  `serviceReloadDebtReassertLoop` is the always-on owner for the case with no
+  next apply at all (a boot-time failure): started unconditionally in `Run`
+  alongside `proxyARPReassertLoop` / `raDeadSenderReassertLoop` /
+  `fabricIPVLANReassertLoop`, it takes `applySem` BEFORE re-driving anything the
+  apply path also writes (#4001 — a restart issued outside the semaphore can
+  load a HALF-CONVERGED drop-in set mid-reconcile and latch a success for it)
+  and re-reads the debt INSIDE the semaphore so a commit that discharged it
+  while the tick queued does not get a gratuitous second bounce. The gate is
+  three booleans under one mutex, so a healthy node pays nothing per tick.
+  Seams: `rsyslogRestartFn` / `chronyReloadFn` (both owners go through one
+  entry point, which is what makes the re-drive assertable), `chronyRunCmd`
+  (per-leg outcomes without a real chronyc), and `rsyslogConfDir` /
+  `chronySourcesPath` / `chronyThresholdPath` as vars so the reconcile runs
+  against a temp dir. Tests: `service_reload_debt_6800_test.go` (latch +
+  discharge pairs for both services; the steady-state retry with an explicit
+  "the files really are converged" premise guard and its debt-free negative;
+  per-leg outcome pairs; the two SYMMETRIC "owed leg survives an apply that
+  changed the other file" cells; a same-config cell binding that the fold
+  precedes the early return; the re-assert replaying the EXACT owed leg; the
+  per-service gates via a paired one-owes/one-quiet cell; the
+  inside-the-semaphore re-read; loop ticks + ctx cancel; a loop-START cell
+  asserting `Run` launches it unconditionally; and the accessor + metric-wiring
+  cells below).
+  **sshd is the third instance, and the one the "already covered" reading
+  misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's
+  `revertDropIn` restores the prior content on a failed reload, so the file no
+  longer matches desired and the next apply rewrites and reloads. The REMOVAL
+  path has nothing to revert TO — the drop-in is DELETED, the reload then fails,
+  and every later apply reads `hadDropIn == false` and returns before reaching a
+  reload. sshd keeps enforcing the xpf policy the operator REMOVED, which may be
+  MORE permissive than the base-image default (`PermitRootLogin`, ciphers,
+  MACs), until a manual restart or a reboot. The removal gate is now
+  `!hadDropIn && !d.sshdReloadOwed()`, both reload sites record their outcome
+  (an update-path SUCCESS discharges a removal debt — sshd has re-read its
+  configuration either way), and the re-assert re-validates with `sshd -t`
+  before the SIGHUP exactly as the apply path does (#4311), leaving the debt
+  OUTSTANDING when validation fails because nothing was reloaded.
+  R61 also flagged chrony's SHARED 15s context: one hung `chronyc reload
+  sources` consumed the whole budget, so all four threshold fallbacks ran
+  against an already-expired context — 15s of apply latency buying no
+  convergence on either leg. The sources leg now has its own
+  `chronySourcesReloadTimeout` inside the aggregate, so it cannot starve them.
+  Operator visibility, mirroring #6802: `ManagedServiceReloadOwed` /
+  `ManagedServiceReloadFailures` are wired into the REST/metrics server
+  (`daemon_run_servers.go`) as `xpf_managed_service_reload_pending` and
+  `xpf_managed_service_reload_failures_total`, both labelled by `service`
+  (`rsyslog`, `chrony-sources`, `chrony-threshold`, `sshd`) because the legs fail
+  independently and a collapsed gauge would not say WHICH reload never landed.
+  The counter earns its place beside the gauge: a count that CLIMBS while the
+  gauge stays 1 means the retry owner is running but not converging (a masked or
+  failed unit), which the gauge alone cannot distinguish from one transient
+  failure already paid. Both series are OMITTED rather than published as `0`
+  when the fn is unwired (the #6828 absent-vs-zero distinction), and an accessor
+  with no production caller would leave the operator exactly as blind as before
+  (the #6852 shape) — hence the source-level wiring cell. Pinned by
+  `pkg/api/metrics_managed_service_reload_6800_test.go` through a PEDANTIC
+  registry, which is what makes a missing `Describe` entry a hard error rather
+  than a silent production degradation.
+
   **VRF setup / management-bind fail-closed (#5700, mirroring #5310/#5696/#5844):**
   `applyVRFReconcile` LOGGED-and-DROPPED its `ReconcileVRFs` failure (WARN) and
   returned only the #2926-C1 ctx-cancellation, even though `reconcileVRFs`'s
