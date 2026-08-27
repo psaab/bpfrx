@@ -1432,6 +1432,31 @@ mod remainder_temporal_tests_6846 {
         assert_eq!(cos_temporal_buffer_bytes(1_000_000, 0), None);
     }
 
+    /// The CALL SITE must hand temporal the queue's transmit rate, not the
+    /// interface burst.
+    ///
+    /// Every other temporal cell calls `cos_temporal_buffer_bytes` directly, so
+    /// none of them exercises `cos_scheduler_buffer_bytes` — and a converter
+    /// that is correct but wired to the wrong argument produces a plausible
+    /// number rather than a failure. Found by the mutation matrix: swapping
+    /// `transmit_rate_bytes` for `interface_burst_bytes` at the call site
+    /// escaped GREEN against the whole crate.
+    #[test]
+    fn temporal_call_site_uses_the_queue_rate_not_the_interface_burst() {
+        let mut sched = CoSSchedulerSnapshot::default();
+        sched.name = "s".to_string();
+        sched.buffer_size_temporal_us = 1_000_000; // one second of drain
+                                                   // Distinct values so the two arguments cannot be confused: converting
+                                                   // against the RATE gives 700, against the BURST gives 90_000.
+        let got = cos_scheduler_buffer_bytes(Some(&sched), 90_000, 700);
+        assert_eq!(
+            got, 700,
+            "one second of drain must be computed from the queue's transmit rate \
+             (700), not the interface burst (90_000) — the converter being right \
+             does not make the call site right"
+        );
+    }
+
     /// `remainder` + `temporal` on ONE queue is LEGAL, and the ORDERING is the
     /// property: temporal must convert against the rate remainder produced,
     /// not against zero or the interface rate.
