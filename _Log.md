@@ -1,3 +1,47 @@
+## 2026-08-27 — #6821: security-log transport packed tail, gate and compiler together
+
+- **Timestamp**: 2026-08-27
+- **Action**: `security log stream <s> transport` has two legal hierarchical
+  spellings and the compiler read only one. `transport protocol tls;` packs its
+  value onto the container's own `Keys` with NO children, so the
+  `prop.Children` loop ran zero times and left `Transport.Protocol` empty on a
+  config that committed cleanly. Not inert: `daemon_system.go` defaults an empty
+  protocol to `udp`, so the compact spelling of a TLS audit stream shipped over
+  PLAINTEXT UDP while the config on disk still read `protocol tls`. That answers
+  the question the issue left open, and it is the worst of the possibilities it
+  listed.
+  The issue prescribed "accumulate `Keys[1:]`", and that alone would have been
+  wrong — the arm carried a comment saying so, and measuring confirmed it: the
+  gate ignores a container's packed tail BY DESIGN (compiler-faithful), so
+  `transport { protocol tpc; }` was rejected by the enum while
+  `transport protocol tpc;` was ACCEPTED. Compiling the tail without the gate
+  turns "not compiled" into "compiled, unvalidated". Added `schemaNode.packedTail`
+  as the explicit pairing: it declares that a compiler reads this container's
+  packed tail, and `walkSchemaNode` then validates the same `packedBodyChildren`
+  expansion the compiler consumes. Three readers, one expansion, resolved through
+  `securityLogTransportSchema()` so a schema move cannot silently hand back the
+  unexpanded children and restore the defect.
+  The `tls-profile` half fails the other way and the issue framed both the same:
+  xpf resolves no TLS profile at all, so the BLOCK spelling is REJECTED at commit
+  (#3350). The compact spelling slipped past that rejection AND dropped the
+  value — a lost diagnostic, not lost protection.
+  The #2419 census tripwire fired, which is it working: the two leaves were
+  recorded as by-design divergent BECAUSE of the packed-tail blocker. They moved
+  to `filedFixed` rather than being deleted so the sites stay checked in both
+  directions, and the `filedByDesign` floor dropped 6 -> 4 with the reason at the
+  assertion.
+- **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
+  `pkg/config/schema_walk.go`, `pkg/config/compiler_security_log.go`,
+  `pkg/config/security_log_transport_compact_6821_test.go` (new),
+  `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`
+- **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0
+  (68 ok, 0 FAIL). 5-cell mutation matrix, 5/5 RED, full package, no `-run`
+  filter, fix committed before mutating. One cell initially reported ANCHOR x2
+  (both readers share the same call prefix) and was re-anchored — a cell that
+  cannot locate its line measures nothing.
+
 ## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
 
 - **Timestamp**: 2026-08-26
