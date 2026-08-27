@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -446,5 +447,51 @@ func TestShimCarriesFragHdrSizeAssertion(t *testing.T) {
 			"a field added to FragHdr would make the shim advance 9 bytes past a Fragment "+
 			"header where userspace-dp advances 8, corrupting every fragmented-chain L4 "+
 			"offset (#4555)", root, itemPrefix, expr)
+	}
+}
+
+// TestReadmeFloorFigureMatchesTheConstants pins what pkg/dataplane/README.md
+// says about the verifier floor to the constants it is describing (#6886
+// follow-up).
+//
+// The sentence this guards rotted within hours of being written, and not by
+// anyone editing it: it was measured and reported against the 3.0% floor, and
+// #7720 raised the floor to 15% in the same window. Correct when written,
+// false once merged -- which no review of either change catches, because each
+// was right in isolation.
+//
+// So the README's figures are bound to the constants rather than restated. A
+// future floor change reds HERE, naming the doc that has to move with it,
+// instead of leaving a stale number in the file that explains the shim's
+// budget to the next person sizing a change against it.
+//
+// Only the two CONSTANT-backed figures are asserted. The admitted ceiling the
+// README also quotes is a pure function of the floor and the kernel's 1M
+// verifier limit, which is not a tracked constant -- asserting it here would
+// mean hardcoding 1,000,000 in the guard, i.e. inventing the third number the
+// guard exists to prevent.
+func TestReadmeFloorFigureMatchesTheConstants(t *testing.T) {
+	raw, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	text := string(raw)
+
+	wantFloor := fmt.Sprintf("%.0f%% floor", UserspaceShimMinVerifierHeadroomPct)
+	if !strings.Contains(text, wantFloor) {
+		t.Errorf("pkg/dataplane/README.md does not mention %q. The floor in force is "+
+			"UserspaceShimMinVerifierHeadroomPct = %.1f, and the README is what explains the "+
+			"shim's budget to whoever sizes the next change against it, so it must name the "+
+			"floor actually applied", wantFloor, UserspaceShimMinVerifierHeadroomPct)
+	}
+
+	// The structural-change size is what makes the floor a TRIPWIRE rather than
+	// a bare threshold, and the README states which direction is healthy.
+	wantStructural := fmt.Sprintf("%d,000", UserspaceShimStructuralChangeInsns/1000)
+	if !strings.Contains(text, wantStructural) {
+		t.Errorf("pkg/dataplane/README.md does not mention the structural-change size %q "+
+			"(UserspaceShimStructuralChangeInsns = %d). The floor's stated property is that it "+
+			"fires BEFORE a change that large lands; the README cannot explain the budget "+
+			"without it", wantStructural, UserspaceShimStructuralChangeInsns)
 	}
 }
