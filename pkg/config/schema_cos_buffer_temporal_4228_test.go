@@ -35,20 +35,50 @@ func TestCoSBufferSizeTemporal_AcceptsAndCompiles(t *testing.T) {
 	}
 }
 
-func TestCoSBufferSizeTemporal_EmitsInertAdvisory(t *testing.T) {
-	cfg := mustCompileSet4228(t,
-		"set class-of-service schedulers be buffer-size temporal 50000",
-	)
-	warnings := config.ValidateConfig(cfg)
-	found := false
-	for _, w := range warnings {
-		if strings.Contains(w, "buffer-size temporal") && strings.Contains(w, "inert") {
-			found = true
+// TestTemporalAdvisoryNarrowsToUnresolvable6846 replaces the #4228 blanket
+// inert-advisory assertion. #6846 makes `buffer-size temporal` RESOLVE against
+// the queue's transmit rate, so the advisory must narrow to the case that still
+// cannot: a queue with no resolvable rate has no drain speed.
+//
+// BOTH DIRECTIONS ARE ASSERTED, and the second is the one that matters. An
+// advisory that keeps firing for configurations that now work is as much a
+// defect as one that stops firing for configurations that do not — it teaches
+// the operator to ignore it. A cell that only checked "it still warns" would
+// pass against a change that never narrowed anything.
+func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
+	hasTemporalAdvisory := func(t *testing.T, lines ...string) bool {
+		t.Helper()
+		for _, w := range config.ValidateConfig(mustCompileSet4228(t, lines...)) {
+			if strings.Contains(w, "buffer-size temporal") {
+				return true
+			}
 		}
+		return false
 	}
-	if !found {
-		t.Fatalf("expected an accepted-but-inert advisory for buffer-size temporal, got: %v", warnings)
-	}
+
+	t.Run("no resolvable rate still warns", func(t *testing.T) {
+		// A bare scheduler: no absolute rate, and not bound via a
+		// scheduler-map to a shaped interface. Nothing to convert against.
+		if !hasTemporalAdvisory(t,
+			"set class-of-service schedulers be buffer-size temporal 50000",
+		) {
+			t.Fatal("a temporal target on a queue with no resolvable transmit-rate " +
+				"must still warn — there is no drain speed to convert it against")
+		}
+	})
+
+	t.Run("absolute rate resolves, so it must NOT warn", func(t *testing.T) {
+		// An explicit transmit-rate needs no shaping base, so temporal
+		// converts and the advisory must be gone.
+		if hasTemporalAdvisory(t,
+			"set class-of-service schedulers be transmit-rate 10m",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+		) {
+			t.Fatal("#6846: temporal RESOLVES against an explicit transmit-rate, so " +
+				"the advisory must not fire. An advisory that keeps firing for a " +
+				"configuration that now works teaches the operator to ignore it")
+		}
+	})
 }
 
 // The byte-size and percent forms must keep working after the tailValidator

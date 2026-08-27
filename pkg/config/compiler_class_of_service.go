@@ -1002,47 +1002,6 @@ func resolveCoSTrafficControlProfiles(cfg *Config) {
 	}
 }
 
-// cosSchedulersWithShapedBinding returns the set of scheduler names that are
-// bound — via a scheduler-map applied to an interface unit with a non-zero
-// root shaping-rate — to at least one shaped interface. A `transmit-rate
-// percent <n>` on such a scheduler RESOLVES: forwarding_build/cos.rs computes
-// the absolute byte/sec rate against the interface's shaping-rate. A scheduler
-// NOT in this set has no shaping base, so its percent stays inert; the
-// ValidateConfig advisory flags exactly that residual. Must run AFTER
-// resolveCoSTrafficControlProfiles so unit.ShapingRateBytes reflects a folded
-// traffic-control-profile shaping-rate (including a resolved shaping-rate
-// percent).
-func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
-	resolved := make(map[string]bool)
-	if cos == nil {
-		return resolved
-	}
-	markUnit := func(unit *CoSInterfaceUnit) {
-		if unit == nil || unit.SchedulerMap == "" || unit.ShapingRateBytes == 0 {
-			return
-		}
-		sm := cos.SchedulerMaps[unit.SchedulerMap]
-		if sm == nil {
-			return
-		}
-		for _, entry := range sm.Entries {
-			if entry != nil && entry.Scheduler != "" {
-				resolved[entry.Scheduler] = true
-			}
-		}
-	}
-	for _, iface := range cos.Interfaces {
-		if iface == nil {
-			continue
-		}
-		markUnit(iface.Level)
-		for _, unit := range iface.Units {
-			markUnit(unit)
-		}
-	}
-	return resolved
-}
-
 // coSInterfaceLineRateBytes returns the configured line rate of a physical
 // interface in bytes/sec, or 0 when unknown. It is the base against which a
 // `shaping-rate percent <n>` traffic-control-profile resolves (Junos resolves

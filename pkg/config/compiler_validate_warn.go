@@ -1235,17 +1235,21 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
 					sched.Name))
 			}
-			// #4228 Gap 2 follow-up: buffer-size temporal <us> is typed + stored
-			// (BufferSizeTemporalUS) so garbage is rejected at commit, but the
-			// microsecond target is NOT yet resolved to a byte-size by the
-			// dataplane (that needs the queue's transmit rate, which itself may
-			// be a per-interface percent). Warn so an operator who sets it is not
-			// misled into believing the queue buffer is sized. Mirrors the
-			// accepted-but-inert doctrine used for codel-target and the percent
-			// rate forms.
-			if sched.BufferSizeTemporalUS > 0 {
+			// #6846: buffer-size temporal <us> now RESOLVES — forwarding_build/
+			// cos.rs converts the microsecond target against the queue's
+			// resolved transmit rate (cos_temporal_buffer_bytes). The advisory
+			// narrows to the one case that still cannot resolve: a queue with
+			// NO resolvable rate has no drain speed, so a microsecond target
+			// has no byte value and the buffer falls back to default sizing.
+			//
+			// The narrowing is the point. An advisory that keeps firing for
+			// configurations that now work is as much a defect as one that
+			// stops firing for configurations that do not — it teaches the
+			// operator to ignore it. Pinned by
+			// TestTemporalAdvisoryNarrowsToUnresolvable6846.
+			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerRateResolves(sched, schedulersResolvingPercent) {
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q buffer-size temporal is accepted for Junos compatibility but inert: xpf does not yet resolve the microsecond target to a byte-size (it needs the queue's transmit rate), so the queue buffer falls back to the default sizing (#4228 Gap 2)",
+					"class-of-service scheduler %q buffer-size temporal is accepted but has no effect: the queue has no resolvable transmit-rate (no absolute rate, and no scheduler-map binding to an interface with a root shaping-rate), so there is no drain speed to convert the microsecond target against (#6846)",
 					sched.Name))
 			}
 			// #4228 Gap 2: transmit-rate percent now RESOLVES per-interface —
@@ -1257,9 +1261,23 @@ func ValidateConfig(cfg *Config) []string {
 			// follow-up) and a `percent` scheduler with no shaping base to
 			// resolve against — i.e. not bound via a scheduler-map to an
 			// interface that has a root shaping-rate.
-			if sched.TransmitRateRemainder {
+			if sched.TransmitRateRemainder && !schedulersResolvingPercent[sched.Name] {
+				// #6846: `remainder` now RESOLVES where there is a shaping rate
+				// to take a remainder OF — forwarding_build/cos.rs computes
+				// `(shaping - resolved siblings) / remainder queues` per
+				// interface. The advisory narrows to the case that genuinely
+				// cannot resolve: no scheduler-map binding to an interface with
+				// a root shaping-rate means no base, and no port speed is
+				// available to substitute (InterfaceSnapshot carries no
+				// link-speed field).
+				//
+				// Note what is deliberately NOT warned: an OVER-SUBSCRIBED
+				// remainder resolves, to zero. That has its own warning below
+				// with its own wording, because "resolved to nothing" and
+				// "could not resolve" are different facts and an operator needs
+				// to know which one they have.
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q transmit-rate remainder is accepted for Junos compatibility but inert: the userspace dataplane consumes an absolute byte/sec rate and xpf does not yet resolve `remainder` against the leftover interface bandwidth, so the queue gets no explicit transmit-rate (#4228 Gap 2)",
+					"class-of-service scheduler %q transmit-rate remainder is accepted but has no effect: the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no interface bandwidth to take a remainder of (#6846)",
 					sched.Name))
 			} else if sched.TransmitRatePercent > 0 && !schedulersResolvingPercent[sched.Name] {
 				warnings = append(warnings, fmt.Sprintf(
