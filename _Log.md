@@ -106855,6 +106855,120 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #7674 — the #6826 contention probe was degenerate under `go test ./...`: the contender goroutine went unscheduled for the whole acquire loop, so the probe's own floor fired reporting it proved nothing. Master was RED. Wait on the observable before the loop, and measure overlap WITH the loop.
   - **File(s)**: pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go
 
+## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hostile review returned a HIGH on my own #7632 fix and it
+  reproduces. `deadlineArmingWriter` sets a deadline before every write and
+  never clears it; a write succeeding does not cancel it. Under HTTP/1.1 that is
+  invisible. Under HTTP/2 Go implements the write deadline as a timer that
+  RESETS THE STREAM, so my fix tore down an idle SSE feed one deadline after its
+  last event — with a client that had consumed everything and a firewall that
+  was legitimately quiet. Exactly the defect the design was written to avoid,
+  reintroduced by the mechanism chosen to avoid it.
+  REPRODUCED BEFORE FIXING rather than acting on the argument: HTTP/2 test
+  server, one event, idle 4x the deadline ->
+  `read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer`.
+  Fix: clear the deadline once the event is fully out. AFTER the flush, not
+  after the last Write — `http.Flusher.Flush()` does not go through the arming
+  writer, so clearing earlier would leave the flush unbounded and re-open the
+  pin.
+  WHY MY IDLE CELL DID NOT CATCH IT, and it is not the vacuity I had already
+  ruled out by mutation: the cell genuinely arms the deadline, but its helper
+  uses `httptest.NewServer`, which is HTTP/1.1 ONLY, while production permits
+  HTTP/2 on the TLS listener. Sound on the protocol it exercises, blind to the
+  one where expiry kills the stream. The lesson generalises past this file: a
+  cell's PROTOCOL is part of its fixture, and an HTTP/1.1 harness cannot observe
+  an HTTP/2 stream-reset timer.
+  So "per-write, not elapsed" was necessary and NOT sufficient — per-write still
+  severs an idle stream if the deadline outlives the write. The window has to
+  CLOSE as well as open.
+  Finding 2 (MEDIUM): the whole payload went out under one absolute deadline, so
+  a large event to a slow-but-PROGRESSING reader was cut off partway. The "few
+  hundred bytes" premise is unenforced — event JSON carries operator-authored
+  strings bounded only by the 16 MiB config limit. Payload now written in 32 KiB
+  chunks, each re-arming.
+  Finding 3 (LOW): my own harness published the establishing event once after a
+  fixed 150ms sleep, with no replay on subscriptions — the #7650 shape in my own
+  test. Now publishes on a ticker until the GET returns, with a bounded client.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+- **Validation**: the new HTTP/2 cell is verified to be the detector — removing
+  the clear reds `TestIdleSSEStreamIsNotResetOnHTTP2_7632` and leaves every
+  HTTP/1.1 cell GREEN, which is the measurement of the blindness rather than an
+  assertion about it.
+
+## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
+
+- **Timestamp**: 2026-08-26
+- **Action**: The SSE sibling of #6809. `writeSSEEvent` wrote straight to the
+  `ResponseWriter` and DISCARDED every write error, and `WriteTimeout` is 0
+  process-wide for exactly these streams — so a subscriber that stays CONNECTED
+  and stops reading parked the handler in `Write` indefinitely while holding a
+  subscriber slot. Both handlers now write through `sseStream`, reusing the
+  `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
+  first write error, which both loops treat as terminal.
+  I FIRST CLAIMED THE ERROR RETURN WAS LOAD-BEARING, THEN MEASURED IT AND IT IS
+  NOT. The claim was that adding the deadline without propagating the error
+  would be worse than the pin — the loop draining the subscription into a dead
+  connection. The mutation matrix said otherwise (M2/M3 green), so I probed
+  instead of arguing: with the error deliberately discarded the handler returns
+  in 254.6ms against a 250ms deadline, versus 254.9ms with the check.
+  Indistinguishable, because net/http cancels the request context as soon as a
+  write to the connection fails and the loop exits through its ctx.Done() arm
+  regardless. The deadline is what fixes the pin. The error check is kept as
+  DEFENCE IN DEPTH — that exit is net/http behaviour, not contract, so a
+  wrapping ResponseWriter or a different server that does not cancel would leave
+  the loop draining — and it is labelled precautionary in the code, the README
+  and the PR rather than described as the thing preventing a worse failure.
+  PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
+  from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
+  an elapsed budget would sever the healthy case. A per-write deadline bounds a
+  write that has BEGUN and says nothing about the gap between events.
+  Found a pre-existing behaviour while building the harness and did NOT fix it:
+  net/http sends no response headers until the first Write/Flush, and
+  `setSSEHeaders` only sets header VALUES — so a client connecting to a quiet
+  feed blocks in `http.Get` waiting for headers nobody sent. A browser
+  EventSource on an idle firewall hangs rather than establishing the stream.
+  Recorded in the README and in the harness comment; out of scope here.
+- **File(s)**: `pkg/api/sse.go`,
+  `pkg/api/sse_slow_reader_pin_7632_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: reused #6809's `stalledConn6809`/`stalledListener6809` — a
+  net.Conn that parks the writer exactly as a full send buffer does — rather
+  than rebuilding an instrument for the same class. Includes the NEGATIVE
+  CONTROL proving the fixture can genuinely pin (deadlines unsupported → the
+  handler must still be running), the SSE-specific idle cell that reds if
+  anyone adds an elapsed budget by analogy with `bgpStreamTotalBudget`, and a
+  paired healthy-reader control.
+
+## 2026-08-26 — #7632 SSE slow reader: review findings 2/3/5/6
+
+- **Timestamp**: 2026-08-26
+- **Action**: Disposition the remaining findings from this PR's own hostile
+  review. Finding 2: `writeEvent` claimed to return the first write error but
+  discarded the FLUSH error, which for a small event is the only write that
+  reaches the socket — `sseStream.flush` now goes through
+  `http.ResponseController.Flush()`, with `ErrNotSupported` latched rather than
+  treated as a dead peer. Finding 3: both slow-reader cells and the negative
+  control now witness a genuinely PARKED write before drawing a conclusion from
+  a timeout ("still running" is also what an IDLE handler looks like — it
+  produced two wrong readings in this PR). Finding 5: added `logStreamHandler`
+  coverage and a subscriber-slot-release cell over both handlers, binding
+  `defer sub.Close()`. Finding 6: replaced the 2-sample precautionary-claim
+  measurement with n=9 min/median/max over three variants and two write paths.
+  Fixture gained `maxWrites` (exact "buffer filled after the first event") and
+  parked-write instrumentation. Finding 4: replaced the fixed 100ms
+  readiness sleeps with `floodUntilParked7632` (wait on the implying
+  observable, fail naming what never arrived) and made `readSSEChunk7632`
+  accumulate to the SSE terminator rather than assume one `Body.Read` returns
+  a complete event. The matrix then caught the large-event cell not binding at
+  all (chunking removed => GREEN): a loopback reader drains too fast for any
+  window to expire, so `stalledConn6809` gained `slowRate`/`slowWindow` for a
+  slow-but-progressing peer and the cell now reds on the revert.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go`, `pkg/api/README.md`, `_Log.md`
+
 ## 2026-08-26 — #7636: split pkg/eventengine/engine.go
 
 - **Timestamp**: 2026-08-26
