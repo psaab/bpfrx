@@ -50,20 +50,44 @@ Returning the two as SIBLINGS is wrong in the silent direction: OSPF compiled
 `AuthType=md5` with an **empty key**. They spell one path, so the nested block is
 now attached UNDER the deepest packed node.
 
-**#6821 is deliberately NOT fixed here, and the reason generalises.** The strict
+**#6821 is now fixed, and the rule that blocked it is what fixed it.** The strict
 gate ignores leftover `Keys` on a container by design — compiler-faithful, since
 the compiler did not read them either. That equivalence breaks the moment a
-compiler starts reading them. Today `transport { protocol tpc; }` is rejected by
-the enum and `transport protocol tpc;` is **accepted**; compiling the compact
-form without teaching the gate to validate it turns "not compiled" into
-"compiled, unvalidated", and the daemon then silently omits the stream. For
-`tls-profile` it is worse: the block spelling is rejected at commit (#3350, no
-profile resolution exists) and the compact one would walk straight past that.
+compiler starts reading them, and measured on master before the fix it had:
+`transport { protocol tpc; }` was rejected by the enum while
+`transport protocol tpc;` was **accepted**.
 
-So the rule is: **a compiler may only start reading a packed tail at a site
+So the rule stands: **a compiler may only start reading a packed tail at a site
 where the gate validates the same expansion.** #6818's leaves have no enum to
 bypass (a bogus child is inert in both spellings today), which is why that one
-lands and #6821 does not.
+landed first.
+
+`schemaNode.packedTail` is how a site satisfies the rule instead of waiting for
+it. Setting it says *"a compiler reads this container's packed tail"*, and
+`walkSchemaNode` then validates the same `packedBodyChildren` expansion the
+compiler consumes — one schema fact rather than two files agreeing by comment.
+Default-off is deliberate: for every other container the tail is not compiled,
+so validating it would reject a configuration that behaves identically either
+way.
+
+`security log stream <s> transport` sets it, and all three readers now share one
+expansion resolved by `securityLogTransportSchema()`:
+
+| spelling | gate | compile |
+|---|---|---|
+| `transport { protocol tls; }` | accept | `Protocol="tls"` |
+| `transport protocol tls;` | accept | `Protocol="tls"` (was `""`) |
+| `transport { protocol tpc; }` | **reject** (enum) | — |
+| `transport protocol tpc;` | **reject** (enum) (was accept) | — |
+| `transport { tls-profile p; }` | accept | **reject** (#3350) |
+| `transport tls-profile p;` | accept | **reject** (#3350) (was accept-and-drop) |
+
+The empty-`Protocol` consequence is worth stating plainly because it is not
+inert: `daemon_system.go` defaults an empty protocol to `udp`, so the compact
+spelling of a TLS audit stream shipped over **plaintext UDP** while the config
+on disk still read `protocol tls`. The `tls-profile` half fails the other way —
+xpf resolves no TLS profile at all, so the block spelling is *rejected* at
+commit; the compact one lost that diagnostic as well as the value.
 
 #6822 is the one that does not use `packedBodyChildren`: its protocol comes from
 the reader's `case` label rather than from a value, so the reader needs the whole
@@ -78,8 +102,8 @@ path it warns and leaves the stanza inert so a peer-synced config behaves exactl
 as the binary that accepted it behaved (#1960). Compiling it there would change
 RBAC across an HA sync between nodes on different binaries. The #2419 inventory
 records this in a `filedByDesign` category so the entry is not mistaken for one
-awaiting a fix. #6821's two leaves sit in the same category with their own
-reason: filed and real, blocked on packed-tail validation.
+awaiting a fix. #6821's two leaves USED to sit in the same category; they moved
+to `filedFixed` once `packedTail` removed their blocker.
 
 A group applying a stanza in the compact spelling over an existing same-name
 peer drops the group's value (#7648). That is a property of the group merge
@@ -4389,8 +4413,10 @@ while adding a `host` sibling makes the value land. Recovering these means
 teaching the harness a per-parent prerequisite, which is why it is tracked
 separately rather than bundled here.
 
-**The #2419 cohort does NOT share this cause.** Measured against the eight open
-issues: only #6821 sits in the blind spot. `#6736`, `#6817`, `#6953`, `#6966`
+**The #2419 cohort does NOT share this cause.** Measured against the eight issues
+open at the time: only #6821 sat in the blind spot (it is fixed now — see the
+`packedTail` section above — but the measurement below is what it was when
+taken, and the blind spot itself is unchanged). `#6736`, `#6817`, `#6953`, `#6966`
 and `#7033` all have leaves the differential compares today, so their defects
 escaped for some other reason and closing them as one cohort would be wrong.
 

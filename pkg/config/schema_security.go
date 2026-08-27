@@ -747,7 +747,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// mirrors the runtime switch (tcp/tls handled, everything else
 			// silently falls back to UDP), so a typo like `protocol tpc`
 			// committed and then quietly used UDP. Validate it.
-			"transport": {desc: "Stream transport (protocol + optional TLS profile)", children: map[string]*schemaNode{
+			// #6821: packedTail — the compiler reads this container's packed
+			// tail (`transport protocol tls;`), so the gate must validate the
+			// same expansion. Without the pairing the compact spelling of a
+			// bogus `protocol` slipped past the enum below.
+			"transport": {desc: "Stream transport (protocol + optional TLS profile)", packedTail: true, children: map[string]*schemaNode{
 				"protocol": {desc: "Transport protocol (udp|tcp|tls)", args: 1, placeholder: "<protocol>",
 					valueType: ValueEnumOf, valueDesc: "syslog transport protocol",
 					valueExamples: []string{"udp", "tcp", "tls"},

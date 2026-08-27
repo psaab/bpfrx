@@ -47,6 +47,30 @@ type schemaNode struct {
 	// sets it; every other multi+children node is unchanged.
 	valueList bool
 
+	// packedTail opts a CONTAINER into having its packed tail VALIDATED
+	// (#6821).
+	//
+	// The gate's default for a container is to IGNORE tokens packed past the
+	// identity, and that default is not laziness — it is a compiler-faithful
+	// contract (see the long note in schema_walk.go). The gate must not
+	// validate what no compiler reads, or a stray token becomes a commit
+	// error for a configuration that behaves identically with or without it.
+	//
+	// The contract is BIDIRECTIONAL, and that is the half #6821 turns on: the
+	// moment a compiler DOES read a container's packed tail, ignoring it here
+	// turns "not compiled" into "compiled, UNVALIDATED". Measured on
+	// `security log stream <s> transport` before this flag existed:
+	//
+	//	transport { protocol tpc; }   gate REJECTS (enum)
+	//	transport protocol tpc;       gate ACCEPTS  <- the hole
+	//
+	// So this flag is the explicit pairing. Setting it says "a compiler reads
+	// this container's packed tail", and the walker then validates the same
+	// expansion `packedBodyChildren` hands that compiler — one schema fact
+	// instead of two files agreeing by comment.
+	// TestPackedTailContainersValidateBothSpellings6821 holds the pairing.
+	packedTail bool
+
 	// blockValue opts a single-value typed leaf into the HIERARCHICAL BLOCK
 	// spelling `keyword { value; }`, in addition to the ordinary
 	// `keyword value` (#6774).
