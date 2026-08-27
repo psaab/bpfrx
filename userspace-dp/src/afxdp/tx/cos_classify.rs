@@ -13,12 +13,18 @@ pub(in crate::afxdp) struct CoSTxSelection {
     pub(in crate::afxdp) drop: bool,
     // #3608: `drop` folds every non-`Accept` output-filter action plus any
     // three-color-policer drop into one bit. `reject` isolates the subset that
-    // was an explicit output-filter `then reject` (`FilterAction::Reject`), so
+    // was an explicit output-filter `then reject` (`FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED)`), so
     // the TX/CoS consumer can synthesize the active reject reply (TCP RST /
     // ICMP admin-prohibited) instead of the silent drop a `then discard` or a
     // red policer produces. `reject` is only ever true when `drop` is true; a
     // policer drop or a `then discard` keeps `reject == false`.
     pub(in crate::afxdp) reject: bool,
+    // #6854: the ICMP codes the matched term's `then reject <message-type>`
+    // resolved to. Meaningless unless `reject` is true, and defaults to
+    // administratively-prohibited, which is what every reject on this path
+    // sent before #6854 — so an output filter whose term carries no
+    // message-type is bit-identical to the old behaviour.
+    pub(in crate::afxdp) reject_message: crate::filter::RejectMessage,
     pub(in crate::afxdp) filter_log: Option<crate::filter::FilterLogMatch>,
 }
 
@@ -204,6 +210,8 @@ fn resolve_cached_cos_tx_selection_impl(
         let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
         let mut drop = false;
         let mut reject = false;
+        // #6854: meaningless unless `reject`; see CoSTxSelection.reject_message.
+        let mut reject_message = crate::filter::RejectMessage::ADMIN_PROHIBITED;
         let mut filter_log = None;
         let mut filter_counters = crate::filter::CachedFilterCounters::default();
         let mut three_color_policers = crate::filter::CachedThreeColorPolicers::default();
@@ -227,7 +235,12 @@ fn resolve_cached_cos_tx_selection_impl(
                 meta.dscp,
             );
             drop = output_result.action != crate::filter::FilterAction::Accept;
-            reject = output_result.action == crate::filter::FilterAction::Reject;
+            reject = matches!(output_result.action, crate::filter::FilterAction::Reject(_));
+            reject_message = if let crate::filter::FilterAction::Reject(m) = output_result.action {
+                m
+            } else {
+                crate::filter::RejectMessage::ADMIN_PROHIBITED
+            };
             filter_log = output_result.log_match;
             filter_counters = output_result.counters;
             three_color_policers = output_result.three_color_policers;
@@ -237,6 +250,7 @@ fn resolve_cached_cos_tx_selection_impl(
             dscp_rewrite,
             drop,
             reject,
+            reject_message,
             filter_counters,
             three_color_policers,
             filter_log,
@@ -423,7 +437,14 @@ fn resolve_cached_cos_tx_selection_impl(
         // replay via `apply_cached_three_color_policers`), so a `drop == true`
         // here is exactly `then discard` or `then reject`. Carry the reject
         // subset so the flow-cache-hit consumer can send an active reply.
-        reject: output_result.action == crate::filter::FilterAction::Reject,
+        reject: matches!(output_result.action, crate::filter::FilterAction::Reject(_)),
+        // #6854: carry the message-type alongside the reject bit so the cached
+        // replay sends the code the operator configured, not the default.
+        reject_message: if let crate::filter::FilterAction::Reject(m) = output_result.action {
+            m
+        } else {
+            crate::filter::RejectMessage::ADMIN_PROHIBITED
+        },
         filter_counters,
         three_color_policers,
         filter_log,
@@ -626,6 +647,8 @@ fn resolve_cos_tx_selection_internal(
         let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
         let mut drop = false;
         let mut reject = false;
+        // #6854: meaningless unless `reject`; see CoSTxSelection.reject_message.
+        let mut reject_message = crate::filter::RejectMessage::ADMIN_PROHIBITED;
         let mut filter_log = None;
         // #6236 PR-2C: fold the `needs_tx_eval` precheck and the output-filter
         // fetch into ONE lookup (see the cached flowless arm above).
@@ -674,7 +697,12 @@ fn resolve_cos_tx_selection_internal(
             // gates the active reject reply on a real L4 flow.
             drop = output_result.policer_drop
                 || output_result.action != crate::filter::FilterAction::Accept;
-            reject = output_result.action == crate::filter::FilterAction::Reject;
+            reject = matches!(output_result.action, crate::filter::FilterAction::Reject(_));
+            reject_message = if let crate::filter::FilterAction::Reject(m) = output_result.action {
+                m
+            } else {
+                crate::filter::RejectMessage::ADMIN_PROHIBITED
+            };
             filter_log = output_result.log_match;
         }
         return CoSTxSelection {
@@ -682,6 +710,7 @@ fn resolve_cos_tx_selection_internal(
             dscp_rewrite,
             drop,
             reject,
+            reject_message,
             filter_log,
         };
     };
@@ -719,6 +748,7 @@ fn resolve_cos_tx_selection_internal(
             dscp_rewrite: None,
             drop: false,
             reject: false,
+            reject_message: crate::filter::RejectMessage::ADMIN_PROHIBITED,
             filter_log: None,
         };
     }
@@ -800,7 +830,12 @@ fn resolve_cos_tx_selection_internal(
     // filter's terminal action produces a reject; a three-color-policer drop
     // (`policer_drop`, above or the ingress meter below) is always a silent
     // discard.
-    let reject = output_result.action == crate::filter::FilterAction::Reject;
+    let reject = matches!(output_result.action, crate::filter::FilterAction::Reject(_));
+    let reject_message = if let crate::filter::FilterAction::Reject(m) = output_result.action {
+            m
+    } else {
+            crate::filter::RejectMessage::ADMIN_PROHIBITED
+    };
     let mut ingress_forwarding_class = None;
     let filter_log = output_result.log_match;
     if let Some(ingress_filter) = ingress_filter.filter(|filter| {
@@ -857,6 +892,7 @@ fn resolve_cos_tx_selection_internal(
             dscp_rewrite: effective_dscp_rewrite,
             drop,
             reject,
+            reject_message,
             filter_log,
         };
     };
@@ -907,6 +943,7 @@ fn resolve_cos_tx_selection_internal(
         dscp_rewrite: effective_dscp_rewrite.or(cos_rewrite),
         drop,
         reject,
+        reject_message,
         filter_log,
     }
 }

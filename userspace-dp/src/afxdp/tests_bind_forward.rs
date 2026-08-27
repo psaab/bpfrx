@@ -727,6 +727,292 @@ fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
     );
 }
 
+/// #6854 (review finding): the OUTPUT-filter reject path must carry the term's
+/// `then reject <message-type>` into the ICMP code on the wire.
+///
+/// The sibling above proves the output path synthesizes a reply at all, using
+/// TCP so the reply is a RST. A RST carries no ICMP code, so it cannot see this
+/// property at all. UDP here is what makes the ICMP builder run.
+///
+/// Why it exists: hostile review hardcoded `RejectMessage::ADMIN_PROHIBITED` at
+/// each of the four hops carrying the message from the filter result to the
+/// builder, and ALL FOUR SURVIVED the full suite. The wires were present and the
+/// assertions were not -- the end-to-end cell in `icmp_tests.rs` reads the code
+/// byte on the input/lo0 path only, which holds every other path harmless by
+/// construction. That is the "complete at both ends, connected by nothing" shape
+/// this whole issue is about, so a structural argument that the hop is wired is
+/// not enough; the byte has to be read off the reply.
+#[test]
+fn output_filter_reject_carries_the_configured_icmp_code_6854() {
+    let _bucket_guard = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let lookup = WorkerBindingLookup::default();
+    let ingress_ident = BindingIdentity {
+        slot: 7,
+        queue_id: 3,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 10,
+    };
+    let src_ip = Ipv4Addr::new(10, 0, 61, 100);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let src_port = 12345u16;
+    let dst_port = 443u16;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[
+        0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00,
+    ]);
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x1c, 0x12, 0x34, 0x40, 0x00, 64, PROTO_UDP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x08, 0x00, 0x00]);
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(src_ip),
+        dst_ip: IpAddr::V4(dst_ip),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_UDP,
+            src_ip: IpAddr::V4(src_ip),
+            dst_ip: IpAddr::V4(dst_ip),
+            src_port,
+            dst_port,
+        },
+    };
+    let mut forwarding = build_forwarding_state(&ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 12,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-web".into(),
+                protocols: vec!["udp".into()],
+                destination_ports: vec!["443".into()],
+                action: "reject".into(),
+                reject_message_type: "host-unreachable".into(),
+                ..Default::default()
+            }],
+        }],
+        ..Default::default()
+    });
+    // The ICMP reply is sourced from the INGRESS interface's primary address, so
+    // without one `can_generate_icmp_error_reply` declines and nothing is built.
+    // The premise assertion below turns that into a named failure rather than a
+    // cell that reads an absent frame.
+    forwarding.egress.insert(
+        10,
+        crate::afxdp::types::EgressInterface {
+            bind_ifindex: 0,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: 0,
+            redundancy_group: 0,
+            primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+            primary_v6: None,
+        },
+    );
+    let mut tx_pipeline = WorkerTxPipeline {
+        free_tx_frames: (0..256u64).collect(),
+        pending_tx_prepared: std::collections::VecDeque::new(),
+        pending_tx_local: std::collections::VecDeque::new(),
+        max_pending_tx: 256,
+        outstanding_tx: 0,
+        pending_fill_frames: std::collections::VecDeque::new(),
+        in_flight_prepared_recycles: FastMap::default(),
+        tx_submit_ns: Vec::new().into_boxed_slice(),
+    };
+    let mut counters = BatchCounters::default();
+
+    let req = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        None,
+        None,
+        None,
+        Some(ForwardRejectReply {
+            tx_pipeline: &mut tx_pipeline,
+            counters: &mut counters,
+        }),
+        None,
+    );
+
+    assert!(
+        req.is_none(),
+        "a `then reject` output term must NOT forward the original packet"
+    );
+    assert_eq!(
+        counters.filter_reject_sent, 1,
+        "#6854 PREMISE: the output-filter reject must enqueue exactly one reply. If this \
+         is 0 the assertion below reads a frame that was never built and proves nothing"
+    );
+    let reply = tx_pipeline
+        .pending_tx_local
+        .front()
+        .expect("#6854: the ICMP reject reply must be queued on the ingress TX pipeline");
+    let (ty, code) = icmp_type_code_v4_6854(&reply.bytes);
+    assert_eq!(
+        (ty, code),
+        (3, 1),
+        "#6854: the OUTPUT-filter path must carry the term's message-type onto the wire -- \
+         `host-unreachable` is ICMPv4 type 3 code 1. Code 13 means the hop from \
+         CoSTxSelection.reject_message to the builder carries the default, which the whole \
+         suite otherwise cannot see"
+    );
+
+    // PRECOMPUTED arm — the flow-cache FALLBACK path, a different hop.
+    //
+    // The call above passes `precomputed_tx_selection: None`, so the selection is
+    // resolved fresh. When a cached descriptor IS supplied, the message-type is
+    // carried across a separate assignment, and the mutation matrix showed that
+    // one still free with the fresh path bound. Covering one arm and calling the
+    // path tested is the exact mistake this cell exists to correct.
+    let precomputed = crate::afxdp::tx::resolve_cached_cos_tx_selection(
+        &forwarding,
+        12,
+        meta,
+        Some(&flow.forward_key),
+    );
+    assert!(
+        precomputed.reject,
+        "#6854 PREMISE: the precomputed descriptor must classify as a reject, or the arm \
+         below never reaches the reject-reply branch"
+    );
+    let mut tx_pipeline2 = WorkerTxPipeline {
+        free_tx_frames: (0..256u64).collect(),
+        pending_tx_prepared: std::collections::VecDeque::new(),
+        pending_tx_local: std::collections::VecDeque::new(),
+        max_pending_tx: 256,
+        outstanding_tx: 0,
+        pending_fill_frames: std::collections::VecDeque::new(),
+        in_flight_prepared_recycles: FastMap::default(),
+        tx_submit_ns: Vec::new().into_boxed_slice(),
+    };
+    let mut counters2 = BatchCounters::default();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let req2 = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        None,
+        None,
+        Some(&precomputed),
+        Some(ForwardRejectReply {
+            tx_pipeline: &mut tx_pipeline2,
+            counters: &mut counters2,
+        }),
+        None,
+    );
+    assert!(
+        req2.is_none(),
+        "the precomputed reject must not forward the original packet either"
+    );
+    assert_eq!(
+        counters2.filter_reject_sent, 1,
+        "#6854 PREMISE: the precomputed arm must enqueue exactly one reply"
+    );
+    let reply2 = tx_pipeline2
+        .pending_tx_local
+        .front()
+        .expect("#6854: the precomputed ICMP reject reply must be queued");
+    assert_eq!(
+        icmp_type_code_v4_6854(&reply2.bytes),
+        (3, 1),
+        "#6854: the PRECOMPUTED (flow-cache fallback) path must carry the message-type too. \
+         Code 13 here means a flow-cache fallback silently downgrades an operator's \
+         `then reject host-unreachable` to administratively-prohibited"
+    );
+}
+
+/// Read (type, code) from the ICMPv4 payload of a built reply frame.
+///
+/// Walks the L2/L3 headers rather than indexing a fixed offset, so a VLAN tag or
+/// an IP options change cannot silently make this read the wrong bytes.
+fn icmp_type_code_v4_6854(frame: &[u8]) -> (u8, u8) {
+    let mut off = 14usize;
+    if frame.len() > 13 && u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
+        off += 4;
+    }
+    assert!(frame.len() > off, "frame too short for an IPv4 header");
+    let ihl = usize::from(frame[off] & 0x0f) * 4;
+    let icmp = off + ihl;
+    assert!(
+        frame.len() > icmp + 1,
+        "frame too short for an ICMP type/code at offset {icmp}"
+    );
+    (frame[icmp], frame[icmp + 1])
+}
 
 /// #3642 forward leg: a SNAT'd transit flow's egress `filter output` must match
 /// the TRANSLATED (post-NAT) SOURCE address, because Junos applies output

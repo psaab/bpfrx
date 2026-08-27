@@ -295,6 +295,7 @@ fn filter_reject_tcp_enqueues_rst_filter_counter() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(sent, "filter TCP reject must enqueue a RST");
     assert_eq!(
@@ -388,6 +389,7 @@ fn filter_reject_non_tcp_enqueues_icmp_unreachable() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(
         sent,
@@ -425,6 +427,7 @@ fn filter_reject_budget_exhausted_uses_filter_counter() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(
         !sent,
@@ -539,6 +542,7 @@ fn filter_reject_output_filter_drop_uses_filter_counter() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(
         !sent,
@@ -674,6 +678,7 @@ fn filter_reject_rate_limited_uses_filter_counter() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(!sent, "filter reject must fail-closed when rate-limited");
     assert_eq!(
@@ -898,6 +903,7 @@ fn unreplyable_non_first_fragment_reject_untouched_3656() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(!sent, "a non-first fragment is unreplyable");
     assert_eq!(counters.filter_reject_sent, 0);
@@ -1424,6 +1430,7 @@ fn filter_reject_non_tcp_v6_sources_from_logical_vlan_ifindex_3976() {
         meta,
         &flow,
         &mut counters,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     );
     assert!(
         sent,

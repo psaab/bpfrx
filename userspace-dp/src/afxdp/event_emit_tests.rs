@@ -532,7 +532,7 @@ fn filter_log_event_emit_reject_reports_reject() {
         0,
         23,
         6,
-        FilterAction::Reject,
+        FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED),
         FilterLogSource::Lo0,
         0,
         // #3615: the reply WAS enqueued, so REJECT is the truthful action.
@@ -555,7 +555,7 @@ fn filter_log_event_emit_reject_reports_reject() {
 
 /// #3615 fail-on-revert: a firewall-filter `then reject` whose reply was
 /// SUPPRESSED (fail-closed — reject_reply_enqueued=false) must report the
-/// truthful RT_FLOW_ACTION_DENY, honoring the FilterAction::Reject contract
+/// truthful RT_FLOW_ACTION_DENY, honoring the FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED) contract
 /// ("must not log that an ICMP/RST reject was generated" when the reply
 /// cannot be synthesized). Reverting `filter_action_to_rt_flow` to map
 /// Reject→REJECT unconditionally turns this RED.
@@ -572,7 +572,7 @@ fn filter_log_event_emit_suppressed_reject_reports_deny() {
         0,
         23,
         6,
-        FilterAction::Reject,
+        FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED),
         FilterLogSource::Lo0,
         0,
         // Reply fail-closed to a silent drop.
