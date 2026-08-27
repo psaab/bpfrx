@@ -3156,13 +3156,25 @@ func natThenTerminalActionCount(then NATThen) int {
 //     revision of this comment asserted only the first outcome ("...and is
 //     translated by it"), which presumes a later rule exists.
 //     Making an actionless rule terminal instead would newly exempt traffic that
-//     already-deployed configs translate, so it is a migration-contract
-//     decision tracked on #5717, not a mechanical fix.
+//     already-deployed configs translate. That was a migration-contract
+//     question, not a mechanical fix, and it is DECIDED on #6823: an actionless
+//     rule is NON-TERMINAL. The short form is that making it terminal is the
+//     only option that changes a packet's fate, and it changes it in the
+//     leaking direction — the pinned 10.0.61.0/24-then-10.0.0.0/8 fixture would
+//     stop translating and put a private source on the WAN, which is the exact
+//     disposition #5688 eliminated a few lines above the `continue` in this
+//     same matcher. Junos parity does not decide it either way (Junos matching
+//     IS terminal, but Junos requires `then`, so a committed Junos config
+//     cannot express this input at all). The full argument, the two rejected
+//     alternatives, and the explicit criterion that would REOPEN the terminal
+//     option live in docs/config-schema.md, "#6823 — an actionless NAT rule is
+//     NON-TERMINAL".
 //     TestTolerantActionlessRuleIsNotInert_5717,
-//     actionless_rule_falls_through_to_later_broader_rule_5717 and
-//     actionless_rule_with_no_later_rule_passes_untranslated_5717 pin BOTH
-//     dispositions so neither the "inert" framing nor the "always translated by
-//     a later rule" framing can silently return.
+//     actionless_rule_falls_through_to_later_broader_rule_5717,
+//     actionless_rule_with_no_later_rule_passes_untranslated_5717 and
+//     actionless_dnat_entry_falls_through_6823 pin BOTH dispositions on BOTH
+//     kinds so neither the "inert" framing nor the "always translated by a
+//     later rule" framing can silently return.
 //
 // Rule-sets are walked in sorted name order for a deterministic first-reported
 // offender.

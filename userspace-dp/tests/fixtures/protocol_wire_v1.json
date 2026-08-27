@@ -466,6 +466,7 @@
   "cos_scheduler_snapshot": {
     "buffer_size_bytes": 0,
     "buffer_size_percent": 0.0,
+    "buffer_size_temporal_us": 0,
     "codel_target_ns": 0,
     "equal_flow_enforcement": false,
     "name": "",
@@ -473,7 +474,8 @@
     "surplus_sharing": false,
     "transmit_rate_bytes": 0,
     "transmit_rate_exact": false,
-    "transmit_rate_percent": 0.0
+    "transmit_rate_percent": 0.0,
+    "transmit_rate_remainder": false
   },
   "destination_nat_rule_snapshot": {
     "counter_id": 0,
@@ -866,6 +868,7 @@
     "forwarding_armed": false,
     "gre_decap_checksum_invalid_drops_total": 0,
     "gre_decap_ecn_illegal_drops_total": 0,
+    "gre_decap_unsupported_version_refusals_total": 0,
     "gre_encap_df_oversize_drops_total": 0,
     "ha_groups": [],
     "helper_mode": "",

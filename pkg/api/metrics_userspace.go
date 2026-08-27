@@ -845,6 +845,17 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.GreDecapChecksumInvalidDropsTotal),
 	)
 
+	// #6842: native-GRE decap refusals for a non-zero GRE version (RFC 2637
+	// / PPTP enhanced GRE is version 1) where the outer tuple named a
+	// configured GRE endpoint. Emitted unconditionally so a 0 is a real "no
+	// PPTP offered to a GRE endpoint" signal rather than an absent series.
+	// Nonzero flags a peer offering PPTP to a tunnel xpf cannot terminate.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceGreDecapUnsupportedVersionRefusals,
+		prometheus.CounterValue,
+		float64(status.GreDecapUnsupportedVersionRefusalsTotal),
+	)
+
 	// #2472: locally-generated error-reply per-reason token-bucket drops.
 	// Emitted unconditionally so a 0 is a real "no generated errors
 	// rate-limited" signal rather than an absent series. Nonzero flags an

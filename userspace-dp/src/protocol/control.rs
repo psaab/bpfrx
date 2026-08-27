@@ -562,6 +562,22 @@ pub(crate) struct ProcessStatus {
     /// compatibility.
     #[serde(rename = "gre_decap_checksum_invalid_drops_total", default)]
     pub gre_decap_checksum_invalid_drops_total: u64,
+    /// #6842: native-GRE frames REFUSED for decap because the GRE version
+    /// field was non-zero while the outer tuple named a configured GRE
+    /// tunnel endpoint. RFC 2784/2890 GRE is version 0; RFC 2637 (PPTP)
+    /// enhanced GRE is version 1 and re-purposes the 32-bit Key as
+    /// `Payload Length (16) | Call ID (16)`, plus an
+    /// Acknowledgment-Number field behind an `A` bit that the RFC 2890
+    /// field order does not skip — so a version-blind parse would promote
+    /// attacker-chosen bytes as the inner packet. Refused before any Key
+    /// read or offset arithmetic. A REFUSAL, not a drop: the frame
+    /// continues on the ordinary transit/host-inbound path. Ordinary
+    /// TRANSIT PPTP is deliberately not counted. Surfaced as
+    /// `xpf_userspace_gre_decap_unsupported_version_refusals_total`;
+    /// nonzero flags a peer offering PPTP to a GRE endpoint xpf has no
+    /// ALG to terminate. Additive / defaulted for backward compatibility.
+    #[serde(rename = "gre_decap_unsupported_version_refusals_total", default)]
+    pub gre_decap_unsupported_version_refusals_total: u64,
     /// #2472: locally-generated ICMP Time Exceeded / PTB / `reject` replies
     /// dropped because the per-reason token bucket was empty. Each reason has
     /// an independent global-per-reason bucket (Linux `icmp_msgs_per_sec`

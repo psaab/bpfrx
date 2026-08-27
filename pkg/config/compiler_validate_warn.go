@@ -1235,17 +1235,29 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
 					sched.Name))
 			}
-			// #4228 Gap 2 follow-up: buffer-size temporal <us> is typed + stored
-			// (BufferSizeTemporalUS) so garbage is rejected at commit, but the
-			// microsecond target is NOT yet resolved to a byte-size by the
-			// dataplane (that needs the queue's transmit rate, which itself may
-			// be a per-interface percent). Warn so an operator who sets it is not
-			// misled into believing the queue buffer is sized. Mirrors the
-			// accepted-but-inert doctrine used for codel-target and the percent
-			// rate forms.
-			if sched.BufferSizeTemporalUS > 0 {
+			// #6846: buffer-size temporal <us> now RESOLVES — forwarding_build/
+			// cos.rs converts the microsecond target against the queue's drain
+			// rate (cos_temporal_buffer_bytes). The advisory narrows to the one
+			// case that still cannot resolve: a queue whose effective rate is
+			// ZERO has no drain speed, so a microsecond target has no byte
+			// value and the buffer falls back to default sizing.
+			//
+			// The predicate is cosSchedulerTemporalResolves and NOT
+			// cosSchedulerRateResolves, which is a strictly stronger question.
+			// A queue with no guarantee of its own still drains at the
+			// interface shaping rate — the `unwrap_or` fallback at the call
+			// site — so an unresolved `percent` or `remainder` does not make
+			// temporal inert. Using the stronger predicate warned that the knob
+			// "has no effect" on configurations where it has one.
+			//
+			// The narrowing is the point. An advisory that keeps firing for
+			// configurations that now work is as much a defect as one that
+			// stops firing for configurations that do not — it teaches the
+			// operator to ignore it. Pinned by
+			// TestTemporalAdvisoryNarrowsToUnresolvable6846.
+			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerTemporalResolves(sched, schedulersResolvingPercent) {
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q buffer-size temporal is accepted for Junos compatibility but inert: xpf does not yet resolve the microsecond target to a byte-size (it needs the queue's transmit rate), so the queue buffer falls back to the default sizing (#4228 Gap 2)",
+					"class-of-service scheduler %q buffer-size temporal is accepted but has no effect: the queue has no resolvable transmit-rate (no absolute rate, and no scheduler-map binding to an interface with a root shaping-rate), so there is no drain speed to convert the microsecond target against (#6846)",
 					sched.Name))
 			}
 			// #4228 Gap 2: transmit-rate percent now RESOLVES per-interface —
@@ -1253,14 +1265,39 @@ func ValidateConfig(cfg *Config) []string {
 			// against the bound interface's shaping-rate (the multi-pass
 			// concern is handled by carrying the percent to the dataplane and
 			// materializing it per interface). Warn only for the residual inert
-			// cases: `remainder` (leftover-bandwidth resolution is still a
-			// follow-up) and a `percent` scheduler with no shaping base to
-			// resolve against — i.e. not bound via a scheduler-map to an
-			// interface that has a root shaping-rate.
-			if sched.TransmitRateRemainder {
+			// cases: a `percent` scheduler with no shaping base to resolve
+			// against — i.e. not bound via a scheduler-map to an interface that
+			// has a root shaping-rate — and, in the branch above, the remainder
+			// forms that still cannot resolve. `remainder` itself stopped being
+			// a follow-up in #6846; this comment said otherwise for one
+			// revision after that stopped being true.
+			if sched.TransmitRateRemainder && !cosSchedulerRateResolves(cos, sched, schedulersResolvingPercent) {
+				// #6846: `remainder` now RESOLVES where there is a shaping rate
+				// to take a remainder OF — forwarding_build/cos.rs computes
+				// `(shaping - resolved siblings) / remainder queues` per
+				// interface. The advisory narrows to the case that genuinely
+				// cannot resolve: no scheduler-map binding to an interface with
+				// a root shaping-rate means no base, and no port speed is
+				// available to substitute (InterfaceSnapshot carries no
+				// link-speed field).
+				//
+				// The wording distinguishes the TWO reasons a remainder can
+				// fail to resolve, because an operator needs to know which one
+				// they have and the fix differs: bind the scheduler to a shaped
+				// interface, versus stop claiming the whole rate with siblings.
+				//
+				// An earlier revision claimed the second case "has its own
+				// warning below". It did not — the warning did not exist, and
+				// the predicate classified a zero leftover as resolving, so an
+				// exactly-subscribed shape was silent at commit AND inert at
+				// runtime. Both halves are fixed here.
+				reason := "the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no interface bandwidth to take a remainder of"
+				if schedulersResolvingPercent[sched.Name] {
+					reason = "its sibling queues already claim the interface shaping-rate, leaving no usable leftover — the dataplane declines a zero share rather than treating it as an unshaped queue"
+				}
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q transmit-rate remainder is accepted for Junos compatibility but inert: the userspace dataplane consumes an absolute byte/sec rate and xpf does not yet resolve `remainder` against the leftover interface bandwidth, so the queue gets no explicit transmit-rate (#4228 Gap 2)",
-					sched.Name))
+					"class-of-service scheduler %q transmit-rate remainder is accepted but has no effect: %s (#6846)",
+					sched.Name, reason))
 			} else if sched.TransmitRatePercent > 0 && !schedulersResolvingPercent[sched.Name] {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q transmit-rate percent %.4g%% is accepted but has no effect: the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no base to resolve the percent against (#4228 Gap 2)",

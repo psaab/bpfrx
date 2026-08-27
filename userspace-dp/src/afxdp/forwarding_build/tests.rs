@@ -217,6 +217,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -230,6 +231,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -304,6 +306,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -368,6 +371,7 @@ fn build_cos_state_resolves_transmit_rate_percent_against_interface_shaping_rate
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -425,6 +429,7 @@ fn build_cos_state_transmit_rate_percent_no_shaping_rate_stays_inert() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -446,6 +451,267 @@ fn build_cos_state_transmit_rate_percent_no_shaping_rate_stays_inert() {
     assert!(
         !iface.queues[0].guarantee_enabled,
         "a percent with no interface shaping-rate has no base and must not fabricate a guarantee"
+    );
+}
+
+// #6846 F5 — the remainder CALL SITE, not the resolver.
+//
+// Every cell in `cos::remainder_temporal_tests_6846` calls
+// `cos_remainder_rate_bytes` directly with its own shaping argument, so none of
+// them exercises `build_cos_iface_config`'s pre-pass. A review measured the
+// hole: swapping `iface.cos_shaping_rate_bytes_per_sec` for `burst_bytes` at
+// that call site changes every remainder queue's rate on every interface and
+// left the whole crate GREEN (4775 tests, 0 failed). Both operands are `u64`
+// and the crate has no `deny(warnings)`, so it compiles silently.
+//
+// That is the same hazard `temporal_call_site_uses_the_queue_rate_not_the_
+// interface_burst` exists to catch for the sibling form, one line above. These
+// three cells bind the wiring: the argument the pre-pass is handed, the
+// precedence the main path applies, and the value the CONSUMER ends up with.
+
+/// Forwarding classes for the #6846 builder cells: three classes so a
+/// remainder queue always has resolved siblings to be a remainder OF.
+fn remainder_forwarding_classes_6846() -> Vec<CoSForwardingClassSnapshot> {
+    vec![
+        CoSForwardingClassSnapshot {
+            name: "be".into(),
+            queue: 0,
+        },
+        CoSForwardingClassSnapshot {
+            name: "ef".into(),
+            queue: 1,
+        },
+        CoSForwardingClassSnapshot {
+            name: "af".into(),
+            queue: 2,
+        },
+    ]
+}
+
+/// A shaped interface (ifindex 42) bound to `wan-map`, carrying `schedulers`
+/// and one map entry per `(forwarding_class, scheduler)` pair.
+///
+/// The shaping rate and the burst are DELIBERATELY different orders of
+/// magnitude (10_000_000 vs 256_000) so that handing the pre-pass the wrong one
+/// cannot produce the expected rate by coincidence.
+fn remainder_snapshot_6846(
+    schedulers: Vec<CoSSchedulerSnapshot>,
+    entries: &[(&str, &str)],
+) -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: remainder_forwarding_classes_6846(),
+            schedulers,
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: entries
+                    .iter()
+                    .map(|(fc, sched)| CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: (*fc).into(),
+                        scheduler: (*sched).into(),
+                    })
+                    .collect(),
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
+        }),
+        ..Default::default()
+    }
+}
+
+/// A scheduler with `transmit-rate remainder` and nothing else.
+fn remainder_scheduler_6846(name: &str) -> CoSSchedulerSnapshot {
+    CoSSchedulerSnapshot {
+        name: name.into(),
+        transmit_rate_remainder: true,
+        ..Default::default()
+    }
+}
+
+/// The queue materialized for `fc`, by forwarding-class rather than by index —
+/// index would silently follow scheduler-map iteration order.
+fn queue_for_class_6846<'a>(iface: &'a CoSInterfaceConfig, fc: &str) -> &'a CoSQueueConfig {
+    iface
+        .queues
+        .iter()
+        .find(|q| q.forwarding_class == fc)
+        .unwrap_or_else(|| panic!("no queue materialized for forwarding-class {fc}"))
+}
+
+// #6846: the pre-pass must be handed the interface SHAPING RATE. RED on the
+// measured escape (`burst_bytes` in place of
+// `iface.cos_shaping_rate_bytes_per_sec`): the absolute sibling alone claims
+// 1_000_000 > the 256_000 burst, so the leftover saturates to nothing, the
+// remainder stops resolving, and the queue falls back to the whole 10_000_000
+// interface rate with no guarantee.
+#[test]
+fn build_cos_state_remainder_pre_pass_takes_the_interface_shaping_rate() {
+    let snapshot = remainder_snapshot_6846(
+        vec![
+            CoSSchedulerSnapshot {
+                name: "abs-sched".into(),
+                transmit_rate_bytes: 1_000_000,
+                ..Default::default()
+            },
+            CoSSchedulerSnapshot {
+                name: "pct-sched".into(),
+                transmit_rate_percent: 30.0,
+                ..Default::default()
+            },
+            remainder_scheduler_6846("rem-sched"),
+        ],
+        &[
+            ("ef", "abs-sched"),
+            ("af", "pct-sched"),
+            ("be", "rem-sched"),
+        ],
+    );
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+
+    // The siblings first: a wrong sibling rate would move the leftover, so
+    // asserting the remainder alone could pass on two compensating errors.
+    assert_eq!(
+        queue_for_class_6846(iface, "ef").transmit_rate_bytes,
+        1_000_000,
+        "the absolute sibling keeps its own rate"
+    );
+    assert_eq!(
+        queue_for_class_6846(iface, "af").transmit_rate_bytes,
+        3_000_000,
+        "percent 30 of the 10_000_000 B/s interface shaping-rate"
+    );
+
+    let rem = queue_for_class_6846(iface, "be");
+    assert_eq!(
+        rem.transmit_rate_bytes, 6_000_000,
+        "the remainder queue takes 10_000_000 - (1_000_000 + 3_000_000). \
+         10_000_000 means it did not resolve at all and fell back to the whole \
+         interface rate; anything derived from 256_000 means the pre-pass was \
+         handed the interface BURST instead of its shaping rate"
+    );
+    assert!(
+        rem.guarantee_enabled,
+        "a resolved remainder is a real rate and must enable the queue guarantee"
+    );
+}
+
+// #6846 R4: the pre-pass and the main path must agree about WHICH queues are
+// remainder queues. The main path prefers an absolute rate
+// (`cos_effective_transmit_rate_bytes` before the `.or_else`), so a scheduler
+// carrying BOTH an absolute rate and `remainder` — reachable on the lenient
+// load / peer-sync path, since the strict commit gate rejects it — must not be
+// counted in the divisor.
+//
+// This binds both halves at the builder, which the resolver-level cells cannot:
+// counting the both-forms queue in the divisor makes the real remainder queue
+// 5_000_000 instead of 8_000_000, and inverting the main path's `.or_else` so
+// remainder beats absolute makes the both-forms queue 8_000_000 instead of
+// 2_000_000. Either one reds exactly one assertion below and names itself.
+#[test]
+fn build_cos_state_remainder_pre_pass_and_main_path_agree_on_the_divisor() {
+    let snapshot = remainder_snapshot_6846(
+        vec![
+            CoSSchedulerSnapshot {
+                name: "both-sched".into(),
+                transmit_rate_bytes: 2_000_000,
+                transmit_rate_remainder: true,
+                ..Default::default()
+            },
+            remainder_scheduler_6846("rem-sched"),
+        ],
+        &[("ef", "both-sched"), ("be", "rem-sched")],
+    );
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+
+    assert_eq!(
+        queue_for_class_6846(iface, "ef").transmit_rate_bytes,
+        2_000_000,
+        "absolute beats remainder on the SAME scheduler — 8_000_000 here means \
+         the main path resolved it as a remainder queue instead"
+    );
+    assert_eq!(
+        queue_for_class_6846(iface, "be").transmit_rate_bytes,
+        8_000_000,
+        "the ONE real remainder queue takes the whole 10_000_000 - 2_000_000 \
+         leftover — 5_000_000 means the pre-pass counted the both-forms \
+         scheduler in the divisor while the main path did not, halving every \
+         real remainder queue's share"
+    );
+}
+
+// #6846 F1, asserted AT THE CONSUMER. A resolver that can return a legal zero
+// needs its assertion where the zero is CONSUMED, because `Some(0)` is
+// indistinguishable from healthy where it is produced: it only collides with a
+// sentinel one layer up.
+//
+// `CoSQueueConfig` states the sentinel itself ("transparent zero-rate queues use
+// that value to mean unshaped/full bucket", types/cos.rs) and cos/token_bucket.rs
+// reads it. So `guarantee_enabled = true` alongside `transmit_rate_bytes = 0`
+// would promote the queue into guarantee service AND leave it uncapped — the
+// inverse of the starved queue the form is meant to describe. `percent 60` +
+// `percent 40` + `remainder` reaches it with no over-subscription at all.
+#[test]
+fn build_cos_state_zero_remainder_leftover_never_guarantees_the_unshaped_sentinel() {
+    let snapshot = remainder_snapshot_6846(
+        vec![
+            CoSSchedulerSnapshot {
+                name: "p60".into(),
+                transmit_rate_percent: 60.0,
+                ..Default::default()
+            },
+            CoSSchedulerSnapshot {
+                name: "p40".into(),
+                transmit_rate_percent: 40.0,
+                ..Default::default()
+            },
+            remainder_scheduler_6846("rem-sched"),
+        ],
+        &[("ef", "p60"), ("af", "p40"), ("be", "rem-sched")],
+    );
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+
+    // Guard the fixture: if the siblings ever stopped claiming the whole rate
+    // there would BE a leftover, and every assertion below would pass over a
+    // case that never arose.
+    assert_eq!(
+        queue_for_class_6846(iface, "ef").transmit_rate_bytes
+            + queue_for_class_6846(iface, "af").transmit_rate_bytes,
+        10_000_000,
+        "fixture broken: the two percent siblings must claim the WHOLE shaping \
+         rate, or the remainder leftover is not zero"
+    );
+
+    let rem = queue_for_class_6846(iface, "be");
+    assert!(
+        !(rem.guarantee_enabled && rem.transmit_rate_bytes == 0),
+        "a guarantee on the zero/unshaped sentinel is the fail-open state: the \
+         token bucket reads transmit_rate_bytes == 0 as `full bucket`, so this \
+         queue would be promoted into guarantee service AND run uncapped"
+    );
+    assert!(
+        !rem.guarantee_enabled,
+        "a leftover of nothing is not a resolution — the form stays inert and \
+         keeps the historical no-guarantee fallback"
+    );
+    assert_eq!(
+        rem.transmit_rate_bytes, 10_000_000,
+        "the inert fallback is the interface shaping-rate, unchanged from \
+         before remainder existed"
     );
 }
 
@@ -476,6 +742,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -543,6 +810,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "iperf-b".into(),
@@ -556,6 +824,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -618,6 +887,7 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
         equal_flow_enforcement: enforcement,
         equal_flow_target_policy: policy.into(),
         codel_target_ns: 0,
+        ..Default::default()
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -742,6 +1012,7 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
                 equal_flow_enforcement: true,
                 equal_flow_target_policy: "bogus-policy".into(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -819,6 +1090,7 @@ fn build_cos_state_rejects_priority_6849(bad_priority: &str) {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -912,6 +1184,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -976,6 +1249,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -1029,6 +1303,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -1181,6 +1456,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "voice".into(),
@@ -1194,6 +1470,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -4328,6 +4605,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -4389,6 +4667,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
                 equal_flow_enforcement: true,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -5857,6 +6136,7 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             // Materializes ONLY best-effort (queue 0). voice/queue 5 is never
             // built on this interface.
@@ -7376,5 +7656,52 @@ fn cos_priority_rank_rejects_medium_and_pins_the_five_real_ranks_6849() {
             ),
         "#6849: COS_PRIORITY_LEVELS must exceed the highest live rank, or indexing by the \
          rank of `low` is out of bounds"
+    );
+}
+
+// #6846: `buffer-size temporal` converts against the queue's DRAIN rate, and
+// that is not the same question as whether the queue has a resolvable
+// transmit-rate.
+//
+// `transmit_rate_bytes` at the call site is
+// `explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec)`,
+// so a queue with no guarantee of its own still drains at the interface shaping
+// rate and its microsecond target still has a byte value. Measured: this
+// scheduler carries ONLY a temporal target — no absolute rate, no percent, no
+// remainder — and one second of drain comes out as the full 10_000_000, not the
+// 100_000 that `default_cos_burst_bytes(10_000_000)` would give.
+//
+// The Go commit advisory depends on exactly this fact. An earlier revision
+// warned that temporal "has no effect" whenever the RATE did not resolve, which
+// is a strictly stronger condition — it told operators a knob does nothing when
+// it does. `cosSchedulerTemporalResolves` (pkg/config) is the narrowed
+// predicate; this cell is what makes it checkable rather than asserted.
+#[test]
+fn build_cos_state_temporal_converts_against_the_fallback_drain_rate() {
+    let snapshot = remainder_snapshot_6846(
+        vec![CoSSchedulerSnapshot {
+            name: "no-rate".into(),
+            buffer_size_temporal_us: 1_000_000, // one second of drain
+            ..Default::default()
+        }],
+        &[("be", "no-rate")],
+    );
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    let q = queue_for_class_6846(iface, "be");
+
+    // Guard the fixture: the queue must genuinely have NO guarantee, or this
+    // cell would be measuring the ordinary resolved-rate path.
+    assert!(
+        !q.guarantee_enabled,
+        "fixture broken: a scheduler with no transmit-rate must not carry a guarantee"
+    );
+    assert_eq!(
+        q.buffer_bytes, 10_000_000,
+        "one second of drain at the 10_000_000 B/s interface shaping-rate. \
+         100_000 would mean the buffer fell back to default_cos_burst_bytes and \
+         temporal really was inert here — which is what the commit advisory used \
+         to claim"
     );
 }

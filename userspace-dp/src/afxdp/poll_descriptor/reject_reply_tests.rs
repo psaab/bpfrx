@@ -2200,6 +2200,7 @@ fn token_allowed_reject_enqueues_with_classify_verdict_5569() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 crate::CoSSchedulerSnapshot {
                     name: "a".into(),
@@ -2213,6 +2214,7 @@ fn token_allowed_reject_enqueues_with_classify_verdict_5569() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![crate::CoSSchedulerMapSnapshot {

@@ -543,6 +543,9 @@ mod tests_gre_local_delivery;
 #[cfg(test)]
 mod tests_gre_outer_bound_6748;
 #[cfg(test)]
+#[path = "tests_gre_version_6842.rs"]
+mod tests_gre_version_6842;
+#[cfg(test)]
 #[path = "tests_decap_dnat_table.rs"]
 mod tests_decap_dnat_table;
 #[cfg(test)]

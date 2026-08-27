@@ -93,6 +93,51 @@ The JSON DB body is the one copy that IS AES-GCM encrypted when
 `system master-password` is set; the text rollback slots, archives, and
 `rescue.conf` stay cleartext-at-rest (0600) by the reasoning above.
 
+### What `system master-password` encryption does and does not protect (#6856)
+
+The section above explains why the *text* copies are not encrypted. This one
+states what encrypting the JSON DB body actually buys, because "AES-GCM at-rest
+encryption" reads stronger than the guarantee it delivers.
+
+**`system master-password` carries no secret.** It is an encryption-*policy*
+knob. The subtree is closed-world and leaf-complete with exactly one leaf,
+`pseudorandom-function` (`config/schema_system.go`), so the Junos form an
+operator reaches for first — `set system master-password plain-text-password
+<secret>` — is **rejected at commit**, not accepted and ignored. Presence of the
+subtree is the on/off switch; the leaf's value selects only the HKDF hash.
+`SystemConfig.MasterPassword` holds that selector *name*, not key material, and
+is deliberately a plain string rather than a `config.Secret`
+(`config/types_system.go`).
+
+**The key is a random on-box file.** `readOrCreateMasterKey` generates 32 bytes
+from `crypto/rand` and persists them to `.configdb/master.key` (0600) — the same
+0700 directory as the ciphertext it protects. No operator input reaches the KDF.
+
+So the guarantee is narrow, and narrower than "encrypted at rest" suggests:
+
+| Threat | Protected? | Why |
+|---|---|---|
+| A reader who obtains the DB **body** but not `master.key` — a backup or file-disclosure scoped to `active.json` | **Yes** | the body is AES-GCM ciphertext and the key is a separate file |
+| A copy of the **`.configdb` directory** — stolen appliance, disk image, whole-directory backup | **No** | `master.key` travels with the ciphertext |
+| **Root** on a running box | **No** | unattended boot: the daemon must decrypt with no operator present |
+
+Both rows of that contract are pinned by
+`TestAtRestKeyTravelsWithTheConfigDirectory6856`
+(`crypto_at_rest_threat_model_6856_test.go`) as a **paired** cell — a
+directory copy must decrypt, and a body-only copy must not. If a future change
+binds the KDF to an operator secret, moves `master.key` out of the DB directory,
+or seals it to a TPM, that test REDS and this table must be rewritten in the
+same change.
+
+**Two things deliberately not done here.** Binding the KDF to an operator secret
+is not a hardening tweak: it would first require *adding* a secret leaf the
+schema currently rejects, and then answering unattended boot, HA key
+distribution, and a power-cut-safe re-key migration — a maintainer decision,
+deferred (#6856). And the HKDF info string `xpf-configstore-master-password`
+(`crypto.go deriveEncryptionKeyFromSalt`) names a secret that never enters the
+derivation: it is misleading, but changing it re-keys **every existing DB**, so
+it must ride with that migration rather than being corrected casually.
+
 **Off-box copy — `transfer-on-commit`:** the honest place to control the
 residual is the off-box transfer, not on-box encryption. When
 `system archival configuration transfer-on-commit` is set, the daemon

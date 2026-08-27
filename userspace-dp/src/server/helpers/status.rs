@@ -168,6 +168,13 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // corrupt residue is counted here.
     state.status.gre_decap_checksum_invalid_drops_total =
         state.afxdp.gre_decap_checksum_invalid_drops_total();
+    // #6842: native-GRE decap refusals for a non-zero GRE version (RFC
+    // 2637 / PPTP is version 1) where the outer tuple named a configured
+    // GRE endpoint. Nonzero = a peer offering PPTP/enhanced GRE to a
+    // tunnel xpf cannot terminate (no PPTP ALG). Transit PPTP is not
+    // counted.
+    state.status.gre_decap_unsupported_version_refusals_total =
+        state.afxdp.gre_decap_unsupported_version_refusals_total();
     // #2472: locally-generated error-reply per-reason token-bucket drops.
     // Nonzero = an error-amplification / reflection flood (or a routing loop)
     // being clamped before it emits unbounded generated ICMP/RST errors.

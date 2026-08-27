@@ -456,6 +456,36 @@ fn process_status_gre_decap_checksum_invalid_drops_roundtrip() {
     assert_eq!(legacy.gre_decap_checksum_invalid_drops_total, 0);
 }
 
+// #6842: round-trip + backward-compat pin for the native-GRE decap
+// unsupported-version REFUSAL counter (RFC 2637 / PPTP enhanced GRE is
+// version 1). The wire key feeds pkg/dataplane/userspace/protocol_status.go
+// and the Prometheus counter
+// `xpf_userspace_gre_decap_unsupported_version_refusals_total`.
+#[test]
+fn process_status_gre_decap_unsupported_version_refusals_roundtrip() {
+    let status = ProcessStatus {
+        gre_decap_unsupported_version_refusals_total: 12,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["gre_decap_unsupported_version_refusals_total"], 12);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.gre_decap_unsupported_version_refusals_total, 12);
+
+    // Pre-#6842 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("gre_decap_unsupported_version_refusals_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#6842 payload decodes");
+    assert_eq!(legacy.gre_decap_unsupported_version_refusals_total, 0);
+}
+
 // #2472: round-trip + backward-compat pin for the per-reason
 // generated-error rate-limit drop counters. The wire keys feed
 // pkg/dataplane/userspace/protocol.go and the Prometheus counters
@@ -1335,6 +1365,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
         equal_flow_enforcement: false,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1355,6 +1386,7 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
         equal_flow_enforcement: true,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1379,6 +1411,7 @@ fn cos_scheduler_snapshot_equal_flow_target_policy_round_trip() {
         equal_flow_enforcement: true,
         equal_flow_target_policy: "mean".into(),
         codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1404,6 +1437,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
         equal_flow_enforcement: false,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     assert!(

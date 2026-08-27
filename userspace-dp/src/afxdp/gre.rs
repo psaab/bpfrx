@@ -219,6 +219,82 @@ pub(in crate::afxdp) static GRE_ENCAP_DF_OVERSIZE_DROPS: AtomicU64 = AtomicU64::
 /// corrupted (or a header truncated past the checksum field).
 pub(in crate::afxdp) static GRE_DECAP_CHECKSUM_INVALID_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// #6842: native-GRE frames REFUSED for decap because the GRE version
+/// field was non-zero while the outer tuple named a configured GRE
+/// tunnel endpoint.
+///
+/// GRE version is a *decap discriminator*, not a cosmetic field. RFC
+/// 2784/2890 GRE is version 0. RFC 2637 (PPTP) "enhanced GRE" is
+/// **version 1** and re-purposes the same 32 bits RFC 2890 defines as an
+/// opaque Key:
+///
+/// ```text
+///   RFC 2890 :  |            Key (32)                          |
+///   RFC 2637 :  |  Payload Length (16)  |     Call ID (16)      |
+/// ```
+///
+/// It also defines an Acknowledgment-Number field behind an `A` bit
+/// (0x0080) that an RFC 2890 reader does not know about, so a
+/// version-blind parse of a version-1 header lands the "inner packet"
+/// pointer on attacker-chosen bytes. Refusing the frame at the version
+/// check — BEFORE any Key read or offset arithmetic — is what keeps that
+/// closed.
+///
+/// This is a REFUSAL, not a drop: `try_native_gre_decap_from_frame`
+/// returns `None` and the frame continues on the ordinary
+/// transit/host-inbound path. It is counted only when a GRE tunnel
+/// endpoint is actually configured for the outer tuple, so ordinary
+/// TRANSIT PPTP crossing the firewall — which is forwarded, not refused
+/// — does not inflate it. Surfaced via `coordinator/status.rs` as
+/// `xpf_userspace_gre_decap_unsupported_version_refusals_total`. A
+/// nonzero value means a peer is offering PPTP/enhanced GRE to a
+/// configured GRE tunnel endpoint; xpf has no PPTP ALG (see #6842) so
+/// that traffic is not terminated here.
+pub(in crate::afxdp) static GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Cold-path bookkeeping for the version refusal above.
+///
+/// Only reached when the version field is non-zero, so it costs the
+/// RFC 2784/2890 fast path nothing. Allocation-free: one hash lookup in
+/// the existing `gre_decap_index` plus a relaxed increment.
+///
+/// The single condition is deliberate. An earlier shape early-returned on
+/// a missing `gre_decap_index` row and THEN ran the kind re-check, which
+/// reads as two guards but is one: `any()` over an empty candidate list is
+/// already false, so the first return was unreachable-by-subsumption and a
+/// mutation that deleted it changed no observable behaviour. Expressing
+/// the gate once means each half of it has exactly one mutation that
+/// reaches a test.
+#[cold]
+#[inline(never)]
+fn note_unsupported_gre_version(frame: &[u8], meta: UserspaceDpMeta, forwarding: &ForwardingState) {
+    let Some((outer_src, outer_dst)) = parse_outer_addresses(frame, meta) else {
+        return;
+    };
+    let key = (meta.addr_family as i32, outer_dst, outer_src);
+    // A refusal is only a refusal if the frame was OFFERED to a GRE tunnel
+    // endpoint. Ordinary transit GRE/PPTP crossing the firewall reaches
+    // this same `return None`, and counting it would make the metric a
+    // traffic gauge instead of a fault signal. The kind test mirrors
+    // `match_tunnel_endpoint` (#2327): only a GRE-mode row would ever have
+    // decapped, at any version.
+    let offered_to_gre_endpoint = forwarding
+        .gre_decap_index
+        .get(&key)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|id| {
+                forwarding
+                    .tunnel_endpoints
+                    .get(id)
+                    .is_some_and(|endpoint| tunnel_mode_kind(&endpoint.mode) == TunnelKind::Gre)
+            })
+        });
+    if !offered_to_gre_endpoint {
+        return;
+    }
+    GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
 /// propagation on tunnel encap (#2303). Returns the full 8-bit
 /// TOS / Traffic-Class value (DSCP in the high 6 bits, ECN in the
@@ -674,7 +750,21 @@ pub(super) fn try_native_gre_decap_from_frame(
     let outer = frame.get(..outer_end)?;
     let base = outer.get(gre_offset..gre_offset + 4)?;
     let flags_version = u16::from_be_bytes([base[0], base[1]]);
+    // #6842: the version field gates EVERY read below. RFC 2784/2890 GRE
+    // is version 0; RFC 2637 (PPTP) enhanced GRE is version 1 and splits
+    // the same 32 bits into `Payload Length (16) | Call ID (16)`, with an
+    // extra Acknowledgment-Number field behind an `A` bit (0x0080) that
+    // the RFC 2890 field order below does not skip. Parsing a version-1
+    // header with these rules therefore (a) reads a per-packet-varying
+    // Payload Length as if it were a stable tunnel Key and (b) lands
+    // `inner_offset` on the Acknowledgment Number — attacker-chosen bytes
+    // that would be promoted as the decapsulated inner packet. Refuse
+    // before any of it. `GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS` records
+    // the case where the outer tuple named a real GRE endpoint, so the
+    // operator can see PPTP being offered to a tunnel xpf cannot
+    // terminate (no PPTP ALG exists — #6842).
     if (flags_version & GRE_VERSION_MASK) != 0 {
+        note_unsupported_gre_version(frame, meta, forwarding);
         return None;
     }
     // Source Route Entries (the Routing-Present R bit) are not parsed —

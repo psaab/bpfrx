@@ -108,6 +108,24 @@ func DestinationNATRuleExcludedReason(dnat *DestinationNATConfig, rule *NATRule)
 	}
 	pool, ok := dnat.Pools[rule.Then.PoolName]
 	if !ok || pool == nil || pool.Address == "" {
+		// #6823: an ACTIONLESS rule names no pool at all, and saying it
+		// "references undefined or address-less pool \"\"" asserts a
+		// reference it does not carry — the destination twin of the
+		// `Action: interface` defect #7640 fixed on the source side, on
+		// exactly the rule shape an operator is trying to find. Worse than
+		// cosmetic: it mis-attributes the CAUSE, sending someone off to
+		// define a pool when the rule carries no translation action for a
+		// pool to belong to.
+		//
+		// The PREDICATE is deliberately untouched — this is the same branch
+		// under the same condition, returning a different string. #6534
+		// shares this function with buildDestinationNATSnapshotsWithFeeds so
+		// the builder and the renderer cannot disagree about which rules are
+		// armed; moving the condition would be the #6534 defect with the
+		// polarity reversed.
+		if rule.Then.PoolName == "" {
+			return "names no translation action (neither `pool` nor `off`)"
+		}
 		return "references undefined or address-less pool " + quoteName(rule.Then.PoolName)
 	}
 	// #3450: a non-host pool address would be coerced to its network base, and

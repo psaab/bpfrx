@@ -786,6 +786,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -799,6 +800,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -901,6 +903,7 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -914,6 +917,7 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1018,6 +1022,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "scheduler-iperf-a".into(),
@@ -1031,6 +1036,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1173,6 +1179,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1186,6 +1193,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1297,6 +1305,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1310,6 +1319,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1417,6 +1427,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1430,6 +1441,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1556,6 +1568,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1569,6 +1582,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1716,6 +1730,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1800,6 +1815,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -2581,6 +2597,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -2594,6 +2611,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -2696,6 +2714,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -2845,6 +2864,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -2932,6 +2952,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -2945,6 +2966,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             inet_precedence_classifiers: vec![],
@@ -3033,6 +3055,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -3046,6 +3069,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3135,6 +3159,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "bulk-sched".into(),
@@ -3148,6 +3173,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3264,6 +3290,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -3277,6 +3304,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -3370,6 +3398,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -3515,6 +3544,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -3528,6 +3558,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "data-sched".into(),
@@ -3541,6 +3572,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -3947,6 +3979,7 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "a".into(),
@@ -3960,6 +3993,7 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -4302,6 +4336,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -4315,6 +4350,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -4504,6 +4540,7 @@ fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -4517,6 +4554,7 @@ fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -4673,6 +4711,7 @@ fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
             CoSSchedulerSnapshot {
                 name: "ef-sched".into(),
@@ -4686,6 +4725,7 @@ fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
         ],
         scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -5245,6 +5285,7 @@ fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -5258,6 +5299,7 @@ fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {

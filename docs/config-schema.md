@@ -5229,15 +5229,98 @@ there very differently, and the difference is load-bearing:
   first outcome ("and is translated by that"), which presumes a later rule
   exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
   the actionless rule and letting the Rust matcher's `else` arm `continue`;
-  destination NAT reaches it by skipping the rule in the builder. Making an
-  actionless rule terminal would newly exempt traffic that already-deployed
-  configs translate, so that is a migration-contract decision tracked on #5717
-  rather than a mechanical fix.
+  destination NAT reaches it by skipping the rule in the builder. Whether to
+  make such a rule TERMINAL instead was a migration-contract question, decided
+  on #6823 — see "#6823 — an actionless NAT rule is NON-TERMINAL" below.
   `TestTolerantActionlessRuleIsNotInert_5717`,
-  `actionless_rule_falls_through_to_later_broader_rule_5717` and
-  `actionless_rule_with_no_later_rule_passes_untranslated_5717` pin BOTH
-  dispositions, so neither the "inert" framing nor the "always translated by a
-  later rule" framing can silently return.
+  `actionless_rule_falls_through_to_later_broader_rule_5717`,
+  `actionless_rule_with_no_later_rule_passes_untranslated_5717` and
+  `actionless_dnat_entry_falls_through_6823` pin BOTH dispositions on BOTH
+  kinds, so neither the "inert" framing nor the "always translated by a later
+  rule" framing can silently return.
+
+**#6823 — an actionless NAT rule is NON-TERMINAL (decided).** A NAT rule
+admitted by the TOLERANT path carrying ZERO terminal actions does not stop rule
+evaluation: matching traffic falls THROUGH to whatever rule follows. That is
+now the stated contract rather than merely the observed behaviour, and changing
+it is a deliberate migration decision, not a cleanup. Four options were on the
+table — **A** non-terminal fall-through (chosen), **B** terminal (matched =>
+exempt, evaluation stops), **C** refuse to install the rule at the builder,
+**D** terminal and fail-CLOSED (drop the flow).
+
+- **B is the only option that changes a packet's fate, and it changes it in the
+  leaking direction.** Take the pinned fixture: an actionless rule matching
+  `10.0.61.0/24` followed by a broad `10.0.0.0/8 interface` rule. Today
+  `10.0.61.102` falls through and is translated to the egress address; under B
+  it is exempt and **leaves on the WAN untranslated**. That is the same
+  disposition #5688 went out of its way to eliminate a few lines above this very
+  `continue`, in this very matcher ("forwarded the packet UNTRANSLATED — the
+  private/internal source leaked onto the egress. Fail CLOSED instead"). The two
+  error directions are not symmetric: when the operator meant "translate", A is
+  correct and B leaks a private source silently, on upgrade; when the operator
+  meant "exempt", B is correct and A breaks the intent in a way that is
+  functional, visible and leaks nothing.
+- **Only B needs the fleet count; A is correct at any count.** The rule survives
+  only on a tolerant load — a config persisted before #5628 added the gate, one
+  peer-synced from an older node, or a rollback target — and until #7643 that
+  population was not merely unmeasured but MISREPRESENTED, because the `show`
+  renderer displayed `Action: interface` for an actionless rule. A migration
+  cost cannot be estimated from a view that could not show the shape.
+- **Junos parity does not decide it.** Junos NAT matching IS terminal, but Junos
+  requires `then`, so a committed Junos config cannot express this input at all.
+  Parity argues for terminal MATCHING — which this matcher already does on every
+  other arm — and says nothing about what an actionless ACTION should mean.
+- **C is packet-identical to A and strictly weaker.** A rule that is not
+  installed is not matched, so evaluation proceeds to the next rule, which is
+  exactly what `continue` does; the same `else` arm already sets
+  `*matched_counter = None`, so the rule is counter-invisible either way. C buys
+  no packet behaviour and removes the information the dataplane would need to
+  implement B later.
+- **D is the option most faithful to #5688 and it is still wrong here.** It
+  would blackhole flows a deployed node forwards today. #1960's no-brick
+  doctrine governs the tolerant load path specifically: its job is to keep a
+  node forwarding on a config it cannot refuse. Turning a malformed rule into a
+  drop is the brick #1960 exists to prevent.
+- **The #3043 security-policy precedent does not carry over.** An actionless
+  POLICY defaults to `PolicyDeny` (`compiler_security_policy.go`) — actionless
+  => fail-closed. That works because a policy's action space `{permit, deny}` is
+  ORDERED by safety, so a safe default exists. A NAT rule's is
+  `{translate, exempt}`, which is not ordered: exempting leaks the private
+  source, translating overrides the operator's intent. With no safe default AT
+  the rule, the safe move is not to decide at the rule at all — which is what
+  falling through does.
+
+**B is not foreclosed, and the reopening criterion is explicit.**
+`xpf_nat_rules_lenient_terminal_action` (#7640, shipped in #7643) reading zero
+across the fleet makes B's migration cost zero, at which point terminal matching
+is the better parity answer. The information B needs is still on the wire — the
+SNAT builder publishes the actionless rule, so the dataplane can be taught to
+stop on it. Preserving that is precisely why C was rejected.
+
+**No upgrade note and no first-hit log**, because A is the status quo: there is
+no behaviour difference to announce or to log. The operator-facing surface for
+the shape is the #7640 gauge plus the per-rule `show security nat
+{source,destination} rule detail` annotation.
+
+**The SNAT/DNAT builder asymmetry is deliberate, and aligning it would be a
+regression.** Source NAT emits the actionless rule and lets Rust's `else` arm
+`continue`; destination NAT skips it in `buildDestinationNATSnapshots`. Both
+reach the same decided disposition, so the asymmetry costs no packet. Aligning
+DNAT to SNAT — installing the entry — is NOT free: measured, `from_snapshots`
+cannot parse the empty `pool_address`, so it drops the entry and records a #4718
+reconcile parse error for every such rule on every reconcile, turning a
+config-level malformation into a recurring wire-corruption diagnostic. Aligning
+SNAT to DNAT is option C. What the asymmetry did owe was a BINDING on the DNAT
+side: the Go builder's skip was pinned (`TestTolerantActionlessRuleIsNotInert_5717`
+asserts ZERO published entries) but the resulting Rust behaviour was not, and
+`DestinationNATRuleSnapshot` is the xpfd->helper wire form, so a hand-built
+snapshot or a mixed-version pair delivers the shape anyway.
+`actionless_dnat_entry_falls_through_6823` closes that: it discriminates
+three-ways between today's fall-through, B landing by accident (`None`), and the
+`snap.off` placeholder being widened to cover any pool-less entry — which reads
+like a harmless generalization but installs the rule with a `0.0.0.0` pool, and
+`DnatEntry::to_outcome` branches on `off` ALONE, so every matching flow is
+translated into a blackhole. That single `if snap.off` token is the whole guard.
 
   The no-later-rule test asserts on `SourceNatLookup`, via
   `match_source_nat_result_for_tuple`, and NOT on the `Option`-returning
@@ -6772,7 +6855,9 @@ Rules:
   1g`) is still accepted — to the validator. `valueType` may still be set for
   `?` completion. The compiler reads the SAME tail via `gatherLeafTailTokens`
   (`parseCoSTransmitRate` / `parseCoSShapingRate`) so validation and
-  compilation never drift. Percent/remainder are accepted-but-inert (see
+  compilation never drift. Percent resolves per-interface (#4228 Gap 2) and
+  remainder resolves against the leftover after resolved siblings (#6846);
+  each keeps a narrowed advisory for the case that still cannot resolve (see
   `docs/cos-traffic-shaping.md`).
 - The generic walker (`schema_walk.go`) needs **no** changes per leaf — it
   descends `setSchema` and validates any typed leaf it finds. Walker rows it

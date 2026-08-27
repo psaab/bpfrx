@@ -928,10 +928,13 @@ fn off_wins_over_contradictory_pool_action_5717() {
 /// the sibling `actionless_rule_with_no_later_rule_passes_untranslated_5717`
 /// covers the other half of that sentence (#6820).
 ///
-/// This test asserts today's behavior, not a desired one. Making an actionless
-/// rule TERMINAL would be a migration-contract change (it would newly exempt
-/// traffic that deployed configs currently translate) and is tracked on #5717,
-/// not made here. Any such change must consciously update this test.
+/// This test asserts the DECIDED contract (#6823: an actionless rule is
+/// NON-TERMINAL), not merely today's behavior. Making one TERMINAL would newly
+/// exempt traffic that deployed configs currently translate — the leaking
+/// direction, contra #5688 a few lines above the `continue` this exercises.
+/// The decision, the rejected alternatives and the criterion that would REOPEN
+/// the terminal option are in docs/config-schema.md; any such change must
+/// consciously update that section AND this test.
 #[test]
 fn actionless_rule_falls_through_to_later_broader_rule_5717() {
     let rules = parse_source_nat_rules(&[
@@ -974,8 +977,9 @@ fn actionless_rule_falls_through_to_later_broader_rule_5717() {
         }),
         "an actionless rule must fall THROUGH to the later broader rule (today's \
          behavior). If this now reports an exemption, the actionless disposition \
-         was changed to terminal — a migration-contract change that must be \
-         reviewed on #5717, not landed silently"
+         was changed to terminal — reversing the #6823 decision, a \
+         migration-contract change that must be argued in \
+         docs/config-schema.md, not landed silently"
     );
 }
 
@@ -1056,8 +1060,9 @@ fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
             "actionless rule with NO later rule reported Matched({d:?}) — a rewrite \
              means the actionless arm started translating on a rule that names no \
              terminal action; a default (no-rewrite) decision means the actionless \
-             disposition became TERMINAL, a migration-contract change tracked on #5717 \
-             that must be reviewed, not landed silently"
+             disposition became TERMINAL, reversing the #6823 decision — a \
+             migration-contract change that must be argued in \
+             docs/config-schema.md, not landed silently"
         ),
     }
 }
