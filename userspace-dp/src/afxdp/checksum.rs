@@ -1033,6 +1033,17 @@ mod dnat_counter_guard_tests_6872 {
                 "a COLUMN-0 quoted `fn` line must not invent a function scope",
                 "mod m {\n    let fixture = r#\"\nfn t() {\n\"#;\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
             ),
+            // The case that requires `contains_unquoted` specifically, as
+            // opposed to the raw-string mask. A SAME-LINE quoted `fn` at an
+            // OUTER indent is examined by the walk (indent 2 < 4), is not
+            // inside a raw string, and would be read as a function header
+            // without the quote guard -- inventing a scope and flagging a
+            // module-scope lock. The mask cannot see this one; the guard is
+            // what answers it.
+            (
+                "a same-line quoted `fn` at an outer indent must not invent a scope",
+                "mod m {\n  let s = \"fn t() {\";\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
+            ),
         ] {
             let lines: Vec<&str> = src.lines().collect();
             assert!(
