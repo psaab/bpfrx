@@ -111,6 +111,12 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 				stream.Category = nodeVal(prop)
 			case "source-address":
 				stream.SourceAddress = nodeVal(prop)
+			case "source-interface":
+				// #6875: compiled so the per-stream spelling reaches the apply
+				// path. It is resolved to an address there, not here, because
+				// resolution reads interface addresses that the compiler does
+				// not own.
+				stream.SourceInterface = nodeVal(prop)
 			case "transport":
 				// #6821: read BOTH spellings. `transport { protocol tls; }`
 				// arrives as children; `transport protocol tls;` packs the

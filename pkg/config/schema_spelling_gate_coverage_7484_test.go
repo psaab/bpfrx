@@ -159,7 +159,25 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// synthetic word. That is why the flag ceiling RISES here — the population
 	// changed, and a blind-spot count going up after a fix is the fix working,
 	// not a regression. Never carry a pre-fix number forward as a target.
-	gateBlindUnreachable: 143,
+	// #6875 raised this 143 -> 144, deliberately, for
+	// `security log stream <*> source-interface`.
+	//
+	// Measured before raising it rather than assumed: a stream with ONLY that
+	// leaf and no sibling `host` compiles to NOTHING —
+	// `cfg.Security.Log.Streams["s"]` is nil — so the differential, which
+	// probes one leaf at a time, sees no output change and can carry no
+	// verdict. That is a property of this stanza requiring a sibling to
+	// materialise, not of the leaf: EVERY existing `stream` leaf
+	// (`severity`, `facility`, `category`, `source-address`) is blind here for
+	// the same reason and is already inside the 143.
+	//
+	// So this cannot be made to compare without changing how the probe
+	// constructs the parent stanza — the #7492-style fix, which is a change to
+	// the gate and not to #6875. The leaf itself is covered behaviourally by
+	// TestStreamSourceInterfaceCompiles_6875, its validator by
+	// TestStreamSourceInterfaceIsValidated_6875, and both apply paths by the
+	// daemon and CLI cells; it is blind to THIS instrument only.
+	gateBlindUnreachable: 144,
 	gateBlindFlag:        175,
 	gateBlindErr:         43,
 	gateBlindValueMoves:  1,
