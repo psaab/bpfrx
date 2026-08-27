@@ -709,6 +709,61 @@ pub(in crate::afxdp) fn host_inbound_admits(
         // interface's ifindex, so the ingress-interface-keyed
         // `host_inbound_admits_iface` denies it while this zone-only path (and a
         // legitimately-zoneless NON-addressed control interface) keeps admit.
+        //
+        // #6873: WHAT THIS ARM DOES NOT SETTLE. The two citations above narrow
+        // WHICH ingress contexts reach `None`; neither says anything about the
+        // table being EMPTY, and an empty table sends EVERY zone id here. That
+        // is a real fail-open — `cold_forwarding_state_admits_every_host_inbound
+        // _service_6873` demonstrates a default `ForwardingState` admitting ssh,
+        // https, v6 DNS and raw GRE — so the question "can a reader observe the
+        // empty table?" is load-bearing and is answered here rather than left to
+        // the next audit to re-derive.
+        //
+        // It cannot, and the reason is worker LIFECYCLE ORDERING, not a flag:
+        //
+        //   - `bring_up_workers` is the only worker spawn path (README:133
+        //     forbids a bare `std::thread::spawn` for a worker), and reconcile
+        //     runs `tear_down` -> `apply_snapshot` (publishes a snapshot-derived
+        //     forwarding state) -> `bring_up_workers`. A worker is spawned only
+        //     after a real state is published.
+        //   - `reconcile(None, ..)` takes its early exit AFTER `tear_down`
+        //     (coordinator/reconcile/mod.rs), so "no snapshot" means "no
+        //     workers", never "workers on an empty table".
+        //   - `stop_inner` JOINS every worker via `workers.stop_and_clear(..)`
+        //     BEFORE `self.forwarding = ForwardingState::default()` (#6592), so
+        //     the reset is never visible to a live reader.
+        //
+        // A `snapshot_installed` check here would therefore be dead code: it
+        // would gate a state no reader can reach, and bury the invariant that
+        // actually protects this arm one layer deeper. The invariant is pinned
+        // instead, by `no_snapshot_reconcile_leaves_no_reader_for_the_empty
+        // _table_6873` (coordinator/tests.rs) — an ordering invariant with no
+        // test is one refactor from being false.
+        //
+        // TWO SURFACES, TWO DIFFERENT ANSWERS — and the difference is why this
+        // arm keeps getting re-audited. host-inbound is enforced BOTH here and
+        // by the kernel nft chain, and the cold-boot question resolves
+        // oppositely on each:
+        //
+        //   - KERNEL nft chain: the window IS reachable. A boot apply can fail
+        //     with no prior table to retain, leaving the host path with no
+        //     chain at all, so it needs a real gate — `installHostInboundCold
+        //     BootFence` (#5644, and its lo0 analogue #6476), guarded by
+        //     `TestColdBootHostInboundInstallFailureInstallsFence`.
+        //   - HERE (userspace AF_XDP classifier): unreachable, by the worker
+        //     lifecycle above. There is no failed-apply equivalent, because a
+        //     worker only exists once a state has been published.
+        //
+        // So "the host-inbound cold-boot fail-open was closed in #5644" is true
+        // of the kernel surface and says nothing about this one. Reading that
+        // sentence next to this arm is what makes an auditor expect a fence
+        // here and file the absence of one — twice so far.
+        //
+        // So, precisely: this arm is settled for CONFIGURED zones (#3405) and
+        // for addressed empty-zone interfaces (#5659); it deliberately keeps
+        // admit for a legitimately zoneless NON-addressed control interface; and
+        // the empty-table case is unreachable by the ordering above rather than
+        // by anything this function does.
         None => true,
         // A configured zone — including one with no `host-inbound-traffic` stanza
         // (empty set) — denies anything its set does not admit (#3405).

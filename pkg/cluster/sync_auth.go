@@ -630,9 +630,16 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 
 // wrapSyncConn applies the negotiated handshake result to a connection: it
 // wraps conn in an authConn (sealing frames when authenticated) and, when the
-// connection authenticated, arms the sticky downgrade-guard. pending is the
-// legacy peer's first frame (nil when none) and is returned for the caller to
-// process before starting the receive loop.
+// connection authenticated, arms the sticky downgrade-guard.
+//
+// #6881: an earlier revision of this comment described a second return value —
+// `pending`, "the legacy peer's first frame (nil when none) ... returned for
+// the caller to process before starting the receive loop". There is no such
+// value and there is no such frame. #5078 removed the dual-accept path that
+// produced one, and this function has returned a bare *authConn since. The
+// prose outlived the mechanism; see the `pendingFrame` note in
+// syncAuthDecision for why executing a peer frame before admission was the
+// bug rather than the feature.
 func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMode, frameKey []byte) *authConn {
 	ac := &authConn{Conn: conn}
 	if mode == syncAuthAuthenticated {

@@ -6919,3 +6919,120 @@ fn refresh_runtime_snapshot_publishes_every_sibling_before_the_view() {
          this is the same bypass the single pre-existing CoS-owner guard had.",
     );
 }
+
+/// #6873 STEP 2 — the ORDERING INVARIANT that makes the host-inbound
+/// cold-boot window unreachable.
+///
+/// `host_inbound_admits` takes its `None => true` arm for every zone id when
+/// `zone_host_inbound` is empty, so an empty table admits every host-bound
+/// packet — demonstrated, not assumed, by
+/// `cold_forwarding_state_admits_every_host_inbound_service_6873`
+/// (forwarding/host_inbound_tests.rs).
+///
+/// #6873 asked whether that state is observable before the first snapshot is
+/// installed, and proposed gating the admit site on `snapshot_installed`. It is
+/// NOT observable, so such a gate would be dead code. The reason is lifecycle
+/// ordering, not a flag:
+///
+///   - `bring_up_workers` is the only worker spawn path (README:133 forbids a
+///     bare `std::thread::spawn` for a worker), and it runs AFTER
+///     `apply_snapshot` has published a snapshot-derived forwarding state;
+///   - `reconcile(None, ..)` takes its early exit AFTER `tear_down`, so "no
+///     snapshot" means "no workers" rather than "workers on an empty table";
+///   - inside `stop_inner`, `workers.stop_and_clear(..)` JOINS every worker
+///     thread before `self.forwarding = ForwardingState::default()` (#6592).
+///
+/// So a worker exists only while a snapshot-derived state is published. What
+/// this cell adds, measured rather than assumed:
+///
+///   - the "no worker survives" half is ALREADY pinned, by
+///     `teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers` — a
+///     cell whose stated subject is #2522 quiesce timing, but which seeds a
+///     live worker and asserts `workers.records.is_empty()`. Removing the
+///     teardown reds it too.
+///   - the "the dangerous state is actually REACHED" half was pinned by
+///     nothing. Deleting `self.forwarding = ForwardingState::default()` from
+///     `stop_inner` reds THIS cell alone; the quiesce cell stays green because
+///     it never looks at the forwarding state.
+///
+/// That second half is what makes the first one mean something: without it,
+/// "no reader survives" guards a state nobody showed was dangerous, and the
+/// pairing with `cold_forwarding_state_admits_every_host_inbound_service_6873`
+/// (the payload proof) has no anchor at this end.
+///
+/// The cell that LOOKS like it covers this does not:
+/// `reconcile_with_none_snapshot_reaches_no_snapshot_early_exit` (#1328)
+/// asserts `workers.live.is_empty()` from a `Coordinator::new()` that never had
+/// a worker, so removing the teardown leaves it GREEN. A fixture that cannot
+/// produce the state it asserts absent is mutation-insensitive by construction.
+///
+/// Fail-on-revert: stop clearing the worker records and the surviving-worker
+/// assertion goes RED (with the quiesce cell, and NOT the #1328 cell); stop
+/// defaulting the forwarding state and the emptied-table assertion goes RED
+/// alone.
+#[test]
+fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
+    const ZONE: u16 = 7;
+
+    let mut coordinator = Coordinator::new();
+
+    // A LIVE worker record: the reader that must not survive.
+    coordinator
+        .workers
+        .records
+        .insert(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()));
+
+    // A POPULATED host-inbound table: the state that must be emptied. Both
+    // halves matter — with an empty table the "it was emptied" assertion is
+    // vacuous, and with no worker the "no reader survives" assertion is.
+    let mut zone = ZoneHostInbound::default();
+    zone.tcp_ports.insert(22);
+    coordinator.forwarding.zone_host_inbound.insert(ZONE, zone);
+
+    assert!(
+        !coordinator.workers.records.is_empty(),
+        "fixture broken: there must be a live worker record BEFORE the reconcile, \
+         or this cell cannot tell a teardown from a no-op"
+    );
+    assert!(
+        !coordinator.forwarding.zone_host_inbound.is_empty(),
+        "fixture broken: the host-inbound table must be POPULATED before the \
+         reconcile, or 'it was emptied' proves nothing"
+    );
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        bound: true,
+        xsk_registered: true,
+        ready: true,
+        ..BindingStatus::default()
+    }];
+    let _ = coordinator.reconcile(None, &mut bindings, 64);
+
+    // The dangerous state IS reached — a no-snapshot reconcile really does
+    // leave the admit path's table empty.
+    assert!(
+        coordinator.forwarding.zone_host_inbound.is_empty(),
+        "a no-snapshot reconcile must reset the forwarding state, leaving the \
+         host-inbound table empty — if this ever stops being true the cell below \
+         is guarding nothing"
+    );
+    // ...and NOTHING survives that could observe it. This is the invariant that
+    // makes a `snapshot_installed` gate at the admit site unnecessary.
+    assert!(
+        coordinator.workers.records.is_empty(),
+        "a worker record survived a no-snapshot reconcile — it would be reading a \
+         forwarding state whose empty zone_host_inbound admits EVERY host-bound \
+         packet (#6873). The teardown-before-early-exit ordering is what prevents \
+         that, and it has just been broken"
+    );
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "no live worker may outlive the forwarding state it was reading"
+    );
+}

@@ -431,6 +431,16 @@ From zone: guest, To zone: lan
     / PMTUD / established-session accepts precede every deny, so the default-deny
     cannot strand management or break HA. (All shipped reference configs already
     declare a `host-inbound-traffic` stanza per zone, so they are unaffected.)
+    What #3405 did **not** change is the arm for a genuinely zoneless ingress
+    context — a NON-addressed control interface with no resolved security zone
+    still takes `None => true` and is admitted, deliberately, so ND and control
+    delivery on the global context keep working. #5659 covers the neighbouring
+    case (an ADDRESSED interface with an empty zone is denied via the
+    interface-keyed path). A cold dataplane, before any snapshot is applied, has
+    an EMPTY zone table in which every id would take that same admit arm — that
+    state is never observable, because a worker thread exists only while a
+    snapshot-derived forwarding state is published (#6873), not because the
+    admit path checks for it.
   - **Lifeline-exemption visibility (#3682):** the lifeline exclusion above is
     an IMPLICIT policy exception — a zone-assigned interface whose base name is a
     lifeline (`fxp0` / `em0` / `fab<N>`, plus a configured chassis-cluster
