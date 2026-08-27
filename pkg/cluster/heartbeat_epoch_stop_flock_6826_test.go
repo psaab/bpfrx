@@ -188,6 +188,18 @@ func TestIncomingProcessDeclinesRatherThanBlocking6826(t *testing.T) {
 		t.Fatalf("hold LOCK_EX: %v", err)
 	}
 
+	// Count attempts, so the bounded wait is proven to PACE itself rather than
+	// busy-spin. Without the retry interval the loop still declines on time and
+	// every other assertion here still passes — measured — while burning a core
+	// for the whole budget on the shutdown and startup paths.
+	var attempts int64
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		atomic.AddInt64(&attempts, 1)
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
 	// RELEASE THE LOCK LATE, well after the acquire budget. Without this a
 	// BLOCKING implementation never returns and the cell fails by HANGING —
 	// which is a red, but a red with no assertion and no diagnostic. Releasing
@@ -214,6 +226,15 @@ func TestIncomingProcessDeclinesRatherThanBlocking6826(t *testing.T) {
 		t.Errorf("#6826: waited %v for a contended lock, budget is %v — an incoming "+
 			"process must decline rather than park behind an outgoing one's worker",
 			elapsed, bootEpochLockAcquireBudget)
+	}
+	// Paced, not spinning. The ceiling is the budget divided by the retry
+	// interval with generous slack for scheduler jitter; a spin loop exceeds it
+	// by orders of magnitude.
+	ceiling := int64(bootEpochLockAcquireBudget/bootEpochLockRetryInterval) * 8
+	if n := atomic.LoadInt64(&attempts); n > ceiling {
+		t.Errorf("#6826: %d lock attempts in %v (ceiling %d) — the bounded wait must "+
+			"sleep between attempts, not busy-spin a core through the whole budget",
+			n, elapsed, ceiling)
 	}
 	// Non-vacuity: it must actually have WAITED, not skipped the attempt.
 	if elapsed < bootEpochLockRetryInterval {
