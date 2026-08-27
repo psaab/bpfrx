@@ -1181,3 +1181,5 @@ impl BindingLiveState {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod torn_bindmode_6898_tests;
