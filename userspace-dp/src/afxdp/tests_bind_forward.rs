@@ -915,6 +915,85 @@ fn output_filter_reject_carries_the_configured_icmp_code_6854() {
          CoSTxSelection.reject_message to the builder carries the default, which the whole \
          suite otherwise cannot see"
     );
+
+    // PRECOMPUTED arm — the flow-cache FALLBACK path, a different hop.
+    //
+    // The call above passes `precomputed_tx_selection: None`, so the selection is
+    // resolved fresh. When a cached descriptor IS supplied, the message-type is
+    // carried across a separate assignment, and the mutation matrix showed that
+    // one still free with the fresh path bound. Covering one arm and calling the
+    // path tested is the exact mistake this cell exists to correct.
+    let precomputed = crate::afxdp::tx::resolve_cached_cos_tx_selection(
+        &forwarding,
+        12,
+        meta,
+        Some(&flow.forward_key),
+    );
+    assert!(
+        precomputed.reject,
+        "#6854 PREMISE: the precomputed descriptor must classify as a reject, or the arm \
+         below never reaches the reject-reply branch"
+    );
+    let mut tx_pipeline2 = WorkerTxPipeline {
+        free_tx_frames: (0..256u64).collect(),
+        pending_tx_prepared: std::collections::VecDeque::new(),
+        pending_tx_local: std::collections::VecDeque::new(),
+        max_pending_tx: 256,
+        outstanding_tx: 0,
+        pending_fill_frames: std::collections::VecDeque::new(),
+        in_flight_prepared_recycles: FastMap::default(),
+        tx_submit_ns: Vec::new().into_boxed_slice(),
+    };
+    let mut counters2 = BatchCounters::default();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let req2 = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        &frame,
+        meta,
+        &decision,
+        &forwarding,
+        Some(&flow),
+        None,
+        false,
+        123,
+        None,
+        None,
+        Some(&precomputed),
+        Some(ForwardRejectReply {
+            tx_pipeline: &mut tx_pipeline2,
+            counters: &mut counters2,
+        }),
+        None,
+    );
+    assert!(
+        req2.is_none(),
+        "the precomputed reject must not forward the original packet either"
+    );
+    assert_eq!(
+        counters2.filter_reject_sent, 1,
+        "#6854 PREMISE: the precomputed arm must enqueue exactly one reply"
+    );
+    let reply2 = tx_pipeline2
+        .pending_tx_local
+        .front()
+        .expect("#6854: the precomputed ICMP reject reply must be queued");
+    assert_eq!(
+        icmp_type_code_v4_6854(&reply2.bytes),
+        (3, 1),
+        "#6854: the PRECOMPUTED (flow-cache fallback) path must carry the message-type too. \
+         Code 13 here means a flow-cache fallback silently downgrades an operator's \
+         `then reject host-unreachable` to administratively-prohibited"
+    );
 }
 
 /// Read (type, code) from the ICMPv4 payload of a built reply frame.
