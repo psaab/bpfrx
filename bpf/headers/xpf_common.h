@@ -34,7 +34,9 @@
 #define NEXTHDR_NONE    59
 /* RETIRED-eBPF (#1476): this bound belongs to the deleted XDP/TC pipeline's
  * walker in xpf_helpers.h, which no .c file compiles any more. It is NOT the
- * live AF_XDP shim's bound — that is MAX_EXT_HDRS in userspace-xdp/src/lib.rs,
+ * live AF_XDP shim's bound — that is MAX_EXT_HDRS in
+ * userspace-xdp/src/ipv6_ext_walk.rs (#6885: it lives there now; lib.rs only
+ * re-exports it),
  * which #4555 moved to 7 to reach parity with MAX_IPV6_EXT_HEADERS in
  * userspace-dp/src/afxdp/frame/inspect.rs. Editing THIS define changes nothing
  * at runtime; see pkg/dataplane/README.md "IPv6 extension-header walk". */
