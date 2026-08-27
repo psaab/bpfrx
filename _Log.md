@@ -1,3 +1,12 @@
+> **CLOSED to new entries as of #6874.** Write action logs to
+> `docs/log/<issue>.md` — one file per issue — not here.
+>
+> This file is the historical record. It stayed a single append-only file that
+> every lane wrote to, which made it an O(n^2) serialization point: every merge
+> conflicted every other open branch, on this file alone. See
+> `docs/log/README.md` for the measurement and for why a `merge=union` driver is
+> not a safe alternative.
+
 ## 2026-08-27 — #6821: security-log transport packed tail, gate and compiler together
 
 - **Timestamp**: 2026-08-27
@@ -107056,6 +107065,12 @@ prose edit above them added. No diff falls in the new test body.
   detector for that mutation rather than decoration.
 - **File(s)**: `pkg/config/compact_depth_census_7653_test.go`,
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-27
+  - **Action**: #6863 — a watcher on the existing 30s management reassert tick records the stale-mgmt-cert debt when the kernel host name moves without xpfd renaming it. Baseline moves under the same lock as xpfd's own rename so one rename cannot produce two debts.
+  - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
+
+<!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
 
 ## 2026-08-27 — #7230: a keepalive now carries the peer that sent it
 
