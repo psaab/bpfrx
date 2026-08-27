@@ -1236,18 +1236,26 @@ func ValidateConfig(cfg *Config) []string {
 					sched.Name))
 			}
 			// #6846: buffer-size temporal <us> now RESOLVES — forwarding_build/
-			// cos.rs converts the microsecond target against the queue's
-			// resolved transmit rate (cos_temporal_buffer_bytes). The advisory
-			// narrows to the one case that still cannot resolve: a queue with
-			// NO resolvable rate has no drain speed, so a microsecond target
-			// has no byte value and the buffer falls back to default sizing.
+			// cos.rs converts the microsecond target against the queue's drain
+			// rate (cos_temporal_buffer_bytes). The advisory narrows to the one
+			// case that still cannot resolve: a queue whose effective rate is
+			// ZERO has no drain speed, so a microsecond target has no byte
+			// value and the buffer falls back to default sizing.
+			//
+			// The predicate is cosSchedulerTemporalResolves and NOT
+			// cosSchedulerRateResolves, which is a strictly stronger question.
+			// A queue with no guarantee of its own still drains at the
+			// interface shaping rate — the `unwrap_or` fallback at the call
+			// site — so an unresolved `percent` or `remainder` does not make
+			// temporal inert. Using the stronger predicate warned that the knob
+			// "has no effect" on configurations where it has one.
 			//
 			// The narrowing is the point. An advisory that keeps firing for
 			// configurations that now work is as much a defect as one that
 			// stops firing for configurations that do not — it teaches the
 			// operator to ignore it. Pinned by
 			// TestTemporalAdvisoryNarrowsToUnresolvable6846.
-			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerRateResolves(cos, sched, schedulersResolvingPercent) {
+			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerTemporalResolves(sched, schedulersResolvingPercent) {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q buffer-size temporal is accepted but has no effect: the queue has no resolvable transmit-rate (no absolute rate, and no scheduler-map binding to an interface with a root shaping-rate), so there is no drain speed to convert the microsecond target against (#6846)",
 					sched.Name))

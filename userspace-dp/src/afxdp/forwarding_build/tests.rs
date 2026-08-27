@@ -7658,3 +7658,50 @@ fn cos_priority_rank_rejects_medium_and_pins_the_five_real_ranks_6849() {
          rank of `low` is out of bounds"
     );
 }
+
+// #6846: `buffer-size temporal` converts against the queue's DRAIN rate, and
+// that is not the same question as whether the queue has a resolvable
+// transmit-rate.
+//
+// `transmit_rate_bytes` at the call site is
+// `explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec)`,
+// so a queue with no guarantee of its own still drains at the interface shaping
+// rate and its microsecond target still has a byte value. Measured: this
+// scheduler carries ONLY a temporal target — no absolute rate, no percent, no
+// remainder — and one second of drain comes out as the full 10_000_000, not the
+// 100_000 that `default_cos_burst_bytes(10_000_000)` would give.
+//
+// The Go commit advisory depends on exactly this fact. An earlier revision
+// warned that temporal "has no effect" whenever the RATE did not resolve, which
+// is a strictly stronger condition — it told operators a knob does nothing when
+// it does. `cosSchedulerTemporalResolves` (pkg/config) is the narrowed
+// predicate; this cell is what makes it checkable rather than asserted.
+#[test]
+fn build_cos_state_temporal_converts_against_the_fallback_drain_rate() {
+    let snapshot = remainder_snapshot_6846(
+        vec![CoSSchedulerSnapshot {
+            name: "no-rate".into(),
+            buffer_size_temporal_us: 1_000_000, // one second of drain
+            ..Default::default()
+        }],
+        &[("be", "no-rate")],
+    );
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    let q = queue_for_class_6846(iface, "be");
+
+    // Guard the fixture: the queue must genuinely have NO guarantee, or this
+    // cell would be measuring the ordinary resolved-rate path.
+    assert!(
+        !q.guarantee_enabled,
+        "fixture broken: a scheduler with no transmit-rate must not carry a guarantee"
+    );
+    assert_eq!(
+        q.buffer_bytes, 10_000_000,
+        "one second of drain at the 10_000_000 B/s interface shaping-rate. \
+         100_000 would mean the buffer fell back to default_cos_burst_bytes and \
+         temporal really was inert here — which is what the commit advisory used \
+         to claim"
+    );
+}

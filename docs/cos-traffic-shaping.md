@@ -278,21 +278,40 @@ Rules, each of which is load-bearing:
   usable leftover — because the fix differs.
 
 **Temporal resolution (#6846 — now ENFORCED).** `buffer-size temporal <us>`
-sizes the queue by drain time, so it converts against the queue's **resolved**
-transmit rate — strictly after the rate, including after `remainder` when both
-are set on one queue. That combination is **legal**: temporal is well defined
-once remainder resolves, and rejecting a combination the model supports would
-break valid Junos. Rounding and clamping mirror `buffer-size percent` exactly.
+sizes the queue by drain time, so it converts against the queue's **drain
+rate** — strictly after the rate, including after `remainder` when both are set
+on one queue. That combination is **legal**: temporal is well defined once
+remainder resolves, and rejecting a combination the model supports would break
+valid Junos. Rounding and clamping mirror `buffer-size percent` exactly.
 
-**Still inert, and only here:** `transmit-rate remainder` with no usable
-leftover — either no shaping base at all (not bound via a scheduler-map to an
-interface with a root shaping-rate) or siblings already claiming the whole rate
-— and `buffer-size temporal` on a queue with no resolvable rate. There is no bandwidth to take a remainder *of*, and no drain speed to
-convert a microsecond target against; no port speed is available to substitute
-either, because `InterfaceSnapshot` carries no link-speed field and a zero
-shaping rate is already treated as "no usable CoS state". Both advisories
-narrowed to exactly these cases in #6846 — an advisory that keeps firing for
-configurations that now work teaches the operator to ignore it.
+The drain rate is not the same thing as a *resolved* transmit-rate, and the
+difference matters for the advisory. A queue with no guarantee of its own keeps
+the historical fallback — the interface shaping-rate — so it still drains, and
+a microsecond target against it still has a byte value. `buffer-size temporal`
+therefore goes inert only where that fallback is itself zero: no absolute rate
+on the scheduler **and** no scheduler-map binding to an interface with a root
+shaping-rate. An unresolved `percent` or an unresolved `remainder` does **not**
+make temporal inert.
+
+**Still inert, and only here:**
+
+- `transmit-rate remainder` with no usable leftover — either no shaping base at
+  all (not bound via a scheduler-map to an interface with a root shaping-rate)
+  or siblings leaving nothing after the floor. There is no bandwidth to take a
+  remainder *of*, and no port speed is available to substitute: `InterfaceSnapshot`
+  carries no link-speed field, and a zero shaping rate is already treated as
+  "no usable CoS state".
+- `buffer-size temporal` on a queue whose effective rate is **zero** — no
+  absolute rate and no shaped binding. There is no drain speed to convert a
+  microsecond target against.
+
+Both advisories narrowed to exactly these cases in #6846 — an advisory that
+keeps firing for configurations that now work teaches the operator to ignore
+it. The narrowing is measured, not asserted:
+`build_cos_state_temporal_converts_against_the_fallback_drain_rate` pins the
+runtime fact the temporal advisory depends on, and
+`TestRemainderAdvisoryTracksTheLeftover6846` pins the remainder one against the
+Rust resolver cells it mirrors.
 
 The commit gate still rejects garbage (`transmit-rate percent 150`,
 `transmit-rate asd`) and a both-forms-set config (an absolute rate AND a

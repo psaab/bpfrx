@@ -86,19 +86,24 @@ func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
 		}
 	})
 
-	t.Run("remainder with a ZERO leftover still warns", func(t *testing.T) {
+	t.Run("remainder with a ZERO leftover: the RATE is inert, temporal is NOT", func(t *testing.T) {
 		// The subtest above binds a lone remainder queue to a 100m shape, so
 		// the leftover is the whole 100m — it varies the right axis and samples
-		// only the passing point. It cannot tell "resolves to a usable rate"
-		// from "resolves to zero and is therefore still inert".
+		// only the passing point.
 		//
-		// Here siblings claim the entire shaping-rate, so the leftover is zero.
-		// The dataplane declines a zero share (zero is its unshaped sentinel),
-		// so the queue has no rate, temporal has no drain speed to convert
-		// against, and the advisory MUST still fire. Suppressing it here would
-		// be an advisory regression: a config that warned before, does not now,
-		// and gained nothing at runtime.
-		if !hasTemporalAdvisory(t,
+		// Here siblings claim the entire shaping-rate, so the leftover is zero
+		// and the dataplane declines the share. The `remainder` form IS inert
+		// and TestRemainderAdvisoryTracksTheLeftover6846 asserts the remainder
+		// advisory fires for exactly this shape.
+		//
+		// TEMPORAL is not. The queue keeps the no-guarantee fallback, which is
+		// the interface shaping-rate, so it still drains at 100m and the
+		// microsecond target still has a byte value. An earlier revision
+		// asserted a warning here on the reasoning that "the queue has no
+		// rate"; the queue has no GUARANTEE, which is a different thing, and
+		// build_cos_state_temporal_converts_against_the_fallback_drain_rate
+		// measures the difference.
+		if hasTemporalAdvisory(t,
 			"set class-of-service schedulers full transmit-rate percent 100",
 			"set class-of-service schedulers be transmit-rate remainder",
 			"set class-of-service schedulers be buffer-size temporal 50000",
@@ -107,9 +112,29 @@ func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
 			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
 			"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
 		) {
-			t.Fatal("#6846: siblings claiming the whole shaping-rate leave a ZERO " +
-				"leftover, the dataplane declines it, and the queue is still inert — " +
-				"so the temporal advisory must still fire")
+			t.Fatal("#6846: an unresolved `remainder` does not make TEMPORAL inert — " +
+				"the queue still drains at the interface shaping-rate, so the " +
+				"microsecond target still has a byte value. Warning here tells the " +
+				"operator a knob does nothing when it does")
+		}
+	})
+
+	t.Run("bound to an UNSHAPED interface still warns", func(t *testing.T) {
+		// The case that keeps the predicate honest. A scheduler-map binding is
+		// not enough on its own: with no root shaping-rate the queue's
+		// effective rate is zero, cos_temporal_buffer_bytes declines it, and
+		// the buffer really does fall back to default sizing.
+		//
+		// Without this row the predicate could be weakened all the way to "is
+		// it bound to anything" and every other row would still pass.
+		if !hasTemporalAdvisory(t,
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+		) {
+			t.Fatal("#6846: an interface with no root shaping-rate gives the queue an " +
+				"effective rate of zero, so temporal has nothing to convert against " +
+				"and the advisory must still fire")
 		}
 	})
 

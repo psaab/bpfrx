@@ -95,6 +95,31 @@ func cosSchedulerRateResolves(cos *ClassOfServiceConfig, sched *CoSScheduler, sh
 	return false
 }
 
+// cosSchedulerTemporalResolves reports whether `buffer-size temporal <us>` has
+// a drain rate to convert against (#6846).
+//
+// DELIBERATELY weaker than cosSchedulerRateResolves. Temporal converts against
+// `transmit_rate_bytes` at the forwarding_build call site, and that value is
+// `explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec)`
+// — so a queue with no guarantee of its own still drains at the interface
+// shaping rate, and its microsecond target still has a byte value. Only a queue
+// whose effective rate is ZERO leaves temporal inert.
+//
+// An earlier revision of #6846 reused cosSchedulerRateResolves here and warned
+// that the knob "has no effect" for configurations where it has one — a queue
+// whose `remainder` did not resolve still got a temporal-sized buffer off the
+// interface rate. The advisory TEXT already named the correct condition ("no
+// absolute rate, and no scheduler-map binding to an interface with a root
+// shaping-rate"), so the message and the predicate disagreed and the message
+// was right. build_cos_state_temporal_converts_against_the_fallback_drain_rate
+// pins the runtime fact this predicate depends on.
+func cosSchedulerTemporalResolves(sched *CoSScheduler, shaped map[string]bool) bool {
+	if sched == nil {
+		return false
+	}
+	return sched.TransmitRateBytes > 0 || shaped[sched.Name]
+}
+
 // cosRemainderLeftoverIsPositive reports whether ANY interface binding gives
 // `sched` a non-zero remainder share (#6846).
 //
