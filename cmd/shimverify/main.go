@@ -113,8 +113,19 @@ func run(
 	}
 
 	decision := decide(stats, getenv(allowLowHeadroomEnv) == "1")
-	summary := fmt.Sprintf("processed %d insns (limit %d), headroom %.2f%%",
-		stats.ProcessedInsns, stats.InsnLimit, stats.HeadroomPct())
+	// #6884: the banner carries the floor's remaining SLACK, not just the
+	// headroom. Headroom answers "how close to the 1M wall"; slack answers the
+	// question this gate's sensitivity actually rests on — "how much can still
+	// land before the tripwire fires". The two diverge as the object improves,
+	// silently: the floor was chosen against a 5.3% object and went on reading
+	// 3% while the object reached 21.58%, at which point it admitted 1-2 whole
+	// extension-header iterations without a word. Printing slack on every build
+	// is what surfaces that drift when it happens instead of by archaeology.
+	summary := fmt.Sprintf("processed %d insns (limit %d), headroom %.2f%%, "+
+		"%d insns of slack before the %.1f%% floor",
+		stats.ProcessedInsns, stats.InsnLimit, stats.HeadroomPct(),
+		stats.SlackToFloorInsns(dataplane.UserspaceShimMinVerifierHeadroomPct),
+		dataplane.UserspaceShimMinVerifierHeadroomPct)
 
 	switch decision.refusal {
 	case refusalUnmeasured:

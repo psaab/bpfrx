@@ -50,7 +50,24 @@ import (
 //
 // 3% is deliberately loose. It is not a performance target; it is a
 // tripwire that says "the next change here will not fit" while there is
-// still room to plan. The current object sits at ~5.3%.
+// still room to plan.
+//
+// #6884: there is deliberately NO "the current object sits at X%" sentence
+// here any more. The one that used to be ("~5.3%") was written when the floor
+// was chosen and was FALSE within weeks — #6676 freed ~193k insns and the
+// object moved to 21.58% headroom. That matters more than a wrong number in a
+// comment, because the floor was CALIBRATED against 5.3%: at 21.58% the same
+// 3% admits ~186k additional insns, which is one to two IPv6 extension-header
+// iterations (87k-106k each) landing SILENTLY — so the tripwire no longer
+// fires "before the next change will not fit", which is the entire claim above
+// it. A hand-maintained number is exactly the wrong instrument for judging
+// whether a threshold is still calibrated, because it drifts in the same
+// silence the threshold is supposed to break.
+//
+// The live figures are reported by EVERY build instead: cmd/shimverify's PASS
+// banner prints the processed count, the headroom, and — the one to judge this
+// floor's sensitivity on — how many insns of slack the floor still admits.
+// Those are computed, so they cannot rot.
 const UserspaceShimMinVerifierHeadroomPct = 3.0
 
 // verifyShrinkHashMaxEntries is the verify-only ceiling applied to
@@ -206,6 +223,31 @@ func (s ShimVerifierStats) HeadroomPct() float64 {
 		return 0
 	}
 	return 100 * float64(s.InsnLimit-s.ProcessedInsns) / float64(s.InsnLimit)
+}
+
+// SlackToFloorInsns is how many additional processed instructions a change may
+// cost before this object would trip the given headroom floor (#6884).
+//
+// HeadroomPct answers "how close is this object to the 1M wall". This answers
+// the question the FLOOR's sensitivity actually depends on: "how much can still
+// land without the tripwire firing". They diverge as the object improves, and
+// that divergence is silent — the floor was chosen against a 5.3% object and
+// went on reading 3% while the object moved to 21.58%, at which point the same
+// constant admitted 1-2 whole extension-header iterations without a word.
+// Reporting this on every build is what makes that drift visible at the moment
+// it happens rather than by archaeology.
+//
+// Negative means the object is already past the floor, and the magnitude is how
+// far — useful in the refusal path, where "by how much" is the first thing
+// asked. Returns 0 when unmeasured, which callers must not read as "no slack":
+// stats.Measured() is the guard, and an unmeasured object is a refusal on its
+// own (see decide()).
+func (s ShimVerifierStats) SlackToFloorInsns(floorPct float64) int {
+	if !s.Measured() {
+		return 0
+	}
+	admitted := int(float64(s.InsnLimit) * (1 - floorPct/100))
+	return admitted - s.ProcessedInsns
 }
 
 // shimVerifierStatsRe matches the kernel's end-of-verification summary,
