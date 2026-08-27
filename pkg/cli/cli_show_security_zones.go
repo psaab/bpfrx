@@ -10,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/policymatch"
+	"github.com/psaab/xpf/pkg/zonecounters"
 )
 
 func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone string) error {
@@ -104,18 +105,8 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 				// nothing. The generic line stays for the other two causes,
 				// because with no overflow they remain genuinely ambiguous and
 				// naming one would be a guess.
-				if zoneCounterOverflowActive(c) {
-					fmt.Println("  Traffic statistics: not available " +
-						"(the dataplane's per-zone hot-path slot capacity is " +
-						"EXHAUSTED, so this zone's traffic is not being counted " +
-						"at all; reduce the number of configured zones or accept " +
-						"that zones past the capacity go uncounted)")
-				} else {
-					fmt.Println("  Traffic statistics: not available " +
-						"(no per-zone volume published for this zone: helper predates " +
-						"per-zone accounting, the zone exceeded the dataplane's " +
-						"hot-path slot capacity, or the zone is idle)")
-				}
+				// #6895: one canonical spelling for all three surfaces.
+				fmt.Println(zonecounters.UnavailableLine(zoneCounterOverflowActive(c)))
 			case errIn == nil && errOut == nil:
 				fmt.Println("  Traffic statistics:")
 				fmt.Printf("    Input:  %d packets, %d bytes\n",

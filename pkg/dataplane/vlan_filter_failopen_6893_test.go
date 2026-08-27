@@ -24,10 +24,23 @@ import (
 // child absent reproduces exactly the post-soft-skip state — the parent
 // resolves, `ge-0-0-2.50` does not — with no netlink and no privileges.
 //
-// WHAT THIS CELL WILL BECOME. #6893's fix direction 1 makes a VLAN creation
-// failure fail the apply. When that lands, the `err != nil` assertion here
-// inverts, and that inversion is its done-signal. Until then this pins the
-// CURRENT behaviour honestly, including that it is a fail-open.
+// WHAT PART 2 CHANGED, and a correction to what this comment used to predict.
+// It said the `err != nil` assertion here would INVERT once a VLAN creation
+// failure failed the apply. It does not, and the anticipation named the wrong
+// function: part 2's guard is in `mapZoneInterface`, and `compileZones` runs
+// BEFORE `compileFirewallFilters` (compiler.go :304 and :366, both
+// `if err != nil { return }`). So a creation failure now aborts the apply
+// before this function is ever reached.
+//
+// This cell therefore still describes `compileFirewallFilters` in isolation
+// truthfully — that is exactly what it does when handed an unresolvable
+// sub-interface — but the route it models is no longer reachable through a
+// creation failure. It stays reachable through the ABSENT-PHYSICAL skip, which
+// part 2 deliberately leaves soft, so the cell is still guarding a live path.
+//
+// The done-signal idea was right and its location was wrong. Part 2's own
+// paired proof lives at the layer the guard is in
+// (vlan_create_failclosed_6893_test.go).
 func TestVLANSubInterfaceFilterSilentlyUnapplied_6893(t *testing.T) {
 	const physName = "ge-0-0-2"
 	const subName = "ge-0-0-2.50"
@@ -159,4 +172,59 @@ func newIfaceFilterRecordingDP6893() *ifaceFilterRecordingDP6893 {
 func (d *ifaceFilterRecordingDP6893) SetIfaceFilter(key IfaceFilterKey, id uint32) error {
 	d.ifaceFilters[key] = id
 	return nil
+}
+
+// Site A: the INTERFACE-NOT-FOUND miss, which is the sibling of the VLAN miss
+// above and was recording without anything binding it.
+//
+// Flagged during review of part 1: dropping the recording at that site left the
+// package fully green, so it read as covered only because its sibling was. That
+// asymmetry is the same shape #6893 is about — a thing that looks recorded
+// because something adjacent is — one level down, in the tests rather than the
+// code.
+//
+// Part 2 deliberately leaves this path a SOFT SKIP (#6893 hedges on an
+// interface configured but absent from this chassis as arguably legitimate), so
+// the record is the only trace it has, and it should be bound.
+func TestMissingInterfaceFilterBindingRecorded_6893(t *testing.T) {
+	const physName = "ge-0-0-9"
+
+	cfg := &config.Config{}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"wan-in": {
+			Name:  "wan-in",
+			Terms: []*config.FirewallFilterTerm{{Name: "deny-all", Action: "discard"}},
+		},
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		physName: {
+			Name:  physName,
+			Units: map[int]*config.InterfaceUnit{0: {Number: 0, FilterInputV4: "wan-in"}},
+		},
+	}
+
+	dp := newIfaceFilterRecordingDP6893()
+	// Nothing seeded: the physical interface itself does not resolve.
+	result := &CompileResult{}
+
+	if err := compileFirewallFilters(dp, cfg, result); err != nil {
+		t.Fatalf("compileFirewallFilters: %v", err)
+	}
+	if len(dp.ifaceFilters) != 0 {
+		t.Fatalf("fixture broken: the filter WAS assigned — the interface must be "+
+			"unresolvable for this cell to mean anything (%d bindings)", len(dp.ifaceFilters))
+	}
+
+	bindings := result.UnappliedFilterBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("want 1 unapplied-binding record for the missing-interface miss, got %d (%+v)",
+			len(bindings), bindings)
+	}
+	if bindings[0].Interface != physName {
+		t.Errorf("record names %q, want %q", bindings[0].Interface, physName)
+	}
+	if !strings.Contains(bindings[0].Reason, "interface not resolvable") {
+		t.Errorf("reason = %q, want the interface-resolution failure — the physical-miss and "+
+			"VLAN-miss paths must stay distinguishable in the record", bindings[0].Reason)
+	}
 }

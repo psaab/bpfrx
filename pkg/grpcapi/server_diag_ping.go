@@ -17,38 +17,16 @@ import (
 
 // --- Diagnostic RPCs ---
 
-// maxDiagArgLen bounds each operator-supplied diagnostic argument
-// (target, source, routing-instance) at the RPC boundary. A DNS name is
-// capped at 253 octets (RFC 1035), an IPv6 literal at ~45, and a VRF
-// name is short, so 512 accepts every legitimate value while rejecting a
-// pathological field far below the streamDiagCmd line-scanner token cap.
-// The gRPC receive limit is 16 MiB, so without this bound a multi-kilobyte
-// target reaches exec and surfaces as a single combined-output line larger
-// than the scanner token size — the ErrTooLong leak vector fixed in
-// streamDiagCmd (#5060).
-const maxDiagArgLen = 512
-
-// checkDiagArg rejects an over-length diagnostic argument with
-// InvalidArgument so an oversized field never reaches exec or the
-// combined-output line scanner.
-func checkDiagArg(name, v string) error {
-	if len(v) > maxDiagArgLen {
-		return status.Errorf(codes.InvalidArgument,
-			"%s exceeds %d bytes (%d)", name, maxDiagArgLen, len(v))
-	}
-	return nil
-}
-
-// checkDiagArgs bounds the shared ping/traceroute fields in one pass.
+// checkDiagArgs bounds the shared ping/traceroute string fields, delegating to
+// diagcmd.CheckArgs so this surface and the REST one cannot drift (#6904).
+//
+// The bound itself and its reasoning live in pkg/diagcmd next to MaxPingSize:
+// this used to hold its own `maxDiagArgLen = 512`, REST held nothing, and the
+// asymmetry is what #6904 filed. Only the transport error is local — the RULE
+// is shared.
 func checkDiagArgs(target, source, routingInstance string) error {
-	for _, f := range []struct{ name, val string }{
-		{"target", target},
-		{"source", source},
-		{"routing-instance", routingInstance},
-	} {
-		if err := checkDiagArg(f.name, f.val); err != nil {
-			return err
-		}
+	if err := diagcmd.CheckArgs(target, source, routingInstance); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	"runtime"
 	"testing"
 	"time"
@@ -92,7 +93,11 @@ func assertGoroutinesSettle(t *testing.T, baseline int) {
 // scanner. Validation runs before the stream is touched, so a nil stream
 // is safe here. Revert the checkDiagArgs calls and this test fails.
 func TestDiagFieldLengthRejected(t *testing.T) {
-	huge := make([]byte, maxDiagArgLen+1)
+	// #6904: the bound moved to pkg/diagcmd so REST and gRPC share ONE rule.
+	// This reads the shared constant rather than a local literal — a test
+	// pinned to its own 512 would keep passing while the surfaces drifted,
+	// which is the failure this move exists to prevent.
+	huge := make([]byte, diagcmd.MaxArgLen+1)
 	for i := range huge {
 		huge[i] = 'a'
 	}
@@ -109,9 +114,31 @@ func TestDiagFieldLengthRejected(t *testing.T) {
 		{"source", &pb.PingRequest{Target: legit, Source: oversized}},
 		{"routing-instance", &pb.PingRequest{Target: legit, RoutingInstance: oversized}},
 	}
+	// #6904: the nil stream is safe only WHILE the bound rejects before the
+	// stream is touched. Remove the check — the revert this test exists to
+	// catch — and the call proceeds into streamDiag, dereferences nil, and
+	// kills the package binary, so the revert reads as a mass crash instead of
+	// a named failure and the collected count collapses. Recovering keeps the
+	// signal NAMED; a panic here means the bound did not reject, which is the
+	// failure this test reports either way.
+	callRejects := func(t *testing.T, call func() error) error {
+		t.Helper()
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = status.Errorf(codes.Unknown,
+						"validation did not reject: reached the stream and panicked (%v)", r)
+				}
+			}()
+			err = call()
+		}()
+		return err
+	}
+
 	for _, c := range pingCases {
 		t.Run("ping/"+c.name, func(t *testing.T) {
-			err := s.Ping(c.req, nil)
+			err := callRejects(t, func() error { return s.Ping(c.req, nil) })
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("Ping oversized %s = %v, want InvalidArgument", c.name, err)
 			}
@@ -128,7 +155,7 @@ func TestDiagFieldLengthRejected(t *testing.T) {
 	}
 	for _, c := range traceCases {
 		t.Run("traceroute/"+c.name, func(t *testing.T) {
-			err := s.Traceroute(c.req, nil)
+			err := callRejects(t, func() error { return s.Traceroute(c.req, nil) })
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("Traceroute oversized %s = %v, want InvalidArgument", c.name, err)
 			}

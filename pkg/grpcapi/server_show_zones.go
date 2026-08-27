@@ -105,6 +105,13 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 						// Leave the counter fields unset (proto3 omit) rather
 						// than Internal-erroring the RPC on the structural
 						// stable-hash-id OOB.
+						//
+						// #6895: SAY SO on the wire. Before this the client saw
+						// four zeros and could not tell them from a real reading
+						// of zero, so the remote cli omitted the section and an
+						// unavailable zone rendered exactly like an idle one.
+						zi.PerZoneCounterAvailability =
+							pb.ZoneCounterAvailability_ZONE_COUNTER_AVAILABILITY_UNAVAILABLE
 					case errIn != nil:
 						if readErr == nil {
 							readErr = errIn
@@ -114,6 +121,9 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 							readErr = errOut
 						}
 					default:
+						// #6895: an actual reading, even if it is zero.
+						zi.PerZoneCounterAvailability =
+							pb.ZoneCounterAvailability_ZONE_COUNTER_AVAILABILITY_AVAILABLE
 						zi.IngressPackets = ing.Packets
 						zi.IngressBytes = ing.Bytes
 						zi.EgressPackets = eg.Packets

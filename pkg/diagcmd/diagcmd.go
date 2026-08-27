@@ -11,7 +11,10 @@
 // applied three times; it now lives here too.
 package diagcmd
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // vrfPrefix is the prefix the daemon uses for the kernel VRF master
 // device that backs a Junos routing-instance (a routing-instance named
@@ -49,6 +52,54 @@ func VRFDeviceName(name string) string {
 // contract, but the shared ceiling lives here so every surface stays in
 // lockstep (#5250 A8-b1 F4 for REST/gRPC; #6382 for the console CLI).
 const MaxPingSize = 65507
+
+// MaxArgLen bounds each operator-supplied diagnostic STRING argument
+// (target, source, routing-instance) at every control surface (#6904).
+//
+// It is a CHOSEN ceiling, not a protocol constant, and it lives here for the
+// same reason MaxPingSize does: two surfaces enforcing the same rule from two
+// literals is how they drift. #6904 is that drift — gRPC bounded these fields
+// and REST did not, so the guarantee the gRPC check was supposed to give was
+// not a system property.
+//
+// The value is derived from the largest LEGITIMATE input with headroom: a DNS
+// name is capped at 253 octets (RFC 1035), an IPv6 literal at ~45, and a VRF
+// name is short. 512 accepts every legitimate value while rejecting a
+// pathological field far below the streamDiagCmd line-scanner token cap. The
+// gRPC receive limit is 16 MiB, so without this bound a multi-kilobyte target
+// reaches exec and surfaces as a single combined-output line larger than the
+// scanner token size — the ErrTooLong leak vector fixed in streamDiagCmd
+// (#5060). REST has no equivalent receive cap of its own.
+const MaxArgLen = 512
+
+// CheckArg rejects an over-length diagnostic argument so an oversized field
+// never reaches exec or the combined-output line scanner (#6904).
+//
+// It returns a plain error naming the field and both lengths; each surface
+// wraps it in its own transport error — gRPC in codes.InvalidArgument, REST in
+// a 400 — so the surfaces share the RULE without sharing a status vocabulary.
+func CheckArg(name, v string) error {
+	if len(v) > MaxArgLen {
+		return fmt.Errorf("%s exceeds %d bytes (%d)", name, MaxArgLen, len(v))
+	}
+	return nil
+}
+
+// CheckArgs bounds the shared ping/traceroute string fields in one pass, in a
+// FIXED order so both surfaces report the same field first for a request that
+// violates more than one.
+func CheckArgs(target, source, routingInstance string) error {
+	for _, f := range []struct{ name, val string }{
+		{"target", target},
+		{"source", source},
+		{"routing-instance", routingInstance},
+	} {
+		if err := CheckArg(f.name, f.val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // PingOptions carries the already-validated, already-clamped ping
 // parameters the three control surfaces collect from their respective
