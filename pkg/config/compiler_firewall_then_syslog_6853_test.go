@@ -26,10 +26,34 @@ import "testing"
 // #6859 owns the other direction (whether `then log` should STOP reaching
 // syslog), which is a real behaviour change with a migration cost.
 func TestThenSyslogIsDistinctFromThenLog_6853(t *testing.T) {
-	// The compiler must handle BOTH AST shapes (#2419), so both are cells.
-	// A fix applied to only one spelling is the recurring defect in this
-	// package, and each shape reaches a DIFFERENT switch in compileFilterThen.
-	t.Run("hierarchical", func(t *testing.T) {
+	// compileFilterThen has TWO switches and the spellings do not map onto
+	// them the way the names suggest. Measured, not assumed:
+	//
+	//   compact  `then syslog;`      -> Keys=[then syslog] IsLeaf=true  -> LEAF switch
+	//   block    `then { syslog; }`  -> Keys=[then]        IsLeaf=false -> hierarchical
+	//   flat set `... then syslog`   -> Keys=[then]        IsLeaf=false -> hierarchical
+	//
+	// So the flat-set spelling does NOT exercise the leaf arm — it lands on the
+	// same switch as the block form. An earlier revision of this test had a
+	// cell labelled "flat set (leaf form)" and believed it covered the leaf
+	// arm; deleting `term.Syslog = true` from that arm left the whole file
+	// GREEN. The compact cell below is the one that binds it.
+	t.Run("compact leaf `then syslog;` (the LEAF switch)", func(t *testing.T) {
+		tree := parseHier(t, `
+firewall {
+    family inet {
+        filter f {
+            term only_log    { then log; }
+            term only_syslog { then syslog; }
+            term both        { then log; then syslog; }
+        }
+    }
+}
+`)
+		assertSyslogTerms6853(t, tree)
+	})
+
+	t.Run("block `then { syslog; }` (the hierarchical switch)", func(t *testing.T) {
 		tree := parseHier(t, `
 firewall {
     family inet {
@@ -44,7 +68,9 @@ firewall {
 		assertSyslogTerms6853(t, tree)
 	})
 
-	t.Run("flat set (leaf form)", func(t *testing.T) {
+	// Same switch as the block form, but a distinct entry path (ParseSetCommand
+	// + SetPath) and the spelling operators actually type, so it stays a cell.
+	t.Run("flat set (also the hierarchical switch)", func(t *testing.T) {
 		tree := flatTreeFromSets(t,
 			"set firewall family inet filter f term only_log then log",
 			"set firewall family inet filter f term only_syslog then syslog",
