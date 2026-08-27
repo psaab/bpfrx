@@ -7,6 +7,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
+	"github.com/psaab/xpf/pkg/zonecounters"
 )
 
 // isPolicyFilterKeyword reports whether tok is a leading `show security
@@ -257,11 +258,7 @@ func (c *ctl) showZones() error {
 		}) {
 			fmt.Println(line)
 		}
-		if z.IngressPackets > 0 || z.EgressPackets > 0 {
-			fmt.Println("  Traffic statistics:")
-			fmt.Printf("    Input:  %d packets, %d bytes\n", z.IngressPackets, z.IngressBytes)
-			fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
-		}
+		renderZoneTraffic6895(z)
 
 		// #3683 (M01): render all THREE policy tiers the runtime evaluates, in
 		// order — zone-pair, applicable global, then the effective
@@ -766,4 +763,60 @@ func (c *ctl) showPoliciesBrief() error {
 		}
 	}
 	return nil
+}
+
+// renderZoneTraffic6895 prints a zone's traffic section from the structured
+// GetZones reply (#6895).
+//
+// WHAT WAS WRONG. The old body was `if z.IngressPackets > 0 || z.EgressPackets
+// > 0`, so the section was omitted whenever both counts were zero — and the
+// wire carried no way to tell a real zero from the absence of a reading. A zone
+// whose counters are unavailable therefore rendered identically to an idle one:
+// SILENCE, which an operator reads as "this zone has no traffic". That is a
+// wrong answer, not a missing one, and it is the surface an operator is most
+// likely holding. With 64+ zones, slot exhaustion means the overflowed zones are
+// exactly the ones that render as idle.
+//
+// WHAT THIS DOES AND DOES NOT FIX. It converts that wrong answer into an honest
+// one. It does NOT distinguish an idle zone from an unavailable one, and no
+// surface does: the helper's status snapshot is sparse and omits all-zero rows,
+// so a pre-#3651 helper, a zone past hot-path slot capacity and a merely idle
+// zone are indistinguishable at the source. The ambiguity is INHERITED, and the
+// shared line says so in as many words rather than naming a cause it cannot
+// know. The one case that IS knowable and actionable — the helper reporting
+// slot overflow — gets its own line via the same shared helper the local CLI
+// and the gRPC text renderer use.
+//
+// UNKNOWN RENDERS EXACTLY AS BEFORE #6895. An old server omits the field, which
+// decodes to UNKNOWN, and this falls back to the historical
+// omit-when-both-zero. That is the whole reason the wire field is a three-state
+// enum instead of a bool: a bool has no absence to observe, so either polarity
+// would make a version-skewed pair produce a NEW wrong answer — every zone
+// reported unavailable, or an unpopulated zone reported as a real 0.
+func renderZoneTraffic6895(z *pb.ZoneInfo) {
+	if z == nil {
+		return
+	}
+	switch z.PerZoneCounterAvailability {
+	case pb.ZoneCounterAvailability_ZONE_COUNTER_AVAILABILITY_UNAVAILABLE:
+		// The server told us it had no reading. Say so, with the same wording
+		// every other surface uses. The overflow specialisation is decided
+		// server-side in the text renderer; here the generic line is correct,
+		// because this reply carries no overflow bit.
+		fmt.Println(zonecounters.UnavailableLine(false))
+	case pb.ZoneCounterAvailability_ZONE_COUNTER_AVAILABILITY_AVAILABLE:
+		// A real reading, INCLUDING a zero one — print it rather than omitting,
+		// so "the server measured zero" is visibly different from "the server
+		// had nothing to measure".
+		fmt.Println("  Traffic statistics:")
+		fmt.Printf("    Input:  %d packets, %d bytes\n", z.IngressPackets, z.IngressBytes)
+		fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
+	default:
+		// UNKNOWN: an old server. Historical behaviour, byte for byte.
+		if z.IngressPackets > 0 || z.EgressPackets > 0 {
+			fmt.Println("  Traffic statistics:")
+			fmt.Printf("    Input:  %d packets, %d bytes\n", z.IngressPackets, z.IngressBytes)
+			fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
+		}
+	}
 }

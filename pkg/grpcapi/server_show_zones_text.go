@@ -16,8 +16,10 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
+	"github.com/psaab/xpf/pkg/zonecounters"
 )
 
 // showZonesDetail renders per-zone configuration plus dataplane traffic
@@ -94,10 +96,12 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 				// security zones` prints real byte counts for slotted zones and
 				// "not implemented" for overflowed ones, pointing the operator
 				// at the wrong cause.
-				buf.WriteString("  Traffic statistics: not available " +
-					"(no per-zone volume published for this zone: helper predates " +
-					"per-zone accounting, the zone exceeded the dataplane's " +
-					"hot-path slot capacity, or the zone is idle)\n")
+				// #6895: one canonical spelling for all three surfaces — and
+				// this renderer previously had NO #6845 overflow
+				// specialisation, so the same cluster reported slot exhaustion
+				// on the local CLI and the generic three-cause line here.
+				buf.WriteString(zonecounters.UnavailableLine(
+					s.zoneCounterOverflowActive()) + "\n")
 			case errIn == nil && errOut == nil:
 				buf.WriteString("  Traffic statistics:\n")
 				fmt.Fprintf(buf, "    Input:  %d packets, %d bytes\n", ingress.Packets, ingress.Bytes)
@@ -311,4 +315,34 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 		}
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// zoneCounterOverflowActive reports whether the dataplane says its per-zone
+// hot-path slot table has OVERFLOWED (#6845), mirroring the local CLI's probe of
+// the same bit so the two surfaces cannot disagree about a cluster's state.
+//
+// FAILS TO FALSE on any error, deliberately and for the same reason the CLI
+// does: the caller uses it to REPLACE a truthful three-cause message with a
+// specific one-cause message, so a wrong true would send the operator to reduce
+// their zone count when the real cause might be an idle zone. An unreachable
+// helper means "cannot say", and "cannot say" must fall back to the honest
+// ambiguous line rather than guess.
+//
+// Read only on the branch that has already decided the zone is unpopulated, so
+// it costs nothing on the healthy path.
+func (s *Server) zoneCounterOverflowActive() bool {
+	if s == nil || s.dp == nil {
+		return false
+	}
+	provider, ok := s.dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return false
+	}
+	status, err := provider.Status()
+	if err != nil {
+		return false
+	}
+	return status.ZoneCounterOverflowActive
 }
