@@ -266,6 +266,10 @@ pub(super) fn stage_flow_cache_hit(
                 meta,
                 flow,
                 telemetry.counters,
+                // #6854: the cached descriptor carries the configured
+                // message-type, so a replayed output reject sends the same
+                // code the first packet did.
+                cached_descriptor.tx_selection.reject_message,
             )
         } else {
             false

@@ -70,11 +70,17 @@ type FirewallTermSnapshot struct {
 	// #6853: `then syslog`, distinct from `then log`. Additive and omitempty,
 	// so an older helper that does not know the field is unaffected and a
 	// mixed-version HA pair stays wire-compatible.
-	Syslog          bool   `json:"syslog,omitempty"`
-	PolicerName     string `json:"policer,omitempty"`
-	RoutingInstance string `json:"routing_instance,omitempty"`
-	ForwardingClass string `json:"forwarding_class,omitempty"`
-	DSCPRewrite     *uint8 `json:"dscp_rewrite,omitempty"`
+	Syslog bool `json:"syslog,omitempty"`
+	// #6854: the `then reject <message-type>` token (e.g. `host-unreachable`).
+	// Empty means the term carried no message-type, which the dataplane
+	// resolves to the administratively-prohibited codes it sent for every
+	// reject before #6854. Additive + omitempty, so a mixed-version HA pair is
+	// unaffected.
+	RejectMessageType string `json:"reject_message_type,omitempty"`
+	PolicerName       string `json:"policer,omitempty"`
+	RoutingInstance   string `json:"routing_instance,omitempty"`
+	ForwardingClass   string `json:"forwarding_class,omitempty"`
+	DSCPRewrite       *uint8 `json:"dscp_rewrite,omitempty"`
 	// Per-packet L4 match conditions (#2362). These are parsed by the Junos
 	// firewall-filter compiler but were previously dropped on the wire, so a
 	// term like `from { tcp-flags syn; }` silently matched broader than

@@ -292,6 +292,10 @@ pub(super) fn build_live_forward_request_from_frame(
             // reply is synthesized on the precomputed (flow-cache fallback) path
             // too, not just the freshly resolved path.
             reject: selection.reject,
+            // #6854: same reasoning — the precomputed path must carry the
+            // configured message-type, or a flow-cache fallback silently
+            // downgrades to administratively-prohibited.
+            reject_message: selection.reject_message,
             filter_log: selection.filter_log,
         })
         .unwrap_or_else(|| {
@@ -333,6 +337,9 @@ pub(super) fn build_live_forward_request_from_frame(
                     meta,
                     flow,
                     reply.counters,
+                    // #6854: the OUTPUT-filter reject path carries its own
+                    // resolved message-type on the CoS selection.
+                    cos.reject_message,
                 )
             }
             _ => false,

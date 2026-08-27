@@ -58,6 +58,10 @@ pub(super) struct CachedTxSelectionDescriptor {
     // active reject reply (TCP RST / ICMP admin-prohibited) rather than the
     // silent drop `then discard` produces. Only ever true when `drop` is true.
     pub(super) reject: bool,
+    // #6854: the ICMP codes the cached `then reject <message-type>` resolved
+    // to. Meaningless unless `reject` is true; defaults to
+    // administratively-prohibited, matching pre-#6854 behaviour.
+    pub(super) reject_message: crate::filter::RejectMessage,
     // #2573: all matched `then count` term counters for this flow, not just the
     // last — the cached replay must increment every fall-through count term.
     pub(super) filter_counters: crate::filter::CachedFilterCounters,

@@ -1044,7 +1044,7 @@ fn parse_term_ports(snap: &FirewallTermSnapshot) -> TermPortMatch {
 fn resolve_term_action(snap: &FirewallTermSnapshot) -> FilterAction {
     match snap.action.as_str() {
         "accept" => FilterAction::Accept,
-        "reject" => FilterAction::Reject,
+        "reject" => FilterAction::Reject(super::resolve_reject_message(&snap.reject_message_type)),
         "discard" => FilterAction::Discard,
         "" => FilterAction::Accept,
         other => {

@@ -38,6 +38,95 @@ use crate::policy::SnapshotIntegrityError;
 #[cfg(test)]
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
+/// The ICMP unreachable codes a `then reject <message-type>` resolves to,
+/// one per address family (#6854).
+///
+/// Junos accepts fifteen tokens after `then reject`. Fourteen are RFC 792
+/// ICMPv4 Destination Unreachable codes and map exactly; `tcp-reset` is not an
+/// ICMP message at all and carries the default here, because it only changes
+/// behaviour on the TCP path where no ICMP reply is built.
+///
+/// # The v6 column fails closed rather than inventing a counterpart
+///
+/// RFC 4443 defines six ICMPv6 Destination Unreachable codes and they are not a
+/// relabelling of RFC 792's sixteen. Four map honestly:
+///
+/// * `network-unreachable` -> 0 (no route to destination)
+/// * `host-unreachable`    -> 3 (address unreachable)
+/// * `port-unreachable`    -> 4 (port unreachable)
+/// * the three prohibitions -> 1 (administratively prohibited)
+///
+/// The rest -- TOS-conditional unreachables, precedence violations, source
+/// routing failures, source-host-isolated, protocol-unreachable -- describe
+/// IPv4 machinery that has no ICMPv6 equivalent. Those keep code 1, which is
+/// exactly what the dataplane already sent before this change, so an operator
+/// who configures one of them sees today's behaviour on v6 rather than a code
+/// invented to fill the column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RejectMessage {
+    pub(crate) v4_code: u8,
+    pub(crate) v6_code: u8,
+}
+
+impl RejectMessage {
+    /// ICMPv4 code 13 / ICMPv6 code 1 -- "communication administratively
+    /// prohibited". What the dataplane hardcoded for every reject before
+    /// #6854, and what a term with no message-type still resolves to.
+    pub(crate) const ADMIN_PROHIBITED: Self = Self {
+        v4_code: 13,
+        v6_code: 1,
+    };
+}
+
+impl Default for RejectMessage {
+    fn default() -> Self {
+        Self::ADMIN_PROHIBITED
+    }
+}
+
+/// Resolve a Junos `then reject` message-type token to its per-family codes.
+///
+/// An unrecognized token resolves to [`RejectMessage::ADMIN_PROHIBITED`]
+/// rather than failing the snapshot. That is deliberate and differs from the
+/// fail-closed treatment of an unknown filter ACTION: the action decides
+/// whether a packet is forwarded, whereas this decides only which code an
+/// already-decided reject carries. The Go commit gate validates the token
+/// against `rejectMessageTypes` before it is persisted, so an unknown value
+/// here means version drift, and degrading to the code the dataplane sent
+/// before #6854 is the conservative answer.
+pub(crate) fn resolve_reject_message(token: &str) -> RejectMessage {
+    // RFC 792 ICMPv4 Destination Unreachable codes.
+    let v4 = match token {
+        "network-unreachable" => 0,
+        "host-unreachable" => 1,
+        "protocol-unreachable" => 2,
+        "port-unreachable" => 3,
+        "source-route-failed" => 5,
+        "source-host-isolated" => 8,
+        "network-prohibited" => 9,
+        "host-prohibited" => 10,
+        "bad-network-tos" => 11,
+        "bad-host-tos" => 12,
+        "administratively-prohibited" => 13,
+        "precedence-violation" => 14,
+        "precedence-cutoff" => 15,
+        // "tcp-reset", "", and anything unrecognized.
+        _ => return RejectMessage::ADMIN_PROHIBITED,
+    };
+    // RFC 4443 ICMPv6 Destination Unreachable, where an honest counterpart
+    // exists. See the type doc for why the rest stay at 1.
+    let v6 = match token {
+        "network-unreachable" => 0,
+        "host-unreachable" => 3,
+        "port-unreachable" => 4,
+        _ => 1,
+    };
+    RejectMessage {
+        v4_code: v4,
+        v6_code: v6,
+    }
+}
+
 /// Result of evaluating a filter term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FilterAction {
@@ -59,7 +148,12 @@ pub(crate) enum FilterAction {
     /// downgraded REJECT→DENY, so the event never claims an active reject that
     /// was not sent. Reply-free paths (flowless fragments, the PBR/output-filter
     /// forward path, cached-log replay) pass `reject_reply_enqueued = false`.
-    Reject,
+    ///
+    /// #6854: carries the ICMP codes the term's `then reject <message-type>`
+    /// resolves to. A term with no message-type carries
+    /// [`RejectMessage::ADMIN_PROHIBITED`], which is what every reject sent
+    /// before #6854, so an unset value is bit-identical to the old behaviour.
+    Reject(RejectMessage),
 }
 
 // ============================================================

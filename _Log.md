@@ -106763,3 +106763,7 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6849 — settled the fork by measurement (no Go producer has ever emitted `medium`; the arm predates T-7 and was carried mechanically), removed the dead arm, kept the rank numbering, and documented why COS_PRIORITY_LEVELS=6 is correct rather than off by one.
   - **File(s)**: userspace-dp/src/afxdp/forwarding_build/cos.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/policy_snapshot_error.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6854 — `then reject <message-type>` now selects the ICMP code. Threaded the token from the compiler through FirewallTermSnapshot into FilterAction::Reject and the ICMP builder, across all three reject paths (input, output/CoS, flow-cache replay).
+  - **File(s)**: pkg/config/compiler_firewall_reject_message_6854_test.go, pkg/dataplane/userspace/{protocol_policies,filters,firewall_snapshot_render}.go, userspace-dp/src/filter/{mod,compiler,tests}.rs, userspace-dp/src/protocol/security.rs, userspace-dp/src/afxdp/{icmp,icmp_tests,flow_cache,forward_request,event_emit}.rs, userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/afxdp/poll_descriptor/*.rs, docs/feature-gaps.md

@@ -638,8 +638,9 @@ pub(super) fn poll_binding_process_descriptor(
                             // action — a reject whose reply fail-closes
                             // (budget/rate/parse/output-filter) logs DENY, not
                             // REJECT.
-                            let reject_reply_enqueued = if input_filter_eval.action
-                                == crate::filter::FilterAction::Reject
+                            let reject_reply_enqueued = if let crate::filter::FilterAction::Reject(
+                                reject_msg,
+                            ) = input_filter_eval.action
                             {
                                 enqueue_filter_reject_reply(
                                     &mut binding.tx_pipeline,
@@ -649,6 +650,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     meta,
                                     flow,
                                     telemetry.counters,
+                                    reject_msg,
                                 )
                             } else {
                                 false
@@ -1304,20 +1306,23 @@ pub(super) fn poll_binding_process_descriptor(
                         // FIRST so the `then log` filter-log below reports the
                         // TRUTHFUL action — a reject whose reply fail-closes logs
                         // DENY, not REJECT.
-                        let reject_reply_enqueued =
-                            if input_filter_eval.action == crate::filter::FilterAction::Reject {
-                                enqueue_filter_reject_reply(
-                                    &mut binding.tx_pipeline,
-                                    worker_ctx.forwarding,
-                                    binding.ifindex,
-                                    packet_frame,
-                                    meta,
-                                    flow,
-                                    telemetry.counters,
-                                )
-                            } else {
-                                false
-                            };
+                        let reject_reply_enqueued = if let crate::filter::FilterAction::Reject(
+                            reject_msg,
+                        ) = input_filter_eval.action
+                        {
+                            enqueue_filter_reject_reply(
+                                &mut binding.tx_pipeline,
+                                worker_ctx.forwarding,
+                                binding.ifindex,
+                                packet_frame,
+                                meta,
+                                flow,
+                                telemetry.counters,
+                                reject_msg,
+                            )
+                        } else {
+                            false
+                        };
                         if let Some(cached_log) = input_filter_eval.cached_log {
                             emit_input_filter_log_match(
                                 worker_ctx.forwarding,

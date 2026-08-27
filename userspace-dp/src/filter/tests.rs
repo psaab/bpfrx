@@ -55,6 +55,7 @@ fn basic_accept_discard() {
                     count: String::new(),
                     log: false,
                     syslog: false,
+                    reject_message_type: String::new(),
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -91,6 +92,7 @@ fn basic_accept_discard() {
                     count: String::new(),
                     log: false,
                     syslog: false,
+                    reject_message_type: String::new(),
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -143,7 +145,7 @@ fn basic_accept_discard() {
     assert_eq!(result.action, FilterAction::Accept);
 }
 
-/// #2521: `then reject` compiles to `FilterAction::Reject` and stays DISTINCT
+/// #2521: `then reject` compiles to `FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED)` and stays DISTINCT
 /// from `then discard` (`FilterAction::Discard`). The dataplane uses this
 /// distinction to synthesize an active reply for reject while keeping discard a
 /// silent drop. Fail-on-revert: if the compiler collapses `reject` to
@@ -186,8 +188,8 @@ fn reject_action_compiles_distinct_from_discard() {
     );
     assert_eq!(
         reject.action,
-        FilterAction::Reject,
-        "`then reject` must compile to FilterAction::Reject, not collapse to Discard"
+        FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED),
+        "`then reject` must compile to FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED), not collapse to Discard"
     );
     let discard = evaluate_filter(
         &state,
@@ -216,6 +218,7 @@ fn interface_filter_log_match_returns_filter_and_term_identity() {
                 action: "accept".into(),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 ..Default::default()
             }],
         }],
@@ -259,6 +262,7 @@ fn interface_filter_log_match_skips_pbr_terms_without_double_emit() {
                 action: "accept".into(),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 routing_instance: "blue".into(),
                 ..Default::default()
             }],
@@ -310,6 +314,7 @@ fn port_range_matching() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -392,6 +397,7 @@ fn destination_port_except_negation() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -489,6 +495,7 @@ fn source_port_except_negation() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -570,6 +577,7 @@ fn protocol_matching() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -644,6 +652,7 @@ fn dscp_rewrite_action() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -704,6 +713,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -1810,6 +1820,7 @@ fn multiple_terms_first_match_wins() {
                     count: String::new(),
                     log: false,
                     syslog: false,
+                    reject_message_type: String::new(),
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -1846,6 +1857,7 @@ fn multiple_terms_first_match_wins() {
                     count: String::new(),
                     log: false,
                     syslog: false,
+                    reject_message_type: String::new(),
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -1921,6 +1933,7 @@ fn source_dest_address_matching() {
                 count: String::new(),
                 log: false,
                 syslog: false,
+                reject_message_type: String::new(),
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -2675,6 +2688,7 @@ fn capability_accessors_equal_fast_map_flags_for_unique_ifindices() {
                     action: "accept".into(),
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 }],
             },
@@ -2964,6 +2978,7 @@ fn pr2c_folded_single_lookup_equals_two_lookup_path() {
                     action: "accept".into(),
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 }],
             },
@@ -3587,6 +3602,7 @@ fn input_dscp_filter_families_changed_detects_same_ifindex_content_change() {
                 action: "discard".into(),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 ..Default::default()
             }],
         }],
@@ -3616,6 +3632,7 @@ fn input_dscp_filter_families_changed_ignores_unchanged_filter() {
             action: "discard".into(),
             log: true,
             syslog: false,
+            reject_message_type: String::new(),
             ..Default::default()
         }],
     };
@@ -3657,6 +3674,7 @@ fn input_dscp_filter_families_changed_ignores_positional_filter_id_change() {
             action: "discard".into(),
             log: true,
             syslog: false,
+            reject_message_type: String::new(),
             ..Default::default()
         }],
     };
@@ -3771,6 +3789,7 @@ fn input_dscp_filter_families_changed_detects_filter_added_to_interface() {
             action: "discard".into(),
             log: true,
             syslog: false,
+            reject_message_type: String::new(),
             ..Default::default()
         }],
     };
@@ -3808,6 +3827,7 @@ fn input_dscp_filter_families_changed_detects_filter_removed_from_interface() {
             action: "discard".into(),
             log: true,
             syslog: false,
+            reject_message_type: String::new(),
             ..Default::default()
         }],
     };
@@ -3844,7 +3864,7 @@ fn input_dscp_filter_families_changed_detects_filter_removed_from_interface() {
 // thin accessor predicates; and cached-vs-runtime baseline parity.
 // ============================================================
 
-// --- Gap 1: FilterAction::Reject through the plain evaluate_filter path ---
+// --- Gap 1: FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED) through the plain evaluate_filter path ---
 #[test]
 fn evaluate_filter_returns_reject_action() {
     let state = make_filter_state(
@@ -3872,7 +3892,7 @@ fn evaluate_filter_returns_reject_action() {
         0,
         TermMatchExtra::default(),
     );
-    assert_eq!(result.action, FilterAction::Reject);
+    assert_eq!(result.action, FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED));
 }
 
 // --- Gap 2: missing filter key + empty filter both fall through to Accept ---
@@ -4558,6 +4578,7 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
                 dscp_rewrite: Some(46),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 ..Default::default()
             }],
         }],
@@ -8135,7 +8156,7 @@ fn terminal_reject_with_next_term_still_rejects_5142() {
     );
     assert_eq!(
         r.action,
-        FilterAction::Reject,
+        FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED),
         "reject+next_term must apply the deny, not fall through (#5142)"
     );
 }
@@ -8363,6 +8384,7 @@ fn fallthrough_log_action_follows_terminal_discard() {
                     next_term: true,
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8416,6 +8438,7 @@ fn fallthrough_log_action_follows_terminal_reject() {
                     next_term: true,
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8440,13 +8463,13 @@ fn fallthrough_log_action_follows_terminal_reject() {
         0,
         TermMatchExtra::default(),
     );
-    assert_eq!(r.action, FilterAction::Reject);
+    assert_eq!(r.action, FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED));
     let lm = r
         .log_match
         .expect("fall-through log term must emit a log_match");
     assert_eq!(
         lm.action,
-        FilterAction::Reject,
+        FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED),
         "RT_FLOW log action must follow the terminal reject (#2616)"
     );
 }
@@ -8466,6 +8489,7 @@ fn fallthrough_log_action_terminating_log_term_unchanged() {
                 action: "accept".into(),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 ..Default::default()
             }],
         }],
@@ -8510,6 +8534,7 @@ fn log_only_helper_matches_full_evaluator_latest_term_and_action() {
                     next_term: true,
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8520,6 +8545,7 @@ fn log_only_helper_matches_full_evaluator_latest_term_and_action() {
                     next_term: true,
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8604,6 +8630,7 @@ fn pbr_evaluator_preserves_fallthrough_log_before_routing_instance() {
                     next_term: true,
                     log: true,
                     syslog: false,
+                    reject_message_type: String::new(),
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8661,6 +8688,7 @@ fn pbr_evaluator_log_on_routing_instance_term_itself() {
                 action: "accept".into(),
                 log: true,
                 syslog: false,
+                reject_message_type: String::new(),
                 routing_instance: "green".into(),
                 ..Default::default()
             }],
@@ -9998,4 +10026,82 @@ fn empty_policer_ref_6540_is_unpoliced_not_an_error() {
     let (filters, ifaces) = policer_ref_fixture_6540("");
     parse_filter_state(&filters, &[], &ifaces, "", "")
         .expect("a term with no policer must compile — empty means unpoliced");
+}
+
+/// #6854: the full `then reject <message-type>` mapping, one row per token the
+/// Go compiler accepts.
+///
+/// This table IS the reviewable artifact of #6854, so it is spelled out in full
+/// rather than derived — a test that recomputed the mapping from the same match
+/// arms would agree with any mistake in them. Every one of the fifteen tokens in
+/// `rejectMessageTypes` (pkg/config/compiler_firewall.go) appears exactly once.
+///
+/// The v4 column is RFC 792 Destination Unreachable and maps exactly. The v6
+/// column is RFC 4443, which is NOT a relabelling of RFC 792: only four rows
+/// have an honest counterpart, and the rest deliberately keep code 1
+/// (administratively prohibited) rather than an invented code. Keeping 1 is not
+/// a placeholder — it is precisely what the dataplane sent for every reject
+/// before this change, so an operator who configures a v4-only message-type
+/// sees unchanged v6 behaviour instead of a guess.
+#[test]
+fn reject_message_type_maps_every_accepted_token_6854() {
+    // (token, v4 code, v6 code)
+    let table: [(&str, u8, u8); 15] = [
+        // Honest v6 counterparts.
+        ("network-unreachable", 0, 0), // RFC 4443 code 0, no route to destination
+        ("host-unreachable", 1, 3),    // RFC 4443 code 3, address unreachable
+        ("port-unreachable", 3, 4),    // RFC 4443 code 4, port unreachable
+        // Prohibitions: RFC 4443 code 1 is the honest counterpart for all three.
+        ("administratively-prohibited", 13, 1),
+        ("network-prohibited", 9, 1),
+        ("host-prohibited", 10, 1),
+        // IPv4-only machinery with no ICMPv6 equivalent — v6 stays at 1.
+        ("protocol-unreachable", 2, 1),
+        ("source-route-failed", 5, 1),
+        ("source-host-isolated", 8, 1),
+        ("bad-network-tos", 11, 1),
+        ("bad-host-tos", 12, 1),
+        ("precedence-violation", 14, 1),
+        ("precedence-cutoff", 15, 1),
+        // Not an ICMP message at all. `tcp-reset` changes behaviour only on the
+        // TCP path, where a RST is sent and no ICMP reply is built, so it
+        // carries the default here.
+        ("tcp-reset", 13, 1),
+        // No message-type configured.
+        ("", 13, 1),
+    ];
+
+    for (token, want_v4, want_v6) in table {
+        let got = super::resolve_reject_message(token);
+        assert_eq!(
+            (got.v4_code, got.v6_code),
+            (want_v4, want_v6),
+            "#6854: `then reject {token}` must resolve to ICMPv4 code {want_v4} / ICMPv6 code \
+             {want_v6}"
+        );
+    }
+
+    // Anti-vacuity: the table must not have collapsed to a single value. If a
+    // future edit made every token resolve to the default, every row above
+    // would still pass for the ten rows whose expectation IS the default.
+    let distinct_v4: std::collections::BTreeSet<u8> = table
+        .iter()
+        .map(|(t, _, _)| super::resolve_reject_message(t).v4_code)
+        .collect();
+    assert!(
+        distinct_v4.len() >= 13,
+        "#6854: the v4 mapping collapsed to {} distinct codes; the table is not discriminating",
+        distinct_v4.len()
+    );
+
+    // An unrecognized token degrades to the default rather than failing the
+    // snapshot. Deliberate, and different from an unknown filter ACTION: the
+    // action decides whether a packet is forwarded, this decides only which
+    // code an already-decided reject carries.
+    let unknown = super::resolve_reject_message("not-a-junos-message-type");
+    assert_eq!(
+        (unknown.v4_code, unknown.v6_code),
+        (13, 1),
+        "#6854: an unrecognized token must degrade to administratively-prohibited"
+    );
 }
