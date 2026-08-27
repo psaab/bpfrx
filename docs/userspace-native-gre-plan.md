@@ -517,10 +517,10 @@ control-connection exchange, so the two directions carry different values
 and no symmetric reverse-key transform can pair them. That needs a
 stateful PPTP control-channel ALG, which does not exist in this codebase
 (`alg_type` is none/FTP/SIP/DNS) and which is sequenced behind the #7188
-`TunnelDiscriminator` work. Until then, PPTP offered to a configured GRE
-endpoint is refused and counted, and PPTP crossing the firewall is
-forwarded as ordinary proto-47 transit — with the pre-existing GRE
-session-aliasing behaviour #7188 owns.
+`TunnelDiscriminator` work — tracked as **#7699**. Until then, PPTP
+offered to a configured GRE endpoint is refused and counted, and PPTP
+crossing the firewall is forwarded as ordinary proto-47 transit — with
+the pre-existing GRE session-aliasing behaviour #7188 owns.
 
 ## Policy-Based Routing Without A Tunnel Netdevice
 
