@@ -205,7 +205,7 @@ optionally followed by `exact`:
 - **`percent <n>`** — `transmit-rate percent 30` (a share of the bound
   interface's rate); and
 - **`remainder`** — `transmit-rate remainder` (a share of the leftover
-  bandwidth).
+  bandwidth, resolved in #6846 — see below).
 
 `shaping-rate` (traffic-control-profiles) accepts an absolute bandwidth or
 `shaping-rate percent <n>`. These forms are accepted so imported vSRX
@@ -239,10 +239,55 @@ resolution exactly (same `ceil` rounding, same clamp to `[1, MaxUint64]`):
   percent cannot resolve and the unit is left unshaped; a per-binding
   `ValidateConfig` advisory names the interface and the fix.
 
-**Still inert:** `transmit-rate remainder` (leftover-bandwidth resolution is
-a follow-up) — a `ValidateConfig` advisory surfaces it. The commit gate still
-rejects garbage (`transmit-rate percent 150`, `transmit-rate asd`) and a
-both-forms-set config (an absolute rate AND a percent).
+**Remainder resolution (#6846 — now ENFORCED).** `transmit-rate remainder`
+resolves in the same Rust builder, but it cannot use the per-scheduler path
+above: it means *"whatever the interface's shaping rate has left after every
+sibling queue on the scheduler-map has resolved"*, so it is a function of the
+SIBLING SET rather than of the scheduler. `cos_remainder_rate_bytes` therefore
+runs as a **pre-pass, once per interface, before any queue is materialized** —
+computing it inside the materialization loop would give each remainder queue a
+different *partial* sibling set depending on map iteration order.
+
+Rules, each of which is load-bearing:
+
+- the sibling sum counts **resolved** siblings only. A sibling that is itself
+  `remainder` contributes **zero** (it claims the leftover, not a share of it);
+  a sibling with no rate contributes zero (no guarantee to subtract). A
+  scheduler carrying *both* an absolute rate and `remainder` — reachable only
+  on the lenient load / peer-sync path, since the strict gate rejects it —
+  resolves via the absolute rate and is **not** counted as a remainder queue,
+  so the pre-pass and the main path agree about which queues those are.
+- the leftover **splits equally, flooring**, across remainder-marked queues.
+  An indivisible leftover loses up to `count − 1` bytes/sec, which is noise
+  against any shaping rate a remainder is meaningful on. Ceiling would make
+  the remainder queues jointly claim *more* than the leftover they were
+  computed from; distributing the slack would make the result depend on which
+  queues come first, reintroducing the map-order dependence the pre-pass
+  exists to avoid.
+- **over-subscription resolves to zero** rather than failing to resolve.
+  Expressing it is legal, so it is not rejected — but a silently starved queue
+  looks configured, so `ValidateConfig` warns.
+
+**Temporal resolution (#6846 — now ENFORCED).** `buffer-size temporal <us>`
+sizes the queue by drain time, so it converts against the queue's **resolved**
+transmit rate — strictly after the rate, including after `remainder` when both
+are set on one queue. That combination is **legal**: temporal is well defined
+once remainder resolves, and rejecting a combination the model supports would
+break valid Junos. Rounding and clamping mirror `buffer-size percent` exactly.
+
+**Still inert, and only here:** `transmit-rate remainder` on a scheduler with
+no shaping base — not bound via a scheduler-map to an interface with a root
+shaping-rate — and `buffer-size temporal` on a queue with no resolvable rate at
+all. There is no bandwidth to take a remainder *of*, and no drain speed to
+convert a microsecond target against; no port speed is available to substitute
+either, because `InterfaceSnapshot` carries no link-speed field and a zero
+shaping rate is already treated as "no usable CoS state". Both advisories
+narrowed to exactly these cases in #6846 — an advisory that keeps firing for
+configurations that now work teaches the operator to ignore it.
+
+The commit gate still rejects garbage (`transmit-rate percent 150`,
+`transmit-rate asd`) and a both-forms-set config (an absolute rate AND a
+percent).
 
 ### First-Pass Fairness Boundary
 
