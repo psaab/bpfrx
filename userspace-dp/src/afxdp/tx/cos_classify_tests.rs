@@ -5792,6 +5792,40 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
          to administratively-prohibited"
     );
 
+    // FLOW-KEYED arm. The two calls above take the FLOWLESS branch (flow_key
+    // None), which is a different fill site — the mutation matrix showed the
+    // flowless one bound and the flow-keyed one still free, so covering only one
+    // of them leaves half the cached path exactly as unverified as before.
+    let forwarding = build_forwarding_state(&snap("host-unreachable"));
+    let keyed = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            dscp: 0,
+            ..Default::default()
+        },
+        Some(&SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        }),
+    );
+    assert!(
+        keyed.reject,
+        "#6854 PREMISE: the flow-keyed arm must classify the term as a reject"
+    );
+    assert_eq!(
+        (keyed.reject_message.v4_code, keyed.reject_message.v6_code),
+        (1, 3),
+        "#6854: the FLOW-KEYED cached descriptor must carry the message-type too — this is          a separate fill site from the flowless arm above"
+    );
+
     // And a term with NO message-type must still carry the default, so this
     // change is invisible to a config that does not use the feature. Without
     // this arm, a fill that hardcoded `host-unreachable` would pass above.
