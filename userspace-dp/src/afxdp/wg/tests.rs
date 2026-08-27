@@ -3023,10 +3023,20 @@ mod telemetry_counters {
         let err = resp_engine
             .try_decap(&wire[..enc.len], &mut plain)
             .unwrap_err();
-        assert_eq!(
-            err,
-            DecapError::MalformedInner,
-            "external error contract unchanged (keepalive still not deliverable)"
+        // #7230 INVERTED DELIBERATELY. The old expectation — and its
+        // justification, "external error contract unchanged" — was the
+        // bug wearing the clothes of a contract. Keeping the keepalive
+        // indistinguishable from a malformed inner packet is exactly what
+        // destroyed the peer attribution.
+        //
+        // What that comment was protecting is still true and still
+        // asserted: the keepalive is NOT deliverable, so it remains an
+        // Err and nothing is written to the TUN. What changed is that the
+        // error now names its peer.
+        assert!(
+            matches!(err, DecapError::Keepalive(_)),
+            "a zero-length authenticated record is a keepalive carrying its peer, \
+             not MalformedInner (#7230); got {err:?}"
         );
         let rc = resp_engine.counters();
         assert_eq!(rc.decap_keepalives.load(Ordering::Relaxed), 1);
@@ -3651,7 +3661,23 @@ mod s5_timer_tests {
 
         resp.set_mock_now_ns(t0 + 2 * SEC);
         let err = resp.try_decap(&wire[..enc.len], &mut out).unwrap_err();
-        assert_eq!(err, DecapError::MalformedInner, "existing keepalive arm");
+        // #7230 INVERTED DELIBERATELY. This asserted MalformedInner —
+        // the "existing keepalive arm". That arm was the defect: it
+        // discarded the peer identity, so the caller had to guess with
+        // single_peer_pubkey(), which returns None on any MULTI-PEER
+        // interface and left a keepalive-only peer unable to roam its
+        // endpoint. The identity was available at the construction site
+        // the whole time (try_decap demuxes by receiver index BEFORE any
+        // AEAD work); it was simply thrown away with the Err.
+        //
+        // The record is still NOT deliverable and still exits as an Err,
+        // so the no-TUN-write contract this test also covers is unchanged
+        // — only the attribution is added.
+        assert!(
+            matches!(err, DecapError::Keepalive(pk) if pk == init_pub),
+            "a keepalive must carry the peer that sent it, not collapse into \
+             MalformedInner (#7230); got {err:?}"
+        );
         assert_eq!(
             resp.counters().decap_keepalives.load(Ordering::Relaxed),
             1
@@ -4120,4 +4146,99 @@ mod tai64n_replay_tests {
             "a legitimate rekey must not count as a replay"
         );
     }
+}
+
+/// #7230 — a zero-length authenticated keepalive must roam the CORRECT
+/// peer's endpoint on a MULTI-PEER interface.
+///
+/// WHY THIS MUST BE A TWO-PEER TEST. Before #7230 the keepalive exited
+/// `try_decap` as `MalformedInner`, which discarded the peer identity;
+/// the caller recovered it with `single_peer_pubkey()`. On a ONE-peer
+/// interface that guess is right, so a single-peer version of this test
+/// passes against the defect and proves nothing. The second peer is what
+/// makes `single_peer_pubkey()` return `None` and the old path fail — the
+/// precondition below asserts exactly that, so the cell cannot silently
+/// degrade into the vacuous single-peer shape if the fixture changes.
+///
+/// FAIL-ON-REVERT: restore `return Err(DecapError::MalformedInner)` at the
+/// `n == 0` arm and this reds — the keepalive stops naming its peer, and
+/// on this interface there is no other way to recover it.
+#[test]
+fn multi_peer_keepalive_carries_its_peer_7230() {
+    let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
+        vec!["0.0.0.0/0".parse().unwrap()],
+        vec!["0.0.0.0/0".parse().unwrap()],
+    );
+
+    // Make the RESPONDER multi-peer: the real initiator plus a decoy that
+    // never sends anything. Reconciling preserves the existing peer, so
+    // the established session is untouched.
+    let (_decoy_priv, decoy_pub) = keypair();
+    resp_engine.reconcile_peers(&[
+        WgPeerConfig {
+            pubkey: init_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        },
+        WgPeerConfig {
+            pubkey: decoy_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["203.0.113.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32].into(),
+        },
+    ]);
+
+    // ANTI-VACUITY FLOOR: the pre-#7230 recovery path must be incapable
+    // of attributing this datagram. If this ever returns Some, the
+    // fixture has collapsed to one peer and the assertion below would
+    // pass against the very defect it exists to catch.
+    assert!(
+        resp_engine.single_peer_pubkey().is_none(),
+        "precondition: the responder must have MORE than one peer, or the old \
+         single_peer_pubkey() path could attribute the keepalive and this cell \
+         proves nothing (#7230)"
+    );
+
+    // A zero-length authenticated transport record: header + tag only.
+    let mut wire = [0u8; 256];
+    let enc = init_engine.try_encap(&resp_pub, &[], &mut wire).unwrap();
+    assert_eq!(
+        enc.len,
+        crate::afxdp::wg::WG_DATA_HEADER_LEN + crate::afxdp::wg::POLY1305_TAG_LEN,
+        "precondition: this must be a bare keepalive (no inner packet)"
+    );
+
+    let mut plain = [0u8; 256];
+    let err = resp_engine
+        .try_decap(&wire[..enc.len], &mut plain)
+        .unwrap_err();
+
+    match err {
+        DecapError::Keepalive(pk) => {
+            assert_eq!(
+                pk, init_pub,
+                "the keepalive must name the peer that actually sent it, not the \
+                 decoy — attribution is by receiver index, resolved before AEAD"
+            );
+            assert_ne!(
+                pk, decoy_pub,
+                "attributed the keepalive to the WRONG peer; a wrong-peer endpoint \
+                 roam is worse than none at all"
+            );
+        }
+        other => panic!(
+            "a zero-length authenticated record on a multi-peer interface must carry \
+             its peer (#7230); got {other:?}, which is the pre-fix behaviour that \
+             blackholes a keepalive-only roaming peer until its next handshake"
+        ),
+    }
+
+    // The keepalive is counted as one, not as a malformed-inner drop.
+    let rc = resp_engine.counters();
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(rc.decap_keepalives.load(relaxed), 1);
+    assert_eq!(rc.decap_drops_malformed_inner.load(relaxed), 0);
 }
