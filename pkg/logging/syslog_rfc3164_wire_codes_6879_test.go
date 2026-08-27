@@ -2,6 +2,8 @@ package logging
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -190,5 +192,57 @@ func TestMinSeveritySentinelsAreNotWireCodes6879(t *testing.T) {
 	if SeverityNone == SeverityEmergency {
 		t.Error("SeverityNone and SeverityEmergency are equal — `none` and " +
 			"`emergency` would be indistinguishable to ShouldSend")
+	}
+}
+
+// TestRFC3164PriorityInTheLocalFile6879 binds the SECOND site that constructs a
+// PRI byte.
+//
+// `SyslogClient.Send` is not the only producer: `LocalLogWriter.Send` builds the
+// same `<PRI>` independently for the sd-syslog format
+// (`locallog.go`, `priority := lw.Facility*8 + severity`), into a file
+// operators and collectors read. Binding only the network path would leave the
+// duplicate unguarded — the arithmetic is spelled twice, and a change to one
+// copy is exactly the drift a single-site test cannot see.
+//
+// Both sites are pinned to the RFC's literals rather than to each other. That
+// is deliberately stronger than asserting the two agree: a shared edit that
+// changed both copies identically would satisfy an agreement check and still
+// ship the wrong byte to the collector.
+func TestRFC3164PriorityInTheLocalFile6879(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		facility int
+		severity int
+		wantPRI  string // quoted from RFC 3164 4.1.1
+	}{
+		{"kernel + emergency -> <0>", FacilityKern, SyslogEmergency, "<0>"},
+		{"local use 4 + notice -> <165>", FacilityLocal4, SyslogNotice, "<165>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "security.log")
+			lw, err := NewLocalLogWriter(LocalLogConfig{Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lw.Format = "sd-syslog"
+			lw.Facility = tc.facility
+			if err := lw.Send(tc.severity, "rfc3164 local priority probe"); err != nil {
+				t.Fatal(err)
+			}
+			if err := lw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(string(b), tc.wantPRI) {
+				t.Errorf("local-file PRI = %.12q..., want prefix %s — RFC 3164 4.1.1 "+
+					"states this exact priority, and the local writer must file "+
+					"records identically to the network path",
+					string(b), tc.wantPRI)
+			}
+		})
 	}
 }
