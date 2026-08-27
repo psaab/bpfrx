@@ -201,7 +201,37 @@ pub(crate) fn extract_screen_info(
     } else if addr_family == libc::AF_INET6 as u8 {
         // IPv6: walk the extension header chain looking for
         // NEXTHDR_FRAGMENT (44). Fixed IPv6 base header is 40 bytes.
-        // We bound the walk to MAX_EXT_HDRS=8 like the BPF parser.
+        //
+        // #6885: the bound below is `0..8` ITERATIONS, and one iteration is
+        // spent on the terminal (the arm that sets `tcp_offset` and breaks),
+        // so this walk resolves chains of **0..=7 extension headers** and
+        // refuses 8 or more. Measured, not asserted:
+        // `screen_ext_header_depth_agrees_with_the_forwarding_walker_6885`
+        // drives chains of 0..=10 headers through this extractor AND through
+        // `walk_ipv6_ext_chain` and requires the two to agree at every length.
+        //
+        // That depth is shared by all three IPv6 ext-header walkers in the
+        // tree, which reach it by DIFFERENT mechanisms and therefore carry
+        // three different numbers — which is why the number alone was never
+        // safe to state here:
+        //
+        //   this extractor            `0..8` iterations, terminal costs one
+        //   `walk_ipv6_ext_chain`     MAX_IPV6_EXT_HEADERS = 8, ditto, and
+        //                             folds exhaustion into `OverLimit`
+        //   the AF_XDP shim           MAX_EXT_HDRS = 7, exits by EXHAUSTION
+        //                             carrying the next-header, so it needs
+        //                             no terminal iteration
+        //
+        // The shim's parity condition is stated once, authoritatively, at
+        // `userspace-xdp/src/ipv6_ext_walk.rs` (`MAX_EXT_HDRS ==
+        // MAX_IPV6_EXT_HEADERS - 1`); #4555 moved it from 6 to 7 to reach it.
+        //
+        // The comment this replaces read "We bound the walk to
+        // MAX_EXT_HDRS=8 like the BPF parser", and both halves were false: no
+        // constant named `MAX_EXT_HDRS` has ever been 8 (it is 7 in the live
+        // shim and 6 in the retired BPF header), and the BPF parser bounded
+        // at 6 — so it was never in parity with this walk at all. The parity
+        // is real; the number and the peer named for it were not.
         //
         // FAIL-CLOSED (#2146): every place the walk runs out of bytes
         // (the base header is short, or an extension header's declared

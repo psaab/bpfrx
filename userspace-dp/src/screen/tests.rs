@@ -5856,3 +5856,85 @@ fn shared_fragment_route_helper_binds_full_path_6238() {
         ScreenVerdict::Drop("ip-source-route")
     );
 }
+
+/// #6885: the screen extractor's ext-header walk resolves the SAME chain
+/// depths as the forwarding walker — bound as an AGREEMENT, not as a number.
+///
+/// The comment this replaces asserted parity by stating a constant
+/// (`MAX_EXT_HDRS=8`) and a peer (`the BPF parser`), and both were false: no
+/// constant of that name has ever been 8, and the BPF parser bounded at 6.
+/// The parity itself was real. That is the failure mode a hand-written number
+/// has here — three walkers reach the same depth by different mechanisms and
+/// therefore carry three different numbers (this extractor's `0..8`
+/// iterations, `MAX_IPV6_EXT_HEADERS = 8`, the shim's `MAX_EXT_HDRS = 7`), so
+/// any single number copied into a comment is wrong for two of them.
+///
+/// Pinning either side's literal would just re-create that. This asserts the
+/// two walkers AGREE at every chain length, which stays true through a
+/// mechanism change on either side and reds the moment their coverage
+/// actually diverges.
+///
+/// The sweep spans the boundary deliberately: 0..=7 must resolve, 8..=10 must
+/// refuse. A sweep that stopped at 7 would pass against a walk with no bound
+/// at all.
+#[test]
+fn screen_ext_header_depth_agrees_with_the_forwarding_walker_6885() {
+    let mut screen_resolved = Vec::new();
+    let mut walker_resolved = Vec::new();
+
+    for n in 0usize..=10 {
+        // base -> n x Destination-Options(8B) -> TCP
+        let base = 14 + 40;
+        let mut frame = vec![0u8; base + n * 8 + 24];
+        frame[14] = 0x60; // version = 6
+        frame[14 + 6] = if n == 0 { 6 } else { 60 };
+        for i in 0..n {
+            let at = base + i * 8;
+            frame[at] = if i + 1 == n { 6 } else { 60 }; // last one points at TCP
+            frame[at + 1] = 0; // HdrExtLen = 0 -> 8 bytes
+        }
+        let tcp = base + n * 8;
+        frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        frame[tcp + 12] = 0x50; // data offset = 5 words
+
+        let screen = extract_screen_info(
+            &frame,
+            libc::AF_INET6 as u8,
+            6,
+            0x02,
+            frame.len() as u16,
+            IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+            IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+            12345,
+            80,
+            14,
+        );
+        // "Resolved" for the extractor means it actually REACHED the L4 and
+        // pulled the TCP header out — not merely that it returned Ok. A walk
+        // that gave up mid-chain still returns Ok with tcp_seq left at 0, and
+        // that is precisely the ext-header evasion #3120/#4517 are about.
+        screen_resolved.push(screen.map(|i| i.tcp_seq == 0x1122_3344).unwrap_or(false));
+
+        let walk = crate::afxdp::walk_ipv6_ext_chain(&frame, 14);
+        walker_resolved.push(matches!(
+            walk.outcome,
+            crate::afxdp::ExtChainOutcome::L4(_, _)
+        ));
+    }
+
+    assert_eq!(
+        screen_resolved, walker_resolved,
+        "#6885: the screen extractor and the forwarding walker must resolve the same IPv6 \
+         ext-header chain depths. Index n is a chain of n Destination-Options headers; a \
+         divergence means a chain one plane screens is invisible to the other, or vice versa"
+    );
+
+    // Anchor the shared depth so the agreement above cannot be satisfied by
+    // BOTH walkers regressing together (two all-false vectors are equal).
+    let expected: Vec<bool> = (0usize..=10).map(|n| n <= 7).collect();
+    assert_eq!(
+        screen_resolved, expected,
+        "#6885: both walkers must resolve 0..=7 extension headers and refuse 8 or more — the \
+         depth the shim's MAX_EXT_HDRS = MAX_IPV6_EXT_HEADERS - 1 parity note names"
+    );
+}
