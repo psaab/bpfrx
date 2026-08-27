@@ -135,6 +135,24 @@ pub(crate) enum SourceNatFailureReason {
     /// `InterfaceIdentityExhausted` because the remedy differs: this says
     /// "no more bookkeeping capacity", not "this identity space is full".
     InterfaceRegistryCap,
+    /// #6751 §5.7: this egress address is QUARANTINED — a retired pool or
+    /// NAT64 allocator still holds live allocations on it, so minting a new
+    /// identity here could hand out a tuple an existing session is still
+    /// using.
+    ///
+    /// Distinct from both siblings because the remedy is "wait", not "add
+    /// capacity": the quarantine lifts on its own when the last incumbent
+    /// closes. Reporting it as exhaustion would send an operator looking for
+    /// pool capacity that is not the problem.
+    InterfaceOverlapDraining,
+    /// #6751 §5.7: every address in this POOL is quarantined, so skip-next had
+    /// nothing to skip to.
+    ///
+    /// Deliberately not folded into `AllocatorExhausted`. A total-drain pool
+    /// and a genuinely full pool are indistinguishable from the outside, and
+    /// an operator who reads "exhausted" will go looking for capacity when the
+    /// answer is that the addresses are draining and will free themselves.
+    PoolAllAddressesDraining,
 }
 
 impl SourceNatFailureReason {
@@ -153,6 +171,8 @@ impl SourceNatFailureReason {
             Self::InterfaceNoEgressAddress => "source_nat_interface_no_egress_address",
             Self::OverBudget => "source_nat_pool_over_budget",
             Self::InterfaceIdentityExhausted => "source_nat_interface_identity_exhausted",
+            Self::InterfaceOverlapDraining => "source_nat_interface_overlap_draining",
+            Self::PoolAllAddressesDraining => "source_nat_pool_all_addresses_draining",
             Self::InterfaceRegistryCap => "source_nat_interface_registry_cap",
         }
     }
@@ -1668,6 +1688,44 @@ fn release_source_nat_allocation_with_mode(
                 .release_flow(flow, translated, now_ns, holder);
         }
     }
+    // #6751 §5.7: free against any DRAINING domain too.
+    //
+    // A pool marked unusable keeps its retired allocator in the registry's
+    // draining map, and the sessions it still owns keep forwarding. Their
+    // releases MUST reach that allocator or its live count never falls to zero
+    // and the address stays fail-closed to new mints for the node's lifetime —
+    // a permanent quarantine that looks exactly like a working drain.
+    //
+    // The `rules` sweep above cannot do it: a pool EDITED or REMOVED while
+    // draining is no longer in `forwarding.source_nat_rules`, so the loop that
+    // just ran never visits it. That unreachability is the same one the
+    // interface registry is passed explicitly to avoid, one domain over.
+    //
+    // Scanned by ADDRESS first (the common case, and O(1) into the map), then
+    // the whole draining set as a fallback: a release does not always know its
+    // translated address is an egress address, and a release that cannot find
+    // its allocator is precisely the leak this exists to prevent.
+    //
+    // Over-freeing is impossible for the same reason the pool sweep is safe:
+    // `release_flow`/`rollback_flow` mutate nothing unless
+    // `live_by_flow[flow].translated` equals THIS tuple, so an allocator
+    // holding a different flow — or the same flow under a different
+    // translation — is untouched. A flow's allocation lives in exactly one
+    // allocator per tuple, so the two scans cannot both free it.
+    {
+        let mut drained: Vec<Arc<PortAllocator>> = iface_allocs.draining_for(translated.ip);
+        if drained.is_empty() {
+            drained = iface_allocs.all_draining();
+        }
+        for alloc in drained {
+            if rollback {
+                alloc.rollback_flow(flow, translated, now_ns, holder);
+            } else {
+                alloc.release_flow(flow, translated, now_ns, holder);
+            }
+        }
+    }
+
     // #6751: free the INTERFACE-mode translated identity. LOOKUP-ONLY — a
     // release for an address that owns no allocator has nothing to free, and
     // creating one here would let a teardown storm fill the registry with
@@ -1925,6 +1983,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // (#5687) does not apply here.
     if let Some((from_zone, to_zone)) = synced_zones
         && reserve_synced_on_first_pool_owner(
+            iface_allocs,
             rules.iter().filter(|rule| {
                 rule.matches_ignoring_scope(
                     from_zone,
@@ -1963,6 +2022,7 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // produces — is NOT a refusal, and is answered exactly like the
     // `rewrite_src == None` early return above.
     match reserve_synced_on_first_pool_owner(
+        iface_allocs,
         rules.iter(),
         flow,
         rewrite_src,
@@ -2091,6 +2151,9 @@ impl SyncedReserveOutcome {
 }
 
 fn reserve_synced_on_first_pool_owner<'a>(
+    // #6751 §5.7: the draining domain sits between the active pools and the
+    // interface registry in the scan order.
+    iface_allocs: &InterfaceNatAllocators,
     rules: impl Iterator<Item = &'a SourceNatRule>,
     flow: SourceNatFlowKey,
     rewrite_src: IpAddr,
@@ -2107,6 +2170,26 @@ fn reserve_synced_on_first_pool_owner<'a>(
     let mut saw_candidate = false;
     for rule in rules {
         if !rule.pool_mode {
+            continue;
+        }
+        // #6751 §5.7: a rule whose pool FAILED holds nothing. Its allocator is
+        // the empty default (`resolve_pool_allocators` builds no bitmap for a
+        // failed pool), so it can only decline — and counting it as a candidate
+        // is worse than skipping it.
+        //
+        // This is not the shape Codex found at r3. Then, a `pool_failure`-blind
+        // scan mis-ATTRIBUTED the reservation to a disjoint domain. Since #7581
+        // added the tri-state, `saw_candidate = true` on a failed pool makes the
+        // loop end in `Refused`, and `may_publish()` is false — so an
+        // interface-SNAT import whose egress is a member of a now-unusable pool
+        // is DROPPED rather than misfiled. A provenance bug became a
+        // availability bug when the outcome type got sharper.
+        //
+        // Skipping restores the intended fall-through: the retired allocator
+        // that genuinely owns this reservation is in the draining domain,
+        // scanned below, and if it is not there either the interface registry
+        // takes it.
+        if rule.pool_failure.is_some() {
             continue;
         }
         // #5338: address-only synced decision (pool address chosen, source port
@@ -2168,6 +2251,39 @@ fn reserve_synced_on_first_pool_owner<'a>(
             holder,
         ) {
             return SyncedReserveOutcome::Reserved;
+        }
+    }
+    // #6751 §5.7: the DRAINING domain, scanned after the active pools and
+    // before the caller falls through to the interface registry.
+    //
+    // A peer-synced session whose translated address belongs to a retired pool
+    // must be able to re-claim the identity it ALREADY holds. Reserves are
+    // never quarantined — refusing one drops a live peer session rather than
+    // protecting anything, since the identity being claimed is one the session
+    // already owns on the active node.
+    for alloc in iface_allocs.draining_for(rewrite_src) {
+        saw_candidate = true;
+        match rewrite_src_port {
+            None => {
+                if alloc.reserve_address_only(flow, rewrite_src, holder).is_ok() {
+                    return SyncedReserveOutcome::Reserved;
+                }
+            }
+            Some(port) => {
+                if alloc.reserve_flow(
+                    flow,
+                    TranslatedTuple {
+                        ip: rewrite_src,
+                        port,
+                    },
+                    0,
+                    false,
+                    now_ns,
+                    holder,
+                ) {
+                    return SyncedReserveOutcome::Reserved;
+                }
+            }
         }
     }
     if saw_candidate {
@@ -2535,6 +2651,32 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rewrite_dst: None,
                     ..NatDecision::default()
                 });
+            }
+            // #6751 §5.7: fail closed while a RETIRED domain still holds live
+            // allocations on this address.
+            //
+            // A pool marked unusable because it overlaps this egress address
+            // keeps forwarding its existing sessions — they resolve from the
+            // `NatDecision` stored on their session entry and never re-enter
+            // this path — so minting here would hand out a tuple that is still
+            // in active use, with nothing to detect the duplicate. That is the
+            // collision #6751 closes, arriving through the fix for it.
+            //
+            // Placed AFTER the probe early-return above so neither probe class
+            // is quarantined or charged, and BEFORE `allocator_for` so a
+            // quarantined address never creates a registry entry it will not
+            // use.
+            //
+            // Mint-gate ONLY. Reserves are never quarantined: a reserve claims
+            // an identity its session already owns on the active node, so
+            // refusing it drops a live peer session instead of protecting
+            // anything.
+            if iface_allocs.is_draining_or_lift(rewrite_src) {
+                crate::nat::INTERFACE_SNAT_IDENTITY_EXHAUSTION.fetch_add(1, Ordering::Relaxed);
+                return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                    rule,
+                    SourceNatFailureReason::InterfaceOverlapDraining,
+                ));
             }
             let Some(alloc) = iface_allocs.allocator_for(rewrite_src) else {
                 // The registry cannot create state for this address and

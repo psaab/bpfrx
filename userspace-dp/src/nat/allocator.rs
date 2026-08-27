@@ -1097,6 +1097,45 @@ impl PortAllocator {
         self.lock_live().live_by_flow.len()
     }
 
+    /// #6751 §5.7: does this allocator still hold a live allocation whose
+    /// TRANSLATED address is `addr`?
+    ///
+    /// This is the drain predicate. It answers per-ADDRESS, which
+    /// `live_flow_count` cannot: a retired pool `[A, E]` with busy traffic on
+    /// `A` and none on `E` has a non-zero flow count while `E` is genuinely
+    /// free, and gating on the whole-allocator count would hold `E` in
+    /// fail-closed quarantine until every unrelated flow on `A` drained too —
+    /// effectively forever on a busy pool.
+    ///
+    /// # Why this scans rather than reading `addr_index`
+    ///
+    /// `addr_index` is NOT authoritative for address-only allocations: all
+    /// three address-only mint sites write `addr_index: 0` deliberately,
+    /// because no pool-port bit is claimed and the index is irrelevant to their
+    /// release. So for pool `[A, E]` an address-only flow on `E` is recorded
+    /// against index 0 (`A`), and a per-index counter would read `E` as drained
+    /// while the session is live — lifting the quarantine early and re-opening
+    /// the collision. That is the drain silently failing, which is worse than
+    /// not draining at all.
+    ///
+    /// Making `addr_index` authoritative is the alternative, and it is a
+    /// distributed invariant: every address-only mint path, every reserve path,
+    /// and every stale-tuple move would have to maintain it, and missing ONE
+    /// site reproduces the early lift with no local symptom. This reads the same
+    /// `translated` field the release path keys on, so it cannot disagree with
+    /// the records it is summarising — correct by construction rather than by
+    /// maintenance.
+    ///
+    /// Cost is O(live flows in this allocator), and it is bounded to the drain
+    /// window: the caller's fast path returns without scanning unless the
+    /// address is actually quarantined. It early-exits on the first match.
+    pub(crate) fn has_live_on_address(&self, addr: IpAddr) -> bool {
+        self.lock_live()
+            .live_by_flow
+            .values()
+            .any(|a| a.translated.ip == addr)
+    }
+
     /// White-box access to the live state for tests. NOT for production
     /// callers — they should use the typed `allocate_translation` /
     /// `release_flow` / `rollback_flow` / `snapshot` entry points. Port

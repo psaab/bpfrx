@@ -114,6 +114,37 @@ pub(crate) static INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION: AtomicU64 = AtomicU64:
 #[derive(Debug, Default)]
 pub(crate) struct InterfaceNatAllocators {
     map: RwLock<FxHashMap<IpAddr, Arc<PortAllocator>>>,
+    /// §5.7 DRAIN: egress addresses whose NEW mints are quarantined because a
+    /// retired pool/NAT64 allocator still holds LIVE allocations on them.
+    ///
+    /// A `Vec` because two pools can overlap one address: the quarantine lifts
+    /// only when EVERY draining domain for that address has emptied.
+    ///
+    /// # Why this is retained at all
+    ///
+    /// When a snapshot marks a pool unusable, `SourceNatRule::allocator_key`
+    /// returns `None` (it requires `pool_failure.is_none()`), so the rule keeps
+    /// the empty default allocator and the previous one is DROPPED. The live
+    /// sessions on it do not stop: they resolve from the `NatDecision` stored on
+    /// their session entry and never re-enter the match path. So the packets
+    /// keep flowing while the only record that anyone owns `(E, port)`
+    /// disappears — and any other domain, including this registry, can then mint
+    /// a tuple that is still in active use.
+    ///
+    /// That is invisible where a strand would be loud, and it is the collision
+    /// #6751 exists to close, reintroduced by the fix for it. Retaining the
+    /// allocator here is what keeps the occupancy remembered until the last
+    /// incumbent closes.
+    ///
+    /// # Node-lifetime, and reachable WITHOUT `rules`
+    ///
+    /// Deliberately on this registry rather than in `ForwardingState`, for the
+    /// same reason `release_source_nat_allocation` takes `iface_allocs`
+    /// explicitly: a pool EDITED or REMOVED while draining is no longer in
+    /// `forwarding.source_nat_rules`, so a rules-derived lookup would miss it,
+    /// its live count would never decrement, and the address would stay
+    /// fail-closed for the node's lifetime.
+    draining: RwLock<FxHashMap<IpAddr, Vec<Arc<PortAllocator>>>>,
 }
 
 impl InterfaceNatAllocators {
@@ -192,5 +223,124 @@ impl InterfaceNatAllocators {
     #[cfg(test)]
     pub(crate) fn retained_len(&self) -> usize {
         self.map.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    // --- §5.7 drain ---------------------------------------------------------
+
+    /// Retain `alloc` as a DRAINING domain on `egress`, quarantining new mints
+    /// there until it empties.
+    ///
+    /// Called when a snapshot marks a pool unusable because it overlaps an
+    /// interface-SNAT egress address. It MUST be called on the apply that sets
+    /// `pool_failure`, not later: allocators are recovered only from the
+    /// IMMEDIATELY previous generation, so by the next apply the retired
+    /// allocator is unreachable and its live occupancy is gone for good.
+    ///
+    /// Idempotent by allocator identity — a repeated quarantined snapshot
+    /// re-presents the same `Arc`, and retaining it twice would make the drain
+    /// count double and the quarantine outlive the sessions.
+    pub(crate) fn begin_drain(&self, egress: IpAddr, alloc: Arc<PortAllocator>) {
+        let mut draining = self.draining.write().unwrap_or_else(|e| e.into_inner());
+        let slot = draining.entry(egress).or_default();
+        if slot.iter().any(|existing| Arc::ptr_eq(existing, &alloc)) {
+            return;
+        }
+        slot.push(alloc);
+    }
+
+    /// Is `egress` quarantined — i.e. does ANY retired domain still hold live
+    /// allocations on it? **Lifts the quarantine as a side effect when it finds
+    /// the drain complete.**
+    ///
+    /// This is the NEW-MINT gate. Reserves (ownership claims for sessions that
+    /// already exist) are never quarantined: refusing them would drop a live
+    /// peer session rather than protect anything, since the identity it is
+    /// claiming is one it already holds.
+    ///
+    /// Lifting happens HERE rather than in a separate sweep so the check and the
+    /// lift are one critical section: a late reserve arriving after the lift
+    /// gets `NotThisDomain` from the removed domain and transfers to this
+    /// registry, and can never resurrect a drained allocator. A sweep would
+    /// leave a window in which the address reads lifted while its allocator is
+    /// still reachable, which is precisely that resurrection.
+    ///
+    /// # The name carries a warning
+    ///
+    /// It is `_or_lift` because a read-shaped call with a write side effect is a
+    /// trap for any future caller that means only to OBSERVE. A `show` command,
+    /// a metric, or a status renderer calling this would silently lift
+    /// quarantines by the act of reporting them — a Heisenbug that appears the
+    /// day someone adds an operator surface, not the day it is written.
+    /// Observers must use [`Self::draining_observed`], which never mutates.
+    pub(crate) fn is_draining_or_lift(&self, egress: IpAddr) -> bool {
+        {
+            let draining = self.draining.read().unwrap_or_else(|e| e.into_inner());
+            match draining.get(&egress) {
+                None => return false,
+                // Fast path: still occupied, no lift needed, no write lock.
+                Some(v) if v.iter().any(|a| a.has_live_on_address(egress)) => return true,
+                Some(_) => {}
+            }
+        }
+        // Every domain for this address reads empty — lift under the write lock,
+        // re-checking because a mint or reserve may have landed in the gap.
+        let mut draining = self.draining.write().unwrap_or_else(|e| e.into_inner());
+        match draining.get(&egress) {
+            None => false,
+            Some(v) if v.iter().any(|a| a.has_live_on_address(egress)) => true,
+            Some(_) => {
+                draining.remove(&egress);
+                false
+            }
+        }
+    }
+
+    /// Pure-read drain state: does `egress` have a draining domain recorded,
+    /// occupied or not? **Never lifts, never takes the write lock.**
+    ///
+    /// For diagnostics, metrics and any `show` surface. It can report an address
+    /// as draining whose last allocation has already released and whose
+    /// quarantine simply has not been lifted yet — that staleness is the price
+    /// of not mutating, and it is the correct trade for an observer.
+    pub(crate) fn draining_observed(&self, egress: IpAddr) -> bool {
+        let draining = self.draining.read().unwrap_or_else(|e| e.into_inner());
+        draining.contains_key(&egress)
+    }
+
+    /// Every draining allocator for `egress`, for the release and reserve scans.
+    ///
+    /// A release for an expiring pool flow, and a mirrored reserve for a peer
+    /// session, must both still reach the retired allocator. Omitting the
+    /// release path is the failure that locks an address in quarantine forever:
+    /// a pool edited or removed while draining is no longer in `rules`, so the
+    /// rules sweep cannot find it, the live count never decrements, and
+    /// `is_draining` stays true for the node's lifetime.
+    pub(crate) fn draining_for(&self, egress: IpAddr) -> Vec<Arc<PortAllocator>> {
+        let draining = self.draining.read().unwrap_or_else(|e| e.into_inner());
+        draining.get(&egress).cloned().unwrap_or_default()
+    }
+
+    /// Every draining allocator, regardless of address — for a release whose
+    /// translated address is not known to be an egress address.
+    pub(crate) fn all_draining(&self) -> Vec<Arc<PortAllocator>> {
+        let draining = self.draining.read().unwrap_or_else(|e| e.into_inner());
+        draining.values().flatten().map(Arc::clone).collect()
+    }
+
+    /// Are ALL of `addrs` quarantined? The degenerate case of skip-next: a pool
+    /// whose every address is draining has nothing to skip to.
+    ///
+    /// Reported separately from ordinary exhaustion on purpose. A total-drain
+    /// pool and a genuinely full pool are indistinguishable from the outside,
+    /// and an operator who reads "exhausted" will go looking for capacity that
+    /// is not the problem.
+    pub(crate) fn all_addresses_draining(&self, addrs: &[IpAddr]) -> bool {
+        !addrs.is_empty() && addrs.iter().all(|a| self.is_draining_or_lift(*a))
+    }
+
+    /// Draining address count. Test/diagnostic seam.
+    #[cfg(test)]
+    pub(crate) fn draining_len(&self) -> usize {
+        self.draining.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
