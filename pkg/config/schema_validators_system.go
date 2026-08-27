@@ -350,6 +350,151 @@ func ValidateSyslogUser(raw string, _ *Config) error {
 	return nil
 }
 
+// SyslogSelectorAtomSafe reports whether one atom of an rsyslog selector token
+// can be interpolated without escaping it.
+//
+// This is the SINGLE SOURCE of that rule. pkg/daemon's render belt (#5797/#6829)
+// delegates to it, and the #6844 commit-time facility gate uses it, so what the
+// commit path ACCEPTS and what the render path WRITES cannot diverge.
+//
+// The direction is forced: pkg/daemon imports pkg/config, so the rule has to
+// live here for the render belt to reach it. Two copies would drift, and the
+// drift has a name -- a config that commits cleanly and whose destination then
+// silently disappears at render, which is the exact failure class #6844 exists
+// to close. A gate that admits bytes the renderer rejects has not closed it.
+//
+// LOAD-BEARING: the ordinary SPACE is the byte this exists for, not the control
+// characters it superficially resembles a check for. A newline cannot reach here
+// (the lexer folds it to a space), while a space alone separates an rsyslog
+// selector from its ACTION field, so a token containing one can push text into
+// the action position of a managed line. Relaxing this to "printable ASCII" or
+// "no control bytes" would keep rejecting the newline and start admitting the
+// space: the guard would look intact and stop guarding anything.
+//
+// #6829 B1: the hyphen is legal INSIDE an atom and never at its head. A leading
+// `-` is a legacy sysklogd/rsyslog HOSTNAME-FILTER directive, which scopes every
+// selector that follows it -- so the byte does not merely appear in the line, it
+// changes what the following lines MEAN. Internal hyphens stay legal;
+// `interactive-commands` is a real Junos facility and a real rendered selector.
+func SyslogSelectorAtomSafe(atom string) bool {
+	if atom == "" {
+		return false
+	}
+	if c := atom[0]; !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+		return false
+	}
+	for i := 0; i < len(atom); i++ {
+		c := atom[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// SyslogSelectorFacilitySafe reports whether a facility token can be
+// interpolated into the FACILITY position of an rsyslog selector.
+//
+// The rule is position-aware because rsyslog's selector grammar is
+// `<facility>.<priority>`, where `*` stands for all facilities and the comma
+// operator specifies several facilities with one priority pattern. Both are
+// NATIVE syntax in this position, both commit on this box today, and both are
+// asserted to render (`auth,authpriv.info`, `*.info`).
+//
+// Rejecting them would not be conservative, it would be a silent regression:
+// a strict-commit-clean, rsyslog-valid destination would be warned about and
+// reconciled AWAY on upgrade.
+//
+// Admitting them costs nothing, because neither can carry a payload. `*` is
+// accepted only as the WHOLE token, and one byte rendered as `%s.%s` can only
+// produce `*.<severity>`. A comma list is accepted only when EVERY member is a
+// nonempty safe atom, so `auth,authpriv` renders while `auth,`, `,auth` and
+// `auth,,authpriv` are rejected -- an empty member is malformed rsyslog, and
+// accepting it would let the size of the accepted set stop being a function of
+// the bytes in it.
+//
+// Everything rejected for structural reasons -- `;`, `.`, `:`, `_`, whitespace,
+// control bytes, arbitrary punctuation -- is still rejected in every position.
+// `daemon;*.* /tmp/pwn` is still dropped.
+//
+// Empty is SAFE here: the render call sites fold an empty facility to the `*`
+// wildcard before building the selector, so an unset facility is ordinary
+// configuration rather than an omission to reject. The commit-time gate applies
+// its own non-empty check, because a schema KEY always has a token.
+func SyslogSelectorFacilitySafe(tok string) bool {
+	if tok == "" || tok == "*" {
+		return true
+	}
+	for _, atom := range strings.Split(tok, ",") {
+		if !SyslogSelectorAtomSafe(atom) {
+			return false
+		}
+	}
+	return true
+}
+
+// maxSyslogFacilityLen bounds the facility name. The longest real one,
+// `interactive-commands`, is 20 characters; 64 leaves generous headroom while
+// keeping an absurd value out of a rendered selector line.
+const maxSyslogFacilityLen = 64
+
+// ValidateSyslogFacility gates the `system syslog <dest> <facility> <severity>`
+// facility KEY.
+//
+// The severity half of that pair has been enum-gated since #2008; the facility
+// half was an unvalidated wildcard key, so `set system syslog file audit
+// "daemon;*.* /tmp/pwn" info` passed SchemaValidate and landed in
+// SyslogFileConfig.Facility verbatim (#6844). #6829 belted the render site, so
+// nothing injected reaches rendered rsyslog configuration; this is the other
+// half -- the commit path told the operator nothing, and their configuration
+// silently did not do what it said.
+//
+// It delegates to SyslogSelectorFacilitySafe, the same predicate the render
+// belt uses, RATHER than carrying its own alphabet. A first cut did carry one,
+// and it was wrong in both directions: it rejected `auth,authpriv` and bare `*`
+// (documented, supported, render-tested forms, so valid configs would have
+// stopped committing) while admitting `.` and `_`, which the renderer drops --
+// leaving the "commit succeeds, destination disappears" class the gate was
+// written to close still open. Sharing the predicate makes commit-accepts and
+// render-writes the same set by construction.
+//
+// It is NOT an enum of Junos facility names. That vocabulary already exists in
+// pkg/logging, which imports pkg/config, so the two cannot be single-sourced
+// without a new leaf package; two copies drift, and the drift is silent in the
+// direction that REJECTS a valid operator config the renderer maps correctly.
+// #6830 diagnoses an unmapped facility at render, by name.
+//
+// Strictness is bounded by the existing #1319 split rather than by a new lenient
+// opt: SchemaValidate is strict only on the operator-driven commit /
+// commit-check path, and Store.compileTreeLenient downgrades a violation to a
+// warning on the tolerant Load / SyncApply ingress. So a persisted or
+// peer-synced config carrying a name this rejects still BOOTS, per #1960.
+func ValidateSyslogFacility(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing syslog facility")
+	}
+	if len(raw) > maxSyslogFacilityLen {
+		return fmt.Errorf("syslog facility %q is %d characters (max %d)",
+			raw, len(raw), maxSyslogFacilityLen)
+	}
+	if !SyslogSelectorFacilitySafe(raw) {
+		return fmt.Errorf("invalid syslog facility %q: a facility is `*`, or a "+
+			"comma-separated list of names each starting with a letter or digit and "+
+			"containing only letters, digits and internal hyphens. No whitespace, "+
+			"control characters, or rsyslog selector punctuation such as ';' '.' ':' "+
+			"'_'. Junos facility names are `any`, `authorization`, `change-log`, "+
+			"`conflict-log`, `daemon`, `dfc`, `firewall`, `ftp`, "+
+			"`interactive-commands`, `kernel`, `ntp`, `pfe`, `security`, `user`, or a "+
+			"BSD name / local0-local7", raw)
+	}
+	return nil
+}
+
 // zoneNameSegmentRE is the safe shape for one `/`-separated segment of a
 // `system time-zone` value (an IANA tz-database / zoneinfo name). Real zone
 // segments are letters, digits, and the punctuation `_ + -`
