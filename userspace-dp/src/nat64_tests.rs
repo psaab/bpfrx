@@ -4809,9 +4809,9 @@ fn nat64_frag_assoc_v6_to_v4_nonfirst_inherits_and_translates() {
     // Install the first fragment's decision; the non-first fragment inherits it.
     let cache = Nat64FragAssoc::new();
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
-    cache.install(kf, decision, None, 1_000, 1);
+    cache.install(kf, decision, None, 1_000, 1, 0);
     let (hit, reverse) = cache
-        .lookup(&kn, 1_500, 1)
+        .lookup(&kn, 1_500, 1, |_| true)
         .expect("non-first inherits association");
     assert!(
         reverse.is_none(),
@@ -4888,9 +4888,9 @@ fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
         orig_dst_v6,
     };
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, server_v4, 5000));
-    cache.install(kf, decision, Some(reverse), 2_000, 1);
+    cache.install(kf, decision, Some(reverse), 2_000, 1, 0);
     let (_hit, rev) = cache
-        .lookup(&kn, 2_400, 1)
+        .lookup(&kn, 2_400, 1, |_| true)
         .expect("reverse non-first inherits");
     assert_eq!(
         rev,
@@ -4943,7 +4943,7 @@ fn nat64_frag_assoc_nonfirst_without_first_misses_and_drops() {
     let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0u8; 16], 100, false, 0x9999);
     let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority()).expect("key");
     assert!(
-        cache.lookup(&kn, 10, 1).is_none(),
+        cache.lookup(&kn, 10, 1, |_| true).is_none(),
         "orphan non-first fragment misses"
     );
     let snat = Ipv4Addr::new(198, 51, 100, 5);
@@ -4978,7 +4978,7 @@ fn nat64_frag_assoc_cache_is_bounded() {
             protocol: PROTO_UDP,
             authority: frag_test_authority(),
         };
-        cache.install(key, decision, None, 1_000, 1);
+        cache.install(key, decision, None, 1_000, 1, 0);
     }
     assert!(
         cache.len() <= ceiling,
@@ -5007,16 +5007,20 @@ fn nat64_frag_assoc_ttl_evicts() {
         Ipv4Addr::new(8, 8, 8, 8),
         5000,
     ));
-    cache.install(key, decision, None, 1_000, 1);
+    cache.install(key, decision, None, 1_000, 1, 0);
     assert_eq!(cache.len(), 1);
     // Still within the TTL window: hit.
-    assert!(cache
-        .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1)
-        .is_some());
-    // Past the (refreshed) TTL with no intervening hit: pruned + miss.
-    cache.install(key, decision, None, 1_000, 1);
     assert!(
-        cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1).is_none(),
+        cache
+            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1, |_| true)
+            .is_some()
+    );
+    // Past the (refreshed) TTL with no intervening hit: pruned + miss.
+    cache.install(key, decision, None, 1_000, 1, 0);
+    assert!(
+        cache
+            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1, |_| true)
+            .is_none(),
         "expired association must miss",
     );
     assert_eq!(cache.len(), 0, "expired entry pruned");
@@ -5102,12 +5106,12 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
     // insertion order). Its deadline is FAR in the future.
     let live_key = mk(idents[0]);
     let live_now = 2 * NAT64_FRAG_TTL_NS; // deadline = 4*TTL
-    cache.install(live_key, decision, None, live_now, 1);
+    cache.install(live_key, decision, None, live_now, 1, 0);
 
     // Fill the rest of the shard to cap with EXPIRED entries: installed at
     // now=0 so their deadline is TTL, which the flood/lookup times below exceed.
     for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
-        cache.install(mk(ident), decision, None, 0, 1);
+        cache.install(mk(ident), decision, None, 0, 1, 0);
     }
     assert_eq!(
         cache.len(),
@@ -5119,16 +5123,16 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
     // deadlines but well within the LIVE entry's window.
     let flood_now = NAT64_FRAG_TTL_NS + 1; // > TTL (expired) but < 4*TTL (live alive)
     let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
-    cache.install(new_key, decision, None, flood_now, 1);
+    cache.install(new_key, decision, None, flood_now, 1, 0);
 
     // The LIVE association survived (expired slots were reclaimed first)...
     assert!(
-        cache.lookup(&live_key, flood_now + 1, 1).is_some(),
+        cache.lookup(&live_key, flood_now + 1, 1, |_| true).is_some(),
         "#5447: live association must survive a first-fragment flood",
     );
     // ...and the NEW association was installed into a reclaimed slot.
     assert!(
-        cache.lookup(&new_key, flood_now + 1, 1).is_some(),
+        cache.lookup(&new_key, flood_now + 1, 1, |_| true).is_some(),
         "new association installed into a reclaimed expired slot",
     );
 }
@@ -5161,22 +5165,22 @@ fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
     let cache = Nat64FragAssoc::new();
     // Fill the shard to cap with entries that are ALL live at the times below.
     for &ident in &idents[..NAT64_FRAG_CAP_PER_SHARD] {
-        cache.install(mk(ident), decision, None, 1_000, 1);
+        cache.install(mk(ident), decision, None, 1_000, 1, 0);
     }
     assert_eq!(cache.len(), NAT64_FRAG_CAP_PER_SHARD, "shard filled to cap");
 
     let oldest_key = mk(idents[0]);
     let new_key = mk(idents[NAT64_FRAG_CAP_PER_SHARD]);
     // Install a NEW key while every existing entry is still live.
-    cache.install(new_key, decision, None, 1_000, 1);
+    cache.install(new_key, decision, None, 1_000, 1, 0);
 
     // The oldest (front) live entry is evicted -- capacity bound preserved.
     assert!(
-        cache.lookup(&oldest_key, 1_000, 1).is_none(),
+        cache.lookup(&oldest_key, 1_000, 1, |_| true).is_none(),
         "capacity bound: oldest live entry evicted when the shard is all-live",
     );
     assert!(
-        cache.lookup(&new_key, 1_000, 1).is_some(),
+        cache.lookup(&new_key, 1_000, 1, |_| true).is_some(),
         "new entry installed",
     );
     assert!(
@@ -5216,12 +5220,12 @@ fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
 
     // A first fragment installs the association under generation 7.
     let gen0: u64 = 7;
-    cache.install(key, decision, None, 1_000, gen0);
+    cache.install(key, decision, None, 1_000, gen0, 0);
 
     // A same-generation non-first fragment still inherits it (valid same-config
     // reassembly is NOT broken by the guard).
     assert!(
-        cache.lookup(&key, 1_100, gen0).is_some(),
+        cache.lookup(&key, 1_100, gen0, |_| true).is_some(),
         "same-generation replay must still hit",
     );
 
@@ -5229,7 +5233,7 @@ fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
     // MISS under generation 8 -- the fix.
     let gen1: u64 = 8;
     assert!(
-        cache.lookup(&key, 1_200, gen1).is_none(),
+        cache.lookup(&key, 1_200, gen1, |_| true).is_none(),
         "#5624: association from a prior config generation must miss",
     );
     // ...and it was EVICTED, not merely skipped, so it cannot linger to be
@@ -5240,15 +5244,15 @@ fn nat64_frag_assoc_generation_change_invalidates_stale_association() {
         "stale association evicted on the mismatched lookup",
     );
     assert!(
-        cache.lookup(&key, 1_300, gen0).is_none(),
+        cache.lookup(&key, 1_300, gen0, |_| true).is_none(),
         "stale association was evicted, not merely skipped",
     );
 
     // A NEW first fragment re-admitted under the current config re-establishes
     // the association, and it hits again under the current generation.
-    cache.install(key, decision, None, 1_400, gen1);
+    cache.install(key, decision, None, 1_400, gen1, 0);
     assert!(
-        cache.lookup(&key, 1_500, gen1).is_some(),
+        cache.lookup(&key, 1_500, gen1, |_| true).is_some(),
         "re-established association under the new generation hits",
     );
 }
@@ -5770,7 +5774,7 @@ fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
     // Domain A: the permitted first fragment installs its decision.
     let ka = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
         .expect("domain-A first-fragment key");
-    cache.install(ka, decision, None, 1_000, 1);
+    cache.install(ka, decision, None, 1_000, 1, 0);
 
     // Domain B: a non-first fragment with the SAME (family, src, dst, ident) —
     // an attacker only has to reproduce a 32-bit fragment ID, which is not an
@@ -5782,7 +5786,7 @@ fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
         "a different ingress domain must build a DIFFERENT key (fail-closed by construction)"
     );
     assert!(
-        cache.lookup(&kb, 1_100, 1).is_none(),
+        cache.lookup(&kb, 1_100, 1, |_| true).is_none(),
         "a non-first fragment from another security domain must NOT inherit domain A's permit"
     );
 
@@ -5793,7 +5797,7 @@ fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
         .expect("domain-A non-first-fragment key");
     assert_eq!(ka, ka_nonfirst, "same-domain first/non-first share one key");
     assert!(
-        cache.lookup(&ka_nonfirst, 1_100, 1).is_some(),
+        cache.lookup(&ka_nonfirst, 1_100, 1, |_| true).is_some(),
         "a same-domain non-first fragment must still inherit (no over-blocking)"
     );
 }
@@ -5856,7 +5860,7 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
 
         let cache = Nat64FragAssoc::new();
         let kf = nat64_first_fragment_key(&first, libc::AF_INET6, base).expect("first key");
-        cache.install(kf, decision, None, 1_000, 1);
+        cache.install(kf, decision, None, 1_000, 1, 0);
 
         // POSITIVE CONTROL FIRST: the baseline non-first fragment HITS. Ordered
         // before the negative assertion so a lookup that never returns anything
@@ -5864,7 +5868,7 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
         let kn_base =
             nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, base).expect("baseline key");
         assert!(
-            cache.lookup(&kn_base, 1_100, 1).is_some(),
+            cache.lookup(&kn_base, 1_100, 1, |_| true).is_some(),
             "{dimension} control: the SAME-authority non-first fragment must inherit — without \
              this the negative assertion below is also satisfied by a cache that never hits"
         );
@@ -5872,14 +5876,14 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
         let kn =
             nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, other).expect("non-first key");
         assert!(
-            cache.lookup(&kn, 1_100, 1).is_none(),
+            cache.lookup(&kn, 1_100, 1, |_| true).is_none(),
             "{dimension} must be part of the association authority; a fragment differing only \
              in it inherited the permit"
         );
         // And the entry the perturbed fragment failed to match is still LIVE —
         // it MISSED, rather than the lookup above having consumed or expired it.
         assert!(
-            cache.lookup(&kn_base, 1_200, 1).is_some(),
+            cache.lookup(&kn_base, 1_200, 1, |_| true).is_some(),
             "{dimension}: the baseline association must survive the cross-authority miss"
         );
     }
@@ -5907,17 +5911,17 @@ fn frag_assoc_protocol_collision_does_not_alias() {
         kf.protocol, PROTO_UDP,
         "the key's protocol must be parsed from the IPv6 Fragment Header's Next Header"
     );
-    cache.install(kf, decision, None, 1_000, 1);
+    cache.install(kf, decision, None, 1_000, 1, 0);
 
     let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
         .expect("non-first key");
     let collided = Nat64FragKey { protocol: PROTO_TCP, ..kn };
     assert!(
-        cache.lookup(&collided, 1_100, 1).is_none(),
+        cache.lookup(&collided, 1_100, 1, |_| true).is_none(),
         "a TCP fragment must not inherit a UDP datagram's decision on an ident collision"
     );
     assert!(
-        cache.lookup(&kn, 1_100, 1).is_some(),
+        cache.lookup(&kn, 1_100, 1, |_| true).is_some(),
         "the matching-protocol fragment must still inherit"
     );
 }
@@ -5966,17 +5970,135 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
     // anything: same-domain HITS, other-domain MISSES, and the entry the
     // other-domain fragment failed to match is still live afterwards.
     let cache = Nat64FragAssoc::new();
-    cache.install(kf, frag_v6_decision(), None, 1_000, 1);
+    cache.install(kf, frag_v6_decision(), None, 1_000, 1, 0);
     assert!(
-        cache.lookup(&kn, 1_100, 1).is_some(),
+        cache.lookup(&kn, 1_100, 1, |_| true).is_some(),
         "control: the same-domain v4 non-first fragment must inherit"
     );
     assert!(
-        cache.lookup(&kn_other, 1_100, 1).is_none(),
+        cache.lookup(&kn_other, 1_100, 1, |_| true).is_none(),
         "a v4 non-first fragment from another domain must NOT inherit"
     );
     assert!(
-        cache.lookup(&kn, 1_200, 1).is_some(),
+        cache.lookup(&kn, 1_200, 1, |_| true).is_some(),
         "the v4 association must survive the cross-domain miss (it missed, it did not vanish)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #6857: the RUNTIME-ownership fence on the fragment association.
+//
+// The config-generation fence (#5624) invalidates an association when a commit
+// changes deny/NAT64 rules. An RG transition is runtime HA state: it changes no
+// config and bumps no snapshot generation, so that fence cannot see it. Without
+// a runtime fence a non-first fragment keeps HITTING an association minted while
+// this node was forwarding-active, inheriting the earlier permit + egress + NAT
+// on a node no longer entitled to grant it — exactly what the #6458 owner-RG
+// gate prevents on the enforcement path.
+// ---------------------------------------------------------------------------
+
+fn frag_rg_fixture() -> (Nat64FragAssoc, Nat64FragKey, Nat64FragKey, SessionDecision) {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().expect("src");
+    let dst_v6: Ipv6Addr = "64:ff9b::808:808".parse().expect("dst");
+    let snat_v4 = Ipv4Addr::new(172, 16, 80, 8);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let ident: u32 = 0x0000_BEEF;
+    let first = make_ipv6_frag_udp(src_v6, dst_v6, 1000, 53, &[0xAAu8; 16], 0, true, ident);
+    let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0xBBu8; 24], 185, false, ident);
+    let kf = nat64_first_fragment_key(&first, libc::AF_INET6, frag_test_authority())
+        .expect("first-fragment key");
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
+        .expect("non-first-fragment key");
+    assert_eq!(
+        kf, kn,
+        "#6857 premise: the two fragments must share one key"
+    );
+    let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
+    (Nat64FragAssoc::new(), kf, kn, decision)
+}
+
+/// The property: an association minted under owner RG 3 must MISS once RG 3 is
+/// no longer forwarding-active locally.
+#[test]
+fn frag_assoc_refuses_a_hit_once_the_owner_rg_stops_forwarding_6857() {
+    let (cache, kf, kn, decision) = frag_rg_fixture();
+    cache.install(kf, decision, None, 1_000, 1, 3);
+
+    assert!(
+        cache.lookup(&kn, 1_500, 1, |_| false).is_none(),
+        "#6857: a non-first fragment must NOT inherit a permit this node is no \
+         longer entitled to grant. The association was minted while owner RG 3 \
+         was forwarding-active; it is not any more, and the config-generation \
+         fence cannot see that because an RG transition bumps no generation"
+    );
+}
+
+/// The POSITIVE control, without which the cell above is satisfied by a lookup
+/// that refuses everything.
+#[test]
+fn frag_assoc_still_inherits_while_the_owner_rg_is_forwarding_6857() {
+    let (cache, kf, kn, decision) = frag_rg_fixture();
+    cache.install(kf, decision, None, 1_000, 1, 3);
+
+    assert!(
+        cache.lookup(&kn, 1_500, 1, |rg| rg == 3).is_some(),
+        "#6857 CONTROL: an unchanged RG must still inherit — over-blocking here \
+         is a fragment blackhole, not a safety improvement"
+    );
+}
+
+/// owner_rg == 0 means NOT RG-dependent and must NEVER be fenced.
+///
+/// This is the cell that stops the fix becoming a regression: on a STANDALONE
+/// box (no chassis cluster) every resolution has owner RG 0, so a fence that
+/// treated 0 as "not entitled" would evict every association on every consult
+/// and disable fragment association for the entire non-HA deployment. The
+/// predicate below refuses everything, exactly as it would on a box with no HA
+/// state at all.
+#[test]
+fn frag_assoc_with_no_owner_rg_is_not_fenced_6857() {
+    let (cache, kf, kn, decision) = frag_rg_fixture();
+    cache.install(kf, decision, None, 1_000, 1, 0);
+
+    assert!(
+        cache.lookup(&kn, 1_500, 1, |_| false).is_some(),
+        "#6857: owner RG 0 is NOT RG-dependent and must not be fenced. A \
+         standalone box has no redundancy groups, so fencing on 0 would disable \
+         fragment association entirely for every non-HA deployment"
+    );
+}
+
+/// A refused hit must also EVICT, so the fence is not re-evaluated on every
+/// later fragment of a datagram that can never be inherited again.
+#[test]
+fn frag_assoc_evicts_the_entry_it_refuses_6857() {
+    let (cache, kf, kn, decision) = frag_rg_fixture();
+    cache.install(kf, decision, None, 1_000, 1, 3);
+    assert_eq!(cache.len(), 1, "#6857 premise: the install must be present");
+
+    assert!(cache.lookup(&kn, 1_500, 1, |_| false).is_none());
+    assert_eq!(
+        cache.len(),
+        0,
+        "#6857: a refused association must be evicted, not left to be re-judged \
+         by every subsequent fragment"
+    );
+}
+
+/// The two fences are INDEPENDENT: a stale generation must still refuse even
+/// while the owner RG is perfectly healthy.
+///
+/// Without this, a fix that replaced the config fence with the runtime one —
+/// rather than adding beside it — would pass every cell above.
+#[test]
+fn frag_assoc_config_fence_survives_the_rg_fence_6857() {
+    let (cache, kf, kn, decision) = frag_rg_fixture();
+    cache.install(kf, decision, None, 1_000, 1, 3);
+
+    assert!(
+        cache.lookup(&kn, 1_500, 2, |rg| rg == 3).is_none(),
+        "#6857: the #5624 config-generation fence must still refuse a \
+         stale-generation entry even when the owner RG is forwarding-active. \
+         The runtime fence is added BESIDE the config one, not instead of it"
     );
 }
