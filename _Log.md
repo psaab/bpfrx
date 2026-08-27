@@ -106988,3 +106988,19 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/eventengine/engine.go`, `pkg/eventengine/queue.go`,
   `pkg/eventengine/evaluate.go`, `pkg/eventengine/README.md`,
   `docs/refactoring-audit-accepted.txt`, `_Log.md`
+
+## 2026-08-26 — #7667: make the retired-leg fixture stop racing the drain
+
+- **Timestamp**: 2026-08-26
+- **Action**: `TestRetiredLegNeverGainsARotatedCredential_5561` samples an
+  asynchronous observable — whether the retired leg has finished draining — at a
+  fixed point. A leg that drains first is dropped by `pruneRetiredLocked`, so
+  `ReplaceAuth` never tightens it and the old credential survives, which the test
+  reports as "a revocation did not land". The fixture now holds a request IN
+  FLIGHT so the drain cannot complete (`http.Server.Shutdown` waits for active
+  requests), and asserts `!drained` by name before the revocation assertions.
+  **Root cause of the observed flake is NOT established**: forcing `drained=true`
+  reproduces the exact failure (sufficient), but the condition did not occur
+  naturally in 80 attempts including 2x CPU oversubscription. The change is
+  therefore a determinism + diagnosis improvement, not a proven fix.
+- **File(s)**: `pkg/api/listener_retiredauth_5561_test.go`, `_Log.md`

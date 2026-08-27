@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 // listener_retiredauth_5561_test.go is the fail-on-revert gate for the #5561
@@ -43,10 +45,30 @@ func legProbe(t *testing.T, leg *listenerLeg, user, pass string) bool {
 // retireTestServer builds a Server whose legs serve a trivial 200 handler over
 // the real per-leg auth middleware, with a listener factory that hands out
 // closed-on-cleanup local sockets.
+//
+// #7667: /hold blocks until the returned release func is called. A leg cannot
+// finish draining while a request is in flight — http.Server.Shutdown WAITS for
+// active requests — so a test that needs the leg to still be RETIRING at a
+// chosen moment can guarantee it instead of racing the drain.
 func retireTestServer(t *testing.T, boot *AuthConfig) *Server {
 	t.Helper()
+	s, _ := retireTestServerWithHold(t, boot)
+	return s
+}
+
+func retireTestServerWithHold(t *testing.T, boot *AuthConfig) (*Server, func()) {
+	t.Helper()
 	s := &Server{}
-	s.sharedBase = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	held := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held) }) }
+	t.Cleanup(release)
+	s.sharedBase = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hold" {
+			<-held
+		}
+		w.WriteHeader(http.StatusOK)
+	})
 	s.auth.Store(boot)
 	var mu sync.Mutex
 	var lns []net.Listener
@@ -70,7 +92,40 @@ func retireTestServer(t *testing.T, boot *AuthConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s.rootCtx = ctx
-	return s
+	return s, release
+}
+
+// startHeldRequest7667 puts a request IN FLIGHT on ln and returns once the
+// handler has certainly been entered. While it is in flight the leg's drain
+// cannot complete, so the leg stays on the retiring list deterministically.
+//
+// This is the #7563 ordering applied to a fixture that was sampling an
+// asynchronous observable: rather than hoping the drain has not finished, make
+// it UNABLE to finish. The test then measures the property it names — that a
+// leg which is still retiring honours a revocation — instead of measuring which
+// goroutine the scheduler picked.
+func startHeldRequest7667(t *testing.T, ln net.Listener) {
+	t.Helper()
+	entered := make(chan struct{})
+	go func() {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			close(entered)
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		req := "GET /hold HTTP/1.1\r\nHost: x\r\nAuthorization: Basic " +
+			base64.StdEncoding.EncodeToString([]byte("admin:secret-a")) + "\r\n\r\n"
+		_, _ = c.Write([]byte(req))
+		close(entered)
+	}()
+	<-entered
+	// The write has been issued; give the server goroutine the chance to accept
+	// and enter the handler. This sleep is NOT the synchronisation — the held
+	// channel is. It only narrows the window before the drain is requested; if
+	// it were too short the caller's explicit !drained precondition fails
+	// loudly by name rather than producing a confusing revocation failure.
+	time.Sleep(50 * time.Millisecond)
 }
 
 // A commit that MOVES the management bind and ROTATES the credential must not
@@ -100,6 +155,15 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 		t.Fatal("the live listener rejects its own configured credential; the case starts wrong")
 	}
 
+	// #7667: hold a request IN FLIGHT so the retired leg cannot finish draining
+	// before ReplaceAuth runs. Without this the fixture races the drain: a leg
+	// that drains first is dropped by pruneRetiredLocked and ReplaceAuth never
+	// tightens it, so secret-a survives and this test fails intermittently
+	// under load — reporting "a revocation did not land" when nothing about
+	// revocation was broken. Measured: forcing drained=true before ReplaceAuth
+	// reproduces the exact failure, and leaving it false does not.
+	startHeldRequest7667(t, ln)
+
 	if err := s.ReconcileHTTP("10.0.0.2:8080"); err != nil {
 		t.Fatalf("ReconcileHTTP: %v", err)
 	}
@@ -110,6 +174,17 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 
 	// This is exactly what managementReconciler does once every live leg sits at
 	// an address the committed config names.
+	// The subject of this test is a leg that is STILL RETIRING. If the drain
+	// finished anyway, say so by name — a leg the server has already reaped is
+	// a different case (its policy is deliberately no longer maintained; see
+	// the drainLeg commentary) and asserting revocation against it would be
+	// asserting something the design does not promise.
+	if retired.drained.Load() {
+		t.Fatal("precondition: the retired leg already finished draining, so it is no " +
+			"longer on the retiring list and ReplaceAuth will not tighten it. This " +
+			"test is about a leg that is still RETIRING (#7667)")
+	}
+
 	s.ReplaceAuth(&AuthConfig{Users: map[string]string{"admin": "secret-b"}})
 
 	if legProbe(t, retired, "admin", "secret-b") {
