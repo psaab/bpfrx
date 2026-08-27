@@ -86,6 +86,33 @@ func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
 		}
 	})
 
+	t.Run("remainder with a ZERO leftover still warns", func(t *testing.T) {
+		// The subtest above binds a lone remainder queue to a 100m shape, so
+		// the leftover is the whole 100m — it varies the right axis and samples
+		// only the passing point. It cannot tell "resolves to a usable rate"
+		// from "resolves to zero and is therefore still inert".
+		//
+		// Here siblings claim the entire shaping-rate, so the leftover is zero.
+		// The dataplane declines a zero share (zero is its unshaped sentinel),
+		// so the queue has no rate, temporal has no drain speed to convert
+		// against, and the advisory MUST still fire. Suppressing it here would
+		// be an advisory regression: a config that warned before, does not now,
+		// and gained nothing at runtime.
+		if !hasTemporalAdvisory(t,
+			"set class-of-service schedulers full transmit-rate percent 100",
+			"set class-of-service schedulers be transmit-rate remainder",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class assured-forwarding scheduler full",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+			"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
+		) {
+			t.Fatal("#6846: siblings claiming the whole shaping-rate leave a ZERO " +
+				"leftover, the dataplane declines it, and the queue is still inert — " +
+				"so the temporal advisory must still fire")
+		}
+	})
+
 	t.Run("absolute rate resolves, so it must NOT warn", func(t *testing.T) {
 		// An explicit transmit-rate needs no shaping base, so temporal
 		// converts and the advisory must be gone.

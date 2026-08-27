@@ -1247,7 +1247,7 @@ func ValidateConfig(cfg *Config) []string {
 			// stops firing for configurations that do not — it teaches the
 			// operator to ignore it. Pinned by
 			// TestTemporalAdvisoryNarrowsToUnresolvable6846.
-			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerRateResolves(sched, schedulersResolvingPercent) {
+			if sched.BufferSizeTemporalUS > 0 && !cosSchedulerRateResolves(cos, sched, schedulersResolvingPercent) {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q buffer-size temporal is accepted but has no effect: the queue has no resolvable transmit-rate (no absolute rate, and no scheduler-map binding to an interface with a root shaping-rate), so there is no drain speed to convert the microsecond target against (#6846)",
 					sched.Name))
@@ -1261,7 +1261,7 @@ func ValidateConfig(cfg *Config) []string {
 			// follow-up) and a `percent` scheduler with no shaping base to
 			// resolve against — i.e. not bound via a scheduler-map to an
 			// interface that has a root shaping-rate.
-			if sched.TransmitRateRemainder && !schedulersResolvingPercent[sched.Name] {
+			if sched.TransmitRateRemainder && !cosSchedulerRateResolves(cos, sched, schedulersResolvingPercent) {
 				// #6846: `remainder` now RESOLVES where there is a shaping rate
 				// to take a remainder OF — forwarding_build/cos.rs computes
 				// `(shaping - resolved siblings) / remainder queues` per
@@ -1271,14 +1271,23 @@ func ValidateConfig(cfg *Config) []string {
 				// available to substitute (InterfaceSnapshot carries no
 				// link-speed field).
 				//
-				// Note what is deliberately NOT warned: an OVER-SUBSCRIBED
-				// remainder resolves, to zero. That has its own warning below
-				// with its own wording, because "resolved to nothing" and
-				// "could not resolve" are different facts and an operator needs
-				// to know which one they have.
+				// The wording distinguishes the TWO reasons a remainder can
+				// fail to resolve, because an operator needs to know which one
+				// they have and the fix differs: bind the scheduler to a shaped
+				// interface, versus stop claiming the whole rate with siblings.
+				//
+				// An earlier revision claimed the second case "has its own
+				// warning below". It did not — the warning did not exist, and
+				// the predicate classified a zero leftover as resolving, so an
+				// exactly-subscribed shape was silent at commit AND inert at
+				// runtime. Both halves are fixed here.
+				reason := "the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no interface bandwidth to take a remainder of"
+				if schedulersResolvingPercent[sched.Name] {
+					reason = "its sibling queues already claim the whole interface shaping-rate, so the leftover is zero — the dataplane declines a zero share rather than treating it as an unshaped queue"
+				}
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q transmit-rate remainder is accepted but has no effect: the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no interface bandwidth to take a remainder of (#6846)",
-					sched.Name))
+					"class-of-service scheduler %q transmit-rate remainder is accepted but has no effect: %s (#6846)",
+					sched.Name, reason))
 			} else if sched.TransmitRatePercent > 0 && !schedulersResolvingPercent[sched.Name] {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q transmit-rate percent %.4g%% is accepted but has no effect: the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no base to resolve the percent against (#4228 Gap 2)",

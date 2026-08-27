@@ -542,7 +542,27 @@ fn cos_remainder_rate_bytes(
         return None;
     }
     let leftover = (iface_shaping_rate_bytes as u128).saturating_sub(claimed);
-    Some((leftover / remainder_queues as u128) as u64)
+    let share = (leftover / remainder_queues as u128) as u64;
+    if share == 0 {
+        // ZERO IS A SENTINEL, NOT A RATE. `types/cos.rs` states it: "transparent
+        // zero-rate queues use that value to mean unshaped/full bucket". At the
+        // call site a `Some(0)` becomes `guarantee_enabled = true` with
+        // `transmit_rate_bytes = 0`, so the queue is promoted into guarantee
+        // service AND read as uncapped by the token bucket — the inverse of the
+        // starved queue this was meant to produce, and a state that was
+        // UNREACHABLE before remainder existed (cos_effective_transmit_rate_bytes
+        // returns Some only for > 0, and cos_percent_rate_bytes clamps to >= 1).
+        //
+        // It does not take over-subscription to get here: `percent 60` +
+        // `percent 40` + `remainder` is an ordinary Junos shape and leaves
+        // exactly nothing.
+        //
+        // So a leftover that rounds to nothing is NOT a resolution. The form
+        // stays inert, the queue keeps the historical no-guarantee fallback, and
+        // the commit advisory says so. Pinned by zero_leftover_must_not_resolve.
+        return None;
+    }
+    Some(share)
 }
 
 fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
@@ -1373,9 +1393,14 @@ mod remainder_temporal_tests_6846 {
         );
     }
 
-    /// Over-subscription RESOLVES TO ZERO rather than failing to resolve.
-    /// `Some(0)` and `None` are different answers and the advisory depends on
-    /// the difference: over-subscribed resolved, unshaped could not.
+    /// Over-subscription leaves no leftover, so it does NOT resolve.
+    ///
+    /// This asserted `Some(0)` in an earlier revision, on the reasoning that
+    /// "resolved to zero" and "could not resolve" are different facts an
+    /// operator needs told apart. The reasoning was right and the ENCODING was
+    /// wrong: zero is the dataplane's sentinel for "unshaped", so `Some(0)`
+    /// promoted the queue into guarantee service uncapped. The distinction now
+    /// lives in the ADVISORY WORDING, which is where it belonged.
     #[test]
     fn over_subscription_resolves_to_zero_not_none() {
         let scheds = [absolute("a", 900), absolute("b", 400), remainder("r")];
@@ -1385,8 +1410,7 @@ mod remainder_temporal_tests_6846 {
             1000,
         );
         assert_eq!(
-            got,
-            Some(0),
+            got, None,
             "siblings claiming more than the shaping rate leave no remainder — \
              but the form RESOLVED, so this must be Some(0) and not None, or the \
              narrowed commit advisory cannot tell it from an unresolvable one"
@@ -1430,6 +1454,32 @@ mod remainder_temporal_tests_6846 {
     fn temporal_without_a_rate_is_unresolvable() {
         assert_eq!(cos_temporal_buffer_bytes(0, 1_500), None);
         assert_eq!(cos_temporal_buffer_bytes(1_000_000, 0), None);
+    }
+
+    /// EXACT subscription leaves a ZERO leftover, and zero is a SENTINEL.
+    ///
+    /// `types/cos.rs` states it: "transparent zero-rate queues use that value
+    /// to mean unshaped/full bucket". A `Some(0)` from the resolver therefore
+    /// arrives at the call site as `guarantee_enabled = true` with
+    /// `transmit_rate_bytes = 0` — promoting the queue into guarantee service
+    /// while the token bucket reads it as unshaped. That is the INVERSE of the
+    /// starved queue the design intended, and it needs no over-subscription:
+    /// `percent 60` + `percent 40` + `remainder` is an ordinary Junos idiom.
+    #[test]
+    fn zero_leftover_must_not_resolve() {
+        let scheds = [percent("a", 60.0), percent("b", 40.0), remainder("r")];
+        let got = resolve(
+            &scheds,
+            vec![entry("fa", "a"), entry("fb", "b"), entry("fr", "r")],
+            1000,
+        );
+        assert_eq!(
+            got, None,
+            "an exactly-subscribed shape leaves NO leftover, so `remainder` has \
+             nothing to resolve to. Some(0) would set guarantee_enabled while \
+             transmit_rate_bytes=0 means `unshaped` to the token bucket — the \
+             queue would be promoted into guarantee service AND uncapped"
+        );
     }
 
     /// The CALL SITE must hand temporal the queue's transmit rate, not the

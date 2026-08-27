@@ -13,6 +13,16 @@ package config
 // between them is either a warning on a configuration that works, or silence on
 // one that does not — and both are the failure #6846 exists to remove.
 
+// cosSchedulersWithShapedBinding returns the set of scheduler names that are
+// bound — via a scheduler-map applied to an interface unit with a non-zero
+// root shaping-rate — to at least one shaped interface. A `transmit-rate
+// percent <n>` on such a scheduler RESOLVES: forwarding_build/cos.rs computes
+// the absolute byte/sec rate against the interface's shaping-rate. A scheduler
+// NOT in this set has no shaping base, so its percent stays inert; the
+// ValidateConfig advisory flags exactly that residual. Must run AFTER
+// resolveCoSTrafficControlProfiles so unit.ShapingRateBytes reflects a folded
+// traffic-control-profile shaping-rate (including a resolved shaping-rate
+// percent).
 func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
 	resolved := make(map[string]bool)
 	if cos == nil {
@@ -44,16 +54,6 @@ func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
 	return resolved
 }
 
-// cosSchedulersWithShapedBinding returns the set of scheduler names that are
-// bound — via a scheduler-map applied to an interface unit with a non-zero
-// root shaping-rate — to at least one shaped interface. A `transmit-rate
-// percent <n>` on such a scheduler RESOLVES: forwarding_build/cos.rs computes
-// the absolute byte/sec rate against the interface's shaping-rate. A scheduler
-// NOT in this set has no shaping base, so its percent stays inert; the
-// ValidateConfig advisory flags exactly that residual. Must run AFTER
-// resolveCoSTrafficControlProfiles so unit.ShapingRateBytes reflects a folded
-// traffic-control-profile shaping-rate (including a resolved shaping-rate
-// percent).
 // cosSchedulerRateResolves reports whether a scheduler ends up with a
 // resolvable absolute transmit rate (#6846).
 //
@@ -68,15 +68,99 @@ func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
 // The last two share `shaped` — a scheduler bound via a scheduler-map to an
 // interface carrying a root shaping-rate — which is why one predicate covers
 // both rather than two that can drift apart.
-func cosSchedulerRateResolves(sched *CoSScheduler, shaped map[string]bool) bool {
+func cosSchedulerRateResolves(cos *ClassOfServiceConfig, sched *CoSScheduler, shaped map[string]bool) bool {
 	if sched == nil {
 		return false
 	}
 	if sched.TransmitRateBytes > 0 {
 		return true
 	}
-	if sched.TransmitRatePercent > 0 || sched.TransmitRateRemainder {
+	if sched.TransmitRatePercent > 0 {
 		return shaped[sched.Name]
 	}
+	if sched.TransmitRateRemainder {
+		// A shaping base is NECESSARY for `remainder` but not sufficient: the
+		// leftover can be nothing. `percent 60` + `percent 40` + `remainder` is
+		// an ordinary Junos shape and leaves exactly zero, and the dataplane
+		// declines a zero share rather than resolving to it (zero is its
+		// "unshaped" sentinel — see cos_remainder_rate_bytes).
+		//
+		// Answering "resolves" here for a zero leftover would suppress the
+		// commit advisory on a queue that is still inert at runtime: an
+		// operator told nothing about a knob that does nothing. That is the
+		// exact failure the narrowing was introduced to avoid, in the opposite
+		// direction.
+		return shaped[sched.Name] && cosRemainderLeftoverIsPositive(cos, sched.Name)
+	}
 	return false
+}
+
+// cosRemainderLeftoverIsPositive reports whether ANY interface binding gives
+// `sched` a non-zero remainder share (#6846).
+//
+// This is the control-plane mirror of `cos_remainder_rate_bytes` and must apply
+// the same rule: subtract the RESOLVED siblings (absolute, or percent against
+// this binding's shaping rate), count the remainder-marked queues, and floor the
+// split. It is ANY rather than ALL because a named scheduler can be bound to
+// several interfaces and only needs to do something somewhere for the advisory
+// to be wrong.
+//
+// The duplication is deliberate and bounded: the Go side decides whether an
+// operator is WARNED and the Rust side decides what the dataplane DOES, so they
+// must agree, and there is no shared representation between them to compute it
+// once. TestRemainderAdvisoryTracksTheLeftover6846 pins the agreement on the
+// case that distinguishes them — a zero leftover.
+func cosRemainderLeftoverIsPositive(cos *ClassOfServiceConfig, name string) bool {
+	if cos == nil {
+		return false
+	}
+	positive := false
+	forUnit := func(unit *CoSInterfaceUnit) {
+		if positive || unit == nil || unit.SchedulerMap == "" || unit.ShapingRateBytes == 0 {
+			return
+		}
+		sm := cos.SchedulerMaps[unit.SchedulerMap]
+		if sm == nil {
+			return
+		}
+		var claimed uint64
+		var remainderQueues uint64
+		bound := false
+		for _, entry := range sm.Entries {
+			if entry == nil || entry.Scheduler == "" {
+				continue
+			}
+			sib := cos.Schedulers[entry.Scheduler]
+			if sib == nil {
+				continue
+			}
+			if entry.Scheduler == name {
+				bound = true
+			}
+			switch {
+			case sib.TransmitRateBytes > 0:
+				claimed += sib.TransmitRateBytes
+			case sib.TransmitRatePercent > 0:
+				claimed += uint64(float64(unit.ShapingRateBytes) * sib.TransmitRatePercent / 100.0)
+			case sib.TransmitRateRemainder:
+				remainderQueues++
+			}
+		}
+		if !bound || remainderQueues == 0 || claimed >= unit.ShapingRateBytes {
+			return
+		}
+		if (unit.ShapingRateBytes-claimed)/remainderQueues > 0 {
+			positive = true
+		}
+	}
+	for _, iface := range cos.Interfaces {
+		if iface == nil {
+			continue
+		}
+		forUnit(iface.Level)
+		for _, unit := range iface.Units {
+			forUnit(unit)
+		}
+	}
+	return positive
 }

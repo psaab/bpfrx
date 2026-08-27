@@ -264,9 +264,15 @@ Rules, each of which is load-bearing:
   computed from; distributing the slack would make the result depend on which
   queues come first, reintroducing the map-order dependence the pre-pass
   exists to avoid.
-- **over-subscription resolves to zero** rather than failing to resolve.
-  Expressing it is legal, so it is not rejected — but a silently starved queue
-  looks configured, so `ValidateConfig` warns.
+- **a leftover of zero does NOT resolve.** Zero is the dataplane's sentinel
+  for "unshaped/full bucket" (`types/cos.rs`), so resolving to it would set
+  `guarantee_enabled` on a queue the token bucket then treats as uncapped —
+  promoting it into guarantee service rather than starving it. It does not take
+  over-subscription to get there: `percent 60` + `percent 40` + `remainder` is
+  an ordinary shape and leaves exactly nothing. So the form stays inert, the
+  queue keeps the historical no-guarantee fallback, and `ValidateConfig` warns
+  with wording that names WHICH of the two reasons applies — no shaping base, or
+  siblings already claiming the whole rate — because the fix differs.
 
 **Temporal resolution (#6846 — now ENFORCED).** `buffer-size temporal <us>`
 sizes the queue by drain time, so it converts against the queue's **resolved**
@@ -275,10 +281,10 @@ are set on one queue. That combination is **legal**: temporal is well defined
 once remainder resolves, and rejecting a combination the model supports would
 break valid Junos. Rounding and clamping mirror `buffer-size percent` exactly.
 
-**Still inert, and only here:** `transmit-rate remainder` on a scheduler with
-no shaping base — not bound via a scheduler-map to an interface with a root
-shaping-rate — and `buffer-size temporal` on a queue with no resolvable rate at
-all. There is no bandwidth to take a remainder *of*, and no drain speed to
+**Still inert, and only here:** `transmit-rate remainder` with no usable
+leftover — either no shaping base at all (not bound via a scheduler-map to an
+interface with a root shaping-rate) or siblings already claiming the whole rate
+— and `buffer-size temporal` on a queue with no resolvable rate. There is no bandwidth to take a remainder *of*, and no drain speed to
 convert a microsecond target against; no port speed is available to substitute
 either, because `InterfaceSnapshot` carries no link-speed field and a zero
 shaping rate is already treated as "no usable CoS state". Both advisories
