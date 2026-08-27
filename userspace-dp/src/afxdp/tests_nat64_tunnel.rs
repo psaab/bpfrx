@@ -2534,18 +2534,59 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
 /// is not.
 #[test]
 fn nat64_flowless_fragment_uses_the_ingress_family_output_filter_6836() {
-    // `want` is the flowless packet's expected event count for each filter
-    // family attached to the SAME v4 egress interface.
+    // Each arm attaches filters to the SAME v4 egress interface and states the
+    // expected event count for BOTH packets: the flow-bearing first fragment
+    // (which has an egress flow_key, so it selects the v4 egress family) and
+    // the flowless non-first fragment (which has none, so it falls back to the
+    // INGRESS meta family, v6).
+    //
+    // Arm 3 is the one that binds the property in this test's name, and arms 1
+    // and 2 cannot do it on their own. Arm 2's zero is ALSO explained by "no v6
+    // filter is configured on the box at all": with no v6 filter the per-family
+    // short-circuit in resolve_cos_tx_selection_at returns before any lookup, so
+    // that zero holds whichever family the flowless path selects. Measured:
+    // inverting the fallback to use the egress family instead of the ingress
+    // meta left BOTH of the original arms green.
+    //
+    // Arm 3 removes that escape. Both families have a filter, so neither
+    // aggregate short-circuits, and only the V6 one logs. The expected pair is
+    // then first=0 / flowless=1, which is producible ONLY if the two packets
+    // select DIFFERENT families -- exactly the asymmetry under test.
     for tc in [
-        ("v6 filter on the egress: the flowless arm finds it", true, 1u64),
-        ("v4 filter only: the flowless arm looks up v6 and finds nothing", false, 0u64),
+        (
+            "both families log: the flowless arm finds the v6 filter",
+            true,
+            true,
+            1u64,
+            1u64,
+        ),
+        (
+            "v4 filter only: the flowless arm looks up v6 and finds nothing",
+            false,
+            true,
+            1u64,
+            0u64,
+        ),
+        (
+            "ONLY the v6 filter logs: the selected FAMILY is the sole difference",
+            true,
+            false,
+            0u64,
+            1u64,
+        ),
     ] {
-        let (name, attach_v6, want) = tc;
-        t_run_6836(name, attach_v6, want);
+        let (name, attach_v6, v4_logs, want_first, want_flowless) = tc;
+        t_run_6836(name, attach_v6, v4_logs, want_first, want_flowless);
     }
 }
 
-fn t_run_6836(name: &str, attach_v6: bool, want_flowless_events: u64) {
+fn t_run_6836(
+    name: &str,
+    attach_v6: bool,
+    v4_logs: bool,
+    want_first_events: u64,
+    want_flowless_events: u64,
+) {
     let mut snapshot = nat64_frag_snapshot();
 
     let egress = snapshot
@@ -2558,19 +2599,23 @@ fn t_run_6836(name: &str, attach_v6: bool, want_flowless_events: u64) {
         egress.filter_output_v6 = "nat64-egress-v6".to_string();
     }
 
-    let log_term = |n: &str| crate::protocol::FirewallFilterSnapshot {
+    // A filter that is PRESENT but does not log is the whole point of arm 3:
+    // presence keeps the per-family aggregate enabled (so no short-circuit),
+    // while `log: false` means an event can only have come from the other
+    // family.
+    let term = |n: &str, logs: bool| crate::protocol::FirewallFilterSnapshot {
         name: n.to_string(),
         family: if n.ends_with("v6") { "inet6" } else { "inet" }.to_string(),
         terms: vec![crate::protocol::FirewallTermSnapshot {
             name: "log-all".to_string(),
             action: "accept".to_string(),
-            log: true,
+            log: logs,
             ..Default::default()
         }],
     };
-    snapshot.filters = vec![log_term("nat64-egress-v4")];
+    snapshot.filters = vec![term("nat64-egress-v4", v4_logs)];
     if attach_v6 {
-        snapshot.filters.push(log_term("nat64-egress-v6"));
+        snapshot.filters.push(term("nat64-egress-v6", true));
     }
 
     let forwarding = build_forwarding_state(&snapshot);
@@ -2613,15 +2658,21 @@ fn t_run_6836(name: &str, attach_v6: bool, want_flowless_events: u64) {
          IPv6, never reach the v4 egress filter, and still satisfy every other \
          assertion here"
     );
-    // CONTROL: the flow-bearing fragment is evaluated against the V4 filter,
-    // which is present in both cases. Without this, the flowless count below
-    // is explained equally well by nothing being wired at all.
+    // The flow-bearing fragment HAS an egress flow_key, so it selects the v4
+    // egress family and is evaluated against the v4 filter. In arms 1 and 2
+    // that filter logs, so this is 1 and serves as the liveness control -- if
+    // it were 0 the fixture would log nothing anywhere and the flowless
+    // assertion below would prove nothing.
+    //
+    // In arm 3 the v4 filter deliberately does NOT log, so this is 0 -- and
+    // that zero is half the discriminator rather than a missing control: paired
+    // with a flowless count of 1, it says the two packets resolved to DIFFERENT
+    // families. Liveness for arm 3 comes from the flowless assertion being 1.
     assert_eq!(
         first_handle.dataplane_event_stats().filter_log.sent,
-        1,
-        "{name} CONTROL: the flow-bearing first fragment must be logged by the v4 \
-         egress filter. If this is 0 the fixture logs nothing and the flowless \
-         assertion proves nothing"
+        want_first_events,
+        "{name}: the flow-bearing first fragment is evaluated against the EGRESS \
+         (v4) family because it has a flow_key. Expected {want_first_events} event(s)."
     );
 
     let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
