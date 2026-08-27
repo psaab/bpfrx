@@ -188,6 +188,16 @@ func TestIncomingProcessDeclinesRatherThanBlocking6826(t *testing.T) {
 		t.Fatalf("hold LOCK_EX: %v", err)
 	}
 
+	// RELEASE THE LOCK LATE, well after the acquire budget. Without this a
+	// BLOCKING implementation never returns and the cell fails by HANGING —
+	// which is a red, but a red with no assertion and no diagnostic. Releasing
+	// late means a blocking implementation completes too, just slowly, so the
+	// elapsed-time assertion below is what fires and it names the defect.
+	go func() {
+		time.Sleep(bootEpochLockAcquireBudget * 2)
+		_ = unix.Flock(int(held.Fd()), unix.LOCK_UN)
+	}()
+
 	ran := false
 	start := time.Now()
 	withEpochFileLock(path, func() { ran = true })
@@ -197,9 +207,10 @@ func TestIncomingProcessDeclinesRatherThanBlocking6826(t *testing.T) {
 		t.Fatal("#6826: the callback RAN while another description held LOCK_EX — " +
 			"withEpochFileLock must not proceed without the lock")
 	}
-	// Generous ceiling: the point is that it gave up on its own rather than
-	// waiting for a release that never came in this test.
-	if elapsed > bootEpochLockAcquireBudget*3 {
+	// Ceiling sits BELOW the late release above, so a blocking acquisition —
+	// which would succeed at 2x the budget — fails here on time rather than on
+	// having run the callback.
+	if elapsed > bootEpochLockAcquireBudget+bootEpochLockAcquireBudget/2 {
 		t.Errorf("#6826: waited %v for a contended lock, budget is %v — an incoming "+
 			"process must decline rather than park behind an outgoing one's worker",
 			elapsed, bootEpochLockAcquireBudget)
@@ -210,7 +221,44 @@ func TestIncomingProcessDeclinesRatherThanBlocking6826(t *testing.T) {
 			"bounded wait must actually retry, or a lock released microseconds later "+
 			"is needlessly declined", elapsed, bootEpochLockRetryInterval)
 	}
-	_ = unix.Flock(int(held.Fd()), unix.LOCK_UN)
+}
+
+// TestNonContentionErrnoDeclinesImmediately6826 pins the OTHER half of the
+// retry rule: EWOULDBLOCK is contention and is retried, every other errno is a
+// real failure and returns at once.
+//
+// Without this cell, "retry every errno until the budget expires" passes the
+// whole suite — measured, it did. That turns a fast, correct decline into a
+// three-second one on a store that will never grant the lock, on the shutdown
+// and startup paths where the delay is most visible.
+func TestNonContentionErrnoDeclinesImmediately6826(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "epoch")
+
+	var calls int64
+	orig := epochFlock
+	epochFlock = func(int, int) error {
+		atomic.AddInt64(&calls, 1)
+		return unix.ENOLCK
+	}
+	t.Cleanup(func() { epochFlock = orig })
+
+	ran := false
+	start := time.Now()
+	withEpochFileLock(path, func() { ran = true })
+	elapsed := time.Since(start)
+
+	if ran {
+		t.Fatal("the callback must not run when the lock could not be taken")
+	}
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Errorf("ENOLCK was attempted %d times; a non-contention errno must NOT be "+
+			"retried — the lock is not going to become available and the caller pays "+
+			"the whole budget for nothing", n)
+	}
+	if elapsed >= bootEpochLockAcquireBudget {
+		t.Errorf("declining on ENOLCK took %v, at or beyond the %v contention budget — "+
+			"a real failure must be immediate", elapsed, bootEpochLockAcquireBudget)
+	}
 }
 
 // TestContendedEpochLockAcquireIsRaceFree6826 is the -race probe, shaped so it
