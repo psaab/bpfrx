@@ -106720,3 +106720,14 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6868 review round — fixed a FIFTH bare-leaf site at compiler_application_chained_leaves_6524_test.go:295 (found by review, in a file this change already edited) and corrected the recorded reason for excluding the 3348 icmp guards.
   - **File(s)**: pkg/config/compiler_application_chained_leaves_6524_test.go, pkg/config/compiler_application_junos_ping_3348_test.go
+- **Timestamp**: 2026-08-26
+  - **Action**: #6872 — replace four function-local `static GUARD`s with one
+    shared module-scope guard; scan for the regression
+  - **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+    userspace-dp/src/afxdp/ha_tests.rs,
+    userspace-dp/src/afxdp/session_glue/tests.rs,
+    userspace-dp/src/afxdp/tests_decap_dnat_table.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6872 review round 2 — corrected the guard's scope claim (the writers are production functions and cannot be locked), made the local-lock predicate name-agnostic and fn-scoped, excluded string literals so the anti-vacuity floor stops counting the scanner's own source, and bound the sensitivity control to the scan's real predicates instead of copies.
+  - **File(s)**: userspace-dp/src/afxdp/checksum.rs
