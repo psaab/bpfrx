@@ -324,6 +324,10 @@ DEPLOY_REASSERT_VERIFY_DELAY="${DEPLOY_REASSERT_VERIFY_DELAY:-2}"
 # instead of handing the next smoke an inverted cluster.
 deploy_reassert_primary_node0() {
 	local rinst="$1"
+	# #7688: the PEER instance. ManualFailover is LOCAL, UNSYNCED node state --
+	# there is no `manual` field in the proto and none in the heartbeat sync --
+	# so a pin left on the peer cannot be observed or cleared from node0.
+	local pinst="${2:-}"
 	local status rgs rg try
 
 	status=""
@@ -340,6 +344,19 @@ deploy_reassert_primary_node0() {
 
 	while read -r rg; do
 		[[ -n "$rg" ]] || continue
+		# Clear the PEER's manual pin FIRST. A pinned peer cannot participate
+		# in the election this transfer depends on -- test-failover.sh says it
+		# outright: "ManualFailover blocks election even when the peer is
+		# lost." Because the flag is local and unsynced, resetting it on node0
+		# (below) does nothing for a pin left on node1 by an earlier smoke:
+		# every HA smoke resets BOTH nodes as a preamble but none as a
+		# teardown, so the cluster is routinely left pinned on exit. The next
+		# deploy is then what fails, and it fails as "node0 is not primary for
+		# every redundancy group" -- indistinguishable from an HA regression in
+		# whatever branch happened to deploy next (#7688).
+		if [[ -n "$pinst" ]]; then
+			incus exec "$pinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
+		fi
 		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
 		incus exec "$rinst" -- cli -c "request chassis cluster failover redundancy-group $rg node 0" >/dev/null 2>&1 || true
 		incus exec "$rinst" -- cli -c "request chassis cluster failover reset redundancy-group $rg" >/dev/null 2>&1 || true
