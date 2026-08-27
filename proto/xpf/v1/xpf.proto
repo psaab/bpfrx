@@ -213,6 +213,34 @@ message GetZonesRequest {}
 message GetZonesResponse {
   repeated ZoneInfo zones = 1;
 }
+// ZoneCounterAvailability reports whether the server had a per-zone traffic
+// reading for a zone, so a client can tell a real counter from the absence of
+// one (#6895).
+//
+// UNKNOWN IS 0 ON PURPOSE, and it is the whole point of this being an enum
+// rather than a bool. proto3 has no field presence for scalars: a `bool
+// per_zone_counters_available` sent by an OLD server decodes to `false` on a new
+// client, which is indistinguishable from the server saying "unavailable" — so
+// every zone from an old server, including ones with real counters, would render
+// as unavailable. The inverted spelling has the mirror-image defect: absent
+// decodes to "available" and an unpopulated zone renders as a real 0.
+//
+// With UNKNOWN = 0 the skewed pair is honest by construction: a new client
+// talking to an old server sees UNKNOWN and renders exactly as it did before
+// #6895, introducing no new wrong answer in either direction.
+enum ZoneCounterAvailability {
+  // The server did not say. An old server omits the field entirely and it
+  // decodes here. Clients MUST fall back to their pre-#6895 rendering.
+  ZONE_COUNTER_AVAILABILITY_UNKNOWN = 0;
+  // The server read live per-zone volume; the counter fields are real.
+  ZONE_COUNTER_AVAILABILITY_AVAILABLE = 1;
+  // The dataplane published no per-zone volume for this zone, so the counter
+  // fields are meaningless zeros. Note this does NOT isolate an idle zone: the
+  // helper's status snapshot omits all-zero rows, so a pre-#3651 helper, a zone
+  // past hot-path slot capacity, and a merely idle zone all land here.
+  ZONE_COUNTER_AVAILABILITY_UNAVAILABLE = 2;
+}
+
 message ZoneInfo {
   string name = 1;
   uint32 id = 2;
@@ -263,6 +291,13 @@ message ZoneInfo {
   // silent bypass. Sorted, deduplicated; empty for a zone with no lifeline
   // member. VISIBILITY only — the exemption semantics are unchanged.
   repeated string lifeline_interfaces = 16;
+  // per_zone_counter_availability (#6895) tells the client whether the four
+  // counter fields above are a real reading or the absence of one. Before it,
+  // the remote cli omitted the traffic section whenever both packet counts were
+  // zero, so a zone whose counters are unavailable rendered identically to an
+  // idle one — silence that reads as "no traffic", which is a wrong answer
+  // rather than a missing one.
+  ZoneCounterAvailability per_zone_counter_availability = 17;
 }
 
 // InterfaceHostInbound (#3328, #3362) is a per-interface host-inbound-traffic
