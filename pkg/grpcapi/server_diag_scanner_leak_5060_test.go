@@ -114,9 +114,31 @@ func TestDiagFieldLengthRejected(t *testing.T) {
 		{"source", &pb.PingRequest{Target: legit, Source: oversized}},
 		{"routing-instance", &pb.PingRequest{Target: legit, RoutingInstance: oversized}},
 	}
+	// #6904: the nil stream is safe only WHILE the bound rejects before the
+	// stream is touched. Remove the check — the revert this test exists to
+	// catch — and the call proceeds into streamDiag, dereferences nil, and
+	// kills the package binary, so the revert reads as a mass crash instead of
+	// a named failure and the collected count collapses. Recovering keeps the
+	// signal NAMED; a panic here means the bound did not reject, which is the
+	// failure this test reports either way.
+	callRejects := func(t *testing.T, call func() error) error {
+		t.Helper()
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = status.Errorf(codes.Unknown,
+						"validation did not reject: reached the stream and panicked (%v)", r)
+				}
+			}()
+			err = call()
+		}()
+		return err
+	}
+
 	for _, c := range pingCases {
 		t.Run("ping/"+c.name, func(t *testing.T) {
-			err := s.Ping(c.req, nil)
+			err := callRejects(t, func() error { return s.Ping(c.req, nil) })
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("Ping oversized %s = %v, want InvalidArgument", c.name, err)
 			}
@@ -133,7 +155,7 @@ func TestDiagFieldLengthRejected(t *testing.T) {
 	}
 	for _, c := range traceCases {
 		t.Run("traceroute/"+c.name, func(t *testing.T) {
-			err := s.Traceroute(c.req, nil)
+			err := callRejects(t, func() error { return s.Traceroute(c.req, nil) })
 			if status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("Traceroute oversized %s = %v, want InvalidArgument", c.name, err)
 			}
