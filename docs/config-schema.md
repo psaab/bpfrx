@@ -1543,6 +1543,61 @@ are UNRULED, not clean — each is a site whose synthesized fixture was too thin
 to see the value (as #6821 was until a required-sibling `host` line was added),
 so the census is a floor.
 
+### The census measures ONE packing depth (#7653)
+
+Junos compaction is **recursive**, and the `#2419` census is not:
+
+```
+authentication simple-password "x"     2 tokens packed   <- measured
+authentication md5 7 key "x"           3 tokens packed   <- was NOT measured
+```
+
+`compact_block_equivalence_2419_test.go` collapses exactly one container onto
+the leaf line. A compiler that reads `prop.Children` correctly at one level can
+still drop the body at two, so its divergent figure is a floor in a second
+dimension nobody had stated.
+
+`pkg/config/compact_depth_census_7653_test.go` extends the SAME walker —
+`collectCompactSites`, `synthPair`, `contextFor`, `nest`, `compileText`,
+`cfgEqual` — across depths, so the two censuses cannot drift into disagreeing
+about what a site is. Depth 1 is by construction the base census's spelling, and
+a cross-check asserts the two report the same divergent count there; without it,
+each would report its own number and neither would be checked against the other.
+
+**Measured, and the shape is the finding — divergence gets WORSE with depth:**
+
+| depth | population | divergent | rate |
+|---|---|---|---|
+| 2 | 546 | 354 | 65% |
+| 3 | 539 | 467 | **87%** |
+| 4 | 442 | 428 | **97%** |
+| 5 | 301 | 297 | 99% |
+| 6–8 | 255 | 247 | 97% |
+
+**≥1793 divergent cells over ≥527 distinct sites.** The base census's 354 is
+therefore the population at the *most favourable* depth: roughly 173 further
+sites compile the single-level spelling correctly and drop the body at two.
+
+Read the rows as separate populations, not one shrinking cohort — a site too
+shallow to have a depth-5 spelling is **absent** from that row rather than
+passing it.
+
+**Only 2 cells in the entire sweep are REJECTED**, and rejected cells are
+excluded from the divergent count deliberately: a spelling the config system
+already refuses is not a silent divergence. This class is *accepted and
+dropped*, and the near-zero rejection count is the measurement that says so.
+
+Two assertions in that file are load-bearing beyond the report:
+
+- **Anti-vacuity on depth 3.** Existence of depth-3 cells is not evidence they
+  PACK — a generator emitting the block spelling at every depth would report a
+  full population, call every cell equivalent, and pass. A zero divergent count
+  there has two very different causes (the class was fixed, or the generator
+  stopped packing) and the failure says to determine which.
+- **The rate must not fall between depth 2 and 3.** Every measurement says
+  deeper packing is dropped more often; an inversion means the generator or the
+  population changed shape and the headline needs re-deriving.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,

@@ -107027,3 +107027,19 @@ prose edit above them added. No diff falls in the new test body.
   naturally in 80 attempts including 2x CPU oversubscription. The change is
   therefore a determinism + diagnosis improvement, not a proven fix.
 - **File(s)**: `pkg/api/listener_retiredauth_5561_test.go`, `_Log.md`
+
+## 2026-08-27 — #7653: measure the #2419 class across PACKING DEPTH
+
+- **Timestamp**: 2026-08-27
+- **Action**: The #2419 census collapses exactly one container onto the leaf
+  line, so its 354-divergent figure was a floor in an unstated second dimension:
+  Junos compaction is recursive. Extended the SAME walker across depths.
+  Measured: divergence RATE rises with depth — 65% at depth 2, 87% at 3, 97% at
+  4, ~99% at 5+ — for >= 1793 divergent cells over >= 527 distinct sites, versus
+  the base census's 354. Only 2 cells in the whole sweep are REJECTED, which is
+  the measurement that this class is "accepted and dropped" rather than refused;
+  rejected cells are excluded from the divergent count per the #7653 policy call.
+  A depth-1 cross-check asserts the extension agrees with the base census cell
+  for cell, plus anti-vacuity on depth 3 and a rate-inversion guard.
+- **File(s)**: `pkg/config/compact_depth_census_7653_test.go`,
+  `docs/config-schema.md`, `_Log.md`
