@@ -4,6 +4,7 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // heartbeat_peer_pin_6888_test.go — #6888.
@@ -196,5 +197,141 @@ func TestStartHeartbeatWiresThePeerIntoTheReceiver6888(t *testing.T) {
 	if r.srcIsConfiguredPeer(&net.UDPAddr{IP: net.ParseIP("127.0.0.9"), Port: 33333}) {
 		t.Fatal("the wired receiver accepts a foreign source — it holds an address but " +
 			"is not pinning on it")
+	}
+}
+
+// awaitForeignDropped6888 blocks until the receiver has counted at least n
+// pin rejections. A rendezvous on the receiver's own counter, mirroring
+// awaitReceived — not a sleep, so it is not a wall-clock timing assertion. The
+// deadline is a bound on waiting, not a claim about latency.
+func awaitForeignDropped6888(t *testing.T, r *heartbeatReceiver, n uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.foreignSrc.Load() >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("receiver counted %d pin rejections, want >= %d — the read loop is not "+
+		"consulting the peer pin (#6888)", r.foreignSrc.Load(), n)
+}
+
+// TestReadLoopConsultsThePeerPin6888 is the END-TO-END cell, and it exists
+// because the unit cells above did NOT catch the mutation that matters.
+//
+// Measured: disabling the pin at its call site in readLoop — leaving the
+// predicate, the counter, the constructor plumbing and the wiring cell all
+// intact — left the ENTIRE 954-test package green. Every other cell in this
+// file tests `srcIsConfiguredPeer` and `noteForeignSource` as pure functions,
+// and the wiring cell proves the receiver HOLDS the address. None of them
+// proves the read loop ever ASKS.
+//
+// So this drives a real datagram from a real socket into a real started
+// receiver, over loopback, with the sender's source address deliberately
+// different from the configured peer. 127.0.0.0/8 is entirely local, so
+// "foreign" here is a genuinely different source IP and not a synthesised one.
+func TestReadLoopConsultsThePeerPin6888(t *testing.T) {
+	recvConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("receiver socket: %v", err)
+	}
+	sendConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		recvConn.Close()
+		t.Fatalf("sender socket: %v", err)
+	}
+	t.Cleanup(func() { sendConn.Close() })
+
+	// Pin the receiver to an address the sender is NOT bound to. The sender
+	// sources from 127.0.0.1; the configured peer is 127.0.0.9.
+	recvMgr := epochGateManagerWithKey(epochTestPSK)
+	recvMgr.nodeID = 1
+	r := newHeartbeatReceiver(recvMgr, recvConn, DefaultHeartbeatThreshold,
+		DefaultHeartbeatInterval, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 9), Port: 4784})
+	recvMgr.mu.Lock()
+	recvMgr.hbReceiver = r
+	recvMgr.mu.Unlock()
+	r.start()
+	t.Cleanup(r.stop)
+
+	target := recvConn.LocalAddr().(*net.UDPAddr)
+	// The payload does not need to be a valid heartbeat: the pin is consulted
+	// BEFORE unmarshal, which is the whole point of where it sits. Using a
+	// deliberately invalid frame also proves the drop happened before parsing —
+	// a valid frame would leave "dropped by the pin" and "dropped by unmarshal"
+	// indistinguishable.
+	for i := 0; i < 5; i++ {
+		if _, err := sendConn.WriteToUDP([]byte("not-a-heartbeat"), target); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	awaitForeignDropped6888(t, r, 1)
+
+	// And it must have been dropped BEFORE the parse: recvErrors counts
+	// unmarshal failures, so a nonzero value here would mean the frame reached
+	// UnmarshalHeartbeat and the pin is sitting too late to save the work it
+	// exists to save.
+	if got := r.recvErrors.Load(); got != 0 {
+		t.Fatalf("recvErrors = %d: the foreign datagram reached UnmarshalHeartbeat, so "+
+			"the pin is not at the cheapest point (#6888)", got)
+	}
+	if got := r.received.Load(); got != 0 {
+		t.Fatalf("received = %d: a foreign datagram was processed as a heartbeat", got)
+	}
+}
+
+// TestReadLoopAdmitsThePinnedPeerEndToEnd6888 is the PAIRED control for the
+// cell above. Without it, "count a rejection" is satisfied by a read loop that
+// rejects EVERYTHING — which would pass the test above and take the cluster
+// down.
+//
+// Same shape, one difference: the receiver is pinned to the address the sender
+// actually sources from, so the datagram must get past the pin and be counted
+// as a parse failure instead (it is still not a valid heartbeat).
+func TestReadLoopAdmitsThePinnedPeerEndToEnd6888(t *testing.T) {
+	recvConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("receiver socket: %v", err)
+	}
+	sendConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		recvConn.Close()
+		t.Fatalf("sender socket: %v", err)
+	}
+	t.Cleanup(func() { sendConn.Close() })
+
+	recvMgr := epochGateManagerWithKey(epochTestPSK)
+	recvMgr.nodeID = 1
+	// Pinned to the sender's actual source address, with a DIFFERENT port —
+	// the ephemeral-source-port case that is how every real heartbeat arrives.
+	r := newHeartbeatReceiver(recvMgr, recvConn, DefaultHeartbeatThreshold,
+		DefaultHeartbeatInterval, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4784})
+	recvMgr.mu.Lock()
+	recvMgr.hbReceiver = r
+	recvMgr.mu.Unlock()
+	r.start()
+	t.Cleanup(r.stop)
+
+	target := recvConn.LocalAddr().(*net.UDPAddr)
+	for i := 0; i < 5; i++ {
+		if _, err := sendConn.WriteToUDP([]byte("not-a-heartbeat"), target); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	// It gets PAST the pin, so it reaches the parser and is counted there.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && r.recvErrors.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := r.recvErrors.Load(); got == 0 {
+		t.Fatal("a datagram from the CONFIGURED peer never reached the parser — the pin " +
+			"is rejecting its own peer, which is a comms outage (#6888)")
+	}
+	if got := r.foreignSrc.Load(); got != 0 {
+		t.Fatalf("foreignSrc = %d for datagrams from the configured peer — the pin is "+
+			"rejecting legitimate traffic (#6888)", got)
 	}
 }
