@@ -205,7 +205,7 @@ optionally followed by `exact`:
 - **`percent <n>`** — `transmit-rate percent 30` (a share of the bound
   interface's rate); and
 - **`remainder`** — `transmit-rate remainder` (a share of the leftover
-  bandwidth).
+  bandwidth, resolved in #6846 — see below).
 
 `shaping-rate` (traffic-control-profiles) accepts an absolute bandwidth or
 `shaping-rate percent <n>`. These forms are accepted so imported vSRX
@@ -239,10 +239,91 @@ resolution exactly (same `ceil` rounding, same clamp to `[1, MaxUint64]`):
   percent cannot resolve and the unit is left unshaped; a per-binding
   `ValidateConfig` advisory names the interface and the fix.
 
-**Still inert:** `transmit-rate remainder` (leftover-bandwidth resolution is
-a follow-up) — a `ValidateConfig` advisory surfaces it. The commit gate still
-rejects garbage (`transmit-rate percent 150`, `transmit-rate asd`) and a
-both-forms-set config (an absolute rate AND a percent).
+**Remainder resolution (#6846 — now ENFORCED).** `transmit-rate remainder`
+resolves in the same Rust builder, but it cannot use the per-scheduler path
+above: it means *"whatever the interface's shaping rate has left after every
+sibling queue on the scheduler-map has resolved"*, so it is a function of the
+SIBLING SET rather than of the scheduler. `cos_remainder_rate_bytes` therefore
+runs as a **pre-pass, once per interface, before any queue is materialized** —
+computing it inside the materialization loop would give each remainder queue a
+different *partial* sibling set depending on map iteration order.
+
+Rules, each of which is load-bearing:
+
+- the sibling sum counts **resolved** siblings only. A sibling that is itself
+  `remainder` contributes **zero** (it claims the leftover, not a share of it);
+  a sibling with no rate contributes zero (no guarantee to subtract). A
+  scheduler carrying *both* an absolute rate and `remainder` — reachable only
+  on the lenient load / peer-sync path, since the strict gate rejects it —
+  resolves via the absolute rate and is **not** counted as a remainder queue,
+  so the pre-pass and the main path agree about which queues those are.
+- a **percent** sibling is counted at the value the dataplane gives it, which
+  means **ceiled**, clamped to at least 1, and zero outside `(0,100]`. The
+  control-plane advisory computes the same leftover independently — there is no
+  shared representation between Go and Rust — so the rounding rule is part of
+  the contract, not an implementation detail. Truncating on one side makes its
+  leftover larger and suppresses the advisory on a shape the dataplane declines:
+  `percent 33.3333333` + `percent 66.6666667` on a 1 Gbps shape is 124_999_999
+  truncated against 125_000_001 ceiled, over a 125_000_000 base.
+- the leftover **splits equally, flooring**, across remainder-marked queues.
+  An indivisible leftover loses up to `count − 1` bytes/sec, which is noise
+  against any shaping rate a remainder is meaningful on. A leftover *smaller*
+  than the queue count floors to nothing, which is the zero case below rather
+  than a rate. Ceiling would make
+  the remainder queues jointly claim *more* than the leftover they were
+  computed from; distributing the slack would make the result depend on which
+  queues come first, reintroducing the map-order dependence the pre-pass
+  exists to avoid.
+- **a leftover of zero does NOT resolve.** Zero is the dataplane's sentinel
+  for "unshaped/full bucket" (`types/cos.rs`), so resolving to it would set
+  `guarantee_enabled` on a queue the token bucket then treats as uncapped —
+  promoting it into guarantee service rather than starving it. It does not take
+  over-subscription to get there: `percent 60` + `percent 40` + `remainder` is
+  an ordinary shape and leaves exactly nothing, and so does any leftover that
+  floors to nothing. So the form stays inert, the queue keeps the historical
+  no-guarantee fallback, and `ValidateConfig` warns with wording that names
+  WHICH of the two reasons applies — no shaping base, or siblings leaving no
+  usable leftover — because the fix differs.
+
+**Temporal resolution (#6846 — now ENFORCED).** `buffer-size temporal <us>`
+sizes the queue by drain time, so it converts against the queue's **drain
+rate** — strictly after the rate, including after `remainder` when both are set
+on one queue. That combination is **legal**: temporal is well defined once
+remainder resolves, and rejecting a combination the model supports would break
+valid Junos. Rounding and clamping mirror `buffer-size percent` exactly.
+
+The drain rate is not the same thing as a *resolved* transmit-rate, and the
+difference matters for the advisory. A queue with no guarantee of its own keeps
+the historical fallback — the interface shaping-rate — so it still drains, and
+a microsecond target against it still has a byte value. `buffer-size temporal`
+therefore goes inert only where that fallback is itself zero: no absolute rate
+on the scheduler **and** no scheduler-map binding to an interface with a root
+shaping-rate. An unresolved `percent` or an unresolved `remainder` does **not**
+make temporal inert.
+
+**Still inert, and only here:**
+
+- `transmit-rate remainder` with no usable leftover — either no shaping base at
+  all (not bound via a scheduler-map to an interface with a root shaping-rate)
+  or siblings leaving nothing after the floor. There is no bandwidth to take a
+  remainder *of*, and no port speed is available to substitute: `InterfaceSnapshot`
+  carries no link-speed field, and a zero shaping rate is already treated as
+  "no usable CoS state".
+- `buffer-size temporal` on a queue whose effective rate is **zero** — no
+  absolute rate and no shaped binding. There is no drain speed to convert a
+  microsecond target against.
+
+Both advisories narrowed to exactly these cases in #6846 — an advisory that
+keeps firing for configurations that now work teaches the operator to ignore
+it. The narrowing is measured, not asserted:
+`build_cos_state_temporal_converts_against_the_fallback_drain_rate` pins the
+runtime fact the temporal advisory depends on, and
+`TestRemainderAdvisoryTracksTheLeftover6846` pins the remainder one against the
+Rust resolver cells it mirrors.
+
+The commit gate still rejects garbage (`transmit-rate percent 150`,
+`transmit-rate asd`) and a both-forms-set config (an absolute rate AND a
+percent).
 
 ### First-Pass Fairness Boundary
 

@@ -310,6 +310,7 @@ fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
             CoSSchedulerSnapshot {
                 name: "ef-sched".into(),
@@ -323,6 +324,7 @@ fn txn_flow_cache_hit_reclassifies_ba_dscp_per_packet_3778() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
         ],
         scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -629,6 +631,7 @@ fn txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
             CoSSchedulerSnapshot {
                 name: "ef-sched".into(),
@@ -642,6 +645,7 @@ fn txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             },
         ],
         scheduler_maps: vec![CoSSchedulerMapSnapshot {

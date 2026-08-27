@@ -466,6 +466,7 @@
   "cos_scheduler_snapshot": {
     "buffer_size_bytes": 0,
     "buffer_size_percent": 0.0,
+    "buffer_size_temporal_us": 0,
     "codel_target_ns": 0,
     "equal_flow_enforcement": false,
     "name": "",
@@ -473,7 +474,8 @@
     "surplus_sharing": false,
     "transmit_rate_bytes": 0,
     "transmit_rate_exact": false,
-    "transmit_rate_percent": 0.0
+    "transmit_rate_percent": 0.0,
+    "transmit_rate_remainder": false
   },
   "destination_nat_rule_snapshot": {
     "counter_id": 0,

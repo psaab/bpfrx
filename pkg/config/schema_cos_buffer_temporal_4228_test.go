@@ -35,20 +35,121 @@ func TestCoSBufferSizeTemporal_AcceptsAndCompiles(t *testing.T) {
 	}
 }
 
-func TestCoSBufferSizeTemporal_EmitsInertAdvisory(t *testing.T) {
-	cfg := mustCompileSet4228(t,
-		"set class-of-service schedulers be buffer-size temporal 50000",
-	)
-	warnings := config.ValidateConfig(cfg)
-	found := false
-	for _, w := range warnings {
-		if strings.Contains(w, "buffer-size temporal") && strings.Contains(w, "inert") {
-			found = true
+// TestTemporalAdvisoryNarrowsToUnresolvable6846 replaces the #4228 blanket
+// inert-advisory assertion. #6846 makes `buffer-size temporal` RESOLVE against
+// the queue's transmit rate, so the advisory must narrow to the case that still
+// cannot: a queue with no resolvable rate has no drain speed.
+//
+// BOTH DIRECTIONS ARE ASSERTED, and the second is the one that matters. An
+// advisory that keeps firing for configurations that now work is as much a
+// defect as one that stops firing for configurations that do not — it teaches
+// the operator to ignore it. A cell that only checked "it still warns" would
+// pass against a change that never narrowed anything.
+func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
+	hasTemporalAdvisory := func(t *testing.T, lines ...string) bool {
+		t.Helper()
+		for _, w := range config.ValidateConfig(mustCompileSet4228(t, lines...)) {
+			if strings.Contains(w, "buffer-size temporal") {
+				return true
+			}
 		}
+		return false
 	}
-	if !found {
-		t.Fatalf("expected an accepted-but-inert advisory for buffer-size temporal, got: %v", warnings)
-	}
+
+	t.Run("no resolvable rate still warns", func(t *testing.T) {
+		// A bare scheduler: no absolute rate, and not bound via a
+		// scheduler-map to a shaped interface. Nothing to convert against.
+		if !hasTemporalAdvisory(t,
+			"set class-of-service schedulers be buffer-size temporal 50000",
+		) {
+			t.Fatal("a temporal target on a queue with no resolvable transmit-rate " +
+				"must still warn — there is no drain speed to convert it against")
+		}
+	})
+
+	t.Run("remainder with a shaping base resolves, so it must NOT warn", func(t *testing.T) {
+		// A `remainder` queue bound via a scheduler-map to a shaped interface
+		// HAS a resolvable rate, so temporal converts against it. Found by the
+		// mutation matrix: making cosSchedulerRateResolves ignore
+		// TransmitRateRemainder escaped GREEN against the whole Go suite,
+		// because every other fixture reaches a resolvable rate by the
+		// ABSOLUTE route and cannot tell the two apart.
+		if hasTemporalAdvisory(t,
+			"set class-of-service schedulers be transmit-rate remainder",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+			"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
+		) {
+			t.Fatal("#6846: a `remainder` queue with a shaping base resolves, so " +
+				"temporal converts against it and the advisory must not fire")
+		}
+	})
+
+	t.Run("remainder with a ZERO leftover: the RATE is inert, temporal is NOT", func(t *testing.T) {
+		// The subtest above binds a lone remainder queue to a 100m shape, so
+		// the leftover is the whole 100m — it varies the right axis and samples
+		// only the passing point.
+		//
+		// Here siblings claim the entire shaping-rate, so the leftover is zero
+		// and the dataplane declines the share. The `remainder` form IS inert
+		// and TestRemainderAdvisoryTracksTheLeftover6846 asserts the remainder
+		// advisory fires for exactly this shape.
+		//
+		// TEMPORAL is not. The queue keeps the no-guarantee fallback, which is
+		// the interface shaping-rate, so it still drains at 100m and the
+		// microsecond target still has a byte value. An earlier revision
+		// asserted a warning here on the reasoning that "the queue has no
+		// rate"; the queue has no GUARANTEE, which is a different thing, and
+		// build_cos_state_temporal_converts_against_the_fallback_drain_rate
+		// measures the difference.
+		if hasTemporalAdvisory(t,
+			"set class-of-service schedulers full transmit-rate percent 100",
+			"set class-of-service schedulers be transmit-rate remainder",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class assured-forwarding scheduler full",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+			"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
+		) {
+			t.Fatal("#6846: an unresolved `remainder` does not make TEMPORAL inert — " +
+				"the queue still drains at the interface shaping-rate, so the " +
+				"microsecond target still has a byte value. Warning here tells the " +
+				"operator a knob does nothing when it does")
+		}
+	})
+
+	t.Run("bound to an UNSHAPED interface still warns", func(t *testing.T) {
+		// The case that keeps the predicate honest. A scheduler-map binding is
+		// not enough on its own: with no root shaping-rate the queue's
+		// effective rate is zero, cos_temporal_buffer_bytes declines it, and
+		// the buffer really does fall back to default sizing.
+		//
+		// Without this row the predicate could be weakened all the way to "is
+		// it bound to anything" and every other row would still pass.
+		if !hasTemporalAdvisory(t,
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+		) {
+			t.Fatal("#6846: an interface with no root shaping-rate gives the queue an " +
+				"effective rate of zero, so temporal has nothing to convert against " +
+				"and the advisory must still fire")
+		}
+	})
+
+	t.Run("absolute rate resolves, so it must NOT warn", func(t *testing.T) {
+		// An explicit transmit-rate needs no shaping base, so temporal
+		// converts and the advisory must be gone.
+		if hasTemporalAdvisory(t,
+			"set class-of-service schedulers be transmit-rate 10m",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+		) {
+			t.Fatal("#6846: temporal RESOLVES against an explicit transmit-rate, so " +
+				"the advisory must not fire. An advisory that keeps firing for a " +
+				"configuration that now works teaches the operator to ignore it")
+		}
+	})
 }
 
 // The byte-size and percent forms must keep working after the tailValidator

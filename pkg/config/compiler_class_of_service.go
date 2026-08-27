@@ -1002,47 +1002,6 @@ func resolveCoSTrafficControlProfiles(cfg *Config) {
 	}
 }
 
-// cosSchedulersWithShapedBinding returns the set of scheduler names that are
-// bound — via a scheduler-map applied to an interface unit with a non-zero
-// root shaping-rate — to at least one shaped interface. A `transmit-rate
-// percent <n>` on such a scheduler RESOLVES: forwarding_build/cos.rs computes
-// the absolute byte/sec rate against the interface's shaping-rate. A scheduler
-// NOT in this set has no shaping base, so its percent stays inert; the
-// ValidateConfig advisory flags exactly that residual. Must run AFTER
-// resolveCoSTrafficControlProfiles so unit.ShapingRateBytes reflects a folded
-// traffic-control-profile shaping-rate (including a resolved shaping-rate
-// percent).
-func cosSchedulersWithShapedBinding(cos *ClassOfServiceConfig) map[string]bool {
-	resolved := make(map[string]bool)
-	if cos == nil {
-		return resolved
-	}
-	markUnit := func(unit *CoSInterfaceUnit) {
-		if unit == nil || unit.SchedulerMap == "" || unit.ShapingRateBytes == 0 {
-			return
-		}
-		sm := cos.SchedulerMaps[unit.SchedulerMap]
-		if sm == nil {
-			return
-		}
-		for _, entry := range sm.Entries {
-			if entry != nil && entry.Scheduler != "" {
-				resolved[entry.Scheduler] = true
-			}
-		}
-	}
-	for _, iface := range cos.Interfaces {
-		if iface == nil {
-			continue
-		}
-		markUnit(iface.Level)
-		for _, unit := range iface.Units {
-			markUnit(unit)
-		}
-	}
-	return resolved
-}
-
 // coSInterfaceLineRateBytes returns the configured line rate of a physical
 // interface in bytes/sec, or 0 when unknown. It is the base against which a
 // `shaping-rate percent <n>` traffic-control-profile resolves (Junos resolves
@@ -1075,6 +1034,20 @@ func coSInterfaceLineRateBytes(cfg *Config, ifaceName string) uint64 {
 // shaping-rate/transmit-rate percent rounds identically on the Go and Rust
 // sides. Returns 0 when the base is unknown (0) or the percent is out of
 // range; the caller then leaves the knob inert.
+//
+// THE ROUNDING IS PART OF THE CONTRACT, not an implementation detail, and this
+// is the package's ONE statement of it — every Go site that needs a CoS percent
+// resolves through here. #6846 F6 is why that is written as a rule: the
+// remainder advisory grew its own inline `uint64(float64(base) * pct / 100.0)`,
+// which TRUNCATES. Truncating makes the control plane's claim lower, its
+// leftover larger, so it answered "resolves" for a shape the dataplane rounds
+// away — silent at commit and inert at runtime, on a config that compiles.
+// `percent 33.3333333` + `percent 66.6666667` on a 1 Gbps shape reaches it:
+// 124_999_999 truncated against 125_000_001 ceiled, over a 125_000_000 base.
+//
+// A second Go implementation of this rule would always be a bug rather than a
+// legitimate divergence, so the answer is one function, not two bound by a
+// test.
 func resolveCoSPercentRateBytes(baseBytesPerSec uint64, percent float64) uint64 {
 	if baseBytesPerSec == 0 || math.IsNaN(percent) || math.IsInf(percent, 0) ||
 		percent <= 0 || percent > 100 {
