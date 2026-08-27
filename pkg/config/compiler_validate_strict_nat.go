@@ -3816,7 +3816,24 @@ type natAllocOwner struct {
 	// `nat64 rule-set "r1" (prefix 64:ff9b::/96) source-pool "wan"`.
 	desc string
 	// pool is the resolved source pool whose addresses this allocator draws from.
+	// nil for an owner that is not pool-backed (see members).
 	pool *NATPool
+	// members overrides pool expansion for an owner whose occupancy is a bare
+	// address set rather than a configured pool — today, interface-mode SNAT
+	// egress addresses (#6751 §5.7). Interface mode draws no pool: it translates
+	// onto the egress interface's own address, so the address IS the allocator's
+	// whole address space. When set, this is expanded instead of pool.
+	members []string
+}
+
+// expandedMembers returns the address texts this owner occupies. A pool-backed
+// owner expands its pool; an address-set owner (interface-mode egress) carries
+// its members directly.
+func (o natAllocOwner) expandedMembers() []string {
+	if len(o.members) > 0 {
+		return o.members
+	}
+	return poolMemberTexts(o.pool)
 }
 
 // natV4Interval / natV6Interval is one expanded pool member as an inclusive
@@ -3974,6 +3991,34 @@ func validateNATPoolExternalTupleOverlapStrict(cfg *Config, lenient bool) ([]str
 		})
 	}
 
+	// #6751 §5.7: interface-mode SNAT egress addresses are an occupancy domain
+	// too, and a DISJOINT one from the pool/NAT64 allocators. A source pool (or
+	// NAT64 pool) that contains an egress interface address reintroduces the
+	// very collision interface admission now forecloses — across the seam,
+	// where neither domain can see the other's reservations.
+	//
+	// DEDUPED BY ADDRESS, deliberately: a multi-rule same-WAN config (several
+	// interface-mode rule-sets all egressing the same interface) names one
+	// address many times, and one owner per RULE would make those rule-sets
+	// overlap each OTHER — a false reject of a correct config. The occupancy is
+	// a property of the ADDRESS, so the address is the owner identity.
+	// #6751 §5.7: a whole-address static mapping on an interface-SNAT egress
+	// address emits the same external tuple as interface SNAT itself. Reject at
+	// strict commit; the warn path emits the same finding for a tolerant load.
+	if !lenient {
+		if collisions := staticOnInterfaceEgressCollisions(cfg); len(collisions) > 0 {
+			return nil, fmt.Errorf("security nat: %s", collisions[0])
+		}
+	}
+
+	ifaceEgress := interfaceSNATEgressAddresses(cfg)
+	for _, host := range sortedAddrKeys(ifaceEgress) {
+		owners = append(owners, natAllocOwner{
+			desc:    ifaceEgress[host],
+			members: []string{host},
+		})
+	}
+
 	if len(owners) == 0 {
 		return nil, nil
 	}
@@ -3982,7 +4027,7 @@ func validateNATPoolExternalTupleOverlapStrict(cfg *Config, lenient bool) ([]str
 	var v4 []natV4Interval
 	var v6 []natV6Interval
 	for idx := range owners {
-		for _, m := range poolMemberTexts(owners[idx].pool) {
+		for _, m := range owners[idx].expandedMembers() {
 			n := parsePoolAddr(m)
 			if n == nil {
 				continue

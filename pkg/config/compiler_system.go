@@ -210,6 +210,16 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					case "class":
 						user.Class = nodeVal(prop)
 					case "authentication":
+						// Children-only is CORRECT here, unlike the sibling
+						// sites fixed for #6818/#6821/#6822. The compact
+						// spelling `authentication encrypted-password "$6$..."`
+						// is REJECTED at commit by the #6662 packed-login-body
+						// gate, which names the rewrite; on the tolerant load /
+						// peer-sync path it is a warning and the stanza stays
+						// inert, deliberately, so a peer-synced config behaves
+						// exactly as the older binary made it behave (#1960).
+						// Compiling the value here would silently reverse that
+						// decision and change RBAC on the HA sync path.
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
 							case "encrypted-password":
@@ -1787,6 +1797,46 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 			userChildren = child.Children[0].Children
 		}
 		for _, prop := range userChildren {
+			// #6822: the compact spelling
+			//   authentication-sha256 authentication-password "s3cret";
+			// flattens the credential onto this node's own Keys, where the
+			// FindChild reads below cannot see it. The result was NOT a skipped
+			// user -- the protocol comes from the case label, so the user was
+			// registered as requiring SHA-256 and AES-128 with EMPTY passwords.
+			//
+			// parseSNMPv3UserKeys already reads exactly this key shape for the
+			// flat-set path. Route the compact block form through the same
+			// function rather than duplicating its table: a second copy is a
+			// second thing to keep in step, and a divergence here is a silent
+			// credential loss either way.
+			//
+			// packedBodyChildren (compact_tail.go) is the general expander and
+			// is used for the #6818/#6821 siblings. It is the wrong tool HERE:
+			// the protocol is carried by the case LABEL rather than by a value,
+			// so the reader below needs the whole key run, not a rebuilt child
+			// tree -- and parseSNMPv3UserKeys already consumes exactly that run.
+			if len(prop.Keys) >= 3 {
+				// Route ONLY the exact credential shape, and do NOT skip the
+				// switch below.
+				//
+				// `len(Keys) >= 3` alone is not a discriminator: extra container
+				// keys survive schema walking, so
+				//   authentication-sha256 ignored ignored { authentication-password "good"; }
+				// matched it, parseSNMPv3UserKeys recognised SHA-256 but not
+				// `ignored`, left the password empty, and an unconditional
+				// `continue` then skipped the real password CHILD the switch
+				// would have compiled. That registers the user as requiring
+				// SHA-256 with an EMPTY credential -- which is the #6822 defect
+				// itself, reintroduced on a different shape.
+				//
+				// Falling through also fixes the precedence: a node can carry a
+				// packed tail AND a real child, and the child is the canonical
+				// block spelling, so it must win.
+				switch prop.Keys[1] {
+				case "authentication-password", "privacy-password":
+					parseSNMPv3UserKeys(prop.Keys, user)
+				}
+			}
 			switch prop.Name() {
 			case "authentication-md5":
 				user.AuthProtocol = "md5"

@@ -79,12 +79,13 @@ func newCredentialTailFixture6790(t *testing.T) *credentialTailFixture6790 {
 	if err := os.MkdirAll(sudoersDir, 0o755); err != nil {
 		t.Fatalf("seed sudoers dir: %v", err)
 	}
-	// applySSHConfig's own mkdir targets the hard-coded production
-	// /etc/ssh/sshd_config.d, so the relocated drop-in's parent must exist
-	// here or the WRITE fails and masks whatever the cell injected.
-	if err := os.MkdirAll(filepath.Dir(sshdConfPath), 0o755); err != nil {
-		t.Fatalf("seed sshd drop-in dir: %v", err)
-	}
+	// #7609 REMOVED the MkdirAll that used to sit here. applySSHConfig derives
+	// its drop-in directory from sshdConfPath now, so relocating that one var
+	// relocates the parent with it and the fixture no longer has to create it.
+	// This deletion IS #7609's regression signal: if the parent stops being
+	// derived, the write fails with ENOENT and the healthy-control cell below
+	// goes red instead of the failure being absorbed into whatever a cell was
+	// actually asserting.
 
 	// A readable, valid identity pair holding only root, so no login user
 	// resolves and no credential is ever mutated by a cell that did not ask.

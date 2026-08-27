@@ -319,9 +319,18 @@ func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 				continue
 			}
 			if excluded[host] {
-				continue // interface-mode SNAT routes this addr into interface_nat
+				// interface-mode SNAT routes this addr into interface_nat
 				// (rst.rs) — NOT kernel-local, so the static translation is not
 				// inert (#5837 rev6052).
+				//
+				// #6751 §5.7: that reasoning is right about INERTNESS and used
+				// to leave the operator with no diagnostic at all for the case
+				// that matters — a whole-address static and interface SNAT on
+				// one address emit the same external tuple. The suppression is
+				// NARROWED, not removed: the inert advisory stays suppressed
+				// (it would be wrong here) and the collision finding is emitted
+				// by staticOnInterfaceEgressCollisions, appended below.
+				continue
 			}
 			if iface, ok := ifAddrs[host]; ok {
 				warnings = append(warnings, fmt.Sprintf(
@@ -339,6 +348,12 @@ func validateNATInterfaceAddressCollisionWarnings(cfg *Config) []string {
 			}
 		}
 	}
+
+	// #6751 §5.7: the collision findings the narrowed suppression above no
+	// longer hides. Warning-only here — the STRICT gate rejects them
+	// (validateNATPoolExternalTupleOverlapStrict), so a tolerant load /
+	// peer-sync still admits the config under the #1960 no-brick doctrine.
+	warnings = append(warnings, staticOnInterfaceEgressCollisions(cfg)...)
 
 	return warnings
 }

@@ -312,6 +312,85 @@ pub(crate) struct NeighborSnapshot {
     pub link_local: bool,
 }
 
+/// SYN-cookie master key (hex) wrapped so its `Debug` never renders the secret
+/// (#6855).
+///
+/// `#4484` L-7 named `ConfigSnapshot` and `ControlRequest` as the carriers.
+/// `#4757` fixed a THIRD struct -- `ForwardingState` in
+/// `afxdp/types/forwarding.rs` -- with a `SynCookieMasterKey` newtype, which
+/// was correct and left the two named ones untouched. This is the same pattern
+/// applied where the item pointed.
+///
+/// A newtype rather than a hand-written `Debug` on `ConfigSnapshot`, and that
+/// choice is the point: the struct has 39 fields, so a manual impl would have
+/// to list all of them, and a field added later would silently stop being
+/// printed. Worse, a SECRET field added later would be printed, because nobody
+/// editing the struct would think to look at a `Debug` impl elsewhere in the
+/// file. Wrapping the secret keeps `#[derive(Debug)]` and makes the redaction a
+/// property of the VALUE, which no future field can undo.
+///
+/// `#[serde(transparent)]` keeps the wire format byte-identical: it serializes
+/// and deserializes exactly as the bare `String` did, so a peer running an older
+/// binary is unaffected. `Deref`/`AsRef` keep read sites unchanged.
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(transparent)]
+pub(crate) struct SynCookieMasterKeyHex(pub(crate) String);
+
+impl std::fmt::Debug for SynCookieMasterKeyHex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Distinguish unset from set, as the sibling WG redactions do: "there
+        // is no key" and "there is a key I will not show you" are different
+        // facts, and the first is the one an operator debugging a control-socket
+        // problem actually needs.
+        if self.0.is_empty() {
+            f.write_str("<unset>")
+        } else {
+            f.write_str("<redacted>")
+        }
+    }
+}
+
+impl std::ops::Deref for SynCookieMasterKeyHex {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SynCookieMasterKeyHex {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SynCookieMasterKeyHex {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SynCookieMasterKeyHex {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+/// Comparison against a bare `&str`, so an existing assertion reads unchanged.
+/// Without this the wrapper would force every call site to reach for `.0`, and
+/// a wrapper that makes every reader touch the raw secret is working against
+/// its own purpose.
+impl PartialEq<str> for SynCookieMasterKeyHex {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SynCookieMasterKeyHex {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct ConfigSnapshot {
     pub version: i32,
@@ -407,7 +486,7 @@ pub(crate) struct ConfigSnapshot {
     /// HA: both chassis must derive the SAME key for cross-node SYN-cookie
     /// validation to survive failover.
     #[serde(rename = "syn_cookie_master_key", default, skip_serializing)]
-    pub syn_cookie_master_key: String,
+    pub syn_cookie_master_key: SynCookieMasterKeyHex,
     #[serde(default)]
     pub filters: Vec<FirewallFilterSnapshot>,
     #[serde(default)]
