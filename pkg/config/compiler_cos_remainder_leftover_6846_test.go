@@ -151,6 +151,34 @@ func TestRemainderAdvisoryTracksTheLeftover6846(t *testing.T) {
 			wantReason: "leaving no usable leftover",
 		},
 		{
+			// THE NEGATIVE HALF OF THE ROUNDING AXIS, and the row that shows
+			// the rounding fix is CORRECT rather than merely louder.
+			//
+			// Every other fractional row is exactly subscribed and expects the
+			// advisory to fire, so a predicate that simply warned more often —
+			// or rounded the percent itself up to a whole number before
+			// scaling, which is the tempting simplification — would satisfy all
+			// of them. 49.99 + 49.99 is 99.98%, so 2_500 B/s of a 12_500_000
+			// B/s shape genuinely remains, the queue resolves, and silence is
+			// the only correct answer.
+			//
+			// Same omission as the floor cell one axis over: I paired that one
+			// and did not pair this one.
+			name:     "a FRACTIONAL percent that leaves real headroom must stay SILENT",
+			rustCell: "cos_percent_buffer_bytes (ceil) with a positive leftover",
+			lines: []string{
+				"set class-of-service schedulers a transmit-rate percent 49.99",
+				"set class-of-service schedulers b transmit-rate percent 49.99",
+				"set class-of-service schedulers r transmit-rate remainder",
+				"set class-of-service scheduler-maps sm forwarding-class assured-forwarding scheduler a",
+				"set class-of-service scheduler-maps sm forwarding-class expedited-forwarding scheduler b",
+				"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler r",
+				"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+				"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
+			},
+			wantWarn: false,
+		},
+		{
 			name:     "no shaping base at all",
 			rustCell: "no_shaping_rate_is_unresolvable",
 			lines: []string{
