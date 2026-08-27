@@ -534,6 +534,11 @@ fn dnat_v6_key_bytes_matches_entry_bytes_key_half() {
 #[test]
 fn delete_dnat_table_entry_noops_without_snat_or_fd() {
     use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    // #6872: this file had THREE readers of the process-global counter,
+    // TWO function-local `static GUARD`s that serialized nothing, and no
+    // shared guard. The issue named one unguarded reader and neither local
+    // guard here — an enumeration is a floor, not a census.
+    let _g = crate::afxdp::checksum::dnat_counter_guard();
     use std::sync::atomic::Ordering;
     let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
     // No SNAT decision -> nothing was published -> no delete attempt.
@@ -786,11 +791,13 @@ fn a_shared_steering_row_survives_the_first_close_6745() {
     // EBADF, which is benign — the contract under test is whether the keyed
     // delete is ATTEMPTED.
     use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    // #6872: this file had THREE readers of the process-global counter,
+    // TWO function-local `static GUARD`s that serialized nothing, and no
+    // shared guard. The issue named one unguarded reader and neither local
+    // guard here — an enumeration is a floor, not a census.
+    let _g = crate::afxdp::checksum::dnat_counter_guard();
     use std::sync::atomic::Ordering;
 
-    // Serialize against any other test touching the process-global counter.
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = GUARD.lock().expect("counter guard");
 
     reset_dnat_steering_holders();
     let (a, b) = colliding_pair_6745();
@@ -852,9 +859,12 @@ fn an_unaccounted_row_is_still_deleted_6745() {
     // must delete exactly as it did before #6745, never leak. "Unchanged" is
     // the right answer here; "the map fills up" is not.
     use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    // #6872: this file had THREE readers of the process-global counter,
+    // TWO function-local `static GUARD`s that serialized nothing, and no
+    // shared guard. The issue named one unguarded reader and neither local
+    // guard here — an enumeration is a floor, not a census.
+    let _g = crate::afxdp::checksum::dnat_counter_guard();
     use std::sync::atomic::Ordering;
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = GUARD.lock().expect("counter guard");
 
     reset_dnat_steering_holders();
     let key = dnat_v4_key();

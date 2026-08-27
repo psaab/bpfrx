@@ -404,12 +404,45 @@ fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
 /// non-empty string so the caller can fail the snapshot CLOSED (#hb166
 /// T-7) — mirroring the #2458 equal-flow-policy parse on the same queue
 /// rather than silently ranking an unknown priority lowest ("low").
+///
+/// # Rank 3 is deliberately vacant (#6849)
+///
+/// Junos has no bare `medium` scheduler priority. The five levels are
+/// `strict-high` / `high` / `medium-high` / `medium-low` / `low`, which is
+/// what the Go config schema's `priority` enum accepts and therefore the
+/// only set any committed config can produce (`pkg/config/schema_cos.go`,
+/// `ValidateEnum`).
+///
+/// A `"medium" => Some(3)` arm was here until #6849. It was not a
+/// deliberate tolerance for version drift: it predates the T-7 fail-closed
+/// work, where the original function was a six-level ladder ending in a
+/// catch-all `_ => 5`, and T-7 mechanically rewrote each arm to `Some(n)`
+/// while converting the signature. Checked before removing it: no version
+/// of the Go producer has ever emitted `medium` for this leaf, so the arm
+/// was unreachable from every path that can reach this function.
+///
+/// The remaining ranks KEEP their original numbers rather than closing up
+/// to 0..=4. Renumbering would move `low` from 5 to 4, and a large number
+/// of CoS tests construct queues with a literal `priority: 5` meaning
+/// "low" — they would still compile, still pass (the builder clamps with
+/// `.min(COS_PRIORITY_LEVELS - 1)`), and quietly mean something else. A
+/// vacant slot costs one unused `Vec` per interface; a silent
+/// reinterpretation of every hardcoded rank costs more.
+///
+/// Consequently `COS_PRIORITY_LEVELS` stays 6 and is CORRECT rather than
+/// off by one: it sizes arrays INDEXED BY RANK, and the highest live rank
+/// is still `low` = 5.
+#[cfg(test)]
+pub(in crate::afxdp::forwarding_build) fn cos_priority_rank_for_test(priority: &str) -> Option<u8> {
+    cos_priority_rank(priority)
+}
+
 fn cos_priority_rank(priority: &str) -> Option<u8> {
     match priority {
         "strict-high" => Some(0),
         "high" => Some(1),
         "medium-high" => Some(2),
-        "medium" => Some(3),
+        // rank 3 vacant — see the note above.
         "medium-low" => Some(4),
         "low" => Some(5),
         _ => None,

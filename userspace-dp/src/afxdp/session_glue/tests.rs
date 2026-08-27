@@ -6239,9 +6239,8 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
     use crate::afxdp::checksum::{DnatTableFds, DNAT_DELETE_ATTEMPTS};
     use std::sync::atomic::Ordering;
 
-    // Serialize against any other test touching the process-global counter.
-    static GUARD: Mutex<()> = Mutex::new(());
-    let _g = GUARD.lock().expect("counter guard");
+    // #6872: the SHARED guard — see checksum::DNAT_COUNTER_GUARD.
+    let _g = crate::afxdp::checksum::dnat_counter_guard();
 
     let build_close = |nat: NatDecision| {
         let key = test_key();

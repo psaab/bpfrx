@@ -1733,6 +1733,16 @@ pub(in crate::afxdp) enum CoSPendingTxItem {
     Prepared(PreparedTxRequest),
 }
 
+/// Size of every per-priority array, INDEXED BY RANK.
+///
+/// Six, not five, and that is correct rather than off by one (#6849).
+/// Junos has five scheduler priorities, but `cos_priority_rank` assigns
+/// them ranks 0, 1, 2, 4, 5 — rank 3 is deliberately vacant since the dead
+/// `medium` arm was removed, and the ranks were not renumbered because a
+/// large number of CoS tests hardcode `priority: 5` meaning "low" and
+/// would silently mean something else. The highest live rank is therefore
+/// still 5, so these arrays need six slots; slot 3 is allocated and never
+/// populated. See `cos_priority_rank` for the full reasoning.
 pub(in crate::afxdp) const COS_PRIORITY_LEVELS: usize = 6;
 
 pub(in crate::afxdp) const COS_TIMER_WHEEL_L0_SLOTS: usize = 256;

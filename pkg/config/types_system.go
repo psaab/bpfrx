@@ -1595,6 +1595,22 @@ type FirewallFilterTerm struct {
 	NextTerm        bool
 	RoutingInstance string // routing-instance name (policy-based routing)
 	Log             bool
+	// Syslog records `then syslog` as DISTINCT from `then log` (#6853).
+	//
+	// In Junos the two name different sinks: `then log` writes the firewall
+	// filter log buffer (`show firewall log`), `then syslog` sends to the
+	// system log. Both spellings previously compiled to `Log` alone, so the
+	// two were indistinguishable in the model and could never be routed
+	// apart.
+	//
+	// `then syslog` sets BOTH this and Log, which keeps today's behaviour
+	// bit-identical: Log is what makes the dataplane emit a filter-log event
+	// at all, and clearing it would stop `then syslog` emitting anything.
+	// Recording the distinction is the whole change; #6859 owns the routing
+	// decision that consumes it (specifically whether `then log` should stop
+	// reaching syslog, which is a behaviour change with a migration cost and
+	// is deliberately NOT made here).
+	Syslog          bool
 	Count           string           // counter name
 	ForwardingClass string           // forwarding-class name
 	LossPriority    string           // loss-priority (low, medium-low, medium-high, high)

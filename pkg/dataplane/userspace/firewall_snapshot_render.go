@@ -114,6 +114,12 @@ func RenderFirewallFilterSnapshot(snap *FirewallFilterSnapshot) string {
 		if term.Log {
 			fmt.Fprintf(&b, "    then log\n")
 		}
+		// #6853: rendered in ADDITION to `then log`, not instead of it — a
+		// `then syslog` term carries both bits, and dropping the `log` line
+		// would misrepresent the term the dataplane was actually given.
+		if term.Syslog {
+			fmt.Fprintf(&b, "    then syslog\n")
+		}
 		if term.Count != "" {
 			fmt.Fprintf(&b, "    then count %s\n", term.Count)
 		}
