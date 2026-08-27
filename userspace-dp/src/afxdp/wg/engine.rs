@@ -175,6 +175,26 @@ pub(crate) enum DecapError {
     /// AF_XDP worker by sending 16..31-byte UDP datagrams with a
     /// valid `receiver_index`.
     ShortRecord,
+    /// #7230: an authenticated ZERO-LENGTH transport record — a
+    /// WireGuard keepalive — tagged with the peer that sent it.
+    ///
+    /// It stays an ERROR, deliberately: there is no inner packet, so the
+    /// "no TUN write" contract is unchanged and callers that only care
+    /// about deliverable packets keep treating it exactly as before.
+    /// What changes is that the peer identity no longer dies with the
+    /// error. It is available at the construction site — `try_decap`
+    /// demuxes the session from `hdr.receiver_index` BEFORE any AEAD
+    /// work, and the record is authenticated by the time this is built —
+    /// so attribution is proven, not inferred.
+    ///
+    /// Before #7230 this collapsed into `MalformedInner`, which discarded
+    /// the identity; the caller then tried to recover it with
+    /// `single_peer_pubkey()`, which returns None on any MULTI-PEER
+    /// interface. A peer whose only traffic is keepalives — a roaming
+    /// client, or one behind a NAT that rebinds — therefore never roamed
+    /// its endpoint and was blackholed until its next handshake
+    /// (~120-180s, bounded, not indefinite).
+    Keepalive([u8; WG_KEY_LEN]),
     /// #1888 S5: the demuxed session is older than REJECT_AFTER_TIME.
     /// Per WG spec the receiver MUST NOT use such keys — dropped
     /// BEFORE AEAD, and deliberately withOUT arming the rekey edge
@@ -1568,8 +1588,13 @@ impl WgEngine {
         // "malformed inner" drops for a keepalive peer (Codex r1 F1 +
         // SMR r1 F1, independent convergence).
         if n == 0 {
-            WgCounters::bump(&self.counters.decap_keepalives);
-            return Err(DecapError::MalformedInner);
+            // #7230: carry the peer out instead of discarding it. Routed
+            // through count_decap_err so the counter arm is exhaustive-
+            // matched rather than bumped by hand here; the counter it
+            // lands on (decap_keepalives) is unchanged.
+            return Err(self
+                .counters
+                .count_decap_err(DecapError::Keepalive(session.peer_pubkey)));
         }
         // AllowedIPs gate on the inner src IP. WG spec §5.4.6:
         // "After decryption, the receiver verifies that the source

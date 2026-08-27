@@ -240,6 +240,13 @@ impl WgCounters {
             DecapError::MalformedInner => &self.decap_drops_malformed_inner,
             DecapError::BufferTooSmall => &self.decap_drops_buffer,
             DecapError::Expired => &self.decap_drops_expired,
+            // #7230: a keepalive is not a DROP — it is an authenticated
+            // record with nothing to deliver — so it keeps its own
+            // counter rather than joining decap_drops_malformed_inner.
+            // This arm exists because the match is exhaustive with no
+            // `_`: adding a DecapError variant cannot silently become
+            // uncounted.
+            DecapError::Keepalive(_) => &self.decap_keepalives,
         };
         Self::bump(c);
         e

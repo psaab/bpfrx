@@ -525,6 +525,22 @@ struct Nat64FragEntry {
     /// change (deny/NAT64 rules) invalidates associations minted under the old
     /// config instead of silently forwarding fragments the new config would drop.
     generation: u64,
+    /// #6857: the owner redundancy group of the resolution the FIRST fragment
+    /// was admitted under, or 0 when no RG-bound interface owns it.
+    ///
+    /// The config generation above is a CONFIG fence and does its job. An RG
+    /// transition is RUNTIME HA state: it changes no config and bumps no
+    /// snapshot generation, so a config-generation counter is structurally the
+    /// wrong instrument for invalidating state whose validity depends on
+    /// runtime ownership. This is the runtime fence beside it.
+    ///
+    /// ZERO MEANS NOT RG-DEPENDENT, and that distinction is load-bearing rather
+    /// than a convenience: on a standalone box (no chassis cluster) every
+    /// resolution has owner RG 0, so treating 0 as "not entitled" would evict
+    /// every association on every consult and disable fragment association
+    /// outright for the non-HA deployment. Only a POSITIVE owner RG is checked
+    /// against `is_forwarding_active`.
+    owner_rg: i32,
 }
 
 /// Cross-family fragment-association cache (#2562). Cheap to `Clone` (shares the
@@ -631,6 +647,9 @@ impl Nat64FragAssoc {
         reverse: Option<Nat64ReverseInfo>,
         now_ns: u64,
         generation: u64,
+        // #6857: owner RG of the resolution this fragment was admitted under;
+        // 0 when no RG-bound interface owns it.
+        owner_rg: i32,
     ) {
         let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
         let idx = nat64_frag_shard_index(&key);
@@ -647,6 +666,12 @@ impl Nat64FragAssoc {
             // generation. A stale-generation refresh would otherwise resurrect
             // a prior-config verdict.
             e.generation = generation;
+            // #6857: refresh the owner RG too. A refresh happens when a LATER
+            // first fragment of the same datagram re-admits under current
+            // state, so the entry must carry THAT admission's entitlement, not
+            // the original one — otherwise a refresh under a now-active RG
+            // would leave the entry stamped with the old value.
+            e.owner_rg = owner_rg;
             shard.push(e);
             return;
         }
@@ -672,6 +697,7 @@ impl Nat64FragAssoc {
             reverse,
             deadline_ns,
             generation,
+            owner_rg,
         });
     }
 
@@ -693,6 +719,15 @@ impl Nat64FragAssoc {
         key: &Nat64FragKey,
         now_ns: u64,
         generation: u64,
+        // #6857: "is this owner RG forwarding-active locally right now?".
+        //
+        // A predicate rather than the HA map, for two reasons. The RG to ask
+        // about is not known until the entry is found, so the caller cannot
+        // pre-compute a bool; and passing the map would drag
+        // `afxdp::HAGroupRuntime` (which is `pub(in crate::afxdp)`) into this
+        // module, widening a type's visibility to serve a fence. The closure
+        // keeps the HA vocabulary on the afxdp side of the boundary.
+        owner_rg_forwarding_active: impl Fn(i32) -> bool,
     ) -> Option<(SessionDecision, Option<Nat64ReverseInfo>)> {
         let idx = nat64_frag_shard_index(key);
         let mut shard = self.shards[idx]
@@ -705,6 +740,24 @@ impl Nat64FragAssoc {
         // changed deny/NAT64 rules invalidates the association instead of
         // letting stale fragments keep inheriting the old verdict.
         if shard[pos].generation != generation {
+            shard.remove(pos);
+            return None;
+        }
+        // #6857 RUNTIME-OWNERSHIP fence, beside the config one above.
+        //
+        // The association carries a permit this node granted while it was
+        // entitled to. An RG transition (failover, tracked-interface demotion)
+        // revokes that entitlement without touching config, so the generation
+        // guard above cannot see it: a later fragment would still HIT and
+        // inherit the earlier permit + egress + NAT on a node that is no longer
+        // forwarding-active for the owning RG. That is exactly what the #6458
+        // owner-RG gate exists to prevent on the enforcement path.
+        //
+        // owner_rg == 0 means NOT RG-dependent and is deliberately NOT checked:
+        // on a standalone box every resolution has owner RG 0, so checking it
+        // would evict every association on every consult and disable fragment
+        // association for the entire non-HA deployment.
+        if shard[pos].owner_rg > 0 && !owner_rg_forwarding_active(shard[pos].owner_rg) {
             shard.remove(pos);
             return None;
         }

@@ -242,6 +242,13 @@ type xpfCollector struct {
 	managedServiceReloadPending  *prometheus.Desc
 	managedServiceReloadFailures *prometheus.Desc
 
+	// #7615: the remaining debt-driven retry owners. Each is 1 while its loop
+	// owes a repair, so a node re-driving a failing recovery stops looking
+	// identical to a healthy one.
+	raDeadSenderPending    *prometheus.Desc
+	fabricOverlayMissing   *prometheus.Desc
+	managementListenerDown *prometheus.Desc
+
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
 	// a schedule window: a permit still forwarding, or a scheduled block
@@ -803,6 +810,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundConntrackRevocationFailures
 	ch <- c.managedServiceReloadPending
 	ch <- c.managedServiceReloadFailures
+	ch <- c.raDeadSenderPending
+	ch <- c.fabricOverlayMissing
+	ch <- c.managementListenerDown
 	ch <- c.configPersistDegraded
 	ch <- c.rollbackHistoryDegraded
 	ch <- c.userspacePolicyContentRejected
@@ -1183,6 +1193,28 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.managedServiceReloadFailures,
 				prometheus.CounterValue, float64(failures[svc]), svc)
 		}
+	}
+
+	// #7615: emitted BEFORE the dataplane gate for the same reason as their
+	// siblings above — every one of these repairs runs in config-only mode too,
+	// and a node whose dataplane never came up is exactly the node whose
+	// unpaid retry debt most needs to be visible.
+	for _, s := range []struct {
+		fn   func() bool
+		desc *prometheus.Desc
+	}{
+		{c.srv.raDeadSenderPendingFn, c.raDeadSenderPending},
+		{c.srv.fabricOverlayMissingFn, c.fabricOverlayMissing},
+		{c.srv.managementListenerDownFn, c.managementListenerDown},
+	} {
+		if s.fn == nil {
+			continue
+		}
+		v := 0.0
+		if s.fn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(s.desc, prometheus.GaugeValue, v)
 	}
 
 	// #3780: scheduler republish-failure is a control-plane signal (the
