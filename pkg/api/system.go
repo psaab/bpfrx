@@ -121,6 +121,14 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "target required")
 		return
 	}
+	// #6904: bound every operator-supplied string field before it reaches exec
+	// argv. The gRPC sibling has enforced this since #5060; REST did not, so
+	// the guarantee was not a system property. Both surfaces now call the same
+	// diagcmd.CheckArgs — sharing the RULE, not a second literal 512.
+	if err := diagcmd.CheckArgs(req.Target, req.Source, req.RoutingInstance); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	count := req.Count
 	if count <= 0 {
@@ -163,6 +171,11 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Target == "" {
 		writeError(w, http.StatusBadRequest, "target required")
+		return
+	}
+	// #6904: same bound as the ping handler and the gRPC surface.
+	if err := diagcmd.CheckArgs(req.Target, req.Source, req.RoutingInstance); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
