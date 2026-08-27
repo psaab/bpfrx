@@ -240,3 +240,64 @@ func TestNeverTransitionedSecondaryGetsGated6889_6890(t *testing.T) {
 			"the gate")
 	}
 }
+
+// TestReconcileRedrivesTheWholeTransitionNotJustTheBit6889 closes a gap the
+// mutation matrix found in my own coverage.
+//
+// Replacing the reconcile's `applyRG0OwnershipTransition(rg0.State)` with a
+// bare `SetClusterReadOnly(wantReadOnly)` left every other cell in this file
+// GREEN — they all assert the BIT, and the bit is identical either way. But the
+// gate is not the transition's only consequence, and a dropped event skipped
+// all of them:
+//
+//   - demotion CONFIRMS a pending commit-confirmed BEFORE going read-only
+//     (#4378), so its rollback timer cannot fire on the demoted standby and
+//     revert that node while the peer keeps the committed config;
+//   - promotion reconciles config-sync to the peer, re-initiates synced IPsec
+//     SAs and nudges DHCP lease-sync.
+//
+// The demotion consequence is the one with a safety story and a cheap
+// observable, so it is what binds the decision. A reconcile that sets the bit
+// alone leaves the window ARMED on a node that just became read-only —
+// precisely the #4378 divergence, reintroduced through the recovery path.
+func TestReconcileRedrivesTheWholeTransitionNotJustTheBit6889(t *testing.T) {
+	// Writable store + RG0 secondary is the dropped-DEMOTION divergence.
+	d := clusteredDaemon6889(t, cluster.StateSecondary, false)
+
+	// Arm a commit-confirmed window: commit A, then commit-confirmed B.
+	if err := d.store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := d.store.LoadOverride("system { host-name A; }"); err != nil {
+		t.Fatalf("LoadOverride A: %v", err)
+	}
+	if _, err := d.store.Commit(); err != nil {
+		t.Fatalf("Commit A: %v", err)
+	}
+	if err := d.store.LoadOverride("system { host-name B; }"); err != nil {
+		t.Fatalf("LoadOverride B: %v", err)
+	}
+	if _, err := d.store.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed: %v", err)
+	}
+	d.store.ExitConfigure()
+
+	if !d.store.IsConfirmPending() {
+		t.Fatal("precondition: a commit-confirmed window must be armed, or this cell " +
+			"cannot observe whether the reconcile confirmed it")
+	}
+
+	d.reconcileRG0ConfigOwnership()
+
+	// The gate — what every other cell already checks.
+	if !d.store.ClusterReadOnly() {
+		t.Fatal("the reconcile did not close the gate on an RG0 secondary")
+	}
+	// The consequence those cells CANNOT see.
+	if d.store.IsConfirmPending() {
+		t.Fatal("the reconcile went read-only with a commit-confirmed window still " +
+			"ARMED — it set the bit instead of re-driving the transition, so the " +
+			"#4378 confirm-on-demotion was skipped and that window's rollback timer " +
+			"will fire on this demoted standby and diverge it from the peer (#6889)")
+	}
+}
