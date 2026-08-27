@@ -323,17 +323,54 @@ func TestContendedEpochLockAcquireIsRaceFree6826(t *testing.T) {
 		}
 	}()
 
+	// #7674: wait until the contender has PROVABLY taken the lock at least once
+	// before the acquire loop starts.
+	//
+	// The acquirer is fast — 40 acquisitions complete in ~300us on an idle box —
+	// and under `go test ./...` this package runs alongside dozens of others. The
+	// contender goroutine could therefore go unscheduled for the entire loop, and
+	// the `got == 0` check below then fired reporting that the probe proved
+	// nothing. That report was true, and it was a statement about the SCHEDULER
+	// rather than about the lock: the floor was reading the machine. Measured on
+	// master: "40 acquisitions in 283.121us, contender completed 0 lock cycles".
+	//
+	// ONE edge, and only BEFORE the contended region. A per-acquisition handshake
+	// would establish happens-before between the contender and the acquisition it
+	// races, which is precisely the absence `-race` looks for — the probe would go
+	// quiet against the very hazard it exists to detect. The contender keeps
+	// looping freely throughout the loop below.
+	waitForContenderProgress(t, &contentions, 5*time.Second)
+	before := atomic.LoadInt64(&contentions)
+
 	const acquires = 40
 	ran := 0
 	start := time.Now()
 	for i := 0; i < acquires; i++ {
 		withEpochFileLock(path, func() { ran++ })
 	}
+	// The contender is provably running by now, but a fixed 40 acquisitions can
+	// still fit inside a single scheduling quantum. Extend until the contender has
+	// demonstrably interleaved with THIS loop, so the overlap `-race` needs is
+	// measured rather than inferred from the pre-loop cycle.
+	overlapDeadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt64(&contentions) == before {
+		if time.Now().After(overlapDeadline) {
+			close(done)
+			wg.Wait()
+			t.Fatalf("the contender took the lock %d times before the acquire loop but "+
+				"not once during it, over 5s — the two sides are not interleaving and "+
+				"-race observed nothing", before)
+		}
+		withEpochFileLock(path, func() { ran++ })
+	}
 	elapsed := time.Since(start)
 	close(done)
 	wg.Wait()
 
-	if ran != acquires {
+	// `ran` may exceed `acquires` when the overlap extension above ran; what must
+	// hold is that EVERY acquisition ran its callback, so a count short of the
+	// fixed floor means an uncontended lock was refused.
+	if ran < acquires {
 		t.Errorf("only %d/%d acquisitions ran their callback — an uncontended lock "+
 			"must always be takeable", ran, acquires)
 	}
@@ -341,8 +378,31 @@ func TestContendedEpochLockAcquireIsRaceFree6826(t *testing.T) {
 	rate := float64(got) / elapsed.Seconds()
 	t.Logf("contention probe: %d acquisitions in %v, contender completed %d "+
 		"lock cycles (%.0f/s)", acquires, elapsed, got, rate)
-	if got == 0 {
-		t.Error("the contender never took the lock once — the two sides did not " +
-			"overlap, so -race observed nothing and this probe proved nothing")
+	// Overlap is now guaranteed by the extension loop above, which fails loudly
+	// and names what never arrived rather than reaching here with zero. Keep the
+	// floor as a belt-and-braces invariant on the accounting itself.
+	if got <= before {
+		t.Errorf("contention count did not advance during the acquire loop "+
+			"(before=%d, after=%d) — the extension loop should have caught this",
+			before, got)
+	}
+}
+
+// waitForContenderProgress blocks until the contender goroutine has completed at
+// least one lock cycle, so the acquire loop is issued into a window that is
+// provably being contended rather than one the scheduler has not reached yet.
+//
+// Bounded, and fails naming what never arrived — a probe that silently proceeds
+// uncontended is the degenerate case this exists to prevent.
+func waitForContenderProgress(t *testing.T, contentions *int64, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for atomic.LoadInt64(contentions) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the contender completed no lock cycles in %s — it was never "+
+				"scheduled, so the acquire loop would run uncontended and the probe "+
+				"would be degenerate", within)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

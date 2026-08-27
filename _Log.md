@@ -106851,6 +106851,10 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go` (new),
   `pkg/cluster/README.md`, `_Log.md`
 
+- **Timestamp**: 2026-08-26
+  - **Action**: #7674 — the #6826 contention probe was degenerate under `go test ./...`: the contender goroutine went unscheduled for the whole acquire loop, so the probe's own floor fired reporting it proved nothing. Master was RED. Wait on the observable before the loop, and measure overlap WITH the loop.
+  - **File(s)**: pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go
+
 ## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
 
 - **Timestamp**: 2026-08-26
