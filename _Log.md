@@ -106760,6 +106760,10 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6853 — carried the new field through the Rust test literals and the wire specimen; added a both-directions wire-compat test pinning the mixed-version HA claim.
   - **File(s)**: userspace-dp/src/filter/tests.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
 
+- **Timestamp**: 2026-08-26
+  - **Action**: #6849 — settled the fork by measurement (no Go producer has ever emitted `medium`; the arm predates T-7 and was carried mechanically), removed the dead arm, kept the rank numbering, and documented why COS_PRIORITY_LEVELS=6 is correct rather than off by one.
+  - **File(s)**: userspace-dp/src/afxdp/forwarding_build/cos.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/policy_snapshot_error.rs
+
 ## 2026-08-26 — #6826 bound the incoming side of the epoch flock
 
 - **Timestamp**: 2026-08-26
