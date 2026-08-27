@@ -1863,6 +1863,19 @@ the drop fails loudly instead of going quietly vacuous.
   an exact "the buffer filled after the first event" that a byte budget cannot
   express: it is checked *before* the write and then passes the whole thing.
 
+  **No fixed wall-clock point stands in for readiness (finding 4).** The cells
+  used to sleep 100 ms and then publish, but subscriptions have no replay — a
+  flood landing before the handler subscribes is simply lost, and the cell then
+  fails 15 s later blaming the deadline, which is the wrong diagnosis for a lost
+  publish. `floodUntilParked7632` publishes until a write has genuinely parked
+  (the observable that implies *both* that the handler subscribed and that it
+  reached the blocking write) and fails loudly naming what never arrived,
+  per the #7563 ordering in `docs/engineering-style.md` — never a longer sleep
+  or a retry. `readSSEChunk7632` likewise accumulates to the `\n\n` SSE
+  terminator instead of assuming one `Body.Read` returns a whole event: a short
+  read of `id: 1\n` would have failed the healthy-reader assertion while
+  delivery was perfectly correct.
+
   **The subscriber SLOT is the product-visible half (finding 5).** A pinned
   handler holds one of 64 capped subscriber slots (#4484), so non-reading
   clients accumulate until `TrySubscribe` returns nil and the endpoint 503s for

@@ -83,6 +83,34 @@ func floodEvents7632(buf *logging.EventBuffer, n int) {
 	}
 }
 
+// floodUntilParked7632 replaces "sleep, then publish once and hope the handler
+// had subscribed" (#7654 review, finding 4).
+//
+// This is the #7650 class in this file's own harness: a fixed wall-clock point
+// standing in for "the other side is ready". Subscriptions have no replay, so a
+// flood that lands before the handler subscribes is simply LOST — and the cell
+// then fails 15 seconds later blaming the deadline, which is the wrong
+// diagnosis for a lost publish.
+//
+// The prescription from docs/engineering-style.md #7563 is to wait on the
+// implying observable, not to lengthen the sleep: keep publishing until a write
+// has genuinely PARKED, which implies both that the handler subscribed and that
+// it reached the blocking write. If that never happens, fail loudly naming what
+// never arrived.
+func floodUntilParked7632(t *testing.T, buf *logging.EventBuffer, sl *stalledListener6809, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		floodEvents7632(buf, 500)
+		if sl.waitForParkedWrite(100 * time.Millisecond) {
+			return
+		}
+	}
+	t.Fatalf("no write ever parked within %v: the handler never subscribed, or the "+
+		"flood never reached a blocking write. Either way this cell cannot "+
+		"observe the property it asserts (#7654 review, finding 4)", d)
+}
+
 // TestSlowSSEReaderDoesNotPinTheHandler7632 is the issue: a connected
 // non-reading subscriber must not park the handler goroutine indefinitely.
 //
@@ -100,18 +128,11 @@ func TestSlowSSEReaderDoesNotPinTheHandler7632(t *testing.T) {
 	defer cleanup()
 	dialAndRequestWithoutReading6809(t, addr)
 
-	// Let the subscription come up, then push far more than the conn will take.
-	time.Sleep(100 * time.Millisecond)
-	floodEvents7632(buf, 4000)
-
 	// #7654 review, finding 3: credit the deadline for the return only after
 	// witnessing that a write actually PARKED. Without this the cell passes
 	// whenever the handler exits for any reason at all, including never having
 	// reached the hazard.
-	if !sl.waitForParkedWrite(10 * time.Second) {
-		t.Fatal("no write ever parked: the flood never reached a blocking write, so " +
-			"this cell would be crediting the deadline for a return it did not cause")
-	}
+	floodUntilParked7632(t, buf, sl, 15*time.Second)
 
 	select {
 	case <-done:
@@ -139,19 +160,12 @@ func TestSlowSSEReaderPinIsReachableWithoutTheDeadline7632(t *testing.T) {
 	defer cleanup()
 	dialAndRequestWithoutReading6809(t, addr)
 
-	time.Sleep(100 * time.Millisecond)
-	floodEvents7632(buf, 4000)
-
 	// #7654 review, finding 3, and the correction this whole cell turns on.
 	// "The handler has not returned" is ALSO what an idle handler looks like,
 	// so without this witness the control proves the fixture can pin only in
 	// the sense that it can fail to do anything at all. Establish that a write
 	// is genuinely parked FIRST; only then does "still running" mean pinned.
-	if !sl.waitForParkedWrite(10 * time.Second) {
-		t.Fatal("no write ever parked, so this control cannot show the fixture is " +
-			"capable of pinning — it would pass equally if the handler were " +
-			"merely idle, which is exactly the reading that fooled this PR twice")
-	}
+	floodUntilParked7632(t, buf, sl, 15*time.Second)
 
 	select {
 	case <-done:
@@ -179,12 +193,7 @@ func TestSlowLogStreamReaderDoesNotPinTheHandler7632(t *testing.T) {
 	defer cleanup()
 	dialAndRequestWithoutReading6809(t, addr)
 
-	time.Sleep(100 * time.Millisecond)
-	floodEvents7632(buf, 4000)
-
-	if !sl.waitForParkedWrite(10 * time.Second) {
-		t.Fatal("no write ever parked on the log stream: the cell never reached the hazard")
-	}
+	floodUntilParked7632(t, buf, sl, 15*time.Second)
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
@@ -245,8 +254,7 @@ func TestASeveredSSEReaderReleasesItsSubscriberSlot7632(t *testing.T) {
 			})
 
 			dialAndRequestWithoutReading6809(t, addr)
-			time.Sleep(100 * time.Millisecond)
-			floodEvents7632(buf, 4000)
+			floodUntilParked7632(t, buf, sl, 15*time.Second)
 
 			// ANTI-VACUITY FLOOR: while the stream is live the cap really is
 			// full. Without this the closing assertion would also pass against
@@ -255,9 +263,6 @@ func TestASeveredSSEReaderReleasesItsSubscriberSlot7632(t *testing.T) {
 				probe.Close()
 				t.Fatal("precondition: a slot was still free while the stalled stream " +
 					"was live, so this cell cannot observe the slot being RELEASED")
-			}
-			if !sl.waitForParkedWrite(10 * time.Second) {
-				t.Fatal("no write ever parked: the stream was never actually stalled")
 			}
 			select {
 			case <-done:
@@ -421,20 +426,34 @@ func httpGetWithTimeout7632(url string, d time.Duration) (*http.Response, error)
 	return c.Get(url)
 }
 
-// readSSEChunk7632 reads whatever the stream has produced within d. An SSE
-// response never ends on its own, so a plain ReadAll would block forever.
+// readSSEChunk7632 reads until a COMPLETE SSE event has arrived, or d elapses.
+// An SSE response never ends on its own, so a plain ReadAll would block forever.
+//
+// #7654 review, finding 4: this used to take whatever ONE Body.Read returned
+// and assume it was a whole event. A read is allowed to return any prefix, so a
+// short read of "id: 1\n" would fail the healthy-reader assertion while
+// delivery was in fact correct — a flaky red that accuses the fix of severing a
+// stream it delivered perfectly. Accumulate until the SSE terminator instead,
+// which is the observable that actually implies "an event arrived".
 func readSSEChunk7632(t *testing.T, resp *http.Response, d time.Duration) string {
 	t.Helper()
-	type res struct{ s string }
-	ch := make(chan res, 1)
+	ch := make(chan string, 1)
 	go func() {
+		var sb strings.Builder
 		b := make([]byte, 16*1024)
-		n, _ := resp.Body.Read(b)
-		ch <- res{string(b[:n])}
+		for {
+			n, err := resp.Body.Read(b)
+			sb.Write(b[:n])
+			// "\n\n" terminates an SSE event: everything before it is complete.
+			if strings.Contains(sb.String(), "\n\n") || err != nil {
+				ch <- sb.String()
+				return
+			}
+		}
 	}()
 	select {
-	case r := <-ch:
-		return r.s
+	case s := <-ch:
+		return s
 	case <-time.After(d):
 		return ""
 	}

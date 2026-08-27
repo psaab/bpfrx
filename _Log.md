@@ -106816,6 +106816,10 @@ prose edit above them added. No diff falls in the new test body.
   `defer sub.Close()`. Finding 6: replaced the 2-sample precautionary-claim
   measurement with n=9 min/median/max over three variants and two write paths.
   Fixture gained `maxWrites` (exact "buffer filled after the first event") and
-  parked-write instrumentation.
+  parked-write instrumentation. Finding 4: replaced the fixed 100ms
+  readiness sleeps with `floodUntilParked7632` (wait on the implying
+  observable, fail naming what never arrived) and made `readSSEChunk7632`
+  accumulate to the SSE terminator rather than assume one `Body.Read` returns
+  a complete event.
 - **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
   `pkg/api/bgp_slow_reader_pin_6809_test.go`, `pkg/api/README.md`, `_Log.md`
