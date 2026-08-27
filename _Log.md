@@ -106716,3 +106716,7 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6868 — leaf-identity assertions matched the quoted occurrence so they can no longer be satisfied by the error's own enumeration. Swept the predicate and found a fourth site the issue did not list (6524 chained leaves).
   - **File(s)**: pkg/config/compiler_application_direct_conflict_5574_test.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_chained_leaves_6524_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6868 review round — fixed a FIFTH bare-leaf site at compiler_application_chained_leaves_6524_test.go:295 (found by review, in a file this change already edited) and corrected the recorded reason for excluding the 3348 icmp guards.
+  - **File(s)**: pkg/config/compiler_application_chained_leaves_6524_test.go, pkg/config/compiler_application_junos_ping_3348_test.go
