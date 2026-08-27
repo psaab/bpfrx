@@ -627,6 +627,62 @@ that is exactly the absolute this section keeps regrowing.
 behaviour; if either reds, the change under your hand is the one that forces
 that outage.
 
+## Heartbeat source pin (#6888)
+
+The read loop discarded the UDP source address (`n, _, err := ReadFromUDP`), so
+nothing compared it to the configured control-link peer. It now drops any
+datagram from another source **before** unmarshal, cluster-id validation and MAC
+verification.
+
+**This is not an authentication boundary, and must not be described as one.**
+Heartbeat frames are HMAC-verified in `admitFrame`, and an attacker without the
+control-link PSK could never get one admitted whatever source address it
+carried. What the pin adds is three narrower things:
+
+- **Cheapest-point filtering.** An off-path sender that can reach the port
+  otherwise makes the node do HMAC work on every forged frame, on a path running
+  at a 200 ms interval with a threshold of 5.
+- **Visibility of a misconfiguration that was previously silent.** A third node
+  accidentally pointed at this control link had its frames read, MAC-checked and
+  dropped with no signal anywhere. Rejections are now counted
+  (`HeartbeatStats.ForeignSrcDropped`) and logged rate-limited at 30 s — a
+  rejection that is not counted would reproduce the exact invisibility the pin
+  exists to fix.
+- **Partial constraint under a leaked PSK**, which still bounds where forged
+  frames can originate.
+
+**It compares the IP ONLY, and that is measured rather than assumed.** The
+peer's *sender* socket is bound with port 0 (`net.JoinHostPort(localAddr, "0")`
+in `startHeartbeatLocked`), so it sources from an **ephemeral** port unrelated
+to the port it listens on, which changes on every daemon restart. Observed on
+the live loss cluster:
+
+| node | listens on | sources from |
+|---|---|---|
+| fw0 | `10.99.12.1:4784` | `10.99.12.1:40745` |
+| fw1 | `10.99.12.2:4784` | `10.99.12.2:50923` |
+
+A pin on the full `UDPAddr` would therefore reject **100% of legitimate
+heartbeats** and take down every cluster on upgrade — strictly worse than no
+pin. `TestPeerPinIgnoresPortEntirely6888` exists to say so at review time rather
+than at failover time, and the admitted-peer fixture deliberately uses a port
+that differs from the configured one so it could not pass under an address+port
+comparison.
+
+The zone on a link-local address is not compared either (`net.IP.Equal` ignores
+it): a peer legitimately sourcing from a link-local address on the control
+interface must not be rejected over a zone string. Tolerance costs little here
+because the frame still faces MAC verification; strictness costs availability.
+
+**Unset fails OPEN.** A receiver with no configured peer (nil `peerAddr`, or a
+nil source address from the read) accepts every source exactly as before #6888.
+A pin that rejects when it does not know what to accept converts a
+defence-in-depth gap into a comms outage. `newHeartbeatReceiver` takes the
+address as a **required parameter** rather than offering a setter, so the
+compiler proves every construction site decided what to pass — a pin that
+silently never receives its address is indistinguishable from no pin, and would
+be found by an attacker or a misconfiguration rather than by review.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds

@@ -328,7 +328,7 @@ func TestHeartbeatAuthReplay_BoundedRing(t *testing.T) {
 func TestHeartbeatReplayGatesLivenessRefresh(t *testing.T) {
 	m := epochGateManager() // keyed with epochTestPSK, which is the key below
 	key := m.controlLinkAuthKey()
-	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 
 	const (
 		sessA = 0xA11CE

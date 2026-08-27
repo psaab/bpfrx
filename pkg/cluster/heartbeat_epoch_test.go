@@ -85,7 +85,7 @@ func newEpochEnv(t *testing.T) *epochEnv {
 // directly.
 func (e *epochEnv) restartHeartbeat() {
 	e.t.Helper()
-	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	e.r.startedAt = time.Now().Add(-2 * heartbeatStartupGrace)
 	e.m.mu.Lock()
 	e.m.hbReceiver = e.r

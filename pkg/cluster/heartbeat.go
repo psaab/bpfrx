@@ -1228,6 +1228,29 @@ type heartbeatReceiver struct {
 	recvErrors atomic.Uint64
 	startedAt  time.Time // when receiver started (for initial peer-lost detection)
 
+	// peerAddr is the configured control-link peer, used to drop datagrams
+	// from any other source before they cost a MAC verification (#6888).
+	//
+	// NIL MEANS UNSET, AND UNSET FAILS OPEN. A receiver with no configured
+	// peer accepts every source exactly as it did before #6888. That is
+	// deliberate and is the branch most likely to be got wrong: a pin that
+	// rejects when it does not know what to accept takes the cluster down,
+	// which is far worse than the defence-in-depth gap it closes.
+	peerAddr *net.UDPAddr
+
+	// foreignSrc counts datagrams dropped by the peer pin.
+	//
+	// It is counted rather than silently dropped because the issue's strongest
+	// argument is that a misconfigured third node pointed at this control link
+	// is currently INVISIBLE — its frames are read, MAC-checked and discarded
+	// with no signal anywhere. A rejection that is not counted reproduces
+	// exactly that, one layer down.
+	foreignSrc atomic.Uint64
+
+	// lastForeignWarn rate-limits the foreign-source log. Owned by readLoop,
+	// which is the only goroutine that touches it, so it needs no lock.
+	lastForeignWarn time.Time
+
 	// auth is the #4107 control-channel auth state (anti-replay watermarks +
 	// the sticky peer-authenticated flag). It is a POINTER to state owned by
 	// the Manager, not an embedded value: the tracker must outlive this
@@ -1325,12 +1348,72 @@ func (s *heartbeatSender) stop() {
 	s.conn.Close()
 }
 
-func newHeartbeatReceiver(mgr *Manager, conn *net.UDPConn, threshold int, interval time.Duration) *heartbeatReceiver {
+// srcIsConfiguredPeer reports whether a datagram's source may be processed
+// (#6888). It compares the IP ONLY, never the port.
+//
+// THE PORT IS DELIBERATELY EXCLUDED, and this is measured, not assumed. The
+// peer's SENDER socket is bound with port 0 — `net.JoinHostPort(localAddr,
+// "0")` in startHeartbeatLocked — so it sources from an EPHEMERAL port that is
+// unrelated to the port it listens on and changes on every daemon restart.
+// Observed on the live loss cluster: fw0 listens on 10.99.12.1:4784 and sends
+// from :40745; fw1 listens on 10.99.12.2:4784 and sends from :50923. A pin on
+// the full UDPAddr would therefore reject 100% of legitimate heartbeats and
+// take down every cluster on upgrade — strictly worse than no pin at all.
+//
+// Two fail-open cases, both returning true:
+//
+//   - peerAddr nil: no configured peer, so there is nothing to pin against.
+//   - src nil: the read gave no source, so the pin has no input. Refusing here
+//     would turn an unexpected-but-harmless read into a comms outage.
+//
+// The zone (%iface on a link-local address) is not compared either. net.IP.Equal
+// ignores it, and that is the tolerant direction: a peer legitimately sourcing
+// from a link-local address on the control interface must not be rejected
+// because a zone string differs. This is defence in depth — the frame still
+// faces MAC verification either way — so tolerance costs little and strictness
+// costs availability.
+func (r *heartbeatReceiver) srcIsConfiguredPeer(src *net.UDPAddr) bool {
+	if r == nil || r.peerAddr == nil || r.peerAddr.IP == nil {
+		return true
+	}
+	if src == nil || src.IP == nil {
+		return true
+	}
+	return r.peerAddr.IP.Equal(src.IP)
+}
+
+// noteForeignSource counts and (rate-limited) reports a datagram dropped by the
+// peer pin. Called only from readLoop, which owns lastForeignWarn.
+func (r *heartbeatReceiver) noteForeignSource(src *net.UDPAddr) {
+	r.foreignSrc.Add(1)
+	now := time.Now()
+	if !r.lastForeignWarn.IsZero() && now.Sub(r.lastForeignWarn) < 30*time.Second {
+		return
+	}
+	r.lastForeignWarn = now
+	slog.Warn("cluster: heartbeat datagram from an unexpected source dropped before "+
+		"authentication — something other than the configured control-link peer is "+
+		"sending to this port. Check for a third node misconfigured onto this "+
+		"cluster's control link.",
+		"src", src.String(), "configured_peer", r.peerAddr.IP.String(),
+		"dropped_total", r.foreignSrc.Load(), "issue", "#6888")
+}
+
+// newHeartbeatReceiver builds the heartbeat read side.
+//
+// peerAddr is the configured control-link peer (#6888). It is a REQUIRED
+// parameter rather than a setter so the compiler proves every construction
+// site decided what to pass: a pin that silently never gets its address is
+// indistinguishable from no pin at all, and would be discovered only by an
+// attacker or a misconfiguration. Pass nil to accept any source (see the
+// peerAddr field comment — unset fails OPEN).
+func newHeartbeatReceiver(mgr *Manager, conn *net.UDPConn, threshold int, interval time.Duration, peerAddr *net.UDPAddr) *heartbeatReceiver {
 	r := &heartbeatReceiver{
 		mgr:       mgr,
 		conn:      conn,
 		threshold: threshold,
 		interval:  interval,
+		peerAddr:  peerAddr,
 		stopCh:    make(chan struct{}),
 		// #5086: bind to the Manager's process-lifetime auth state so a
 		// heartbeat restart (VRF rebind, comms restart) keeps every retired
@@ -1363,7 +1446,7 @@ func (r *heartbeatReceiver) readLoop() {
 		}
 
 		r.conn.SetReadDeadline(time.Now().Add(r.interval))
-		n, _, err := r.conn.ReadFromUDP(buf)
+		n, src, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
@@ -1375,6 +1458,28 @@ func (r *heartbeatReceiver) readLoop() {
 				slog.Debug("cluster: heartbeat read error", "err", err)
 				continue
 			}
+		}
+
+		// #6888: drop anything not from the configured peer at the CHEAPEST
+		// point — before unmarshal, before cluster-id validation, before MAC
+		// verification. Placed first because that is the whole benefit: an
+		// off-path sender that can reach this port otherwise makes the node do
+		// HMAC work on every forged frame, on a path that runs at a 200ms
+		// interval with a threshold of 5.
+		//
+		// It cannot skip replay-state updates for genuine frames: a frame from
+		// the peer passes this and reaches admitFrame exactly as before, and a
+		// frame from anywhere else has no legitimate replay state to update.
+		//
+		// This is NOT an authentication boundary and must not be read as one —
+		// frames are HMAC-verified in admitFrame, and an attacker without the
+		// control-link PSK could never get one admitted whatever source it
+		// carried. What this adds is cheapest-point filtering, visibility of a
+		// misconfiguration that was previously silent, and a constraint on
+		// where forged frames can originate if the PSK ever leaks.
+		if !r.srcIsConfiguredPeer(src) {
+			r.noteForeignSource(src)
+			continue
 		}
 
 		pkt, err := UnmarshalHeartbeat(buf[:n])
