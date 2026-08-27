@@ -106649,3 +106649,9 @@ prose edit above them added. No diff falls in the new test body.
     terminal schema node permitting a body (Codex re-review finding 1)
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6818 — drive the packedBodyChildren guard test at the HELPER
+    instead of through a compile; one cell had a nil schema path and tested
+    nothing
+  - **File(s)**: pkg/config/compact_leaf_credentials_test.go

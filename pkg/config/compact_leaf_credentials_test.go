@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"testing"
 )
 
@@ -196,7 +195,7 @@ func ospfIface6818(t *testing.T, cfg *Config, spelling string) *OSPFInterface {
 // secLogStream6821 resolves a security-log stream by name.
 
 // TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818 pins the guard on
-// packedBodyChildren's deep attachment.
+// packedBodyChildren's deep attachment, by calling the HELPER DIRECTLY.
 //
 // The helper attaches a node's real children UNDER the deepest node of the
 // expanded packed tail, which is what the grammar means for
@@ -204,43 +203,129 @@ func ospfIface6818(t *testing.T, cfg *Config, spelling string) *OSPFInterface {
 // the terminal is a LEAF: `stanza leaf value { body }` describes no nesting the
 // schema has, and attaching there would invent one.
 //
-// Both directions matter, so both are cells. Without the permits-a-body case,
-// a guard that refused every attachment would pass the refusal case and
-// silently reintroduce the empty-MD5-key defect; without the refusal case, the
-// guard could be deleted with nothing noticing.
+// # Why this drives the helper rather than a compile
+//
+// It used to go through CompileConfig on a packed source, which made it a test
+// of "does this packed config compile correctly" rather than of the helper's
+// contract. That is the wrong subject twice over:
+//
+//   - it tested the guard only via whichever callers happen to reach it today,
+//     so a new direct caller of packedBodyChildren was never covered;
+//   - and it is fragile to anything that rewrites the tree BEFORE the compiler
+//     runs. #2419's whole-tree normalizer does exactly that, and with it in
+//     place the compiler never sees a packed tail at all — the cell would pass
+//     while testing nothing, or fail for a reason unrelated to the guard.
+//
+// The guard is a property of packedBodyChildren. Test it there, and it holds
+// for every caller regardless of what runs upstream.
 func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
-	t.Run("terminal PERMITS a body: the block attaches under it", func(t *testing.T) {
-		// `md5 7` takes a `key` child, so the nested block belongs under it.
-		compact, block := compileBothSpellings(t,
-			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication md5 7 { key "k"; } } } } }`,
-			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication { md5 7 { key "k"; } } } } } }`)
-		for name, cfg := range map[string]*Config{"packed": compact, "nested": block} {
-			iface := ospfIface6818(t, cfg, name)
-			if string(iface.AuthKey) != "k" {
-				t.Errorf("%s: AuthKey = %q, want \"k\" — the guard must not refuse an "+
-					"attachment the grammar allows, or the empty-MD5-key defect returns",
-					name, string(iface.AuthKey))
+	t.Run("terminal PERMITS a body: the block attaches UNDER it", func(t *testing.T) {
+		// `authentication md5 7 { key "k"; }` -- a packed tail AND a nested
+		// block on one node, which the parser does produce.
+		node := &Node{
+			Keys:     []string{"authentication", "md5", "7"},
+			Children: []*Node{{Keys: []string{"key", "k"}}},
+		}
+		got := packedBodyChildren(node,
+			schemaForPath("protocols", "ospf", "area", "interface", "authentication"))
+
+		if len(got) != 1 {
+			t.Fatalf("expected ONE synthesized child (the md5 chain head), got %d: %+v",
+				len(got), got)
+		}
+		md5 := got[0]
+		if md5.Name() != "md5" {
+			t.Fatalf("synthesized head = %q, want md5", md5.Name())
+		}
+		// The nested block must be UNDER md5, not beside it. Beside is what
+		// compiled an MD5 adjacency with an EMPTY key.
+		if len(md5.Children) != 1 || md5.Children[0].Name() != "key" {
+			t.Errorf("md5 children = %+v, want the `key` block attached BENEATH it. "+
+				"Returning it as a SIBLING is what dropped the key.", md5.Children)
+		}
+	})
+
+	t.Run("terminal is a LEAF: the body is NOT attached, tail unexpanded", func(t *testing.T) {
+		// `protocol` is a scalar leaf under `transport`; it takes no body, so
+		// `transport protocol tcp { protocol tls; }` describes no nesting the
+		// schema has. The helper must decline rather than invent one.
+		node := &Node{
+			Keys:     []string{"transport", "protocol", "tcp"},
+			Children: []*Node{{Keys: []string{"protocol", "tls"}}},
+		}
+		got := packedBodyChildren(node,
+			schemaForPath("security", "log", "stream", "transport"))
+
+		if len(got) != 1 || got[0].Name() != "protocol" {
+			t.Fatalf("expected the node's own children returned unexpanded, got %+v", got)
+		}
+		// The real child, unexpanded -- NOT a synthesized `protocol tcp` with
+		// the block hung underneath it.
+		if len(got[0].Children) != 0 {
+			t.Errorf("the helper attached a body under a LEAF terminal: %+v. That invents "+
+				"a nesting level the schema does not have.", got[0].Children)
+		}
+	})
+
+	// A schema path that does not resolve makes packedBodyChildren a NO-OP --
+	// its first guard returns the node's children when the schema is nil. So a
+	// cell that passes a wrong path tests nothing and passes. This one nearly
+	// did: `schemaForPath("firewall","family","filter",...)` omits the address
+	// family and returns nil, and the cell below was green against it while the
+	// helper never ran. Assert the path RESOLVES before using it.
+	t.Run("the schema paths these cells use actually resolve", func(t *testing.T) {
+		for _, p := range [][]string{
+			{"protocols", "ospf", "area", "interface", "authentication"},
+			{"security", "log", "stream", "transport"},
+			{"firewall", "family", "inet", "filter", "term", "from"},
+		} {
+			if schemaForPath(p...) == nil {
+				t.Errorf("schemaForPath(%v) is nil — packedBodyChildren short-circuits on a "+
+					"nil schema, so every cell using this path is a no-op that passes", p)
 			}
 		}
 	})
 
-	t.Run("three-level chain still attaches", func(t *testing.T) {
-		// `from flexible-match-range range r { byte-offset 9; }` expands through
-		// three levels and its terminal does take a body. Chain LENGTH was never
-		// the question; whether the terminal holds a body is.
-		compact, block := compileBothSpellings(t,
-			`firewall { family inet { filter f { term t { from flexible-match-range range r { byte-offset 9; } } } } }`,
-			`firewall { family inet { filter f { term t { from { flexible-match-range { range r { byte-offset 9; } } } } } } }`)
-		if !cfgEqualFirewall6818(compact, block) {
-			t.Error("the packed three-level chain compiled differently from the fully " +
-				"nested spelling; the guard is refusing an attachment the grammar allows")
+	t.Run("three-level chain: attaches at the DEEPEST node", func(t *testing.T) {
+		// Chain LENGTH was never the question; whether the terminal holds a
+		// body is. `range r` does, so the block belongs beneath it.
+		node := &Node{
+			Keys:     []string{"from", "flexible-match-range", "range", "r"},
+			Children: []*Node{{Keys: []string{"byte-offset", "9"}}},
+		}
+		got := packedBodyChildren(node,
+			schemaForPath("firewall", "family", "inet", "filter", "term", "from"))
+		if len(got) != 1 {
+			t.Fatalf("expected one chain head, got %+v", got)
+		}
+		// Walk to the deepest synthesized node and require the block there.
+		deepest := got[0]
+		depth := 1
+		for len(deepest.Children) == 1 && deepest.Children[0].Name() != "byte-offset" {
+			deepest = deepest.Children[0]
+			depth++
+		}
+		if depth < 2 {
+			t.Errorf("the tail expanded to depth %d; it should be a CHAIN, not one level", depth)
+		}
+		if len(deepest.Children) != 1 || deepest.Children[0].Name() != "byte-offset" {
+			t.Errorf("deepest node %q children = %+v, want the byte-offset block",
+				deepest.Name(), deepest.Children)
 		}
 	})
-}
 
-// cfgEqualFirewall6818 compares the compiled firewall section of two configs.
-func cfgEqualFirewall6818(a, b *Config) bool {
-	ja, errA := json.Marshal(a.Firewall)
-	jb, errB := json.Marshal(b.Firewall)
-	return errA == nil && errB == nil && string(ja) == string(jb)
+	t.Run("no packed tail: the children are returned untouched", func(t *testing.T) {
+		// The identity case, and the control for all three above: a node with
+		// no tail must come back exactly as it went in. Without this, a helper
+		// that synthesized something for EVERY node would satisfy the shapes
+		// above and corrupt every block-spelled config.
+		child := &Node{Keys: []string{"md5", "7"}}
+		node := &Node{Keys: []string{"authentication"}, Children: []*Node{child}}
+		got := packedBodyChildren(node,
+			schemaForPath("protocols", "ospf", "area", "interface", "authentication"))
+		if len(got) != 1 || got[0] != child {
+			t.Errorf("a node with no packed tail must return its own children unchanged, "+
+				"got %+v", got)
+		}
+	})
 }
