@@ -106678,3 +106678,37 @@ prose edit above them added. No diff falls in the new test body.
     terminal schema node permitting a body (Codex re-review finding 1)
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
+
+## 2026-08-26 — #2419 widen the compact/block census to named instances
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove the named-instance exclusion from the #2419 census walker
+  and regenerate the inventory. No production change — this is a measurement
+  correction, and it makes the number the normalizer's criterion rests on
+  checkable by anyone.
+- **The exclusion was WRONG, and wrong in the direction that hides defects.**
+  It was generalized from ONE probe — `interfaces { ge-0/0/0 description
+  hello; }`, which genuinely compiles to zero interfaces — to every named
+  instance in the schema. Measured on the rest: `interface ge-0/0/0.0 cost 10;`
+  compiles the interface with `cost=0`. The instance IS recognised; only its
+  body is lost, which is strictly worse than not recognising it because the
+  half-built object reaches the renderer and the runtime. #7653 is the same
+  shape two levels deep, with OSPF authentication as the dropped body.
+- **Numbers, re-derived at `6b80a84f6`** (NOT the 363 measured before #6817/
+  #6818/#6822 merged — that number is now stale in a way that looks like
+  progress): **546 checked, 356 divergent, 204 unruled**. The honest quote is
+  ">= 356 divergent, 204 unruled": the unruled grew 96 -> 204 with the widening
+  and they are sites whose synthesized fixture was too thin to OBSERVE the
+  value, not clean sites.
+- **Golden diff classified before trusting it**: 0 data lines REMOVED (nothing
+  that was divergent silently stopped being divergent, so no behaviour change is
+  laundered in), +169 added, 5 header lines re-counted. Sample-verified one
+  added site by hand: `applications { application myapp description hello; }`
+  compiles the application with an EMPTY description while the block spelling
+  sets it.
+- **Not covered, and named as such**: the walker collapses exactly ONE level, so
+  it cannot generate #7653's two-level tail. Shape 3 is unmeasured here and its
+  number is owed separately, with the depth it reached stated.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`, `_Log.md`
