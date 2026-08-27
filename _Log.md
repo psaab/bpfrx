@@ -107040,6 +107040,11 @@ prose edit above them added. No diff falls in the new test body.
   the measurement that this class is "accepted and dropped" rather than refused;
   rejected cells are excluded from the divergent count per the #7653 policy call.
   A depth-1 cross-check asserts the extension agrees with the base census cell
-  for cell, plus anti-vacuity on depth 3 and a rate-inversion guard.
+  for cell, plus anti-vacuity on depth 3 and a rate-inversion guard. The
+  mutation matrix found the exclusion policy had NO detector — folding rejected
+  cells into `divergent` left the suite green — so a floor assertion on the
+  rejected count was added and now reds. A paired cell (vacuous generator WITH
+  the cross-check disabled) goes green, proving the cross-check is the sole
+  detector for that mutation rather than decoration.
 - **File(s)**: `pkg/config/compact_depth_census_7653_test.go`,
   `docs/config-schema.md`, `_Log.md`
