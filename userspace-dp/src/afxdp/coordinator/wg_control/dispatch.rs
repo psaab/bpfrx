@@ -225,25 +225,43 @@ pub(super) fn dispatch_inbound(
                     }
                     InboundOutcome::Authenticated(outcome.peer_pubkey)
                 }
+                Err(crate::afxdp::wg::DecapError::Keepalive(pk)) => {
+                    // #7230: an authenticated zero-length keepalive, WITH
+                    // the peer it came from. Attribution is proven, not
+                    // inferred: try_decap demuxes the session from
+                    // hdr.receiver_index before any AEAD work, and the
+                    // record is authenticated by the time this variant is
+                    // built, so `pk` is the peer that holds those session
+                    // keys. Endpoint learning applies on ANY interface,
+                    // multi-peer included.
+                    InboundOutcome::Authenticated(pk)
+                }
                 Err(crate::afxdp::wg::DecapError::MalformedInner) => {
-                    // MalformedInner is only ever returned POST-AEAD:
-                    // the authenticated zero-length keepalive exits
-                    // decap through it by design (#1865), and a
-                    // malformed-but-authenticated inner also proves
-                    // the peer holds the session keys. Both count for
-                    // endpoint learning (this closes the #1865 plan §9
-                    // latent gap: a keepalive-only roaming peer now
-                    // updates our egress endpoint). #1434: try_decap's
-                    // MalformedInner/keepalive arm does not surface the
-                    // peer, so per-peer endpoint learning is only
-                    // unambiguous when the tunnel has exactly ONE peer
-                    // (the keepalive-roaming case the #1865 fix targets).
-                    // With multiple peers we cannot attribute a bare
-                    // keepalive to a specific peer here, so skip the
-                    // learn for THIS datagram (the next DATA record from
-                    // the peer learns it via the Authenticated(peer)
-                    // arm above). Return Unauthenticated so no wrong-peer
-                    // endpoint is learned.
+                    // POST-AEAD, so the sender provably holds the session
+                    // keys and this counts for endpoint learning.
+                    //
+                    // #7230 RETRACTION. The comment that stood here
+                    // claimed xpf "cannot attribute a bare keepalive to a
+                    // specific peer" on a multi-peer interface. That was
+                    // FALSE, and false in the direction that stops anyone
+                    // looking: the identity was in hand at the error's
+                    // construction site the whole time — try_decap
+                    // resolves the session by receiver index BEFORE any
+                    // crypto — and was simply discarded with the Err.
+                    // Keepalives now carry it out (the arm above).
+                    //
+                    // WHAT IS STILL UNATTRIBUTED, stated precisely so the
+                    // next reader is not misled a second time: a
+                    // MALFORMED-but-authenticated inner packet reaches
+                    // here without a peer, and its identity is available
+                    // at its construction sites too. That is the same
+                    // discard, unfixed — scoped out of #7230 rather than
+                    // overlooked, because widening the variant touches 13
+                    // assertion sites for a case that is anomalous rather
+                    // than continuous. Filed as #7686.
+                    //
+                    // So the single-peer fallback below is now reached
+                    // ONLY by malformed-inner, never by a keepalive.
                     match engine.single_peer_pubkey() {
                         Some(pk) => InboundOutcome::Authenticated(pk),
                         None => InboundOutcome::Unauthenticated,
