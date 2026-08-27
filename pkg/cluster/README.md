@@ -2022,26 +2022,57 @@ constraint rather than recommended practice.
 
 ### Rolling it onto a live unkeyed cluster
 
-**STALE — dual-accept was removed by #5078; the sequence below no longer works
-as written.** It is kept for the shape of the problem, not as a procedure. Step 2
-asks the operator to commit the key on the *other* node: on an RG0 secondary
-whose read-only gate is armed that returns `ErrClusterReadOnly`, and if sync
-drops before step 2 the keyed side rejects the unkeyed reconnect outright. See
-the "Recovery" discussion above for what is actually available and under which
-preconditions. Rewriting this section is tracked as **#6881**.
+**There is no non-disruptive sequence. Keying a live unkeyed cluster costs a
+controlled outage on one node.** #5078 removed dual-accept, which was the only
+mechanism that made the forward direction seamless, so the operation is now a
+special case of the recovery problem rather than a rollout procedure of its own.
 
-Dual-accept made the forward direction non-disruptive:
+**Do not follow a step list from this section.** The preconditions are what
+decide whether a given node can be keyed at all, and they are enumerated once —
+with their failure modes and their tracking issues — under **"Recovery: no path
+is unconditional, and the one you can plan around costs a controlled outage"**
+above. Read that enumeration, establish which row your cluster is in, and act on
+that row.
 
-1. Set the key on one node and commit. It now signs; the unkeyed peer has no
-   key, so it accepts everything, and the keyed node has not armed
-   enforcement yet, so it still accepts the peer's unsigned frames.
-2. Set the SAME key on the other node and commit. Both sign, each observes
-   the other authenticate, and enforcement arms.
-3. **Restart `xpfd` on both nodes**, one at a time, waiting for the cluster
-   to re-form in between.
+Why this section does not restate them: three earlier revisions of the recovery
+discussion each replaced a hedge with an absolute, in three different
+directions, and each was refuted. A second summary here would be a fourth
+attempt at the same mistake, and it would drift from the enumeration the moment
+either changed.
 
-Step 3 is **no longer required for the legitimate peer** (#6628), and the
-reason it used to be is worth keeping in view.
+The shape of the constraint, so the enumeration reads in context:
+
+- **The keyed side stops accepting the unkeyed peer immediately.** Once one node
+  commits the key, `syncAuthDecision` rejects a local-key/peer-unkeyed
+  connection unconditionally. There is no first-contact grace — that grace was
+  an unauthenticated active bypass, not a compatibility affordance (#5078).
+- **So the second node must be keyed while it can still commit.** On an RG0
+  secondary whose read-only gate is ARMED, `EnterConfigureSession` returns
+  `ErrClusterReadOnly` from every entry point, and the commit that would key it
+  is refused. If sync has already dropped, it cannot be reached over the
+  fabric either.
+- **`configuration-synchronize` does not rescue this**, because the connection
+  that would carry the config to the secondary is the one the keyed side is now
+  rejecting.
+
+The path you can plan around is **controlled RG0 promotion** (row 3 of the
+recovery enumeration): stop `xpfd` on the keyed node so the secondary promotes,
+which clears its read-only gate and lets it accept a local commit of the same
+key. Every "if" in that row is a real precondition — election eligibility,
+event delivery — and they are stated there rather than duplicated here.
+
+For the historical record, dual-accept made the forward direction non-disruptive
+by having the keyed node accept the peer's unsigned frames until both sides had
+authenticated. **That mechanism no longer exists**; it is described here only so
+that a reader encountering the term in older commits or comments knows what it
+referred to and that it is gone.
+
+An in-place upgrade (#6628) now promotes an ESTABLISHED connection to
+authenticated without a reconnect, so a restart is **not** required for the
+legitimate peer once both sides are keyed. That is a separate mechanism from
+dual-accept and does not restore a non-disruptive rollout: it upgrades a
+connection that is already admitted, and the problem above is a connection that
+is being refused.
 
 Session sync fixed a connection's authentication state when the TCP connection
 was established (`performSyncHandshake` → `wrapSyncConn`), and committing the

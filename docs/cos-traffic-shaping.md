@@ -1085,12 +1085,13 @@ and runtime queues still retain a minimum burst floor.
 (#4228 Gap 2 follow-up) — size the buffer by a target queue delay rather
 than an absolute byte-size or percent. It is validated at commit (a
 positive whole number of microseconds; `0` and garbage are rejected) and
-stored as `BufferSizeTemporalUS`, but is currently **accepted-but-inert**:
-resolving microseconds to bytes needs the queue's transmit rate (which may
-itself be a per-interface percent), so xpf does not yet materialize a
-byte-size from it and the queue falls back to the default sizing. A commit
-advisory surfaces the inertness. Modeled so imported vSRX configs that use
-`temporal` buffer sizing commit clean instead of being rejected.
+stored as `BufferSizeTemporalUS`. Since #6846 it **RESOLVES** — see
+"Temporal resolution" above: `cos_temporal_buffer_bytes` converts the
+microsecond target against the queue's resolved transmit rate. The commit
+advisory narrowed to the one case that still cannot resolve (a queue with no
+resolvable rate at all) rather than being retracted. Modeled so imported vSRX
+configs that use `temporal` buffer sizing commit clean instead of being
+rejected.
 
 ### Current Userspace Test Recipe
 
