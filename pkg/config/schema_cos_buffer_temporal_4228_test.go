@@ -67,6 +67,25 @@ func TestTemporalAdvisoryNarrowsToUnresolvable6846(t *testing.T) {
 		}
 	})
 
+	t.Run("remainder with a shaping base resolves, so it must NOT warn", func(t *testing.T) {
+		// A `remainder` queue bound via a scheduler-map to a shaped interface
+		// HAS a resolvable rate, so temporal converts against it. Found by the
+		// mutation matrix: making cosSchedulerRateResolves ignore
+		// TransmitRateRemainder escaped GREEN against the whole Go suite,
+		// because every other fixture reaches a resolvable rate by the
+		// ABSOLUTE route and cannot tell the two apart.
+		if hasTemporalAdvisory(t,
+			"set class-of-service schedulers be transmit-rate remainder",
+			"set class-of-service schedulers be buffer-size temporal 50000",
+			"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler be",
+			"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+			"set class-of-service interfaces ge-0/0/0 shaping-rate 100m",
+		) {
+			t.Fatal("#6846: a `remainder` queue with a shaping base resolves, so " +
+				"temporal converts against it and the advisory must not fire")
+		}
+	})
+
 	t.Run("absolute rate resolves, so it must NOT warn", func(t *testing.T) {
 		// An explicit transmit-rate needs no shaping base, so temporal
 		// converts and the advisory must be gone.
