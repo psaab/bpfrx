@@ -462,6 +462,66 @@ a real GRE-tunnelled inner echo through `poll_binding_process_descriptor`
 and asserts the host-inbound DENY that only the `packet_frame` read
 produces.
 
+### 6e. GRE Version Is A Decap Discriminator — RFC 2637 (PPTP) Is Refused (#6842)
+
+Everything in 6a-6d above parses an RFC 2784/2890 header, which is GRE
+**version 0**. RFC 2637 (PPTP) "enhanced GRE" is **version 1**, and it is
+not a superset — it re-purposes the same 32 bits RFC 2890 defines as an
+opaque Key, and adds a field RFC 2890 does not know to skip:
+
+```text
+  RFC 2890 :  |                     Key (32)                    |
+  RFC 2637 :  |   Payload Length (16)   |       Call ID (16)     |
+
+  RFC 2890 field order :  Checksum+Reserved1, Key, Sequence
+  RFC 2637 field order :  Key, Sequence, Acknowledgment      (A bit = 0x0080)
+```
+
+The version check at the top of `try_native_gre_decap_from_frame` runs
+BEFORE any Key read or offset arithmetic, and closes two distinct
+failures:
+
+1. **Identity.** The high half of a version-1 "Key" is Payload Length,
+   which changes with every packet. Any code that reads those 32 bits as
+   a stable tunnel discriminator gets a different value per packet. That
+   is the load-bearing finding behind #6842: a version-blind 32-bit read
+   is **strictly worse than aliasing**, because aliasing bounds the damage
+   to one session per endpoint pair while a per-packet discriminator mints
+   a session per packet. Today the only 32-bit Key read is
+   `match_tunnel_endpoint`; **#7188 adds a second one on the session path
+   and the same version branch has to gate it.**
+2. **Promotion.** With `A` set, an RFC 2890 reader skips Key and Sequence
+   only, so `inner_offset` lands on the Acknowledgment Number — four bytes
+   the peer chose. If they open a well-formed IPv4/IPv6 header the parser
+   promotes an attacker-authored packet as the tunnel's decapsulated inner
+   frame. `gre_version_1_ack_field_cannot_promote_an_injected_inner_packet`
+   drives exactly that frame and pairs it with a version-0 control that
+   DOES promote the injected packet, so the injection is demonstrably
+   reachable and the version field is demonstrably the only guard.
+
+A refused frame is **not** dropped: `try_native_gre_decap_from_frame`
+returns `None`, `stage_native_gre_decap` leaves `meta` unchanged, and the
+frame continues on the ordinary transit / host-inbound path. So the
+counter `GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS` →
+`xpf_userspace_gre_decap_unsupported_version_refusals_total` is bumped
+**only when the outer tuple names a configured GRE tunnel endpoint** (a
+cold-path lookup in the existing `gre_decap_index`, plus the #2327 kind
+re-check). Counting unconditionally would turn ordinary TRANSIT PPTP —
+which is forwarded, not refused — into a permanent nonzero alarm and make
+the metric a traffic gauge instead of a fault signal.
+
+**What this does NOT do.** Terminating PPTP requires pairing the two
+directions of a call, and the Call ID in a version-1 header is the
+*peer's* — each side allocates its own during the TCP 1723
+control-connection exchange, so the two directions carry different values
+and no symmetric reverse-key transform can pair them. That needs a
+stateful PPTP control-channel ALG, which does not exist in this codebase
+(`alg_type` is none/FTP/SIP/DNS) and which is sequenced behind the #7188
+`TunnelDiscriminator` work. Until then, PPTP offered to a configured GRE
+endpoint is refused and counted, and PPTP crossing the firewall is
+forwarded as ordinary proto-47 transit — with the pre-existing GRE
+session-aliasing behaviour #7188 owns.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.

@@ -68,6 +68,26 @@ func (c *xpfCollector) initUserspaceDropsDescriptors() {
 			"frames or a truncated GRE header (#2782).",
 		nil, nil,
 	)
+	c.userspaceGreDecapUnsupportedVersionRefusals = prometheus.NewDesc(
+		"xpf_userspace_gre_decap_unsupported_version_refusals_total",
+		"Native-GRE frames refused for decapsulation because the GRE "+
+			"version field was non-zero while the outer tuple named a "+
+			"configured GRE tunnel endpoint. RFC 2784 and RFC 2890 GRE "+
+			"is version 0; RFC 2637 (PPTP) enhanced GRE is version 1 and "+
+			"re-purposes the same 32 bits the Key occupies as a 16-bit "+
+			"Payload Length plus a 16-bit Call ID, and adds an "+
+			"Acknowledgment Number field the RFC 2890 field order does "+
+			"not skip, so parsing it with version-0 rules would read a "+
+			"per-packet-varying length as a tunnel key and promote "+
+			"attacker-chosen bytes as the inner packet. This is a "+
+			"refusal, not a drop: the frame continues on the ordinary "+
+			"transit or host-inbound path, and ordinary transit PPTP "+
+			"(no configured endpoint for the outer tuple) is not "+
+			"counted. A nonzero value flags a peer offering PPTP or "+
+			"enhanced GRE to a tunnel endpoint xpf has no ALG to "+
+			"terminate (#6842).",
+		nil, nil,
+	)
 	c.userspaceTimeExceededRateLimited = prometheus.NewDesc(
 		"xpf_userspace_time_exceeded_rate_limited_total",
 		"Locally-generated ICMP/ICMPv6 Time Exceeded (TTL/hop-limit) "+

@@ -866,6 +866,7 @@
     "forwarding_armed": false,
     "gre_decap_checksum_invalid_drops_total": 0,
     "gre_decap_ecn_illegal_drops_total": 0,
+    "gre_decap_unsupported_version_refusals_total": 0,
     "gre_encap_df_oversize_drops_total": 0,
     "ha_groups": [],
     "helper_mode": "",

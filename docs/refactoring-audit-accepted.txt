@@ -21,3 +21,4 @@
 # has landed, every later branch measures the file as already over the
 # floor and no longer crosses it, so an entry may be pruned as soon as it
 # stops describing a live decision. It is a decision record, not state.
+[REFACTOR] pkg/api/metrics_userspace.go high-touch aggregation point for the helper ProcessStatus collect path — ~45 independent emit* methods, and every new dataplane counter appends one line here (#6842 added the GRE unsupported-version refusal counter and crossed 2000 at 2010 LOC). A topical split is the right end state but is a mechanical repo-wide change that must carry the metrics_test.go per-function count and coverage assertions with it, or it decommissions them; doing that inside a one-counter dataplane fix would bury the change under code motion. Owed as its own PR — see the follow-up issue filed with #6842.

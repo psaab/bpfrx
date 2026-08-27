@@ -432,6 +432,24 @@ impl super::Coordinator {
         crate::afxdp::gre::GRE_DECAP_CHECKSUM_INVALID_DROPS.load(Ordering::Relaxed)
     }
 
+    /// #6842: native-GRE frames REFUSED for decap because the GRE version
+    /// field was non-zero (RFC 2637 / PPTP enhanced GRE is version 1)
+    /// while the outer tuple named a configured GRE tunnel endpoint. RFC
+    /// 2784/2890 GRE is version 0; a version-1 header re-purposes the
+    /// 32-bit Key as `Payload Length (16) | Call ID (16)` and adds an
+    /// Acknowledgment-Number field the RFC 2890 field order does not
+    /// skip, so parsing it with version-0 rules would promote
+    /// attacker-chosen bytes as the inner packet. This is a REFUSAL, not
+    /// a drop — the frame continues on the ordinary transit/host-inbound
+    /// path — and ordinary TRANSIT PPTP (no configured endpoint for the
+    /// outer tuple) is deliberately NOT counted. Surfaced as
+    /// `xpf_userspace_gre_decap_unsupported_version_refusals_total`; a
+    /// nonzero value flags a peer offering PPTP to a GRE tunnel endpoint
+    /// xpf has no ALG to terminate.
+    pub fn gre_decap_unsupported_version_refusals_total(&self) -> u64 {
+        crate::afxdp::gre::GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed)
+    }
+
     /// #2472: locally-generated ICMP/ICMPv6 Time Exceeded replies dropped
     /// because the per-reason token bucket was empty. The TTL/hop-limit error
     /// generator is rate-limited (global-per-reason, Linux `icmp_msgs_per_sec`
