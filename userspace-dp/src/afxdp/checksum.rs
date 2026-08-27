@@ -707,11 +707,44 @@ mod dnat_counter_guard_tests_6872 {
     ///    that is not there. Both recognitions now go through
     ///    `contains_unquoted`.
     fn enclosing_is_fn(lines: &[&str], i: usize) -> bool {
+        // Which lines are RAW-STRING CONTENT rather than code (#6872 r2).
+        //
+        // `contains_unquoted` alone is not enough, and the sensitivity control
+        // proved it: a quoted `mod` at COLUMN 0 is never even offered to that
+        // guard, because the indent filter below skips it first — and worse, it
+        // updates `level` to 0 on the way past, so the real enclosing `fn` at
+        // column 0 is then skipped as "not further out". The line has to be
+        // excluded from the walk entirely, not merely from the keyword match.
+        //
+        // Computed forward from the file start, since "am I inside a string"
+        // cannot be answered by the backward walk. A line-granular `r#"` /
+        // `"#` tracker, which is the shape this file's fixtures actually use;
+        // the scan runs once over one file in a test, so the extra pass is
+        // free.
+        let mut in_raw = vec![false; i + 1];
+        let mut open = false;
+        for (j, l) in lines.iter().enumerate().take(i + 1) {
+            if open {
+                in_raw[j] = true;
+                if l.contains("\"#") {
+                    open = false;
+                }
+                continue;
+            }
+            if l.contains("r#\"") && !l.contains("\"#") {
+                open = true;
+            }
+        }
+
         let mut level = indent_of(lines[i]);
         for j in (0..i).rev() {
             let l = lines[j];
             let t = l.trim_start();
             if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+                continue;
+            }
+            // String content is not a scope boundary and must not move `level`.
+            if in_raw[j] {
                 continue;
             }
             if indent_of(l) >= level {
@@ -957,8 +990,8 @@ mod dnat_counter_guard_tests_6872 {
             // one function away already rejects quoted patterns; the scope
             // walk now applies the same care.
             (
-                "a quoted `mod` line must not end the walk",
-                "fn t() {\n    let fixture = \"mod m {\";\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
+                "a COLUMN-0 quoted `mod` line must not end the walk",
+                "fn t() {\n    let fixture = r#\"\nmod m {\n\"#;\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
             ),
         ] {
             let lines: Vec<&str> = src.lines().collect();
@@ -997,8 +1030,8 @@ mod dnat_counter_guard_tests_6872 {
             // cut both ways or it trades one false negative for a false
             // positive.
             (
-                "a quoted `fn` line must not invent a function scope",
-                "mod m {\n    let fixture = \"fn t() {\";\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
+                "a COLUMN-0 quoted `fn` line must not invent a function scope",
+                "mod m {\n    let fixture = r#\"\nfn t() {\n\"#;\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n",
             ),
         ] {
             let lines: Vec<&str> = src.lines().collect();
