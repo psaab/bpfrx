@@ -223,6 +223,16 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 			if err != nil {
 				slog.Warn("interface not found for filter assignment",
 					"interface", physName, "err", err)
+				// #6893: record the CONSEQUENCE. compiler_iface.go already
+				// records the cause (the interface was soft-skipped); without
+				// this the binding that could not be applied left no structured
+				// trace at all, so "the filter silently went missing" was
+				// undetectable except by reading logs.
+				result.recordUnappliedFilterBinding(UnappliedFilterBinding{
+					Interface: physName,
+					Filters:   unitFilterBindings(unit),
+					Reason:    fmt.Sprintf("interface not resolvable at filter assignment: %v", err),
+				})
 				continue
 			}
 
@@ -234,6 +244,15 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 				if err != nil {
 					slog.Warn("VLAN sub-interface not found for filter",
 						"name", subName, "err", err)
+					// #6893: the sharp case. compiler_iface.go's VLAN soft skip
+					// recorded the child as unarmed; this records the binding
+					// that therefore never reached the dataplane. A filter that
+					// is absent permits what it was configured to deny.
+					result.recordUnappliedFilterBinding(UnappliedFilterBinding{
+						Interface: subName,
+						Filters:   unitFilterBindings(unit),
+						Reason:    fmt.Sprintf("VLAN sub-interface not resolvable at filter assignment: %v", err),
+					})
 					continue
 				}
 				ifindex = uint32(subIface.Index)
@@ -824,4 +843,21 @@ func resolvePortName(name string) uint16 {
 		}
 		return 0
 	}
+}
+
+// unitFilterBindings renders the filter bindings a unit declares, for the
+// #6893 unapplied-binding record.
+func unitFilterBindings(unit *config.InterfaceUnit) []string {
+	var out []string
+	for _, b := range []struct{ dir, fam, name string }{
+		{"input", "inet", unit.FilterInputV4},
+		{"input", "inet6", unit.FilterInputV6},
+		{"output", "inet", unit.FilterOutputV4},
+		{"output", "inet6", unit.FilterOutputV6},
+	} {
+		if b.name != "" {
+			out = append(out, b.dir+" "+b.fam+":"+b.name)
+		}
+	}
+	return out
 }
