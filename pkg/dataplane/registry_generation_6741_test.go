@@ -49,13 +49,87 @@ func TestObsoleteRegistryAccessCounted_6741(t *testing.T) {
 	m.registryObsoleteFrom = m.registryGeneration
 	m.mu.Unlock()
 
-	if _, present, _ := m.lookupMapLocked("sessions"); !present {
-		t.Fatalf("the retained registry must still SERVE the handle — proceed-on-retained is " +
-			"the deliberate #2114 A3 behaviour and this change must not alter it")
+	// #6741 AC1 INVERTS this assertion, deliberately. It used to require that
+	// the retained registry still SERVE the handle. It must now REFUSE: the
+	// handle is an orphan of a generation Cleanup already unpinned, and serving
+	// it lets a mutation succeed against an object nothing forwards through.
+	//
+	// The acceptance criterion offered "fails loudly OR is a verified no-op with
+	// a metric". The no-op branch is unavailable and that is measured, not
+	// assumed: `Close` closes only the XDP/TC link handles and `Cleanup` unpins
+	// without closing, so `m.maps` / `m.programs` FDs are never closed and the
+	// orphaned map stays alive and WRITABLE.
+	if h, present, _ := m.lookupMapLocked("sessions"); present || h != nil {
+		t.Errorf("a Teardown-superseded generation must be REFUSED, got present=%v handle=%v — "+
+			"serving it is the #6741 hazard: the mutation succeeds and reaches nothing",
+			present, h != nil)
 	}
 	if got := m.ObsoleteRegistryAccesses(); got != 1 {
-		t.Errorf("obsolete access count = %d, want 1 — a lookup served a handle whose kernel "+
-			"object Cleanup destroyed, and nothing measured that before #6741", got)
+		t.Errorf("obsolete access count = %d, want 1 — the counter is now the observability "+
+			"half of a real guard: it counts REFUSALS, not served-obsolete accesses", got)
+	}
+}
+
+// TestCloseRetainedRegistryStillProceeds_6741 is the SCOPE half of AC1, and the
+// reason the guard above is safe to add at all.
+//
+// #6741 AC1 refuses to serve a superseded generation. That revokes the #2114 A3
+// proceed-on-retained rule — but ONLY on the Teardown path, and by construction
+// rather than by care: `registryObsoleteFrom` is set by `Teardown` and
+// explicitly NOT by `Close`. Close keeps its pinned handles live for hitless
+// restart, which is the case A3 was argued for.
+//
+// Without this cell the change is indistinguishable from one that revoked
+// proceed-on-retained everywhere, and the guard's scope would live only in
+// prose.
+//
+// FAIL-ON-REVERT, measured rather than asserted: make `Close` set
+// `registryObsoleteFrom` and this goes RED while
+// TestObsoleteRegistryAccessCounted_6741 stays green.
+//
+// What it does NOT bind, stated because an unverified fail-on-revert claim is
+// worse than none: dropping the `registryObsoleteFrom != 0` conjunct from
+// registryObsoleteLocked leaves this cell GREEN. Its fixture has
+// generation=1 and obsoleteFrom=0, so `1 <= 0` is false either way. (That
+// conjunct is not unguarded — removing it hangs the package suite, because
+// every lookup then refuses — but this cell is not what catches it.)
+//
+// And it is not the only guard for the Close boundary:
+// TestCloseDoesNotStartAnObsoleteEpoch_6741 pre-existed and reds on the same
+// mutation. That one pins the COUNTER not starting; this one pins the handle
+// still being SERVED, which is the half AC1 could have broken.
+func TestCloseRetainedRegistryStillProceeds_6741(t *testing.T) {
+	m := regTestManager6741()
+
+	m.mu.Lock()
+	m.registryGeneration = 1
+	m.maps["sessions"] = &ebpf.Map{}
+	m.mu.Unlock()
+
+	// The hitless-restart shape: Close unarms and closes link handles, and
+	// deliberately leaves the pinned map registry intact for reuse. It does not
+	// mark the generation superseded.
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Guard the fixture: if Close ever DID mark the generation obsolete, the
+	// assertion below would be testing the refusal path by accident.
+	m.mu.Lock()
+	obsoleteFrom := m.registryObsoleteFrom
+	m.mu.Unlock()
+	if obsoleteFrom != 0 {
+		t.Fatalf("fixture broken: Close set registryObsoleteFrom=%d — Close must NOT mark a "+
+			"generation superseded, or hitless restart loses its retained handles", obsoleteFrom)
+	}
+
+	if _, present, _ := m.lookupMapLocked("sessions"); !present {
+		t.Error("a CLOSE-retained registry must still SERVE its handle — proceed-on-retained " +
+			"(#2114 A3) is preserved exactly where it was argued for. AC1 declines a " +
+			"generation TEARDOWN superseded; it does not weaken the rule")
+	}
+	if got := m.ObsoleteRegistryAccesses(); got != 0 {
+		t.Errorf("refusal count = %d, want 0 — nothing was superseded, so nothing is refused", got)
 	}
 }
 
