@@ -1098,10 +1098,16 @@ authoritative list; quick recap:
 > kernel 7.0.13, after #6676's runtime `binding_slot` extraction. The
 > table below is the #4555 measurement series and is retained because the
 > *couplings* it establishes still hold; its absolute counts are a
-> snapshot of a tree that has since moved by ~206k insns. Processed-insn
-> counts are also **kernel-dependent**, so treat any absolute figure here
-> as provenance-bearing, not as a current value — run `cmd/shimverify`
-> for that.
+> snapshot of a tree that has since moved by ~206k insns. Treat any
+> absolute figure here as provenance-bearing, not as a current value — run
+> `cmd/shimverify` for that.
+>
+> Counts *may* also vary across kernel versions — verifier instruction
+> accounting is not a stable ABI — but that is a **caution, not a measured
+> property of this object**: the only cross-kernel measurement taken
+> (7.0.0-rc7+ vs 7.0.13, byte-identical object) found **zero** difference.
+> Nothing here should be read as evidence that a count moved because a
+> kernel did.
 
 The shim's `parse_ipv6` extension-header loop is fully unrolled, so every
 iteration duplicates each arm body and its `read_bytes` range
