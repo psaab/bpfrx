@@ -740,6 +740,25 @@ pub(in crate::afxdp) fn host_inbound_admits(
         // _table_6873` (coordinator/tests.rs) — an ordering invariant with no
         // test is one refactor from being false.
         //
+        // TWO SURFACES, TWO DIFFERENT ANSWERS — and the difference is why this
+        // arm keeps getting re-audited. host-inbound is enforced BOTH here and
+        // by the kernel nft chain, and the cold-boot question resolves
+        // oppositely on each:
+        //
+        //   - KERNEL nft chain: the window IS reachable. A boot apply can fail
+        //     with no prior table to retain, leaving the host path with no
+        //     chain at all, so it needs a real gate — `installHostInboundCold
+        //     BootFence` (#5644, and its lo0 analogue #6476), guarded by
+        //     `TestColdBootHostInboundInstallFailureInstallsFence`.
+        //   - HERE (userspace AF_XDP classifier): unreachable, by the worker
+        //     lifecycle above. There is no failed-apply equivalent, because a
+        //     worker only exists once a state has been published.
+        //
+        // So "the host-inbound cold-boot fail-open was closed in #5644" is true
+        // of the kernel surface and says nothing about this one. Reading that
+        // sentence next to this arm is what makes an auditor expect a fence
+        // here and file the absence of one — twice so far.
+        //
         // So, precisely: this arm is settled for CONFIGURED zones (#3405) and
         // for addressed empty-zone interfaces (#5659); it deliberately keeps
         // admit for a legitimately zoneless NON-addressed control interface; and
