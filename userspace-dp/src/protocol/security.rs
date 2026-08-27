@@ -227,6 +227,14 @@ pub(crate) struct FirewallTermSnapshot {
     pub count: String,
     #[serde(default)]
     pub log: bool,
+    /// #6853: `then syslog`, distinct from `then log`.
+    ///
+    /// A `then syslog` term carries BOTH this and `log`; `log` is what makes
+    /// the term emit a filter-log event at all. `serde(default)` keeps wire
+    /// parity with a Go control plane that omits the field, so a
+    /// mixed-version HA pair is unaffected (#1961).
+    #[serde(default)]
+    pub syslog: bool,
     #[serde(default)]
     pub policer: String,
     #[serde(rename = "routing_instance", default)]

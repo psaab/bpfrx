@@ -2716,3 +2716,37 @@ fn syn_cookie_master_key_wire_format_is_unchanged_6855() {
     let as_str: &str = &wrapped;
     assert_eq!(as_str, KEY);
 }
+
+/// #6853: the `syslog` term field must be ADDITIVE in BOTH directions.
+///
+/// The claim this pins is mixed-version HA compatibility, and it is worth a
+/// test rather than an appeal to `#[serde(default)]` alone — that attribute
+/// only covers one of the two directions, and the other rests on the ABSENCE
+/// of `deny_unknown_fields`, which is exactly the kind of property a later
+/// hardening commit removes without realising what depended on it.
+#[test]
+fn firewall_term_syslog_is_additive_both_ways_6853() {
+    use crate::protocol::security::FirewallTermSnapshot;
+
+    // NEW reader, OLD payload: the field is absent and must default to false
+    // rather than failing the whole snapshot parse.
+    let old_payload = r#"{"name":"t","log":true}"#;
+    let parsed: FirewallTermSnapshot =
+        serde_json::from_str(old_payload).expect("an old payload without `syslog` must parse");
+    assert!(parsed.log, "the old payload's own fields must survive");
+    assert!(
+        !parsed.syslog,
+        "an absent `syslog` must default to false, not be an error or true"
+    );
+
+    // OLD reader, NEW payload: an unknown field must be IGNORED. Simulated by
+    // parsing a payload carrying a field this struct does not declare, which
+    // is precisely the shape an older helper sees when it receives `syslog`.
+    let new_payload = r#"{"name":"t","log":true,"syslog":true,"a_field_from_the_future":42}"#;
+    let parsed: FirewallTermSnapshot = serde_json::from_str(new_payload)
+        .expect("an unknown field must be ignored, or every older helper breaks on upgrade");
+    assert!(
+        parsed.syslog,
+        "a payload that carries syslog=true must be read as true"
+    );
+}

@@ -54,6 +54,7 @@ fn basic_accept_discard() {
                     next_term: false,
                     count: String::new(),
                     log: false,
+                    syslog: false,
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -89,6 +90,7 @@ fn basic_accept_discard() {
                     next_term: false,
                     count: String::new(),
                     log: false,
+                    syslog: false,
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -213,6 +215,7 @@ fn interface_filter_log_match_returns_filter_and_term_identity() {
                 destination_ports: vec!["443".into()],
                 action: "accept".into(),
                 log: true,
+                syslog: false,
                 ..Default::default()
             }],
         }],
@@ -255,6 +258,7 @@ fn interface_filter_log_match_skips_pbr_terms_without_double_emit() {
                 destination_ports: vec!["443".into()],
                 action: "accept".into(),
                 log: true,
+                syslog: false,
                 routing_instance: "blue".into(),
                 ..Default::default()
             }],
@@ -305,6 +309,7 @@ fn port_range_matching() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -386,6 +391,7 @@ fn destination_port_except_negation() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -482,6 +488,7 @@ fn source_port_except_negation() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -562,6 +569,7 @@ fn protocol_matching() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -635,6 +643,7 @@ fn dscp_rewrite_action() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -694,6 +703,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -1799,6 +1809,7 @@ fn multiple_terms_first_match_wins() {
                     next_term: false,
                     count: String::new(),
                     log: false,
+                    syslog: false,
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -1834,6 +1845,7 @@ fn multiple_terms_first_match_wins() {
                     next_term: false,
                     count: String::new(),
                     log: false,
+                    syslog: false,
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
@@ -1908,6 +1920,7 @@ fn source_dest_address_matching() {
                 next_term: false,
                 count: String::new(),
                 log: false,
+                syslog: false,
                 policer: String::new(),
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
@@ -2661,6 +2674,7 @@ fn capability_accessors_equal_fast_map_flags_for_unique_ifindices() {
                     name: "t".into(),
                     action: "accept".into(),
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 }],
             },
@@ -2949,6 +2963,7 @@ fn pr2c_folded_single_lookup_equals_two_lookup_path() {
                     name: "t".into(),
                     action: "accept".into(),
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 }],
             },
@@ -3571,6 +3586,7 @@ fn input_dscp_filter_families_changed_detects_same_ifindex_content_change() {
                 dscp_values: vec![46],
                 action: "discard".into(),
                 log: true,
+                syslog: false,
                 ..Default::default()
             }],
         }],
@@ -3599,6 +3615,7 @@ fn input_dscp_filter_families_changed_ignores_unchanged_filter() {
             dscp_values: vec![46],
             action: "discard".into(),
             log: true,
+            syslog: false,
             ..Default::default()
         }],
     };
@@ -3639,6 +3656,7 @@ fn input_dscp_filter_families_changed_ignores_positional_filter_id_change() {
             dscp_values: vec![46],
             action: "discard".into(),
             log: true,
+            syslog: false,
             ..Default::default()
         }],
     };
@@ -3752,6 +3770,7 @@ fn input_dscp_filter_families_changed_detects_filter_added_to_interface() {
             dscp_values: vec![46],
             action: "discard".into(),
             log: true,
+            syslog: false,
             ..Default::default()
         }],
     };
@@ -3788,6 +3807,7 @@ fn input_dscp_filter_families_changed_detects_filter_removed_from_interface() {
             dscp_values: vec![46],
             action: "discard".into(),
             log: true,
+            syslog: false,
             ..Default::default()
         }],
     };
@@ -4537,6 +4557,7 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
                 forwarding_class: "iperf-a".into(),
                 dscp_rewrite: Some(46),
                 log: true,
+                syslog: false,
                 ..Default::default()
             }],
         }],
@@ -8341,6 +8362,7 @@ fn fallthrough_log_action_follows_terminal_discard() {
                     action: String::new(),
                     next_term: true,
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8393,6 +8415,7 @@ fn fallthrough_log_action_follows_terminal_reject() {
                     action: String::new(),
                     next_term: true,
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8442,6 +8465,7 @@ fn fallthrough_log_action_terminating_log_term_unchanged() {
                 destination_ports: vec!["443".into()],
                 action: "accept".into(),
                 log: true,
+                syslog: false,
                 ..Default::default()
             }],
         }],
@@ -8485,6 +8509,7 @@ fn log_only_helper_matches_full_evaluator_latest_term_and_action() {
                     action: String::new(),
                     next_term: true,
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8494,6 +8519,7 @@ fn log_only_helper_matches_full_evaluator_latest_term_and_action() {
                     action: String::new(),
                     next_term: true,
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8577,6 +8603,7 @@ fn pbr_evaluator_preserves_fallthrough_log_before_routing_instance() {
                     action: String::new(),
                     next_term: true,
                     log: true,
+                    syslog: false,
                     ..Default::default()
                 },
                 FirewallTermSnapshot {
@@ -8633,6 +8660,7 @@ fn pbr_evaluator_log_on_routing_instance_term_itself() {
                 destination_ports: vec!["5201".into()],
                 action: "accept".into(),
                 log: true,
+                syslog: false,
                 routing_instance: "green".into(),
                 ..Default::default()
             }],

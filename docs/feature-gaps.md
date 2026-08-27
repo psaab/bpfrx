@@ -589,7 +589,27 @@ synthesizes a TCP RST (TCP) or ICMP/ICMPv6 admin-prohibited unreachable
 (`poll_descriptor/reject_reply.rs`), runs the generated reply through #2238
 output-filter/CoS/DSCP classification, and counts it on `filter_reject_sent`.
 `then discard` stays a silent drop. Previously filter reject collapsed to a
-silent drop (fail-closed parity gap). The output-firewall-filter case was
+silent drop (fail-closed parity gap).
+
+**`then syslog` is now DISTINCT from `then log` in the model (#6853), with no
+behaviour change yet.** Both spellings previously compiled to the single
+`FirewallFilterTerm.Log` bit, so the two Junos actions — which name different
+sinks, the filter log buffer (`show firewall log`) and the system log — were
+indistinguishable and could never be routed apart. `then syslog` now sets
+`Syslog` in addition to `Log`, and the bit is carried to the dataplane on
+`FirewallTermSnapshot.syslog` (additive + `omitempty` / `serde(default)`, so a
+mixed-version HA pair is unaffected).
+
+Note what has NOT changed, because the asymmetry is easy to misread: `then
+syslog` already reached the system log before #6853, and still does. Filter-log
+events are categorised `CategoryFirewall` and the syslog fan-out is gated only
+by a per-CLIENT category filter, never per-term (`pkg/logging/ringbuf.go`), so
+BOTH spellings emit to every subscribed syslog client. `Log` remains set on the
+syslog arm deliberately — it is what makes the term emit a filter-log event at
+all. The consequence is that `then log` also reaches syslog, which is the
+over-send direction tracked in **#6859**; correcting it is a behaviour change
+that would silently stop a feed some deployments may depend on, so it is a
+separate decision and is not made here. The output-firewall-filter case was
 closed in #3608: the TX/CoS classifier carries a `reject` bit alongside the
 collapsed `drop` bit, and the transit forward-request builder
 (`build_live_forward_request_from_frame`) + the flow-cache-hit fast path
