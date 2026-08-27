@@ -230,7 +230,7 @@ func TestChainedAppUnrepresentableTailRejected(t *testing.T) {
 				t.Fatalf("expected commit to REJECT %q — the unrepresentable tail "+
 					"was silently dropped, widening the application (#6524)", c.set)
 			}
-			if !strings.Contains(err.Error(), c.wantToken) {
+			if !strings.Contains(err.Error(), `"`+c.wantToken+`"`) {
 				t.Fatalf("reject message must name the offending token %q, got: %v",
 					c.wantToken, err)
 			}
@@ -292,7 +292,13 @@ func TestChainedAppDuplicateDetectionStillFires(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected commit to REJECT conflicting duplicate destination-port")
 	}
-	if !strings.Contains(err.Error(), "destination-port") {
+	// QUOTED, for the same reason as :233 above. This hits the #5574
+	// conflicting-duplicate message, whose static enumeration prints EVERY
+	// application leaf unquoted — so the bare form is true for a reject that
+	// names `protocol`, or any other leaf. Measured on a config whose
+	// conflicting leaf is `protocol`: Contains(err, "destination-port") is
+	// TRUE, Contains(err, `"destination-port"`) is FALSE.
+	if !strings.Contains(err.Error(), `"destination-port"`) {
 		t.Fatalf("reject message must name destination-port, got: %v", err)
 	}
 }

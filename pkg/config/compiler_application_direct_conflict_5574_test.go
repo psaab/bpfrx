@@ -54,7 +54,7 @@ func TestApplicationDirectConflict_EachScalarLeaf_Rejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected commit to REJECT conflicting direct %q", c.leaf)
 			}
-			if !strings.Contains(err.Error(), "conflicting duplicate") || !strings.Contains(err.Error(), c.leaf) {
+			if !strings.Contains(err.Error(), "conflicting duplicate") || !strings.Contains(err.Error(), `"`+c.leaf+`"`) {
 				t.Fatalf("error should name the conflicting leaf %q, got: %v", c.leaf, err)
 			}
 		})
@@ -148,7 +148,7 @@ func TestApplicationDirectConflict_FlatSetProtocol_Rejected(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected commit to REJECT a flat-set combined-leaf protocol conflict")
 	}
-	if !strings.Contains(err.Error(), "conflicting duplicate") || !strings.Contains(err.Error(), "protocol") {
+	if !strings.Contains(err.Error(), "conflicting duplicate") || !strings.Contains(err.Error(), `"protocol"`) {
 		t.Fatalf("error should name the conflicting protocol leaf, got: %v", err)
 	}
 }
