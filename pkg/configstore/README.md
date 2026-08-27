@@ -574,6 +574,22 @@ per-path:
   a crash in the microseconds between the `writeActive` syscall and the
   `confirm.json` write leaves no `confirm.json` — vastly smaller than
   the whole multi-minute window this closes.
+
+  **The re-armed timer dispatches into a HALF-BUILT daemon (#6739).**
+  `recoverPendingConfirmLocked` runs at the tail of `Load`, which the daemon
+  calls in startup **phase 1**; the daemon's managers are not constructed until
+  **phase 3**, and nothing holds the daemon's apply semaphore across the phases.
+  The remaining duration is strictly positive (an already-expired window takes
+  the synchronous branch above and never reaches this re-arm) but is bounded
+  below only by how close the boot is to the deadline, so a reboot shortly
+  before the deadline arms a timer with seconds on it. The store is not the
+  right layer to fix that — it owns the deadline, not the daemon's startup
+  ordering — but the re-arm is where the hazard originates, so it is recorded
+  here. The daemon side (the fail-closed `d.vrrpMgr` guard, and the
+  dispatch-level coverage that binds it) is documented in
+  `pkg/daemon/README.md`, "The recovered commit-confirmed rollback fires against
+  a HALF-BUILT daemon (#6739)". The startup-readiness gate that would move the
+  dispatch point is work item G, held in #7675 with H and H2.
 - **A degenerate `confirm.json` is rejected, never treated as a valid
   pending confirm (#5637, codex-review-181 M29).** `ReadConfirm` now
   validates the record's shape and fields, mirroring the #5474
