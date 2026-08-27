@@ -1419,3 +1419,72 @@ func TestLo0PayloadSharedCounterDeclaredOnce(t *testing.T) {
 		t.Errorf("shared counter declared %d times, want exactly 1 (duplicate is an nft hard error):\n%s", n, payload)
 	}
 }
+
+// TestNftRuleFromTermFlexMatchUnrepresentableMatchesNothing7722 pins
+// DISPOSITION D of the lo0 term-lowering contract
+// (daemon_nft_term_lower.go): an unrepresentable flexible-match-range makes
+// the term match NOTHING — no rule at all — mirroring userspace, which poisons
+// it to FlexMatchStart::Unsupported so flex_matches() returns false and later
+// terms still run.
+//
+// WHY THIS EXISTS when the disposition was already caught. #7722 was filed
+// after a mutation that removed the belt at the flex-match RENDER site escaped
+// green. That mutation is a no-op: the early return dominates it, so at the
+// render site the predicate is already known false. Removing the EARLY RETURN
+// does red — but only `TestNftNetlinkParity`, which catches D incidentally,
+// because the two renderers disagree. Parity says "these two differ"; it does
+// not say WHICH disposition is right, and it would not survive both renderers
+// drifting the same way. This cell asserts the disposition itself.
+//
+// It is deliberately discriminated against DISPOSITION C (#5512 tcp-flags),
+// whose answer to an unrenderable narrowing is a scoped `drop` rather than no
+// rule. The code states why they differ: a tcp-flags constraint only ever
+// matches TCP so its drop can be scoped with `meta l4proto 6`, while a
+// flexible-match-range has no natural narrowing — a bare `drop` would deny ALL
+// host-inbound traffic, turning a fail-open into a lockout. So "empty" is
+// asserted, and "not a drop" is asserted separately: a future change that
+// flattened D into C would still return a non-empty rule and must be caught.
+//
+// Fail-on-revert: remove the `lo0FlexMatchUnrepresentable` early return from
+// nftRulesFromTerm and the first two subtests go RED.
+func TestNftRuleFromTermFlexMatchUnrepresentableMatchesNothing7722(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	// Route 1: a load width outside 1..4 bytes (40 bits -> 5).
+	wide := config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 40, Value: 1, Mask: 0xff}
+	got := nftRule(t, &config.FirewallFilterTerm{
+		Name: "flex-too-wide", FlexMatch: &wide, Action: "accept",
+	}, "ip", prefixLists)
+	if got != "" {
+		t.Errorf("unrepresentable flex-match (5-byte load) rendered %q, want \"\" — "+
+			"disposition D is match-NOTHING, and rendering it anyway is the #6804 "+
+			"control-plane fail-open on the primary host-traffic chain", got)
+	}
+	if strings.Contains(got, "drop") {
+		t.Errorf("unrepresentable flex-match rendered a DROP (%q) — that is disposition C "+
+			"(#5512 tcp-flags), which is scoped to TCP. A flex-match has no natural "+
+			"narrowing, so a bare drop denies ALL host-inbound traffic", got)
+	}
+
+	// Route 2: an unparseable numeric token recorded by the compiler.
+	got = nftRule(t, &config.FirewallFilterTerm{
+		Name: "flex-unparseable", UnknownFlexMatch: []string{"byte-offset=not-a-number"},
+		Action: "discard",
+	}, "ip", prefixLists)
+	if got != "" {
+		t.Errorf("UnknownFlexMatch token rendered %q, want \"\" — a token the compiler "+
+			"could not parse must not be silently dropped from the narrowing", got)
+	}
+
+	// CONTROL. A REPRESENTABLE flex-match must still render, or the two
+	// assertions above would pass against a build that never renders a
+	// flex-match at all.
+	ok := config.FlexMatchConfig{MatchStart: "layer-3", ByteOffset: 6, BitLength: 8, Value: 1, Mask: 0xff}
+	got = nftRule(t, &config.FirewallFilterTerm{
+		Name: "flex-ok", FlexMatch: &ok, Action: "accept",
+	}, "ip", prefixLists)
+	if !strings.Contains(got, "@nh,") {
+		t.Errorf("representable flex-match did not render a payload match: %q — without "+
+			"this control the match-nothing assertions above prove nothing", got)
+	}
+}
