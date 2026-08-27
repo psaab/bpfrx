@@ -2785,18 +2785,20 @@ fn nat64_frag_assoc_install_site_derives_the_owner_rg_6857() {
         panic!("#6857: could not build the non-first fragment key");
     };
     let asked = std::cell::Cell::new(Vec::<i32>::new());
-    let hit = forwarding.nat64.frag_assoc.lookup(
-        &key,
-        1_000,
-        forwarding.nat64.build_generation,
-        |rg| {
-            let mut v = asked.take();
-            v.push(rg);
-            asked.set(v);
-            true
-        },
+    let hit =
+        forwarding
+            .nat64
+            .frag_assoc
+            .lookup(&key, 1_000, forwarding.nat64.build_generation, |rg| {
+                let mut v = asked.take();
+                v.push(rg);
+                asked.set(v);
+                true
+            });
+    assert!(
+        hit.is_some(),
+        "#6857 PREMISE: the association must be findable"
     );
-    assert!(hit.is_some(), "#6857 PREMISE: the association must be findable");
     assert_eq!(
         asked.take(),
         vec![3],

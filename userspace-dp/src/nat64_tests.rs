@@ -5010,13 +5010,17 @@ fn nat64_frag_assoc_ttl_evicts() {
     cache.install(key, decision, None, 1_000, 1, 0);
     assert_eq!(cache.len(), 1);
     // Still within the TTL window: hit.
-    assert!(cache
-        .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1, |_| true)
-        .is_some());
+    assert!(
+        cache
+            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1, 1, |_| true)
+            .is_some()
+    );
     // Past the (refreshed) TTL with no intervening hit: pruned + miss.
     cache.install(key, decision, None, 1_000, 1, 0);
     assert!(
-        cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1, |_| true).is_none(),
+        cache
+            .lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1, 1, |_| true)
+            .is_none(),
         "expired association must miss",
     );
     assert_eq!(cache.len(), 0, "expired entry pruned");
@@ -6005,7 +6009,10 @@ fn frag_rg_fixture() -> (Nat64FragAssoc, Nat64FragKey, Nat64FragKey, SessionDeci
         .expect("first-fragment key");
     let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, frag_test_authority())
         .expect("non-first-fragment key");
-    assert_eq!(kf, kn, "#6857 premise: the two fragments must share one key");
+    assert_eq!(
+        kf, kn,
+        "#6857 premise: the two fragments must share one key"
+    );
     let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
     (Nat64FragAssoc::new(), kf, kn, decision)
 }
