@@ -223,7 +223,14 @@ fn reject_suppressed_for_v4_multicast_dst() {
     );
     let fwd = forwarding_with_egress(0);
     assert!(
-        build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+        build_reject_icmp_unreachable(
+            &frame,
+            meta,
+            ICMP_IFINDEX,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        )
+        .is_none(),
         "reject unreachable must not build for a multicast destination"
     );
 }
@@ -270,7 +277,14 @@ fn reject_suppressed_for_v4_directed_broadcast_dst() {
         "IPv4 subnet-directed broadcast must suppress the reply"
     );
     assert!(
-        build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+        build_reject_icmp_unreachable(
+            &frame,
+            meta,
+            ICMP_IFINDEX,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        )
+        .is_none(),
         "reject unreachable must not build for a directed broadcast"
     );
 }
@@ -335,7 +349,14 @@ fn reject_suppressed_for_v4_directed_broadcast_src() {
         "IPv4 subnet-directed broadcast SOURCE must suppress the reply"
     );
     assert!(
-        build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+        build_reject_icmp_unreachable(
+            &frame,
+            meta,
+            ICMP_IFINDEX,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        )
+        .is_none(),
         "reject unreachable must not build for a directed-broadcast source"
     );
 }
@@ -381,7 +402,14 @@ fn reject_suppressed_for_v6_multicast_dst() {
     );
     let fwd = forwarding_with_egress(0);
     assert!(
-        build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+        build_reject_icmp_unreachable(
+            &frame,
+            meta,
+            ICMP_IFINDEX,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        )
+        .is_none(),
         "reject unreachable must not build for an IPv6 multicast destination"
     );
 }
@@ -399,7 +427,14 @@ fn reject_still_allowed_for_unicast_dst() {
     );
     let fwd = forwarding_with_egress(0);
     assert!(
-        build_reject_icmp_unreachable(&frame4, meta4, ICMP_IFINDEX, &fwd).is_some(),
+        build_reject_icmp_unreachable(
+            &frame4,
+            meta4,
+            ICMP_IFINDEX,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        )
+        .is_some(),
         "reject unreachable must build for a unicast destination"
     );
     // IPv6 global unicast destination.
@@ -408,4 +443,67 @@ fn reject_still_allowed_for_unicast_dst() {
         can_generate_icmp_error_reply(&frame6, meta6, &forwarding_with_egress(0)),
         "a unicast IPv6 destination must allow the reply"
     );
+}
+
+/// #6854: the ICMP code on a reject reply comes from the term's
+/// `then reject <message-type>`, not a hardcoded constant.
+///
+/// Before #6854 `build_reject_icmp_unreachable` passed literal 13 (v4) / 1 (v6)
+/// for every reject, so `then reject host-unreachable` committed cleanly,
+/// displayed back, and put administratively-prohibited on the wire. A peer that
+/// distinguishes them — a traceroute renderer, or an application that retries on
+/// host-unreachable but gives up on admin-prohibited — saw the wrong signal.
+///
+/// This asserts the code BYTE in the built frame rather than the resolver's
+/// return value. A unit test on `resolve_reject_message` alone passes just as
+/// well when the builder ignores its argument, which is exactly the state this
+/// issue describes.
+#[test]
+fn reject_reply_carries_the_configured_icmp_code_6854() {
+    let fwd = forwarding_with_egress(0);
+
+    // v4: host-unreachable is RFC 792 code 1, not 13.
+    let (frame, meta) = inbound_v4(InL2::Untagged);
+    let msg = crate::filter::resolve_reject_message("host-unreachable");
+    let built = build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd, msg)
+        .expect("#6854: the v4 reject reply must build");
+    let (ty, code) = icmp_type_code_v4_6854(&built);
+    assert_eq!(
+        (ty, code),
+        (3, 1),
+        "#6854: `then reject host-unreachable` must put ICMPv4 type 3 code 1 on the wire, \
+         not the hardcoded code 13 (administratively-prohibited)"
+    );
+
+    // The default is unchanged: a term with no message-type still sends 13, so
+    // this change is invisible to every config that does not use the feature.
+    let dflt = crate::filter::resolve_reject_message("");
+    let built = build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd, dflt)
+        .expect("#6854: the default v4 reject reply must build");
+    assert_eq!(
+        icmp_type_code_v4_6854(&built),
+        (3, 13),
+        "#6854: a term with NO message-type must keep sending code 13 — this change must be \
+         bit-identical for a config that does not use the feature"
+    );
+}
+
+/// Read (type, code) out of the ICMPv4 payload of a built reply frame.
+///
+/// Walks the L2/L3 headers rather than indexing a fixed offset, so a VLAN tag
+/// or an IP options change does not silently make this read the wrong bytes and
+/// assert against garbage.
+fn icmp_type_code_v4_6854(frame: &[u8]) -> (u8, u8) {
+    let mut off = 14usize; // ethernet
+    if frame.len() > 13 && u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
+        off += 4; // one VLAN tag
+    }
+    assert!(frame.len() > off, "frame too short for an IPv4 header");
+    let ihl = usize::from(frame[off] & 0x0f) * 4;
+    let icmp = off + ihl;
+    assert!(
+        frame.len() > icmp + 1,
+        "frame too short for an ICMP type/code at offset {icmp}"
+    );
+    (frame[icmp], frame[icmp + 1])
 }

@@ -591,6 +591,34 @@ output-filter/CoS/DSCP classification, and counts it on `filter_reject_sent`.
 `then discard` stays a silent drop. Previously filter reject collapsed to a
 silent drop (fail-closed parity gap).
 
+**`then reject <message-type>` now selects the ICMP code (#6854).** The config
+half shipped in #2399 -- the token was validated against `rejectMessageTypes`
+and stored on `FirewallFilterTerm.RejectMessageType` -- and nothing read it, so
+the dataplane hardcoded ICMPv4 type 3 code 13 / ICMPv6 type 1 code 1
+(administratively prohibited) for every reject. `then reject host-unreachable`
+committed cleanly, displayed back, and put admin-prohibited on the wire; a peer
+that distinguishes the two saw the wrong signal.
+
+The token is now carried to the dataplane on `FirewallTermSnapshot`
+(`reject_message_type`, additive + `omitempty` / `serde(default)`) and resolved
+by `crate::filter::resolve_reject_message`. Fourteen of the fifteen accepted
+tokens are RFC 792 ICMPv4 Destination Unreachable codes and map exactly. The
+ICMPv6 column is RFC 4443, which is not a relabelling of RFC 792: only
+`network-unreachable` (0), `host-unreachable` (3), `port-unreachable` (4) and
+the three prohibitions (1) have an honest counterpart, and every other token
+deliberately keeps code 1 rather than an invented one -- which is exactly what
+the dataplane sent before, so a v4-only message-type leaves v6 behaviour
+unchanged.
+
+Two things this does NOT change, both stated because they look like omissions:
+`tcp-reset` still routes to the RST builder for TCP and to an ICMP reply
+otherwise, which is its Junos behaviour and needs no message-type; and a TCP
+flow matching a term with an explicit ICMP message-type still receives a RST
+rather than that ICMP message, because the TCP/non-TCP split happens before the
+code is consulted. The latter is a pre-existing divergence from Junos (where
+only `tcp-reset` produces a RST) and is untouched here -- changing it would
+alter what every existing `then reject` sends on TCP.
+
 **`then syslog` is now DISTINCT from `then log` in the model (#6853), with no
 behaviour change yet.** Both spellings previously compiled to the single
 `FirewallFilterTerm.Log` bit, so the two Junos actions — which name different

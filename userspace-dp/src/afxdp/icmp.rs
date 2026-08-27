@@ -603,6 +603,7 @@ pub(super) fn build_reject_icmp_unreachable(
     meta: UserspaceDpMeta,
     ingress_ifindex: i32,
     forwarding: &ForwardingState,
+    reject_message: crate::filter::RejectMessage,
 ) -> Option<Vec<u8>> {
     // #2237: shared RFC 1812 §4.3.2.7 / RFC 4443 §2.4 suppression gate.
     // Subsumes the prior inline non-first-fragment and inbound-ICMP-error
@@ -612,12 +613,29 @@ pub(super) fn build_reject_icmp_unreachable(
         return None;
     }
     match meta.addr_family as i32 {
-        // ICMPv4 Destination Unreachable, code 13 (communication
-        // administratively prohibited).
-        libc::AF_INET => build_local_icmp_error_v4(frame, meta, ingress_ifindex, forwarding, 3, 13),
-        // ICMPv6 Destination Unreachable, code 1 (communication with
-        // destination administratively prohibited).
-        libc::AF_INET6 => build_local_icmp_error_v6(frame, meta, ingress_ifindex, forwarding, 1, 1),
+        // ICMPv4 Destination Unreachable (type 3). The CODE comes from the
+        // term's `then reject <message-type>` (#6854); a term with no
+        // message-type resolves to 13, "communication administratively
+        // prohibited", which is what every reject carried before.
+        libc::AF_INET => build_local_icmp_error_v4(
+            frame,
+            meta,
+            ingress_ifindex,
+            forwarding,
+            3,
+            reject_message.v4_code,
+        ),
+        // ICMPv6 Destination Unreachable (type 1). Most RFC 792 codes have no
+        // ICMPv6 counterpart and deliberately resolve to 1 rather than an
+        // invented code — see `RejectMessage`.
+        libc::AF_INET6 => build_local_icmp_error_v6(
+            frame,
+            meta,
+            ingress_ifindex,
+            forwarding,
+            1,
+            reject_message.v6_code,
+        ),
         _ => None,
     }
 }

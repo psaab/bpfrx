@@ -106988,3 +106988,11 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/eventengine/engine.go`, `pkg/eventengine/queue.go`,
   `pkg/eventengine/evaluate.go`, `pkg/eventengine/README.md`,
   `docs/refactoring-audit-accepted.txt`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6854 — `then reject <message-type>` now selects the ICMP code. Threaded the token from the compiler through FirewallTermSnapshot into FilterAction::Reject and the ICMP builder, across all three reject paths (input, output/CoS, flow-cache replay).
+  - **File(s)**: pkg/config/compiler_firewall_reject_message_6854_test.go, pkg/dataplane/userspace/{protocol_policies,filters,firewall_snapshot_render}.go, userspace-dp/src/filter/{mod,compiler,tests}.rs, userspace-dp/src/protocol/security.rs, userspace-dp/src/afxdp/{icmp,icmp_tests,flow_cache,forward_request,event_emit}.rs, userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/afxdp/poll_descriptor/*.rs, docs/feature-gaps.md
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #7679 — raised the #7257 probe's teardown-progress bound from 5s to 30s. The 5s deadline made master RED under `go test ./...` twice; it is itself a fixed wall-clock sample of an asynchronous observable, which is the #7650 defect the file was changed to fix.
+  - **File(s)**: pkg/cluster/heartbeat_start_stop_race_7257_test.go
