@@ -160,6 +160,40 @@ inspect or rewrite a packet sitting in a UMEM frame.
   TCP flags/seq/MSS still reach the TCP-flag screens and the SYN-cookie
   flood challenge; a non-first fragment carries no L4 here and stays
   flowless.
+- **A protocol with no shim-resolved L4 identity is flowless (#6837)**:
+  `metadata_tuple_complete` returns true only for the protocols the XDP
+  shim actually parses an L4 identity for — TCP, UDP, ICMP and ICMPv6.
+  The shim's `parse_l4` catch-all stamps `Some((l4_offset, 0, 0, 0, 0))`
+  for everything else, and those zeros are a PLACEHOLDER, not a parse.
+  Before #6837 the predicate asked only whether both addresses were set,
+  so GRE (47), ESP (50), AH (51), OSPF (89) and every other portless
+  protocol were declared complete on the strength of that placeholder —
+  overriding the frame side, which had already refused them
+  (`parse_flow_ports` has no arm for them). The packet then took the
+  flow-backed arm and, on permit, installed
+  `SessionKey { protocol, src_port: 0, dst_port: 0, .. }` plus its reverse
+  companion: measured at **two entries per transit flow**, aliasing every
+  distinct flow between one endpoint pair onto one key, one policy
+  decision, one NAT state and one timeout.
+
+  **Flowless is not a drop and not a bypass.** The packet still forwards
+  (measured: an unchanged `tx=1` across the change), and since #3291 the
+  flowless transit arm applies zone policy, interface input filters and
+  PBR through the *same* helpers the flow-backed arm uses
+  (`evaluate_non_pbr_input_filter`, `ingress_route_table_override`,
+  `evaluate_policy_result_l3_aware`). The flowless arm is additionally
+  stricter in one respect that matters here: it evaluates with
+  `l4_present = false`, so port-bearing policy terms fail closed instead
+  of being compared against fabricated port 0.
+
+  What IS given up is **stateful return admission** for these protocols,
+  and their appearance in `show security flow session` — an observable
+  behaviour change on upgrade, not a pure correctness fix. Restoring a
+  session for them needs a discriminator that is the SAME in both
+  directions: the RFC 2890 GRE Key qualifies, an RFC 2637 PPTP Call ID and
+  an ESP SPI do not (both are allocated per-direction — see
+  `docs/userspace-native-gre-plan.md` §6e). That belongs on the PARSE
+  side (#7188's typed discriminator), never as a metadata-side default.
 - **L4 ports are bounded by the IP-DECLARED packet length (#2361)**: the
   live ingress parsers (`parse_ipv4_session_flow_from_frame`, the IPv6 arm
   of `parse_session_flow_from_frame`, the meta-offset fallback in

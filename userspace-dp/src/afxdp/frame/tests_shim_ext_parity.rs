@@ -2637,20 +2637,45 @@ fn over_limit_refusal_does_not_over_reach() {
     esp_meta.protocol = 50;
     esp_meta.flow_src_port = 0;
     esp_meta.flow_dst_port = 0;
+    // #6837 changed what happens to ESP here, but NOT for a reason this guard
+    // is about. ESP is now refused because the shim resolves no L4 identity for
+    // it and its 0/0 ports are a placeholder — the same rule that refuses GRE
+    // and OSPF. The over-reach this test guards is different and still absent:
+    // ESP must never be refused for being an unresolved IPv6 CHAIN, because it
+    // is a resolved terminal on both sides.
+    //
+    // Asserting that directly is also stronger than the session-flow row it
+    // replaces, which could not distinguish the two reasons: `None` looked the
+    // same either way. Teaching either walker that ESP is traversable reds
+    // here; #6837's portless rule cannot make this assertion fire.
+    assert!(
+        !crate::afxdp::ipv6_ext_header_is_traversable(50),
+        "#6923: ESP is a resolved terminal, so the unresolved-chain refusal must not reach it"
+    );
+    // And the refusal that DOES apply is the portless one, which is scoped to
+    // the metadata tuple rather than to the chain — pinned over all 256 values
+    // by `metadata_tuple_complete_refuses_unresolved_ipv6_ext_protocols_even_with_ports`
+    // and `metadata_tuple_complete_matches_the_shim_resolved_set_6837`.
     assert_eq!(
         parse_session_flow_from_bytes(&esp, esp_meta).map(|f| f.forward_key.protocol),
-        Some(50),
-        "#6923: an ESP flow carries ports 0/0 too, and must NOT be caught by the refusal"
+        None,
+        "#6837: ESP has no shim-resolved L4 identity, so its placeholder tuple is refused"
     );
 
     // (b) No-Next-Header (59) is a terminal verdict, not a traversed header.
     assert_eq!(shim_walk::eh_class(59), EH_CLASS_NONEXT);
     let mut nonext_meta = esp_meta;
     nonext_meta.protocol = 59;
+    // Same split as (a): 59 is refused by #6837's portless rule, never by the
+    // unresolved-chain rule. The chain property is what this guard owns.
+    assert!(
+        !crate::afxdp::ipv6_ext_header_is_traversable(59),
+        "#6923: No-Next-Header is a terminal verdict on both sides, not a traversed header"
+    );
     assert_eq!(
         parse_session_flow_from_bytes(&esp, nonext_meta).map(|f| f.forward_key.protocol),
-        Some(59),
-        "#6923: No-Next-Header is a resolved terminal on both sides, not an unresolved chain"
+        None,
+        "#6837: No-Next-Header carries no L4 identity, so its placeholder tuple is refused"
     );
 
     // (c) IPv4 is untouched: 0/43/44/51/60/135/... are ordinary IPv4 protocol
@@ -2686,10 +2711,31 @@ fn over_limit_refusal_does_not_over_reach() {
             },
             ..UserspaceDpMeta::default()
         };
+        // #6923's point here was that the ext-header refusal is IPv6-scoped.
+        // After #6837 these values are refused on IPv4 too — but by the
+        // PORTLESS rule, which applies to both families equally, so the
+        // IPv6-scoping of the ext-header rule is untouched. What this row can
+        // still say is that IPv4 is judged by the #6837 rule and nothing else.
         assert_eq!(
             parse_session_flow_from_bytes(&v4, meta).map(|f| f.forward_key.protocol),
-            Some(proto),
-            "#6923: IPv4 protocol {proto} has no extension-header meaning and must not be refused"
+            None,
+            "#6837: IPv4 protocol {proto} has no shim-resolved L4 identity, so its placeholder \
+             tuple is refused — by the portless rule, not by an ext-header rule that must stay \
+             IPv6-scoped"
+        );
+
+        // NON-VACUITY CONTROL. Without it this loop asserts `None` for every
+        // row and would pass just as happily if `parse_session_flow_from_bytes`
+        // started refusing EVERYTHING. A TCP tuple on the same IPv4 fixture
+        // must still resolve.
+        let mut tcp_meta = meta;
+        tcp_meta.protocol = TCP;
+        tcp_meta.flow_src_port = 0x1234;
+        tcp_meta.flow_dst_port = 0x5678;
+        assert_eq!(
+            parse_session_flow_from_bytes(&v4, tcp_meta).map(|f| f.forward_key.protocol),
+            Some(TCP),
+            "control: a resolved IPv4 TCP tuple on the same fixture must still produce a flow"
         );
     }
 }
