@@ -462,6 +462,120 @@ a real GRE-tunnelled inner echo through `poll_binding_process_descriptor`
 and asserts the host-inbound DENY that only the `packet_frame` read
 produces.
 
+### 6e. GRE Version Is A Decap Discriminator — RFC 2637 (PPTP) Is Refused (#6842)
+
+Everything in 6a-6d above parses an RFC 2784/2890 header, which is GRE
+**version 0**. RFC 2637 (PPTP) "enhanced GRE" is **version 1**, and it is
+not a superset — it re-purposes the same 32 bits RFC 2890 defines as an
+opaque Key, and adds a field RFC 2890 does not know to skip:
+
+```text
+  RFC 2890 :  |                     Key (32)                    |
+  RFC 2637 :  |   Payload Length (16)   |       Call ID (16)     |
+
+  RFC 2890 field order :  Checksum+Reserved1, Key, Sequence
+  RFC 2637 field order :  Key, Sequence, Acknowledgment      (A bit = 0x0080)
+```
+
+The version check at the top of `try_native_gre_decap_from_frame` runs
+BEFORE any Key read or offset arithmetic, and closes two distinct
+failures:
+
+1. **Identity.** The high half of a version-1 "Key" is Payload Length,
+   which changes with every packet. Any code that reads those 32 bits as
+   a stable tunnel discriminator gets a different value per packet. That
+   is the load-bearing finding behind #6842: a version-blind 32-bit read
+   is **strictly worse than aliasing**, because aliasing bounds the damage
+   to one session per endpoint pair while a per-packet discriminator mints
+   a session per packet. Today the only 32-bit Key read is
+   `match_tunnel_endpoint`; **#7188 adds a second one on the session path
+   and the same version branch has to gate it.**
+2. **Promotion.** With `A` set, an RFC 2890 reader skips Key and Sequence
+   only, so `inner_offset` lands on the Acknowledgment Number — four bytes
+   the peer chose. If they open a well-formed IPv4/IPv6 header the parser
+   promotes an attacker-authored packet as the tunnel's decapsulated inner
+   frame. `gre_version_1_ack_field_cannot_promote_an_injected_inner_packet`
+   drives exactly that frame and pairs it with a version-0 control that
+   DOES promote the injected packet, so the injection is demonstrably
+   reachable and the version field is demonstrably the only guard.
+
+A refused frame is **not** dropped: `try_native_gre_decap_from_frame`
+returns `None`, `stage_native_gre_decap` leaves `meta` unchanged, and the
+frame continues on the ordinary transit / host-inbound path. So the
+counter `GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS` →
+`xpf_userspace_gre_decap_unsupported_version_refusals_total` is bumped
+**only when the outer tuple names a configured GRE tunnel endpoint** (a
+cold-path lookup in the existing `gre_decap_index`, plus the #2327 kind
+re-check). Counting unconditionally would turn ordinary TRANSIT PPTP —
+which is forwarded, not refused — into a permanent nonzero alarm and make
+the metric a traffic gauge instead of a fault signal.
+
+**What this does NOT do.** Terminating PPTP requires pairing the two
+directions of a call, and the Call ID in a version-1 header is the
+*peer's* — each side allocates its own during the TCP 1723
+control-connection exchange, so the two directions carry different values
+and no symmetric reverse-key transform can pair them. That needs a
+stateful PPTP control-channel ALG, which does not exist in this codebase
+(`alg_type` is none/FTP/SIP/DNS) and which is sequenced behind the #7188
+`TunnelDiscriminator` work — tracked as **#7699**. Until then, PPTP
+offered to a configured GRE endpoint is refused and counted, and PPTP
+crossing the firewall is forwarded as ordinary proto-47 transit — with
+the pre-existing GRE session-aliasing behaviour #7188 owns.
+
+#### Which header discriminators can key a session, and which cannot
+
+The tempting shortcut for the GRE aliasing in #6837/#7188 is "read the
+discriminator out of the header and put it in the `SessionKey`". Whether
+that works is **not** decided by whether the field exists in the header.
+It is decided by whether the field is **symmetric** — the same value in
+both directions of one flow. A session key installs a forward entry and a
+reverse companion derived from it (`reverse_wire_key` /
+`reverse_canonical_key`, `userspace-dp/src/session/key.rs`); an asymmetric
+discriminator has no reverse transform, so the return direction lands on a
+DIFFERENT key and the two halves of one conversation never pair.
+
+Quoted verbatim from the standards, because this is exactly the kind of
+claim that gets paraphrased into its own opposite:
+
+| Discriminator | Symmetric? | Authority |
+|---|---|---|
+| RFC 2890 GRE Key (v0, K bit) | **YES** | RFC 2890 §2.1: "Packets belonging to a traffic flow are encapsulated using the **same Key value** and the decapsulating tunnel endpoint identifies packets belonging to a traffic flow based on the Key Field value." It "defines a logical traffic flow between encapsulator and decapsulator" — a per-flow constant. |
+| RFC 2637 PPTP Call ID (v1) | **NO** | RFC 2637 §4.1, Key field: "Call ID — (Low 2 octets) Contains the **Peer's** Call ID for the session to which this packet belongs." Each side allocates its own during the TCP 1723 control exchange, so the two directions carry different values. |
+| ESP / AH SPI | **NO** | RFC 4303 §2.1: "Because the **SPI value is generated by the receiver** for a unicast SA..." The inbound and outbound SAs of one pair carry different SPIs. |
+
+So the RFC 2890 Key is header-keyable, and is exactly what #7188 should
+key on. The PPTP Call ID and the ESP/AH SPI are **not**: each needs an
+association learned from a control plane (PPTP: the TCP 1723 channel,
+#7699; IPsec: IKE / the SAD, which the control plane already tracks in
+`pkg/ipsec`). Reading either straight into a `SessionKey` yields a forward
+entry whose reverse companion no peer will ever match — a per-call session
+that only ever sees one direction, which is worse than the aliasing it
+was meant to replace.
+
+Two consequences for #7188's predicate:
+
+- The protocol set that gets a header-derived discriminator must be an
+  **allowlist of SYMMETRIC discriminators** — never a denylist, and never
+  "every protocol carrying a 32-bit field at this offset". A denylist
+  defaults each unknown protocol back to the degenerate `0/0` key; an
+  existence-based allowlist admits the SPI and the Call ID.
+- GRE version 0 and version 1 are **different classes, not a value range**
+  of one. A v0 tunnel has no Call ID at all, so the predicate must decline
+  rather than synthesize one; a v1 packet has no RFC 2890 Key, so its 32
+  bits must not be read as one. That is the branch section 6e enforces on
+  the decap path, and #7188 inherits it on the session path.
+
+For the record on the adjacent issue: **this section changes nothing about
+#6837.** GRE is flow-backed today because `metadata_tuple_complete`
+(`frame/inspect.rs`) ends in `_ => true` while `parse_flow_ports` in the
+same file ends in `_ => None` — the metadata arm admits the zero-ported
+tuple that the frame arm refuses. This change does not touch either
+predicate. Note also that a flowless packet is not stranded: it takes the
+route-based, session-less forward path (`frame/README.md`) and is still
+policy-evaluated — `flowless_non_first_fragment_transit_dropped_by_deny_all_3291`
+pins that a deny-all zone pair DROPS it. What flowless actually costs is
+**stateful return admission**, not reachability.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.

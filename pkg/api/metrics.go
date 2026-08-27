@@ -495,6 +495,11 @@ type xpfCollector struct {
 	// the checksum (RFC 2784 §2.1 / RFC 2890) instead of being silently
 	// blackholed; only a corrupt frame is counted here.
 	userspaceGreDecapChecksumInvalidDrops *prometheus.Desc
+	// #6842: native-GRE frames refused for decap because the GRE version
+	// field was non-zero (RFC 2637 / PPTP enhanced GRE is version 1) while
+	// the outer tuple named a configured GRE tunnel endpoint. A refusal,
+	// not a drop; transit PPTP is not counted.
+	userspaceGreDecapUnsupportedVersionRefusals *prometheus.Desc
 	// #2472: locally-generated ICMP/RST error replies dropped by the
 	// per-reason token-bucket rate limiter (Time Exceeded / PTB / reject).
 	userspaceTimeExceededRateLimited *prometheus.Desc
@@ -924,6 +929,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceGreEncapDfOversizeDrops
 	ch <- c.userspaceGreDecapChecksumInvalidDrops
+	ch <- c.userspaceGreDecapUnsupportedVersionRefusals
 	ch <- c.userspaceTimeExceededRateLimited
 	ch <- c.userspacePacketTooBigRateLimited
 	ch <- c.userspaceRejectRateLimited

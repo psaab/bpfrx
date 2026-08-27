@@ -565,6 +565,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_wg_decap_ecn_illegal_drops_total",                   // #2317 WG RFC 6040 4.2 decap illegal-combo drops
 		"xpf_userspace_gre_encap_df_oversize_drops_total",                  // #2331 GRE encap DF-set oversized-outer drops
 		"xpf_userspace_gre_decap_checksum_invalid_drops_total",             // #2782 GRE decap checksum-present invalid drops
+		"xpf_userspace_gre_decap_unsupported_version_refusals_total",       // #6842 GRE decap refused: non-zero GRE version (PPTP) at a configured endpoint
 		// #1771 §2.6 resolver backoff + §2.5 ENOBUFS/re-dump + key gauges
 		"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",
 		"xpf_userspace_neighbor_netlink_enobufs_total",

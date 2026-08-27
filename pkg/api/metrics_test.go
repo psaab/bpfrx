@@ -1057,6 +1057,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceGreDecapUnsupportedVersionRefusals: prometheus.NewDesc(
+			"xpf_userspace_gre_decap_unsupported_version_refusals_total",
+			"gre decap unsupported-version refusals",
+			nil,
+			nil,
+		),
 		userspaceTimeExceededRateLimited: prometheus.NewDesc(
 			"xpf_userspace_time_exceeded_rate_limited_total",
 			"time-exceeded generated-error rate-limit drops",
@@ -1161,6 +1167,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2782: GRE-decap checksum-present invalid drop counter emitted
 		// unconditionally.
 		GreDecapChecksumInvalidDropsTotal: 8,
+		// #6842: GRE-decap unsupported-version (RFC 2637 / PPTP) refusal
+		// counter emitted unconditionally.
+		GreDecapUnsupportedVersionRefusalsTotal: 9,
 		// #2472: per-reason generated-error rate-limit drop counters emitted
 		// unconditionally.
 		TimeExceededRateLimitedTotal: 11,
@@ -1253,9 +1262,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// distinct-source subset of the reverse-key collision counter = 40,
 	// plus the #6751 PR 2/3 interface-mode SNAT identity registry trio
 	// (PAT collisions + identity exhaustion + sync-import identity-conflict
-	// drops + registry-cap exhaustion) = 44.
-	if len(got) != 44 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 44 metrics, got %d", len(got))
+	// drops + registry-cap exhaustion) = 44, plus the #6842
+	// gre_decap_unsupported_version_refusals_total counter = 45.
+	if len(got) != 45 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 45 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1318,6 +1328,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #2782: GRE-decap checksum-present invalid drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapChecksumInvalidDrops, nil, 8)
+	// #6842: GRE-decap unsupported-version refusal counter emitted
+	// unconditionally, carrying its OWN value -- 9 against the
+	// checksum-invalid counter's 8, so a collector wired to the wrong
+	// status field is caught here rather than agreeing by coincidence.
+	assertCounterClose(t, got, c.userspaceGreDecapUnsupportedVersionRefusals, nil, 9)
 	// #2472: per-reason generated-error rate-limit drop counters emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceTimeExceededRateLimited, nil, 11)
