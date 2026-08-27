@@ -53,7 +53,18 @@ touches — a brief that says "read engineering-style.md" is followed; one
 that assumes the agent already did is not.
 
 ## Logging Rules
-- Maintain a log of all major actions in `_Log.md`.
+- Maintain a log of all major actions in **`docs/log/<issue>.md`** — one file per
+  issue or PR. Do **NOT** append to the repository-root `_Log.md`; it is the
+  historical record up to #6874 and is now closed to new entries.
+  - Why: `_Log.md` was an append-only file every lane wrote to, so every branch
+    touched the same trailing region. That made it an **O(n^2) serialization
+    point** — merging one PR flipped every other open PR to CONFLICTING, and
+    resolving one did not help the others. Measured on a 30-PR board: 19 of 30
+    flipped within seconds of one merge, with `_Log.md` the ONLY conflicting
+    path on every branch sampled.
+  - A `merge=union` driver is NOT the fix and must not be added for this file:
+    it fuses two same-minute entries into one malformed entry and exits 0. See
+    `docs/log/README.md` for the measurement.
 - Use YAML or Markdown bullet points for structure:
     - **Timestamp**: [Time]
     - **Action**: [Brief Description]
