@@ -503,9 +503,24 @@ Guard layers (`build-userspace-xdp.sh`):
      nothing said. `SlackToFloorInsns` is derived from the enforced constant
      (never a copy of its value) and printed on every build, so a
      recalibration this large is visible when it happens rather than found
-     by archaeology. **Whether 3% is still the right floor at 21.58% is an
-     open question — see #6884 — and the number to judge it on is the
-     slack, not the percentage.**
+     by archaeology. **#6884 raised the floor 3% -> 15% on that basis**, and
+     15% is deliberately not the mathematical minimum: 12.88% is where the
+     admitted delta equals one structural change exactly, and a threshold on
+     its own boundary holds for an 87,000-insn change and fails for an 88,000
+     one. The 2.1 points above it are margin, and they are a JUDGEMENT — the
+     21.58% headroom is measured, the 87,000-insn structural-change cost is
+     chosen, and the second is the one to revisit.
+   - **The build now checks that the floor still satisfies its own property
+     (#6884).** Nothing did before, and nothing could: "does it fire before the
+     next structural change" is a fact about the RELATIONSHIP between the floor
+     and the current object, and that moves whenever the object does. A test
+     cannot own it without pinning the object size — the hand-maintained live
+     number this issue removed. `cmd/shimverify` compares slack against
+     `UserspaceShimStructuralChangeInsns` on every PASSING build and prints a
+     NOTE (not a refusal) when the property has broken. Silent while it holds:
+     at 15% the slack is 65,825 against a cost of 87,000. **General form: a
+     threshold whose sensitivity is defined relative to a moving value needs a
+     check on the relationship, not on the value.**
    - **Processed-insn counts did NOT vary by kernel, measured (#6884).** The
      byte-identical tracked object (md5 `8799db9d…`) verifies at **784,175 on
      both `7.0.13+deb14-amd64` and `7.0.0-rc7+`** — zero difference. This is
@@ -1152,6 +1167,29 @@ loops exit differently, so they are deliberately NOT equal:
 So the correct condition is `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
 (7 and 8): both walkers resolve 0..=7 extension headers and both refuse 8
 or more.
+
+**There is a THIRD walker, and it shares the same depth (#6885).** The screen
+extractor (`userspace-dp/src/screen/extract.rs`) walks the chain independently
+to find the Fragment header and the L4 for the TCP-flag screens and the
+SYN-cookie challenge. It is bounded by a bare `for _ in 0..8` — no named
+constant — and, like `walk_ipv6_ext_chain`, spends one iteration on the
+terminal, so it too resolves 0..=7 and refuses 8 or more. Measured, not
+assumed: `screen_ext_header_depth_agrees_with_the_forwarding_walker_6885`
+drives chains of 0..=10 headers through the extractor AND the walker and
+requires them to agree at every length.
+
+That test is the third edge of the parity triangle. The shim↔walker edge is
+held by the #4555 emitted-facts assertion in `tests_shim_ext_parity.rs`; the
+screen↔walker edge was unguarded until #6885, and a divergence there is a
+chain one plane screens and the other does not — an ext-header IDS evasion of
+the #3120/#4517 class rather than a fast-path miss.
+
+Note the three walkers carry three DIFFERENT numbers for one shared depth
+(`0..8` iterations, `MAX_IPV6_EXT_HEADERS = 8`, `MAX_EXT_HDRS = 7`), which is
+why the depth must be bound as an AGREEMENT and never restated as a literal in
+a comment. #6885 was exactly that failure: `extract.rs` claimed
+"MAX_EXT_HDRS=8 like the BPF parser", and no constant of that name has ever
+been 8 while the BPF parser bounded at 6.
 
 **The two mismatch directions are not symmetric.** Only shim-BELOW-userspace
 is fail-closed: the shim's unresolved chain leaves the extension-header type

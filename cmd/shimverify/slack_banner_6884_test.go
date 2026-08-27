@@ -169,3 +169,112 @@ func TestSlackTracksTheFloorConstant6884(t *testing.T) {
 		t.Fatalf("SlackToFloorInsns(15.0) = %d, want %d", at15, 850000-784175)
 	}
 }
+
+// TestFloorSelfCheckFiresWhenThePropertyBreaks6884 is the self-check's reason
+// to exist: the floor's promise is to fire BEFORE the next structural change
+// lands, and whether it still does depends on the RELATIONSHIP between the
+// floor and the current object — which moves whenever the object does, in the
+// direction that looks like good news.
+//
+// The fixture is the historical condition: a 3%-era slack of 185,825, which is
+// more than two of the cheapest structural change. The note must say so.
+func TestFloorSelfCheckFiresWhenThePropertyBreaks6884(t *testing.T) {
+	var buf bytes.Buffer
+	noteFloorNoLongerTripwires(&buf, 185825)
+
+	out := buf.String()
+	if out == "" {
+		t.Fatal("the floor admitted 185,825 insns — more than two structural changes — and " +
+			"the build said nothing. That is the drift #6884 exists to make visible")
+	}
+	// It must name the structural-change cost, since that is the number the
+	// reader has to judge the floor against.
+	if !strings.Contains(out, strconv.Itoa(dataplane.UserspaceShimStructuralChangeInsns)) {
+		t.Fatalf("the note does not name the structural-change cost it compared against: %s", out)
+	}
+	// And it must not read as a build failure — the object verified.
+	if strings.Contains(strings.ToLower(out), "reject") {
+		t.Fatalf("the note reads as a refusal, but the object PASSED: %s", out)
+	}
+}
+
+// TestFloorSelfCheckSilentWhenThePropertyHolds6884 is the PAIRED control, and
+// it is the cell that makes the one above mean something: without it, "print a
+// note" is satisfied by a note that prints unconditionally, which would fire on
+// every healthy build and be tuned out within a week.
+//
+// 65,825 is the real slack at the 15% floor against master's measured 784,175.
+func TestFloorSelfCheckSilentWhenThePropertyHolds6884(t *testing.T) {
+	var buf bytes.Buffer
+	noteFloorNoLongerTripwires(&buf, 65825)
+
+	if got := buf.String(); got != "" {
+		t.Fatalf("the floor still fires before one structural change (65,825 < %d) and the "+
+			"build emitted a drift note anyway: %s",
+			dataplane.UserspaceShimStructuralChangeInsns, got)
+	}
+}
+
+// TestFloorSelfCheckBoundary6884 pins the comparison at the exact edge.
+//
+// The check is `slack < cost -> silent`, so a slack of EXACTLY the
+// structural-change cost means one change fits precisely and the property has
+// broken. `<=` there would stay silent at the moment it first fails — the
+// off-by-one that makes a tripwire fire one change too late, which is the
+// entire defect this issue documents, reproduced in the detector for it.
+func TestFloorSelfCheckBoundary6884(t *testing.T) {
+	cost := dataplane.UserspaceShimStructuralChangeInsns
+
+	var atCost bytes.Buffer
+	noteFloorNoLongerTripwires(&atCost, cost)
+	if atCost.String() == "" {
+		t.Fatalf("slack of exactly %d insns fits one structural change precisely, so the "+
+			"property has broken — the note must fire", cost)
+	}
+
+	var justUnder bytes.Buffer
+	noteFloorNoLongerTripwires(&justUnder, cost-1)
+	if justUnder.String() != "" {
+		t.Fatalf("slack of %d is one insn short of a structural change, so the property "+
+			"still holds — the note must be silent: %s", cost-1, justUnder.String())
+	}
+}
+
+// TestFloorSelfCheckIsWiredIntoThePassPath6884 binds the WIRING.
+//
+// noteFloorNoLongerTripwires is inert unless run() calls it on the PASS path.
+// Deleting that one call leaves every cell above green while the build goes
+// back to saying nothing — which is precisely the silence this whole issue is
+// about.
+//
+// Driven with a stats value whose slack at the REAL floor exceeds the
+// structural-change cost, so the note is expected on stderr.
+func TestFloorSelfCheckIsWiredIntoThePassPath6884(t *testing.T) {
+	// Headroom well above the floor (so this PASSES), but slack large enough
+	// that the property has broken. At a 15% floor, 700,000 used leaves 150,000
+	// of slack — above the 87,000 cost.
+	stats := dataplane.ShimVerifierStats{ProcessedInsns: 700000, InsnLimit: 1000000}
+	if stats.HeadroomPct() < dataplane.UserspaceShimMinVerifierHeadroomPct {
+		t.Skipf("fixture no longer passes the floor (%.2f%% < %.1f%%); pick a smaller object",
+			stats.HeadroomPct(), dataplane.UserspaceShimMinVerifierHeadroomPct)
+	}
+	if stats.SlackToFloorInsns(dataplane.UserspaceShimMinVerifierHeadroomPct) <
+		dataplane.UserspaceShimStructuralChangeInsns {
+		t.Skipf("fixture no longer breaks the property; pick a smaller object")
+	}
+
+	var stdout, stderr bytes.Buffer
+	exit := run([]string{"shimverify", "/tmp/candidate.o"}, &stdout, &stderr,
+		func(string) string { return "" },
+		func(string) (dataplane.ShimVerifierStats, error) { return stats, nil })
+
+	if exit != 0 || !strings.HasPrefix(stdout.String(), "PASS ") {
+		t.Fatalf("expected a PASS; exit=%d stdout=%q", exit, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "#6884") {
+		t.Fatalf("run() did not emit the floor drift note on a PASSING build whose floor "+
+			"admits %d insns — the check is not wired into the PASS path.\nstderr: %s",
+			stats.SlackToFloorInsns(dataplane.UserspaceShimMinVerifierHeadroomPct),
+			stderr.String())
+	}
+}
