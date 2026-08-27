@@ -107056,3 +107056,7 @@ prose edit above them added. No diff falls in the new test body.
   detector for that mutation rather than decoration.
 - **File(s)**: `pkg/config/compact_depth_census_7653_test.go`,
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-27
+  - **Action**: #6863 — a watcher on the existing 30s management reassert tick records the stale-mgmt-cert debt when the kernel host name moves without xpfd renaming it. Baseline moves under the same lock as xpfd's own rename so one rename cannot produce two debts.
+  - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
