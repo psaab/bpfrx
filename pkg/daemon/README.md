@@ -2272,6 +2272,20 @@ never lock an operator out of a remote box it manages.
   inside-the-semaphore re-read; loop ticks + ctx cancel; a loop-START cell
   asserting `Run` launches it unconditionally; and the accessor + metric-wiring
   cells below).
+  **One var relocates the whole sshd drop-in (#7609).** `sshdConfPath` is a
+  package var so a test can point the drop-in at a throwaway tree, and
+  `applySSHConfig` used to create its DIRECTORY from a hard-coded
+  `/etc/ssh/sshd_config.d`. Relocating the var therefore produced a file path
+  with no parent, the write failed with `ENOENT`, and — the part that matters —
+  that failure surfaced as whatever the test was actually asserting. A cell
+  checking only "an error was returned" passed while observing the fixture's own
+  broken seam rather than the condition it injected. The directory is now
+  `filepath.Dir(sshdConfPath)`: byte-identical in production (pinned by
+  `TestProductionDropInDirIsUnchanged7609`, because every other cell relocates
+  the path and so none of them would notice a wrong production value), and one
+  seam relocates file and parent together — the property `provisionedUsersDir`
+  already has for the three #5841 marker roots.
+
   **sshd is the third instance, and the one the "already covered" reading
   misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's
   `revertDropIn` restores the prior content on a failed reload, so the file no
