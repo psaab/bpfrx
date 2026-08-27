@@ -56,12 +56,29 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 /// * `port-unreachable`    -> 4 (port unreachable)
 /// * the three prohibitions -> 1 (administratively prohibited)
 ///
-/// The rest -- TOS-conditional unreachables, precedence violations, source
-/// routing failures, source-host-isolated, protocol-unreachable -- describe
-/// IPv4 machinery that has no ICMPv6 equivalent. Those keep code 1, which is
-/// exactly what the dataplane already sent before this change, so an operator
-/// who configures one of them sees today's behaviour on v6 rather than a code
-/// invented to fill the column.
+/// The rest keep code 1, which is exactly what the dataplane already sent
+/// before this change, so an operator who configures one of them sees today's
+/// behaviour on v6 rather than a code invented to fill the column. But the
+/// REASON differs by token and it is worth being exact, because a later change
+/// that widens this struct will read this comment to decide what becomes
+/// expressible:
+///
+/// * Genuinely no ICMPv6 equivalent: TOS-conditional unreachables, precedence
+///   violations, source-host-isolated. `source-route-failed` belongs here too --
+///   IPv6 has no RFC 791 source routing (RH0 is deprecated by RFC 5095), and
+///   RFC 4443 code 5 is "Source address failed ingress/egress policy", a
+///   genuinely different condition, so mapping to 5 would be wrong.
+///
+/// * `protocol-unreachable` is DIFFERENT, and an earlier version of this comment
+///   was factually wrong about it. It HAS a specified ICMPv6 counterpart --
+///   Parameter Problem, **type 4 code 1**, "unrecognized Next Header type
+///   encountered" (RFC 4443 3.4). What puts it out of reach is not the absence
+///   of a counterpart but that this struct carries only `{v4_code, v6_code}`
+///   while `build_reject_icmp_unreachable` hardcodes ICMPv6 **type 1**: the
+///   counterpart lives at a different TYPE, which the struct cannot express.
+///   Emitting code 1 today is still right -- inventing a Destination Unreachable
+///   code would be worse -- but if a `v6_type` is ever added, this is the one
+///   token that becomes expressible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RejectMessage {
     pub(crate) v4_code: u8,
