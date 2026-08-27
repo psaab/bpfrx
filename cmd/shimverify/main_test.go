@@ -33,7 +33,13 @@ import (
 // `<=` flips a 3.00%% object from install to refusal with every other fixture
 // unmoved.
 func TestShimverifyDecision(t *testing.T) {
-	// Above the floor: 947188/1000000 leaves 5.28%, the current object.
+	// Above the floor: 947188/1000000 leaves 5.28% — the object as it stood
+	// WHEN #4555 WAS WRITTEN, not now. #6884: master is at 784,175 (21.58%).
+	// The value stays because what it is chosen for is its RELATION to the
+	// floor (comfortably above), not its currency; the label is corrected
+	// because "the current object" is exactly the hand-maintained live number
+	// that #6884 removed from the constant's doc comment, and this copy of it
+	// misled a reader into a cross-kernel inference the data did not support.
 	above := dataplane.ShimVerifierStats{ProcessedInsns: 947188, InsnLimit: 1000000}
 	// Below it: 990796/1000000 leaves 0.92%, master before #4555.
 	below := dataplane.ShimVerifierStats{ProcessedInsns: 990796, InsnLimit: 1000000}
