@@ -574,19 +574,27 @@ than summarised into a verdict:
    `validateClusterAuthKeyStrict`. This document says the same thing under "Do
    not try to return to dual-accept by clearing the key first". Tracked as
    **#6630**.
-2. **Console on the seated secondary — CLOSED only where the gate is actually
-   ARMED.** The gate is on the **config store**, not the transport, so *when it
-   is armed* `EnterConfigureSession` returns `ErrClusterReadOnly` regardless of
-   which entry point the operator used — console, remote CLI, gRPC or REST.
-   Arming is not automatic, and that is the whole caveat: `SetClusterReadOnly(true)`
-   is reached only from the RG0 **transition** handler, so a node that cold-starts,
-   seats as secondary and never transitions still has a **writable** store. On
-   such a node this row is OPEN, and REST is the way in — `pkg/api/config.go`
-   enters a configure session with no RG0 check of its own, where the interactive
-   CLI (`pkg/cli/cli_dispatch.go`) and gRPC (`IsLocalPrimary(0)`) each have one.
-   Tracked as **#6890**; the dropped-event variant of the same unarmed-gate
-   failure is **#6889**. Do not treat this row as CLOSED on a node whose RG0
-   state you have not checked.
+2. **Console on the seated secondary — CLOSED.** The gate is on the **config
+   store**, not the transport, so `EnterConfigureSession` returns
+   `ErrClusterReadOnly` regardless of which entry point the operator used —
+   console, remote CLI, gRPC or REST.
+
+   **This row used to be conditional on the gate being ARMED, and it no longer
+   is (#6889/#6890).** `SetClusterReadOnly` was reached only from the RG0
+   **transition** handler, so a node that cold-started, seated as secondary and
+   never transitioned kept a **writable** store — and `pkg/api/config.go` enters
+   a configure session with no RG0 check of its own, where the interactive CLI
+   and gRPC each have one, so REST was a way in on a node that did not own
+   config. The gate is now **re-derived from RG0's authoritative state** on every
+   `reconcileRGState` pass (2 s, plus the event-drop nudge), so arming no longer
+   depends on an edge ever being crossed. Both the never-transitioned case
+   (**#6890**) and the dropped-event case (**#6889**) are closed by that one
+   change: a gate derived from state cannot preserve a hole that existed only
+   because the transition edge was never taken.
+
+   What is still true: the gate reflects RG0 state within one reconcile pass,
+   not instantaneously. A check made in the ~2 s after a state change may still
+   observe the previous value.
 3. **Controlled RG0 promotion — the only path you can PLAN for, and it is
    CONDITIONAL.** ("Plan for", not "that works": row 2 is open on an unarmed
    node, so a path exists there too — it is just a bug you must not build a
@@ -596,28 +604,36 @@ than summarised into a verdict:
    commit of the same key. Restart the old primary and the pair converges keyed.
    Same stop-one-node shape documented above for `configuration-synchronize`.
 
-   **Each "if" is a real precondition, not a formality:**
-   - the secondary must be eligible — `election.go` returns early on
-     `m.kernelUpgradeHold`, and promotes only when `rg.Weight > 0`. Zero weight
-     or an active upgrade hold and no promotion happens at all;
-   - the promotion **event must be delivered**. `Manager.sendEvent` is
-     non-blocking and drops on a full channel, and the dropped-event fallback
-     does not reconcile `Store.ClusterReadOnly` — so the manager can report RG0
-     primary while the store stays read-only. Tracked as **#6889**.
+   **This row had TWO preconditions; #6889 removed one of them.**
+   - **STILL A PRECONDITION** — the secondary must be eligible. `election.go`
+     returns early on `m.kernelUpgradeHold`, and promotes only when
+     `rg.Weight > 0`. Zero weight or an active upgrade hold and no promotion
+     happens at all. Nothing in #6889 changes this.
+   - **NO LONGER A PRECONDITION** — the promotion event no longer has to be
+     delivered. `Manager.sendEvent` is still non-blocking and still drops on a
+     full channel, so the *event* remains unreliable; what changed is that the
+     gate is no longer driven by it. `reconcileRGState` re-derives
+     `Store.ClusterReadOnly` from RG0's authoritative state and, on a
+     divergence, re-drives `applyRG0OwnershipTransition` itself — so a dropped
+     promotion self-heals within one reconcile pass instead of stranding the
+     node until the next transition. Tracked and closed as **#6889**.
 
-   (The unarmed-gate case from row 2 — **#6890** — is *not* a precondition here.
-   It does not block promotion; it means the gate you are trying to clear was
-   never closed on that node, so the recovery was never needed there. It is
-   listed under row 2, where it belongs, rather than padding this list.)
+   (The unarmed-gate case from row 2 — **#6890** — was never a precondition
+   here, and is now closed by the same change. It did not block promotion; it
+   meant the gate you were trying to clear had never been closed on that node.)
 
-   So do not read this row as a procedure. It is the path you would design
-   around; whether it is available on a given cluster at a given moment depends
-   on both preconditions above.
+   So this row is now the one you can plan around, with one precondition left
+   rather than two. It is still **not unconditional**: an ineligible secondary
+   does not promote, and no amount of reconciliation creates a primary out of a
+   node with zero weight or an active upgrade hold.
 
 So the recovery you can actually plan for is a deliberate cluster failover —
-you have turned a config commit into an outage. (A node that happens to fall in
-the row-2 unarmed-gate case is writable without any of that, but you cannot
-design a procedure around a gap that is merely FILED.) That is why committing
+you have turned a config commit into an outage. (The row-2 unarmed-gate escape
+hatch is gone as of #6890: a seated secondary's store is now gated whether or
+not it ever transitioned. That removes a hazard rather than a capability — this
+document already said it was "a bug you must not build a procedure on" — and in
+exchange row 3 lost its event-delivery precondition, so the path you plan around
+is now reliable rather than merely likely.) That is why committing
 `authentication-key` must never restart cluster comms: the fallback is
 CONDITIONAL on everything row 3 lists, and even when available it is one you
 would have to schedule. Do not read "a fallback exists" off this sentence —
