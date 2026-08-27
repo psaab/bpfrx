@@ -115,8 +115,10 @@ func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st re
 		registryLookupHook()
 	}
 	h, present = m.maps[name]
-	if present {
+	if present && m.registryObsoleteLocked() {
+		// #6741 AC1: REFUSE rather than serve. See registryObsoleteLocked.
 		m.obsoleteRegistryLocked("map", name)
+		return nil, false, classifyRegistry(&m.loaded, len(m.maps))
 	}
 	return h, present, classifyRegistry(&m.loaded, len(m.maps))
 }
@@ -133,25 +135,52 @@ func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st re
 // (bootstrap.go's enterBootstrapMode, and the standalone first-commit timeout in
 // daemon_apply_commit.go).
 //
-// WHAT THIS IS NOT — and the distinction is the whole reason it is a counter and
-// not a guard. It does NOT close the hazard, and it must not be read as
-// evidence that the hazard cannot happen:
+// WHAT CHANGED (#6741 AC1). This used to count SERVED handles and change no
+// behaviour. The lookup now REFUSES: it returns present=false so the caller
+// takes its not-present path instead of mutating an orphan. The counter is the
+// observability half of that guard, and counts refusals.
 //
-//   - it is a LOOKUP-TIME observation. lookupMapLocked returns the *ebpf.Map by
-//     reference and then RELEASES m.mu, so a republish that lands after the
-//     lookup returns is invisible here. A caller holding an escaped handle
-//     across a republish is counted zero times.
-//   - it changes no behaviour. Every caller proceeds exactly as before,
-//     deliberately: making retained mutations fail is a behaviour change at 135
-//     call sites and is the deferred half of #6741.
+// The acceptance criterion offered "fails loudly OR is a verified no-op with a
+// metric". The no-op branch was foreclosed by measurement: Close closes only
+// the XDP/TC link handles and Cleanup unpins WITHOUT closing, so m.maps /
+// m.programs FDs are never closed — the orphaned map stays alive and WRITABLE,
+// and the mutation succeeds against a generation nothing forwards through.
 //
-// A zero counter therefore means "no lookup OBSERVED a superseded generation",
-// never "no obsolete mutation occurred". The design tension that makes the
-// stronger guarantee expensive — #6740 forbids holding m.mu across a BPF
-// syscall, which is what a mutation-time check would require — is recorded on
-// #6741.
+// WHAT IT STILL DOES NOT COVER, and this must not be read as the hazard being
+// closed:
+//
+//   - it remains a LOOKUP-TIME check. lookupMapLocked returns the *ebpf.Map by
+//     reference and then RELEASES m.mu, so a handle obtained BEFORE the
+//     Teardown and held across it is never re-checked and is neither refused
+//     nor counted. AC1 is met for handles obtained after the boundary, not for
+//     escaped ones.
+//   - a mutation-time check, which would cover those, needs the generation read
+//     at the syscall — and #6740 forbids holding m.mu across a BPF syscall.
+//     That tension is why AC2 (a lease/refcount with drain discipline) is a
+//     design item rather than an extension of this.
+//
+// A zero counter means "no lookup was refused", never "no obsolete mutation
+// occurred".
+// registryObsoleteLocked reports whether the registry is currently serving a
+// generation that Teardown has superseded (#6741 AC1). The caller must hold
+// m.mu.
+//
+// SCOPE — this is the whole safety argument for refusing. `registryObsoleteFrom`
+// is set by `Teardown` and explicitly NOT by `Close`: Close keeps its pinned
+// handles live for hitless restart, and the #2114 A3 proceed-on-retained rule
+// is argued for exactly that case. So a Close-then-reuse sequence never sees
+// this predicate true and proceeds precisely as before. What is refused is only
+// the Teardown window, where `Cleanup` has already unpinned the objects and the
+// retained handles are ORPHANS of a generation nothing forwards through.
+//
+// The rule is not weakened; a generation Teardown already superseded is
+// declined.
+func (m *Manager) registryObsoleteLocked() bool {
+	return m.registryObsoleteFrom != 0 && m.registryGeneration <= m.registryObsoleteFrom
+}
+
 func (m *Manager) obsoleteRegistryLocked(kind, name string) {
-	if m.registryObsoleteFrom == 0 || m.registryGeneration > m.registryObsoleteFrom {
+	if !m.registryObsoleteLocked() {
 		return
 	}
 	m.obsoleteRegistryAccesses++
@@ -190,8 +219,10 @@ func (m *Manager) lookupProgramLocked(name string) (p *ebpf.Program, present boo
 		registryLookupHook()
 	}
 	p, present = m.programs[name]
-	if present {
+	if present && m.registryObsoleteLocked() {
+		// #6741 AC1: REFUSE rather than serve. See registryObsoleteLocked.
 		m.obsoleteRegistryLocked("program", name)
+		return nil, false, classifyRegistry(&m.loaded, len(m.maps))
 	}
 	return p, present, classifyRegistry(&m.loaded, len(m.maps))
 }
