@@ -721,6 +721,26 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // with a successfully loaded zero-drop table shell; it does not prove table
 // absence.
 //
+// WHY THE FENCE SURFACE IS NOT A SEPARATE FILE (#7714 Seam A, measured and
+// declined). The fence functions look like a cluster — 9 of them, 333 lines,
+// in 4 runs — and their scope difference below reads like a seam. It is not one,
+// because the file boundary would not carry the property:
+//
+//   - the scope is CHOSEN BY THE CALLERS, not by the fences.
+//     `dpuserspace.BuildFenceAddrSets` is invoked inside `applyLo0Filter` and
+//     `applyHostInboundFilter` — the REAL-ruleset functions — and the result is
+//     passed in as `sets dpuserspace.FenceAddrSets`. The divergence is visible
+//     precisely because the choice sits next to the scope it diverges from.
+//   - the two surfaces SHARE their address-set helpers.
+//     `hostInboundDesiredDropAddrs` is called by both `applyHostInboundFilter`
+//     and `installHostInboundColdBootFence`; `hostInboundDropAddrKey` and
+//     `hostInboundUncoveredDropAddrs` likewise straddle them.
+//
+// So moving the fences out would separate the receivers from the choosers and
+// from the helpers they share with the real path — making the relationship this
+// comment exists to explain HARDER to see, not easier. The property is stated
+// here instead, which is where a reader asking the question already is.
+//
 // Scope: the fence is the real table with every service ACCEPT removed, so its
 // drop scope is NOT the real ruleset's scope — dpuserspace.BuildFenceAddrSets
 // (#6492) derives it. Lifeline INTERFACES are excluded by the view builders as
