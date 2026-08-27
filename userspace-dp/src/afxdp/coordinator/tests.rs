@@ -6942,21 +6942,34 @@ fn refresh_runtime_snapshot_publishes_every_sibling_before_the_view() {
 ///   - inside `stop_inner`, `workers.stop_and_clear(..)` JOINS every worker
 ///     thread before `self.forwarding = ForwardingState::default()` (#6592).
 ///
-/// So a worker exists only while a snapshot-derived state is published. That is
-/// a real invariant with real consequences, and it was unpinned: the closest
-/// existing cell,
-/// `reconcile_with_none_snapshot_reaches_no_snapshot_early_exit` (#1328),
+/// So a worker exists only while a snapshot-derived state is published. What
+/// this cell adds, measured rather than assumed:
+///
+///   - the "no worker survives" half is ALREADY pinned, by
+///     `teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers` — a
+///     cell whose stated subject is #2522 quiesce timing, but which seeds a
+///     live worker and asserts `workers.records.is_empty()`. Removing the
+///     teardown reds it too.
+///   - the "the dangerous state is actually REACHED" half was pinned by
+///     nothing. Deleting `self.forwarding = ForwardingState::default()` from
+///     `stop_inner` reds THIS cell alone; the quiesce cell stays green because
+///     it never looks at the forwarding state.
+///
+/// That second half is what makes the first one mean something: without it,
+/// "no reader survives" guards a state nobody showed was dangerous, and the
+/// pairing with `cold_forwarding_state_admits_every_host_inbound_service_6873`
+/// (the payload proof) has no anchor at this end.
+///
+/// The cell that LOOKS like it covers this does not:
+/// `reconcile_with_none_snapshot_reaches_no_snapshot_early_exit` (#1328)
 /// asserts `workers.live.is_empty()` from a `Coordinator::new()` that never had
-/// a worker — so removing the teardown leaves it GREEN. A fixture that cannot
+/// a worker, so removing the teardown leaves it GREEN. A fixture that cannot
 /// produce the state it asserts absent is mutation-insensitive by construction.
 ///
-/// This one starts from a coordinator that HAS a live worker record AND a
-/// populated host-inbound table — the smallest shape where removing the
-/// teardown changes an outcome.
-///
-/// Fail-on-revert: make the `no_snapshot` leg return before `tear_down` (or
-/// stop clearing the worker records) and the surviving-worker assertion goes
-/// RED, while the #1328 cell stays green.
+/// Fail-on-revert: stop clearing the worker records and the surviving-worker
+/// assertion goes RED (with the quiesce cell, and NOT the #1328 cell); stop
+/// defaulting the forwarding state and the emptied-table assertion goes RED
+/// alone.
 #[test]
 fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
     const ZONE: u16 = 7;
