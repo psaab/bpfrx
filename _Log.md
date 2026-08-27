@@ -106712,3 +106712,7 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
   `pkg/config/testdata/compact_block_divergences_2419.txt`,
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6853 — `then syslog` is now distinct from `then log` in the config model and carried to the dataplane snapshot. Behaviour-preserving; the routing decision stays with #6859.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go, pkg/dataplane/userspace/protocol_policies.go, pkg/dataplane/userspace/filters.go, pkg/dataplane/userspace/firewall_snapshot_render.go, userspace-dp/src/protocol/security.rs, docs/feature-gaps.md
