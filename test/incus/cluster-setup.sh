@@ -727,7 +727,7 @@ rolling_detect_secondary() {
 # unrelated smoke target's preflight, where the first hypothesis is that the
 # change under test broke HA.
 reassert_primary_node0() {
-	deploy_reassert_primary_node0 "$(r "$VM0")"
+	deploy_reassert_primary_node0 "$(r "$VM0")" "$(r "$VM1")"
 }
 
 # deploy_rolling_deb sequences the deb cut across both nodes (secondary
