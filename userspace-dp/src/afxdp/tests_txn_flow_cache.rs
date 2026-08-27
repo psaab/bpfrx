@@ -1511,3 +1511,118 @@ fn missing_neighbor_recycle_exactly_once_pin() {
     assert_eq!(deny_sessions.len(), 0, "a denied flow seeds no session");
 }
 
+
+// ---------------------------------------------------------------------
+// #6837: a portless protocol takes the FLOWLESS arm, still FORWARDS, and
+// installs no degenerate session.
+//
+// PAIRED, and the pairing is what makes it mean anything. Protocol is the only
+// variable: same snapshot, same worker, same descriptor harness. The TCP leg is
+// the control that proves this fixture reaches session install at all — a GRE
+// leg reporting 0 sessions proves nothing on its own, because a harness that
+// installs nothing for ANY protocol reports 0 just as happily.
+//
+// This is also the measurement #6923 never took. Its comment justified keeping
+// the portless tuple complete because refusing it "would strand ESP, GRE and
+// ICMPv6". `tx` is that claim's test, and it comes back 1 on both sides of the
+// change: flowless FORWARDS. What it actually costs is stateful return
+// admission (sessions 2 -> 0) and the flow's appearance in
+// `show security flow session`, not reachability.
+// ---------------------------------------------------------------------
+fn run_6837_descriptor(protocol: u8, sport: u16, dport: u16, flags: u8) -> (u64, usize, bool) {
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(64);
+
+    let src = Ipv4Addr::new(10, 0, 61, 102);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+    let frame = if protocol == PROTO_TCP {
+        build_txn_tcp_syn_frame_v4(src, dst, sport, dport, flags)
+    } else {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0x02, 0xbf, 0x72, 0x01, 0x00, 0x01],
+            [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+            0,
+            0x0800,
+        );
+        let s = src.octets();
+        let d = dst.octets();
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, protocol, 0x00, 0x00, s[0], s[1],
+            s[2], s[3], d[0], d[1], d[2], d[3],
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = (ip_sum & 0xff) as u8;
+        frame.extend_from_slice(&[0u8; 20]);
+        frame
+    };
+
+    let mut meta = txn_meta_v4(24, flags, (frame.len() - 14) as u16);
+    meta.protocol = protocol;
+    meta.tcp_flags = flags;
+    // The addresses matter: `metadata_tuple_complete` returns false for an
+    // unspecified address BEFORE it reaches the protocol match, so a fixture
+    // that leaves them zero exercises the early return and never reaches the
+    // rule under test. (An abandoned probe for this issue did exactly that and
+    // reported "GRE seeds no session" against UNFIXED code.)
+    let mut sa = [0u8; 16];
+    sa[..4].copy_from_slice(&src.octets());
+    let mut da = [0u8; 16];
+    da[..4].copy_from_slice(&dst.octets());
+    meta.flow_src_addr = sa;
+    meta.flow_dst_addr = da;
+    meta.flow_src_port = sport;
+    meta.flow_dst_port = dport;
+
+    let flow_backed = crate::afxdp::frame::parse_session_flow_from_bytes(&frame, meta).is_some();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    (dbg.tx, sessions.len(), flow_backed)
+}
+
+#[test]
+fn portless_transit_is_flowless_and_still_forwards_6837() {
+    // CONTROL: TCP resolves an L4 identity, stays flow-backed, and seeds the
+    // forward + reverse pair. If this row ever reports 0 sessions the GRE/ESP
+    // rows below are measuring a broken fixture, not the fix.
+    let (tcp_tx, tcp_sessions, tcp_flow_backed) =
+        run_6837_descriptor(PROTO_TCP, 12345, 443, TCP_FLAG_SYN);
+    assert!(tcp_flow_backed, "control: TCP must stay flow-backed");
+    assert_eq!(tcp_tx, 1, "control: TCP must forward");
+    assert_eq!(
+        tcp_sessions, 2,
+        "control: a permitted TCP flow seeds the forward entry and its reverse companion — \
+         this fixture DOES reach session install"
+    );
+
+    for (protocol, name) in [(47u8, "GRE"), (50u8, "ESP"), (89u8, "OSPF")] {
+        let (tx, sessions, flow_backed) = run_6837_descriptor(protocol, 0, 0, 0);
+        assert!(
+            !flow_backed,
+            "#6837: {name} carries no shim-resolved L4 identity, so it must take the FLOWLESS arm"
+        );
+        assert_eq!(
+            tx, 1,
+            "#6837: {name} must still FORWARD when flowless — this is the measurement #6923's \
+             \"would strand ESP, GRE and ICMPv6\" rationale asserted without taking"
+        );
+        assert_eq!(
+            sessions, 0,
+            "#6837: {name} must install NO session — the pre-fix path installed a degenerate \
+             `SessionKey {{ src_port: 0, dst_port: 0 }}` plus its reverse companion, aliasing \
+             every distinct {name} flow between one endpoint pair onto one key"
+        );
+    }
+}

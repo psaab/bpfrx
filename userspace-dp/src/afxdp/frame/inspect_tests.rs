@@ -574,15 +574,216 @@ fn traversable_predicate_matches_walker_behaviour_over_all_256_values() {
     );
 }
 
-/// The over-limit refusal lives in `metadata_tuple_complete`, and this pins the
-/// decision itself: the SAME addresses and the SAME 0/0 ports are COMPLETE for a
-/// resolved terminal and INCOMPLETE for a next-header value the walk traverses.
+/// #6837: `metadata_tuple_complete` is complete exactly for the protocols the
+/// SHIM resolves an L4 identity for — and for no others.
 ///
-/// The pair is the point. "Refuses the ext-header tuple" alone is satisfied by a
-/// predicate that refuses every portless tuple, which would strand ESP, GRE and
-/// ICMPv6; the ESP row is what excludes that.
+/// The predicate's name asks "did the shim resolve an L4 identity?". Before
+/// #6837 it answered "are both addresses set?", so every protocol the shim did
+/// not parse arrived carrying the placeholder `0/0` its `parse_l4` catch-all
+/// stamps and was declared complete anyway.
+///
+/// This is an ALLOWLIST sweep, deliberately. A denylist ("refuse GRE, ESP,
+/// AH, OSPF") defaults every protocol number nobody thought about back to the
+/// degenerate key, which is the defect itself wearing a longer match arm.
 #[test]
-fn metadata_tuple_complete_refuses_only_unresolved_ipv6_ext_protocols() {
+fn metadata_tuple_complete_matches_the_shim_resolved_set_6837() {
+    let src = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    let judge = |protocol: u8, src_port: u16, dst_port: u16| {
+        let flow = SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol,
+                src_ip: src,
+                dst_ip: dst,
+                src_port,
+                dst_port,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol,
+            ..UserspaceDpMeta::default()
+        };
+        metadata_tuple_complete(meta, &flow)
+    };
+
+    let mut complete_portless = Vec::new();
+    for proto in 0u8..=255 {
+        // With a real port pair, only TCP/UDP/ICMP/ICMPv6 may be complete.
+        assert_eq!(
+            judge(proto, 1234, 5678),
+            matches!(proto, PROTO_TCP | PROTO_UDP | PROTO_ICMP | PROTO_ICMPV6),
+            "#6837: protocol {proto} — completeness must follow whether the SHIM resolves an L4 \
+             identity, not whether the addresses happen to be set"
+        );
+        if judge(proto, 0, 0) {
+            complete_portless.push(proto);
+        }
+    }
+
+    // Portless: TCP/UDP need BOTH ports, so they drop out; ICMP stays, because
+    // its pseudo-port is the IDENTIFIER and 0 is a legal identifier.
+    assert_eq!(
+        complete_portless,
+        vec![PROTO_ICMP, PROTO_ICMPV6],
+        "#6837: with 0/0 ports only ICMP/ICMPv6 may stay complete (identifier 0 is legal); \
+         anything else here is a protocol getting a degenerate zero-port session key"
+    );
+}
+
+/// #6837: the resolved set and the IPv6 traversable set must stay DISJOINT.
+///
+/// While they are, the `ipv6_ext_header_is_traversable` early return inside
+/// `metadata_tuple_complete` is subsumed — every traversable value is portless,
+/// so `_ => false` refuses it anyway, and deleting that branch reds nothing
+/// (measured). It is kept as defence in depth for the day the sets overlap,
+/// and this is the guard that makes that day visible instead of silent: adding
+/// a traversable protocol to the resolved set lands here, where the reviewer
+/// has to decide which rule wins, rather than in a branch nobody re-reads.
+///
+/// #6923's own protection does NOT depend on that branch. It lives in
+/// `refused_protocol_set_equals_the_shim_traversable_set` and in
+/// `server/helpers/session_sync.rs`; regressing the traversable set reds four
+/// tests, none of which is this one.
+#[test]
+fn resolved_set_and_ipv6_traversable_set_are_disjoint_6837() {
+    let src = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    for proto in 0u8..=255 {
+        // Derived from the production predicate rather than a second copy of
+        // the arm list — a duplicated allowlist could drift from the real one
+        // and this guard would keep passing against its own stale copy.
+        let flow = SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: proto,
+                src_ip: src,
+                dst_ip: dst,
+                src_port: 1234,
+                dst_port: 5678,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol: proto,
+            ..UserspaceDpMeta::default()
+        };
+        let resolved = metadata_tuple_complete(meta, &flow);
+        assert!(
+            !(resolved && ipv6_ext_header_is_traversable(proto)),
+            "#6837/#6923: protocol {proto} is in BOTH the shim-resolved set and the IPv6 \
+             traversable set. Two rules now disagree about it on IPv6 — decide which wins \
+             explicitly rather than letting branch order decide"
+        );
+    }
+}
+
+/// #6837 cross-boundary bind: the resolved set above is the shim's set.
+///
+/// `metadata_tuple_complete` cannot import `parse_l4` — it lives in the
+/// `no_std` shim crate root, which cannot be `#[path]`-included the way
+/// `ipv6_ext_walk.rs` is by `tests_shim_ext_parity`. So this reads the shim
+/// source and pins the arms, with COMMENTS STRIPPED FIRST: this test's own
+/// prose names the same `PROTO_*` identifiers, and an unstripped scan would be
+/// satisfied by the documentation instead of by the code.
+///
+/// Teaching the shim to resolve a new protocol without widening
+/// `metadata_tuple_complete` reds here — that identity would otherwise be
+/// parsed and then discarded. The reverse reds too.
+#[test]
+fn shim_parse_l4_resolves_exactly_the_set_metadata_tuple_complete_accepts_6837() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../userspace-xdp/src/lib.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let code_only: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let start = code_only
+        .find("fn parse_l4(")
+        .expect("#6837: shim `parse_l4` not found — this bind has rotted, fix it, do not delete it");
+    let body = &code_only[start..];
+    let end = body
+        .find("\n}")
+        .expect("#6837: could not bound `parse_l4`'s body");
+    let body = &body[..end];
+
+    // Extract EVERY `PROTO_*` the body mentions, not just the four expected
+    // ones. A membership check ("are TCP/UDP/ICMP/ICMPv6 present?") is
+    // one-directional and cannot see a FIFTH arm — measured: adding
+    // `PROTO_SCTP => ...` to the shim left such a check green, so the claim
+    // above about teaching the shim a new protocol would have been false.
+    let mut resolved: Vec<String> = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    while let Some(hit) = body[i..].find("PROTO_") {
+        let start = i + hit;
+        let mut end = start + "PROTO_".len();
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        let name = body[start..end].to_string();
+        if !resolved.contains(&name) {
+            resolved.push(name);
+        }
+        i = end;
+    }
+    resolved.sort_unstable();
+    assert_eq!(
+        resolved,
+        vec![
+            "PROTO_ICMP".to_string(),
+            "PROTO_ICMPV6".to_string(),
+            "PROTO_TCP".to_string(),
+            "PROTO_UDP".to_string(),
+        ],
+        "#6837: the shim's `parse_l4` must mention exactly the protocols \
+         `metadata_tuple_complete` accepts. A protocol here that the predicate does not accept \
+         has its identity parsed and then DISCARDED; one the predicate accepts but that is \
+         missing here is a 0/0 placeholder being treated as resolved"
+    );
+    assert!(
+        body.contains("_ => Some((l4_offset, 0, 0, 0, 0))"),
+        "#6837: the shim's catch-all must still be the 0/0 PLACEHOLDER this predicate exists to \
+         refuse. If it changed shape, `metadata_tuple_complete` needs re-deciding, not this \
+         assertion relaxing"
+    );
+}
+
+/// #6923's property, kept load-bearing after #6837 narrowed the predicate
+/// around it.
+///
+/// The original form of this test paired "ext-header value is refused" against
+/// "ESP's portless tuple stays complete", and said so: *"Refuses the ext-header
+/// tuple alone is satisfied by a predicate that refuses every portless tuple,
+/// **which would strand ESP, GRE and ICMPv6**; the ESP row is what excludes
+/// that."*
+///
+/// #6837 is that predicate, and the rationale for excluding it was wrong.
+/// "Strand" is a testable word and it was never measured: a flowless packet
+/// still FORWARDS. Measured directly on this tree — a GRE transit descriptor
+/// yields `tx=1` whether it is flow-backed or flowless; only the session count
+/// changes (2 -> 0). See `portless_transit_is_flowless_and_still_forwards_6837`
+/// in `tests_txn_flow_cache.rs`, which asserts both halves. What flowless
+/// actually costs is stateful return admission, not reachability.
+///
+/// So the ESP row is gone and #6923's property needs a different anchor. The
+/// one that survives is STRICTLY STRONGER than the row it replaces: a
+/// traversable next-header value is refused on IPv6 **even when the tuple
+/// carries real ports**, while TCP/UDP with those same ports are complete.
+/// That distinguishes "refused because it is an unresolved chain" from
+/// "refused because it is portless" — which is exactly the discrimination the
+/// ESP row was there to provide, and it cannot be satisfied by #6837's rule.
+#[test]
+fn metadata_tuple_complete_refuses_unresolved_ipv6_ext_protocols_even_with_ports() {
     let src = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x11));
     let dst = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x22));
     let judge_ports = |family: u8, protocol: u8, src_port: u16, dst_port: u16| {
@@ -609,37 +810,65 @@ fn metadata_tuple_complete_refuses_only_unresolved_ipv6_ext_protocols() {
     let v6 = libc::AF_INET6 as u8;
     let v4 = libc::AF_INET as u8;
 
+    // The ext-header numbers overlap nothing in the resolved set, so this
+    // sweep would be vacuous if it only checked the portless case after #6837.
+    // It checks the WITH-PORTS case, which #6837's rule cannot explain.
+    let mut ext_rows = 0usize;
     for proto in 0u8..=255 {
         if ipv6_ext_header_is_traversable(proto) {
+            ext_rows += 1;
             assert!(
                 !judge(v6, proto),
                 "#6923: IPv6 protocol {proto} is a next-header the walk traverses — the shim only \
                  emits it by EXHAUSTING its loop, so the tuple names where it gave up, not a \
                  resolved L4 flow"
             );
+            // THE LOAD-BEARING ROW. Ports present, and still refused on IPv6.
+            // #6837 refuses portless tuples; it has nothing to say about a
+            // tuple carrying 1234/5678. Only the ext-header rule explains this,
+            // so deleting `ipv6_ext_header_is_traversable` from
+            // `metadata_tuple_complete` reds HERE and nowhere else.
             assert!(
-                judge(v4, proto),
-                "#6923: IPv4 protocol {proto} has no extension-header meaning and must stay \
-                 complete"
+                !judge_ports(v6, proto, 1234, 5678),
+                "#6923: IPv6 protocol {proto} must stay refused even WITH ports — the refusal is \
+                 about the unresolved chain, not about the tuple being portless"
             );
-            // #6923 does not disturb the pre-existing port rule either: the
-            // same value on IPv6 stays refused WITH ports, so the refusal is
-            // about the protocol, not about the tuple being portless.
-            assert!(!judge_ports(v6, proto, 1234, 5678));
+            // The same value on IPv4 has no extension-header meaning, so the
+            // IPv6-only scoping of the ext-header rule is still observable
+            // there: WITH ports it is judged by the #6837 rule alone.
+            assert_eq!(
+                judge_ports(v4, proto, 1234, 5678),
+                matches!(proto, PROTO_TCP | PROTO_UDP),
+                "#6923/#6837: IPv4 protocol {proto} carries no ext-header meaning, so it must be \
+                 judged purely by whether the shim resolves an L4 identity for it"
+            );
             continue;
         }
         if matches!(proto, PROTO_TCP | PROTO_UDP) {
-            // Pre-#6923 rule, untouched: TCP/UDP need BOTH ports. Asserting it
-            // here is what keeps the sweep from mistaking "0/0 is incomplete"
-            // for the new ext-header refusal.
+            // Pre-#6923 rule, untouched: TCP/UDP need BOTH ports.
             assert!(!judge(v6, proto));
             assert!(judge_ports(v6, proto, 1234, 5678));
             continue;
         }
+        if matches!(proto, PROTO_ICMP | PROTO_ICMPV6) {
+            // #6837 keeps ICMP complete — the shim resolves a real identifier
+            // for it, and 0 is a legal identifier.
+            assert!(judge(v6, proto));
+            continue;
+        }
+        // #6837: every other protocol is portless as far as the shim is
+        // concerned, and its metadata tuple is a placeholder.
         assert!(
-            judge(v6, proto),
-            "#6923: IPv6 protocol {proto} is a RESOLVED terminal and its portless tuple must \
-             stay complete — refusing it would strand ESP/GRE/ICMPv6 transit flows"
+            !judge(v6, proto),
+            "#6837: IPv6 protocol {proto} has no shim-resolved L4 identity, so its 0/0 tuple is a \
+             placeholder and must not be declared complete"
         );
     }
+    // Guard against the sweep silently covering nothing if the traversable set
+    // is ever emptied — the assertions above would then all be skipped.
+    assert_eq!(
+        ext_rows, 10,
+        "#6923: the traversable set changed size; this sweep is calibrated to it and would \
+         otherwise pass vacuously"
+    );
 }

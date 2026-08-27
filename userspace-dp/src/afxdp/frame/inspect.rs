@@ -1120,7 +1120,48 @@ pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &Se
     }
     match meta.protocol {
         PROTO_TCP | PROTO_UDP => flow.forward_key.src_port != 0 && flow.forward_key.dst_port != 0,
-        _ => true,
+        // ICMP/ICMPv6 keep their metadata tuple: the shim resolves a REAL
+        // identifier for them (`parse_l4`'s ICMP arm reads bytes [l4+4, l4+6)),
+        // and the meta-side gate in `parse_session_flow_from_bytes` has already
+        // nulled `meta_flow` for every non-identifier-bearing type. An
+        // identifier of 0 is legal, so this is deliberately not a non-zero
+        // check like the TCP/UDP arm above.
+        PROTO_ICMP | PROTO_ICMPV6 => true,
+        // #6837: every other protocol is NOT complete.
+        //
+        // The question this function's NAME asks is "did the shim resolve an
+        // L4 identity?". The `_ => true` this replaces answered a different
+        // one — "are both addresses set?" — and that gap is the whole defect.
+        // The shim resolves L4 for exactly TCP, UDP, ICMP and ICMPv6; its
+        // `parse_l4` catch-all (`userspace-xdp/src/lib.rs`) returns
+        // `Some((l4_offset, 0, 0, 0, 0))` for everything else. Those zeros are
+        // a PLACEHOLDER, not a parse, and treating them as a resolved tuple is
+        // what let GRE (47), ESP (50), AH (51), OSPF (89) and friends past.
+        //
+        // The consequence was not merely cosmetic. The frame side had already
+        // refused these protocols (`parse_flow_ports` has no arm for them), so
+        // the two sides disagreed and `parse_session_flow_from_bytes` resolved
+        // the disagreement in favour of the side that had not parsed anything.
+        // The packet then took the flow-backed arm and, on permit, installed
+        // `SessionKey { protocol, src_port: 0, dst_port: 0, .. }` plus its
+        // reverse companion — measured at two entries per transit flow, and
+        // aliasing every distinct flow between one endpoint pair onto one key.
+        //
+        // Declining here makes the metadata arm agree with the frame arm, so
+        // the packet stays flowless and takes the route-based, session-less
+        // forward path (`frame/README.md`). Flowless is NOT a drop and NOT a
+        // bypass: it still FORWARDS (measured), and since #3291 the flowless
+        // transit arm applies zone policy, interface input filters and PBR.
+        //
+        // What is genuinely given up is STATEFUL RETURN ADMISSION for these
+        // protocols, and their appearance in `show security flow session`.
+        // Restoring a session for them requires a discriminator that is the
+        // SAME in both directions — the RFC 2890 GRE Key qualifies, an RFC 2637
+        // PPTP Call ID and an ESP SPI do not (they are allocated per-direction;
+        // see `docs/userspace-native-gre-plan.md` §6e). That is #7188's typed
+        // discriminator, on the PARSE side. It must not come back as a
+        // metadata-side default.
+        _ => false,
     }
 }
 
