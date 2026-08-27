@@ -282,6 +282,7 @@ fn active_flow_debug_test_entry(
                 dscp_rewrite: Some(46),
                 drop: false,
                 reject: false,
+                reject_message: crate::filter::RejectMessage::ADMIN_PROHIBITED,
                 filter_counters: crate::filter::CachedFilterCounters::default(),
                 three_color_policers: crate::filter::CachedThreeColorPolicers::default(),
                 filter_log: None,

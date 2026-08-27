@@ -556,12 +556,12 @@ fn filter_action_to_rt_flow(action: FilterAction, reject_reply_enqueued: bool) -
         // (poll_descriptor enqueue_filter_reject_reply). #3615: report REJECT
         // only when the reply was actually enqueued; if it fail-closed to a
         // silent drop (budget/rate/parse/output-filter), report the truthful
-        // DENY — honoring the FilterAction::Reject contract ("callers that
+        // DENY — honoring the FilterAction::Reject(RejectMessage::ADMIN_PROHIBITED) contract ("callers that
         // cannot synthesize the reject packet ... must not log that an
         // ICMP/RST reject was generated"). `discard` is always a silent drop
         // → deny.
-        FilterAction::Reject if reject_reply_enqueued => RT_FLOW_ACTION_REJECT,
-        FilterAction::Reject => RT_FLOW_ACTION_DENY,
+        FilterAction::Reject(_) if reject_reply_enqueued => RT_FLOW_ACTION_REJECT,
+        FilterAction::Reject(_) => RT_FLOW_ACTION_DENY,
     }
 }
 

@@ -132,7 +132,14 @@ func RenderFirewallFilterSnapshot(snap *FirewallFilterSnapshot) string {
 			if action == "" {
 				action = "accept"
 			}
-			fmt.Fprintf(&b, "    then %s\n", action)
+			// #6854: render the reject message-type alongside the action, so a
+			// term configured `then reject host-unreachable` is distinguishable
+			// in the snapshot from a bare `then reject`.
+			if term.RejectMessageType != "" {
+				fmt.Fprintf(&b, "    then %s %s\n", action, term.RejectMessageType)
+			} else {
+				fmt.Fprintf(&b, "    then %s\n", action)
+			}
 		}
 	}
 	b.WriteString("\n")

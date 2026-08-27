@@ -99,7 +99,7 @@ pub(super) fn emit_pending_filter_log(
 /// TRUTHFUL order — enqueue the reject reply FIRST (only for `Reject`), then
 /// emit the matched filter-log (if any) with the ACTUAL reply outcome, so a
 /// suppressed reject is logged as DENY not REJECT (honoring the
-/// `FilterAction::Reject` contract: a caller that cannot synthesize the reject
+/// `FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED)` contract: a caller that cannot synthesize the reject
 /// packet must not log that a reject was generated). Returns `true` iff the
 /// packet must be dropped (`action != Accept`); the poll-loop caller performs
 /// the recycle / host-bound session teardown on a `true` return. An accepted
@@ -122,7 +122,7 @@ pub(super) fn filter_terminal(
     log: Option<PendingFilterLog>,
     now_ns: u64,
 ) -> bool {
-    let reject_reply_enqueued = if matches!(action, crate::filter::FilterAction::Reject) {
+    let reject_reply_enqueued = if let crate::filter::FilterAction::Reject(reject_msg) = action {
         enqueue_filter_reject_reply(
             tx_pipeline,
             forwarding,
@@ -131,6 +131,7 @@ pub(super) fn filter_terminal(
             meta,
             flow,
             counters,
+            reject_msg,
         )
     } else {
         false
@@ -814,7 +815,9 @@ mod lo0_gate_tests {
         );
         assert_eq!(
             action.map(|(a, _)| a),
-            Some(FilterAction::Reject),
+            Some(FilterAction::Reject(
+                crate::filter::RejectMessage::ADMIN_PROHIBITED
+            )),
             "admitted packet runs the lo0 reject term",
         );
         assert_eq!(
@@ -1075,7 +1078,9 @@ mod filter_terminal_tests {
             egress_zone_id: 0,
             filter_id: 23,
             term_id: 6,
-            action: crate::filter::FilterAction::Reject,
+            action: crate::filter::FilterAction::Reject(
+                crate::filter::RejectMessage::ADMIN_PROHIBITED,
+            ),
             source: FilterLogSource::Lo0,
             app_id: 0,
         }
@@ -1151,7 +1156,7 @@ mod filter_terminal_tests {
             meta,
             &flow,
             &mut counters,
-            crate::filter::FilterAction::Reject,
+            crate::filter::FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED),
             Some(reject_log()),
             123,
         );
@@ -1273,7 +1278,7 @@ mod filter_terminal_tests {
             meta,
             &flow,
             &mut counters,
-            crate::filter::FilterAction::Reject,
+            crate::filter::FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED),
             Some(log),
             123,
         );
@@ -1351,7 +1356,7 @@ mod filter_terminal_tests {
             meta,
             &flow,
             &mut counters,
-            crate::filter::FilterAction::Reject,
+            crate::filter::FilterAction::Reject(crate::filter::RejectMessage::ADMIN_PROHIBITED),
             Some(log),
             123,
         );

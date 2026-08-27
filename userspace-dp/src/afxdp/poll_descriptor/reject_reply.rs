@@ -58,6 +58,9 @@ pub(super) fn enqueue_policy_reject_reply(
         flow,
         counters,
         RejectReplySource::Policy,
+        // #6854: a POLICY reject has no filter term and so no message-type;
+        // it keeps the administratively-prohibited codes it has always sent.
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
     )
 }
 
@@ -71,6 +74,7 @@ pub(super) fn enqueue_policy_reject_reply(
 /// behavior (the caller still drops the packet on a `false` return).
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::afxdp) fn enqueue_filter_reject_reply(
     tx_pipeline: &mut WorkerTxPipeline,
     forwarding: &ForwardingState,
@@ -79,6 +83,10 @@ pub(in crate::afxdp) fn enqueue_filter_reject_reply(
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
     counters: &mut BatchCounters,
+    // #6854: the ICMP codes the matched term's `then reject <message-type>`
+    // resolved to. `RejectMessage::ADMIN_PROHIBITED` for a term with no
+    // message-type, which is what this path sent for every reject before.
+    reject_message: crate::filter::RejectMessage,
 ) -> bool {
     enqueue_reject_reply(
         tx_pipeline,
@@ -89,6 +97,7 @@ pub(in crate::afxdp) fn enqueue_filter_reject_reply(
         flow,
         counters,
         RejectReplySource::Filter,
+        reject_message,
     )
 }
 
@@ -221,6 +230,7 @@ fn enqueue_reject_reply(
     flow: &SessionFlow,
     counters: &mut BatchCounters,
     source: RejectReplySource,
+    reject_message: crate::filter::RejectMessage,
 ) -> bool {
     // #3656: determine reply-build FEASIBILITY before consuming the reject
     // rate-limit token OR counting a TX-frame-budget drop. A frame that can
@@ -277,7 +287,13 @@ fn enqueue_reject_reply(
     let bytes = if meta.protocol == PROTO_TCP {
         build_reject_rst_frame(packet_frame)
     } else {
-        build_reject_icmp_unreachable(packet_frame, meta, logical_ingress_ifindex, forwarding)
+        build_reject_icmp_unreachable(
+            packet_frame,
+            meta,
+            logical_ingress_ifindex,
+            forwarding,
+            reject_message,
+        )
     };
     let Some(bytes) = bytes else {
         // Unreplyable: fail-closed to the silent drop the caller already

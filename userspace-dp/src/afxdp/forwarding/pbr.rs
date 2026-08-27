@@ -100,10 +100,10 @@ pub(in crate::afxdp) fn ingress_route_table_override(
     // drop silently.
     let is_drop = matches!(
         routing_result.action,
-        crate::filter::FilterAction::Reject | crate::filter::FilterAction::Discard
+        crate::filter::FilterAction::Reject(_) | crate::filter::FilterAction::Discard
     );
     let reject_reply_enqueued = match (routing_result.action, reject_sink) {
-        (crate::filter::FilterAction::Reject, Some(sink)) => {
+        (crate::filter::FilterAction::Reject(reject_msg), Some(sink)) => {
             crate::afxdp::poll_descriptor::reject_reply::enqueue_filter_reject_reply(
                 sink.tx_pipeline,
                 forwarding,
@@ -112,6 +112,7 @@ pub(in crate::afxdp) fn ingress_route_table_override(
                 meta,
                 flow,
                 sink.counters,
+                reject_msg,
             )
         }
         _ => false,

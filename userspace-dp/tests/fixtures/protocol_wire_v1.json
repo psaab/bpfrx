@@ -568,6 +568,7 @@
     "policer": "",
     "ports_unrepresentable": false,
     "protocols": [],
+    "reject_message_type": "",
     "routing_instance": "",
     "source_addresses": [],
     "source_constrained": false,
