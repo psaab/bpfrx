@@ -263,6 +263,12 @@ _fake_cli_status() {
 
 reset_cli_mock() {
 	CLI_LOG=$(mktemp)
+	# $CLI_LOG records the command TEXT ONLY: incus() shifts the instance away
+	# before _fake_exec sees it, so a reset issued to the peer is byte-identical
+	# there to a duplicate reset issued to node0. $FAKE_CALL_LOG keeps the full
+	# argv, so it is the only log that can answer WHICH NODE a command went to
+	# -- which is the whole property under test in #7688.
+	FAKE_CALL_LOG=$(mktemp)
 	CLI_IDX_FILE=$(mktemp)
 	printf '0' >"$CLI_IDX_FILE"
 	CLI_REQUEST_RC=0
@@ -829,6 +835,43 @@ test_reassert_issues_reset_transfer_reset_per_rg() {
 	fi
 }
 
+test_reassert_clears_the_peer_manual_pin() {
+	reset_cli_mock
+	CLI_STATUS_RESPONSES=("$STATUS_BOTH_RG_NODE0_PRIMARY")
+	( deploy_reassert_primary_node0 "fake:vm0" "fake:vm1" ) >/dev/null 2>&1 || true
+	# Assert on the INSTANCE-bearing log, not $CLI_LOG. Keyed on $CLI_LOG this
+	# cell would stay green with the peer reset deleted, because node0 is reset
+	# twice per RG anyway and the texts are identical.
+	local peer node0
+	peer=$(grep -c '^exec fake:vm1 -- cli -c request chassis cluster failover reset redundancy-group' "$FAKE_CALL_LOG" || true)
+	node0=$(grep -c '^exec fake:vm0 -- cli -c request chassis cluster failover reset redundancy-group' "$FAKE_CALL_LOG" || true)
+	if (( peer == 2 && node0 == 4 )); then
+		ok "reassert: clears the PEER's manual pin once per RG (peer=$peer, node0=$node0)"
+	else
+		bad "reassert: peer resets=$peer (want 2, one per RG), node0 resets=$node0 (want 4).
+ManualFailover is local, unsynced state: a pin left on node1 is invisible to
+node0's CLI and blocks the election the transfer depends on (#7688)."
+	fi
+}
+
+test_reassert_call_site_passes_the_peer() {
+	# Bind the WIRING, not just the function. The peer is an OPTIONAL second
+	# argument -- deliberately, so the other reassert cells can keep driving the
+	# single-node form -- which means a call site that omits it silently gets
+	# the pre-#7688 one-sided behaviour while every other test here still
+	# passes. Only reading the production call site can catch that.
+	local f="${SCRIPT_DIR}/cluster-setup.sh"
+	local call
+	call=$(grep '^[[:space:]]*deploy_reassert_primary_node0 ' "$f" | head -1)
+	if [[ "$call" == *'VM0'*'VM1'* ]]; then
+		ok "reassert: cluster-setup.sh call site passes BOTH nodes"
+	else
+		bad "reassert: cluster-setup.sh passes no peer instance, so the peer pin
+is never cleared and the deploy still fails its primary reassert (#7688).
+  got: $call"
+	fi
+}
+
 test_reassert_transfer_rc_is_not_the_verdict() {
 	reset_cli_mock
 	# Every request returns non-zero, but the cluster ends up correct. The
@@ -1016,6 +1059,8 @@ test_reassert_dies_when_role_not_achieved
 test_reassert_issues_reset_transfer_reset_per_rg
 test_reassert_transfer_rc_is_not_the_verdict
 test_reassert_is_wired_into_both_deploy_paths
+test_reassert_clears_the_peer_manual_pin
+test_reassert_call_site_passes_the_peer
 test_ownership_verdict_ok
 test_ownership_verdict_diverged
 test_ownership_verdict_nostream
