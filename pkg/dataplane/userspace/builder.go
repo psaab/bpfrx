@@ -161,6 +161,14 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		snap.Summary.ZoneCount = len(snap.Zones)
 		snap.Summary.PolicyCount = len(snap.Policies)
 	}
+	// #7717: report (do NOT foreclose) a NAT pool overlapping an interface-mode
+	// SNAT egress address that is only knowable at snapshot build — a DHCP or
+	// netlink-learned address the commit-time gate cannot see. Quarantining the
+	// pool here is what §5.7 specifies, and it ships with the drain, in one
+	// change, because the merged config gate says marking a pool unusable with
+	// nothing draining strands live sessions.
+	reportInterfaceSNATPoolOverlaps(snap)
+
 	return snap, nil
 }
 
