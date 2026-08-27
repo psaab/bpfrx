@@ -106715,3 +106715,7 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6836 — give the NAT64 meta fixtures real flow addresses, and
     pin the #7656 flowless egress-logging gap the fix made observable
   - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 review round 2 — addressed all four Codex findings on PR 7657. Measured gate ownership by mutating each fail-closed gate in isolation.
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs

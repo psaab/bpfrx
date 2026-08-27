@@ -1336,10 +1336,16 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
     );
     assert_eq!(
         dbg2.tx, 0,
-        "#5146/#6927: with no association to inherit, the missed non-first fragment drops \
+        "#5146: with no association to inherit, the missed non-first fragment drops \
          fail-closed. The fixture DOES carry a v6 default route now — deleting it is what hid \
-         the #6927 leak — so the drop is the Pref64-destination gate on the flowless arm, NOT \
-         an absent route"
+         the #6927 leak — so this is a real fail-closed drop, NOT the absence of a route. \
+         This cell does NOT identify WHICH gate dropped it: the flowless arm carries two \
+         independent fail-closed gates that both cover this packet (the #6122 same-family \
+         NAT-miss gate and the #6927 Pref64-destination gate), so tx==0 survives removing \
+         either one. Each gate is bound by its own cell — #6122 by \
+         tests_fragment::nat_nonfirst_fragment_assoc_miss_fails_closed_6122, #6927 by \
+         nat64_frag_assoc_miss_must_drop_with_default_route_6927 — and mutating either gate \
+         reds exactly that cell, not this one"
     );
     assert_eq!(
         forwarding.nat64.frag_assoc.len(),
@@ -2464,9 +2470,12 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
     // declares reachable — the same path the Pref64 destination above took.
     let plain_dst: Ipv6Addr = "2606:4700:4700::1111".parse().expect("plain v6 dst");
     let plain = nat64_v6_frag_frame(0x0008, 0x6927_0005, src, plain_dst, 0, 0);
-    let mut plain_meta = nat64_v6_frag_meta(plain.len(), src, dst);
-    plain_meta.flow_src_addr = src.octets();
-    plain_meta.flow_dst_addr = plain_dst.octets();
+    // #6836: the meta is constructed with the frame's OWN dst. Passing the
+    // NAT64 `dst` here and repairing it on the next two lines worked, and it is
+    // exactly the fixture/frame disagreement the parameterisation exists to
+    // prevent: the repair lines look redundant, and deleting them would
+    // reintroduce a meta that describes a packet the frame does not carry.
+    let plain_meta = nat64_v6_frag_meta(plain.len(), src, plain_dst);
     let (plain_batch, plain_dbg) = txn_run_descriptor(
         &mut binding,
         &mut sessions,
@@ -2487,71 +2496,82 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
     );
 }
 
-/// #6836 + #7656: the flowless egress filter-log path, exercised for the first
-/// time — and it records a REAL GAP rather than a passing feature.
+/// #6836: the flowless egress filter-log path, exercised for the first time —
+/// and what it actually shows is a FAMILY asymmetry, not a missing log.
 ///
 /// `forward_request.rs`'s flowless branch (#5467) rebuilds an L3-only flow
-/// SOLELY to attribute a filter-log event for a packet with no
-/// `tx_selection_flow` — a non-first fragment or a non-query ICMP. Its stated
-/// purpose is that "egress logging is not silently bypassed" for those packets.
+/// solely to attribute a filter-log event for a packet with no
+/// `tx_selection_flow`. It had never run under a NAT64 fixture, because two
+/// independent conditions gate it and no NAT64 fixture satisfied either: the
+/// meta fixtures left the flow addresses zeroed, and none ever set an output
+/// filter.
 ///
-/// It had never run under a NAT64 fixture, and it took TWO defects to keep it
-/// dark, not one:
+/// # The asymmetry, measured
 ///
-///  1. the meta fixtures left `flow_src_addr`/`flow_dst_addr` zeroed, and
-///     `l3_session_flow_from_meta` returns `None` for an unspecified address;
-///  2. no NAT64 fixture ever set an output filter, so `cos.filter_log` was
-///     `None` too.
+/// `resolve_cos_tx_selection_at` picks the output-filter family from the
+/// egress `flow_key` when there is one, and falls back to the INGRESS
+/// `meta.addr_family` when there is not (`cos_classify.rs`, "Fall back to the
+/// ingress meta family only on the flowless / default-queue path"). Under NAT64
+/// the packet CHANGES family, so:
 ///
-/// Both gate the same `if let`, so fixing (1) alone changes nothing observable
-/// — which is why the fixture-address fix landing green was not evidence of
-/// anything.
+///     first fragment  (has a flow_key)  -> evaluated against the egress V4 filter
+///     non-first frag  (flowless)        -> evaluated against the egress V6 filter
 ///
-/// # What this measured, once both were supplied
+/// Both leave the box as IPv4 on the same interface. An operator who applies a
+/// v4 output filter to that v4 egress sees the first fragment and not the rest.
 ///
-///     first fragment  (has a flow)  tx=1   filter-log events = 1
-///     non-first frag  (FLOWLESS)    tx=1   filter-log events = 0
+/// # This test asserts the behaviour, not a gap
 ///
-/// The inherited non-first fragment FORWARDS THROUGH A LOGGING OUTPUT FILTER
-/// AND IS NOT LOGGED. That is the bypass #5467 exists to prevent, still open on
-/// this path. Filed as #7656.
+/// An earlier version of this cell attached only a v4 filter, observed
+/// `filter_log.sent == 0` for the flowless packet, and concluded the branch did
+/// not run. That was wrong, and wrong in the way this whole issue is about:
+/// zero is also what you get when no filter of the looked-up family exists, so
+/// the assertion could not tell "the branch is broken" from "nothing matched".
+/// Deleting the entire #5467 branch left it green.
 ///
-/// # Why this asserts the gap instead of the fix
-///
-/// Asserting the desired behaviour would leave a permanently-red test. Pinning
-/// the gap makes it self-announcing: the day the flowless branch reaches this
-/// path, the `second_events == 0` assertion REDS and tells the fixer to invert
-/// it in the same commit. That is the pattern #6860's author used and it is why
-/// I found that one.
-///
-/// The `first_events == 1` half is the POSITIVE CONTROL, and it is what makes
-/// the zero meaningful: without it, "no event" is equally explained by the
-/// filter never being consulted, the event stream not being wired, or the
-/// fixture not logging at all. With it, the filter demonstrably logs the very
-/// next packet on the same interface through the same term.
+/// Both arms are now asserted, which is what makes either mean anything: with
+/// the v6 filter the flowless packet IS logged, and with only the v4 filter it
+/// is not.
 #[test]
-fn nat64_flowless_nonfirst_fragment_is_not_egress_logged_6836() {
+fn nat64_flowless_fragment_uses_the_ingress_family_output_filter_6836() {
+    // `want` is the flowless packet's expected event count for each filter
+    // family attached to the SAME v4 egress interface.
+    for tc in [
+        ("v6 filter on the egress: the flowless arm finds it", true, 1u64),
+        ("v4 filter only: the flowless arm looks up v6 and finds nothing", false, 0u64),
+    ] {
+        let (name, attach_v6, want) = tc;
+        t_run_6836(name, attach_v6, want);
+    }
+}
+
+fn t_run_6836(name: &str, attach_v6: bool, want_flowless_events: u64) {
     let mut snapshot = nat64_frag_snapshot();
 
-    // A LOGGING output filter on the v4 egress (reth0.80 — the interface the
-    // NAT64-translated packet leaves by). `accept`, so the packet still
-    // forwards: the claim under test is about LOGGING, not disposition.
     let egress = snapshot
         .interfaces
         .iter_mut()
         .find(|i| i.name == "reth0.80")
         .expect("#6836 premise: the NAT64 fixture must have the reth0.80 v4 egress");
-    egress.filter_output_v4 = "nat64-egress-log".to_string();
-    snapshot.filters = vec![crate::protocol::FirewallFilterSnapshot {
-        name: "nat64-egress-log".to_string(),
-        family: "inet".to_string(),
+    egress.filter_output_v4 = "nat64-egress-v4".to_string();
+    if attach_v6 {
+        egress.filter_output_v6 = "nat64-egress-v6".to_string();
+    }
+
+    let log_term = |n: &str| crate::protocol::FirewallFilterSnapshot {
+        name: n.to_string(),
+        family: if n.ends_with("v6") { "inet6" } else { "inet" }.to_string(),
         terms: vec![crate::protocol::FirewallTermSnapshot {
             name: "log-all".to_string(),
             action: "accept".to_string(),
             log: true,
             ..Default::default()
         }],
-    }];
+    };
+    snapshot.filters = vec![log_term("nat64-egress-v4")];
+    if attach_v6 {
+        snapshot.filters.push(log_term("nat64-egress-v6"));
+    }
 
     let forwarding = build_forwarding_state(&snapshot);
     let ha_state = txn_ha_state();
@@ -2561,19 +2581,19 @@ fn nat64_flowless_nonfirst_fragment_is_not_egress_logged_6836() {
     sessions.set_max_sessions_for_test(16);
 
     let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
-    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+    let dst: Ipv6Addr = "64:ff9b::808:808"
+        .parse()
+        .expect("nat64 dst (extracts 8.8.8.8)");
 
     // BOTH packets go through the CAPTURING runner, and that is load-bearing.
-    //
-    // `txn_run_descriptor` passes a fixed `123_000_000_000` for `now_ns`;
-    // `txn_run_descriptor_capturing_events` passes real
-    // `neighbor::monotonic_nanos()`. Mixing them hands the two packets clocks
-    // billions of nanoseconds apart, so the association the first installs is
-    // not valid for the second and the non-first fragment silently does not
-    // forward — `tx=0` with NO drop counted, which reads as "this test is
-    // wrong" rather than "the helpers disagree about time". Found the hard way.
+    // `txn_run_descriptor` passes a fixed `123_000_000_000` for `now_ns` while
+    // the capturing variant passes real `monotonic_nanos()`. Mixing them hands
+    // the two packets clocks billions of nanoseconds apart, so the association
+    // the first installs is not valid for the second and the non-first fragment
+    // silently does not forward -- `tx=0` with NO drop counted, which reads as
+    // "this test is wrong" rather than "the helpers disagree about time".
     let first = nat64_v6_frag_frame(0x0001, 0x1234_5678, src, dst, 12345, 443);
-    let (_b1, dbg1, first_handle, _rx1) = txn_run_descriptor_capturing_events(
+    let (b1, dbg1, first_handle, _rx1) = txn_run_descriptor_capturing_events(
         &mut binding,
         &mut sessions,
         &forwarding,
@@ -2583,24 +2603,29 @@ fn nat64_flowless_nonfirst_fragment_is_not_egress_logged_6836() {
     );
     assert_eq!(
         dbg1.tx, 1,
-        "premise: the committed first fragment must translate and forward, or the \
-         non-first fragment below has no association to inherit"
+        "{name}: the first fragment must translate and forward"
     );
-
-    // POSITIVE CONTROL. The filter logs a packet that HAS a flow, on this
-    // interface, through this term. Without this the zero below is explained
-    // equally well by the filter never being consulted at all.
+    assert_eq!(
+        b1.nat64_translations, 1,
+        "{name}: the first fragment must be NAT64-TRANSLATED. Without this, \
+         `tx == 1` proves only that something forwarded -- a regression that kept \
+         the cached resolution but lost decision.nat would forward it as native \
+         IPv6, never reach the v4 egress filter, and still satisfy every other \
+         assertion here"
+    );
+    // CONTROL: the flow-bearing fragment is evaluated against the V4 filter,
+    // which is present in both cases. Without this, the flowless count below
+    // is explained equally well by nothing being wired at all.
     assert_eq!(
         first_handle.dataplane_event_stats().filter_log.sent,
         1,
-        "#6836 CONTROL: the flow-bearing first fragment MUST be egress-logged. If this \
-         is 0 the fixture is not logging anything and the assertion below proves nothing"
+        "{name} CONTROL: the flow-bearing first fragment must be logged by the v4 \
+         egress filter. If this is 0 the fixture logs nothing and the flowless \
+         assertion proves nothing"
     );
 
-    // The non-first fragment: no L4 header, so no `tx_selection_flow`. This is
-    // the packet #5467's flowless branch exists for.
     let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
-    let (_b2, dbg2, second_handle, _rx2) = txn_run_descriptor_capturing_events(
+    let (b2, dbg2, second_handle, _rx2) = txn_run_descriptor_capturing_events(
         &mut binding,
         &mut sessions,
         &forwarding,
@@ -2610,17 +2635,21 @@ fn nat64_flowless_nonfirst_fragment_is_not_egress_logged_6836() {
     );
     assert_eq!(
         dbg2.tx, 1,
-        "the inheriting non-first fragment must still forward — the filter accepts"
+        "{name}: the inheriting non-first fragment must forward"
+    );
+    assert_eq!(
+        b2.nat64_translations, 1,
+        "{name}: the non-first fragment must ALSO be NAT64-translated -- it is the \
+         packet under test and it must leave as IPv4 for the family question to mean \
+         anything"
     );
 
     assert_eq!(
         second_handle.dataplane_event_stats().filter_log.sent,
-        0,
-        "#7656 GAP (pinned, not fixed here): a NAT64 non-first fragment forwards \
-         through a LOGGING output filter and is NOT logged — the very bypass #5467's \
-         flowless branch exists to prevent. If this is now 1, that branch has been \
-         made to reach this path: INVERT this assertion in the same commit and delete \
-         the gap note above, so the fix is a deliberate edit rather than a silent \
-         divergence."
+        want_flowless_events,
+        "{name}: the flowless arm selects the output-filter family from the INGRESS \
+         meta (v6 here), not from the v4 egress the packet actually leaves by. So a \
+         v6 filter on that interface logs it and a v4 filter does not, even though \
+         the packet on the wire is IPv4."
     );
 }
