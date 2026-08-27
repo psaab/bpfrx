@@ -809,9 +809,15 @@ fn concurrency_fixture_is_wired_to_the_measured_window_7650() {
     // passes against a fixture that no longer contains any of them. Stripping
     // comments does not fix that — these needles are code, not prose. The
     // matrix caught this: three cells stayed green against the whole-file scan.
-    let start = src
-        .find("fn snapshot_under_concurrent_writer_never_tears()")
-        .expect("concurrency fixture not found");
+    // Anchor on a REAL newline before the fn header. The obvious
+    // `find("fn snapshot_...()")` matches this function's own argument to
+    // `find` — a string literal that necessarily contains the name — so the
+    // slice became the SCANNER's body, which holds every needle. That is the
+    // third depth of the same self-satisfaction trap in this one gate, and the
+    // matrix caught each one. A Rust string literal on a single line cannot
+    // contain a raw newline, so this marker can only match the definition.
+    let marker = "\nfn snapshot_under_concurrent_writer_never_tears() {\n";
+    let start = src.find(marker).expect("concurrency fixture not found");
     let rest = &src[start..];
     let end = rest.find("\n#[test]").unwrap_or(rest.len());
     let body: String = rest[..end]
