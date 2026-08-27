@@ -106558,3 +106558,28 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: #6751 3a — name the census selector's deliberate looseness
     (a comment mention of source-nat pulls a config in) per lane review
   - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go
+  - **Action**: #6818/#6821/#6822 — compile the compact spelling of OSPF
+    interface authentication, security-log transport and SNMPv3 credentials;
+    classify #6817 as divergent by design (#6662)
+  - **File(s)**: pkg/config/compiler_protocols.go,
+    pkg/config/compiler_security_log.go, pkg/config/compiler_system.go,
+    pkg/config/compact_leaf_credentials_test.go (new),
+    pkg/config/compact_block_equivalence_2419_test.go,
+    pkg/config/testdata/compact_block_divergences_2419.txt,
+    docs/config-schema.md
+  - **Action**: #2419 gate — floors so the control maps cannot be silently
+    emptied (found by mutation cell M6)
+  - **File(s)**: pkg/config/compact_block_equivalence_2419_test.go
+  - **Action**: #6818/#6822 — act on the Codex hostile review of PR 7647: fix
+    the packed-tail/nested-block sibling bug, correct the SNMPv3 discriminator,
+    drop the #6821 change, give the #2419 census a per-site state
+  - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
+    pkg/config/compiler_security_log.go,
+    pkg/config/compact_block_equivalence_2419_test.go,
+    pkg/config/compact_leaf_credentials_test.go,
+    pkg/config/testdata/compact_block_divergences_2419.txt,
+    docs/config-schema.md
+  - **Action**: #6818 — guard packedBodyChildren's deep attachment on the
+    terminal schema node permitting a body (Codex re-review finding 1)
+  - **File(s)**: pkg/config/compact_tail.go,
+    pkg/config/compact_leaf_credentials_test.go
