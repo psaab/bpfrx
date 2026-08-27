@@ -122,52 +122,6 @@ func cosSchedulerTemporalResolves(sched *CoSScheduler, shaped map[string]bool) b
 	return sched.TransmitRateBytes > 0 || shaped[sched.Name]
 }
 
-// cosPercentRateBytes is the Go mirror of `cos_percent_buffer_bytes` in
-// userspace-dp/src/afxdp/forwarding_build/cos.rs, which `cos_percent_rate_bytes`
-// delegates to (#6846 F6).
-//
-// It exists because there is no shared representation between the two sides and
-// a divergence here is ALWAYS a bug: this side decides whether an operator is
-// WARNED that a knob is inert, the Rust side decides whether the dataplane
-// declines the share. Every rule is mirrored deliberately, including the ones
-// that look like noise:
-//
-//   - CEIL, not truncate. This is the one that bit. Truncating makes this
-//     side's `claimed` systematically LOWER, so its leftover is larger, so it
-//     answers "resolves" for a shape whose leftover the dataplane rounds away.
-//     A config that is silent at commit AND inert at runtime is exactly the
-//     failure #6846 exists to remove, arriving through the mirror instead of
-//     through the predicate. `percent 33.3333333` + `percent 66.6666667` on a
-//     1 Gbps shape reaches it: 124_999_999 truncated versus 125_000_001
-//     ceiled, against a 125_000_000 base.
-//   - the (0, 100] DOMAIN. SchemaValidate already rejects a percent outside it
-//     ("percent out of range (0,100]"), so this is defense-in-depth for the
-//     lenient load / peer-sync path (#1960) — but the direction matters: Rust
-//     returns None and the sibling contributes NOTHING to the claim, where an
-//     unguarded multiplication would have it claim 150% of the interface.
-//   - the min-1 clamp, which is unreachable for a positive percent over a
-//     non-zero base (ceil of anything above zero is at least 1) and is mirrored
-//     only so the two functions cannot be read as differing.
-//
-// TestRemainderAdvisoryTracksTheLeftover6846 pins the agreement at a FRACTIONAL
-// percent, which is the only fixture shape that can see a rounding divergence:
-// at an integral percent ceil and truncate are equal by construction.
-func cosPercentRateBytes(baseBytes uint64, percent float64) (uint64, bool) {
-	if baseBytes == 0 || math.IsNaN(percent) || math.IsInf(percent, 0) ||
-		percent <= 0 || percent > 100 {
-		return 0, false
-	}
-	scaled := math.Ceil(float64(baseBytes) * percent / 100.0)
-	switch {
-	case scaled < 1:
-		return 1, true
-	case scaled >= math.MaxUint64:
-		return math.MaxUint64, true
-	default:
-		return uint64(scaled), true
-	}
-}
-
 // cosSaturatingAdd mirrors the `u128` saturating accumulation the Rust pre-pass
 // uses for `claimed`. Wrapping here would make an over-subscribed set of
 // siblings look like a SMALL claim and hand the remainder queue a leftover it
@@ -184,9 +138,9 @@ func cosSaturatingAdd(a, b uint64) uint64 {
 //
 // This is the control-plane mirror of `cos_remainder_rate_bytes` and must apply
 // the same rule: subtract the RESOLVED siblings (absolute, or percent through
-// cosPercentRateBytes, which mirrors the Rust rounding and is a shared helper
-// rather than an inline expression precisely because an inline one drifted),
-// count the remainder-marked queues, and floor the split. It is ANY rather than ALL because a named scheduler can be bound to
+// resolveCoSPercentRateBytes, the package's single mirror of the Rust rounding
+// — this arm was an inline multiply until it drifted, see #6846 F6), count the
+// remainder-marked queues, and floor the split. It is ANY rather than ALL because a named scheduler can be bound to
 // several interfaces and only needs to do something somewhere for the advisory
 // to be wrong.
 //
@@ -236,7 +190,11 @@ func cosRemainderLeftoverIsPositive(cos *ClassOfServiceConfig, name string) bool
 				// inline form truncated where Rust ceils, which made this
 				// side's leftover larger and suppressed the advisory on
 				// configurations the dataplane declines (#6846 F6).
-				if bytes, ok := cosPercentRateBytes(unit.ShapingRateBytes, sib.TransmitRatePercent); ok {
+				// Through resolveCoSPercentRateBytes, the package's ONE mirror
+				// of the Rust rounding — a 0 return means "no usable rate", and
+				// a usable one is always >= 1 because of the min-1 clamp, so
+				// `> 0` is an exact test rather than a heuristic.
+				if bytes := resolveCoSPercentRateBytes(unit.ShapingRateBytes, sib.TransmitRatePercent); bytes > 0 {
 					claimed = cosSaturatingAdd(claimed, bytes)
 				}
 			case sib.TransmitRateRemainder:
