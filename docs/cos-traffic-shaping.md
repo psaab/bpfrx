@@ -259,7 +259,9 @@ Rules, each of which is load-bearing:
   so the pre-pass and the main path agree about which queues those are.
 - the leftover **splits equally, flooring**, across remainder-marked queues.
   An indivisible leftover loses up to `count − 1` bytes/sec, which is noise
-  against any shaping rate a remainder is meaningful on. Ceiling would make
+  against any shaping rate a remainder is meaningful on. A leftover *smaller*
+  than the queue count floors to nothing, which is the zero case below rather
+  than a rate. Ceiling would make
   the remainder queues jointly claim *more* than the leftover they were
   computed from; distributing the slack would make the result depend on which
   queues come first, reintroducing the map-order dependence the pre-pass
@@ -269,10 +271,11 @@ Rules, each of which is load-bearing:
   `guarantee_enabled` on a queue the token bucket then treats as uncapped —
   promoting it into guarantee service rather than starving it. It does not take
   over-subscription to get there: `percent 60` + `percent 40` + `remainder` is
-  an ordinary shape and leaves exactly nothing. So the form stays inert, the
-  queue keeps the historical no-guarantee fallback, and `ValidateConfig` warns
-  with wording that names WHICH of the two reasons applies — no shaping base, or
-  siblings already claiming the whole rate — because the fix differs.
+  an ordinary shape and leaves exactly nothing, and so does any leftover that
+  floors to nothing. So the form stays inert, the queue keeps the historical
+  no-guarantee fallback, and `ValidateConfig` warns with wording that names
+  WHICH of the two reasons applies — no shaping base, or siblings leaving no
+  usable leftover — because the fix differs.
 
 **Temporal resolution (#6846 — now ENFORCED).** `buffer-size temporal <us>`
 sizes the queue by drain time, so it converts against the queue's **resolved**

@@ -108,8 +108,11 @@ func cosSchedulerRateResolves(cos *ClassOfServiceConfig, sched *CoSScheduler, sh
 // The duplication is deliberate and bounded: the Go side decides whether an
 // operator is WARNED and the Rust side decides what the dataplane DOES, so they
 // must agree, and there is no shared representation between them to compute it
-// once. TestRemainderAdvisoryTracksTheLeftover6846 pins the agreement on the
-// case that distinguishes them — a zero leftover.
+// once. TestRemainderAdvisoryTracksTheLeftover6846 pins the AGREEMENT rather
+// than either side's literals — each row transcribes a named cell from the Rust
+// `remainder_temporal_tests_6846` module and asserts the advisory is silent IFF
+// that cell resolves. TestRemainderLeftoverThatFloorsToZeroStillWarns6846 pins
+// the floor, which is where two implementations of one rule drift first.
 func cosRemainderLeftoverIsPositive(cos *ClassOfServiceConfig, name string) bool {
 	if cos == nil {
 		return false

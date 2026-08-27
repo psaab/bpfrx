@@ -1402,7 +1402,7 @@ mod remainder_temporal_tests_6846 {
     /// promoted the queue into guarantee service uncapped. The distinction now
     /// lives in the ADVISORY WORDING, which is where it belonged.
     #[test]
-    fn over_subscription_resolves_to_zero_not_none() {
+    fn over_subscription_is_unresolvable() {
         let scheds = [absolute("a", 900), absolute("b", 400), remainder("r")];
         let got = resolve(
             &scheds,
@@ -1411,9 +1411,10 @@ mod remainder_temporal_tests_6846 {
         );
         assert_eq!(
             got, None,
-            "siblings claiming more than the shaping rate leave no remainder — \
-             but the form RESOLVED, so this must be Some(0) and not None, or the \
-             narrowed commit advisory cannot tell it from an unresolvable one"
+            "siblings claiming MORE than the shaping rate leave no remainder, and \
+             a share of nothing is not a rate: Some(0) reaches the token bucket as \
+             the `unshaped/full bucket` sentinel, so the over-subscribed queue \
+             would come out UNCAPPED rather than starved"
         );
     }
 

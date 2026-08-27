@@ -1257,10 +1257,12 @@ func ValidateConfig(cfg *Config) []string {
 			// against the bound interface's shaping-rate (the multi-pass
 			// concern is handled by carrying the percent to the dataplane and
 			// materializing it per interface). Warn only for the residual inert
-			// cases: `remainder` (leftover-bandwidth resolution is still a
-			// follow-up) and a `percent` scheduler with no shaping base to
-			// resolve against — i.e. not bound via a scheduler-map to an
-			// interface that has a root shaping-rate.
+			// cases: a `percent` scheduler with no shaping base to resolve
+			// against — i.e. not bound via a scheduler-map to an interface that
+			// has a root shaping-rate — and, in the branch above, the remainder
+			// forms that still cannot resolve. `remainder` itself stopped being
+			// a follow-up in #6846; this comment said otherwise for one
+			// revision after that stopped being true.
 			if sched.TransmitRateRemainder && !cosSchedulerRateResolves(cos, sched, schedulersResolvingPercent) {
 				// #6846: `remainder` now RESOLVES where there is a shaping rate
 				// to take a remainder OF — forwarding_build/cos.rs computes
@@ -1283,7 +1285,7 @@ func ValidateConfig(cfg *Config) []string {
 				// runtime. Both halves are fixed here.
 				reason := "the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no interface bandwidth to take a remainder of"
 				if schedulersResolvingPercent[sched.Name] {
-					reason = "its sibling queues already claim the whole interface shaping-rate, so the leftover is zero — the dataplane declines a zero share rather than treating it as an unshaped queue"
+					reason = "its sibling queues already claim the interface shaping-rate, leaving no usable leftover — the dataplane declines a zero share rather than treating it as an unshaped queue"
 				}
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q transmit-rate remainder is accepted but has no effect: %s (#6846)",
