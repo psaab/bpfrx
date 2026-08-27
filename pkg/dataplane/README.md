@@ -490,6 +490,22 @@ Guard layers (`build-userspace-xdp.sh`):
      is `<`, so an object leaving EXACTLY 3.00% passes;
      `TestShimverifyDecision` carries a `970000/1000000` fixture, the only
      one that distinguishes `<` from `<=`.
+   - **The banner reports SLACK, not just headroom (#6884), and the two are
+     not the same question.** Headroom is "how close to the 1M wall". Slack
+     is "how much can still land before the tripwire fires" — the quantity
+     this floor's *sensitivity* rests on. They diverge as the object
+     improves, and the divergence is silent, because a rising headroom is
+     indistinguishable from a healthy object, which is exactly what it is.
+     The floor was chosen against a 5.3% object; #6676 then freed ~193k
+     insns and the object reached **21.58% (784,175/1,000,000)**, at which
+     point the unchanged 3% admitted ~186k more insns — one to two whole
+     extension-header iterations at 87k–106k each — with the gate green and
+     nothing said. `SlackToFloorInsns` is derived from the enforced constant
+     (never a copy of its value) and printed on every build, so a
+     recalibration this large is visible when it happens rather than found
+     by archaeology. **Whether 3% is still the right floor at 21.58% is an
+     open question — see #6884 — and the number to judge it on is the
+     slack, not the percentage.**
    - **The decision lives in ONE place.** `decide()` maps
      `(stats, override)` to the verdict, and `run()` only PRESENTS it —
      `main()` is `os.Exit(run(...))` and nothing else. Before that, `main`
@@ -1063,7 +1079,17 @@ authoritative list; quick recap:
 - xdp_zone fails the verifier on kernel 6.12 (NAT64 complexity); passes
   on 6.18+.
 
-### IPv6 extension-header walk: the shim's budget is nearly spent (#4555)
+### IPv6 extension-header walk: the shim's budget (#4555; re-measured #6884)
+
+> **Re-measured 2026-08-27 (#6884): the budget is no longer nearly spent.**
+> The tracked object is at **784,175 / 1,000,000 — 21.58% headroom** on
+> kernel 7.0.13, after #6676's runtime `binding_slot` extraction. The
+> table below is the #4555 measurement series and is retained because the
+> *couplings* it establishes still hold; its absolute counts are a
+> snapshot of a tree that has since moved by ~206k insns. Processed-insn
+> counts are also **kernel-dependent**, so treat any absolute figure here
+> as provenance-bearing, not as a current value — run `cmd/shimverify`
+> for that.
 
 The shim's `parse_ipv6` extension-header loop is fully unrolled, so every
 iteration duplicates each arm body and its `read_bytes` range
