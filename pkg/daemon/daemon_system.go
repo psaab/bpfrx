@@ -532,7 +532,11 @@ func isProcessDisabled(cfg *config.Config, name string) bool {
 // RenderResolvedDropin remains in pkg/daemon/system for any future
 // resolved-owner mode but is no longer wired into the apply path.
 
-const (
+// The two xpf-managed chrony files. Vars rather than consts so a test can
+// point them at a temp dir and exercise the write/reload/retry-debt paths
+// without a real /etc/chrony — the same seam convention sshdConfPath and
+// sshKnownHostsPath already use in this file.
+var (
 	chronySourcesPath   = "/etc/chrony/sources.d/xpf.sources"
 	chronyThresholdPath = "/etc/chrony/conf.d/xpf-threshold.conf"
 )
@@ -610,20 +614,64 @@ func reconcileManagedFile(path, content string) (bool, error) {
 	return true, nil
 }
 
-func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
+// chronyRunCmd runs one chrony runtime-reload shell-out. A package var so the
+// per-leg outcome reloadChronyRuntime reports (#6800) can be exercised
+// hermetically — the leg outcomes are what the retained reload debt is built
+// from, and driving them through a real chronyc/systemctl would make the cells
+// depend on whether the dev host happens to run chrony.
+//
+// WaitDelay is the #1794 post-SIGKILL pipe-drain cap, preserved verbatim from
+// the two call sites this replaced.
+// chronySourcesReloadTimeout bounds the `chronyc reload sources` leg on its own,
+// inside reloadChronyRuntime's 15s aggregate. See the call site for why.
+var chronySourcesReloadTimeout = 5 * time.Second
+
+var chronyRunCmd = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
+}
+
+// chronyReloadOutcome reports which REQUESTED chrony reload legs did not
+// complete (#6800). A leg that was not requested is never reported as failed,
+// so the caller can assign the outcome straight onto the retained debt.
+type chronyReloadOutcome struct {
+	sourcesFailed   bool
+	thresholdFailed bool
+}
+
+// reloadChronyRuntime drives the chrony runtime reload for the legs whose
+// managed file changed, and REPORTS which of those legs failed.
+//
+// #6800: it used to return nothing. The two managed files had already been
+// written by the time it ran, so a failed reload left the on-disk state
+// converged and the running chrony stale, and the next apply's `changed` flags
+// (computed against the converged files) were false — the debt was erased and
+// the reload was never retried. The outcome returned here is what the caller
+// latches so the retry owner can replay it.
+func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) chronyReloadOutcome {
+	var out chronyReloadOutcome
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if sourcesChanged {
-		chronyCmd := exec.CommandContext(ctx, "chronyc", "reload", "sources")
-		chronyCmd.WaitDelay = 5 * time.Second // post-SIGKILL pipe-drain cap (#1794)
-		if out, err := chronyCmd.CombinedOutput(); err != nil {
-			slog.Warn("failed to reload chrony sources", "err", err, "output", string(out))
+		// The sources leg gets its OWN bounded context. Sharing the aggregate
+		// deadline meant a single hung `chronyc` could consume all 15s, leaving
+		// every threshold fallback below to run against an already-expired
+		// context and fail instantly — 15 seconds of apply latency buying no
+		// convergence on either leg, and a threshold reload that was never
+		// really attempted. Bounding it separately keeps the aggregate as the
+		// ceiling while guaranteeing the fallbacks a share.
+		srcCtx, srcCancel := context.WithTimeout(ctx, chronySourcesReloadTimeout)
+		defer srcCancel()
+		if cmdOut, err := chronyRunCmd(srcCtx, "chronyc", "reload", "sources"); err != nil {
+			slog.Warn("failed to reload chrony sources; will retry", "err", err, "output", string(cmdOut))
+			out.sourcesFailed = true
 		}
 	}
 
 	if !thresholdChanged {
-		return
+		return out
 	}
 
 	commands := [][]string{
@@ -633,21 +681,26 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 		{"systemctl", "restart", "chronyd"},
 	}
 	for _, cmd := range commands {
-		reloadCmd := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-		reloadCmd.WaitDelay = 5 * time.Second
-		if out, err := reloadCmd.CombinedOutput(); err == nil {
-			return
+		if cmdOut, err := chronyRunCmd(ctx, cmd[0], cmd[1:]...); err == nil {
+			return out
 		} else {
-			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(out))
+			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(cmdOut))
 		}
 	}
-	slog.Warn("failed to reload chrony threshold config; change will apply on next chronyd restart")
+	slog.Warn("failed to reload chrony threshold config; will retry")
+	out.thresholdFailed = true
+	return out
 }
 
 // applySystemNTP configures chrony from system { ntp } config.
 // Writes per-server source lines to /etc/chrony/sources.d/xpf.sources and
 // optional threshold directives to /etc/chrony/conf.d/xpf-threshold.conf.
 func (d *Daemon) applySystemNTP(cfg *config.Config) {
+	// #6800: fold in any reload a previous apply still owes. The managed files
+	// are already converged, so this apply's own change flags cannot re-derive
+	// that debt — the ONLY record of it is what the failing reload latched.
+	sourcesOwed, thresholdOwed := d.chronyReloadOwed()
+
 	if isProcessDisabled(cfg, "ntp") {
 		sourcesChanged, err := reconcileManagedFile(chronySourcesPath, "")
 		if err != nil {
@@ -657,8 +710,10 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 		if err != nil {
 			slog.Warn("failed to remove chrony threshold config", "err", err)
 		}
+		sourcesChanged = sourcesChanged || sourcesOwed
+		thresholdChanged = thresholdChanged || thresholdOwed
 		if sourcesChanged || thresholdChanged {
-			reloadChronyRuntime(sourcesChanged, thresholdChanged)
+			d.noteChronyReloadResult(chronyReloadFn(sourcesChanged, thresholdChanged))
 			slog.Info("NTP disabled; chrony managed configuration removed")
 		}
 		return
@@ -674,11 +729,13 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 		slog.Warn("failed to reconcile chrony threshold config", "err", err)
 		return
 	}
+	sourcesChanged = sourcesChanged || sourcesOwed
+	thresholdChanged = thresholdChanged || thresholdOwed
 	if !sourcesChanged && !thresholdChanged {
 		return
 	}
 
-	reloadChronyRuntime(sourcesChanged, thresholdChanged)
+	d.noteChronyReloadResult(chronyReloadFn(sourcesChanged, thresholdChanged))
 	slog.Info("NTP config applied via chrony",
 		"servers", cfg.System.NTPServers,
 		"threshold", cfg.System.NTPThreshold,
@@ -1173,11 +1230,16 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 	d.slogHandler.SetClients(clients)
 }
 
+// rsyslogConfDir is the directory holding the xpf-managed rsyslog drop-ins. A
+// var rather than a literal so a test can reconcile against a temp dir instead
+// of the host's real /etc/rsyslog.d.
+var rsyslogConfDir = "/etc/rsyslog.d"
+
 // applySyslogFiles writes rsyslog drop-in configs for system { syslog { file ... } }
 // destinations. Each file entry generates a rule that directs matching
 // facility/severity messages to /var/log/<name>.
 func (d *Daemon) applySyslogFiles(cfg *config.Config) {
-	confDir := "/etc/rsyslog.d"
+	confDir := rsyslogConfDir
 	prefix := "10-xpf-"
 
 	desired := syslogDropinContents(cfg, prefix)
@@ -1186,9 +1248,20 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 	// (re)write flips `changed`, which gates the single restart below.
 	changed := reconcileSyslogDropins(confDir, prefix, desired)
 
-	if changed {
-		if out, err := runCommandTimeout("systemctl", "restart", "rsyslog"); err != nil {
-			slog.Error("failed to restart rsyslog",
+	// #6800: the `changed` gate alone erased the debt of a FAILED restart. The
+	// reconcile above had already converged the drop-ins, so once a restart
+	// failed, every later apply compared desired against the converged files,
+	// saw no change, skipped the restart, and rsyslog kept serving the previous
+	// ruleset — records still flowing to a destination the operator removed —
+	// until an unrelated syslog edit or a reboot. The retained debt is the only
+	// record of that owed restart, so it joins the gate here (the prompt path)
+	// and is re-driven by serviceReloadDebtReassertLoop (the always-on path).
+	if changed || d.rsyslogRestartOwed() {
+		out, err := rsyslogRestartFn()
+		d.noteRsyslogRestartResult(err)
+		if err != nil {
+			slog.Error("failed to restart rsyslog; the managed drop-ins are on disk "+
+				"but rsyslog has not re-read them — will retry",
 				"err", err, "output", strings.TrimSpace(string(out)))
 		} else {
 			slog.Info("rsyslog file configs applied", "files", len(desired))
@@ -1978,7 +2051,19 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) (retErr error) {
 	if content == "" {
 		// No xpf-managed ssh settings. Remove any existing drop-in and reload
 		// so sshd reverts to base-image defaults. No-op when absent.
-		if !hadDropIn {
+		//
+		// #6800: `!hadDropIn` alone erased the debt of a FAILED reload. This
+		// branch has nothing to revert TO — unlike the update path below, whose
+		// #2062 revert leaves the file differing from desired so the next apply
+		// rewrites and reloads on its own. Here the drop-in is DELETED, so once
+		// the reload fails every later apply reads `hadDropIn == false` and
+		// returns above without ever reaching a reload: sshd keeps enforcing the
+		// xpf policy the operator REMOVED — a PermitRootLogin/cipher/MAC setting
+		// that may be MORE permissive than the base-image default — until a
+		// manual restart or a reboot. The retained debt is the only record, so
+		// it joins the gate here and is re-driven by
+		// serviceReloadDebtReassertLoop.
+		if !hadDropIn && !d.sshdReloadOwed() {
 			return nil
 		}
 		if err := sshdRemoveFile(sshdConfPath); err != nil && !os.IsNotExist(err) {
@@ -1988,8 +2073,11 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) (retErr error) {
 			fail(fmt.Errorf("remove sshd config drop-in: %w", err))
 			return
 		}
-		if out, err := sshdReloadCmd(); err != nil {
-			slog.Error("failed to reload sshd after removing drop-in",
+		out, err := sshdReloadCmd()
+		d.noteSSHDReloadResult(err)
+		if err != nil {
+			slog.Error("failed to reload sshd after removing drop-in; the drop-in "+
+				"is gone but sshd has not re-read its configuration — will retry",
 				"err", err, "output", strings.TrimSpace(string(out)))
 			fail(fmt.Errorf("reload sshd after removing drop-in: %w", err))
 			return
@@ -2062,7 +2150,14 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) (retErr error) {
 	// Reload sshd to pick up changes. Validation passed, so this should
 	// succeed; the reload-failure revert stays as a backstop (e.g. a runtime
 	// reload error unrelated to config syntax).
-	if out, err := sshdReloadCmd(); err != nil {
+	out, err := sshdReloadCmd()
+	// #6800: report the outcome even though this path has its own retry owner
+	// (revertDropIn leaves the file differing from desired, so the next apply
+	// rewrites and reloads). A SUCCESS here must still DISCHARGE a debt an
+	// earlier REMOVAL left outstanding — sshd has just re-read its
+	// configuration, so nothing is owed any more.
+	d.noteSSHDReloadResult(err)
+	if err != nil {
 		slog.Error("failed to reload sshd",
 			"err", err, "output", strings.TrimSpace(string(out)))
 		revertDropIn("reload-failed")

@@ -87,6 +87,72 @@
   cells pinned the literal "unmapped facility name"; they MOVED with the code
   to "warned, named the facility, and classified it correctly", which is
   strictly stronger than the literal they replaced.
+## 2026-08-26 — #6800: managed service-file convergence erased failed reload debt
+
+- **Timestamp**: 2026-08-26
+- **Action**: Gave the two managed-service-file appliers a persistent reload
+  debt plus an always-on retry owner. `applySyslogFiles` and `applySystemNTP`
+  converge an on-disk service configuration and then gate the RUNTIME reload on
+  "did the on-disk set change". The gate is correct for the steady state — it
+  is what stops every commit from bouncing rsyslog and chrony — but it also
+  erased the debt of a FAILED reload: the write half had already converged the
+  files, the failing reload was logged and dropped, and every later apply
+  compared desired against the converged set, saw `changed == false`, and
+  skipped the reload. The daemon kept serving the PREVIOUS ruleset (records
+  still flowing to a removed syslog destination; chrony still polling the old
+  server set) until an unrelated syslog/NTP edit or a reboot, on a node that
+  had reported a successful commit.
+  The chrony half needed the debt to be PER-LEG, not per-service: the sources
+  reload (`chronyc reload sources`) and the threshold reload (`systemctl reload
+  chrony`) are independent commands, so a sources failure followed by a
+  threshold-only edit must replay BOTH — re-deriving the request from the later
+  apply's own change flags drops the sources debt silently. `reloadChronyRuntime`
+  now returns a per-leg `chronyReloadOutcome` instead of returning nothing, and
+  both call sites fold the retained debt into the request BEFORE the no-change
+  early return. `serviceReloadDebtReassertLoop` covers the case with no next
+  apply at all (a boot-time failure): started unconditionally in `Run` next to
+  the three sibling re-asserts, taking `applySem` before re-driving anything the
+  apply path also writes (a restart issued outside the semaphore can load a
+  half-converged drop-in set mid-reconcile and latch a success for it) and
+  re-reading the debt inside it.
+  The recovered opus-review-001 §R61 (restored to `docs/reviews/recovered/`
+  mid-branch) named a THIRD site this branch had explicitly written off:
+  `applySSHConfig`. Its UPDATE path really is covered — #2062 reverts the
+  drop-in on a failed reload, so the file stops matching desired and the next
+  apply retries — but the REMOVAL path has nothing to revert to. The drop-in is
+  deleted, the reload fails, and every later apply reads `hadDropIn == false`
+  and returns before any reload, so sshd keeps enforcing the policy the operator
+  REMOVED (possibly more permissive than the base-image default) until a manual
+  restart. Added as a fourth leg, with the re-assert re-validating via `sshd -t`
+  before the SIGHUP (#4311) and leaving the debt outstanding when validation
+  fails. R61's second point — chrony's SHARED 15s context letting one hung
+  `chronyc` starve all four threshold fallbacks — is fixed by giving the sources
+  leg its own bounded budget inside the aggregate.
+  Operator visibility was added in the same change rather than deferred, after
+  #6802 landed the identical pattern with a wired metric pair: an exported
+  accessor with no production caller is its own defect here (#6852), and a
+  retry owner nobody can see is the blindness the owner exists to end.
+  `ManagedServiceReloadOwed` / `ManagedServiceReloadFailures` reach the
+  REST/metrics server as `xpf_managed_service_reload_pending` and
+  `xpf_managed_service_reload_failures_total`, labelled by `service` because the
+  three legs fail independently.
+- **File(s)**: `pkg/daemon/daemon_service_reload_debt.go` (new),
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/api/server.go`, `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/daemon/service_reload_debt_6800_test.go` (new),
+  `pkg/daemon/sshd_reload_debt_6800_test.go` (new),
+  `pkg/api/metrics_managed_service_reload_6800_test.go` (new),
+  `pkg/daemon/README.md`
+- **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0.
+  20-cell mutation matrix, 20/20 RED, one reverted production line per cell,
+  every cell run full-package (`go test -count=1 ./pkg/daemon/`) with no `-run`
+  filter. The first pass reported one SURVIVED cell — the aggregate debt re-read
+  inside the semaphore — which was correct: it was redundant with the
+  per-service gates that follow it. Removed the redundant line and bound the
+  per-service gates instead, with a paired one-owes/one-quiet cell in both
+  directions.
 
 ## 2026-08-26 — #7640: a leniently-admitted malformed NAT rule is now visible
 
