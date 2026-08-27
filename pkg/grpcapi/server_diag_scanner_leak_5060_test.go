@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	"runtime"
 	"testing"
 	"time"
@@ -92,7 +93,11 @@ func assertGoroutinesSettle(t *testing.T, baseline int) {
 // scanner. Validation runs before the stream is touched, so a nil stream
 // is safe here. Revert the checkDiagArgs calls and this test fails.
 func TestDiagFieldLengthRejected(t *testing.T) {
-	huge := make([]byte, maxDiagArgLen+1)
+	// #6904: the bound moved to pkg/diagcmd so REST and gRPC share ONE rule.
+	// This reads the shared constant rather than a local literal — a test
+	// pinned to its own 512 would keep passing while the surfaces drifted,
+	// which is the failure this move exists to prevent.
+	huge := make([]byte, diagcmd.MaxArgLen+1)
 	for i := range huge {
 		huge[i] = 'a'
 	}
