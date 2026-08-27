@@ -47,6 +47,9 @@ mod tests_pool;
 #[path = "tests_iface.rs"]
 mod tests_iface;
 #[cfg(test)]
+#[path = "tests_iface_pool_overlap_7717.rs"]
+mod tests_iface_pool_overlap_7717;
+#[cfg(test)]
 #[path = "tests_counter.rs"]
 mod tests_counter;
 #[cfg(test)]
