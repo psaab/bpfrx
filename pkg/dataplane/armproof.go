@@ -226,6 +226,40 @@ func attachModeName(generic bool) string {
 // parent is admin-DOWN and about to be torn down, and delegating to that would
 // report a covered child with nothing enforcing its traffic.
 
+// UnappliedFilterBinding records a firewall-filter binding the CONFIG declared
+// but the compiler could not assign, because the interface it names was not
+// resolvable at assignment time (#6893).
+//
+// WHY THIS IS SEPARATE FROM UnarmedSurface. The two soft skips in
+// compiler_iface.go already record the CAUSE — the physical interface was not
+// found, or the VLAN child could not be created — as an UnarmedSurface. Nothing
+// recorded the CONSEQUENCE: compileFirewallFilters resolves the same name,
+// misses, logs a warning and continues, so the binding vanishes with no
+// structured trace even internally. The cause was visible to the arm-coverage
+// proof and its consequence was not, which is why "the filter silently went
+// missing" is undetectable by anything except reading logs.
+//
+// It is not folded into UnarmedSurface for two reasons. A filter binding is not
+// an attach point, which is what that type documents itself as. And
+// recordUnarmedSurface dedups on (Name, Ifindex), so in the exact case this
+// exists for — a VLAN child that could not be created, whose filter then cannot
+// be assigned — the consequence record would dedup onto the cause record and be
+// lost.
+//
+// This is a record, not a gate: the compile still succeeds. Failing the apply on
+// a VLAN creation failure is the separate, narrower change (#6893 fix direction
+// 1), and this record is what its demonstration cell inverts.
+type UnappliedFilterBinding struct {
+	// Interface is the configured surface the binding names — "ge-0-0-2" for a
+	// physical miss, "ge-0-0-2.50" for a VLAN child.
+	Interface string
+	// Filters lists the declared bindings that were not applied, each rendered
+	// as "<direction> <family>:<name>".
+	Filters []string
+	// Reason is the resolution failure that prevented assignment.
+	Reason string
+}
+
 // UnarmedSurface records an attach point the CONFIG required but the compiler
 // DECLINED to arm, while the compile itself still SUCCEEDED (#5275).
 //
