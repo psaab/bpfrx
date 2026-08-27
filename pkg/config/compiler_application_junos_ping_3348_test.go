@@ -134,6 +134,28 @@ func TestApplicationExplicitICMPTypeOverridesAlias(t *testing.T) {
 	}
 }
 
+// #6868 note, recorded here because this is the file a future reader edits.
+//
+// The two guards below assert BARE `icmp-type` / `icmp-code` against messages
+// that are not quoted-leaf messages, and they were deliberately left alone
+// when #6868 converted the duplicate-leaf assertions to the quoted form. The
+// reason is narrower than it first appears, and getting it wrong would lead a
+// later sweep to exclude a site that IS vulnerable:
+//
+//   NOT because "the messages name both leaves on purpose". Both messages do
+//   contain both tokens — `:154`'s names `icmp-type` twice — so a wrong-leaf
+//   outcome IS detectable in principle: if either gate emitted the other's
+//   message, both tests would still pass.
+//
+//   What actually saves these two is that the ALTERNATIVE REJECT IS
+//   UNREACHABLE FOR THE INPUT. The icmp-code-without-type case compiles
+//   `protocol icmp`, so the non-ICMP-protocol gate cannot fire; if its own
+//   gate were removed the config would compile clean and the `err == nil`
+//   check catches it.
+//
+// So the test to apply at a similar site is "can the other message reach this
+// input?", not "does the message mention more than one leaf".
+
 // Strict guard: icmp-type on a non-ICMP protocol is a never-match term — reject
 // at commit (#3348, mirroring the #3373 port-on-non-port-protocol gate).
 func TestApplicationICMPTypeOnNonICMPProtocol_Rejected(t *testing.T) {

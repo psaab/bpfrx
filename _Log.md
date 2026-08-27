@@ -106714,6 +106714,14 @@ prose edit above them added. No diff falls in the new test body.
   `docs/config-schema.md`, `_Log.md`
 
 - **Timestamp**: 2026-08-26
+  - **Action**: #6868 — leaf-identity assertions matched the quoted occurrence so they can no longer be satisfied by the error's own enumeration. Swept the predicate and found a fourth site the issue did not list (6524 chained leaves).
+  - **File(s)**: pkg/config/compiler_application_direct_conflict_5574_test.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_chained_leaves_6524_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6868 review round — fixed a FIFTH bare-leaf site at compiler_application_chained_leaves_6524_test.go:295 (found by review, in a file this change already edited) and corrected the recorded reason for excluding the 3348 icmp guards.
+  - **File(s)**: pkg/config/compiler_application_chained_leaves_6524_test.go, pkg/config/compiler_application_junos_ping_3348_test.go
+
+- **Timestamp**: 2026-08-26
   - **Action**: #6853 — `then syslog` is now distinct from `then log` in the config model and carried to the dataplane snapshot. Behaviour-preserving; the routing decision stays with #6859.
   - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go, pkg/dataplane/userspace/protocol_policies.go, pkg/dataplane/userspace/filters.go, pkg/dataplane/userspace/firewall_snapshot_render.go, userspace-dp/src/protocol/security.rs, docs/feature-gaps.md
 
