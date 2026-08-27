@@ -444,9 +444,21 @@ security {
 // Destination NAT reaches the same fall-through by a different mechanism: the
 // builder skips the rule entirely.
 //
-// This test asserts today's behavior, not a desired one — see the #5717
-// scoping note for why changing it is a migration-contract decision. It exists
-// so the "inert" framing cannot silently return.
+// This test asserts the DECIDED contract, not merely today's behavior: #6823
+// settled that an actionless rule is NON-TERMINAL, so matching traffic falls
+// through. Making it terminal is the one option that changes a packet's fate,
+// and it does so in the leaking direction (contra #5688); the argument, the
+// rejected alternatives and the criterion that would REOPEN the terminal option
+// are in docs/config-schema.md, "#6823 — an actionless NAT rule is
+// NON-TERMINAL". This test exists so neither the "inert" framing nor a silent
+// reversal of that decision can return.
+//
+// The DNAT sub-test below pins the BUILDER (zero published entries), which is
+// only the Go half of the DNAT story. The resulting dataplane behaviour is
+// pinned by actionless_dnat_entry_falls_through_6823
+// (userspace-dp/src/nat/tests_destination.rs), because
+// DestinationNATRuleSnapshot is the xpfd->helper WIRE form and a hand-built
+// snapshot or a mixed-version pair delivers the shape this builder never emits.
 func TestTolerantActionlessRuleIsNotInert_5717(t *testing.T) {
 	t.Run("source NAT emits the actionless rule", func(t *testing.T) {
 		cfg := compileSetLenient5717(t, []string{

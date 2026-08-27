@@ -349,8 +349,39 @@ impl DnatTable {
             // a placeholder that is never read (the exemption short-circuits
             // before any translation), so a missing/empty pool_address must NOT
             // drop the entry the way it does for a translate rule.
+            //
+            // #6823: an ACTIONLESS entry (`off` clear AND no pool at all) is
+            // the third shape, and it lands here too — the empty string does
+            // not parse, so the entry is dropped and the traffic falls
+            // through, which IS the decided contract (see the ZERO-actions
+            // bullet in pkg/config/compiler_validate_strict_nat.go). Only the
+            // DIAGNOSTIC was wrong: "unparseable pool address" sends an
+            // operator hunting a serialization bug, when the cause is a
+            // malformed CONFIG rule that named no translation action —
+            // precisely the shape `xpf_nat_rules_lenient_terminal_action`
+            // (#7640) reports on the control-plane side. The Go builder never
+            // emits this entry (`nat_destination.go` skips it), so reaching it
+            // means a hand-built snapshot or a mixed-version xpfd/helper pair;
+            // the drop, the counter and the loud log are all unchanged, and
+            // the message now names the actual cause so the two surfaces can
+            // be connected.
+            //
+            // NOTE this branch is load-bearing beyond its wording: widening the
+            // `snap.off` placeholder above to cover any pool-less entry would
+            // install this rule with a 0.0.0.0 pool, and `to_outcome` — which
+            // branches on `off` alone — would then TRANSLATE every matching
+            // flow into a blackhole. actionless_dnat_entry_falls_through_6823
+            // pins that.
             let pool_ip: IpAddr = if snap.off {
                 IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else if snap.pool_address.is_empty() {
+                nat_counters.record_parse_error(&format!(
+                    "DNAT rule {:?}: no translation action (neither a pool nor \
+                     `off`) — a malformed rule admitted by a tolerant load; the \
+                     rule is dropped and matching traffic falls through",
+                    snap.name
+                ));
+                continue;
             } else {
                 match snap.pool_address.parse() {
                     Ok(ip) => ip,

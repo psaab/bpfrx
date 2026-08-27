@@ -98,6 +98,16 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 			// for these rules, so the pool address/port printed below is config
 			// the dataplane never installed.
 			noteNotInstalled(w, config.DestinationNATRuleExcludedReason(dnat, rule))
+			// #6823: #7640 wired this annotation on the SOURCE renderer only,
+			// while its record and gauge both walk source AND destination
+			// (TestOffendersCoverBothKinds7640). So the operator-facing half
+			// covered one kind: `show security nat destination rule detail`
+			// never said a rule had been admitted by a tolerant load, on
+			// exactly the paths — boot, peer-sync, rollback — where such a
+			// rule is the only kind that can exist. An enumerator that finds
+			// both kinds and a view that shows one is a coverage gap that
+			// looks identical to healthy from the operator's side.
+			noteLenientTerminalAction(w, cfg, "destination", rs.Name, rule.Name)
 
 			if rule.Then.PoolName != "" && dnat.Pools != nil {
 				if pool, ok := dnat.Pools[rule.Then.PoolName]; ok {

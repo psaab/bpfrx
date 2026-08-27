@@ -2218,3 +2218,144 @@ fn dnat_unparseable_source_constraint_surfaces_and_still_fails_closed_5190() {
          a NAT reconcile parse error, not silently dropped"
     );
 }
+
+/// #6823 DECIDED CONTRACT: an ACTIONLESS destination-NAT entry — `off` clear
+/// and no pool at all — is NON-TERMINAL. It installs nothing, so matching
+/// traffic falls THROUGH to whatever rule follows.
+///
+/// This is the DNAT half of the migration-contract decision taken on #6823
+/// (option A, fall-through, over option B, terminal-and-exempt). The SNAT half
+/// is `actionless_rule_falls_through_to_later_broader_rule_5717` /
+/// `actionless_rule_with_no_later_rule_passes_untranslated_5717` in
+/// tests_source.rs. Until now the DNAT half was bound only in Go
+/// (`TestTolerantActionlessRuleIsNotInert_5717` asserts the builder publishes
+/// ZERO entries) — which pins the MECHANISM on one side of the language
+/// boundary and leaves the resulting BEHAVIOUR unbound on the other.
+///
+/// That gap is reachable. `DestinationNATRuleSnapshot` IS the xpfd->helper wire
+/// form, so a hand-built snapshot or a mixed-version xpfd/helper pair delivers
+/// the shape the current Go builder never emits — and any future change that
+/// aligns the DNAT builder to the SNAT one (the asymmetry #6823 was asked to
+/// settle) makes xpfd itself emit it on the ordinary path.
+///
+/// THREE-WAY DISCRIMINATION, which is why the fixture pairs the actionless rule
+/// with a later broader TRANSLATING rule rather than asserting a bare `None`:
+///
+///   - today / decided: `Some(192.168.99.99:9999)` — the actionless entry was
+///     not installed and the LATER rule translated. Fall-through, observed.
+///   - option B landing by accident (the actionless entry installs and exempts):
+///     `None`. A bare-`None` assertion could not tell this from today.
+///   - the `snap.off` placeholder in `from_snapshots` widened to cover any
+///     pool-less entry — which reads like a harmless generalization:
+///     `Some(0.0.0.0:0)`. `DnatEntry::to_outcome` branches on `off` ALONE
+///     (#6820), so a pool-less entry that gets INSTALLED translates every
+///     matching flow into a blackhole, silently. That single `if snap.off`
+///     token is the whole guard.
+///
+/// The CONTROL is what makes the measurement mean anything: the same rule, same
+/// position, same match criteria, given a pool, must win over the later rule.
+/// Without it "the later rule translated" is equally satisfied by a fixture
+/// whose first rule never matched at all.
+#[test]
+fn actionless_dnat_entry_falls_through_6823() {
+    // The narrow /32 rule, differing ONLY in whether a translation action is
+    // present. An exact-host entry always beats the /24 prefix in the lookup,
+    // so position is fixed and only actionlessness varies.
+    let narrow_host = |pool: &str| DestinationNATRuleSnapshot {
+        name: "actionless-narrow".to_string(),
+        destination_address: "203.0.113.50".to_string(),
+        destination_port: 80,
+        protocol: "tcp".to_string(),
+        from_zone: "untrust".to_string(),
+        pool_address: pool.to_string(),
+        pool_port: if pool.is_empty() { 0 } else { 8080 },
+        // off stays false: this is the ACTIONLESS shape, not the exemption.
+        ..DestinationNATRuleSnapshot::default()
+    };
+    // The later, BROADER translating rule the narrow rule falls through to —
+    // the same shape as the SNAT fixture's 10.0.61.0/24 -> 10.0.0.0/8 pair.
+    let broader_prefix = DestinationNATRuleSnapshot {
+        name: "catch-all".to_string(),
+        destination_prefix: "203.0.113.0/24".to_string(),
+        destination_port: 80,
+        protocol: "tcp".to_string(),
+        from_zone: "untrust".to_string(),
+        pool_address: "192.168.99.99".to_string(),
+        pool_port: 9999,
+        ..DestinationNATRuleSnapshot::default()
+    };
+    let lookup = |rules: &[DestinationNATRuleSnapshot], counters: &crate::nat::NatCounterStore| {
+        DnatTable::from_snapshots(rules, counters).lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.50".parse().unwrap(),
+            80,
+            "untrust",
+        )
+    };
+
+    // CONTROL: give the narrow rule a pool and it wins — proving its match
+    // criteria and its PRECEDENCE over the /24 are live, so the measurement
+    // arm's fall-through is caused by the missing action and nothing else.
+    let control_counters = crate::nat::NatCounterStore::default();
+    assert_eq!(
+        lookup(
+            &[narrow_host("192.168.1.10"), broader_prefix.clone()],
+            &control_counters
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "control: with a pool, the narrow /32 rule must win over the /24 and \
+         translate to its OWN pool — if it does not, the measurement arm below \
+         proves nothing about actionlessness"
+    );
+    assert_eq!(
+        control_counters.parse_errors(),
+        0,
+        "control: a well-formed pair must record no reconcile parse error"
+    );
+
+    // MEASUREMENT: strip the action. The rule must not install, and the later
+    // broader /24 must translate.
+    let counters = crate::nat::NatCounterStore::default();
+    assert_eq!(
+        lookup(&[narrow_host(""), broader_prefix.clone()], &counters),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.99.99".parse().unwrap()),
+            rewrite_dst_port: Some(9999),
+            ..NatDecision::default()
+        }),
+        "an actionless DNAT entry must be NON-TERMINAL — the later broader rule \
+         translates (#6823, decided). `None` here means the actionless rule \
+         became terminal-and-exempt (option B, a migration-contract change that \
+         must not land silently); `Some(0.0.0.0)` means a pool-less entry was \
+         INSTALLED and `to_outcome`, which branches on `off` alone, translated \
+         the flow into a blackhole"
+    );
+
+    // #4718 + #6823: the drop must stay OBSERVABLE, and must say what actually
+    // happened. Reporting this rule as an "unparseable pool address" sends an
+    // operator after a serialization bug rather than the malformed config rule
+    // that `xpf_nat_rules_lenient_terminal_action` (#7640) already reports on
+    // the control-plane side; the two surfaces have to name the same thing.
+    assert_eq!(
+        counters.parse_errors(),
+        1,
+        "the actionless rule's drop must be COUNTED — a silent drop is how a \
+         translation vanishes with no trace at the helper boundary"
+    );
+    let details = counters.parse_error_details();
+    assert_eq!(
+        details.len(),
+        1,
+        "expected exactly one drop detail: {details:?}"
+    );
+    assert!(
+        details[0].contains("actionless-narrow") && details[0].contains("no translation action"),
+        "the drop must NAME the actionless cause, not report an unparseable \
+         pool address: {details:?}"
+    );
+}
