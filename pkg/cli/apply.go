@@ -119,7 +119,17 @@ func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
 	}
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {
+		// #6875: MIRROR of daemon.applySyslogConfig. #5738 exists because these
+		// two paths must bind the same source — an in-process CLI commit and a
+		// daemon reconcile that disagree is the defect that issue closed — so
+		// the per-stream source-interface arm belongs at both sites or neither.
+		// TestSyslogSourcePrecedenceMatchesDaemon_6875 pins the agreement.
+		//
+		//	source-address  >  source-interface  >  global source-interface
 		srcAddr := stream.SourceAddress
+		if srcAddr == "" && stream.SourceInterface != "" {
+			srcAddr = config.ResolveSyslogSourceAddr(cfg, stream.SourceInterface)
+		}
 		if srcAddr == "" {
 			srcAddr = globalSourceAddr
 		}
