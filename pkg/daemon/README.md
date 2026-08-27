@@ -216,6 +216,65 @@ and absent from the plain-commit entry points) and
 `pkg/config/lenient_dropped_locator_6707_test.go` (both policy shapes, compiled
 by the real tolerant compiler rather than asserted into a struct literal).
 
+### The recovered commit-confirmed rollback fires against a HALF-BUILT daemon (#6739)
+
+`Store.Load` restores a still-live `commit confirmed` window by re-arming
+`time.AfterFunc(time.Until(deadline))` (#4577). That happens in startup **phase
+1** (`loadAndBootstrapConfig`), and `d.store.SetRollbackExecutor(
+d.executeConfirmedRollback)` is registered before the phase list even starts —
+while every manager `initManagers` builds (`d.routing`, `d.frr`, `d.networkd`,
+`d.ipsec`, `d.ra`, `d.cluster`, `d.vrrpMgr`, the dataplane) is not constructed
+until **phase 3**. Nothing holds `applySem` across the phases, so the timer
+goroutine and the startup phases run concurrently.
+
+The remaining duration is strictly positive — an already-expired window is
+rolled back *synchronously* in an earlier branch of
+`recoverPendingConfirmLocked` and never reaches the re-arm — but it is bounded
+below only by how close the boot is to the deadline. A box that reboots shortly
+before its deadline (`commit confirmed 1` plus a ~55 s boot) arms a timer with
+seconds on it, against startup phases doing netlink and manager construction.
+**So the whole rollback transaction can run with every manager nil.**
+
+Both branches of `executeConfirmedRollback` are reachable in that window:
+
+- `prevCfg != nil` — the full `applyConfigLocked` pipeline re-applies the
+  rollback target. `applyTailReconciles` step 8 is the site that was NOT
+  nil-guarded: it dereferenced `d.vrrpMgr` and **panicked the daemon at boot**.
+  It now fails CLOSED, matching the gate one branch below it — reporting a
+  successful apply while the manager does not hold the requested instance set
+  claims HA coverage that is not running, and a nil manager holds no instance
+  set at all.
+- `prevCfg == nil` — the #1922 Item 1b first-commit branch runs
+  `enterBootstrapMode` + `reconcileManagementAfterPromotion` instead of an
+  apply. Its teardown steps are individually nil-guarded
+  (`relinquishClusterForBootstrap` on `d.cluster`, the FRR and dataplane steps
+  on theirs).
+
+**Coverage is at the DISPATCH, not just at the guarded function.** The cell that
+enters `applyTailReconciles` directly binds the guard but cannot see an
+unguarded dereference in any of the ~10 reconcile helpers *ahead* of the tail —
+that would panic the daemon at boot while the direct-entry cell stayed green.
+`recovered_rollback_dispatch_6739_test.go` therefore drives the real dispatch
+(the store's own timer-expiry logic → the registered executor → an **unstubbed**
+apply body) against a daemon in the exact pre-manager shape, over both branches,
+with a rollback target that declares a chassis cluster and RETH members so the
+cluster/VRRP/fabric reconciles actually run. It asserts the apply REACHED the
+guarded site rather than surviving by returning early, and a fixture assertion
+fails if the config ever stops compiling to that cluster shape — an
+empty-config apply survives for reasons that have nothing to do with the guard
+and would report a clean census anyway.
+
+The pre-existing rollback cells in `bootstrap_rollback_test.go` drive the same
+dispatch but set `applyBodyForTest`, which returns from `applyConfigLocked`
+before any reconcile helper runs. That seam is why this panic survived to be
+found by reading rather than by the suite.
+
+This is deliberately **not** work item G's startup-readiness gate. G releases
+recovery at end-of-phase-5, and #7675 (which carries G + H + H2, and their
+unresolved 2-of-3 reviewer split) records that landing G without H converts this
+short pre-manager window into a post-manager bootstrap-with-live-cluster hybrid.
+Guarding the dereference and binding the dispatch move **no dispatch point**.
+
 ### Config-apply file layout (#5661)
 
 The config-apply path was carved out of the former ~3095-line
