@@ -139,6 +139,52 @@ sanitizer's allocation-free fast path means an already-clean record — every
 ordinary one — pays a scan and no allocation, which is what keeps this
 acceptable on the shared dataplane event path described below.
 
+## `then log` does not reach the syslog clients (#6859)
+
+Junos routes the two firewall-filter logging actions to different sinks: `then
+log` writes the filter-log buffer, `then syslog` sends to the system log. xpf
+categorised every filter-log event as `CategoryFirewall` and gated the fan-out
+only per-CLIENT, never per-term — so both spellings went to every subscribed
+syslog client, and a term an operator wrote as `then log` specifically to keep
+hits ON the box was shipped to whatever remote collector was configured.
+
+`EventReader` now holds a `(filter_id, term_id) -> then syslog` map and skips
+the syslog fan-out for a FILTER_LOG event whose term did not carry `then
+syslog`. Three things about it are load-bearing:
+
+**The decision cannot be made in the dataplane.** The `syslog` bit reaches the
+Rust `FirewallTermSnapshot` (#6853) but `parse_term` never consumes it, so the
+event carries no indication of which spelling produced it. What it does carry is
+`RuleID`/`TermID`, and the Rust side assigns both as positional indices into the
+snapshot the Go control plane itself rendered — so the control plane can answer
+authoritatively from the same snapshot it sent. `userspace.FilterTermSyslogMap`
+is a projection of that snapshot rather than a second walk of the config,
+because a divergence between the two orderings would silently route one term's
+hits under another term's spelling with nothing failing.
+
+**Placement is what makes the subtractive change safe.** The gate sits AFTER the
+event-buffer callbacks and the daemon log line, and BEFORE the local-writer
+loop, so suppression costs no local visibility. xpf has no `show firewall log`;
+`show security log` reads the event buffer and still shows the hit. One step
+earlier and the gate would blind the local surface too — which is why the
+regression cells assert the RENDERED local record, not that a call was made.
+
+**Nil is not the same as empty.** A nil map means "no apply has wired this yet"
+and preserves the pre-#6859 fan-out, so a path that never wires it cannot
+silently suppress `then syslog` as well. An empty NON-nil map is the opposite
+instruction — "wired; this config has no `then syslog` terms" — and is what a
+config with all filters removed installs, so the reader cannot resume forwarding
+under deleted terms' ids. `FilterTermSyslog()` returns the map rather than a
+count for exactly this reason: both states have length zero.
+
+Only FILTER_LOG is gated. Session/policy/screen events have no per-term spelling
+to honour, and suppressing them would be a logging outage dressed as a parity
+fix.
+
+The behaviour change is announced at commit by a `pkg/config` advisory naming
+each affected term, fired only when the config actually installs syslog clients.
+See `docs/feature-gaps.md`.
+
 ## Syslog stream-transport resilience (#2283)
 
 `SyslogClient.Send` / `SendBinary` are reached on the SHARED dataplane

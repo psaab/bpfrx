@@ -619,8 +619,8 @@ code is consulted. The latter is a pre-existing divergence from Junos (where
 only `tcp-reset` produces a RST) and is untouched here -- changing it would
 alter what every existing `then reject` sends on TCP.
 
-**`then syslog` is now DISTINCT from `then log` in the model (#6853), with no
-behaviour change yet.** Both spellings previously compiled to the single
+**`then log` and `then syslog` now route to DIFFERENT sinks (#6853 model split,
+#6859 routing).** Both spellings previously compiled to the single
 `FirewallFilterTerm.Log` bit, so the two Junos actions — which name different
 sinks, the filter log buffer (`show firewall log`) and the system log — were
 indistinguishable and could never be routed apart. `then syslog` now sets
@@ -628,16 +628,41 @@ indistinguishable and could never be routed apart. `then syslog` now sets
 `FirewallTermSnapshot.syslog` (additive + `omitempty` / `serde(default)`, so a
 mixed-version HA pair is unaffected).
 
-Note what has NOT changed, because the asymmetry is easy to misread: `then
-syslog` already reached the system log before #6853, and still does. Filter-log
-events are categorised `CategoryFirewall` and the syslog fan-out is gated only
-by a per-CLIENT category filter, never per-term (`pkg/logging/ringbuf.go`), so
-BOTH spellings emit to every subscribed syslog client. `Log` remains set on the
-syslog arm deliberately — it is what makes the term emit a filter-log event at
-all. The consequence is that `then log` also reaches syslog, which is the
-over-send direction tracked in **#6859**; correcting it is a behaviour change
-that would silently stop a feed some deployments may depend on, so it is a
-separate decision and is not made here. The output-firewall-filter case was
+`Log` remains set on the syslog arm deliberately — it is what makes the term
+emit a filter-log event at all — so `then syslog` carries BOTH bits and `then
+log` carries only `Log`.
+
+**#6859 then made the routing follow the spelling.** Until it landed, filter-log
+events were categorised `CategoryFirewall` and the syslog fan-out was gated only
+by a per-CLIENT category filter, never per-term, so BOTH spellings emitted to
+every subscribed syslog client — a term written as `then log` specifically to
+keep hits on the box was shipped to whatever remote collector was configured.
+The gate now lives at the fan-out in `pkg/logging/ringbuf.go`, keyed on the
+event's `(RuleID, TermID)` identity.
+
+The decision is control-plane-side, and deliberately so: the `syslog` bit
+reaches the Rust `FirewallTermSnapshot` but `parse_term` never consumes it, so
+the event carries no indication of which spelling produced it. What it does
+carry is the positional filter/term identity the Rust side assigns from the
+snapshot the Go control plane rendered — so `userspace.FilterTermSyslogMap`
+projects the answer from that same snapshot (one ordering source, since a
+divergence would silently mis-route in either direction) and the daemon installs
+it on every apply via `EventReader.SetFilterTermSyslog`.
+
+**Local visibility is unaffected**, and that is what makes the subtractive
+direction safe: the event buffer behind `show security log`, the daemon log
+line, and the event-mode local writers are all written BEFORE the syslog gate.
+xpf has no `show firewall log`; `show security log` is the surviving local
+surface, so a suppressed `then log` hit is still there. A nil map means "no
+apply has wired this yet" and preserves the pre-#6859 fan-out, which is distinct
+from an empty non-nil map ("wired; this config has no `then syslog` terms").
+
+Because correcting it silently stops a stream some deployments may have built
+alerting on, the change ships WITH a commit advisory that names each affected
+term — fired only when the config actually installs syslog clients (stream mode
+with at least one stream), so it is silent on a box where nothing was leaving.
+It is not a deprecation notice: `then log` is the correct Junos spelling and is
+not going away. The output-firewall-filter case was
 closed in #3608: the TX/CoS classifier carries a `reject` bit alongside the
 collapsed `drop` bit, and the transit forward-request builder
 (`build_live_forward_request_from_frame`) + the flow-cache-hit fast path

@@ -230,11 +230,39 @@ type EventReader struct {
 	zoneNames     map[uint16]string // zone ID -> zone name
 	policyNamesMu sync.RWMutex
 	policyNames   map[uint32]string // rule_id -> policy name
-	ifNamesMu     sync.RWMutex
-	ifNames       map[uint32]string // ifindex -> interface name
-	appNamesMu    sync.RWMutex
-	appNames      map[uint16]string // app_id -> application name
-	sessionSeq    uint64            // #4915: per-EVENT monotonic ordinal (EventSeq), NOT a session id
+	// #6859: (filter_id, term_id) -> does the term carry `then syslog`.
+	//
+	// Junos routes the two filter-log actions to different sinks: `then log`
+	// writes the local filter-log buffer, `then syslog` sends to the system
+	// log. xpf compiled both to the same event and fanned every one of them out
+	// to every syslog client, so a term the operator wrote as `then log`
+	// specifically to keep hits ON the box was shipped to whatever remote
+	// collector was configured.
+	//
+	// The dataplane cannot make this decision: the `syslog` bit reaches the
+	// Rust FirewallTermSnapshot but parse_term never consumes it, so the event
+	// carries no indication of which spelling produced it. What the event DOES
+	// carry is RuleID/TermID, and the Rust side assigns both as positional
+	// indices into the snapshot the Go control plane itself rendered — so the
+	// control plane can answer the question authoritatively from the same
+	// snapshot it sent. userspace.FilterTermSyslogMap builds this from that one
+	// ordering source rather than re-deriving it, because a divergence between
+	// the two would be a silent mis-route in either direction.
+	//
+	// NIL means "no apply has wired this yet", and is deliberately distinct
+	// from an empty non-nil map: nil preserves the pre-#6859 fan-out, so a path
+	// that never wires it cannot silently suppress `then syslog` too. Once
+	// wired, an absent key means the term is not in the current snapshot and
+	// the event is suppressed from syslog only — every local surface (the event
+	// buffer behind `show security log`, the daemon log line, and the event-mode
+	// local writers) is written BEFORE this gate and is unaffected.
+	filterTermSyslogMu sync.RWMutex
+	filterTermSyslog   map[uint64]bool
+	ifNamesMu          sync.RWMutex
+	ifNames            map[uint32]string // ifindex -> interface name
+	appNamesMu         sync.RWMutex
+	appNames           map[uint16]string // app_id -> application name
+	sessionSeq         uint64            // #4915: per-EVENT monotonic ordinal (EventSeq), NOT a session id
 }
 
 // NewEventReader creates a new event reader for the given event source.
@@ -362,6 +390,70 @@ func (er *EventReader) CallbackCount() int {
 	n := len(er.callbacks)
 	er.callbackMu.RUnlock()
 	return n
+}
+
+// FilterTermSyslogKey packs a filter-log event's (filter_id, term_id) identity
+// into the key used by the #6859 syslog-routing map.
+//
+// It is the SINGLE definition of that packing. The producer
+// (userspace.FilterTermSyslogMap) and this consumer must agree exactly — a
+// divergence would route filter-log events to the wrong sink with nothing
+// failing — so the producer calls this function rather than repeating the
+// shift.
+func FilterTermSyslogKey(filterID, termID uint32) uint64 {
+	return uint64(filterID)<<32 | uint64(termID)
+}
+
+// FilterTermSyslog returns a copy of the installed #6859 routing map
+// (goroutine-safe), preserving the nil/non-nil distinction the gate depends on.
+//
+// A COUNT would be the wrong instrument here and is deliberately not what this
+// exposes: nil ("never wired", legacy fan-out) and an empty non-nil map
+// ("wired, no syslog terms") both have length zero while instructing the gate
+// to do OPPOSITE things, and a caller checking a count could not tell a wiring
+// regression from a config with no `then syslog` terms. Returning the map makes
+// both observable — the same reason SyslogClients exists alongside
+// SyslogClientCount (#6829 F2).
+func (er *EventReader) FilterTermSyslog() map[uint64]bool {
+	er.filterTermSyslogMu.RLock()
+	defer er.filterTermSyslogMu.RUnlock()
+	if er.filterTermSyslog == nil {
+		return nil
+	}
+	out := make(map[uint64]bool, len(er.filterTermSyslog))
+	for k, v := range er.filterTermSyslog {
+		out[k] = v
+	}
+	return out
+}
+
+// SetFilterTermSyslog installs the #6859 (filter_id, term_id) -> `then syslog`
+// map (goroutine-safe). Called on every config apply with the map projected
+// from the same filter snapshot that was pushed to the dataplane.
+//
+// Passing a nil map restores the pre-#6859 behaviour of forwarding every
+// filter-log event to every syslog client. Callers wiring a real config should
+// pass the projection even when it is empty (a config with no filter terms
+// yields an empty NON-nil map), so the gate is active.
+func (er *EventReader) SetFilterTermSyslog(m map[uint64]bool) {
+	er.filterTermSyslogMu.Lock()
+	er.filterTermSyslog = m
+	er.filterTermSyslogMu.Unlock()
+}
+
+// filterLogReachesSyslog reports whether a FILTER_LOG event from
+// (filterID, termID) may be forwarded to the syslog clients.
+//
+// Fail-open on an unwired map (see the filterTermSyslog field comment); once
+// wired, only a term that carried `then syslog` passes.
+func (er *EventReader) filterLogReachesSyslog(filterID, termID uint32) bool {
+	er.filterTermSyslogMu.RLock()
+	m := er.filterTermSyslog
+	er.filterTermSyslogMu.RUnlock()
+	if m == nil {
+		return true
+	}
+	return m[FilterTermSyslogKey(filterID, termID)]
 }
 
 // SetSyslogClients replaces the set of syslog clients (goroutine-safe).
@@ -805,10 +897,22 @@ func (er *EventReader) logEvent(data []byte) {
 			"egress_zone", outZone)
 	}
 
-	// Forward to syslog clients
+	// Forward to syslog clients.
+	//
+	// #6859: a FILTER_LOG event only reaches them when its term carried
+	// `then syslog`. Junos routes `then log` to the local filter-log buffer and
+	// `then syslog` to the system log; xpf sent both off-box. Placed HERE, after
+	// the event-buffer callbacks, the daemon log line and before the local-writer
+	// loop below, so suppression costs the operator no local visibility — the hit
+	// is still in `show security log`. Only FILTER_LOG is gated: every other
+	// event type has no per-term spelling to honour.
 	er.syslogMu.RLock()
 	clients := er.syslogClients
 	er.syslogMu.RUnlock()
+
+	if evt.EventType == eventTypeFilterLog && !er.filterLogReachesSyslog(rec.RuleID, rec.TermID) {
+		clients = nil
+	}
 
 	if len(clients) > 0 {
 		severity := eventSeverity(evt.EventType, evt.Action)

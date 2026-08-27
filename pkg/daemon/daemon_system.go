@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
@@ -47,6 +48,18 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 			er.SetAppNames(cr.AppNames)
 		}
 	}
+
+	// #6859: wire the (filter_id, term_id) -> `then syslog` map so the event
+	// reader can keep a `then log` hit off the syslog clients, the way Junos
+	// does. Derived from cfg through the SAME snapshot builder whose output is
+	// pushed to the dataplane, so the ids agree with the ones the events carry.
+	//
+	// Set UNCONDITIONALLY on every apply, including a config with no filters
+	// (an empty non-nil map): the empty case is exactly a config whose filters
+	// were all removed, and leaving the previous map installed would keep
+	// forwarding under a deleted term's spelling. Nil is reserved for "never
+	// wired" and would restore the pre-#6859 fan-out.
+	er.SetFilterTermSyslog(dpuserspace.FilterTermSyslogMap(cfg))
 
 	// Wire interface names (ifindex -> name) from config
 	ifNames := make(map[uint32]string)
