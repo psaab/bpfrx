@@ -218,23 +218,24 @@ var screenFlagNames = map[uint32]string{
 
 // EventReader reads events from an EventSource.
 type EventReader struct {
-	source        EventSource
-	buffer        *EventBuffer
-	syslogMu      sync.RWMutex
-	syslogClients []*SyslogClient
-	localMu       sync.RWMutex
-	localWriters  []*LocalLogWriter
-	callbackMu    sync.RWMutex
-	callbacks     []EventCallback
-	zoneNamesMu   sync.RWMutex
-	zoneNames     map[uint16]string // zone ID -> zone name
-	policyNamesMu sync.RWMutex
-	policyNames   map[uint32]string // rule_id -> policy name
-	ifNamesMu     sync.RWMutex
-	ifNames       map[uint32]string // ifindex -> interface name
-	appNamesMu    sync.RWMutex
-	appNames      map[uint16]string // app_id -> application name
-	sessionSeq    uint64            // #4915: per-EVENT monotonic ordinal (EventSeq), NOT a session id
+	source            EventSource
+	buffer            *EventBuffer
+	syslogMu          sync.RWMutex
+	syslogClients     []*SyslogClient
+	localMu           sync.RWMutex
+	localWriters      []*LocalLogWriter
+	callbackMu        sync.RWMutex
+	callbacks         []EventCallback
+	zoneNamesMu       sync.RWMutex
+	zoneNames         map[uint16]string // zone ID -> zone name
+	policyNamesMu     sync.RWMutex
+	policyNames       map[uint32]string // rule_id -> policy name
+	filterSyslogRoute filterSyslogRoute // #6859; see filter_log_syslog_route.go
+	ifNamesMu         sync.RWMutex
+	ifNames           map[uint32]string // ifindex -> interface name
+	appNamesMu        sync.RWMutex
+	appNames          map[uint16]string // app_id -> application name
+	sessionSeq        uint64            // #4915: per-EVENT monotonic ordinal (EventSeq), NOT a session id
 }
 
 // NewEventReader creates a new event reader for the given event source.
@@ -805,10 +806,17 @@ func (er *EventReader) logEvent(data []byte) {
 			"egress_zone", outZone)
 	}
 
-	// Forward to syslog clients
+	// Forward to syslog clients. #6859: a FILTER_LOG event reaches them only if
+	// its term carried `then syslog`; FILTER_LOG alone is gated, and the gate
+	// sits HERE (after the buffer callbacks, before the local writers) for the
+	// reasons in filter_log_syslog_route.go.
 	er.syslogMu.RLock()
 	clients := er.syslogClients
 	er.syslogMu.RUnlock()
+
+	if evt.EventType == eventTypeFilterLog && !er.filterSyslogRoute.allows(rec.RuleID, rec.TermID) {
+		clients = nil
+	}
 
 	if len(clients) > 0 {
 		severity := eventSeverity(evt.EventType, evt.Action)

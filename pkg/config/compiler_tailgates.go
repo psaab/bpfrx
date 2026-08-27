@@ -343,5 +343,17 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// runs last because it is a pure advisory read that depends on no other gate.
 	cfg.Warnings = append(cfg.Warnings, sharedUMEMAuditWarnings(cfg)...)
 
+	// #6859: `then log` no longer forwards filter hits to the syslog streams
+	// (Junos routes only `then syslog` off-box). The correction is right, and it
+	// silently stops a stream some deployments may have built alerting on — so
+	// name the affected terms at commit, while the operator has the config in
+	// front of them. Advisory only, and self-silencing on a box that installs no
+	// syslog clients, where nothing was leaving in the first place.
+	//
+	// Runs here, after the compile, because the predicate reads the COMPILED
+	// Log/Syslog bits rather than the AST: `then syslog` sets both, so an AST
+	// walk would have to re-derive the pairing the compiler already did.
+	cfg.Warnings = append(cfg.Warnings, filterLogSyslogRoutingWarnings(cfg)...)
+
 	return nil
 }
