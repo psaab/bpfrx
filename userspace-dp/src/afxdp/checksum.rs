@@ -439,6 +439,44 @@ pub(super) static DNAT_DELETE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 pub(super) static DNAT_PUBLISH_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// #6872: the ONE mutex that serializes tests reading the two counters above.
+///
+/// It lives here, at module scope beside the counters, because that is the only
+/// place it can do its job. Two tests previously declared
+/// `static GUARD: Mutex<()>` INSIDE their own function bodies with a comment
+/// saying it serialized them "against any other test touching the process-global
+/// counters". A `static` in a function body is unnameable from any other
+/// function, so each test locked a private mutex and excluded nobody — not even
+/// the other test with the identically-named guard.
+///
+/// Proven by the compiler rather than by reading: referencing the old `GUARD`
+/// from another function yields `error[E0425]: cannot find value GUARD in this
+/// scope`. That error IS the defect — the name the comment claims to share
+/// cannot be shared.
+///
+/// The counters are genuinely process-global (`AtomicU64` statics), so a test
+/// that samples one before an action and after it is racing every other test
+/// that touches the same counter. Module scope is what makes the exclusion real.
+///
+/// Take it with [`dnat_counter_guard`] rather than locking it directly, so a
+/// poisoned lock from an unrelated test panic cannot cascade.
+#[cfg(test)]
+pub(super) static DNAT_COUNTER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`DNAT_COUNTER_GUARD`], recovering from poisoning.
+///
+/// A test that panics while holding the guard poisons it, and every later test
+/// would then fail on `.expect("counter guard")` for a reason unrelated to what
+/// it is testing — one real failure turning into a cascade that hides its own
+/// cause. The counters are plain atomics with no invariant a panic can break,
+/// so recovering is safe and is what the module does elsewhere (#2402/#1807).
+#[cfg(test)]
+pub(super) fn dnat_counter_guard() -> std::sync::MutexGuard<'static, ()> {
+    DNAT_COUNTER_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[must_use]
 pub(super) fn publish_dnat_table_entry(
     fds: &DnatTableFds,
@@ -553,5 +591,180 @@ pub(super) fn publish_dnat_table_entry(
             true
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod dnat_counter_guard_tests_6872 {
+    /// #6872: a source scan that fails when a test reads one of the
+    /// process-global DNAT counters WITHOUT taking the shared guard.
+    ///
+    /// The defect it exists for is not "someone forgot a lock" — it is that the
+    /// forgotten lock LOOKS present. Two tests declared
+    /// `static GUARD: Mutex<()>` inside their own function bodies with a comment
+    /// claiming they serialized against each other. A `static` in a function
+    /// body is unnameable elsewhere, so each locked a private mutex and excluded
+    /// nobody. The code reads as guarded and is not, which no amount of review
+    /// reliably catches.
+    ///
+    /// A third file read the same counter with no guard at all, and the issue
+    /// that reported this named ONE such reader. There were three. That is why
+    /// this is a scan over the tree rather than a fix at the sites the issue
+    /// listed: an enumeration is a floor, not a census.
+    ///
+    /// It scans SOURCE, so it is not a runtime proof — a test could take the
+    /// guard and still race by sampling outside it. It closes the specific
+    /// regression of reading the counter with no guard, or with a
+    /// function-local one, which is what actually happened twice.
+    #[test]
+    fn no_dnat_counter_reader_lacks_the_shared_guard_6872() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut scanned = 0usize;
+        let mut readers = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut locals: Vec<String> = Vec::new();
+
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                scanned += 1;
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+
+                // Only files that READ a counter are in scope for either check.
+                //
+                // This is what keeps the scan from matching its OWN doc
+                // comments and fixtures — a source gate satisfied by the text
+                // that describes it is a known way for one to stop guarding
+                // anything. A blanket "skip checksum.rs" would do that too, and
+                // worse: it would also stop seeing a real function-local guard
+                // if one were ever written here.
+                //
+                // Restricting to counter-reading files is not a workaround for
+                // self-matching, it is the correct scope: a function-local
+                // guard is only a defect in a file that reads the counters.
+                let reads_counter = text.contains("DNAT_DELETE_ATTEMPTS.load")
+                    || text.contains("DNAT_PUBLISH_ATTEMPTS.load");
+                if !reads_counter {
+                    continue;
+                }
+
+                // A function-local guard: `static GUARD` at ANY indentation.
+                // At module scope it would start at column 0.
+                for (i, line) in text.lines().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if t.starts_with("static GUARD") && line.starts_with(char::is_whitespace) {
+                        locals.push(format!("{name}:{}", i + 1));
+                    }
+                }
+
+                for (i, line) in text.lines().enumerate() {
+                    let is_read = line.contains("DNAT_DELETE_ATTEMPTS.load")
+                        || line.contains("DNAT_PUBLISH_ATTEMPTS.load");
+                    if !is_read {
+                        continue;
+                    }
+                    readers += 1;
+                    // The guard must be taken somewhere ABOVE this read inside
+                    // the same file. Function granularity is not available to a
+                    // line scan, so this is deliberately coarse: it catches the
+                    // "no guard anywhere" and "function-local guard" cases,
+                    // which are the two that occurred.
+                    let above = text.lines().take(i).collect::<Vec<_>>().join("\n");
+                    if !above.contains("dnat_counter_guard()") {
+                        offenders.push(format!("{name}:{}", i + 1));
+                    }
+                }
+            }
+        }
+
+        // ANTI-VACUITY. A scan that walked no files, or found no readers, would
+        // report "no offenders" — indistinguishable from a clean result, and
+        // exactly the failure this whole issue is about.
+        assert!(
+            scanned >= 50,
+            "#6872: the scan reached only {scanned} .rs files; it is not walking the crate \
+             and would report clean whatever the tree said"
+        );
+        assert!(
+            readers >= 5,
+            "#6872: the scan found only {readers} counter reads. There were at least 8 when \
+             this was written, so the pattern it matches has changed and it is no longer \
+             looking at the thing it guards"
+        );
+
+        assert!(
+            locals.is_empty(),
+            "#6872: function-local `static GUARD` found at {locals:?}. A `static` in a \
+             function body is unnameable from any other function, so it serializes NOTHING \
+             — including against the identically-named guard in another test. Use \
+             checksum::dnat_counter_guard()"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#6872: these read a process-global DNAT counter with no dnat_counter_guard() \
+             above them: {offenders:?}. The before/after sample races every other test \
+             touching the same counter"
+        );
+    }
+
+    /// SENSITIVITY CONTROL for the scan above.
+    ///
+    /// The scan passes today because the tree is clean, which is also what a
+    /// scan that can never fire looks like. This drives the same two predicates
+    /// over synthetic text and requires each to be caught — and requires a
+    /// correctly-guarded reader NOT to be, so a predicate that flagged
+    /// everything fails as loudly as one that flagged nothing.
+    #[test]
+    fn the_guard_scan_detects_both_defect_shapes_6872() {
+        let unguarded = "fn t() {\n    let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);\n}\n";
+        let guarded = "fn t() {\n    let _g = crate::afxdp::checksum::dnat_counter_guard();\n    \
+                       let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);\n}\n";
+        let local_static = "fn t() {\n    static GUARD: Mutex<()> = Mutex::new(());\n}\n";
+        let module_static = "static GUARD: Mutex<()> = Mutex::new(());\n";
+
+        let lacks_guard = |text: &str| -> bool {
+            for (i, line) in text.lines().enumerate() {
+                if line.contains("DNAT_DELETE_ATTEMPTS.load") {
+                    let above = text.lines().take(i).collect::<Vec<_>>().join("\n");
+                    if !above.contains("dnat_counter_guard()") {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let has_local_static = |text: &str| -> bool {
+            text.lines()
+                .any(|l| l.trim_start().starts_with("static GUARD") && l.starts_with(char::is_whitespace))
+        };
+
+        assert!(lacks_guard(unguarded), "an unguarded read must be caught");
+        assert!(!lacks_guard(guarded), "a correctly guarded read must NOT be flagged");
+        assert!(has_local_static(local_static), "a function-local static GUARD must be caught");
+        assert!(
+            !has_local_static(module_static),
+            "a MODULE-scope static GUARD is the correct shape and must not be flagged"
+        );
     }
 }

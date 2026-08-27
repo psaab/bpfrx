@@ -106649,3 +106649,11 @@ prose edit above them added. No diff falls in the new test body.
     terminal schema node permitting a body (Codex re-review finding 1)
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6872 — replace four function-local `static GUARD`s with one
+    shared module-scope guard; scan for the regression
+  - **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+    userspace-dp/src/afxdp/ha_tests.rs,
+    userspace-dp/src/afxdp/session_glue/tests.rs,
+    userspace-dp/src/afxdp/tests_decap_dnat_table.rs
