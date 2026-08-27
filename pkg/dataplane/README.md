@@ -506,6 +506,18 @@ Guard layers (`build-userspace-xdp.sh`):
      by archaeology. **Whether 3% is still the right floor at 21.58% is an
      open question — see #6884 — and the number to judge it on is the
      slack, not the percentage.**
+   - **Processed-insn counts did NOT vary by kernel, measured (#6884).** The
+     byte-identical tracked object (md5 `8799db9d…`) verifies at **784,175 on
+     both `7.0.13+deb14-amd64` and `7.0.0-rc7+`** — zero difference. This is
+     recorded because the opposite was *assumed* during #6884 and used to
+     argue for a ratio over a tracked absolute: the 947,188 figure in
+     `verify_userspace_shim_headroom_test.go` is annotated "kernel 7.0" and
+     was read as a cross-kernel data point, but it is the same kernel line as
+     today's host and simply an older, larger object. **The three known counts
+     — 990,796 → 947,188 → 784,175 — are a time series of the object
+     shrinking, not kernel spread.** No evidence either way for a wider
+     version gap (6.x vs 7.x); the measurement above bounds only 7.0.0-rc7 →
+     7.0.13.
    - **The decision lives in ONE place.** `decide()` maps
      `(stats, override)` to the verdict, and `run()` only PRESENTS it —
      `main()` is `os.Exit(run(...))` and nothing else. Before that, `main`

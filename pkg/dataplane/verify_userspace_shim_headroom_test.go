@@ -16,7 +16,13 @@ import (
 // headroom arithmetic the floor is applied to.
 
 func TestParseShimVerifierStats_RealKernelLine(t *testing.T) {
-	// Verbatim from this repo's own `make generate` run (kernel 7.0).
+	// Verbatim from this repo's own `make generate` run (kernel 7.0), taken
+	// when #4555 was written. It is a PARSER fixture — what matters is that it
+	// is a real kernel stats line, not that its count is current. #6884: the
+	// object is now at 784,175; do not read 947,188 here as today's value, and
+	// do not read the kernel note as evidence that counts vary BY kernel (they
+	// were measured identical on 7.0.0-rc7+ and 7.0.13 — see pkg/dataplane
+	// README).
 	const log = "  1092: (bf) r5 = r8\n" +
 		"processed 947188 insns (limit 1000000) max_states_per_insn 34 " +
 		"total_states 54628 peak_states 4153 mark_read 0\n"
