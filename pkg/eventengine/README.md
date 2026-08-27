@@ -17,6 +17,30 @@ temporal `within` windows) and triggers commit-and-apply actions.
   metrics.
 - `CommitFn` — `engine.go`. The atomic commit-and-apply hook.
 
+## File layout (#7636)
+
+`engine.go` crossed the 1500-LOC `[WATCH]` floor in #6810 and was split into
+three cohesive units by a **verbatim move** — no behaviour change, so the diff
+reads as a move:
+
+- **`engine.go`** (943) — construction, `Apply`, `HandleEvent`, the action
+  worker, `runAction`/`applyOnce`, cooldown arming, and the public accessors.
+- **`queue.go`** (215) — action-queue *admission*: `enqueue`, `supersede`,
+  `releaseEdgeLatch`, `actionQueueDepth`. A bounded-channel admission policy
+  with its own concurrency contract (#5062, #5853, #2869, #6810).
+- **`evaluate.go`** (427) — *evaluation*: `evaluateEvent`, `withinMatches`,
+  `pruneWindow`, `attributesMatch`, `classifyPlan` and their helpers. The
+  `within`-clause semantics (#3751, #3756, #7223, #4423) read as one subject
+  and were previously separated from themselves by the worker code.
+
+**The lock-order invariant is the thing the split makes easier to break**, and
+it is therefore stated in all three places rather than once: `e.mu` (evaluation
+and runtime state) and `enqueueMu` (admission) are **never nested in either
+order**. `enqueue` runs after `evaluateEvent` has released `e.mu`, which is what
+lets `releaseEdgeLatch` take `e.mu` at all — #6810's latch rollback would
+deadlock against a held `enqueueMu`. Before the split the two locks were visible
+on one screen; now they are not.
+
 ## Callers
 
 `pkg/daemon` (event loop, RPM results). `pkg/api` reads `Stats()` for metrics.
@@ -368,7 +392,7 @@ by `engine_armed_debt_5063_test.go` (fail-on-revert: the debt case goes RED if
 ## Temporal `within` trigger semantics (#3756)
 
 `within <seconds> { trigger on N }` / `{ trigger until N }` are pinned to the
-Junos reading in `withinMatches` (`engine.go`):
+Junos reading in `withinMatches` (`evaluate.go`):
 
 - **`trigger on N` is EDGE-triggered** — the policy fires on the threshold
   CROSSING (the in-window count first reaching N), NOT on every event while the
