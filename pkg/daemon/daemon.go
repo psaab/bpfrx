@@ -371,6 +371,21 @@ type Daemon struct {
 	//
 	// Guarded by staleCertMu.
 	staleCertPending bool
+	// lastSeenHostName is the kernel host name as of the last observation, used
+	// to detect a rename xpfd did NOT perform (#6863).
+	//
+	// Guarded by staleCertMu, and moved by renameHostNotingStaleMgmtCert under
+	// that same hold. That is what keeps the watcher from double-firing on the
+	// daemon's own renames: applyHostname already records the debt and delivers,
+	// so if the baseline did not move with it the next tick would see the new
+	// name as external and record a second debt for one rename — the duplicate
+	// WARN the #6827 generation fence exists to prevent, reintroduced from
+	// outside.
+	//
+	// Empty means "not yet observed": the first observation seeds the baseline
+	// and records nothing, because a daemon that has just started has no earlier
+	// name to have been renamed FROM.
+	lastSeenHostName string
 	// staleCertGen advances on every rename. A delivery claims a generation and
 	// clears the debt only if it is still current, so a rename landing while an
 	// in-flight delivery is unlocked is not settled by that older delivery

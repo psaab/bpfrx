@@ -657,6 +657,13 @@ func (d *Daemon) renameHostNotingStaleMgmtCert(name string) error {
 	}
 	d.staleCertPending = true
 	d.staleCertGen++
+	// #6863: move the external-rename watcher's baseline under this SAME hold.
+	// Without it the next watch tick reads the new kernel name, finds it differs
+	// from a baseline this rename never updated, and records a SECOND debt for
+	// one rename — a duplicate WARN arriving from outside the generation fence
+	// that the fence cannot suppress, because it is a genuinely newer
+	// generation.
+	d.lastSeenHostName = name
 	return nil
 }
 

@@ -70,6 +70,22 @@ func (d *Daemon) mgmtListenerReassertLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// #6863: observe the kernel host name on this tick.
+			//
+			// Deliberately OUTSIDE reassertMgmtListenersOnce and NOT behind its
+			// `mgmtListenerDown()` gate: an external rename can happen while
+			// every listener is healthy, which is the common case. Gating it on
+			// a down listener would mean the diagnostic only ever fired on a box
+			// that already had a second problem.
+			//
+			// This loop is the right host rather than a new one — it is
+			// always-on, mode-agnostic, low frequency (30s), and already in the
+			// management plane whose certificate is the thing at stake. A rename
+			// is a rare, operator-driven event, so the tick interval is the
+			// latency and that is acceptable for a LOW diagnostic. It reads
+			// os.Hostname through the seam and takes staleCertMu briefly; it
+			// runs on no per-packet or per-poll path.
+			d.watchExternalHostRenameOnce()
 			d.reassertMgmtListenersOnce(ctx)
 		}
 	}
