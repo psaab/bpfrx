@@ -6855,7 +6855,9 @@ Rules:
   1g`) is still accepted — to the validator. `valueType` may still be set for
   `?` completion. The compiler reads the SAME tail via `gatherLeafTailTokens`
   (`parseCoSTransmitRate` / `parseCoSShapingRate`) so validation and
-  compilation never drift. Percent/remainder are accepted-but-inert (see
+  compilation never drift. Percent resolves per-interface (#4228 Gap 2) and
+  remainder resolves against the leftover after resolved siblings (#6846);
+  each keeps a narrowed advisory for the case that still cannot resolve (see
   `docs/cos-traffic-shaping.md`).
 - The generic walker (`schema_walk.go`) needs **no** changes per leaf — it
   descends `setSchema` and validates any typed leaf it finds. Walker rows it
