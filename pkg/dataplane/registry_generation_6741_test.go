@@ -81,9 +81,23 @@ func TestObsoleteRegistryAccessCounted_6741(t *testing.T) {
 //
 // Without this cell the change is indistinguishable from one that revoked
 // proceed-on-retained everywhere, and the guard's scope would live only in
-// prose. Fail-on-revert: make Close set registryObsoleteFrom (or drop the
-// `registryObsoleteFrom != 0` conjunct from registryObsoleteLocked) and this
-// goes RED while the cell above stays green.
+// prose.
+//
+// FAIL-ON-REVERT, measured rather than asserted: make `Close` set
+// `registryObsoleteFrom` and this goes RED while
+// TestObsoleteRegistryAccessCounted_6741 stays green.
+//
+// What it does NOT bind, stated because an unverified fail-on-revert claim is
+// worse than none: dropping the `registryObsoleteFrom != 0` conjunct from
+// registryObsoleteLocked leaves this cell GREEN. Its fixture has
+// generation=1 and obsoleteFrom=0, so `1 <= 0` is false either way. (That
+// conjunct is not unguarded — removing it hangs the package suite, because
+// every lookup then refuses — but this cell is not what catches it.)
+//
+// And it is not the only guard for the Close boundary:
+// TestCloseDoesNotStartAnObsoleteEpoch_6741 pre-existed and reds on the same
+// mutation. That one pins the COUNTER not starting; this one pins the handle
+// still being SERVED, which is the half AC1 could have broken.
 func TestCloseRetainedRegistryStillProceeds_6741(t *testing.T) {
 	m := regTestManager6741()
 
