@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -218,7 +219,53 @@ func ospfIface6818(t *testing.T, cfg *Config, spelling string) *OSPFInterface {
 //
 // The guard is a property of packedBodyChildren. Test it there, and it holds
 // for every caller regardless of what runs upstream.
+// packedTailSchemaPaths is the SINGLE source of the schema paths the cells
+// below address.
+//
+// Every cell resolves its schema through packedTailSchema, which fails loudly
+// on a nil result, so a cell CANNOT run against a path that does not resolve.
+// The previous shape kept the paths as literals in each cell and re-spelled
+// them a second time in a "do these resolve?" control, which is two independent
+// copies of a fact that must agree: editing a cell's literal left the control
+// checking the OLD path and still passing. That is how
+// `firewall/family/filter/term/from` — missing the address family, therefore
+// nil — went unnoticed while the cell using it was green against a helper that
+// never ran.
+var packedTailSchemaPaths = map[string][]string{
+	"ospf-auth":     {"protocols", "ospf", "area", "interface", "authentication"},
+	"log-transport": {"security", "log", "stream", "transport"},
+	"filter-from":   {"firewall", "family", "inet", "filter", "term", "from"},
+}
+
+// packedTailSchema resolves one of the shared paths, failing the test if it is
+// nil. packedBodyChildren returns the node's children unchanged on a nil
+// schema, so an unresolved path turns its cell into a no-op that PASSES —
+// the failure has to happen here, not silently at the assertion.
+func packedTailSchema(t *testing.T, key string) *schemaNode {
+	t.Helper()
+	path, ok := packedTailSchemaPaths[key]
+	if !ok {
+		t.Fatalf("no packed-tail schema path registered under %q; add it to "+
+			"packedTailSchemaPaths so the resolution control covers it too", key)
+	}
+	s := schemaForPath(path...)
+	if s == nil {
+		t.Fatalf("schemaForPath(%v) is nil — packedBodyChildren short-circuits on a nil "+
+			"schema, so this cell would be a no-op that passes", path)
+	}
+	return s
+}
+
 func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
+	// Every path resolves. packedTailSchema already fails a cell that uses a
+	// dead path, but a path can also go dead while the only cell using it is
+	// removed or skipped, so the registry is checked as a whole.
+	t.Run("every registered schema path resolves", func(t *testing.T) {
+		for key := range packedTailSchemaPaths {
+			packedTailSchema(t, key)
+		}
+	})
+
 	t.Run("terminal PERMITS a body: the block attaches UNDER it", func(t *testing.T) {
 		// `authentication md5 7 { key "k"; }` -- a packed tail AND a nested
 		// block on one node, which the parser does produce.
@@ -226,22 +273,31 @@ func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
 			Keys:     []string{"authentication", "md5", "7"},
 			Children: []*Node{{Keys: []string{"key", "k"}}},
 		}
-		got := packedBodyChildren(node,
-			schemaForPath("protocols", "ospf", "area", "interface", "authentication"))
+		got := packedBodyChildren(node, packedTailSchema(t, "ospf-auth"))
 
 		if len(got) != 1 {
 			t.Fatalf("expected ONE synthesized child (the md5 chain head), got %d: %+v",
 				len(got), got)
 		}
 		md5 := got[0]
-		if md5.Name() != "md5" {
-			t.Fatalf("synthesized head = %q, want md5", md5.Name())
+		// KEYS, not Name(). The head carries the key-id `7` as its second key;
+		// a head that synthesized the name and dropped the value would satisfy
+		// Name() == "md5" while losing the thing the operator configured.
+		if !keysEqual6818(md5.Keys, "md5", "7") {
+			t.Fatalf("synthesized head Keys = %v, want [md5 7]", md5.Keys)
 		}
 		// The nested block must be UNDER md5, not beside it. Beside is what
-		// compiled an MD5 adjacency with an EMPTY key.
-		if len(md5.Children) != 1 || md5.Children[0].Name() != "key" {
-			t.Errorf("md5 children = %+v, want the `key` block attached BENEATH it. "+
-				"Returning it as a SIBLING is what dropped the key.", md5.Children)
+		// compiled an MD5 adjacency with an EMPTY key -- so the assertion is on
+		// the VALUE. `Name() == "key"` is equally true of a `key` node that
+		// arrived with its value stripped, which is precisely the defect.
+		if len(md5.Children) != 1 {
+			t.Fatalf("md5 children = %+v, want exactly the `key` block attached BENEATH "+
+				"it. Returning it as a SIBLING is what dropped the key.", md5.Children)
+		}
+		if !keysEqual6818(md5.Children[0].Keys, "key", "k") {
+			t.Errorf("md5 child Keys = %v, want [key k] — the defect this guards is an "+
+				"EMPTY key, so the VALUE is the property under test",
+				md5.Children[0].Keys)
 		}
 	})
 
@@ -249,40 +305,28 @@ func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
 		// `protocol` is a scalar leaf under `transport`; it takes no body, so
 		// `transport protocol tcp { protocol tls; }` describes no nesting the
 		// schema has. The helper must decline rather than invent one.
+		orig := &Node{Keys: []string{"protocol", "tls"}}
 		node := &Node{
 			Keys:     []string{"transport", "protocol", "tcp"},
-			Children: []*Node{{Keys: []string{"protocol", "tls"}}},
+			Children: []*Node{orig},
 		}
-		got := packedBodyChildren(node,
-			schemaForPath("security", "log", "stream", "transport"))
+		got := packedBodyChildren(node, packedTailSchema(t, "log-transport"))
 
-		if len(got) != 1 || got[0].Name() != "protocol" {
+		if len(got) != 1 {
 			t.Fatalf("expected the node's own children returned unexpanded, got %+v", got)
 		}
-		// The real child, unexpanded -- NOT a synthesized `protocol tcp` with
-		// the block hung underneath it.
-		if len(got[0].Children) != 0 {
-			t.Errorf("the helper attached a body under a LEAF terminal: %+v. That invents "+
-				"a nesting level the schema does not have.", got[0].Children)
-		}
-	})
-
-	// A schema path that does not resolve makes packedBodyChildren a NO-OP --
-	// its first guard returns the node's children when the schema is nil. So a
-	// cell that passes a wrong path tests nothing and passes. This one nearly
-	// did: `schemaForPath("firewall","family","filter",...)` omits the address
-	// family and returns nil, and the cell below was green against it while the
-	// helper never ran. Assert the path RESOLVES before using it.
-	t.Run("the schema paths these cells use actually resolve", func(t *testing.T) {
-		for _, p := range [][]string{
-			{"protocols", "ospf", "area", "interface", "authentication"},
-			{"security", "log", "stream", "transport"},
-			{"firewall", "family", "inet", "filter", "term", "from"},
-		} {
-			if schemaForPath(p...) == nil {
-				t.Errorf("schemaForPath(%v) is nil — packedBodyChildren short-circuits on a "+
-					"nil schema, so every cell using this path is a no-op that passes", p)
-			}
+		// IDENTITY, not name. If the guard is deleted the helper returns a
+		// SYNTHESIZED `protocol tcp` node -- whose Name() is also "protocol",
+		// so no name-based assertion can tell the two apart. Requiring the
+		// caller's own child pointer back is what makes deleting the guard
+		// visible here, and it stays visible however the synthesized node is
+		// shaped.
+		if got[0] != orig {
+			t.Fatalf("the helper returned a SYNTHESIZED node (Keys=%v), not the node's own "+
+				"child. Under a LEAF terminal it must decline and hand back what it was "+
+				"given; inventing a nesting level the schema lacks is how the synthesized "+
+				"`tcp` overwrote a real `tls` child and downgraded an audit stream to "+
+				"plaintext", got[0].Keys)
 		}
 	})
 
@@ -293,8 +337,7 @@ func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
 			Keys:     []string{"from", "flexible-match-range", "range", "r"},
 			Children: []*Node{{Keys: []string{"byte-offset", "9"}}},
 		}
-		got := packedBodyChildren(node,
-			schemaForPath("firewall", "family", "inet", "filter", "term", "from"))
+		got := packedBodyChildren(node, packedTailSchema(t, "filter-from"))
 		if len(got) != 1 {
 			t.Fatalf("expected one chain head, got %+v", got)
 		}
@@ -308,9 +351,19 @@ func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
 		if depth < 2 {
 			t.Errorf("the tail expanded to depth %d; it should be a CHAIN, not one level", depth)
 		}
-		if len(deepest.Children) != 1 || deepest.Children[0].Name() != "byte-offset" {
-			t.Errorf("deepest node %q children = %+v, want the byte-offset block",
+		// The terminal is `range r`: the instance NAME is the value, and a
+		// chain that synthesized `range` without it addresses a different
+		// filter term while still walking to the right depth.
+		if !keysEqual6818(deepest.Keys, "range", "r") {
+			t.Errorf("deepest node Keys = %v, want [range r]", deepest.Keys)
+		}
+		if len(deepest.Children) != 1 {
+			t.Fatalf("deepest node %q children = %+v, want the byte-offset block",
 				deepest.Name(), deepest.Children)
+		}
+		if !keysEqual6818(deepest.Children[0].Keys, "byte-offset", "9") {
+			t.Errorf("deepest child Keys = %v, want [byte-offset 9]",
+				deepest.Children[0].Keys)
 		}
 	})
 
@@ -321,11 +374,75 @@ func TestPackedTailAttachesOnlyWhereTheGrammarPermitsABody_6818(t *testing.T) {
 		// above and corrupt every block-spelled config.
 		child := &Node{Keys: []string{"md5", "7"}}
 		node := &Node{Keys: []string{"authentication"}, Children: []*Node{child}}
-		got := packedBodyChildren(node,
-			schemaForPath("protocols", "ospf", "area", "interface", "authentication"))
+		got := packedBodyChildren(node, packedTailSchema(t, "ospf-auth"))
 		if len(got) != 1 || got[0] != child {
 			t.Errorf("a node with no packed tail must return its own children unchanged, "+
 				"got %+v", got)
 		}
 	})
+}
+
+// keysEqual6818 reports whether n.Keys is exactly want.
+func keysEqual6818(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestPackedTailCompilesLikeTheNestedSpelling_6818 is the END-TO-END half, and
+// it is a SUPPLEMENT to the helper cells above rather than a thing they
+// replace.
+//
+// The two answer different questions and neither subsumes the other:
+//
+//   - the helper cells pin the guard's contract at packedBodyChildren, so it
+//     holds for every caller including ones that do not exist yet, and they
+//     keep holding if something upstream (a #2419 whole-tree normalizer, say)
+//     stops the compiler from ever seeing a packed tail;
+//   - these cells pin that the guard is actually WIRED — that the compiler
+//     reaches it and the operator's key survives all the way into the compiled
+//     Config. A correct helper that no caller consults compiles an empty MD5
+//     key exactly like a broken one, and every cell above would still pass.
+//
+// The earlier revision of this file deleted these when it added the helper
+// cells. That traded the assertion on the compiled VALUE (AuthKey == "k") for
+// assertions on synthesized node NAMES, which is the wrong direction: the
+// defect being guarded is an EMPTY key.
+func TestPackedTailCompilesLikeTheNestedSpelling_6818(t *testing.T) {
+	t.Run("ospf md5: the packed spelling keeps the key", func(t *testing.T) {
+		compact, block := compileBothSpellings(t,
+			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication md5 7 { key "k"; } } } } }`,
+			`protocols { ospf { area 0.0.0.0 { interface ge-0/0/0.0 { authentication { md5 7 { key "k"; } } } } } }`)
+		for name, cfg := range map[string]*Config{"packed": compact, "nested": block} {
+			iface := ospfIface6818(t, cfg, name)
+			if string(iface.AuthKey) != "k" {
+				t.Errorf("%s: AuthKey = %q, want \"k\" — the guard must not refuse an "+
+					"attachment the grammar allows, or the empty-MD5-key defect returns",
+					name, string(iface.AuthKey))
+			}
+		}
+	})
+
+	t.Run("three-level chain compiles identically", func(t *testing.T) {
+		compact, block := compileBothSpellings(t,
+			`firewall { family inet { filter f { term t { from flexible-match-range range r { byte-offset 9; } } } } }`,
+			`firewall { family inet { filter f { term t { from { flexible-match-range { range r { byte-offset 9; } } } } } } }`)
+		if !cfgEqualFirewall6818(compact, block) {
+			t.Error("the packed three-level chain compiled differently from the fully " +
+				"nested spelling; the guard is refusing an attachment the grammar allows")
+		}
+	})
+}
+
+// cfgEqualFirewall6818 compares the compiled firewall section of two configs.
+func cfgEqualFirewall6818(a, b *Config) bool {
+	ja, errA := json.Marshal(a.Firewall)
+	jb, errB := json.Marshal(b.Firewall)
+	return errA == nil && errB == nil && string(ja) == string(jb)
 }

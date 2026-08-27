@@ -106717,3 +106717,7 @@ prose edit above them added. No diff falls in the new test body.
     instead of through a compile; one cell had a nil schema path and tested
     nothing
   - **File(s)**: pkg/config/compact_leaf_credentials_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6818 review round 2 — cells now assert VALUES and IDENTITY rather than node names, the schema paths are single-sourced so the resolution control cannot drift, and the end-to-end compile cells are restored alongside the helper cells instead of replaced by them.
+  - **File(s)**: pkg/config/compact_leaf_credentials_test.go
