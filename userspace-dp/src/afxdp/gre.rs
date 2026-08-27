@@ -219,6 +219,41 @@ pub(in crate::afxdp) static GRE_ENCAP_DF_OVERSIZE_DROPS: AtomicU64 = AtomicU64::
 /// corrupted (or a header truncated past the checksum field).
 pub(in crate::afxdp) static GRE_DECAP_CHECKSUM_INVALID_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Serialises the tests that OBSERVE `GRE_DECAP_CHECKSUM_INVALID_DROPS`.
+///
+/// #6891: the counter above is PROCESS-GLOBAL production state — it is read by
+/// `coordinator::status` and exported as
+/// `xpf_userspace_gre_decap_checksum_invalid_drops_total`. So it cannot be made
+/// per-test (a `thread_local!` here would silently break the real counter);
+/// the tests must be serialised against each other instead.
+///
+/// Two tests observe it and they race under a parallel `cargo test`:
+/// `native_gre_decap_checksum_invalid_drops_and_counts` BUMPS it (it corrupts a
+/// payload byte after sealing the checksum), while
+/// `native_gre_decap_checksum_present_yields_inner_packet` asserts the counter
+/// is UNCHANGED across a valid-checksum decap. Interleaved, the second reads the
+/// first's increment and fails with `left: 1, right: 0`.
+///
+/// Measured at `021869e5f`: **29 of 30** parallel runs of
+/// `cargo test --bins native_gre_decap_checksum` failed before this lock.
+///
+/// It stayed hidden because `make test-rust` pins `-- --test-threads=1`
+/// (`Makefile`), adopted for the #6657 wedge — so the sanctioned gate is
+/// structurally blind to it, and it only surfaces on a plain parallel
+/// `cargo test`, which is exactly when a lane concludes "master is red".
+///
+/// **Any new test that can reach the `fetch_add` above must take this lock**,
+/// including one that merely corrupts a GRE checksum incidentally.
+///
+/// Poison-tolerant (`into_inner`) so one failing test does not cascade into
+/// every other holder reporting a lock error instead of its own assertion.
+#[cfg(test)]
+pub(in crate::afxdp) fn gre_checksum_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// #6842: native-GRE frames REFUSED for decap because the GRE version
 /// field was non-zero while the outer tuple named a configured GRE
 /// tunnel endpoint.

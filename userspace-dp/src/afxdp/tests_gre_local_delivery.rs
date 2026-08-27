@@ -880,6 +880,9 @@ fn native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta() {
 /// skip+validate makes this row drop and the assert fires.
 #[test]
 fn native_gre_decap_checksum_present_yields_inner_packet() {
+    // #6891: this test observes the process-global GRE_DECAP_CHECKSUM_INVALID_DROPS
+    // counter; hold the lock so the sibling that bumps it cannot interleave.
+    let _counter_guard = crate::afxdp::gre::gre_checksum_counter_test_lock();
     let forwarding = build_forwarding_state(&gre_to_self_snapshot());
     let inner = build_gre_inner_icmp_packet_v4();
     let frame = build_gre_checksum_present_outer_frame_v4(
@@ -944,6 +947,9 @@ fn native_gre_decap_checksum_key_sequence_present_yields_inner_packet() {
 /// and the decap must return `None`.
 #[test]
 fn native_gre_decap_checksum_invalid_drops_and_counts() {
+    // #6891: this test observes the process-global GRE_DECAP_CHECKSUM_INVALID_DROPS
+    // counter; hold the lock so the sibling that bumps it cannot interleave.
+    let _counter_guard = crate::afxdp::gre::gre_checksum_counter_test_lock();
     let forwarding = build_forwarding_state(&gre_to_self_snapshot());
     let inner = build_gre_inner_icmp_packet_v4();
     let frame = build_gre_checksum_present_outer_frame_v4(
