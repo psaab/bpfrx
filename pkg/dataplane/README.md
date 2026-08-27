@@ -1198,7 +1198,24 @@ It now gates on `eh_class(protocol) != EH_CLASS_TERMINAL` — the shim's own
 single classifier, the one the walk dispatches on and the emitted class table
 is generated from — so the site cannot drift from the walker again. Verifier
 cost of deferring to it, measured: 784,175 -> **801,448 insns**, headroom
-21.58% -> **19.86%**, still 168,552 insns of slack above the 3.0% floor.
+21.58% -> **19.86%**, comfortably above the floor.
+
+That measurement was reported against the **3.0%** floor, which is what the
+build printed at the time. #7720 raised the floor to **15%** in the same window,
+so the slack figure it carried (168,552 insns) was stale on arrival. Recomputed
+against the floor actually in force: the 15% floor admits 850,000 insns, so the
+slack is **48,552**.
+
+The distinction matters because the floor's stated property is that it fires
+BEFORE a structural change lands (`UserspaceShimStructuralChangeInsns` = 87,000,
+one IPv6 extension-header iteration). At 48,552 slack that property **HOLDS** —
+a structural change would take the object to 888,448, past the 850,000 ceiling,
+and the floor would fire. Correspondingly `noteFloorNoLongerTripwires`
+(`cmd/shimverify/main.go`) does **not** fire here: it returns early when
+`slack < UserspaceShimStructuralChangeInsns`, because that is the healthy
+direction. It fires on the opposite condition — slack so LARGE that a whole
+structural change could land unnoticed, which is how the shim previously reached
+0.92% headroom with every gate green.
 
 Whether such a mis-built key could ever HIT is now a bound property rather than
 an expectation: `shim_non_terminal_protocols_are_never_installable_by_userspace_6886`
