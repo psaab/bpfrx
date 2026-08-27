@@ -76,6 +76,28 @@ import (
 // teardown and the start it races, which is exactly what the race detector
 // looks for the absence of — the probe would go quiet against the very bug it
 // exists to catch.
+// teardownProgressBudget bounds the wait for the teardown goroutine's first
+// stop. It is deliberately generous, and 5s was not.
+//
+// #7679: at 5s this test made master RED under `go test ./...` — twice. The
+// bound is not a timing assertion about the heartbeat code; its only job is to
+// turn "the goroutine was never scheduled at all" into a named failure instead
+// of a silent degenerate probe or a hang. Under `./...` the runner starts many
+// package binaries concurrently, each with GOMAXPROCS equal to the core count,
+// so the machine is heavily oversubscribed and a cheap goroutine can wait a
+// long time for a P.
+//
+// Raising it costs nothing when healthy — the loop exits on the first observed
+// stop, typically within a millisecond — and it does not weaken what the bound
+// detects, because a goroutine that is genuinely never scheduled stays
+// unscheduled for 30s just as surely as for 5s. Sampling an asynchronous
+// observable at a fixed wall-clock point is exactly the #7650 defect this file
+// was changed to fix; a 5s deadline is still such a point, just a later one.
+//
+// See #7663: this probe reaches nothing it claims to probe, so a green here is
+// not evidence the #7257 regression is guarded either way.
+const teardownProgressBudget = 30 * time.Second
+
 func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
@@ -142,7 +164,7 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	// suppress the very data race this probe exists to detect. The teardown
 	// goroutine keeps running freely for the whole start loop, so each start
 	// still overlaps unordered teardowns.
-	waitForTeardownProgress(t, &stops, 5*time.Second)
+	waitForTeardownProgress(t, &stops, teardownProgressBudget)
 	wg.Wait()
 	m.StopHeartbeat()
 
