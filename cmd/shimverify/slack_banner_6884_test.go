@@ -65,13 +65,50 @@ func TestSlackGoesNegativePastTheFloor6884(t *testing.T) {
 // TestSlackIsZeroWhenUnmeasured6884 guards the documented caveat. Unmeasured
 // returns 0, which is NOT "no slack" — it is "no answer", and the gate refuses
 // an unmeasured object on its own.
+//
+// THE FIXTURES ARE THE POINT, and my first attempt at this cell was worthless.
+// It used the zero value, where the guarded and unguarded code return the SAME
+// answer: 0*(1-0.03) - 0 == 0 either way. Deleting the `!s.Measured()` guard
+// left the cell green — a real escape, caught by the mutation matrix and not by
+// review. The zero value is precisely the value the bug falls back to.
+//
+// Measured() requires BOTH fields positive, so the discriminating fixtures are
+// the half-populated ones. The first is the one that matters operationally: a
+// stat with a real limit and no count would report ~970,000 insns of slack —
+// "enormous room" — at exactly the moment headroom is UNKNOWN, which is the
+// #4555 blind spot reproduced inside the instrument built to close it.
 func TestSlackIsZeroWhenUnmeasured6884(t *testing.T) {
-	var none dataplane.ShimVerifierStats
-	if none.Measured() {
-		t.Fatal("precondition: the zero value must be unmeasured")
-	}
-	if got := none.SlackToFloorInsns(3.0); got != 0 {
-		t.Fatalf("SlackToFloorInsns on an unmeasured stat = %d, want 0", got)
+	for _, tc := range []struct {
+		name      string
+		stats     dataplane.ShimVerifierStats
+		unguarded int // what the arithmetic alone would produce
+	}{
+		{
+			name:      "limit but no processed count",
+			stats:     dataplane.ShimVerifierStats{ProcessedInsns: 0, InsnLimit: 1000000},
+			unguarded: 970000,
+		},
+		{
+			name:      "processed count but no limit",
+			stats:     dataplane.ShimVerifierStats{ProcessedInsns: 784175, InsnLimit: 0},
+			unguarded: -784175,
+		},
+		{
+			name:      "zero value",
+			stats:     dataplane.ShimVerifierStats{},
+			unguarded: 0, // NOT a discriminator — retained only as a boundary case
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.stats.Measured() {
+				t.Fatal("precondition: this fixture must be UNMEASURED")
+			}
+			if got := tc.stats.SlackToFloorInsns(3.0); got != 0 {
+				t.Fatalf("SlackToFloorInsns on an unmeasured stat = %d, want 0 "+
+					"(the bare arithmetic would give %d, which would read as a "+
+					"slack figure while headroom is unknown)", got, tc.unguarded)
+			}
+		})
 	}
 }
 
