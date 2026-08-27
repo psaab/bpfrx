@@ -3157,6 +3157,8 @@ pub(super) fn poll_binding_process_descriptor(
                             meta.addr_family as i32,
                             frag_authority,
                             now_ns,
+                            worker_ctx.ha_state,
+                            now_secs,
                         )
                         // #5689: fall back to the ORDINARY same-family NAT /
                         // NPTv6 fragment association so a non-first fragment of
@@ -3173,6 +3175,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 meta.addr_family as i32,
                                 frag_authority,
                                 now_ns,
+                                worker_ctx.ha_state,
+                                now_secs,
                             )
                         })
                     })

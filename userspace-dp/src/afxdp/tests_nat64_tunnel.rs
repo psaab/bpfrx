@@ -1577,7 +1577,7 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
             seed_fwd
                 .nat64
                 .frag_assoc
-                .lookup(&seed_key, 0, seed_fwd.nat64.build_generation)
+                .lookup(&seed_key, 0, seed_fwd.nat64.build_generation, |_| true)
                 .expect("the seed first fragment must have published an association")
                 .0
         };
@@ -1599,6 +1599,7 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
             None,
             crate::afxdp::neighbor::monotonic_nanos(),
             forwarding.nat64.build_generation,
+            0,
         );
         assert_eq!(
             forwarding.nat64.frag_assoc.len(),

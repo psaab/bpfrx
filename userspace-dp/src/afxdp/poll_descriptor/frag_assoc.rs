@@ -105,6 +105,14 @@ pub(super) fn nat64_install_forward_fragment_assoc(
             None,
             now_ns,
             forwarding.nat64.build_generation,
+            // #6857: stamp the runtime entitlement this admission rested on, so
+            // a later fragment can be refused once the RG stops forwarding
+            // locally. The config generation beside it cannot see an RG
+            // transition: that changes no config and bumps no snapshot.
+            crate::afxdp::forwarding::owner_rg_for_resolution(
+                forwarding,
+                decision.resolution,
+            ),
         );
     }
 }
@@ -123,6 +131,10 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
     addr_family: i32,
     authority: crate::nat64::FragAuthority,
     now_ns: u64,
+    // #6857: the runtime-ownership fence needs to ask whether the association's
+    // stamped owner RG is STILL forwarding-active locally.
+    ha_state: &std::collections::BTreeMap<i32, crate::afxdp::types::HAGroupRuntime>,
+    now_secs: u64,
 ) -> Option<SessionDecision> {
     if addr_family != libc::AF_INET6 {
         return None;
@@ -137,7 +149,16 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
         forwarding
             .nat64
             .frag_assoc
-            .lookup(&key, now_ns, forwarding.nat64.build_generation)?;
+            .lookup(
+                &key,
+                now_ns,
+                forwarding.nat64.build_generation,
+                |rg| {
+                    ha_state
+                        .get(&rg)
+                        .is_some_and(|group| group.is_forwarding_active(now_secs))
+                },
+            )?;
     // Only a genuine NAT64 forward decision (nat64=true, rewrite_src/dst set)
     // routes to the NAT64 frame builder.
     if !decision.nat.nat64 {
@@ -193,6 +214,14 @@ pub(super) fn nat_install_forward_fragment_assoc(
             None,
             now_ns,
             forwarding.nat64.build_generation,
+            // #6857: stamp the runtime entitlement this admission rested on, so
+            // a later fragment can be refused once the RG stops forwarding
+            // locally. The config generation beside it cannot see an RG
+            // transition: that changes no config and bumps no snapshot.
+            crate::afxdp::forwarding::owner_rg_for_resolution(
+                forwarding,
+                decision.resolution,
+            ),
         );
     }
 }
@@ -235,13 +264,26 @@ pub(super) fn nat_consult_forward_fragment_assoc(
     addr_family: i32,
     authority: crate::nat64::FragAuthority,
     now_ns: u64,
+    // #6857: the runtime-ownership fence needs to ask whether the association's
+    // stamped owner RG is STILL forwarding-active locally.
+    ha_state: &std::collections::BTreeMap<i32, crate::afxdp::types::HAGroupRuntime>,
+    now_secs: u64,
 ) -> Option<SessionDecision> {
     let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     let (decision, _reverse) =
         forwarding
             .nat64
             .frag_assoc
-            .lookup(&key, now_ns, forwarding.nat64.build_generation)?;
+            .lookup(
+                &key,
+                now_ns,
+                forwarding.nat64.build_generation,
+                |rg| {
+                    ha_state
+                        .get(&rg)
+                        .is_some_and(|group| group.is_forwarding_active(now_secs))
+                },
+            )?;
     // Only an ordinary same-family NAT / NPT rewrite routes here; a NAT64
     // (cross-family) association is handled by `nat64_consult_forward_fragment_assoc`.
     if decision.nat.nat64
