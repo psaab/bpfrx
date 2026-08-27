@@ -106731,3 +106731,14 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6872 review round 2 — corrected the guard's scope claim (the writers are production functions and cannot be locked), made the local-lock predicate name-agnostic and fn-scoped, excluded string literals so the anti-vacuity floor stops counting the scanner's own source, and bound the sensitivity control to the scan's real predicates instead of copies.
   - **File(s)**: userspace-dp/src/afxdp/checksum.rs
+  - **Action**: #6836 — give the NAT64 meta fixtures real flow addresses, and
+    pin the #7656 flowless egress-logging gap the fix made observable
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 review round 2 — addressed all four Codex findings on PR 7657. Measured gate ownership by mutating each fail-closed gate in isolation.
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 review round — added the third arm that actually binds the ingress-family selection. The two original arms both survived inverting the fallback; arm 3 (v4 present but silent, v6 logging) reds it.
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
