@@ -127,7 +127,24 @@ func restPingRejects6904(t *testing.T, target, source, ri string) bool {
 // grpcPingRejects6904 drives the real gRPC Ping validation. The length check
 // runs before the stream is touched, so a nil stream is safe — the same
 // property TestDiagFieldLengthRejected relies on.
-func grpcPingRejects6904(target, source, ri string) bool {
+func grpcPingRejects6904(target, source, ri string) (rejected bool) {
+	// PANIC-SAFE, and the reason is a real property of the thing under test.
+	// The nil stream is safe only WHILE the length check rejects before the
+	// stream is touched. Remove that check — the exact revert this table
+	// exists to catch — and the call proceeds into streamDiag and dereferences
+	// the nil stream, killing the whole package binary and taking ~1200
+	// unrelated tests with it. A revert would then look like a mass failure
+	// instead of a named one, and the collected count would drop to a third of
+	// the control: the "did it RED or did it CRASH" tell.
+	//
+	// A panic here means validation did NOT reject, which is exactly the
+	// verdict the caller needs, so recovering and reporting false is truthful
+	// rather than a workaround.
+	defer func() {
+		if recover() != nil {
+			rejected = false
+		}
+	}()
 	err := (&grpcapi.Server{}).Ping(&pb.PingRequest{
 		Target: target, Source: source, RoutingInstance: ri,
 	}, nil)
