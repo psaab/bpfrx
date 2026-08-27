@@ -227,6 +227,14 @@ pub(crate) struct FirewallTermSnapshot {
     pub count: String,
     #[serde(default)]
     pub log: bool,
+    /// #6854: the `then reject <message-type>` token, e.g. `host-unreachable`.
+    ///
+    /// Empty means the term carried no message-type, which resolves to the
+    /// administratively-prohibited codes the dataplane sent for every reject
+    /// before #6854. `serde(default)` keeps wire parity with a Go control
+    /// plane that omits the field (#1961).
+    #[serde(rename = "reject_message_type", default)]
+    pub reject_message_type: String,
     /// #6853: `then syslog`, distinct from `then log`.
     ///
     /// A `then syslog` term carries BOTH this and `log`; `log` is what makes

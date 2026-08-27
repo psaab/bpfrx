@@ -39,13 +39,25 @@ fn reject_unreachable_routes_through_shared_gate() {
         ..UserspaceDpMeta::default()
     };
     assert!(
-        build_reject_icmp_unreachable(&mcast, meta, 5, &fwd).is_none(),
+        build_reject_icmp_unreachable(
+            &mcast,
+            meta,
+            5,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        ).is_none(),
         "reject path must suppress a multicast destination via the shared gate"
     );
     // A plain unicast UDP reject still works.
     let unicast = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 64);
     assert!(
-        build_reject_icmp_unreachable(&unicast, meta, 5, &fwd).is_some(),
+        build_reject_icmp_unreachable(
+            &unicast,
+            meta,
+            5,
+            &fwd,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        ).is_some(),
         "reject path still replies to a normal unicast packet"
     );
 }
@@ -190,7 +202,13 @@ fn reject_icmp_unreachable_v4_is_type3_code13_admin_prohibited() {
         ..UserspaceDpMeta::default()
     };
     let forwarding = reject_egress_forwarding(Some(Ipv4Addr::new(10, 0, 61, 1)), None);
-    let out = build_reject_icmp_unreachable(&frame, meta, 5, &forwarding)
+    let out = build_reject_icmp_unreachable(
+        &frame,
+        meta,
+        5,
+        &forwarding,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
+    )
         .expect("reject ICMP unreachable v4");
     // MAC reflect: reply dst = inbound src (client).
     assert_eq!(&out[0..6], &[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -223,7 +241,13 @@ fn reject_icmp_unreachable_v6_is_type1_code1_admin_prohibited() {
         ..UserspaceDpMeta::default()
     };
     let forwarding = reject_egress_forwarding(None, Some("2001:559:8585:ef00::1".parse().unwrap()));
-    let out = build_reject_icmp_unreachable(&frame, meta, 5, &forwarding)
+    let out = build_reject_icmp_unreachable(
+        &frame,
+        meta,
+        5,
+        &forwarding,
+        crate::filter::RejectMessage::ADMIN_PROHIBITED,
+    )
         .expect("reject ICMPv6 unreachable v6");
     // ICMPv6 type 1 (dest unreachable), code 1 (admin prohibited).
     assert_eq!(out[54], 1);
@@ -248,7 +272,13 @@ fn reject_icmp_unreachable_suppressed_for_inbound_icmp_error() {
     };
     let forwarding = reject_egress_forwarding(Some(Ipv4Addr::new(10, 0, 61, 1)), None);
     assert!(
-        build_reject_icmp_unreachable(&frame, meta, 5, &forwarding).is_none(),
+        build_reject_icmp_unreachable(
+            &frame,
+            meta,
+            5,
+            &forwarding,
+            crate::filter::RejectMessage::ADMIN_PROHIBITED,
+        ).is_none(),
         "must not reply to an inbound ICMP error"
     );
     // Direct guard checks.

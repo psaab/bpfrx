@@ -92,14 +92,15 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			continue
 		}
 		snap := FirewallTermSnapshot{
-			Name:            term.Name,
-			Action:          term.Action,
-			Count:           term.Count,
-			Log:             term.Log,
-			Syslog:          term.Syslog,
-			PolicerName:     term.Policer,
-			RoutingInstance: term.RoutingInstance,
-			ForwardingClass: term.ForwardingClass,
+			Name:              term.Name,
+			Action:            term.Action,
+			Count:             term.Count,
+			Log:               term.Log,
+			RejectMessageType: term.RejectMessageType,
+			Syslog:            term.Syslog,
+			PolicerName:       term.Policer,
+			RoutingInstance:   term.RoutingInstance,
+			ForwardingClass:   term.ForwardingClass,
 			// #2544: fall-through. A term whose `then` carries NO terminating
 			// action must apply its modifiers and FALL THROUGH to the next term
 			// (Junos). This covers BOTH the explicit `then next term`
