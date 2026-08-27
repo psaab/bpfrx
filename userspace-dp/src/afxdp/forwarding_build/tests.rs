@@ -775,6 +775,18 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
 
 #[test]
 fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
+    // #6849 added the `medium` case. `hgh` is an operator typo; `medium` is
+    // the more interesting one, because until #6849 removed its match arm it
+    // resolved to a REAL rank (3) and silently placed the class between
+    // medium-high and medium-low instead of failing. A unit test on
+    // cos_priority_rank alone would not catch that arm coming back: the
+    // caller has to actually consult it, which is what this drives.
+    for bad_priority in ["hgh", "medium"] {
+        build_cos_state_rejects_priority_6849(bad_priority);
+    }
+}
+
+fn build_cos_state_rejects_priority_6849(bad_priority: &str) {
     // #hb166 T-7: a scheduler carrying a NON-EMPTY `priority` string that
     // is not a known Junos scheduler priority fails the snapshot CLOSED
     // (the helper-boundary backstop for a typo / version-drifted snapshot)
@@ -800,7 +812,7 @@ fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
                 transmit_rate_bytes: 1_000_000_000 / 8,
                 transmit_rate_percent: 0.0,
                 transmit_rate_exact: true,
-                priority: "hgh".into(),
+                priority: bad_priority.into(),
                 buffer_size_bytes: 128 * 1024,
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
@@ -829,10 +841,13 @@ fn build_cos_state_fails_closed_on_unknown_scheduler_priority() {
             priority,
         }) => {
             assert_eq!(forwarding_class, "fc-bad");
-            assert_eq!(priority, "hgh");
+            assert_eq!(priority, bad_priority);
         }
         Err(other) => panic!("wrong integrity error: {other}"),
-        Ok(_) => panic!("unknown scheduler priority must fail the snapshot closed"),
+        Ok(_) => panic!(
+            "#6849: scheduler priority {bad_priority:?} must fail the snapshot CLOSED, not \
+             resolve to a rank"
+        ),
     }
 }
 
@@ -7305,4 +7320,61 @@ fn interface_snat_identity_registry_survives_apply_6751() {
         ),
         other => panic!("expected a matched interface SNAT decision, got {other:?}"),
     }
+}
+
+/// #6849: `medium` is not a Junos scheduler priority and must fail CLOSED.
+///
+/// The dead `"medium" => Some(3)` arm predated the T-7 fail-closed work —
+/// the original function was a six-level ladder ending in `_ => 5`, and T-7
+/// mechanically rewrote every arm to `Some(n)` while changing the signature,
+/// carrying `medium` along with it. No version of the Go producer has ever
+/// emitted it: the schema's `priority` enum accepts only the five below.
+///
+/// This is a fail-OPEN removal in the sense that matters — with the arm
+/// present, a `medium` string from a typo or a drifting snapshot resolved to
+/// a real rank and silently placed the class between `medium-high` and
+/// `medium-low`, rather than surfacing `CosUnknownSchedulerPriority`.
+#[test]
+fn cos_priority_rank_rejects_medium_and_pins_the_five_real_ranks_6849() {
+    assert_eq!(
+        super::cos::cos_priority_rank_for_test("medium"),
+        None,
+        "#6849: `medium` is not a Junos scheduler priority — it must fail CLOSED so the \
+         caller raises CosUnknownSchedulerPriority, not resolve to a rank between \
+         medium-high and medium-low"
+    );
+
+    // The five REAL priorities, with their ranks pinned to the exact values
+    // they have always had. This is the other half of #6849: the ranks were
+    // deliberately NOT renumbered when rank 3 became vacant, because a large
+    // number of CoS tests construct queues with a literal `priority: 5`
+    // meaning "low" and would silently mean something else. If a later change
+    // closes the gap to 0..=4, this cell reds and points at those literals.
+    for (name, want) in [
+        ("strict-high", 0u8),
+        ("high", 1),
+        ("medium-high", 2),
+        ("medium-low", 4),
+        ("low", 5),
+    ] {
+        assert_eq!(
+            super::cos::cos_priority_rank_for_test(name),
+            Some(want),
+            "#6849: rank of {name:?} must stay {want} — renumbering silently reinterprets \
+             every hardcoded `priority:` literal in the CoS tests"
+        );
+    }
+
+    // Rank 3 is vacant, and COS_PRIORITY_LEVELS is sized for the highest LIVE
+    // rank (low = 5), so six slots is correct rather than off by one. Without
+    // this the constant looks like a stale leftover and an unrelated tidy-up
+    // would shrink it to 5 and truncate `low`.
+    assert!(
+        crate::afxdp::types::COS_PRIORITY_LEVELS
+            > usize::from(
+                super::cos::cos_priority_rank_for_test("low").expect("low is a known priority")
+            ),
+        "#6849: COS_PRIORITY_LEVELS must exceed the highest live rank, or indexing by the \
+         rank of `low` is out of bounds"
+    );
 }

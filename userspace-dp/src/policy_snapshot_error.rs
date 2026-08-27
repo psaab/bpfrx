@@ -608,8 +608,11 @@ pub(crate) enum SnapshotIntegrityError {
     },
     /// #hb166 T-7: a CoS scheduler snapshot carried a NON-EMPTY `priority`
     /// wire string that is not one of the known Junos scheduler priorities
-    /// (`strict-high` / `high` / `medium-high` / `medium` / `medium-low` /
-    /// `low`). The pre-fix `cos_priority_rank` mapped any unrecognized
+    /// (`strict-high` / `high` / `medium-high` / `medium-low` / `low`).
+    /// There are FIVE, not six: this list named a bare `medium` until
+    /// #6849, which Junos does not have and the Go schema's `priority`
+    /// enum has never accepted. The pre-fix `cos_priority_rank` mapped any
+    /// unrecognized
     /// string to rank 5 (`low`, the strict-priority FLOOR) via a catch-all
     /// match arm — so a typo or a mixed-version snapshot silently demoted a
     /// class to lowest priority with no failure surfaced. Fail-closed here,
