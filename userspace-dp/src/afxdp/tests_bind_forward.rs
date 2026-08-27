@@ -727,7 +727,6 @@ fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
     );
 }
 
-
 /// #6854 (review finding): the OUTPUT-filter reject path must carry the term's
 /// `then reject <message-type>` into the ICMP code on the wire.
 ///
@@ -1014,7 +1013,6 @@ fn icmp_type_code_v4_6854(frame: &[u8]) -> (u8, u8) {
     );
     (frame[icmp], frame[icmp + 1])
 }
-
 
 /// #3642 forward leg: a SNAT'd transit flow's egress `filter output` must match
 /// the TRANSLATED (post-NAT) SOURCE address, because Junos applies output
