@@ -339,7 +339,19 @@ type SyslogStream struct {
 	Format        string // per-stream format override
 	Category      string // "all", or specific category
 	SourceAddress string // source IP for this stream
-	Transport     SyslogTransport
+	// SourceInterface is the per-stream `source-interface` (#6875). It is
+	// RESOLVED to an address at apply time, so it is a lower-precedence way of
+	// saying the same thing as SourceAddress:
+	//
+	//	SourceAddress  >  SourceInterface  >  LogConfig.SourceInterface (global)
+	//
+	// An explicitly configured address beats one derived from an interface, and
+	// both beat the global fallback. Before #6875 this leaf parsed (the stream
+	// subtree is open-world) and was compiled by nothing, so a per-stream
+	// source-interface committed clean and the stream sourced from the global
+	// setting or from nothing.
+	SourceInterface string
+	Transport       SyslogTransport
 }
 
 // SSHKnownHostKey represents a known SSH host key.
