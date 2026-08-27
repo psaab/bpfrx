@@ -714,10 +714,205 @@ fn snapshot_returns_none_on_perpetually_odd_gen() {
 ///
 /// Copilot code-r1: replaces the prior misnamed test that only
 /// did back-to-back same-thread publishes.
+/// Size the concurrent writer's inter-publish sleep from the MEASURED cost of
+/// one uncontended snapshot pass (#7650).
+///
+/// The seqlock's even-window is exactly this sleep. A reader can only return
+/// `Some` if a whole `snapshot()` pass — `COLD_PATH_PUBLISH_ATOMIC_OPS` atomic
+/// loads over a ~100 KiB working set — fits inside one even-window. Retries do
+/// not help: every attempt needs a fresh uninterrupted window, so a budget of
+/// 8192 buys nothing once the pass is wider than the window. The gate is the
+/// WINDOW, not the budget.
+///
+/// It has to scale rather than be a literal. The 100 µs literal this replaced
+/// was sized when the payload was 16×24 (~450 atomics); #1635 grew it 30× to
+/// 256×48 (~13.3k) and the throttle was never resized, leaving roughly 2.5×
+/// margin on an idle machine and none at all on a machine under memory
+/// pressure — where the pass faults instead of hitting cache and coherence
+/// collapses. That is the regime #7650 was reported from.
+///
+/// The floor keeps a fast machine from spinning the writer into a busy loop;
+/// the multiplier is what guarantees the margin on a slow or loaded one.
+/// Minimum coherent snapshots out of 1000 for the concurrency test to mean
+/// anything (#7650). This is an ANTI-VACUITY floor, not a tuning knob: without
+/// it the test would pass having observed nothing, because every snapshot can
+/// legitimately return `None` under retry exhaustion. Lowering it is how the
+/// test gets "fixed" into uselessness, so it is pinned by
+/// `coherence_floor_is_pinned_7650` rather than left as a bare literal.
+const COHERENCE_FLOOR: u64 = 100;
+
+fn writer_throttle_for_read_cost(read_cost: std::time::Duration) -> std::time::Duration {
+    /// How many reader passes must fit inside one even-window.
+    const WINDOW_MARGIN: u32 = 8;
+    const FLOOR: std::time::Duration = std::time::Duration::from_micros(100);
+    std::cmp::max(FLOOR, read_cost * WINDOW_MARGIN)
+}
+
+/// #7650: the publish/snapshot surface is what makes a reader pass expensive,
+/// and it has grown silently before. #1635 took it from 16×24 to 256×48 — a
+/// 30× increase — updating one doc comment while a second comment in the same
+/// function kept claiming ~450 atomics and the concurrency test kept a writer
+/// throttle sized for the old shape.
+///
+/// This pins the DERIVED constant against the two dimensions, so the constant
+/// cannot drift from the arrays it describes. It deliberately does NOT pin a
+/// literal 13314: pinning the number would just be a third place to forget.
+#[test]
+fn publish_atomic_ops_tracks_the_actual_surface_7650() {
+    assert_eq!(
+        COLD_PATH_PUBLISH_ATOMIC_OPS,
+        POLICY_COLD_PATH_ZONE_PAIR_SLOTS * POLICY_COLD_PATH_HIST_BUCKETS
+            + POLICY_COLD_PATH_ZONE_PAIR_SLOTS * 4
+            + 2,
+        "the derived publish/snapshot cost must track the arrays it describes"
+    );
+    // A reader pass this wide is the whole reason the even-window has to be
+    // measured rather than assumed. If this ever shrinks back to the old dense
+    // shape the throttle maths should be revisited deliberately, not silently.
+    assert!(
+        COLD_PATH_PUBLISH_ATOMIC_OPS > 10_000,
+        "one publish/snapshot pass is {COLD_PATH_PUBLISH_ATOMIC_OPS} atomics; \
+         if that has fallen back under 10k the surface changed shape and the \
+         seqlock even-window sizing in this file needs re-deriving (#7650)"
+    );
+}
+
+#[test]
+fn coherence_floor_is_pinned_7650() {
+    // 10% of the 1000 snapshots the reader takes. The number is the CLAIM that
+    // the test saw enough to mean something; the correct response to it failing
+    // is to widen the seqlock's even-window, never to lower this.
+    assert_eq!(
+        COHERENCE_FLOOR, 100,
+        "the anti-vacuity floor was changed. If the concurrency test is failing \
+         here, the reader could not complete a snapshot pass inside the writer's \
+         even-window often enough — widen the window \
+         (writer_throttle_for_read_cost) or explain why a reader pass became so \
+         expensive. Lowering the floor leaves a test that runs, passes, and \
+         measures nothing (#7650)"
+    );
+}
+
+/// The helper tests above prove `writer_throttle_for_read_cost` computes the
+/// right window, and prove nothing about whether the concurrency test USES it.
+/// Every one of them stays green against a fixture that measures nothing and
+/// sleeps a hardcoded 100 µs — which is exactly the pre-#7650 code.
+///
+/// So scan the fixture's own source for the three wirings. Comments are
+/// stripped first: this file's prose names all three identifiers, and a gate
+/// satisfiable by its own documentation proves nothing.
+#[test]
+fn concurrency_fixture_is_wired_to_the_measured_window_7650() {
+    let src = include_str!("cold_path_hist_tests.rs");
+    // Scan ONLY the fixture's body. Scanning the whole file is self-satisfying:
+    // the needle table below contains every string it greps for, so the gate
+    // passes against a fixture that no longer contains any of them. Stripping
+    // comments does not fix that — these needles are code, not prose. The
+    // matrix caught this: three cells stayed green against the whole-file scan.
+    // Anchor on a REAL newline before the fn header. The obvious
+    // `find("fn snapshot_...()")` matches this function's own argument to
+    // `find` — a string literal that necessarily contains the name — so the
+    // slice became the SCANNER's body, which holds every needle. That is the
+    // third depth of the same self-satisfaction trap in this one gate, and the
+    // matrix caught each one. A Rust string literal on a single line cannot
+    // contain a raw newline, so this marker can only match the definition.
+    let marker = "\nfn snapshot_under_concurrent_writer_never_tears() {\n";
+    let start = src.find(marker).expect("concurrency fixture not found");
+    let rest = &src[start..];
+    let end = rest.find("\n#[test]").unwrap_or(rest.len());
+    let body: String = rest[..end]
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = body;
+
+    for (needle, why) in [
+        (
+            "std::thread::sleep(writer_sleep)",
+            "the writer must sleep the MEASURED window; a hardcoded literal is \
+             the #1635 drift that made the coherence floor unreachable",
+        ),
+        (
+            "writer_throttle_for_read_cost(read_cost)",
+            "the window must be derived from the measured pass cost, not from a \
+             constant — otherwise the helper is dead code and the fixture is \
+             back to assuming",
+        ),
+        (
+            "let read_cost = probe_start.elapsed() / PROBE_ITERS",
+            "the read cost must actually be MEASURED on this machine; a fixed \
+             stand-in re-introduces the assumption the measurement replaces",
+        ),
+        (
+            "atomics.snapshot().is_some()",
+            "the uncontended precondition must remain: if a snapshot cannot be \
+             coherent with NO writer running, the seqlock is broken and the \
+             concurrency result below is uninterpretable",
+        ),
+    ] {
+        assert!(
+            code.contains(needle),
+            "concurrency fixture no longer contains `{needle}` — {why} (#7650)"
+        );
+    }
+}
+
+#[test]
+fn writer_throttle_scales_with_the_measured_read_cost_7650() {
+    use std::time::Duration;
+    // A fast machine is clamped by the floor, so the writer never becomes a
+    // busy loop that starves the reader outright.
+    assert_eq!(
+        writer_throttle_for_read_cost(Duration::from_micros(1)),
+        Duration::from_micros(100),
+        "a very cheap read must still leave the 100 µs floor in place"
+    );
+    // The load-bearing case, and the one a hardcoded literal fails: when a
+    // reader pass is EXPENSIVE the window must grow with it. This is the
+    // regression #1635 introduced silently — the payload grew 30× and the
+    // window did not move, so the margin quietly went to nothing.
+    assert_eq!(
+        writer_throttle_for_read_cost(Duration::from_micros(500)),
+        Duration::from_micros(4000),
+        "an expensive read pass must widen the even-window proportionally; a \
+         fixed throttle is what let #1635's 30× payload growth silently erase \
+         the reader's margin (#7650)"
+    );
+    assert!(
+        writer_throttle_for_read_cost(Duration::from_millis(2)) >= Duration::from_millis(16),
+        "the margin must hold for a slow/loaded machine too, or the coherence \
+         floor becomes unreachable exactly when the machine is busy"
+    );
+}
+
 #[test]
 fn snapshot_under_concurrent_writer_never_tears() {
     use std::sync::atomic::{AtomicBool, Ordering as AOrd};
     let atomics = std::sync::Arc::new(WorkerColdPathAtomics::new());
+
+    // Measure one uncontended snapshot pass BEFORE the writer starts, so the
+    // writer's even-window can be sized from what a reader actually costs on
+    // THIS machine rather than from a literal that was correct for a payload
+    // 30× smaller (#7650).
+    const PROBE_ITERS: u32 = 32;
+    let probe_start = std::time::Instant::now();
+    for _ in 0..PROBE_ITERS {
+        assert!(
+            atomics.snapshot().is_some(),
+            "an UNCONTENDED snapshot must be coherent; if this fails the \
+             seqlock is broken independently of any concurrency"
+        );
+    }
+    let read_cost = probe_start.elapsed() / PROBE_ITERS;
+    let writer_sleep = writer_throttle_for_read_cost(read_cost);
+
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let writer_atomics = atomics.clone();
     let writer_stop = stop.clone();
@@ -728,18 +923,15 @@ fn snapshot_under_concurrent_writer_never_tears() {
             local.record_sample(5, 3, 5, 1000 + (count & 0xff));
             writer_atomics.publish_from_local(&local);
             count += 1;
-            // The production writer publishes at ~1 Hz cadence
-            // (see worker_runtime.rs::publish). The test writer
-            // is much faster — drop to ~10 kHz with a 100 µs
-            // sleep so the reader has room to observe even-gen
-            // snapshots within its 16-retry budget. Without
-            // this, the writer keeps the seqlock perpetually
-            // odd and every reader snapshot exhausts retries
-            // → returns default(zero) → test fails the
-            // max_samples > 0 sanity assertion (Codex code-r3
-            // NIT: the weaker oracle would have falsely passed
-            // by accepting all zeros).
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            // The production writer publishes at ~1 Hz (see
+            // worker_runtime.rs::publish); the test writer is far faster on
+            // purpose, but it must still leave an even-window wide enough for
+            // a whole reader pass — see writer_throttle_for_read_cost. Without
+            // that the seqlock is odd nearly always, every snapshot exhausts
+            // its retry budget and returns None, and the test fails its
+            // coherence floor having observed nothing (Codex code-r3 NIT: the
+            // weaker oracle would have falsely passed by accepting all zeros).
+            std::thread::sleep(writer_sleep);
         }
         count
     });
@@ -821,9 +1013,27 @@ fn snapshot_under_concurrent_writer_never_tears() {
     );
     // Sanity-4: at least 10% of snapshots must have been coherent;
     // if EVERY snapshot exhausted retries the test is meaningless.
+    //
+    // #7650: the message names what this is and is not. Reaching here means
+    // BOTH tear detections above already PASSED — the seqlock did not tear —
+    // so a reader who starts by auditing the seqlock is auditing the wrong
+    // thing. This is an observability precondition: the reader could not win
+    // the race often enough to see anything, which is a property of the
+    // even-window versus the reader's pass cost (and of how loaded the machine
+    // is), not of the lock.
     assert!(
-        coherent_snapshots >= 100,
-        "only {coherent_snapshots}/1000 snapshots coherent — retry budget may be too low"
+        coherent_snapshots >= COHERENCE_FLOOR,
+        "OBSERVABILITY PRECONDITION FAILED, NOT A TEAR: only \
+         {coherent_snapshots}/1000 snapshots were coherent \
+         ({retry_exhausted_snapshots} exhausted their retry budget). The \
+         seqlock did NOT tear — both tear detections above passed on every \
+         coherent snapshot. The reader simply could not complete a \
+         {read_cost:?} pass inside the writer's {writer_sleep:?} even-window \
+         often enough. Raising the retry budget will NOT help: each attempt \
+         needs its own uninterrupted window. Widen the window \
+         (writer_throttle_for_read_cost) or find out why this machine made a \
+         reader pass so expensive — do not lower this floor, it is the claim \
+         that the test saw enough to mean something (#7650)"
     );
 }
 
