@@ -153,7 +153,7 @@ func TestApplicationTerm_DuplicateScalarLeaf_Rejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected commit to REJECT duplicate %q inside a term", c.leaf)
 			}
-			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), c.leaf) {
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"`+c.leaf+`"`) {
 				t.Fatalf("error should name the duplicate leaf %q, got: %v", c.leaf, err)
 			}
 		})
