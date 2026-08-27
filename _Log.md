@@ -106712,3 +106712,23 @@ prose edit above them added. No diff falls in the new test body.
 - **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
   `pkg/config/testdata/compact_block_divergences_2419.txt`,
   `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-26 — #7636: split pkg/eventengine/engine.go
+
+- **Timestamp**: 2026-08-26
+- **Action**: Verbatim split of `engine.go` (1540 LOC, over the soft 1500
+  `[WATCH]` floor since #6810) into three cohesive units: `queue.go` (215,
+  action-queue admission — `enqueue`, `supersede`, `releaseEdgeLatch`,
+  `actionQueueDepth`) and `evaluate.go` (427, evaluation — `evaluateEvent`,
+  `withinMatches`, `pruneWindow`, `attributesMatch`, `classifyPlan` and
+  helpers), leaving `engine.go` at 943. No behaviour change: all 10 moved
+  functions verified byte-identical to their originals and absent from
+  `engine.go`, declaration census 48 before and 48 after with an empty diff and
+  no duplicates, and the 16-file `pkg/eventengine` suite green with ZERO test
+  edits. The `e.mu`/`enqueueMu` never-nested lock order is now stated in all
+  three files, since the split is exactly what stops the two locks being
+  visible on one screen. Pruned the `[WATCH]` entry from
+  `docs/refactoring-audit-accepted.txt` — it is a decision record, not state.
+- **File(s)**: `pkg/eventengine/engine.go`, `pkg/eventengine/queue.go`,
+  `pkg/eventengine/evaluate.go`, `pkg/eventengine/README.md`,
+  `docs/refactoring-audit-accepted.txt`, `_Log.md`
