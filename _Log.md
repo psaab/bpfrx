@@ -107035,3 +107035,24 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-27
   - **Action**: #6875 — `security log stream <s> source-interface` is now modelled, validated, compiled and honoured at apply time, with precedence source-address > source-interface > global. The #3349 happy-path entry now asserts the compiled value instead of a clean commit.
   - **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/compiler_security_log.go, pkg/daemon/daemon_system.go, pkg/config/log_stream_config_3349_test.go, pkg/config/log_stream_source_interface_6875_test.go, docs/config-schema.md
+
+## 2026-08-27 — #7653: measure the #2419 class across PACKING DEPTH
+
+- **Timestamp**: 2026-08-27
+- **Action**: The #2419 census collapses exactly one container onto the leaf
+  line, so its 354-divergent figure was a floor in an unstated second dimension:
+  Junos compaction is recursive. Extended the SAME walker across depths.
+  Measured: divergence RATE rises with depth — 65% at depth 2, 87% at 3, 97% at
+  4, ~99% at 5+ — for >= 1793 divergent cells over >= 527 distinct sites, versus
+  the base census's 354. Only 2 cells in the whole sweep are REJECTED, which is
+  the measurement that this class is "accepted and dropped" rather than refused;
+  rejected cells are excluded from the divergent count per the #7653 policy call.
+  A depth-1 cross-check asserts the extension agrees with the base census cell
+  for cell, plus anti-vacuity on depth 3 and a rate-inversion guard. The
+  mutation matrix found the exclusion policy had NO detector — folding rejected
+  cells into `divergent` left the suite green — so a floor assertion on the
+  rejected count was added and now reds. A paired cell (vacuous generator WITH
+  the cross-check disabled) goes green, proving the cross-check is the sole
+  detector for that mutation rather than decoration.
+- **File(s)**: `pkg/config/compact_depth_census_7653_test.go`,
+  `docs/config-schema.md`, `_Log.md`
