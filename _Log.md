@@ -106736,3 +106736,23 @@ prose edit above them added. No diff falls in the new test body.
     terminal schema node permitting a body (Codex re-review finding 1)
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
+
+## 2026-08-26 — #7632 SSE slow reader: review findings 2/3/5/6
+
+- **Timestamp**: 2026-08-26
+- **Action**: Disposition the remaining findings from this PR's own hostile
+  review. Finding 2: `writeEvent` claimed to return the first write error but
+  discarded the FLUSH error, which for a small event is the only write that
+  reaches the socket — `sseStream.flush` now goes through
+  `http.ResponseController.Flush()`, with `ErrNotSupported` latched rather than
+  treated as a dead peer. Finding 3: both slow-reader cells and the negative
+  control now witness a genuinely PARKED write before drawing a conclusion from
+  a timeout ("still running" is also what an IDLE handler looks like — it
+  produced two wrong readings in this PR). Finding 5: added `logStreamHandler`
+  coverage and a subscriber-slot-release cell over both handlers, binding
+  `defer sub.Close()`. Finding 6: replaced the 2-sample precautionary-claim
+  measurement with n=9 min/median/max over three variants and two write paths.
+  Fixture gained `maxWrites` (exact "buffer filled after the first event") and
+  parked-write instrumentation.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go`, `pkg/api/README.md`, `_Log.md`

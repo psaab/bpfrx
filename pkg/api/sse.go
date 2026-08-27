@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,30 +41,45 @@ func setSSEHeaders(w http.ResponseWriter) {
 // This is the axis on which SSE genuinely differs from the RIB dump, where a
 // total budget was a sensible backstop.
 //
-// THE ERROR RETURN IS PRECAUTIONARY, NOT BOUND — labelled as such because I
-// first claimed the opposite and measured it.
+// THE ERROR RETURNS ARE PRECAUTIONARY, NOT BOUND — labelled as such because I
+// first claimed the opposite and then measured it.
 //
-// The claim was that adding the deadline without propagating the error would be
-// WORSE than the pin: the write failing on every later event while the loop
-// kept draining the subscription and discarding. Measured, it is not. With the
-// deadline armed and the error deliberately discarded, the handler still
-// returns in 254.6ms against a 250ms deadline — indistinguishable from 254.9ms
-// with the check — because net/http cancels the request context as soon as a
-// write to the connection fails, so the loop exits through its ctx.Done() arm
-// regardless.
+// The claim was that arming the deadline without propagating the error would be
+// WORSE than the pin: the write failing on every later event while the loop kept
+// draining the subscription and discarding. Measured over 9 runs per variant
+// against a 250ms deadline, on both paths a small event can take — the flood
+// that overruns net/http's 2 KiB response buffer and produces direct socket
+// writes, and the single small event whose only socket contact is the flush:
 //
-// So the deadline is what fixes the pin, and the error return currently changes
-// nothing observable. It is kept for one reason that survives the measurement:
-// that exit depends on net/http cancelling the context on a write error, which
-// is behaviour rather than contract. A wrapping ResponseWriter, or a different
-// server, that does not do it would leave this loop draining the subscription
-// into a dead connection. Checking the error makes the exit local and explicit
-// instead of inherited.
+//	variant                  write path (flood)          flush path (1 event)
+//	as shipped               min 251.0 med 251.9 max 254.9   250.3 / 250.7 / 250.8
+//	write check discarded    min 251.1 med 251.5 max 252.4   250.3 / 250.5 / 250.8
+//	flush check discarded    min 251.1 med 251.4 max 252.9   250.6 / 250.6 / 250.7
+//
+// Every variant returns inside one deadline window and the distributions
+// overlap completely. The reason is measurable too: net/http cancels the
+// request context when a connection write fails —
+//
+//	PROBE: request context CANCELLED 250.693838ms after the blocking write began
+//
+// — so the loop exits through its ctx.Done() arm whether or not anything here
+// inspects an error.
+//
+// So THE DEADLINE is what fixes the pin, and the error returns currently change
+// nothing observable. They are kept for one reason that survives the
+// measurement: that exit depends on net/http cancelling the context on a write
+// error, which is behaviour rather than contract. A wrapping ResponseWriter, or
+// a different server, that does not do it would leave this loop draining the
+// subscription into a dead connection. Checking makes the exit local and
+// explicit instead of inherited.
 //
 // Stated this way deliberately: a guard described as load-bearing when it is
 // defence in depth is the kind of claim that survives into someone else's
-// reasoning. The mutation matrix agrees — removing the error check leaves the
+// reasoning. The mutation matrix agrees — removing either check leaves the
 // suite green, and that is recorded rather than papered over.
+//
+// What the flush check DOES fix is a false claim rather than a live pin; see
+// sseStream.flush.
 
 // sseWriteDeadline bounds a SINGLE downstream SSE write. A subscriber that
 // cannot accept one small event within this window is not reading. Generous by
@@ -88,11 +104,13 @@ const sseWriteChunk = 32 * 1024
 // discarding a write failure again.
 type sseStream struct {
 	w  io.Writer
-	f  http.Flusher
 	rc *http.ResponseController
 	// deadlineUnsupported mirrors deadlineArmingWriter's own probe: once
 	// SetWriteDeadline has failed there is nothing to clear either.
 	deadlineUnsupported bool
+	// flushUnsupported records a ResponseWriter that cannot flush at all, so
+	// the not-supported answer is not mistaken for a peer failure.
+	flushUnsupported bool
 }
 
 // newSSEStream wraps w so every SSE write arms a fresh write deadline first.
@@ -101,11 +119,7 @@ type sseStream struct {
 // #6809's own first attempt got wrong.
 func newSSEStream(w http.ResponseWriter, d time.Duration) *sseStream {
 	rc := http.NewResponseController(w)
-	st := &sseStream{w: &deadlineArmingWriter{w: w, rc: rc, d: d}, rc: rc}
-	if f, ok := w.(http.Flusher); ok {
-		st.f = f
-	}
-	return st
+	return &sseStream{w: &deadlineArmingWriter{w: w, rc: rc, d: d}, rc: rc}
 }
 
 // clearDeadline drops the write deadline once an event is fully on the wire
@@ -144,7 +158,9 @@ func (s *sseStream) clearDeadline() {
 	}
 }
 
-// writeEvent writes a single SSE event and RETURNS the first write error.
+// writeEvent writes a single SSE event and RETURNS the first failure — from a
+// write OR from the flush, which for a small event is the only one that reaches
+// the socket at all (#7654 review, finding 2).
 // A non-nil return is terminal for the stream: the peer is not reading, and
 // continuing would drain the subscription into a connection that cannot take
 // it.
@@ -184,12 +200,68 @@ func (s *sseStream) writeEvent(id, event, data string) error {
 	if _, err := io.WriteString(s.w, "\n\n"); err != nil {
 		return err
 	}
-	if s.f != nil {
-		s.f.Flush()
+	// The FLUSH is where a small event actually reaches the socket, so its
+	// error is the one that matters most (#7654 review, finding 2).
+	if err := s.flush(); err != nil {
+		return err
 	}
 	// The event is on the wire; the stream is idle again until the next one.
 	s.clearDeadline()
 	return nil
+}
+
+// flush pushes the buffered event to the connection and REPORTS a failure.
+//
+// WHAT WAS ACTUALLY WRONG (#7654 review, finding 2). http.Flusher.Flush() has
+// no error return, and net/http's response.Flush calls FlushError() and throws
+// the error away. net/http buffers the response in a 2 KiB bufio.Writer and an
+// SSE event is a few hundred bytes, so for an ordinary event the handler's
+// Write calls never touch the socket at all — the write that can block is the
+// one INSIDE the flush. So writeEvent's own doc comment ("returns the first
+// write error") was FALSE for the common case: measured against a
+// ResponseWriter whose flush fails, writeEvent returned nil while the flush
+// error was discarded.
+//
+// http.ResponseController.Flush() returns what response.Flush swallows.
+// ErrNotSupported is a property of the ResponseWriter, not of the peer, so it
+// is latched and treated as "no flush available" rather than as a dead stream.
+//
+// AND IT IS PRECAUTIONARY, NOT LOAD-BEARING — measured, like the write-error
+// check above, and for the same reason. With the flush error deliberately
+// discarded, a stalled peer still releases the handler in 245.5ms against a
+// 250ms deadline, indistinguishable from 245.6ms with the check, because
+// net/http cancels the request context when a connection write fails:
+//
+//	PROBE: request context CANCELLED 250.693838ms after the blocking write began
+//
+// So this fixes a false CLAIM and makes the exit local instead of inherited; it
+// does not change when the handler returns under net/http. Recorded that way
+// deliberately — the whole reason this file already carries one retraction is
+// that a guard described as load-bearing when it is defence in depth survives
+// into someone else's reasoning.
+//
+// A NOTE ON HOW THIS WAS NEARLY MIS-REPORTED, because the instrument matters
+// more than the result. The first end-to-end probe of this said "handler STILL
+// RUNNING after 6s" and looked like a live pin that the PR had missed. It was
+// not: stalledConn6809's byte budget is checked BEFORE the write and then lets
+// the whole write through, so any positive budget passed the entire flush and
+// the handler was sitting IDLE in its select with nothing to write. "Has not
+// returned" and "is blocked in Write" are different facts and a timeout cannot
+// tell them apart — the same confusion that produced two wrong readings about
+// HTTP/2 earlier in this PR. The fixture now witnesses a PARKED WRITE
+// (stalledListener6809.waitForParkedWrite) so no cell here can make that claim
+// without evidence, and maxWrites gives an exact "the buffer filled after the
+// first event" that a byte budget cannot express.
+func (s *sseStream) flush() error {
+	if s.flushUnsupported {
+		return nil
+	}
+	err := s.rc.Flush()
+	if errors.Is(err, http.ErrNotSupported) {
+		s.flushUnsupported = true
+		return nil
+	}
+	return err
 }
 
 // writeSSEEvent writes a single SSE event to the response.

@@ -40,7 +40,7 @@ func startStalledSSEServer7632(
 	h func(*Server, http.ResponseWriter, *http.Request),
 	budget int,
 	deadlineUnsupported bool,
-) (addr string, buf *logging.EventBuffer, done <-chan struct{}, cleanup func()) {
+) (addr string, buf *logging.EventBuffer, done <-chan struct{}, sl *stalledListener6809, cleanup func()) {
 	t.Helper()
 	buf = logging.NewEventBuffer(1024)
 	srv := &Server{eventBuf: buf}
@@ -49,7 +49,7 @@ func startStalledSSEServer7632(
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	sl := &stalledListener6809{Listener: base, budget: budget, deadlineUnsupported: deadlineUnsupported}
+	sl = &stalledListener6809{Listener: base, budget: budget, deadlineUnsupported: deadlineUnsupported}
 
 	handlerDone := make(chan struct{})
 	var once sync.Once
@@ -61,7 +61,7 @@ func startStalledSSEServer7632(
 		})},
 	}
 	ts.Start()
-	return ts.Listener.Addr().String(), buf, handlerDone, func() {
+	return ts.Listener.Addr().String(), buf, handlerDone, sl, func() {
 		sl.releaseAll()
 		ts.Close()
 	}
@@ -95,7 +95,7 @@ func TestSlowSSEReaderDoesNotPinTheHandler7632(t *testing.T) {
 	sseWriteDeadline = 250 * time.Millisecond
 	t.Cleanup(func() { sseWriteDeadline = restore })
 
-	addr, buf, done, cleanup := startStalledSSEServer7632(t,
+	addr, buf, done, sl, cleanup := startStalledSSEServer7632(t,
 		(*Server).eventStreamHandler, 8*1024, false)
 	defer cleanup()
 	dialAndRequestWithoutReading6809(t, addr)
@@ -103,6 +103,15 @@ func TestSlowSSEReaderDoesNotPinTheHandler7632(t *testing.T) {
 	// Let the subscription come up, then push far more than the conn will take.
 	time.Sleep(100 * time.Millisecond)
 	floodEvents7632(buf, 4000)
+
+	// #7654 review, finding 3: credit the deadline for the return only after
+	// witnessing that a write actually PARKED. Without this the cell passes
+	// whenever the handler exits for any reason at all, including never having
+	// reached the hazard.
+	if !sl.waitForParkedWrite(10 * time.Second) {
+		t.Fatal("no write ever parked: the flood never reached a blocking write, so " +
+			"this cell would be crediting the deadline for a return it did not cause")
+	}
 
 	select {
 	case <-done:
@@ -125,7 +134,7 @@ func TestSlowSSEReaderPinIsReachableWithoutTheDeadline7632(t *testing.T) {
 	sseWriteDeadline = 100 * time.Millisecond
 	t.Cleanup(func() { sseWriteDeadline = restore })
 
-	addr, buf, done, cleanup := startStalledSSEServer7632(t,
+	addr, buf, done, sl, cleanup := startStalledSSEServer7632(t,
 		(*Server).eventStreamHandler, 8*1024, true /* deadlines unsupported */)
 	defer cleanup()
 	dialAndRequestWithoutReading6809(t, addr)
@@ -133,12 +142,146 @@ func TestSlowSSEReaderPinIsReachableWithoutTheDeadline7632(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	floodEvents7632(buf, 4000)
 
+	// #7654 review, finding 3, and the correction this whole cell turns on.
+	// "The handler has not returned" is ALSO what an idle handler looks like,
+	// so without this witness the control proves the fixture can pin only in
+	// the sense that it can fail to do anything at all. Establish that a write
+	// is genuinely parked FIRST; only then does "still running" mean pinned.
+	if !sl.waitForParkedWrite(10 * time.Second) {
+		t.Fatal("no write ever parked, so this control cannot show the fixture is " +
+			"capable of pinning — it would pass equally if the handler were " +
+			"merely idle, which is exactly the reading that fooled this PR twice")
+	}
+
 	select {
 	case <-done:
 		t.Fatal("the handler returned with write deadlines unsupported — the " +
 			"fixture cannot pin, so the sibling cell's pass proves nothing")
 	case <-time.After(2 * time.Second):
-		// Still blocked, as a real socket would be.
+		// Still blocked in Write, witnessed above, as a real socket would be.
+	}
+}
+
+// TestSlowLogStreamReaderDoesNotPinTheHandler7632 covers the OTHER stream
+// handler (#7654 review, finding 5).
+//
+// /api/v1/logs/stream is the same shape as the event stream and was changed by
+// the same commit, but no cell touched it: every assertion in this file ran
+// through eventStreamHandler. Two handlers changed, one was tested, and the
+// untested one could have been reverted without reddening anything here.
+func TestSlowLogStreamReaderDoesNotPinTheHandler7632(t *testing.T) {
+	restore := sseWriteDeadline
+	sseWriteDeadline = 250 * time.Millisecond
+	t.Cleanup(func() { sseWriteDeadline = restore })
+
+	addr, buf, done, sl, cleanup := startStalledSSEServer7632(t,
+		(*Server).logStreamHandler, 8*1024, false)
+	defer cleanup()
+	dialAndRequestWithoutReading6809(t, addr)
+
+	time.Sleep(100 * time.Millisecond)
+	floodEvents7632(buf, 4000)
+
+	if !sl.waitForParkedWrite(10 * time.Second) {
+		t.Fatal("no write ever parked on the log stream: the cell never reached the hazard")
+	}
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the LOG stream handler is still running long after a connected " +
+			"subscriber stopped reading — logStreamHandler carries the same pin " +
+			"as eventStreamHandler and needs the same bound (#7632)")
+	}
+}
+
+// TestASeveredSSEReaderReleasesItsSubscriberSlot7632 is the finding-5 cell that
+// binds the part of the fix nothing else could see: the SLOT.
+//
+// The issue is not only a parked goroutine. Each stream holds one of 64 capped
+// subscriber slots (#4484), so pinned handlers accumulate until TrySubscribe
+// starts returning nil and the endpoint 503s for everyone — a non-reading
+// client taking the feed away from readers. Bounding the write is what lets the
+// handler return, and `defer sub.Close()` is what turns that return into a
+// freed slot; only the two together deliver the property.
+//
+// FAIL-ON-REVERT, both ways: delete `defer sub.Close()` from the handler and
+// the slot is never released, so the final TrySubscribe stays nil; remove the
+// write deadline and the handler never returns to release it at all.
+func TestASeveredSSEReaderReleasesItsSubscriberSlot7632(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		h    func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{"events", (*Server).eventStreamHandler},
+		{"logs", (*Server).logStreamHandler},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := sseWriteDeadline
+			sseWriteDeadline = 250 * time.Millisecond
+			t.Cleanup(func() { sseWriteDeadline = restore })
+
+			addr, buf, done, sl, cleanup := startStalledSSEServer7632(t, tc.h, 8*1024, false)
+			defer cleanup()
+
+			// Occupy every slot but one, so the stalled stream takes the last.
+			var held []*logging.Subscription
+			for {
+				sub := buf.TrySubscribe(4)
+				if sub == nil {
+					break
+				}
+				held = append(held, sub)
+			}
+			if len(held) < 2 {
+				t.Fatalf("precondition: expected a real subscriber cap, filled only %d", len(held))
+			}
+			last := held[len(held)-1]
+			held = held[:len(held)-1]
+			last.Close() // free exactly one slot for the handler
+			t.Cleanup(func() {
+				for _, s := range held {
+					s.Close()
+				}
+			})
+
+			dialAndRequestWithoutReading6809(t, addr)
+			time.Sleep(100 * time.Millisecond)
+			floodEvents7632(buf, 4000)
+
+			// ANTI-VACUITY FLOOR: while the stream is live the cap really is
+			// full. Without this the closing assertion would also pass against
+			// a buffer that never enforced a cap at all.
+			if probe := buf.TrySubscribe(4); probe != nil {
+				probe.Close()
+				t.Fatal("precondition: a slot was still free while the stalled stream " +
+					"was live, so this cell cannot observe the slot being RELEASED")
+			}
+			if !sl.waitForParkedWrite(10 * time.Second) {
+				t.Fatal("no write ever parked: the stream was never actually stalled")
+			}
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("handler never returned, so the slot cannot come back")
+			}
+
+			// The slot must come back. Poll: the release happens in a deferred
+			// call on the handler goroutine, just after the signal above.
+			var freed *logging.Subscription
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+				if freed = buf.TrySubscribe(4); freed != nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if freed == nil {
+				t.Fatal("a severed slow reader did NOT release its subscriber slot: the " +
+					"handler returned but the subscription outlived it, so enough " +
+					"non-reading clients still exhaust the #4484 cap and 503 the " +
+					"stream for readers that ARE reading (#7654 review, finding 5)")
+			}
+			freed.Close()
+		})
 	}
 }
 
@@ -452,3 +595,91 @@ func TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632(t *testing.T) {
 			seen, len(big))
 	}
 }
+
+// --- the FLUSH is where a small event reaches the socket --------------------
+
+// flushFailingWriter7632 is a ResponseWriter whose FLUSH fails while every
+// Write succeeds. That is not a contrived split: it is precisely what net/http
+// does to an ordinary SSE event, which is a few hundred bytes and therefore
+// sits in the 2 KiB response buffer until the flush pushes it at the socket.
+type flushFailingWriter7632 struct {
+	hdr        http.Header
+	flushes    int
+	flushErr   error
+	notFlusher bool
+}
+
+func (f *flushFailingWriter7632) Header() http.Header {
+	if f.hdr == nil {
+		f.hdr = http.Header{}
+	}
+	return f.hdr
+}
+func (f *flushFailingWriter7632) Write(p []byte) (int, error) { return len(p), nil }
+func (f *flushFailingWriter7632) WriteHeader(int)             {}
+
+// Flush is the errorless http.Flusher form — the one whose error net/http's
+// response.Flush discards. Kept so a revert to s.f.Flush() still COMPILES and
+// this cell reds on behaviour rather than on a build break.
+func (f *flushFailingWriter7632) Flush() { f.flushes++ }
+
+func (f *flushFailingWriter7632) FlushError() error {
+	f.flushes++
+	return f.flushErr
+}
+
+// TestSSEFlushFailureIsReportedToTheCaller7632 is the finding-2 regression.
+//
+// writeEvent's doc comment claimed it "RETURNS the first write error". For the
+// ordinary small event that was FALSE: the Writes are buffered by net/http and
+// succeed, the socket write happens inside the flush, and http.Flusher.Flush()
+// has no error return — net/http's response.Flush calls FlushError() and
+// discards it. So the one write that can actually fail was the one write whose
+// failure was guaranteed to be dropped.
+//
+// FAIL-ON-REVERT: change writeEvent back to `if s.f != nil { s.f.Flush() }` and
+// this cell reds — the errorless Flush is still implemented above precisely so
+// that revert compiles.
+func TestSSEFlushFailureIsReportedToTheCaller7632(t *testing.T) {
+	w := &flushFailingWriter7632{flushErr: fmt.Errorf("connection reset by peer")}
+	st := newSSEStream(w, time.Second)
+
+	err := st.writeEvent("1", "SESSION_OPEN", `{"src":"10.0.1.1"}`)
+	if w.flushes == 0 {
+		t.Fatal("precondition: the event was never flushed, so this cell cannot " +
+			"observe a flush failure at all")
+	}
+	if err == nil {
+		t.Fatal("writeEvent discarded a FLUSH failure and reported success: for an " +
+			"ordinary small event the flush is the only write that reaches the " +
+			"socket, so this is the failure that matters and it was invisible to " +
+			"the caller (#7654 review, finding 2)")
+	}
+	if !strings.Contains(err.Error(), "connection reset by peer") {
+		t.Fatalf("writeEvent returned %v, want the underlying flush error", err)
+	}
+}
+
+// TestSSEFlushNotSupportedIsNotAPeerFailure7632 is the PAIRED control.
+//
+// Without it, "return whatever Flush says" is satisfied by treating every
+// stream as broken: http.ResponseController.Flush reports ErrNotSupported for a
+// ResponseWriter that cannot flush, which is a property of the WRITER and not
+// evidence that the peer has gone. Returning it would tear down a healthy
+// stream on the first event.
+func TestSSEFlushNotSupportedIsNotAPeerFailure7632(t *testing.T) {
+	// A bare ResponseWriter: no Flush, no FlushError.
+	var w http.ResponseWriter = plainWriter7632{hdr: http.Header{}}
+	st := newSSEStream(w, time.Second)
+	if err := st.writeEvent("1", "SESSION_OPEN", `{"src":"10.0.1.1"}`); err != nil {
+		t.Fatalf("writeEvent returned %v for a ResponseWriter that merely cannot "+
+			"flush — ErrNotSupported is a property of the writer, not a dead peer, "+
+			"and treating it as terminal severs the stream on its first event", err)
+	}
+}
+
+type plainWriter7632 struct{ hdr http.Header }
+
+func (p plainWriter7632) Header() http.Header         { return p.hdr }
+func (p plainWriter7632) Write(b []byte) (int, error) { return len(b), nil }
+func (p plainWriter7632) WriteHeader(int)             {}

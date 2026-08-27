@@ -33,6 +33,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,8 +56,26 @@ type stalledConn6809 struct {
 	// write and only the elapsed backstop remains (which bounds the CHILD, not
 	// this goroutine — see the routing.go note).
 	deadlineUnsupported bool
-	closed              chan struct{}
-	closeOnce           sync.Once
+	// maxWrites, when > 0, replaces the byte budget with a WRITE COUNT: the
+	// first maxWrites conn.Writes pass and every later one parks, whatever its
+	// size (#7654 review, finding 2).
+	//
+	// The byte budget cannot express "the buffer filled after the first event".
+	// It checks budget > 0 BEFORE the write and then lets the whole write
+	// through, so any positive budget passes an entire flush no matter how
+	// large — which silently turned a probe of the pin into a probe of an IDLE
+	// handler. A write count is exact and needs no size arithmetic.
+	maxWrites int
+	writes    int
+	// parked counts writers currently blocked in Write, and parkedEver counts
+	// how many ever were. This is the instrument for #7654 review finding 3:
+	// "the handler is still running" and "the handler is blocked in Write" are
+	// different facts, and a timeout cannot tell them apart. Every cell that
+	// claims a pin must first witness parkedEver > 0.
+	parked     atomic.Int64
+	parkedEver atomic.Int64
+	closed     chan struct{}
+	closeOnce  sync.Once
 }
 
 func (c *stalledConn6809) SetWriteDeadline(t time.Time) error {
@@ -71,8 +90,13 @@ func (c *stalledConn6809) SetWriteDeadline(t time.Time) error {
 
 func (c *stalledConn6809) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	if c.budget > 0 {
+	pass := c.budget > 0
+	if c.maxWrites > 0 {
+		pass = c.writes < c.maxWrites
+	}
+	if pass {
 		c.budget -= len(p)
+		c.writes++
 		c.mu.Unlock()
 		return c.Conn.Write(p)
 	}
@@ -80,6 +104,9 @@ func (c *stalledConn6809) Write(p []byte) (int, error) {
 	c.mu.Unlock()
 
 	// Buffers are "full". A real socket parks the writer here.
+	c.parked.Add(1)
+	c.parkedEver.Add(1)
+	defer c.parked.Add(-1)
 	if wdl.IsZero() {
 		<-c.closed // no deadline armed: block until the test tears down
 		return 0, net.ErrClosed
@@ -105,6 +132,7 @@ func (c *stalledConn6809) Close() error {
 type stalledListener6809 struct {
 	net.Listener
 	budget              int
+	maxWrites           int
 	deadlineUnsupported bool
 	mu                  sync.Mutex
 	conns               []*stalledConn6809
@@ -118,6 +146,7 @@ func (l *stalledListener6809) Accept() (net.Conn, error) {
 	sc := &stalledConn6809{
 		Conn:                c,
 		budget:              l.budget,
+		maxWrites:           l.maxWrites,
 		deadlineUnsupported: l.deadlineUnsupported,
 		closed:              make(chan struct{}),
 	}
@@ -125,6 +154,36 @@ func (l *stalledListener6809) Accept() (net.Conn, error) {
 	l.conns = append(l.conns, sc)
 	l.mu.Unlock()
 	return sc, nil
+}
+
+// parkedEver reports how many writes have EVER parked across every accepted
+// conn. A cell that asserts a pin must witness this go non-zero: "the handler
+// has not returned" is also what an IDLE handler looks like, and that
+// confusion is what #7654 review finding 3 is about. It is not hypothetical —
+// it produced two wrong readings in this PR's own investigation before a
+// goroutine dump showed the handler sitting in its select rather than in Write.
+func (l *stalledListener6809) parkedEver() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var n int64
+	for _, c := range l.conns {
+		n += c.parkedEver.Load()
+	}
+	return n
+}
+
+// waitForParkedWrite blocks until some write has parked, and reports whether
+// one ever did. A cell that gets false must FAIL NAMING WHAT NEVER ARRIVED
+// rather than retry or sleep longer (docs/engineering-style.md, #7563).
+func (l *stalledListener6809) waitForParkedWrite(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if l.parkedEver() > 0 {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return l.parkedEver() > 0
 }
 
 func (l *stalledListener6809) releaseAll() {
