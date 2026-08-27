@@ -1,89 +1,31 @@
-## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
+## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
 
 - **Timestamp**: 2026-08-26
-- **Action**: Hostile review returned a HIGH on my own #7632 fix and it
-  reproduces. `deadlineArmingWriter` sets a deadline before every write and
-  never clears it; a write succeeding does not cancel it. Under HTTP/1.1 that is
-  invisible. Under HTTP/2 Go implements the write deadline as a timer that
-  RESETS THE STREAM, so my fix tore down an idle SSE feed one deadline after its
-  last event — with a client that had consumed everything and a firewall that
-  was legitimately quiet. Exactly the defect the design was written to avoid,
-  reintroduced by the mechanism chosen to avoid it.
-  REPRODUCED BEFORE FIXING rather than acting on the argument: HTTP/2 test
-  server, one event, idle 4x the deadline ->
-  `read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer`.
-  Fix: clear the deadline once the event is fully out. AFTER the flush, not
-  after the last Write — `http.Flusher.Flush()` does not go through the arming
-  writer, so clearing earlier would leave the flush unbounded and re-open the
-  pin.
-  WHY MY IDLE CELL DID NOT CATCH IT, and it is not the vacuity I had already
-  ruled out by mutation: the cell genuinely arms the deadline, but its helper
-  uses `httptest.NewServer`, which is HTTP/1.1 ONLY, while production permits
-  HTTP/2 on the TLS listener. Sound on the protocol it exercises, blind to the
-  one where expiry kills the stream. The lesson generalises past this file: a
-  cell's PROTOCOL is part of its fixture, and an HTTP/1.1 harness cannot observe
-  an HTTP/2 stream-reset timer.
-  So "per-write, not elapsed" was necessary and NOT sufficient — per-write still
-  severs an idle stream if the deadline outlives the write. The window has to
-  CLOSE as well as open.
-  Finding 2 (MEDIUM): the whole payload went out under one absolute deadline, so
-  a large event to a slow-but-PROGRESSING reader was cut off partway. The "few
-  hundred bytes" premise is unenforced — event JSON carries operator-authored
-  strings bounded only by the 16 MiB config limit. Payload now written in 32 KiB
-  chunks, each re-arming.
-  Finding 3 (LOW): my own harness published the establishing event once after a
-  fixed 150ms sleep, with no replay on subscriptions — the #7650 shape in my own
-  test. Now publishes on a ticker until the GET returns, with a bounded client.
-- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
-  `pkg/api/README.md`, `_Log.md`
-- **Validation**: the new HTTP/2 cell is verified to be the detector — removing
-  the clear reds `TestIdleSSEStreamIsNotResetOnHTTP2_7632` and leaves every
-  HTTP/1.1 cell GREEN, which is the measurement of the blindness rather than an
-  assertion about it.
-
-## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
-
-- **Timestamp**: 2026-08-26
-- **Action**: The SSE sibling of #6809. `writeSSEEvent` wrote straight to the
-  `ResponseWriter` and DISCARDED every write error, and `WriteTimeout` is 0
-  process-wide for exactly these streams — so a subscriber that stays CONNECTED
-  and stops reading parked the handler in `Write` indefinitely while holding a
-  subscriber slot. Both handlers now write through `sseStream`, reusing the
-  `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
-  first write error, which both loops treat as terminal.
-  I FIRST CLAIMED THE ERROR RETURN WAS LOAD-BEARING, THEN MEASURED IT AND IT IS
-  NOT. The claim was that adding the deadline without propagating the error
-  would be worse than the pin — the loop draining the subscription into a dead
-  connection. The mutation matrix said otherwise (M2/M3 green), so I probed
-  instead of arguing: with the error deliberately discarded the handler returns
-  in 254.6ms against a 250ms deadline, versus 254.9ms with the check.
-  Indistinguishable, because net/http cancels the request context as soon as a
-  write to the connection fails and the loop exits through its ctx.Done() arm
-  regardless. The deadline is what fixes the pin. The error check is kept as
-  DEFENCE IN DEPTH — that exit is net/http behaviour, not contract, so a
-  wrapping ResponseWriter or a different server that does not cancel would leave
-  the loop draining — and it is labelled precautionary in the code, the README
-  and the PR rather than described as the thing preventing a worse failure.
-  PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
-  from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
-  an elapsed budget would sever the healthy case. A per-write deadline bounds a
-  write that has BEGUN and says nothing about the gap between events.
-  Found a pre-existing behaviour while building the harness and did NOT fix it:
-  net/http sends no response headers until the first Write/Flush, and
-  `setSSEHeaders` only sets header VALUES — so a client connecting to a quiet
-  feed blocks in `http.Get` waiting for headers nobody sent. A browser
-  EventSource on an idle firewall hangs rather than establishing the stream.
-  Recorded in the README and in the harness comment; out of scope here.
-- **File(s)**: `pkg/api/sse.go`,
-  `pkg/api/sse_slow_reader_pin_7632_test.go` (new), `pkg/api/README.md`,
-  `_Log.md`
-- **Validation**: reused #6809's `stalledConn6809`/`stalledListener6809` — a
-  net.Conn that parks the writer exactly as a full send buffer does — rather
-  than rebuilding an instrument for the same class. Includes the NEGATIVE
-  CONTROL proving the fixture can genuinely pin (deadlines unsupported → the
-  handler must still be running), the SSE-specific idle cell that reds if
-  anyone adds an elapsed budget by analogy with `bgpStreamTotalBudget`, and a
-  paired healthy-reader control.
+- **Action**: `sshdConfPath` is a package var precisely so a test can point the
+  xpf-managed sshd drop-in at a throwaway tree, but `applySSHConfig` created its
+  DIRECTORY from a hard-coded `/etc/ssh/sshd_config.d`. Relocating the var gave
+  a file path with no parent, the write failed ENOENT, and the failure surfaced
+  as whatever the test was actually asserting — so a cell checking only "an
+  error was returned" passed while observing the fixture's own broken seam
+  rather than the injected condition. Derived the directory from
+  `filepath.Dir(sshdConfPath)`; byte-identical in production.
+  DELETED the `os.MkdirAll(filepath.Dir(sshdConfPath))` workaround the #6790
+  credential cells were carrying. That deletion IS the regression signal: the
+  #6790 suite passes without it, which is the observable proof the derivation
+  works, and if the parent stops being derived the healthy-control cell goes red
+  instead of the failure being absorbed.
+  Added a PAIRED production-value cell, which is the one that keeps this from
+  being a behaviour change: every other cell relocates the path, so none of them
+  would notice if the derivation produced the wrong directory on a real box.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/sshd_dropin_dir_seam_7609_test.go` (new),
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+- **Validation**: 3 cells — the relocation property with a NESTED path (so a fix
+  that only works for an existing grandparent still fails) and no pre-created
+  parent, the production-value control, and a cell holding the pre-existing
+  #2062 property that the mkdir error is still surfaced by name rather than
+  swallowed into the opaque downstream write error.
 
 ## 2026-08-26 — #6830 round 2: `ntp` was an INVENTED row, and it was on the wire
 
@@ -106736,6 +106678,127 @@ prose edit above them added. No diff falls in the new test body.
     terminal schema node permitting a body (Codex re-review finding 1)
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
+
+## 2026-08-26 — #2419 widen the compact/block census to named instances
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove the named-instance exclusion from the #2419 census walker
+  and regenerate the inventory. No production change — this is a measurement
+  correction, and it makes the number the normalizer's criterion rests on
+  checkable by anyone.
+- **The exclusion was WRONG, and wrong in the direction that hides defects.**
+  It was generalized from ONE probe — `interfaces { ge-0/0/0 description
+  hello; }`, which genuinely compiles to zero interfaces — to every named
+  instance in the schema. Measured on the rest: `interface ge-0/0/0.0 cost 10;`
+  compiles the interface with `cost=0`. The instance IS recognised; only its
+  body is lost, which is strictly worse than not recognising it because the
+  half-built object reaches the renderer and the runtime. #7653 is the same
+  shape two levels deep, with OSPF authentication as the dropped body.
+- **Numbers, re-derived at `6b80a84f6`** (NOT the 363 measured before #6817/
+  #6818/#6822 merged — that number is now stale in a way that looks like
+  progress): **546 checked, 356 divergent, 204 unruled**. The honest quote is
+  ">= 356 divergent, 204 unruled": the unruled grew 96 -> 204 with the widening
+  and they are sites whose synthesized fixture was too thin to OBSERVE the
+  value, not clean sites.
+- **Golden diff classified before trusting it**: 0 data lines REMOVED (nothing
+  that was divergent silently stopped being divergent, so no behaviour change is
+  laundered in), +169 added, 5 header lines re-counted. Sample-verified one
+  added site by hand: `applications { application myapp description hello; }`
+  compiles the application with an EMPTY description while the block spelling
+  sets it.
+- **Not covered, and named as such**: the walker collapses exactly ONE level, so
+  it cannot generate #7653's two-level tail. Shape 3 is unmeasured here and its
+  number is owed separately, with the depth it reached stated.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`, `_Log.md`
+
+## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hostile review returned a HIGH on my own #7632 fix and it
+  reproduces. `deadlineArmingWriter` sets a deadline before every write and
+  never clears it; a write succeeding does not cancel it. Under HTTP/1.1 that is
+  invisible. Under HTTP/2 Go implements the write deadline as a timer that
+  RESETS THE STREAM, so my fix tore down an idle SSE feed one deadline after its
+  last event — with a client that had consumed everything and a firewall that
+  was legitimately quiet. Exactly the defect the design was written to avoid,
+  reintroduced by the mechanism chosen to avoid it.
+  REPRODUCED BEFORE FIXING rather than acting on the argument: HTTP/2 test
+  server, one event, idle 4x the deadline ->
+  `read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer`.
+  Fix: clear the deadline once the event is fully out. AFTER the flush, not
+  after the last Write — `http.Flusher.Flush()` does not go through the arming
+  writer, so clearing earlier would leave the flush unbounded and re-open the
+  pin.
+  WHY MY IDLE CELL DID NOT CATCH IT, and it is not the vacuity I had already
+  ruled out by mutation: the cell genuinely arms the deadline, but its helper
+  uses `httptest.NewServer`, which is HTTP/1.1 ONLY, while production permits
+  HTTP/2 on the TLS listener. Sound on the protocol it exercises, blind to the
+  one where expiry kills the stream. The lesson generalises past this file: a
+  cell's PROTOCOL is part of its fixture, and an HTTP/1.1 harness cannot observe
+  an HTTP/2 stream-reset timer.
+  So "per-write, not elapsed" was necessary and NOT sufficient — per-write still
+  severs an idle stream if the deadline outlives the write. The window has to
+  CLOSE as well as open.
+  Finding 2 (MEDIUM): the whole payload went out under one absolute deadline, so
+  a large event to a slow-but-PROGRESSING reader was cut off partway. The "few
+  hundred bytes" premise is unenforced — event JSON carries operator-authored
+  strings bounded only by the 16 MiB config limit. Payload now written in 32 KiB
+  chunks, each re-arming.
+  Finding 3 (LOW): my own harness published the establishing event once after a
+  fixed 150ms sleep, with no replay on subscriptions — the #7650 shape in my own
+  test. Now publishes on a ticker until the GET returns, with a bounded client.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+- **Validation**: the new HTTP/2 cell is verified to be the detector — removing
+  the clear reds `TestIdleSSEStreamIsNotResetOnHTTP2_7632` and leaves every
+  HTTP/1.1 cell GREEN, which is the measurement of the blindness rather than an
+  assertion about it.
+
+## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
+
+- **Timestamp**: 2026-08-26
+- **Action**: The SSE sibling of #6809. `writeSSEEvent` wrote straight to the
+  `ResponseWriter` and DISCARDED every write error, and `WriteTimeout` is 0
+  process-wide for exactly these streams — so a subscriber that stays CONNECTED
+  and stops reading parked the handler in `Write` indefinitely while holding a
+  subscriber slot. Both handlers now write through `sseStream`, reusing the
+  `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
+  first write error, which both loops treat as terminal.
+  I FIRST CLAIMED THE ERROR RETURN WAS LOAD-BEARING, THEN MEASURED IT AND IT IS
+  NOT. The claim was that adding the deadline without propagating the error
+  would be worse than the pin — the loop draining the subscription into a dead
+  connection. The mutation matrix said otherwise (M2/M3 green), so I probed
+  instead of arguing: with the error deliberately discarded the handler returns
+  in 254.6ms against a 250ms deadline, versus 254.9ms with the check.
+  Indistinguishable, because net/http cancels the request context as soon as a
+  write to the connection fails and the loop exits through its ctx.Done() arm
+  regardless. The deadline is what fixes the pin. The error check is kept as
+  DEFENCE IN DEPTH — that exit is net/http behaviour, not contract, so a
+  wrapping ResponseWriter or a different server that does not cancel would leave
+  the loop draining — and it is labelled precautionary in the code, the README
+  and the PR rather than described as the thing preventing a worse failure.
+  PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
+  from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
+  an elapsed budget would sever the healthy case. A per-write deadline bounds a
+  write that has BEGUN and says nothing about the gap between events.
+  Found a pre-existing behaviour while building the harness and did NOT fix it:
+  net/http sends no response headers until the first Write/Flush, and
+  `setSSEHeaders` only sets header VALUES — so a client connecting to a quiet
+  feed blocks in `http.Get` waiting for headers nobody sent. A browser
+  EventSource on an idle firewall hangs rather than establishing the stream.
+  Recorded in the README and in the harness comment; out of scope here.
+- **File(s)**: `pkg/api/sse.go`,
+  `pkg/api/sse_slow_reader_pin_7632_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: reused #6809's `stalledConn6809`/`stalledListener6809` — a
+  net.Conn that parks the writer exactly as a full send buffer does — rather
+  than rebuilding an instrument for the same class. Includes the NEGATIVE
+  CONTROL proving the fixture can genuinely pin (deadlines unsupported → the
+  handler must still be running), the SSE-specific idle cell that reds if
+  anyone adds an elapsed budget by analogy with `bgpStreamTotalBudget`, and a
+  paired healthy-reader control.
 
 ## 2026-08-26 — #7632 SSE slow reader: review findings 2/3/5/6
 

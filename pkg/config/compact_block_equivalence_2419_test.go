@@ -107,19 +107,34 @@ type compactSite struct {
 	node      *schemaNode
 }
 
-// A site is compactable ONLY when the innermost container is a PLAIN KEYWORD
-// stanza — args == 0 and not reached through a wildcard. A NAMED INSTANCE
-// (`interfaces ge-0/0/0`, `user ops`, `stream audit`) carries its name in the
-// node's own Keys, so collapsing the next level onto it does not produce the
-// compact spelling of the same intent; it produces a node the compiler cannot
-// recognise as that named instance at all. All four filed instances compact a
-// plain stanza (`authentication`, `transport`, `authentication-sha256`).
+// A site is compactable when the innermost container is EITHER a plain keyword
+// stanza (`authentication`, `transport`) OR a NAMED INSTANCE
+// (`interface ge-0/0/0.0`, `user ops`, `stream audit`).
+//
+// This census previously excluded named instances, on the stated premise that
+// collapsing one "produces a node the compiler cannot recognise as that named
+// instance at all". That premise was WRONG, and wrong in the direction that
+// hides defects. It was generalized from a single probe — `interfaces {
+// ge-0/0/0 description hello; }`, which really does compile to zero interfaces
+// — to every named instance in the schema. Measured on the rest:
+//
+//	interface ge-0/0/0.0 { cost 10; }        -> ifaces=1 cost=10
+//	interface ge-0/0/0.0 cost 10;            -> ifaces=1 cost=0     <- recognised, body dropped
+//
+// The instance IS recognised; only its body is lost. That is strictly worse
+// than not recognising it, because the half-built object reaches the renderer
+// and the runtime: `show configuration` displays what the operator wrote, the
+// interface binds normally, and it enforces nothing. #7653 is the same shape
+// two levels deep, where the dropped body is OSPF authentication.
+//
+// So the exclusion was hiding ~169 sites of the same class the census exists to
+// count. Removing it is not a scope change; it is a correction.
 
 func collectCompactSites() []compactSite {
 	var out []compactSite
 	seen := map[string]bool{}
-	var walk func(n *schemaNode, path []string, depth int, plainInner bool)
-	walk = func(n *schemaNode, path []string, depth int, plainInner bool) {
+	var walk func(n *schemaNode, path []string, depth int)
+	walk = func(n *schemaNode, path []string, depth int) {
 		if n == nil || depth > 7 {
 			return
 		}
@@ -133,7 +148,7 @@ func collectCompactSites() []compactSite {
 			if ch == nil {
 				continue
 			}
-			if ch.children == nil && ch.wildcard == nil && ch.args == 1 && len(path) >= 1 && plainInner {
+			if ch.children == nil && ch.wildcard == nil && ch.args == 1 && len(path) >= 1 {
 				key := strings.Join(path, "/") + "|" + name
 				if !seen[key] {
 					seen[key] = true
@@ -147,13 +162,13 @@ func collectCompactSites() []compactSite {
 				elem += " xpfarg"
 			}
 			np := append(append([]string(nil), path...), elem)
-			walk(ch, np, depth+1, ch.args == 0)
+			walk(ch, np, depth+1)
 		}
 		if n.wildcard != nil {
-			walk(n.wildcard, append(append([]string(nil), path...), "xpfname"), depth+1, false)
+			walk(n.wildcard, append(append([]string(nil), path...), "xpfname"), depth+1)
 		}
 	}
-	walk(setSchema, nil, 0, false)
+	walk(setSchema, nil, 0)
 	return out
 }
 
