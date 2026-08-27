@@ -2705,3 +2705,104 @@ fn t_run_6836(
          the packet on the wire is IPv4."
     );
 }
+
+/// #6857 WIRING: the install SITE must derive the owner RG, not stamp a
+/// constant.
+///
+/// The cells in nat64_tests.rs call `Nat64FragAssoc::install` directly with an
+/// explicit owner RG, so they pin the fence and say nothing about where the
+/// stamp comes from. The mutation matrix proved it: replacing the
+/// `owner_rg_for_resolution(...)` call at both install sites with a literal `0`
+/// left the ENTIRE suite green — the fence was correct and permanently unarmed,
+/// because owner RG 0 is deliberately never fenced.
+///
+/// This drives a real NAT64 first fragment through `txn_run_descriptor` with an
+/// RG-bound egress, then asks the published association which RG it carries.
+#[test]
+fn nat64_frag_assoc_install_site_derives_the_owner_rg_6857() {
+    let mut forwarding = build_forwarding_state(&nat64_frag_snapshot());
+    // Bind every egress to RG 3. The fixture binds none, so without this the
+    // derivation returns 0 legitimately and the cell could not tell a derived
+    // zero from a hardcoded one.
+    for iface in forwarding.egress.values_mut() {
+        iface.redundancy_group = 3;
+    }
+    // RG 3 must be forwarding-active for the first fragment to be admitted at
+    // all — the install is what publishes the association this cell reads.
+    // txn_ha_state() only carries RGs 1 and 2, and the PREMISE assertion below
+    // is what turned that omission into a named failure rather than an empty
+    // read.
+    let mut ha_state = txn_ha_state();
+    ha_state.insert(
+        3,
+        crate::afxdp::types::HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: 123,
+            lease: crate::afxdp::types::HAGroupRuntime::active_lease_until(123, 123),
+        },
+    );
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(16);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let first = nat64_v6_frag_frame(0x0001, 0x1234_5678, src, dst, 12345, 443);
+    let (_b, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        nat64_v6_frag_meta(first.len(), src, dst),
+    );
+    assert_eq!(
+        dbg.tx, 1,
+        "#6857 PREMISE: the first fragment must translate and forward, or no \
+         association is published and the assertion below reads nothing"
+    );
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "#6857 PREMISE: exactly one association must have been published"
+    );
+
+    // Ask the association which RG it carries, by recording what the fence
+    // predicate is asked about. A hardcoded 0 never reaches the predicate at
+    // all, because owner_rg 0 is deliberately not fenced.
+    let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
+    let key = crate::nat64::nat64_nonfirst_fragment_key(
+        &non_first[14..],
+        libc::AF_INET6,
+        crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
+            &forwarding,
+            nat64_v6_frag_meta(non_first.len(), src, dst),
+            None,
+        ),
+    );
+    let Some(key) = key else {
+        panic!("#6857: could not build the non-first fragment key");
+    };
+    let asked = std::cell::Cell::new(Vec::<i32>::new());
+    let hit = forwarding.nat64.frag_assoc.lookup(
+        &key,
+        1_000,
+        forwarding.nat64.build_generation,
+        |rg| {
+            let mut v = asked.take();
+            v.push(rg);
+            asked.set(v);
+            true
+        },
+    );
+    assert!(hit.is_some(), "#6857 PREMISE: the association must be findable");
+    assert_eq!(
+        asked.take(),
+        vec![3],
+        "#6857: the install site must DERIVE the owner RG from the resolution. \
+         An empty list means the entry carries 0, so the fence can never fire \
+         and the whole change is inert — which is exactly what the matrix saw \
+         when the derivation was replaced by a literal"
+    );
+}
