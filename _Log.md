@@ -107071,13 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-- **Timestamp**: 2026-08-27 02:35
-  - **Action**: #7688 — clear the PEER's manual-failover pin in the post-deploy
-    primary reassert. ManualFailover is local, unsynced state, so a pin left on
-    node1 by an earlier smoke was invisible to node0 and blocked the election
-    the reassert depends on, failing `cluster-deploy` as a plausible-looking HA
-    regression. Verified by measurement: node1 read `Manual=yes` on all 3 RGs;
-    resetting it there made `cluster-deploy` on clean master pass rc=0.
-  - **File(s)**: test/incus/deploy-lib.sh, test/incus/cluster-setup.sh,
-    test/incus/deploy-lib-selftest.sh
