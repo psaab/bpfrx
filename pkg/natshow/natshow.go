@@ -102,13 +102,22 @@ func noteLenientTerminalAction(w io.Writer, cfg *config.Config, kind, ruleSet, r
 		}
 		var consequence string
 		switch {
-		case r.Actions == 0 && kind == "source":
+		case r.Actions == 0:
+			// #6823: ONE arm for both kinds, because the decision is that the
+			// CONSEQUENCE is kind-independent — an actionless rule is
+			// NON-TERMINAL either way. Source NAT reaches that by publishing
+			// the rule and letting the Rust matcher's `else` arm continue;
+			// destination NAT by not publishing it at all. Naming the
+			// MECHANISM per kind is what went wrong before: the destination
+			// arm said only "the rule is not published to the dataplane at
+			// all", which is true and reads as INERT — the exact framing the
+			// #5717/#6820 work retired — so the operator whose DNAT exemption
+			// silently does nothing was told the reassuring half of the
+			// sentence. The mechanism is already covered on that side by the
+			// #6534 NOT INSTALLED line; the consequence is what this one owes.
 			consequence = "it installs no translation and does NOT stop rule " +
 				"evaluation, so matching traffic falls through to any later " +
 				"broader rule"
-		case r.Actions == 0:
-			consequence = "it installs no translation; the rule is not published " +
-				"to the dataplane at all"
 		default:
 			consequence = fmt.Sprintf("it carries %d mutually-exclusive actions; "+
 				"all but one are discarded by a fixed precedence, not by "+

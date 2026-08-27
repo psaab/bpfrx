@@ -279,6 +279,17 @@ pub(crate) struct NatCounterStore {
     /// fail-on-revert test) reads. Monotonic error counter, not a gauge: it is
     /// only bumped, never reset by a reconcile.
     parse_errors: Arc<AtomicU64>,
+    /// #6823: the `record_parse_error` DETAILS, captured in test builds so a
+    /// test can bind what the operator is told and not merely how many drops
+    /// happened. Two drops with different causes are indistinguishable by
+    /// `parse_errors` alone, and the message is the whole operator-facing
+    /// half of #4718's loud-skip doctrine — an actionless DNAT rule reported
+    /// as an "unparseable pool address" sends someone hunting a
+    /// serialization bug instead of the malformed config rule that
+    /// `xpf_nat_rules_lenient_terminal_action` (#7640) is already flagging.
+    /// Compiled out of production builds entirely.
+    #[cfg(test)]
+    parse_error_details: Arc<Mutex<Vec<String>>>,
 }
 
 impl NatCounterStore {
@@ -375,7 +386,22 @@ impl NatCounterStore {
     /// the log adds no forwarding latency.
     pub(crate) fn record_parse_error(&self, detail: &str) {
         self.parse_errors.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Ok(mut d) = self.parse_error_details.lock() {
+            d.push(detail.to_string());
+        }
         eprintln!("xpf nat reconcile: dropping rule (unparseable field): {detail}");
+    }
+
+    /// #6823: the details recorded by [`record_parse_error`](Self::record_parse_error),
+    /// in call order. The testable seam for the MESSAGE, alongside
+    /// [`parse_errors`](Self::parse_errors) for the count.
+    #[cfg(test)]
+    pub(crate) fn parse_error_details(&self) -> Vec<String> {
+        self.parse_error_details
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default()
     }
 
     /// #4718: cumulative NAT reconcile parse-failure count (see
