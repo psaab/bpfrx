@@ -1,3 +1,24 @@
+## 2026-08-27 — #7615: the remaining debt-driven retry owners get an operator signal
+
+- **Timestamp**: 2026-08-27
+- **Action**: Measured the population against master before wiring, and my own
+  issue text was wrong twice. There are SIX always-on retry loops, not four —
+  `mgmtListenerReassertLoop` (#6803) did not exist when the issue was filed —
+  and `proxyARPReassertLoop` is not wirable as stated: it keeps no debt and
+  re-runs its reconcile unconditionally, so a gauge could only report a
+  constant. Giving it a real signal means inventing a predicate first, which is
+  design rather than wiring; split out as #7685 rather than folded in.
+  Wired the three that already have a predicate — #6793, #6791, #6803 — onto the
+  surface #6800/#6802 established. Each accessor reads the SAME predicate its
+  loop gates on, because one derived from a parallel predicate could read 0
+  while the loop was still re-driving and both halves would look correct alone.
+- **File(s)**: `pkg/daemon/retry_owner_visibility_7615.go` (new),
+  `pkg/daemon/daemon_run_servers.go`, `pkg/api/server.go`,
+  `pkg/api/metrics.go`, `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/api/metrics_retry_owner_visibility_7615_test.go` (new),
+  `pkg/daemon/retry_owner_visibility_7615_test.go` (new),
+  `pkg/daemon/README.md`
+
 ## 2026-08-27 — #6821: security-log transport packed tail, gate and compiler together
 
 - **Timestamp**: 2026-08-27

@@ -2286,6 +2286,25 @@ never lock an operator out of a remote box it manages.
   seam relocates file and parent together — the property `provisionedUsersDir`
   already has for the three #5841 marker roots.
 
+  **Retry-owner visibility completed (#7615).** Six always-on loops in `Run`
+  re-drive a failure that had no other owner. #6800 and #6802 published;
+  `RADeadSenderPending` (#6793), `FabricOverlayMissing` (#6791) and
+  `ManagementListenerDown` (#6803) now do too, as
+  `xpf_ra_dead_sender_pending` / `xpf_fabric_overlay_missing` /
+  `xpf_management_listener_down`. Each accessor reads the SAME predicate its
+  loop gates on — deliberately, because one derived from a parallel predicate
+  could report 0 while the loop was still re-driving, and both halves would look
+  correct alone. Emitted before the dataplane gate (these repairs all run in
+  config-only mode) and OMITTED rather than published as `0` when unwired
+  (#6828). `proxyARPReassertLoop` is deliberately absent: it keeps no debt and
+  re-runs its reconcile unconditionally, so a gauge could only report a
+  constant; giving it a real signal needs a predicate invented first, tracked as
+  **#7685**. Tests: `pkg/api/metrics_retry_owner_visibility_7615_test.go`
+  (paired per gauge through a pedantic registry, plus the absent-vs-zero
+  contract) and `pkg/daemon/retry_owner_visibility_7615_test.go` (the
+  source-level wiring cell, and a cell binding each accessor to its loop's own
+  gate in both directions).
+
   **sshd is the third instance, and the one the "already covered" reading
   misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's
   `revertDropIn` restores the prior content on a failed reload, so the file no
