@@ -107071,24 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-## 2026-08-27 — #7230: a keepalive now carries the peer that sent it
-
-- **Timestamp**: 2026-08-27
-- **Action**: A zero-length authenticated WireGuard keepalive exited `try_decap`
-  as `Err(MalformedInner)`, discarding the peer identity; the caller recovered it
-  with `single_peer_pubkey()`, which is `None` on any multi-peer interface, so a
-  keepalive-only roaming peer never roamed its endpoint and was blackholed until
-  its next handshake (~120-180s, bounded). Added `DecapError::Keepalive(pubkey)`
-  — the identity is available at the construction site because `try_decap`
-  demuxes by `hdr.receiver_index` BEFORE any AEAD work — routed through
-  `count_decap_err` so the exhaustive match forces an observability arm.
-  Deliberately inverted two green tests with their rationale, and retracted the
-  `docs/wireguard-interop.md` S5 claim that keepalive endpoint learning had
-  shipped (true single-peer, false multi-peer). Scoped OUT and filed as #7686:
-  the same discard on the malformed-but-authenticated inner path, measured at 13
-  assertion sites and anomalous rather than continuous traffic.
-- **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs`,
-  `userspace-dp/src/afxdp/wg/counters.rs`,
-  `userspace-dp/src/afxdp/coordinator/wg_control/dispatch.rs`,
-  `userspace-dp/src/afxdp/wg/tests.rs`, `docs/wireguard-interop.md`, `_Log.md`
