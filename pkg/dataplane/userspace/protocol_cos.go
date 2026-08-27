@@ -78,13 +78,31 @@ type CoSSchedulerSnapshot struct {
 	// absolute transmit_rate_bytes is set. omitempty keeps the wire
 	// byte-identical for configs that use an absolute rate.
 	TransmitRatePercent float64 `json:"transmit_rate_percent,omitempty"`
-	TransmitRateExact   bool    `json:"transmit_rate_exact,omitempty"`
-	Priority            string  `json:"priority,omitempty"`
-	BufferSizeBytes     uint64  `json:"buffer_size_bytes,omitempty"`
+	// TransmitRateRemainder (#6846, the #4228 Gap 2 residual) carries the
+	// Junos `transmit-rate remainder` form. Additive for the same reason
+	// TransmitRatePercent is: an older dataplane ignores it and behaves
+	// exactly as before.
+	//
+	// Unlike percent it is NOT a function of the scheduler alone — it means
+	// "whatever the interface's shaping rate has left after every sibling
+	// queue on the same scheduler-map has resolved", so it can only be
+	// materialized once the sibling set is known. That is why it is carried
+	// as a flag and resolved per-interface in forwarding_build::cos rather
+	// than pre-computed here.
+	TransmitRateRemainder bool   `json:"transmit_rate_remainder,omitempty"`
+	TransmitRateExact     bool   `json:"transmit_rate_exact,omitempty"`
+	Priority              string `json:"priority,omitempty"`
+	BufferSizeBytes       uint64 `json:"buffer_size_bytes,omitempty"`
 	// BufferSizePercent is additive to preserve the legacy
 	// buffer_size_bytes wire contract. Older dataplanes ignore it;
 	// newer dataplanes use it only when buffer_size_bytes is absent.
 	BufferSizePercent float64 `json:"buffer_size_percent,omitempty"`
+	// BufferSizeTemporalUS (#6846) carries the Junos `buffer-size temporal
+	// <microseconds>` form: a queue depth expressed as DRAIN TIME rather
+	// than as bytes. Converting it needs the queue's own resolved
+	// transmit-rate, so it resolves strictly AFTER the rate — including
+	// after `remainder`, when both are set on one queue.
+	BufferSizeTemporalUS uint64 `json:"buffer_size_temporal_us,omitempty"`
 	// SurplusSharing (#915) opts an exact queue into surplus-phase
 	// participation; only meaningful when TransmitRateExact == true.
 	SurplusSharing bool `json:"surplus_sharing,omitempty"`

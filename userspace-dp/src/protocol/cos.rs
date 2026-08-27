@@ -131,6 +131,14 @@ pub(crate) struct CoSSchedulerSnapshot {
     /// so a well-formed snapshot never sets both.
     #[serde(rename = "transmit_rate_percent", default)]
     pub transmit_rate_percent: f64,
+    /// #6846: the Junos `transmit-rate remainder` form — "whatever the
+    /// interface shaping rate has left after every sibling queue on the same
+    /// scheduler-map resolves". Carried as a FLAG rather than a rate because
+    /// it is a function of the sibling set, not of this scheduler, and the
+    /// sibling set is only known per-interface in `forwarding_build::cos`.
+    /// Legacy snapshots default to false and behave exactly as before.
+    #[serde(rename = "transmit_rate_remainder", default)]
+    pub transmit_rate_remainder: bool,
     #[serde(rename = "transmit_rate_exact", default)]
     pub transmit_rate_exact: bool,
     #[serde(default)]
@@ -142,6 +150,13 @@ pub(crate) struct CoSSchedulerSnapshot {
     /// to 0.0 and is used by the runtime only when byte size is absent.
     #[serde(rename = "buffer_size_percent", default)]
     pub buffer_size_percent: f64,
+    /// #6846: the Junos `buffer-size temporal <microseconds>` form — a queue
+    /// depth expressed as DRAIN TIME. Converting it to bytes needs the
+    /// queue's own resolved transmit-rate, so it is applied strictly after
+    /// the rate resolves (including after `remainder`). Legacy snapshots
+    /// default to 0 and keep the existing byte/percent sizing.
+    #[serde(rename = "buffer_size_temporal_us", default)]
+    pub buffer_size_temporal_us: u64,
     /// #915: opt an exact queue into surplus-phase participation
     /// so it can draw from root surplus tokens once its own bucket
     /// is empty. Only meaningful when transmit_rate_exact == true;
@@ -525,4 +540,3 @@ pub(crate) struct CoSActiveFlowCountStatus {
     #[serde(rename = "active_flow_count", default)]
     pub active_flow_count: u32,
 }
-

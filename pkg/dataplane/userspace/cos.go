@@ -208,10 +208,18 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				Name:                sched.Name,
 				TransmitRateBytes:   sched.TransmitRateBytes,
 				TransmitRatePercent: sched.TransmitRatePercent,
-				TransmitRateExact:   sched.TransmitRateExact,
-				Priority:            sched.Priority,
-				BufferSizeBytes:     sched.BufferSizeBytes,
-				BufferSizePercent:   sched.BufferSizePercent,
+				// #6846: carry the two forms that #4228 Gap 2 left
+				// accepted-but-inert. Both are resolved per-interface in
+				// forwarding_build::cos rather than here, for the same
+				// reason percent is: a named scheduler maps onto interfaces
+				// with different shaping rates, so the absolute value is a
+				// property of the (scheduler, interface) pair.
+				TransmitRateRemainder: sched.TransmitRateRemainder,
+				TransmitRateExact:     sched.TransmitRateExact,
+				Priority:              sched.Priority,
+				BufferSizeBytes:       sched.BufferSizeBytes,
+				BufferSizePercent:     sched.BufferSizePercent,
+				BufferSizeTemporalUS:  sched.BufferSizeTemporalUS,
 				// #915/#4966: surplus-sharing is a no-op without
 				// transmit-rate exact. ValidateConfig warns but no
 				// longer strips it (that made validation mutate the

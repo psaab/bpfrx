@@ -298,7 +298,10 @@ fn build_cos_lp_rewrite(
     if let Some(rule) = tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule) {
         for queue in &cfg.queues {
             for lp in 0..COS_LOSS_PRIORITY_LEVELS {
-                if let Some(&dscp) = rule.dscp_by_fc_lp.get(&(queue.forwarding_class.clone(), lp)) {
+                if let Some(&dscp) = rule
+                    .dscp_by_fc_lp
+                    .get(&(queue.forwarding_class.clone(), lp))
+                {
                     dscp_rewrite_by_queue_lp.insert((queue.queue_id, lp), dscp);
                 }
             }
@@ -341,7 +344,47 @@ fn cos_scheduler_buffer_bytes(
     if let Some(bytes) = percent_bytes {
         return bytes;
     }
+    // #6846: `buffer-size temporal <us>` sizes the queue by DRAIN TIME rather
+    // than bytes, so it converts against `transmit_rate_bytes` — which by this
+    // point is the queue's RESOLVED rate, including a `remainder` that has
+    // already taken its share. That ordering is the reason temporal could not
+    // be done as part of the #4228 percent work: it has no meaning until the
+    // rate is known.
+    //
+    // The three buffer-size forms are mutually exclusive in Junos and the Go
+    // strict gate enforces that, so the order among them here only decides
+    // which wins on a malformed snapshot reaching the lenient path — and
+    // preferring the explicit byte/percent forms over the derived one is the
+    // conservative choice.
+    if let Some(bytes) =
+        cos_temporal_buffer_bytes(transmit_rate_bytes, sched.buffer_size_temporal_us)
+    {
+        return bytes.into();
+    }
     default_cos_burst_bytes(transmit_rate_bytes)
+}
+
+/// #6846: convert `buffer-size temporal <microseconds>` into bytes at
+/// `rate_bytes_per_sec`, or `None` when it cannot be converted.
+///
+/// `None` for a zero rate is the load-bearing case: a queue with no resolved
+/// transmit rate has no drain speed, so a microsecond target has no byte value
+/// and the caller falls back to the default sizing exactly as before this
+/// change. Returning 0 instead would size the queue to nothing, which is a
+/// blackhole dressed as configuration.
+///
+/// Clamped identically to `cos_percent_buffer_bytes` — ceil, floor of 1, and
+/// saturation at u64::MAX — so the two derived forms round the same way and a
+/// reviewer does not have to hold two rounding rules.
+fn cos_temporal_buffer_bytes(rate_bytes_per_sec: u64, temporal_us: u64) -> Option<u64> {
+    if rate_bytes_per_sec == 0 || temporal_us == 0 {
+        return None;
+    }
+    // u128 throughout: rate * us overflows u64 for a 10G interface at ~2s.
+    let scaled = (rate_bytes_per_sec as u128)
+        .saturating_mul(temporal_us as u128)
+        .div_ceil(1_000_000);
+    Some(scaled.clamp(1, u64::MAX as u128) as u64)
 }
 
 fn cos_percent_buffer_bytes(pool_bytes: u64, percent: f64) -> Option<u64> {
@@ -388,6 +431,82 @@ fn cos_effective_transmit_rate_bytes(
         return cos_percent_rate_bytes(iface_shaping_rate_bytes, sched.transmit_rate_percent);
     }
     None
+}
+
+/// #6846: the absolute per-queue rate for `transmit-rate remainder`, or `None`
+/// when it cannot be resolved.
+///
+/// # Why this is a PRE-PASS and not a per-scheduler function
+///
+/// `percent` is a function of the scheduler and the interface, so it resolves
+/// inside `cos_effective_transmit_rate_bytes`. `remainder` is not: it means
+/// "whatever the interface's shaping rate has left after every SIBLING queue on
+/// the same scheduler-map has resolved", so it cannot be computed without the
+/// sibling set. That is the whole reason #4228 Gap 2 deferred it.
+///
+/// # The sibling sum is over RESOLVED siblings only
+///
+/// A sibling contributes what it actually claims: an absolute rate, or a
+/// percent resolved against this interface's shaping rate. A sibling that is
+/// itself `remainder` contributes ZERO — it is claiming the leftover, not a
+/// share of it — and a sibling with no rate at all contributes zero because it
+/// has no guarantee to subtract. Summing an UNRESOLVED sibling would produce a
+/// leftover that looks right and is not, which is the failure mode this
+/// function is shaped to avoid.
+///
+/// # Over-subscription clamps to zero, and the caller warns
+///
+/// When the siblings already claim at least the whole shaping rate there is no
+/// leftover, and the result is `Some(0)`. Over-subscription is legal to express
+/// and rejecting it would break configurations that commit today — but a
+/// silently starved queue looks configured, so the Go commit path warns
+/// (compiler_validate_warn.go). `Some(0)` is deliberately not `None`: the form
+/// RESOLVED, to zero.
+///
+/// # No shaping rate means genuinely unresolvable
+///
+/// With `iface_shaping_rate_bytes == 0` there is no base to take a remainder
+/// of, and no port speed is available here to substitute — `InterfaceSnapshot`
+/// carries no link-speed field, and `contributes_usable_cos_state` already
+/// treats a zero shaping rate as "no usable CoS state". So this returns `None`
+/// and the form stays inert with its (narrowed) commit advisory, rather than
+/// resolving to a fabricated zero.
+///
+/// # Determinism
+///
+/// The sum and the count are both order-independent, and the split is an
+/// integer division of the leftover by the number of remainder-marked queues.
+/// Iteration order over the scheduler map therefore cannot change the result —
+/// which matters because a map-order-dependent rate would pass a hundred runs
+/// before it did not.
+fn cos_remainder_rate_bytes(
+    sched_map: &CoSSchedulerMapSnapshot,
+    schedulers: &FastMap<String, &CoSSchedulerSnapshot>,
+    iface_shaping_rate_bytes: u64,
+) -> Option<u64> {
+    if iface_shaping_rate_bytes == 0 {
+        return None;
+    }
+    let mut claimed: u128 = 0;
+    let mut remainder_queues: u64 = 0;
+    for entry in &sched_map.entries {
+        let Some(sched) = schedulers.get(&entry.scheduler).copied() else {
+            continue;
+        };
+        if sched.transmit_rate_remainder {
+            remainder_queues += 1;
+            continue;
+        }
+        if let Some(rate) = cos_effective_transmit_rate_bytes(Some(sched), iface_shaping_rate_bytes)
+        {
+            claimed = claimed.saturating_add(rate as u128);
+        }
+    }
+    if remainder_queues == 0 {
+        return None;
+    }
+    let leftover = (iface_shaping_rate_bytes as u128).saturating_sub(claimed);
+    Some((leftover / remainder_queues as u128) as u64)
 }
 
 fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
@@ -674,6 +793,15 @@ pub(super) fn build_cos_iface_config(
     let mut queues = Vec::new();
     let dscp_rewrite_rule = tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule);
     if let Some(sched_map) = tables.scheduler_maps.get(&iface.cos_scheduler_map) {
+        // #6846: `remainder` needs the RESOLVED sibling set, so it is computed
+        // ONCE for this interface before any queue is materialized. Computing
+        // it inside the loop would make each remainder queue see a different
+        // (partial) sibling set depending on iteration order.
+        let remainder_rate_bytes = cos_remainder_rate_bytes(
+            sched_map,
+            &tables.schedulers,
+            iface.cos_shaping_rate_bytes_per_sec,
+        );
         for entry in &sched_map.entries {
             // #2409: a scheduler-map entry referencing a forwarding-class that
             // is not in `class_to_queue` (a typo, a version-drifted snapshot,
@@ -682,10 +810,12 @@ pub(super) fn build_cos_iface_config(
             // scheduler — some queues silently missing, no apply failure — a
             // very hard-to-troubleshoot fail-silent loss of shaping.
             let Some(queue_id) = tables.class_to_queue.get(&entry.forwarding_class).copied() else {
-                return Err(crate::policy::SnapshotIntegrityError::SchedulerMapUnknownClass {
-                    scheduler_map: iface.cos_scheduler_map.clone(),
-                    forwarding_class: entry.forwarding_class.clone(),
-                });
+                return Err(
+                    crate::policy::SnapshotIntegrityError::SchedulerMapUnknownClass {
+                        scheduler_map: iface.cos_scheduler_map.clone(),
+                        forwarding_class: entry.forwarding_class.clone(),
+                    },
+                );
             };
             let scheduler = tables.schedulers.get(&entry.scheduler).copied();
             // A scheduler-map entry naming a scheduler that is NOT defined
@@ -723,7 +853,18 @@ pub(super) fn build_cos_iface_config(
             // on each, which is exactly why the percent is carried (not
             // pre-resolved) on the shared snapshot.
             let explicit_transmit_rate_bytes =
-                cos_effective_transmit_rate_bytes(scheduler, iface.cos_shaping_rate_bytes_per_sec);
+                cos_effective_transmit_rate_bytes(scheduler, iface.cos_shaping_rate_bytes_per_sec)
+                    // #6846: `remainder` resolves AFTER absolute and percent —
+                    // it is the leftover once they have claimed their share, so
+                    // it can only apply where neither did. `remainder_rate_bytes`
+                    // is None when the interface has no shaping rate to take a
+                    // remainder of, in which case the form stays inert exactly
+                    // as before this change.
+                    .or_else(|| {
+                        scheduler
+                            .filter(|sched| sched.transmit_rate_remainder)
+                            .and(remainder_rate_bytes)
+                    });
             let guarantee_enabled = explicit_transmit_rate_bytes.is_some();
             let transmit_rate_bytes =
                 explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec);
@@ -804,13 +945,12 @@ pub(super) fn build_cos_iface_config(
                 // #3995: only the loss-priority-UNIFORM rewrite is baked into
                 // the per-queue drain fallback; differentiated rewrites are
                 // resolved per-flow at classification (see `uniform_fc_rewrite`).
-                dscp_rewrite: dscp_rewrite_rule
-                    .and_then(|rewrite_rule| uniform_fc_rewrite(rewrite_rule, &entry.forwarding_class)),
+                dscp_rewrite: dscp_rewrite_rule.and_then(|rewrite_rule| {
+                    uniform_fc_rewrite(rewrite_rule, &entry.forwarding_class)
+                }),
                 // #1614 A3: per-queue CoDel target from scheduler. 0
                 // disables CoDel for the queue (current default).
-                codel_target_ns: scheduler
-                    .map(|sched| sched.codel_target_ns)
-                    .unwrap_or(0),
+                codel_target_ns: scheduler.map(|sched| sched.codel_target_ns).unwrap_or(0),
             });
         }
     }
@@ -822,15 +962,15 @@ pub(super) fn build_cos_iface_config(
     // the synthetic default best-effort queue (queue_id=0,
     // class="best-effort") is added later — but ONLY if we admit the
     // interface, so we model it here for the gate's purposes.
-    let (iface_queue_ids, iface_classes): (Vec<u8>, Vec<&str>) =
-        if scheduler_map_resolved_to_queues {
-            (
-                queues.iter().map(|q| q.queue_id).collect(),
-                queues.iter().map(|q| q.forwarding_class.as_str()).collect(),
-            )
-        } else {
-            (vec![0], vec!["best-effort"])
-        };
+    let (iface_queue_ids, iface_classes): (Vec<u8>, Vec<&str>) = if scheduler_map_resolved_to_queues
+    {
+        (
+            queues.iter().map(|q| q.queue_id).collect(),
+            queues.iter().map(|q| q.forwarding_class.as_str()).collect(),
+        )
+    } else {
+        (vec![0], vec!["best-effort"])
+    };
 
     // A classifier arm contributes only if it maps at least one
     // DSCP/802.1p code-point to a queue_id the interface actually
