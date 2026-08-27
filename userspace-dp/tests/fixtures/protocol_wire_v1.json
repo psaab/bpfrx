@@ -574,6 +574,7 @@
     "source_except": false,
     "source_ports": [],
     "source_ports_except": [],
+    "syslog": false,
     "tcp_flags": null,
     "tcp_flags_forbidden": null,
     "tcp_flags_unparseable": false

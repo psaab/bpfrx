@@ -106716,3 +106716,7 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6853 — `then syslog` is now distinct from `then log` in the config model and carried to the dataplane snapshot. Behaviour-preserving; the routing decision stays with #6859.
   - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go, pkg/dataplane/userspace/protocol_policies.go, pkg/dataplane/userspace/filters.go, pkg/dataplane/userspace/firewall_snapshot_render.go, userspace-dp/src/protocol/security.rs, docs/feature-gaps.md
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6853 — carried the new field through the Rust test literals and the wire specimen; added a both-directions wire-compat test pinning the mixed-version HA claim.
+  - **File(s)**: userspace-dp/src/filter/tests.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
