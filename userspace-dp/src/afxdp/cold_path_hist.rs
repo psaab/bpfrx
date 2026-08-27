@@ -62,6 +62,21 @@ const _: () = assert!(COLD_PATH_PIVOT_NS == 512);
 /// serialization (only slots with `samples > 0` ride the wire), so
 /// the static cap does not impose a per-scrape byte cost.
 pub(in crate::afxdp) const POLICY_COLD_PATH_ZONE_PAIR_SLOTS: usize = 256;
+
+/// Number of atomic operations one `publish_from_local` writes, and one
+/// `snapshot()` pass reads: every bucket, four metadata fields per slot, plus
+/// the two monotonic fields.
+///
+/// Derived rather than written down, because the last time this surface grew
+/// (#1635, 16×24 → 256×48, a 30× increase) the constant was only updated in a
+/// doc comment while a second comment and the concurrency test's writer
+/// throttle kept the old scale. A reader pass is this expensive, so anything
+/// that has to bracket a reader pass — notably the seqlock's even-window —
+/// must be sized from it and not from a literal.
+pub(in crate::afxdp) const COLD_PATH_PUBLISH_ATOMIC_OPS: usize = POLICY_COLD_PATH_ZONE_PAIR_SLOTS
+    * POLICY_COLD_PATH_HIST_BUCKETS
+    + POLICY_COLD_PATH_ZONE_PAIR_SLOTS * 4
+    + 2;
 const _: () = assert!(POLICY_COLD_PATH_ZONE_PAIR_SLOTS == 256);
 
 /// Maximum number of ASSIGNABLE slots. Slot index 255 (`u8::MAX`) is
@@ -701,8 +716,15 @@ impl WorkerColdPathAtomics {
         // 1. Bump gen even → odd. AcqRel forbids subsequent Relaxed
         //    stores from being hoisted above this point.
         self.cold_window_gen.fetch_add(1, Ordering::AcqRel);
-        // 2. Relaxed-store the payload (16 slots × 24 buckets = 384
-        //    bucket stores + 16 × 4 metadata = 64 + 2 monotonic = 450).
+        // 2. Relaxed-store the payload. #1635 grew this surface from the
+        //    old 16×24 dense shape to POLICY_COLD_PATH_ZONE_PAIR_SLOTS ×
+        //    POLICY_COLD_PATH_HIST_BUCKETS = 256 × 48, so one publish now
+        //    writes 12_288 bucket stores + 256 × 4 metadata + 2 monotonic
+        //    = 13_314 atomics, not the ~450 this comment used to claim.
+        //    The number matters to readers: a snapshot pass is the same
+        //    size, so the seqlock's even-window has to be wide enough for
+        //    a whole reader pass or `snapshot()` can never return Some.
+        //    See COLD_PATH_PUBLISH_ATOMIC_OPS, which the tests pin.
         self.sample_phase
             .store(local.sample_phase, Ordering::Relaxed);
         self.wrapper_underflow_count
