@@ -47,7 +47,7 @@ func newReplay5086Env(t *testing.T) *replay5086Env {
 // directly.
 func (e *replay5086Env) restartHeartbeat() {
 	e.t.Helper()
-	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	// start() would set this; back-date it past the cold-boot grace so
 	// peer-lost decisions are not suppressed by the #4386 startup floor.
 	e.r.startedAt = time.Now().Add(-2 * heartbeatStartupGrace)
@@ -252,7 +252,7 @@ func TestHeartbeatRestartStillAcceptsGenuinePeer_5086(t *testing.T) {
 func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	m := NewManager(0, 42)
 
-	first := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	first := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	if first.auth == nil {
 		t.Fatal("receiver auth state must never be nil")
 	}
@@ -265,7 +265,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	// 100 heartbeat restarts.
 	var last *heartbeatReceiver
 	for i := 0; i < 100; i++ {
-		last = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+		last = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 		if last.auth != first.auth {
 			t.Fatalf("restart %d: receiver must share the Manager's auth state, not a fresh one", i)
 		}

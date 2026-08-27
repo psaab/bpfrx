@@ -24,7 +24,7 @@ func newRotNode(t *testing.T, nodeID int) *rotNode {
 	t.Helper()
 	m := NewManager(nodeID, 42)
 	n := &rotNode{m: m}
-	n.r = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	n.r = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	n.r.startedAt = time.Now().Add(-2 * heartbeatStartupGrace)
 	m.mu.Lock()
 	m.hbReceiver = n.r

@@ -75,7 +75,7 @@ func TestColdBootNeverSeenFloorSuppressesPromotion(t *testing.T) {
 	// heartbeat ever seen, but we must hold — a live peer is likely just
 	// slow to be heard. On the buggy path 5s > 500ms → promote → split-brain.
 	m := coldBootManager(t)
-	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	r.startedAt = time.Now().Add(-5 * time.Second)
 	// r.lastSeen defaults to 0 (never seen).
 	r.checkTimeout()
@@ -117,7 +117,7 @@ func TestSeenThenLostPathUnchangedByNeverSeenFloor(t *testing.T) {
 	// Within the grace: a stale heartbeat is suppressed (same grace as
 	// before) so a recovering node does not declare its live peer dead.
 	m := newSeenLostManager()
-	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	r := newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	r.startedAt = time.Now().Add(-5 * time.Second)
 	r.lastSeen.Store(MonotonicNanos() - (timeout + time.Second).Nanoseconds())
 	r.checkTimeout()
@@ -131,7 +131,7 @@ func TestSeenThenLostPathUnchangedByNeverSeenFloor(t *testing.T) {
 	// Past the grace: the staleness path fires exactly as before the fix —
 	// peer is marked lost at threshold*interval staleness.
 	m = newSeenLostManager()
-	r = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	r = newHeartbeatReceiver(m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	r.startedAt = time.Now().Add(-(heartbeatStartupGrace + time.Second))
 	r.lastSeen.Store(MonotonicNanos() - (timeout + time.Second).Nanoseconds())
 	r.checkTimeout()

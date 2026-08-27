@@ -25,7 +25,7 @@ func hbTimingManager(t *testing.T, liveInterval time.Duration, liveThreshold int
 		// newHeartbeatReceiver is the production constructor; StartHeartbeat
 		// calls it with the values read out of m at that instant.
 		m.mu.Lock()
-		m.hbReceiver = newHeartbeatReceiver(m, nil, liveThreshold, liveInterval)
+		m.hbReceiver = newHeartbeatReceiver(m, nil, liveThreshold, liveInterval, nil)
 		m.mu.Unlock()
 	}
 	return m

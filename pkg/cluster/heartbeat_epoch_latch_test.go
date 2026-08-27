@@ -76,7 +76,7 @@ func (e *latchEnv) restartDaemon() {
 	// The restarted daemon re-reads the COMMITTED PSK, so it comes up on
 	// whatever rotateKey last installed — not on the original key.
 	e.m = epochGateManagerWithKey(e.key)
-	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	e.m.mu.Lock()
 	e.m.hbReceiver = e.r
 	e.m.mu.Unlock()

@@ -149,7 +149,7 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 		return ErrHeartbeatStartSuperseded
 	}
 	sender := newHeartbeatSender(m, sendConn, peer, interval)
-	receiver := newHeartbeatReceiver(m, recvConn, threshold, interval)
+	receiver := newHeartbeatReceiver(m, recvConn, threshold, interval, peer)
 	m.hbSender = sender
 	m.hbReceiver = receiver
 	m.hbLocalAddr = localAddr
@@ -630,6 +630,7 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	if receiver != nil {
 		s.Received = receiver.received.Load()
 		s.RecvErrors = receiver.recvErrors.Load()
+		s.ForeignSrcDropped = receiver.foreignSrc.Load()
 	}
 	// Process-scoped, not receiver-scoped: valid with no receiver installed.
 	s.EpochlessAdmitted = m.hbAuth.epochlessAdmitted.Load()
@@ -647,6 +648,13 @@ type HeartbeatStats struct {
 	Received   uint64
 	SendErrors uint64
 	RecvErrors uint64
+	// ForeignSrcDropped counts heartbeat datagrams dropped by the #6888 peer
+	// pin — read from the control-link port but sourced from something other
+	// than the configured peer. Surfaced rather than kept internal because the
+	// condition it reports (a third node misconfigured onto this cluster's
+	// control link) is otherwise invisible: such frames were previously read,
+	// MAC-checked and discarded with no signal anywhere.
+	ForeignSrcDropped uint64
 
 	// EpochlessAdmitted counts authenticated heartbeats admitted WITHOUT a
 	// #6169 boot epoch, and EpochDowngradeRejected counts those refused because

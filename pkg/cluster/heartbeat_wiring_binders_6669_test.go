@@ -47,7 +47,7 @@ func sendCapture(t *testing.T) (senderMgr *Manager, sendConn *net.UDPConn, peer 
 		recvConn.Close()
 		t.Fatalf("sender socket: %v", err)
 	}
-	recv = newHeartbeatReceiver(recvMgr, recvConn, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
+	recv = newHeartbeatReceiver(recvMgr, recvConn, DefaultHeartbeatThreshold, DefaultHeartbeatInterval, nil)
 	recvMgr.mu.Lock()
 	recvMgr.hbReceiver = recv
 	recvMgr.mu.Unlock()
