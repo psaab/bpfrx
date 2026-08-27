@@ -5725,3 +5725,89 @@ fn inet_precedence_classifier_loss_priority_selects_the_egress_rewrite() {
         "the entry's loss-priority high must select the high rewrite, not the low default"
     );
 }
+
+/// #6854 (review finding): the CACHED descriptor must carry the term's
+/// `then reject <message-type>`, not just the reject bit.
+///
+/// Scope, stated because it is narrower than the sibling in
+/// `tests_bind_forward.rs` and the difference matters: that cell reads the ICMP
+/// code BYTE off a built reply, which is the real property. This one asserts the
+/// value on the carrying struct. It is a weaker instrument and it is here
+/// because `stage_flow_cache_hit` — the consumer that replays a cached reject —
+/// has no test harness at all, so an end-to-end assertion on the replay path
+/// cannot be written without building one first.
+///
+/// What it does buy: the hop that FILLS the descriptor is mutation-bound.
+/// Hardcoding it to the default previously survived the entire suite, which is
+/// how a `then reject host-unreachable` could silently revert to
+/// administratively-prohibited on cached traffic with everything green.
+#[test]
+fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
+    let term = |mt: &str| FirewallTermSnapshot {
+        name: "reject-host".into(),
+        destination_addresses: vec!["172.16.80.200/32".into()],
+        destination_constrained: true,
+        protocols: vec!["tcp".into()],
+        action: "reject".into(),
+        reject_message_type: mt.into(),
+        ..Default::default()
+    };
+    let snap = |mt: &str| ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-reject-l3".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-reject-l3".into(),
+            family: "inet".into(),
+            terms: vec![term(mt)],
+        }],
+        ..Default::default()
+    };
+
+    // A configured message-type must reach the descriptor as its resolved codes.
+    let forwarding = build_forwarding_state(&snap("host-unreachable"));
+    let selection = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+    );
+    assert!(
+        selection.reject,
+        "#6854 PREMISE: the term must be classified as a reject, or the message-type \
+         assertion below is about a descriptor nothing will consume"
+    );
+    assert_eq!(
+        (
+            selection.reject_message.v4_code,
+            selection.reject_message.v6_code
+        ),
+        (1, 3),
+        "#6854: the cached descriptor must carry `host-unreachable` (ICMPv4 code 1 / \
+         ICMPv6 code 3). The default (13, 1) here means a cached reject silently reverts \
+         to administratively-prohibited"
+    );
+
+    // And a term with NO message-type must still carry the default, so this
+    // change is invisible to a config that does not use the feature. Without
+    // this arm, a fill that hardcoded `host-unreachable` would pass above.
+    let forwarding = build_forwarding_state(&snap(""));
+    let selection = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        flowless_v4_meta([172, 16, 80, 200]),
+        None,
+    );
+    assert_eq!(
+        (
+            selection.reject_message.v4_code,
+            selection.reject_message.v6_code
+        ),
+        (13, 1),
+        "#6854: a cached reject with no message-type must keep administratively-prohibited"
+    );
+}
