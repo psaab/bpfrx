@@ -69,8 +69,7 @@ mod binding_index;
 mod ipv6_ext_walk;
 use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
 use ipv6_ext_walk::{
-    FragHdr, MAX_EXT_HDRS, NEXTHDR_AUTH, NEXTHDR_DEST, NEXTHDR_FRAGMENT, NEXTHDR_HOP,
-    NEXTHDR_ROUTING, eh_class_table, read_bytes,
+    EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, eh_class, eh_class_table, read_bytes,
 };
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
@@ -955,11 +954,24 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
         return 0;
     }
     let protocol = ip6[6];
-    match protocol {
-        NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST | NEXTHDR_AUTH | NEXTHDR_FRAGMENT => {
-            return 0;
-        }
-        _ => {}
+    // #6886: bail out unless the inner next-header is a genuine L4 TERMINAL.
+    //
+    // This used to hand-list `HOP | ROUTING | DEST | AUTH | FRAGMENT`, which
+    // was the complete extension-header set when it was written and stopped
+    // being complete when #4517 added Mobility (135), HIP (139), Shim6 (140)
+    // and the two experimental values (253/254) to the walker. It also never
+    // covered No-Next-Header (59). Those six fell through to `_ => {}` and
+    // built a session key whose `protocol` field held an EXTENSION-HEADER
+    // type — an identity the real L4 hides behind, not an L4 identity.
+    //
+    // `eh_class` is the shim's own single classifier: its doc says the walk
+    // dispatches on it AND the emitted class table is generated from it, so it
+    // cannot describe a different set than the walk treats specially.
+    // Deferring to it is what stops this site drifting again the next time the
+    // walker learns a type — which is exactly how it drifted the first time,
+    // because #4517 swept the walker and not this shortcut.
+    if eh_class(protocol) != EH_CLASS_TERMINAL {
+        return 0;
     }
     let mut key = UserspaceSessionKey {
         addr_family: AF_INET6,
