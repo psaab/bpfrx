@@ -217,6 +217,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -230,6 +231,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -304,6 +306,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -368,6 +371,7 @@ fn build_cos_state_resolves_transmit_rate_percent_against_interface_shaping_rate
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -425,6 +429,7 @@ fn build_cos_state_transmit_rate_percent_no_shaping_rate_stays_inert() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -476,6 +481,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -543,6 +549,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "iperf-b".into(),
@@ -556,6 +563,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -618,6 +626,7 @@ fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
         equal_flow_enforcement: enforcement,
         equal_flow_target_policy: policy.into(),
         codel_target_ns: 0,
+        ..Default::default()
     };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
@@ -742,6 +751,7 @@ fn build_cos_state_fails_closed_on_unknown_equal_flow_target_policy() {
                 equal_flow_enforcement: true,
                 equal_flow_target_policy: "bogus-policy".into(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -819,6 +829,7 @@ fn build_cos_state_rejects_priority_6849(bad_priority: &str) {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -912,6 +923,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -976,6 +988,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -1029,6 +1042,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -1181,6 +1195,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
                 CoSSchedulerSnapshot {
                     name: "voice".into(),
@@ -1194,6 +1209,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
                     codel_target_ns: 0,
+                    ..Default::default()
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -4328,6 +4344,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -4389,6 +4406,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
                 equal_flow_enforcement: true,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -5857,6 +5875,7 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
+                ..Default::default()
             }],
             // Materializes ONLY best-effort (queue 0). voice/queue 5 is never
             // built on this interface.

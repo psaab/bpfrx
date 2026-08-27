@@ -1335,6 +1335,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
         equal_flow_enforcement: false,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1355,6 +1356,7 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
         equal_flow_enforcement: true,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1379,6 +1381,7 @@ fn cos_scheduler_snapshot_equal_flow_target_policy_round_trip() {
         equal_flow_enforcement: true,
         equal_flow_target_policy: "mean".into(),
         codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1404,6 +1407,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
         equal_flow_enforcement: false,
         equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
+        ..Default::default()
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     assert!(

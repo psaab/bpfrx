@@ -479,6 +479,26 @@ fn cos_effective_transmit_rate_bytes(
 /// Iteration order over the scheduler map therefore cannot change the result —
 /// which matters because a map-order-dependent rate would pass a hundred runs
 /// before it did not.
+///
+/// # The split FLOORS, deliberately
+///
+/// An indivisible leftover loses up to `count - 1` bytes/sec in total — 10
+/// across 3 queues gives 3+3+3 and drops 1. That is intentional, not an
+/// artefact of `/`:
+///
+///   - the loss is bounded by `count - 1` BYTES per second, which is noise
+///     against any shaping rate a remainder is meaningful on (a 1 Gbps shape
+///     is 125_000_000 bytes/sec);
+///   - the alternatives are worse. Ceiling would over-allocate, making the
+///     remainder queues jointly claim MORE than the leftover and quietly
+///     over-subscribe the very rate they were computed from. Distributing the
+///     slack to the first N queues would make the result depend on WHICH
+///     queues come first, reintroducing the map-order dependence this function
+///     is shaped to avoid.
+///
+/// So: floor, equal shares, no queue privileged. `cos_remainder_split_floors`
+/// pins it with an indivisible leftover, because an evenly-divisible fixture
+/// cannot tell floor from ceil from distribute-the-slack.
 fn cos_remainder_rate_bytes(
     sched_map: &CoSSchedulerMapSnapshot,
     schedulers: &FastMap<String, &CoSSchedulerSnapshot>,
@@ -1173,4 +1193,219 @@ pub(super) fn build_cos_state(
     state.ieee8021_classifiers = tables.ieee8021_classifiers;
     state.dscp_rewrite_rules = tables.dscp_rewrite_rules;
     Ok(state)
+}
+
+#[cfg(test)]
+mod remainder_temporal_tests_6846 {
+    use super::*;
+    use crate::CoSSchedulerMapEntrySnapshot;
+
+    /// A scheduler-map entry naming `sched` for `fc`.
+    fn entry(fc: &str, sched: &str) -> CoSSchedulerMapEntrySnapshot {
+        CoSSchedulerMapEntrySnapshot {
+            forwarding_class: fc.to_string(),
+            scheduler: sched.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn absolute(name: &str, bytes: u64) -> CoSSchedulerSnapshot {
+        CoSSchedulerSnapshot {
+            name: name.to_string(),
+            transmit_rate_bytes: bytes,
+            ..Default::default()
+        }
+    }
+
+    fn percent(name: &str, pct: f64) -> CoSSchedulerSnapshot {
+        CoSSchedulerSnapshot {
+            name: name.to_string(),
+            transmit_rate_percent: pct,
+            ..Default::default()
+        }
+    }
+
+    fn remainder(name: &str) -> CoSSchedulerSnapshot {
+        CoSSchedulerSnapshot {
+            name: name.to_string(),
+            transmit_rate_remainder: true,
+            ..Default::default()
+        }
+    }
+
+    fn resolve(
+        scheds: &[CoSSchedulerSnapshot],
+        entries: Vec<CoSSchedulerMapEntrySnapshot>,
+        shaping: u64,
+    ) -> Option<u64> {
+        let map = CoSSchedulerMapSnapshot {
+            name: "m".to_string(),
+            entries,
+        };
+        let table: FastMap<String, &CoSSchedulerSnapshot> =
+            scheds.iter().map(|s| (s.name.clone(), s)).collect();
+        cos_remainder_rate_bytes(&map, &table, shaping)
+    }
+
+    /// The leftover is what the shaping rate has after RESOLVED siblings, and
+    /// a percent sibling must be counted at its resolved value rather than
+    /// skipped — a fixture with only absolute siblings cannot tell the two
+    /// apart, because both "resolve percent" and "ignore percent" leave an
+    /// absolute-only sum identical.
+    #[test]
+    fn remainder_subtracts_resolved_percent_siblings() {
+        let scheds = [absolute("a", 200), percent("p", 10.0), remainder("r")];
+        // shaping 1000, absolute 200, percent 10% = 100 -> leftover 700.
+        let got = resolve(
+            &scheds,
+            vec![entry("fa", "a"), entry("fp", "p"), entry("fr", "r")],
+            1000,
+        );
+        assert_eq!(
+            got,
+            Some(700),
+            "a `percent` sibling must be subtracted at its RESOLVED value (10% of \
+             1000 = 100), not skipped"
+        );
+    }
+
+    /// THE SPLIT FLOORS, pinned with an INDIVISIBLE leftover.
+    ///
+    /// An evenly-divisible fixture cannot distinguish floor, ceil, or
+    /// distribute-the-slack — all three agree there. 1000 - 1 = 999 across two
+    /// queues is 499 under floor and 500 under ceil, so this fixture separates
+    /// them; and a `leftover`-not-`leftover/n` implementation returns 999.
+    #[test]
+    fn cos_remainder_split_floors() {
+        let scheds = [absolute("a", 1), remainder("r1"), remainder("r2")];
+        let got = resolve(
+            &scheds,
+            vec![entry("fa", "a"), entry("f1", "r1"), entry("f2", "r2")],
+            1000,
+        );
+        assert_eq!(
+            got,
+            Some(499),
+            "999 across two remainder queues must FLOOR to 499 each. 500 means \
+             ceiling (the two jointly over-claim the leftover they came from); \
+             999 means the leftover was handed to each queue whole instead of split"
+        );
+    }
+
+    /// Order-independence. A rate that depends on scheduler-map iteration
+    /// order passes a hundred runs before it does not, so it is asserted
+    /// rather than hoped for.
+    #[test]
+    fn remainder_is_order_independent() {
+        let scheds = [absolute("a", 250), percent("p", 25.0), remainder("r")];
+        let forward = resolve(
+            &scheds,
+            vec![entry("fa", "a"), entry("fp", "p"), entry("fr", "r")],
+            1000,
+        );
+        let reversed = resolve(
+            &scheds,
+            vec![entry("fr", "r"), entry("fp", "p"), entry("fa", "a")],
+            1000,
+        );
+        assert_eq!(
+            forward, reversed,
+            "the same config must resolve identically regardless of entry order"
+        );
+        assert_eq!(forward, Some(500), "1000 - 250 - 250 = 500");
+    }
+
+    /// A sibling that is ITSELF `remainder` claims the leftover rather than a
+    /// share of it, so it must contribute ZERO to the claimed sum. If it
+    /// contributed its own resolved value the computation would be circular.
+    #[test]
+    fn a_remainder_sibling_contributes_zero_to_the_claim() {
+        let scheds = [remainder("r1"), remainder("r2")];
+        let got = resolve(&scheds, vec![entry("f1", "r1"), entry("f2", "r2")], 1000);
+        assert_eq!(
+            got,
+            Some(500),
+            "with no absolute/percent siblings the whole shaping rate is the \
+             leftover, split across the two remainder queues"
+        );
+    }
+
+    /// Over-subscription RESOLVES TO ZERO rather than failing to resolve.
+    /// `Some(0)` and `None` are different answers and the advisory depends on
+    /// the difference: over-subscribed resolved, unshaped could not.
+    #[test]
+    fn over_subscription_resolves_to_zero_not_none() {
+        let scheds = [absolute("a", 900), absolute("b", 400), remainder("r")];
+        let got = resolve(
+            &scheds,
+            vec![entry("fa", "a"), entry("fb", "b"), entry("fr", "r")],
+            1000,
+        );
+        assert_eq!(
+            got,
+            Some(0),
+            "siblings claiming more than the shaping rate leave no remainder — \
+             but the form RESOLVED, so this must be Some(0) and not None, or the \
+             narrowed commit advisory cannot tell it from an unresolvable one"
+        );
+    }
+
+    /// No shaping rate is genuinely unresolvable: there is no base to take a
+    /// remainder of, and no port speed is available here to substitute.
+    #[test]
+    fn no_shaping_rate_is_unresolvable() {
+        let scheds = [remainder("r")];
+        assert_eq!(
+            resolve(&scheds, vec![entry("fr", "r")], 0),
+            None,
+            "with no shaping rate the form must stay INERT (None), not resolve to \
+             a fabricated zero"
+        );
+    }
+
+    /// No remainder-marked queue means nothing to compute — and in particular
+    /// must not divide by zero.
+    #[test]
+    fn no_remainder_queue_yields_none() {
+        let scheds = [absolute("a", 100)];
+        assert_eq!(resolve(&scheds, vec![entry("fa", "a")], 1000), None);
+    }
+
+    /// `temporal` converts against the queue's RESOLVED rate.
+    #[test]
+    fn temporal_converts_against_the_resolved_rate() {
+        // 1_000_000 bytes/sec for 1500us = 1500 bytes.
+        assert_eq!(cos_temporal_buffer_bytes(1_000_000, 1_500), Some(1_500));
+        // Ceiling, matching cos_percent_buffer_bytes.
+        assert_eq!(cos_temporal_buffer_bytes(1_000_000, 1), Some(1));
+        assert_eq!(cos_temporal_buffer_bytes(3, 1), Some(1), "floor of 1");
+    }
+
+    /// A queue with no resolved rate has no drain speed, so a microsecond
+    /// target has no byte value. Returning 0 would size the queue to nothing.
+    #[test]
+    fn temporal_without_a_rate_is_unresolvable() {
+        assert_eq!(cos_temporal_buffer_bytes(0, 1_500), None);
+        assert_eq!(cos_temporal_buffer_bytes(1_000_000, 0), None);
+    }
+
+    /// `remainder` + `temporal` on ONE queue is LEGAL, and the ORDERING is the
+    /// property: temporal must convert against the rate remainder produced,
+    /// not against zero or the interface rate.
+    #[test]
+    fn remainder_then_temporal_on_one_queue() {
+        let mut r = remainder("r");
+        r.buffer_size_temporal_us = 1_000_000; // one second of drain
+        let scheds = [absolute("a", 400), r.clone()];
+        let rate = resolve(&scheds, vec![entry("fa", "a"), entry("fr", "r")], 1000)
+            .expect("remainder must resolve");
+        assert_eq!(rate, 600, "1000 - 400");
+        assert_eq!(
+            cos_temporal_buffer_bytes(rate, r.buffer_size_temporal_us),
+            Some(600),
+            "one second at the RESOLVED remainder rate is 600 bytes — using the \
+             interface rate would give 1000, and using an unresolved zero would \
+             give None"
+        );
+    }
 }
