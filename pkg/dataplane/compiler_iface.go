@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -138,6 +139,29 @@ func resolveInterfaceRef(ref string, cfg *config.Config) (physName string, confi
 	return
 }
 
+// errVLANCreateFailed marks the ONE VLAN failure that must fail the apply
+// (#6893 part 2): netlink.LinkAdd itself refused, so the device the config
+// asked for does not exist and nothing downstream can be correct.
+//
+// It is deliberately NOT attached to the other three error returns of
+// ensureVLANSubInterface, and the reason is the harm rather than tidiness:
+//
+//   - "parent interface %s" is the absent-PHYSICAL case, which #6893 itself
+//     hedges on as arguably legitimate (an interface configured but not present
+//     on this chassis). Out of scope by decision, not oversight.
+//   - "find created ..." and "set ... up" both report created=true, so the link
+//     EXISTS. compileFirewallFilters then resolves it and the filter IS
+//     assigned — the #6893 harm (a binding silently dropped) does not arise, so
+//     failing the apply there would refuse a config for a reason this issue is
+//     not about.
+var errVLANCreateFailed = errors.New("VLAN sub-interface creation failed")
+
+// ensureVLANSubInterfaceFn is ensureVLANSubInterface's test seam, mirroring
+// teardownCleanupFn in loader.go: the paired proof for #6893 part 2 needs a
+// CREATION FAILURE, which is not reachable in a unit test without netlink and
+// CAP_NET_ADMIN. Production leaves it pointing at the real function.
+var ensureVLANSubInterfaceFn = ensureVLANSubInterface
+
 // ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
 // Returns the sub-interface's ifindex and whether this call CREATED it.
 //
@@ -178,7 +202,8 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 		VlanId: vlanID,
 	}
 	if err := netlink.LinkAdd(vlan); err != nil {
-		return 0, false, fmt.Errorf("create VLAN sub-interface %s: %w", subName, err)
+		return 0, false, fmt.Errorf("create VLAN sub-interface %s: %w: %w",
+			subName, errVLANCreateFailed, err)
 	}
 
 	// Every return from here on reports created=true: the LinkAdd above
@@ -620,12 +645,24 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 
 	if vlanID > 0 {
 		// VLAN sub-interface: create it, populate vlan_iface_map
-		subIfindex, vlanCreated, err := ensureVLANSubInterface(physName, vlanID)
+		subIfindex, vlanCreated, err := ensureVLANSubInterfaceFn(physName, vlanID)
 		if vlanCreated {
 			// #4960: recorded BEFORE the error branch. LinkAdd succeeded even
 			// on the paths that fail afterwards, so the host carries the new
 			// link either way.
 			result.markHostMutated("created VLAN sub-interface")
+		}
+		if err != nil && errors.Is(err, errVLANCreateFailed) {
+			// #6893 part 2: FAIL THE APPLY. The config asked for a device, the
+			// create refused, and the device does not exist — so
+			// compileFirewallFilters will miss it and the filter bound to it is
+			// silently not assigned. A filter that is absent permits what it was
+			// configured to deny, and the commit used to report success.
+			//
+			// Scoped to the CREATE failure alone: the absent-parent and
+			// created-but-unusable cases keep the soft skip. See
+			// errVLANCreateFailed for why each.
+			return fmt.Errorf("zone %s interface %s.%d: %w", name, physName, vlanID, err)
 		}
 		if err != nil {
 			slog.Warn("VLAN sub-interface failed, skipping",
