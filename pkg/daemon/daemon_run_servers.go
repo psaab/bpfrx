@@ -390,6 +390,13 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// cleanly, which is the blindness the retry owner exists to end.
 		ManagedServiceReloadOwedFn:     d.ManagedServiceReloadOwed,
 		ManagedServiceReloadFailuresFn: d.ManagedServiceReloadFailures,
+		// #7615: the remaining debt-driven retry owners on the same surface.
+		// An accessor with no production caller leaves the operator exactly as
+		// blind as before (#6852), which is why these assignments are pinned by
+		// a source-level cell.
+		RADeadSenderPendingFn:    d.RADeadSenderPending,
+		FabricOverlayMissingFn:   d.FabricOverlayMissing,
+		ManagementListenerDownFn: d.ManagementListenerDown,
 		// #3780: surface scheduler republish-failure so
 		// xpf_scheduler_republish_failed reads 1 (and
 		// xpf_scheduler_republish_stale_seconds climbs) while a

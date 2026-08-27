@@ -269,6 +269,13 @@ type Config struct {
 	// ManagedServiceReloadFailuresFn reports the monotonic per-service count of
 	// failed reload attempts, retries included (#6800). Same nil contract.
 	ManagedServiceReloadFailuresFn func() map[string]uint64
+	// #7615: the remaining debt-driven retry owners, on the same surface as the
+	// two above. Each reports whether its loop currently owes a repair; nil on
+	// a server that does not wire it, in which case the series is OMITTED
+	// rather than published as an authoritative 0.
+	RADeadSenderPendingFn    func() bool
+	FabricOverlayMissingFn   func() bool
+	ManagementListenerDownFn func() bool
 	// SchedulerRepublishFailedFn reports whether the most recent
 	// scheduler-driven policy republish failed and has not yet converged
 	// (#3780). A scheduler window transition republishes enforcement; a
@@ -444,6 +451,9 @@ type Server struct {
 	hostInboundConntrackFlushFailuresFn  func() uint64
 	managedServiceReloadOwedFn           func() map[string]bool
 	managedServiceReloadFailuresFn       func() map[string]uint64
+	raDeadSenderPendingFn                func() bool
+	fabricOverlayMissingFn               func() bool
+	managementListenerDownFn             func() bool
 	schedulerRepublishFailedFn           func() bool
 	schedulerRepublishStaleSecondsFn     func() float64
 	schedulerRepublishFailClosedFn       func() bool
@@ -551,6 +561,9 @@ func NewServer(cfg Config) *Server {
 		hostInboundConntrackFlushFailuresFn:  cfg.HostInboundConntrackFlushFailuresFn,
 		managedServiceReloadOwedFn:           cfg.ManagedServiceReloadOwedFn,
 		managedServiceReloadFailuresFn:       cfg.ManagedServiceReloadFailuresFn,
+		raDeadSenderPendingFn:                cfg.RADeadSenderPendingFn,
+		fabricOverlayMissingFn:               cfg.FabricOverlayMissingFn,
+		managementListenerDownFn:             cfg.ManagementListenerDownFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn:     cfg.SchedulerRepublishStaleSecondsFn,
 		schedulerRepublishFailClosedFn:       cfg.SchedulerRepublishFailClosedFn,

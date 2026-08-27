@@ -112,6 +112,38 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"rather than a single transient failure already paid.",
 		[]string{"service"}, nil,
 	)
+	// #7615: the remaining debt-driven retry owners. Two siblings already
+	// publish (#6800, #6802); these complete the family. Proxy-ARP is
+	// deliberately absent — it keeps no debt, so a gauge could only report a
+	// constant (#7685).
+	c.raDeadSenderPending = prometheus.NewDesc(
+		"xpf_ra_dead_sender_pending",
+		"1 while a router-advertisement sender's asynchronous conn open has "+
+			"failed and has not yet been rebuilt (#6793). While set, that "+
+			"interface is advertising NOTHING and hosts on the segment get no "+
+			"default route from this firewall — on a node whose commit reported "+
+			"success. The daemon rebuilds it autonomously every 30s; 0 once it "+
+			"succeeds.",
+		nil, nil,
+	)
+	c.fabricOverlayMissing = prometheus.NewDesc(
+		"xpf_fabric_overlay_missing",
+		"1 while a configured fabric IPVLAN (fab0/fab1) is absent or down "+
+			"(#6791). While set the node has NO cluster heartbeat and no "+
+			"session-sync transport, so a peer cannot distinguish it from a dead "+
+			"node. The daemon re-creates it autonomously every 30s; 0 once the "+
+			"overlay is present and admin-up.",
+		nil, nil,
+	)
+	c.managementListenerDown = prometheus.NewDesc(
+		"xpf_management_listener_down",
+		"1 while a management listener the configuration asks for is not "+
+			"serving (#6803). This is the failure an operator is least able to "+
+			"observe by other means, because the channel they would use to look "+
+			"is the channel that is down. The daemon rebinds it autonomously "+
+			"every 30s; 0 once it is serving.",
+		nil, nil,
+	)
 	c.schedulerRepublishFailed = prometheus.NewDesc(
 		"xpf_scheduler_republish_failed",
 		"1 while the most recent scheduler-driven policy republish "+
