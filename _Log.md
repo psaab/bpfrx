@@ -107027,3 +107027,7 @@ prose edit above them added. No diff falls in the new test body.
   naturally in 80 attempts including 2x CPU oversubscription. The change is
   therefore a determinism + diagnosis improvement, not a proven fix.
 - **File(s)**: `pkg/api/listener_retiredauth_5561_test.go`, `_Log.md`
+
+- **Timestamp**: 2026-08-27
+  - **Action**: committed `opus-review-001.md` into `docs/reviews/recovered/`. Two OPEN issues (#6813, #6751) cite it and it existed only outside the repo, so their evidence was unreachable to anyone but the machine that produced it.
+  - **File(s)**: docs/reviews/recovered/opus-review-001.md
