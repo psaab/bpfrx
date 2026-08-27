@@ -935,8 +935,27 @@ fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
 // once the neighbor resolves. Full buffer-and-translate parity is a follow-up.
 // =====================================================================
 
-fn nat64_v6_syn_meta(frame_len: usize) -> UserspaceDpMeta {
+/// #6836: the meta carries the FLOW ADDRESSES of the frame it describes.
+///
+/// Both NAT64 meta fixtures used to leave `flow_src_addr`/`flow_dst_addr` at
+/// their all-zero default. `l3_session_flow_from_meta` returns `None` for an
+/// unspecified address, so the ENTIRE flowless input-filter block in
+/// `forward_request.rs` was unreachable under every test built on these
+/// fixtures — including the pre-existing miss-branch filter, which has been
+/// carrying coverage it did not have.
+///
+/// A test asserting a value that happens to equal its path's failure default is
+/// at least EXECUTING the path. Here the path was not executed at all, so no
+/// assertion strength saved it, and nothing in the output distinguished that
+/// from a genuine pass.
+///
+/// The addresses are PARAMETERS rather than baked-in constants deliberately: a
+/// meta that silently disagrees with its frame is the same class of defect one
+/// step over, and every caller already has the real `src`/`dst` in scope.
+fn nat64_v6_syn_meta(frame_len: usize, src: Ipv6Addr, dst: Ipv6Addr) -> UserspaceDpMeta {
     UserspaceDpMeta {
+        flow_src_addr: src.octets(),
+        flow_dst_addr: dst.octets(),
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
         length: std::mem::size_of::<UserspaceDpMeta>() as u16,
@@ -981,7 +1000,7 @@ fn nat64_missing_neighbor_fail_closed_drop_5174() {
     let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
     let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
     let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
-    let meta = nat64_v6_syn_meta(frame.len());
+    let meta = nat64_v6_syn_meta(frame.len(), src, dst);
     let (_batch, dbg) =
         txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
 
@@ -1058,7 +1077,7 @@ fn nat64_missing_neighbor_denied_no_fail_closed_drop_5174() {
     let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
     let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
     let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
-    let meta = nat64_v6_syn_meta(frame.len());
+    let meta = nat64_v6_syn_meta(frame.len(), src, dst);
     let (_batch, dbg) =
         txn_run_descriptor(&mut binding, &mut sessions, &forwarding, &ha_state, &frame, meta);
 
@@ -1135,8 +1154,11 @@ fn nat64_v6_frag_frame(
 
 /// Metadata for a v6 NAT64 fragment: the L4 header sits after the 8-byte
 /// Fragment extension header, so `l4_offset = 14 + 40 + 8 = 62`.
-fn nat64_v6_frag_meta(frame_len: usize) -> UserspaceDpMeta {
+/// #6836: as `nat64_v6_syn_meta` — the meta carries the frame's flow addresses.
+fn nat64_v6_frag_meta(frame_len: usize, src: Ipv6Addr, dst: Ipv6Addr) -> UserspaceDpMeta {
     UserspaceDpMeta {
+        flow_src_addr: src.octets(),
+        flow_dst_addr: dst.octets(),
         magic: USERSPACE_META_MAGIC,
         version: USERSPACE_META_VERSION,
         length: std::mem::size_of::<UserspaceDpMeta>() as u16,
@@ -1215,7 +1237,7 @@ fn nat64_committed_first_fragment_publishes_frag_assoc_and_nonfirst_inherits_514
         &forwarding,
         &ha_state,
         &first,
-        nat64_v6_frag_meta(first.len()),
+        nat64_v6_frag_meta(first.len(), src, dst),
     );
     assert_eq!(dbg1.tx, 1, "the committed NAT64 first fragment must translate + forward");
     assert_eq!(b1.nat64_translations, 1, "the first fragment is NAT64-translated");
@@ -1236,7 +1258,7 @@ fn nat64_committed_first_fragment_publishes_frag_assoc_and_nonfirst_inherits_514
         &forwarding,
         &ha_state,
         &non_first,
-        nat64_v6_frag_meta(non_first.len()),
+        nat64_v6_frag_meta(non_first.len(), src, dst),
     );
     assert_eq!(
         dbg2.tx, 1,
@@ -1280,7 +1302,7 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
         &forwarding,
         &ha_state,
         &first,
-        nat64_v6_frag_meta(first.len()),
+        nat64_v6_frag_meta(first.len(), src, dst),
     );
     assert_eq!(dbg1.tx, 0, "a refused NAT64 first fragment must not forward");
     assert_eq!(sessions.admission_refused(), 1, "the flow must hit the can_admit rollback arm");
@@ -1304,7 +1326,7 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
         &forwarding,
         &ha_state,
         &non_first,
-        nat64_v6_frag_meta(non_first.len()),
+        nat64_v6_frag_meta(non_first.len(), src, dst),
     );
     assert_eq!(
         b2.nat64_translations, 0,
@@ -1381,7 +1403,7 @@ fn nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798() {
         &forwarding,
         &ha_state,
         &first,
-        nat64_v6_frag_meta(first.len()),
+        nat64_v6_frag_meta(first.len(), src, dst),
     );
     assert_eq!(dbg1.tx, 1, "the domain-A first fragment must translate + forward");
     assert_eq!(
@@ -1393,7 +1415,7 @@ fn nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798() {
     // Domain B: SAME (src, dst, ident) — the whole pre-#5798 key — but a
     // different, fully-configured ingress interface/VLAN/zone.
     let non_first = nat64_v6_frag_frame(0x0008, 0x5798_0042, src, dst, 0, 0);
-    let mut meta_b = nat64_v6_frag_meta(non_first.len());
+    let mut meta_b = nat64_v6_frag_meta(non_first.len(), src, dst);
     meta_b.ingress_ifindex = 12;
     meta_b.ingress_vlan_id = 80;
     let (b2, dbg2) = txn_run_descriptor(
@@ -1428,7 +1450,7 @@ fn nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798() {
         &forwarding,
         &ha_state,
         &non_first,
-        nat64_v6_frag_meta(non_first.len()),
+        nat64_v6_frag_meta(non_first.len(), src, dst),
     );
     assert_eq!(
         dbg3.tx, 1,
@@ -1504,7 +1526,7 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
         let ident: u32 = 0x5798_0002;
         let first = nat64_v6_frag_frame(0x0001, ident, src, dst, 12345, 443);
         let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
-        let mut meta = nat64_v6_frag_meta(non_first.len());
+        let mut meta = nat64_v6_frag_meta(non_first.len(), src, dst);
         // The shared NAT64 fragment fixture leaves `flow_{src,dst}_addr` at their
         // all-zero default. `l3_session_flow_from_meta` returns None for an
         // unspecified address, and BOTH the hit-arm filter added here and the
@@ -1532,12 +1554,12 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
                 &seed_fwd,
                 &seed_ha,
                 &first,
-                nat64_v6_frag_meta(first.len()),
+                nat64_v6_frag_meta(first.len(), src, dst),
             );
             assert_eq!(seed_dbg.tx, 1, "the seed first fragment must translate + forward");
             let seed_authority = crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
                 &seed_fwd,
-                nat64_v6_frag_meta(first.len()),
+                nat64_v6_frag_meta(first.len(), src, dst),
                 None,
             );
             let seed_key = crate::nat64::nat64_first_fragment_key(
@@ -1695,7 +1717,7 @@ fn nat64_frag_authority_dimensions_are_threaded_end_to_end_5798() {
     let first = nat64_v6_frag_frame(0x0001, ident, src, dst, 12345, 443);
     let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
 
-    let base_meta = nat64_v6_frag_meta(non_first.len());
+    let base_meta = nat64_v6_frag_meta(non_first.len(), src, dst);
     let ifindex_only = UserspaceDpMeta {
         ingress_ifindex: 25,
         ..base_meta
@@ -1772,7 +1794,7 @@ fn nat64_frag_authority_dimensions_are_threaded_end_to_end_5798() {
             &forwarding,
             &ha_state,
             &first,
-            nat64_v6_frag_meta(first.len()),
+            nat64_v6_frag_meta(first.len(), src, dst),
         );
         assert_eq!(
             dbg1.tx, 1,
@@ -1881,7 +1903,7 @@ fn nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798
         &forwarding,
         &ha_state,
         &frag1_first,
-        nat64_v6_frag_meta(frag1_first.len()),
+        nat64_v6_frag_meta(frag1_first.len(), src, dst),
     );
     assert_eq!(dbg1.tx, 1, "the domain-A first fragment must translate + forward");
     assert_eq!(
@@ -1897,7 +1919,7 @@ fn nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798
         &forwarding,
         &ha_state,
         &frag2_middle,
-        nat64_v6_frag_meta(frag2_middle.len()),
+        nat64_v6_frag_meta(frag2_middle.len(), src, dst),
     );
     assert_eq!(
         dbg2.tx, 1,
@@ -1910,7 +1932,7 @@ fn nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798
 
     // (3) last-B — same datagram identity, different security domain. Must be
     //     refused even though the association is live AND has just been hit.
-    let mut meta_b = nat64_v6_frag_meta(frag3_last.len());
+    let mut meta_b = nat64_v6_frag_meta(frag3_last.len(), src, dst);
     meta_b.ingress_ifindex = 12;
     meta_b.ingress_vlan_id = 80;
     let (b3, dbg3) = txn_run_descriptor(
@@ -1944,7 +1966,7 @@ fn nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798
         &forwarding,
         &ha_state,
         &frag3_last,
-        nat64_v6_frag_meta(frag3_last.len()),
+        nat64_v6_frag_meta(frag3_last.len(), src, dst),
     );
     assert_eq!(
         dbg4.tx, 1,
@@ -2058,7 +2080,7 @@ fn nat64_frag_assoc_hit_counts_route_lookup_affecting_input_filter_5798() {
         &forwarding,
         &ha_state,
         &first,
-        nat64_v6_frag_meta(first.len()),
+        nat64_v6_frag_meta(first.len(), src, dst),
     );
     assert_eq!(dbg1.tx, 1, "the first fragment must translate + forward");
     assert_eq!(
@@ -2074,7 +2096,7 @@ fn nat64_frag_assoc_hit_counts_route_lookup_affecting_input_filter_5798() {
     // count still lands once per fragment; what changed is which evaluator
     // records it.
     let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
-    let mut meta = nat64_v6_frag_meta(non_first.len());
+    let mut meta = nat64_v6_frag_meta(non_first.len(), src, dst);
     // The shared NAT64 fragment fixture leaves `flow_{src,dst}_addr` zeroed;
     // `l3_session_flow_from_meta` returns None for an unspecified address and
     // the hit-arm filter block is gated on it, so without these the block is
@@ -2227,7 +2249,7 @@ fn nat64_frag_assoc_hit_applies_matching_pbr_discard_6927() {
         &forwarding,
         &ha_state,
         &first,
-        nat64_v6_frag_meta(first.len()),
+        nat64_v6_frag_meta(first.len(), src, dst),
     );
     assert_eq!(
         dbg1.tx, 1,
@@ -2237,7 +2259,7 @@ fn nat64_frag_assoc_hit_applies_matching_pbr_discard_6927() {
     assert_eq!(b1.nat64_translations, 1);
 
     let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
-    let mut meta = nat64_v6_frag_meta(non_first.len());
+    let mut meta = nat64_v6_frag_meta(non_first.len(), src, dst);
     meta.flow_src_addr = src.octets();
     meta.flow_dst_addr = dst.octets();
     let (b2, dbg2) = txn_run_descriptor(
@@ -2318,7 +2340,7 @@ fn nat64_frag_assoc_hit_reenforces_owner_rg_6927() {
             &forwarding,
             &active,
             &first,
-            nat64_v6_frag_meta(first.len()),
+            nat64_v6_frag_meta(first.len(), src, dst),
         );
         assert_eq!(
             dbg1.tx, 1,
@@ -2327,7 +2349,7 @@ fn nat64_frag_assoc_hit_reenforces_owner_rg_6927() {
         );
 
         let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
-        let mut meta = nat64_v6_frag_meta(non_first.len());
+        let mut meta = nat64_v6_frag_meta(non_first.len(), src, dst);
         meta.flow_src_addr = src.octets();
         meta.flow_dst_addr = dst.octets();
         let (_b2, dbg2) =
@@ -2399,7 +2421,7 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
 
     // No first fragment: nothing installs an association, so this is a MISS.
     let non_first = nat64_v6_frag_frame(0x0008, 0x6927_0004, src, dst, 0, 0);
-    let mut meta = nat64_v6_frag_meta(non_first.len());
+    let mut meta = nat64_v6_frag_meta(non_first.len(), src, dst);
     meta.flow_src_addr = src.octets();
     meta.flow_dst_addr = dst.octets();
     let (batch, dbg) = txn_run_descriptor(
@@ -2442,7 +2464,7 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
     // declares reachable — the same path the Pref64 destination above took.
     let plain_dst: Ipv6Addr = "2606:4700:4700::1111".parse().expect("plain v6 dst");
     let plain = nat64_v6_frag_frame(0x0008, 0x6927_0005, src, plain_dst, 0, 0);
-    let mut plain_meta = nat64_v6_frag_meta(plain.len());
+    let mut plain_meta = nat64_v6_frag_meta(plain.len(), src, dst);
     plain_meta.flow_src_addr = src.octets();
     plain_meta.flow_dst_addr = plain_dst.octets();
     let (plain_batch, plain_dbg) = txn_run_descriptor(
@@ -2462,5 +2484,143 @@ fn nat64_frag_assoc_miss_must_drop_with_default_route_6927() {
     assert_eq!(
         plain_batch.nat64_frag_dropped, 0,
         "#6927: and it must not be accounted as a NAT64 fail-closed drop"
+    );
+}
+
+/// #6836 + #7656: the flowless egress filter-log path, exercised for the first
+/// time — and it records a REAL GAP rather than a passing feature.
+///
+/// `forward_request.rs`'s flowless branch (#5467) rebuilds an L3-only flow
+/// SOLELY to attribute a filter-log event for a packet with no
+/// `tx_selection_flow` — a non-first fragment or a non-query ICMP. Its stated
+/// purpose is that "egress logging is not silently bypassed" for those packets.
+///
+/// It had never run under a NAT64 fixture, and it took TWO defects to keep it
+/// dark, not one:
+///
+///  1. the meta fixtures left `flow_src_addr`/`flow_dst_addr` zeroed, and
+///     `l3_session_flow_from_meta` returns `None` for an unspecified address;
+///  2. no NAT64 fixture ever set an output filter, so `cos.filter_log` was
+///     `None` too.
+///
+/// Both gate the same `if let`, so fixing (1) alone changes nothing observable
+/// — which is why the fixture-address fix landing green was not evidence of
+/// anything.
+///
+/// # What this measured, once both were supplied
+///
+///     first fragment  (has a flow)  tx=1   filter-log events = 1
+///     non-first frag  (FLOWLESS)    tx=1   filter-log events = 0
+///
+/// The inherited non-first fragment FORWARDS THROUGH A LOGGING OUTPUT FILTER
+/// AND IS NOT LOGGED. That is the bypass #5467 exists to prevent, still open on
+/// this path. Filed as #7656.
+///
+/// # Why this asserts the gap instead of the fix
+///
+/// Asserting the desired behaviour would leave a permanently-red test. Pinning
+/// the gap makes it self-announcing: the day the flowless branch reaches this
+/// path, the `second_events == 0` assertion REDS and tells the fixer to invert
+/// it in the same commit. That is the pattern #6860's author used and it is why
+/// I found that one.
+///
+/// The `first_events == 1` half is the POSITIVE CONTROL, and it is what makes
+/// the zero meaningful: without it, "no event" is equally explained by the
+/// filter never being consulted, the event stream not being wired, or the
+/// fixture not logging at all. With it, the filter demonstrably logs the very
+/// next packet on the same interface through the same term.
+#[test]
+fn nat64_flowless_nonfirst_fragment_is_not_egress_logged_6836() {
+    let mut snapshot = nat64_frag_snapshot();
+
+    // A LOGGING output filter on the v4 egress (reth0.80 — the interface the
+    // NAT64-translated packet leaves by). `accept`, so the packet still
+    // forwards: the claim under test is about LOGGING, not disposition.
+    let egress = snapshot
+        .interfaces
+        .iter_mut()
+        .find(|i| i.name == "reth0.80")
+        .expect("#6836 premise: the NAT64 fixture must have the reth0.80 v4 egress");
+    egress.filter_output_v4 = "nat64-egress-log".to_string();
+    snapshot.filters = vec![crate::protocol::FirewallFilterSnapshot {
+        name: "nat64-egress-log".to_string(),
+        family: "inet".to_string(),
+        terms: vec![crate::protocol::FirewallTermSnapshot {
+            name: "log-all".to_string(),
+            action: "accept".to_string(),
+            log: true,
+            ..Default::default()
+        }],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(16);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst (extracts 8.8.8.8)");
+
+    // BOTH packets go through the CAPTURING runner, and that is load-bearing.
+    //
+    // `txn_run_descriptor` passes a fixed `123_000_000_000` for `now_ns`;
+    // `txn_run_descriptor_capturing_events` passes real
+    // `neighbor::monotonic_nanos()`. Mixing them hands the two packets clocks
+    // billions of nanoseconds apart, so the association the first installs is
+    // not valid for the second and the non-first fragment silently does not
+    // forward — `tx=0` with NO drop counted, which reads as "this test is
+    // wrong" rather than "the helpers disagree about time". Found the hard way.
+    let first = nat64_v6_frag_frame(0x0001, 0x1234_5678, src, dst, 12345, 443);
+    let (_b1, dbg1, first_handle, _rx1) = txn_run_descriptor_capturing_events(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        nat64_v6_frag_meta(first.len(), src, dst),
+    );
+    assert_eq!(
+        dbg1.tx, 1,
+        "premise: the committed first fragment must translate and forward, or the \
+         non-first fragment below has no association to inherit"
+    );
+
+    // POSITIVE CONTROL. The filter logs a packet that HAS a flow, on this
+    // interface, through this term. Without this the zero below is explained
+    // equally well by the filter never being consulted at all.
+    assert_eq!(
+        first_handle.dataplane_event_stats().filter_log.sent,
+        1,
+        "#6836 CONTROL: the flow-bearing first fragment MUST be egress-logged. If this \
+         is 0 the fixture is not logging anything and the assertion below proves nothing"
+    );
+
+    // The non-first fragment: no L4 header, so no `tx_selection_flow`. This is
+    // the packet #5467's flowless branch exists for.
+    let non_first = nat64_v6_frag_frame(0x0008, 0x1234_5678, src, dst, 0, 0);
+    let (_b2, dbg2, second_handle, _rx2) = txn_run_descriptor_capturing_events(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        nat64_v6_frag_meta(non_first.len(), src, dst),
+    );
+    assert_eq!(
+        dbg2.tx, 1,
+        "the inheriting non-first fragment must still forward — the filter accepts"
+    );
+
+    assert_eq!(
+        second_handle.dataplane_event_stats().filter_log.sent,
+        0,
+        "#7656 GAP (pinned, not fixed here): a NAT64 non-first fragment forwards \
+         through a LOGGING output filter and is NOT logged — the very bypass #5467's \
+         flowless branch exists to prevent. If this is now 1, that branch has been \
+         made to reach this path: INVERT this assertion in the same commit and delete \
+         the gap note above, so the fix is a deliberate edit rather than a silent \
+         divergence."
     );
 }

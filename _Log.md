@@ -106306,3 +106306,8 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/compact_block_inventory_regen_2419_test.go` (new),
   `pkg/config/testdata/compact_block_divergences_2419.txt` (new),
   `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 — give the NAT64 meta fixtures real flow addresses, and
+    pin the #7656 flowless egress-logging gap the fix made observable
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
