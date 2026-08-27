@@ -351,6 +351,15 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// nft's raw payload syntax takes BIT offset and BIT length from the base:
 	// `@nh,<off>,<len>`. match-start layer-3 — the only start point the compiler
 	// emits — is the network header base.
+	// The `!lo0FlexMatchUnrepresentable` conjunct is a BELT and is currently
+	// UNREACHABLE: the early return above already left the function for every
+	// unrepresentable term, so by here the predicate is always false. It is kept
+	// because it is the guard that would matter if the early return were ever
+	// moved or narrowed — but a mutation that deletes it CANNOT red, and #7722
+	// was filed on exactly that green. Recorded here so the next mutation sweep
+	// reads it as dominated rather than as an unguarded fail-open. The
+	// disposition itself is bound by
+	// TestNftRuleFromTermFlexMatchUnrepresentableMatchesNothing7722.
 	if fm := term.FlexMatch; fm != nil && !lo0FlexMatchUnrepresentable(term) {
 		parts = append(parts, nftFlexMatchExpr(*fm))
 	}
