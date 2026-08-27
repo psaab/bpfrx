@@ -25,13 +25,24 @@ impl BindingLiveState {
             .lock()
             .map(|status| status.clone())
             .unwrap_or_default();
+        // #6898 (A1-b5-F1): ONE load, both fields derived from it. These two
+        // fields are two spellings of the same value -- the mode's name and
+        // whether that mode is zero-copy -- so reading the atomic twice lets a
+        // concurrent rebind land between them and publish a snapshot whose
+        // `xsk_bind_mode` and `zero_copy` describe DIFFERENT modes. That is a
+        // torn pair in an operator-facing status surface: `show` would report a
+        // copy-mode bind as zero-copy, or the reverse, and the disagreement is
+        // internal to one snapshot so nothing downstream can detect it.
+        //
+        // Relaxed remains correct -- the fields are independent status values,
+        // not a release/acquire handshake -- but they must come from a single
+        // observation of the atomic, not two.
+        let bind_mode = XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed));
         BindingLiveSnapshot {
             bound: self.bound.load(Ordering::Relaxed),
             xsk_registered: self.xsk_registered.load(Ordering::Relaxed),
-            xsk_bind_mode: XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed))
-                .as_str()
-                .to_string(),
-            zero_copy: XskBindMode::from_u8(self.bind_mode.load(Ordering::Relaxed)).is_zerocopy(),
+            xsk_bind_mode: bind_mode.as_str().to_string(),
+            zero_copy: bind_mode.is_zerocopy(),
             socket_fd: self.socket_fd.load(Ordering::Relaxed),
             socket_ifindex: self.socket_ifindex.load(Ordering::Relaxed),
             socket_queue_id: self.socket_queue_id.load(Ordering::Relaxed),

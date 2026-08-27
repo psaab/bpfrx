@@ -94,6 +94,10 @@ type CompileResult struct {
 	// (armproof.go) cannot tell a declined surface from one armed
 	// successfully. Appended lazily; nil is a valid empty state.
 	unarmedSurfaces []UnarmedSurface
+	// unappliedFilterBindings records firewall-filter bindings the config
+	// declared but the compiler could not assign (#6893). The CAUSE of such a
+	// miss is already an unarmedSurfaces entry; this is its consequence.
+	unappliedFilterBindings []UnappliedFilterBinding
 
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
@@ -199,6 +203,33 @@ func (r *CompileResult) peekLinkByIndex(idx int) (netlink.Link, error) {
 // cosmetic wart. A repeat sighting never downgrades the classification: if
 // either one could not prove the netdev down, the surface keeps the
 // conservative reading.
+// recordUnappliedFilterBinding records a filter binding the compiler could not
+// assign (#6893). Deduped on (Interface, Reason) so one unresolvable interface
+// with several units does not fan out into near-identical rows.
+func (r *CompileResult) recordUnappliedFilterBinding(b UnappliedFilterBinding) {
+	if r == nil || len(b.Filters) == 0 {
+		return
+	}
+	for i := range r.unappliedFilterBindings {
+		if r.unappliedFilterBindings[i].Interface != b.Interface ||
+			r.unappliedFilterBindings[i].Reason != b.Reason {
+			continue
+		}
+		r.unappliedFilterBindings[i].Filters = append(r.unappliedFilterBindings[i].Filters, b.Filters...)
+		return
+	}
+	r.unappliedFilterBindings = append(r.unappliedFilterBindings, b)
+}
+
+// UnappliedFilterBindings reports the filter bindings this compile declined to
+// assign (#6893). See UnappliedFilterBinding for what a non-empty slice means.
+func (r *CompileResult) UnappliedFilterBindings() []UnappliedFilterBinding {
+	if r == nil {
+		return nil
+	}
+	return r.unappliedFilterBindings
+}
+
 func (r *CompileResult) recordUnarmedSurface(u UnarmedSurface) {
 	if r == nil {
 		return
