@@ -106759,3 +106759,46 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6853 — carried the new field through the Rust test literals and the wire specimen; added a both-directions wire-compat test pinning the mixed-version HA claim.
   - **File(s)**: userspace-dp/src/filter/tests.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+## 2026-08-26 — #6826 bound the incoming side of the epoch flock
+
+- **Timestamp**: 2026-08-26
+- **Action**: Pin the invariant that a returned `Manager.Stop` does NOT release
+  the cross-process epoch flock, and bound the OTHER side so an incoming process
+  declines rather than parks behind an outgoing one's still-running worker.
+- **Re-derived at `773c3e655`** by shape rather than by the issue's line numbers
+  (they had moved): `withEpochFileLock` takes `LOCK_EX`, defers `LOCK_UN`, and
+  runs the callback — including the durable write and `fsync` — in between;
+  `joinBootEpochRefine` returns false on timeout without cancelling the worker;
+  `Manager.Stop` warns and returns on that false. Confirmed.
+- **Fix direction chosen, and the two rejected**: releasing on the timeout path
+  means interrupting a durable write plus `fsync` at an arbitrary point, which
+  is how a torn epoch file is written. Making the join budget cover the worst
+  case is impossible — the worst case is a wedged `fsync`, and refusing to block
+  on that is the reason the bound exists at all. So the fix is the third
+  direction the issue offers: the INCOMING process treats a held lock as an
+  expected transient. `withEpochFileLock` used a BLOCKING `LOCK_EX`;
+  `acquireEpochFileLock` now polls `LOCK_EX|LOCK_NB` for
+  `bootEpochLockAcquireBudget` and then declines, matching the two sibling
+  branches that already decline.
+- **EWOULDBLOCK is treated differently from other errno**: contention is
+  retried, a real failure returns immediately. Retrying `ENOLCK` for three
+  seconds would turn a fast correct decline into a slow one.
+- **The test was the thing the issue said was missing**, and it is written to
+  pin the CURRENT contract rather than a fix nobody made: if someone later makes
+  `Stop` imply release, the cell reds and points at the invariant comment. That
+  is drift detection in whichever direction it drifts.
+- **Ground-truth control first**: `flock(2)` associates a lock with the open file
+  DESCRIPTION, not the process, so a second `os.OpenFile` in the same process
+  contends exactly as another process would. That property is asserted directly —
+  without it every "the lock is free" assertion in the file passes vacuously.
+- **The -race probe uses UNEQUAL iteration counts.** A contender and an acquirer
+  with equal counts lets the cheap side finish inside the expensive side's first
+  pass, so the two barely overlap and `-race` observes nothing while the test
+  reports success. The contender loops until the acquirer signals done, and the
+  achieved RATE is reported: 40 acquisitions in 77ms against 4874 contender lock
+  cycles (63047/s). A run that degenerated to no overlap fails instead of
+  passing.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`,
+  `pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go` (new),
+  `pkg/cluster/README.md`, `_Log.md`

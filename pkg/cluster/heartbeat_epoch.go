@@ -608,7 +608,7 @@ func withEpochFileLock(path string, fn func()) {
 		return
 	}
 	defer f.Close()
-	if err := epochFlock(int(f.Fd()), unix.LOCK_EX); err != nil {
+	if err := acquireEpochFileLock(int(f.Fd()), path); err != nil {
 		slog.Warn("cluster: HA epoch state lock failed; SKIPPING the persist "+
 			"(the wall-clock epoch is already in use; only backward-clock-step "+
 			"protection is lost)", "path", path, "err", err)
@@ -616,6 +616,76 @@ func withEpochFileLock(path string, fn func()) {
 	}
 	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
 	fn()
+}
+
+// bootEpochLockAcquireBudget bounds how long withEpochFileLock waits for a lock
+// another PROCESS holds before declining the persist.
+//
+// It exists because a returned Manager.Stop does NOT imply this lock is free —
+// see the invariant at joinBootEpochRefine — and restart is the documented
+// recovery path for this subsystem, so the incoming process is exactly the
+// party positioned to meet the outgoing one's lock. Sized to cover an ordinary
+// durable write plus fsync on a healthy store while staying far below anything
+// an operator would experience as a hang.
+const bootEpochLockAcquireBudget = 3 * time.Second
+
+// bootEpochLockRetryInterval is the poll gap inside that budget. flock(2) has no
+// timed variant, so a bounded wait is a non-blocking attempt in a loop.
+const bootEpochLockRetryInterval = 25 * time.Millisecond
+
+// acquireEpochFileLock takes the epoch flock with a BOUNDED wait.
+//
+// WHY NOT A BLOCKING LOCK_EX, which is what this used to do. The lock is
+// cross-process, and the process most likely to be holding it is an outgoing
+// xpfd whose Manager.Stop has already returned: Stop joins the refinement
+// worker with a bounded budget and, on timeout, warns and returns while the
+// worker is still inside its callback holding LOCK_EX. A blocking acquisition
+// here parks the INCOMING process's refinement worker for as long as that
+// outgoing worker takes — which, if it is wedged on a dead disk, is the
+// unbounded wait this entire file exists to avoid.
+//
+// WHY DECLINING IS THE RIGHT FAILURE. Its two siblings already decline:
+// MkdirAllDurable failure declines and WriteFileDurable failure declines. What
+// declining costs is bounded and transient — the wall-clock epoch is already
+// published and already on the wire, so only backward-clock-step protection is
+// lost, and only until the next resolve succeeds. What blocking costs is a
+// refinement worker parked forever behind another process's wedged fsync.
+//
+// The bound is not a guess about the other process's health. It is a statement
+// that this node's epoch refinement is not worth waiting on another node's
+// store for, which is the same trade every other branch in this file makes.
+func acquireEpochFileLock(fd int, path string) error {
+	deadline := time.Now().Add(bootEpochLockAcquireBudget)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		lastErr = epochFlock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if lastErr == nil {
+			if attempt > 0 {
+				slog.Info("cluster: HA epoch state lock acquired after contention "+
+					"(another process — most likely an outgoing xpfd whose refinement "+
+					"worker outlived its Stop — held it)",
+					"path", path, "attempts", attempt+1)
+			}
+			return nil
+		}
+		// EWOULDBLOCK is CONTENTION, not failure: someone else holds it and may
+		// release it. Every other errno is a real failure and is returned
+		// immediately rather than retried until the budget expires — retrying
+		// ENOLCK for three seconds would turn a fast, correct decline into a
+		// slow one.
+		if lastErr != unix.EWOULDBLOCK {
+			return lastErr
+		}
+		if !time.Now().Before(deadline) {
+			slog.Warn("cluster: HA epoch state lock still held by another process after "+
+				"the acquire budget; DECLINING the persist rather than parking this "+
+				"node's refinement worker behind it (a returned Manager.Stop does not "+
+				"imply the previous holder released it — see joinBootEpochRefine)",
+				"path", path, "waited", bootEpochLockAcquireBudget)
+			return lastErr
+		}
+		time.Sleep(bootEpochLockRetryInterval)
+	}
 }
 
 // heartbeatEpochMarker derives this cluster's boot-epoch section marker from
@@ -923,6 +993,28 @@ func (m *Manager) releaseBootEpochRefine() bool {
 
 // joinBootEpochRefine waits for an in-flight refine worker to exit, up to
 // budget. It reports whether the worker was joined.
+//
+// THE INVARIANT, STATED SO IT CANNOT DRIFT (#6826). A join that returns FALSE
+// means the worker is STILL RUNNING, and that worker may be inside
+// withEpochFileLock holding a CROSS-PROCESS flock: the lock is taken before the
+// callback and released by a defer after it, and nothing cancels the callback.
+// So:
+//
+//	a returned Manager.Stop does NOT imply the epoch flock is released.
+//
+// It is stated rather than fixed because the alternatives are worse. Releasing
+// the lock on the timeout path would mean interrupting a durable write and an
+// fsync at an arbitrary point, which is how a torn epoch file gets written.
+// Making the budget cover the worst-case callback is not possible — the
+// worst case is a wedged fsync, and bounding that is what this whole file
+// exists to avoid.
+//
+// What closes the hole is the OTHER side: acquireEpochFileLock waits a bounded
+// time for a contended lock and then declines the persist, so an incoming
+// process meeting an outgoing one's still-held lock degrades to "no
+// backward-clock-step protection this pass" instead of parking behind it.
+// TestStopReturnsWhileEpochFlockIsStillHeld6826 pins this direction, and
+// TestIncomingProcessDeclinesRatherThanBlocking6826 pins the other.
 //
 // THE BOUND IS THE POINT. The worker's blocking calls are a flock and an fsync,
 // and this whole file exists because those can wedge indefinitely without that
