@@ -331,10 +331,16 @@ func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *
 // Read only on the branch that has already decided the zone is unpopulated, so
 // it costs nothing on the healthy path.
 func (s *Server) zoneCounterOverflowActive() bool {
-	if s == nil || s.dp == nil {
+	if s == nil {
 		return false
 	}
-	provider, ok := s.dp.(interface {
+	// #2114: probe through dpProbe(), NEVER the stored dp field. Under the live
+	// indirection an assertion on the field answers "capability absent" for a
+	// perfectly HEALTHY backend that implements it — here that would silently
+	// suppress the #6845 overflow line and leave the operator reading the
+	// generic three-cause message on a cluster whose slot table really has
+	// overflowed. The daemon_dp_probe_canary_test.go guard caught exactly that.
+	provider, ok := s.dpProbe().(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
