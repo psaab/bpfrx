@@ -1,3 +1,32 @@
+## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
+
+- **Timestamp**: 2026-08-26
+- **Action**: `sshdConfPath` is a package var precisely so a test can point the
+  xpf-managed sshd drop-in at a throwaway tree, but `applySSHConfig` created its
+  DIRECTORY from a hard-coded `/etc/ssh/sshd_config.d`. Relocating the var gave
+  a file path with no parent, the write failed ENOENT, and the failure surfaced
+  as whatever the test was actually asserting — so a cell checking only "an
+  error was returned" passed while observing the fixture's own broken seam
+  rather than the injected condition. Derived the directory from
+  `filepath.Dir(sshdConfPath)`; byte-identical in production.
+  DELETED the `os.MkdirAll(filepath.Dir(sshdConfPath))` workaround the #6790
+  credential cells were carrying. That deletion IS the regression signal: the
+  #6790 suite passes without it, which is the observable proof the derivation
+  works, and if the parent stops being derived the healthy-control cell goes red
+  instead of the failure being absorbed.
+  Added a PAIRED production-value cell, which is the one that keeps this from
+  being a behaviour change: every other cell relocates the path, so none of them
+  would notice if the derivation produced the wrong directory on a real box.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/sshd_dropin_dir_seam_7609_test.go` (new),
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+- **Validation**: 3 cells — the relocation property with a NESTED path (so a fix
+  that only works for an existing grandparent still fails) and no pre-created
+  parent, the production-value control, and a cell holding the pre-existing
+  #2062 property that the mkdir error is still surfaced by name rather than
+  swallowed into the opaque downstream write error.
+
 ## 2026-08-26 — #6830 round 2: `ntp` was an INVENTED row, and it was on the wire
 
 - **Timestamp**: 2026-08-26
@@ -106650,6 +106679,39 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/config/compact_tail.go,
     pkg/config/compact_leaf_credentials_test.go
 
+## 2026-08-26 — #2419 widen the compact/block census to named instances
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove the named-instance exclusion from the #2419 census walker
+  and regenerate the inventory. No production change — this is a measurement
+  correction, and it makes the number the normalizer's criterion rests on
+  checkable by anyone.
+- **The exclusion was WRONG, and wrong in the direction that hides defects.**
+  It was generalized from ONE probe — `interfaces { ge-0/0/0 description
+  hello; }`, which genuinely compiles to zero interfaces — to every named
+  instance in the schema. Measured on the rest: `interface ge-0/0/0.0 cost 10;`
+  compiles the interface with `cost=0`. The instance IS recognised; only its
+  body is lost, which is strictly worse than not recognising it because the
+  half-built object reaches the renderer and the runtime. #7653 is the same
+  shape two levels deep, with OSPF authentication as the dropped body.
+- **Numbers, re-derived at `6b80a84f6`** (NOT the 363 measured before #6817/
+  #6818/#6822 merged — that number is now stale in a way that looks like
+  progress): **546 checked, 356 divergent, 204 unruled**. The honest quote is
+  ">= 356 divergent, 204 unruled": the unruled grew 96 -> 204 with the widening
+  and they are sites whose synthesized fixture was too thin to OBSERVE the
+  value, not clean sites.
+- **Golden diff classified before trusting it**: 0 data lines REMOVED (nothing
+  that was divergent silently stopped being divergent, so no behaviour change is
+  laundered in), +169 added, 5 header lines re-counted. Sample-verified one
+  added site by hand: `applications { application myapp description hello; }`
+  compiles the application with an EMPTY description while the block spelling
+  sets it.
+- **Not covered, and named as such**: the walker collapses exactly ONE level, so
+  it cannot generate #7653's two-level tail. Shape 3 is unmeasured here and its
+  number is owed separately, with the depth it reached stated.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`, `_Log.md`
 - **Timestamp**: 2026-08-26
   - **Action**: #6872 — replace four function-local `static GUARD`s with one
     shared module-scope guard; scan for the regression

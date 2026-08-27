@@ -1471,12 +1471,25 @@ Three things to know before working on this class:
    hand-authored or `load merge`d text, and from tools that render flat paths
    into partial braces. A test that compares "flat-set vs block" is comparing
    block against block: vacuously equal for every leaf and green everywhere.
-2. **Only a PLAIN KEYWORD stanza is compactable.** Collapsing a NAMED INSTANCE
-   (`interfaces ge-0/0/0`, `user ops`, `stream audit`) does not produce the
-   compact spelling of the same intent — the name is part of the node's identity
-   and the result is a node the compiler cannot recognise as that instance at
-   all. A census that compacts named instances over-reports by roughly a factor
-   of two.
+2. **A NAMED INSTANCE is compactable too, and that is where the dangerous
+   variant lives.** An earlier version of this section claimed collapsing a
+   named instance (`interfaces ge-0/0/0`, `user ops`, `stream audit`) produces
+   "a node the compiler cannot recognise as that instance at all". **That was
+   wrong**, generalized from a single probe, and wrong in the direction that
+   hides defects. There are two outcomes and they are not equally bad:
+
+   - **instance not created** — `interfaces { ge-0/0/0 description hello; }`
+     compiles to zero interfaces. A loud, total drop.
+   - **instance created, body dropped** — `interface ge-0/0/0.0 cost 10;`
+     compiles the interface with `cost=0`. This is the dangerous one: the
+     half-built object reaches the renderer and the runtime, so
+     `show configuration` displays what the operator wrote, the object binds
+     normally, and it enforces nothing. #7653 is this shape two levels deep,
+     where the dropped body is OSPF authentication.
+
+   `interfaces` gave the first outcome; everything else checked gives the
+   second. Excluding named instances hid ~169 sites of exactly the class the
+   census exists to count.
 3. **Bracketed multi-value lists are schema LEAVES, not containers.**
    `from protocol [ tcp udp ]` legitimately collapses onto `Keys` (see the next
    section). Any fix for this class must key on the schema's container/leaf
