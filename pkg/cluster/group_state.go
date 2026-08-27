@@ -224,6 +224,23 @@ func (m *Manager) GroupState(rgID int) *RedundancyGroupState {
 	return &cp
 }
 
+// SetGroupStateForTesting forces an RG's local state without running an
+// election. Test-only, mirroring SetPeerDHCPLeasesForTesting; not for
+// production callers.
+//
+// It exists because the #6889 reconciliation is defined against the manager's
+// AUTHORITATIVE RG0 state, and the divergence it corrects is precisely the one
+// an election would never produce on its own — a state reached while the event
+// announcing it was dropped. Driving a real election would reproduce the state
+// and the delivered event together, which is the case that was never broken.
+func (m *Manager) SetGroupStateForTesting(rgID int, st NodeState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rg, ok := m.groups[rgID]; ok {
+		rg.State = st
+	}
+}
+
 // IsLocalPrimary returns true if this node is primary for the given RG.
 func (m *Manager) IsLocalPrimary(rgID int) bool {
 	m.mu.RLock()

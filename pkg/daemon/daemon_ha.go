@@ -706,6 +706,80 @@ func (d *Daemon) handleClusterEvent(ctx context.Context, ev cluster.ClusterEvent
 	return vrrpTimer
 }
 
+// reconcileRG0ConfigOwnership re-derives the config-store read-only gate from
+// RG0's authoritative state, correcting a divergence a dropped event left
+// behind (#6889).
+//
+// THE PROBLEM IT SOLVES. SetClusterReadOnly is the authority boundary for who
+// may write config in a cluster, and its only production driver was the RG0
+// TRANSITION handler, reached from the event consumer. Manager.sendEvent is
+// non-blocking and drops on a full channel, so the boundary's state could
+// diverge from the state that decides it:
+//
+//   - drop a PROMOTION and the node reports RG0 primary (IsLocalPrimary(0)
+//     passes, gRPC admits the operator) while the store still refuses writes
+//     with ErrClusterReadOnly. The operator sees a node that claims to own
+//     config and will not be configured, and the only trace is a slog.Warn
+//     about a full channel that never mentions config ownership;
+//   - drop a DEMOTION and it diverges the other way, which fails OPEN.
+//
+// Neither self-heals: nothing re-drove the gate until the NEXT RG0 transition,
+// so a single burst of events could strand a node indefinitely. The
+// dropped-event fallback (triggerReconcile -> reconcileRGState) did generic RG
+// work and never touched this gate.
+//
+// WHY IT RE-DRIVES THE TRANSITION HANDLER instead of calling SetClusterReadOnly
+// directly. The gate is not the handler's only consequence: promotion also
+// reconciles config-sync to the peer, re-initiates synced IPsec SAs and nudges
+// DHCP lease-sync, and demotion CONFIRMS a pending commit-confirmed before
+// going read-only (#4378) so its rollback timer cannot fire on the demoted
+// standby and diverge from the peer. A dropped event skipped all of those, not
+// just the gate. Setting the bit alone would paper over the symptom this issue
+// names while leaving the rest of the transition unapplied — so the correction
+// runs the SAME code path the event would have, and there is exactly one
+// implementation of what an RG0 ownership change means.
+//
+// IT IS SILENT WHEREVER THE EVENT HANDLER IS SILENT. Only StatePrimary,
+// StateSecondary and StateSecondaryHold drive the gate, because those are the
+// only cases applyRG0OwnershipTransition acts on. StateLost and StateDisabled
+// are left exactly as they are: inventing a gate decision for a state the
+// transition path never decided would be new behaviour arriving through a
+// recovery mechanism, which is the wrong place to introduce it.
+//
+// A no-op when the gate already agrees, so the 2s loop costs one comparison.
+func (d *Daemon) reconcileRG0ConfigOwnership() {
+	if d.cluster == nil || d.store == nil {
+		return
+	}
+	rg0 := d.cluster.GroupState(0)
+	if rg0 == nil {
+		// No RG0 in this config — nothing owns the gate, so nothing to
+		// reconcile. Not the same as "RG0 exists and is secondary".
+		return
+	}
+
+	var wantReadOnly bool
+	switch rg0.State {
+	case cluster.StatePrimary:
+		wantReadOnly = false
+	case cluster.StateSecondary, cluster.StateSecondaryHold:
+		wantReadOnly = true
+	default:
+		return
+	}
+	if d.store.ClusterReadOnly() == wantReadOnly {
+		return
+	}
+
+	slog.Warn("cluster: config read-only gate disagreed with RG0 state — correcting. "+
+		"An RG0 transition event was almost certainly dropped (see the "+
+		"\"event channel full\" warning); the node would otherwise have stayed in "+
+		"this split state until the next transition.",
+		"rg0_state", rg0.State.String(), "store_read_only_was", !wantReadOnly,
+		"issue", "#6889")
+	d.applyRG0OwnershipTransition(rg0.State)
+}
+
 // applyRG0OwnershipTransition reacts to a RG0 ownership change: it toggles the
 // store's cluster read-only gate (whose INTENT is that only the RG0 primary
 // writes config -- this function is the only thing that arms it, so a node that
@@ -995,6 +1069,11 @@ func (d *Daemon) reconcileRGState() {
 	if d.cluster == nil || d.vrrpMgr == nil {
 		return
 	}
+
+	// #6889: re-derive the config read-only gate from RG0's authoritative
+	// state. Placed FIRST so no later early return in this function can skip
+	// it — the gate is an authority boundary, not per-RG actuation.
+	d.reconcileRG0ConfigOwnership()
 
 	// #2114: ONE dataplane snapshot per reconcile pass (plan §5.3 rule 1),
 	// shared across the per-RG actuation loop below — a mid-pass cell clear
