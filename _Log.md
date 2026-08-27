@@ -1,3 +1,47 @@
+## 2026-08-27 — #6821: security-log transport packed tail, gate and compiler together
+
+- **Timestamp**: 2026-08-27
+- **Action**: `security log stream <s> transport` has two legal hierarchical
+  spellings and the compiler read only one. `transport protocol tls;` packs its
+  value onto the container's own `Keys` with NO children, so the
+  `prop.Children` loop ran zero times and left `Transport.Protocol` empty on a
+  config that committed cleanly. Not inert: `daemon_system.go` defaults an empty
+  protocol to `udp`, so the compact spelling of a TLS audit stream shipped over
+  PLAINTEXT UDP while the config on disk still read `protocol tls`. That answers
+  the question the issue left open, and it is the worst of the possibilities it
+  listed.
+  The issue prescribed "accumulate `Keys[1:]`", and that alone would have been
+  wrong — the arm carried a comment saying so, and measuring confirmed it: the
+  gate ignores a container's packed tail BY DESIGN (compiler-faithful), so
+  `transport { protocol tpc; }` was rejected by the enum while
+  `transport protocol tpc;` was ACCEPTED. Compiling the tail without the gate
+  turns "not compiled" into "compiled, unvalidated". Added `schemaNode.packedTail`
+  as the explicit pairing: it declares that a compiler reads this container's
+  packed tail, and `walkSchemaNode` then validates the same `packedBodyChildren`
+  expansion the compiler consumes. Three readers, one expansion, resolved through
+  `securityLogTransportSchema()` so a schema move cannot silently hand back the
+  unexpanded children and restore the defect.
+  The `tls-profile` half fails the other way and the issue framed both the same:
+  xpf resolves no TLS profile at all, so the BLOCK spelling is REJECTED at commit
+  (#3350). The compact spelling slipped past that rejection AND dropped the
+  value — a lost diagnostic, not lost protection.
+  The #2419 census tripwire fired, which is it working: the two leaves were
+  recorded as by-design divergent BECAUSE of the packed-tail blocker. They moved
+  to `filedFixed` rather than being deleted so the sites stay checked in both
+  directions, and the `filedByDesign` floor dropped 6 -> 4 with the reason at the
+  assertion.
+- **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
+  `pkg/config/schema_walk.go`, `pkg/config/compiler_security_log.go`,
+  `pkg/config/security_log_transport_compact_6821_test.go` (new),
+  `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`
+- **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0
+  (68 ok, 0 FAIL). 5-cell mutation matrix, 5/5 RED, full package, no `-run`
+  filter, fix committed before mutating. One cell initially reported ANCHOR x2
+  (both readers share the same call prefix) and was re-anchored — a cell that
+  cannot locate its line measures nothing.
+
 ## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
 
 - **Timestamp**: 2026-08-26
@@ -106759,6 +106803,53 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6853 — carried the new field through the Rust test literals and the wire specimen; added a both-directions wire-compat test pinning the mixed-version HA claim.
   - **File(s)**: userspace-dp/src/filter/tests.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6849 — settled the fork by measurement (no Go producer has ever emitted `medium`; the arm predates T-7 and was carried mechanically), removed the dead arm, kept the rank numbering, and documented why COS_PRIORITY_LEVELS=6 is correct rather than off by one.
+  - **File(s)**: userspace-dp/src/afxdp/forwarding_build/cos.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/policy_snapshot_error.rs
+
+## 2026-08-26 — #6826 bound the incoming side of the epoch flock
+
+- **Timestamp**: 2026-08-26
+- **Action**: Pin the invariant that a returned `Manager.Stop` does NOT release
+  the cross-process epoch flock, and bound the OTHER side so an incoming process
+  declines rather than parks behind an outgoing one's still-running worker.
+- **Re-derived at `773c3e655`** by shape rather than by the issue's line numbers
+  (they had moved): `withEpochFileLock` takes `LOCK_EX`, defers `LOCK_UN`, and
+  runs the callback — including the durable write and `fsync` — in between;
+  `joinBootEpochRefine` returns false on timeout without cancelling the worker;
+  `Manager.Stop` warns and returns on that false. Confirmed.
+- **Fix direction chosen, and the two rejected**: releasing on the timeout path
+  means interrupting a durable write plus `fsync` at an arbitrary point, which
+  is how a torn epoch file is written. Making the join budget cover the worst
+  case is impossible — the worst case is a wedged `fsync`, and refusing to block
+  on that is the reason the bound exists at all. So the fix is the third
+  direction the issue offers: the INCOMING process treats a held lock as an
+  expected transient. `withEpochFileLock` used a BLOCKING `LOCK_EX`;
+  `acquireEpochFileLock` now polls `LOCK_EX|LOCK_NB` for
+  `bootEpochLockAcquireBudget` and then declines, matching the two sibling
+  branches that already decline.
+- **EWOULDBLOCK is treated differently from other errno**: contention is
+  retried, a real failure returns immediately. Retrying `ENOLCK` for three
+  seconds would turn a fast correct decline into a slow one.
+- **The test was the thing the issue said was missing**, and it is written to
+  pin the CURRENT contract rather than a fix nobody made: if someone later makes
+  `Stop` imply release, the cell reds and points at the invariant comment. That
+  is drift detection in whichever direction it drifts.
+- **Ground-truth control first**: `flock(2)` associates a lock with the open file
+  DESCRIPTION, not the process, so a second `os.OpenFile` in the same process
+  contends exactly as another process would. That property is asserted directly —
+  without it every "the lock is free" assertion in the file passes vacuously.
+- **The -race probe uses UNEQUAL iteration counts.** A contender and an acquirer
+  with equal counts lets the cheap side finish inside the expensive side's first
+  pass, so the two barely overlap and `-race` observes nothing while the test
+  reports success. The contender loops until the acquirer signals done, and the
+  achieved RATE is reported: 40 acquisitions in 77ms against 4874 contender lock
+  cycles (63047/s). A run that degenerated to no overlap fails instead of
+  passing.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`,
+  `pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go` (new),
+  `pkg/cluster/README.md`, `_Log.md`
 
 ## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
 

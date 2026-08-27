@@ -56,6 +56,35 @@ locating any symbol below is now a matter of opening the named file.
   start-time wiring (`Manager.initHeartbeatEpochState`) — `heartbeat_epoch.go`. The downgrade
   latch itself is process-scoped state on `heartbeatAuthState`; there is no
   peer-floor file.
+  - **A returned `Manager.Stop` does NOT imply the epoch flock is released
+    (#6826).** `Stop` joins the refinement worker with a bounded budget
+    (`bootEpochStopJoinBudget`) and, on timeout, warns and returns; nothing
+    cancels the worker, and `withEpochFileLock` holds `LOCK_EX` across the
+    callback's durable write and `fsync`. So a timed-out `Stop` returns while a
+    lock OTHER PROCESSES can see is still held.
+
+    It is stated rather than eliminated because both alternatives are worse.
+    Releasing on the timeout path means interrupting a durable write plus
+    `fsync` at an arbitrary point, which is how a torn epoch file is written.
+    Making the budget cover the worst case is not possible — the worst case is a
+    wedged `fsync`, and refusing to block on that is why the bound exists.
+
+    What closes the hole is the OTHER side: `acquireEpochFileLock` waits
+    `bootEpochLockAcquireBudget` for a contended lock and then DECLINES the
+    persist, so an incoming process meeting an outgoing one's still-held lock
+    degrades to "no backward-clock-step protection this pass" instead of parking
+    behind it. That matters because restart is the documented recovery path here
+    — a day-2 topology or identity change is refused at commit
+    (`pkg/daemon/cluster_topology_preflight.go`) — so the incoming process is
+    exactly the party positioned to meet the lock. Declining matches its
+    siblings: `MkdirAllDurable` and `WriteFileDurable` failures already decline.
+
+    Both directions are pinned:
+    `TestStopReturnsWhileEpochFlockIsStillHeld6826` (Stop returns, lock held) and
+    `TestIncomingProcessDeclinesRatherThanBlocking6826` (the incoming side gives
+    up on time rather than blocking), with a ground-truth control asserting a
+    second open file description really does contend — without which every
+    lock-availability assertion would pass vacuously.
 - Single-RG manual failover and transfer-commit protocol
   (`ManualFailover`, `ForceSecondary`, `ResetFailover`,
   `RequestPeerFailover`, `commitRequestedPeerFailover`,

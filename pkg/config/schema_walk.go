@@ -607,7 +607,19 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		return nil
 	}
 
-	return walkSchemaChildren(node.Children, descendSchema, newPath, vc, childClosed)
+	// #6821: a container that OPTS IN to packedTail has its packed tail
+	// validated, because a compiler reads it. The expansion is the SAME one
+	// `packedBodyChildren` hands that compiler, so the gate and the compiler
+	// cannot disagree about what the tokens mean.
+	//
+	// Default-off is deliberate and is the compiler-faithful contract above:
+	// for every other container the tail is not compiled, so validating it
+	// would reject a configuration that behaves identically either way.
+	walkChildren := node.Children
+	if childSchema.packedTail && len(node.Keys) > consumed {
+		walkChildren = packedBodyChildren(node, childSchema)
+	}
+	return walkSchemaChildren(walkChildren, descendSchema, newPath, vc, childClosed)
 }
 
 // walkInstanceChildren peels the missing instance-name level(s) off a

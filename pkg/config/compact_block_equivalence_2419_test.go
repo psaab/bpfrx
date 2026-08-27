@@ -197,6 +197,14 @@ const inventoryPath = "testdata/compact_block_divergences_2419.txt"
 var filedFixed = map[string]string{
 	"protocols ospf area xpfarg interface xpfarg authentication simple-password":         "#6818",
 	"snmp v3 usm local-engine user xpfarg authentication-sha256 authentication-password": "#6822",
+	// #6821 moved here from filedByDesign rather than being deleted. Its
+	// blocker -- the gate not validating a container's packed tail -- was
+	// removed by the `packedTail` opt-in, so the divergence is fixed rather
+	// than deliberate. Deleting the lines instead would stop the site being
+	// checked in EITHER direction, which is the stale-allowlist failure this
+	// file exists to prevent.
+	"security log stream xpfarg transport protocol":    "#6821",
+	"security log stream xpfarg transport tls-profile": "#6821",
 }
 
 // filedByDesign is the category the inventory did not previously distinguish:
@@ -219,15 +227,14 @@ var filedFixed = map[string]string{
 // longer exists: it is neither silent (commit names it, load warns) nor
 // accidental.
 var filedByDesign = map[string]string{
-	// #6821 is filed and REAL, but compiling the compact spelling is blocked on
-	// the strict gate learning to validate a container's packed tail. Today the
-	// block spelling `transport { protocol tpc; }` is rejected by the enum and
-	// the compact `transport protocol tpc;` is accepted, so compiling the
-	// compact form would turn "not compiled" into "compiled, unvalidated" --
-	// and for `tls-profile` it would walk past the deliberate #3350 commit
-	// rejection into a stream that silently ignores the named profile.
-	"security log stream xpfarg transport protocol":    "#6821 -> blocked on packed-tail validation",
-	"security log stream xpfarg transport tls-profile": "#6821 -> blocked on packed-tail validation",
+	// #6821's two transport leaves USED to sit here, blocked on the strict gate
+	// learning to validate a container's packed tail. That blocker is gone: the
+	// schema node now sets `packedTail: true`, walkSchemaNode validates the same
+	// expansion `packedBodyChildren` hands the compiler, and the #3350
+	// tls-profile check reads it too -- so the compact spelling is validated,
+	// compiled and rejected exactly as the block spelling is. This tripwire
+	// firing is what said the decision had been reversed; see
+	// security_log_transport_compact_6821_test.go.
 
 	"system login user xpfarg authentication encrypted-password": "#6817 -> resolved by #6662",
 	"system login user xpfarg authentication ssh-ed25519":        "#6817 -> resolved by #6662",
@@ -403,7 +410,7 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 	// adding an anchor never needs a second edit here -- but draining one out
 	// does.
 	if len(filedFixed) < 2 {
-		t.Errorf("filedFixed holds %d anchors, want at least 2 (#6818, #6822). "+
+		t.Errorf("filedFixed holds %d anchors, want at least 2 (#6818, #6822, #6821). "+
 			"An entry was removed, and the site it named is no longer checked in "+
 			"either direction.", len(filedFixed))
 	}
@@ -412,12 +419,17 @@ func TestCompactBlockEquivalenceInventory2419(t *testing.T) {
 			"compiler files. With fewer, a fault confined to one file can silence "+
 			"the whole known-true half of the control.", len(filedStillOpen))
 	}
-	if len(filedByDesign) < 6 {
-		t.Errorf("filedByDesign holds %d entries, want at least 6 (four `system login "+
-			"user ... authentication` leaves plus the two #6821 transport leaves). "+
-			"A dropped entry turns a deliberate "+
-			"divergence back into an ordinary inventory line, which is exactly the "+
-			"confusion this category exists to prevent.", len(filedByDesign))
+	if len(filedByDesign) < 4 {
+		t.Errorf("filedByDesign holds %d entries, want at least 4 (the four `system "+
+			"login user ... authentication` leaves). A dropped entry turns a "+
+			"deliberate divergence back into an ordinary inventory line, which is "+
+			"exactly the confusion this category exists to prevent.\n"+
+			"The floor was 6 until #6821: its two transport leaves were by-design "+
+			"divergent only because the gate could not validate a container's "+
+			"packed tail. `packedTail` removed that blocker, so they MOVED to "+
+			"filedFixed -- a count that falls because a population shrank is the "+
+			"fix working, and carrying the old number forward would demand entries "+
+			"that should no longer exist.", len(filedByDesign))
 	}
 
 	// Positive control, both directions.
