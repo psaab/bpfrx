@@ -66,7 +66,7 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 	}
 
 	t.Run("unmapped facility warns", func(t *testing.T) {
-		got, clients := build(t, "authorization")
+		got, clients := build(t, "security")
 		// #6829 round 8: count asserted with Fatalf rather than folded into the
 		// value check — `len(clients) == 1 && ...` evaporates when nothing is
 		// installed, so a regression to ZERO passed silently.
@@ -91,7 +91,7 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 				"with no warning, while the daemon warns for the same config — the two "+
 				"paths are documented to mirror each other (#5738/#6829). captured:\n%s", got)
 		}
-		if !strings.Contains(got, "authorization") {
+		if !strings.Contains(got, "security") {
 			t.Errorf("the warning must name the unmapped facility. captured:\n%s", got)
 		}
 	})
@@ -111,7 +111,7 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"audit": {
 				Name: "audit", Host: "no-such-host.invalid.", Port: 514,
-				Facility: "authorization", Severity: "info",
+				Facility: "security", Severity: "info",
 			},
 		}
 		clients := buildSyslogClients(cfg)
@@ -133,7 +133,7 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 		cfg := &config.Config{}
 		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
 			"unmappable": {Name: "unmappable", Host: "192.0.2.10", Port: 514,
-				Facility: "authorization", Severity: "info"},
+				Facility: "security", Severity: "info"},
 			"mapped": {Name: "mapped", Host: "192.0.2.11", Port: 514,
 				Facility: "auth", Severity: "info"},
 		}

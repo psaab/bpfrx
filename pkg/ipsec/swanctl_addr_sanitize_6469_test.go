@@ -32,20 +32,6 @@ func buildAddrCfg(gwAddr, gwDyn, gwLocal, vpnLocal string) *config.IPsecConfig {
 	}
 }
 
-// hasBareDirectiveLine reports whether any rendered line, once its leading /
-// trailing whitespace is stripped, is EXACTLY the given swanctl directive.
-// A newline-injection payload that survives to render produces such a
-// standalone line (`    reauth_time = 0`); a neutralized payload keeps the
-// token mid-line inside the address value, so no line trims to it.
-func hasBareDirectiveLine(rendered, directive string) bool {
-	for _, line := range strings.Split(rendered, "\n") {
-		if strings.TrimSpace(line) == directive {
-			return true
-		}
-	}
-	return false
-}
-
 // TestSwanctlAddrInjectionNeutralized_6469 is the fail-on-revert guard for
 // #6469: the swanctl local_addrs / remote_addrs render sites must run the
 // endpoint value through sanitizeSwanctlValue so an embedded newline cannot
@@ -60,55 +46,64 @@ func TestSwanctlAddrInjectionNeutralized_6469(t *testing.T) {
 	// connection block. reauth_time is emitted by NO code path in this
 	// fixture, so its appearance as a bare line is proof of injection.
 	const inject = "203.0.113.1\n    reauth_time = 0"
-	const injectedDirective = "reauth_time = 0"
+	const injectedDirectiveKey = "reauth_time"
 
 	cases := []struct {
 		name string
 		cfg  *config.IPsecConfig
-		// addrLine is the sanitized address line that must be present,
-		// proving the connection still rendered (the VPN was not skipped)
-		// and the belt ran in place rather than dropping the field.
-		addrLine string
+		// addrKey / addrPrefix: the sanitized address must still lead the
+		// value of this setting, proving the connection rendered (the VPN was
+		// not skipped) and the belt ran in place rather than dropping the
+		// field. #6824: a key + a path, not a rendered line.
+		addrKey    string
+		addrPrefix string
 	}{
 		{
-			name:     "remote via gateway Address",
-			cfg:      buildAddrCfg(inject, "", "", ""),
-			addrLine: "remote_addrs = 203.0.113.1",
+			name:       "remote via gateway Address",
+			cfg:        buildAddrCfg(inject, "", "", ""),
+			addrKey:    "remote_addrs",
+			addrPrefix: "203.0.113.1",
 		},
 		{
-			name:     "remote via gateway DynamicHostname",
-			cfg:      buildAddrCfg("", inject, "198.51.100.7", ""),
-			addrLine: "remote_addrs = 203.0.113.1",
+			name:       "remote via gateway DynamicHostname",
+			cfg:        buildAddrCfg("", inject, "198.51.100.7", ""),
+			addrKey:    "remote_addrs",
+			addrPrefix: "203.0.113.1",
 		},
 		{
-			name:     "local via gateway LocalAddress",
-			cfg:      buildAddrCfg("198.51.100.7", "", inject, ""),
-			addrLine: "local_addrs = 203.0.113.1",
+			name:       "local via gateway LocalAddress",
+			cfg:        buildAddrCfg("198.51.100.7", "", inject, ""),
+			addrKey:    "local_addrs",
+			addrPrefix: "203.0.113.1",
 		},
 		{
-			name:     "local via vpn LocalAddr",
-			cfg:      buildAddrCfg("198.51.100.7", "", "", inject),
-			addrLine: "local_addrs = 203.0.113.1",
+			name:       "local via vpn LocalAddr",
+			cfg:        buildAddrCfg("198.51.100.7", "", "", inject),
+			addrKey:    "local_addrs",
+			addrPrefix: "203.0.113.1",
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
-			got := m.generateConfig(c.cfg)
+			doc := parseSwanctlDoc(t, m.generateConfig(c.cfg))
 
-			if hasBareDirectiveLine(got, injectedDirective) {
-				t.Fatalf("swanctl injection NOT neutralized: %q rendered as a "+
-					"live directive line — the newline in the endpoint value "+
-					"was not stripped:\n%s", injectedDirective, got)
-			}
-			// The sanitized value must still lead the address line: the belt
+			// #6824: the injection is neutralized iff the directive never
+			// becomes a SETTING anywhere in the parsed document. That is what
+			// strongSwan would act on, and it fires whatever value the payload
+			// carried -- where the old line scan matched only the exact
+			// injected text.
+			doc.hasNoSettingAnywhere(t, injectedDirectiveKey)
+
+			// The sanitized value must still lead the address setting: the belt
 			// collapses the newline to a space, so the address renders inert
 			// on one line rather than the field being dropped or the VPN
 			// skipped.
-			if !strings.Contains(got, c.addrLine) {
-				t.Fatalf("expected sanitized address line %q in render:\n%s",
-					c.addrLine, got)
+			conn := doc.at(t, "connections", "tun")
+			if v := conn.setting(t, c.addrKey); !strings.HasPrefix(v, c.addrPrefix) {
+				t.Fatalf("connections.tun.%s = %q, want it to still start with %q",
+					c.addrKey, v, c.addrPrefix)
 			}
 		})
 	}
@@ -122,35 +117,33 @@ func TestSwanctlAddrInjectionNeutralized_6469(t *testing.T) {
 // that the #6469 fix does not mangle a real address list or IPv6 endpoint.
 func TestSwanctlAddrLegitPreserved_6469(t *testing.T) {
 	cases := []struct {
-		name     string
-		gwAddr   string
-		wantLine string
+		name   string
+		gwAddr string
+		want   string
 	}{
 		{
-			name:     "single IPv4",
-			gwAddr:   "203.0.113.1",
-			wantLine: "remote_addrs = 203.0.113.1",
+			name:   "single IPv4",
+			gwAddr: "203.0.113.1",
+			want:   "203.0.113.1",
 		},
 		{
-			name:     "comma-separated multi-address list",
-			gwAddr:   "203.0.113.1,203.0.113.2",
-			wantLine: "remote_addrs = 203.0.113.1,203.0.113.2",
+			name:   "comma-separated multi-address list",
+			gwAddr: "203.0.113.1,203.0.113.2",
+			want:   "203.0.113.1,203.0.113.2",
 		},
 		{
-			name:     "IPv6 literal",
-			gwAddr:   "2001:db8::1",
-			wantLine: "remote_addrs = 2001:db8::1",
+			name:   "IPv6 literal",
+			gwAddr: "2001:db8::1",
+			want:   "2001:db8::1",
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
-			got := m.generateConfig(buildAddrCfg(c.gwAddr, "", "", ""))
-			if !strings.Contains(got, c.wantLine) {
-				t.Fatalf("legit endpoint over-escaped or dropped: want %q in "+
-					"render:\n%s", c.wantLine, got)
-			}
+			parseSwanctlDoc(t, m.generateConfig(buildAddrCfg(c.gwAddr, "", "", ""))).
+				at(t, "connections", "tun").
+				requireSetting(t, "remote_addrs", c.want)
 		})
 	}
 
@@ -160,10 +153,9 @@ func TestSwanctlAddrLegitPreserved_6469(t *testing.T) {
 		cfg := buildAddrCfg("", "", "", "")
 		cfg.Gateways["gw"].ResponderOnly = true
 		m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
-		got := m.generateConfig(cfg)
-		if !strings.Contains(got, "remote_addrs = %any") {
-			t.Fatalf("responder-only %%any endpoint not preserved:\n%s", got)
-		}
+		parseSwanctlDoc(t, m.generateConfig(cfg)).
+			at(t, "connections", "tun").
+			requireSetting(t, "remote_addrs", "%any")
 	})
 }
 
@@ -217,37 +209,48 @@ func TestSwanctlProposalsInjectionNeutralized_6469(t *testing.T) {
 	}
 
 	cases := []struct {
-		name      string
-		cfg       *config.IPsecConfig
-		directive string // the injected line that must NOT render live
-		wantSlot  string // the render slot that must still be present
+		name string
+		cfg  *config.IPsecConfig
+		// #6824: a KEY that must not become live anywhere, and the slot the
+		// sanitized value must still lead -- named by path, not by a rendered
+		// line whose indentation encoded which phase it belonged to.
+		directiveKey string
+		slotKey      string
+		slotPrefix   string
 	}{
 		{
-			name:      "IKE proposals newline injection",
-			cfg:       ikeCfg,
-			directive: "reauth_time = 0",
-			wantSlot:  "proposals = aes256",
+			name:         "IKE proposals newline injection",
+			cfg:          ikeCfg,
+			directiveKey: "reauth_time",
+			slotKey:      "proposals",
+			slotPrefix:   "aes256",
 		},
 		{
-			name:      "ESP esp_proposals updown->root injection",
-			cfg:       espCfg,
-			directive: "updown = /tmp/pwn.sh",
-			wantSlot:  "esp_proposals = aes256",
+			name:         "ESP esp_proposals updown->root injection",
+			cfg:          espCfg,
+			directiveKey: "updown",
+			slotKey:      "esp_proposals",
+			slotPrefix:   "aes256",
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
-			got := m.generateConfig(c.cfg)
-			if hasBareDirectiveLine(got, c.directive) {
-				t.Fatalf("swanctl proposal injection NOT neutralized: %q rendered "+
-					"as a live directive line — the newline in the proposal value "+
-					"was not stripped:\n%s", c.directive, got)
+			doc := parseSwanctlDoc(t, m.generateConfig(c.cfg))
+			doc.hasNoSettingAnywhere(t, c.directiveKey)
+
+			// The sanitized proposal must still lead its slot. #6824 pins WHICH
+			// slot: `proposals` on the connection is Phase 1, `esp_proposals`
+			// on the child SA is Phase 2, and a containment needle for
+			// "esp_proposals = aes256" could previously be satisfied by either
+			// render site emitting the token.
+			slot := doc.at(t, "connections", "tun")
+			if c.slotKey == "esp_proposals" {
+				slot = childSA_3904(t, m.generateConfig(c.cfg), "tun")
 			}
-			if !strings.Contains(got, c.wantSlot) {
-				t.Fatalf("expected sanitized proposal slot %q in render:\n%s",
-					c.wantSlot, got)
+			if v := slot.setting(t, c.slotKey); !strings.HasPrefix(v, c.slotPrefix) {
+				t.Fatalf("%s = %q, want it to still start with %q", c.slotKey, v, c.slotPrefix)
 			}
 		})
 	}
@@ -285,14 +288,12 @@ func TestSwanctlProposalsLegitPreserved_6469(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	got := m.generateConfig(cfg)
 
-	const wantIKE = "    proposals = aes256-sha256-modp2048,aes128-sha256-modp2048\n"
-	const wantESP = "        esp_proposals = aes256-sha256-modp2048,aes128-sha256-modp2048\n"
-	if !strings.Contains(got, wantIKE) {
-		t.Fatalf("legit IKE proposal list over-escaped or dropped: want %q in "+
-			"render:\n%s", wantIKE, got)
-	}
-	if !strings.Contains(got, wantESP) {
-		t.Fatalf("legit ESP proposal list over-escaped or dropped: want %q in "+
-			"render:\n%s", wantESP, got)
-	}
+	// #6824: the two needles carried leading indentation ("    " vs "        ")
+	// purely to distinguish Phase 1 from Phase 2, and a trailing "\n" to mean
+	// "the value ends here". Both are properties of the tree, so state them as
+	// such -- the assertions now survive a change to the renderer's indent and
+	// still reject a value with anything appended.
+	const wantList = "aes256-sha256-modp2048,aes128-sha256-modp2048"
+	parseSwanctlDoc(t, got).at(t, "connections", "tun").requireSetting(t, "proposals", wantList)
+	childSA_3904(t, got, "tun").requireSetting(t, "esp_proposals", wantList)
 }

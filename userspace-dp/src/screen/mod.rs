@@ -607,9 +607,44 @@ impl ScreenState {
             .unwrap_or(true)
     }
 
-    /// Returns true if any zone has a screen profile configured.
+    /// Returns true if any zone has a RESOLVED screen profile.
+    ///
+    /// Note what this deliberately does NOT include: a zone that references a
+    /// profile which does not exist. Unresolved references live in
+    /// `missing_profile_refs` and never touch `zones` (see
+    /// `update_missing_profiles`), so this predicate answers "is there anything
+    /// to enforce?" and nothing else. That is the right question for a
+    /// short-circuit that skips ENFORCEMENT.
+    ///
+    /// It is the wrong question for a short-circuit that also skips the
+    /// missing-profile WARN -- see `has_screen_state` (#6860).
     pub fn has_profiles(&self) -> bool {
         !self.zones.is_empty()
+    }
+
+    /// Returns true if this state has anything a screen stage needs to act on:
+    /// a resolved profile to ENFORCE, or an unresolved reference to REPORT.
+    ///
+    /// #6860: `stage_screen_check` gated on `has_profiles()`, which consults
+    /// only the resolved map. When a zone references a profile and NO profile
+    /// resolves anywhere, the stage returned before either missing-profile WARN
+    /// branch could run -- so the rate-limited runtime warning that #3082 and
+    /// #3908 shipped never fired in the one configuration it was written for.
+    ///
+    /// The state is reachable only through the tolerant paths, which is exactly
+    /// what makes the missing signal matter: strict commit rejects a dangling
+    /// reference, so a zone left screening NOTHING can only arrive via a
+    /// tolerant startup on an older or externally modified active.json, an HA
+    /// config-sync from a schema-skewed peer, or a rolling-upgrade interval
+    /// where the producing side does not emit the stanza. In every one of those
+    /// the operator believes a screen profile is applied and none is, and the
+    /// warning was the only thing that would have said so.
+    ///
+    /// Partial resolution was never affected: with one profile resolved,
+    /// `has_profiles()` is already true and the WARN fires normally. This
+    /// closes the all-or-nothing case only.
+    pub fn has_screen_state(&self) -> bool {
+        !self.zones.is_empty() || !self.missing_profile_refs.is_empty()
     }
 
     /// Run all screen checks for a packet arriving on the given zone.

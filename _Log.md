@@ -1,3 +1,188 @@
+## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
+
+- **Timestamp**: 2026-08-26
+- **Action**: `sshdConfPath` is a package var precisely so a test can point the
+  xpf-managed sshd drop-in at a throwaway tree, but `applySSHConfig` created its
+  DIRECTORY from a hard-coded `/etc/ssh/sshd_config.d`. Relocating the var gave
+  a file path with no parent, the write failed ENOENT, and the failure surfaced
+  as whatever the test was actually asserting — so a cell checking only "an
+  error was returned" passed while observing the fixture's own broken seam
+  rather than the injected condition. Derived the directory from
+  `filepath.Dir(sshdConfPath)`; byte-identical in production.
+  DELETED the `os.MkdirAll(filepath.Dir(sshdConfPath))` workaround the #6790
+  credential cells were carrying. That deletion IS the regression signal: the
+  #6790 suite passes without it, which is the observable proof the derivation
+  works, and if the parent stops being derived the healthy-control cell goes red
+  instead of the failure being absorbed.
+  Added a PAIRED production-value cell, which is the one that keeps this from
+  being a behaviour change: every other cell relocates the path, so none of them
+  would notice if the derivation produced the wrong directory on a real box.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/sshd_dropin_dir_seam_7609_test.go` (new),
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+- **Validation**: 3 cells — the relocation property with a NESTED path (so a fix
+  that only works for an existing grandparent still fails) and no pre-created
+  parent, the production-value control, and a cell holding the pre-existing
+  #2062 property that the mkdir error is still surfaced by name rather than
+  swallowed into the opaque downstream write error.
+
+## 2026-08-26 — #6830 round 2: `ntp` was an INVENTED row, and it was on the wire
+
+- **Timestamp**: 2026-08-26
+- **Action**: Reviewing the commit that wired the mapping into `ParseFacility`, I
+  found a defect in MY OWN table from round 1. `ntp` is not a configurable Junos
+  `[edit system syslog]` facility. Table 2 ("Facility Codes Reported in Priority
+  Information") carries the NTP code with NO Junos facility name against it, and
+  the documented rule is that a code whose second column is empty "cannot be
+  included in a statement at the [edit system syslog] hierarchy level".
+  I had taken `ntp` from a PROSE SUMMARY of the vocabulary; the authoritative
+  table excludes it. The two sources conflict on exactly one name, and that name
+  is the one I could not substantiate — so xpf was inventing a wire facility for
+  a name Junos itself rejects, which is the "picked by implementation
+  convenience" #6830 exists to avoid. Removed the row; `ntp` falls through to
+  local0 and the unmapped diagnostic, which is the correct handling for a name
+  with no documented wire facility. `FacilityNTP` stays (RFC 5424 assigns 12 to
+  the NTP subsystem — a real code we are simply not entitled to map to).
+  WHY MY OWN TEST DID NOT CATCH IT: `TestJunosRemoteFacilityMatchesTheDocumented
+  Table6830` asserts no-invented-rows against an independent TRANSCRIPTION — but
+  I transcribed it from the same prose I derived the production map from. The
+  "read the map you are checking pins nothing" failure, one level up, at the
+  documentation. Independence of the transcription is necessary and not
+  sufficient; the SOURCE has to be the authoritative one.
+  Also corrected a false claim in the round-1 unmapped-corpus comment: `security`,
+  `external` and `dcd` are described there as "valid Junos configuration with no
+  documented wire facility". Verified against the documentation — `security`
+  names a different hierarchy (`[edit security log]`), and `external`/`dcd` do
+  not appear in the configurable set at all. They are names Junos does not
+  accept here, which is why local0 is right for them, but the stated reason
+  would have licensed a future reader to invent mappings.
+  Hardened the anti-vacuity floor while I was there: it was the literal `12`,
+  which is a second place the table's size lives, so removing a row reds the
+  cell for the wrong reason and the obvious repair is to edit the number. Floor
+  and name list are now DERIVED from the independent transcription.
+- **File(s)**: `pkg/logging/syslog.go`,
+  `pkg/logging/junos_facility_mapping_6830_test.go`,
+  `pkg/logging/parse_facility_checked_5797_test.go`, `_Log.md`
+- **Validation**: full `pkg/logging`, `pkg/daemon` and `pkg/cli` green; repo-wide
+  gate re-run at the corrected head.
+
+## 2026-08-26 — #6830: the Junos facility mapping is a documented lookup, not a judgement
+
+- **Timestamp**: 2026-08-26
+- **Action**: #6830 asks which facility each unmapped Junos name should carry,
+  flagging `interactive-commands`, `conflict-log` and `pfe` as possibly having
+  no sensible BSD equivalent. They do have one: Junos publishes the table.
+  Verified against Juniper's documentation rather than recalled — *Table 3,
+  Default Facilities for Messages Directed to a Remote Destination*
+  (change-log->local6, conflict-log->local5, dfc->local1, firewall->local3,
+  interactive-commands->local7, pfe->local4) plus "for facilities that are not
+  listed, the default alternative name is the same as the local facility name"
+  (authorization->auth, daemon, ftp, kernel->kern, ntp, user). Together those
+  two rules cover the entire `[edit system syslog]` vocabulary, so the first of
+  the issue's three questions is a LOOKUP with zero judgement left in it.
+  The repo had already implemented ONE row — `change-log` -> local6 in
+  ParseFacility is exactly Table 3's value — so the table was consulted once
+  and never finished. 9 of the 13 names are wrong today.
+  Sharpest edge: Junos writes `authorization` and `kernel`; ParseFacility
+  recognizes the BSD spellings `auth`/`kern`. An operator configuring this box
+  as the Junos clone it is gets local0 for authentication and kernel records,
+  the two buckets a security collector is most likely watching.
+  Also established that only ONE surface is exposed: `security log stream ...
+  facility` IS enum-validated against exactly the recognized set, so no
+  substitution is reachable there. `system syslog <dest> <facility> <severity>`
+  models the facility as the schema's wildcard KEY with no keyValidator (only
+  the severity VALUE is validated), so every spelling commits clean. That is
+  the whole reachable surface.
+  Shipped the DECISION-NEUTRAL half: the table as data
+  (`JunosRemoteFacility`/`FacilityMisfiled`), NOT wired into the emit path, and
+  a diagnostic that now names the target facility and distinguishes a real
+  Junos name this box misfiles from a name in neither vocabulary. Those need
+  opposite operator actions, and conflating them sent an operator looking for a
+  typo when they had a mapping gap, or vice versa. The wire is unchanged: what
+  leaves the box for a name that is silently local0 today is the one part that
+  is a genuine contract decision (#6830 Q3), and it stays open.
+- **File(s)**: `pkg/logging/syslog.go`,
+  `pkg/logging/junos_facility_mapping_6830_test.go` (new),
+  `pkg/logging/README.md`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`, `_Log.md`
+- **Validation**: the documented table is transcribed INDEPENDENTLY in the test
+  rather than read from the production map — a test that reads the map it
+  checks pins nothing — and asserts both directions (no missing row, no
+  invented row). `TestFacilityMisfiledIdentifiesTodaysGap6830` is deliberately
+  written to go RED the day the emit path applies the mapping, with a failure
+  message saying to update it in the SAME commit, so the contract flip is a
+  deliberate edit rather than a silent divergence. The pre-existing #5797/#6829
+  cells pinned the literal "unmapped facility name"; they MOVED with the code
+  to "warned, named the facility, and classified it correctly", which is
+  strictly stronger than the literal they replaced.
+## 2026-08-26 — #6800: managed service-file convergence erased failed reload debt
+
+- **Timestamp**: 2026-08-26
+- **Action**: Gave the two managed-service-file appliers a persistent reload
+  debt plus an always-on retry owner. `applySyslogFiles` and `applySystemNTP`
+  converge an on-disk service configuration and then gate the RUNTIME reload on
+  "did the on-disk set change". The gate is correct for the steady state — it
+  is what stops every commit from bouncing rsyslog and chrony — but it also
+  erased the debt of a FAILED reload: the write half had already converged the
+  files, the failing reload was logged and dropped, and every later apply
+  compared desired against the converged set, saw `changed == false`, and
+  skipped the reload. The daemon kept serving the PREVIOUS ruleset (records
+  still flowing to a removed syslog destination; chrony still polling the old
+  server set) until an unrelated syslog/NTP edit or a reboot, on a node that
+  had reported a successful commit.
+  The chrony half needed the debt to be PER-LEG, not per-service: the sources
+  reload (`chronyc reload sources`) and the threshold reload (`systemctl reload
+  chrony`) are independent commands, so a sources failure followed by a
+  threshold-only edit must replay BOTH — re-deriving the request from the later
+  apply's own change flags drops the sources debt silently. `reloadChronyRuntime`
+  now returns a per-leg `chronyReloadOutcome` instead of returning nothing, and
+  both call sites fold the retained debt into the request BEFORE the no-change
+  early return. `serviceReloadDebtReassertLoop` covers the case with no next
+  apply at all (a boot-time failure): started unconditionally in `Run` next to
+  the three sibling re-asserts, taking `applySem` before re-driving anything the
+  apply path also writes (a restart issued outside the semaphore can load a
+  half-converged drop-in set mid-reconcile and latch a success for it) and
+  re-reading the debt inside it.
+  The recovered opus-review-001 §R61 (restored to `docs/reviews/recovered/`
+  mid-branch) named a THIRD site this branch had explicitly written off:
+  `applySSHConfig`. Its UPDATE path really is covered — #2062 reverts the
+  drop-in on a failed reload, so the file stops matching desired and the next
+  apply retries — but the REMOVAL path has nothing to revert to. The drop-in is
+  deleted, the reload fails, and every later apply reads `hadDropIn == false`
+  and returns before any reload, so sshd keeps enforcing the policy the operator
+  REMOVED (possibly more permissive than the base-image default) until a manual
+  restart. Added as a fourth leg, with the re-assert re-validating via `sshd -t`
+  before the SIGHUP (#4311) and leaving the debt outstanding when validation
+  fails. R61's second point — chrony's SHARED 15s context letting one hung
+  `chronyc` starve all four threshold fallbacks — is fixed by giving the sources
+  leg its own bounded budget inside the aggregate.
+  Operator visibility was added in the same change rather than deferred, after
+  #6802 landed the identical pattern with a wired metric pair: an exported
+  accessor with no production caller is its own defect here (#6852), and a
+  retry owner nobody can see is the blindness the owner exists to end.
+  `ManagedServiceReloadOwed` / `ManagedServiceReloadFailures` reach the
+  REST/metrics server as `xpf_managed_service_reload_pending` and
+  `xpf_managed_service_reload_failures_total`, labelled by `service` because the
+  three legs fail independently.
+- **File(s)**: `pkg/daemon/daemon_service_reload_debt.go` (new),
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/api/server.go`, `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors_controlplane.go`,
+  `pkg/daemon/service_reload_debt_6800_test.go` (new),
+  `pkg/daemon/sshd_reload_debt_6800_test.go` (new),
+  `pkg/api/metrics_managed_service_reload_6800_test.go` (new),
+  `pkg/daemon/README.md`
+- **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0.
+  20-cell mutation matrix, 20/20 RED, one reverted production line per cell,
+  every cell run full-package (`go test -count=1 ./pkg/daemon/`) with no `-run`
+  filter. The first pass reported one SURVIVED cell — the aggregate debt re-read
+  inside the semaphore — which was correct: it was redundant with the
+  per-service gates that follow it. Removed the redundant line and bound the
+  per-service gates instead, with a paired one-owes/one-quiet cell in both
+  directions.
+
 ## 2026-08-26 — #7640: a leniently-admitted malformed NAT rule is now visible
 
 - **Timestamp**: 2026-08-26
@@ -106308,6 +106493,225 @@ prose edit above them added. No diff falls in the new test body.
   `docs/config-schema.md`, `_Log.md`
 
 - **Timestamp**: 2026-08-26
+  - **Action**: #6824 — add a structural swanctl document checker and convert
+    the first render tests off `strings.Contains`
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go (new),
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go (new),
+    pkg/ipsec/endpoint_render_5630_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/ipsec/childname_collision_5122_test.go
+  - **Action**: #6824 — convert the remaining issue-numbered ipsec render
+    regression tests off `strings.Contains`
+  - **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
+    pkg/ipsec/proposalset_ah_hb167_test.go,
+    pkg/ipsec/ike_proposals_multivalue_3904_test.go,
+    pkg/ipsec/swanctl_addr_sanitize_6469_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — convert the 68 `strings.Contains` render assertions in
+    ipsec_test.go to structural checks
+  - **File(s)**: pkg/ipsec/ipsec_test.go
+  - **Action**: #6824 — add the AST guard that fails on new swanctl-syntax
+    containment needles, with its own sensitivity control
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go (new)
+  - **Action**: #6824 self-review — the AST guard missed an inline render call
+    as the containment subject; parser section-vs-setting ambiguity documented
+  - **File(s)**: pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/swanctl_doc_6824_test.go
+  - **Action**: #6824 — act on the Codex hostile review: nine findings, all
+    real, including a false claim in the guard's own doc comment
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go,
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go,
+    pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go,
+    pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/ipsec_test.go,
+    pkg/ipsec/swanctl_render_test.go, pkg/ipsec/dhcp_rebind_test.go
+  - **Action**: #6824 — act on the Codex RE-review: refuse ambiguous parser
+    shapes instead of guessing; restore the deleted negatives with faithful
+    (prefix/substring) semantics; teach the guard helpers, package-level vars
+    and closures
+  - **File(s)**: pkg/ipsec/swanctl_doc_6824_test.go,
+    pkg/ipsec/swanctl_doc_selftest_6824_test.go,
+    pkg/ipsec/swanctl_containment_guard_6824_test.go,
+    pkg/ipsec/ipsec_test.go, pkg/ipsec/swanctl_render_test.go,
+    pkg/ipsec/dhcp_rebind_test.go,
+    pkg/ipsec/trafficselector_render_4098_test.go
+  - **Action**: #6855 — redact the SYN-cookie master key in ConfigSnapshot and
+    ControlRequest Debug via a newtype (the two carriers #4484 L-7 named)
+  - **File(s)**: userspace-dp/src/protocol/snapshot.rs,
+    userspace-dp/src/protocol/tests.rs
+  - **Action**: #6860 — gate stage_screen_check on has_screen_state so the
+    missing-profile WARN fires when NO screen profile resolves
+  - **File(s)**: userspace-dp/src/screen/mod.rs,
+    userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/poll_stages_tests.rs, docs/feature-coverage.md
+  - **Action**: #6844 — key-validate the system-syslog facility wildcard; extend
+    the #6834 wildcard-identity rule to typed leaves
+  - **File(s)**: pkg/config/schema_walk.go, pkg/config/schema_system.go,
+    pkg/config/schema_validators_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go (new),
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go (new),
+    docs/config-schema.md
+  - **Action**: #6844 — matrix findings: add the untested length-bound cell,
+    state that the !exactMatch guard has no current instance
+  - **File(s)**: pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/schema_walk.go
+  - **Action**: #6844 — a #5797 tripwire fired as designed; re-derived that the
+    render belt is still load-bearing on the tolerant load path
+  - **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/daemon/daemon_system.go
+  - **Action**: #6844 — act on the Codex review: single-source the selector
+    predicate so commit-accepts == render-writes, de-vacuum the fixtures, fix
+    the inventory dedup/predicate, prove the tolerant path at configstore
+  - **File(s)**: pkg/config/schema_validators_system.go,
+    pkg/daemon/daemon_system.go,
+    pkg/config/syslog_facility_keyvalidator_6844_test.go,
+    pkg/config/wildcard_keyvalidator_inventory_6844_test.go,
+    pkg/daemon/syslog_gate_render_agreement_6844_test.go (new),
+    pkg/configstore/syslog_facility_lenient_6844_test.go (new),
+    pkg/daemon/syslog_selector_render_5797_test.go, docs/config-schema.md
+  - **Action**: #6830 takeover — take the contract decision and wire the
+    documented Junos facility table into the emit path; invert the tripwires
+  - **File(s)**: pkg/logging/syslog.go,
+    pkg/logging/junos_facility_mapping_6830_test.go,
+    pkg/logging/parse_facility_checked_5797_test.go,
+    pkg/daemon/daemon_system.go,
+    pkg/daemon/syslog_selector_render_5797_test.go,
+    pkg/cli/syslog_facility_checked_6829_test.go
+## 2026-08-26 — #6751 PR 3a: interface egress joins the cross-domain NAT owner set
+
+- **Timestamp**: 2026-08-26
+- **Action**: First of the approved 3-PR split on #6751 PR 3/3. Config-time half
+  of §5.7: interface-mode SNAT egress addresses become an owner domain in the
+  #5144 external-tuple overlap gate, and the warn-only static/interface
+  suppression is narrowed. No binary move — no cargo leg, no cluster smoke.
+- **Scope call, reported and approved before building**: §5.7 is six mechanisms
+  across two languages, not one increment. Split 3a (Go commit validator) /
+  3b (Go snapshot builder + Rust DRAIN, ATOMIC) / 3c (static occupancy +
+  counters). 3b must stay atomic: landing the builder fail-close without the
+  Rust drain would mark pools unusable with nothing draining behind them,
+  STRANDING every live session on that pool — a worse outage than the defect.
+- **THE VALIDATOR'S FIRST RUN FOUND A LIVE DEFECT IN A SHIPPED CONFIG.**
+  `test/incus/xpf-cluster-fw0.conf` had `nat64-pool` on `172.16.50.6`, which is
+  `reth0.50`'s own address, while `lan-to-wan` does interface-mode SNAT on that
+  interface. The file's own comment NAMES `172.16.50.6` as the colliding tuple —
+  it justifies why `nat64-snat-pool` sits on `.7` — and then leaves `nat64-pool`
+  on `.6`. The author understood the hazard, fixed the pool-vs-pool arm, and
+  missed the pool-vs-interface arm. The comment even asserts "the commit gate
+  now rejects" — a belief in a guarantee that was never true for this arm.
+- **AND A SECOND INSTANCE THE GREEN SUITE COULD NOT SEE.** `xpf-test.conf` had
+  the identical defect one address over (`nat64-pool` on `.5` = `ge-0/0/3.50`'s
+  address, seven interface-mode rules, `ge-0/0/3.50` in zone `wan`). It was NOT
+  flagged — because NO test in `pkg/config` ever compiled that file. `go test
+  ./pkg/config/` was green while a shipped config violated the rule the package
+  had just added. A gate's reach is not what it can detect, it is what it is
+  actually pointed at. `TestShippedConfigsHaveNoCrossDomainNATOverlap_6751` now
+  compiles all eight shipped NAT configs and asserts the count, so a config
+  dropping off the list cannot silently stop being gated.
+- **Not "adjust the fixture until the gate passes"**: the configs are WRONG,
+  their own comments say the shape is wrong, and the validator found it. Both
+  moved to free addresses (`.9`, `.11`) and both comments now name the
+  interface-mode arm explicitly.
+- **The `maps_sync.go` precedent is DEFECTIVE, not merely limited**: it collected
+  only non-empty `ToZone` and returned NOTHING for an unscoped rule-set. An
+  unscoped rule matches every egress, so the empty set understates the candidate
+  set exactly where it is widest — failing OPEN on the broadest input. Replaced
+  by the four-shape derivation mirroring the dataplane's `scope_matches`
+  wildcard-on-empty semantics.
+- **Deduped by address, deliberately**: several interface-mode rule-sets
+  egressing one WAN interface occupy ONE address; one owner per RULE would make
+  them overlap each other and false-reject every real multi-zone config.
+- **Warn suppression NARROWED, not removed**: the #5837 inert advisory is right
+  to suppress itself when interface SNAT owns the address (the translation is
+  not inert) — and that left the unsafe case with no diagnostic at all. The
+  inert advisory stays suppressed; the collision finding takes its place. Strict
+  rejects, tolerant warns (#1960).
+- **Mapped-port statics deliberately NOT flagged** — they emit a distinct
+  external port, so they are not the ambiguity; reserving the emitted port is
+  3b/3c's job. Without that control the detector degenerates into "any static on
+  an interface address" and false-rejects the shipped `8080 -> 80` shape.
+- **Boundary call**: the plan files the four-scope derivation under item 2 (3b),
+  but the strict validator needs it and the to-zone-only precedent is
+  insufficient. 3a carries it, 3b reuses it — pure config→address, no binary
+  move, so it drags neither of 3b's validation lanes forward. Approved.
+- **Process note**: ran `gofmt -w pkg/config/` on the DIRECTORY and reformatted
+  5 untouched files — the exact hazard recorded earlier today, walked into after
+  documenting it. Knowing the rule is not the same as having the habit; the
+  habit is `gofmt -w <file>...`. Caught in `git status`, reverted by filtering
+  each modified `.go` for this change's identifiers.
+- **File(s)**: `pkg/config/compiler_nat_iface_egress.go` (new),
+  `pkg/config/compiler_nat_iface_egress_6751_test.go` (new),
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_validate_warn_nat_iface_addr.go`,
+  `test/incus/xpf-cluster-fw0.conf`, `test/incus/xpf-test.conf`,
+  `docs/config-schema.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6751 PR 3a takeover — turn shippedNATConfigs from a floor into
+    a census so a NEW NAT config cannot land ungated
+  - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go
+  - **Action**: #6751 3a — name the census selector's deliberate looseness
+    (a comment mention of source-nat pulls a config in) per lane review
+  - **File(s)**: pkg/config/compiler_nat_iface_egress_6751_test.go
+  - **Action**: #6818/#6821/#6822 — compile the compact spelling of OSPF
+    interface authentication, security-log transport and SNMPv3 credentials;
+    classify #6817 as divergent by design (#6662)
+  - **File(s)**: pkg/config/compiler_protocols.go,
+    pkg/config/compiler_security_log.go, pkg/config/compiler_system.go,
+    pkg/config/compact_leaf_credentials_test.go (new),
+    pkg/config/compact_block_equivalence_2419_test.go,
+    pkg/config/testdata/compact_block_divergences_2419.txt,
+    docs/config-schema.md
+  - **Action**: #2419 gate — floors so the control maps cannot be silently
+    emptied (found by mutation cell M6)
+  - **File(s)**: pkg/config/compact_block_equivalence_2419_test.go
+  - **Action**: #6818/#6822 — act on the Codex hostile review of PR 7647: fix
+    the packed-tail/nested-block sibling bug, correct the SNMPv3 discriminator,
+    drop the #6821 change, give the #2419 census a per-site state
+  - **File(s)**: pkg/config/compact_tail.go, pkg/config/compiler_system.go,
+    pkg/config/compiler_security_log.go,
+    pkg/config/compact_block_equivalence_2419_test.go,
+    pkg/config/compact_leaf_credentials_test.go,
+    pkg/config/testdata/compact_block_divergences_2419.txt,
+    docs/config-schema.md
+  - **Action**: #6818 — guard packedBodyChildren's deep attachment on the
+    terminal schema node permitting a body (Codex re-review finding 1)
+  - **File(s)**: pkg/config/compact_tail.go,
+    pkg/config/compact_leaf_credentials_test.go
+
+## 2026-08-26 — #2419 widen the compact/block census to named instances
+
+- **Timestamp**: 2026-08-26
+- **Action**: Remove the named-instance exclusion from the #2419 census walker
+  and regenerate the inventory. No production change — this is a measurement
+  correction, and it makes the number the normalizer's criterion rests on
+  checkable by anyone.
+- **The exclusion was WRONG, and wrong in the direction that hides defects.**
+  It was generalized from ONE probe — `interfaces { ge-0/0/0 description
+  hello; }`, which genuinely compiles to zero interfaces — to every named
+  instance in the schema. Measured on the rest: `interface ge-0/0/0.0 cost 10;`
+  compiles the interface with `cost=0`. The instance IS recognised; only its
+  body is lost, which is strictly worse than not recognising it because the
+  half-built object reaches the renderer and the runtime. #7653 is the same
+  shape two levels deep, with OSPF authentication as the dropped body.
+- **Numbers, re-derived at `6b80a84f6`** (NOT the 363 measured before #6817/
+  #6818/#6822 merged — that number is now stale in a way that looks like
+  progress): **546 checked, 356 divergent, 204 unruled**. The honest quote is
+  ">= 356 divergent, 204 unruled": the unruled grew 96 -> 204 with the widening
+  and they are sites whose synthesized fixture was too thin to OBSERVE the
+  value, not clean sites.
+- **Golden diff classified before trusting it**: 0 data lines REMOVED (nothing
+  that was divergent silently stopped being divergent, so no behaviour change is
+  laundered in), +169 added, 5 header lines re-counted. Sample-verified one
+  added site by hand: `applications { application myapp description hello; }`
+  compiles the application with an EMPTY description while the block spelling
+  sets it.
+- **Not covered, and named as such**: the walker collapses exactly ONE level, so
+  it cannot generate #7653's two-level tail. Shape 3 is unmeasured here and its
+  number is owed separately, with the depth it reached stated.
+- **File(s)**: `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`, `_Log.md`
   - **Action**: #6836 — give the NAT64 meta fixtures real flow addresses, and
     pin the #7656 flowless egress-logging gap the fix made observable
   - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs

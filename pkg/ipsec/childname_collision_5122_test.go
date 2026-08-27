@@ -7,25 +7,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// childSectionNames returns the trimmed swanctl child-section header names
-// (the `<name> {` line inside the children{} block) that begin with the given
-// connection-name prefix. It returns every occurrence, so a duplicate name
-// shows up twice — the exact symptom of the #5122 collision.
-func childSectionNames(rendered, connPrefix string) []string {
-	var names []string
-	for _, line := range strings.Split(rendered, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, connPrefix+"-") {
-			continue
-		}
-		if !strings.HasSuffix(trimmed, " {") {
-			continue
-		}
-		names = append(names, strings.TrimSuffix(trimmed, " {"))
-	}
-	return names
-}
-
 // TestChildNameCollisionDisambiguated is the #5122 RED-on-revert guard. Two
 // distinct traffic-selector names that differ ONLY in a sanitized character
 // (`site/a` vs `site:a` — both legal Junos identifier chars) both sanitize to
@@ -58,23 +39,37 @@ func TestChildNameCollisionDisambiguated(t *testing.T) {
 
 	got := m.generateConfig(cfg)
 
-	names := childSectionNames(got, "tun1")
+	// #6824: read the child sections out of the PARSED document rather than by
+	// scanning for lines that look like section openers. The parser also
+	// rejects two sections sharing a name under one parent outright, which is
+	// the #5122 defect stated as a structural property instead of inferred from
+	// a name list.
+	children := parseSwanctlDoc(t, got).at(t, "connections", "tun1", "children")
+	names := children.childNames()
 	if len(names) != 2 {
 		t.Fatalf("expected 2 child sections for the two selectors, got %d: %v\n%s",
-			len(names), names, got)
+			len(names), names, children)
 	}
 	if names[0] == names[1] {
 		t.Fatalf("distinct selectors site/a and site:a rendered DUPLICATE child "+
 			"section name %q (strongSwan would reject/merge one selector, #5122):\n%s",
-			names[0], got)
+			names[0], children)
 	}
-	// Both selectors must survive to the render — assert each distinct local_ts
-	// prefix is present, proving neither child was overwritten/dropped.
-	if !strings.Contains(got, "local_ts = 10.0.1.0/24") {
-		t.Fatalf("selector site/a (local_ts 10.0.1.0/24) missing from render:\n%s", got)
+	// Both selectors must survive to the render. Containment could only say the
+	// two local_ts values appear SOMEWHERE; what matters is that they land in
+	// two DIFFERENT child sections, so neither selector was overwritten.
+	byLocalTS := map[string]string{}
+	for _, n := range names {
+		byLocalTS[children.at(t, n).setting(t, "local_ts")] = n
 	}
-	if !strings.Contains(got, "local_ts = 10.0.2.0/24") {
-		t.Fatalf("selector site:a (local_ts 10.0.2.0/24) missing from render:\n%s", got)
+	for _, want := range []string{"10.0.1.0/24", "10.0.2.0/24"} {
+		if _, ok := byLocalTS[want]; !ok {
+			t.Errorf("no child section carries local_ts = %s; sections carry %v\n%s",
+				want, byLocalTS, children)
+		}
+	}
+	if len(byLocalTS) != 2 {
+		t.Errorf("the two selectors did not land in two distinct child sections: %v", byLocalTS)
 	}
 	// Both disambiguated names must keep the sanitized base as a prefix so the
 	// naming stays recognizable / stable-shaped.
@@ -109,16 +104,19 @@ func TestChildNameNonCollidingUnchanged(t *testing.T) {
 		},
 	}
 
-	got := m.generateConfig(cfg)
-	names := childSectionNames(got, "tun1")
+	// #6824: the child-section names come from the parsed tree, so a name that
+	// appears in the document but is NOT a child of this connection can no
+	// longer satisfy the assertion.
+	children := parseSwanctlDoc(t, m.generateConfig(cfg)).at(t, "connections", "tun1", "children")
+	names := children.childNames()
 	want := map[string]bool{"tun1-alpha": true, "tun1-beta": true}
 	if len(names) != 2 {
-		t.Fatalf("expected 2 child sections, got %d: %v\n%s", len(names), names, got)
+		t.Fatalf("expected 2 child sections, got %d: %v\n%s", len(names), names, children)
 	}
 	for _, n := range names {
 		if !want[n] {
 			t.Fatalf("non-colliding selector rendered unexpected/disambiguated name "+
-				"%q (want one of %v):\n%s", n, want, got)
+				"%q (want one of %v):\n%s", n, want, children)
 		}
 	}
 }
@@ -143,8 +141,9 @@ func TestChildNameSingleSelectorUnchanged(t *testing.T) {
 		},
 	}
 
-	got := m.generateConfig(cfg)
-	if !strings.Contains(got, "tun1-ts1 {\n") {
-		t.Fatalf("single selector did not render its plain child section tun1-ts1:\n%s", got)
-	}
+	// #6824: `Contains(got, "tun1-ts1 {\n")` depended on brace placement and
+	// would also match the text appearing inside a value. Resolving the path
+	// asserts the section EXISTS where it belongs.
+	parseSwanctlDoc(t, m.generateConfig(cfg)).
+		at(t, "connections", "tun1", "children", "tun1-ts1")
 }
