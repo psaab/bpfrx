@@ -503,9 +503,24 @@ Guard layers (`build-userspace-xdp.sh`):
      nothing said. `SlackToFloorInsns` is derived from the enforced constant
      (never a copy of its value) and printed on every build, so a
      recalibration this large is visible when it happens rather than found
-     by archaeology. **Whether 3% is still the right floor at 21.58% is an
-     open question — see #6884 — and the number to judge it on is the
-     slack, not the percentage.**
+     by archaeology. **#6884 raised the floor 3% -> 15% on that basis**, and
+     15% is deliberately not the mathematical minimum: 12.88% is where the
+     admitted delta equals one structural change exactly, and a threshold on
+     its own boundary holds for an 87,000-insn change and fails for an 88,000
+     one. The 2.1 points above it are margin, and they are a JUDGEMENT — the
+     21.58% headroom is measured, the 87,000-insn structural-change cost is
+     chosen, and the second is the one to revisit.
+   - **The build now checks that the floor still satisfies its own property
+     (#6884).** Nothing did before, and nothing could: "does it fire before the
+     next structural change" is a fact about the RELATIONSHIP between the floor
+     and the current object, and that moves whenever the object does. A test
+     cannot own it without pinning the object size — the hand-maintained live
+     number this issue removed. `cmd/shimverify` compares slack against
+     `UserspaceShimStructuralChangeInsns` on every PASSING build and prints a
+     NOTE (not a refusal) when the property has broken. Silent while it holds:
+     at 15% the slack is 65,825 against a cost of 87,000. **General form: a
+     threshold whose sensitivity is defined relative to a moving value needs a
+     check on the relationship, not on the value.**
    - **Processed-insn counts did NOT vary by kernel, measured (#6884).** The
      byte-identical tracked object (md5 `8799db9d…`) verifies at **784,175 on
      both `7.0.13+deb14-amd64` and `7.0.0-rc7+`** — zero difference. This is

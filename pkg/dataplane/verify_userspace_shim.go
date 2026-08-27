@@ -68,7 +68,39 @@ import (
 // banner prints the processed count, the headroom, and — the one to judge this
 // floor's sensitivity on — how many insns of slack the floor still admits.
 // Those are computed, so they cannot rot.
-const UserspaceShimMinVerifierHeadroomPct = 3.0
+// #6884 raised this from 3.0 to 15.0. 3% was chosen against a 5.3% object; by
+// the time the object reached 21.58% the same constant admitted ~186k insns —
+// one to two whole extension-header iterations landing silently — so the
+// tripwire fired only after the thing it exists to prevent had happened twice.
+//
+// 15% is NOT the mathematical minimum. That is 12.88% (the floor at which the
+// admitted delta equals UserspaceShimStructuralChangeInsns exactly), and a
+// threshold placed on its own boundary satisfies the property for an 87,000
+// insn change and fails it for an 88,000 one. The extra 2.1 points are margin,
+// and they are a JUDGEMENT, not a measurement — recorded as such so whoever
+// revisits this knows which inputs were which:
+//
+//   - MEASURED: the object at 784,175/1,000,000, 21.58% headroom.
+//   - JUDGED:   the 87,000-insn structural-change cost the property is defined
+//     against. That is the number to revisit.
+//
+// Erring high is cheap and erring low is not: the gate carries a loud
+// XPF_SHIM_ALLOW_LOW_HEADROOM=1 override that names the object and the reason,
+// so a floor set too high is an announced detour, while one set too low is the
+// silent hole described above.
+const UserspaceShimMinVerifierHeadroomPct = 15.0
+
+// UserspaceShimStructuralChangeInsns is the measured cost of the shim's
+// cheapest known STRUCTURAL change — one additional IPv6 extension-header
+// iteration, which #4555 measured at 87,000-106,000 insns. The conservative
+// end is used deliberately: the floor's stated property is that it fires
+// BEFORE one of these lands, and the cheapest change is the one that tests it.
+//
+// This is the constant the floor is calibrated AGAINST, which is why it is
+// named rather than inlined: cmd/shimverify checks the relationship between
+// them on every build, so a future floor that stops satisfying the property
+// says so out loud instead of drifting quietly the way 3% did.
+const UserspaceShimStructuralChangeInsns = 87000
 
 // verifyShrinkHashMaxEntries is the verify-only ceiling applied to
 // hash-map MaxEntries before the anonymous load. The kernel allocates

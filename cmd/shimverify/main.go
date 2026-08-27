@@ -184,6 +184,8 @@ func run(
 				allowLowHeadroomEnv, stats.HeadroomPct(), dataplane.UserspaceShimMinVerifierHeadroomPct)
 		}
 		fmt.Fprintf(stdout, "%s %s (%s)\n", decision.label, path, summary)
+		noteFloorNoLongerTripwires(stderr,
+			stats.SlackToFloorInsns(dataplane.UserspaceShimMinVerifierHeadroomPct))
 	}
 
 	return decision.exit
@@ -274,6 +276,50 @@ func decide(stats dataplane.ShimVerifierStats, overridden bool) shimverifyDecisi
 		return shimverifyDecision{refusal: refusalLowHeadroom, exit: 4, label: "LOW-HEADROOM"}
 	}
 	return shimverifyDecision{refusal: refusalNone, exit: 0, label: "PASS", staleOverrideNote: overridden}
+}
+
+// noteFloorNoLongerTripwires reports, on a PASSING build, that the floor has
+// stopped satisfying its own stated property (#6884).
+//
+// The floor promises to fire BEFORE the next structural change lands. Whether
+// it still does is a fact about the RELATIONSHIP between the floor and the
+// current object, and that relationship moves whenever the object does —
+// silently, and in the direction that looks like good news. 3% was chosen
+// against a 5.3% object and went on reading 3% while the object reached
+// 21.58%, at which point it admitted one to two whole extension-header
+// iterations with every gate green.
+//
+// A test cannot own this. The property depends on the current object size, and
+// pinning that in a test reintroduces exactly the hand-maintained live number
+// #6884 removed from the floor's doc comment. The BUILD can, because it already
+// computes slack from live inputs — so the check needs no maintained current
+// value, only the structural-change cost the property is defined against.
+//
+// This is the general form of the lesson: a threshold whose sensitivity is
+// defined relative to a moving value needs a check on the RELATIONSHIP, not on
+// the value.
+//
+// Silent when the property holds. It is a NOTE, not a refusal: the object
+// verified and the floor was satisfied, so the build is good — what has decayed
+// is the tripwire's usefulness, which is a thing to fix deliberately rather
+// than a reason to fail someone's build.
+func noteFloorNoLongerTripwires(w io.Writer, slack int) {
+	if slack < dataplane.UserspaceShimStructuralChangeInsns {
+		return
+	}
+	fmt.Fprintf(w,
+		"shimverify: NOTE (#6884): the %.1f%% floor now admits %d more insns before it "+
+			"fires, which is at least one STRUCTURAL change (%d insns — one IPv6 "+
+			"extension-header iteration).\n"+
+			"  The floor's stated property is that it fires BEFORE the next structural "+
+			"change lands. It no longer does: a change that large would be admitted "+
+			"silently, which is the exact condition that let the shim reach 0.92%% "+
+			"headroom with every gate green.\n"+
+			"  This is not a failure — the object verified and the floor was satisfied. "+
+			"It means the floor has drifted out of calibration because the object "+
+			"IMPROVED, and raising it is now a deliberate decision someone should make.\n",
+		dataplane.UserspaceShimMinVerifierHeadroomPct, slack,
+		dataplane.UserspaceShimStructuralChangeInsns)
 }
 
 // announceOverrideConsumed logs, loudly and unambiguously, that a build
