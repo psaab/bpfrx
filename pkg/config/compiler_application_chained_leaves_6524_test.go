@@ -230,7 +230,7 @@ func TestChainedAppUnrepresentableTailRejected(t *testing.T) {
 				t.Fatalf("expected commit to REJECT %q — the unrepresentable tail "+
 					"was silently dropped, widening the application (#6524)", c.set)
 			}
-			if !strings.Contains(err.Error(), c.wantToken) {
+			if !strings.Contains(err.Error(), `"`+c.wantToken+`"`) {
 				t.Fatalf("reject message must name the offending token %q, got: %v",
 					c.wantToken, err)
 			}
