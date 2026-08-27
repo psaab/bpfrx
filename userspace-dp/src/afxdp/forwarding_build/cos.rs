@@ -513,7 +513,23 @@ fn cos_remainder_rate_bytes(
         let Some(sched) = schedulers.get(&entry.scheduler).copied() else {
             continue;
         };
-        if sched.transmit_rate_remainder {
+        // A scheduler counts as a remainder queue only if it would ACTUALLY
+        // resolve via remainder — i.e. it has no absolute rate and no percent.
+        //
+        // The main path prefers absolute, then percent, then remainder
+        // (cos_effective_transmit_rate_bytes .or_else), so a malformed
+        // scheduler carrying BOTH an absolute rate and `remainder` resolves via
+        // the absolute one and never uses the leftover. Counting it here anyway
+        // would inflate `remainder_queues` and shrink every real remainder
+        // queue's share — the pre-pass and the main path disagreeing about
+        // which queues are remainder queues.
+        //
+        // The strict commit gate rejects that combination, so this is the
+        // lenient load / peer-sync path (#1960) — which is exactly where a
+        // disagreement between two passes is least likely to be noticed.
+        if sched.transmit_rate_remainder
+            && cos_effective_transmit_rate_bytes(Some(sched), iface_shaping_rate_bytes).is_none()
+        {
             remainder_queues += 1;
             continue;
         }
@@ -1327,6 +1343,33 @@ mod remainder_temporal_tests_6846 {
             Some(500),
             "with no absolute/percent siblings the whole shaping rate is the \
              leftover, split across the two remainder queues"
+        );
+    }
+
+    /// A malformed scheduler carrying BOTH an absolute rate and `remainder`
+    /// must NOT be counted as a remainder queue.
+    ///
+    /// The main path prefers absolute, so such a queue never uses the leftover
+    /// — counting it here would inflate the divisor and silently shrink every
+    /// real remainder queue's share. The two passes must agree about which
+    /// queues are remainder queues.
+    ///
+    /// Reachable only on the lenient load / peer-sync path (#1960): the strict
+    /// commit gate rejects the combination. That is precisely where a
+    /// disagreement between two passes goes unnoticed.
+    #[test]
+    fn a_scheduler_with_both_forms_is_not_a_remainder_queue() {
+        let mut both = remainder("both");
+        both.transmit_rate_bytes = 400;
+        let scheds = [both, remainder("r")];
+        let got = resolve(&scheds, vec![entry("fb", "both"), entry("fr", "r")], 1000);
+        assert_eq!(
+            got,
+            Some(600),
+            "the both-forms queue resolves via its ABSOLUTE 400 and is not a \
+             remainder queue, so the single real remainder queue takes the whole \
+             600 leftover. 300 means it was counted as a remainder queue too, \
+             halving every real remainder queue's share"
         );
     }
 
