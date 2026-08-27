@@ -66,8 +66,12 @@ type Manager struct {
 	// forwarding generation — Close does NOT set this, because Close
 	// deliberately keeps its pinned handles live for hitless-restart reuse.
 	//
-	// obsoleteRegistryAccesses counts lookups that SERVED such a handle. It is
-	// an observability counter, not a guard: see obsoleteRegistryLocked.
+	// obsoleteRegistryAccesses counts lookups REFUSED for that reason (#6741
+	// AC1). It used to count lookups that SERVED such a handle and was
+	// explicitly "not a guard"; the lookup now declines, so this is the
+	// observability half of a real guard. See obsoleteRegistryLocked for what
+	// it still does not cover — a handle obtained BEFORE the Teardown and held
+	// across it is never re-checked.
 	registryGeneration       uint64
 	registryObsoleteFrom     uint64
 	obsoleteRegistryAccesses uint64
