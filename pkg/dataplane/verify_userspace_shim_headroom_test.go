@@ -64,19 +64,38 @@ func TestParseShimVerifierStats_Unmeasurable(t *testing.T) {
 	}
 }
 
-// The floor must sit strictly between the pre-#4555 headroom (0.92%) and
-// the current one (5.28%), or it is either dead or an immediate blocker.
+// The floor must be a tripwire and not a blocker: strictly above the object it
+// was introduced to catch, and strictly below the one the build actually ships.
+//
+// #6884: the second fixture used to be 947,188 and was labelled "the current
+// object". That is the hand-maintained live number this issue removed from the
+// floor's doc comment, appearing here as a test constant — and when the floor
+// moved 3% -> 15% it made this cell fail with "rejects the CURRENT object",
+// which was FALSE: the real object is at 784,175/21.58% and passes 15%
+// comfortably. A stale fixture label turned a correct raise into a phantom
+// blocker report.
+//
+// Both fixtures are now SYNTHETIC and round, chosen purely for their relation
+// to the floor, with the real measurement quoted only as provenance. A fixture
+// value's job is to sit above or below a threshold; claiming to be the current
+// object is a different job, done badly, and one that goes stale by
+// construction.
 func TestUserspaceShimHeadroomFloorBracketsKnownValues(t *testing.T) {
-	preFix := ShimVerifierStats{ProcessedInsns: 990796, InsnLimit: 1000000}
-	current := ShimVerifierStats{ProcessedInsns: 947188, InsnLimit: 1000000}
+	// Well below the floor: the tripwire must catch this.
+	tooTight := ShimVerifierStats{ProcessedInsns: 990796, InsnLimit: 1000000} // 0.92%
+	// Well above it: a healthy object must not be blocked. 800,000 is 20.00%,
+	// chosen to bracket the floor without tracking any real object. For scale,
+	// master measured 784,175 (21.58%) on 2026-08-27.
+	healthy := ShimVerifierStats{ProcessedInsns: 800000, InsnLimit: 1000000}
 
-	if preFix.HeadroomPct() >= UserspaceShimMinVerifierHeadroomPct {
-		t.Errorf("floor %.1f%% does not catch the pre-#4555 object (%.2f%% headroom) — the tripwire is dead",
-			UserspaceShimMinVerifierHeadroomPct, preFix.HeadroomPct())
+	if tooTight.HeadroomPct() >= UserspaceShimMinVerifierHeadroomPct {
+		t.Errorf("floor %.1f%% does not catch a %.2f%%-headroom object — the tripwire is dead",
+			UserspaceShimMinVerifierHeadroomPct, tooTight.HeadroomPct())
 	}
-	if current.HeadroomPct() < UserspaceShimMinVerifierHeadroomPct {
-		t.Errorf("floor %.1f%% rejects the CURRENT object (%.2f%% headroom) — `make generate` would be blocked",
-			UserspaceShimMinVerifierHeadroomPct, current.HeadroomPct())
+	if healthy.HeadroomPct() < UserspaceShimMinVerifierHeadroomPct {
+		t.Errorf("floor %.1f%% rejects a %.2f%%-headroom object — it has stopped being a "+
+			"tripwire and become a blocker", UserspaceShimMinVerifierHeadroomPct,
+			healthy.HeadroomPct())
 	}
 }
 

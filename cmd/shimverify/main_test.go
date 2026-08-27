@@ -33,20 +33,23 @@ import (
 // `<=` flips a 3.00%% object from install to refusal with every other fixture
 // unmoved.
 func TestShimverifyDecision(t *testing.T) {
-	// Above the floor: 947188/1000000 leaves 5.28% — the object as it stood
-	// WHEN #4555 WAS WRITTEN, not now. #6884: master is at 784,175 (21.58%).
-	// The value stays because what it is chosen for is its RELATION to the
-	// floor (comfortably above), not its currency; the label is corrected
-	// because "the current object" is exactly the hand-maintained live number
-	// that #6884 removed from the constant's doc comment, and this copy of it
-	// misled a reader into a cross-kernel inference the data did not support.
-	above := dataplane.ShimVerifierStats{ProcessedInsns: 947188, InsnLimit: 1000000}
+	// Above the floor: 800000/1000000 leaves 20.00%. SYNTHETIC and round,
+	// chosen purely for its relation to the floor.
+	//
+	// #6884: this was 947,188 labelled "the current object" — a hand-maintained
+	// live number, the same defect this issue removed from the floor's doc
+	// comment, and the one that misled a reviewer into a cross-kernel inference
+	// the data did not support. When the floor moved 3% -> 15% it also turned a
+	// correct raise into a phantom "rejects the current object" failure. A
+	// fixture's job is to sit above or below the threshold; claiming to be the
+	// live object is a different job that goes stale by construction.
+	above := dataplane.ShimVerifierStats{ProcessedInsns: 800000, InsnLimit: 1000000}
 	// Below it: 990796/1000000 leaves 0.92%, master before #4555.
 	below := dataplane.ShimVerifierStats{ProcessedInsns: 990796, InsnLimit: 1000000}
-	// EXACTLY on it: 970000/1000000 leaves 3.00%, which in IEEE-754 is the
+	// EXACTLY on it: 850000/1000000 leaves 15.00%, which in IEEE-754 is the
 	// floor's value bit for bit (100*(10^6-97*10^4)/10^6 == 3.0 exactly, both
 	// operands being exactly representable), so this fixture straddles nothing.
-	atFloor := dataplane.ShimVerifierStats{ProcessedInsns: 970000, InsnLimit: 1000000}
+	atFloor := dataplane.ShimVerifierStats{ProcessedInsns: 850000, InsnLimit: 1000000}
 	// No recognisable stats line: Measured() is false.
 	unmeasured := dataplane.ShimVerifierStats{}
 
@@ -171,8 +174,8 @@ func TestShimverifyRun(t *testing.T) {
 		}
 	}
 
-	above := dataplane.ShimVerifierStats{ProcessedInsns: 947188, InsnLimit: 1000000}
-	atFloor := dataplane.ShimVerifierStats{ProcessedInsns: 970000, InsnLimit: 1000000}
+	above := dataplane.ShimVerifierStats{ProcessedInsns: 800000, InsnLimit: 1000000}
+	atFloor := dataplane.ShimVerifierStats{ProcessedInsns: 850000, InsnLimit: 1000000}
 	below := dataplane.ShimVerifierStats{ProcessedInsns: 990796, InsnLimit: 1000000}
 
 	for _, tc := range []struct {
