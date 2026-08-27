@@ -64,9 +64,13 @@ type FirewallTermSnapshot struct {
 	// the Rust evaluator continues to the next term instead of returning. When
 	// false (no fall-through), behavior is unchanged. serde(default) on the Rust
 	// side keeps wire parity with an older Go control plane that omits it (#1961).
-	NextTerm        bool   `json:"next_term,omitempty"`
-	Count           string `json:"count,omitempty"`
-	Log             bool   `json:"log,omitempty"`
+	NextTerm bool   `json:"next_term,omitempty"`
+	Count    string `json:"count,omitempty"`
+	Log      bool   `json:"log,omitempty"`
+	// #6853: `then syslog`, distinct from `then log`. Additive and omitempty,
+	// so an older helper that does not know the field is unaffected and a
+	// mixed-version HA pair stays wire-compatible.
+	Syslog          bool   `json:"syslog,omitempty"`
 	PolicerName     string `json:"policer,omitempty"`
 	RoutingInstance string `json:"routing_instance,omitempty"`
 	ForwardingClass string `json:"forwarding_class,omitempty"`

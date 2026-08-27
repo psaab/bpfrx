@@ -106713,6 +106713,53 @@ prose edit above them added. No diff falls in the new test body.
   `pkg/config/testdata/compact_block_divergences_2419.txt`,
   `docs/config-schema.md`, `_Log.md`
 
+- **Timestamp**: 2026-08-26
+  - **Action**: #6868 — leaf-identity assertions matched the quoted occurrence so they can no longer be satisfied by the error's own enumeration. Swept the predicate and found a fourth site the issue did not list (6524 chained leaves).
+  - **File(s)**: pkg/config/compiler_application_direct_conflict_5574_test.go, pkg/config/compiler_application_mixed_term_3366_test.go, pkg/config/compiler_application_chained_leaves_6524_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6868 review round — fixed a FIFTH bare-leaf site at compiler_application_chained_leaves_6524_test.go:295 (found by review, in a file this change already edited) and corrected the recorded reason for excluding the 3348 icmp guards.
+  - **File(s)**: pkg/config/compiler_application_chained_leaves_6524_test.go, pkg/config/compiler_application_junos_ping_3348_test.go
+- **Timestamp**: 2026-08-26
+  - **Action**: #6872 — replace four function-local `static GUARD`s with one
+    shared module-scope guard; scan for the regression
+  - **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+    userspace-dp/src/afxdp/ha_tests.rs,
+    userspace-dp/src/afxdp/session_glue/tests.rs,
+    userspace-dp/src/afxdp/tests_decap_dnat_table.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6872 review round 2 — corrected the guard's scope claim (the writers are production functions and cannot be locked), made the local-lock predicate name-agnostic and fn-scoped, excluded string literals so the anti-vacuity floor stops counting the scanner's own source, and bound the sensitivity control to the scan's real predicates instead of copies.
+  - **File(s)**: userspace-dp/src/afxdp/checksum.rs
+  - **Action**: #6836 — give the NAT64 meta fixtures real flow addresses, and
+    pin the #7656 flowless egress-logging gap the fix made observable
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 review round 2 — addressed all four Codex findings on PR 7657. Measured gate ownership by mutating each fail-closed gate in isolation.
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6836 review round — added the third arm that actually binds the ingress-family selection. The two original arms both survived inverting the fallback; arm 3 (v4 present but silent, v6 logging) reds it.
+  - **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs
+- **Timestamp**: 2026-08-26
+  - **Action**: #6818 — drive the packedBodyChildren guard test at the HELPER
+    instead of through a compile; one cell had a nil schema path and tested
+    nothing
+  - **File(s)**: pkg/config/compact_leaf_credentials_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6818 review round 2 — cells now assert VALUES and IDENTITY rather than node names, the schema paths are single-sourced so the resolution control cannot drift, and the end-to-end compile cells are restored alongside the helper cells instead of replaced by them.
+  - **File(s)**: pkg/config/compact_leaf_credentials_test.go
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6853 — `then syslog` is now distinct from `then log` in the config model and carried to the dataplane snapshot. Behaviour-preserving; the routing decision stays with #6859.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go, pkg/dataplane/userspace/protocol_policies.go, pkg/dataplane/userspace/filters.go, pkg/dataplane/userspace/firewall_snapshot_render.go, userspace-dp/src/protocol/security.rs, docs/feature-gaps.md
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #6853 — carried the new field through the Rust test literals and the wire specimen; added a both-directions wire-compat test pinning the mixed-version HA claim.
+  - **File(s)**: userspace-dp/src/filter/tests.rs, userspace-dp/src/protocol/tests.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
+
 ## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
 
 - **Timestamp**: 2026-08-26

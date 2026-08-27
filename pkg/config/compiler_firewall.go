@@ -1203,7 +1203,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			case "log":
 				term.Log = true
 			case "syslog":
+				// #6853: record the distinct action, and keep Log set so the
+				// dataplane still emits the event. Behaviour-preserving.
 				term.Log = true
+				term.Syslog = true
 			case "routing-instance":
 				if v := arg(); v != "" {
 					term.RoutingInstance = v
@@ -1275,7 +1278,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 		case "log":
 			term.Log = true
 		case "syslog":
+			// #6853: record the distinct action, and keep Log set so the
+			// dataplane still emits the event. Behaviour-preserving.
 			term.Log = true
+			term.Syslog = true
 		case "routing-instance":
 			if len(child.Keys) >= 2 {
 				term.RoutingInstance = child.Keys[1]
