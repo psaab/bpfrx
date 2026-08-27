@@ -1041,6 +1041,11 @@ fn parse_term_ports(snap: &FirewallTermSnapshot) -> TermPortMatch {
 /// rejects an unknown `then` token before it is persisted). For a FIREWALL
 /// FILTER an unknown terminating action must fail CLOSED, never silently
 /// permit — map it to Discard rather than Accept.
+#[cfg(test)]
+pub(crate) fn resolve_term_action_for_test(snap: &FirewallTermSnapshot) -> FilterAction {
+    resolve_term_action(snap)
+}
+
 fn resolve_term_action(snap: &FirewallTermSnapshot) -> FilterAction {
     match snap.action.as_str() {
         "accept" => FilterAction::Accept,

@@ -10105,3 +10105,49 @@ fn reject_message_type_maps_every_accepted_token_6854() {
         "#6854: an unrecognized token must degrade to administratively-prohibited"
     );
 }
+
+/// #6854 WIRING: the snapshot's `reject_message_type` must actually reach
+/// `FilterAction::Reject`.
+///
+/// This cell exists because the mutation matrix caught its absence. With the
+/// resolver correct and the ICMP builder correct, replacing
+/// `resolve_term_action`'s lookup with a hardcoded default left the ENTIRE
+/// suite green: the resolver had a test, the builder had a test, and the hop
+/// between them had none. A feature can be complete at both ends and connected
+/// by nothing.
+#[test]
+fn reject_message_type_reaches_the_filter_action_6854() {
+    use crate::protocol::FirewallTermSnapshot;
+
+    let typed = FirewallTermSnapshot {
+        name: "t".to_string(),
+        action: "reject".to_string(),
+        reject_message_type: "host-unreachable".to_string(),
+        ..Default::default()
+    };
+    match super::compiler::resolve_term_action_for_test(&typed) {
+        super::FilterAction::Reject(msg) => assert_eq!(
+            (msg.v4_code, msg.v6_code),
+            (1, 3),
+            "#6854: the term's message-type did not reach FilterAction::Reject — the \
+             resolver and the ICMP builder are both correct and nothing connects them"
+        ),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+
+    // A term with no message-type must still resolve to the pre-#6854 codes,
+    // so this change is invisible to a config that does not use the feature.
+    let plain = FirewallTermSnapshot {
+        name: "t".to_string(),
+        action: "reject".to_string(),
+        ..Default::default()
+    };
+    match super::compiler::resolve_term_action_for_test(&plain) {
+        super::FilterAction::Reject(msg) => assert_eq!(
+            (msg.v4_code, msg.v6_code),
+            (13, 1),
+            "#6854: a bare `then reject` must keep administratively-prohibited"
+        ),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
