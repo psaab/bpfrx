@@ -659,3 +659,76 @@ fn explicit_gre_service_still_admits_proto_47() {
         "an explicit `system-services gre` must still admit IP protocol 47",
     );
 }
+
+// #6873 STEP 1 — the PAYLOAD PROOF for the ordering guard in
+// `coordinator/tests.rs`.
+//
+// An empty `zone_host_inbound` admits every host-bound packet: every zone id
+// misses the table, so every lookup takes the `None => true` arm. That is the
+// hazard #6873 describes, and it is real — this cell demonstrates it rather
+// than assuming it.
+//
+// It exists because the companion cell asserts an ABSENCE (no worker thread is
+// ever live while the table is empty), and an absence assertion is only worth
+// as much as the demonstrated ability of that state to cause harm. Without
+// this cell, `no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873`
+// would be guarding against a danger nobody had shown exists.
+//
+// Driven through `host_inbound_admits_iface` — the entry point the
+// local-delivery poll path actually calls (`poll_stages.rs`) — not the
+// zone-only primitive, so it cannot pass by binding a helper the production
+// path does not reach.
+#[test]
+fn cold_forwarding_state_admits_every_host_inbound_service_6873() {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const GRE: u8 = 47;
+    const IFINDEX: i32 = 10;
+    const ZONE: u16 = 7;
+
+    // A cold state: exactly what `ForwardingState::default()` produces before
+    // any snapshot is applied, and what `stop_inner` resets to on teardown.
+    let cold = ForwardingState::default();
+    assert!(
+        cold.zone_host_inbound.is_empty() && cold.ifindex_host_inbound.is_empty(),
+        "fixture broken: a cold ForwardingState must carry NO host-inbound entries — \
+         this cell is about the empty table, so a populated one would prove nothing"
+    );
+
+    // Every one of these is admitted, on a zone that admits nothing when the
+    // table is populated. None of them is ICMP, so none can reach admit via
+    // the #3171/#3201 global error/ND accept — the admit here is the
+    // `None => true` arm and nothing else.
+    for (proto, port, v6, what) in [
+        (TCP, 22u16, false, "ssh"),
+        (TCP, 443, false, "https"),
+        (UDP, 53, true, "dns over v6"),
+        (GRE, 0, false, "raw GRE"),
+    ] {
+        assert!(
+            host_inbound_admits_iface(&cold, IFINDEX, ZONE, proto, port, v6, 0),
+            "a cold (empty) forwarding state admits {what} — this is the fail-open \
+             #6873 is about, and it is why nothing may observe this state"
+        );
+    }
+
+    // THE CONTROL. The same packets on the same zone id are DENIED once the
+    // zone is in the table. Without this, the loop above would pass equally
+    // against a build that admitted everything unconditionally, and would say
+    // nothing about emptiness being the cause.
+    let mut warm = ForwardingState::default();
+    warm.zone_host_inbound
+        .insert(ZONE, zone_host_inbound_from_tokens(&[], &[]));
+    for (proto, port, v6, what) in [
+        (TCP, 22u16, false, "ssh"),
+        (TCP, 443, false, "https"),
+        (UDP, 53, true, "dns over v6"),
+        (GRE, 0, false, "raw GRE"),
+    ] {
+        assert!(
+            !host_inbound_admits_iface(&warm, IFINDEX, ZONE, proto, port, v6, 0),
+            "with the zone PRESENT and admitting nothing, {what} must be denied — \
+             it is the table being EMPTY that admits, not the admit path being open"
+        );
+    }
+}
