@@ -107032,6 +107032,10 @@ prose edit above them added. No diff falls in the new test body.
   - **Action**: committed `opus-review-001.md` into `docs/reviews/recovered/`. Two OPEN issues (#6813, #6751) cite it and it existed only outside the repo, so their evidence was unreachable to anyone but the machine that produced it.
   - **File(s)**: docs/reviews/recovered/opus-review-001.md
 
+- **Timestamp**: 2026-08-27
+  - **Action**: #6875 — `security log stream <s> source-interface` is now modelled, validated, compiled and honoured at apply time, with precedence source-address > source-interface > global. The #3349 happy-path entry now asserts the compiled value instead of a clean commit.
+  - **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go, pkg/config/compiler_security_log.go, pkg/daemon/daemon_system.go, pkg/config/log_stream_config_3349_test.go, pkg/config/log_stream_source_interface_6875_test.go, docs/config-schema.md
+
 ## 2026-08-27 — #7653: measure the #2419 class across PACKING DEPTH
 
 - **Timestamp**: 2026-08-27

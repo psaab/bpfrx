@@ -106,7 +106,24 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {
+		// #6875 precedence: an explicitly configured address beats one derived
+		// from an interface, and both beat the global fallback.
+		//
+		//	source-address  >  source-interface  >  global source-interface
+		//
+		// The per-stream source-interface arm is the new one. Before #6875 the
+		// leaf parsed (the stream subtree is open-world), compiled to nothing,
+		// and the stream silently sourced from globalSourceAddr or from
+		// nothing at all.
+		//
+		// A source-interface that resolves to no address falls through to the
+		// global rather than pinning the stream to "": resolution reads
+		// interface state, so an interface that is merely not up yet must not
+		// permanently strip a source the operator did configure globally.
 		srcAddr := stream.SourceAddress
+		if srcAddr == "" && stream.SourceInterface != "" {
+			srcAddr = config.ResolveSyslogSourceAddr(cfg, stream.SourceInterface)
+		}
 		if srcAddr == "" {
 			srcAddr = globalSourceAddr
 		}

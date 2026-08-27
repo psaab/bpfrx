@@ -97,8 +97,27 @@ func TestLogStream3349_SchemaFields_AcceptValid(t *testing.T) {
 		t.Fatalf("valid log config rejected: %v", err)
 	}
 	// And it must actually compile (strict).
-	if _, err := config.CompileConfig(buildTree3349(t, good...)); err != nil {
+	cfg, err := config.CompileConfig(buildTree3349(t, good...))
+	if err != nil {
 		t.Fatalf("valid log config failed strict compile: %v", err)
+	}
+	// #6875: this list contains `stream s2 source-interface reth1.100`, and
+	// until #6875 the only thing asserted about it was that it COMMITTED. It
+	// compiled to nothing — the stream subtree is open-world, so the leaf
+	// parsed as an unmodelled keyword and no field received it. A happy-path
+	// entry pinning "this commits clean" for a statement with no effect is
+	// worse than no coverage, because it makes the no-op look deliberate.
+	//
+	// Assert the COMPILED value, so this entry now witnesses the feature
+	// instead of witnessing its absence.
+	s2 := cfg.Security.Log.Streams["s2"]
+	if s2 == nil {
+		t.Fatalf("stream s2 did not compile; got streams %v", cfg.Security.Log.Streams)
+	}
+	if s2.SourceInterface != "reth1.100" {
+		t.Errorf("stream s2 SourceInterface = %q, want reth1.100 — the per-stream "+
+			"source-interface must reach the typed config, not be absorbed by the "+
+			"open-world stream subtree (#6875)", s2.SourceInterface)
 	}
 }
 

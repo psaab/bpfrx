@@ -8178,8 +8178,29 @@ reserved for whole-dataplane selection where a rewrite shim
   (`error|warning|info`, matching `pkg/logging` `ParseSeverity`), `facility`
   (the `ParseFacility` set incl. `local0..7`/`change-log`), `category`
   (`all|session|policy|screen|firewall`, matching `ParseCategory`), and
-  `source-address` (`ValueIPAddress`). `source-interface` uses
-  `ValidateSyslogSourceInterface`, which rejects a non-numeric `.<unit>`
+  `source-address` (`ValueIPAddress`). **`source-interface` is modelled at BOTH
+  levels since #6875** — `security log source-interface` (global) and `security
+  log stream <s> source-interface` (per stream), sharing one validator. The
+  per-stream spelling previously parsed as an unmodelled keyword (the `stream`
+  subtree is open-world), compiled to nothing, and committed clean while the
+  stream sourced from the global setting or from nothing; a happy-path test
+  pinned that no-op as valid. Apply-time precedence is **`source-address` >
+  `source-interface` > global `source-interface`** (`daemon_system.go`): an
+  explicitly configured address beats one derived from an interface, and both
+  beat the global fallback. A per-stream `source-interface` that resolves to no
+  address falls through to the global rather than pinning the stream to "" —
+  resolution reads interface state, so an interface that is merely not up yet
+  must not permanently strip a source the operator did configure globally.
+
+  Worth knowing when reading either level: `ResolveSyslogSourceAddr` consults
+  only `unit.PrimaryAddress` from config, and a plain `address` line populates
+  `Addresses` while leaving `PrimaryAddress` empty. So a unit configured
+  without an explicit `primary` resolves to "" from config and depends on the
+  kernel-lookup fallback. That is pre-existing behaviour of the global feature,
+  not something #6875 introduced, and it is why the #6875 precedence tests set
+  `primary` explicitly.
+
+  `ValidateSyslogSourceInterface` rejects a non-numeric `.<unit>`
   suffix (`resolveSourceAddr` silently `Atoi`-fell-back to unit 0, binding the
   wrong source IP) AND, since #6218 item 7, a `.<unit>` above `MaxLogicalUnit`
   (16385) — e.g. `ge-0-0-0.50000` — which previously committed even though no

@@ -739,6 +739,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueIPAddress, valueDesc: "source IP address for this stream",
 				valueExamples: []string{"10.0.1.10", "2001:db8::1"},
 				validator:     ValidateIPAddress, children: nil},
+			// #6875: modelled so the leaf is VALIDATED rather than absorbed by
+			// the open-world stream subtree. Before this it parsed as an
+			// unmodelled keyword, committed clean, and was compiled by nothing.
+			"source-interface": {desc: "Interface whose address is used as this stream's syslog source", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>",
+				valueType: ValueIdentifier, valueDesc: "interface name (optionally .<unit>)",
+				valueExamples: []string{"ge-0-0-0", "reth1.100"},
+				validator:     ValidateSyslogSourceInterface, children: nil},
 			// H8 (#2008): transport is fully compiled
 			// (compiler_security.go stream loop) and runtime-honored
 			// (pkg/logging/syslog.go dial), but the schema declared no
