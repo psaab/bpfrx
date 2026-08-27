@@ -490,134 +490,6 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 	return true
 }
 
-// withEpochFileLock serializes a read-modify-write of an epoch state file
-// across PROCESSES, not merely within one.
-//
-// Within a process the one file this guards has a single writer at a time
-// (Manager.startBootEpochRefine admits one refine worker), but nothing in xpf
-// enforces a single daemon instance: there is no pidfile, and the gRPC listener
-// sets SO_REUSEPORT (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a
-// port collision the way it otherwise would. Two overlapping incarnations could
-// therefore interleave read-modify-write, and an interleaved one can lose the
-// update the other just made. An advisory lock on a sidecar file is cheaper than
-// reasoning about whether the race is reachable.
-//
-// IT DOES NOT ORDER INCARNATIONS, and an earlier revision of this comment said
-// it did ("publish epochs that are not strictly ordered — which is precisely the
-// property the whole mechanism rests on"). It serializes by LOCK ACQUISITION,
-// and there is no happens-before edge from daemon start, or from survivorship,
-// to that acquisition. heartbeatBootEpoch publishes the wall-clock seed and
-// starts emitting BEFORE its worker reaches this function, deliberately (a
-// storage fault must not take a healthy node off the air), so the two orders are
-// independent. Older incarnation A publishes `a` and is delayed; newer B
-// publishes `b > a`, locks first, persists `b`; A locks second, reads `b`,
-// raises itself to `b+1` and persists that. The peer then latches `b+1` from the
-// OLDER incarnation and refuses the NEWER one at `b`.
-//
-// That mis-ordering is not closed here, and it cannot be with this file alone:
-// refinement only ever matters when the persisted value exceeds our own seed,
-// and "a predecessor wrote it after a backward clock step" and "a concurrent
-// newer incarnation wrote it" produce the identical file. Separating them needs
-// state this design does not keep — a lifetime-held liveness lock, or a writer
-// identity in the file — i.e. a larger change than the epoch itself. What IS
-// closed is the unrecoverable half: refinement is re-runnable
-// (Manager.refreshBootEpoch), so the stranded incarnation raises itself above
-// the file again at its next heartbeat (re)start instead of being pinned below
-// the floor for the life of the process by a one-shot sync.Once. Between the
-// mis-ordering and that next start this node IS refused. #6724 closed the
-// half of that gap which was a MISSING TRIGGER rather than missing state —
-// Manager.retryOwedBootEpochPersist re-runs refinement from the sender loop
-// when, and only when, a pass could not persist — and the mis-ordering itself
-// is tracked as #7501. See
-// TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669.
-//
-// THAT RECOVERY CARRIES TWO CONDITIONS, and stating it flat overstates it. The
-// re-run reads the FILE, so it can only recover what the file expresses:
-//
-//   - THE FLOOR-RAISING EPOCH MUST HAVE REACHED THE FILE. refineBootEpoch
-//     publishes a raise BEFORE persisting it, deliberately — a node that has
-//     read a predecessor's higher value must still order itself above that
-//     value even when it cannot write, which is the backward-clock-step case
-//     persistence exists for. So A can EMIT `b+1` while the file still reads
-//     `b`. B then has no signal at all: it wrote `b`, the file says `b`, and
-//     every restart returns at refineBootEpoch's `prev == lastWrote` shortcut.
-//     B stays below the peer's floor for its whole process lifetime, however
-//     many times it restarts, because the information is not in the only
-//     channel it reads.
-//   - THE OTHER INCARNATION MUST BE GONE. While both run, each pass raises
-//     above the other and rewrites the file, so they leapfrog indefinitely and
-//     alternately strand each other while the file ratchets. The test above
-//     makes A exit before B re-refines, and that step is load-bearing.
-//
-// Both are characterized in
-// TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669, and they are tracked
-// with the mis-ordering — but they do NOT both need the same missing state, and
-// an earlier revision of this comment said they did.
-//
-// CONDITION 2 does: separating "a concurrent newer incarnation wrote it" from
-// "a predecessor wrote it after a backward clock step" needs a writer identity
-// or a lifetime-held liveness lock, which is where the leapfrog lives.
-//
-// CONDITION 1 needs neither, and is CLOSED (#6724). It needed A to RETRY ITS
-// FAILED PERSIST, and the code already did the right thing on a retry: A's
-// published value is already b+1, so `next := prev+1` is not > epoch, nothing
-// ratchets, and the WriteFileDurable is simply re-attempted. Once b+1 reaches
-// the file, B's next refreshBootEpoch reads it, raises to b+2 and is admitted.
-// What was missing was only a TRIGGER for that retry, which is a materially
-// smaller change than a writer identity: refineBootEpochReporting now reports
-// whether a persist is OWED, and Manager.retryOwedBootEpochPersist re-runs
-// refinement from the heartbeat sender loop while one is. The gate is
-// load-bearing in the other direction too — an UNCONDITIONAL periodic refine
-// would make the leapfrog below continuous, so both nodes would be refused for
-// part of every period instead of one being refused until its next restart.
-//
-// Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
-// rather than run unlocked. A lock whose failure path executes the critical
-// section anyway is not a lock — it reinstates the very race it exists to
-// prevent, exactly when the guard cannot fire.
-//
-// WHY DECLINING IS RIGHT, not merely cheap. Proceeding unlocked does not trade
-// correctness for liveness; it trades a TRANSIENT liveness risk for a DURABLE
-// one. A raced read-modify-write can leave a lower epoch in the file than an
-// overlapping incarnation already emitted. That value is read back as `prev` on
-// the next boot, and it is exactly the term that matters after a backward clock
-// step — the one case persistence exists for. The epoch then produced can sit
-// BELOW the peer's latched floor, where admitAuthed refuses it: the same
-// false-peer-death the fail-open was supposed to avoid, moved one restart later
-// and made durable rather than transient. Corrupting the state whose only job is
-// surviving a clock step is not a safe way to fail.
-//
-// What declining costs is bounded and transient by comparison: the wall-clock
-// epoch is already published and already on the wire (see
-// Manager.heartbeatBootEpoch), so only backward-clock-step protection is lost,
-// and only until the next resolve succeeds.
-//
-// The old justification — "a node that cannot lock must not be a node that
-// cannot heartbeat" — was a SENDER-liveness argument applied to a call site that
-// is not on the heartbeat path at all. This runs on refineBootEpoch's worker,
-// off both the send loop and the receive loop, so declining it cannot stop this
-// node emitting anything. It also matches its siblings: MkdirAllDurable failure
-// already declines and WriteFileDurable failure already declines, so lock
-// failure was the only branch of three that proceeded.
-func withEpochFileLock(path string, fn func()) {
-	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		slog.Warn("cluster: HA epoch state lock unavailable; SKIPPING the persist "+
-			"(the wall-clock epoch is already in use; only backward-clock-step "+
-			"protection is lost)", "path", path, "err", err)
-		return
-	}
-	defer f.Close()
-	if err := epochFlock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		slog.Warn("cluster: HA epoch state lock failed; SKIPPING the persist "+
-			"(the wall-clock epoch is already in use; only backward-clock-step "+
-			"protection is lost)", "path", path, "err", err)
-		return
-	}
-	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
-	fn()
-}
-
 // heartbeatEpochMarker derives this cluster's boot-epoch section marker from
 // the control-link PSK. Both nodes hold the same PSK (#6624 makes it mandatory
 // for a chassis cluster), so both derive the same marker.
@@ -923,6 +795,28 @@ func (m *Manager) releaseBootEpochRefine() bool {
 
 // joinBootEpochRefine waits for an in-flight refine worker to exit, up to
 // budget. It reports whether the worker was joined.
+//
+// THE INVARIANT, STATED SO IT CANNOT DRIFT (#6826). A join that returns FALSE
+// means the worker is STILL RUNNING, and that worker may be inside
+// withEpochFileLock holding a CROSS-PROCESS flock: the lock is taken before the
+// callback and released by a defer after it, and nothing cancels the callback.
+// So:
+//
+//	a returned Manager.Stop does NOT imply the epoch flock is released.
+//
+// It is stated rather than fixed because the alternatives are worse. Releasing
+// the lock on the timeout path would mean interrupting a durable write and an
+// fsync at an arbitrary point, which is how a torn epoch file gets written.
+// Making the budget cover the worst-case callback is not possible — the
+// worst case is a wedged fsync, and bounding that is what this whole file
+// exists to avoid.
+//
+// What closes the hole is the OTHER side: acquireEpochFileLock waits a bounded
+// time for a contended lock and then declines the persist, so an incoming
+// process meeting an outgoing one's still-held lock degrades to "no
+// backward-clock-step protection this pass" instead of parking behind it.
+// TestStopReturnsWhileEpochFlockIsStillHeld6826 pins this direction, and
+// TestIncomingProcessDeclinesRatherThanBlocking6826 pins the other.
 //
 // THE BOUND IS THE POINT. The worker's blocking calls are a flock and an fsync,
 // and this whole file exists because those can wedge indefinitely without that

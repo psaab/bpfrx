@@ -1,3 +1,47 @@
+## 2026-08-27 — #6821: security-log transport packed tail, gate and compiler together
+
+- **Timestamp**: 2026-08-27
+- **Action**: `security log stream <s> transport` has two legal hierarchical
+  spellings and the compiler read only one. `transport protocol tls;` packs its
+  value onto the container's own `Keys` with NO children, so the
+  `prop.Children` loop ran zero times and left `Transport.Protocol` empty on a
+  config that committed cleanly. Not inert: `daemon_system.go` defaults an empty
+  protocol to `udp`, so the compact spelling of a TLS audit stream shipped over
+  PLAINTEXT UDP while the config on disk still read `protocol tls`. That answers
+  the question the issue left open, and it is the worst of the possibilities it
+  listed.
+  The issue prescribed "accumulate `Keys[1:]`", and that alone would have been
+  wrong — the arm carried a comment saying so, and measuring confirmed it: the
+  gate ignores a container's packed tail BY DESIGN (compiler-faithful), so
+  `transport { protocol tpc; }` was rejected by the enum while
+  `transport protocol tpc;` was ACCEPTED. Compiling the tail without the gate
+  turns "not compiled" into "compiled, unvalidated". Added `schemaNode.packedTail`
+  as the explicit pairing: it declares that a compiler reads this container's
+  packed tail, and `walkSchemaNode` then validates the same `packedBodyChildren`
+  expansion the compiler consumes. Three readers, one expansion, resolved through
+  `securityLogTransportSchema()` so a schema move cannot silently hand back the
+  unexpanded children and restore the defect.
+  The `tls-profile` half fails the other way and the issue framed both the same:
+  xpf resolves no TLS profile at all, so the BLOCK spelling is REJECTED at commit
+  (#3350). The compact spelling slipped past that rejection AND dropped the
+  value — a lost diagnostic, not lost protection.
+  The #2419 census tripwire fired, which is it working: the two leaves were
+  recorded as by-design divergent BECAUSE of the packed-tail blocker. They moved
+  to `filedFixed` rather than being deleted so the sites stay checked in both
+  directions, and the `filedByDesign` floor dropped 6 -> 4 with the reason at the
+  assertion.
+- **File(s)**: `pkg/config/schema.go`, `pkg/config/schema_security.go`,
+  `pkg/config/schema_walk.go`, `pkg/config/compiler_security_log.go`,
+  `pkg/config/security_log_transport_compact_6821_test.go` (new),
+  `pkg/config/compact_block_equivalence_2419_test.go`,
+  `pkg/config/testdata/compact_block_divergences_2419.txt`,
+  `docs/config-schema.md`
+- **Validation**: `go build ./...` + `go test -count=1 ./...` repo-wide, rc 0
+  (68 ok, 0 FAIL). 5-cell mutation matrix, 5/5 RED, full package, no `-run`
+  filter, fix committed before mutating. One cell initially reported ANCHOR x2
+  (both readers share the same call prefix) and was re-anchored — a cell that
+  cannot locate its line measures nothing.
+
 ## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
 
 - **Timestamp**: 2026-08-26
@@ -106763,6 +106807,187 @@ prose edit above them added. No diff falls in the new test body.
 - **Timestamp**: 2026-08-26
   - **Action**: #6849 — settled the fork by measurement (no Go producer has ever emitted `medium`; the arm predates T-7 and was carried mechanically), removed the dead arm, kept the rank numbering, and documented why COS_PRIORITY_LEVELS=6 is correct rather than off by one.
   - **File(s)**: userspace-dp/src/afxdp/forwarding_build/cos.rs, userspace-dp/src/afxdp/forwarding_build/tests.rs, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/policy_snapshot_error.rs
+
+## 2026-08-26 — #6826 bound the incoming side of the epoch flock
+
+- **Timestamp**: 2026-08-26
+- **Action**: Pin the invariant that a returned `Manager.Stop` does NOT release
+  the cross-process epoch flock, and bound the OTHER side so an incoming process
+  declines rather than parks behind an outgoing one's still-running worker.
+- **Re-derived at `773c3e655`** by shape rather than by the issue's line numbers
+  (they had moved): `withEpochFileLock` takes `LOCK_EX`, defers `LOCK_UN`, and
+  runs the callback — including the durable write and `fsync` — in between;
+  `joinBootEpochRefine` returns false on timeout without cancelling the worker;
+  `Manager.Stop` warns and returns on that false. Confirmed.
+- **Fix direction chosen, and the two rejected**: releasing on the timeout path
+  means interrupting a durable write plus `fsync` at an arbitrary point, which
+  is how a torn epoch file is written. Making the join budget cover the worst
+  case is impossible — the worst case is a wedged `fsync`, and refusing to block
+  on that is the reason the bound exists at all. So the fix is the third
+  direction the issue offers: the INCOMING process treats a held lock as an
+  expected transient. `withEpochFileLock` used a BLOCKING `LOCK_EX`;
+  `acquireEpochFileLock` now polls `LOCK_EX|LOCK_NB` for
+  `bootEpochLockAcquireBudget` and then declines, matching the two sibling
+  branches that already decline.
+- **EWOULDBLOCK is treated differently from other errno**: contention is
+  retried, a real failure returns immediately. Retrying `ENOLCK` for three
+  seconds would turn a fast correct decline into a slow one.
+- **The test was the thing the issue said was missing**, and it is written to
+  pin the CURRENT contract rather than a fix nobody made: if someone later makes
+  `Stop` imply release, the cell reds and points at the invariant comment. That
+  is drift detection in whichever direction it drifts.
+- **Ground-truth control first**: `flock(2)` associates a lock with the open file
+  DESCRIPTION, not the process, so a second `os.OpenFile` in the same process
+  contends exactly as another process would. That property is asserted directly —
+  without it every "the lock is free" assertion in the file passes vacuously.
+- **The -race probe uses UNEQUAL iteration counts.** A contender and an acquirer
+  with equal counts lets the cheap side finish inside the expensive side's first
+  pass, so the two barely overlap and `-race` observes nothing while the test
+  reports success. The contender loops until the acquirer signals done, and the
+  achieved RATE is reported: 40 acquisitions in 77ms against 4874 contender lock
+  cycles (63047/s). A run that degenerated to no overlap fails instead of
+  passing.
+- **File(s)**: `pkg/cluster/heartbeat_epoch.go`,
+  `pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go` (new),
+  `pkg/cluster/README.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-26
+  - **Action**: #7674 — the #6826 contention probe was degenerate under `go test ./...`: the contender goroutine went unscheduled for the whole acquire loop, so the probe's own floor fired reporting it proved nothing. Master was RED. Wait on the observable before the loop, and measure overlap WITH the loop.
+  - **File(s)**: pkg/cluster/heartbeat_epoch_stop_flock_6826_test.go
+
+## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hostile review returned a HIGH on my own #7632 fix and it
+  reproduces. `deadlineArmingWriter` sets a deadline before every write and
+  never clears it; a write succeeding does not cancel it. Under HTTP/1.1 that is
+  invisible. Under HTTP/2 Go implements the write deadline as a timer that
+  RESETS THE STREAM, so my fix tore down an idle SSE feed one deadline after its
+  last event — with a client that had consumed everything and a firewall that
+  was legitimately quiet. Exactly the defect the design was written to avoid,
+  reintroduced by the mechanism chosen to avoid it.
+  REPRODUCED BEFORE FIXING rather than acting on the argument: HTTP/2 test
+  server, one event, idle 4x the deadline ->
+  `read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer`.
+  Fix: clear the deadline once the event is fully out. AFTER the flush, not
+  after the last Write — `http.Flusher.Flush()` does not go through the arming
+  writer, so clearing earlier would leave the flush unbounded and re-open the
+  pin.
+  WHY MY IDLE CELL DID NOT CATCH IT, and it is not the vacuity I had already
+  ruled out by mutation: the cell genuinely arms the deadline, but its helper
+  uses `httptest.NewServer`, which is HTTP/1.1 ONLY, while production permits
+  HTTP/2 on the TLS listener. Sound on the protocol it exercises, blind to the
+  one where expiry kills the stream. The lesson generalises past this file: a
+  cell's PROTOCOL is part of its fixture, and an HTTP/1.1 harness cannot observe
+  an HTTP/2 stream-reset timer.
+  So "per-write, not elapsed" was necessary and NOT sufficient — per-write still
+  severs an idle stream if the deadline outlives the write. The window has to
+  CLOSE as well as open.
+  Finding 2 (MEDIUM): the whole payload went out under one absolute deadline, so
+  a large event to a slow-but-PROGRESSING reader was cut off partway. The "few
+  hundred bytes" premise is unenforced — event JSON carries operator-authored
+  strings bounded only by the 16 MiB config limit. Payload now written in 32 KiB
+  chunks, each re-arming.
+  Finding 3 (LOW): my own harness published the establishing event once after a
+  fixed 150ms sleep, with no replay on subscriptions — the #7650 shape in my own
+  test. Now publishes on a ticker until the GET returns, with a bounded client.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+- **Validation**: the new HTTP/2 cell is verified to be the detector — removing
+  the clear reds `TestIdleSSEStreamIsNotResetOnHTTP2_7632` and leaves every
+  HTTP/1.1 cell GREEN, which is the measurement of the blindness rather than an
+  assertion about it.
+
+## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
+
+- **Timestamp**: 2026-08-26
+- **Action**: The SSE sibling of #6809. `writeSSEEvent` wrote straight to the
+  `ResponseWriter` and DISCARDED every write error, and `WriteTimeout` is 0
+  process-wide for exactly these streams — so a subscriber that stays CONNECTED
+  and stops reading parked the handler in `Write` indefinitely while holding a
+  subscriber slot. Both handlers now write through `sseStream`, reusing the
+  `deadlineArmingWriter` from #6809 so coverage is structural, and RETURNING the
+  first write error, which both loops treat as terminal.
+  I FIRST CLAIMED THE ERROR RETURN WAS LOAD-BEARING, THEN MEASURED IT AND IT IS
+  NOT. The claim was that adding the deadline without propagating the error
+  would be worse than the pin — the loop draining the subscription into a dead
+  connection. The mutation matrix said otherwise (M2/M3 green), so I probed
+  instead of arguing: with the error deliberately discarded the handler returns
+  in 254.6ms against a 250ms deadline, versus 254.9ms with the check.
+  Indistinguishable, because net/http cancels the request context as soon as a
+  write to the connection fails and the loop exits through its ctx.Done() arm
+  regardless. The deadline is what fixes the pin. The error check is kept as
+  DEFENCE IN DEPTH — that exit is net/http behaviour, not contract, so a
+  wrapping ResponseWriter or a different server that does not cancel would leave
+  the loop draining — and it is labelled precautionary in the code, the README
+  and the PR rather than described as the thing preventing a worse failure.
+  PER-WRITE, NEVER ELAPSED, and this is the axis on which SSE genuinely differs
+  from the RIB dump: an event feed on a quiet firewall is SUPPOSED to idle, so
+  an elapsed budget would sever the healthy case. A per-write deadline bounds a
+  write that has BEGUN and says nothing about the gap between events.
+  Found a pre-existing behaviour while building the harness and did NOT fix it:
+  net/http sends no response headers until the first Write/Flush, and
+  `setSSEHeaders` only sets header VALUES — so a client connecting to a quiet
+  feed blocks in `http.Get` waiting for headers nobody sent. A browser
+  EventSource on an idle firewall hangs rather than establishing the stream.
+  Recorded in the README and in the harness comment; out of scope here.
+- **File(s)**: `pkg/api/sse.go`,
+  `pkg/api/sse_slow_reader_pin_7632_test.go` (new), `pkg/api/README.md`,
+  `_Log.md`
+- **Validation**: reused #6809's `stalledConn6809`/`stalledListener6809` — a
+  net.Conn that parks the writer exactly as a full send buffer does — rather
+  than rebuilding an instrument for the same class. Includes the NEGATIVE
+  CONTROL proving the fixture can genuinely pin (deadlines unsupported → the
+  handler must still be running), the SSE-specific idle cell that reds if
+  anyone adds an elapsed budget by analogy with `bgpStreamTotalBudget`, and a
+  paired healthy-reader control.
+
+## 2026-08-26 — #7632 SSE slow reader: review findings 2/3/5/6
+
+- **Timestamp**: 2026-08-26
+- **Action**: Disposition the remaining findings from this PR's own hostile
+  review. Finding 2: `writeEvent` claimed to return the first write error but
+  discarded the FLUSH error, which for a small event is the only write that
+  reaches the socket — `sseStream.flush` now goes through
+  `http.ResponseController.Flush()`, with `ErrNotSupported` latched rather than
+  treated as a dead peer. Finding 3: both slow-reader cells and the negative
+  control now witness a genuinely PARKED write before drawing a conclusion from
+  a timeout ("still running" is also what an IDLE handler looks like — it
+  produced two wrong readings in this PR). Finding 5: added `logStreamHandler`
+  coverage and a subscriber-slot-release cell over both handlers, binding
+  `defer sub.Close()`. Finding 6: replaced the 2-sample precautionary-claim
+  measurement with n=9 min/median/max over three variants and two write paths.
+  Fixture gained `maxWrites` (exact "buffer filled after the first event") and
+  parked-write instrumentation. Finding 4: replaced the fixed 100ms
+  readiness sleeps with `floodUntilParked7632` (wait on the implying
+  observable, fail naming what never arrived) and made `readSSEChunk7632`
+  accumulate to the SSE terminator rather than assume one `Body.Read` returns
+  a complete event. The matrix then caught the large-event cell not binding at
+  all (chunking removed => GREEN): a loopback reader drains too fast for any
+  window to expire, so `stalledConn6809` gained `slowRate`/`slowWindow` for a
+  slow-but-progressing peer and the cell now reds on the revert.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/bgp_slow_reader_pin_6809_test.go`, `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-26 — #7636: split pkg/eventengine/engine.go
+
+- **Timestamp**: 2026-08-26
+- **Action**: Verbatim split of `engine.go` (1540 LOC, over the soft 1500
+  `[WATCH]` floor since #6810) into three cohesive units: `queue.go` (215,
+  action-queue admission — `enqueue`, `supersede`, `releaseEdgeLatch`,
+  `actionQueueDepth`) and `evaluate.go` (427, evaluation — `evaluateEvent`,
+  `withinMatches`, `pruneWindow`, `attributesMatch`, `classifyPlan` and
+  helpers), leaving `engine.go` at 943. No behaviour change: all 10 moved
+  functions verified byte-identical to their originals and absent from
+  `engine.go`, declaration census 48 before and 48 after with an empty diff and
+  no duplicates, and the 16-file `pkg/eventengine` suite green with ZERO test
+  edits. The `e.mu`/`enqueueMu` never-nested lock order is now stated in all
+  three files, since the split is exactly what stops the two locks being
+  visible on one screen. Pruned the `[WATCH]` entry from
+  `docs/refactoring-audit-accepted.txt` — it is a decision record, not state.
+- **File(s)**: `pkg/eventengine/engine.go`, `pkg/eventengine/queue.go`,
+  `pkg/eventengine/evaluate.go`, `pkg/eventengine/README.md`,
+  `docs/refactoring-audit-accepted.txt`, `_Log.md`
 
 - **Timestamp**: 2026-08-26
   - **Action**: #6854 — `then reject <message-type>` now selects the ICMP code. Threaded the token from the compiler through FirewallTermSnapshot into FilterAction::Reject and the ICMP builder, across all three reject paths (input, output/CoS, flow-cache replay).

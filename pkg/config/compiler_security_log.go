@@ -16,6 +16,38 @@ import (
 // syslog dial and silently lose audit records (#5250 A3-b2 F2).
 func validSyslogPort(n int) bool { return n >= 1 && n <= 65535 }
 
+// securityLogTransportSchema resolves the schema node for
+// `security log stream <s> transport` (#6821).
+//
+// Both readers of that container's packed tail — compileLog and the #3350
+// tls-profile strict check — expand it through `packedBodyChildren` with THIS
+// node, and `walkSchemaNode` validates the same expansion because the node sets
+// `packedTail: true`. Resolving it in one place is what stops the three from
+// drifting: a schema move that broke the lookup would make the expansion
+// silently return the unexpanded children again, which is the original defect.
+// TestSecurityLogTransportSchemaResolves6821 fails loudly if the path moves.
+func securityLogTransportSchema() *schemaNode {
+	n := setSchema
+	for _, k := range []string{"security", "log", "stream"} {
+		if n == nil {
+			return nil
+		}
+		n = n.children[k]
+	}
+	if n == nil {
+		return nil
+	}
+	// `stream` is a named instance: its per-instance body hangs off the
+	// wildcard when one is declared, otherwise off the node itself.
+	if n.wildcard != nil {
+		n = n.wildcard
+	}
+	if n == nil {
+		return nil
+	}
+	return n.children["transport"]
+}
+
 func compileLog(node *Node, sec *SecurityConfig) error {
 	if sec.Log.Streams == nil {
 		sec.Log.Streams = make(map[string]*SyslogStream)
@@ -80,26 +112,22 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			case "source-address":
 				stream.SourceAddress = nodeVal(prop)
 			case "transport":
-				// Children-only, deliberately, unlike the #6818 sibling.
+				// #6821: read BOTH spellings. `transport { protocol tls; }`
+				// arrives as children; `transport protocol tls;` packs the
+				// value onto this node's own Keys with NO children, so a
+				// Children-only loop ran zero times and left Protocol and
+				// TLSProfile empty on a config that committed cleanly.
 				//
-				// #6821 asks for the compact `transport protocol tls;` spelling
-				// to compile. It must NOT until the strict gate validates a
-				// container's packed tail, because today it does not: the block
-				// spelling `transport { protocol tpc; }` is rejected by the
-				// enum, and the compact `transport protocol tpc;` is ACCEPTED
-				// -- the walker ignores leftover Keys on a container by design
-				// (compiler-faithful: the compiler did not read them either).
-				// Compiling them here without teaching the gate to validate
-				// them turns "not compiled" into "compiled, unvalidated", and
-				// the daemon then silently omits the stream. For a compact
-				// `tls-profile` it is worse: the block spelling is REJECTED at
-				// commit (#3350, no profile resolution exists), and compiling
-				// the compact one walks straight past that rejection into a
-				// stream that ignores the named profile.
-				//
-				// The gate and the compiler have to move together here. Tracked
-				// separately; see the #6821 note in docs/config-schema.md.
-				for _, tc := range prop.Children {
+				// This arm used to be Children-only DELIBERATELY, because
+				// compiling a packed tail the gate does not validate turns
+				// "not compiled" into "compiled, unvalidated" — measured:
+				// `transport { protocol tpc; }` was rejected by the enum while
+				// `transport protocol tpc;` was ACCEPTED. That is why the
+				// schema's `transport` node now sets `packedTail: true`, which
+				// makes the walker validate this same expansion. The gate and
+				// the compiler move together, which is the rule
+				// docs/config-schema.md states; neither half is correct alone.
+				for _, tc := range packedBodyChildren(prop, securityLogTransportSchema()) {
 					switch tc.Name() {
 					case "protocol":
 						stream.Transport.Protocol = nodeVal(tc)
@@ -267,7 +295,13 @@ func validateSecurityLogStreamTLSProfileAST(nodes []*Node, prefix string, lenien
 					if prop.Name() != "transport" {
 						continue
 					}
-					for _, tc := range prop.Children {
+					// #6821: the SAME expansion the compiler reads. This check
+					// was Children-only too, so `transport tls-profile X;`
+					// slipped past the rejection that `transport { tls-profile
+					// X; }` gets — and then the compiler dropped the value, so
+					// the operator got neither the profile nor the error saying
+					// it is unimplemented.
+					for _, tc := range packedBodyChildren(prop, securityLogTransportSchema()) {
 						if tc.Name() != "tls-profile" {
 							continue
 						}

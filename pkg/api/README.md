@@ -1766,6 +1766,153 @@ the drop fails loudly instead of going quietly vacuous.
   `bgp_routes_cap_5056_test.go`; the streaming/non-buffering + wire-format
   invariants by `bgp_routes_stream_4708_test.go`.
 
+  **SSE streams carry the same bound, on a different axis (#7632).**
+  `writeSSEEvent` wrote straight to the `ResponseWriter` and **discarded every
+  write error**, and `WriteTimeout` is 0 process-wide, so a subscriber that
+  stays CONNECTED and stops reading parked the handler in `Write` indefinitely
+  while holding a subscriber slot. Both stream handlers
+  (`/api/v1/events/stream`, `/api/v1/logs/stream`) now write through
+  `sseStream`, which wraps the `ResponseWriter` in the same
+  `deadlineArmingWriter` the BGP route stream uses and **returns** the first
+  failure — from a write *or from the flush*; both loops treat it as terminal.
+
+  **Armed before the write, CLEARED after it (#7654 review, finding 1).** A
+  deadline is not cancelled by the write succeeding — it stays live. Under
+  HTTP/1.1 that is invisible; under **HTTP/2** Go implements the write deadline
+  with a timer that **resets the stream** when it fires, so a deadline left
+  armed tore down an idle feed one deadline after its last event, with a client
+  that had consumed everything. Reproduced before fixing: `read n=0 err=stream
+  error: stream ID 1; INTERNAL_ERROR`. So **"per-write, not elapsed" is
+  necessary and not sufficient — the window has to close as well as open.**
+  Cleared after the *flush*, not after the last `Write`, because
+  `http.Flusher.Flush()` does not go through the arming writer and clearing
+  earlier would leave it unbounded.
+
+  Pinned by `TestIdleSSEStreamIsNotResetOnHTTP2_7632`. Note why a separate cell
+  was needed: every other cell here uses `httptest.NewServer`, which is
+  **HTTP/1.1 only**, while production permits HTTP/2 on the TLS listener.
+  Removing the clear reds that one cell and **leaves every HTTP/1.1 cell green**
+  — a test can be sound on the protocol it exercises and blind to the one where
+  the defect lives.
+
+  **The payload is written in bounded chunks — and the first cell for it did
+  not bind (finding 2).** The mutation matrix returned GREEN for "chunking
+  removed": the cell drained a 256 KiB payload over loopback as fast as it
+  could, and over loopback that transits in microseconds, so the window never
+  came close to expiring either way. It varied the right axis and sampled only
+  the passing point. The hazard needs a reader that is slow but *still
+  progressing*, which neither a full-speed loopback client nor a stalled conn
+  can be, so `stalledConn6809` gained `slowRate`/`slowWindow`: bytes move, at a
+  rate, honouring the armed deadline. `TestLargeEventSurvivesASlowButProgressingReader7632`
+  now reds on the revert (truncated after 3 676 of 262 144 payload bytes) and
+  passes with the chunking.
+
+  Worth knowing for anyone changing `sseWriteChunk`: net/http's own 4 KiB
+  `conn.bufw` means the **socket** sees ~4 KiB writes whatever the chunk size
+  is, so chunking does not change the write pattern at all — **it changes when
+  `SetWriteDeadline` is re-armed.** It is a re-arming schedule, not a write
+  schedule. The original cell was implicitly testing the write pattern, which is
+  identical in both arms, which is why it could never have failed.
+
+  **What the chunking is for.** One `Fprintf` of the
+  whole event gave the entire payload a single absolute window, so a large event
+  to a slow-but-*progressing* reader was cut off partway — the budget measuring
+  elapsed time rather than lack of progress, which is the same conflation this
+  design rejects at the stream level. The "a few hundred bytes" premise is
+  unenforced: event JSON carries operator-authored strings whose only external
+  bound is the 16 MiB config limit. Each `sseWriteChunk` (32 KiB) re-arms, so a
+  reader that keeps draining keeps the stream however large the event.
+
+  **Per-write, never elapsed** — this is where SSE differs from the RIB dump and
+  the difference is load-bearing. An event feed on a quiet firewall is
+  *supposed* to sit silent for long stretches; that is its normal operating
+  state, not a symptom. An elapsed budget would sever exactly the healthy case.
+  A per-write deadline bounds a write that has BEGUN and says nothing about the
+  gap between events. `TestIdleSSEStreamIsNotSevered7632` pins it, and reds if
+  anyone adds an elapsed budget here by analogy with `bgpStreamTotalBudget`.
+
+  **The FLUSH error is reported, not discarded (finding 2).** `writeEvent`'s doc
+  comment claimed it returned the first write error. For an ordinary event that
+  was **false**: net/http buffers the response in a 2 KiB `bufio.Writer` and an
+  SSE event is a few hundred bytes, so the handler's `Write` calls never touch
+  the socket — the write that can block is the one *inside* the flush, and
+  `http.Flusher.Flush()` has no error return (net/http's `response.Flush` calls
+  `FlushError()` and throws it away). So the only write that can genuinely fail
+  was the only one whose failure was guaranteed to be dropped. `sseStream.flush`
+  now goes through `http.ResponseController.Flush()`, which returns what
+  `response.Flush` swallows. `ErrNotSupported` is latched as "this writer cannot
+  flush" rather than treated as a dead peer — pinned by a paired control, since
+  "return whatever Flush says" is otherwise satisfied by severing every stream
+  on its first event.
+
+  **The error returns are precautionary, not bound — measured, not assumed.**
+  The obvious claim is that arming the deadline alone would be worse than the
+  pin, with the loop draining the subscription into a dead connection. It is
+  not. Nine runs per variant against a 250 ms deadline, on both paths a small
+  event can take — the flood that overruns the 2 KiB buffer into direct socket
+  writes, and the single small event whose only socket contact is the flush:
+
+  | variant | write path (flood) min/med/max | flush path (1 event) |
+  |---|---|---|
+  | as shipped | 251.0 / 251.9 / 254.9 ms | 250.3 / 250.7 / 250.8 ms |
+  | write check discarded | 251.1 / 251.5 / 252.4 ms | 250.3 / 250.5 / 250.8 ms |
+  | flush check discarded | 251.1 / 251.4 / 252.9 ms | 250.6 / 250.6 / 250.7 ms |
+
+  Every variant returns inside one deadline window and the distributions overlap
+  completely, because net/http cancels the request context when a connection
+  write fails — measured directly at `250.69 ms` after the blocking write began
+  — so the loop exits through its `ctx.Done()` arm regardless.
+
+  The deadline is what fixes the pin. Both checks are kept because that exit
+  depends on net/http cancelling on a write error — behaviour, not contract — so
+  a wrapping `ResponseWriter` or a different server that does not do it would
+  leave the loop draining. Removing either leaves the suite green, which is
+  recorded here rather than papered over: it is defence in depth, and calling it
+  load-bearing would put a false claim into the next reader's reasoning. What
+  the flush fix repairs is the **claim**, not the bound.
+
+  **"Still running" is not "pinned" (finding 3).** Both slow-reader cells, and
+  the negative control above all, now witness a genuinely PARKED write
+  (`stalledListener6809.waitForParkedWrite`) before drawing any conclusion from
+  a timeout. An idle handler and a blocked one look identical to a deadline, and
+  that confusion produced two wrong readings during this PR — once about HTTP/2,
+  where a goroutine dump showed the handler sitting in its `select` rather than
+  in `Write`, and once about the flush, where a byte budget let a whole flush
+  through and the "pin" was an idle stream. The fixture also gained `maxWrites`,
+  an exact "the buffer filled after the first event" that a byte budget cannot
+  express: it is checked *before* the write and then passes the whole thing.
+
+  **No fixed wall-clock point stands in for readiness (finding 4).** The cells
+  used to sleep 100 ms and then publish, but subscriptions have no replay — a
+  flood landing before the handler subscribes is simply lost, and the cell then
+  fails 15 s later blaming the deadline, which is the wrong diagnosis for a lost
+  publish. `floodUntilParked7632` publishes until a write has genuinely parked
+  (the observable that implies *both* that the handler subscribed and that it
+  reached the blocking write) and fails loudly naming what never arrived,
+  per the #7563 ordering in `docs/engineering-style.md` — never a longer sleep
+  or a retry. `readSSEChunk7632` likewise accumulates to the `\n\n` SSE
+  terminator instead of assuming one `Body.Read` returns a whole event: a short
+  read of `id: 1\n` would have failed the healthy-reader assertion while
+  delivery was perfectly correct.
+
+  **The subscriber SLOT is the product-visible half (finding 5).** A pinned
+  handler holds one of 64 capped subscriber slots (#4484), so non-reading
+  clients accumulate until `TrySubscribe` returns nil and the endpoint 503s for
+  everyone — a client that is not reading taking the feed away from clients that
+  are. Bounding the write lets the handler return; `defer sub.Close()` turns
+  that return into a freed slot; only both together deliver the property, and
+  `TestASeveredSSEReaderReleasesItsSubscriberSlot7632` reds if either is
+  removed. It runs against **both** handlers, as does the slow-reader cell —
+  before this, every assertion here went through `eventStreamHandler` and
+  `logStreamHandler` could have been reverted whole without reddening anything.
+
+  Note one pre-existing behaviour #7632 did **not** change: net/http does not
+  send response headers until the first `Write` or `Flush`, and `setSSEHeaders`
+  only sets header VALUES — so a client connecting to a feed with no traffic
+  blocks waiting for headers nobody has sent. A browser `EventSource` on an idle
+  firewall hangs rather than establishing the stream. Out of scope here;
+  recorded because the test harness has to work around it.
+
   **A slow reader is a different hazard from a disconnected one (#6809).**
   Every bound above is a bound on PROGRESS. A client that stays CONNECTED and
   stops reading produces neither a disconnect nor a write error: the socket
