@@ -1509,9 +1509,11 @@ fn synced_snat_entry() -> SyncedSessionEntry {
 fn synced_snat_install_publishes_and_delete_releases_dnat_table_entry() {
     use crate::afxdp::checksum::{DNAT_DELETE_ATTEMPTS, DNAT_PUBLISH_ATTEMPTS};
 
-    // Serialize against any other test touching the process-global counters.
-    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = GUARD.lock().expect("counter guard");
+    // #6872: the SHARED guard, not a function-local one. A `static` declared in
+    // a function body is unnameable elsewhere, so the guard this used to hold
+    // excluded nobody — including the identically-named guard in
+    // session_glue/tests.rs.
+    let _g = crate::afxdp::checksum::dnat_counter_guard();
 
     let mut coordinator = Coordinator::new();
     // A live v4 dnat_table fd so the publish/delete path is reached; -1 makes
