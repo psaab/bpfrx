@@ -257,6 +257,14 @@ Rules, each of which is load-bearing:
   on the lenient load / peer-sync path, since the strict gate rejects it —
   resolves via the absolute rate and is **not** counted as a remainder queue,
   so the pre-pass and the main path agree about which queues those are.
+- a **percent** sibling is counted at the value the dataplane gives it, which
+  means **ceiled**, clamped to at least 1, and zero outside `(0,100]`. The
+  control-plane advisory computes the same leftover independently — there is no
+  shared representation between Go and Rust — so the rounding rule is part of
+  the contract, not an implementation detail. Truncating on one side makes its
+  leftover larger and suppresses the advisory on a shape the dataplane declines:
+  `percent 33.3333333` + `percent 66.6666667` on a 1 Gbps shape is 124_999_999
+  truncated against 125_000_001 ceiled, over a 125_000_000 base.
 - the leftover **splits equally, flooring**, across remainder-marked queues.
   An indivisible leftover loses up to `count − 1` bytes/sec, which is noise
   against any shaping rate a remainder is meaningful on. A leftover *smaller*

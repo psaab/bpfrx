@@ -123,6 +123,34 @@ func TestRemainderAdvisoryTracksTheLeftover6846(t *testing.T) {
 			wantReason: "leaving no usable leftover",
 		},
 		{
+			// F6. THE ROUNDING AXIS — the only row that can see a divergence
+			// between the two implementations of one rule.
+			//
+			// Every other row uses an INTEGRAL percent, where ceil and truncate
+			// are equal by construction: they vary the right axis and sample
+			// only the point where the two sides agree. Here 1 Gbps is
+			// 125_000_000 B/s, and 33.3333333% + 66.6666667% is 124_999_999
+			// truncated but 125_000_001 ceiled. Rust ceils, so its leftover
+			// saturates to zero and the dataplane declines the share; a Go
+			// mirror that truncated would see a leftover of 1, answer
+			// "resolves", and suppress this advisory on a queue that does
+			// nothing at runtime.
+			name:     "a FRACTIONAL percent must round the way the dataplane rounds",
+			rustCell: "cos_percent_buffer_bytes (ceil, via cos_percent_rate_bytes)",
+			lines: []string{
+				"set class-of-service schedulers a transmit-rate percent 33.3333333",
+				"set class-of-service schedulers b transmit-rate percent 66.6666667",
+				"set class-of-service schedulers r transmit-rate remainder",
+				"set class-of-service scheduler-maps sm forwarding-class assured-forwarding scheduler a",
+				"set class-of-service scheduler-maps sm forwarding-class expedited-forwarding scheduler b",
+				"set class-of-service scheduler-maps sm forwarding-class best-effort scheduler r",
+				"set class-of-service interfaces ge-0/0/0 scheduler-map sm",
+				"set class-of-service interfaces ge-0/0/0 shaping-rate 1g",
+			},
+			wantWarn:   true,
+			wantReason: "leaving no usable leftover",
+		},
+		{
 			name:     "no shaping base at all",
 			rustCell: "no_shaping_rate_is_unresolvable",
 			lines: []string{
@@ -211,5 +239,55 @@ func TestRemainderLeftoverThatFloorsToZeroStillWarns6846(t *testing.T) {
 					"and the row above would prove nothing")
 			}
 		})
+	}
+}
+
+// TestRemainderLeftoverIgnoresAnOutOfRangePercentSibling6846 pins the DOMAIN
+// half of the mirror (#6846 F6).
+//
+// `SchemaValidate` rejects a percent outside (0,100] at commit, so this shape
+// cannot be typed — it is built as a struct directly, the way the lenient load
+// / peer-sync path (#1960) can deliver one. The Rust resolver returns `None`
+// for such a sibling, so it contributes NOTHING to the claim. An unguarded
+// multiplication on this side would have it claim 150% of the interface,
+// exhaust the rate, and suppress nothing — it would INVENT an advisory for a
+// remainder queue that the dataplane resolves normally.
+func TestRemainderLeftoverIgnoresAnOutOfRangePercentSibling6846(t *testing.T) {
+	cfg := &config.Config{ClassOfService: &config.ClassOfServiceConfig{
+		ForwardingClasses: map[string]*config.CoSForwardingClass{
+			"best-effort":        {Name: "best-effort", Queue: 0},
+			"assured-forwarding": {Name: "assured-forwarding", Queue: 1},
+		},
+		Schedulers: map[string]*config.CoSScheduler{
+			"bad": {Name: "bad", TransmitRatePercent: 150},
+			"r":   {Name: "r", TransmitRateRemainder: true},
+		},
+		SchedulerMaps: map[string]*config.CoSSchedulerMap{
+			"sm": {Name: "sm", Entries: map[string]*config.CoSSchedulerMapEntry{
+				"assured-forwarding": {ForwardingClass: "assured-forwarding", Scheduler: "bad"},
+				"best-effort":        {ForwardingClass: "best-effort", Scheduler: "r"},
+			}},
+		},
+		Interfaces: map[string]*config.CoSInterface{
+			"ge-0/0/0": {Name: "ge-0/0/0", Level: &config.CoSInterfaceUnit{
+				SchedulerMap: "sm", ShapingRateBytes: 125_000_000,
+			}},
+		},
+	}}
+
+	// Guard the fixture: if the out-of-range percent ever stopped surviving
+	// into the compiled shape, this cell would pass over a config that never
+	// exercised the domain check.
+	if cfg.ClassOfService.Schedulers["bad"].TransmitRatePercent <= 100 {
+		t.Fatal("fixture broken: the sibling must carry a percent OUTSIDE (0,100]")
+	}
+
+	for _, w := range config.ValidateConfig(cfg) {
+		if strings.Contains(w, "transmit-rate remainder is accepted but has no effect") {
+			t.Fatalf("#6846: an out-of-range percent sibling must contribute NOTHING to "+
+				"the claim, exactly as cos_percent_rate_bytes returns None for it. The "+
+				"remainder queue has the whole 125_000_000 to itself and resolves, so "+
+				"this advisory is invented:\n  %s", w)
+		}
 	}
 }

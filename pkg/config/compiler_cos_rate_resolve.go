@@ -1,5 +1,7 @@
 package config
 
+import "math"
+
 // CoS transmit-rate resolvability predicates.
 //
 // Split out of compiler_class_of_service.go (#6846). These two answer one
@@ -120,13 +122,71 @@ func cosSchedulerTemporalResolves(sched *CoSScheduler, shaped map[string]bool) b
 	return sched.TransmitRateBytes > 0 || shaped[sched.Name]
 }
 
+// cosPercentRateBytes is the Go mirror of `cos_percent_buffer_bytes` in
+// userspace-dp/src/afxdp/forwarding_build/cos.rs, which `cos_percent_rate_bytes`
+// delegates to (#6846 F6).
+//
+// It exists because there is no shared representation between the two sides and
+// a divergence here is ALWAYS a bug: this side decides whether an operator is
+// WARNED that a knob is inert, the Rust side decides whether the dataplane
+// declines the share. Every rule is mirrored deliberately, including the ones
+// that look like noise:
+//
+//   - CEIL, not truncate. This is the one that bit. Truncating makes this
+//     side's `claimed` systematically LOWER, so its leftover is larger, so it
+//     answers "resolves" for a shape whose leftover the dataplane rounds away.
+//     A config that is silent at commit AND inert at runtime is exactly the
+//     failure #6846 exists to remove, arriving through the mirror instead of
+//     through the predicate. `percent 33.3333333` + `percent 66.6666667` on a
+//     1 Gbps shape reaches it: 124_999_999 truncated versus 125_000_001
+//     ceiled, against a 125_000_000 base.
+//   - the (0, 100] DOMAIN. SchemaValidate already rejects a percent outside it
+//     ("percent out of range (0,100]"), so this is defense-in-depth for the
+//     lenient load / peer-sync path (#1960) — but the direction matters: Rust
+//     returns None and the sibling contributes NOTHING to the claim, where an
+//     unguarded multiplication would have it claim 150% of the interface.
+//   - the min-1 clamp, which is unreachable for a positive percent over a
+//     non-zero base (ceil of anything above zero is at least 1) and is mirrored
+//     only so the two functions cannot be read as differing.
+//
+// TestRemainderAdvisoryTracksTheLeftover6846 pins the agreement at a FRACTIONAL
+// percent, which is the only fixture shape that can see a rounding divergence:
+// at an integral percent ceil and truncate are equal by construction.
+func cosPercentRateBytes(baseBytes uint64, percent float64) (uint64, bool) {
+	if baseBytes == 0 || math.IsNaN(percent) || math.IsInf(percent, 0) ||
+		percent <= 0 || percent > 100 {
+		return 0, false
+	}
+	scaled := math.Ceil(float64(baseBytes) * percent / 100.0)
+	switch {
+	case scaled < 1:
+		return 1, true
+	case scaled >= math.MaxUint64:
+		return math.MaxUint64, true
+	default:
+		return uint64(scaled), true
+	}
+}
+
+// cosSaturatingAdd mirrors the `u128` saturating accumulation the Rust pre-pass
+// uses for `claimed`. Wrapping here would make an over-subscribed set of
+// siblings look like a SMALL claim and hand the remainder queue a leftover it
+// does not have.
+func cosSaturatingAdd(a, b uint64) uint64 {
+	if a > math.MaxUint64-b {
+		return math.MaxUint64
+	}
+	return a + b
+}
+
 // cosRemainderLeftoverIsPositive reports whether ANY interface binding gives
 // `sched` a non-zero remainder share (#6846).
 //
 // This is the control-plane mirror of `cos_remainder_rate_bytes` and must apply
-// the same rule: subtract the RESOLVED siblings (absolute, or percent against
-// this binding's shaping rate), count the remainder-marked queues, and floor the
-// split. It is ANY rather than ALL because a named scheduler can be bound to
+// the same rule: subtract the RESOLVED siblings (absolute, or percent through
+// cosPercentRateBytes, which mirrors the Rust rounding and is a shared helper
+// rather than an inline expression precisely because an inline one drifted),
+// count the remainder-marked queues, and floor the split. It is ANY rather than ALL because a named scheduler can be bound to
 // several interfaces and only needs to do something somewhere for the advisory
 // to be wrong.
 //
@@ -136,8 +196,11 @@ func cosSchedulerTemporalResolves(sched *CoSScheduler, shaped map[string]bool) b
 // once. TestRemainderAdvisoryTracksTheLeftover6846 pins the AGREEMENT rather
 // than either side's literals — each row transcribes a named cell from the Rust
 // `remainder_temporal_tests_6846` module and asserts the advisory is silent IFF
-// that cell resolves. TestRemainderLeftoverThatFloorsToZeroStillWarns6846 pins
-// the floor, which is where two implementations of one rule drift first.
+// that cell resolves — including one row at a FRACTIONAL percent, the only
+// shape that can see a rounding divergence.
+// TestRemainderLeftoverThatFloorsToZeroStillWarns6846 pins the floor and
+// TestRemainderLeftoverIgnoresAnOutOfRangePercentSibling6846 the domain: the
+// three places two implementations of one rule drift first.
 func cosRemainderLeftoverIsPositive(cos *ClassOfServiceConfig, name string) bool {
 	if cos == nil {
 		return false
@@ -167,9 +230,15 @@ func cosRemainderLeftoverIsPositive(cos *ClassOfServiceConfig, name string) bool
 			}
 			switch {
 			case sib.TransmitRateBytes > 0:
-				claimed += sib.TransmitRateBytes
+				claimed = cosSaturatingAdd(claimed, sib.TransmitRateBytes)
 			case sib.TransmitRatePercent > 0:
-				claimed += uint64(float64(unit.ShapingRateBytes) * sib.TransmitRatePercent / 100.0)
+				// Through the shared mirror, NOT an inline expression. The
+				// inline form truncated where Rust ceils, which made this
+				// side's leftover larger and suppressed the advisory on
+				// configurations the dataplane declines (#6846 F6).
+				if bytes, ok := cosPercentRateBytes(unit.ShapingRateBytes, sib.TransmitRatePercent); ok {
+					claimed = cosSaturatingAdd(claimed, bytes)
+				}
 			case sib.TransmitRateRemainder:
 				remainderQueues++
 			}
