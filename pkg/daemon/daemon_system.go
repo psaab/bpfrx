@@ -1981,6 +1981,12 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 
 // sshdConfPath is the xpf-managed sshd drop-in. Overridable in tests so the
 // remove/revert side effects can be exercised against a temp dir.
+//
+// #7609: it is the SOLE seam for the drop-in's location. applySSHConfig
+// derives the directory it creates from this path (filepath.Dir) rather than
+// repeating the literal, so pointing this one var at a throwaway tree relocates
+// the file AND its parent together. Before that the parent was hard-coded, so a
+// relocated path had no directory to be written into.
 var sshdConfPath = "/etc/ssh/sshd_config.d/xpf.conf"
 
 // FS + reload seam (#2062). applySSHConfig owns three real-world side effects
@@ -2094,7 +2100,26 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) (retErr error) {
 	// the write below will also fail, but the mkdir error is the real cause
 	// (e.g. a read-only /etc) so surface it rather than only the opaque write
 	// error.
-	if err := sshdMkdirAll("/etc/ssh/sshd_config.d", 0755); err != nil {
+	//
+	// #7609: derived from sshdConfPath rather than repeated as a literal.
+	// Byte-identical in production — filepath.Dir("/etc/ssh/sshd_config.d/
+	// xpf.conf") IS "/etc/ssh/sshd_config.d" — so this changes no behaviour on
+	// a real box. What it fixes is the SEAM: sshdConfPath is a package var
+	// precisely so a test can point the drop-in at a throwaway tree, and a
+	// hard-coded parent meant relocating it created the file path without its
+	// directory. The write then failed with ENOENT, and the failure surfaced
+	// as whatever the test was actually asserting — a cell that only checked
+	// "the tail returned an error" would pass for the wrong reason.
+	//
+	// That is not hypothetical: the #6790 credential cells hit it, and carried
+	// an os.MkdirAll(filepath.Dir(sshdConfPath)) workaround in their fixture
+	// until this landed. Deleting that workaround is this change's regression
+	// signal — if the control cell stays green without it, the derivation
+	// works.
+	//
+	// One var now relocates the whole drop-in, which is the property
+	// provisionedUsersDir already has for the three #5841 marker roots.
+	if err := sshdMkdirAll(filepath.Dir(sshdConfPath), 0755); err != nil {
 		slog.Warn("failed to create sshd config drop-in directory", "err", err)
 		fail(fmt.Errorf("create sshd config drop-in directory: %w", err))
 	}

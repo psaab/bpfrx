@@ -1,3 +1,32 @@
+## 2026-08-26 — #7609: one var now relocates the whole sshd drop-in
+
+- **Timestamp**: 2026-08-26
+- **Action**: `sshdConfPath` is a package var precisely so a test can point the
+  xpf-managed sshd drop-in at a throwaway tree, but `applySSHConfig` created its
+  DIRECTORY from a hard-coded `/etc/ssh/sshd_config.d`. Relocating the var gave
+  a file path with no parent, the write failed ENOENT, and the failure surfaced
+  as whatever the test was actually asserting — so a cell checking only "an
+  error was returned" passed while observing the fixture's own broken seam
+  rather than the injected condition. Derived the directory from
+  `filepath.Dir(sshdConfPath)`; byte-identical in production.
+  DELETED the `os.MkdirAll(filepath.Dir(sshdConfPath))` workaround the #6790
+  credential cells were carrying. That deletion IS the regression signal: the
+  #6790 suite passes without it, which is the observable proof the derivation
+  works, and if the parent stops being derived the healthy-control cell goes red
+  instead of the failure being absorbed.
+  Added a PAIRED production-value cell, which is the one that keeps this from
+  being a behaviour change: every other cell relocates the path, so none of them
+  would notice if the derivation produced the wrong directory on a real box.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/sshd_dropin_dir_seam_7609_test.go` (new),
+  `pkg/daemon/apply_credential_failclosed_6790_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+- **Validation**: 3 cells — the relocation property with a NESTED path (so a fix
+  that only works for an existing grandparent still fails) and no pre-created
+  parent, the production-value control, and a cell holding the pre-existing
+  #2062 property that the mkdir error is still surfaced by name rather than
+  swallowed into the opaque downstream write error.
+
 ## 2026-08-26 — #6830 round 2: `ntp` was an INVENTED row, and it was on the wire
 
 - **Timestamp**: 2026-08-26
