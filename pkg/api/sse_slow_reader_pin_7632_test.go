@@ -231,15 +231,33 @@ func openSSEStream7632(t *testing.T, deadline time.Duration) (*logging.EventBuff
 		srv.eventStreamHandler(w, r)
 	}))
 
+	// #7654 review, finding 3: publish on a TICKER until the GET returns, not
+	// once after a fixed sleep. Subscriptions have no replay, so a single
+	// publish that lands before the handler subscribes is lost — and because no
+	// headers are then written, the GET waits for the package timeout rather
+	// than failing. That is the #7650 shape (a fixed wall-clock point standing
+	// in for "the other side is ready") in my own harness, which is not a
+	// defensible place to have it.
+	established := make(chan struct{})
 	go func() {
-		time.Sleep(150 * time.Millisecond) // let the subscription come up
-		floodEvents7632(buf, 1)
+		tick := time.NewTicker(25 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-established:
+				return
+			case <-tick.C:
+				floodEvents7632(buf, 1)
+			}
+		}
 	}()
 
-	resp, err := http.Get(ts.URL + "/api/v1/events/stream")
+	resp, err := httpGetWithTimeout7632(ts.URL+"/api/v1/events/stream", 20*time.Second)
+	close(established)
 	if err != nil {
 		ts.Close()
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("GET: %v — the stream never established, so no headers were "+
+			"written (see #7655)", err)
 	}
 	stop := func() {
 		resp.Body.Close()
@@ -249,6 +267,15 @@ func openSSEStream7632(t *testing.T, deadline time.Duration) (*logging.EventBuff
 		ts.Close()
 	}
 	return buf, resp, stop
+}
+
+// httpGetWithTimeout7632 bounds the establishing GET. An SSE handler writes no
+// response headers until its first event, so a GET against a feed that never
+// produces one hangs until the package timeout and reports nothing useful
+// (#7655). A bounded client turns that into a named failure.
+func httpGetWithTimeout7632(url string, d time.Duration) (*http.Response, error) {
+	c := &http.Client{Timeout: d}
+	return c.Get(url)
 }
 
 // readSSEChunk7632 reads whatever the stream has produced within d. An SSE
@@ -267,5 +294,161 @@ func readSSEChunk7632(t *testing.T, resp *http.Response, d time.Duration) string
 		return r.s
 	case <-time.After(d):
 		return ""
+	}
+}
+
+// --- HTTP/2, the protocol the HTTP/1.1 cells above are blind to -------------
+
+// openSSEStreamH2_7632 is openSSEStream7632 over HTTP/2.
+//
+// This exists because every other cell in this file uses httptest.NewServer,
+// which is HTTP/1.1 ONLY — and production permits HTTP/2 on the TLS listener
+// (server.go). The distinction is not cosmetic: Go implements the HTTP/2 write
+// deadline with a timer that RESETS THE STREAM when it fires, so a deadline
+// left armed after a successful write tears down an idle stream. Under
+// HTTP/1.1 the same stale deadline is invisible.
+//
+// A cell can be sound on the protocol it exercises and blind to the one where
+// the defect lives.
+func openSSEStreamH2_7632(t *testing.T, deadline time.Duration) (*logging.EventBuffer, *http.Response, func()) {
+	t.Helper()
+	restore := sseWriteDeadline
+	sseWriteDeadline = deadline
+	t.Cleanup(func() { sseWriteDeadline = restore })
+
+	buf := logging.NewEventBuffer(256)
+	srv := &Server{eventBuf: buf}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Proto != "HTTP/2.0" {
+			t.Errorf("this cell must exercise HTTP/2; handler saw %s", r.Proto)
+		}
+		srv.eventStreamHandler(w, r)
+	}))
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+
+	established := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(25 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-established:
+				return
+			case <-tick.C:
+				floodEvents7632(buf, 1)
+			}
+		}
+	}()
+	c := ts.Client()
+	c.Timeout = 20 * time.Second
+	resp, err := c.Get(ts.URL + "/api/v1/events/stream")
+	close(established)
+	if err != nil {
+		ts.Close()
+		t.Fatalf("GET over HTTP/2: %v", err)
+	}
+	if resp.Proto != "HTTP/2.0" {
+		resp.Body.Close()
+		ts.Close()
+		t.Fatalf("negotiated %s, not HTTP/2 — the cell would test the wrong protocol", resp.Proto)
+	}
+	return buf, resp, func() {
+		resp.Body.Close()
+		ts.CloseClientConnections()
+		ts.Close()
+	}
+}
+
+// TestIdleSSEStreamIsNotResetOnHTTP2_7632 is the regression cell for the HIGH
+// finding on this PR's own review, and it is the one the HTTP/1.1 idle cell
+// could not have caught.
+//
+// The first version of this fix armed a write deadline before every write and
+// never cleared it. On HTTP/1.1 that is harmless. On HTTP/2 the deadline is a
+// timer that resets the stream when it expires, so an idle SSE feed was torn
+// down one deadline after its last event — with a client that had consumed
+// everything and a firewall that was legitimately quiet. Reproduced before
+// fixing:
+//
+//	after idling 4x the deadline:
+//	read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer
+//
+// So the lesson the earlier design missed: "per-write, not elapsed" is
+// necessary and not sufficient. The window has to CLOSE as well as open.
+//
+// FAIL-ON-REVERT: remove the clearDeadline() call at the end of writeEvent and
+// this cell reds with exactly that stream error, while every HTTP/1.1 cell in
+// this file stays green.
+func TestIdleSSEStreamIsNotResetOnHTTP2_7632(t *testing.T) {
+	const deadline = 500 * time.Millisecond
+	buf, resp, stop := openSSEStreamH2_7632(t, deadline)
+	defer stop()
+
+	if first := readSSEChunk7632(t, resp, 5*time.Second); !strings.Contains(first, "SESSION_OPEN") {
+		t.Fatalf("precondition: the HTTP/2 stream did not establish; read %q", first)
+	}
+
+	// Idle well past the deadline with no traffic at all.
+	time.Sleep(4 * deadline)
+
+	// Still live: an event published now is still delivered, and the read
+	// returns data rather than a stream reset.
+	floodEvents7632(buf, 1)
+	got := readSSEChunk7632(t, resp, 5*time.Second)
+	if !strings.Contains(got, "SESSION_OPEN") {
+		t.Fatalf("an idle HTTP/2 SSE stream was RESET %v after its last event — a "+
+			"write deadline that is armed and never cleared is an h2 stream-reset "+
+			"timer, so the fix severed exactly the healthy quiet feed it was "+
+			"written to protect (#7654 review, finding 1). read: %q",
+			4*deadline, got)
+	}
+}
+
+// TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632 covers the MEDIUM
+// finding: one event large enough to outlast a single deadline window.
+//
+// Before the payload was chunked, the whole event went out under ONE absolute
+// deadline, so a large event to a slow-but-PROGRESSING reader was cut off
+// partway — the budget measured elapsed time rather than lack of progress,
+// which is the same conflation this file rejects at the stream level. The
+// "a few hundred bytes" premise is unenforced: event JSON carries
+// operator-authored strings.
+//
+// The reader here drains continuously, so any failure is the deadline
+// misfiring rather than a genuine stall.
+func TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632(t *testing.T) {
+	const deadline = 750 * time.Millisecond
+	buf, resp, stop := openSSEStreamH2_7632(t, deadline)
+	defer stop()
+	if first := readSSEChunk7632(t, resp, 5*time.Second); !strings.Contains(first, "SESSION_OPEN") {
+		t.Fatalf("precondition: stream did not establish; read %q", first)
+	}
+
+	// A payload many chunks long: with one deadline for the whole event this is
+	// a single window, with chunking it is many.
+	big := strings.Repeat("A", 8*sseWriteChunk)
+	buf.Add(logging.EventRecord{
+		Time: time.Now(), Type: "SESSION_OPEN",
+		SrcAddr: "10.0.1.9:1", DstAddr: "10.0.2.1:80",
+		Protocol: "TCP", Action: "permit", Reason: big,
+	})
+
+	// Drain continuously until the whole payload has arrived.
+	deadlineAt := time.Now().Add(20 * time.Second)
+	var seen int
+	b := make([]byte, 32*1024)
+	for seen < len(big) && time.Now().Before(deadlineAt) {
+		n, err := resp.Body.Read(b)
+		seen += strings.Count(string(b[:n]), "A")
+		if err != nil {
+			t.Fatalf("a %d-byte event to a CONTINUOUSLY reading client failed after "+
+				"%d payload bytes: %v — the write budget is measuring elapsed time "+
+				"rather than progress (#7654 review, finding 2)", len(big), seen, err)
+		}
+	}
+	if seen < len(big) {
+		t.Fatalf("only %d of %d payload bytes arrived before the cell's own bound",
+			seen, len(big))
 	}
 }

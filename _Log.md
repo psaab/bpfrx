@@ -1,3 +1,46 @@
+## 2026-08-26 — #7632 round 2: the deadline was armed and never CLEARED
+
+- **Timestamp**: 2026-08-26
+- **Action**: Hostile review returned a HIGH on my own #7632 fix and it
+  reproduces. `deadlineArmingWriter` sets a deadline before every write and
+  never clears it; a write succeeding does not cancel it. Under HTTP/1.1 that is
+  invisible. Under HTTP/2 Go implements the write deadline as a timer that
+  RESETS THE STREAM, so my fix tore down an idle SSE feed one deadline after its
+  last event — with a client that had consumed everything and a firewall that
+  was legitimately quiet. Exactly the defect the design was written to avoid,
+  reintroduced by the mechanism chosen to avoid it.
+  REPRODUCED BEFORE FIXING rather than acting on the argument: HTTP/2 test
+  server, one event, idle 4x the deadline ->
+  `read n=0 err=stream error: stream ID 1; INTERNAL_ERROR; received from peer`.
+  Fix: clear the deadline once the event is fully out. AFTER the flush, not
+  after the last Write — `http.Flusher.Flush()` does not go through the arming
+  writer, so clearing earlier would leave the flush unbounded and re-open the
+  pin.
+  WHY MY IDLE CELL DID NOT CATCH IT, and it is not the vacuity I had already
+  ruled out by mutation: the cell genuinely arms the deadline, but its helper
+  uses `httptest.NewServer`, which is HTTP/1.1 ONLY, while production permits
+  HTTP/2 on the TLS listener. Sound on the protocol it exercises, blind to the
+  one where expiry kills the stream. The lesson generalises past this file: a
+  cell's PROTOCOL is part of its fixture, and an HTTP/1.1 harness cannot observe
+  an HTTP/2 stream-reset timer.
+  So "per-write, not elapsed" was necessary and NOT sufficient — per-write still
+  severs an idle stream if the deadline outlives the write. The window has to
+  CLOSE as well as open.
+  Finding 2 (MEDIUM): the whole payload went out under one absolute deadline, so
+  a large event to a slow-but-PROGRESSING reader was cut off partway. The "few
+  hundred bytes" premise is unenforced — event JSON carries operator-authored
+  strings bounded only by the 16 MiB config limit. Payload now written in 32 KiB
+  chunks, each re-arming.
+  Finding 3 (LOW): my own harness published the establishing event once after a
+  fixed 150ms sleep, with no replay on subscriptions — the #7650 shape in my own
+  test. Now publishes on a ticker until the GET returns, with a bounded client.
+- **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+- **Validation**: the new HTTP/2 cell is verified to be the detector — removing
+  the clear reds `TestIdleSSEStreamIsNotResetOnHTTP2_7632` and leaves every
+  HTTP/1.1 cell GREEN, which is the measurement of the blindness rather than an
+  assertion about it.
+
 ## 2026-08-26 — #7632: bound a slow SSE reader, per-WRITE and never elapsed
 
 - **Timestamp**: 2026-08-26

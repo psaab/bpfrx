@@ -76,13 +76,23 @@ func setSSEHeaders(w http.ResponseWriter) {
 // change to one into the other.
 var sseWriteDeadline = 30 * time.Second
 
+// sseWriteChunk bounds how many payload bytes go out under ONE write deadline
+// (#7654 review, finding 2). Each chunk re-arms, so the budget is per-chunk
+// progress rather than a single window for the whole event. 32 KiB is large
+// enough that an ordinary event is one chunk and the common path is unchanged.
+const sseWriteChunk = 32 * 1024
+
 // sseStream is one SSE response: a deadline-arming writer over the
 // ResponseWriter plus its flusher. It single-sources the deadline, the flush
 // and the error return for both stream handlers, so neither can drift into
 // discarding a write failure again.
 type sseStream struct {
-	w io.Writer
-	f http.Flusher
+	w  io.Writer
+	f  http.Flusher
+	rc *http.ResponseController
+	// deadlineUnsupported mirrors deadlineArmingWriter's own probe: once
+	// SetWriteDeadline has failed there is nothing to clear either.
+	deadlineUnsupported bool
 }
 
 // newSSEStream wraps w so every SSE write arms a fresh write deadline first.
@@ -90,15 +100,48 @@ type sseStream struct {
 // rather than at a call site makes the coverage structural, which is what
 // #6809's own first attempt got wrong.
 func newSSEStream(w http.ResponseWriter, d time.Duration) *sseStream {
-	st := &sseStream{w: &deadlineArmingWriter{
-		w:  w,
-		rc: http.NewResponseController(w),
-		d:  d,
-	}}
+	rc := http.NewResponseController(w)
+	st := &sseStream{w: &deadlineArmingWriter{w: w, rc: rc, d: d}, rc: rc}
 	if f, ok := w.(http.Flusher); ok {
 		st.f = f
 	}
 	return st
+}
+
+// clearDeadline drops the write deadline once an event is fully on the wire
+// (#7654 review, finding 1).
+//
+// ARMING ALONE IS NOT ENOUGH, and this is the correction that finding forced.
+// A deadline set before a write is not cancelled by the write succeeding — it
+// stays live. Under HTTP/1.1 that is invisible, because a stale absolute
+// deadline only matters when something writes again and deadlineArmingWriter
+// re-arms first. Under HTTP/2 Go implements the write deadline with a timer
+// that RESETS THE STREAM when it fires, so an idle SSE stream was torn down one
+// deadline after its last event, with a client that had consumed everything.
+//
+// Reproduced before fixing, not argued:
+//
+//	PROBE: response proto=HTTP/2.0
+//	PROBE: first read n=233 err=<nil>   (the establishing event)
+//	after idling 4x the deadline:
+//	PROBE RESULT: read n=0 err=stream error: stream ID 1; INTERNAL_ERROR
+//
+// So "per-write, not elapsed" was necessary and NOT sufficient: per-write still
+// severs an idle stream if the deadline outlives the write. The window has to
+// CLOSE as well as open — armed before the bytes go out, cleared once they are
+// out and the stream goes quiet again.
+//
+// Cleared AFTER the flush rather than after the last Write, deliberately.
+// http.Flusher.Flush() does not go through deadlineArmingWriter, so clearing
+// any earlier would leave the flush itself unbounded and re-open the very pin
+// this file exists to close.
+func (s *sseStream) clearDeadline() {
+	if s.deadlineUnsupported {
+		return
+	}
+	if err := s.rc.SetWriteDeadline(time.Time{}); err != nil {
+		s.deadlineUnsupported = true
+	}
 }
 
 // writeEvent writes a single SSE event and RETURNS the first write error.
@@ -114,12 +157,38 @@ func (s *sseStream) writeEvent(id, event, data string) error {
 			return err
 		}
 	}
-	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", data); err != nil {
+	if _, err := io.WriteString(s.w, "data: "); err != nil {
+		return err
+	}
+	// #7654 review, finding 2: write the PAYLOAD in bounded chunks so each one
+	// re-arms the deadline. One Fprintf of the whole event gave the entire
+	// payload a single absolute window, so a large event to a slow-but-
+	// PROGRESSING reader was cut off partway — the deadline measured elapsed
+	// time rather than lack of progress, which is the same conflation this file
+	// rejects at the stream level.
+	//
+	// The "an SSE event is a few hundred bytes" premise is unenforced: event
+	// JSON carries operator-authored strings (policy names and the like) whose
+	// only external bound is the 16 MiB config limit. Chunking makes the budget
+	// per-chunk, so a reader that keeps draining keeps the stream however large
+	// the event.
+	for off := 0; off < len(data); off += sseWriteChunk {
+		end := off + sseWriteChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		if _, err := io.WriteString(s.w, data[off:end]); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(s.w, "\n\n"); err != nil {
 		return err
 	}
 	if s.f != nil {
 		s.f.Flush()
 	}
+	// The event is on the wire; the stream is idle again until the next one.
+	s.clearDeadline()
 	return nil
 }
 

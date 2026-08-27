@@ -1776,6 +1776,34 @@ the drop fails loudly instead of going quietly vacuous.
   `deadlineArmingWriter` the BGP route stream uses and **returns** the first
   write error; both loops treat that error as terminal.
 
+  **Armed before the write, CLEARED after it (#7654 review, finding 1).** A
+  deadline is not cancelled by the write succeeding — it stays live. Under
+  HTTP/1.1 that is invisible; under **HTTP/2** Go implements the write deadline
+  with a timer that **resets the stream** when it fires, so a deadline left
+  armed tore down an idle feed one deadline after its last event, with a client
+  that had consumed everything. Reproduced before fixing: `read n=0 err=stream
+  error: stream ID 1; INTERNAL_ERROR`. So **"per-write, not elapsed" is
+  necessary and not sufficient — the window has to close as well as open.**
+  Cleared after the *flush*, not after the last `Write`, because
+  `http.Flusher.Flush()` does not go through the arming writer and clearing
+  earlier would leave it unbounded.
+
+  Pinned by `TestIdleSSEStreamIsNotResetOnHTTP2_7632`. Note why a separate cell
+  was needed: every other cell here uses `httptest.NewServer`, which is
+  **HTTP/1.1 only**, while production permits HTTP/2 on the TLS listener.
+  Removing the clear reds that one cell and **leaves every HTTP/1.1 cell green**
+  — a test can be sound on the protocol it exercises and blind to the one where
+  the defect lives.
+
+  **The payload is written in bounded chunks (finding 2).** One `Fprintf` of the
+  whole event gave the entire payload a single absolute window, so a large event
+  to a slow-but-*progressing* reader was cut off partway — the budget measuring
+  elapsed time rather than lack of progress, which is the same conflation this
+  design rejects at the stream level. The "a few hundred bytes" premise is
+  unenforced: event JSON carries operator-authored strings whose only external
+  bound is the 16 MiB config limit. Each `sseWriteChunk` (32 KiB) re-arms, so a
+  reader that keeps draining keeps the stream however large the event.
+
   **Per-write, never elapsed** — this is where SSE differs from the RIB dump and
   the difference is load-bearing. An event feed on a quiet firewall is
   *supposed* to sit silent for long stretches; that is its normal operating
