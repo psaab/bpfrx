@@ -2765,3 +2765,138 @@ fn refused_protocol_set_equals_the_shim_traversable_set() {
         );
     }
 }
+
+/// #6886: every protocol the SHIM classifies as non-terminal is one userspace
+/// refuses to build a session flow for — so a shim-built key carrying an
+/// extension-header type in its `protocol` field can never HIT.
+///
+/// This is the trace the issue asked for and explicitly did not do. The shim's
+/// `classify_native_gre_inner_ipv6` builds a `UserspaceSessionKey` from the
+/// inner IPv6 header and probes `USERSPACE_SESSIONS` with it. Before #6886 its
+/// bail-out hand-listed `HOP|ROUTING|DEST|AUTH|FRAGMENT`, so the six types it
+/// missed — Mobility (135), HIP (139), Shim6 (140), the two experimental
+/// values (253/254) added by #4517, and No-Next-Header (59) — fell through and
+/// built a key whose `protocol` was an extension header rather than an L4.
+///
+/// The issue's open question was whether such a key is merely a MISS or can
+/// actually match something. It can only match if userspace ever installs a
+/// session under an EH protocol, and this sweep is what forecloses that: the
+/// shim's non-terminal set is a subset of the set userspace declines. A miss
+/// routes the packet to userspace for full policy evaluation, which is the
+/// fail-closed direction.
+///
+/// Note the guarantee is NEWER than the issue: before #6837 (merged 2026-08-27)
+/// `metadata_tuple_complete` ended in `_ => true` and WOULD have installed a
+/// zero-ported session under protocol 135, which the shim's mis-built key
+/// matches exactly. So this was reachable, not merely theoretical, and the two
+/// fixes are complementary — this sweep fails if either regresses.
+#[test]
+fn shim_non_terminal_protocols_are_never_installable_by_userspace_6886() {
+    let src = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x11));
+    let dst = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x22));
+
+    let mut non_terminal = 0usize;
+    let mut terminal_installable = 0usize;
+    for proto in 0u8..=255 {
+        let flow = SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: proto,
+                src_ip: src,
+                dst_ip: dst,
+                // The shim leaves these 0 for any protocol that is not
+                // TCP/UDP/ICMPv6 — exactly the key shape under test.
+                src_port: 0,
+                dst_port: 0,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: proto,
+            ..UserspaceDpMeta::default()
+        };
+        let userspace_accepts = metadata_tuple_complete(meta, &flow);
+
+        if shim_walk::eh_class(proto) != shim_walk::EH_CLASS_TERMINAL {
+            non_terminal += 1;
+            assert!(
+                !userspace_accepts,
+                "#6886: proto={proto} is NON-TERMINAL to the shim, so its GRE-inner classify \
+                 must never find a session under it — but userspace would install one. A \
+                 shim-built key carrying an extension-header protocol would then HIT and take \
+                 the fast path on a mis-parsed identity"
+            );
+        } else if userspace_accepts {
+            terminal_installable += 1;
+        }
+    }
+
+    // Non-vacuity, both directions. Without these the sweep passes if the class
+    // table went all-terminal (zero assertions run) or if userspace refused
+    // EVERYTHING (the assertion holds for a reason that is not the property).
+    assert_eq!(
+        non_terminal, 11,
+        "#6886: the shim's non-terminal set changed size; this sweep is calibrated to it \
+         (HOP/ROUTING/DEST/MOBILITY/HIP/SHIM6/EXP1/EXP2/AUTH/FRAGMENT/NONEXT) and would \
+         otherwise assert over fewer rows than it claims"
+    );
+    assert!(
+        terminal_installable > 0,
+        "#6886: no terminal protocol is installable at all — the sweep above then holds \
+         vacuously rather than because EH types specifically are refused"
+    );
+}
+
+/// #6886 anti-drift: the GRE-inner bail-out must DEFER to `eh_class`, not
+/// restate the extension-header set.
+///
+/// This site drifted precisely because #4517 swept the walker and not the
+/// shortcut, leaving a hand-written list that was complete when written. A
+/// second hand-written list — here, or in the shim — would drift the same way,
+/// so the guard is on the SHAPE of the code rather than on its membership.
+///
+/// Comments are stripped first: the fix's own comment names the very types and
+/// identifiers this scans for, so an unstripped scan would be satisfied by the
+/// documentation instead of by the code (the #6885 lesson).
+#[test]
+fn gre_inner_v6_bailout_defers_to_the_shim_classifier_6886() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../userspace-xdp/src/lib.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let code_only: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let start = code_only
+        .find("fn classify_native_gre_inner_ipv6(")
+        .expect("#6886: classify_native_gre_inner_ipv6 not found — this bind has rotted; fix it");
+    let body = &code_only[start..];
+    let end = body.find("\n}").expect("#6886: could not bound the function body");
+    let body = &body[..end];
+
+    assert!(
+        body.contains("eh_class(protocol) != EH_CLASS_TERMINAL"),
+        "#6886: the GRE-inner IPv6 classify must gate on `eh_class(protocol) != \
+         EH_CLASS_TERMINAL`. Deferring to the shim's single classifier is what stops this \
+         site drifting from the walker again the next time a next-header type is added"
+    );
+    for hand_listed in [
+        "NEXTHDR_HOP",
+        "NEXTHDR_ROUTING",
+        "NEXTHDR_DEST",
+        "NEXTHDR_AUTH",
+        "NEXTHDR_FRAGMENT",
+    ] {
+        assert!(
+            !body.contains(hand_listed),
+            "#6886: `{hand_listed}` is hand-listed in the GRE-inner classify again. That list \
+             was complete when written and stopped being complete when #4517 added five types \
+             to the walker; re-introducing it re-introduces the drift"
+        );
+    }
+}

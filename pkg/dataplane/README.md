@@ -1184,6 +1184,31 @@ screen↔walker edge was unguarded until #6885, and a divergence there is a
 chain one plane screens and the other does not — an ext-header IDS evasion of
 the #3120/#4517 class rather than a fast-path miss.
 
+**A fourth site read the chain without walking it (#6886).** The shim's
+`classify_native_gre_inner_ipv6` does not walk at all — it reads the inner
+IPv6 next-header byte and builds a `UserspaceSessionKey` from it, bailing out
+when that byte is an extension header. It hand-listed
+`HOP|ROUTING|DEST|AUTH|FRAGMENT`, which was the complete set when written and
+stopped being complete when #4517 added Mobility (135), HIP (139), Shim6 (140)
+and the experimental 253/254 to the walker; it also never covered
+No-Next-Header (59). Those six built a key whose `protocol` field held an
+extension-header type instead of an L4 identity.
+
+It now gates on `eh_class(protocol) != EH_CLASS_TERMINAL` — the shim's own
+single classifier, the one the walk dispatches on and the emitted class table
+is generated from — so the site cannot drift from the walker again. Verifier
+cost of deferring to it, measured: 784,175 -> **801,448 insns**, headroom
+21.58% -> **19.86%**, still 168,552 insns of slack above the 3.0% floor.
+
+Whether such a mis-built key could ever HIT is now a bound property rather than
+an expectation: `shim_non_terminal_protocols_are_never_installable_by_userspace_6886`
+sweeps all 256 values and requires the shim's non-terminal set to be a subset of
+what userspace declines to install. It could not have been asserted before
+2026-08-27 — pre-#6837 `metadata_tuple_complete` ended in `_ => true` and WOULD
+have installed a zero-ported session under protocol 135, which the shim's
+mis-built key matches exactly. The two fixes are complementary and the sweep
+reds if either regresses.
+
 Note the three walkers carry three DIFFERENT numbers for one shared depth
 (`0..8` iterations, `MAX_IPV6_EXT_HEADERS = 8`, `MAX_EXT_HDRS = 7`), which is
 why the depth must be bound as an AGREEMENT and never restated as a literal in
