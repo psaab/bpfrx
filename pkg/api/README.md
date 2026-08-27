@@ -1795,7 +1795,26 @@ the drop fails loudly instead of going quietly vacuous.
   — a test can be sound on the protocol it exercises and blind to the one where
   the defect lives.
 
-  **The payload is written in bounded chunks (finding 2).** One `Fprintf` of the
+  **The payload is written in bounded chunks — and the first cell for it did
+  not bind (finding 2).** The mutation matrix returned GREEN for "chunking
+  removed": the cell drained a 256 KiB payload over loopback as fast as it
+  could, and over loopback that transits in microseconds, so the window never
+  came close to expiring either way. It varied the right axis and sampled only
+  the passing point. The hazard needs a reader that is slow but *still
+  progressing*, which neither a full-speed loopback client nor a stalled conn
+  can be, so `stalledConn6809` gained `slowRate`/`slowWindow`: bytes move, at a
+  rate, honouring the armed deadline. `TestLargeEventSurvivesASlowButProgressingReader7632`
+  now reds on the revert (truncated after 3 676 of 262 144 payload bytes) and
+  passes with the chunking.
+
+  Worth knowing for anyone changing `sseWriteChunk`: net/http's own 4 KiB
+  `conn.bufw` means the **socket** sees ~4 KiB writes whatever the chunk size
+  is, so chunking does not change the write pattern at all — **it changes when
+  `SetWriteDeadline` is re-armed.** It is a re-arming schedule, not a write
+  schedule. The original cell was implicitly testing the write pattern, which is
+  identical in both arms, which is why it could never have failed.
+
+  **What the chunking is for.** One `Fprintf` of the
   whole event gave the entire payload a single absolute window, so a large event
   to a slow-but-*progressing* reader was cut off partway — the budget measuring
   elapsed time rather than lack of progress, which is the same conflation this

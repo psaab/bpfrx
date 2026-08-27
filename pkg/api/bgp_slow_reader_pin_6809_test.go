@@ -67,6 +67,13 @@ type stalledConn6809 struct {
 	// handler. A write count is exact and needs no size arithmetic.
 	maxWrites int
 	writes    int
+	// slowRate/slowWindow model a SLOW BUT PROGRESSING peer rather than a
+	// stopped one: each Write costs len(p)*slowWindow/slowRate of wall time and
+	// honours whatever deadline is armed. A stalled conn cannot express this —
+	// it is either accepting instantly or parked forever, and the hazard for a
+	// large event is neither (#7654 review, finding 2).
+	slowRate   int
+	slowWindow time.Duration
 	// parked counts writers currently blocked in Write, and parkedEver counts
 	// how many ever were. This is the instrument for #7654 review finding 3:
 	// "the handler is still running" and "the handler is blocked in Write" are
@@ -90,6 +97,15 @@ func (c *stalledConn6809) SetWriteDeadline(t time.Time) error {
 
 func (c *stalledConn6809) Write(p []byte) (int, error) {
 	c.mu.Lock()
+	if c.slowRate > 0 {
+		rate, window, wdl := c.slowRate, c.slowWindow, c.wdl
+		c.mu.Unlock()
+		cost := time.Duration(len(p)) * window / time.Duration(rate)
+		if err := c.progressOrDeadline(cost, wdl); err != nil {
+			return 0, err
+		}
+		return c.Conn.Write(p)
+	}
 	pass := c.budget > 0
 	if c.maxWrites > 0 {
 		pass = c.writes < c.maxWrites
@@ -121,6 +137,34 @@ func (c *stalledConn6809) Write(p []byte) (int, error) {
 	}
 }
 
+// progressOrDeadline spends cost of wall time transferring bytes, unless the
+// armed write deadline expires first. This is what separates a reader that is
+// slow from a reader that has stopped: the bytes DO move, so a bound measuring
+// lack of progress must let it through, and a bound measuring elapsed time must
+// cut it off.
+func (c *stalledConn6809) progressOrDeadline(cost time.Duration, wdl time.Time) error {
+	t := time.NewTimer(cost)
+	defer t.Stop()
+	if wdl.IsZero() {
+		select {
+		case <-t.C:
+			return nil
+		case <-c.closed:
+			return net.ErrClosed
+		}
+	}
+	dl := time.NewTimer(time.Until(wdl))
+	defer dl.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-dl.C:
+		return os.ErrDeadlineExceeded
+	case <-c.closed:
+		return net.ErrClosed
+	}
+}
+
 func (c *stalledConn6809) Close() error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return c.Conn.Close()
@@ -133,6 +177,8 @@ type stalledListener6809 struct {
 	net.Listener
 	budget              int
 	maxWrites           int
+	slowRate            int
+	slowWindow          time.Duration
 	deadlineUnsupported bool
 	mu                  sync.Mutex
 	conns               []*stalledConn6809
@@ -147,6 +193,8 @@ func (l *stalledListener6809) Accept() (net.Conn, error) {
 		Conn:                c,
 		budget:              l.budget,
 		maxWrites:           l.maxWrites,
+		slowRate:            l.slowRate,
+		slowWindow:          l.slowWindow,
 		deadlineUnsupported: l.deadlineUnsupported,
 		closed:              make(chan struct{}),
 	}

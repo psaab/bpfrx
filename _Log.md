@@ -106820,6 +106820,9 @@ prose edit above them added. No diff falls in the new test body.
   readiness sleeps with `floodUntilParked7632` (wait on the implying
   observable, fail naming what never arrived) and made `readSSEChunk7632`
   accumulate to the SSE terminator rather than assume one `Body.Read` returns
-  a complete event.
+  a complete event. The matrix then caught the large-event cell not binding at
+  all (chunking removed => GREEN): a loopback reader drains too fast for any
+  window to expire, so `stalledConn6809` gained `slowRate`/`slowWindow` for a
+  slow-but-progressing peer and the cell now reds on the revert.
 - **File(s)**: `pkg/api/sse.go`, `pkg/api/sse_slow_reader_pin_7632_test.go`,
   `pkg/api/bgp_slow_reader_pin_6809_test.go`, `pkg/api/README.md`, `_Log.md`

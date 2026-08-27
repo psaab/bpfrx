@@ -567,51 +567,112 @@ func TestIdleSSEStreamIsNotResetOnHTTP2_7632(t *testing.T) {
 	}
 }
 
-// TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632 covers the MEDIUM
-// finding: one event large enough to outlast a single deadline window.
+// TestLargeEventSurvivesASlowButProgressingReader7632 covers review A's MEDIUM:
+// one event large enough to outlast a single deadline window.
 //
-// Before the payload was chunked, the whole event went out under ONE absolute
-// deadline, so a large event to a slow-but-PROGRESSING reader was cut off
-// partway — the budget measured elapsed time rather than lack of progress,
-// which is the same conflation this file rejects at the stream level. The
-// "a few hundred bytes" premise is unenforced: event JSON carries
-// operator-authored strings.
+// THIS CELL REPLACES ONE THAT DID NOT BIND, and the reason generalises.
+// The first version drained a 256 KiB payload over loopback HTTP/2 as fast as
+// the client could read. Over loopback that transits in microseconds, so a
+// 750 ms window never came close to expiring either way — the mutation matrix
+// caught it as M9 GREEN: deleting the chunking left the suite green, so the
+// fix for "one absolute deadline per event" was riding on a cell that could not
+// see it. The fixture varied the right axis and sampled only the passing point.
 //
-// The reader here drains continuously, so any failure is the deadline
-// misfiring rather than a genuine stall.
-func TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632(t *testing.T) {
-	const deadline = 750 * time.Millisecond
-	buf, resp, stop := openSSEStreamH2_7632(t, deadline)
-	defer stop()
-	if first := readSSEChunk7632(t, resp, 5*time.Second); !strings.Contains(first, "SESSION_OPEN") {
-		t.Fatalf("precondition: stream did not establish; read %q", first)
+// The hazard needs a reader that is SLOW BUT STILL PROGRESSING, which a
+// full-speed loopback client cannot be and a stalled conn cannot be either — a
+// stalled conn is accepting instantly or parked forever, and this is neither.
+// stalledConn6809 gained slowRate/slowWindow for exactly that: bytes move, at a
+// rate, honouring the armed deadline.
+//
+// WHAT THE CHUNKING ACTUALLY IS. net/http's own 4 KiB conn.bufw means the
+// SOCKET sees ~4 KiB writes whatever sseWriteChunk is, so chunk size does not
+// change the write pattern at all — it changes WHEN SetWriteDeadline IS
+// RE-ARMED. The chunking is a re-arming schedule, not a write schedule. The
+// original cell was implicitly testing the write pattern, which is identical in
+// both arms, which is why it could never have failed.
+//
+// FAIL-ON-REVERT: send the payload in one io.WriteString and the whole event
+// runs under a single window; at this rate it expires mid-payload and the
+// client sees a truncated stream.
+func TestLargeEventSurvivesASlowButProgressingReader7632(t *testing.T) {
+	const (
+		deadline = 100 * time.Millisecond
+		// 32 KiB costs 40ms: one chunk fits comfortably inside one window,
+		// the whole 8-chunk payload (320ms) cannot.
+		rate   = 32 * 1024
+		window = 40 * time.Millisecond
+	)
+	restore := sseWriteDeadline
+	sseWriteDeadline = deadline
+	t.Cleanup(func() { sseWriteDeadline = restore })
+
+	buf := logging.NewEventBuffer(256)
+	srv := &Server{eventBuf: buf}
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	sl := &stalledListener6809{Listener: base, slowRate: rate, slowWindow: window}
+	ts := &httptest.Server{
+		Listener: sl,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv.eventStreamHandler(w, r)
+		})},
+	}
+	ts.Start()
+	defer func() { sl.releaseAll(); ts.Close() }()
+
+	c, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if _, err := fmt.Fprintf(c, "GET /api/v1/events/stream HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
 	}
 
-	// A payload many chunks long: with one deadline for the whole event this is
-	// a single window, with chunking it is many.
+	// A payload many chunks long: one window under the mutation, many with it.
 	big := strings.Repeat("A", 8*sseWriteChunk)
-	buf.Add(logging.EventRecord{
-		Time: time.Now(), Type: "SESSION_OPEN",
-		SrcAddr: "10.0.1.9:1", DstAddr: "10.0.2.1:80",
-		Protocol: "TCP", Action: "permit", Reason: big,
-	})
+	// Publish until the stream establishes — no fixed wall-clock point (finding 4).
+	established := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-established:
+				return
+			case <-tick.C:
+				buf.Add(logging.EventRecord{
+					Time: time.Now(), Type: "SESSION_OPEN",
+					SrcAddr: "10.0.1.9:1", DstAddr: "10.0.2.1:80",
+					Protocol: "TCP", Action: "permit", Reason: big,
+				})
+			}
+		}
+	}()
 
-	// Drain continuously until the whole payload has arrived.
-	deadlineAt := time.Now().Add(20 * time.Second)
+	// Drain CONTINUOUSLY — the reader is slow, never stopped, so any failure
+	// here is the budget measuring elapsed time rather than lack of progress.
+	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
 	var seen int
 	b := make([]byte, 32*1024)
-	for seen < len(big) && time.Now().Before(deadlineAt) {
-		n, err := resp.Body.Read(b)
+	for seen < len(big) {
+		n, err := c.Read(b)
 		seen += strings.Count(string(b[:n]), "A")
+		if seen > 0 {
+			select {
+			case <-established:
+			default:
+				close(established)
+			}
+		}
 		if err != nil {
 			t.Fatalf("a %d-byte event to a CONTINUOUSLY reading client failed after "+
 				"%d payload bytes: %v — the write budget is measuring elapsed time "+
-				"rather than progress (#7654 review, finding 2)", len(big), seen, err)
+				"rather than progress, so one large event severs a healthy reader "+
+				"(#7654 review A, finding 2)", len(big), seen, err)
 		}
-	}
-	if seen < len(big) {
-		t.Fatalf("only %d of %d payload bytes arrived before the cell's own bound",
-			seen, len(big))
 	}
 }
 
@@ -622,10 +683,9 @@ func TestLargeEventSurvivesAProgressingReaderOnHTTP2_7632(t *testing.T) {
 // does to an ordinary SSE event, which is a few hundred bytes and therefore
 // sits in the 2 KiB response buffer until the flush pushes it at the socket.
 type flushFailingWriter7632 struct {
-	hdr        http.Header
-	flushes    int
-	flushErr   error
-	notFlusher bool
+	hdr      http.Header
+	flushes  int
+	flushErr error
 }
 
 func (f *flushFailingWriter7632) Header() http.Header {
