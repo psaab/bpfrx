@@ -195,6 +195,11 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 	var pools []poolInfo
 
 	// Named pools
+	// #7000: capacity comes from the compiler's verdict, not from a per-consumer
+	// re-derivation. `len(pool.Addresses)` reported capacity for a REFUSED pool,
+	// under-reported every prefix member, and missed the singular `address`
+	// field entirely.
+	overBudget := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		portLow, portHigh := pool.PortLow, pool.PortHigh
 		if portLow == 0 {
@@ -203,7 +208,8 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
+		ports, _ := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, overBudget)
+		totalPorts := int(ports)
 		addr := strings.Join(pool.Addresses, ",")
 		pools = append(pools, poolInfo{name: name, address: addr, total: totalPorts})
 	}
@@ -334,6 +340,7 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 		cr = c.applyResult()
 	}
 
+	detailOverBudget := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		if !showAll && name != poolName {
 			continue
@@ -346,13 +353,22 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
+		// #7000: see the summary view above.
+		ports, unusable := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, detailOverBudget)
+		totalPorts := int(ports)
 
 		fmt.Printf("Pool name: %s\n", name)
 		for _, addr := range pool.Addresses {
 			fmt.Printf("  Address: %s\n", addr)
 		}
 		fmt.Printf("  Port range: %d-%d\n", portLow, portHigh)
+		// #7000: a capacity of 0 is ambiguous on its own — no members, a
+		// malformed member, or the #6812 aggregate budget all produce it, and
+		// they have different remedies. The detail view has room to say which,
+		// so it does; the operator is not left inferring it from a bare 0.
+		if unusable != "" {
+			fmt.Printf("  Unusable: %s\n", config.SourceNATDisarmReasonText(unusable))
+		}
 
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {

@@ -25,7 +25,7 @@ func TestDeterministicSubscriberCapacity_IPv6ReportsPoolCapacity(t *testing.T) {
 			HostAddress: "2001:db8::/64",
 		},
 	}
-	got := deterministicSubscriberCapacity(pool)
+	got := deterministicSubscriberCapacity(pool, "p", nil)
 	if got == 0 {
 		t.Fatal("IPv6 deterministic pool reported 0 capacity (1<<(128-ones) shift overflow) — #4692")
 	}
@@ -45,7 +45,7 @@ func TestDeterministicSubscriberCapacity_IPv4HostCount(t *testing.T) {
 			HostAddress: "100.64.0.0/24", // /24 => 256 subscriber addresses
 		},
 	}
-	if got := deterministicSubscriberCapacity(pool); got != 256 {
+	if got := deterministicSubscriberCapacity(pool, "p", nil); got != 256 {
 		t.Fatalf("IPv4 capacity = %d, want 256 (1<<(32-24))", got)
 	}
 }
@@ -54,13 +54,13 @@ func TestDeterministicSubscriberCapacity_IPv4HostCount(t *testing.T) {
 func TestDeterministicSubscriberCapacity_Degenerate(t *testing.T) {
 	if got := deterministicSubscriberCapacity(&config.NATPool{
 		Deterministic: &config.DeterministicNATConfig{HostAddress: "not-a-cidr"},
-	}); got != 0 {
+	}, "p", nil); got != 0 {
 		t.Fatalf("unparseable host CIDR must report 0, got %d", got)
 	}
 	if got := deterministicSubscriberCapacity(&config.NATPool{
 		Addresses:     []string{"203.0.113.1"},
 		Deterministic: &config.DeterministicNATConfig{BlockSize: 0, HostAddress: "2001:db8::/64"},
-	}); got != 0 {
+	}, "p", nil); got != 0 {
 		t.Fatalf("non-positive block size must report 0, got %d", got)
 	}
 }
