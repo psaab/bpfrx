@@ -2448,6 +2448,9 @@ fn v8_epoch_seqlock_snapshot_never_tears_tag_grace() {
     // "no rotation yet".
     let clock = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    // #6945: reader progress, PUBLISHED so the writer can establish it
+    // instead of hoping for it. See the wait below `stop.store(true)`.
+    let observed = Arc::new(AtomicU64::new(0));
 
     // Reader threads: pure snapshots (no rotation) racing the writer's
     // payload publish. Each verifies the tag/grace invariant.
@@ -2456,6 +2459,7 @@ fn v8_epoch_seqlock_snapshot_never_tears_tag_grace() {
         let lease = Arc::clone(&lease);
         let clock = Arc::clone(&clock);
         let stop = Arc::clone(&stop);
+        let observed = Arc::clone(&observed);
         readers.push(std::thread::spawn(move || -> u64 {
             let mut checked: u64 = 0;
             while !stop.load(AtomicOrdering::Relaxed) {
@@ -2474,6 +2478,7 @@ fn v8_epoch_seqlock_snapshot_never_tears_tag_grace() {
                             tag, grace, expected,
                         );
                         checked += 1;
+                        observed.fetch_add(1, AtomicOrdering::Relaxed);
                     }
                 }
             }
@@ -2489,6 +2494,46 @@ fn v8_epoch_seqlock_snapshot_never_tears_tag_grace() {
         // acquire_v8 runs maybe_rotate_epoch_v8(now) then the snapshot.
         let _ = lease.acquire_v8(0, now, 1);
         clock.store(now, AtomicOrdering::Relaxed);
+    }
+    // #6945: WAIT for a reader to validate a snapshot before stopping them.
+    //
+    // The `total_checked > 0` guard below is a non-vacuity check, not the
+    // property under test — the property is the tag/grace equality asserted
+    // inside the reader loop. But the guard was HOPED for rather than
+    // established: readers spin while `clock == 0`, the writer publishes
+    // `clock` only after its first rotation, and all 4 000 rotations are
+    // in-memory, so on a contended box the writer could finish and set `stop`
+    // before any reader was scheduled past that spin. Every reader then
+    // returned 0, `total_checked` was 0, and the guard tripped while the
+    // tearing assertion had never been evaluated once.
+    //
+    // Measured, at master, on a 16-core box: 0/8 full-suite runs reproduced it
+    // under ambient load, but confining the test's threads to 2 CPUs
+    // (`taskset -c 0,1`) failed 16 of 25 runs — and EVERY failure was this
+    // guard, never the tag/grace assertion. Contention starved the readers; it
+    // did not tear a snapshot.
+    //
+    // So this is not a timing bound to relax. Waiting for the signal makes the
+    // precondition true by construction, which is the same treatment #6633
+    // gave the sibling guard in `install_session_serializes_with_reconcile_
+    // removal` ("can no longer trip as a scheduler artifact on a loaded
+    // machine"). `yield_now` rather than a spin so the wait cannot itself
+    // starve the readers it is waiting on, which on 2 CPUs it otherwise would.
+    // BOUNDED, and the bound is a deadlock guard rather than a timing
+    // assertion. An unbounded wait would convert a genuine regression -- one
+    // where `test_snapshot_epoch_v8` stopped returning snapshots at all -- from
+    // a named RED into a HANG, and a suite that times out reports nothing about
+    // which assertion failed. If the bound is ever reached the loop simply
+    // falls through and the `total_checked > 0` assert below fires with its
+    // original message, so the failure mode is preserved exactly. The cap is
+    // deliberately enormous relative to the work: readers need one scheduling
+    // slot, and the writer has already completed every rotation before this
+    // point.
+    for _ in 0..50_000_000u64 {
+        if observed.load(AtomicOrdering::Relaxed) > 0 {
+            break;
+        }
+        std::thread::yield_now();
     }
     stop.store(true, AtomicOrdering::Relaxed);
 
