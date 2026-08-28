@@ -102,6 +102,50 @@ func TestBodyWaiterEdgeIsTheCallersOwn_6977(t *testing.T) {
 	}
 }
 
+// TestBodyAbsenceAssertionIsADeltaToo_6977 covers the OTHER direction of the
+// same contamination.
+//
+// TestNoBodyRouteIsNotBufferedByTheGate_5561 asserts an ABSENCE on the same
+// process-global counter — "no request is parked after a no-body route
+// answered" — and that is its PROPERTY, not a precondition. So a foreign park
+// does not make it pass early; it makes it RED, accusing a route that parked
+// nothing. `count == baseline` says what the sentence means ("this route added
+// no park") and survives a park it did not create; `count == 0` does not.
+//
+// Deterministic in both directions because the fixture manufactures the foreign
+// park rather than waiting for one.
+func TestBodyAbsenceAssertionIsADeltaToo_6977(t *testing.T) {
+	usePasswdFixture(t)
+	_, base := authzServer(t, Config{
+		Addr:         "127.0.0.1:8080",
+		Store:        authzStore(t, authzTestConfig),
+		PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
+	})
+	waitForGateQuiescent(t)
+
+	const body = `{"input":"set system host-name r6977b"}`
+	foreign := openDeclaredBody(t, base, "POST /api/v1/config/set", len(body), "", nil)
+	_ = foreign
+	if !awaitMutationBodyWaiterAbove(0, 10*time.Second) {
+		t.Fatal("the fixture never parked its foreign request, so both predicates below are " +
+			"being compared on an empty gate and neither means anything")
+	}
+	baseline := MutationBodyWaitersForTest()
+
+	// The absence a no-body route asserts: nothing NEW parked. The route is not
+	// driven here — what is under test is which predicate expresses it.
+	if got := MutationBodyWaitersForTest(); got != baseline {
+		t.Fatalf("the delta predicate is unstable on its own fixture: %d != %d", got, baseline)
+	}
+	// CONTROL: the literal-zero form this replaced would red on the same state,
+	// naming a route that parked nothing. Without this the assertion above could
+	// hold because the gate is empty, and the cell would prove nothing.
+	if baseline == 0 {
+		t.Fatal("ZERO_FORM_WOULD_RED: the fixture holds no foreign park, so `count == 0` and " +
+			"`count == baseline` are the same predicate here and this cell is vacuous")
+	}
+}
+
 // TestBodyWaiterHelperIsNotUsedUnattributably_6977 binds the WIRING: the
 // unattributable helper must not come back, and the delta helper must actually
 // be the idiom the package uses.
