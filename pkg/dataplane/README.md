@@ -826,11 +826,56 @@ several test fakes), and widening that is a separable change with its own review
   the adapter is permanently non-nil, so the field cannot answer "does a
   dataplane exist?".
 
-### Counter-clear error propagation: what it does NOT cover
+### Map-write error propagation (#6743 r4-F2, #6959)
 
 `clearPolicyCountersIn` / `clearFilterCountersIn` propagate their
-`Map.Update` error (#6743 r4-F2), which fixes the discarded-error false
-success. It does NOT fix the DETACHED-backend false success: `Teardown()`
+`Map.Update` error (#6743 r4-F2). #6959 finished the sweep: an AST census
+of every DISCARDED `Update` in non-test `pkg/dataplane` found 32, split
+17 / 15 by whether the enclosing function returns `error`.
+
+- **The 15 in functions with NO error return** are a different
+  disposition — `maps_stale.go`'s stale-entry sweeps,
+  `seedInterfaceCounter`, `clearNativeXDPFlags*`, `SeedNATPortCounters`,
+  `clearAllBindingRowsLocked`, `reEnableUserspaceCtrlLocked`. There is
+  nothing to propagate to. Left alone by #6959.
+- **13 of the 17 were blind-write clear loops** and now share one body,
+  `clearArrayEntriesIn` (`maps_policy.go`), which returns the first
+  rejection naming the map and the index. It takes the same
+  `counterMapUpdater` seam #6743 introduced, because creating a real BPF
+  map returns EPERM in the unprivileged unit lane. Each call site's bound
+  is the map's declared `max_entries`, byte-identical to the inline loop
+  it replaced, so no working clear becomes an error and no sweep
+  narrowed.
+- **Two more were not clear loops but were the same defect.**
+  `SetNAT64Config`'s mirror write into `nat64_prefix_map` — the array
+  write beside it was already propagated, so a discarded mirror let the
+  two descriptions of one NAT64 prefix diverge while the caller was told
+  the whole write landed. `programBootstrapMapsLocked`'s heartbeat
+  zero-init (`userspace/maps_sync.go`) — a discarded rejection leaves the
+  slot holding the previous load's timestamp, which reads as FRESH and
+  lets the shim redirect to a worker that is not there; the
+  `userspace_ctrl` write in the same function already aborted bring-up on
+  the same class of failure.
+- **Two are DELIBERATE and stay discarded**, allowlisted with their
+  reasons in `discarded_map_update_6959_test.go`: `Compile`'s
+  `redirect_capable` write (an optimisation hint whose unset default
+  fails safe to `XDP_PASS`, on the config-commit path rather than an
+  operator clear) and `UpdatePolicyScheduleState` (the #3780 contract is
+  that it ALWAYS reports success so the scheduler self-heal never spins
+  on this retired, runtime-shadowed path).
+
+`TestNoUndocumentedDiscardedMapUpdate` gates the class. It parses the
+package WITHOUT `parser.ParseComments`, so a doc comment quoting the
+pattern cannot satisfy it; it matches both discard spellings (bare
+`zm.Update(...)` and `_ = zm.Update(...)`, four of the 32 used the
+second); it also flags a discarded call to an error-returning clear
+helper, which would otherwise launder the defect past a scan that only
+looks at `.Update`; and it asserts a NON-ZERO match count first, so a
+broken walker fails loudly instead of sweeping nothing and passing clean.
+The allowlist is compared for EXACT equality, so "fixing" a deliberate
+discard fails too.
+
+None of this fixes the DETACHED-backend false success: `Teardown()`
 closes only the link handles and `Cleanup` merely unpins, so a retained,
 torn-down `Manager` still holds live FD-backed map objects and an
 `Update` through them SUCCEEDS. A `clear` issued against a disowned

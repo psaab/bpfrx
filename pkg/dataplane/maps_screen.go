@@ -33,11 +33,8 @@ func (m *Manager) ClearScreenConfigs() error {
 	if !present {
 		return fmt.Errorf("screen_configs map not found")
 	}
-	empty := ScreenConfig{}
-	for i := uint32(0); i < 64; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. 64 is screen_configs' max_entries.
+	return clearArrayEntriesIn(zm, "screen_configs", 64, ScreenConfig{})
 }
 
 // UpdateSessionCountSrc writes a per-source-IP session count entry.
