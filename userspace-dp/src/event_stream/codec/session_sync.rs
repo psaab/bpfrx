@@ -5,9 +5,11 @@
 //! the correctness-critical deltas that mutate peer session state on failover.
 
 use crate::afxdp::ForwardingDisposition;
-use crate::session::{SessionDecision, SessionDelta, SessionKey, SessionMetadata};
+use crate::session::{
+    SessionDecision, SessionDelta, SessionKey, SessionMetadata, SessionSyncAttribution,
+    nat64_snat_v4_octets,
+};
 use rustc_hash::FxHashMap;
-use std::net::IpAddr;
 
 use super::EventFrame;
 use super::wire::*;
@@ -25,6 +27,20 @@ impl EventFrame {
     ) -> Self {
         let mut buf = [0u8; 256];
         let mut pos = FRAME_HEADER_SIZE; // skip header, fill later
+
+        // #6949: the HA-carried policy attribution is derived ONCE, here, and
+        // the JSON RPC-fallback producer (`afxdp::session_delta_info`) derives
+        // it from the same helper. The destructure is EXHAUSTIVE on purpose —
+        // no `..` — so a field added to `SessionSyncAttribution` cannot be
+        // carried by only one of the two legs without failing to compile.
+        // Before #6949 the JSON leg silently carried none of these.
+        let SessionSyncAttribution {
+            policy_id,
+            policy_counter_idx,
+            inactivity_timeout_secs,
+            nat64,
+            nat64_snat_v4,
+        } = SessionSyncAttribution::from_session(decision, metadata);
 
         // [0] AddrFamily
         let is_v6 = key.addr_family == libc::AF_INET6 as u8;
@@ -100,7 +116,7 @@ impl EventFrame {
         }
         // #4565: signal a NAT64 cross-family session so the peer rebuilds the
         // reverse BIB after failover (see FLAG_NAT64 doc + the trailing snat_v4).
-        if decision.nat.nat64 {
+        if nat64 {
             flags |= FLAG_NAT64;
         }
         buf[pos] = flags;
@@ -152,20 +168,17 @@ impl EventFrame {
         // The Go decoder length-skips these; an old daemon ignores them.
         //
         // [+0:+4] policy_id u32 LE (#3056)
-        buf[pos..pos + 4].copy_from_slice(&metadata.policy_id.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&policy_id.to_le_bytes());
         pos += 4;
         // [+4:+8] policy_counter_idx u32 LE (#3073)
-        buf[pos..pos + 4].copy_from_slice(&metadata.policy_counter_idx.to_le_bytes());
+        buf[pos..pos + 4].copy_from_slice(&policy_counter_idx.to_le_bytes());
         pos += 4;
         // [+8:+12] inactivity_timeout SECONDS u32 LE (#3227). The metadata
         // carries ns; the cross-node wire (Go SessionValue.AppTimeout,
-        // SessionSyncRequest.inactivity_timeout) is whole seconds, so convert
-        // ns -> s (saturating). 0 => "use the global per-protocol timeout".
-        let inactivity_secs = match metadata.inactivity_timeout_ns {
-            Some(ns) => u32::try_from(ns / 1_000_000_000).unwrap_or(u32::MAX),
-            None => 0,
-        };
-        buf[pos..pos + 4].copy_from_slice(&inactivity_secs.to_le_bytes());
+        // SessionSyncRequest.inactivity_timeout) is whole seconds. The ns -> s
+        // saturating conversion lives in `SessionSyncAttribution` (#6949) so
+        // the JSON leg cannot round it differently.
+        buf[pos..pos + 4].copy_from_slice(&inactivity_timeout_secs.to_le_bytes());
         pos += 4;
 
         // #4565: [+12:+16] the NAT64 translated pool SOURCE (`snat_v4`, 4 raw
@@ -176,11 +189,7 @@ impl EventFrame {
         // chosen by `allocate_source`, not embedded in the key — so it must ride
         // the wire (the orig v6 src/dst ARE the key; `dst_v4` is the /96 low 32
         // of the key dst). An old Go decoder length-skips these 4 bytes.
-        let snat_v4 = match (decision.nat.nat64, decision.nat.rewrite_src) {
-            (true, Some(IpAddr::V4(v4))) => v4.octets(),
-            _ => [0u8; 4],
-        };
-        buf[pos..pos + 4].copy_from_slice(&snat_v4);
+        buf[pos..pos + 4].copy_from_slice(&nat64_snat_v4_octets(nat64_snat_v4));
         pos += 4;
 
         // #5212: [+16:+24] the ORIGINATING node's stable RT_FLOW session id (u64
