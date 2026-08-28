@@ -993,9 +993,20 @@ fn reconcile_churn_completes_a_cycle_even_when_already_stopped_6633() {
 ///
 /// The deadline is deliberately loose (30s against a body that takes
 /// microseconds when healthy) — it is a liveness backstop, not a timing
-/// assertion, so a loaded machine cannot turn it into a flake. On the failure
+/// assertion, so a loaded machine cannot turn it into a flake. On the deadlock
 /// path the worker thread stays parked; that is intentional and harmless,
 /// because libtest exits the process rather than joining detached threads.
+///
+/// #6989: a body that PANICS is a different outcome from a body that parks,
+/// and the two must not report the same way. The wait therefore watches the
+/// join handle as well as the flag: once the worker has finished without
+/// setting `done`, its panic is resumed on the calling thread verbatim. Found
+/// while mutation-testing #6989 — removing `reconcile_lock` from
+/// `install_session` makes the sweep's orphan assertion fire ("found 126"),
+/// and the flag-only shape reported that 30 seconds later as a "same-thread
+/// RwLock self-deadlock". That is the wrong defect at 60x the cost, and a
+/// mutation cell scored on the named message would have attributed a real
+/// serialization regression to #6952.
 fn run_bounded<F>(what: &str, f: F)
 where
     F: FnOnce() + Send + 'static,
@@ -1005,21 +1016,30 @@ where
     use std::thread;
     use std::time::{Duration, Instant};
     let done = Arc::new(AtomicBool::new(false));
-    {
+    let handle = {
         let done = done.clone();
         thread::spawn(move || {
             f();
             done.store(true, AOrd::SeqCst);
-        });
-    }
+        })
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done.load(AOrd::SeqCst) {
+        // Finished but `done` unset: the body panicked. Re-raise ITS panic so
+        // the failure names the assertion that actually fired.
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(()) => return,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
         assert!(
             Instant::now() < deadline,
             "{what} did not finish within 30s — the worker thread is parked, \
              which for this body means a same-thread RwLock self-deadlock \
              (#6952). It did NOT merely run slowly: the healthy path is \
-             microseconds."
+             microseconds, and a body that panicked would have been re-raised \
+             above instead of reaching this deadline."
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -1269,7 +1289,12 @@ fn install_session_serializes_with_reconcile_removal() {
         let cycles = cycles.clone();
         thread::spawn(move || reconcile_churn_until(&engine, &cfg, &stop, &cycles))
     };
-    let (ok, unknown, collision, saw_cycles) = installer.join().unwrap();
+    // Re-raise the installer's own panic rather than `unwrap()`-ing it into an
+    // opaque `Any { .. }`: the rendezvous above fails BY MESSAGE on its
+    // liveness backstop, and that message is the diagnosis.
+    let (ok, unknown, collision, saw_cycles) = installer
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     stop.store(true, AOrd::Relaxed);
     let reconcile_iters = reconciler.join().unwrap();
     assert!(
