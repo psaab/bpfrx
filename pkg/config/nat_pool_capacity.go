@@ -99,8 +99,25 @@ func sourceNATPoolMemberHosts(addr string) int {
 		addrBits = 128
 	}
 	hostBits := addrBits - p.Bits()
-	// The >= 64 guard mirrors the Rust early-out and prevents an over-wide
-	// shift, which Go defines as 0 and which would UNDER-count.
+	// BEHAVIOURALLY REDUNDANT, AND SAID SO RATHER THAN CLAIMED OTHERWISE.
+	//
+	// This guard mirrors the Rust early-out, but unlike the Rust one it changes
+	// no output here. Go DEFINES an over-wide shift as 0 (it is not UB and does
+	// not wrap), and 0 fails the `count > MaxSourceNATPoolPrefixHosts` check
+	// below exactly as a huge value does, so both paths return 0 for every
+	// hostBits >= 64. Measured at 63 / 64 / 65 / 128.
+	//
+	// An earlier revision of this comment said the guard "prevents an over-wide
+	// shift ... which would UNDER-count". That was FALSE: under-counting to 0 is
+	// precisely the right answer for an over-cap prefix, which is why the cap
+	// check already produces it. #7000's mutation cell M5 relaxed this bound to
+	// `>= 1024` and the whole suite stayed GREEN — an unbound guard, correctly
+	// reported as an escape rather than dressed up as a red.
+	//
+	// It is kept as a structural guard for a refactor that moves or widens the
+	// cap check, and for parity with the Rust expander it mirrors — not because
+	// it is load-bearing today. Do not write a test claiming it is; there is no
+	// input that distinguishes the two.
 	if hostBits < 0 || hostBits >= 64 {
 		return 0
 	}
