@@ -152,6 +152,36 @@ func startHeldRequest7667(t *testing.T, ln net.Listener, entered <-chan struct{}
 	}
 }
 
+// retiredRevocationFailure6993 chooses WHICH failure the round-7 revocation
+// assertion reports, from the one fact that separates the two meanings: whether
+// the leg had finished draining by the time the probe ran.
+//
+// It is a function rather than an inline branch so the classification can be
+// tested directly. The behaviour it encodes is only observable when a drain
+// actually wins, which the held request exists to prevent — so an inline branch
+// would be a correctness claim no cell could red.
+//
+// drained==true is NOT a revocation defect: pruneRetiredLocked drops a drained
+// leg from the retiring list, so ReplaceAuth never tightens it and secret-a
+// survives for a reason that has nothing to do with revocation. A leg the
+// server has already reaped is deliberately no longer maintained — see the
+// drainLeg commentary. Reporting that under the round-7 message is what made
+// the #7667/#6993 flake read as a security defect, and it is the reason the
+// obvious "fix" (relaxing the assertion) would have left a test that passes
+// forever while guarding nothing.
+func retiredRevocationFailure6993(drained bool) string {
+	if drained {
+		return "the retired leg finished draining between the precondition above and " +
+			"ReplaceAuth, so it was pruned from the retiring list and never tightened. " +
+			"This is the FIXTURE losing a race, not a revocation defect: a leg the server " +
+			"has already reaped is deliberately no longer maintained (see the drainLeg " +
+			"commentary). The held request exists to make this impossible — if this fires, " +
+			"that hold stopped working (#6993/#7667)"
+	}
+	return "secret-a still authenticates on the retired listener — a retiring leg must " +
+		"still honour a revocation immediately (#5561 round 7)"
+}
+
 // A commit that MOVES the management bind and ROTATES the credential must not
 // make the new secret usable at the old address. The old leg is retired but is
 // still serving while it drains, and the reconciler publishes the full committed
@@ -230,16 +260,7 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 		// message, and the reason it read as a security defect. The held request
 		// is what makes the drain impossible; this re-read is what makes the
 		// classification TOTAL if it ever becomes possible again.
-		if retired.drained.Load() {
-			t.Fatal("the retired leg finished draining between the precondition above and " +
-				"ReplaceAuth, so it was pruned from the retiring list and never tightened. " +
-				"This is the FIXTURE losing a race, not a revocation defect: a leg the " +
-				"server has already reaped is deliberately no longer maintained (see the " +
-				"drainLeg commentary). The held request exists to make this impossible — " +
-				"if it fires, that hold stopped working (#6993/#7667)")
-		}
-		t.Fatal("secret-a still authenticates on the retired listener — a retiring leg must " +
-			"still honour a revocation immediately (#5561 round 7)")
+		t.Fatal(retiredRevocationFailure6993(retired.drained.Load()))
 	}
 	// The live leg gets the whole committed set, as before.
 	if !legProbe(t, live, "admin", "secret-b") {
