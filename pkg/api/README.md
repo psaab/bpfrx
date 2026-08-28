@@ -1411,34 +1411,36 @@ the drop fails loudly instead of going quietly vacuous.
       concurrent deadlined closes — a larger change than #6827, deliberately not
       taken here, and the claim is narrowed to what is true instead of asserting
       a bound that is not.
-      **Hijacked connections are OUT OF SCOPE, and the exclusion is only partly
-      enforced.** Go
-      excludes them from both calls (`Shutdown` "does not attempt to close nor
-      wait for hijacked connections", `Close` "does not even know about" them),
-      and a hijacked conn leaves `activeConn`, so it can outlive the drain with
-      `drained` stored. Nothing in `drainLeg` can reach it — the handle is gone.
-      This package has no hijacker, and `TestNoHijackerInThisPackage_6827` is a
-      **tripwire, not a gate** — round 8 claimed enforcement and that was too
-      strong (#6827 round 9). It catches three forms: a local `http.Hijacker`
-      assertion, a local `Hijack` call, and an import of a package known to
-      hijack internally. The third exists because a purely local AST walk is
-      defeated by a dependency this module ALREADY has:
-      `golang.org/x/net/websocket`'s `Server` hijacks inside its own handler, so
-      `mux.Handle("/ws", websocket.Handler(h))` would add the case with nothing
-      in this package's syntax to match. That import list is DERIVED, not
-      asserted (#6827 round 10): round 9 called it "the ones reachable from this
-      module today" and it was missing `golang.org/x/net/http2/h2c`, which lives
-      in the SAME direct dependency and hijacks in `NewHandler` — mounting a real
-      `h2c.NewHandler` in a production file left the test PASSING. The map now
-      records the grep that produced it and the dependency version it was run
-      against (`golang.org/x/net v0.48.0`, which yields exactly `websocket` and
-      `http2/h2c`), so the next reader can re-run it and a version bump makes it
-      visibly stale — where an assertion of completeness just stops them looking,
-      which is what happened twice. Reverse proxies, upgrade helpers,
-      aliases and reflection escape even the import check. Read a pass as "none
-      of the three known forms is present". It is an AST scan rather than a text
-      scan so that this documentation, and `drainLeg`'s, do not trip it — a guard
-      has to be able to coexist with its own description.
+      **Hijacked connections are IN SCOPE since #7011**, and that is what
+      removed the caveat this paragraph used to carry. Go excludes them from
+      both calls (`Shutdown` "does not attempt to close nor wait for hijacked
+      connections", `Close` "does not even know about" them) and a hijacked conn
+      leaves `activeConn`, so neither can reach one — but the `ConnState` hook
+      can: it fires with `StateHijacked` and hands over the `net.Conn` at the
+      moment the server loses track of it. Every leg constructor installs that
+      hook (`trackHijackedConns`, `listener_hijack_drain.go`) and `drainLeg`
+      closes what it recorded, on both the graceful and the deadline path.
+      What that does NOT claim: the connection is closed, not the goroutine the
+      hijacking handler started — nothing can join that, and the guarantee is
+      about what is still being SERVED.
+
+      **The tripwire that used to defend the caveat is deleted, not re-keyed.**
+      `TestNoHijackerInThisPackage_6827` maintained a map of hijacking types and
+      was defeated three times: `golang.org/x/net/websocket` (round 8),
+      `golang.org/x/net/http2/h2c` (round 9), and `net/rpc` — a STANDARD LIBRARY
+      hijacker. The last is why re-keying was the wrong answer: the hijacker set
+      is a function of the TOOLCHAIN rather than of `go.mod`, so the corpus the
+      map was derived over moves with nothing in the repository changing, and a
+      `go list -deps` closure would have missed `net/rpc` too unless written to
+      include the standard library. The property is now asserted DIRECTLY
+      against a real hijacking handler
+      (`listener_hijack_drain_7011_test.go`) instead of proxied through type
+      names, and a leg constructor that forgot the hook fails there.
+      **Cost, stated:** `ConnState` is never called again for a hijacked
+      connection, so a handler that hijacks and then closes leaves a tracker
+      entry until the leg drains — the map grows with the number of hijacks a
+      leg serves, not with the number live. This package has no hijacker today,
+      so it stays empty.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —

@@ -912,7 +912,11 @@ func (s *Server) httpsLegPlan() legPlan {
 }
 
 func (s *Server) buildHTTPServer(addr string, slot *authSlot) *http.Server {
-	return &http.Server{
+	// #7011: trackHijackedConns installs the ConnState hook, so a connection a
+	// handler hijacks is still closed by this leg's drain. Every leg
+	// constructor must wrap, or that leg's hijacked connections outlive its
+	// drain silently.
+	return trackHijackedConns(&http.Server{
 		Addr:              addr,
 		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
@@ -925,7 +929,7 @@ func (s *Server) buildHTTPServer(addr string, slot *authSlot) *http.Server {
 		ConnContext: s.connContext,
 		// WriteTimeout intentionally unset — see the const block above (SSE
 		// streams + large scrapes must not be severed).
-	}
+	})
 }
 
 // buildHTTPSServer constructs a fresh HTTPS *http.Server bound-for addr with
@@ -947,7 +951,8 @@ func (s *Server) buildHTTPSServer(addr string, slot *authSlot) (*http.Server, er
 	if err != nil {
 		return nil, err
 	}
-	return &http.Server{
+	// #7011: same hijack tracking as the HTTP leg — see trackHijackedConns.
+	return trackHijackedConns(&http.Server{
 		Addr:              addr,
 		Handler:           s.listenerHandler(addr, slot),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
@@ -961,7 +966,7 @@ func (s *Server) buildHTTPSServer(addr string, slot *authSlot) (*http.Server, er
 			Certificates: []tls.Certificate{tlsCert},
 			MinVersion:   tls.VersionTLS12,
 		},
-	}, nil
+	}), nil
 }
 
 // Run starts the HTTP (and optionally HTTPS) server and blocks until ctx is
