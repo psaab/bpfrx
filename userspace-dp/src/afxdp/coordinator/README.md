@@ -86,6 +86,35 @@ Differences that matter (#1881):
 
 ## Notable invariants
 
+- **Every per-worker counter on the wire is BOUND to its own source
+  (#6961).** `status.rs::worker_runtime_snapshots` maps
+  `WorkerRuntimeAtomics` -> `WorkerRuntimeCounters` -> the wire
+  `WorkerRuntimeStatus` through two long field-by-field literals, and
+  **thirty of the fields are `u64` with the same name on both ends** —
+  so substituting any one for a same-typed sibling
+  (`new_flow_installs: s.session_create_drops`, two
+  `cos_queue_lease_undergrant_*` transposed) compiled and reddened
+  nothing. Every counter reaching gRPC and Prometheus goes through
+  there, so a copy-paste reports a correct counter under a neighbour's
+  series forever while every upstream counter test stays green.
+  `status_mapping_6961_tests.rs` seeds each field with a **DISTINCT**
+  value and drives the real `worker_runtime_snapshots`: distinctness is
+  the whole mechanism, because an all-zeros or repeated-value fixture
+  cannot tell `st.a = src.a` from `st.a = src.b`. It binds from the
+  ATOMICS, not from the counters snapshot, so a swap in EITHER hop reds.
+  A binding test over today's fields cannot see tomorrow's, so
+  `every_runtime_atomic_is_bound_or_knowingly_off_wire_6961` parses the
+  struct and requires each `AtomicU64` to be bound or listed in
+  `DELIBERATELY_OFF_WIRE` (the four window bases + `window_gen`, which
+  are rotation bookkeeping) — the same structural discipline as #5190's
+  `zero_unbound_slot_clears_every_copied_field_5190`. **Adding a counter
+  here means adding it to `for_each_shared_scalar!` or to the off-wire
+  list with a reason; there is no third option that compiles green.**
+  Not single-sourced: the two shapes legitimately differ (wire type with
+  omitempty, four source structs, the `cos_queue_lease_undergrant`
+  sub-struct flattened to six scalars, the window fields renamed to
+  `*_60s`), so the AGREEMENT is bound instead.
+
 - **The worker launch boundary is 5 typed bundles, constructed via named
   builders — not a positional arg list (#6241).** The `bring_up_workers`
   spawn closure (`reconcile/bringup.rs`) builds `WorkerLaunchPlan`,
