@@ -353,3 +353,36 @@ func ValidateLoginUsername(raw string, _ *Config) error {
 	}
 	return nil
 }
+
+// TunnelModeNames is the set of `interfaces <if> tunnel mode <mode>` values the
+// userspace dataplane actually carries traffic for (#6924).
+//
+// It MIRRORS the dataplane's own predicate, `tunnel_mode_kind` in
+// userspace-dp/src/afxdp/forwarding_build/tunnels.rs, which is the SSOT: a mode
+// it maps to TunnelKind::Gre or TunnelKind::WireGuard is carried, and everything
+// else falls to TunnelKind::Unknown and is dropped. The two lists live in
+// different languages so neither can import the other; the agreement is
+// asserted by a drift guard that parses the Rust match arms
+// (tunnel_mode_allowlist_6924_test.go), the same shape MasterPasswordPRFNames
+// uses against configstore.prfHash.
+//
+// Before this list existed the leaf had NO validator at all, so
+// `set interfaces ge-0/0/0 tunnel mode banana` committed green, built a kernel
+// GRE device (buildKernelTunnelLink's default arm), and carried no traffic —
+// the same "an interface an operator can see that carries nothing" symptom
+// #4785 exists to reject, reached by a route #4785's ipip-keyed gate cannot
+// see.
+//
+// `ipip` is deliberately ABSENT. It is a mode the system recognises and the
+// dataplane does NOT carry, and #4785 rejects it at commit with a diagnostic
+// that names the affected endpoints. Adding it here would accept it at the
+// schema layer for #4785 to reject later; leaving it out makes the leaf refuse
+// every mode the dataplane cannot carry, which is the general rule #4785's
+// ipip case is one instance of.
+//
+// The leaf validator runs only on the STRICT commit/commit-check path
+// (compileTreeStrict -> schemaValidateExpandedTreeForNode). compileTreeLenient,
+// which Store.Load and Store.SyncApply use, does not schema-validate at all, so
+// a config already persisted with an unrecognised mode still BOOTS (#1960
+// no-brick doctrine, the same split #4785 half 1 arranged).
+var TunnelModeNames = []string{"gre", "ip6gre", "wireguard"}

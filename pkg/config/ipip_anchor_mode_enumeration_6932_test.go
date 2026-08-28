@@ -22,6 +22,13 @@ import (
 // That is still worth guarding, and these two tests split the property:
 // this one pins WHICH modes suppress, and the one below pins what the
 // unrecognised-cause arm actually renders.
+//
+// NOTE on the mode space: #6932 reasoned over "exactly three values — gre, ipip,
+// wireguard". #6924 has since declared the set as TunnelModeNames =
+// {gre, ip6gre, wireguard} — ipip is deliberately NOT in it, and ip6gre is. This
+// enumeration is keyed on suppression behaviour rather than on that list, so it
+// does not need updating when the list changes; but do not read the rows below
+// as a copy of the declared set.
 
 // unitIpipSuppressedUnder reports whether an interface-level stanza in the named
 // mode suppresses a COMPLETE unit-level `ipip` endpoint.
@@ -80,10 +87,18 @@ func TestOnlyWireguardSuppressesACompleteUnitIpip_6932(t *testing.T) {
 			"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
 			"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
 		},
-		// An UNVALIDATED mode is a real input today, not a hypothetical: the
-		// `mode` schema leaf carries no ValueEnumOf (#6924), so `mode banana`
-		// commits. It is enumerated here because a mode nobody declared must not
-		// short-circuit either.
+		// A mode outside the declared set. #6924 has since added
+		// `validator: ValidateEnum(TunnelModeNames)` to the `mode` leaf, so
+		// `mode banana` no longer COMMITS — but that validator runs in
+		// SchemaValidate at commit-check, and this row drives CompileConfig
+		// directly, which does not consult it.
+		//
+		// That is the row's justification now, and it is stronger than the
+		// original "this is a real input today": CompileConfig is reachable from
+		// paths that never pass schema validation — the tolerant/programmatic
+		// load and HA peer sync, the same paths compiler_iface.go names when it
+		// guards against a nil zone slot. So an undeclared mode remains a real
+		// input to THIS function, and it must not short-circuit.
 		"unvalidated": {
 			"set interfaces gr-0/0/1 tunnel mode banana",
 			"set interfaces gr-0/0/1 tunnel source 10.0.0.1",
