@@ -1106,6 +1106,31 @@ Scope of the fallback:
   ifindex egresses into, and ships it as `InterfaceSnapshot.egress_zone`.
   `populate_interfaces` reads it and adjudicates nothing.
 
+  **The wire KEY is bound by an agreement test, not by a literal on one side
+  (#7037).** Both planes spell `egress_zone` independently — Go's `json:` tag on
+  `InterfaceSnapshot.EgressZone`, Rust's `#[serde(rename = "egress_zone",
+  default)]` in `protocol/snapshot.rs` — and the Rust `default` is what makes a
+  disagreement SILENT: an absent key does not fail to decode, it fills the empty
+  String. A one-sided rename would ship a snapshot in which every interface
+  resolves egress zone `""`, while both planes still agree the version is 8, so
+  no version gate fires. `TestEgressZoneWireKeyLockstepWithRust_7037` parses
+  `snapshot.rs` and compares it to the Go tag read by REFLECTION, asserting the
+  two AGREE rather than pinning either to a literal — pinning one side encodes
+  which side you trust. A consistent rename of BOTH sides passes there and is
+  caught instead by `TestEgressZoneCrossesTheWireAndTheQuarantine_6722`, which
+  pins the Go literal against the emitted blob. Measured: a Rust-side rename, or
+  dropping the `rename` attribute altogether, reds the lockstep test and
+  **nothing else** in the Go suite.
+
+  Note what this is NOT. #7037 was filed against the version NUMBER; that premise
+  is stale — reverting `ProtocolVersion` at head reds three tests, because
+  #6691's pins landed after the issue was written. A fourth equality pin would be
+  another copy of the same literal, and a per-feature `MinProtocolEgressZone`
+  floor is ruled out by the decision recorded above in `protocol.go`: the
+  acceptance question is answered in exactly ONE place
+  (`ensureEgressZoneProtocolLocked`), and a second gate would be the divergent
+  copy #6649 forbids.
+
   **Why the decision had to move.** Rounds 4 through 9 built the answer in Rust
   by polling the rows — "do all rows on this ifindex agree?" — and exempting the
   rows whose agreement or dissent was an artefact rather than an observation.
