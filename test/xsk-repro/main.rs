@@ -23,6 +23,38 @@ const FRAME_COUNT: u32 = 4096;
 const HEADROOM: u32 = 256;
 const XDP_OBJ: &[u8] = include_bytes!("xdp_pass_redirect.o");
 
+/// #6898 A10-b5-F1: the marker that identifies a frame as OUR generated probe.
+///
+/// ONE definition, used by both the generator and the receive filter. Two
+/// copies of a literal is how the two sides drift, and a drifted marker fails
+/// in the direction that matters here — every frame reads as foreign, rx goes
+/// to zero, and the tool reports FAIL on a healthy rebind.
+const PROBE_MARKER: &[u8] = b"xsk-test-probe";
+
+/// Does this received frame carry our probe marker?
+///
+/// WHY THIS EXISTS. The XDP program redirects EVERY packet on the queue to the
+/// XSK — `xdp_pass_redirect.c` looks the queue up in the xskmap and redirects
+/// unconditionally, with no filter. So the receive counters counted ALL traffic
+/// on the interface, not the traffic this tool generated.
+///
+/// That made the PASS criterion unable to detect the bug the tool exists to
+/// detect. `rx2 > 0` was satisfied by any background frame — an ARP, an IPv6
+/// RA or MLD report, a stray broadcast — so a rebind that was completely broken
+/// still reported PASS as long as the link carried any chatter at all. On a
+/// live interface IPv6 multicast alone is usually enough.
+///
+/// A substring scan rather than a parse at fixed offsets: the frame is
+/// Ethernet + IP + UDP + payload and the header sizes vary (VLAN tags, IPv4
+/// options, v4 vs v6), so a fixed offset would silently stop matching on a
+/// tagged or optioned link and reintroduce the false FAIL. Cost is irrelevant
+/// — this is a repro tool, not a dataplane.
+fn is_probe_frame(frame: &[u8]) -> bool {
+    frame
+        .windows(PROBE_MARKER.len())
+        .any(|w| w == PROBE_MARKER)
+}
+
 // UAPI XDP attach flags (linux/if_link.h).
 const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1 << 0;
 const XDP_FLAGS_REPLACE: u32 = 1 << 4;
@@ -286,6 +318,7 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
         // Receive loop
         let start = Instant::now();
         let mut total_rx = 0u64;
+        let mut foreign_rx = 0u64;
         let mut poll_count = 0u64;
         while start.elapsed() < duration {
             let available = rx.available();
@@ -303,7 +336,30 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
                 let mut recv = rx.receive(available);
                 let mut recycle: Vec<u64> = Vec::with_capacity(recv.capacity() as usize);
                 while let Some(desc) = recv.read() {
-                    total_rx += 1;
+                    // #6898 A10-b5-F1: count only OUR probes. Counting every
+                    // redirected frame made PASS satisfiable by unrelated
+                    // interface traffic, so the tool could not see the failure
+                    // it exists to find. Foreign frames are still counted, and
+                    // reported, because "rx=0 but 5000 foreign frames seen" and
+                    // "rx=0 and the link is silent" are different diagnoses and
+                    // the operator needs to tell them apart.
+                    let end = (desc.addr as usize).saturating_add(desc.len as usize);
+                    let is_ours = if end <= area_size {
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                area_ptr.cast::<u8>().add(desc.addr as usize),
+                                desc.len as usize,
+                            )
+                        };
+                        is_probe_frame(bytes)
+                    } else {
+                        false
+                    };
+                    if is_ours {
+                        total_rx += 1;
+                    } else {
+                        foreign_rx += 1;
+                    }
                     recycle.push(desc.addr & !((FRAME_SIZE as u64) - 1));
                 }
                 recv.release();
@@ -320,7 +376,10 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
                 unsafe { libc::poll(&mut pfd, 1, 10) };
             }
         }
-        eprintln!("  rx={} empty_polls={}", total_rx, poll_count);
+        eprintln!(
+            "  rx={} (probe frames)  foreign_rx={} (other traffic on this queue)  empty_polls={}",
+            total_rx, foreign_rx, poll_count
+        );
 
         // Deregister before the sockets/umem drop at the end of this block.
         xskmap_delete(xsk_map_fd, queue);
@@ -346,7 +405,7 @@ fn generate_traffic(iface: &str, stop: std::sync::Arc<std::sync::atomic::AtomicB
     sa.sin_port = 9999u16.to_be();
     sa.sin_addr.s_addr = u32::from_ne_bytes(ip);
 
-    let payload = b"xsk-test-probe";
+    let payload = PROBE_MARKER;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         unsafe {
             libc::sendto(fd, payload.as_ptr() as _, payload.len(), libc::MSG_DONTWAIT,
@@ -443,4 +502,80 @@ fn xskmap_delete(map_fd: i32, key: u32) {
 fn if_nametoindex(name: &str) -> u32 {
     let cname = CString::new(name).unwrap();
     unsafe { libc::if_nametoindex(cname.as_ptr()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A realistic redirected frame: Ethernet + IPv4 + UDP + payload. The
+    /// marker sits at an OFFSET, which is the whole reason the matcher scans
+    /// rather than reading a fixed position.
+    fn framed(payload: &[u8], vlan_tagged: bool) -> Vec<u8> {
+        let mut f = vec![0u8; 14];
+        if vlan_tagged {
+            // 802.1Q pushes every later header 4 bytes along — the case a
+            // fixed-offset parse silently stops matching on.
+            f.extend_from_slice(&[0x81, 0x00, 0x00, 0x64]);
+        }
+        f.extend_from_slice(&[0u8; 20]); // IPv4 header
+        f.extend_from_slice(&[0u8; 8]); // UDP header
+        f.extend_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn probe_frame_is_recognised_at_any_offset() {
+        assert!(is_probe_frame(&framed(PROBE_MARKER, false)));
+        assert!(
+            is_probe_frame(&framed(PROBE_MARKER, true)),
+            "a VLAN tag shifts every header; a fixed-offset match would stop seeing our own \
+             probes on a tagged link and report FAIL on a healthy rebind"
+        );
+    }
+
+    /// THE CELL THIS FIX EXISTS FOR.
+    ///
+    /// The XDP program redirects every packet on the queue with no filter, so
+    /// before #6898 the receive counters counted background traffic. `rx > 0`
+    /// was therefore satisfiable by an ARP or an IPv6 RA while the tool's own
+    /// probes were not arriving at all — which is the exact failure the
+    /// reproducer exists to detect, reported as PASS.
+    #[test]
+    fn foreign_traffic_is_not_counted_as_a_probe() {
+        // An IPv6 router advertisement is the realistic case: essentially every
+        // live link carries them, so this is not an exotic input.
+        let ra = framed(b"\x86\x00\x00\x00 router advertisement", false);
+        assert!(
+            !is_probe_frame(&ra),
+            "background interface traffic must not satisfy the PASS criterion — that is what \
+             made the reproducer unable to detect a broken rebind"
+        );
+        assert!(!is_probe_frame(&framed(b"", false)));
+        assert!(!is_probe_frame(b"arp who-has"));
+    }
+
+    #[test]
+    fn short_frames_do_not_panic() {
+        // `windows(n)` on a slice shorter than n yields nothing — but a runt
+        // frame reaching the matcher is a real possibility on a live queue, and
+        // a panic here would take down the tool mid-run.
+        for len in 0..PROBE_MARKER.len() {
+            assert!(!is_probe_frame(&vec![0u8; len]));
+        }
+    }
+
+    /// The generator and the matcher must use ONE marker definition.
+    ///
+    /// A duplicated literal drifts, and it drifts in the direction that hides
+    /// the fix: every frame reads as foreign, rx falls to zero, and the tool
+    /// reports FAIL on a healthy rebind — a false alarm that looks exactly like
+    /// the defect it is supposed to find.
+    #[test]
+    fn generator_and_matcher_share_one_marker() {
+        assert!(
+            is_probe_frame(&framed(PROBE_MARKER, false)),
+            "the marker the generator sends must be the marker the receiver matches"
+        );
+    }
 }
