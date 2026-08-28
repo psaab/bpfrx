@@ -1006,6 +1006,12 @@ type Daemon struct {
 	// activeClusterTransport stores the transport config used by the
 	// currently running cluster comms. Compared on each applyConfig to
 	// detect changes that require a comms restart (#87).
+	//
+	// Guarded by clusterCommsMu since #6290; write only through
+	// setActiveTransportIfCurrent (epoch-gated) and read only through
+	// activeTransport, which returns one snapshot. Never touch this field
+	// directly — the boot writer holds neither applySem nor this mutex, so
+	// an unguarded access here is a real data race, not a theoretical one.
 	activeClusterTransport clusterTransportKey
 
 	// startClusterCommsFn is the startClusterComms entry point used by
@@ -1027,7 +1033,8 @@ type Daemon struct {
 	// clusterCommsMu guards the cluster-comms epoch state that is published
 	// asynchronously by the startClusterComms constructor goroutine and torn
 	// down by stopClusterComms: sessionSync, fabricRefreshCh/fabricRefreshCh1,
-	// clusterCommsCtx/clusterCommsCancel, and clusterCommsGen (#4958). Before
+	// clusterCommsCtx/clusterCommsCancel, clusterCommsGen (#4958), and
+	// activeClusterTransport, which joined the epoch in #6290. Before
 	// #4958 the constructor wrote sessionSync (and re-dereferenced it) and the
 	// fabric channels from an untracked goroutine with no lock, so a
 	// stop→start restart could nil-deref (stop nils sessionSync between the
