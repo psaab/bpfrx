@@ -123,10 +123,19 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		}},
 		// Interface / address leaves stay untyped until the interfaces
 		// subsystem PR introduces the IP/identifier value types.
-		"control-interface":             {desc: "Control link interface for heartbeats and cluster sync", args: 1, placeholder: "<interface>", children: nil},
-		"peer-address":                  {desc: "Cluster peer IP address on the control link", args: 1, placeholder: "<address>", children: nil},
-		"fabric-interface":              {desc: "Fabric link interface for session sync and cross-chassis forwarding", args: 1, placeholder: "<interface>", children: nil},
-		"fabric-peer-address":           {desc: "Cluster peer IP address on the fabric link", args: 1, placeholder: "<address>", children: nil},
+		"control-interface":   {desc: "Control link interface for heartbeats and cluster sync", args: 1, placeholder: "<interface>", children: nil},
+		"peer-address":        {desc: "Cluster peer IP address on the control link", args: 1, placeholder: "<address>", children: nil},
+		"fabric-interface":    {desc: "Fabric link interface for session sync and cross-chassis forwarding", args: 1, placeholder: "<interface>", children: nil},
+		"fabric-peer-address": {desc: "Cluster peer IP address on the fabric link", args: 1, placeholder: "<address>", children: nil},
+		// #7448: the second fabric link. Compiled since dual-fabric landed
+		// (clusterStatements, compiler_chassis_cluster_packed.go; the
+		// completeness warning in compiler_validate_warn.go pairs them), but
+		// never declared here -- so they committed fine and were invisible to
+		// `?` help and tab completion, the only two `chassis cluster`
+		// statements of which that was true.
+		// TestChassisClusterSchemaAndSplitterAgree_7448 now binds the two sets.
+		"fabric1-interface":             {desc: "Second fabric link interface for session sync and cross-chassis forwarding", args: 1, placeholder: "<interface>", children: nil},
+		"fabric1-peer-address":          {desc: "Cluster peer IP address on the second fabric link", args: 1, placeholder: "<address>", children: nil},
 		"configuration-synchronize":     {desc: "Synchronize committed configuration from primary to secondary", children: nil},
 		"nat-state-synchronization":     {desc: "NAT state synchronization (accepted for Junos compatibility; no runtime effect)", children: nil},
 		"ipsec-session-synchronization": {desc: "Synchronize IPsec SAs to the cluster peer", children: nil},
