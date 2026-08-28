@@ -41,7 +41,25 @@ pub(in crate::afxdp) fn frag_ingress_authority(
     // override wins, else the LOGICAL unit's configured zone (#5802). An
     // unzoned ingress resolves to 0, which is itself a distinct authority —
     // an unzoned interface must not inherit a zoned interface's permit.
+    //
+    // The override is VALIDATED against zone_id_to_name before it wins (#7050),
+    // the same way both sibling consumers of this value do it —
+    // prerouting_ingress_scope resolves id->name and falls through on a miss,
+    // filter_log_ingress_zone_id applies this exact `contains_key` filter. Taking
+    // it raw made the association key and enforcement disagree: enforcement
+    // normalizes an unknown id away and uses the logical unit's configured zone,
+    // while this stamped the raw id, so two fragments of ONE datagram carrying
+    // two DIFFERENT unknown ids built two different keys — an over-scope whose
+    // miss is a fail-closed drop — for a datagram enforcement treats as one
+    // domain.
+    //
+    // Not reachable today: the sole production binding of ingress_zone_override
+    // comes from parse_zone_encoded_fabric_ingress_from_frame, which already
+    // rejects an id absent from zone_id_to_name, and every later shadow can only
+    // narrow Some -> None. This closes the gap at the consumer so the three
+    // consumers agree by construction rather than by a property of one producer.
     let zone = ingress_zone_override
+        .filter(|id| forwarding.zone_id_to_name.contains_key(id))
         .or_else(|| forwarding.ifindex_to_zone_id.get(&logical).copied())
         .unwrap_or(0);
     crate::nat64::FragAuthority {
