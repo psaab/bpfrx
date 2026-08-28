@@ -3055,6 +3055,44 @@ outside the monitor loop:
   | `resetRecvGen` | all three, clear to 0 | receive loop (×2) | `configGenMu` |
   | `initGenState` | all three | `NewSessionSync` | none — pre-`Start`, no goroutines yet |
 
+  **What the #5084 incarnation fence actually covers, which is less than its
+  name suggests.** `configItemIncarnationStale` drops a payload whose stamped
+  incarnation differs from the current one, and the stamp comes from
+  `connBootIncarnation(conn)` — *the connection the payload arrived on*. A
+  connection that never received an incarnated `BulkStart` returns the ZERO
+  value, and zero is the never-dropped class (plan §6 rule 4, fail open). In a
+  two-fabric cluster only the fabric that primed carries a stamp; the other
+  routinely carries config with none — measured directly: after a prime on
+  fabric 0, `conn0` reports the incarnation and `conn1` reports `none`. So the
+  fence covers *config arriving on a connection that itself primed under a
+  now-replaced incarnation*, NOT "any config from a replaced boot". That is
+  deliberate and it strands nothing, because rule 4 is symmetric — an
+  un-incarnated payload passes at the receive site and at the apply site alike,
+  so it can never raise the received mark and then be refused at apply. Read as
+  the stronger claim it is not, this looks like a hole; it is a documented
+  fail-open with matching behaviour on both sides of the queue.
+
+  **The enqueue-side ordering cannot open the readiness gap (#6908, closed
+  not-reproducible).** `recordRecvConfigGen` runs on a receive loop and can
+  land *after* `resetRecvGen` has cleared the marks for a re-prime driven by
+  the other fabric — a real ordering, not prevented by `configGenMu`, which
+  serialises the writes but not their order. It was filed as leaving `received`
+  high while `applied` lands low, wedging the #5563 manual-failover gate. It
+  cannot: the reset that opens the window also removes the barrier that would
+  hold the marks apart. `resetRecvGen` zeroes `lastAppliedConfigGen` in the same
+  `configGenMu` transaction, and `shouldApplyConfigGen` is `last == 0 || gen >
+  last`, so with `applied == 0` the late payload that raises `received` is the
+  same payload that then applies and raises `applied`. Measured across the whole
+  ordering space (late-raise alone; live re-push before and after it; live
+  generation above and below the stale one) — `applied == received` in every
+  case. A same-incarnation re-prime is a first-class case, not an edge
+  (`notePeerBootIncarnation` rule 2, the #5450 forced resync), so the fence
+  above is not what closes this; the reset's own transaction is. The gap between
+  the marks CAN open, by the #6778 queue-full drop and by apply failure, both
+  deliberate and separately tracked, plus a genuine one-apply transient while a
+  queued newer generation is still in flight — which is the in-flight window
+  #5563 exists to represent.
+
   Readers stay lock-free (the marks are atomics and `configEpochStale` runs per
   synced session install); a reader racing a writer observes one side of a
   single monotone step, which is the tolerance the marks already had. **The guard is
