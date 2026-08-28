@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
 	"testing"
 
@@ -119,5 +122,60 @@ func TestRenameRethMemberNilHookStillRenames(t *testing.T) {
 	}
 	if link.attrs.Name != "ge-0-0-1" {
 		t.Fatalf("link not renamed with a nil hook: %q", link.attrs.Name)
+	}
+}
+
+// TestDaemonPassesRenameRethMemberBeforeCycleHook_6911 binds the WIRING, not the
+// function.
+//
+// The behavioural cells above drive renameRethMember directly, so they bind what
+// happens INSIDE it. They do not bind the daemon's call TO it: replacing the
+// hook argument with a literal `nil` at the apply site compiles, keeps all three
+// of them green, and restores the #6911 defect exactly. I measured that — a
+// mutation passing nil at the call site produced ZERO failures across the whole
+// pkg/daemon suite before this test existed.
+//
+// Structured as an AST walk rather than a grep for the same reason as its #5103
+// sibling: a source scan keyed on text can be satisfied by a comment quoting the
+// pattern it looks for, and can silently sweep nothing. packageGoFiles fatals
+// when it finds no non-test files, so a broken sweep fails loudly instead of
+// counting zero call sites and passing.
+func TestDaemonPassesRenameRethMemberBeforeCycleHook_6911(t *testing.T) {
+	fset := token.NewFileSet()
+	calls := 0
+	for _, file := range packageGoFiles(t) {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok || id.Name != "renameRethMember" {
+				return true
+			}
+			calls++
+			if len(call.Args) != 3 {
+				t.Errorf("%s:%d: renameRethMember called with %d args, want 3 — the third "+
+					"is the beforeCycle worker-join hook (#6911)",
+					file, fset.Position(call.Pos()).Line, len(call.Args))
+				return true
+			}
+			if arg, ok := call.Args[2].(*ast.Ident); ok && arg.Name == "nil" {
+				t.Errorf("%s:%d: the daemon passes a nil beforeCycle hook to renameRethMember, "+
+					"so AF_XDP workers are never joined before the rename link cycle — the "+
+					"#6911 defect, restored with every producer-side test still green",
+					file, fset.Position(call.Pos()).Line)
+			}
+			return true
+		})
+	}
+	if calls != 1 {
+		t.Errorf("found %d production renameRethMember call sites, want exactly 1. "+
+			"A second call site would need its own hook, and zero means this canary "+
+			"is watching a function the daemon no longer calls.", calls)
 	}
 }
