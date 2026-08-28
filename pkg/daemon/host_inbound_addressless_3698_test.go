@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"sync"
 )
 
 // captureRecord is one slog record captured by capturingHandler.
@@ -15,7 +16,44 @@ type captureRecord struct {
 	attrs map[string]string
 }
 
-type capturingHandler struct{ recs *[]captureRecord }
+// capturingHandler collects slog records for assertion.
+//
+// #7075: it is installed as the GLOBAL slog default, so anything still logging
+// in this process writes through it — including goroutines the test did not
+// start and does not join, such as a leaked configstore persistRetryLoop. The
+// previous shape appended to a caller-owned `*[]captureRecord` with no
+// synchronisation at all, so `go test -race ./pkg/daemon/` reported a DATA RACE
+// between two Handle calls, and the test it failed was whichever one happened
+// to be running — not the one that leaked the goroutine.
+//
+// The mutex lives INSIDE the handler and the records are read back through
+// records(), so a caller cannot hold the slice directly and forget the lock.
+// That is the difference between fixing this instance and making the shape
+// unrepresentable: the previous API handed out the address of the slice, which
+// is an invitation to read it unguarded, and every caller accepted.
+type capturingHandler struct{ sink *captureSink }
+
+// captureSink owns the records and the mutex that guards them.
+type captureSink struct {
+	mu   sync.Mutex
+	recs []captureRecord
+}
+
+// newCaptureSink returns a sink ready to be installed in a capturingHandler.
+func newCaptureSink() *captureSink { return &captureSink{} }
+
+// records returns a COPY of what has been captured so far, under the lock.
+//
+// A copy rather than the slice itself: the handler keeps appending for as long
+// as it is the slog default, so handing out the live slice would move the race
+// from the append to the caller's range loop.
+func (s *captureSink) records() []captureRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]captureRecord, len(s.recs))
+	copy(out, s.recs)
+	return out
+}
 
 func (h capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
 func (h capturingHandler) Handle(_ context.Context, r slog.Record) error {
@@ -24,7 +62,9 @@ func (h capturingHandler) Handle(_ context.Context, r slog.Record) error {
 		attrs[a.Key] = a.Value.String()
 		return true
 	})
-	*h.recs = append(*h.recs, captureRecord{level: r.Level, msg: r.Message, attrs: attrs})
+	h.sink.mu.Lock()
+	h.sink.recs = append(h.sink.recs, captureRecord{level: r.Level, msg: r.Message, attrs: attrs})
+	h.sink.mu.Unlock()
 	return nil
 }
 func (h capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
@@ -57,16 +97,16 @@ func addresslessDaemonCfg(withWANAddr bool) *config.Config {
 // the daemon-side observability: an addressless enforcing zone logs a WARN once
 // on ENTRY (not every apply), and an INFO on RECOVERY when it gains an address.
 func TestLogHostInboundAddresslessTransitions(t *testing.T) {
-	var recs []captureRecord
+	sink := newCaptureSink()
 	prev := slog.Default()
-	slog.SetDefault(slog.New(capturingHandler{recs: &recs}))
+	slog.SetDefault(slog.New(capturingHandler{sink: sink}))
 	defer slog.SetDefault(prev)
 
 	d := &Daemon{}
 
 	warnsFor := func(zone string) int {
 		n := 0
-		for _, r := range recs {
+		for _, r := range sink.records() {
 			if r.level == slog.LevelWarn && r.attrs["zone"] == zone {
 				n++
 			}
@@ -75,7 +115,7 @@ func TestLogHostInboundAddresslessTransitions(t *testing.T) {
 	}
 	infosFor := func(zone string) int {
 		n := 0
-		for _, r := range recs {
+		for _, r := range sink.records() {
 			if r.level == slog.LevelInfo && r.attrs["zone"] == zone {
 				n++
 			}
