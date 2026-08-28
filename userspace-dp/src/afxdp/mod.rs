@@ -486,10 +486,26 @@ const MAX_PENDING_NEIGH: usize = 4096;
 // destinations.
 const NEG_NEIGH_TTL_NS: u64 = 3_000_000_000; // 3 seconds
 // Per-binding cap on the negative cache. A /24 scan touches 254 distinct
-// dsts; 256 covers a full subnet sweep without unbounded growth. On overflow
-// the map is cleared wholesale — a best-effort optimization, so losing
-// suppression for a few dsts only costs one more PENDING_NEIGH_TIMEOUT drop,
-// never correctness. FastMap::clear() retains bucket capacity (no realloc).
+// dsts; 256 covers a full subnet sweep without unbounded growth.
+//
+// #6905: on overflow ONE entry is reclaimed — expired first, else the oldest —
+// not the whole map. The previous wholesale `clear()` made the eviction victim
+// set a function of the ARRIVING key: a host sweeping distinct next-hops chose
+// when the clear fired and discarded unrelated suppression at will, partially
+// undoing the defence this cache exists to provide. Note how little headroom
+// the sizing leaves for that: 256 is deliberately one /24, so a single subnet
+// sweep plus two other dead hosts reaches the overflow. Losing suppression is
+// still never a correctness problem — it costs one more
+// PENDING_NEIGH_TIMEOUT drop — but it should cost that for ONE dst, not for
+// every dst on the box.
+//
+// Still allocation-free (retain/remove reuse the buckets) and still O(len) in
+// the worst case, which is what `clear()` already was: clearing a map is
+// O(capacity), not O(1). The work also lands on the COLD path —
+// `neg_neigh_record` runs once per (ifindex, next_hop) per pending-neighbour
+// timeout, while `neg_neigh_active` is the per-packet one. That asymmetry is
+// why an LRU is the wrong instrument: it would pay bookkeeping on every hot
+// -path HIT to improve a decision made only on the cold path.
 const MAX_NEG_NEIGH_CACHE: usize = 256;
 
 #[inline]

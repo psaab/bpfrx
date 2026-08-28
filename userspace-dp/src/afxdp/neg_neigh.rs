@@ -62,13 +62,65 @@ pub(super) fn neg_neigh_active(cache: &mut NegNeighCache, key: &(i32, IpAddr), n
 }
 
 /// Record a dead-host drop at `now_ns`. Bounded by `MAX_NEG_NEIGH_CACHE`: on
-/// overflow (and only when inserting a genuinely new key) the map is cleared
-/// wholesale. `clear()` retains capacity, so this is allocation-free.
+/// overflow (and only when inserting a genuinely new key) ONE entry is
+/// reclaimed — expired entries first, else the oldest — instead of the whole
+/// map (#6905).
+///
+/// The eviction victim used to be *every* entry. That made the victim set
+/// chosen by the ARRIVING key rather than by age or usefulness: a host sweeping
+/// distinct next-hops decided when the clear fired and destroyed unrelated
+/// suppression at will, partially undoing the defence this module exists to
+/// provide. Bounded eviction loses at most one entry per overflow.
+///
+/// Still allocation-free — `retain` and `remove` reuse the existing buckets —
+/// and still O(len) in the worst case, which is what `clear()` already cost:
+/// clearing a map is O(capacity), not O(1). So this is not a hot-path
+/// regression, it is the same order of work choosing a better victim.
+///
+/// And the work lands on the COLD side of this module. `neg_neigh_record` is
+/// called once per `(egress_ifindex, next_hop)` per pending-neighbour TIMEOUT
+/// window (`neighbor_dispatch.rs`), not per packet; `neg_neigh_active` is the
+/// per-packet path. That asymmetry is why an LRU is the wrong instrument here
+/// — LRU pays its bookkeeping on every HIT, i.e. on the hot path, to improve a
+/// decision made only on the cold one.
 pub(super) fn neg_neigh_record(cache: &mut NegNeighCache, key: (i32, IpAddr), now_ns: u64) {
     if cache.len() >= MAX_NEG_NEIGH_CACHE && !cache.contains_key(&key) {
-        cache.clear();
+        neg_neigh_reclaim_one(cache, now_ns);
     }
     cache.insert(key, now_ns);
+}
+
+/// Free room for one new key: drop every EXPIRED entry, and if that freed
+/// nothing, drop the single oldest.
+///
+/// Expired-first matters because this cache has NO background prune — TTL is
+/// enforced lazily in [`neg_neigh_active`], on access. An entry recorded during
+/// a scan and never looked up again is never revisited, so without this pass a
+/// bounded policy would fill with stale entries and stay full. That is the trap
+/// in "just refuse the new key at capacity", which is otherwise the cheapest
+/// option and matches the pending-neighbour precedent: that map has a
+/// timeout-driven drain, and this one does not, so refusing alone would wedge
+/// suppression permanently for every NEW dead host — strictly worse than the
+/// wholesale clear it replaced.
+///
+/// One pass, no allocation: `retain` prunes and simultaneously records the
+/// oldest survivor, so the fallback eviction needs no second scan.
+fn neg_neigh_reclaim_one(cache: &mut NegNeighCache, now_ns: u64) {
+    let mut oldest: Option<((i32, IpAddr), u64)> = None;
+    cache.retain(|k, inserted| {
+        if now_ns.saturating_sub(*inserted) >= NEG_NEIGH_TTL_NS {
+            return false;
+        }
+        if oldest.is_none_or(|(_, t)| *inserted < t) {
+            oldest = Some((*k, *inserted));
+        }
+        true
+    });
+    if cache.len() >= MAX_NEG_NEIGH_CACHE
+        && let Some((victim, _)) = oldest
+    {
+        cache.remove(&victim);
+    }
 }
 
 /// Explicit eviction (resolved-neighbor-wins). Idempotent.
@@ -171,21 +223,183 @@ mod tests {
         assert!(!neg_neigh_active(&mut c, &key(137), 1_500));
     }
 
+    fn filler(i: usize) -> (i32, IpAddr) {
+        // Spread across two octets so >256 distinct keys are expressible.
+        (
+            14i32,
+            IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8)),
+        )
+    }
+
+    /// #6905: overflow evicts a BOUNDED amount, not the whole map.
+    ///
+    /// This replaces `overflow_clears_then_reinserts_new_key`, which asserted
+    /// `len() == 1` after an overflow. That test pinned the IMPLEMENTATION —
+    /// it passes only for a wholesale clear and would have had to be deleted to
+    /// land any fix, which is the shape of a test that blocks the change it
+    /// exists to guide.
+    ///
+    /// The property is stated instead: an unrelated hop's suppression SURVIVES
+    /// pressure from other hops. That reds for a wholesale clear and passes for
+    /// any bounded policy — LRU, oldest-first, random victim, refuse-new —
+    /// so it constrains the outcome without dictating the mechanism.
     #[test]
-    fn overflow_clears_then_reinserts_new_key() {
+    fn overflow_eviction_is_bounded_not_wholesale_6905() {
         let mut c = NegNeighCache::default();
-        // Fill exactly to the cap with distinct keys.
         for i in 0..MAX_NEG_NEIGH_CACHE {
-            // Spread across two octets so >256 distinct keys are expressible.
-            let k = (14i32, IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8)));
-            neg_neigh_record(&mut c, k, 1_000);
+            neg_neigh_record(&mut c, filler(i), 1_000);
         }
-        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE);
-        // One more NEW key triggers wholesale clear, then inserts the new key.
-        let extra = (14i32, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
-        neg_neigh_record(&mut c, extra, 2_000);
-        assert_eq!(c.len(), 1, "overflow must clear then hold only the new key");
-        assert!(neg_neigh_active(&mut c, &extra, 2_000));
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE, "setup: filled to the cap");
+
+        // The hop whose suppression must survive. Recorded LAST so it is not
+        // the oldest — under an age-ordered policy the victim is deterministic,
+        // and a test that let the victim be arbitrary could not name a survivor.
+        let protected = (14i32, IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)));
+        neg_neigh_record(&mut c, protected, 1_500);
+
+        // One more NEW key from a scanning host forces an overflow.
+        let scanner = (14i32, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        neg_neigh_record(&mut c, scanner, 2_000);
+
+        assert!(
+            neg_neigh_active(&mut c, &protected, 2_000),
+            "#6905: an unrelated hop's suppression must SURVIVE another hop's overflow. \
+             Wholesale clear discards it, which lets a host sweeping distinct next-hops \
+             choose when to disarm the defence for every other destination"
+        );
+        assert!(neg_neigh_active(&mut c, &scanner, 2_000), "the new key is recorded");
+        assert!(
+            c.len() >= MAX_NEG_NEIGH_CACHE - 1,
+            "#6905: at most a BOUNDED number of entries may be lost per overflow; len={} \
+             after one overflow of a {}-entry cache",
+            c.len(),
+            MAX_NEG_NEIGH_CACHE
+        );
+
+        // THE UPPER BOUND, and it is not decoration. A mutation cell that
+        // removed the fallback eviction entirely survived the rest of this
+        // suite: every other assertion here is a LOWER bound on what survives,
+        // so "evict nothing and grow forever" satisfied them all. A cache whose
+        // only job is to be bounded needs the bound asserted.
+        for i in 0..(4 * MAX_NEG_NEIGH_CACHE) {
+            neg_neigh_record(&mut c, filler(MAX_NEG_NEIGH_CACHE + i), 2_000);
+            assert!(
+                c.len() <= MAX_NEG_NEIGH_CACHE,
+                "#6905: the cache must stay bounded by MAX_NEG_NEIGH_CACHE ({}); len={} after \
+                 {} sustained inserts. Unbounded growth is the failure this cap exists to \
+                 prevent, and it is invisible to any assertion about what SURVIVES",
+                MAX_NEG_NEIGH_CACHE,
+                c.len(),
+                i + 1
+            );
+        }
+    }
+
+    /// #6905: the expired-first pass reclaims ALL dead entries in one scan, not
+    /// just the one needed to make room.
+    ///
+    /// This binds the pass as an AMORTIZATION, which is what it actually buys.
+    /// It is not needed for victim selection: with a single clock, "expired"
+    /// means "inserted before now - TTL", which is a prefix of the age order —
+    /// so evicting the oldest already evicts an expired entry whenever one
+    /// exists, and the two orderings cannot be separated by a fixture.
+    /// (`overflow_reclaims_expired_before_live_6905` therefore does not
+    /// distinguish them either, and its doc says so.)
+    ///
+    /// What the pass does buy is scan cost under exactly the attack this issue
+    /// is about: without it EVERY new key at capacity runs another O(len) scan
+    /// to evict one entry; with it, one scan reclaims the whole expired
+    /// generation and the next ~MAX inserts are O(1).
+    #[test]
+    fn expired_generation_is_reclaimed_in_one_pass_6905() {
+        let mut c = NegNeighCache::default();
+        for i in 0..MAX_NEG_NEIGH_CACHE {
+            neg_neigh_record(&mut c, filler(i), 1_000);
+        }
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE, "setup");
+
+        // One overflow, at a time when the entire existing generation is dead.
+        let later = 1_000 + NEG_NEIGH_TTL_NS + 1;
+        neg_neigh_record(&mut c, filler(9_000), later);
+
+        assert!(
+            c.len() <= 2,
+            "#6905: a single overflow against a fully-expired cache must reclaim the whole \
+             dead generation, leaving room for the inserts that follow. len={} — reclaiming \
+             one victim at a time makes every subsequent insert pay another O(len) scan, \
+             which is the cost this pass exists to amortise",
+            c.len()
+        );
+    }
+
+    /// #6905: live entries survive an overflow when expired ones are available.
+    ///
+    /// HONEST SCOPE, corrected after a mutation cell: this does NOT distinguish
+    /// "prefers expired" from "prefers oldest". With a single clock, expired
+    /// means inserted before `now - TTL`, which is a PREFIX of the age order —
+    /// so evicting the oldest already evicts an expired entry whenever one
+    /// exists, and no fixture can separate the two orderings. Removing the
+    /// expired-first pass leaves this test green, and that is correct rather
+    /// than a gap: the pass is an amortization, bound by
+    /// `expired_generation_is_reclaimed_in_one_pass_6905`.
+    ///
+    /// What this test does bind is the property an operator cares about: an
+    /// overflow must not take LIVE suppression while dead entries are sitting
+    /// there to be reclaimed.
+    #[test]
+    fn overflow_reclaims_expired_before_live_6905() {
+        let mut c = NegNeighCache::default();
+        // Half the cache recorded long ago (will be expired), half recent.
+        let half = MAX_NEG_NEIGH_CACHE / 2;
+        for i in 0..half {
+            neg_neigh_record(&mut c, filler(i), 1_000);
+        }
+        let fresh_at = 1_000 + NEG_NEIGH_TTL_NS;
+        for i in half..MAX_NEG_NEIGH_CACHE {
+            neg_neigh_record(&mut c, filler(i), fresh_at);
+        }
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE, "setup");
+
+        // Overflow at a time when the first half is expired and the second is not.
+        let scanner = (14i32, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        neg_neigh_record(&mut c, scanner, fresh_at);
+
+        // Every LIVE entry survived: the reclaim took only expired ones.
+        for i in half..MAX_NEG_NEIGH_CACHE {
+            assert!(
+                neg_neigh_active(&mut c, &filler(i), fresh_at),
+                "#6905: live entry {i} was evicted while EXPIRED entries were available to \
+                 reclaim — the victim choice must prefer entries that are already dead"
+            );
+        }
+    }
+
+    /// #6905: a sustained scan must not WEDGE suppression.
+    ///
+    /// The control for the failure mode "refuse the new key at capacity" would
+    /// have had: fill the cache, let everything expire without ever looking it
+    /// up (which is exactly what a scan does — each hop is recorded once and
+    /// never revisited), then verify a NEW dead host still gets suppressed.
+    /// Without expired-first reclaim this fails, and it fails silently: the
+    /// cache is full, `len()` looks healthy, and no counter moves.
+    #[test]
+    fn sustained_scan_does_not_wedge_suppression_6905() {
+        let mut c = NegNeighCache::default();
+        for i in 0..MAX_NEG_NEIGH_CACHE {
+            neg_neigh_record(&mut c, filler(i), 1_000);
+        }
+        // Everything above is now expired, and NOTHING looked any of it up, so
+        // the lazy TTL never ran.
+        let later = 1_000 + NEG_NEIGH_TTL_NS + 1;
+        let new_dead_host = (14i32, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+        neg_neigh_record(&mut c, new_dead_host, later);
+        assert!(
+            neg_neigh_active(&mut c, &new_dead_host, later),
+            "#6905: a new dead host must still be suppressible after the cache filled with \
+             entries that expired unobserved. A bounded policy without expired-first reclaim \
+             wedges here — the cache stays full of stale keys forever because nothing prunes \
+             them, and every subsequent dead host goes unsuppressed"
+        );
     }
 
     #[test]
