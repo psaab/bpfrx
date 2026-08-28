@@ -6311,3 +6311,336 @@ fn nat64_6892_unmatched_destination_still_falls_back_to_the_pool_scan() {
         "the fallback scan did not reserve anywhere (#6892)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6982: the NAT64 allocator aggregate budget.
+//
+// There are exactly TWO production `PortAllocator::new` call sites in the tree.
+// #6812 gated the SNAT one at its apply boundary; this one was gated by
+// nothing. A NAT64 prefix costs `pool_v4.len() * 64512` occupancy bits, and
+// because the port range is a FIXED CONSTANT every pool address costs the
+// MAXIMUM — there is no narrow-range case, unlike SNAT. So the ~1.48 GiB
+// allocation #6812 exists to prevent was reachable here with #6812 fully in
+// place.
+//
+// TWO THINGS THESE TESTS DO DELIBERATELY, both learned from #6815's own review:
+//
+//  1. THEY DRIVE THE REAL ENTRY POINT UNDER THE REAL BUDGET. #6815's cap
+//     arithmetic was fully tested while its production wiring was not —
+//     substituting an infinite budget into the production call left that suite
+//     at 273 passed / 0 failed. A test that injects a scaled-down budget binds
+//     the injection, not the shipped constant. Every test below calls
+//     `Nat64State::from_snapshots{,_with_previous}` and crosses
+//     `NAT64_AGGREGATE_BUDGET` itself.
+//
+//  2. THEY CROSS BY PREFIX COUNT, NOT PORT CAPACITY. Materialising 2^33 port
+//     slots is a test that gets deleted for being slow, and a deleted guard is
+//     no guard. `max_prefixes` is 1024, so 1025 prefixes of ONE address each
+//     cross the real budget while allocating ~66M bits total — and the refused
+//     one allocates nothing at all, which is the property under test.
+// ---------------------------------------------------------------------------
+
+/// Build `n` distinct single-address NAT64 prefixes.
+fn budget_snaps(n: usize) -> Vec<NAT64RuleSnapshot> {
+    (0..n)
+        .map(|i| NAT64RuleSnapshot {
+            name: format!("r{i}"),
+            // Distinct /96 prefixes: 2001:db8:<i>::/96.
+            prefix: format!("2001:db8:{:x}::/96", i),
+            pool_addresses: vec![format!("198.51.100.{}", (i % 250) + 1)],
+            no_v6_frag_header: false,
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// THE BINDING (#6982). The real entry point, the real constant: a snapshot one
+/// prefix past `max_prefixes` gets that prefix REFUSED, and the refusal builds
+/// no bitmap.
+///
+/// Fail-on-revert: delete the `admitted_with` gate in
+/// `from_snapshots_with_previous` and the 1025th prefix installs its pool and
+/// its allocator, so both assertions below fail.
+#[test]
+fn nat64_6982_aggregate_budget_refuses_past_the_prefix_cap() {
+    let n = NAT64_AGGREGATE_BUDGET.max_prefixes as usize;
+    let state = Nat64State::from_snapshots(&budget_snaps(n + 1));
+
+    // Every prefix is INSTALLED — a refused one is not dropped, or its traffic
+    // would fall through to NoPrefixMatch and route as ordinary IPv6.
+    assert_eq!(
+        state.prefixes.len(),
+        n + 1,
+        "a refused prefix must still be installed, or its traffic routes UNTRANSLATED \
+         instead of dropping fail-closed (#6982)"
+    );
+
+    let refused: Vec<usize> = state
+        .prefixes
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.over_budget)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        refused,
+        vec![n],
+        "exactly the one prefix past the cap must be refused, and it must be the LAST \
+         (first-fit: earlier prefixes fit and are admitted)"
+    );
+    assert!(
+        state.prefixes[n].pool_v4.is_empty(),
+        "a refused prefix must carry an EMPTY pool — the whole point is that no occupancy \
+         bitmap is materialised for it"
+    );
+    // ...and the admitted ones are untouched.
+    assert_eq!(state.prefixes[0].pool_v4.len(), 1);
+    assert!(!state.prefixes[0].over_budget);
+}
+
+/// THREE STATES, NOT TWO (#6982), asserted at the CONSUMPTION boundary.
+///
+/// A refused prefix carries an empty pool, which makes it classify exactly like
+/// the legitimate no-source-pool rule the Go side emits — both are
+/// `MatchUnavailable`. That collapse is the trap: the two have OPPOSITE
+/// remedies (raise the budget / split the config, versus add a source pool), so
+/// an operator who cannot tell them apart is sent to the wrong one.
+///
+/// This asserts all three states where they are CONSUMED — through
+/// `classify_ipv6_dest`, not at the point the budget is computed — because a
+/// distinction that exists only inside the resolver is not a distinction the
+/// dataplane can act on.
+#[test]
+fn nat64_6982_over_budget_is_distinguishable_from_empty_pool() {
+    // (a) healthy, (b) empty-by-config — both under budget.
+    let healthy = NAT64RuleSnapshot {
+        name: "healthy".to_string(),
+        prefix: "2001:db8:aaaa::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        ..Default::default()
+    };
+    let empty = NAT64RuleSnapshot {
+        name: "empty-by-config".to_string(),
+        prefix: "2001:db8:bbbb::/96".to_string(),
+        pool_addresses: vec![],
+        ..Default::default()
+    };
+    let state = Nat64State::from_snapshots(&[healthy.clone(), empty.clone()]);
+    assert!(!state.prefixes[0].over_budget, "healthy is not over budget");
+    assert!(
+        !state.prefixes[1].over_budget,
+        "an empty-by-config pool is NOT a budget refusal — collapsing the two is the defect"
+    );
+    assert!(state.prefixes[1].pool_v4.is_empty());
+
+    // Consumption boundary: healthy translates, empty-by-config is unavailable.
+    let dst_healthy: Ipv6Addr = "2001:db8:aaaa::c633:6401".parse().unwrap();
+    let dst_empty: Ipv6Addr = "2001:db8:bbbb::c633:6401".parse().unwrap();
+    assert!(
+        matches!(state.classify_ipv6_dest(dst_healthy), Nat64Match::MatchReady { .. }),
+        "a healthy prefix must translate"
+    );
+    assert_eq!(
+        state.classify_ipv6_dest(dst_empty),
+        Nat64Match::MatchUnavailable,
+        "an empty-by-config pool drops fail-closed"
+    );
+
+    // (c) refused-by-budget. Same classification, DIFFERENT state.
+    let mut snaps = budget_snaps(NAT64_AGGREGATE_BUDGET.max_prefixes as usize);
+    snaps.push(NAT64RuleSnapshot {
+        name: "refused".to_string(),
+        prefix: "2001:db8:cccc::/96".to_string(),
+        pool_addresses: vec!["198.51.100.9".to_string()],
+        ..Default::default()
+    });
+    let over = Nat64State::from_snapshots(&snaps);
+    let last = over.prefixes.last().expect("the refused prefix is installed");
+    assert!(last.over_budget, "the past-cap prefix must be marked over-budget");
+
+    let dst_refused: Ipv6Addr = "2001:db8:cccc::c633:6401".parse().unwrap();
+    assert_eq!(
+        over.classify_ipv6_dest(dst_refused),
+        Nat64Match::MatchUnavailable,
+        "a refused prefix must DROP fail-closed, never route as untranslated IPv6"
+    );
+
+    // The three states are pairwise distinguishable. Classification alone is
+    // NOT enough — (b) and (c) share it — which is exactly why `over_budget`
+    // has to be carried rather than inferred from `pool_v4.is_empty()`.
+    let healthy_p = &state.prefixes[0];
+    let empty_p = &state.prefixes[1];
+    assert_ne!(
+        (empty_p.pool_v4.is_empty(), empty_p.over_budget),
+        (last.pool_v4.is_empty(), last.over_budget),
+        "empty-by-config and refused-by-budget must not be the same observable state; \
+         both classify MatchUnavailable, so the flag is the only thing separating them"
+    );
+    assert_ne!(
+        (healthy_p.pool_v4.is_empty(), healthy_p.over_budget),
+        (empty_p.pool_v4.is_empty(), empty_p.over_budget),
+    );
+}
+
+/// #6982: a REUSED allocator is charged in phase 1, BEFORE any new prefix is
+/// admitted — so admission does not depend on snapshot ORDER.
+///
+/// This is the #6812 F2-round-4 invariant. Charging reuse where it is met lets
+/// a NEW prefix be admitted against a total that does not yet include reused
+/// prefixes appearing LATER in the slice; those are then accepted
+/// unconditionally and the live set ends up over the cap, one extra prefix per
+/// apply.
+///
+/// Fail-on-revert: move the phase-1 loop inline (charge reuse at the point it
+/// is met) and the reversed order admits the new prefix.
+#[test]
+fn nat64_6982_reuse_is_charged_before_new_prefixes_regardless_of_order() {
+    let n = NAT64_AGGREGATE_BUDGET.max_prefixes as usize;
+    // A full generation at exactly the cap.
+    let first = Nat64State::from_snapshots(&budget_snaps(n));
+    assert!(first.prefixes.iter().all(|p| !p.over_budget), "generation 1 fits exactly");
+
+    let newcomer = NAT64RuleSnapshot {
+        name: "newcomer".to_string(),
+        prefix: "2001:db8:ffff::/96".to_string(),
+        pool_addresses: vec!["198.51.100.200".to_string()],
+        ..Default::default()
+    };
+
+    for (label, snaps) in [
+        ("reused-first", {
+            let mut v = budget_snaps(n);
+            v.push(newcomer.clone());
+            v
+        }),
+        ("newcomer-first", {
+            let mut v = vec![newcomer.clone()];
+            v.extend(budget_snaps(n));
+            v
+        }),
+    ] {
+        let next = Nat64State::from_snapshots_with_previous(&snaps, Some(&first), 0, 1);
+        let refused = next.prefixes.iter().filter(|p| p.over_budget).count();
+        assert_eq!(
+            refused, 1,
+            "{label}: exactly one prefix must be refused. If this is 0 the newcomer was \
+             admitted against a total that did not yet include the reused prefixes later in \
+             the slice — the live set is then over the cap, and it repeats one prefix per \
+             apply (#6982 / #6812 F2 r4)"
+        );
+        let newcomer_prefix = next
+            .prefixes
+            .iter()
+            .find(|p| p.prefix_bytes[..6] == [0x20, 0x01, 0x0d, 0xb8, 0xff, 0xff])
+            .expect("the newcomer is installed either way");
+        assert!(
+            newcomer_prefix.over_budget,
+            "{label}: the REFUSED one must be the newcomer, not a reused prefix — a reused \
+             allocator carries live translations and must be accepted unconditionally"
+        );
+    }
+}
+
+/// #6982: a no-op re-apply must not refuse anything.
+///
+/// Every prefix reuses, so phase 1 charges the whole live set and phase 2
+/// admits nothing new. If reuse were charged through `admitted_with` instead of
+/// unconditionally, a generation sitting exactly AT the cap would refuse its own
+/// prefixes on re-apply and kill live translations.
+#[test]
+fn nat64_6982_noop_reapply_refuses_nothing_at_the_cap() {
+    let n = NAT64_AGGREGATE_BUDGET.max_prefixes as usize;
+    let snaps = budget_snaps(n);
+    let first = Nat64State::from_snapshots(&snaps);
+    let again = Nat64State::from_snapshots_with_previous(&snaps, Some(&first), 0, 1);
+    assert_eq!(
+        again.prefixes.iter().filter(|p| p.over_budget).count(),
+        0,
+        "a no-op re-apply at exactly the cap must refuse nothing — a reused allocator holds \
+         live translated-port ownership and refusing it would strand those flows"
+    );
+    assert!(again.prefixes.iter().all(|p| p.pool_v4.len() == 1));
+}
+
+/// #6982: the silent phase-1 identity parser must accept exactly the rules the
+/// build loop accepts.
+///
+/// The two parses are separate code (the loop's logs loudly and skips
+/// all-or-nothing per #3888; phase 1 must not double-log). If phase 1 were
+/// STRICTER, a rule the loop installs would be invisible to the budget and its
+/// reuse uncharged — reopening the ordering hole. If it were LOOSER, a skipped
+/// rule would consume budget that nothing uses.
+#[test]
+fn nat64_6982_identity_parser_matches_the_build_loop() {
+    let cases = vec![
+        // accepted
+        NAT64RuleSnapshot {
+            name: "ok".into(),
+            prefix: "64:ff9b::/96".into(),
+            pool_addresses: vec!["198.51.100.1".into(), "198.51.100.2/32".into()],
+            ..Default::default()
+        },
+        NAT64RuleSnapshot {
+            name: "ok-empty-pool".into(),
+            prefix: "64:ff9b::/96".into(),
+            pool_addresses: vec![],
+            ..Default::default()
+        },
+        // skipped by the loop
+        NAT64RuleSnapshot { name: "empty-prefix".into(), prefix: String::new(), ..Default::default() },
+        NAT64RuleSnapshot { name: "no-mask".into(), prefix: "64:ff9b::".into(), ..Default::default() },
+        NAT64RuleSnapshot { name: "bad-mask".into(), prefix: "64:ff9b::/64".into(), ..Default::default() },
+        NAT64RuleSnapshot { name: "extra-slash".into(), prefix: "64:ff9b::/96/x".into(), ..Default::default() },
+        NAT64RuleSnapshot { name: "bad-addr".into(), prefix: "zzz/96".into(), ..Default::default() },
+        NAT64RuleSnapshot {
+            name: "bad-pool".into(),
+            prefix: "64:ff9b::/96".into(),
+            pool_addresses: vec!["198.51.100.0/24".into()],
+            ..Default::default()
+        },
+    ];
+    for snap in &cases {
+        // The loop's verdict: does a single-rule snapshot install a prefix?
+        let installed = !Nat64State::from_snapshots(std::slice::from_ref(snap))
+            .prefixes
+            .is_empty();
+        let identified = nat64_rule_identity(snap).is_some();
+        assert_eq!(
+            identified, installed,
+            "rule {:?}: phase-1 identity parser says {identified}, the build loop says \
+             {installed}. They must agree, or a rule's reuse is either uncharged (budget \
+             hole) or charged while nothing uses it (#6982)",
+            snap.name
+        );
+    }
+}
+
+/// #6982: the charge arithmetic saturates rather than wrapping.
+///
+/// A hand-crafted or HA-peer-synced snapshot can claim an absurd pool
+/// cardinality. Wrapping would make a colossal charge look SMALL and be
+/// admitted — the over-budget verdict has to be fail-closed.
+#[test]
+fn nat64_6982_charge_saturates_and_fails_closed() {
+    let huge = Nat64AggregateUse {
+        prefixes: u64::MAX,
+        addresses: u64::MAX,
+        port_capacity: u64::MAX,
+    };
+    let sum = huge.saturating_with(huge);
+    assert_eq!(sum.port_capacity, u64::MAX, "must saturate, never wrap");
+    assert!(
+        Nat64AggregateUse::default()
+            .admitted_with(huge, &NAT64_AGGREGATE_BUDGET)
+            .is_none(),
+        "an absurd charge must be REFUSED, not wrapped into a small one"
+    );
+    // A single pool address costs the FIXED full port range — there is no
+    // narrow-range case on this path, which is what makes NAT64 costlier per
+    // address than SNAT.
+    assert_eq!(
+        nat64_prefix_charge(1).port_capacity,
+        (NAT64_PORT_HIGH as u64 - NAT64_PORT_LOW as u64) + 1
+    );
+    assert_eq!(nat64_prefix_charge(0).port_capacity, 0);
+}

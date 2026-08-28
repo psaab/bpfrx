@@ -98,6 +98,7 @@ pub(crate) use iface_registry::{
     InterfaceNatAllocators,
 };
 pub(crate) use source::{
+    MAX_POOL_PREFIX_HOSTS,
     SourceNatFailure, SourceNatFailureReason, SourceNatFlowKey, SourceNatLookup, SourceNatRule,
     SyncedNatZones, allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6,
     match_source_nat,
