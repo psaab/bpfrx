@@ -268,6 +268,39 @@ func TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent(t *testing.T) {
 // rebuilds its own snapshot), so it cannot be probed by mutating a snapshot;
 // both sets are fed by the same two loops per producer, so a producer that
 // reached only the allowlist would be a new shape, not a missed one.
+//
+// THE EMPTY-REFUSED-SET ADDENDUM (#7021), which had been left open. The question
+// was what this guard asserts when the refused set is DEGENERATE — the shape in
+// which a coverage guard usually goes quietly vacuous. It does not, and the
+// answer is measured rather than argued.
+//
+// Forcing buildUserspaceRefusedNetdevs to return an empty set reds TEN
+// top-level tests. Re-measured at fb6b0bc93 by making the function return
+// userspaceRefusedNetdevs{} for any non-nil snapshot:
+//
+//	TestAFabricVoteCannotOverturnAnOwningRow
+//	TestAliasTableRefusesOnAReachablePlainSibling
+//	TestFabricLoopCannotReadmitARefusedMember
+//	TestFabricParentVerdictSurvivesACanonicalAlias
+//	TestOwnerlessFabricParentIsRefused
+//	TestParentRedirectCannotReadmitTheExcludedXfrmi
+//	TestPlainUnitKeepsItsOwnIfindexUnderARefusedParent
+//	TestSkewedFabricSampleKeepsIngressAndAllowlistAgreed
+//	TestSkewedParentSampleKeepsTheChildOutOfAdjudication
+//	TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT
+//
+// And THIS guard cannot go vacuous on a degenerate snapshot either, by three
+// separate constructions rather than by one:
+//
+//	len(baseEmitted) < 2   is a t.Fatalf PREMISE, not a skip, so a fixture that
+//	                       stops emitting fails instead of passing quietly.
+//	excused == 0           fires if the fixture loses its redirect shape.
+//	fallbackOnly == 0      fires if it loses its ownerless-fabric shape.
+//
+// So the empty case is guarded, and what was missing was only the write-up.
+// Stated plainly: an empty refused set is not a state this guard tolerates
+// silently — it is a state ten other tests already refuse, and the two arms
+// below refuse a fixture that has drifted into it.
 func TestEveryNetdevProducerIsEnumerated(t *testing.T) {
 	defer stubLinkSnapshot5619(t, map[string]int{
 		"ge-0-0-0": 20, "ge-0-0-3": 21, "fab0": 22,
@@ -497,9 +530,37 @@ func TestEveryNetdevProducerIsEnumerated(t *testing.T) {
 //
 // Measured at 8c011681c: refusesName(gr-0-0-3) = false, ingress set contains 20.
 //
-// FAIL-ON-REVERT: return the parent-config lookup to an exact map hit, or let a
-// fabric vote count while an interface row already owns the netdev, and this
-// reds.
+// FAIL-ON-REVERT — CORRECTED IN #7019, because the clause that stood here named
+// two reverts and THIS test reds on neither. Re-measured at fb6b0bc93, each cell
+// run against both this test and its sibling:
+//
+//	revert                                      this test   TestAFabricVote-
+//	                                                        CannotOverturnAnOwningRow
+//	R1 parent-config lookup -> exact map hit     GREEN       GREEN
+//	R2 drop the hasOwner -> abstains branch      GREEN       RED
+//	R1 + R2 together                             GREEN       RED
+//
+// R1 is DOMINATED at this fixture, which is the part worth knowing. A probe on
+// the two lookups printed, for the only parent this test produces:
+//
+//	parentLinux=gr-0-0-3 exact=found+tunnel tolerant=found+tunnel
+//	keys=[fab0,gr-0-0-3,ge-0/0/3,]
+//
+// The alias here is authored the other way round from what the paragraph above
+// describes: the fabric MEMBER is slash-spelled and the STANZA is dash-spelled,
+// so the stanza key already IS the netdev name and the exact hit finds it. The
+// tolerant lookup buys nothing on this config. It is not unbound — reverting it
+// reds TestFabricParentVerdictReadsTheClassTable, TestFabricAndBaseRowNeverDisagree
+// and TestProtocolGateDoesNotArmWhenARowOwnsTheFabricParent, whose fixtures put
+// the alias on the parent — it is simply not bound HERE.
+//
+// What this test actually binds is the PRODUCER: forcing
+// buildUserspaceRefusedNetdevs to return an empty set reds it, along with nine
+// others (#7021). So the honest contract is:
+//
+//	FAIL-ON-REVERT: empty the refused set, and this reds. The two reverts the
+//	old clause named are covered by the sibling and by the three class-table
+//	tests, not here.
 func TestFabricParentVerdictSurvivesACanonicalAlias(t *testing.T) {
 	const (
 		greIfindex = 20
