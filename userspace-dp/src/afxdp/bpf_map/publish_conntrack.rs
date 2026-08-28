@@ -243,6 +243,24 @@ pub(super) fn build_conntrack_value_v4(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// #6923: may a v6 session key with this protocol become visible to the shim?
+///
+/// False for exactly the next-header values the shim's extension-header walk
+/// TRAVERSES. Those are the values the walk can emit by EXHAUSTING its loop —
+/// it returns the last declared next-header, so an over-limit chain surfaces as
+/// a key whose "protocol" is an extension header. Such a key must never exist
+/// in the map, because the shim probes it and a hit means the over-limit chain
+/// takes the fast path on an identity nothing parsed.
+///
+/// Derived from `ipv6_ext_header_is_traversable` rather than a second list of
+/// protocol numbers. A duplicated set drifts, and it drifts in the direction
+/// that reopens the hole: the walker learns a new traversable type, this copy
+/// does not, and the refusal silently stops covering it — which is exactly how
+/// the #4517 types came to be missing from the GRE-inner classify in #6886.
+fn v6_session_key_is_publishable(protocol: u8) -> bool {
+    !crate::afxdp::ipv6_ext_header_is_traversable(protocol)
+}
+
 pub(super) fn publish_v6_session(
     conntrack_v6_fd: c_int,
     key: &SessionKey,
@@ -259,7 +277,50 @@ pub(super) fn publish_v6_session(
     // #5213: stable dataplane session id — see publish_v4_session.
     session_id: u64,
 ) {
-    let bpf_key = bpf_session_key_v6(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
+    // #6923: THE CHOKEPOINT. Refuse to make a key the shim would probe visible
+    // when its protocol is an IPv6 extension-header type rather than an L4.
+    //
+    // The shim's over-limit refusal was never a property of the shim. Its walk
+    // exhausts and returns the LAST DECLARED next-header — an extension-header
+    // value, not a real protocol — and `parse_l4`'s catch-all then yields ports
+    // 0/0. The intended consequence is that the session lookup MISSES and the
+    // packet is redirected to userspace. But the lookup only misses while
+    // nothing has published `(AF_INET6, <a traversable next-header>, src, dst,
+    // 0, 0)`. Publish that tuple and the next packet of the same over-limit
+    // chain HITS and takes the fast path, silently, with no code change
+    // anywhere near the shim.
+    //
+    // That was previously held by an ENUMERATION — two writers that both
+    // declined the tuple (`metadata_tuple_complete` on the packet path,
+    // `build_synced_session_key` on the HA import path) and a doc comment
+    // asking that a third not be added. A comment is not a gate, and an
+    // enumeration is only as good as its completeness.
+    //
+    // Here it is expressed ONCE, at the point where a key becomes shim-visible,
+    // so a third writer inherits it instead of having to remember it. This is
+    // the sole path by which a v6 key can enter the map the shim probes:
+    //   - `publish_bpf_conntrack_entry` -> here, `BPF_ANY` (creates)
+    //   - `refresh_bpf_conntrack_last_seen`, `BPF_EXIST` — CANNOT create; that
+    //     is demonstrated against a real map, not inferred from the flag's
+    //     name, by `test/mutation/selftest-bpf-exist-cannot-create_6923.sh`
+    //   - `delete_bpf_conntrack_entry` — a delete, which cannot mint a key
+    //
+    // DELIBERATELY UNREACHABLE TODAY. Both existing writers already decline, so
+    // this refuses nothing that currently happens — it is a backstop, and its
+    // value is that it stays true when a third writer appears. It is exercised
+    // by its own tests rather than by production traffic, which is the intended
+    // state for a backstop and not the "ships and does nothing" shape: the
+    // guard IS the deliverable, and it is directly testable at its own entry.
+    if !v6_session_key_is_publishable(key.protocol) {
+        return;
+    }
+    let bpf_key = bpf_session_key_v6(
+        src.octets(),
+        dst.octets(),
+        key.src_port,
+        key.dst_port,
+        key.protocol,
+    );
 
     let Some(value) = build_conntrack_value_v6(
         key,
@@ -511,5 +572,165 @@ mod alg_type_tests {
         );
         // Wrong protocol on an ALG port (e.g. TCP/53) is not the DNS ALG.
         assert_eq!(alg_type_for_session(PROTO_TCP, 41234, 53, 0), ALG_TYPE_NONE);
+    }
+}
+
+#[cfg(test)]
+mod publish_chokepoint_6923_tests {
+    use super::*;
+
+    /// #6923: the refusal covers exactly the traversable set — and no more.
+    ///
+    /// The second half is the part that needs saying. A refusal that is too
+    /// WIDE is not a safe direction here: it would stop publishing sessions
+    /// that are legitimate today, turning a backstop into an outage. So this
+    /// sweeps all 256 values and asserts both directions.
+    #[test]
+    fn refusal_covers_exactly_the_traversable_set_6923() {
+        let mut refused = Vec::new();
+        for protocol in 0u8..=255 {
+            let publishable = v6_session_key_is_publishable(protocol);
+            let traversable = crate::afxdp::ipv6_ext_header_is_traversable(protocol);
+            assert_eq!(
+                publishable, !traversable,
+                "#6923: protocol {protocol}: publishable={publishable} but traversable={traversable}. \
+                 The refusal must be exactly the set the shim's walk can emit by exhausting its \
+                 loop — narrower reopens the hole, wider drops legitimate sessions"
+            );
+            if !publishable {
+                refused.push(protocol);
+            }
+        }
+        assert_eq!(
+            refused,
+            vec![0, 43, 44, 51, 60, 135, 139, 140, 253, 254],
+            "#6923: the refused set changed. If the walker legitimately learned a new traversable \
+             type this is the expected red — update it deliberately. If it SHRANK, the refusal \
+             just stopped covering a value the shim can still emit"
+        );
+    }
+
+    /// THE POSITIVE CONTROL: the refusal must not reject a key that is
+    /// legitimate today.
+    ///
+    /// Without this the sweep above is satisfiable by refusing everything, and
+    /// "refuse everything" is a total outage of v6 session publication that
+    /// would look, from the shim's side, exactly like the fix working — every
+    /// probe misses and every packet goes to userspace. Slower, correct-looking,
+    /// and catastrophic.
+    #[test]
+    fn refusal_does_not_reject_a_currently_legitimate_key_6923() {
+        for (protocol, name) in [
+            (PROTO_TCP, "TCP"),
+            (PROTO_UDP, "UDP"),
+            (crate::ip_proto::PROTO_ICMPV6, "ICMPv6"),
+            (crate::ip_proto::PROTO_ESP, "ESP"),
+            (crate::ip_proto::PROTO_SCTP, "SCTP"),
+            (crate::ip_proto::PROTO_GRE, "GRE"),
+        ] {
+            assert!(
+                v6_session_key_is_publishable(protocol),
+                "#6923: {name} ({protocol}) is a real L4/terminal protocol whose v6 sessions must \
+                 still publish. Refusing it would take the fast path away from live traffic, and \
+                 from the shim's side that is indistinguishable from the backstop working"
+            );
+        }
+    }
+
+    /// #6923 WIRING: `publish_v6_session` must CALL the refusal, before it
+    /// builds the key.
+    ///
+    /// Added because deleting the call red nothing: every other test here
+    /// exercises the predicate directly, and the predicate was never the part
+    /// at risk. A refusal that is perfectly correct and never invoked is the
+    /// defect this whole change is about, one layer in — and this codebase has
+    /// hit that shape repeatedly (#6888, #7713, and #7734's own detector).
+    ///
+    /// A behavioural test would be better, but publishing needs a real BPF map
+    /// fd and CAP_BPF, which unit tests do not have. So this binds the call
+    /// site structurally, and the ORDER with it: the refusal must precede the
+    /// `BpfSessionKeyV6` construction, because a check after the map update
+    /// would let the key exist for the window that matters.
+    #[test]
+    fn publish_v6_session_calls_the_refusal_before_building_the_key_6923() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/afxdp/bpf_map/publish_conntrack.rs"),
+        )
+        .expect("read publish_conntrack.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(super) fn publish_v6_session(")
+            .expect("#6923: publish_v6_session is gone — fix this bind, do not delete it");
+        let body = &code[start..];
+        let end = body.find("\n}").expect("#6923: could not bound publish_v6_session");
+        let body = &body[..end];
+
+        let guard_at = body.find("v6_session_key_is_publishable").expect(
+            "#6923: publish_v6_session does not call the refusal. The predicate can be entirely \
+             correct and never invoked — that is the same defect this change exists to close, one \
+             layer in",
+        );
+        // #7743: the key construction was single-sourced into
+        // `bpf_session_key_v6`, so this anchor accepts EITHER spelling and
+        // takes whichever appears first. Pinning only the struct literal made
+        // this guard fail the moment the builder replaced it — a pinned literal
+        // must become an alias, not a decommissioned test. If NEITHER spelling
+        // is present the key is no longer built here at all, and the expect
+        // below fails loudly rather than passing vacuously.
+        let key_at = [
+            body.find("bpf_session_key_v6("),
+            body.find("BpfSessionKeyV6 {"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect(
+            "#6923/#7743: publish_v6_session no longer builds a v6 key by any known spelling \
+             (neither `bpf_session_key_v6(` nor `BpfSessionKeyV6 {`) — re-anchor this bind, do \
+             not delete it",
+        );
+        assert!(
+            guard_at < key_at,
+            "#6923: the refusal must run BEFORE the key is built and published. A check placed \
+             after the map update leaves the key visible to the shim for exactly the window that \
+             matters"
+        );
+    }
+
+    /// #6923 anti-drift: the refusal must DERIVE from the walker's own set.
+    ///
+    /// Comments stripped first — this module's prose names both identifiers, so
+    /// an unstripped scan would be satisfied by the documentation rather than
+    /// the code (the #6885 lesson).
+    #[test]
+    fn refusal_derives_from_the_walker_set_not_a_second_list_6923() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/afxdp/bpf_map/publish_conntrack.rs"),
+        )
+        .expect("read publish_conntrack.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("fn v6_session_key_is_publishable(")
+            .expect("#6923: the predicate is gone — this bind has rotted, fix it, do not delete it");
+        let body = &code[start..];
+        let end = body.find("\n}").expect("#6923: could not bound the predicate");
+        let body = &body[..end];
+        assert!(
+            body.contains("ipv6_ext_header_is_traversable"),
+            "#6923: the refusal must derive from `ipv6_ext_header_is_traversable`, not restate a \
+             list of protocol numbers. A second copy drifts, and it drifts toward reopening the \
+             hole: the walker learns a type, the copy does not, and the refusal silently stops \
+             covering it"
+        );
     }
 }

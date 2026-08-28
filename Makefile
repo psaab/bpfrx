@@ -230,6 +230,28 @@ test-rust:
 # the temp files are removed on every exit path. The awk projection
 # drops the LOC column ($$2), leaving "tier path" — the canary's
 # criterion — and sorts it so row order cannot affect the verdict.
+# #6937 struct-heterogeneity drift. Standalone, like audit-check, and for
+# the same reason: this is a repo-GLOBAL snapshot, so making it a gate
+# would flip it for every author whenever any struct anywhere crossed a
+# floor (see pkg/refactoraudit/doc.go on why global freshness stopped
+# being a gate). The per-struct signal is reviewable in the artifact diff.
+.PHONY: audit-structs
+audit-structs:
+	@tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; \
+	bash scripts/refactoring-audit-structs.sh > "$$tmp" || { \
+		echo "ERROR: scripts/refactoring-audit-structs.sh failed."; exit 1; }; \
+	if [ ! -s "$$tmp" ]; then \
+		echo "ERROR: generator produced no rows; refusing to report an empty audit."; \
+		exit 1; \
+	fi; \
+	if diff -u docs/refactoring-audit-structs.txt "$$tmp"; then \
+		echo "struct audit: up to date ($$(wc -l < "$$tmp") rows)"; \
+	else \
+		echo ""; \
+		echo "struct audit is stale. Regenerate with:"; \
+		echo "  bash scripts/refactoring-audit-structs.sh > docs/refactoring-audit-structs.txt"; \
+	fi
+
 .PHONY: audit-check
 audit-check:
 	@tmp=$$(mktemp); com=$$(mktemp); gen=$$(mktemp); \
