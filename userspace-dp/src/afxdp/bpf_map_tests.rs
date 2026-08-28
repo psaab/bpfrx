@@ -348,15 +348,13 @@ fn bpf_conntrack_key_port_byte_order() {
     // SessionKey stores ports in host order (u16::from_be_bytes in parsing).
     // publish_bpf_conntrack_entry must apply .to_be() to produce the correct
     // big-endian byte pattern in the packed struct.
+    // #7743: this fixture used to build the struct literal INLINE, with its own
+    // `.to_be()` calls. It therefore asserted only that `u16::to_be` works —
+    // reverting the production encoding left it GREEN, because no production
+    // code was on the path. It now calls the single-source builder every
+    // publish/refresh/delete site uses, so dropping a `.to_be()` there REDS.
     let port: u16 = 80;
-    let bpf_key = BpfSessionKeyV4 {
-        src_ip: [10, 0, 1, 102],
-        dst_ip: [10, 0, 2, 1],
-        src_port: port.to_be(),
-        dst_port: 443u16.to_be(),
-        protocol: 6,
-        pad: [0; 3],
-    };
+    let bpf_key = bpf_session_key_v4([10, 0, 1, 102], [10, 0, 2, 1], port, 443, 6);
     // The packed struct bytes at the port offsets must be big-endian:
     // port 80 = 0x0050 -> bytes [0x00, 0x50]
     // port 443 = 0x01BB -> bytes [0x01, 0xBB]
@@ -641,4 +639,67 @@ fn ingress_identity_does_not_occupy_the_fib_egress_slots_4983() {
         value.fib_vlan_id, 0,
         "the ingress VLAN must not leak into the FIB EGRESS vlan slot (#4983)"
     );
+}
+
+// #7743: the v6 twin of `bpf_conntrack_key_port_byte_order`. The v6 key is
+// `#[repr(C, packed)]` and 40 bytes, so the ports sit at offsets 32..36 with no
+// alignment padding before them.
+#[test]
+fn bpf_conntrack_key_v6_port_byte_order() {
+    let src = Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200);
+    let dst = Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 8);
+    let bpf_key = bpf_session_key_v6(src.octets(), dst.octets(), 80, 443, 6);
+    let bytes: [u8; 40] = unsafe { core::mem::transmute(bpf_key) };
+    assert_eq!(bytes[32], 0x00, "src_port high byte");
+    assert_eq!(bytes[33], 0x50, "src_port low byte");
+    assert_eq!(bytes[34], 0x01, "dst_port high byte");
+    assert_eq!(bytes[35], 0xBB, "dst_port low byte");
+    assert_eq!(bytes[36], 6, "protocol");
+    assert_eq!(&bytes[37..40], &[0, 0, 0], "pad must be zeroed");
+}
+
+// #7743 ANTI-DRIFT: the conntrack key encoding is single-sourced in
+// `bpf_session_key_v4` / `bpf_session_key_v6` precisely because publish,
+// refresh and delete must address the same map row byte-for-byte. A ninth
+// hand-rolled literal would silently reintroduce the drift this consolidated,
+// and it would not fail any behavioural test — publish and delete would simply
+// stop matching, leaking the row. Scan the source for a struct literal that
+// builds the key from `.octets()` outside the builders.
+#[test]
+fn conntrack_key_encoding_has_no_hand_rolled_copies() {
+    let sources = [
+        (
+            "bpf_map/mod.rs",
+            include_str!("bpf_map/mod.rs"),
+        ),
+        (
+            "bpf_map/publish_conntrack.rs",
+            include_str!("bpf_map/publish_conntrack.rs"),
+        ),
+    ];
+    for (name, src) in sources {
+        // Strip line comments so this test's own prose (and the builder doc
+        // comments, which name the literal) cannot satisfy or trip the scan.
+        let code: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for family in ["BpfSessionKeyV4", "BpfSessionKeyV6"] {
+            for (idx, _) in code.match_indices(&format!("{family} {{")) {
+                let tail = &code[idx..];
+                let end = tail.find('}').map_or(tail.len(), |e| e + 1);
+                let body = &tail[..end];
+                assert!(
+                    !body.contains(".octets()"),
+                    "{name}: hand-rolled {family} literal built from .octets() — \
+                     use bpf_session_key_v4/v6 so publish, refresh and delete \
+                     cannot drift apart (#7743). Offending block:\n{body}"
+                );
+            }
+        }
+    }
 }
