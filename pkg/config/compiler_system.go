@@ -22,6 +22,34 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 	}
 	sys.DataplaneType = dpType
 
+	// #6956: `system host-name fw1;` packs the value onto the `system` node's
+	// OWN Keys — `Keys=["system","host-name","fw1"]` with ZERO children — so the
+	// child walk below never runs and the host name compiled to "" with no
+	// error and no warning. The nested spelling `system { host-name fw1; }`
+	// works, and the flattened one is what `display set` output and vSRX
+	// migration paths produce.
+	//
+	// Everything keyed on host name is affected: the management TLS
+	// certificate's subject, syslog's origin field, the CLI prompt.
+	//
+	// Read here rather than through `packedBodyChildren` + a `packedTail` opt-in
+	// (the #6821 mechanism) DELIBERATELY. That pairing exists because compiling
+	// a packed tail the gate does not validate turns "not compiled" into
+	// "compiled, unvalidated". It has nothing to bypass here: `host-name` is a
+	// scalar leaf with NO validator, measured in both spellings — `system
+	// host-name bad..name;` and `system { host-name bad..name; }` are both
+	// accepted by SchemaValidate today. So the rule is satisfied vacuously, and
+	// this stays narrowed to the leaf the issue names rather than teaching the
+	// gate to validate every packed token on the `system` line, which would
+	// newly reject configurations that commit cleanly now.
+	if len(node.Keys) >= 3 && node.Keys[1] == "host-name" {
+		sys.HostName = node.Keys[2]
+	}
+
+	// #6957/#6992: spans every `login` child of this `system` node. See the
+	// `case "login"` arm.
+	var loginUserByName map[string]*LoginUser
+
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "host-name":
@@ -100,7 +128,41 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				}
 			}
 		case "login":
-			sys.Login = &LoginConfig{}
+			// #6957: allocate ONCE. This arm runs per `login` child, and two
+			// sibling `login { … }` blocks under one `system` are legal Junos —
+			// a generated or concatenated config produces them routinely, and an
+			// operator appending a second stanza to add an account is the
+			// motivating case. Reallocating here discarded everything the
+			// EARLIER block had contributed, so the compiled set reduced to the
+			// last block and the first block's users vanished with no error.
+			//
+			// That is not merely absent-from-config: `reconcileAbsentLoginUsers`
+			// treats the compiled set as authoritative and DEPROVISIONS
+			// xpf-managed accounts missing from it, so the lost accounts were
+			// removed from the box by a commit that reported success.
+			//
+			// Everything below this line already appends (`sys.Login.Classes`,
+			// `sys.Login.Users`), so allocating once is the whole fix —
+			// subsequent blocks accumulate into the same struct.
+			//
+			// Distinct root from #6956, which is fixed in the same change: that
+			// one is a packed tail the walk never reads; this one is two
+			// children the walk reads and then overwrites.
+			if sys.Login == nil {
+				sys.Login = &LoginConfig{}
+			}
+			// #6957 + #6992: the name->entry index must span blocks too, for the
+			// same reason the allocation must. #6992 folds a user NAME authored
+			// twice into ONE entry, but its index was declared inside this arm,
+			// so it reset per block and could only ever fold WITHIN one. That
+			// was invisible while the reallocation above discarded the earlier
+			// block — the duplicate never coexisted, so the fold was never asked
+			// to span anything and #6992's own cross-block cell passed for the
+			// wrong reason. Fixing #6957 makes the duplicate real, which is what
+			// surfaced it.
+			if loginUserByName == nil {
+				loginUserByName = map[string]*LoginUser{}
+			}
 			// #4304 S-2: parse custom `login class <name>` RBAC definitions so
 			// a real vSRX config commits (the `user ... class` enum accepts
 			// the defined names) and maps its Junos permission set onto xpf's
@@ -176,7 +238,7 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			// Deliberately NOT applied to `class`: #6838 already made the class
 			// cohort reader-independent by folding permissions across it, and a
 			// merge here would fight that design.
-			userByName := map[string]*LoginUser{}
+			userByName := loginUserByName
 			for _, userInst := range namedInstances(child.FindChildren("user")) {
 				user := userByName[userInst.name]
 				if user == nil {

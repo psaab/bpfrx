@@ -1054,8 +1054,21 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 		if config.IsSecureTunnelIfName(ifName) {
 			mtu := ifCfg.MTU
 			for unitNum, unit := range ifCfg.Units {
-				unitName, _ := config.XFRMIfNameAndID(fmt.Sprintf("%s.%d", ifName, unitNum))
-				if unitName == "" {
+				// #6955: resolve the netdev through the AUTHORED
+				// `bind-interface` string, not by reconstructing it from the
+				// ref. pkg/routing/xfrm.go materialises the device under
+				// exactly `LinuxIfName(bindInterface)`, so `bind-interface
+				// st0` creates `st0` while the unit ref is `st0.0` — and the
+				// reconstruction answered `st0.0`, a device that does not
+				// exist. The lookup below then missed and `continue`d, so the
+				// authored `family inet address` was never applied and the
+				// tunnel came up with no IP and no connected prefix.
+				//
+				// `ok == false` means no configured VPN binds this ref (or its
+				// if_id collides), in which case pkg/routing creates NO device
+				// and there is nothing to address.
+				unitName, ok := cfg.SecureTunnelUnitNetdev(fmt.Sprintf("%s.%d", ifName, unitNum))
+				if !ok {
 					continue
 				}
 				if _, err := result.cachedInterfaceByName(unitName); err != nil {
