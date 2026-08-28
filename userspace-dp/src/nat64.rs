@@ -223,6 +223,22 @@ pub(crate) struct Nat64Prefix {
     /// `(external IPv4, port)` → subscriber reverse needs no per-flow log
     /// (lawful-intercept / CGN audit). `None` => the pre-#4559 round-robin path.
     pub(crate) deterministic_v6: Option<DeterministicV6>,
+    /// #6982: this prefix was REFUSED by the aggregate allocator budget, so it
+    /// carries an empty pool and no bitmap.
+    ///
+    /// It is installed rather than skipped on purpose: a skipped prefix does not
+    /// match, so its traffic falls through to `NoPrefixMatch` and is ROUTED as
+    /// ordinary IPv6 — a memory guard that turns into a translation bypass.
+    /// Installed-with-an-empty-pool drops fail-closed instead.
+    ///
+    /// The flag exists because that makes a refusal LOOK like the legitimate
+    /// empty-pool rule the Go side emits for a no-source-pool config: both
+    /// classify `MatchUnavailable`. The two have opposite remedies (raise the
+    /// budget or split the config vs. add a source pool), so the state is
+    /// carried explicitly rather than inferred from `pool_v4.is_empty()`.
+    /// Asserted at the CONSUMPTION boundary by
+    /// `nat64_6982_over_budget_is_distinguishable_from_empty_pool`.
+    pub(crate) over_budget: bool,
 }
 
 impl Clone for Nat64Prefix {
@@ -234,6 +250,7 @@ impl Clone for Nat64Prefix {
             // Clone shares the Arc-backed allocator state (see field doc).
             port_allocator: self.port_allocator.clone(),
             deterministic_v6: self.deterministic_v6,
+            over_budget: self.over_budget,
         }
     }
 }
@@ -982,6 +999,140 @@ fn parse_pool_v4(s: &str) -> Option<Ipv4Addr> {
 /// paired `eprintln!` at the call site; this counter gives tests (and, via
 /// future stats plumbing, operators) a signal that does not require scraping
 /// stderr.
+/// #6982: aggregate ceiling on the NAT64 allocator bitmaps ONE apply may hold
+/// live. The SNAT sibling (#6812, `nat::source::SOURCE_NAT_AGGREGATE_BUDGET`).
+///
+/// WHY NAT64 NEEDS ITS OWN. #6812 caps `PortAllocator::new` at the SNAT apply
+/// boundary, but there are exactly two production construction sites and the
+/// other one is here — gated by nothing. A NAT64 prefix costs
+/// `pool_v4.len() * (NAT64_PORT_HIGH - NAT64_PORT_LOW + 1)` = `len * 64512`
+/// occupancy bits, and unlike SNAT the port range is a FIXED CONSTANT, so every
+/// pool address costs the MAXIMUM — there is no narrow-range case to soften it.
+/// The ~1.48 GiB scenario #6812 exists to prevent was reachable through this
+/// path with #6812 fully in place.
+///
+/// The three limits are the SNAT values unchanged. Deliberate: the two paths
+/// draw on one machine's memory, so a NAT64-specific relaxation would just move
+/// the ceiling. They are charged SEPARATELY rather than against one shared
+/// counter — see the PR discussion; a shared counter would make a NAT64 apply's
+/// admissibility depend on SNAT rule ordering in a different snapshot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Nat64AggregateBudget {
+    /// Max DISTINCT prefix allocator instances.
+    pub(crate) max_prefixes: u64,
+    /// Max SUM of every prefix's pool address count.
+    pub(crate) max_addresses: u64,
+    /// Max SUM of (addresses x fixed port range) = occupancy bitmap SLOTS.
+    pub(crate) max_port_capacity: u64,
+}
+
+pub(crate) const NAT64_AGGREGATE_BUDGET: Nat64AggregateBudget = Nat64AggregateBudget {
+    max_prefixes: 1024,
+    max_addresses: 16 * crate::nat::MAX_POOL_PREFIX_HOSTS, // 1,048,576
+    max_port_capacity: 1 << 33,                            // 8,589,934,592
+};
+
+/// Running aggregate charge. u64 with SATURATING adds: a hand-crafted or
+/// HA-peer-synced snapshot can claim absurd cardinalities, and saturating
+/// (never wrapping) keeps the over-budget verdict fail-closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Nat64AggregateUse {
+    pub(crate) prefixes: u64,
+    pub(crate) addresses: u64,
+    pub(crate) port_capacity: u64,
+}
+
+impl Nat64AggregateUse {
+    /// Cumulative use UNCONDITIONALLY including `charge`. Used for keys that
+    /// must be accepted regardless of budget (reused live state), and as the
+    /// candidate inside `admitted_with`.
+    pub(crate) fn saturating_with(self, charge: Self) -> Self {
+        Self {
+            prefixes: self.prefixes.saturating_add(charge.prefixes),
+            addresses: self.addresses.saturating_add(charge.addresses),
+            port_capacity: self.port_capacity.saturating_add(charge.port_capacity),
+        }
+    }
+
+    /// Cumulative use IF `charge` is admitted, or `None` when admitting it
+    /// would cross any limit. First-fit: a refused prefix commits NOTHING, so a
+    /// later smaller one can still install.
+    pub(crate) fn admitted_with(
+        self,
+        charge: Self,
+        budget: &Nat64AggregateBudget,
+    ) -> Option<Self> {
+        let next = self.saturating_with(charge);
+        (next.prefixes <= budget.max_prefixes
+            && next.addresses <= budget.max_addresses
+            && next.port_capacity <= budget.max_port_capacity)
+            .then_some(next)
+    }
+}
+
+/// The charge one prefix's pool costs. Separated so the test suite can cross a
+/// limit by POOL COUNT without materialising 2^33 port slots — a fixture that
+/// genuinely allocates the bitmap is a test that gets deleted for being slow,
+/// and a deleted guard is no guard (#6982).
+pub(crate) fn nat64_prefix_charge(pool_len: usize) -> Nat64AggregateUse {
+    Nat64AggregateUse {
+        prefixes: 1,
+        addresses: pool_len as u64,
+        // ONE formula for "port slots this allocator materialises", shared with
+        // `PortAllocator::new`'s own capacity arithmetic — the same helper the
+        // SNAT charge uses (#6812). Open-coding `len * 64512` here would be a
+        // second copy of the allocation formula, and a charge that drifts from
+        // what is actually allocated is a budget that does not bind. Pinned by
+        // `nat64_6982_charge_uses_the_allocators_own_capacity_formula`.
+        port_capacity: crate::nat::allocator_capacity(
+            pool_len,
+            NAT64_PORT_LOW,
+            NAT64_PORT_HIGH,
+        ) as u64,
+    }
+}
+
+/// #6982 phase 1 helper: the (prefix, pool) IDENTITY of a snapshot, or `None`
+/// if the rule is one the build loop will skip as malformed.
+///
+/// SILENT by design. The build loop below logs each skip loudly (#3888
+/// all-or-nothing); this pass runs first, over the same snapshots, purely to
+/// learn which prefixes will REUSE a live allocator. Logging here would double
+/// every malformed-rule warning. It must stay in lockstep with the loop's own
+/// parse — `nat64_6982_identity_parser_matches_the_build_loop` binds that, so
+/// a rule the loop accepts can never be invisible to the budget.
+fn nat64_rule_identity(snap: &NAT64RuleSnapshot) -> Option<([u8; 12], Vec<Ipv4Addr>)> {
+    if snap.prefix.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = snap.prefix.split('/').collect();
+    if parts.len() != 2 || parts[1].parse::<u8>().ok() != Some(96) {
+        return None;
+    }
+    let addr: Ipv6Addr = parts[0].parse().ok()?;
+    let octets = addr.octets();
+    let mut prefix_bytes = [0u8; 12];
+    prefix_bytes.copy_from_slice(&octets[..12]);
+    let mut pool_v4 = Vec::with_capacity(snap.pool_addresses.len());
+    for s in &snap.pool_addresses {
+        pool_v4.push(parse_pool_v4(s)?);
+    }
+    Some((prefix_bytes, pool_v4))
+}
+
+/// #6982: prefixes refused by the aggregate budget since boot.
+///
+/// A refused prefix is INSTALLED with an empty pool rather than skipped, so
+/// traffic to it drops fail-closed (`MatchUnavailable`) instead of falling
+/// through to `NoPrefixMatch` and being ROUTED as ordinary IPv6 — skipping
+/// would turn a memory guard into a translation bypass. But that makes the
+/// refusal look exactly like the legitimate empty-pool rule the Go side emits
+/// for a no-source-pool config, which is why the state is ALSO carried
+/// explicitly on the prefix (`Nat64Prefix::over_budget`) and counted here.
+/// Three states, not two: healthy, empty-by-config, refused-by-budget.
+pub(crate) static NAT64_OVER_BUDGET_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) static DETERMINISTIC_V6_DOWNGRADE_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1103,6 +1254,26 @@ impl Nat64State {
         // onto every rule snapshot. Treat the state as enabled if any rule
         // carries the flag (they all carry the same value in practice).
         let no_v6_frag_header = snaps.iter().any(|s| s.no_v6_frag_header);
+        // #6982 PHASE 1: reserve every prefix that will REUSE a live allocator,
+        // BEFORE any new one is admitted.
+        //
+        // This ordering is the #6812 F2-round-4 invariant, and it is not
+        // optional. Charging reuse where it is MET lets a NEW prefix be admitted
+        // against a total that does not yet include reused prefixes appearing
+        // LATER in the slice — and those are then accepted unconditionally, so
+        // the live set ends up over the cap. Same snapshots, opposite outcome
+        // from ORDER alone, repeating one prefix per apply. Bound by
+        // `nat64_6982_reuse_is_charged_before_new_prefixes_regardless_of_order`.
+        let mut used = Nat64AggregateUse::default();
+        if let Some(prev) = previous {
+            for snap in snaps {
+                if let Some((pb, pool)) = nat64_rule_identity(snap) {
+                    if prev.reuse_allocator(&pb, &pool).is_some() {
+                        used = used.saturating_with(nat64_prefix_charge(pool.len()));
+                    }
+                }
+            }
+        }
         // Labeled so a bad pool entry can skip the WHOLE rule (all-or-nothing,
         // #3888) rather than narrowing the pool (the #2212 fail-open).
         'rules: for snap in snaps {
@@ -1186,8 +1357,43 @@ impl Nat64State {
             // counters are pool-position indexed, so stale reservations against
             // a different pool must not be replayed. Mirrors source NAT's
             // `previous_allocators` reuse in `parse_source_nat_rules_with_previous`.
-            let port_allocator = previous
-                .and_then(|prev| prev.reuse_allocator(&prefix_bytes, &pool_v4))
+            //
+            // #6982 PHASE 2. A REUSED allocator is accepted unconditionally (it
+            // was charged in phase 1): a no-op re-apply must never kill live
+            // translations. A NEW one is admitted only if it fits the remaining
+            // budget; a refused prefix commits nothing (first-fit), so a later
+            // smaller prefix can still install.
+            let reused = previous.and_then(|prev| prev.reuse_allocator(&prefix_bytes, &pool_v4));
+            let mut over_budget = false;
+            if reused.is_none() {
+                match used.admitted_with(nat64_prefix_charge(pool_v4.len()), &NAT64_AGGREGATE_BUDGET)
+                {
+                    Some(next) => used = next,
+                    None => {
+                        over_budget = true;
+                        NAT64_OVER_BUDGET_COUNT.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "xpf nat64: rule {:?} REFUSED by the aggregate allocator budget \
+                             (prefixes {}/{}, addresses {}/{}, port slots {}/{} would be \
+                             exceeded by a {}-address pool); installing it with an EMPTY pool so \
+                             its traffic drops fail-closed rather than routing untranslated \
+                             (#6982)",
+                            snap.name,
+                            used.prefixes,
+                            NAT64_AGGREGATE_BUDGET.max_prefixes,
+                            used.addresses,
+                            NAT64_AGGREGATE_BUDGET.max_addresses,
+                            used.port_capacity,
+                            NAT64_AGGREGATE_BUDGET.max_port_capacity,
+                            pool_v4.len(),
+                        );
+                        // Drop the pool BEFORE any allocator is built: the whole
+                        // point is that no occupancy bitmap is materialised.
+                        pool_v4.clear();
+                    }
+                }
+            }
+            let port_allocator = reused
                 .unwrap_or_else(|| {
                     let fresh =
                         PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH);
@@ -1252,8 +1458,15 @@ impl Nat64State {
             // `deterministic_host_base_v6`), that fallback is an operator-
             // visible compliance loss (CGN mapping stops being deterministic),
             // so it must not be silent.
-            let deterministic_v6 = build_deterministic_v6(snap, pool_v4.len());
-            if deterministic_v6.is_none() && !snap.deterministic_host_base_v6.is_empty() {
+            // #6982: a refused prefix has no pool, so it has no deterministic
+            // mapping either — and it must NOT emit the downgrade warning below,
+            // which would attribute a budget refusal to bad deterministic config.
+            let deterministic_v6 = if over_budget {
+                None
+            } else {
+                build_deterministic_v6(snap, pool_v4.len())
+            };
+            if !over_budget && deterministic_v6.is_none() && !snap.deterministic_host_base_v6.is_empty() {
                 DETERMINISTIC_V6_DOWNGRADE_COUNT.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
                     "xpf nat64: rule {:?} requested deterministic NAPT64 mapping (host-base {:?}) but failed to build (bad base / unsupported prefix-len / degenerate block math / pool-size overflow) — falling back to round-robin PAT; subscriber mappings are no longer deterministic",
@@ -1266,6 +1479,7 @@ impl Nat64State {
                 pool_index: AtomicUsize::new(0),
                 port_allocator,
                 deterministic_v6,
+                over_budget,
             });
         }
         Self {
