@@ -87,11 +87,9 @@ func (m *Manager) ClearSNATRules() error {
 	if !present {
 		return fmt.Errorf("snat_rules map not found")
 	}
-	empty := SNATValue{}
-	for i := uint32(0); i < MaxZones*MaxZones*MaxSNATRulesPerPair; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. MaxZones*MaxZones*MaxSNATRulesPerPair is
+	// snat_rules' max_entries.
+	return clearArrayEntriesIn(zm, "snat_rules", MaxZones*MaxZones*MaxSNATRulesPerPair, SNATValue{})
 }
 
 // SetDNATEntryV6 writes a dnat_table_v6 entry.
@@ -166,11 +164,9 @@ func (m *Manager) ClearSNATRulesV6() error {
 	if !present {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
-	empty := SNATValueV6{}
-	for i := uint32(0); i < MaxZones*MaxZones*MaxSNATRulesPerPair; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. MaxZones*MaxZones*MaxSNATRulesPerPair is
+	// snat_rules_v6' max_entries.
+	return clearArrayEntriesIn(zm, "snat_rules_v6", MaxZones*MaxZones*MaxSNATRulesPerPair, SNATValueV6{})
 }
 
 // SetNATPoolConfig writes a NAT pool configuration entry.
@@ -221,11 +217,8 @@ func (m *Manager) ClearNATPoolConfigs() error {
 	if !present {
 		return fmt.Errorf("nat_pool_configs map not found")
 	}
-	empty := NATPoolConfig{}
-	for i := uint32(0); i < 32; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. 32 is nat_pool_configs' max_entries.
+	return clearArrayEntriesIn(zm, "nat_pool_configs", 32, NATPoolConfig{})
 }
 
 // ClearNATPoolIPs zeroes all nat_pool_ips_v4 and nat_pool_ips_v6 entries.
@@ -247,9 +240,17 @@ func (m *Manager) ClearNATPoolIPs() error {
 	maxEntries := uint32(32 * MaxNATPoolIPsPerPool)
 	var zeroV4 uint32
 	zeroV6 := NATPoolIPV6{}
+	// #6959: PROPAGATE. Both writes stay in ONE interleaved loop rather
+	// than two clearArrayEntriesIn passes, so the visit order is byte for
+	// byte what it was before the error check was added. maxEntries is
+	// both maps' max_entries.
 	for i := uint32(0); i < maxEntries; i++ {
-		v4Map.Update(i, zeroV4, ebpf.UpdateAny)
-		v6Map.Update(i, zeroV6, ebpf.UpdateAny)
+		if err := v4Map.Update(i, zeroV4, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear nat_pool_ips_v4 entry %d: %w", i, err)
+		}
+		if err := v6Map.Update(i, zeroV6, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear nat_pool_ips_v6 entry %d: %w", i, err)
+		}
 	}
 	return nil
 }
@@ -364,7 +365,16 @@ func (m *Manager) SetNAT64Config(index uint32, cfg NAT64Config) error {
 	hm, present, _ := m.lookupMapLocked("nat64_prefix_map")
 	if present {
 		key := NAT64PrefixKey{Prefix: cfg.Prefix}
-		hm.Update(key, cfg, ebpf.UpdateAny)
+		// #6959: PROPAGATE. The array write above is already propagated;
+		// discarding this one let the two descriptions of the same NAT64
+		// prefix DIVERGE — the array holds the config, the hash map the
+		// BPF path actually looks up holds nothing — while the caller was
+		// told the whole write landed. The absent-map skip above stays
+		// deliberate (#2114 A3 optional access); only the rejected write
+		// on a map that IS present becomes an error.
+		if err := hm.Update(key, cfg, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("mirror nat64 prefix into nat64_prefix_map: %w", err)
+		}
 	}
 	return nil
 }
@@ -391,9 +401,11 @@ func (m *Manager) ClearNAT64Configs() error {
 	if !present {
 		return fmt.Errorf("nat64_configs not found")
 	}
+	// #6959: PROPAGATE. 4 == MAX_NAT64_PREFIXES is nat64_configs'
+	// max_entries.
 	var empty NAT64Config
-	for i := uint32(0); i < 4; i++ { // MAX_NAT64_PREFIXES
-		zm.Update(i, empty, ebpf.UpdateAny)
+	if err := clearArrayEntriesIn(zm, "nat64_configs", 4, empty); err != nil {
+		return err
 	}
 	// Clear the hash map
 	if hm, present, _ := m.lookupMapLocked("nat64_prefix_map"); present {
@@ -480,10 +492,9 @@ func (m *Manager) ClearNATRuleCounters() error {
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
-	for i := uint32(0); i < MaxNATRuleCounters; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. MaxNATRuleCounters is nat_rule_counters'
+	// max_entries.
+	return clearArrayEntriesIn(zm, "nat_rule_counters", MaxNATRuleCounters, zero)
 }
 
 // ReadNATPortCounter reads the per-CPU NAT port allocation counter for a pool

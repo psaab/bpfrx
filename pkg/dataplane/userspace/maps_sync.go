@@ -217,8 +217,19 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		// loss cluster. Every un-zeroed slot keeps whatever stale value it
 		// held. The bound the loop actually uses is the only thing worth
 		// pinning, so it is the only thing written.
+		//
+		// #6959: the Update error is PROPAGATED, matching the
+		// userspace_ctrl write above which already aborts bring-up on the
+		// same class of failure. A DISCARDED rejection here leaves the
+		// slot holding the previous load's timestamp, which reads as
+		// FRESH and lets the shim redirect to a worker that is not there
+		// — the exact hazard the #6702 bound fix above closed. The bound
+		// is the Array's own MaxEntries(), so no in-range write turns
+		// into a spurious bring-up failure.
 		for slot := uint32(0); slot < plan.HeartbeatSlots; slot++ {
-			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
+			if err := heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("zero userspace heartbeat slot %d: %w", slot, err)
+			}
 		}
 	}
 	return m.syncUserspaceClassifierMapsLocked(snapshot)
