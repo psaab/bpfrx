@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -122,7 +123,17 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 					t.Fatalf("CompileConfig ACCEPTED the ambiguous stanza %q; the truncator silently keeps only the names before `host-inbound-traffic`, so %q is dropped (#6735)",
 						tc.stanza, tc.wantLost)
 				}
-				for _, want := range []string{`"Z"`, "host-inbound-traffic", tc.wantLost} {
+				// #7028: the keyword is asserted through the RENDERED fragment,
+				// not as a bare substring. `host-inbound-traffic` also appears
+				// verbatim in the template's "rewrite in the block spelling"
+				// clause, so `strings.Contains(err, "host-inbound-traffic")`
+				// held for every reject this gate produced — including one whose
+				// %q argument was a constant. The detector returns the matched
+				// keyword precisely so the message cannot name the wrong token
+				// (see zoneInterfaceKeysBeforeBody's doc comment), and that is
+				// the property this row is here to bind.
+				wantKeyword := fmt.Sprintf("with %q followed by", "host-inbound-traffic")
+				for _, want := range []string{`"Z"`, wantKeyword, tc.wantLost} {
 					if !strings.Contains(err.Error(), want) {
 						t.Fatalf("reject error %q does not name %q — the message must identify the zone, the keyword, and the tokens that would have been dropped (#6735)",
 							err.Error(), want)

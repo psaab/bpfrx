@@ -3,6 +3,8 @@ package userspace
 import (
 	"encoding/json"
 	"fmt"
+	goscanner "go/scanner"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -97,15 +99,19 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 	// failure mode being defended against is an ordinary copy-paste of a
 	// sentence, not an adversary hand-obfuscating one.
 	//
-	// Known FALSE POSITIVE, pre-existing and deliberately not fixed here: the
-	// scan counts raw source bytes, so quoting this sentence inside a `//`
-	// comment in any non-test .go under pkg/ or cmd/ also reds the guard —
-	// measured — with a message asserting a duplicated literal that "lets the
-	// metric HELP and the status block drift". A comment cannot cause drift. It
-	// predates round 2 (round 1 counted raw bytes too) and is left alone, but
-	// screens.go and server_show_security_text.go now carry long comments ABOUT
-	// this sentence, so a near-miss is one reword away: if this guard reds on a
-	// file you only added prose to, that is this, not a duplicated literal.
+	// FIXED in #7061. The scan used to count raw source bytes, so quoting this
+	// sentence inside a `//` comment in any non-test .go under pkg/ or cmd/ red
+	// the guard — measured — with a message asserting a duplicated literal that
+	// "lets the metric HELP and the status block drift". A comment cannot cause
+	// drift, and the risk was not theoretical: screens.go and
+	// server_show_security_text.go carry long comments ABOUT this sentence, so
+	// the guard was one reword away from firing on prose.
+	//
+	// Comments are now blanked before the count (blankGoComments). That also
+	// narrows escape 1 above — a `+` seam interrupted by a comment is spliceable
+	// once the comment is whitespace — which is measured in
+	// TestBlankGoCommentsHidesProseAndExposesACommentInterruptedSeam_7061.
+	// Escapes 2, 3 and 4 are unchanged and remain deliberate limits.
 	total := 0
 	var hits []string
 	for _, sub := range []string{"pkg", "cmd"} {
@@ -118,7 +124,7 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 			if rerr != nil {
 				return nil
 			}
-			if n := strings.Count(concatSplice.ReplaceAllString(string(b), ""), fragment); n > 0 {
+			if n := strings.Count(concatSplice.ReplaceAllString(blankGoComments(string(b)), ""), fragment); n > 0 {
 				total += n
 				hits = append(hits, fmt.Sprintf("%s (x%d)", p, n))
 			}
@@ -161,7 +167,7 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 		// A split-concatenation copy: two adjacent quoted chunks that together
 		// reproduce the sentence. Normalising away Go string concatenation and
 		// re-counting catches it where the plain scan cannot.
-		normalised := concatSplice.ReplaceAllString(body, "")
+		normalised := concatSplice.ReplaceAllString(blankGoComments(body), "")
 		if n := strings.Count(normalised, fragment); n > 0 && consumer != filepath.Join(
 			root, "pkg", "dataplane", "userspace", "screens.go") {
 			t.Errorf("%s appears to inline the disposition via a split string "+
@@ -175,6 +181,42 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 // spacing — so a literal deliberately broken across chunks can be rejoined and
 // compared against the shared sentence.
 var concatSplice = regexp.MustCompile(`"\s*\+\s*\n?\s*"`)
+
+// blankGoComments replaces every Go comment in src with spaces, preserving the
+// byte offsets and the newlines of everything else so the concatSplice seam
+// regex and the offsets in any message still line up with the original file.
+//
+// #7061: without this the scan counted raw source bytes, so prose that merely
+// QUOTED the disposition sentence reddened a guard whose message asserts a
+// duplicated literal — a drift a comment cannot cause. The guard's subject is
+// what the program says, not what the file contains.
+//
+// The scanner tolerates a file that does not parse: it reports errors to the
+// handler and keeps going, and a malformed file would fail this package's own
+// build long before this test runs.
+func blankGoComments(src string) string {
+	out := []byte(src)
+	fset := token.NewFileSet()
+	f := fset.AddFile("", fset.Base(), len(src))
+	var sc goscanner.Scanner
+	sc.Init(f, []byte(src), func(token.Position, string) {}, goscanner.ScanComments)
+	for {
+		pos, tok, lit := sc.Scan()
+		if tok == token.EOF {
+			break
+		}
+		if tok != token.COMMENT {
+			continue
+		}
+		start := f.Offset(pos)
+		for i := start; i < start+len(lit) && i < len(out); i++ {
+			if out[i] != '\n' {
+				out[i] = ' '
+			}
+		}
+	}
+	return string(out)
+}
 
 // TestScreenMissingProfilesPublishedToSnapshot binds the publication path the
 // whole SSOT argument rests on (#5806): the metric and status block claim to
@@ -242,4 +284,61 @@ func TestScreenMissingProfilesPublishedToSnapshot(t *testing.T) {
 				i, wire.Refs[i].Zone, wire.Refs[i].Profile, want[i].Zone, want[i].Profile)
 		}
 	}
+}
+
+// #7061: blankGoComments' own contract, plus the one escape it narrows.
+//
+// The middle row is the point. TestScreenUnresolvedDispositionHasOneSource's
+// message asserts a duplicated LITERAL that "lets the metric HELP and the status
+// block drift"; a comment cannot cause that, so a guard that reds on prose is
+// asserting something it has not observed. Two production files already carry
+// long comments about this very sentence.
+func TestBlankGoCommentsHidesProseAndExposesACommentInterruptedSeam_7061(t *testing.T) {
+	const sentence = "no screen checks are applied"
+
+	t.Run("prose quoting the sentence is not counted", func(t *testing.T) {
+		src := "package p\n\n// Prose only: " + sentence + " to this zone.\nvar x = 1\n"
+		if strings.Count(src, sentence) != 1 {
+			t.Fatalf("fixture is wrong: the raw source must contain the sentence once")
+		}
+		if n := strings.Count(blankGoComments(src), sentence); n != 0 {
+			t.Fatalf("blankGoComments left %d occurrence(s) of a sentence that appears only in a comment", n)
+		}
+	})
+
+	t.Run("a real string literal is still counted", func(t *testing.T) {
+		src := "package p\n\nconst D = \"" + sentence + " to this zone\"\n"
+		if n := strings.Count(blankGoComments(src), sentence); n != 1 {
+			t.Fatalf("blankGoComments removed a real literal: %d occurrence(s), want 1", n)
+		}
+	})
+
+	t.Run("the sentence inside a block comment is not counted", func(t *testing.T) {
+		src := "package p\n\n/*\n" + sentence + " to this zone\n*/\nvar x = 1\n"
+		if n := strings.Count(blankGoComments(src), sentence); n != 0 {
+			t.Fatalf("blankGoComments left %d occurrence(s) of a sentence inside a block comment", n)
+		}
+	})
+
+	t.Run("byte offsets are preserved", func(t *testing.T) {
+		src := "package p\n\n// a comment\nconst D = \"x\"\n"
+		if got, want := len(blankGoComments(src)), len(src); got != want {
+			t.Fatalf("blankGoComments changed the length: %d, want %d — the concatSplice seam offsets depend on this", got, want)
+		}
+	})
+
+	t.Run("escape 1: a + seam interrupted by a comment becomes spliceable", func(t *testing.T) {
+		// Escape 1 in the scan's own list: a split-concatenation copy whose
+		// seam is interrupted by a `//` comment, which defeated concatSplice
+		// because the comment text sat between the two quotes. With the comment
+		// blanked to spaces the seam is whitespace again and splices.
+		src := "package p\n\nconst D = \"" + sentence + "\" + // seam\n\t\" to this zone\"\n"
+		if n := strings.Count(concatSplice.ReplaceAllString(src, ""), sentence+" to this zone"); n != 0 {
+			t.Fatalf("fixture is wrong: the RAW seam must not splice (that is what made it an escape); got %d", n)
+		}
+		spliced := concatSplice.ReplaceAllString(blankGoComments(src), "")
+		if n := strings.Count(spliced, sentence+" to this zone"); n != 1 {
+			t.Fatalf("blanking the comment did not make the seam spliceable: %d occurrence(s), want 1", n)
+		}
+	})
 }
