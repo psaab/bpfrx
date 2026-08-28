@@ -15,6 +15,31 @@ pub enum PollMode {
 }
 
 impl PollMode {
+    /// The `_` arm selects the SPINNING mode, which is the CPU-expensive
+    /// direction — so an unrecognised value burns a core rather than failing
+    /// visibly (#7745, from the #6907 re-verification).
+    ///
+    /// REACHABILITY, measured rather than assumed. From a committed config the
+    /// only strings that can arrive here are `"busy-poll"` and `"interrupt"`,
+    /// guarded three times before this point:
+    ///
+    ///   1. `pkg/config/schema_system.go` — `poll-mode` carries
+    ///      `ValidateEnum([]string{"busy-poll", "interrupt"})`, so a typo is
+    ///      rejected at COMMIT.
+    ///   2. `pkg/config/compiler_system.go` — the `poll-mode` case assigns only
+    ///      for those two literals; anything else leaves `cfg.PollMode` empty.
+    ///   3. `pkg/dataplane/userspace/process.go` — an empty `cfg.PollMode`
+    ///      becomes the explicit `"busy-poll"` before `--poll-mode` is passed.
+    ///
+    /// So the wildcard is reachable only by invoking this binary BY HAND with a
+    /// bad `--poll-mode`, which is an operator/debug surface rather than a
+    /// configuration fail-open.
+    ///
+    /// Left as a wildcard deliberately: making it fail closed would refuse a
+    /// hand-run debug invocation for a typo while changing nothing a committed
+    /// config can express, and the arm's real hazard is documented above where
+    /// a reader meets it. If the three guards upstream are ever relaxed, this
+    /// becomes live.
     pub(crate) fn from_str(s: &str) -> Self {
         match s {
             "interrupt" => PollMode::Interrupt,
