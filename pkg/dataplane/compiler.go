@@ -176,6 +176,49 @@ func (r *CompileResult) cachedLinkByIndex(idx int) (netlink.Link, error) {
 	return link, nil
 }
 
+// skipGenericAttachForVLANChild reports whether the generic-attach loop should
+// SKIP ifidx entirely because the VLAN parent it delegates to already fell back
+// to generic XDP. Attaching generic XDP to the child as well can raise EEXIST on
+// the parent, since the parent's generic hook already sees the tagged frames
+// (netif_receive_generic_xdp runs before kernel VLAN demuxing in
+// __netif_receive_skb_core).
+//
+// #6917: the parent is read from LinkAttrs.ParentIndex, which is only a VLAN
+// delegation once the KIND and the NAMESPACE are proven — see
+// vlanDelegationDefect. vishvananda/netlink folds IFLA_LINK into that field for
+// every link kind, so on an unproven device it can be a veth's peer or an
+// ifindex belonging to another namespace, free to alias a local interface
+// numerically. Read blind, an aliased value that happens to name a locally
+// failed interface returns true here and the interface gets NO XDP attach at
+// all: a live forwarding surface with no program on it.
+//
+// So an unproven device NEVER skips. Falling through to the generic attach is
+// the direction that cannot hide a surface, and the WARN names why.
+//
+// SECOND BELT, and labelled as one. The only production writer of
+// genericXDPIfindexes is the VLAN-child append in compiler_iface.go, whose
+// ifindex now comes from an adoption that refuses a wrong-kind or foreign
+// device (#6916) — so this is not independently reachable in first-order
+// production and is not claimed to be. What it covers is the distance between
+// check and use: the adoption runs in compile phase 2 through
+// netlink.LinkByName, this runs in the attach loop after program load through
+// cachedLinkByIndex, and the cache holds this child only when a unit MTU
+// happened to be configured. The two are not guaranteed to be looking at the
+// same device.
+func (r *CompileResult) skipGenericAttachForVLANChild(ifidx int, failedNativeXDP map[int]bool) bool {
+	link, err := r.cachedLinkByIndex(ifidx)
+	if err != nil {
+		return false
+	}
+	if why := vlanDelegationDefect(link); why != "" {
+		slog.Warn("VLAN child is not a local 802.1Q delegation; not skipping its "+
+			"XDP attach on an unverifiable parent", "ifindex", ifidx, "why", why)
+		return false
+	}
+	parentIfindex := link.Attrs().ParentIndex
+	return parentIfindex > 0 && failedNativeXDP[parentIfindex]
+}
+
 // peekLinkByIndex resolves idx WITHOUT writing to the result's link caches.
 //
 // cachedLinkByIndex memoises into linkIdxMap and linkCache. The observe-only
@@ -542,11 +585,8 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 				if isUserspaceShim {
 					continue // skip VLAN sub-interfaces — parent handles VLAN traffic
 				}
-				if link, err := result.cachedLinkByIndex(ifidx); err == nil {
-					parentIfindex := link.Attrs().ParentIndex
-					if parentIfindex > 0 && failedNativeXDP[parentIfindex] {
-						continue
-					}
+				if result.skipGenericAttachForVLANChild(ifidx, failedNativeXDP) {
+					continue
 				}
 			}
 			if err := m.AttachXDP(ifidx, true); err != nil {
