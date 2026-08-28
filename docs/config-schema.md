@@ -5196,6 +5196,33 @@ rejection message names it rather than claiming the block-level case is
 covered. `TestNATTerminalActionPackedContradictionCommits_7034` pins each
 spelling, so closing #7033 has to update this text too.
 
+*One authored token IS counted now, and only one (#7013).* The sentence above
+still holds for MODES — a packed `off pool P` collapses to one field and
+commits, and #7033 is still open. But a block naming the SAME mode twice is no
+longer invisible: `then destination-nat pool PD pool PD2` and
+`then { destination-nat { pool PD; pool PD2; } }` are rejected at strict commit
+by an occurrence check that runs BEFORE the mode count, reading a per-container
+record of the authored pool NAMES (`natThenAuthored`, unexported on `NATRule`,
+built by `natThenAuthoredOccurrences` at both lowering sites). Where the collapse
+happens the FIRST authored pool is the one that takes effect, in both spellings.
+
+Three neighbouring shapes stay legal, and the distinction is the whole of why
+this does not disturb #3850 or #7035:
+
+- **Duplicate `then` CONTAINERS** — last-container-wins, unchanged. The record is
+  scoped to ONE container precisely so summing cannot false-reject them.
+- **Two separate `set … then destination-nat pool X` lines** — NOT a collapse.
+  The second REPLACES the leaf in the candidate tree, as a single-value leaf
+  should, so only one pool ever reaches the compiler and `show configuration`
+  displays what will be enforced. #7013's body described this as the same defect;
+  it is ordinary leaf replacement at a different layer.
+- **The same pool named twice in one block** — nothing is discarded, so it is a
+  redundancy rather than an error.
+
+`off` and `interface` are not recorded at all: they carry no value, so repeating
+either discards nothing. `compiler_nat_then_occurrences_7013_test.go` pins every
+row above, including the three legal ones.
+
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land
 there very differently, and the difference is load-bearing:
