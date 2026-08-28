@@ -62,6 +62,7 @@ type leaseTracingLinkController struct {
 	abandonCalls  int
 	held          bool
 	everHeld      bool
+	abandonHeld   []bool // what each AbandonLinkCycle FOUND — the discriminator
 	trace         []string
 	releasedEarly bool // a release observed while a later acquire could still come
 	acquiresAfter int  // acquires seen after the first release
@@ -135,6 +136,7 @@ func (c *leaseTracingLinkController) AbandonLinkCycle() bool {
 	defer c.mu.Unlock()
 	c.abandonCalls++
 	was := c.held
+	c.abandonHeld = append(c.abandonHeld, was)
 	c.held = false
 	if was {
 		c.trace = append(c.trace, "abandon(LEASE WAS STILL HELD)")
@@ -149,6 +151,26 @@ func (c *leaseTracingLinkController) snapshot() (int, int, int, bool, bool, []st
 	defer c.mu.Unlock()
 	return c.prepareCalls, c.notifyCalls, c.keepCalls, c.releasedEarly, c.held,
 		append([]string(nil), c.trace...)
+}
+
+// deferredAbandonFoundLease reports what the LAST AbandonLinkCycle of the apply
+// found. That last one is applyDataplaneAndHACore's deferred backstop, and it is
+// the only observation that separates "the apply released the lease" from "the
+// apply leaked it and the backstop cleaned up".
+//
+// `held == false` at the end cannot make that distinction — the backstop clears
+// it either way — which is exactly how the first version of the abort-only test
+// below passed against a build with the end-of-apply release DELETED.
+func (c *leaseTracingLinkController) deferredAbandonFoundLease(t *testing.T) bool {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.abandonHeld) == 0 {
+		t.Fatalf("no AbandonLinkCycle at all: applyDataplaneAndHACore defers one over its "+
+			"whole body, so its absence means the apply never got that far and every "+
+			"assertion here is about nothing. trace=%v", c.trace)
+	}
+	return c.abandonHeld[len(c.abandonHeld)-1]
 }
 
 // perNameRethOps is newRecordingRethOps' missing sibling: a fake netlink seam
@@ -317,11 +339,12 @@ func TestMixedMultiMemberApplyHoldsTheLeaseToTheLastRepair7007(t *testing.T) {
 			"sentinel, so those renewals silently stop extending the window. trace=%v",
 			trace)
 	}
-	if stillHeld {
-		t.Errorf("the apply finished with the lease STILL HELD, which strands it to the "+
-			"deferred abandon and makes that backstop's ERROR routine. The last repair "+
-			"must release. trace=%v", trace)
+	if lc.deferredAbandonFoundLease(t) {
+		t.Errorf("the deferred abandonLinkCycleLease still FOUND a held lease: the apply "+
+			"leaked it rather than releasing at its last repair, and that backstop's "+
+			"ERROR now fires on an ordinary mixed commit. trace=%v", trace)
 	}
+	_ = stillHeld
 }
 
 // TestAbortOnlyApplyStillReleasesTheLease7007 covers the arm the other two
@@ -384,13 +407,24 @@ func TestAbortOnlyApplyStillReleasesTheLease7007(t *testing.T) {
 	}
 
 	// THE DISCRIMINATOR for the end-of-apply arm.
-	if stillHeld {
-		t.Errorf("the apply finished with the link-cycle lease STILL HELD. With no "+
-			"member cycled there is no step 2.6b2 to release it, so the explicit "+
-			"end-of-apply release is the only thing that can — and without it the lease "+
-			"survives to the deferred abandon, whose ERROR then fires on an ordinary "+
-			"all-abort commit. trace=%v", trace)
+	//
+	// NOT `stillHeld`. The deferred abandonLinkCycleLease clears the word on
+	// every exit, so the apply always ENDS with it released — the first version
+	// of this test asserted exactly that and passed against a build with the
+	// end-of-apply release deleted (mutation cell R2). What separates the two is
+	// WHO released it: if the deferred backstop still FOUND a lease, the apply
+	// leaked one and that backstop logs its ERROR, which is the routine-noise
+	// outcome this whole design avoids.
+	if lc.deferredAbandonFoundLease(t) {
+		t.Errorf("the deferred abandonLinkCycleLease still FOUND a held lease, so the "+
+			"apply leaked it. With no member cycled there is no step 2.6b2 to release "+
+			"it, and since the rollbacks stopped releasing (#7007) the explicit "+
+			"end-of-apply release is the only thing that can. Without it that backstop's "+
+			"\"leaving with a RETH link-cycle lease still held\" ERROR fires on an "+
+			"ordinary all-abort commit — the same failure mode the issue rejects a "+
+			"refcount for. trace=%v", trace)
 	}
+	_ = stillHeld
 }
 
 // TestAllMembersCyclingReleasesExactlyOnce7007 is the anti-over-fix control.
@@ -423,11 +457,12 @@ func TestAllMembersCyclingReleasesExactlyOnce7007(t *testing.T) {
 			"in-loop rollback, so step 2.6b2's single repair is the only one. trace=%v",
 			notify, keep, trace)
 	}
-	if stillHeld {
-		t.Errorf("two acquires and one release must still leave the lease RELEASED. A "+
-			"refcount would sit at 1 here and strand it — which is why #7007 is not "+
-			"fixed by refcounting. trace=%v", trace)
+	if lc.deferredAbandonFoundLease(t) {
+		t.Errorf("two acquires and one release must leave the lease RELEASED by the "+
+			"apply, not by the backstop. A refcount would sit at 1 here and strand it — "+
+			"which is why #7007 is not fixed by refcounting. trace=%v", trace)
 	}
+	_ = stillHeld
 	if releasedEarly {
 		t.Errorf("no renewal may run unprotected on the all-cycling path. trace=%v", trace)
 	}
