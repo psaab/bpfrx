@@ -347,6 +347,41 @@ incus exec xpf-fw -- xpfd cleanup
 
 ## Debugging Techniques
 
+### Packet capture is BLIND on the AF_XDP data interfaces (#7770)
+
+**`tcpdump` on `ge-*-0-1` / `ge-*-0-2` of the loss userspace cluster does not see
+forwarded traffic.** Those interfaces run native XDP with AF_XDP, so the Rust
+dataplane consumes packets in userspace and the kernel's `AF_PACKET` tap — which
+is what `tcpdump` binds — never sees them.
+
+**This fails in the dangerous direction: the blindness is indistinguishable from
+packet loss.** A capture returns a frame count far below what was sent, which on
+an investigation that is *about* dropped packets reads as confirmation. Measured
+during #7770: a four-hop capture across a manual failover returned 4-14 frames
+against 15 echo requests, and every ICMP frame it did catch was the cluster's own
+`id 0, seq 0` probe traffic rather than the packets under test.
+
+The same shape sent #6934 down a wrong path for two rounds — its "zero unsolicited
+NAs on the wire" was an absence produced by measuring the wrong thing, not by the
+system. **Treat a low capture count on these interfaces as "the instrument did not
+see it", never as "the packet was not sent".**
+
+What DOES observe this traffic:
+
+| instrument | sees AF_XDP traffic | notes |
+|---|---|---|
+| `show security flow statistics` | **yes** | dataplane's own counters: `Packets dropped`, `Policy deny`, `Screen drops`, `NAT allocation failures`, `Sessions created`. Diff it around a single probe, with a control run, to attribute a drop to a node and a category |
+| `POLICY_DENY` journal lines on the node | **yes** | carries `src`/`dst`/`ingress_zone`/`egress_zone`/`policy_id`, which is what identifies *which direction* of a flow was dropped |
+| `show security flow session` | **yes** | whether a session exists on that node at all |
+| `tcpdump` on the LAN host / containers | yes | ordinary NICs, no XDP — capture at the *ends* rather than on the firewall's data interfaces |
+| `tcpdump` on the firewall's `ge-*-0-1` / `ge-*-0-2` | **NO** | see above |
+| `show security policies hit-count` | **no** (observed) | reported `0 packets / 0 bytes` on every row including permit policies carrying live traffic, before and after a probe (#7770). Do not use it to confirm a policy fired |
+
+Capturing on the **fabric parent** (`ge-*-0-0`) and on the peer's interfaces has the
+same limitation wherever those carry AF_XDP traffic. Capture at the traffic's
+endpoints (LAN host, target container) when you need frames, and use the counter
+surfaces for anything crossing the firewall.
+
 ### BPF Program Verification
 ```bash
 # Check attached BPF programs
