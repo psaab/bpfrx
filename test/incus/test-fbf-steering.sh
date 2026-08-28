@@ -163,7 +163,7 @@ for _cand in $PBR_CANDIDATES; do
     fi
 done
 [[ -n "$PBR_TABLE" ]] || fail "no table in the 31000+ band ($(echo $PBR_CANDIDATES)) holds 'default via ${ISP_B_GW4}' — either FRR table rendering is broken (pre-PR-2 divergence) or the FBF rule never installed"
-info "ISP-B table $PBR_TABLE holds the instance default (divergence fix OK)"
+info "ISP-B table $PBR_TABLE holds the instance default (divergence fix OK): $(grep -m1 '^default' <<<"$ROUTES")"
 
 # #6936: take the route TEXT, not a count. The counting form collapsed
 # "no leak" and "the probe returned nothing" onto the same healthy verdict
