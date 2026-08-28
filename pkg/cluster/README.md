@@ -898,6 +898,38 @@ peer liveness (`lastSeen`) or drive election.
     would cover every successor and is declined: waiting out the dead-peer
     interval between captures is free, so it hands the attacker back the
     unbounded churn the bound exists to stop.
+
+    **Admission triage, measured at `20a6068b4` (#6969).** Three of the four
+    findings that issue collects are LIVE, and one is not. Driving
+    `heartbeatAuthState.admitAuthed` directly with a pinned `epochNowNanos`:
+
+    | finding | state | site | measured |
+    |---|---|---|---|
+    | F3 third session at an unchanged epoch | **live** | `heartbeat.go:711`, `heartbeat_epoch_admit.go:263`, `:372` | sessions 1,2 admitted; 3 and 4 refused `"too many peer sessions at one boot epoch"`, `highEpochSessionCount` pinned at 2 |
+    | F5 healthy peer, receiver >`bootEpochMaxSkew` slow | **FIXED by #6969** (live when measured) | `heartbeat_epoch_admit.go` | was: raise beyond the forward bound → `ok=false`. Now: an ESTABLISHED receiver admits the frame and declines the RAISE; a FRESH one still refuses. See the forward-bound section above |
+    | F7 below-floor incarnation cannot progress | **live** | `heartbeat_epoch_admit.go:246` | three below-floor frames all refused, floor unchanged; `highEpoch` has one write site (`:351`, the raise path) |
+    | F4 backward step persists a lower epoch | **not live as filed** | `heartbeat_epoch.go:1236` | #6711's `bootEpochPreserveMaxSkew` preserves an intact predecessor across the 2h step the issue names; only a step **beyond 30 days** still heals over one |
+
+    F5's SCOPE is already right — the guard is `epoch > s.highEpoch && !epochWithinForwardBound(...)`,
+    so equality frames are not gated. The live gap is its EFFECT: when the bound
+    fires it returns false, rejecting the frame outright rather than admitting it
+    *without* raising the floor. Any remedy that admits such a frame routes it
+    into the same bounded per-value session budget F3 is about, so the two cannot
+    be sized independently — and "raise the cap" is not available, because the
+    security property is that the budget stays finite and non-refilling (a `k`
+    larger than the ring restores exactly the sustained churn it closes; see
+    `heartbeat.go:701-710`). F7 looks separable: it needs a re-read or re-raise
+    path at `highEpoch`'s single write site rather than a change to the budget.
+
+    **The healing side is load-bearing and hangs the suite if it is traded away.**
+    Making the preserve branch unconditional — the shape "stop overwriting an
+    intact higher persisted epoch" naturally takes — reds
+    `TestPersistedEpochHealsOnlyWhenClockCredible_6169` and then HANGS
+    `TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`
+    (`heartbeat_epoch_clock_sample_6669_test.go:146`), so the package run ends at
+    the 600s timeout with a third of its tests never collected. #6967 records
+    that the obvious fix "broke two tests and hung a third" without naming which;
+    this is which.
     (`TestEqualEpochsCannotChurnTheRing_6669`,
     `TestEqualEpochSuccessorIsAdmitted_6669`,
     `TestFloorRebindsToTheRaisingIncarnation_6669`.)

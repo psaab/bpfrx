@@ -128,17 +128,17 @@ func (m *Manager) RegenerateNeighborSnapshot() {
 	}
 	m.lastSnapshot.Neighbors = newNeighbors
 	m.rebuildNeighborIndex() // #1197 (after publish success)
-	m.generation++
-	m.lastSnapshot.Generation = m.generation
-	// Copilot review: advance publishedSnapshot + refresh
-	// lastSnapshotHash. Otherwise the status loop sees the
-	// bumped generation as unpublished and may force a redundant
-	// apply_snapshot, AND any churn in filtered-out rows could
+	// Copilot review: advance publishedSnapshot + refresh lastSnapshotHash,
+	// so the status loop does not see the bumped generation as unpublished and
+	// force a redundant apply_snapshot, and churn in filtered-out rows cannot
 	// leak through hash-dedup.
-	m.publishedSnapshot = m.lastSnapshot.Generation
-	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
-		m.lastSnapshotHash = h
-	}
+	//
+	// #6986: both of those only when the full snapshot ALREADY was published.
+	// update_neighbors is a PARTIAL update — the helper does not have the rest
+	// of this generation's content — so claiming "published" over a
+	// Compile-deferred snapshot swallows it. See
+	// advanceGenerationAfterPartialUpdateLocked.
+	m.advanceGenerationAfterPartialUpdateLocked()
 }
 
 // LookupSnapshotNeighbor returns a copy of the snapshot's

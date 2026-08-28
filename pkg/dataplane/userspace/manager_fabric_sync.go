@@ -62,11 +62,16 @@ func (m *Manager) SyncFabricState() {
 // paths (which do `next := *m.lastSnapshot` and refresh only Routes) carry the
 // resolved peer MAC forward instead of reverting to the stale set (#5306).
 //
-// It mirrors RegenerateNeighborSnapshot's post-publish bookkeeping: advance the
-// generation + publishedSnapshot and refresh lastSnapshotHash so the status
-// reconcile loop does not mistake the mutated snapshot for an unpublished
-// generation (a redundant full apply_snapshot) and the content-dedup gate
-// compares against the now-current content. No-op when the fabric set is
+// It shares RegenerateNeighborSnapshot's post-publish bookkeeping —
+// advanceGenerationAfterPartialUpdateLocked — which advances the generation and,
+// ONLY when the full snapshot was already published, publishedSnapshot and
+// lastSnapshotHash. Advancing those unconditionally is #6986: update_fabrics is
+// a PARTIAL update, so claiming "published" over a Compile-deferred snapshot
+// closes the status tick's gate on content the helper never received. When
+// nothing is deferred the behaviour is unchanged: the reconcile loop does not
+// mistake the mutated snapshot for an unpublished generation (a redundant full
+// apply_snapshot) and the content-dedup gate compares against the now-current
+// content. No-op when the fabric set is
 // unchanged so the daemon's post-refreshFabricFwd SyncFabricState cadence does
 // not churn the generation on every steady-state call. Caller holds m.mu.
 func (m *Manager) persistResolvedFabricsLocked(fabrics []FabricSnapshot) {
@@ -77,12 +82,12 @@ func (m *Manager) persistResolvedFabricsLocked(fabrics []FabricSnapshot) {
 		return
 	}
 	m.lastSnapshot.Fabrics = fabrics
-	m.generation++
-	m.lastSnapshot.Generation = m.generation
-	m.publishedSnapshot = m.lastSnapshot.Generation
-	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
-		m.lastSnapshotHash = h
-	}
+	// #6986: shared with RegenerateNeighborSnapshot rather than duplicated.
+	// These two are the only writebacks that advance publishedSnapshot after a
+	// PARTIAL update, so any divergence between them is a bug by construction —
+	// one would swallow a deferred publish and the other would not, and the
+	// difference would only ever show up as a lost config on a loaded box.
+	m.advanceGenerationAfterPartialUpdateLocked()
 }
 
 // fabricSnapshotsEqual reports whether two fabric snapshot slices are
