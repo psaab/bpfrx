@@ -246,7 +246,7 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 // connection that never PRIMES carries no boot id at all (connBootIncarnation
 // returns zero for it, deliberately fail-open), so this path never runs for it.
 // The empty-slot case in installConn's LIMIT comment is therefore still open and
-// still needs the heartbeat epoch — see #7754. This closes the reboot-that-primes
+// still needs the heartbeat epoch — see #7762. This closes the reboot-that-primes
 // half only.
 //
 // The remedy mirrors the supersession path exactly rather than inventing one:
@@ -610,7 +610,7 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// fail-open class. The empty-slot connection this limit is about is exactly
 	// such a connection, so #5084's incarnation is structurally unable to
 	// classify it. Closing this needs the heartbeat epoch plumbed through
-	// clusterRuntime, which is a contract change plus a latch race (see #7754).
+	// clusterRuntime, which is a contract change plus a latch race (see #7762).
 	//
 	// What IS now actionable is the case where the replacement DOES prime:
 	// notePeerBootIncarnation's `switched` return is positive peer-supplied

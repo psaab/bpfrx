@@ -240,7 +240,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// Scoped to the connection that PRIMED. A replacement that never primes
 		// carries no boot id (connBootIncarnation is zero for it, fail-open by
 		// design), so this cannot reach that case — see the LIMIT comment in
-		// installConn and #7754.
+		// installConn and #7762.
 		//
 		// GUARDED ON THE PRIOR VALUE BEING KNOWN, and this is not a nicety.
 		// notePeerBootIncarnation reports `switched` for zero -> X as well as
