@@ -1567,6 +1567,10 @@ func ValidateConfig(cfg *Config) []string {
 	// realized by the Phase-1 per-prefix leak (no enumerable static connected
 	// prefix, or a VRF→VRF import target that Phase 1 does not install) so the
 	// operator sees a fail-loud diagnostic rather than a silent no-op.
+	// #6972: a `system login` stanza that names nobody DENIES every non-root
+	// CLI command, and did so with no diagnostic at all.
+	warnings = append(warnings, validateContentFreeSystemLoginWarnings(cfg)...)
+
 	warnings = append(warnings, validateRibGroupLeakWarnings(cfg)...)
 	// #7512: a `routing-options rib <name>` the compiler does not implement
 	// discarded its static routes. Warn rather than reject — see
