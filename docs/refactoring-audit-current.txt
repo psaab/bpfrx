@@ -24,9 +24,9 @@
 [WATCH]      1935  pkg/config/types_system.go
 [WATCH]      1907  pkg/dataplane/compiler_iface.go
 [WATCH]      1883  pkg/dataplane/userspace/maps_sync.go
-[WATCH]      1877  userspace-dp/src/afxdp/frame/inspect.rs
 [WATCH]      1864  pkg/snmp/agent.go
 [WATCH]      1860  userspace-dp/src/afxdp/types/cos.rs
+[WATCH]      1856  userspace-dp/src/afxdp/frame/inspect.rs
 [WATCH]      1854  pkg/api/server.go
 [WATCH]      1833  userspace-dp/src/afxdp/worker/mod.rs
 [WATCH]      1829  pkg/config/compiler_validate_strict_filter.go
