@@ -855,9 +855,11 @@ const RECONCILE_CYCLE_LIVENESS_DEADLINE: std::time::Duration =
 ///    never an rc=124 wedge — which was #6952's whole complaint about
 ///    uninterpretable cells.
 ///
-/// The deadline is a parameter rather than a hardcoded constant purely so
-/// `wait_for_first_reconcile_cycle_reds_by_name_when_progress_stalls` can pin
-/// the liveness path deterministically at 50ms instead of taking 60s.
+/// The deadline is a parameter rather than a hardcoded constant so that the
+/// two fail-on-revert tests below can pin both halves at 50ms — in particular
+/// `wait_for_first_reconcile_cycle_reds_by_name_when_progress_stalls`, which
+/// would otherwise take 60s to exercise the liveness path. Production callers
+/// pass `RECONCILE_CYCLE_LIVENESS_DEADLINE`.
 fn wait_for_first_reconcile_cycle(
     cycles: &std::sync::atomic::AtomicU32,
     deadline: std::time::Duration,
@@ -883,27 +885,32 @@ fn wait_for_first_reconcile_cycle(
     }
 }
 
-/// #6989 fail-on-revert, positive half: the wait returns the published count
-/// as soon as it is non-zero, without consuming its deadline.
+/// #6989 fail-on-revert, positive half: the wait is bounded by PROGRESS, not
+/// by elapsed time, and it reports the count it observed.
 ///
-/// The tiny deadline here is safe precisely because the counter is ALREADY
-/// non-zero — the first load returns. If someone reshapes the helper to sleep
-/// before its first load, or to return a hardcoded 1 instead of the observed
-/// count, this reds.
+/// The deadline passed here is `Duration::ZERO`, which is the whole point:
+/// with the observable already satisfied, a correct helper loads, returns, and
+/// never consults the deadline at all, so ZERO passes. Hoist the deadline
+/// assertion above the `seen >= 1` check — the natural way to get the ordering
+/// wrong — and `start.elapsed() < ZERO` is false on the first iteration and
+/// this reds, on every machine, every time.
+///
+/// It deliberately does NOT assert on `Instant::elapsed`. An earlier draft
+/// asserted the call returned within 50ms, which is a wall-clock assertion of
+/// exactly the kind this whole change exists to remove: a preemption between
+/// `Instant::now()` and the load would have reddened it on a loaded box, and
+/// the flake would have been introduced by the flake fix. A zero deadline
+/// binds the same property — "does not wait when it does not have to" — as a
+/// structural fact rather than a timing measurement.
 #[test]
 fn wait_for_first_reconcile_cycle_returns_the_observed_count() {
     use std::sync::atomic::AtomicU32;
     let cycles = AtomicU32::new(7);
-    let started = std::time::Instant::now();
-    let seen = wait_for_first_reconcile_cycle(&cycles, std::time::Duration::from_millis(50));
+    let seen = wait_for_first_reconcile_cycle(&cycles, std::time::Duration::ZERO);
     assert_eq!(
         seen, 7,
         "the wait must report the count the reconciler published, not a \
          constant — the caller's overlap guard reads this number"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(50),
-        "an already-satisfied wait must return on its first load, not sleep"
     );
 }
 
@@ -1273,8 +1280,9 @@ fn install_session_serializes_with_reconcile_removal() {
             // Do not begin installing until the reconciler has demonstrably
             // completed a full remove/re-add cycle. Every install below then
             // races LIVE churn. Bounded by the reconciler's progress, not by
-            // elapsed time; on a stall it panics by name here and the
-            // `installer.join().unwrap()` below fails this test by name.
+            // elapsed time; on a stall it panics HERE, and the join below
+            // re-raises that panic so this test fails by name with the
+            // liveness message rather than an opaque `Any { .. }`.
             let saw_cycles =
                 wait_for_first_reconcile_cycle(&cycles, RECONCILE_CYCLE_LIVENESS_DEADLINE);
             let mut ok = 0u32;
