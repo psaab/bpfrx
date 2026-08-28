@@ -41,6 +41,29 @@ source "${SCRIPT_DIR}/deploy-lib.sh"
 source "${SCRIPT_DIR}/iperf-throughput-lib.sh"
 
 IPERF_TARGET="${IPERF_TARGET:-$IPERF_TARGET4}"
+# #6934: the IPv6 transit target. cluster-env.sh has exported IPERF_TARGET6 all
+# along and this gate never read it — every assertion here was IPv4-only, which
+# is why an IPv6-specific failover regression reached a human as an ad-hoc
+# observation instead of reddening this gate.
+IPERF_TARGET6="${IPERF_TARGET6:-2001:559:8585:80::200}"
+V6_PROBE_COUNT=5        # #6934: see check_v6_transit for why this is not 1
+V6_PROBE_MIN=3          # received replies required to call the path up
+# COUPLED TO #7770 — tighten this when that is fixed.
+#
+# 3-of-5 is not a general-purpose tolerance; it is calibrated to absorb one
+# specific KNOWN defect. #7770: a LAN/WAN redundancy-group split drops the first
+# packet of every new flow, symmetrically in v4 and v6, and does not self-heal
+# (measured 12.5% on 8 packets, still 12.5% on a fresh probe 45s later, against
+# 0% for a full failover). A 0%-loss assertion here would red on that rather
+# than on anything this gate is scoped to.
+#
+# So once #7770 lands, this threshold is LOOSER than it needs to be and would
+# hide a one-packet regression. Raise V6_PROBE_MIN to V6_PROBE_COUNT then.
+#
+# Written down because a tolerance whose reason is undocumented is
+# indistinguishable from a tolerance nobody thought about — the next reader
+# cannot tell "3 of 5 because a known defect costs exactly one packet" from
+# "3 of 5 because the author was not sure", and only the first has an expiry.
 IPERF_DURATION=120      # seconds — long enough to span retries + reboot + failback
 IPERF_STREAMS=8
 MIN_SESSIONS=4          # minimum established sessions (control + some data streams)
@@ -57,6 +80,32 @@ pass()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
 fail()  { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); ERRORS+=("$*"); }
 
 die() { echo "FATAL: $*" >&2; exit 2; }
+
+# check_v6_transit asserts IPv6 traffic still crosses the firewall (#6934).
+#
+# It probes the WAN-side target rather than the LAN VIP deliberately. Pinging
+# the VIP exercises L2 and local delivery on the same segment and never crosses
+# the fabric, so it stays green through exactly the failures this is here to
+# catch — measured: during a LAN/WAN redundancy-group split the VIP answers with
+# 0% loss while transit is degraded.
+#
+# It tolerates losing packets but not all of them, and that threshold is
+# measured rather than picked. A cross-node split costs the FIRST packet of a
+# new flow, reproducibly and without self-healing, so a `-c 1` probe would be
+# flaky on a healthy-enough cluster while a "0% loss" assertion would red on a
+# condition this gate is not scoped to. Requiring 3 of 5 separates a blackhole
+# (0 received — the #6934 report) from that first-packet loss (4 of 5).
+check_v6_transit() {
+	local label="$1" out recv
+	out=$(incus exec "$CLUSTER_LAN_HOST" -- ping6 -c "$V6_PROBE_COUNT" -W 1 "$IPERF_TARGET6" 2>&1 || true)
+	recv=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9][0-9]*\) received.*/\1/p' | head -1)
+	[ -z "$recv" ] && recv=0
+	if [ "$recv" -ge "$V6_PROBE_MIN" ]; then
+		pass "IPv6 transit OK ${label} (${recv}/${V6_PROBE_COUNT} to ${IPERF_TARGET6})"
+	else
+		fail "IPv6 transit BLACKHOLED ${label}: only ${recv}/${V6_PROBE_COUNT} replies from ${IPERF_TARGET6}. IPv4 can stay healthy through this — ND holds a REACHABLE entry ~30s before probing, so a stale or unannounced neighbour entry blackholes v6 while ARP re-resolves in seconds (#6934)"
+	fi
+}
 # #7368: a PRECONDITION failure is not a failover regression, and neither is an
 # ownership/forwarding divergence. All three used to exit 2, so `FO_RC=2` was
 # read as "failover broke" when it meant "the cluster was not in a state to
@@ -122,6 +171,11 @@ if incus exec "$CLUSTER_LAN_HOST" -- ping -c 2 -W 2 "$IPERF_TARGET" &>/dev/null;
 else
 	die "Cannot reach iperf3 target $IPERF_TARGET from ${CLUSTER_LAN_HOST}"
 fi
+
+# #6934: the IPv6 baseline. Asserted BEFORE any failover so a later v6 failure
+# is attributable to the transition rather than to a cluster that never had v6
+# transit — without this the post-failover cells could red on a broken fixture.
+check_v6_transit "at baseline (before any failover)"
 
 # Kill any stale iperf3
 incus exec "$CLUSTER_LAN_HOST" -- pkill -9 iperf3 2>/dev/null || true
@@ -376,6 +430,13 @@ else
 		fail "iperf3 DIED during manual failover"
 	fi
 fi
+
+# #6934: the reported scenario. A manual RG failover moves the RETH virtual MAC,
+# so every peer holding a neighbour entry for a VIP or for the stable RETH
+# link-local must be corrected by the unsolicited-NA burst. The iperf3 check
+# above cannot see a failure here: it is one long-lived IPv4 flow, so it
+# survives on established state while a NEW IPv6 flow blackholes.
+check_v6_transit "after manual failover"
 
 # ── Phase 5: Wait for iperf3 to complete and validate results ───────
 

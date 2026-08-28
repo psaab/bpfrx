@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"runtime"
@@ -163,7 +164,8 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	// #5718 fold F3: ONE derivation feeds every representation of this
 	// quantity. cfg.Workers used to be consumed TWICE under different rules —
 	// `maxInt(cfg.Workers, 1)` cast to uint32 for ctrl.Workers/ctrl.QueueCount,
-	// and the RAW cfg.Workers passed to heartbeatZeroSlots below — so the two
+	// and the RAW cfg.Workers passed to the heartbeat zero-init bound below —
+	// so the two
 	// descriptions of "how many workers this dataplane has" could drift, and
 	// after the A6-b01-C1 narrowing fix they demonstrably DID: `workers
 	// 4294967296` clamps to the full heartbeat map for the zero-init loop
@@ -1816,14 +1818,43 @@ func planUserspaceWorkers(workers int, heartbeatMapCap uint32) userspaceWorkerPl
 // maxW is how many workers the fixed-size userspace_heartbeat Array can carry
 // slots for (4096 / 32 = 128 today), which is also the honest ceiling for the
 // ctrl fields: a worker with no zero-initialised heartbeat slot has none to
-// keep fresh, and the shim refuses to redirect on a stale slot. The floor
-// stays 1 even when the Array cannot hold a single worker's slots;
-// heartbeatZeroSlots caps the resulting SLOT count at mapCap for that
-// degenerate case instead of reporting zero workers.
+// keep fresh, and the shim refuses to redirect on a stale slot.
+//
+// #6930: THE INT-SPACE CLAIM ABOVE IS CONDITIONAL, AND THE CONDITION IS THE
+// DEGENERATE CASE. `maxW` is 0 whenever the Array holds fewer than
+// heartbeatSlotsPerWorker entries, and the clamp is then SKIPPED entirely — so
+// `w` leaves this function unbounded and `planUserspaceWorkers`' `uint32(w)`
+// narrows it. Measured before fixing, with heartbeatMapCap = 31:
+//
+//	workers 1<<32    -> effectiveWorkers 4294967296 -> plan.Workers 0
+//	workers 1<<32+5  -> effectiveWorkers 4294967301 -> plan.Workers 5
+//
+// Those are the exact two values the paragraph above names as the A6-b01-C1
+// defect — reporting ZERO workers and ZERO queues to the shim, or a
+// plausible-looking 5 — reproduced at the CAST rather than at the multiply that
+// #6702 removed. Running the clamp in int space does not help when there is no
+// clamp.
+//
+// The floor stays 1 even when the Array cannot hold a single worker's slots.
+// The CEILING is now unconditional: clamping to MaxUint32 makes the cast in
+// planUserspaceWorkers faithful for every input without changing any reachable
+// answer (with maxW >= 1 the maxW clamp binds first and is far smaller), so
+// this fixes the narrowing without altering the degenerate case's documented
+// intent of reporting a worker count rather than zero.
+//
+// Bounding the OPERAND rather than checking the product is deliberate: a
+// post-hoc check on a value that has already narrowed cannot tell 0-because-
+// overflow from 0-because-zero, which is what made the original silent.
 func effectiveWorkers(workers int, heartbeatMapCap uint32) int {
 	w := maxInt(workers, 1)
 	if maxW := int(heartbeatMapCap / heartbeatSlotsPerWorker); maxW >= 1 && w > maxW {
 		w = maxW
+	}
+	// #6930: unconditional, so it also binds when the maxW clamp above was
+	// skipped. int is 64-bit on every platform this builds for, so this cannot
+	// itself wrap.
+	if w > math.MaxUint32 {
+		w = math.MaxUint32
 	}
 	return w
 }

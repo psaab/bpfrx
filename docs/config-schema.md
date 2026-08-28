@@ -331,6 +331,51 @@ derivation, and a validator wrong in the *rejecting* direction turns a working
 config into a failed commit with no operator workaround (the #6564
 `ValidateOSPFArea` lesson, where a `>= 1` floor would have refused OSPF area 0).
 
+### `interfaces <if> tunnel mode` — the leaf allowlist mirrors the dataplane (#6924)
+
+`tunnel mode` carried **no validator at all** until #6924, so
+`set interfaces gr-0/0/0 tunnel mode banana` committed green. `buildKernelTunnelLink`
+(`pkg/routing/tunnel.go`) has a `default:` arm that builds a GRE device for
+anything that is not `ipip`, so the operator got a visible, UP interface that
+carried nothing — the same symptom #4785 exists to reject, reached by a route
+#4785's `ipip`-keyed gate cannot see.
+
+The leaf now carries `valueType: ValueEnumOf` +
+`validator: ValidateEnum(TunnelModeNames)`, and **`TunnelModeNames` is a mirror,
+not a source**. The SSOT is the dataplane's own predicate, `tunnel_mode_kind` in
+`userspace-dp/src/afxdp/forwarding_build/tunnels.rs`: a mode it maps to
+`TunnelKind::Gre` or `TunnelKind::WireGuard` is carried, everything else falls to
+`TunnelKind::Unknown` and is dropped. The two lists are in different languages so
+neither can import the other, and the agreement — not either literal — is what
+`TestTunnelModeAllowlistMatchesTheDataplane_6924` asserts, by parsing the Rust
+match arms. Same shape as `MasterPasswordPRFNames` against `configstore.prfHash`.
+
+Accepted: `gre`, `ip6gre`, `wireguard`.
+
+`ipip` is deliberately **absent**. It is a mode the system recognises and the
+dataplane does not carry, so the leaf refuses it as one instance of the general
+rule rather than as a special case; #4785's strict gate still runs and still
+produces the endpoint-naming diagnostic for the case the leaf cannot see — an
+`ip-*` interface with no `mode` statement at all, which the parser defaults to
+`ipip`.
+
+**#1960 no-brick.** The leaf validator runs only on the STRICT path
+(`compileTreeStrict` → `schemaValidateExpandedTreeForNode`). `compileTreeLenient`,
+which `Store.Load` and `Store.SyncApply` use, does not schema-validate at all, so
+a config already persisted with an unrecognised mode still boots and keeps the
+stanza verbatim. Both halves are bound at the STORE ingress
+(`tunnel_mode_no_brick_6924_test.go`), not only at the validator, because a change
+that made `Store.Load` schema-validate would leave every `pkg/config` test green
+while a booting node lost its config.
+
+**The `valueExamples` order is load-bearing.** They are listed `ip6gre, gre`, not
+`gre, ip6gre`. The #2419 compact/block census synthesises its probe values from
+`valueExamples[0]` and `[1]`, and this site is compact-blind: the compact spelling
+drops the value and `Mode` falls back to the parser's default, which is `gre`.
+Putting `gre` first makes the dropped value and the fallback identical, so a real
+divergence reads as EQUIVALENT and the #2419 inventory entry looks stale. A
+fixture must never use the value the bug falls back to.
+
 ## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
 
 The typed per-leaf `SchemaValidate` walk (4) cannot express cross-field or
