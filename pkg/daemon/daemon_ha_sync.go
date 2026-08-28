@@ -1271,9 +1271,14 @@ func transportChangeLogArgs(active, next clusterTransportKey) []any {
 		if name == "" {
 			name = rt.Field(i).Name
 		}
+		// .Interface(), not .String(): reflect.Value.String() does not fail on a
+		// non-string field, it returns "<int Value>". Every field is a string
+		// today, so this is not a live bug — but the whole point of deriving
+		// the line is that a future field joins it automatically, and joining
+		// it as garbage would be worse than the omission this replaced.
 		args = append(args,
-			"old_"+name, av.Field(i).String(),
-			"new_"+name, nv.Field(i).String())
+			"old_"+name, av.Field(i).Interface(),
+			"new_"+name, nv.Field(i).Interface())
 	}
 	return args
 }

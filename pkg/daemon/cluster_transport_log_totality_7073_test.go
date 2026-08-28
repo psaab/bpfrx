@@ -51,20 +51,16 @@ func TestTransportChangeLogArgsCoverEveryTransportField_7073(t *testing.T) {
 			len(args), want, rt.Name())
 	}
 
-	pairs := map[string]string{}
+	pairs := map[string]any{}
 	for i := 0; i+1 < len(args); i += 2 {
 		k, ok := args[i].(string)
 		if !ok {
 			t.Fatalf("arg %d is not a string key: %#v", i, args[i])
 		}
-		v, ok := args[i+1].(string)
-		if !ok {
-			t.Fatalf("value for %q is not a string: %#v", k, args[i+1])
-		}
 		if _, dup := pairs[k]; dup {
 			t.Fatalf("duplicate log key %q", k)
 		}
-		pairs[k] = v
+		pairs[k] = args[i+1]
 	}
 
 	av := reflect.ValueOf(active)
@@ -90,11 +86,11 @@ func TestTransportChangeLogArgsCoverEveryTransportField_7073(t *testing.T) {
 			t.Errorf("no new_%s pair for clusterTransportKey.%s", tag, f.Name)
 			continue
 		}
-		if want := av.Field(i).String(); gotOld != want {
-			t.Errorf("old_%s = %q, want %q", tag, gotOld, want)
+		if want := av.Field(i).Interface(); gotOld != want {
+			t.Errorf("old_%s = %v, want %v", tag, gotOld, want)
 		}
-		if want := nv.Field(i).String(); gotNew != want {
-			t.Errorf("new_%s = %q, want %q", tag, gotNew, want)
+		if want := nv.Field(i).Interface(); gotNew != want {
+			t.Errorf("new_%s = %v, want %v", tag, gotNew, want)
 		}
 		if gotOld != gotNew {
 			differing++
