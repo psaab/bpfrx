@@ -107,11 +107,8 @@ func (m *Manager) ClearPolicerConfigs() error {
 	if !present {
 		return fmt.Errorf("policer_configs map not found")
 	}
-	empty := PolicerConfig{}
-	for i := uint32(0); i < MaxPolicers; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. MaxPolicers is policer_configs' max_entries.
+	return clearArrayEntriesIn(zm, "policer_configs", MaxPolicers, PolicerConfig{})
 }
 
 // ClearFilterConfigs clears all filter config and rule entries.
@@ -123,11 +120,9 @@ func (m *Manager) ClearFilterConfigs() error {
 	if !present {
 		return fmt.Errorf("filter_configs not found")
 	}
+	// #6959: PROPAGATE. MaxFilterConfigs is filter_configs' max_entries.
 	var empty FilterConfig
-	for i := uint32(0); i < MaxFilterConfigs; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-	return nil
+	return clearArrayEntriesIn(zm, "filter_configs", MaxFilterConfigs, empty)
 }
 
 // ReadFilterCounters reads the per-CPU firewall filter counter values and sums them.

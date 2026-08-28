@@ -528,6 +528,17 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 				if result.tunnelIfindexes[ifidx] {
 					continue
 				}
+				// #6959 DELIBERATE DISCARD (allowlisted in
+				// discarded_map_update_6959_test.go). redirect_capable is
+				// a per-interface OPTIMISATION HINT, not policy: an unset
+				// flag makes xdp_forward take XDP_PASS and hand the packet
+				// to the kernel forwarding path instead of
+				// bpf_redirect_map, which is slower but forwards
+				// correctly. The default is unset, so a rejected write
+				// fails SAFE. This is also the config-commit path, not an
+				// operator clear — a hard error here aborts a commit over
+				// a lost performance hint. The absent-map skip above is
+				// the matching #2114 A3 optional-access contract.
 				rcMap.Update(uint32(ifidx), uint8(1), ebpf.UpdateAny)
 			}
 		}

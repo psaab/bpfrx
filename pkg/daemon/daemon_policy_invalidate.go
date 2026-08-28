@@ -322,9 +322,35 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// cleared sessions forwarding while logging an apparently-clean invalidation.
 	// Surface it loudly and suppress the success line so the partial clear is
 	// observable, not masked (Copilot #4320).
+	// #6948: the id set was computed from the OLD config's numbering, and
+	// runtime policy ids are POSITIONAL — deleting a policy renumbers every
+	// later one. The dataplane starts admitting under the NEW numbering as soon
+	// as the apply publishes it, which happens long before this sweep runs, so a
+	// session admitted in between by a policy that INHERITED a deleted policy's
+	// id matches `ids` and would be dropped while correctly permitted.
+	//
+	// admittedAfterActivation is the discriminator. It is STRICTLY greater on
+	// purpose: Created has one-second granularity, so a session created in the
+	// same integer second as the stamp is ambiguous, and an ambiguous session is
+	// still cleared — the direction this code already chose (over-clear is
+	// fail-safe for security; under-clear is a stale-authorization gap).
+	//
+	// That leaves a residual: this narrows the over-clear from the entire
+	// post-activation apply, tail included, to at most one second. It does not
+	// eliminate it, and nothing here should be read as claiming otherwise —
+	// closing it fully needs either an admission fence across
+	// activation->invalidation or a stable admitting-rule identity on the row.
+	activationSecs := d.policyActivationSecs
+	admittedAfterActivation := func(created uint64) bool {
+		return activationSecs != 0 && created > activationSecs
+	}
+
 	var v4Entries []dataplane.SessionEntryV4
 	v4EnumErr := store.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
+			return true
+		}
+		if admittedAfterActivation(val.Created) {
 			return true
 		}
 		if _, hit := ids[val.PolicyID]; hit {
@@ -336,6 +362,11 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	var v6Entries []dataplane.SessionEntryV6
 	v6EnumErr := store.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
+			return true
+		}
+		// #6948: same boundary as v4. Both families must apply it or the defect
+		// simply moves to the other address family.
+		if admittedAfterActivation(val.Created) {
 			return true
 		}
 		if _, hit := ids[val.PolicyID]; hit {
