@@ -324,6 +324,75 @@ func TestMixedMultiMemberApplyHoldsTheLeaseToTheLastRepair7007(t *testing.T) {
 	}
 }
 
+// TestAbortOnlyApplyStillReleasesTheLease7007 covers the arm the other two
+// cannot reach: an apply where EVERY member aborts.
+//
+// This is the case the fix could most easily get wrong, and the mutation matrix
+// proved the other two tests are blind to it — deleting the end-of-apply release
+// leaves both of them green. Step 2.6b2 is gated on needLinkCycleRecovery, which
+// only a member that COMPLETED a cycle arms, so an all-abort apply reaches no
+// NotifyLinkCycle at all. Once the rollbacks stopped releasing (#7007), nothing
+// else would end the lease: it would survive to the deferred abandon and make
+// that backstop's ERROR routine on a path that is not a bug — which is exactly
+// the failure mode the issue rejects a refcount for, arrived at by another
+// route.
+func TestAbortOnlyApplyStillReleasesTheLease7007(t *testing.T) {
+	var events []string
+	var mu sync.Mutex
+	withRethOps(t, perNameRethOps(t, curMAC5103, map[string]bool{
+		"ge-0-0-1": true, "ge-0-0-2": true,
+	}, &events, &mu))
+
+	// BOTH joins fail, so both members abort and neither cycle completes.
+	lc := &leaseTracingLinkController{
+		prepareErrSeq: []error{
+			errors.New("worker join failed"),
+			errors.New("worker join failed"),
+		},
+	}
+	d := twoMemberRethDaemon(t, lc)
+
+	_ = d.applyConfigLocked(context.Background(), twoMemberRethConfig())
+
+	prepare, notify, keep, _, stillHeld, trace := lc.snapshot()
+
+	// FIXTURE LIVENESS, and it is doing real work here: if either member had
+	// cycled, needLinkCycleRecovery would arm, 2.6b2 would run, and this test
+	// would be a duplicate of the mixed one rather than the arm it is for.
+	if prepare != 2 {
+		t.Fatalf("PrepareLinkCycle calls = %d, want 2 — both members must reach the "+
+			"hook. trace=%v", prepare, trace)
+	}
+	mu.Lock()
+	for _, e := range events {
+		if len(e) > 14 && e[len(e)-14:] == "set-mac-cycled" {
+			mu.Unlock()
+			t.Fatalf("a member COMPLETED a cycle; this fixture requires that none does, "+
+				"or step 2.6b2 runs and the end-of-apply arm is not the thing under "+
+				"test. events=%v", events)
+		}
+	}
+	mu.Unlock()
+	if notify != 0 {
+		t.Errorf("releasing NotifyLinkCycle calls = %d, want 0: no member cycled, so "+
+			"needLinkCycleRecovery is clear and step 2.6b2 must not run. trace=%v",
+			notify, trace)
+	}
+	if keep != 2 {
+		t.Errorf("non-releasing repairs = %d, want 2 (one per aborted member): each "+
+			"aborted member still owns its own rebind. trace=%v", keep, trace)
+	}
+
+	// THE DISCRIMINATOR for the end-of-apply arm.
+	if stillHeld {
+		t.Errorf("the apply finished with the link-cycle lease STILL HELD. With no "+
+			"member cycled there is no step 2.6b2 to release it, so the explicit "+
+			"end-of-apply release is the only thing that can — and without it the lease "+
+			"survives to the deferred abandon, whose ERROR then fires on an ordinary "+
+			"all-abort commit. trace=%v", trace)
+	}
+}
+
 // TestAllMembersCyclingReleasesExactlyOnce7007 is the anti-over-fix control.
 //
 // Two acquires and ONE release is the ordinary multi-member shape, and it must

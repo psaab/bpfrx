@@ -348,7 +348,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			networkdErr, needLinkCycleRecovery, rethRollbackKeptLease =
-				d.programRethMemberMACTracked(linuxName, mac, networkdErr,
+				d.programRethMemberMAC(linuxName, mac, networkdErr,
 					needLinkCycleRecovery, rethRollbackKeptLease)
 			if err := d.finishRethMemberLinkTail(linuxName, mac, rethCfg); err != nil {
 				networkdErr = errors.Join(networkdErr, err)
@@ -534,16 +534,17 @@ var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the 
 // canary is satisfied by an assignment that is unreachable, shadowed, or jumped
 // over. Here the fold runs against the same fake link seam and fake dataplane the
 // wrapper's own tests use.
+// #7007 adds the `leaseKept` accumulator alongside `needLinkCycleRecovery`.
+// Both are accumulators rather than per-member facts: they are ORed across the
+// loop.
+//
+// Widened in place rather than wrapped, for the same reason as
+// programRethMACWithWorkerJoin above: TestDaemonPassesRethBeforeCycleHook_5103
+// requires EXACTLY ONE call site of this function in the package, and routing
+// the loop through a differently named inner function left this one with zero —
+// which reddened that gate correctly, since "reached from nowhere else" is the
+// property it pins.
 func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
-	commitErr error, needLinkCycleRecovery bool) (error, bool) {
-	err, need, _ := d.programRethMemberMACTracked(ifName, mac, commitErr, needLinkCycleRecovery, false)
-	return err, need
-}
-
-// programRethMemberMACTracked is programRethMemberMAC carrying the #7007
-// lease-kept accumulator alongside the needLinkCycleRecovery one. Both are
-// accumulators rather than per-member facts: they are ORed across the loop.
-func (d *Daemon) programRethMemberMACTracked(ifName string, mac net.HardwareAddr,
 	commitErr error, needLinkCycleRecovery bool, leaseKept bool) (error, bool, bool) {
 	memberKeptLease := false
 	linkCycled, prepareErr := d.programRethMACWithWorkerJoin(ifName, mac, &memberKeptLease)
