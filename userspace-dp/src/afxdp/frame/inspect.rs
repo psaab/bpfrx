@@ -831,27 +831,6 @@ pub(in crate::afxdp) fn term_match_extra_from_meta(
     }
 }
 
-/// #2314: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
-/// originate an ICMP/ICMPv6 *error* in reply to a datagram whose IP
-/// destination was a broadcast or multicast address. Reading the
-/// destination straight off the L3-relative packet slice keeps this
-/// cheap on the (cold-ish) error-generation arms: a single octet test
-/// for the common cases.
-///
-///   - IPv4: multicast 224.0.0.0/4 (first octet 224..=239) OR the
-///     limited broadcast 255.255.255.255. Subnet/directed broadcasts
-///     require per-interface mask knowledge that is not available at the
-///     generation site, so they are not detectable here — the limited
-///     broadcast and the multicast block are the cases this gate covers.
-///   - IPv6: multicast ff00::/8 (first byte 0xff). IPv6 has no broadcast.
-///
-/// Returns `true` when an ICMP error MUST be suppressed for this trigger
-/// destination. Fails closed (`true`) on a too-short packet slice and on
-/// an unknown/unexpected `addr_family`: a destination we cannot classify
-/// must suppress the error rather than risk emitting backscatter for a
-/// packet whose family (and therefore whose group/broadcast bits) we did
-/// not parse.
-#[inline]
 // #6926: the address-classification group moved to `addr_class.rs` when this
 // file crossed the 2000-LOC [REFACTOR] tier. Re-exported here rather than
 // leaving callers to be rewritten: the tree reaches these by BOTH a bare `use`
