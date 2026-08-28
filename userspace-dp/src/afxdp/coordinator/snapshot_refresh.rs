@@ -344,10 +344,6 @@ impl super::Coordinator {
             config_generation: snapshot.generation,
             fib_generation: snapshot.fib_generation,
         };
-        self.policy_counters.reconcile_rules(&snapshot.policies);
-        // #2218: drop hit counters for NAT rules removed by this config.
-        self.nat_counters
-            .reconcile_ids(&super::snapshot_active_nat_counter_ids(snapshot));
         // #1866 D3: WG endpoint-set transition log at the Rust apply
         // boundary. Rare (only when the set actually changes); pairs
         // with the Go publish-boundary log to pin which layer dropped
@@ -386,6 +382,17 @@ impl super::Coordinator {
         // `forwarding_build::commit_zone_counter_prune` for why the two halves
         // are split.
         crate::afxdp::forwarding_build::commit_zone_counter_prune(&self.forwarding, snapshot);
+        // #7010: the policy / NAT hit-counter prune, moved down from above the
+        // swap to sit beside the zone one. BEHAVIOUR-NEUTRAL on this path —
+        // nothing between the old position and here can return, so the prune
+        // already ran only on a committed refresh — but leaving it above the
+        // swap left two counter families pruning at two different points in one
+        // function, which is the shape that let the reconcile path drift.
+        crate::afxdp::forwarding_build::commit_rule_counter_prune(
+            &self.policy_counters,
+            &self.nat_counters,
+            snapshot,
+        );
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
         } else if !preserved_fabrics.is_empty() {

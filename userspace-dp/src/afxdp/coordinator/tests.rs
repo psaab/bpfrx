@@ -5032,6 +5032,276 @@ fn rejected_apply_does_not_prune_live_zone_counters_6832() {
     );
 }
 
+/// #7010 fixtures. The policy and NAT HIT-counter twin of the #6832 zone
+/// fixtures above, and the same three directions.
+///
+/// Both stores are seeded through the PRODUCTION entry points — the policy half
+/// via `parse_policy_state_with_counters` (which get-or-creates a block per
+/// rule) and the NAT half via `NatCounterStore::rule_counter` — so the seeding
+/// path is the one the builder itself takes.
+const RULE_COUNTER_LIVE_NAT_ID: u32 = 7;
+const RULE_COUNTER_DOOMED_NAT_ID: u32 = 4243;
+const RULE_COUNTER_LIVE_POLICY_ID: &str = "zone100->zone200/live-rule";
+const RULE_COUNTER_DOOMED_POLICY_ID: &str = "zone100->zone200/doomed-rule";
+
+fn rule_counter_policy_snapshots() -> Vec<crate::PolicyRuleSnapshot> {
+    ["live-rule", "doomed-rule"]
+        .iter()
+        .map(|name| crate::PolicyRuleSnapshot {
+            name: (*name).into(),
+            from_zone: "zone100".into(),
+            to_zone: "zone200".into(),
+            action: "permit".into(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Seed BOTH stores with a live id and a doomed id, and give the live policy
+/// rule a non-zero hit count.
+///
+/// The live id is what separates a correctly deferred prune from a prune that
+/// simply never runs: an over-correction that stops pruning entirely passes
+/// "the doomed id survived a rejection" and fails
+/// `committed_reconcile_prunes_rule_counters_for_removed_rules_7010`.
+fn rule_counter_live_coordinator(coord: &mut Coordinator) {
+    let mut zone_map = rustc_hash::FxHashMap::default();
+    zone_map.insert("zone100".to_string(), 100u16);
+    zone_map.insert("zone200".to_string(), 200u16);
+    crate::policy::parse_policy_state_with_counters(
+        "deny",
+        &rule_counter_policy_snapshots(),
+        &zone_map,
+        &[],
+        &coord.policy_counters,
+    )
+    .expect("the live seed policy must parse");
+    // A real total on the LIVE NAT row. This is what separates "the block
+    // SURVIVED the prune" from "the build re-created it": a committed reconcile
+    // runs the additive get-or-create BEFORE the prune, so a present id alone
+    // is satisfied by a freshly minted zero block.
+    coord
+        .nat_counters
+        .rule_counter(RULE_COUNTER_LIVE_NAT_ID)
+        .expect("the live NAT counter must be creatable")
+        .add(64);
+    let _ = coord.nat_counters.rule_counter(RULE_COUNTER_DOOMED_NAT_ID);
+
+    for want in [RULE_COUNTER_LIVE_POLICY_ID, RULE_COUNTER_DOOMED_POLICY_ID] {
+        assert!(
+            coord.policy_counters.tracked_rule_ids().iter().any(|id| id == want),
+            "fixture: policy id {want} must be seeded, or every assertion below is \
+             vacuous. Got {:?}",
+            coord.policy_counters.tracked_rule_ids()
+        );
+    }
+    let mut nat_ids = coord.nat_counters.tracked_ids();
+    nat_ids.sort_unstable();
+    assert_eq!(
+        nat_ids,
+        vec![RULE_COUNTER_LIVE_NAT_ID, RULE_COUNTER_DOOMED_NAT_ID],
+        "fixture: both NAT ids must be seeded"
+    );
+}
+
+/// The candidate: it keeps the live policy rule and the live NAT rule, and
+/// DROPS the doomed pair. A committed apply must prune exactly the doomed two.
+fn rule_counter_candidate(generation: u64) -> crate::ConfigSnapshot {
+    let mut snap = mandatory_ok_snapshot(generation);
+    snap.zones = zone_counter_zones(&[100, 200]);
+    snap.policies = vec![crate::PolicyRuleSnapshot {
+        name: "live-rule".into(),
+        from_zone: "zone100".into(),
+        to_zone: "zone200".into(),
+        action: "permit".into(),
+        ..Default::default()
+    }];
+    snap.static_nat_rules = vec![crate::StaticNATRuleSnapshot {
+        name: "live-static".into(),
+        counter_id: RULE_COUNTER_LIVE_NAT_ID,
+        external_ip: "198.51.100.7".into(),
+        internal_ip: "10.9.9.7".into(),
+        ..Default::default()
+    }];
+    snap
+}
+
+fn rule_counter_state(coord: &Coordinator) -> (Vec<String>, Vec<u32>) {
+    let mut policy = coord.policy_counters.tracked_rule_ids();
+    policy.sort();
+    let mut nat = coord.nat_counters.tracked_ids();
+    nat.sort_unstable();
+    (policy, nat)
+}
+
+/// #7010 NEGATIVE, `WorkerSpawn` arm — the arm that leaves the candidate state
+/// PUBLISHED, so `nat_rule_counters()` keeps serving from a store the rejected
+/// apply already pruned.
+///
+/// RED before the fix: the prune ran inside `apply_snapshot`, above
+/// `bring_up_workers`, so the doomed ids were already gone. Measured on
+/// origin/master, both arms.
+#[test]
+fn rejected_spawn_apply_does_not_prune_live_rule_counters_7010() {
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
+    // `StoppedCoordinator`, not a trailing `coordinator.stop()`: a cell that
+    // PANICS skips the trailing call and leaks its neigh-monitor thread into the
+    // process-wide #6637 gates, which then red alongside it. Measured — the
+    // first #7010 mutation matrix showed this cell's G1 red carrying two
+    // collateral #6637 failures that had nothing to do with the mutation, and a
+    // mutation cell that reds three tests when it should red one cannot
+    // localise.
+    let mut coordinator = StoppedCoordinator::new();
+    rule_counter_live_coordinator(&mut coordinator);
+
+    let mut bindings = zone_counter_binding();
+    coordinator.force_worker_spawn_fail = 1;
+    let result = coordinator.reconcile(Some(&rule_counter_candidate(6)), &mut bindings, 64);
+    assert!(
+        matches!(result, Err(ReconcileError::WorkerSpawn(_))),
+        "fixture: this apply must be rejected by the worker SPAWN arm — got {result:?}"
+    );
+
+    let (policy, nat) = rule_counter_state(&coordinator);
+    assert!(
+        policy.iter().any(|id| id == RULE_COUNTER_DOOMED_POLICY_ID),
+        "a REJECTED apply destroyed the hit counter of a policy rule the refused \
+         candidate removed. The config never brought up a worker and the \
+         WorkerSpawn arm leaves it published, so `show security policies \
+         hit-count` serves from a store whose history is already gone — and \
+         unlike the zone store, `stop_inner` never resets this one, so it stays \
+         gone (#7010). Got {policy:?}"
+    );
+    assert!(
+        nat.contains(&RULE_COUNTER_DOOMED_NAT_ID),
+        "same, NAT half: `nat_rule_counters()` serves from this store (#7010). \
+         Got {nat:?}"
+    );
+    assert!(
+        policy.iter().any(|id| id == RULE_COUNTER_LIVE_POLICY_ID)
+            && nat.contains(&RULE_COUNTER_LIVE_NAT_ID),
+        "control: the LIVE ids must also still be present — an assertion that \
+         only the doomed ids survive would pass against a store nothing pruned \
+         and nothing seeded"
+    );
+}
+
+/// #7010 NEGATIVE, `WorkerBindIncomplete` arm.
+///
+/// The zone case only leaked on the spawn arm, because `stop_inner(false)`
+/// defaults `coord.forwarding` and takes the zone store's publisher with it.
+/// These two stores are Coordinator fields that `stop_inner` never touches, so
+/// BOTH arms leak here — which is why this arm gets its own cell rather than
+/// being folded into the one above.
+#[test]
+fn rejected_bind_apply_does_not_prune_live_rule_counters_7010() {
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
+    let mut coordinator = StoppedCoordinator::new();
+    rule_counter_live_coordinator(&mut coordinator);
+
+    let mut bindings = zone_counter_binding();
+    // No healthy-worker stub: a real XSK bind is impossible in-process, so the
+    // reconcile is rejected at the bind-incomplete arm.
+    let result = coordinator.reconcile(Some(&rule_counter_candidate(6)), &mut bindings, 64);
+    assert!(
+        result.is_err(),
+        "fixture: this apply must be REJECTED — got {result:?}"
+    );
+
+    let (policy, nat) = rule_counter_state(&coordinator);
+    assert!(
+        policy.iter().any(|id| id == RULE_COUNTER_DOOMED_POLICY_ID)
+            && nat.contains(&RULE_COUNTER_DOOMED_NAT_ID),
+        "a reconcile rejected at the BIND arm destroyed the removed rules' hit \
+         counters. `stop_inner` defaults only `self.forwarding`; policy_counters \
+         and nat_counters are untouched, so this arm leaks exactly as the spawn \
+         arm does (#7010). policy={policy:?} nat={nat:?}"
+    );
+}
+
+/// #7010 POSITIVE — the anti-over-fix direction. Deferring the prune must not
+/// DELETE it: a COMMITTED apply must still drop the removed rules.
+#[test]
+fn committed_reconcile_prunes_rule_counters_for_removed_rules_7010() {
+    let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
+    let mut coordinator = StoppedCoordinator::new();
+    rule_counter_live_coordinator(&mut coordinator);
+
+    let mut bindings = zone_counter_binding();
+    coordinator.force_worker_healthy_stub = true;
+    let result = coordinator.reconcile(Some(&rule_counter_candidate(6)), &mut bindings, 64);
+    assert!(
+        result.is_ok(),
+        "fixture: this apply must COMMIT (workers up) — got {result:?}"
+    );
+
+    let (policy, nat) = rule_counter_state(&coordinator);
+    assert!(
+        !policy.iter().any(|id| id == RULE_COUNTER_DOOMED_POLICY_ID),
+        "a COMMITTED reconcile must still prune the removed policy rule's \
+         counter; deferring the prune past worker bring-up must not delete it. \
+         Got {policy:?}"
+    );
+    assert!(
+        !nat.contains(&RULE_COUNTER_DOOMED_NAT_ID),
+        "same, NAT half. Got {nat:?}"
+    );
+    assert!(
+        policy.iter().any(|id| id == RULE_COUNTER_LIVE_POLICY_ID),
+        "the surviving rule must keep its block across the commit, not be swept \
+         with the doomed one — a prune that empties the store passes the two \
+         assertions above for the wrong reason. Got {policy:?}"
+    );
+    assert!(
+        nat.contains(&RULE_COUNTER_LIVE_NAT_ID),
+        "NAT half of the same control. Got {nat:?}"
+    );
+    let live_row = coordinator
+        .nat_counters
+        .snapshots()
+        .into_iter()
+        .find(|r| r.counter_id == RULE_COUNTER_LIVE_NAT_ID)
+        .expect("the live NAT row must still exist after a committed prune");
+    assert!(
+        live_row.packets > 0,
+        "the surviving NAT row must keep its CARRIED-FORWARD totals. A zero here \
+         means the block was re-created by the build's get-or-create rather than \
+         retained — which the id-presence assertion above cannot tell apart"
+    );
+}
+
+/// #7010, the REFRESH call site. The reconcile cells above cannot see this one
+/// and vice versa — one production line, one assertion.
+///
+/// This path's prune MOVED in #7010, from above the `self.forwarding` swap to
+/// beside the zone prune below it. The move is behaviour-neutral (nothing
+/// between the two positions can return, so the prune already ran only on a
+/// committed refresh), but "behaviour-neutral" was an unbound claim until this
+/// cell existed: deleting the call outright leaves every other test green.
+#[test]
+fn committed_refresh_prunes_rule_counters_for_removed_rules_7010() {
+    let mut coordinator = StoppedCoordinator::new();
+    rule_counter_live_coordinator(&mut coordinator);
+
+    coordinator
+        .refresh_runtime_snapshot(&rule_counter_candidate(6))
+        .expect("fixture: the candidate must refresh cleanly");
+
+    let (policy, nat) = rule_counter_state(&coordinator);
+    assert!(
+        !policy.iter().any(|id| id == RULE_COUNTER_DOOMED_POLICY_ID)
+            && !nat.contains(&RULE_COUNTER_DOOMED_NAT_ID),
+        "a COMMITTED same-plan refresh must drop the removed rules' hit counters. \
+         policy={policy:?} nat={nat:?}"
+    );
+    assert!(
+        policy.iter().any(|id| id == RULE_COUNTER_LIVE_POLICY_ID)
+            && nat.contains(&RULE_COUNTER_LIVE_NAT_ID),
+        "...and must keep the surviving rules — a prune that empties the store \
+         passes the assertion above for the wrong reason. policy={policy:?} nat={nat:?}"
+    );
+}
+
 #[test]
 fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832() {
     // #7413: this test spawns a `neigh-monitor` thread, and the #6637 leak

@@ -1391,6 +1391,7 @@ impl Coordinator {
     /// a legitimate config-transition reset still lands.
     ///
     /// Returns `true` when the bump was applied, `false` when it was refused
+
     /// as a rollback.
     #[must_use]
     pub fn bump_fib_generation(&mut self, fib_generation: u32) -> bool {
