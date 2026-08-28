@@ -82,14 +82,17 @@ impl crate::afxdp::Coordinator {
                 // rg_epochs bumps. lock_recover applies the uniform
                 // committed-prefix + clear_poison policy (worker_queue.rs).
                 let mut pending = worker_queue::lock_recover(&rec.handle.commands);
-                pending.push_back(WorkerCommand::DemoteOwnerRGS {
-                    owner_rgs: demoted_rgs.clone(),
-                });
+                worker_queue::push_bounded(
+                    &mut pending,
+                    WorkerCommand::DemoteOwnerRGS {
+                        owner_rgs: demoted_rgs.clone(),
+                    },
+                );
                 // #941 Work item C: vacate V_min slots on demotion.
                 // Stale-low slot values would cause peer workers to
                 // throttle unnecessarily until the first post-settle
                 // publish from this worker after re-promotion.
-                pending.push_back(WorkerCommand::VacateAllSharedExactSlots);
+                worker_queue::push_bounded(&mut pending, WorkerCommand::VacateAllSharedExactSlots);
             }
             demote_shared_owner_rgs(
                 &self.sessions.synced,
@@ -141,9 +144,12 @@ impl crate::afxdp::Coordinator {
         for commands in &worker_commands {
             // #1790/#1807: uniform poison recovery (worker_queue.rs).
             let mut pending = worker_queue::lock_recover(commands);
-            pending.push_back(WorkerCommand::RefreshOwnerRGS {
-                owner_rgs: activated_rgs.to_vec(),
-            });
+            worker_queue::push_bounded(
+                &mut pending,
+                WorkerCommand::RefreshOwnerRGS {
+                    owner_rgs: activated_rgs.to_vec(),
+                },
+            );
         }
         let current = self.ha.rg_runtime.load();
         let session_map_fd = self.bpf_maps.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
