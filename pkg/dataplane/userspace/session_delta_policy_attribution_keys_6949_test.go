@@ -3,7 +3,9 @@ package userspace
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -140,4 +142,127 @@ func TestSessionDeltaPolicyAttributionCommentIsNotFalse6949(t *testing.T) {
 			t.Fatalf("empty serde rename for %s", f)
 		}
 	}
+}
+
+// TestSessionDeltaInfoKeySetsAreInParityWithRust6949 is the guard that would
+// have caught #6949 on the day #3301 shipped, and the answer to the issue's
+// "worth also checking the same struct against the binary codec for any other
+// field that has drifted out of parity".
+//
+// The per-field lockstep tests above pin the SPELLING of the keys someone
+// thought to write a test for. This one pins the SET: every JSON key this Go
+// consumer declares must exist on the Rust producer, and vice versa. #6949 was
+// not a misspelling — it was five fields the consumer read and the producer had
+// never emitted, invisible for four releases because each one decodes to a
+// legitimate zero. No spelling assertion can see that; only a set comparison
+// can.
+//
+// Both sides are parsed, neither is restated: a field list written down twice is
+// two field lists, and the whole defect class is the two drifting apart. Adding
+// a field to either struct alone reds this.
+//
+// SCOPE: this is the delta struct only, and it proves the two spellings agree —
+// not that a MIXED-VERSION cluster is safe. An old helper still omits keys a new
+// daemon reads, and serde(default) decodes them to the same legitimate zeros.
+// Fail-closed capability negotiation, and the canonical-schema equivalence test
+// that generalizes this across every wire struct, are #7194.
+func TestSessionDeltaInfoKeySetsAreInParityWithRust6949(t *testing.T) {
+	goKeys := goJSONTagsInStruct(t,
+		filepath.Join("protocol_ha.go"), "SessionDeltaInfo")
+	rustKeys := rustSerdeKeysInStruct(t,
+		filepath.Join("..", "..", "..", "userspace-dp", "src", "protocol", "binding.rs"),
+		"SessionDeltaInfo")
+
+	// A parse that found nothing would make this test vacuously green, which is
+	// the same failure shape it exists to catch.
+	if len(goKeys) < 30 || len(rustKeys) < 30 {
+		t.Fatalf("parsed %d Go keys and %d Rust keys; the parse broke, so this guard is "+
+			"vacuous. FIX THE PARSE — do not delete the guard", len(goKeys), len(rustKeys))
+	}
+
+	for k := range goKeys {
+		if !rustKeys[k] {
+			t.Errorf("Go SessionDeltaInfo declares JSON key %q that the Rust producer "+
+				"(userspace-dp/src/protocol/binding.rs) never emits. Every session learned "+
+				"through the JSON RPC-fallback leg — drained every 100 ms while the event "+
+				"stream is down, every 5 s while it is up, and re-serialized whole on every "+
+				"FullResync — will decode it as the zero value. That is #6949 exactly, and "+
+				"it is silent: the zero is a legitimate value on each of these fields", k)
+		}
+	}
+	for k := range rustKeys {
+		if !goKeys[k] {
+			t.Errorf("the Rust producer emits JSON key %q that Go SessionDeltaInfo does not "+
+				"declare, so the value is dropped on arrival. Add the Go field (with the "+
+				"matching struct tag) or stop emitting the key", k)
+		}
+	}
+}
+
+// goJSONTagsInStruct returns the set of `json:"..."` tag names declared by the
+// named Go struct in the given file.
+func goJSONTagsInStruct(t *testing.T, path, name string) map[string]bool {
+	t.Helper()
+	body := structBody(t, path, "type "+name+" struct {")
+	re := regexp.MustCompile("`json:\"([A-Za-z0-9_]+)")
+	out := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		out[m[1]] = true
+	}
+	return out
+}
+
+// rustSerdeKeysInStruct returns the set of JSON keys the named Rust struct
+// serializes: the `#[serde(rename = "...")]` when the field carries one, and
+// the field's own identifier otherwise (which is what serde emits then).
+func rustSerdeKeysInStruct(t *testing.T, path, name string) map[string]bool {
+	t.Helper()
+	body := structBody(t, path, "pub(crate) struct "+name+" {")
+	renameRe := regexp.MustCompile(`#\[serde\([^)]*rename\s*=\s*"([A-Za-z0-9_]+)"`)
+	fieldRe := regexp.MustCompile(`^\s*pub ([a-z0-9_]+)\s*:`)
+	out := map[string]bool{}
+	pending := ""
+	for _, line := range strings.Split(body, "\n") {
+		if m := renameRe.FindStringSubmatch(line); m != nil {
+			pending = m[1]
+			continue
+		}
+		if m := fieldRe.FindStringSubmatch(line); m != nil {
+			if pending != "" {
+				out[pending] = true
+			} else {
+				out[m[1]] = true
+			}
+			pending = ""
+			continue
+		}
+		// An attribute line with no rename (e.g. a bare `#[serde(default)]`)
+		// means this field serializes under its own name; anything else
+		// (doc comment, blank) leaves a pending rename alone only if it
+		// belongs to the field still ahead of us, which the `continue` above
+		// already handled.
+		if strings.HasPrefix(strings.TrimSpace(line), "#[serde(") {
+			pending = ""
+		}
+	}
+	return out
+}
+
+func structBody(t *testing.T, path, opener string) string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (the #6949 key-set parity guard cannot run)", path, err)
+	}
+	_, after, ok := strings.Cut(string(src), opener)
+	if !ok {
+		t.Fatalf("no %q in %s. If the struct was renamed or moved, UPDATE this guard rather "+
+			"than deleting it — without it nothing stops the two ends of the session-delta "+
+			"wire from drifting apart field by field, which is #6949", opener, path)
+	}
+	body, _, ok := strings.Cut(after, "\n}")
+	if !ok {
+		t.Fatalf("unterminated struct %q in %s", opener, path)
+	}
+	return body
 }
