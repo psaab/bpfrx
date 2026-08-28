@@ -204,6 +204,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// reset leaves the whole suite green.
 		inc := parseBootIncarnation(payload)
 		s.noteConnBootIncarnation(conn, inc)
+		// #6910: capture the PRIOR incarnation before the note overwrites it —
+		// distinguishing a first prime (zero -> X) from a reboot (X -> Y)
+		// requires the old value, and notePeerBootIncarnation's bool does not
+		// carry it.
+		priorInc := s.PeerBootIncarnation()
 		switched := s.notePeerBootIncarnation(inc)
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
@@ -221,8 +226,42 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
+		// #6910: ACT on the switch, do not merely report it. Until now
+		// `switched` reached only this log line, so a reboot whose replacement
+		// primed on the alternate fabric left the corpse installed, stamped
+		// current, and winning fab0 preference in preferredFabricLocked — the
+		// consequence the issue is actually about.
+		//
+		// This is peer-supplied evidence, not a local inference: the boot id on
+		// the wire changed, which only a new peer boot produces. installConn
+		// deliberately refuses to guess from slot occupancy; here there is
+		// nothing to guess.
+		//
+		// Scoped to the connection that PRIMED. A replacement that never primes
+		// carries no boot id (connBootIncarnation is zero for it, fail-open by
+		// design), so this cannot reach that case — see the LIMIT comment in
+		// installConn and #7754.
+		//
+		// GUARDED ON THE PRIOR VALUE BEING KNOWN, and this is not a nicety.
+		// notePeerBootIncarnation reports `switched` for zero -> X as well as
+		// for X -> Y, because both change the recorded incarnation. Only the
+		// second is a REBOOT; the first is simply the first incarnated prime
+		// this SessionSync has seen. Acting on it would advance the incarnation
+		// and evict the peer's OTHER fabric — a healthy connection from the same
+		// boot — which is the routine second-fabric case #5718's tests exist to
+		// protect. So the remedy needs "we knew a DIFFERENT boot before", which
+		// `switched` alone does not say.
+		var evictedStale bool
+		if switched && priorInc.known() {
+			s.mu.Lock()
+			if idx := s.fabricIdxForConnLocked(conn); idx >= 0 {
+				evictedStale = s.applyPeerIncarnationSwitchLocked(idx)
+			}
+			s.mu.Unlock()
+		}
 		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch,
 			"peer_boot_incarnation", inc.String(), "incarnation_switched", switched,
+			"evicted_stale_incarnation_conn", evictedStale,
 			"local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn))
 		// #5084: a peer that primes without an incarnation gets today's
 		// generation-only ordering (fail open). Warn ONCE per connection, not

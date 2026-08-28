@@ -232,6 +232,61 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 // case (the same process bringing up its second fabric), so it is not fixable
 // here: it needs the peer-supplied boot epoch #6669 signs into the heartbeat.
 // See pkg/cluster/README.md for the full sequence and which half self-heals.
+// applyPeerIncarnationSwitchLocked retires the previous peer incarnation when
+// the peer's own BOOT ID proves it rebooted (#6910, on #5084's signal).
+//
+// WHY THIS EXISTS SEPARATELY FROM installConn's supersededCurrent. That
+// classification is LOCAL: it infers a reboot from slot occupancy, and it is
+// blind whenever the replacement lands in the empty alternate slot beside a
+// corpse. This one is not an inference — `notePeerBootIncarnation` reports that
+// the boot id on the wire CHANGED, which only a genuinely new peer boot can
+// produce. So where the local classification must not guess, this may act.
+//
+// WHAT IT DOES NOT CLOSE, stated so the two are not confused: a replacement
+// connection that never PRIMES carries no boot id at all (connBootIncarnation
+// returns zero for it, deliberately fail-open), so this path never runs for it.
+// The empty-slot case in installConn's LIMIT comment is therefore still open and
+// still needs the heartbeat epoch — see #7754. This closes the reboot-that-primes
+// half only.
+//
+// The remedy mirrors the supersession path exactly rather than inventing one:
+// advance the incarnation, drop the previous incarnation's ack capability, evict
+// the connections still stamped with it, then re-stamp the priming connection so
+// it belongs to the incarnation it actually established. Keeping the two paths
+// identical is deliberate — a second, subtly different notion of "retire the old
+// peer" is how the readers listed on evictStaleIncarnationConnsLocked come to
+// disagree about which process is live.
+//
+// keepIdx names the priming connection's slot; it is re-stamped and never
+// evicted. Returns whether anything was evicted, for the caller's log.
+func (s *SessionSync) applyPeerIncarnationSwitchLocked(keepIdx int) bool {
+	s.peerIncarnation++
+	s.peerHeartbeatAckEver.Store(false)
+	evicted := s.evictStaleIncarnationConnsLocked(keepIdx)
+	// Stamp AFTER the advance, exactly as installConn does, so the priming
+	// connection belongs to the incarnation it established rather than to the
+	// one just retired.
+	switch keepIdx {
+	case 0:
+		s.conn0Gen = s.peerIncarnation
+	case 1:
+		s.conn1Gen = s.peerIncarnation
+	}
+	return evicted
+}
+
+// fabricIdxForConnLocked reports which slot holds conn, or -1.
+func (s *SessionSync) fabricIdxForConnLocked(conn net.Conn) int {
+	switch {
+	case conn != nil && s.conn0 == conn:
+		return 0
+	case conn != nil && s.conn1 == conn:
+		return 1
+	default:
+		return -1
+	}
+}
+
 func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
 	// #5718 fold r6: "this can never empty the registry" is the ENTIRE
 	// justification for exempting this function from
@@ -519,18 +574,48 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// would strand the connection that legitimately proved the capability at a
 	// stale stamp, so it could never re-arm.
 	//
-	// LIMIT OF THIS CLASSIFICATION (#6910, blocked on #6669): wasDisconnected
-	// and supersededCurrent between them detect a reboot only when it lands on
-	// an OCCUPIED slot or an empty registry. A reboot whose replacement dials
-	// the EMPTY alternate slot, while the dead process's socket sits
-	// ESTABLISHED in the other one, satisfies NEITHER — so it advances no
-	// incarnation, evicts nothing, clears no capability and arms no cold prime,
-	// and the replacement is stamped current alongside the corpse (which then
-	// wins fab0 preference if it holds slot 0). Nothing observable locally
-	// separates that from the same peer bringing up its second fabric after a
-	// link flap, so do NOT add a heuristic here — it needs the peer-supplied
-	// boot epoch #6669 signs into the heartbeat. Full sequence, and which half
-	// self-heals, in pkg/cluster/README.md under "ACCEPTED RESIDUAL".
+	// LIMIT OF THIS CLASSIFICATION (#6910). wasDisconnected and
+	// supersededCurrent between them detect a reboot only when it lands on an
+	// OCCUPIED slot or an empty registry. A reboot whose replacement dials the
+	// EMPTY alternate slot, while the dead process's socket sits ESTABLISHED in
+	// the other one, satisfies NEITHER — so it advances no incarnation, evicts
+	// nothing, clears no capability and arms no cold prime, and the replacement
+	// is stamped current alongside the corpse (which then wins fab0 preference
+	// if it holds slot 0). Nothing observable LOCALLY separates that from the
+	// same peer bringing up its second fabric after a link flap, so do NOT add
+	// a heuristic here. Full sequence in pkg/cluster/README.md under
+	// "ACCEPTED RESIDUAL".
+	//
+	// THIS COMMENT USED TO SAY "blocked on #6669". THAT WAS WRONG IN A WAY THAT
+	// SENDS THE NEXT READER AT THE WRONG SIGNAL, so it is corrected here rather
+	// than deleted. #6669 MERGED (2026-08-12). Two distinct peer-boot signals
+	// now exist and they are NOT interchangeable:
+	//
+	//   - bootIncarnation (#5084) — an opaque /proc boot_id compared for
+	//     EQUALITY ONLY ("Never order two boot ids", sync_boot_incarnation.go),
+	//     carried in the syncMsgBulkStart PAYLOAD;
+	//   - the heartbeat boot epoch (#6669) — an ORDERED uint64 floor, latched
+	//     on Manager.hbAuth from the independent UDP heartbeat.
+	//
+	// NEITHER is reachable here, and the root fact is one line: SessionSync's
+	// whole view of the outside world is `clusterRuntime`, which exposes
+	// Sessions() and Telemetry() and nothing else — there is no Manager handle,
+	// so the heartbeat epoch cannot be consulted at all. And the config-sync
+	// incarnation arrives only on BulkStart, i.e. strictly AFTER this install.
+	//
+	// Nor can it simply be applied later for THIS case: connBootIncarnation
+	// documents that a connection which never received an incarnated prime —
+	// "including the second fabric, which may carry config without having
+	// primed" — keeps the ZERO value, and zero is deliberately the never-dropped
+	// fail-open class. The empty-slot connection this limit is about is exactly
+	// such a connection, so #5084's incarnation is structurally unable to
+	// classify it. Closing this needs the heartbeat epoch plumbed through
+	// clusterRuntime, which is a contract change plus a latch race (see #7754).
+	//
+	// What IS now actionable is the case where the replacement DOES prime:
+	// notePeerBootIncarnation's `switched` return is positive peer-supplied
+	// evidence of a reboot, and applyPeerIncarnationSwitchLocked below acts on
+	// it.
 	supersededCurrent := false
 	switch fabricIdx {
 	case 0:
