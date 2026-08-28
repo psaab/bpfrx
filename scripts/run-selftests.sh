@@ -158,6 +158,13 @@ run_shell test/xsk-repro/selftest-skipgate_6289.sh
 # through instead of false-SKIPping. Hermetic (fake cc via `env`); SKIPs without
 # make/xxd/env.
 run_shell test/xsk-repro/selftest-multitoken-cc_6355.sh
+# #6898 A10-b5-F1: BEHAVIOURAL gate (not a strict-warning compile) for the
+# reproducer's probe filter. The XDP program redirects every packet on the queue,
+# so the receive counters used to count all interface traffic and `rx > 0` was
+# satisfiable by an ARP or an IPv6 RA while the tool's own probes never arrived —
+# the exact failure the reproducer exists to detect, reported as PASS. SKIPs
+# without cargo or offline-buildable deps.
+run_shell test/xsk-repro/selftest-probe-filter_6898.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'
