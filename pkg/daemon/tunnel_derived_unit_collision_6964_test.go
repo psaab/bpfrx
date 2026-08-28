@@ -50,8 +50,10 @@ func TestCollectAppliedTunnelsCollapsesDerivedUnitDevice_6964(t *testing.T) {
 		// every assertion here would hold on a correct config too.
 		"set interfaces gr-0/0/0u1 tunnel source 10.0.0.1",
 		"set interfaces gr-0/0/0u1 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0u1 unit 0 family inet address 10.9.0.1/30",
 		"set interfaces gr-0/0/0 unit 1 tunnel source 10.1.0.1",
 		"set interfaces gr-0/0/0 unit 1 tunnel destination 10.1.0.2",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.9.1.1/30",
 	} {
 		path, err := config.ParseSetCommand(s)
 		if err != nil {
@@ -86,6 +88,27 @@ func TestCollectAppliedTunnelsCollapsesDerivedUnitDevice_6964(t *testing.T) {
 	for src, dst := range map[string]string{"10.0.0.1": "10.0.0.2", "10.1.0.1": "10.1.0.2"} {
 		if got[src] != dst {
 			t.Errorf("device %q is missing the intent src=%s dst=%s; collected = %+v", tunnels[0].Name, src, dst, got)
+		}
+	}
+
+	// The ADDRESS fight, read directly rather than inferred from the code.
+	// reconcileLinkAddrsLocked is called as
+	//   reconcileLinkAddrsLocked(link, tc.Name, tc.Addresses, appliedAddrs[tc.Name], kind)
+	// and AddrDels every non-link-local address present on the device that is
+	// absent from `tc.Addresses`. Both records below name the SAME device and
+	// carry DISJOINT, NON-EMPTY address sets, so whichever runs second deletes
+	// the other's address off the shared device — and repeats, inverted, on any
+	// apply where the map order flips.
+	//
+	// Disjoint is the load-bearing property. If both records carried the same
+	// address the reconcile would be a no-op and this cell would pass against a
+	// config with no defect at all.
+	addrs := map[string][]string{tunnels[0].Source: tunnels[0].Addresses, tunnels[1].Source: tunnels[1].Addresses}
+	for src, want := range map[string]string{"10.0.0.1": "10.9.0.1/30", "10.1.0.1": "10.9.1.1/30"} {
+		list := addrs[src]
+		if len(list) != 1 || list[0] != want {
+			t.Fatalf("record src=%s on device %q carries Addresses=%v, want exactly [%s] — without a distinct non-empty address set on each record the mutual AddrDel is not exercised",
+				src, tunnels[0].Name, list, want)
 		}
 	}
 }
