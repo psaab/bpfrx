@@ -170,7 +170,29 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 					// zone-interface-defined gate. zoneInterfaceMembers flattens
 					// the nested chain so the hierarchical `{ a; b; }`, a single
 					// `a`, and the bracketed `[ a b c ]` all yield every member.
-					zone.Interfaces = append(zone.Interfaces, zoneInterfaceMembers(iface)...)
+					// #7031: FIRST-SEEN dedupe. Naming a member twice -- once
+					// bare for membership, once as the head of a
+					// host-inbound-traffic body -- is the ORDINARY way an
+					// operator adds a member and then gives it an override, and
+					// it is what `show configuration | display set` emits for a
+					// zone that has both. It compiled to the member appearing
+					// TWICE in zone.Interfaces, committing clean with no
+					// warning, on master and on every tree measured in the
+					// issue.
+					//
+					// Deduping here rather than at each consumer because the
+					// duplicate has no meaning to preserve: zone membership is
+					// a SET. The per-interface override map is already keyed by
+					// name and merges (#4544/#4818), so the second mention has
+					// always contributed nothing but the extra slice entry.
+					//
+					// First-seen order, not sorted: the slice order is what the
+					// operator authored and several renderers show it verbatim.
+					for _, member := range zoneInterfaceMembers(iface) {
+						if !zoneHasInterface(zone, member) {
+							zone.Interfaces = append(zone.Interfaces, member)
+						}
+					}
 					// #3362: per-interface host-inbound-traffic override
 					// (`interfaces <if> host-inbound-traffic { ... }`). Same
 					// token grammar as the zone-level stanza; parsed by the
@@ -256,6 +278,35 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						// stops the compact-leaf packed spelling
 						// `interfaces a host-inbound-traffic ...` from keying
 						// the override on its own body tokens.
+						//
+						// #7027, measured at b4ac34f10: this truncation is now a
+						// BELT IN FRONT OF A GATE, not a load-bearing read. The
+						// issue reports that reverting it to iface.Keys leaves
+						// the whole pkg/config suite green and reads that as a
+						// missing assertion. It is not missing — the two
+						// expressions never DIFFER. Instrumenting this site to
+						// print whenever len(truncated) != len(iface.Keys) and
+						// running the full package (rc=0, 0 build errors, 0
+						// failures) produced ZERO hits: no config in the corpus
+						// reaches a member node whose Keys carry a body keyword.
+						//
+						// The spelling the truncation was written for is now
+						// rejected earlier: #6735's packed-tail gate refuses
+						// `interfaces a host-inbound-traffic <tail>` at commit
+						// (validateZoneInterfacePackedTailStrict), and the one
+						// remaining keyword-on-Keys spelling, the nested block
+						// `interfaces { a host-inbound-traffic { ... } }`, does
+						// not reach this branch at all — it compiles to the
+						// member with NO override, which is a separate question
+						// and not this one.
+						//
+						// So a regression test for the truncation would first
+						// need a config that both differs AND commits, and the
+						// sweep found none. Kept rather than deleted, and kept
+						// with this note rather than dressed up as load-bearing:
+						// if #6735's gate is ever narrowed, this belt becomes
+						// live again, and the next reader should know the
+						// dependency runs in that direction.
 						for _, name := range zoneInterfaceMemberKeys(iface) {
 							zone.InterfaceHostInbound[name] = mergeHostInbound(zone.InterfaceHostInbound[name], cloneHostInbound(hib))
 						}
@@ -726,4 +777,19 @@ func zoneInterfaceStanzaPackedTail(prop *Node) (keyword string, tail []string, f
 		}
 	}
 	return "", nil, false
+}
+
+// zoneHasInterface reports whether the zone already lists this member.
+//
+// #7031: zone membership is a SET, but it is stored as a slice because the
+// authored order is operator-visible in several renderers. A linear scan is
+// right at this size -- a zone's member list is a handful of names, and a map
+// would have to be built and thrown away per zone per compile.
+func zoneHasInterface(zone *ZoneConfig, member string) bool {
+	for _, have := range zone.Interfaces {
+		if have == member {
+			return true
+		}
+	}
+	return false
 }
