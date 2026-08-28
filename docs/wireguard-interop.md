@@ -21,6 +21,56 @@ therefore staged by capability, not by vendor.
 | S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). **RESPONDER CookieReply + MAC2 under-load DoS mitigation DONE (#4094 PR-A)** — a per-tunnel rotating secret `Rm` (120 s, one-window previous-secret carry), an inbound-initiation fixed-window load gate, and MAC2 verification bind an initiation to the source that received the responder's type-3 CookieReply, so a valid-MAC1 flood (attacker knows our public key) no longer forces a Noise handshake per forged datagram. See "Responder cookie / MAC2 under-load DoS mitigation" below. **INITIATOR-side CookieReply *consume* DONE (#4094 PR-B)** — an inbound type-3 is decrypted (responder pubkey-derived key + our last-sent MAC1 as AAD), the cookie stored per-peer, and our NEXT initiation carries a real MAC2 (honoring the 120 s cookie TTL), so xpf-as-initiator now completes a handshake against a peer that is itself under load. IPv6 outer encap still pending |
 | S8 | HA RG WG-session migration | pending |
 
+## Config shape: interface-level tunnel with per-unit peers (#7786)
+
+A WireGuard interface can be written two ways, and they are not the same
+object.
+
+- **Per-unit** — `set interfaces wgN unit U tunnel mode wireguard ...` with no
+  interface-level `tunnel` stanza. This is the canonical spelling. Each unit
+  emits its own tunnel endpoint with its own device, listen port, private key
+  and peers.
+- **Interface-level** — `set interfaces wgN tunnel mode wireguard ...`. This is
+  **ONE persistent TUN and ONE local identity**: one kernel UDP socket, one
+  private key (`TunnelConfig.WgListenPort` / `WgLocalPrivkeyHex` are
+  tunnel-level; `WgPeers` is the per-peer set). The emitter produces exactly
+  one endpoint for the whole interface, keyed by the lowest configured unit ref
+  (#1910).
+
+Under the **interface-level** form a unit may still carry its own `tunnel`
+stanza, and what that means is now defined:
+
+- **`peer` entries are additive.** Every unit's peers are merged into the
+  interface's single endpoint, de-duplicated by public key and sorted by public
+  key. A unit re-declaring an inherited peer is already refused at commit
+  (`duplicate peer public key`), so a unit's peers are always the inherited set
+  plus keys no other unit declares — the merge cannot conflict and needs no
+  precedence rule.
+
+  Before #7786 those peers were discarded. `pkg/dataplane/userspace/tunnels.go`
+  builds the wire peer set from the emitted endpoint's `TunnelConfig`, and that
+  is the only path config peers have to the dataplane, so a peer authored under
+  a unit was parsed, deep-copied (#3898) and validated — and then silently
+  never installed. The tunnel came up carrying only the interface-level peers.
+
+- **`listen-port` and `private-key` overrides are refused at commit.** They ask
+  for a second local identity on one logical interface, which the one-socket /
+  one-identity model has no representation for. Merging such a unit would offer
+  a *different* identity's peers the parent's key; emitting it as its own
+  endpoint would put two endpoints on one listen port (two WireGuard tunnels
+  sharing a listen port compile without complaint, and
+  `WireGuardListenPorts()` de-duplicates them, so nothing would report it).
+  Configure the second identity on its own interface.
+
+  This shape was previously half-wired in a misleading direction: routing
+  materialised the unit's TUN and `WireGuardListenPorts()` already collected
+  the unit's port, so the host-inbound filter opened a port that no endpoint
+  ever listened on.
+
+Which Linux device that single endpoint binds to when the lowest configured
+unit carries its own `tunnel` stanza is a separate open question — see #6941.
+#7786 deliberately does not move the endpoint's ref or device.
+
 ## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303 / #2329)
 
 These correctness fixes share the encap sites and the tunnel-MTU

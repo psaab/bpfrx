@@ -113,10 +113,15 @@ func TestPerUnitTunnelAddressesIndependent(t *testing.T) {
 // 2's peer instead of its own.
 func TestPerUnitTunnelWgPeersIndependent(t *testing.T) {
 	const (
-		priv  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-		peerX = "1111111111111111111111111111111111111111111111111111111111111111"
-		peerY = "2222222222222222222222222222222222222222222222222222222222222222"
-		peerZ = "3333333333333333333333333333333333333333333333333333333333333333"
+		priv = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		// X/Y/Z sort AFTER A/B on purpose (#7786). The merge appends the
+		// interface-level peers before the per-unit ones, so pubkeys that
+		// ascend in that order are already sorted by coincidence and the
+		// emitted-order assertion below could not detect the sort being
+		// dropped.
+		peerX = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		peerY = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+		peerZ = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 		peerA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		peerB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	)
@@ -183,6 +188,49 @@ func TestPerUnitTunnelWgPeersIndependent(t *testing.T) {
 	if len(u1.Tunnel.WgPeers) > 0 && len(u2.Tunnel.WgPeers) > 0 &&
 		&u1.Tunnel.WgPeers[0] == &u2.Tunnel.WgPeers[0] {
 		t.Error("unit 1 and unit 2 tunnel WgPeers share the same backing array")
+	}
+
+	// #7786: every assertion above is about the COMPILED config, and all of
+	// them passed for the entire period in which per-unit peers never reached
+	// the dataplane at all. The interface-level WireGuard branch of
+	// EmitTunnelEndpointNames discarded every per-unit TunnelConfig, and
+	// buildTunnelEndpointSnapshots builds WgPeers from the emitted endpoint's
+	// TunnelConfig, which is the only config->dataplane path for them. So this
+	// test established the shape as SUPPORTED while nothing consumed it.
+	//
+	// Deliberately asserted here rather than in a separate file: the property
+	// that makes the deep copy worth doing is that each unit's peer is
+	// installed, and if that is guarded somewhere else it can be deleted
+	// without this test noticing and the shape goes back to being tested at
+	// the config layer and dead at the runtime layer.
+	eps := EmitTunnelEndpointNames(cfg)
+	if len(eps) != 1 {
+		t.Fatalf("interface-level WireGuard must emit exactly ONE endpoint (#1910); got %d", len(eps))
+	}
+	emitted := make([]string, 0, len(eps[0].Tunnel.WgPeers))
+	for _, p := range eps[0].Tunnel.WgPeers {
+		emitted = append(emitted, p.PublicKeyHex)
+	}
+	for _, want := range []string{peerX, peerY, peerZ, peerA, peerB} {
+		if !hasStr(emitted, want) {
+			t.Errorf("peer %s never reaches the dataplane: the emitted endpoint carries %v. "+
+				"Per-unit peers are merged into the interface's single endpoint (#7786); "+
+				"without that they are compiled, deep-copied and validated and then dropped",
+				want, emitted)
+		}
+	}
+	if len(emitted) != 5 {
+		t.Errorf("emitted endpoint carries %d peers %v, want the 5 distinct pubkeys "+
+			"(X/Y/Z inherited + A from unit 1 + B from unit 2) exactly once each",
+			len(emitted), emitted)
+	}
+	// Sorted by pubkey so every consumer of this emitter sees one order
+	// regardless of authoring or unit iteration (#1434 5.4).
+	for i := 1; i < len(emitted); i++ {
+		if emitted[i-1] >= emitted[i] {
+			t.Errorf("emitted peers are not sorted by pubkey: %v", emitted)
+			break
+		}
 	}
 }
 
