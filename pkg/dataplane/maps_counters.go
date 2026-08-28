@@ -341,10 +341,8 @@ func (m *Manager) ClearZoneCounters() error {
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
-	for i := uint32(0); i < 128; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. 128 is zone_counters' max_entries.
+	return clearArrayEntriesIn(zm, "zone_counters", 128, zero)
 }
 
 // ClearAllCounters zeroes all counter maps (global, interface, zone, policy, filter).
