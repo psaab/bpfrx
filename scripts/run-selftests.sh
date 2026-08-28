@@ -165,6 +165,13 @@ run_shell test/xsk-repro/selftest-multitoken-cc_6355.sh
 # the exact failure the reproducer exists to detect, reported as PASS. SKIPs
 # without cargo or offline-buildable deps.
 run_shell test/xsk-repro/selftest-probe-filter_6898.sh
+# #6923: the chokepoint argument for the v6 conntrack publish path rests on
+# `refresh_bpf_conntrack_last_seen` being unable to CREATE a key, because it
+# updates with BPF_EXIST. "The flag is named EXIST" and "the kernel refuses
+# creation under this flag" are different claims; this asks the kernel, with a
+# BPF_ANY positive control so an ENOENT cannot come from a broken fixture.
+# SKIPs without cc, passwordless sudo, or CAP_BPF.
+run_shell test/mutation/selftest-bpf-exist-cannot-create_6923.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'
