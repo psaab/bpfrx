@@ -114,14 +114,25 @@ newflow_cluster_primary_verdict() {
 		}
 
 		# A node row: "nodeN  <prio>  <state>  <preempt> <manual> <mon>".
-		# Anchored on field 1, so the PEER row can never answer for the local
-		# node — and the "  Takeover ready: ..." / "Held secondary: ..." lines,
-		# whose free-text reasons could contain any word, are not node rows.
+		#
+		# Field 1 must EQUAL the local node token. That one test is the whole
+		# anchor: the PEER row cannot answer for the local node, and the
+		# "  Takeover ready: ..." / "Held secondary: ..." lines — whose
+		# free-text reasons do contain the words "primary" and "secondary"
+		# (#103, #6495) — are not node tokens and so are not rows. Equality,
+		# not a prefix: node1 must not answer for node10.
+		#
+		# A local row with no group in scope (before the first header, or after
+		# a header whose id did not parse) is a STRAY: the output is not the
+		# grammar this verdict is written against, so it fails closed rather
+		# than being attributed to a group it might not belong to.
 		n = split(line, f, /[ \t]+/)
-		if (n >= 3 && cur != "" && tolower(f[1]) ~ /^node[0-9]+$/) {
-			if (local != "" && tolower(f[1]) == local) {
+		if (n >= 3 && local != "" && tolower(f[1]) == local) {
+			if (cur != "") {
 				state[cur] = tolower(f[3])
 				sawlocal[cur] = 1
+			} else {
+				stray++
 			}
 		}
 	}
@@ -132,6 +143,10 @@ newflow_cluster_primary_verdict() {
 		}
 		if (malformed > 0) {
 			printf "UNKNOWN %s\n", "status contains " malformed " unparseable \"Redundancy group:\" header(s) — a group whose id cannot be read is a group whose ownership is unknown, and this verdict is about owning EVERY group"
+			exit 0
+		}
+		if (stray > 0) {
+			printf "UNKNOWN %s\n", "status has " stray " row(s) for " local " outside any redundancy group — a node row with no group in scope means this is not the status grammar the verdict reads, so the ownership of no group can be claimed from it"
 			exit 0
 		}
 		if (nrg == 0) {

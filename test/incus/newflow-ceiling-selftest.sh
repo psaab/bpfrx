@@ -232,6 +232,16 @@ node1   100      secondary      yes      no       None
 check ROW_BEFORE_ANY_RG_HEADER UNKNOWN 'Node name: node0
 node0   200      primary        yes      no       None
 '
+# ... and the same guard with REAL groups present, so the verdict cannot be
+# reached by the no-groups path instead. Without the in-scope test the stray row
+# is attributed to a group and this reads as an ownership claim.
+check STRAY_ROW_ALONGSIDE_REAL_GROUPS UNKNOWN 'Node name: node0
+node0   200      primary        yes      no       None
+
+Redundancy group: 0 , Failover count: 0
+node0   100      secondary      yes      no       None
+node1   200      primary        yes      no       None
+'
 # A group whose id cannot be read is a group whose ownership is unknown, so the
 # verdict is fail-closed even though every group that DID parse reads primary.
 check MALFORMED_RG_HEADER_FAILS_CLOSED UNKNOWN 'Node name: node0
@@ -245,11 +255,15 @@ node0   200      primary        yes      no       None
 
 # --- node-token anchoring must be exact ----------------------------------
 # node1 must not answer for node10, or the anchor is a prefix match.
+# ORDER IS LOAD-BEARING: the local row comes FIRST and the prefix-colliding row
+# LAST. With node10 first, a prefix match would be overwritten by node1's own
+# later row and the cell would pass against a broken anchor — which is exactly
+# what the first version of this fixture did, and the mutation matrix caught.
 check NODE10_IS_NOT_NODE1 NOT-PRIMARY 'Node name: node1
 
 Redundancy group: 0 , Failover count: 0
-node10  200      primary        yes      no       None
 node1   100      secondary      yes      no       None
+node10  200      primary        yes      no       None
 '
 check NODE10_LOCAL_PRIMARY PRIMARY 'Node name: node10
 
