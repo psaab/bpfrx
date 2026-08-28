@@ -234,7 +234,7 @@ func TestEpochlessCounterQuietWhenClean_6169(t *testing.T) {
 // The gap it closes: "Epoch session collisions" was rendered on every surface
 // and asserted by no test, so all three copies could be deleted with the
 // package green. The two #6669 counters added alongside it
-// (EpochOutOfBandRejected, EpochAheadOfClockRejected) would have inherited the
+// (EpochOutOfBandRejected, EpochRaiseDeclinedAheadOfClock) would have inherited the
 // same hole. A counter that is populated but not rendered is documentation, not
 // observability — and one that is rendered but unbound is one careless edit
 // away from being neither.
@@ -304,7 +304,7 @@ func TestEveryEpochCounterIsRendered_6669(t *testing.T) {
 		t.Fatal("setup: no session collisions were produced")
 	}
 
-	// (6) EpochAheadOfClockRejected — above the floor AND beyond the forward
+	// (6) EpochRaiseDeclinedAheadOfClock — above the floor AND beyond the forward
 	// bound, so only epochWithinForwardBound can refuse it.
 	ahead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
 	if !epochUsableAsFloor(ahead) {
@@ -326,7 +326,7 @@ func TestEveryEpochCounterIsRendered_6669(t *testing.T) {
 		{"Epoch downgrades rejected:", st.EpochDowngradeRejected},
 		{"Epoch session collisions:", st.EpochSessionCollision},
 		{"Epoch out-of-band rejected:", st.EpochOutOfBandRejected},
-		{"Epoch ahead of our clock:", st.EpochAheadOfClockRejected},
+		{"Epoch raises declined:", st.EpochRaiseDeclinedAheadOfClock},
 	}
 
 	// THE PRECONDITION THAT MAKES THIS A GUARD RATHER THAN A LABEL CHECK.

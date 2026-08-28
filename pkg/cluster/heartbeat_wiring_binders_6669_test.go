@@ -165,8 +165,8 @@ func TestEpochCountersAreExposedWithoutAReceiver_6669(t *testing.T) {
 			"but the counter was incremented on the admission path: the exposure is " +
 			"receiver-scoped, so a VRF rebind blanks a real refusal count")
 	}
-	if st.EpochAheadOfClockRejected == 0 {
-		t.Fatal("HeartbeatStats reports EpochAheadOfClockRejected=0 with no receiver installed, " +
+	if st.EpochRaiseDeclinedAheadOfClock == 0 {
+		t.Fatal("HeartbeatStats reports EpochRaiseDeclinedAheadOfClock=0 with no receiver installed, " +
 			"but the counter was incremented on the admission path")
 	}
 }
@@ -187,9 +187,9 @@ func TestEpochCountersStillExposedWithAReceiver_6669(t *testing.T) {
 	if st.EpochOutOfBandRejected == 0 {
 		t.Fatal("EpochOutOfBandRejected=0 WITH a receiver installed; the counter is not being read")
 	}
-	if st.EpochAheadOfClockRejected != 0 {
-		t.Fatalf("EpochAheadOfClockRejected = %d with nothing driving it, want 0: the accessor is "+
-			"not reporting real state", st.EpochAheadOfClockRejected)
+	if st.EpochRaiseDeclinedAheadOfClock != 0 {
+		t.Fatalf("EpochRaiseDeclinedAheadOfClock = %d with nothing driving it, want 0: the accessor is "+
+			"not reporting real state", st.EpochRaiseDeclinedAheadOfClock)
 	}
 }
 

@@ -636,7 +636,7 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 	s.EpochlessAdmitted = m.hbAuth.epochlessAdmitted.Load()
 	s.EpochDowngradeRejected = m.hbAuth.epochDowngradeRejected.Load()
 	s.EpochOutOfBandRejected = m.hbAuth.epochOutOfBandRejected.Load()
-	s.EpochAheadOfClockRejected = m.hbAuth.epochAheadOfClockRejected.Load()
+	s.EpochRaiseDeclinedAheadOfClock = m.hbAuth.epochRaiseDeclinedAheadOfClock.Load()
 	s.EpochSessionCollision = m.hbAuth.epochSessionCollision.Load()
 	s.PeerEpochLatched = m.hbAuth.peerEpochLatched()
 	return s
@@ -721,7 +721,7 @@ type HeartbeatStats struct {
 	// EpochDowngradeRejected).
 	EpochSessionCollision uint64
 
-	// EpochOutOfBandRejected and EpochAheadOfClockRejected are the two epoch
+	// EpochOutOfBandRejected and EpochRaiseDeclinedAheadOfClock are the two epoch
 	// refusals that are NOT replays, split out so the operator action differs
 	// from the one "stale nonce (replay)" implies.
 	//
@@ -731,15 +731,19 @@ type HeartbeatStats struct {
 	// so this points at the peer's state file or at the peer running something
 	// that is not this build — never at this node's clock.
 	//
-	// A non-zero EpochAheadOfClockRejected is a CLOCK fault and usually a
+	// A non-zero EpochRaiseDeclinedAheadOfClock is a CLOCK fault and usually a
 	// perfectly healthy peer: its epoch is more than bootEpochMaxSkew (one hour)
 	// ahead of THIS node's clock, so either the peer runs fast or this node runs
 	// slow. Check NTP on both nodes. It gates only the RAISE path, so a peer
 	// already at the floor keeps being admitted — which is why this can climb
 	// while peer liveness stays healthy, and why reading it as an attack wastes
 	// an incident. It self-clears once the clocks agree; no restart is needed.
-	EpochOutOfBandRejected    uint64
-	EpochAheadOfClockRejected uint64
+	// #6969 F5: from an established receiver the frame itself is ADMITTED with
+	// the raise declined (the floor is held, liveness is not lost); from a fresh
+	// one it is still refused. The name says "declined" rather than "rejected"
+	// for that reason — the common case no longer drops the frame.
+	EpochOutOfBandRejected         uint64
+	EpochRaiseDeclinedAheadOfClock uint64
 
 	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.
 	// epochSeen): an epoch-bearing frame has been accepted from this peer.
