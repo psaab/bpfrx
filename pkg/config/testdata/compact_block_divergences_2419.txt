@@ -12,7 +12,23 @@
 #
 # `xpfarg` / `xpfname` are synthesized instance names.
 #
-# checked: 546
+# checked: 547
+#
+# #6940 raised the checked count 546 -> 547 and added
+# `interfaces xpfname aggregated-ether-options minimum-links`. That site is NOT
+# a new compiler defect — it is a pre-existing compact-blind reader that this
+# census could not SEE until #6940 landed.
+#
+# Before #6940 the leaf carried no valueType or valueExamples, so the census
+# synthesised the generic pair "xpfaaa"/"xpfbbb"; the compiler parsed both with
+# `x, _ = strconv.Atoi(v)`, whose discarded error made BOTH compile to 0. The
+# value therefore did not change the compiled config, the vacuity guard fired,
+# and the cell was recorded "skipped: leaf value not observable" — measured
+# both ways. Giving the leaf a validator and integer examples made the two
+# probe values observable, and the compact spelling is genuinely blind.
+#
+# So one defect was masking another: a blind-spot count that RISES after a fix
+# is the fix working. Fixing the compact reader is #2419's job, not #6940's.
 #
 # skipped (leaf value not observable in the typed config): 204
 # skipped (a spelling did not parse or compile): 37
@@ -66,6 +82,7 @@ forwarding-options sampling instance xpfarg family inet6 output source-address
 forwarding-options sampling instance xpfarg input rate
 interfaces xpfname aggregated-ether-options lacp periodic
 interfaces xpfname aggregated-ether-options link-speed
+interfaces xpfname aggregated-ether-options minimum-links
 interfaces xpfname description
 interfaces xpfname duplex
 interfaces xpfname encapsulation

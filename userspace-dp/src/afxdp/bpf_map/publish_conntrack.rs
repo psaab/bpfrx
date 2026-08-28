@@ -20,7 +20,8 @@
 
 use super::{
     BpfSessionKeyV4, BpfSessionKeyV6, BpfSessionValueV4, BpfSessionValueV6, SESS_STATE_ESTABLISHED,
-    SessionDecision, SessionKey, SessionMetadata, reverse_session_key,
+    SessionDecision, SessionKey, SessionMetadata, bpf_session_key_v4, bpf_session_key_v6,
+    reverse_session_key,
 };
 use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 use core::ffi::{c_int, c_void};
@@ -112,14 +113,7 @@ pub(super) fn publish_v4_session(
     // live entry), preserving the legacy ordinal fallback on the Go render side.
     session_id: u64,
 ) {
-    let bpf_key = BpfSessionKeyV4 {
-        src_ip: src.octets(),
-        dst_ip: dst.octets(),
-        src_port: key.src_port.to_be(),
-        dst_port: key.dst_port.to_be(),
-        protocol: key.protocol,
-        pad: [0; 3],
-    };
+    let bpf_key = bpf_session_key_v4(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
 
     // A cross-family reverse key means the session cannot be mirrored to the v4
     // conntrack map — skip the write entirely (pre-#5213 behaviour).
@@ -182,14 +176,7 @@ pub(super) fn build_conntrack_value_v4(
                 IpAddr::V4(d) => d,
                 _ => return None,
             };
-            BpfSessionKeyV4 {
-                src_ip: rsrc.octets(),
-                dst_ip: rdst.octets(),
-                src_port: rev.src_port.to_be(),
-                dst_port: rev.dst_port.to_be(),
-                protocol: rev.protocol,
-                pad: [0; 3],
-            }
+            bpf_session_key_v4(rsrc.octets(), rdst.octets(), rev.src_port, rev.dst_port, rev.protocol)
         }
         _ => return None,
     };
@@ -327,14 +314,13 @@ pub(super) fn publish_v6_session(
     if !v6_session_key_is_publishable(key.protocol) {
         return;
     }
-    let bpf_key = BpfSessionKeyV6 {
-        src_ip: src.octets(),
-        dst_ip: dst.octets(),
-        src_port: key.src_port.to_be(),
-        dst_port: key.dst_port.to_be(),
-        protocol: key.protocol,
-        pad: [0; 3],
-    };
+    let bpf_key = bpf_session_key_v6(
+        src.octets(),
+        dst.octets(),
+        key.src_port,
+        key.dst_port,
+        key.protocol,
+    );
 
     let Some(value) = build_conntrack_value_v6(
         key,
@@ -393,14 +379,7 @@ pub(super) fn build_conntrack_value_v6(
                 IpAddr::V6(d) => d,
                 _ => return None,
             };
-            BpfSessionKeyV6 {
-                src_ip: rsrc.octets(),
-                dst_ip: rdst.octets(),
-                src_port: rev.src_port.to_be(),
-                dst_port: rev.dst_port.to_be(),
-                protocol: rev.protocol,
-                pad: [0; 3],
-            }
+            bpf_session_key_v6(rsrc.octets(), rdst.octets(), rev.src_port, rev.dst_port, rev.protocol)
         }
         _ => return None,
     };
@@ -696,9 +675,25 @@ mod publish_chokepoint_6923_tests {
              correct and never invoked — that is the same defect this change exists to close, one \
              layer in",
         );
-        let key_at = body
-            .find("BpfSessionKeyV6 {")
-            .expect("#6923: publish_v6_session no longer builds a BpfSessionKeyV6");
+        // #7743: the key construction was single-sourced into
+        // `bpf_session_key_v6`, so this anchor accepts EITHER spelling and
+        // takes whichever appears first. Pinning only the struct literal made
+        // this guard fail the moment the builder replaced it — a pinned literal
+        // must become an alias, not a decommissioned test. If NEITHER spelling
+        // is present the key is no longer built here at all, and the expect
+        // below fails loudly rather than passing vacuously.
+        let key_at = [
+            body.find("bpf_session_key_v6("),
+            body.find("BpfSessionKeyV6 {"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect(
+            "#6923/#7743: publish_v6_session no longer builds a v6 key by any known spelling \
+             (neither `bpf_session_key_v6(` nor `BpfSessionKeyV6 {`) — re-anchor this bind, do \
+             not delete it",
+        );
         assert!(
             guard_at < key_at,
             "#6923: the refusal must run BEFORE the key is built and published. A check placed \
