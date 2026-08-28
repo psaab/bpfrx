@@ -567,11 +567,19 @@ pub(super) fn apply_snapshot(
         config_generation: snapshot.generation,
         fib_generation: snapshot.fib_generation,
     };
-    coord.policy_counters.reconcile_rules(&snapshot.policies);
-    // #2218: drop hit counters for NAT rules removed by this config.
-    coord
-        .nat_counters
-        .reconcile_ids(&super::super::snapshot_active_nat_counter_ids(snapshot));
+    // #7010: the destructive prune of the policy / NAT hit counters USED to be
+    // here, above `bring_up_workers`. It moved to
+    // `Coordinator::commit_rule_counter_prune`, which each apply path calls at
+    // ITS OWN commit point — the same split #6832 made for the per-zone
+    // counters, and for the same measured reason: a build can succeed and the
+    // apply still be rejected by a worker spawn failure (#4952) or an
+    // incomplete queue bind (#5143), and pruning here destroyed the removed
+    // rules' cumulative hit counts for a configuration that never forwarded a
+    // packet. Worse than the zone case, which is why it needed its own issue:
+    // `stop_inner` defaults `coord.forwarding` and takes the zone store's
+    // publisher with it, but `policy_counters` and `nat_counters` are
+    // Coordinator fields it never touches — so BOTH bring-up failure arms leaked
+    // here, and `nat_rule_counters()` kept serving from the pruned store.
     // #1866 D3: WG endpoint-set transition log at the reconcile apply
     // boundary (mirrors refresh_runtime_snapshot).
     super::super::log_wg_endpoint_set_transition("reconcile", &coord.forwarding, &new_forwarding);
