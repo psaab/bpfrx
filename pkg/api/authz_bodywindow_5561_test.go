@@ -116,11 +116,13 @@ func TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561(t *testing.T) {
 					// the real one rather than an artefact of the gate buffering on
 					// some handler's behalf — a route in the mutationBodyNone class
 					// answers without entering it at all.
+					// #6977: baseline before the request exists.
+					parked := MutationBodyWaitersForTest()
 					req := openWithheldBody(t, base, "POST /api/v1/config/set", tc.hdrs)
 
 					// Authorized, and now parked reading a body the caller has not
 					// sent. This is the window, and the caller holds it open.
-					waitForMutationBodyWaiter(t)
+					waitForNewMutationBodyWaiter(t, parked)
 					if change {
 						s.ReplaceAuth(tc.change)
 					}
