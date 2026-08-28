@@ -542,6 +542,20 @@ delayed config-A session install that arrives **after** that sweep is installed
 anyway — a stale permit. The standby would then forward under the revoked
 config-A decision after failover.
 
+**What "that sweep" reads (#6948).** The deletion-clear no longer enumerates the
+session table after the apply. Runtime policy ids are POSITIONAL, so a new
+snapshot renumbers them and a surviving policy can inherit a deleted policy's
+id; and the helper's #3395 live-row refresh
+(`refresh_bpf_conntrack_last_seen`) re-resolves every forward row's `policy_id`
+against the CURRENT rule table into the same pinned conntrack map the control
+plane enumerates. Both writers make a post-apply read mean something other than
+what the old-numbering diff meant. The candidate sessions are therefore captured
+in ONE pass at the last statement before `rt.ApplyConfig` publishes the snapshot
+(`capturePolicyInvalidationLocked`) and the deletes — including the #2468 peer
+delete-sync — are issued from that capture afterwards. The capture is a READ, so
+it cannot re-admit anything; the deletes still land after the new policy set is
+live, so a cleared flow re-evaluates against the new config.
+
 The epoch is stamped by the SENDER at queue time (`stampInstallGen*` sets
 `ConfigEpoch = configGenCounter.Load()`), and compared by the RECEIVER against
 `lastAppliedConfigGen`. Both live in the **same** #3931 config-sync-generation

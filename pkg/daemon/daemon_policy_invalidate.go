@@ -56,17 +56,28 @@ import (
 // DIFFERENT deleted policy covered is kept — so it is not a security
 // regression.
 //
-// Correctness depends on running BEFORE the ~1s live-row refresh
-// (#3395 reresolve_session_policy_id) re-stamps a session's policy_id: a
-// deleted policy's rule_id no longer resolves, so after a refresh tick its
-// sessions carry DEFAULT_POLICY_SENTINEL_ID (u32::MAX) rather than their old
-// numeric id and would no longer match. The clear runs synchronously in the
+// This set is only meaningful against rows that still carry the OLD numbering,
+// which is why the invalidation READS the session table before the dataplane
+// publishes the new snapshot and deletes from that capture afterwards (#6948,
+// daemon_policy_invalidate_capture.go). Two writers move a live row's policy_id
+// the moment the snapshot goes live: new admissions use the NEW ids, and the
+// helper's #3395 live-row refresh (reresolve_session_policy_id, driven from
+// refresh_bpf_conntrack_last_seen into the same pinned conntrack map Go
+// enumerates) re-resolves every forward row from its bound rule handle against
+// the CURRENT rule table. A deleted policy's rows become
+// DEFAULT_POLICY_SENTINEL_ID (u32::MAX — its rule_id no longer resolves) and a
+// surviving policy's rows become that policy's NEW id, which may be the id this
+// set targets.
+//
+// An earlier revision of this comment said the clear "runs synchronously in the
 // apply path (right after the dataplane ApplyConfig), before the next refresh
-// tick, so the deleted-policy sessions still carry the OLD id this set targets.
-// A narrow residual remains for two commits inside one refresh window
-// (reorder-then-delete): a session re-stamped between them could carry an id
-// this diff no longer recognizes — bounded and self-healing (the next refresh
-// or idle timeout resolves it), accepted for the Junos-default deletion-clear.
+// tick". It did not: the sweep ran after the WHOLE of applyConfigLocked,
+// including applyTailReconciles (DNS, sudoers, sshd, IPsec, VRRP, FRR), while
+// the refresh runs a 2048-slot slice every 100ms with a 10s full-table target
+// — so on a real box a large fraction of the table had already been re-stamped
+// by the time the sweep read it. The claim mattered because it is the stated
+// reason the numeric-id diff is sound, and it is recorded here rather than
+// deleted so the next reader can see which premise moved.
 //
 // Returns nil when oldCfg is nil (boot / first commit — nothing to invalidate)
 // or nothing was deleted.
@@ -132,6 +143,14 @@ func deletedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 // this into the commit/sync/rollback result rather than let it be lost to a log
 // line (#5578).
 func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) error {
+	// #6948: when the apply took a pre-publication capture, delete exactly what
+	// it observed. The capture read the session table while the rows still
+	// carried the OLD numbering this id set was derived from, which neither a
+	// post-activation admission nor the helper's #3395 live-row re-stamp can
+	// contaminate. See daemon_policy_invalidate_capture.go.
+	if c := d.policyInvalidationCapture; c != nil {
+		return d.deleteInvalidatedSessions(c.deleted, dataplane.DeleteReasonPolicyDeleted, "deleted")
+	}
 	return d.clearSessionsForPolicyIDs(
 		deletedPolicyRuntimeIDs(oldCfg, newCfg),
 		dataplane.DeleteReasonPolicyDeleted,
@@ -171,6 +190,13 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 // so the caller can surface the stale-authorization gap; see
 // clearSessionsForDeletedPolicies (#5578).
 func (d *Daemon) clearSessionsForModifiedPolicies(oldCfg, newCfg *config.Config) error {
+	// #6948: see clearSessionsForDeletedPolicies. The rematch half is exposed to
+	// the same two contaminations — a surviving-but-changed policy's OLD id can
+	// be inherited by a different policy, and the #3395 refresh re-stamps this
+	// policy's own rows to its NEW id — so it consumes the same capture.
+	if c := d.policyInvalidationCapture; c != nil {
+		return d.deleteInvalidatedSessions(c.modified, dataplane.DeleteReasonPolicyModified, "modified (policy-rematch)")
+	}
 	now := time.Now()
 	oldSched := d.policySchedulerActiveStateForApplyLocked(oldCfg, now)
 	newSched := d.policySchedulerActiveStateForApplyLocked(newCfg, now)
@@ -235,6 +261,29 @@ func defaultPolicyChanged(oldCfg, newCfg *config.Config) (changed, unconditional
 // so the caller can surface the stale-authorization gap; see
 // clearSessionsForDeletedPolicies (#5578).
 func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Config) error {
+	// #6948: see clearSessionsForDeletedPolicies. The sentinel is never
+	// inherited, so this class cannot be over-cleared by renumbering — but it
+	// shares the capture so that ALL THREE classes read the session table
+	// exactly once, at one instant, on the same side of the publication
+	// boundary. A per-class read would put them on different sides of it.
+	if c := d.policyInvalidationCapture; c != nil {
+		return d.deleteInvalidatedSessions(c.deflt, dataplane.DeleteReasonDefaultPolicyChanged, "default-policy changed")
+	}
+	return d.clearSessionsForPolicyIDs(
+		defaultPolicyChangeRuntimeIDs(oldCfg, newCfg),
+		dataplane.DeleteReasonDefaultPolicyChanged,
+		"default-policy changed",
+	)
+}
+
+// defaultPolicyChangeRuntimeIDs is the #4342 target set: the default-policy
+// sentinel when the implicit default-policy changed in a way that must
+// invalidate live default-PERMIT sessions, and nil otherwise. Factored out of
+// clearSessionsForDefaultPolicyChange so the pre-publication capture
+// (#6948) and the legacy post-apply path decide the GATE identically — a
+// duplicated gate is a divergence waiting to happen, and this one is what makes
+// a log-only flip without `policy-rematch` a no-op.
+func defaultPolicyChangeRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} {
 	changed, unconditional := defaultPolicyChanged(oldCfg, newCfg)
 	if !changed {
 		return nil
@@ -245,11 +294,7 @@ func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Conf
 		// in-progress sessions only under policy-rematch).
 		return nil
 	}
-	return d.clearSessionsForPolicyIDs(
-		map[uint32]struct{}{dataplane.DefaultPolicySentinelID: {}},
-		dataplane.DeleteReasonDefaultPolicyChanged,
-		"default-policy changed",
-	)
+	return map[uint32]struct{}{dataplane.DefaultPolicySentinelID: {}}
 }
 
 // clearSessionsForPolicyChanges runs the three commit-time session
@@ -264,7 +309,19 @@ func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Conf
 //
 // Caller must hold d.applySem (all commit/sync/rollback call sites do).
 func (d *Daemon) clearSessionsForPolicyChanges(oldCfg, newCfg *config.Config) error {
+	// #6948: the pre-publication capture is CONSUMED here — read once for the
+	// three clears below, then dropped, so a later apply that bails before the
+	// capture point can never delete against a stale candidate set. The shared
+	// enumerate error is reported once for all three classes (they share one
+	// scan).
+	capture := d.policyInvalidationCapture
+	defer func() { d.policyInvalidationCapture = nil }()
+	var captureErr error
+	if capture != nil {
+		captureErr = capture.enumerateErr()
+	}
 	return errors.Join(
+		captureErr,
 		d.clearSessionsForDeletedPolicies(oldCfg, newCfg),
 		d.clearSessionsForModifiedPolicies(oldCfg, newCfg),
 		d.clearSessionsForDefaultPolicyChange(oldCfg, newCfg),
@@ -305,13 +362,6 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	if store == nil {
 		return nil
 	}
-	// Whether to propagate the local deletes to the HA peer. Mirrors the GC
-	// delete callback (daemon_run.go): only a node that is primary for some RG
-	// owns the authoritative session and syncs its deletes; the peer ignores
-	// deletes for sessions it does not hold.
-	ss := d.getSessionSync()
-	syncPeer := d.cluster != nil && d.cluster.IsLocalPrimaryAny() && ss != nil
-
 	// Collect forward entries only; DeleteBatchKnownV4/V6 expands each to its
 	// reverse + DNAT companions. A reverse entry carries the SAME policy_id as
 	// its forward, so including it would double-delete the same session and, for
@@ -379,7 +429,8 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// lost to a log line while the commit reports success with stale authorized
 	// sessions still forwarding.
 	var errs []error
-	if v4EnumErr != nil || v6EnumErr != nil {
+	enumFailed := v4EnumErr != nil || v6EnumErr != nil
+	if enumFailed {
 		slog.Error("policy session invalidation: session-table enumerate failed; clear is PARTIAL — some sessions of changed policies may keep forwarding",
 			"change", what, "reason", reason, "policies", len(ids),
 			"v4_err", v4EnumErr, "v6_err", v6EnumErr,
@@ -395,37 +446,82 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		// partial state is visible and the success line below is skipped.
 	}
 
-	if len(v4Entries) == 0 && len(v6Entries) == 0 {
-		return errors.Join(errs...)
-	}
+	errs = append(errs, d.deleteInvalidatedSessions(capturedSessions{
+		targets:    len(ids),
+		v4:         v4Entries,
+		v6:         v6Entries,
+		enumFailed: enumFailed,
+	}, reason, what))
+	return errors.Join(errs...)
+}
 
+// deleteInvalidatedSessions issues the deletes for ONE change class's candidate
+// set and is the single place the commit-time invalidation actually removes a
+// session. Both producers feed it: the #6948 pre-publication capture
+// (daemon_policy_invalidate_capture.go) and the legacy post-apply enumeration
+// above. Keeping one delete site is what makes the two producers
+// indistinguishable to the HA peer, the delete reason, and the operator log —
+// the choice of producer changes WHICH sessions are deleted, never HOW.
+//
+// The delete reuses the companion-aware DeleteBatchKnownV4/V6 (forward entry +
+// reverse companion + any dynamic DNAT/NAT64 companion) and propagates each
+// deletion to the HA peer through the same #2468 delete-sync channel the GC
+// delete callback uses, so a session dropped on the owner is dropped on the
+// standby too and cannot resurrect on failover.
+//
+// Returns a non-nil error when a batch delete failed — MATCHED sessions stay
+// INSTALLED, which is the #5578 stale-authorization gap the caller must surface
+// rather than swallow. c.enumFailed suppresses the success line only: an
+// incomplete candidate set must not be reported as a complete clear.
+//
+// Caller must hold d.applySem.
+func (d *Daemon) deleteInvalidatedSessions(c capturedSessions, reason dataplane.DeleteReason, what string) error {
+	if c.empty() {
+		return nil
+	}
+	rt := d.dataplane()
+	if rt == nil {
+		return nil
+	}
+	store := rt.Sessions()
+	if store == nil {
+		return nil
+	}
+	// Whether to propagate the local deletes to the HA peer. Mirrors the GC
+	// delete callback (daemon_run.go): only a node that is primary for some RG
+	// owns the authoritative session and syncs its deletes; the peer ignores
+	// deletes for sessions it does not hold.
+	ss := d.getSessionSync()
+	syncPeer := d.cluster != nil && d.cluster.IsLocalPrimaryAny() && ss != nil
+
+	var errs []error
 	v4Cleared := 0
-	if len(v4Entries) > 0 {
-		if n, err := store.DeleteBatchKnownV4(v4Entries, reason); err != nil {
+	if len(c.v4) > 0 {
+		if n, err := store.DeleteBatchKnownV4(c.v4, reason); err != nil {
 			slog.Warn("policy session invalidation: v4 clear failed",
-				"reason", reason, "policies", len(ids), "matched", len(v4Entries), "err", err)
+				"reason", reason, "policies", c.targets, "matched", len(c.v4), "err", err)
 			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v4 delete: %w", what, err))
 		} else {
 			v4Cleared = n
 		}
 		if syncPeer {
-			for _, e := range v4Entries {
+			for _, e := range c.v4 {
 				ss.QueueDeleteV4(e.Key)
 			}
 		}
 	}
 
 	v6Cleared := 0
-	if len(v6Entries) > 0 {
-		if n, err := store.DeleteBatchKnownV6(v6Entries, reason); err != nil {
+	if len(c.v6) > 0 {
+		if n, err := store.DeleteBatchKnownV6(c.v6, reason); err != nil {
 			slog.Warn("policy session invalidation: v6 clear failed",
-				"reason", reason, "policies", len(ids), "matched", len(v6Entries), "err", err)
+				"reason", reason, "policies", c.targets, "matched", len(c.v6), "err", err)
 			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v6 delete: %w", what, err))
 		} else {
 			v6Cleared = n
 		}
 		if syncPeer {
-			for _, e := range v6Entries {
+			for _, e := range c.v6 {
 				ss.QueueDeleteV6(e.Key)
 			}
 		}
@@ -435,11 +531,11 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// the right level (project logging rules). Suppress the success line when the
 	// enumerate failed: the counts describe only what we managed to gather, so an
 	// Info "cleared" line would misreport a partial clear as complete (the Error
-	// line above already recorded it).
-	if v4EnumErr == nil && v6EnumErr == nil && len(errs) == 0 {
+	// line already recorded it).
+	if !c.enumFailed && len(errs) == 0 {
 		slog.Info("cleared sessions of changed policies at commit",
 			"change", what,
-			"policies", len(ids),
+			"policies", c.targets,
 			"v4_cleared", v4Cleared,
 			"v6_cleared", v6Cleared,
 			"ha_sync", syncPeer)

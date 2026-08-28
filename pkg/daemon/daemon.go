@@ -468,6 +468,13 @@ type Daemon struct {
 	// Mutated under applySem like the fields above, and read by the sweep the
 	// same commit's caller runs while still holding it.
 	policyActivationSecs uint64
+	// policyInvalidationPlan / policyInvalidationCapture are the #6948
+	// PRE-PUBLICATION capture that supersedes policyActivationSecs on a
+	// commit-class apply: the (old, new) pair armed by the caller, and the
+	// candidate sessions read just before the new snapshot is published.
+	// Mutated under applySem. Rationale: daemon_policy_invalidate_capture.go.
+	policyInvalidationPlan    *policyInvalidationPlan
+	policyInvalidationCapture *policyInvalidationCapture
 	// scheduler is the live policy-window scheduler. It is an atomic.Pointer so
 	// the metrics collector can read it lock-free for the
 	// xpf_scheduler_republish_fail_closed SSOT gauge
