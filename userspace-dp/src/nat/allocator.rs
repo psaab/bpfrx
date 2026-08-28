@@ -3292,7 +3292,7 @@ pub(crate) struct PortAllocatorSnapshot {
     pub(crate) live_lock_contended_total: u64,
 }
 
-pub(super) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
+pub(crate) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
     if num_addresses == 0 || port_low == 0 || port_high == 0 || port_low > port_high {
         return 0;
     }

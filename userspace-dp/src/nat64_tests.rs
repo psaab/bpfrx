@@ -6644,3 +6644,26 @@ fn nat64_6982_charge_saturates_and_fails_closed() {
     );
     assert_eq!(nat64_prefix_charge(0).port_capacity, 0);
 }
+
+/// #6982: the budget's charge and the allocator's own sizing must be ONE
+/// formula.
+///
+/// The SNAT sibling charges through `nat::allocator_capacity`, the same helper
+/// `PortAllocator::new` sizes itself with. An open-coded `len * 64512` here
+/// would be a second copy of the allocation arithmetic, and a charge that
+/// drifts from what is actually allocated is a budget that does not bind — it
+/// would admit a prefix whose real bitmap is larger than the slots it was
+/// charged for. Asserting the AGREEMENT rather than pinning either side to a
+/// literal: a literal here would just be a third copy.
+#[test]
+fn nat64_6982_charge_uses_the_allocators_own_capacity_formula() {
+    for len in [0usize, 1, 2, 7, 250, 65536] {
+        assert_eq!(
+            nat64_prefix_charge(len).port_capacity,
+            crate::nat::allocator_capacity(len, NAT64_PORT_LOW, NAT64_PORT_HIGH) as u64,
+            "charge and allocation disagree at pool_len={len}; the budget would not bind"
+        );
+    }
+    // The values are non-trivial, so the agreement above is not two zeros.
+    assert!(nat64_prefix_charge(1).port_capacity > 60_000);
+}

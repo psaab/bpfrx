@@ -1075,12 +1075,20 @@ impl Nat64AggregateUse {
 /// genuinely allocates the bitmap is a test that gets deleted for being slow,
 /// and a deleted guard is no guard (#6982).
 pub(crate) fn nat64_prefix_charge(pool_len: usize) -> Nat64AggregateUse {
-    let addresses = pool_len as u64;
     Nat64AggregateUse {
         prefixes: 1,
-        addresses,
-        port_capacity: addresses
-            .saturating_mul((NAT64_PORT_HIGH as u64 - NAT64_PORT_LOW as u64) + 1),
+        addresses: pool_len as u64,
+        // ONE formula for "port slots this allocator materialises", shared with
+        // `PortAllocator::new`'s own capacity arithmetic — the same helper the
+        // SNAT charge uses (#6812). Open-coding `len * 64512` here would be a
+        // second copy of the allocation formula, and a charge that drifts from
+        // what is actually allocated is a budget that does not bind. Pinned by
+        // `nat64_6982_charge_uses_the_allocators_own_capacity_formula`.
+        port_capacity: crate::nat::allocator_capacity(
+            pool_len,
+            NAT64_PORT_LOW,
+            NAT64_PORT_HIGH,
+        ) as u64,
     }
 }
 
