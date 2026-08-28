@@ -279,10 +279,50 @@ func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter 
 	// a real clock that regime is unreachable from a test, which left the
 	// absolute band looking redundant with this one. See
 	// TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669.
+	//
+	// #6969 F5: when the bound fires, DECLINE THE RAISE — do not reject the
+	// frame. Rejecting cost liveness: the frame never reaches the monotonic
+	// lastSeen update, so a peer that restarts while this receiver's clock is
+	// more than bootEpochMaxSkew slow is declared dead in ~500ms and the
+	// cluster goes dual-master, over what is a clock fault on ONE node. The
+	// comment above already said the bound gates "ONLY the irreversible
+	// operation"; the implementation was wider than its own stated intent.
+	//
+	// The frame is then treated exactly as if it had arrived AT the floor, so
+	// it must pass the SAME per-value session budget an equality frame does.
+	// That is not incidental: without it, a frame that cannot be latched would
+	// be an unbounded admission path — precisely the epochless bypass the floor
+	// exists to close. Checked here, BEFORE s.replay.admit, for the same reason
+	// the equality check is: admit() records a never-seen session as a side
+	// effect, so a check after it would evict a live watermark while rejecting.
+	//
+	// NARROWED TO AN ESTABLISHED PEER (s.highEpoch != 0), which is the whole
+	// reason this can be a small change. The harm being fixed is "a peer this
+	// receiver has already accepted is declared dead", and that needs a floor to
+	// exist. A receiver with NO floor has no established peer and therefore no
+	// liveness to protect, so refusing there costs nothing — and it keeps every
+	// fresh-state guard at full strength: an unorderable epoch presented to a
+	// fresh receiver is still refused outright, never arms the latch, and leaves
+	// the floor at 0. Without this clause the change would re-decide six
+	// deliberate assertions across four files instead of one.
+	declineRaise := false
 	if epoch > s.highEpoch && !epochWithinForwardBound(epoch, epochNowNanos()) {
-		s.epochAheadOfClockRejected.Add(1)
-		return false, "boot epoch more than bootEpochMaxSkew ahead of our clock " +
-			"(check NTP on BOTH nodes — this is a clock fault, not a replay)"
+		s.epochRaiseDeclinedAheadOfClock.Add(1)
+		if s.highEpoch == 0 {
+			// NO ESTABLISHED PEER, so there is no liveness to protect and the
+			// old refusal is kept exactly. This arm is why the change re-decides
+			// one deliberate assertion instead of six: every fresh-state guard —
+			// an unorderable epoch is refused, never arms the latch, leaves the
+			// floor at 0 — is untouched.
+			return false, "boot epoch more than bootEpochMaxSkew ahead of our clock " +
+				"(check NTP on BOTH nodes — this is a clock fault, not a replay)"
+		}
+		declineRaise = true
+		if !s.epochSessionAdmissible(session) {
+			s.epochSessionCollision.Add(1)
+			return false, "too many peer sessions at one boot epoch (peer cannot advance its " +
+				"epoch store, or a replayed capture set sharing one epoch)"
+		}
 	}
 	if !s.replay.admit(session, counter) {
 		return false, ""
@@ -346,8 +386,28 @@ func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter 
 	// only; the forged-liveness half is the same replay, and the same PSK
 	// rotation retires it.
 	// Pinned by TestArchivedEpochReplayReArmsLatchAfterRestart_6169.
-	s.epochSeen = true
-	if epoch > s.highEpoch {
+	// #6969 F5: declineRaise means the epoch is ABOVE the floor but could not be
+	// verified against this node's clock. TWO consequences of admission are
+	// withheld from it, and the second was found by the tests rather than
+	// reasoned out in advance:
+	//
+	//  1. the FLOOR does not move. A floor raised to a value this node cannot
+	//     verify locks out the live peer (#6711 poisoning) — the worst outcome
+	//     in this area, and the reason the bound exists at all.
+	//  2. the DOWNGRADE LATCH is not armed. epochSeen means "this peer has been
+	//     observed signing boot epochs", after which its epochless frames are
+	//     refused. A frame whose epoch this node cannot judge is not evidence
+	//     for that: arming on it would let one captured far-future frame lock
+	//     out a genuinely rolled-back peer, which is exactly what
+	//     TestHeartbeatUnorderableEpochNeverArmsLatch_6169 guards.
+	//
+	// What the frame DOES get is the thing it was rejected for: it reaches the
+	// monotonic lastSeen update, so a peer that restarted while this node's
+	// clock is slow stays alive instead of being declared dead in ~500ms.
+	if !declineRaise {
+		s.epochSeen = true
+	}
+	if epoch > s.highEpoch && !declineRaise {
 		s.highEpoch = epoch
 		// Rebind the floor to THIS incarnation, DISCARDING the sessions bound at
 		// the old value. The two must move together: a floor whose bound

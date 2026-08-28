@@ -864,10 +864,22 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	}
 
 	// The one-way door is still shut: a HIGHER out-of-bound epoch must not be
-	// latched, because raising the floor is the irreversible operation.
+	// LATCHED, because raising the floor is the irreversible operation.
+	//
+	// #6969 F5 re-decided the frame's DISPOSITION here, and only that. This
+	// case's own message already said the bound "must still gate raising", and
+	// that is what is asserted below and still holds: the floor is pinned. What
+	// changed is that the frame is no longer REJECTED — rejecting it dropped it
+	// before the monotonic lastSeen update, so a peer that restarts while this
+	// receiver's clock is slow was declared dead in ~500ms and the cluster went
+	// dual-master over a clock fault on THIS node. The receiver has an
+	// established floor here, which is exactly the condition under which the
+	// decline applies; a FRESH receiver still refuses outright.
 	higher := stepped + 1
-	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x7702, 1, higher)) {
-		t.Fatal("an out-of-bound HIGHER epoch was admitted; the forward bound must still gate raising")
+	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x7702, 1, higher)) {
+		t.Fatal("an out-of-bound HIGHER epoch was REJECTED by an already-latched receiver. " +
+			"The frame must be admitted with the RAISE declined: the floor is the " +
+			"irreversible operation, liveness is not (#6969 F5)")
 	}
 	if got := e.r.auth.peerEpochFloor(); got != stepped {
 		t.Fatalf("floor moved to %d, want it pinned at %d", got, stepped)
