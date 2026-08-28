@@ -49,7 +49,7 @@ use crate::SourceNATRuleSnapshot;
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -717,6 +717,89 @@ fn reseed_retained_pool(
     }
 }
 
+/// #6979 F6: carry live reservations out of a previous allocator whose pool was
+/// RENAMED into this generation's allocator for the same addresses and range.
+///
+/// THE DEFECT. `previous_allocators` is keyed by
+/// `SourceNatPoolAllocatorKey` = pool NAME + address vectors + port range. Two
+/// rules with identical addresses under DIFFERENT pool names are two keys; give
+/// one of them a live flow and then rename it to the other's name, and both new
+/// rules collapse onto the surviving name's key. The renamed pool's allocator is
+/// simply dropped, so its live translated identity becomes free and reissuable
+/// while the session that owns it is still in the table.
+///
+/// Measured on master: gen 1 with pools `a` (idle) and `b` (holding
+/// `203.0.113.1:20000`); gen 2 renames `b` -> `a`; both rules come back with
+/// ZERO live flows. The control — the same rebuild WITHOUT the rename — carries
+/// the flow correctly, so the loss is caused by the collapse and not by the
+/// rebuild.
+///
+/// WHY MERGING IS THE RIGHT ANSWER AND NOT A WIDER KEY. Two rules naming one
+/// pool SHOULD share one allocator — that is the point of the key, and widening
+/// it to keep them apart would hand the same address two independent occupancy
+/// domains, which is the collision this whole structure exists to prevent. The
+/// bug is not the sharing; it is that the OTHER generation's live state is
+/// discarded rather than carried. Addresses and range are identical by
+/// construction here (they are part of the key we matched on), so the index map
+/// is the identity and every carried reservation stays on the address it was
+/// minted for.
+///
+/// A conflict — two previous pools that each held the SAME (address, port) —
+/// cannot be resolved by carrying both, and `reseed_retained_from` refuses the
+/// loser and counts it. That is the conservative direction: one owner survives
+/// and is logged, versus today's outcome where BOTH are freed.
+fn carry_renamed_pool_reservations(
+    key: &SourceNatPoolAllocatorKey,
+    allocator: &PortAllocator,
+    previous_allocators: &FxHashMap<SourceNatPoolAllocatorKey, PortAllocator>,
+    live_pool_names: &FxHashSet<String>,
+    now_ns: u64,
+) {
+    let total = key.pool_addresses_v4.len() + key.pool_addresses_v6.len();
+    if total == 0 {
+        return;
+    }
+    for (prev_key, prev) in previous_allocators.iter() {
+        // The exact key is the allocator we already reused or reseeded from.
+        if prev_key == key {
+            continue;
+        }
+        // Only a RENAME: everything except the name must match, or the indices
+        // would not line up and a carried reservation would land on a different
+        // address than the one it was minted for.
+        if prev_key.pool_addresses_v4 != key.pool_addresses_v4
+            || prev_key.pool_addresses_v6 != key.pool_addresses_v6
+            || prev_key.port_low != key.port_low
+            || prev_key.port_high != key.port_high
+        {
+            continue;
+        }
+        // A RENAME, not two coexisting pools. If the previous name is STILL a
+        // live pool in this generation, these are two distinct pools that
+        // merely share an address, and carrying between them would be an
+        // over-reach in the other direction: the source pool keeps its own
+        // allocator, so the copy here is never released when the original is,
+        // and it leaks a phantom reservation on an address the peer pool owns.
+        // Measured while building this: without the check the control case (the
+        // same rebuild WITHOUT a rename) cross-pollinated `a` and `b`.
+        if live_pool_names.contains(&prev_key.pool_name) {
+            continue;
+        }
+        if prev.live_flow_count() == 0 {
+            continue;
+        }
+        let map: FxHashMap<usize, usize> = (0..total).map(|i| (i, i)).collect();
+        let outcome = allocator.reseed_retained_from(prev, &map, now_ns);
+        eprintln!(
+            "xpf-dp: source-nat pool {:?} appears to be pool {:?} renamed (same addresses and \
+             port range): carried {} live translation(s) across the rename; {} refused \
+             (another pool already owns the identity), {} out of range (#6979)",
+            key.pool_name, prev_key.pool_name, outcome.reseeded, outcome.refused,
+            outcome.skipped_out_of_range,
+        );
+    }
+}
+
 /// #6812: assign pool allocators AFTER parsing, under the aggregate budget.
 ///
 /// Three invariants the pre-#6812 inline block violated:
@@ -846,6 +929,15 @@ fn resolve_pool_allocators(
         }
     }
 
+    // #6979 F6: the pool names this generation still has. A previous allocator
+    // whose name is absent here was RENAMED (or removed); one whose name is
+    // still present is a peer pool that merely shares an address.
+    let live_pool_names: FxHashSet<String> = out
+        .iter()
+        .filter(|r| r.pool_mode && !r.pool_name.is_empty())
+        .map(|r| r.pool_name.clone())
+        .collect();
+
     // PHASE 2: assign. Reused keys were charged in phase 1 and must NOT be
     // charged again here.
     for (rule, pending) in out.iter_mut().zip(pendings.iter()) {
@@ -875,6 +967,10 @@ fn resolve_pool_allocators(
                 reserved.contains_key(&key),
                 "a previously-allocated key must have been reserved in phase 1",
             );
+            // #6979 F6: a pool RENAMED onto this key brings its live state with
+            // it. Without this the renamed pool's allocator is dropped and its
+            // translated identities become free while their sessions live.
+            carry_renamed_pool_reservations(&key, existing, previous_allocators, &live_pool_names, now_ns);
             pool_allocators.insert(key, existing.clone());
             rule.pool_allocator = existing.clone();
             continue;
@@ -904,6 +1000,9 @@ fn resolve_pool_allocators(
                     rule,
                     now_ns,
                 );
+                // #6979 F6: the same carry for a key with no exact predecessor —
+                // a rename onto a name that did not previously exist.
+                carry_renamed_pool_reservations(&key, &allocator, previous_allocators, &live_pool_names, now_ns);
                 pool_allocators.insert(key, allocator.clone());
                 rule.pool_allocator = allocator;
             }
