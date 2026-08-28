@@ -1786,6 +1786,141 @@ mod tests {
         );
     }
 
+    /// #6971: the CoS lease / wheel refresh's own ARITHMETIC, which nothing
+    /// covered — `refresh_worker_cos_queue_lease_runtime_counters` had zero
+    /// references in the tree outside its definition and its one production
+    /// call site. Its sibling `refresh_worker_new_flow_install_counters` had
+    /// two direct tests; this one had none, so #6971's "the callees are bound"
+    /// held for one of the two and not for this one.
+    ///
+    /// WHAT MAKES A MISTAKE VISIBLE HERE. The function folds SIX same-typed
+    /// `u64` families off `binding.cos` onto `WorkerRuntimeCounters`, and one of
+    /// them aggregates DIFFERENTLY from the other five:
+    /// `cos_wheel_ticks_advanced_max` is a `.max()` while everything else is a
+    /// `wrapping_add`. A fixture of equal or repeated values cannot separate
+    /// `max` from `sum` from a first-element read, and cannot separate
+    /// `counters.a = sum(binding.a)` from `counters.a = sum(binding.b)` — both
+    /// assertions pass. So every seeded number is distinct, every EXPECTED
+    /// number is distinct, and the wheel-max fixture is chosen so its `max`
+    /// (97) and its `sum` (191) are different numbers.
+    ///
+    /// RED on revert: turning the `.max()` into a `wrapping_add` yields 191,
+    /// turning any `wrapping_add` into a first-element read yields that
+    /// binding's own value, and transposing any two of the six under-grant
+    /// causes lands on another cause's expected total. Each fails on its own
+    /// message.
+    #[test]
+    fn refresh_worker_cos_queue_lease_counters_sums_and_maxes_across_bindings_6971() {
+        let seeds: [(u64, u64, u64, u64, [u64; 6]); 3] = [
+            (7, 1_000_003, 13, 41, [101, 103, 107, 109, 113, 127]),
+            (11, 2_000_003, 17, 97, [131, 137, 139, 149, 151, 157]),
+            (101, 4_000_003, 19, 53, [163, 167, 173, 179, 181, 193]),
+        ];
+        let bindings: Vec<BindingWorker> = seeds
+            .iter()
+            .enumerate()
+            .map(|(slot, (calls, granted, wheel_total, wheel_max, ug))| {
+                let mut binding =
+                    BindingWorker::new_for_mirror_test(slot as u32, 0, 24, slot as u32);
+                binding.cos.cos_queue_lease_acquire_v8_calls = *calls;
+                binding.cos.cos_queue_lease_acquire_v8_granted_bytes = *granted;
+                binding.cos.cos_wheel_ticks_advanced_total = *wheel_total;
+                binding.cos.cos_wheel_ticks_advanced_max = *wheel_max;
+                binding.cos.cos_queue_lease_undergrants =
+                    crate::afxdp::worker_runtime::CoSQueueLeaseUndergrantCounters {
+                        seqlock_give_up: ug[0],
+                        cap_zero: ug[1],
+                        epoch_rotated: ug[2],
+                        share_exhausted: ug[3],
+                        class_cap: ug[4],
+                        outstanding_cap: ug[5],
+                    };
+                binding
+            })
+            .collect();
+
+        let mut counters = crate::afxdp::worker_runtime::WorkerRuntimeCounters::default();
+        refresh_worker_cos_queue_lease_runtime_counters(&mut counters, &bindings);
+
+        assert_eq!(
+            counters.cos_queue_lease_acquire_v8_calls, 119,
+            "lease acquire CALLS must be the SUM over this worker's bindings \
+             (7+11+101); 7 would be a first-element read and 101 a max"
+        );
+        assert_eq!(
+            counters.cos_queue_lease_acquire_v8_granted_bytes, 7_000_009,
+            "lease GRANTED BYTES must be the SUM (1000003+2000003+4000003)"
+        );
+        assert_eq!(
+            counters.cos_wheel_ticks_advanced_total, 49,
+            "wheel ticks TOTAL must be the SUM (13+17+19)"
+        );
+        assert_eq!(
+            counters.cos_wheel_ticks_advanced_max, 97,
+            "wheel ticks MAX must be the MAXIMUM across bindings (max(41,97,53)), \
+             not their sum — 191 here means the one field that aggregates \
+             differently from its five neighbours was folded like them, and the \
+             published per-worker catch-up depth becomes an invented number no \
+             binding ever saw"
+        );
+        let ug = &counters.cos_queue_lease_undergrant;
+        assert_eq!(ug.seqlock_give_up, 395, "under-grant seqlock_give_up sum");
+        assert_eq!(ug.cap_zero, 407, "under-grant cap_zero sum");
+        assert_eq!(ug.epoch_rotated, 419, "under-grant epoch_rotated sum");
+        assert_eq!(ug.share_exhausted, 437, "under-grant share_exhausted sum");
+        assert_eq!(ug.class_cap, 445, "under-grant class_cap sum");
+        assert_eq!(
+            ug.outstanding_cap, 477,
+            "under-grant outstanding_cap sum. All six expected totals are \
+             distinct (395/407/419/437/445/477), so transposing any two causes \
+             lands on another cause's number and fails here rather than passing \
+             with the attribution silently swapped"
+        );
+    }
+
+    /// OVER-REACH GUARD for the CoS lease refresh, mirroring the one its
+    /// sibling already has: it must leave the slots its neighbouring refreshers
+    /// own alone. `new_flow_installs` is refreshed two lines below it on the
+    /// same publish tick, so a CoS refresh that zeroed it would blank a counter
+    /// that is about to be published — and #4800's two cross-worker analyzer
+    /// gates key on exactly that series.
+    ///
+    /// Stays GREEN under every mutation the cell above catches: those change
+    /// which number lands in the CoS slots, which this test does not read.
+    #[test]
+    fn refresh_worker_cos_queue_lease_counters_touches_no_other_slot_6971() {
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.cos.cos_queue_lease_acquire_v8_calls = 5;
+        let bindings = vec![binding];
+
+        let mut counters = crate::afxdp::worker_runtime::WorkerRuntimeCounters {
+            new_flow_installs: 31,
+            session_install_partial: 3,
+            session_create_drops: 13,
+            session_install_admission_refused: 17,
+            ..Default::default()
+        };
+        refresh_worker_cos_queue_lease_runtime_counters(&mut counters, &bindings);
+
+        assert_eq!(
+            counters.new_flow_installs, 31,
+            "the CoS lease refresh must not disturb new_flow_installs, which the \
+             sibling refresher two lines below it owns"
+        );
+        assert_eq!(
+            counters.session_install_partial, 3,
+            "the CoS lease refresh must not disturb session_install_partial"
+        );
+        assert_eq!(
+            counters.session_create_drops, 13,
+            "the CoS lease refresh must not disturb session_create_drops"
+        );
+        assert_eq!(
+            counters.session_install_admission_refused, 17,
+            "the CoS lease refresh must not disturb session_install_admission_refused"
+        );
+    }
+
     /// OVER-REACH GUARD for the same refresh: it owns exactly ONE slot on
     /// `WorkerRuntimeCounters` and must leave every neighbouring slot alone.
     /// The neighbours are filled by sibling refreshers on the same ~1s

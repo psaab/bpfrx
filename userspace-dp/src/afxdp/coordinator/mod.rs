@@ -1230,6 +1230,22 @@ impl Coordinator {
         self.forwarding.zone_id_to_name.insert(zone, name.to_string());
     }
 
+    /// #6983: the zone-TRAFFIC twin of `seed_flood_counter_for_test`, opened
+    /// for the same reason and on the same seam. `server::tests` cannot reach
+    /// into `crate::afxdp` to record and flush a zone tally itself, so binding
+    /// the status publication from the caller's side needs a seeder here.
+    #[cfg(test)]
+    pub(crate) fn seed_zone_traffic_counter_for_test(&mut self, zone: u16, name: &str, bytes: u64) {
+        use crate::afxdp::zone_counters::{
+            flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
+        };
+        let map = ZoneCounterSlotMap::build(&[zone], &self.forwarding.zone_counter_store);
+        record_zone_traffic(&map, zone, 0, bytes);
+        flush_recorded_zone_counters(&self.forwarding.zone_counter_store, &map);
+        self.forwarding.zone_counter_slot_map = std::sync::Arc::new(map);
+        self.forwarding.zone_id_to_name.insert(zone, name.to_string());
+    }
+
     /// Current in-memory FIB generation (the value flow-cache lookups
     /// validate against). Read by the `bump_fib_generation` control handler
     /// to build a rollback-rejection error and by tests.
