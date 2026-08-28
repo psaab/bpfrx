@@ -91,7 +91,7 @@ func TestRenameRethMemberBringsLinkUpWhenMACMatches(t *testing.T) {
 	var ops []string
 	installFakeRethLinkOps(t, link, &adminUp, &ops, false)
 
-	old := renameRethMember("ge-0-0-1", mac)
+	old := renameRethMember("ge-0-0-1", mac, nil)
 	if old != "enp8s0" {
 		t.Fatalf("renameRethMember returned old name %q, want enp8s0", old)
 	}
@@ -148,7 +148,7 @@ func TestRenameRethMemberUpOnFailedRename(t *testing.T) {
 		},
 	}
 
-	if old := renameRethMember("ge-0-0-1", mac); old != "" {
+	if old := renameRethMember("ge-0-0-1", mac, nil); old != "" {
 		t.Fatalf("expected empty old name on failed rename, got %q", old)
 	}
 	if !adminUp {
