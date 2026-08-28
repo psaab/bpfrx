@@ -195,12 +195,40 @@ impl PrefixSetV6 {
     }
 }
 
+/// `MatchAny`, and that is FAIL-OPEN by construction — a defaulted prefix set
+/// matches every address (#7745, from the #6907 re-verification).
+///
+/// REACHABILITY, measured rather than assumed. No production path reaches
+/// `PrefixSetV4::default()`:
+///
+///   - the only production references are inside `impl Default for PolicyRule`
+///     (`policy.rs`), and the real rule constructor names EVERY field
+///     explicitly. `policy.rs:2127` records why: the `..PolicyRule::default()`
+///     tail was deliberately dropped so a future field addition is a compile
+///     error, "eliminating the silent-zero-default hazard" (#1632).
+///   - so `PolicyRule::default()` itself is never called on a packet path; the
+///     `impl` survives as a type-level convenience.
+///
+/// WHY IT IS NOT FLIPPED TO `MatchNone`. Inside that same `Default` impl the
+/// sibling fields are `source_v4_match_any: true`, `destination_v4_match_any:
+/// true`, and so on. A defaulted `PolicyRule` is deliberately a match-anything
+/// rule; making the prefix sets match NOTHING would leave it internally
+/// inconsistent — the booleans saying "any", the sets saying "none" — which is
+/// a worse hazard than the one being removed, and it would land on whichever
+/// caller relies on the current shape.
+///
+/// This is therefore a LATENT hazard recorded in place, not a defect to fix:
+/// the fail-open direction is real, and nothing can reach it today. If a
+/// `..Default::default()` tail is ever reintroduced to a rule constructor, this
+/// becomes live and the fix is at that call site, not here.
 impl Default for PrefixSetV4 {
     fn default() -> Self {
         Self::MatchAny
     }
 }
 
+/// See `impl Default for PrefixSetV4` for the reachability measurement and why
+/// this stays `MatchAny` (#7745).
 impl Default for PrefixSetV6 {
     fn default() -> Self {
         Self::MatchAny
@@ -319,4 +347,3 @@ impl PrefixTrieV6 {
 #[cfg(test)]
 #[path = "prefix_set_tests.rs"]
 mod tests;
-
