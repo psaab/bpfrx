@@ -982,6 +982,28 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			// review).
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				rule.Then = NATThen{}
+				// #7014: the FULLY-COMPACT authoring `then source-nat off;`
+				// packs every token onto the `then` node itself, so there is no
+				// `source-nat` CHILD for the loop below to find and the action
+				// set came back EMPTY. The zero-action arm then rejected a
+				// stanza that visibly carries an action, with a message saying
+				// it "carries no translation action" — a legal Junos spelling
+				// refused with a diagnostic that contradicts the config in front
+				// of the operator.
+				//
+				// It failed CLOSED, so no traffic was ever mishandled; the cost
+				// was a correct config that would not commit.
+				//
+				// Read DELIBERATELY the same way as the packed CHILD spelling
+				// (`then { source-nat pool P off; }`) one level down: the first
+				// action token wins and the result counts as ONE action. That is
+				// not the ideal semantics -- a packed contradiction should be
+				// rejected -- but it is #7033's whole subject, and #7033's gate
+				// message names the packed class as the open case. Narrowing it
+				// in this ONE spelling would make that message half-false and
+				// leave two packed spellings behaving differently. Uniformity
+				// here means #7033 closes the class in one move.
+				applyPackedNATThenTokens7014(&rule.Then, thenNode.Keys, "source-nat", NATSource)
 				for _, t := range thenNode.Children {
 					if t.Name() == "source-nat" {
 						if len(t.Keys) >= 2 {
@@ -1045,4 +1067,38 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		}
 	}
 	return nil
+}
+
+// applyPackedNATThenTokens7014 reads a terminal action packed onto the `then`
+// node's OWN Keys, as the fully-compact `then source-nat off;` spelling
+// produces (#7014).
+//
+// keys is thenNode.Keys, i.e. ["then", "<kind>", <action tokens...>]. It is a
+// no-op for every other shape: the hierarchical `then { ... }` and the flat-set
+// form both put <kind> in a CHILD, so keys is just ["then"] and this returns
+// before touching anything.
+//
+// First action token wins, matching the packed-child read one level down. See
+// the call site for why that uniformity is deliberate rather than an oversight.
+func applyPackedNATThenTokens7014(then *NATThen, keys []string, kind string, typ NATType) {
+	if len(keys) < 3 || keys[1] != kind {
+		return
+	}
+	switch keys[2] {
+	case "interface":
+		if typ != NATSource {
+			return
+		}
+		then.Type = typ
+		then.Interface = true
+	case "off":
+		then.Type = typ
+		then.Off = true
+	case "pool":
+		if len(keys) < 4 {
+			return
+		}
+		then.Type = typ
+		then.PoolName = keys[3]
+	}
 }

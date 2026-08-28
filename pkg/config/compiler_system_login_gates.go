@@ -277,7 +277,9 @@ func loginPathPackedAnywhere(tree *ConfigTree) bool {
 	packed := false
 	forEachClusterNodeView(tree, func(view *ConfigTree) {
 		_ = forEachChild(view.Children, "system", func(sys *Node) error {
-			if len(sys.Keys) > 1 && sys.Keys[1] == "login" {
+			// #6966: `login` may sit BEHIND another system statement on the
+			// same packed line, not only at Keys[1].
+			if packedLoginKeyIndex(sys.Keys) > 0 {
 				packed = true
 				return nil
 			}
@@ -341,10 +343,14 @@ const (
 // and a second thing to wire wrong.
 func collectLoginPackedFindings(nodes []*Node, f *loginFindings) {
 	_ = forEachChild(nodes, "system", func(sys *Node) error {
-		if len(sys.Keys) > 1 && sys.Keys[1] == "login" {
+		// #6966: the same index scan. rest starts AT the `login` token, so the
+		// instance name is at index 2 exactly as it was when login was pinned
+		// to Keys[1] — the reporting shape is unchanged, only where the tail
+		// starts.
+		if i := packedLoginKeyIndex(sys.Keys); i > 0 {
 			// rest = [login, <keyword>, <name>, body...] — the instance name
 			// would sit at index 2.
-			reportLoginPathPacked(loginPathLevelSystem, sys.Keys[1:], 2, sys.Children, f)
+			reportLoginPathPacked(loginPathLevelSystem, sys.Keys[i:], 2, sys.Children, f)
 			return nil
 		}
 		return forEachChild(sys.Children, "login", func(login *Node) error {
@@ -681,4 +687,70 @@ func collectLoginClassShadowFindings(nodes []*Node, f *loginFindings) {
 			return nil
 		})
 	})
+}
+
+// packedLoginKeyIndex reports the index in keys at which a `login` statement
+// begins, when `login` is packed onto a `system` node's own Keys BEHIND another
+// system statement, or -1.
+//
+// #6966: both detection arms used to test `keys[1] == "login"` only, so
+//
+//	system host-name fw login user alice class ops;
+//	system services ssh login user alice class ops;
+//
+// were invisible — `login` sits at index 3 and 4. Both commit CLEAN with no
+// diagnostic, the stanza is dropped (`Config.System.Login == nil`), and because
+// downstream reads nil as "no policy configured" the shell runs with an empty
+// class: allow-everything, secrets in cleartext. That is worse than the shape
+// #6706 closed, which at least failed a strict commit.
+//
+// Scanning for the literal `login` anywhere would be wrong in the fail-CLOSED
+// direction, which is the worse mistake here. A firewall may legitimately be
+// NAMED login:
+//
+//	system host-name login;
+//
+// Marking that as packed sets LoginDroppedByPacking and DENIES every non-root
+// command — an outage produced by a legal config. So the scan walks the packed
+// tokens against the SCHEMA and only reports `login` in a KEYWORD position:
+//
+//   - a scalar statement consumes `args` value tokens, so `host-name login`
+//     consumes `login` as the hostname and this returns -1;
+//   - a container statement descends, so tokens after it are read at the child
+//     level;
+//   - a token that is not consumable at the current level but IS a `system`
+//     child re-opens a system-level statement — which is what makes
+//     `services ssh login …` report, since `login` is no child of `ssh`.
+//
+// That last rule is the same reasoning the packed-line splitter uses for
+// `chassis cluster` (isClusterStatement): an unrecognized token does not go
+// inert, it opens the next statement.
+func packedLoginKeyIndex(keys []string) int {
+	if len(keys) < 2 || schemaSystem == nil {
+		return -1
+	}
+	level := schemaSystem
+	for i := 1; i < len(keys); i++ {
+		tok := keys[i]
+		if tok == "login" {
+			// A keyword position: nothing above consumed it as a value.
+			return i
+		}
+		if node, ok := level.children[tok]; ok {
+			// Consume this statement's value tokens, then either descend into
+			// it or stay at the same level for the next statement.
+			i += node.args
+			if len(node.children) > 0 {
+				level = node
+			}
+			continue
+		}
+		// Not consumable here. If `system` knows it, the previous statement
+		// ended and this one opens at the system level; otherwise treat it as
+		// an opaque value and keep going.
+		if _, ok := schemaSystem.children[tok]; ok {
+			level = schemaSystem
+		}
+	}
+	return -1
 }
