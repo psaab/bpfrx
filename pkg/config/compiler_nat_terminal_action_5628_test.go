@@ -86,54 +86,51 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 	if err == nil {
 		t.Fatal("CompileConfig ACCEPTED a two-action source-NAT rule")
 	}
-	for _, want := range []string{
-		"2 mutually-exclusive translation actions",
-		"every one of them is published to the dataplane",
-		"fixed precedence",
-		"`off` wins over `interface`, and `interface` over `pool`",
-		"all but one action is silently discarded",
-		// #6820 round 4: the survivor clause must be the PRECISE form, the one
-		// docs/config-schema.md and the peer-effective test already carry. Round
-		// 3 shipped a looser paraphrase here — "not the one you configured first
-		// or last" — which is literally FALSE for a 2-action rule, where one
-		// action IS first and the other IS last (this test's own DNAT fixture
-		// authors `pool PD` first and `off` second, and `off` wins). Three
-		// renderings of one fix went out together and the operator-facing one was
-		// the wrong one, in a round whose subject was an operator-facing sentence
-		// being false. Assert the exact phrase, because the loose form reads
-		// better and that is precisely where it wins.
-		//
-		// #7035 narrowed that phrase. The unscoped form ("the survivor is not
-		// chosen by configuration order") was false in exactly the case that
-		// prints it: with duplicate `then` CONTAINERS the #3850 reset makes the
-		// LAST container supply the counted fields, so container order selects
-		// which contradiction — and therefore which survivor — you get. The
-		// clause is now scoped to the block, and the parenthetical carries the
-		// cross-container case. Both halves are asserted, so neither the old
-		// unscoped form nor a silent drop of the scope can return.
-		"WITHIN THIS BLOCK, the survivor is decided by that fixed precedence " +
-			"rather than by the order the actions were written",
-		"container order therefore does decide WHICH contradiction you get here",
-		// #7034: the parenthetical used to end "this rejects contradictory
-		// actions inside one block", which reads as a completeness claim and is
-		// false for every token-packed spelling (`source-nat pool P off` and
-		// friends lower to ONE field and commit — see
-		// TestNATTerminalActionPackedContradictionCommits_7034). It now states
-		// the shape it actually covers and names #7033 for the rest.
-		"a contradiction whose tokens are PACKED onto one node",
-		"#7033",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("2+-action SNAT rejection missing %q — the message must describe the "+
-				"mechanism the compiler ACTUALLY uses (publish-all + dataplane precedence), "+
-				"not the pre-#5628 packed-key/child-order pick: %v", want, err)
-		}
-	}
-	if strings.Contains(err.Error(), "packed-key") || strings.Contains(err.Error(), "child order") {
-		t.Errorf("2+-action rejection still tells the operator the compiler picks an "+
-			"action by packed-key/child order; it records every field (#5628) and the "+
-			"dataplane resolves them: %v", err)
-	}
+	// #7036: the WHOLE message, not a list of substrings.
+	//
+	// This used to assert ten substrings with strings.Contains. That binds the
+	// presence of bytes, and two mutations were measured green against it:
+	//
+	//   M-A  append "THE PRECEDING SENTENCE IS FALSE: configuration order
+	//        chooses the survivor." right after the survivor claim
+	//   M-B  delete the clause "and never looking the pool up, and the
+	//        dataplane applies the same " from the DNAT mechanism sentence
+	//
+	// Every asserted substring survives both. M-A is the one that matters: the
+	// message asserts a claim and then explicitly denies it, and a guard whose
+	// entire subject is whether this sentence is TRUE could not see it. An
+	// addition is invisible to a containment check by construction, and a
+	// deletion is invisible whenever the deleted text is not itself asserted —
+	// which is most of the message.
+	//
+	// So the assertion is EQUALITY. The message is an operator-facing contract
+	// that four rounds have already got wrong (#6820 r3 shipped a survivor
+	// clause that was literally false for a 2-action rule; #7035 found the
+	// unscoped form false in exactly the case that prints it; #7034 found the
+	// parenthetical claiming a completeness it does not have), so pinning it
+	// exactly is the point rather than a cost.
+	//
+	// Updating this golden is a DELIBERATE act. Classify the diff before you
+	// regenerate: a reworded clause and a clause whose CLAIM changed look
+	// identical in a diff that is merely accepted.
+	//
+	// What each clause is for, preserved from the rounds that put it there:
+	//   - "every one of them is published to the dataplane" — the mechanism the
+	//     compiler ACTUALLY uses (publish-all + dataplane precedence), not the
+	//     pre-#5628 packed-key/child-order pick.
+	//   - "WITHIN THIS BLOCK, the survivor is decided by that fixed precedence
+	//     rather than by the order the actions were written" — the PRECISE form
+	//     (#6820 r4). The loose paraphrase "not the one you configured first or
+	//     last" is FALSE for a 2-action rule, where one action IS first and the
+	//     other IS last. #7035 then scoped it: with duplicate `then` CONTAINERS
+	//     the #3850 reset makes the LAST container supply the counted fields, so
+	//     container order selects which contradiction you get.
+	//   - "a contradiction whose tokens are PACKED onto one node" + "#7033" —
+	//     #7034. The parenthetical used to end "this rejects contradictory
+	//     actions inside one block", a completeness claim that is false for every
+	//     token-packed spelling.
+	const wantSNAT = "source-nat rule-set \"RS\" rule \"R1\": `then` carries 2 mutually-exclusive translation actions (expected exactly one of `source-nat interface`, `source-nat pool <p>`, or `source-nat off`); every one of them is published to the dataplane, which resolves the rule by a fixed precedence — `off` wins over `interface`, and `interface` over `pool`, so all but one action is silently discarded and, WITHIN THIS BLOCK, the survivor is decided by that fixed precedence rather than by the order the actions were written. (Duplicate `then` CONTAINERS resolve last-wins per #3850, so a rule with several containers is counted on the LAST one — container order therefore does decide WHICH contradiction you get here. This gate counts the actions the rule RESOLVED to, so it catches a block that LOWERS two distinct actions; a contradiction whose tokens are PACKED onto one node, as in `pool <p> off`, lowers to a single action, is counted as one and is NOT caught here — tracked as #7033.)"
+	assertExactMessage7036(t, "2+-action SNAT", err, wantSNAT)
 
 	twoActionDNAT := buildTree(t, []string{
 		"set security nat destination pool PD address 10.0.0.5",
@@ -146,28 +143,21 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 	if err == nil {
 		t.Fatal("CompileConfig ACCEPTED a two-action destination-NAT rule")
 	}
-	if !strings.Contains(err.Error(), "`off`-over-`pool` precedence") {
-		t.Errorf("2+-action DNAT rejection must name the DESTINATION precedence: %v", err)
-	}
-	if strings.Contains(err.Error(), "`interface`") {
-		t.Errorf("2+-action DNAT rejection names `interface`, an action a destination-NAT "+
-			"rule cannot carry — the mechanism clause leaked across kinds: %v", err)
-	}
-	// The kind-specific MECHANISM, not just the ordering (#6820 round 3). The DNAT
+	// The DNAT message is a DIFFERENT message, not the SNAT one with a word
+	// changed, and that is the property the equality carries here. The DNAT
 	// builder short-circuits on `isOff` and never resolves the pool
-	// (pkg/dataplane/userspace/nat_destination.go), so telling a DNAT operator
-	// that "every one of them is published to the dataplane" — true only of SNAT —
-	// describes a path their rule does not take. A shared sentence here is
-	// necessarily false for one of the two kinds.
-	if !strings.Contains(err.Error(), "the compiler resolves `off` itself") {
-		t.Errorf("2+-action DNAT rejection must say the COMPILER resolves `off` (pool-less "+
-			"exemption, no pool lookup), not that every action reaches the dataplane: %v", err)
-	}
-	if strings.Contains(err.Error(), "every one of them is published") {
-		t.Errorf("2+-action DNAT rejection claims every action is published — false for "+
-			"destination NAT, whose builder skips pool resolution entirely for an `off` "+
-			"rule and publishes an empty PoolAddress: %v", err)
-	}
+	// (pkg/dataplane/userspace/nat_destination.go), so "every one of them is
+	// published to the dataplane" — true of SNAT — describes a path a DNAT rule
+	// does not take. A sentence shared between the two kinds is necessarily
+	// false for one of them. It must also not name `interface`, an action a
+	// destination-NAT rule cannot carry.
+	//
+	// Under equality those three former Contains/NotContains checks are
+	// consequences rather than separate assertions, and M-B — deleting "and
+	// never looking the pool up, and the dataplane applies the same " from this
+	// very sentence, measured GREEN against the substring form — now reds.
+	const wantDNAT = "destination-nat rule-set \"RD\" rule \"R1\": `then` carries 2 mutually-exclusive translation actions (expected exactly one of `destination-nat pool <p>` or `destination-nat off`); the compiler resolves `off` itself, publishing a pool-less exemption and never looking the pool up, and the dataplane applies the same `off`-over-`pool` precedence to any entry that carries both, so all but one action is silently discarded and, WITHIN THIS BLOCK, the survivor is decided by that fixed precedence rather than by the order the actions were written. (Duplicate `then` CONTAINERS resolve last-wins per #3850, so a rule with several containers is counted on the LAST one — container order therefore does decide WHICH contradiction you get here. This gate counts the actions the rule RESOLVED to, so it catches a block that LOWERS two distinct actions; a contradiction whose tokens are PACKED onto one node, as in `pool <p> off`, lowers to a single action, is counted as one and is NOT caught here — tracked as #7033.)"
+	assertExactMessage7036(t, "2+-action DNAT", err, wantDNAT)
 
 	// The ZERO-action message was rewritten by this PR too ("falls through —
 	// translated by a later broader rule if one matches, otherwise left
@@ -183,18 +173,52 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 	if err == nil {
 		t.Fatal("CompileConfig ACCEPTED a zero-action source-NAT rule")
 	}
-	for _, want := range []string{
-		"carries no translation action",
-		"does not stop rule evaluation",
-		"translated by a later broader rule if one matches",
-		"otherwise left untranslated",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("zero-action rejection missing %q — the message must state BOTH "+
-				"fall-through outcomes; asserting only the translated one presumes a "+
-				"later rule exists (#6820): %v", want, err)
-		}
+	// BOTH halves of the fall-through disjunction, which is why equality matters
+	// here too: the pre-#6820 wording claimed a later rule always exists, and a
+	// substring check for the "translated by a later broader rule" half alone
+	// would still hold if the "otherwise left untranslated" half were deleted —
+	// restoring exactly the single-outcome claim #6820 removed.
+	const wantZero = "source-nat rule-set \"RS\" rule \"R1\": `then` carries no translation action (expected exactly one of `source-nat interface`, `source-nat pool <p>`, or `source-nat off`); the rule would commit but installs no translation and does not stop rule evaluation, so matching traffic falls through — translated by a later broader rule if one matches, otherwise left untranslated — and an intended exemption silently disappears"
+	assertExactMessage7036(t, "zero-action SNAT", err, wantZero)
+}
+
+// assertExactMessage7036 compares a rejection message to its golden EXACTLY,
+// and on mismatch reports the first differing byte with context.
+//
+// #7036: the messages this pins are operator-facing contracts that four
+// consecutive rounds got wrong, so the guard has to be able to see a sentence
+// becoming FALSE. Containment cannot: an appended clause is invisible to it by
+// construction, and a deleted clause is invisible whenever the deleted text was
+// not itself one of the asserted substrings.
+func assertExactMessage7036(t *testing.T, what string, err error, want string) {
+	t.Helper()
+	got := err.Error()
+	if got == want {
+		return
 	}
+	i := 0
+	for i < len(got) && i < len(want) && got[i] == want[i] {
+		i++
+	}
+	lo := i - 60
+	if lo < 0 {
+		lo = 0
+	}
+	t.Errorf("%s rejection does not match its golden.\n"+
+		"  first difference at byte %d\n"+
+		"  want ...%s\n"+
+		"   got ...%s\n"+
+		"Update this golden only DELIBERATELY, and classify the diff first: a\n"+
+		"reworded clause and a clause whose CLAIM changed look identical in a\n"+
+		"diff that is merely accepted (#7036).",
+		what, i, clip7036(want[lo:]), clip7036(got[lo:]))
+}
+
+func clip7036(s string) string {
+	if len(s) > 180 {
+		return s[:180] + "..."
+	}
+	return s
 }
 
 // --- VALID single-action rules must COMPILE clean (flat + hierarchical) ------
