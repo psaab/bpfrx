@@ -34,10 +34,33 @@ import (
 // authenticated heartbeat) is a design change with its own HA gate, tracked
 // separately.
 //
-// WHY THE MEASUREMENT IS TRUSTWORTHY. The scan below only reports a skew when
-// the presented token matches a window under an ACCEPTED KEY. Only a key holder
-// can produce that, so the number is an authenticated statement, not something
-// an on-segment attacker can plant in an operator's status output.
+// WHAT THE MEASUREMENT PROVES, AND WHAT IT DOES NOT. The scan below reports an
+// offset only when the presented token matches a window under an ACCEPTED KEY.
+// That makes one thing certain and one thing merely likely, and the operator
+// message must not confuse them:
+//
+//   - CERTAIN: the PSK is correct. Only a key holder can produce a token that
+//     verifies at any window, so a forged token or a genuine key mismatch never
+//     reaches this clause. That is the diagnostic worth most — it is what stops
+//     an operator from re-provisioning a key that was never wrong.
+//
+//   - NOT CERTAIN: that the peer's clock is skewed. Producing the token needs
+//     the key; PRESENTING it does not. Tokens ride every fabric RPC on the
+//     control link, and this verifier has no nonce (replay-within-window is
+//     accepted Residual 1 in fabric_auth.go), so an on-segment attacker can
+//     CAPTURE a token and replay it later. Replayed from outside the accept
+//     band but inside the scan band, it fails verification — correctly — and
+//     lands here indistinguishable from a drifting clock.
+//
+// The truth condition for "the peer's clock is skewed" is therefore production
+// under the key AND arrival within that window's lifetime, and this scan can
+// only establish the first. An earlier version of this comment claimed the
+// number was "not something an on-segment attacker can plant in an operator's
+// status output"; that followed from produce-vs-present being conflated. The
+// clause below now states the certain half as fact and names both causes for
+// the rest, so the message stays true on every path that reaches it — a
+// confident wrong diagnosis being the same class of defect as the opaque one
+// #6708 exists to remove.
 
 const (
 	// fabricAuthSkewScanWindows bounds the diagnostic scan to ±2 hours
@@ -141,7 +164,7 @@ func (s *Server) noteFabricAuthSkew(keys [][]byte, tokenHex string, now time.Tim
 	s.fabricSkew.atNanos.Store(nowNanos)
 	if !s.fabricSkew.reported.Swap(true) {
 		slog.Warn(
-			"cluster: peer wall clock is skewed past the fabric auth window; every cross-node fabric RPC (session queries, aggregation, clear propagation, cross-node failover) will fail authentication until the clocks agree. Forwarding, VRRP and failover are NOT affected — the heartbeat authenticates independently. Synchronise NTP on both nodes.",
+			"cluster: a fabric auth token authenticated under an accepted key but at a window outside the accept band — the PSK is correct. Almost always a peer wall clock skewed past the fabric auth window; a stale or replayed token is indistinguishable here. Every cross-node fabric RPC (session queries, aggregation, clear propagation, cross-node failover) will fail authentication until the clocks agree. Forwarding, VRRP and failover are NOT affected — the heartbeat authenticates independently. Synchronise NTP on both nodes.",
 			"peer_skew_seconds", skew,
 			"auth_window_seconds", fabricAuthWindowSeconds,
 		)
@@ -157,8 +180,11 @@ func fabricSkewClause(skew int64) string {
 		dir = "behind"
 		mag = -mag
 	}
-	return " (peer wall clock is " + strconv.FormatInt(mag, 10) + "s " + dir +
-		" ours; the fabric token is time-windowed — synchronise NTP on both nodes)"
+	return " (the token authenticates under an accepted key at a window " +
+		strconv.FormatInt(mag, 10) + "s " + dir +
+		" ours, so the PSK is correct; the fabric token is time-windowed, so this " +
+		"is a peer wall clock skewed past the auth window — or a stale/replayed " +
+		"token, which this node cannot tell apart. Synchronise NTP on both nodes)"
 }
 
 // fabricSkewClause returns the clause for the LAST measurement, or "" when

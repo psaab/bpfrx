@@ -159,7 +159,7 @@ func TestRejectedSkewedTokenNamesTheClock6708(t *testing.T) {
 			if err == nil {
 				t.Fatal("checkFabricAuth admitted an out-of-band token")
 			}
-			named := strings.Contains(err.Error(), "peer wall clock is")
+			named := strings.Contains(err.Error(), "the PSK is correct")
 			if named != tc.wantClock {
 				if tc.wantClock {
 					t.Fatalf("rejection did not name the clock: %v\n"+
@@ -221,7 +221,7 @@ func TestSkewScanIsThrottled6708(t *testing.T) {
 	}
 	// ...and the throttled answer must still be the LAST GOOD one, so an
 	// operator's query does not depend on winning a race.
-	if !strings.Contains(first, "peer wall clock is") {
+	if !strings.Contains(first, "the PSK is correct") {
 		t.Fatalf("clause = %q, want it to name the clock", first)
 	}
 
@@ -293,5 +293,60 @@ func TestClusterStatusWarnsOnlyWhenSkewed6708(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("status warning missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// The skew clause must stay TRUE on every path that reaches it.
+//
+// #6708's scan proves the token verified under an accepted key at some window.
+// That makes the PSK certainly correct, and the clock only PROBABLY skewed:
+// producing the token requires the key, but PRESENTING it does not. Tokens ride
+// every fabric RPC on the control link and this verifier has no nonce
+// (replay-within-window is accepted Residual 1), so a captured token replayed
+// from outside the accept band but inside the scan band fails verification —
+// correctly — and arrives here indistinguishable from a drifting clock.
+//
+// This test is the guard on the WORDING, because that is where the defect would
+// be: an unhedged "peer wall clock is Ns behind ours" is a confident wrong
+// diagnosis in the replay case, which is the same class of fault as the opaque
+// "invalid auth token" #6708 removed. It is deliberately paired: the certain
+// half must be asserted as fact, and the uncertain half must not be.
+func TestSkewClauseDoesNotAssertSkewAsTheOnlyCause_6708(t *testing.T) {
+	// A token from a window well outside the accept band — the shape both a
+	// drifting peer and a replayed capture produce. Nothing at this layer can
+	// distinguish them, which is the point.
+	clause := fabricSkewClause(-2400)
+
+	// CERTAIN half: this is the diagnostic that stops an operator
+	// re-provisioning a key that was never wrong. It must be stated plainly.
+	if !strings.Contains(clause, "the PSK is correct") {
+		t.Errorf("clause does not state the one thing the scan PROVES — that the "+
+			"key verified. That is the finding that ends the investigation: %q", clause)
+	}
+	// The measurement itself must survive; an operator needs the magnitude.
+	if !strings.Contains(clause, "2400s") {
+		t.Errorf("clause dropped the measured offset: %q", clause)
+	}
+	// UNCERTAIN half: the alternative cause must be named. Without this the
+	// message asserts a clock skew that may not exist.
+	if !strings.Contains(clause, "replayed") {
+		t.Errorf("clause asserts clock skew without naming the replay alternative: %q\n\n"+
+			"Producing this token needs the key; presenting it does not. A captured "+
+			"token replayed inside the scan band lands here too, and the scan cannot "+
+			"tell them apart — so an unhedged skew claim is a confident wrong "+
+			"diagnosis.", clause)
+	}
+	// The remedy for the overwhelmingly common cause must still be present, or
+	// hedging the diagnosis has cost the operator the action.
+	if !strings.Contains(clause, "NTP") {
+		t.Errorf("clause hedges the cause but drops the remedy: %q", clause)
+	}
+
+	// NON-VACUITY / direction: the sign must still be rendered, or the clause
+	// could satisfy every assertion above while telling an operator to look at
+	// the wrong node's clock.
+	ahead := fabricSkewClause(2400)
+	if !strings.Contains(ahead, "ahead of") || !strings.Contains(clause, "behind") {
+		t.Errorf("clause lost the skew DIRECTION: behind=%q ahead=%q", clause, ahead)
 	}
 }

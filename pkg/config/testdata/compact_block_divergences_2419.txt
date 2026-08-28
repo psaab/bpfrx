@@ -354,7 +354,6 @@ system dataplane shared-umem phase0-artifact-file
 system dataplane state-file
 system dataplane workers
 system domain-search
-system host-name
 system license autoupdate url
 system login class xpfarg allow-commands
 system login class xpfarg allow-configuration

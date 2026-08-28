@@ -101,7 +101,22 @@ func EmitTunnelEndpointNames(cfg *Config) []TunnelEndpointName {
 				// Interface-level WireGuard is ONE persistent TUN; the
 				// builder emits exactly one endpoint keyed by the lowest
 				// configured unit ref (#1910). Mirror that here.
-				add(fmt.Sprintf("%s.%d", name, unitNums[0]), iface.Tunnel)
+				//
+				// #7786: that single endpoint carries the MERGED peer set,
+				// not the interface-level object's peers alone. A unit's own
+				// tunnel stanza under an interface-level WireGuard holds
+				// per-unit PEERS, and this branch used to discard every
+				// per-unit TunnelConfig — so a peer authored under a unit was
+				// compiled, deep-copied (#3898) and validated, and then never
+				// reached the dataplane, because tunnels.go builds WgPeers
+				// from the emitted endpoint's TunnelConfig and that is the
+				// only config->dataplane path for them. The non-WireGuard
+				// branch below already emits the unit's own TunnelConfig for
+				// exactly this reason (#5635); this is the same decision
+				// applied to the branch that skipped it, in the form the
+				// one-TUN model allows.
+				add(fmt.Sprintf("%s.%d", name, unitNums[0]),
+					mergeWireguardUnitPeers(iface, unitNums))
 				continue
 			}
 			for _, unitNum := range unitNums {
@@ -142,4 +157,83 @@ func EmitTunnelEndpointNames(cfg *Config) []TunnelEndpointName {
 		}
 	}
 	return out
+}
+
+// mergeWireguardUnitPeers returns the TunnelConfig for the single endpoint an
+// interface-level WireGuard interface emits: the interface-level object, with
+// every unit's peers merged in (#7786).
+//
+// WHY MERGE RATHER THAN EMIT PER UNIT. TunnelConfig documents the model this
+// follows (types_routing.go): WgListenPort and WgLocalPrivkeyHex are
+// TUNNEL-level -- "one kernel UDP socket, one local identity per WG interface"
+// -- while WgPeers is the per-peer set. So a unit's peers are additive to the
+// one interface, and emitting a second endpoint per unit would put two
+// endpoints on one listen port and one private key. Nothing would catch that:
+// two WireGuard tunnels sharing a listen port compile without complaint today
+// and WireGuardListenPorts() simply de-duplicates them. A unit that overrides
+// the port or the key is a different local identity and is refused at commit
+// instead (compiler_validate_wireguard.go), so it never reaches here.
+//
+// THE MERGE CANNOT CONFLICT, and that is a property of the validator rather
+// than of this function: a unit re-declaring an inherited peer is already
+// rejected at commit ("duplicate peer public key"), so a unit's peer set is
+// always the inherited set plus pubkeys no other unit declares. De-duplication
+// by pubkey is therefore total -- there is never a case where two different
+// values compete for one peer, so no precedence rule is needed or implied.
+//
+// The result is sorted by pubkey. Iteration here is already deterministic
+// (unitNums is sorted, and peers keep their authored order within a unit), and
+// the snapshot builder sorts by pubkey again before serializing, which is what
+// actually pins the #1434 5.4 byte-identical-across-HA-nodes property. Sorting
+// here buys the same determinism for the OTHER consumers of this emitter --
+// the strict-tunnel validators and the endpoint-collision gate read
+// ep.Tunnel.WgPeers directly and never see the builder's sort.
+//
+// Returns the interface-level object UNCHANGED, same pointer, when no unit
+// contributes a peer. That keeps the overwhelmingly common WireGuard config
+// allocation-free through this path and leaves every existing endpoint
+// byte-identical.
+func mergeWireguardUnitPeers(iface *InterfaceConfig, unitNums []int) *TunnelConfig {
+	contributes := false
+	for _, unitNum := range unitNums {
+		unit := iface.Units[unitNum]
+		if unit != nil && unit.Tunnel != nil && len(unit.Tunnel.WgPeers) > 0 {
+			contributes = true
+			break
+		}
+	}
+	if !contributes {
+		return iface.Tunnel
+	}
+
+	// cloneForUnit is the audited deep copy (#3898): a plain struct copy would
+	// share the parent's WgPeers backing array, so appending here would write
+	// into the interface-level tunnel every sibling also reads. The name is
+	// preserved -- this endpoint is still the interface-level device.
+	merged := iface.Tunnel.cloneForUnit(iface.Tunnel.Name)
+	seen := make(map[string]bool, len(merged.WgPeers))
+	for _, p := range merged.WgPeers {
+		seen[p.PublicKeyHex] = true
+	}
+	for _, unitNum := range unitNums {
+		unit := iface.Units[unitNum]
+		if unit == nil || unit.Tunnel == nil {
+			continue
+		}
+		for _, p := range unit.Tunnel.WgPeers {
+			if seen[p.PublicKeyHex] {
+				continue
+			}
+			seen[p.PublicKeyHex] = true
+			cp := p
+			if p.AllowedIPs != nil {
+				cp.AllowedIPs = append([]string(nil), p.AllowedIPs...)
+			}
+			merged.WgPeers = append(merged.WgPeers, cp)
+		}
+	}
+	sort.Slice(merged.WgPeers, func(i, j int) bool {
+		return merged.WgPeers[i].PublicKeyHex < merged.WgPeers[j].PublicKeyHex
+	})
+	return merged
 }

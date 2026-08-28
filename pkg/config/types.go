@@ -402,7 +402,17 @@ func IRBToBridge(bds []*BridgeDomainConfig) map[string]string {
 // compiler_interfaces.go) — even when an interface-level tunnel
 // coexists, because the compiler creates BOTH devices and mapping the
 // unit ref to the base name would shadow the real uN device (#1910 r1
-// Codex/AGY convergent High). Units WITHOUT their own tunnel stanza
+// Codex/AGY convergent High).
+//
+// The compiler no longer assigns a "uN" name in ONE case: a unit that stays
+// on an interface-level `tunnel mode wireguard` (#6941,
+// unitSharesInterfaceWireguardDevice). There is no real uN device to shadow
+// there — that interface has exactly ONE emitted endpoint (#1910), so at most
+// one device can carry it, and the uN device could only ever hold the unit's
+// addresses with no endpoint behind them. Nothing changes here for that case
+// because this function reads TunnelConfig.Name and the compiler now sets it
+// to the base name; a unit that OVERRIDES the mode still gets its own uN
+// device and is unaffected. Units WITHOUT their own tunnel stanza
 // under an interface-level tunnel share the interface device; the
 // interface-level gate admits WireGuard despite its empty GRE-style
 // `source` (the #1736 collectAppliedTunnels twin — the persistent wgN

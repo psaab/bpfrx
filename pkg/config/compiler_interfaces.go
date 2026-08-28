@@ -297,8 +297,12 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 				// Per-unit tunnel: each unit with its own tunnel config gets
 				// a separate Linux interface. Unit 0 uses the base name,
 				// unit N>0 appends "uN".
+				//
+				// EXCEPT for a unit that stays on the interface's WireGuard
+				// mode, which shares the interface device
+				// (unitSharesInterfaceWireguardDevice, #6941).
 				linuxName := LinuxIfName(ifName)
-				if unitNum > 0 {
+				if unitNum > 0 && !unitSharesInterfaceWireguardDevice(ifc, tunnelNode) {
 					linuxName = linuxName + "u" + strconv.Itoa(unitNum)
 				}
 				tc := &TunnelConfig{Name: linuxName, Mode: defaultMode}

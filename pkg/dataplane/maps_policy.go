@@ -223,11 +223,8 @@ func (m *Manager) ClearAppRanges() error {
 	if !present {
 		return fmt.Errorf("app_ranges map not found")
 	}
-	zero := AppRangeEntry{}
-	for i := uint32(0); i < MaxAppRanges; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
-	}
-	return nil
+	// #6959: PROPAGATE. MaxAppRanges is app_ranges' max_entries.
+	return clearArrayEntriesIn(zm, "app_ranges", MaxAppRanges, AppRangeEntry{})
 }
 
 // ClearZonePairPolicies zeros all zone-pair policy entries.
@@ -246,7 +243,12 @@ func (m *Manager) ClearZonePairPolicies() error {
 	iter := zm.Iterate()
 	for iter.Next(&key, &val) {
 		if val.NumRules > 0 {
-			zm.Update(key, zeroPS, ebpf.UpdateAny)
+			// #6959: PROPAGATE. The keys come from the map's own
+			// iterator, so every one is in range by construction and
+			// no working clear becomes an error.
+			if err := zm.Update(key, zeroPS, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("clear zone_pair_policies entry %d: %w", key, err)
+			}
 		}
 	}
 	return nil
@@ -324,6 +326,13 @@ func (m *Manager) UpdatePolicyScheduleState(_ *config.Config, activeState map[st
 		}
 		if rule.Active != newActive {
 			rule.Active = newActive
+			// #6959 DELIBERATE DISCARD (allowlisted in
+			// discarded_map_update_6959_test.go). The #3780 contract in
+			// this function's doc comment is that it ALWAYS reports
+			// success so the daemon's scheduler self-heal never spins on
+			// a dead path; this is the retired eBPF map, shadowed at
+			// runtime by pkg/dataplane/userspace. Propagating here would
+			// break that contract, not fix a defect.
 			zm.Update(idx, rule, ebpf.UpdateAny)
 			slog.Info("policy schedule state updated",
 				"policy", slot.PolicyName,
@@ -384,6 +393,30 @@ func (m *Manager) clearPolicyCountersRaw() error {
 // on a comment alone. *ebpf.Map satisfies it as declared.
 type counterMapUpdater interface {
 	Update(key, value any, flags ebpf.MapUpdateFlags) error
+}
+
+// clearArrayEntriesIn zeroes entries [0, entries) of a BPF ARRAY map and
+// PROPAGATES the first Update error, naming the map and the index.
+//
+// #6959: this is the shared body of the blind-write clear loops that #6743
+// left behind. Each of them ran `zm.Update(i, zero, ebpf.UpdateAny)` as a
+// bare statement, so an operator's `clear ...` reported success no matter
+// how many slots the map actually rejected — a detached map, a permissions
+// failure, or a size mismatch was indistinguishable from a completed clear.
+// It takes the same counterMapUpdater seam #6743 introduced because
+// creating a real BPF map returns EPERM in the unprivileged unit lane, so
+// the propagation contract is otherwise untestable.
+//
+// The bound is always the map's declared max_entries (see each call site),
+// so no index can be out of range on an armed map and no WORKING clear
+// becomes an error.
+func clearArrayEntriesIn(zm counterMapUpdater, mapName string, entries uint32, zero any) error {
+	for i := uint32(0); i < entries; i++ {
+		if err := zm.Update(i, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear %s entry %d: %w", mapName, i, err)
+		}
+	}
+	return nil
 }
 
 // clearPolicyCountersIn zeroes every policy_counters slot.
