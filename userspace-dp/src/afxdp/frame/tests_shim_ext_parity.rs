@@ -465,11 +465,30 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
 // mutates `ipv6_ext_walk.rs` — each arm's advance arithmetic, each arm's
 // post-advance revalidation (deleted, and weakened by one byte), the Fragment
 // read length, the revalidation's L3 base, a statement inside the loop but
-// outside the `match` — and requires the guards below to red on every one,
-// plus a semantically null edit that must SURVIVE. It is not run by
-// `make test` (each row is a full release rebuild); run it after changing
-// either walker, or after narrowing anything the corpus compares. A guard is
-// worth what its mutation matrix says it is worth.
+// outside the `match`, AND (#6920) the two constants #4555 actually delivered:
+// `MAX_EXT_HDRS` in both directions and the `eh_class` generic arm — and
+// requires the guards below to red on every one, plus a semantically null edit
+// that must SURVIVE. It is not run by `make test` (each row is a full release
+// rebuild); run it after changing either walker, or after narrowing anything
+// the corpus compares. A guard is worth what its mutation matrix says it is
+// worth.
+//
+// #6920, and read this before trusting the sentence above: until that change
+// the enumeration omitted `MAX_EXT_HDRS` and `eh_class`, so "PROVING THESE
+// GUARDS FIRE" overstated its own coverage — it did not exercise either half
+// of what #4555 shipped. Worse, the harness could not COMPLETE a run: a
+// mutation that panics rather than asserting left its reason unextractable
+// once the toolchain began printing thread ids, and the extraction failure
+// aborted the whole matrix at row 7, so rows 8-21 silently never ran.
+//
+// Both are fixed there. What is NOT fixed, and is tracked by #7766: this
+// harness is wired into no gate — not `run-selftests.sh`, not any Makefile
+// target, no CI — so its alarm is loud and nothing is listening, which is why
+// the rot survived. `pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go`
+// states the general form: "A shipped comment asserting an enforcement that is
+// absent is worse than no comment: it is the reason the next reader does not
+// add the check." A comment asserting an enforcement that exists but never
+// RUNS is the same defect one step out.
 #[path = "../../../../userspace-xdp/src/ipv6_ext_walk.rs"]
 mod shim_walk;
 
@@ -1261,6 +1280,12 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     // by mutating the shim and requiring each guard to red. These floors exist
     // to stop a shape being DELETED between acceptance runs.
     //
+    // #6920/#7766 — the caveat that sentence needs: "measures" is only true of
+    // a run that COMPLETES, and until #6920 the harness aborted at row 7, so
+    // two thirds of the matrix measured nothing. It is also in no gate, so
+    // nothing forces a run at all. Treat the measurement as current only if
+    // someone has run it since the last change to either walker.
+    //
     // All of them read only the corpus bytes and this crate's walker. Nothing
     // here touches the shim, so no mutation the acceptance matrix applies can
     // move a floor — a floor red is always a corpus defect, never a shim
@@ -1665,6 +1690,9 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    mutating the shim and requiring the guards to red. A block that never
     //    detects anything would still be required here; floors stop deletion,
     //    the matrix measures value.
+    //    #6920/#7766: "the matrix measures value" holds only for a run that
+    //    finishes and only if one has been run — it aborted at row 7 until
+    //    #6920 and is wired into no gate.
     //    Does NOT bind: the 256-value sweep (floor 3), the boundary witness
     //    pairs (floor 1), or the four exhaustive dimension sweeps (floor 7),
     //    each bound where it is constructed. The chain-length and long-chain
