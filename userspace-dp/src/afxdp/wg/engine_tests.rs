@@ -754,15 +754,25 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
 /// caller asserts — a scheduler artifact, not a regression in the lock the
 /// test exists to pin.
 ///
-/// The fix is the loop SHAPE rather than the rendezvous #6633 proposed (the
-/// reconciler publishing a cycle count the installer blocks on). A rendezvous
-/// makes the bounded thread WAIT on the unbounded one, adding a blocking
-/// dependency between two test threads in a module whose other open defect is
-/// a futex wedge; trading a false red for a possible hang is the wrong trade.
-/// The do-while establishes the same precondition with no new blocking edge,
-/// and — unlike a rendezvous — it holds by CONSTRUCTION, which is what lets
+/// #6633's fix was the loop SHAPE rather than the rendezvous it had proposed
+/// (the reconciler publishing a cycle count the installer blocks on). A
+/// rendezvous makes the bounded thread WAIT on the unbounded one, adding a
+/// blocking dependency between two test threads in a module whose other open
+/// defect was a futex wedge; trading a false red for a possible hang was the
+/// wrong trade at the time. The do-while establishes the precondition with no
+/// new blocking edge, and it holds by CONSTRUCTION, which is what lets
 /// `reconcile_churn_completes_a_cycle_even_when_already_stopped_6633` bind it
-/// deterministically.
+/// deterministically. That part stands and the shape below is unchanged.
+///
+/// **#6989 REVISED the rendezvous half of that judgement — read the two
+/// paragraphs together, not the older one alone.** Holding by construction
+/// made the caller's guard unfalsifiable in BOTH directions: `>= 1` is also
+/// satisfied by a reconciler that ran its one cycle entirely after the
+/// installer joined, i.e. zero overlap. So a rendezvous is now added ON TOP of
+/// the do-while, under two conditions that did not hold when #6633 declined it
+/// — no cycle in the wait-for graph, and a bounded poll that panics BY NAME
+/// rather than a block. The futex wedge that grounded the original objection
+/// (#6952) closed in #7809. Full reasoning at `wait_for_first_reconcile_cycle`.
 ///
 /// #6989/#6985/#6945: `cycles` publishes the same count LIVE, after every
 /// completed cycle, so the installer thread can wait on the reconciler's
