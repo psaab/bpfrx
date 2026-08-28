@@ -541,11 +541,15 @@ mod tests {
     /// must reach the HIGHEST assignable slot.
     ///
     /// The dangerous regression is not "a delta is lost" — it is "a delta is
-    /// folded but not cleared", because the stale value then folds AGAIN on
-    /// the next batch and the counter silently double-counts. A test that
-    /// records once and checks the total arrives cannot see that; it needs a
-    /// SECOND batch that touches a different slot, so the first slot's
-    /// residue would be re-folded if reset missed it.
+    /// folded but not cleared", because the stale value is then added AGAIN
+    /// the next time that same slot is touched, and the counter over-counts.
+    ///
+    /// The second batch must touch the SAME zone, and that is not obvious.
+    /// A second batch on a DIFFERENT zone cannot detect the bug: the fold
+    /// walks the mask, so with the stale slot's bit cleared its residue is
+    /// never revisited. The first version of this cell used a different zone
+    /// and stayed GREEN under its own killing mutation — it was measuring
+    /// nothing, and only the mutation matrix showed it.
     #[test]
     fn touched_slot_mask_clears_what_it_folded_6946() {
         let store = ZoneCounterStore::default();
@@ -555,8 +559,13 @@ mod tests {
         record_zone_traffic(&map, 11, 0, 100);
         flush_recorded_zone_counters(&store, &map);
 
-        // Batch 2: traffic on zone 22 only. If reset() failed to clear slot
-        // 11, its batch-1 delta folds a second time here.
+        // Batch 2: the SAME zone again. If reset() left slot 11's values in
+        // place, this folds 100 (residue) + 100 (new) = 200 bytes.
+        record_zone_traffic(&map, 11, 0, 100);
+        flush_recorded_zone_counters(&store, &map);
+
+        // Batch 3: a different zone, so the assertion above cannot pass by the
+        // mask having stopped recording zone 11 altogether.
         record_zone_traffic(&map, 22, 0, 500);
         flush_recorded_zone_counters(&store, &map);
 
@@ -567,7 +576,7 @@ mod tests {
             .expect("zone 11 must be counted");
         assert_eq!(
             (z11.ingress_packets, z11.ingress_bytes),
-            (1, 100),
+            (2, 200),
             "zone 11 folded twice — reset() did not clear the slot it folded, so \
              the stale delta was re-added on the next batch (#6946)"
         );
