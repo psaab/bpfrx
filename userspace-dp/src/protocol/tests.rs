@@ -308,6 +308,45 @@ fn process_status_worker_command_queue_poison_recoveries_roundtrip() {
     assert_eq!(legacy.worker_command_queue_poison_recoveries, 0);
 }
 
+// #6929: round-trip + backward-compat pin for the per-worker command-queue
+// capacity-drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol_status.go and the Prometheus counter
+// `xpf_userspace_worker_command_queue_drops_total`. Its Go twin
+// (TestWorkerCommandQueueDropsWireKeyLockstepWithRust6929) asserts the two
+// spellings AGREE; this end pins the serialize/decode behaviour the agreement
+// is about, including that an older payload without the key still decodes.
+#[test]
+fn process_status_worker_command_queue_drops_roundtrip_6929() {
+    let status = ProcessStatus {
+        worker_command_queue_drops: 3,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["worker_command_queue_drops"], 3);
+    // The neighbouring counter must stay put. A rename that aliased the drop
+    // field onto the poison key would satisfy every assertion about the drop
+    // field alone while reporting a lossless recovery as a lost command.
+    assert_eq!(
+        value["worker_command_queue_poison_recoveries"], 0,
+        "the capacity-drop field must not serialize onto the poison key"
+    );
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.worker_command_queue_drops, 3);
+
+    // Pre-#6929 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("worker_command_queue_drops")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#6929 payload decodes");
+    assert_eq!(legacy.worker_command_queue_drops, 0);
+}
+
 // #2402/#6641: round-trip + backward-compat pin for the shared-session
 // poison-recovery counter. The wire key feeds
 // pkg/dataplane/userspace/protocol_status.go and the Prometheus counter

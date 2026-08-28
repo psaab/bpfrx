@@ -50,10 +50,17 @@ impl crate::afxdp::Coordinator {
             // HEALTHY worker (the export-ack timeout handles dead workers
             // in the wait). Same policy as update_ha_state above.
             let mut pending = worker_queue::lock_recover(&handle.commands);
-            pending.push_back(WorkerCommand::ExportOwnerRGSessions {
-                sequence,
-                owner_rgs: owner_rgs.to_vec(),
-            });
+            // #6929: bounded. A dropped export request means this worker
+            // never acks, which the export-ack timeout in the wait below
+            // already handles — so the return is ignored here rather than
+            // inventing a second failure channel for a case that has one.
+            worker_queue::push_bounded(
+                &mut pending,
+                WorkerCommand::ExportOwnerRGSessions {
+                    sequence,
+                    owner_rgs: owner_rgs.to_vec(),
+                },
+            );
             drop(pending);
             ack_atomics.push(handle.session_export_ack.clone());
         }

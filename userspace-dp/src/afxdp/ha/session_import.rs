@@ -414,9 +414,15 @@ impl crate::afxdp::Coordinator {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);
-            pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+            // #6929: bounded. A drop here is an HA upsert the worker will
+            // never see; the counter is what makes that visible instead of
+            // silent.
+            worker_queue::push_bounded(&mut pending, WorkerCommand::UpsertSynced(entry.clone()));
             if let Some(reverse) = &reverse_entry {
-                pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
+                worker_queue::push_bounded(
+                    &mut pending,
+                    WorkerCommand::UpsertSynced(reverse.clone()),
+                );
             }
         }
         SyncedImportOutcome::Applied
@@ -521,9 +527,12 @@ impl crate::afxdp::Coordinator {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);
-            pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+            worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
             if let Some(reverse_key) = &reverse_key {
-                pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
+                worker_queue::push_bounded(
+                    &mut pending,
+                    WorkerCommand::DeleteSynced(reverse_key.clone()),
+                );
             }
         }
     }

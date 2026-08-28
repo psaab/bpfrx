@@ -256,6 +256,19 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"occurred (#1807, extends #1790).",
 		nil, nil,
 	)
+	c.userspaceWorkerCommandQueueDrops = prometheus.NewDesc(
+		"xpf_userspace_worker_command_queue_drops_total",
+		"Worker commands discarded because the target per-worker "+
+			"command queue was already at its 4096-entry cap. Distinct "+
+			"from the poison-recovery counter: a recovery keeps the "+
+			"committed queue and loses nothing, a capacity drop "+
+			"discards a command. The expected steady-state value is 0 "+
+			"— the consumer drains the whole deque per poll and cannot "+
+			"be outrun by a sustained producer — so a rising value "+
+			"means some worker has stopped draining and its producers "+
+			"are still enqueueing to it (#6929).",
+		nil, nil,
+	)
 	c.userspaceSharedSessionPoisonRecoveries = prometheus.NewDesc(
 		"xpf_userspace_shared_session_poison_recoveries_total",
 		"Shared-session mutex poison recoveries across every "+

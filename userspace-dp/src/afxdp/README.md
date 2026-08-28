@@ -1027,6 +1027,33 @@ directly:
   exactly the commands pushed before it. Commands are individually
   self-contained, so consumers tolerate partial batches; discarding the
   deque would lose acknowledged HA/session commands.
+- `push_bounded` is the ONLY way a command may be enqueued (#6929). It
+  refuses at `MAX_PENDING_WORKER_COMMANDS` (4096, matching
+  `MAX_PENDING_SESSION_DELTAS`) and bumps the counter surfaced as
+  `xpf_userspace_worker_command_queue_drops_total`. Read that counter
+  ALONGSIDE the poison counter above, never as a substitute: a poison
+  recovery keeps the committed queue and loses nothing, a capacity drop
+  discards a command, and the two have opposite remediations.
+  - The expected steady-state value is **0**, and not because the queue
+    is roomy: the consumer drains the WHOLE deque in one
+    `core::mem::take` per poll, so a sustained producer cannot outrun
+    it. A rising counter therefore does not mean "busy" — it means a
+    worker has STOPPED draining. `spawn_supervised_worker` catches a
+    `worker_loop` panic, sets `runtime_atomics.dead = true` and lets the
+    thread exit, but the worker RECORD is never removed and producers
+    fan out over `records.values()` with no `dead` check, so they keep
+    enqueueing into a queue nothing will drain.
+  - It refuses the NEWEST rather than evicting the oldest. The queue
+    carries ordered state transitions (`UpsertSynced` then
+    `DeleteSynced` for one key), so dropping from the front would apply
+    a delete whose matching upsert was discarded — inverting the
+    worker's view of that key rather than merely making it stale.
+  - A source-level guard in `worker_queue_tests.rs` asserts every
+    production `push_back` of a `WorkerCommand` under `src/afxdp` goes
+    through `push_bounded`. Hand-seeded consumer fixtures
+    (`session_glue/tests.rs`, `newflow_contention_tests.rs`) are
+    excluded on purpose; they drive the consumer and routing them
+    through the cap would change what they exercise.
 - `try_lock_recover` keeps WouldBlock as a skip (`None`) — only the
   Poisoned arm changes behavior.
 
