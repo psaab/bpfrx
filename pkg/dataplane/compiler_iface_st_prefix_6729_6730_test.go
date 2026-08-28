@@ -184,7 +184,23 @@ func TestNetworkdModelsCoverAnStPrefixedNIC_6730(t *testing.T) {
 // that branch and must NOT be emitted as an ordinary physical interface — the
 // xfrmi is created by pkg/routing, not by networkd.
 func TestNetworkdModelsStillSkipARealSecureTunnel_6730(t *testing.T) {
-	cfg := stCfg6729("st0", []int{0}, "st0")
+	// #6955 re-pointed this fixture from BOUND to UNBOUND, and the reason is
+	// the point of the test rather than a detail.
+	//
+	// This cell exists to prove a secure-tunnel name does not fall through to
+	// the PHYSICAL-interface handling. It used to assert that with a VPN
+	// binding the bare `st0`, no model named `st0` was emitted — but that held
+	// only because of the #6955 defect: the branch reconstructed the netdev as
+	// `st0.0`, missed the lookup, and `continue`d. It was pinning the bug. The
+	// DOTTED spelling emitted a model from this same branch even then, so
+	// "a real secure tunnel never gets a model" was never the contract.
+	//
+	// UNBOUND is the shape that tests the stated intent. No VPN binds `st0`,
+	// so pkg/routing creates no device and the secure-tunnel branch correctly
+	// emits nothing — and if the predicate ever let the name reach the
+	// physical path, a model WOULD appear and this fails. The seeded netdev
+	// below is what gives that its teeth.
+	cfg := stCfg6729("st0", []int{0}, "")
 	// Seeded for the same reason, and here it is what gives the control its
 	// teeth: with the netdev present, a predicate that wrongly let `st0` reach
 	// the physical path WOULD emit a model, so this can actually fail.
