@@ -742,6 +742,55 @@ they repeatedly bite:
     TAKES it — verify that application by inspection, since a deterministic
     test for it reduces to the underlying flake. Back both with repeated
     parallel runs of the previously-flaky test.
+  - **Not every parallel-only wedge is a scheduling problem. MEASURE the
+    wedged process before theorising: sample `utime+stime` from
+    `/proc/<pid>/stat` over 5s. Non-zero => spinning (oversubscription,
+    starvation). ZERO => every thread is parked, and it is a real deadlock
+    that no amount of serialization fixes.** #6952 was the residual wedge
+    left after the #6157 guard, and it measured ZERO ticks: three tests
+    appeared hung, but two were innocents parked on `wg_engine_test_serial`
+    and the third — `install_session_serializes_with_reconcile_removal` — sat
+    in `RwLock::write_contended` inside `reconcile_peers`, on its OWN read
+    guard. The cause was a **shadowed lock-guard rebind**:
+
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        ... asserts ...
+        engine.reconcile_peers(&[]);   // takes .write() on the SAME RwLock
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+
+    The second `let` shadows the name but does NOT drop the first guard — a
+    shadowed value lives to the end of the enclosing BLOCK, not to its last
+    use — so the read guard was still held across the reconcile, and
+    `std::sync::RwLock` is not reentrant. Scope the guard (`{ ... }` or an
+    explicit `drop`); do not rely on rebinding to release it. The sweep for
+    this class is cheap: within one function, a lock guard binding that is
+    still in scope when the same lock is taken again.
+  - **A conditional write is what makes such a self-deadlock INTERMITTENT.**
+    `reconcile_peers` takes the demux write lock only when
+    `dropped_indices` is non-empty, i.e. only when the peer it removes still
+    owns a live session. In a test that races an installer against a
+    reconciler, whether it does is decided by the interleaving — so the
+    deadlock fired on roughly one schedule in six and every other run passed
+    with the bug fully present. When a hazard is gated on a conditional, a
+    regression test must ARRANGE the deciding condition deterministically
+    (`orphan_demux_sweep_does_not_self_deadlock_6952` installs a session and
+    asserts the demux map is non-empty BEFORE running the sweep) rather than
+    inherit it from the racing caller, which reds one run in six.
+  - **`--test-threads=1` does not make a test's OWN threads safe.** It
+    serializes libtest's test slots, not threads a test body spawns. #6952
+    self-deadlocks a single thread; serial mode only shifts CPU availability
+    and therefore the odds. Treat the flag as a rate reducer, never as a
+    correctness guarantee — and never as evidence that a wedge is a
+    parallelism artifact.
+  - **Wrap a body that can self-deadlock in a bounded runner so a revert
+    fails BY NAME.** A wedge exits 124: neither "the guard fired" nor "the
+    guard failed to fire", so any mutation cell that lands on it is
+    uninterpretable and scoring it as either polarity manufactures evidence.
+    `engine_tests::run_bounded` runs the body on a worker thread and asserts
+    completion against a deliberately loose 30s backstop (the healthy path is
+    microseconds, so a loaded machine cannot flake it). The parked worker is
+    left detached on the failure path; libtest exits the process rather than
+    joining it.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in
