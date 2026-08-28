@@ -641,15 +641,27 @@ func TestPeerLookupSlotsAreReturned_5561(t *testing.T) {
 
 	// Take every token but one, so a single lookup can be observed against a
 	// pool whose occupancy is otherwise pinned.
+	//
+	// #6974: FROM THE POOL THIS CASE'S OWN CONNECTION WILL USE. The budget is
+	// split by whether a connection can reach the interface enumeration, and
+	// this fixture's addresses are loopback on both ends, so it draws on the
+	// loopback pool. Filling the other one would leave this case's acquire
+	// unconstrained and the accounting assertions below would measure nothing.
+	// The pool is resolved through the production selector rather than named
+	// here, so a case cannot fill one pool while its fixture uses the other.
+	slotPool := PeerLookupPoolForTest(
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40001},
+		&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080},
+	)
 	held := 0
 	defer func() {
 		for i := 0; i < held; i++ {
-			<-peerLookupSlots
+			<-slotPool
 		}
 	}()
 	for held < maxConcurrentPeerLookups-1 {
 		select {
-		case peerLookupSlots <- struct{}{}:
+		case slotPool <- struct{}{}:
 			held++
 		default:
 			t.Fatalf("could not fill the lookup pool; %d of %d taken before it refused",
