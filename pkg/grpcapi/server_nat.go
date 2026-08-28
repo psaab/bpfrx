@@ -127,6 +127,7 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 	telemetry := s.telemetry()
 
 	// Named pools
+	grpcOverBudget := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		portLow, portHigh := pool.PortLow, pool.PortHigh
 		if portLow == 0 {
@@ -142,7 +143,12 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 		// through clampInt32 (#2282). config.NATPoolTotalPorts also carries
 		// the portHigh >= portLow guard REST had and the other three surfaces
 		// did not (#6553).
-		totalPorts64 := config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))
+		// #7000: the cardinality fed into that formula was the wrong part.
+		// `len(pool.Addresses)` reported capacity for a REFUSED pool,
+		// under-reported a prefix member (a /24 installs 256, not 1), and
+		// missed the singular `address` field. The compiler's verdict answers
+		// all three; the shared multiplication above is unchanged.
+		totalPorts64, _ := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, grpcOverBudget)
 		var used64 int64
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {

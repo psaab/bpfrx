@@ -120,8 +120,6 @@ var families = []family{
 			"pkg/api/nat.go:natPoolStatsHandler",
 			"pkg/api/nat.go:natRuleStatsHandler",
 			"pkg/api/nat.go:natSourceHandler",
-			"pkg/cli/cli_show_nat.go:showNATSource",
-			"pkg/cli/cli_show_nat.go:showNATSourcePool",
 			"pkg/cli/cli_show_nat.go:showNATSourceRuleAll",
 			"pkg/cli/cli_show_nat.go:showNATSourceRuleSet",
 			"pkg/cli/cli_show_nat.go:showNATSourceSummary",

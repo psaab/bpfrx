@@ -101,11 +101,11 @@ func TestDeterministicPoolBlockMath(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotTotal := deterministicPoolBlockCapacity(tc.pool)
+			gotTotal := deterministicPoolBlockCapacity(tc.pool, "p", nil)
 			if gotTotal != tc.wantTotal {
 				t.Errorf("deterministicPoolBlockCapacity = %d, want %d", gotTotal, tc.wantTotal)
 			}
-			gotAlloc := deterministicSubscriberCapacity(tc.pool)
+			gotAlloc := deterministicSubscriberCapacity(tc.pool, "p", nil)
 			// The emission clamps allocated to total; assert the clamped value
 			// (matches what the gauge reports).
 			if gotAlloc > gotTotal {
@@ -134,7 +134,7 @@ func TestDeterministicPoolBlockCapacityInvalid(t *testing.T) {
 	}
 	for name, pool := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := deterministicPoolBlockCapacity(pool); got != 0 {
+			if got := deterministicPoolBlockCapacity(pool, "p", nil); got != 0 {
 				t.Errorf("deterministicPoolBlockCapacity(%s) = %d, want 0", name, got)
 			}
 		})
