@@ -160,14 +160,29 @@ type SessionDeltaInfo struct {
 	LogSessionInit  bool `json:"log_session_init,omitempty"`
 	LogSessionClose bool `json:"log_session_close,omitempty"`
 	// #3301: the admitting policy's firewall metadata, decoded from the
-	// trailing fields of the binary open frame (after NextHop) AND mirrored on
-	// the JSON RPC-fallback delta. Stamped onto the synced SessionValue
-	// (PolicyID/PolicyCounterIdx/AppTimeout) by daemon_ha_userspace.go so the
-	// cluster sync wire and the peer helper carry them, correcting a
-	// peer-promoted session's policy attribution / hit-count / idle timeout
-	// after failover. PolicyID = #3056 policy ID; PolicyCounterIdx = #3073
-	// 1-based per-rule counter handle; AppTimeout = #3227 per-application idle
-	// timeout in SECONDS.
+	// trailing fields of the binary open frame (after NextHop) AND — since
+	// #6949 — mirrored on the JSON RPC-fallback delta. Stamped onto the synced
+	// SessionValue (PolicyID/PolicyCounterIdx/AppTimeout) by
+	// daemon_ha_userspace.go so the cluster sync wire and the peer helper carry
+	// them, correcting a peer-promoted session's policy attribution /
+	// hit-count / idle timeout after failover. PolicyID = #3056 policy ID;
+	// PolicyCounterIdx = #3073 1-based per-rule counter handle; AppTimeout =
+	// #3227 per-application idle timeout in SECONDS.
+	//
+	// The "AND mirrored on the JSON RPC-fallback delta" half of that sentence
+	// was FALSE from #3301 until #6949: the Rust producer
+	// (userspace-dp/src/protocol/binding.rs) had no such fields, so that leg —
+	// drained every 100 ms while the event stream is down, every 5 s while it
+	// is up, and re-serialized whole on every helper-requested FullResync —
+	// delivered all three as 0 on every session it carried. Nothing surfaced
+	// it: a rendered id of 0 displays as `unattributed` (#6851), the same as a
+	// session no policy admitted. Auditing this leg from the consumer side, as
+	// the natural reading of this comment invited, concluded it was already at
+	// parity. Since #6949 both producers derive these from ONE helper
+	// (`session::SessionSyncAttribution`) and destructure it exhaustively, so a
+	// divergence no longer compiles, and
+	// TestSessionDeltaPolicyAttributionWireKeysLockstepWithRust6949 pins these
+	// struct tags to the keys that helper's JSON leg actually emits.
 	PolicyID         uint32 `json:"policy_id,omitempty"`
 	PolicyCounterIdx uint32 `json:"policy_counter_idx,omitempty"`
 	AppTimeout       uint32 `json:"app_timeout,omitempty"`
@@ -178,6 +193,9 @@ type SessionDeltaInfo struct {
 	// peer-PROMOTED NAT64 session rebuild its reverse (v4->v6) BIB after
 	// failover. Nat64SnatV4 is the one datum not reconstructable from the synced
 	// forward v6 key (the orig v6 src/dst ARE the key; dst_v4 is the /96 low 32).
+	// Also mirrored on the JSON RPC-fallback delta since #6949; before that a
+	// NAT64 session promoted from that leg could not rebuild its reverse BIB at
+	// all — a translation failure after failover, not a mis-attribution.
 	Nat64       bool   `json:"nat64,omitempty"`
 	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
 	// #5212: the ORIGINATING node's stable RT_FLOW session id, decoded from the

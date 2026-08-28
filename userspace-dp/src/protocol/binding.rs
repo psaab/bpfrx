@@ -1261,5 +1261,46 @@ pub(crate) struct SessionDeltaInfo {
     /// exact pre-#6312 behaviour of this leg.
     #[serde(rename = "rt_flow_session_id", default)]
     pub rt_flow_session_id: u64,
+    /// #6949: the admitting policy's firewall metadata, at parity with the
+    /// binary open frame's trailing #3301 fields. Derived with the frame's from
+    /// the single-source `SessionSyncAttribution` (`session/sync_attribution.rs`).
+    ///
+    /// Until #6949 this struct carried NONE of the five fields below while the
+    /// Go consumer (`pkg/dataplane/userspace/protocol_ha.go`, `SessionDeltaInfo`)
+    /// read all of them unconditionally, so every session recovered through this
+    /// leg — `drain_session_deltas` polling at 100 ms whenever the event stream
+    /// is down and at 5 s while it is up, plus every helper-requested FullResync
+    /// export — imported policy 0, counter 0, the global idle timeout and no
+    /// NAT64 pool source. It rendered `unattributed` (a 0 id displays that way
+    /// since #6851), was skipped by the commit-time deletion-clear and the #4234
+    /// policy-rematch, and a later reconciliation copy could OVERWRITE an
+    /// earlier, correct, event-derived copy on the peer.
+    ///
+    /// The renames below MUST match the Go struct tags; a mismatch is silent on
+    /// both planes (the key is simply absent and serde/encoding-json leaves 0).
+    /// `TestSessionDeltaPolicyAttributionWireKeysLockstepWithRust6949` pins
+    /// each one against this file. Additive and rolling-upgrade safe in both
+    /// directions: an old helper omits the keys and `default` decodes 0/""
+    /// — precisely the pre-#6949 behaviour of this leg — and an old daemon
+    /// ignores keys it does not know.
+    #[serde(rename = "policy_id", default)]
+    pub policy_id: u32,
+    #[serde(rename = "policy_counter_idx", default)]
+    pub policy_counter_idx: u32,
+    /// #3227 per-application idle timeout in WHOLE SECONDS. The Go field is
+    /// `AppTimeout`, so the key is `app_timeout` and NOT the
+    /// `inactivity_timeout` spelling `SessionSyncRequest` uses for the same
+    /// quantity on the install leg.
+    #[serde(rename = "app_timeout", default)]
+    pub app_timeout: u32,
+    /// #4565 NAT64 cross-family marker + the translated pool SOURCE (dotted
+    /// quad, "" when not NAT64). `nat64_snat_v4` is the one datum the standby
+    /// cannot reconstruct from the synced forward v6 key, so without it a NAT64
+    /// session promoted from this leg cannot rebuild its reverse v4->v6 BIB at
+    /// all — a translation failure after failover, not a mis-attribution.
+    #[serde(rename = "nat64", default)]
+    pub nat64: bool,
+    #[serde(rename = "nat64_snat_v4", default)]
+    pub nat64_snat_v4: String,
 }
 
