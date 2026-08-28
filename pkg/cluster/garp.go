@@ -567,9 +567,21 @@ func runNABurstFollowups(fd int, iface, ip string, pkt []byte, addr unix.Sockadd
 }
 
 // buildUnsolicitedNA constructs a raw Ethernet + IPv6 + ICMPv6 Neighbor
-// Advertisement packet. The NA is sent to the all-nodes multicast address
-// (ff02::1) with Override and Solicited flags cleared per RFC 4861 §7.2.6
-// (unsolicited NA). Includes Target Link-Layer Address option.
+// Advertisement packet, sent to the all-nodes multicast address (ff02::1) per
+// RFC 4861 §7.2.6 (unsolicited NA). Includes the Target Link-Layer Address
+// option.
+//
+// Flags are Router=1, Override=1, Solicited=0 — see the pkt[58] = 0xA0 setter
+// below, which states the same thing thirty lines further down.
+//
+// #6934: this comment used to say "with Override and Solicited flags cleared",
+// which contradicted that setter. Only Solicited is cleared. The distinction is
+// not cosmetic and it is the whole reason this builder works: RFC 4861 §7.2.5
+// lets a receiver keep its existing cache entry when an NA arrives with
+// Override=0, so an Override=0 burst could not correct a peer still pointing at
+// the old node — precisely the failover convergence this exists to drive. A
+// reader auditing RFC conformance hit the false sentence first, and #6934 spent
+// a round ruling out an Override=0 bug that the code never had.
 func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	// 14 Ethernet + 40 IPv6 + 24 ICMPv6 NA (8 hdr + 16 target) + 8 TLLA option = 86
 	pkt := make([]byte, 86)
