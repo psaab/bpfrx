@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -247,4 +248,120 @@ func TestShellGateMarkersMatchCLI_6440(t *testing.T) {
 				assign, want.marker)
 		}
 	}
+}
+
+// shellCodeLines returns the script's lines with comment-only lines removed.
+//
+// A source-scanning gate that reads comments can be satisfied by prose ABOUT
+// the thing it greps for — including this test's own explanatory text once
+// someone pastes it into a script header. Strip them so the scan sees code.
+func shellCodeLines(src string) []string {
+	var out []string
+	for _, l := range strings.Split(src, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "#") {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// #6936: TestShellGateMarkersMatchCLI_6440 above binds exactly ONE script,
+// cos-apply-lib.sh. That is a floor, not a census: a second script can pipe a
+// config-mode session into this REPL and gate on the session's exit status —
+// which is always 0 — and nothing notices. test-fbf-steering.sh did exactly
+// that for its commit check, its commit, AND its rollback, so its whole apply
+// phase was ungated and every downstream cell could have been measuring the
+// pre-test config.
+//
+// State the rule as a PREDICATE over every smoke instead: a script that
+// commits configuration through the piped CLI must gate on the success
+// markers. Exemptions are explicit, carry a tracking issue, and are themselves
+// checked for staleness — an allowlist entry is a claim, so it expires the
+// moment the script it excuses starts passing.
+//
+// SCOPE, stated so this does not read as stronger than it is. The predicate is
+// FILE-level: "this script commits config, so it must reference the marker
+// gate". It catches a NEW ungated smoke and a stale exemption. It does NOT
+// catch removing one of several gates inside an already-gated script, because
+// the file still references the helpers elsewhere.
+//
+// A blanket ban on the `if ! incus exec ... cli <<EOF` shape was considered as
+// the finer-grained check and REJECTED on measurement: apply-cos-config.sh
+// uses that shape legitimately as a belt alongside the marker gate (its own
+// comment reads "the exit status above is NOT sufficient"), and the `cli -c`
+// form exits non-zero meaningfully. Banning the shape would fail correct code,
+// so the discriminator is marker PRESENCE, not the absence of an idiom.
+func TestEveryConfigCommittingSmokeUsesTheMarkerGate_6936(t *testing.T) {
+	const dir = "../../test/incus"
+	// name -> tracking issue for the known-ungated scripts.
+	exempt := map[string]string{
+		"wg-interop.sh": "#7792",
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	scanned := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sh") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		lines := shellCodeLines(string(raw))
+
+		commits := false
+		for _, l := range lines {
+			// A bare `commit` / `commit check` line is heredoc content fed to
+			// the CLI, not a shell command — that is the config-mode session.
+			if t := strings.TrimSpace(l); t == "commit" || t == "commit check" {
+				commits = true
+				break
+			}
+		}
+		if !commits {
+			continue
+		}
+		scanned++
+
+		gated := false
+		for _, l := range lines {
+			if strings.Contains(l, "cos_require_markers") ||
+				strings.Contains(l, "cos_rollback_one") ||
+				strings.Contains(l, "COS_MARKER_") {
+				gated = true
+				break
+			}
+		}
+
+		issue, isExempt := exempt[e.Name()]
+		switch {
+		case gated && isExempt:
+			t.Errorf("%s is now marker-gated but is still listed as exempt (%s) — "+
+				"drop the exemption so the rule covers it; a stale allowlist entry "+
+				"silently re-opens the hole for the next script added under it",
+				e.Name(), issue)
+		case !gated && !isExempt:
+			t.Errorf("%s commits configuration through the piped-stdin CLI but never "+
+				"references the #6440 marker gate (cos_require_markers / "+
+				"cos_rollback_one / COS_MARKER_*). The piped CLI is a REPL: it prints "+
+				"'error: ...' for a failed command and still exits 0, so any gate on "+
+				"the session's exit status cannot fire. Source test/incus/cos-apply-lib.sh "+
+				"and assert the markers, or add an explicit exemption with a tracking issue.",
+				e.Name())
+		}
+	}
+
+	// The scan must actually reach scripts. If the heredoc shape changes and
+	// nothing matches, this test would pass having checked nothing — the same
+	// vacuity class it exists to catch.
+	if scanned == 0 {
+		t.Fatalf("scanned 0 config-committing scripts in %s — the detector matched "+
+			"nothing and this gate is vacuous", dir)
+	}
+	t.Logf("scanned %d config-committing smoke scripts", scanned)
 }
