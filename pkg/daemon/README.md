@@ -973,8 +973,21 @@ are read/written only under that lock; every reader goes through
   BEFORE the write. Goroutine creation therefore orders them the wrong way and
   supplies no happens-before, so a lease landing in that window was a real data
   race, the mirror of #5113 on `mgmtVRFInterfaces`. Step 20 now takes ONE
-  `activeTransport()` snapshot for both its comparison and its eight log
-  fields.
+  `activeTransport()` snapshot for both its comparison and every `old_*` pair it
+  logs. (Not a count: the earlier "eight log fields" here was wrong when it was
+  written — four of step 20's eight pairs came from the locally-computed
+  `newTransport`, which was never shared state — and #7073 has since changed the
+  number again, #7070.)
+- The line reporting the restart is derived from `clusterTransportKey` by
+  `transportChangeLogArgs`, one `old_`/`new_` pair per field, rather than
+  written out by hand. The hand-written list had drifted from the whole-struct
+  comparison that decides the restart: it printed four pairs where the
+  comparison used six, so a commit changing only `fabric1-interface` /
+  `fabric1-peer-address` restarted comms correctly and then logged four
+  identical `old`/`new` pairs — a line asserting a change and showing none
+  (#7073). Deriving the pairs from the struct makes that drift
+  unrepresentable; `cluster_transport_log_totality_7073_test.go` binds both the
+  totality and the call site.
 
 `make test-failover` is the required smoke for this path. The guard is covered
 by `daemon_ha_comms_race_test.go` (deterministic drop-of-stale-publish +

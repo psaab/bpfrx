@@ -328,18 +328,16 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		// #6290: ONE guarded snapshot. The boot startClusterComms writes this
 		// field holding neither applySem nor clusterCommsMu, and a DHCP
 		// lease-change callback re-enters this step on a goroutine started
-		// before that write — see setActiveTransport for the full ordering.
+		// before that write — see setActiveTransportIfCurrent for the full
+		// ordering.
 		active := d.activeTransport()
 		if active != (clusterTransportKey{}) && newTransport != active {
+			// #7073: the pairs are derived from clusterTransportKey, the same
+			// struct the comparison above compares whole. Writing them out by
+			// hand had already dropped the two fab1 fields, so a fab1-only
+			// change logged four identical old/new pairs.
 			slog.Info("cluster: transport config changed, restarting comms",
-				"old_control", active.ControlInterface,
-				"new_control", newTransport.ControlInterface,
-				"old_peer", active.PeerAddress,
-				"new_peer", newTransport.PeerAddress,
-				"old_fabric", active.FabricInterface,
-				"new_fabric", newTransport.FabricInterface,
-				"old_fabric_peer", active.FabricPeerAddress,
-				"new_fabric_peer", newTransport.FabricPeerAddress)
+				transportChangeLogArgs(active, newTransport)...)
 			d.stopClusterComms()
 			// #6878: through the seam so a test can bind restart COMPLETION.
 			// stopClusterComms bumps clusterCommsGen first, so the generation

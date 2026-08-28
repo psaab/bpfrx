@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
@@ -1226,16 +1227,60 @@ func (d *Daemon) stopClusterComms() {
 	}
 }
 
-// clusterTransportKey extracts the four cluster transport fields that
-// determine heartbeat and session sync endpoints. Used to detect config
-// changes that require restarting cluster comms.
+// clusterTransportKey extracts the cluster transport fields that determine
+// heartbeat and session sync endpoints. Used to detect config changes that
+// require restarting cluster comms: step 20 compares the WHOLE struct, so every
+// field here participates in the restart decision.
+//
+// The `log` tag is the key suffix step 20 uses when it reports that decision.
+// It exists so transportChangeLogArgs can derive the line from the struct
+// rather than from a hand-maintained argument list that has to be remembered
+// separately (#7073).
 type clusterTransportKey struct {
-	ControlInterface   string
-	PeerAddress        string
-	FabricInterface    string
-	FabricPeerAddress  string
-	Fabric1Interface   string
-	Fabric1PeerAddress string
+	ControlInterface   string `log:"control"`
+	PeerAddress        string `log:"peer"`
+	FabricInterface    string `log:"fabric"`
+	FabricPeerAddress  string `log:"fabric_peer"`
+	Fabric1Interface   string `log:"fabric1"`
+	Fabric1PeerAddress string `log:"fabric1_peer"`
+}
+
+// transportChangeLogArgs builds the key/value pairs for step 20's
+// "cluster: transport config changed, restarting comms" line: one old_/new_
+// pair per clusterTransportKey field, in declaration order.
+//
+// Derived from the struct by reflection rather than written out by hand,
+// because the two had already drifted: the comparison that decides the restart
+// used all six fields while the line that reported it printed four, so a commit
+// changing only fab1 correctly restarted comms and then logged four identical
+// old/new pairs — a line asserting a change and showing none, which reads as a
+// spurious restart (#7073). Deriving it makes that drift unrepresentable: a
+// field added to the struct joins the comparison and the line together.
+//
+// A field with no `log` tag still gets logged, under its Go name; the tag is
+// for a readable key, not for inclusion. Omission is not a reachable state.
+// Reflection is affordable here — this runs only on a commit that actually
+// changed the transport, never per packet or per session.
+func transportChangeLogArgs(active, next clusterTransportKey) []any {
+	rt := reflect.TypeOf(clusterTransportKey{})
+	av := reflect.ValueOf(active)
+	nv := reflect.ValueOf(next)
+	args := make([]any, 0, 4*rt.NumField())
+	for i := range rt.NumField() {
+		name := rt.Field(i).Tag.Get("log")
+		if name == "" {
+			name = rt.Field(i).Name
+		}
+		// .Interface(), not .String(): reflect.Value.String() does not fail on a
+		// non-string field, it returns "<int Value>". Every field is a string
+		// today, so this is not a live bug — but the whole point of deriving
+		// the line is that a future field joins it automatically, and joining
+		// it as garbage would be worse than the omission this replaced.
+		args = append(args,
+			"old_"+name, av.Field(i).Interface(),
+			"new_"+name, nv.Field(i).Interface())
+	}
+	return args
 }
 
 func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
@@ -1253,9 +1298,9 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 	}
 }
 
-// setActiveTransport publishes the transport key of the comms epoch that
-// startClusterComms is bringing up, and activeTransport reads it back — both
-// under clusterCommsMu (#6290).
+// setActiveTransportIfCurrent publishes the transport key of the comms epoch
+// that startClusterComms is bringing up, and activeTransport reads it back —
+// both under clusterCommsMu (#6290).
 //
 // The lock is required, not decorative. The field is written by
 // startClusterComms, which runs on the boot path (daemon_run.go) holding
@@ -1277,9 +1322,13 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 // written under applySem, read by the same callback without it — and was fixed
 // the same way.
 //
-// activeTransport also returns ONE snapshot, so step 20's comparison and the
-// eight fields it logs all describe a single epoch rather than up to six
-// separate reads that a concurrent restart could interleave.
+// activeTransport also returns ONE snapshot, so step 20's comparison and every
+// old_* pair it logs all describe a single epoch rather than up to six separate
+// reads that a concurrent restart could interleave. Deliberately not a count:
+// the previous wording said "eight fields", which was wrong when written (four
+// of step 20's eight pairs came from the locally-computed newTransport, not
+// from the snapshot) and would have gone wrong again when #7073 added the two
+// fab1 pairs. The invariant is "every old_* pair", which does not rot (#7070).
 //
 // setActiveTransportIfCurrent is epoch-gated rather than a bare locked store,
 // mirroring publishSessionSyncIfCurrent. The same window that makes the race
