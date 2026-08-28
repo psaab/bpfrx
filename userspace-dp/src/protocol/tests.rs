@@ -1733,6 +1733,52 @@ fn app_catalog_entry_roundtrip() {
 // default (no per-zone data) ProcessStatus omits the layout-version /
 // overflow keys. The Go mirror lives in
 // pkg/dataplane/userspace/zone_counters_status_test.go.
+/// #6947: both per-zone blocks are OMITTED when empty and PRESENT when
+/// populated.
+///
+/// The two halves are load-bearing together. "The key is absent" alone is
+/// satisfied by a field that never serializes at all, so the populated half is
+/// what proves the omission is conditional rather than total — that is the
+/// difference between this fix and a silent wire regression that drops real
+/// counters.
+///
+/// Before this, both fields carried `default` but not
+/// `skip_serializing_if = "Vec::is_empty"`, so the helper put
+/// `"zone_traffic_counters":[]` and `"zone_flood_counters":[]` on the shared
+/// control socket on every 1/s status poll, forever, on a firewall that had
+/// never populated either — while their sibling scalars in the same struct,
+/// and both Go mirrors (`json:"...,omitempty"`), already omitted.
+#[test]
+fn zone_counter_blocks_omitted_when_empty_present_when_populated_6947() {
+    let empty = serde_json::to_string(&ProcessStatus::default()).expect("serialize default");
+    for key in ["zone_traffic_counters", "zone_flood_counters"] {
+        assert!(
+            !empty.contains(key),
+            "default ProcessStatus still emits {key} — an empty array on the shared \
+             control socket every poll, which the Go mirror already omits (#6947): {empty}"
+        );
+    }
+
+    let mut status = ProcessStatus::default();
+    status.zone_traffic_counters = vec![ZoneTrafficCounterStatus {
+        zone_id: 40000,
+        ingress_packets: 1,
+        ingress_bytes: 2,
+        egress_packets: 3,
+        egress_bytes: 4,
+    }];
+    status.zone_flood_counters = vec![ZoneFloodCounterStatus::default()];
+    let populated = serde_json::to_string(&status).expect("serialize populated");
+    for key in ["zone_traffic_counters", "zone_flood_counters"] {
+        assert!(
+            populated.contains(key),
+            "a POPULATED {key} was dropped from the wire. skip_serializing_if must be \
+             conditional on emptiness; if it omits a non-empty block the fix has \
+             become a counter-losing regression: {populated}"
+        );
+    }
+}
+
 #[test]
 fn zone_traffic_counters_wire_roundtrip_and_default_omits() {
     // Default helper: no zone data -> version/overflow omitted from the wire.
