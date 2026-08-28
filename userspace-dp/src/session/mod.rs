@@ -1469,6 +1469,31 @@ impl SessionTable {
         self.entry_by_key(key).map(|e| e.counters)
     }
 
+    /// #2749/#6997: read the two SESSION_CLOSE observation fields — the
+    /// OR-accumulated TCP control bits and the forward-direction ToS byte —
+    /// for the session keyed by `key`, or `None` if no live entry exists.
+    ///
+    /// Sibling of `session_counters` above and same cost profile (one lookup +
+    /// a `Copy` of two bytes). It exists because these two fields were
+    /// observable ONLY through an expiry-driven Close delta, which forces a
+    /// caller that wants to bind them at their SOURCE to drive GC and drain the
+    /// delta ring first — enough machinery that #6997's call site went unbound
+    /// rather than under-asserted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn observed_close_fields(&self, key: &SessionKey) -> Option<(u8, u8)> {
+        self.entry_by_key(key)
+            .map(|e| (e.observed_tcp_flags, e.observed_tos))
+    }
+
+    /// #918/#6997: read the session's liveness timestamp, or `None` if no live
+    /// entry exists. Same idiom and same reason as `observed_close_fields`:
+    /// `touch_if_stale`'s only externally visible effect is this field moving,
+    /// so a caller binding that call site has to be able to read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn last_seen_ns(&self, key: &SessionKey) -> Option<u64> {
+        self.entry_by_key(key).map(|e| e.last_seen_ns)
+    }
+
     /// Unified session update function replacing promote_synced,
     /// refresh_local, and refresh_for_ha_activation.
     ///
