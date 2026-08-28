@@ -415,6 +415,13 @@ impl Coordinator {
         // time — see `forwarding_build::commit_zone_counter_prune`.
         if bringup_result.is_ok() {
             crate::afxdp::forwarding_build::commit_zone_counter_prune(&self.forwarding, snapshot);
+            // #7010: the policy / NAT hit-counter prune shares this commit
+            // point, for the reason on `commit_rule_counter_prune`.
+            crate::afxdp::forwarding_build::commit_rule_counter_prune(
+                &self.policy_counters,
+                &self.nat_counters,
+                snapshot,
+            );
         }
         // #4952 / #5143: a POST-TEARDOWN worker-bringup failure fails the
         // reconcile closed. `bring_up_workers` returned the specific failure —

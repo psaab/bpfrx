@@ -641,6 +641,41 @@ func loopbackDelivery(client, server *net.TCPAddr) bool {
 	return server.IP.IsLoopback() || client.IP.IsLoopback()
 }
 
+// LoopbackDeliveryCannotEnumerate reports whether a connection between these two
+// addresses is answered WITHOUT consulting the interface-address cache — i.e.
+// without ever reaching localAddrsFn and the mutex it holds.
+//
+// It exists for one caller: pkg/api's accept-time admission budget (#6974),
+// which bounds exactly that enumeration. A connection this returns true for
+// cannot reach the wedge the budget is defending, so it does not need to spend
+// that budget.
+//
+// SINGLE-SOURCED WITH THE SHORT-CIRCUIT ON PURPOSE. couldBeLocal returns before
+// isLocalAddr for precisely these connections, and the api-side split is only
+// sound while the two agree. Written as a second copy of the predicate they
+// would agree until someone edited one of them, and the failure would be
+// silent: connections that CAN wedge would stop spending the budget. Both call
+// this function, so the agreement is structural rather than remembered.
+//
+// A non-TCP address answers FALSE — the conservative direction. LookupPeer
+// returns early for those without consulting the cache, so a false here only
+// costs a budget slot that was not needed; a true would skip the budget on a
+// path this function has not actually reasoned about.
+func LoopbackDeliveryCannotEnumerate(client, server net.Addr) bool {
+	ct, ok := client.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	st, ok := server.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	if ct.IP == nil || st.IP == nil {
+		return false
+	}
+	return loopbackDelivery(ct, st)
+}
+
 // findPeerSocket looks for the row whose LOCAL address is the client and whose
 // REMOTE address is the server — the mirror of the connection this server
 // accepted.
