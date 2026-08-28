@@ -168,9 +168,16 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// space/control/malformed value cannot inject a second chrony directive
 		// token or fail the chrony reload.
 		"server": {desc: "NTP server", args: 1, multi: true, valueType: ValueHostname, valueDesc: "NTP server IP address or hostname", valueExamples: []string{"192.0.2.1", "pool.ntp.org"}, validator: ValidateNTPServer, placeholder: "<address>", children: nil},
-		"threshold": {desc: "Threshold", args: 1, placeholder: "<seconds>", children: map[string]*schemaNode{
-			"action": {desc: "Action on threshold", args: 1, placeholder: "<action>", children: nil},
-		}},
+		"threshold": {desc: "Threshold", args: 1, placeholder: "<seconds>",
+			valueType: ValueInteger, valueDesc: "NTP step threshold in seconds (>= 1; 0 means 'use the default')",
+			valueExamples: []string{"128", "600"},
+			// #6940: 0 is the documented default here and consumers gate on > 0,
+			// so a silently-zeroed malformed value disabled the threshold action
+			// with no diagnostic.
+			validator: ValidateIntegerMin(1),
+			children: map[string]*schemaNode{
+				"action": {desc: "Action on threshold", args: 1, placeholder: "<action>", children: nil},
+			}},
 	}},
 	"syslog": {desc: "Syslog configuration", children: map[string]*schemaNode{
 		// #2008 (syslog schema-only): a system syslog host/file/user

@@ -87,8 +87,20 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 			"passive":  {desc: "Passive LACP mode", children: nil},
 			"periodic": {desc: "LACP timer period", args: 1, children: nil},
 		}},
-		"link-speed":    {desc: "Member link speed", args: 1, children: nil},
-		"minimum-links": {desc: "Minimum active member links", args: 1, children: nil},
+		"link-speed": {desc: "Member link speed", args: 1, children: nil},
+		"minimum-links": {
+			desc:          "Minimum active member links",
+			args:          1,
+			placeholder:   "<number>",
+			valueType:     ValueInteger,
+			valueDesc:     "Minimum active member links before the bundle goes down (>= 1)",
+			valueExamples: []string{"1", "2"},
+			// #6940: the leaf carried no validator, so a malformed value reached
+			// compileInterfaces and `Atoi`'s discarded error made it 0. Bounded at
+			// >= 1 because 0 members is not a floor an operator can mean.
+			validator: ValidateIntegerMin(1),
+			children:  nil,
+		},
 	}},
 	"redundant-ether-options": {desc: "Redundant Ethernet interface options", children: map[string]*schemaNode{
 		"redundancy-group": {desc: "Redundancy group for this RETH", args: 1, children: nil},
@@ -198,10 +210,21 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					},
 				},
 				"dhcp": {desc: "DHCP client", children: map[string]*schemaNode{
-					"lease-time":              {desc: "Lease time", args: 1, placeholder: "<seconds>", children: nil},
-					"retransmission-attempt":  {desc: "Retransmission attempts", args: 1, placeholder: "<number>", children: nil},
-					"retransmission-interval": {desc: "Retransmission interval", args: 1, placeholder: "<seconds>", children: nil},
-					"force-discover":          {desc: "Force DHCP discover", children: nil},
+					"lease-time": {desc: "Lease time", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "DHCP lease time in seconds (>= 1; 0 means 'use the default' and cannot be requested)",
+						valueExamples: []string{"3600", "86400"},
+						// #6940: 0 is this leaf's DOCUMENTED sentinel for "default", so a
+						// silently-zeroed malformed value was indistinguishable from an
+						// unconfigured leaf. Bounded at >= 1 so the sentinel can only be
+						// reached by omitting the leaf, which is what it means.
+						validator: ValidateIntegerMin(1), children: nil},
+					"retransmission-attempt": {desc: "Retransmission attempts", args: 1, placeholder: "<number>",
+						valueType: ValueInteger, valueDesc: "DHCP retransmission attempts (>= 1)",
+						valueExamples: []string{"4"}, validator: ValidateIntegerMin(1), children: nil},
+					"retransmission-interval": {desc: "Retransmission interval", args: 1, placeholder: "<seconds>",
+						valueType: ValueInteger, valueDesc: "Seconds between DHCP retransmissions (>= 1)",
+						valueExamples: []string{"2"}, validator: ValidateIntegerMin(1), children: nil},
+					"force-discover": {desc: "Force DHCP discover", children: nil},
 				}},
 				"sampling": {desc: "Traffic sampling", children: map[string]*schemaNode{
 					"input":  {desc: "Sample input traffic", children: nil},
