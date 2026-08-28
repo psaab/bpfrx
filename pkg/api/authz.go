@@ -475,8 +475,23 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	select {
 	case peerLookupSlots <- struct{}{}:
 		go func() {
-			defer func() { <-peerLookupSlots }()
+			// #6977: the admission token is returned BEFORE p.done is closed,
+			// so a waiter that observes p.done knows the slot is back as well
+			// as that the lookup finished. Defers run LIFO, so the ORDER OF
+			// THESE TWO LINES IS THE INVARIANT — registered in this order,
+			// close(p.done) runs last.
+			//
+			// The reverse order is what shipped, and it makes `done` mean
+			// something subtly weaker than its name: a caller that joins on it
+			// returns while the token is still out, so a test that immediately
+			// fills the pool observes a preceding lookup's transient token and
+			// fails on its own precondition. That cost two review rounds
+			// (#6645 r22 finding 3, then #6977) and every case near the pool
+			// carries a waitSlots precondition to absorb it. The receive cannot
+			// block — this goroutine's own token is in the buffer — so running
+			// it first is free.
 			defer close(p.done)
+			defer func() { <-peerLookupSlots }()
 			p.id = s.lookupPeer(client, server)
 		}()
 	default:
