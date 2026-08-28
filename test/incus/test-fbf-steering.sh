@@ -140,14 +140,29 @@ sleep 3
 
 # ---- Phase 2: kernel side of the divergence fix ----
 info "Discovering ISP-B kernel table from the PBR ip-rule band..."
-PBR_TABLE="$(incus exec "$TARGET" -- sh -c \
-    "ip rule show | awk -F'lookup ' '\$1 ~ /^31[0-9][0-9][0-9]:/ {print \$2; exit}'" | tr -d '[:space:]')"
-[[ -n "$PBR_TABLE" ]] || fail "no PBR ip rule in the 31000+ band (FBF kernel rule missing)"
-info "PBR rule -> table $PBR_TABLE"
+# #6936: enumerate ALL tables in the band and select by CONTENT, not by
+# position. The old form took the FIRST 31xxx rule and exited, but the band is
+# not private to FBF: this cluster already carries a GRE rule at exactly
+# priority 31000 (`from all to 10.255.192.40/30 iif ge-0-0-1 lookup 488570`),
+# so the discovery bound a GRE table and the cell below then blamed FRR for a
+# default it was never going to find there.
+PBR_CANDIDATES="$(incus exec "$TARGET" -- sh -c \
+    "ip rule show | awk -F'lookup ' '\$1 ~ /^31[0-9][0-9][0-9]:/ {print \$2}'" | tr -d '\r')"
+[[ -n "${PBR_CANDIDATES//[[:space:]]/}" ]] \
+    || fail "no PBR ip rule in the 31000+ band (FBF kernel rule missing)"
+info "PBR band candidates: $(echo $PBR_CANDIDATES)"
 
-ROUTES="$(incus exec "$TARGET" -- ip route show table "$PBR_TABLE")"
-echo "$ROUTES" | grep -q "default via ${ISP_B_GW4}" \
-    || fail "ISP-B kernel table $PBR_TABLE lacks 'default via ${ISP_B_GW4}' — FRR table rendering broken (pre-PR-2 divergence): ${ROUTES:-<empty>}"
+PBR_TABLE=""
+ROUTES=""
+for _cand in $PBR_CANDIDATES; do
+    _routes="$(incus exec "$TARGET" -- ip route show table "$_cand" 2>/dev/null || true)"
+    if fbf_table_holds_default "$ISP_B_GW4" "$_routes"; then
+        PBR_TABLE="$_cand"
+        ROUTES="$_routes"
+        break
+    fi
+done
+[[ -n "$PBR_TABLE" ]] || fail "no table in the 31000+ band ($(echo $PBR_CANDIDATES)) holds 'default via ${ISP_B_GW4}' — either FRR table rendering is broken (pre-PR-2 divergence) or the FBF rule never installed"
 info "ISP-B table $PBR_TABLE holds the instance default (divergence fix OK)"
 
 # #6936: take the route TEXT, not a count. The counting form collapsed
