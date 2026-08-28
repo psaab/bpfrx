@@ -1387,6 +1387,33 @@ func zoneMapCorpus6722() []struct {
 			"set security zones security-zone zzz interfaces ge-0/0/1",
 			"set security zones security-zone zzz interfaces reth1",
 		}, true},
+		// #7024: THE FALSIFYING SHAPE. A BARE reference in one zone and a
+		// DOTTED reference from a DIFFERENT zone naming the same interface.
+		// buildInterfaceZoneMap fans the dotted ref UP to the base
+		// (first-write-wins over sorted zone names, so `aaa` beats `zzz`);
+		// authoredZoneRefs deliberately does not fan up, and records the bare
+		// sentence. The two therefore give different answers for `ge-0/0/1`.
+		//
+		// This is the ONLY shape that falsifies the old unconditional
+		// agreement claim, and the corpus had nothing like it: the five strict
+		// shapes never double-claim, and `member-claimed-by-two-zones` uses TWO
+		// BARE refs, so no fan-up is involved.
+		{"base-and-unit-claimed-by-different-zones", []string{
+			"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+			"set security zones security-zone aaa interfaces ge-0/0/1.0",
+			"set security zones security-zone zzz interfaces ge-0/0/1",
+		}, true},
+		// ...and its MIRROR, with the zone names swapped so the fan-up winner
+		// is also the bare ref's zone. This samples the BENIGN side of the same
+		// axis: no divergence. Both are here because a fixture that picked only
+		// this order would prove nothing — the ordering is what makes the shape
+		// falsifying, and a corpus sitting on the passing point of an axis it
+		// varies is the defect this issue is about.
+		{"base-and-unit-same-zone-wins-fanup", []string{
+			"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+			"set security zones security-zone zzz interfaces ge-0/0/1.0",
+			"set security zones security-zone aaa interfaces ge-0/0/1",
+		}, true},
 	}
 }
 
@@ -1419,6 +1446,12 @@ func zoneMapCorpus6722() []struct {
 // dropping CanonicalInterfaceUnitRef from authoredZoneRefs reds it on
 // `noncanonical-unit-ref` (authored keys `.01`, the zone map keys `.1`).
 func TestAuthoredAndDerivedZoneMapsAgreeOnEveryAuthoredRef_6722(t *testing.T) {
+	// #7024 ANTI-VACUITY. The narrowing below tolerates a base-reference
+	// divergence, which is only safe to tolerate if the corpus actually
+	// CONTAINS one — otherwise the loop degrades to the old unconditional
+	// claim and the tolerance is untested prose. The old corpus had no such
+	// shape, which is exactly how the guard passed while its claim was false.
+	sawExplainedBaseDivergence := false
 	for _, tc := range zoneMapCorpus6722() {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := compileWithStubbedLinks6722(t, tc.lines, map[string]int{}, map[string]string{}, tc.lenient)
@@ -1437,20 +1470,68 @@ func TestAuthoredAndDerivedZoneMapsAgreeOnEveryAuthoredRef_6722(t *testing.T) {
 			}
 			sort.Strings(refs)
 			for _, ref := range refs {
-				if got, want := derived[ref], authored[ref]; got != want {
-					t.Errorf("the two zone maps DISAGREE about the authored "+
-						"reference %q: authoredZoneRefs=%q buildInterfaceZoneMap=%q. "+
-						"Both read the same operator sentence, so a disagreement "+
-						"means one of them changed its write policy or its "+
-						"canonicalization alone. stampEgressZones resolves rule 2 "+
-						"from the first and the helper corroborates against rows "+
-						"stamped from the second, so this is a claim the helper "+
-						"will honour under a zone the operator never wrote for "+
-						"that identity.\n  authored=%v\n  derived =%v",
-						ref, want, got, authored, derived)
+				got, want := derived[ref], authored[ref]
+				if got == want {
+					continue
 				}
+				// #7024: a UNIT reference must ALWAYS agree. Both maps record a
+				// unit ref from the operator's literal sentence and neither
+				// synthesizes one, so a disagreement here really is one of them
+				// changing its write policy or canonicalization alone.
+				if strings.Contains(ref, ".") {
+					t.Errorf("the two zone maps DISAGREE about the authored UNIT "+
+						"reference %q: authoredZoneRefs=%q buildInterfaceZoneMap=%q. "+
+						"Neither map synthesizes a unit reference, so this is one of "+
+						"them changing its write policy or its canonicalization "+
+						"alone.\n  authored=%v\n  derived =%v",
+						ref, want, got, authored, derived)
+					continue
+				}
+				// A BASE reference MAY diverge, and #7024 is the record of why.
+				// buildInterfaceZoneMap fans a unit reference UP to its base;
+				// authoredZoneRefs deliberately does not, because it is
+				// PROVENANCE — what the operator literally wrote. When a bare
+				// ref in one zone and a dotted ref from an alphabetically
+				// earlier zone name the same interface, the derived map answers
+				// with the fan-up winner and the authored map answers with the
+				// bare sentence. Both are correct for their own consumer.
+				//
+				// What must hold is that the divergence is EXPLAINED by the
+				// fan-up rather than arbitrary: the derived value has to be the
+				// zone of some authored UNIT under this base. A derived value
+				// from nowhere would mean the fan-up itself had changed.
+				explained := false
+				for other, otherZone := range authored {
+					if other == ref || !strings.HasPrefix(other, ref+".") {
+						continue
+					}
+					if otherZone == got {
+						explained = true
+						break
+					}
+				}
+				if !explained {
+					t.Errorf("the two zone maps disagree about the authored BASE "+
+						"reference %q (authoredZoneRefs=%q buildInterfaceZoneMap=%q) "+
+						"and the derived value is NOT the zone of any authored unit "+
+						"under it, so the fan-up does not explain it. A base "+
+						"divergence is tolerated ONLY as the fan-up of a unit "+
+						"reference (#7024); this one came from somewhere else.\n"+
+						"  authored=%v\n  derived =%v",
+						ref, want, got, authored, derived)
+					continue
+				}
+				sawExplainedBaseDivergence = true
 			}
 		})
+	}
+	if !sawExplainedBaseDivergence {
+		t.Fatalf("no corpus shape produced a base-reference divergence, so the #7024 " +
+			"tolerance above was never exercised and this guard has silently " +
+			"reverted to the unconditional agreement claim it replaced. Restore " +
+			"`base-and-unit-claimed-by-different-zones` (a BARE ref in one zone and " +
+			"a DOTTED ref from an alphabetically EARLIER zone naming one interface) " +
+			"— note the zone ORDER is what makes it falsifying")
 	}
 }
 
@@ -1882,4 +1963,60 @@ func TestBarePortOfADifferentRethDoesNotDeferToThisOne_6722(t *testing.T) {
 			"reth whose unit it aliases, the two cohere, and the authored zone "+
 			"resolves; if this control also answers \"\" then the cell above is "+
 			"measuring the aliasing, not the redundant-parent match")
+}
+
+
+// #7024: the OUTCOME half. A base/unit divergence must resolve FAIL-CLOSED.
+//
+// Cell P now TOLERATES a base-reference divergence, which is only defensible if
+// the divergence cannot produce a wrong answer. This is the cell that shows it
+// cannot: the ifindex resolves to no zone at all, so nothing forwards under a
+// zone the operator did not write for it.
+//
+// Tolerating a divergence without pinning its outcome would be the same defect
+// this issue is about, moved one step: a claim that reads as safe with nothing
+// asserting the safety.
+//
+// Strict rejects the doubly-claimed interface, so — like cells O, P's sixth
+// shape and Q — the surface this defends is the tolerant load / HA peer-sync
+// path (#1960 no-brick).
+func TestBaseAndUnitClaimedByDifferentZonesFailsClosed_7024(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+		"set security zones security-zone aaa interfaces ge-0/0/1.0",
+		"set security zones security-zone zzz interfaces ge-0/0/1",
+	}
+	links := map[string]int{"ge-0-0-1": 24}
+	macs := map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"}
+
+	// Pinned rather than assumed, mirroring cell Q: if strict ever admitted
+	// this, "reachable only leniently" would be false and a reader would be
+	// misled about which surface this defends.
+	if _, err := config.CompileConfig(treeFromSet6722(t, lines)); err == nil {
+		t.Fatalf("precondition: strict CompileConfig ADMITTED an interface whose " +
+			"base and unit are claimed by different zones; this cell claims the " +
+			"shape reaches the builder only on the tolerant path")
+	}
+
+	cfg := compileWithStubbedLinks6722(t, lines, links, macs, true)
+
+	// The divergence itself, pinned here too so this cell fails for its OWN
+	// reason if the maps are ever made to agree — rather than quietly becoming
+	// a test of a shape that no longer exists.
+	authored, derived := authoredZoneRefs(cfg), buildInterfaceZoneMap(cfg)
+	if authored["ge-0/0/1"] != "zzz" || derived["ge-0/0/1"] != "aaa" {
+		t.Fatalf("precondition: authored[ge-0/0/1]=%q derived[ge-0/0/1]=%q, want "+
+			"\"zzz\" and \"aaa\" — the fan-up winner must differ from the bare "+
+			"sentence, or there is no divergence here to fail closed on",
+			authored["ge-0/0/1"], derived["ge-0/0/1"])
+	}
+
+	snaps := buildInterfaceSnapshots(cfg)
+	assertEgressZone6722(t, snaps, 24, "",
+		"the operator's sentences put `aaa` on ge-0/0/1.0 and `zzz` on ge-0/0/1, "+
+			"and both land on one netdev, so it identifies no single egress zone. "+
+			"Answering either one adjudicates transit under a zone the operator "+
+			"did not write for that identity — and cell P now TOLERATES this "+
+			"divergence, so if the outcome stops being fail-closed the tolerance "+
+			"becomes a hole rather than a documented limit (#7024)")
 }
