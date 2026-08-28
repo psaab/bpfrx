@@ -244,7 +244,7 @@ var rethLinkOpsFn = rethLinkOps{
 // always no-ops on the just-renamed member. Without this UP the RETH data link
 // would be left administratively DOWN → the interface track detects link-down
 // → the redundancy group demotes → traffic blackhole (#3920).
-func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
+func renameRethMember(targetName string, expectedMAC net.HardwareAddr, beforeCycle func() error) string {
 	ops := rethLinkOpsFn
 	ifaces, err := ops.interfaces()
 	if err != nil {
@@ -257,6 +257,28 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 		link, err := ops.byIndex(iface.Index)
 		if err != nil {
 			return ""
+		}
+		// #6911: the worker join belongs HERE — after a rename candidate is
+		// confirmed (so the hook cannot fire on a scan that cycles nothing) and
+		// strictly BEFORE setDown, the first mutation of the link. This mirrors
+		// programRethMAC's #5103 contract: worker threads live across the link
+		// DOWN, touching UMEM pages the NIC unmaps as it tears down its queues.
+		//
+		// The hazard is LATENT today, not live: renameRethMember runs only when
+		// LinkByName(targetName) already failed, it matches by the VIRTUAL MAC,
+		// and the dataplane cannot have resolved a binding to a name that did
+		// not exist — so there are no live bindings to tear down. That chain
+		// rests on three properties of unrelated code, none of them asserted.
+		// The hook makes the two cycle sites symmetric so a future change to
+		// any of them fails loudly here instead of silently reopening #5103.
+		if beforeCycle != nil {
+			if err := beforeCycle(); err != nil {
+				slog.Warn("skipping RETH member rename: worker join failed",
+					"from", iface.Name, "to", targetName, "err", err)
+				// Abort WITHOUT touching the link — the caller's workers are in
+				// an unknown state and a cycle now is exactly the #5103 hazard.
+				return ""
+			}
 		}
 		// Ensure interface is DOWN for rename.
 		ops.setDown(link)

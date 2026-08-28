@@ -297,7 +297,22 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			// find it by RETH virtual MAC and rename it.
 			if _, err := netlink.LinkByName(linuxName); err != nil {
 				mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-				if oldName := renameRethMember(linuxName, mac); oldName != "" {
+				// #6911: renameRethMember cycles the link too, so it gets the
+				// same worker join programRethMAC has had since #5103. The
+				// lease PrepareLinkCycle takes is released by the
+				// abandonLinkCycleLease deferred over this whole apply, so the
+				// rebind is owned exactly as it is for the MAC-programming
+				// cycle — this hook adds a join, not a new lifecycle.
+				renameJoin := func() error {
+					rt := d.dataplane()
+					if rt == nil {
+						return nil
+					}
+					slog.Info("userspace: stopping workers before RETH member rename",
+						"iface", linuxName)
+					return rt.Link().PrepareLinkCycle()
+				}
+				if oldName := renameRethMember(linuxName, mac, renameJoin); oldName != "" {
 					slog.Info("renamed RETH member interface",
 						"from", oldName, "to", linuxName)
 					fixRethLinkFile(linuxName, oldName)
