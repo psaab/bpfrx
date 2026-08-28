@@ -3208,6 +3208,47 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 				if rule == nil {
 					continue
 				}
+				// #7013: ONE `then` BLOCK NAMING TWO POOLS, which the mode count
+				// below cannot see. NATThen resolves a single pool name, so
+				// `pool PD pool PD2` arrives here as n == 1. The per-container
+				// occurrence record kept at lowering is what makes the discarded
+				// pool checkable.
+				//
+				// Checked BEFORE the mode count so the message names the actual
+				// defect: a rule that authored two pools AND an `off` is
+				// reported as the duplicate first, because "you wrote pool
+				// twice" is the more specific and more actionable of the two.
+				//
+				// This fires only where ONE container carries both occurrences:
+				// a packed run (`pool PD pool PD2`) or hierarchical braces
+				// (`destination-nat { pool PD; pool PD2; }`), measured at this
+				// head to keep the FIRST in both. Three shapes deliberately stay
+				// legal, and each of them is already pinned elsewhere in the
+				// suite:
+				//
+				//   - DUPLICATE `then` CONTAINERS — #3850 last-wins, whether
+				//     they name the same pool or different actions. Summing
+				//     across containers false-rejects both, so the record is
+				//     kept per container.
+				//   - TWO SEPARATE `set ... pool X` LINES — the second REPLACES
+				//     the leaf in the candidate tree, exactly as a single-value
+				//     leaf is meant to behave, so only one pool ever reaches the
+				//     compiler and `show configuration` displays what will be
+				//     enforced. Rejecting it would break the ordinary way an
+				//     operator edits a pool.
+				//   - THE SAME POOL NAMED TWICE in one block — nothing is
+				//     discarded, so there is nothing to report; distinctPools
+				//     is what makes that a redundancy rather than an error.
+				if names := rule.thenAuthored.distinctPools(); len(names) >= 2 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: one `then` block names %d different pools "+
+							"(%s), but a rule carries ONE translation action per mode — the FIRST "+
+							"is the one that takes effect and the rest are silently discarded "+
+							"before anything validates them, so the firewall translates "+
+							"differently from the configuration as written and nothing says so. "+
+							"Name one, or split them into separate rules",
+						kind, rs.Name, rule.Name, len(names), strings.Join(names, ", "))
+				}
 				switch n := natThenTerminalActionCount(rule.Then); {
 				case n == 0:
 					return fmt.Errorf(
