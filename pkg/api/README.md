@@ -1636,7 +1636,27 @@ the drop fails loudly instead of going quietly vacuous.
         domain-qualified SAN next to a short kernel name means the TLS identity
         is independent of it — stay quiet. The RENAME entry point skips that
         heuristic: the operator just chose the name, which is direct evidence
-        rather than inference. **Accepted residual:** a rename that CROSSES the
+        rather than inference.
+        **BOTH entry points are gated on the listener being remotely reachable
+        (`bindIsLoopbackOnly`, #7039).** On a loopback-only HTTPS bind — which is
+        what `set system services web-management https` with no `interface`
+        resolves to, `127.0.0.1:443` — there is no remote client, so nothing can
+        verify by host name and a re-mint would fix nothing. The bind-host half
+        above already declined there (`bindHostWarnable("127.0.0.1")` is false);
+        the host-name half had no equivalent gate, so every `set system
+        host-name` on a loopback-bound management plane warned about clients that
+        cannot exist. That is the failure mode this whole heuristic exists to
+        prevent, arriving through the door it left open. The gate is a property
+        of the BIND, not of the name, so it composes with the rename path's
+        direct evidence rather than contradicting it.
+        **It is deliberately NOT `!bindHostWarnable`.** Those two answer
+        different questions and disagree on the wildcard binds: `0.0.0.0` and
+        `::` are `bindHostWarnable == false` — because they name no single host,
+        not because they are unreachable — so suppressing on the complement would
+        silence the diagnostic on the most remotely-reachable listener there is.
+        `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the
+        divergence, and the wildcard binds appear as MUST-STILL-WARN cells beside
+        the loopback silence cells so the suppression cannot widen unnoticed. **Accepted residual:** a rename that CROSSES the
         qualified/unqualified boundary is diagnosed at the commit but not on any
         later boot, so it is never diagnosed at all in the two states that had
         no commit-time diagnosis behind them — a box already drifted before this
