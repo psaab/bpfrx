@@ -217,6 +217,57 @@ struct BpfSessionKeyV6 {
     pad: [u8; 3],
 }
 
+/// Build the v4 conntrack map key.
+///
+/// SINGLE SOURCE (#7743). The conntrack map is written by three separate
+/// operations — publish (`publish_conntrack`), refresh (the lookup+`BPF_EXIST`
+/// update in `refresh_bpf_conntrack_entry`), and delete
+/// (`delete_bpf_conntrack_entry`). A BPF hash map is keyed on the raw key
+/// BYTES, so all three must produce a byte-identical key or the operations
+/// stop addressing the same row: a publish that encodes ports differently from
+/// the delete writes an entry the delete can never remove, leaking a conntrack
+/// row for the life of the map. Before #7743 each of the eight sites
+/// hand-rolled this literal, so the `to_be()` and the zeroed `pad` were
+/// repeated assumptions rather than one enforced encoding.
+#[inline]
+fn bpf_session_key_v4(
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+) -> BpfSessionKeyV4 {
+    BpfSessionKeyV4 {
+        src_ip,
+        dst_ip,
+        // __be16 on the wire; SessionKey holds host order.
+        src_port: src_port.to_be(),
+        dst_port: dst_port.to_be(),
+        protocol,
+        pad: [0; 3],
+    }
+}
+
+/// Build the v6 conntrack map key. See [`bpf_session_key_v4`] for why this is
+/// single-sourced.
+#[inline]
+fn bpf_session_key_v6(
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    protocol: u8,
+) -> BpfSessionKeyV6 {
+    BpfSessionKeyV6 {
+        src_ip,
+        dst_ip,
+        src_port: src_port.to_be(),
+        dst_port: dst_port.to_be(),
+        protocol,
+        pad: [0; 3],
+    }
+}
+
 /// Mirrors C `struct session_value_v6` — full connection state with 128-bit IPs.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -406,14 +457,7 @@ pub(super) fn delete_bpf_conntrack_entry(
 ) {
     match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
         (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
-            let bpf_key = BpfSessionKeyV4 {
-                src_ip: src.octets(),
-                dst_ip: dst.octets(),
-                src_port: key.src_port.to_be(),
-                dst_port: key.dst_port.to_be(),
-                protocol: key.protocol,
-                pad: [0; 3],
-            };
+            let bpf_key = bpf_session_key_v4(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
             let _ = unsafe {
                 libbpf_sys::bpf_map_delete_elem(
                     conntrack_v4_fd,
@@ -422,14 +466,7 @@ pub(super) fn delete_bpf_conntrack_entry(
             };
         }
         (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
-            let bpf_key = BpfSessionKeyV6 {
-                src_ip: src.octets(),
-                dst_ip: dst.octets(),
-                src_port: key.src_port.to_be(),
-                dst_port: key.dst_port.to_be(),
-                protocol: key.protocol,
-                pad: [0; 3],
-            };
+            let bpf_key = bpf_session_key_v6(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
             let _ = unsafe {
                 libbpf_sys::bpf_map_delete_elem(
                     conntrack_v6_fd,
@@ -498,14 +535,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
             .reresolve_session_policy_id(metadata.policy_counter.as_ref(), metadata.policy_id);
         match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
             (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
-                let bpf_key = BpfSessionKeyV4 {
-                    src_ip: src.octets(),
-                    dst_ip: dst.octets(),
-                    src_port: key.src_port.to_be(),
-                    dst_port: key.dst_port.to_be(),
-                    protocol: key.protocol,
-                    pad: [0; 3],
-                };
+                let bpf_key = bpf_session_key_v4(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
                 let mut value: BpfSessionValueV4 = unsafe { std::mem::zeroed() };
                 let rc = unsafe {
                     libbpf_sys::bpf_map_lookup_elem(
@@ -539,14 +569,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                 }
             }
             (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
-                let bpf_key = BpfSessionKeyV6 {
-                    src_ip: src.octets(),
-                    dst_ip: dst.octets(),
-                    src_port: key.src_port.to_be(),
-                    dst_port: key.dst_port.to_be(),
-                    protocol: key.protocol,
-                    pad: [0; 3],
-                };
+                let bpf_key = bpf_session_key_v6(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
                 let mut value: BpfSessionValueV6 = unsafe { std::mem::zeroed() };
                 let rc = unsafe {
                     libbpf_sys::bpf_map_lookup_elem(
@@ -790,11 +813,16 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
 ) {
+    // #7743: the conntrack mirror is deleted unconditionally. This was written
+    // as an `if uses_kernel_local_session_map_entry(..) { delete; return } delete`
+    // whose two arms called the SAME function with the SAME arguments, so the
+    // branch never changed an outcome. It is collapsed rather than given a
+    // second behaviour because the delete is already correct for both cases:
+    // the kernel-local publish path writes its entry under `session_map_key`
+    // (only the map VALUE differs — `USERSPACE_SESSION_ACTION_PASS_TO_KERNEL`),
+    // and a BPF delete addresses the row by KEY, so the redirect walk below
+    // removes the kernel-local row and the live row alike.
     delete_session_map_redirect_for_session(map_fd, key, decision, metadata, origin);
-    if uses_kernel_local_session_map_entry(decision, metadata, origin) {
-        delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
-        return;
-    }
     delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
 }
 

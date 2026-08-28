@@ -20,7 +20,8 @@
 
 use super::{
     BpfSessionKeyV4, BpfSessionKeyV6, BpfSessionValueV4, BpfSessionValueV6, SESS_STATE_ESTABLISHED,
-    SessionDecision, SessionKey, SessionMetadata, reverse_session_key,
+    SessionDecision, SessionKey, SessionMetadata, bpf_session_key_v4, bpf_session_key_v6,
+    reverse_session_key,
 };
 use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 use core::ffi::{c_int, c_void};
@@ -112,14 +113,7 @@ pub(super) fn publish_v4_session(
     // live entry), preserving the legacy ordinal fallback on the Go render side.
     session_id: u64,
 ) {
-    let bpf_key = BpfSessionKeyV4 {
-        src_ip: src.octets(),
-        dst_ip: dst.octets(),
-        src_port: key.src_port.to_be(),
-        dst_port: key.dst_port.to_be(),
-        protocol: key.protocol,
-        pad: [0; 3],
-    };
+    let bpf_key = bpf_session_key_v4(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
 
     // A cross-family reverse key means the session cannot be mirrored to the v4
     // conntrack map — skip the write entirely (pre-#5213 behaviour).
@@ -182,14 +176,7 @@ pub(super) fn build_conntrack_value_v4(
                 IpAddr::V4(d) => d,
                 _ => return None,
             };
-            BpfSessionKeyV4 {
-                src_ip: rsrc.octets(),
-                dst_ip: rdst.octets(),
-                src_port: rev.src_port.to_be(),
-                dst_port: rev.dst_port.to_be(),
-                protocol: rev.protocol,
-                pad: [0; 3],
-            }
+            bpf_session_key_v4(rsrc.octets(), rdst.octets(), rev.src_port, rev.dst_port, rev.protocol)
         }
         _ => return None,
     };
@@ -272,14 +259,7 @@ pub(super) fn publish_v6_session(
     // #5213: stable dataplane session id — see publish_v4_session.
     session_id: u64,
 ) {
-    let bpf_key = BpfSessionKeyV6 {
-        src_ip: src.octets(),
-        dst_ip: dst.octets(),
-        src_port: key.src_port.to_be(),
-        dst_port: key.dst_port.to_be(),
-        protocol: key.protocol,
-        pad: [0; 3],
-    };
+    let bpf_key = bpf_session_key_v6(src.octets(), dst.octets(), key.src_port, key.dst_port, key.protocol);
 
     let Some(value) = build_conntrack_value_v6(
         key,
@@ -338,14 +318,7 @@ pub(super) fn build_conntrack_value_v6(
                 IpAddr::V6(d) => d,
                 _ => return None,
             };
-            BpfSessionKeyV6 {
-                src_ip: rsrc.octets(),
-                dst_ip: rdst.octets(),
-                src_port: rev.src_port.to_be(),
-                dst_port: rev.dst_port.to_be(),
-                protocol: rev.protocol,
-                pad: [0; 3],
-            }
+            bpf_session_key_v6(rsrc.octets(), rdst.octets(), rev.src_port, rev.dst_port, rev.protocol)
         }
         _ => return None,
     };
