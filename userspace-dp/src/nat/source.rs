@@ -135,6 +135,32 @@ pub(crate) enum SourceNatFailureReason {
     /// `InterfaceIdentityExhausted` because the remedy differs: this says
     /// "no more bookkeeping capacity", not "this identity space is full".
     InterfaceRegistryCap,
+    /// #7717: the egress address this interface-mode admission would mint on
+    /// still carries LIVE allocations from a quarantined source-NAT pool that
+    /// is draining. The two domains keep independent occupancy, so minting
+    /// here can hand out an identity the draining pool still owns — the
+    /// collision `defect_pin_pool_and_interface_snat_mint_one_identity_7717`
+    /// demonstrates.
+    ///
+    /// Deliberately NOT folded into `InterfaceIdentityExhausted`: the remedy
+    /// differs and so does the expected duration. Exhaustion says "this
+    /// identity space is full"; this says "someone else is still holding part
+    /// of it and will let go". The quarantine lifts on its own when the last
+    /// draining flow closes, so an operator seeing this counter climb should
+    /// look at the overlap, not at pool sizing.
+    InterfaceOverlapDraining,
+    /// #7717: this POOL is quarantined because one of its addresses is also an
+    /// interface-mode SNAT egress address, which the snapshot builder can only
+    /// see for a runtime-resolved (DHCP/netlink) address. New pool mints are
+    /// refused; its existing allocator is RETAINED so live flows drain.
+    ///
+    /// A distinct variant rather than reusing an existing failure because it is
+    /// the ONLY one whose allocator is retained. Folding it into, say,
+    /// `EmptyPool` would silently extend drain retention to every pool failure
+    /// — a wider behaviour change than the demonstrated defect needs, and one
+    /// that perturbs the #6812 budget walk for pools that have nothing to
+    /// drain.
+    PoolIfaceEgressOverlap,
 }
 
 impl SourceNatFailureReason {
@@ -154,6 +180,8 @@ impl SourceNatFailureReason {
             Self::OverBudget => "source_nat_pool_over_budget",
             Self::InterfaceIdentityExhausted => "source_nat_interface_identity_exhausted",
             Self::InterfaceRegistryCap => "source_nat_interface_registry_cap",
+            Self::InterfaceOverlapDraining => "source_nat_interface_overlap_draining",
+            Self::PoolIfaceEgressOverlap => "source_nat_pool_iface_egress_overlap",
         }
     }
 }
@@ -172,6 +200,10 @@ fn source_nat_failure_reason_from_snapshot(reason: &str) -> SourceNatFailureReas
         // exclude the pool it knows builds no allocator.
         "invalid_pool" => SourceNatFailureReason::InvalidPool,
         "wrong_address_family" => SourceNatFailureReason::WrongAddressFamily,
+        // #7717: emitted by the Go snapshot builder when a pool address is also
+        // an interface-SNAT egress address. The ONLY reason whose allocator is
+        // retained for draining.
+        "iface_snat_egress_overlap" => SourceNatFailureReason::PoolIfaceEgressOverlap,
         "allocator_exhausted" => SourceNatFailureReason::AllocatorExhausted,
         // #6812: the Go tolerant snapshot poison for a pool that does not fit
         // the #5877 aggregate cardinality budget. Wire-skew safe: an older
@@ -392,6 +424,43 @@ impl SourceNatRule {
         })
     }
 
+    /// #7717: the carry-over key that IGNORES `pool_failure`.
+    ///
+    /// `allocator_key` refuses a failed pool, which is right for MINTING and
+    /// wrong for RETENTION. A pool quarantined because its address overlaps an
+    /// interface-SNAT egress still has live flows holding real identities; if
+    /// its allocator is not carried into the next generation those flows lose
+    /// the state that releases them, which is the stranding the merged config
+    /// gate names as the reason the quarantine could not ship alone.
+    ///
+    /// This is a strict WIDENING of `allocator_key`: for a healthy pool the two
+    /// return the same key, so retention is unchanged there. It must also
+    /// survive REPEATED quarantined snapshots — every rebuild while the overlap
+    /// persists re-derives the previous generation through this key, and a
+    /// key that dropped on the second one would strand exactly the flows the
+    /// first one preserved.
+    fn drain_allocator_key(&self) -> Option<SourceNatPoolAllocatorKey> {
+        let total_pool = self.pool_addresses_v4.len() + self.pool_addresses_v6.len();
+        (self.pool_mode && total_pool > 0)
+            .then(|| self.allocator_key_for(self.pool_port_low, self.pool_port_high))
+    }
+
+    /// #7717: is this rule a quarantined pool whose allocator is DRAINING —
+    /// refusing new mints while live flows still release into it?
+    fn is_draining_pool(&self) -> bool {
+        self.pool_failure == Some(SourceNatFailureReason::PoolIfaceEgressOverlap)
+            && self.pool_mode
+            && (self.pool_addresses_v4.len() + self.pool_addresses_v6.len()) > 0
+    }
+
+    /// Does this rule's pool contain `addr` as a member address?
+    fn pool_contains_address(&self, addr: IpAddr) -> bool {
+        match addr {
+            IpAddr::V4(v4) => self.pool_addresses_v4.contains(&v4),
+            IpAddr::V6(v6) => self.pool_addresses_v6.contains(&v6),
+        }
+    }
+
     /// Build the allocator key with an EXPLICIT port range. The resolve pass
     /// (#6812) keys a rule BEFORE its allocator exists, so it cannot read the
     /// range back off `pool_allocator` (still the empty default there); the
@@ -405,6 +474,24 @@ impl SourceNatRule {
             port_high,
         }
     }
+}
+
+/// #7717: does any QUARANTINED pool still hold live allocations on `addr`?
+///
+/// Scans the rule slice rather than consulting a precomputed set because the
+/// answer is time-varying: the same rule flips from draining to drained when
+/// its last flow closes, and a set computed at apply would pin the pre-drain
+/// answer forever — a permanent quarantine wearing the shape of a working
+/// drain. The scan is bounded by the rule count and runs only on the
+/// interface-mode mint path (new flows), and the `is_draining_pool` test is a
+/// cheap `Option::is_some` that is false for every rule in a healthy config, so
+/// the common case never reaches the address comparison.
+fn address_has_draining_pool_occupancy(rules: &[SourceNatRule], addr: IpAddr) -> bool {
+    rules.iter().any(|candidate| {
+        candidate.is_draining_pool()
+            && candidate.pool_contains_address(addr)
+            && candidate.pool_allocator.live_flow_count() > 0
+    })
 }
 
 /// #6812: source-NAT AGGREGATE allocator budget at the apply boundary — the
@@ -704,6 +791,59 @@ fn resolve_pool_allocators(
         }
         used = used.saturating_with(pending.charge());
         reserved.insert(key, ());
+    }
+
+    // PHASE 1b (#7717): DRAIN retention. A quarantined pool gets no pending, so
+    // phase 2 never assigns it an allocator and its previous one would be
+    // dropped — stranding the flows still holding identities from it. Reuse the
+    // previous allocator for such a rule, REUSE-ONLY: never create one, because
+    // a quarantined pool that never had live state has nothing to drain and
+    // fabricating an allocator for it would just be a new occupancy domain on
+    // an address we are quarantining precisely to stop that.
+    //
+    // Charged in phase 1 alongside the other reused keys: a draining allocator
+    // holds real ports for as long as its flows live, and omitting it would let
+    // the aggregate budget admit new keys against capacity that is still in use.
+    for rule in out.iter() {
+        if !rule.is_draining_pool() {
+            continue;
+        }
+        let Some(key) = rule.drain_allocator_key() else {
+            continue;
+        };
+        if !previous_allocators.contains_key(&key) || reserved.contains_key(&key) {
+            continue;
+        }
+        // Charged through the SAME `PendingPoolAllocator::charge` formula the
+        // healthy rules use, rather than a second copy of the arithmetic — a
+        // draining pool occupies exactly what it occupied before it was
+        // quarantined.
+        used = used.saturating_with(
+            PendingPoolAllocator {
+                port_low: rule.pool_port_low,
+                port_high: rule.pool_port_high,
+                total_pool: rule.pool_addresses_v4.len() + rule.pool_addresses_v6.len(),
+            }
+            .charge(),
+        );
+        reserved.insert(key, ());
+    }
+
+    // PHASE 1c (#7717): hand the retained allocator to the draining rule. It
+    // mints nothing — `pool_failure` is set, so the match path returns the
+    // exception before it reaches the allocator — but releases from live flows
+    // resolve through `rule.pool_allocator`, and the interface-side quarantine
+    // reads its live count to know when the drain is done.
+    for rule in out.iter_mut() {
+        if !rule.is_draining_pool() {
+            continue;
+        }
+        let Some(key) = rule.drain_allocator_key() else {
+            continue;
+        };
+        if let Some(existing) = previous_allocators.get(&key) {
+            rule.pool_allocator = existing.clone();
+        }
     }
 
     // PHASE 2: assign. Reused keys were charged in phase 1 and must NOT be
@@ -1195,7 +1335,11 @@ fn parse_source_nat_rules_inner(
     let mut previous_pools = FxHashMap::<String, Option<PreviousPool>>::default();
     if let Some(prev_rules) = previous {
         for prev in prev_rules {
-            if let Some(key) = prev.allocator_key() {
+            // #7717: keyed on `drain_allocator_key`, which ignores
+            // `pool_failure`. A QUARANTINED pool's allocator must survive into
+            // the next generation or its live flows lose the state that
+            // releases them. Widening only: a healthy pool keys identically.
+            if let Some(key) = prev.drain_allocator_key() {
                 previous_allocators
                     .entry(key)
                     .or_insert_with(|| prev.pool_allocator.clone());
@@ -2535,6 +2679,27 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     rewrite_dst: None,
                     ..NatDecision::default()
                 });
+            }
+            // #7717: UNIFORM MINT QUARANTINE. While a quarantined pool is
+            // still DRAINING live allocations on this egress address, the two
+            // domains keep independent occupancy — the interface registry
+            // reports "uncontended" for a port the draining pool is actively
+            // using, preserves it, and both flows go out as one wire identity.
+            // That is the collision
+            // `defect_pin_pool_and_interface_snat_mint_one_identity_7717`
+            // demonstrates.
+            //
+            // Fail CLOSED rather than PAT around it. The interface registry
+            // cannot see which ports the pool holds, so "PAT to something else"
+            // would be a guess; and the plan's posture for a mint colliding
+            // with a domain it cannot enumerate is to refuse. The refusal is
+            // self-limiting: it lifts when the last draining flow closes, which
+            // is what makes this a drain rather than a permanent quarantine.
+            if address_has_draining_pool_occupancy(rules, rewrite_src) {
+                return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                    rule,
+                    SourceNatFailureReason::InterfaceOverlapDraining,
+                ));
             }
             let Some(alloc) = iface_allocs.allocator_for(rewrite_src) else {
                 // The registry cannot create state for this address and
