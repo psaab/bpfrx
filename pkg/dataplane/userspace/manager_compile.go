@@ -955,6 +955,9 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 			return nil
 		}
 	}
+	if m.noHelperVersionObservedLocked() {
+		return nil
+	}
 	return fmt.Errorf(
 		"%w: helper config snapshot protocol version %d < required %d for multi-zone scoped global policies "+
 			"(an older helper reads only the singular match from-zone/to-zone and would NARROW the scope)",
@@ -1059,7 +1062,7 @@ func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 	// helper has never reported is #7002, which has to weigh each one's own
 	// fail-closed argument. Fixing the one this PR introduces is not a licence
 	// to change three others under the same commit.
-	if !m.helperStatusObserved {
+	if m.noHelperVersionObservedLocked() {
 		return nil
 	}
 	return fmt.Errorf(
@@ -1088,6 +1091,9 @@ func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error 
 			return nil
 		}
 	}
+	if m.noHelperVersionObservedLocked() {
+		return nil
+	}
 	return fmt.Errorf(
 		"%w: helper config snapshot protocol version %d < required %d for policy scheduler snapshots",
 		ErrPolicySchedulerProtocolIncompatible,
@@ -1110,12 +1116,46 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 			return nil
 		}
 	}
+	if m.noHelperVersionObservedLocked() {
+		return nil
+	}
 	return fmt.Errorf(
 		"%w: helper config snapshot protocol version %d < required %d for persistent source NAT snapshots",
 		ErrPersistentSourceNATProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
 		MinProtocolPersistentSourceNAT,
 	)
+}
+
+// noHelperVersionObservedLocked reports that NO helper has ever told this
+// Manager a config-snapshot protocol version — the state every required-protocol
+// gate must DEFER on rather than arm (#7002).
+//
+// WHY DEFER. Arming here aborts the operator's commit and DISARMS a dataplane
+// that is not running, on the strength of a reading that never happened — a
+// brick, not a fence (#1960). The fail-closed property is kept one step later:
+// when the helper returns it gets a fresh apply, and if it is genuinely too old
+// its own exact-equality gate refuses that snapshot. This is the answer #6691
+// round 10 and #6722 each reached independently; #7002 exists because the other
+// three gates had not been brought in line.
+//
+// WHY BOTH TERMS. Three states share one value. "Never observed" and "a helper
+// ANSWERED reporting 0" both leave ConfigSnapshotProtocolVersion at 0, and only
+// the first is not evidence of a mismatch — a helper that answers with 0 is one
+// old enough not to emit the field, exactly what these gates exist to refuse.
+// helperStatusObserved is what separates them, which is why manager_status.go
+// maintains the two as a PAIR in one function.
+//
+// In production the pair is always consistent — lastStatus is written only by
+// setLastStatusLocked (which sets the flag) and clearLastStatusLocked (which
+// clears both) — so on every reachable state this conjunction is EXACTLY
+// `!helperStatusObserved`. The version term is what makes the predicate
+// well-defined on the inconsistent pair too, and it resolves that pair toward
+// ARMING: a non-zero version with no recorded observation is treated as an
+// observation. That is the fail-closed direction, and it is the direction a
+// future producer that forgets the flag should land in.
+func (m *Manager) noHelperVersionObservedLocked() bool {
+	return !m.helperStatusObserved && m.lastStatus.ConfigSnapshotProtocolVersion <= 0
 }
 
 // ensureRequiredSnapshotProtocolLocked takes the SNAPSHOT, not the config
@@ -1201,6 +1241,24 @@ func (m *Manager) ensureEgressZoneProtocolLocked() error {
 			return nil
 		}
 	}
+	// #7002, deliberately NOT unified onto noHelperVersionObservedLocked.
+	//
+	// This gate is the one that keeps `observed <= 0`, and the reason is
+	// measured rather than stylistic. The shared predicate resolves "a helper
+	// ANSWERED reporting 0" toward ARMING, which is the stronger reading and the
+	// one ensureSecureTunnelProtocolLocked argues for. But no shipping helper
+	// reports 0 — lifecycle.rs sets the field unconditionally to a non-zero
+	// constant — so the case this gate would newly fence does not occur, while
+	// the cost is real and wide: unlike its four siblings this gate has NO shape
+	// predicate, so it runs on every commit and every route-overlay publish, and
+	// tightening it fences any caller whose status probe answers with a partial
+	// or stub ProcessStatus (measured: TestSyncFabricStatePersistsResolvedFabrics
+	// IntoLastSnapshot reds on exactly that).
+	//
+	// Changing a deliberate, documented #6722 design for a benefit that cannot
+	// currently be reached is a revert wearing the shape of a fix. The
+	// divergence is recorded in the #7002 census test instead, so a later change
+	// that makes a zero-reporting helper reachable finds the note.
 	if observed <= 0 {
 		// No helper has told us a version. Not evidence of a mismatch.
 		return nil
