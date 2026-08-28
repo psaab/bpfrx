@@ -8178,3 +8178,166 @@ fn synced_reserve_distinguishes_no_pool_from_a_refusal_7581() {
          translation it does not own (#6600)"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #7076: the synced-reservation loop must skip a `pool_failure` rule BY
+// CONTRACT, not by accident of `impl Default for PortAllocator`.
+//
+// Since #6812, `resolve_pool_allocators` marks a budget-refused rule
+// `OverBudget` while deliberately leaving `pool_mode == true`, the pool
+// FULLY EXPANDED, and the DEFAULT `PortAllocator` in place. The standby's
+// `reserve_synced_on_first_pool_owner` gated only on `pool_mode`, so it would
+// offer a reservation to a rule that owns the translated address on paper and
+// has no allocator any packet path will ever consult.
+//
+// Nothing broke, for two incidental reasons — `occupancy: Vec::new()` makes the
+// port-bearing arm's `reserve_flow` fail closed, and `max_tracked_flows: 0`
+// makes the address-only arm's `reserve_address_only` fail closed. Neither is a
+// stated contract of this path and neither was bound.
+// ---------------------------------------------------------------------------
+
+/// A single pool-mode rule owning 203.0.113.1, in the exact #6812 refused shape.
+fn quarantined_pool_owner(allocator: PortAllocator) -> Vec<SourceNatRule> {
+    let mut rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "quarantined".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(rules[0].pool_mode, "fixture must be pool-mode");
+    assert!(
+        rules[0]
+            .pool_addresses_v4
+            .contains(&"203.0.113.1".parse().unwrap()),
+        "fixture's pool must OWN the translated address, or the loop never reaches the arm \
+         under test and this cell passes for the wrong reason"
+    );
+    rules[0].pool_failure = Some(SourceNatFailureReason::OverBudget);
+    rules[0].pool_allocator = allocator;
+    rules
+}
+
+fn synced_may_publish(rules: &[SourceNatRule], rewrite_src_port: Option<u16>) -> bool {
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        rules,
+        &key,
+        NatDecision {
+            rewrite_src: Some("203.0.113.1".parse().unwrap()),
+            rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        Some(("lan", "wan")),
+        0,
+    )
+}
+
+/// THE BINDING (#7076). The refusal must come from `pool_failure`, NOT from the
+/// allocator being empty.
+///
+/// This is the cell that separates contract from accident: the quarantined rule
+/// is given a FULLY FUNCTIONAL allocator, sized for its pool, which would
+/// happily accept the reservation. A loop that decides by asking the allocator
+/// therefore ACCEPTS; only a loop that checks `pool_failure` refuses.
+///
+/// RED AT MASTER on both arms — the real allocator returns success, the loop
+/// returns `Reserved`, and `may_publish` is true. It is also immune to any
+/// future change to `impl Default for PortAllocator`, because the default is
+/// never used here.
+#[test]
+fn synced_reservation_refuses_a_quarantined_owner_with_a_working_allocator_7076() {
+    for (label, port) in [("port-bearing", Some(42650u16)), ("address-only", None)] {
+        // A real allocator over the rule's one pool address and full port range.
+        let rules = quarantined_pool_owner(PortAllocator::new(1, 1024, 65535));
+        assert!(
+            !synced_may_publish(&rules, port),
+            "{label}: a synced session whose only pool owner is QUARANTINED was published. \
+             The allocator here is fully functional, so the old loop accepted the \
+             reservation — the refusal must come from `pool_failure`, mirroring the active \
+             node's SourceNatLookup::Unavailable, not from the allocator happening to be \
+             empty (#7076)"
+        );
+    }
+}
+
+/// #7076: the fail-closed outcome must not depend on `PortAllocator::default()`.
+///
+/// The same assertion with the DEFAULT allocator — the shape production
+/// actually carries on a budget-refused rule. Master passes this one already;
+/// it is here so the pair documents that both allocator shapes reach the same
+/// verdict, which is the property "fail-closed by contract" means.
+#[test]
+fn synced_reservation_refuses_a_quarantined_owner_with_the_default_allocator_7076() {
+    for (label, port) in [("port-bearing", Some(42650u16)), ("address-only", None)] {
+        let rules = quarantined_pool_owner(PortAllocator::default());
+        assert!(
+            !synced_may_publish(&rules, port),
+            "{label}: a quarantined owner with the default allocator must block the import"
+        );
+    }
+}
+
+/// THREE STATES, NOT TWO (#7076). A quarantined owner is not "no owner".
+///
+/// `SyncedReserveOutcome` already separates `Refused` from `NothingToReserve`
+/// (#7581), and the separation is consequential: `Refused` blocks the publish,
+/// while `NothingToReserve` falls through to `reserve_synced_interface_identity`
+/// — a DIFFERENT allocation domain. The pass-2 comment spells out why they must
+/// not merge: "two domains would each hand out one translated identity".
+///
+/// So a quarantined owner must land in `Refused`, not `NothingToReserve`. That
+/// is precisely what the issue's suggested one-line fix gets wrong — skipping
+/// the rule BEFORE `saw_candidate` is set. Measured on master with that fix
+/// applied: `may_publish` flips false -> true on both arms, handing a
+/// pool-domain address to the interface domain.
+///
+/// Asserted at the CONSUMPTION point (`may_publish`), because a distinction
+/// that exists only inside the loop is not one the import path can act on.
+#[test]
+fn synced_reservation_quarantined_owner_is_not_nothing_to_reserve_7076() {
+    // (a) HEALTHY owner -> reserved, published.
+    let mut healthy = quarantined_pool_owner(PortAllocator::new(1, 1024, 65535));
+    healthy[0].pool_failure = None;
+    assert!(
+        synced_may_publish(&healthy, Some(42650)),
+        "a healthy pool owner must reserve and publish — without this the other two \
+         assertions could both hold on a loop that refuses everything"
+    );
+
+    // (b) QUARANTINED owner -> refused, NOT published.
+    let quarantined = quarantined_pool_owner(PortAllocator::new(1, 1024, 65535));
+    assert!(
+        !synced_may_publish(&quarantined, Some(42650)),
+        "a quarantined owner must REFUSE"
+    );
+
+    // (c) NO owner -> nothing to reserve, and the interface domain answers.
+    //     Publishing is correct here; it is the shape interface-mode SNAT
+    //     always produces (#7581).
+    let mut foreign = quarantined_pool_owner(PortAllocator::new(1, 1024, 65535));
+    foreign[0].pool_failure = None;
+    foreign[0].pool_addresses_v4 = vec!["198.51.100.7".parse().unwrap()];
+    assert!(
+        synced_may_publish(&foreign, Some(42650)),
+        "no rule's pool owns the address: NothingToReserve, answered by the interface \
+         domain, and NOT a refusal"
+    );
+
+    // The three are pairwise distinct at the consumption point. (b) and (c) are
+    // the pair the naive fix collapses.
+    assert_ne!(
+        synced_may_publish(&quarantined, Some(42650)),
+        synced_may_publish(&foreign, Some(42650)),
+        "a QUARANTINED owner and NO owner must not reach the same verdict: the first \
+         blocks the import, the second falls through to the interface allocation domain. \
+         Collapsing them hands a pool-domain address to the interface domain (#7076)"
+    );
+}
