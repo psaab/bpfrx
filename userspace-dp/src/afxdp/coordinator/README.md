@@ -101,7 +101,13 @@ Differences that matter (#1881):
   value and drives the real `worker_runtime_snapshots`: distinctness is
   the whole mechanism, because an all-zeros or repeated-value fixture
   cannot tell `st.a = src.a` from `st.a = src.b`. It binds from the
-  ATOMICS, not from the counters snapshot, so a swap in EITHER hop reds.
+  ATOMICS, not from the counters snapshot, so a swap in EITHER hop reds —
+  though the upstream `WorkerRuntimeAtomics::snapshot()` hop was ALREADY
+  guarded by `worker_runtime::tests::snapshot_roundtrip`, a distinct-value
+  round-trip predating #6961 (matrix cell B1 confirms it still reds). The
+  hop that was genuinely unbound is the `worker_runtime_snapshots` literal;
+  covering the upstream one too is belt-and-braces, and `snapshot_roundtrip`
+  must not be deleted on the strength of the new file.
   A binding test over today's fields cannot see tomorrow's, so
   `every_runtime_atomic_is_bound_or_knowingly_off_wire_6961` parses the
   struct and requires each `AtomicU64` to be bound or listed in
