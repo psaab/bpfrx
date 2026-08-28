@@ -1259,10 +1259,11 @@ func collectCoSINetPrecedenceCodePoints(node *Node) ([]uint8, error) {
 		if raw == "" {
 			return nil
 		}
-		v, err := strconv.Atoi(raw)
-		if err != nil {
+		v, ok := coSINetPrecedenceCodePointValue(raw)
+		if !ok {
 			return newUnknownCodePointTokenError(
-				"class-of-service inet-precedence classifier code-point %q is not a valid 0..7 value", raw)
+				"class-of-service inet-precedence classifier code-point %q is not a valid "+
+					"0..7 value, 3-bit binary (000..111) or IP-precedence alias", raw)
 		}
 		if v < 0 || v > 7 {
 			return newCodePointRangeError(

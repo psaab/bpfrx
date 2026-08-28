@@ -97,7 +97,9 @@ pub(crate) use iface_registry::{
     INTERFACE_SNAT_REGISTRY_CAP_EXHAUSTION, INTERFACE_SNAT_SYNC_IDENTITY_CONFLICT_DROPS,
     InterfaceNatAllocators,
 };
+pub(crate) use allocator::allocator_capacity;
 pub(crate) use source::{
+    MAX_POOL_PREFIX_HOSTS,
     SourceNatFailure, SourceNatFailureReason, SourceNatFlowKey, SourceNatLookup, SourceNatRule,
     SyncedNatZones, allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6,
     match_source_nat,
