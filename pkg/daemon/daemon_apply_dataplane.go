@@ -165,7 +165,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// misses the deleted policy's own. Placement is the design: this is a READ,
 	// so it cannot re-admit anything, and moving it any later re-opens the
 	// window. See daemon_policy_invalidate_capture.go.
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(cfg)
 
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult

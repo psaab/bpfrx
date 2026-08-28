@@ -314,6 +314,8 @@ func (d *Daemon) clearSessionsForPolicyChanges(oldCfg, newCfg *config.Config) er
 	// capture point can never delete against a stale candidate set. The shared
 	// enumerate error is reported once for all three classes (they share one
 	// scan).
+	// The three clears below read d.policyInvalidationCapture themselves — the
+	// same object this local names — so the reset must not run until they have.
 	capture := d.policyInvalidationCapture
 	defer func() { d.policyInvalidationCapture = nil }()
 	var captureErr error

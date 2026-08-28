@@ -110,7 +110,7 @@ func TestRestampedSurvivorIsNotSweptFromCapture6948(t *testing.T) {
 	// The apply: capture at the publication boundary, while the row still
 	// carries the numbering the deletion set was derived from.
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	// ... then the helper's #3395 refresh re-resolves the row against the NEW
 	// rule table: p-ssh survived, so its row is re-stamped to p-ssh's new id —
@@ -159,7 +159,7 @@ func TestDeletedPolicySessionSweptEvenAfterRestamp6948(t *testing.T) {
 	d.policyActivationSecs = activation
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	// The refresh re-resolves a DELETED rule to the unattributed sentinel.
 	restamped := dp.v4[webSess]
@@ -205,7 +205,7 @@ func TestRestampedSurvivorIsNotSweptFromCaptureV6_6948(t *testing.T) {
 	d.setDataplane(dp)
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	// The refresh re-stamps both: the survivor to the id it inherited, the
 	// deleted policy's row to the unattributed sentinel.
@@ -251,7 +251,7 @@ func TestSessionAdmittedAfterCaptureIsNotSwept6948(t *testing.T) {
 	// policyActivationSecs deliberately 0: the pre-#6948 guard cannot help.
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	// After publication p-ssh admits a fresh session; it carries p-ssh's NEW id,
 	// which is the id p-web held.
@@ -308,7 +308,7 @@ func TestDefaultPolicyTighteningClearsFromCapture6948(t *testing.T) {
 	d.policyActivationSecs = activation
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	if err := d.clearSessionsForPolicyChanges(oldCfg, newCfg); err != nil {
 		t.Fatalf("clearSessionsForPolicyChanges: %v", err)
@@ -352,7 +352,7 @@ func TestModifiedPolicyRematchUsesTheCapture6948(t *testing.T) {
 	d.setDataplane(dp)
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 
 	// The refresh re-stamps the row to p-ssh's NEW id (the one p-web vacated).
 	restamped := dp.v4[sshSess]
@@ -389,7 +389,7 @@ func TestCaptureIsConsumedOnce6948(t *testing.T) {
 	d.setDataplane(dp)
 
 	d.armPolicyInvalidationPlan(oldCfg, newCfg)
-	d.capturePolicyInvalidationLocked()
+	d.capturePolicyInvalidationLocked(newCfg)
 	if d.policyInvalidationCapture == nil {
 		t.Fatal("an armed plan must produce a capture")
 	}
@@ -414,6 +414,40 @@ func TestCaptureIsConsumedOnce6948(t *testing.T) {
 	if d.policyInvalidationCapture != nil {
 		t.Fatal("applyConfigLocked must drop a capture left by a previous apply " +
 			"before doing anything else (#6948)")
+	}
+}
+
+// TestStalePlanIsNotCapturedAgainstADifferentConfig6948 pins the identity
+// check. An apply that bails before its own capture point leaves its plan
+// armed, and the next apply to reach the capture may be a different one — a
+// feed-driven re-apply, a rollback. A candidate set is a list of live 5-tuples,
+// so capturing one under a diff that does not describe what is being published
+// is the same error as reading the table after the publish.
+func TestStalePlanIsNotCapturedAgainstADifferentConfig6948(t *testing.T) {
+	oldCfg, newCfg, webOldID, _ := inheritedIDFixture6948(t)
+	otherCfg := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil)
+
+	webSess := v4Key6948(1, 40001, 80)
+	dp := &policyInvalTestDP{
+		v4: map[dataplane.SessionKey]dataplane.SessionValue{
+			webSess: {State: dataplane.SessStateEstablished, PolicyID: webOldID, Created: 500},
+		},
+	}
+	d := &Daemon{}
+	d.setDataplane(dp)
+
+	d.armPolicyInvalidationPlan(oldCfg, newCfg)
+	// A DIFFERENT config reaches the publication boundary.
+	d.capturePolicyInvalidationLocked(otherCfg)
+
+	if d.policyInvalidationCapture != nil {
+		t.Fatal("a plan armed for one config was captured against another. The " +
+			"candidate set would name sessions by a diff that does not describe " +
+			"the config being published (#6948)")
+	}
+	if d.policyInvalidationPlan != nil {
+		t.Fatal("the stale plan must be dropped, not left armed for the apply " +
+			"after this one (#6948)")
 	}
 }
 

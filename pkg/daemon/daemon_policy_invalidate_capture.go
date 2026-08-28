@@ -135,12 +135,31 @@ func (d *Daemon) armPolicyInvalidationPlan(oldCfg, newCfg *config.Config) {
 // capture stays nil and the clears fall back to the legacy post-apply
 // enumeration, which is what those paths did before #6948.
 //
+// cfg is the config THIS apply is publishing, and the plan is used only if it
+// describes that config. An apply that bails before this point leaves its plan
+// armed — a context abort, a preflight rejection — and the next apply to reach
+// here may be a different one entirely (a feed-driven re-apply, #5646). A
+// candidate set is a list of live 5-tuples, so capturing one against a config
+// pair that is not this apply's is the same class of error as reading the table
+// after the publish: it names sessions by a diff that does not describe what is
+// happening. Identity, not equality: the arm site passes the very
+// *config.Config the apply is called with.
+//
 // Caller holds d.applySem.
-func (d *Daemon) capturePolicyInvalidationLocked() {
+func (d *Daemon) capturePolicyInvalidationLocked(cfg *config.Config) {
 	plan := d.policyInvalidationPlan
 	d.policyInvalidationPlan = nil
 	d.policyInvalidationCapture = nil
 	if plan == nil {
+		return
+	}
+	if plan.newCfg != cfg {
+		// A plan left behind by an apply that never reached its own capture.
+		// Dropped above; take no capture, so this apply's invalidation (if any)
+		// falls back to the legacy scan rather than deleting a candidate set
+		// gathered for a different commit.
+		slog.Warn("policy session invalidation: dropping a stale pre-publication plan; " +
+			"it was armed for a different config than this apply is publishing")
 		return
 	}
 
