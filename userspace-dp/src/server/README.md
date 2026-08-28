@@ -451,6 +451,22 @@ all", and that has been false since round 10):
   field on the row means an older helper plans a binding this control plane
   refuses, which is true whoever wins the tally — the protocol question is asked
   per contributor, the refusal question per netdev.
+
+  **Reproducing this needs a precondition the sentence above does not carry
+  (#7022): the CHILD's own netdev must be the secure tunnel.** `iface.SecureTunnel`
+  is `secureTunnelOwned(cfg, ref) || liveXfrm[netdev]`, and for `st0` with
+  `unit N vlan-id 100` the child's netdev is `st0.100` — so the flag lands on the
+  child only when a VPN binds that unit ref, or when `st0.100` is ITSELF a live
+  xfrmi. Point the kernel half at the base instead and the flag lands on `st0`,
+  which is not a VLAN child and DOES cast a counted vote: the arming is real but
+  it arrives by the ordinary contributor path, not by the abstaining one this
+  bullet describes. A reader who reproduces it that way sees a different
+  mechanism and concludes the doc is wrong when it is merely incomplete.
+  Measured both ways by
+  `TestVlanChildArmsOnlyWhenItsOwnNetdevIsLiveXfrm7022`
+  (`pkg/dataplane/userspace`), which asserts BOTH rows in BOTH directions —
+  asserting only "the child is armed" would pass against an implementation that
+  armed every row.
 - A **fabric parent** speaks for its netdev only where NO row does. A fabric
   MEMBER needs no `set interfaces` stanza, so a fabric parent routinely has no
   `InterfaceSnapshot` at all — and the round-9 rule, tallying over rows alone,
