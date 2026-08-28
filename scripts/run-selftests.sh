@@ -132,6 +132,9 @@ scripts/run-selftests.sh
 test/incus/fbf-steering-lib.sh
 test/incus/fbf-steering-selftest.sh
 test/incus/test-fbf-steering.sh
+test/incus/newflow-ceiling-lib.sh
+test/incus/newflow-ceiling-selftest.sh
+test/incus/newflow-ceiling-harness.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -210,6 +213,12 @@ run_shell test/mutation/selftest-bpf-exist-cannot-create_6923.sh
 # no network. Guards a negative cell that used to fail to a HEALTHY value:
 # "no leak" and "the probe returned nothing" both scored PASS. Needs bash.
 run_bash test/incus/fbf-steering-selftest.sh
+# #6962: the new-flow ceiling harness's node selection. Hermetic — no incus, no
+# cluster. Guards a grep that matched the PEER's row in `show chassis cluster
+# status` and therefore always selected $FW0: it failed to a PLAUSIBLE VALUE
+# (a node name), not to an error, so the run completed and was refused three
+# layers later by the analyzer as if the dataplane were at fault. Needs bash.
+run_bash test/incus/newflow-ceiling-selftest.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'

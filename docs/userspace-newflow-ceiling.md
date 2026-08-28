@@ -243,6 +243,41 @@ newflow-gen --mode sink --bind 172.16.80.200 --ports 5300-5363
     --rates 5000,10000,20000,40000,80000 --duration 30 --threads 32
 ```
 
+### Which node it measures, and when it refuses to run (#6962)
+
+The harness reads NAT-pool and Prometheus counters off ONE node, so it has to
+pick the node that installs the flows before any traffic starts. It asks BOTH
+nodes for `show chassis cluster status` and takes the answer from each node's
+OWN row — `show chassis cluster status` prints both nodes' rows on whichever
+node you ask, so a pattern with no node token in it matches the PEER's row.
+That was the #6962 defect: the selection matched node1's `primary` row inside
+node0's output and always chose `$FW0`, whoever was actually primary. It failed
+to a plausible value, not to an error — the run completed, and the analyzer
+refused the cells three layers later as if the dataplane were at fault.
+
+"Primary" here means primary for EVERY redundancy group the status reports, not
+for some group. The measured path spans two of them on this cluster — reth0
+(WAN) is `redundancy-group 1` and reth1 (LAN) is `redundancy-group 2`
+(`docs/ha-cluster-userspace.conf`) — so a node owning only one installs part of
+the flows and its counters describe half a measurement. There is deliberately
+no `--rg` selector: the harness reads one node's counters for the whole path,
+so "measure the node that owns RG N only" is not a question its output can
+answer.
+
+It therefore refuses, before taking any traffic, when:
+
+* **no node** is primary for every RG (a split/active-active cluster), or
+* **both** nodes claim to be (split-brain), or
+* neither node's status can be read at all.
+
+Each refusal prints both nodes' verdicts, because the cost of a wrong choice is
+a wasted run under the shared cluster lock and the log has to be enough to tell
+the cases apart. The verdict and the selection live in
+`test/incus/newflow-ceiling-lib.sh`; `make test-newflow-ceiling-lib` proves them
+on fixtures where the two nodes carry DIFFERENT states, which is the only shape
+in which the anchoring is observable — a fixture with both nodes in the same
+state passes with or without it.
+
 ### What proves the run was valid
 
 Per cell, under `artifacts/newflow-ceiling/<UTC>/rate-<N>/`:

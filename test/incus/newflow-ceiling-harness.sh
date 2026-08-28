@@ -45,6 +45,12 @@ set -uo pipefail
 _CELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${_CELL_DIR}/../.." && pwd)"
 
+# Node-selection verdict (#6962). Pure bash+awk, no side effects, sourced
+# before the --dry-run early exit so a syntax error in it cannot hide until a
+# run has already taken the shared cluster lock.
+# shellcheck source=newflow-ceiling-lib.sh
+source "${_CELL_DIR}/newflow-ceiling-lib.sh"
+
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/test/incus/loss-userspace-cluster.env}"
 ANALYZER="${ANALYZER:-$ROOT_DIR/test/incus/newflow_ceiling_analyze.py}"
 
@@ -137,17 +143,29 @@ echo "newflow-ceiling: artifacts -> $ARTIFACT_ROOT"
 fail() { echo "newflow-ceiling: $*" >&2; exit 2; }
 
 # --- preflight ------------------------------------------------------------
-# Establish which node owns the tested RG BEFORE any traffic. Reading
+# Establish which node owns the measured path BEFORE any traffic. Reading
 # counters off the standby would report a firewall that installed nothing.
-ACTIVE_FW=""
-for fw in "$FW0" "$FW1"; do
-    if incus_cmd exec "$fw" -- cli -c "show chassis cluster status" 2>/dev/null \
-        | grep -qi "primary"; then
-        ACTIVE_FW="$fw"
-        break
-    fi
-done
-[[ -n "$ACTIVE_FW" ]] || fail "no node reports primary for the tested RG"
+#
+# #6962: this used to be `grep -qi "primary"` over the whole status. That text
+# contains BOTH nodes' rows on whichever node you ask, so it matched the PEER's
+# row and $FW0 always won — and it won by printing a node name, not by
+# erroring. Ask each node, ANCHOR the answer on that node's own row, and decide
+# only after both have answered. The verdict + selection are in
+# newflow-ceiling-lib.sh so `make test-newflow-ceiling-lib` can prove the
+# selection on fixtures where the two nodes carry DIFFERENT states, which is
+# the only shape in which the anchoring is observable.
+node_status() { # node_status <instance>
+    incus_cmd exec "$1" -- cli -c "show chassis cluster status" 2>/dev/null || true
+}
+V_FW0="$(newflow_cluster_primary_verdict "$(node_status "$FW0")")"
+V_FW1="$(newflow_cluster_primary_verdict "$(node_status "$FW1")")"
+echo "newflow-ceiling: $FW0 -> $V_FW0"
+echo "newflow-ceiling: $FW1 -> $V_FW1"
+SELECTION="$(newflow_select_active_node "$FW0" "$V_FW0" "$FW1" "$V_FW1")"
+if [[ "${SELECTION%% *}" != "SELECT" ]]; then
+    fail "${SELECTION#REFUSE }"
+fi
+ACTIVE_FW="${SELECTION#SELECT }"
 echo "newflow-ceiling: active node = $ACTIVE_FW"
 
 # The pool must already exist. This harness does NOT mutate the NAT config:
@@ -259,6 +277,11 @@ PY
     # different question — "did the generator run at all" — and must never
     # degrade to 0, because a silent 0 would disable the underdrive gate from
     # the other side.
+    # shellcheck disable=SC2034  # `offered` is deliberately WRITE-ONLY: the
+    # value is not used, the EXIT STATUS is. The python snippet raises when the
+    # generator reported no established connections, which is what refuses the
+    # cell; capturing stdout keeps the parse and the liveness check in one
+    # place. Named rather than assigned to `_` so the reason survives.
     if ! offered="$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
