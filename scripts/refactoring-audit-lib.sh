@@ -92,6 +92,21 @@ AUDIT_FLOOR=1500
 # shellcheck disable=SC2034 # consumed by sourcing scripts, not here.
 AUDIT_REFACTOR_FLOOR=2000
 
+# #6937 struct-heterogeneity floors, in DISTINCT FIELD TYPES per struct.
+# Mirrored by StructWatchFloor / StructRefactorFloor in
+# pkg/refactoraudit/structs.go and pinned by
+# TestStructFloorsMatchShellConstants6937.
+#
+# Distinct types, not field count: measured over 1095 named top-level Go
+# structs, a `fields >= 100` rule flags seven and FOUR are false positives,
+# with the top hit (xpfCollector, 347 fields, 334 of them *prometheus.Desc)
+# ranked above the target the issue was filed about. The rationale and the
+# calibration pair live in pkg/refactoraudit/structs.go's doc comment.
+# shellcheck disable=SC2034 # consumed by sourcing scripts, not here.
+AUDIT_STRUCT_FLOOR=20
+# shellcheck disable=SC2034 # consumed by sourcing scripts, not here.
+AUDIT_STRUCT_REFACTOR_FLOOR=40
+
 # Audited roots, per language. A path is audited only if it lives under
 # one of the roots for ITS extension — pkg/x.rs and userspace-dp/src/x.go
 # are both uninteresting — and is not excluded by AUDIT_SKIP_RE.

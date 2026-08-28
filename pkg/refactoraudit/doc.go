@@ -1,9 +1,19 @@
 // Package refactoraudit hosts the enforcement canary for the committed
 // modularity heatmap (docs/refactoring-audit-current.txt).
 //
-// It contains no runtime code. Its sole purpose is to give `go test
-// ./...` — the required pre-commit aggregate (`make test`) — a home for
-// the modularity gate.
+// It contains no xpf runtime code — nothing here is linked into xpfd or
+// the CLI. Its primary purpose is to give `go test ./...` — the required
+// pre-commit aggregate (`make test`) — a home for the modularity gate.
+//
+// #6937 added the one piece of non-test code: structs.go / structs_rust.go
+// measure struct heterogeneity for the sibling artifact
+// docs/refactoring-audit-structs.txt, driven by the `structaudit`
+// command in this package's subdirectory. That measurement needs go/ast
+// (a regex counter descends into anonymous nested structs and inflates
+// the count), so it cannot live in the shell generator the way the LOC
+// measurement does. An earlier revision of this paragraph said the
+// package "contains no runtime code" full stop, which stopped being true
+// the moment the counter landed.
 //
 // # Two properties, two surfaces (#7253)
 //
