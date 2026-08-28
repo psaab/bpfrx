@@ -274,6 +274,14 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// is not driven from inside this function.
 	d.resetVIPWarnings()
 
+	// #6948: drop any capture left by a previous apply. The capture is normally
+	// consumed by the invalidation this apply's caller runs, but an apply that
+	// bails BEFORE the capture point (a context abort, a preflight rejection)
+	// never reaches its own capture — and a stale candidate set from an earlier
+	// config pair must never be deleted against this one. Placed before the
+	// applyBodyForTest seam so the reset holds on the stubbed path too.
+	d.policyInvalidationCapture = nil
+
 	if d.applyBodyForTest != nil {
 		d.applyBodyForTest(cfg)
 		return d.applyErrForTest

@@ -141,9 +141,17 @@ make test-iperf-throughput-lib # Self-test the #6897 iperf3 throughput parse +
                      #   NOTHING while still summarising "0 failed". Hermetic.
 make test-newflow-ceiling-lib # Self-test the #4800 connection-rate analysis
                      #   layer (synthetic snapshot pairs -> new-flows/sec +
-                     #   which contention site saturated) and the newflow-gen
+                     #   which contention site saturated), the newflow-gen
                      #   generator crate, which lives outside the dataplane
-                     #   workspaces so root `cargo test` does not reach it.
+                     #   workspaces so root `cargo test` does not reach it,
+                     #   AND the #6962 harness NODE SELECTION. That defect
+                     #   was an unanchored `grep -qi "primary"` over `show
+                     #   chassis cluster status`, which prints BOTH nodes'
+                     #   rows on whichever node you ask — so it matched the
+                     #   PEER's row and always chose $FW0. It failed to a
+                     #   PLAUSIBLE VALUE (a node name), not to an error. The
+                     #   fixtures give the two nodes DIFFERENT states, the
+                     #   only shape in which the anchor is observable.
                      #   Hermetic — no cluster. See
                      #   docs/userspace-newflow-ceiling.md
 make test-ssh        # Shell into VM

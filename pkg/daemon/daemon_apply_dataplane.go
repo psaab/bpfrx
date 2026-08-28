@@ -154,6 +154,19 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		return commitOverlay, networkdErr, nil, err
 	}
 
+	// #6948: capture the commit-time session-invalidation candidates HERE — the
+	// last statement before the dataplane publishes the new policy snapshot.
+	// Runtime policy ids are positional, so the new snapshot renumbers them; the
+	// invalidation's target set is derived from the OLD numbering and the live
+	// rows stop carrying that numbering the moment ApplyConfig returns (new
+	// admissions use the new ids, and the helper's #3395 refresh re-stamps
+	// established rows to them). Reading the table after the apply therefore
+	// sweeps sessions of the policy that INHERITED a deleted policy's id and
+	// misses the deleted policy's own. Placement is the design: this is a READ,
+	// so it cannot re-admit anything, and moving it any later re-opens the
+	// window. See daemon_policy_invalidate_capture.go.
+	d.capturePolicyInvalidationLocked(cfg)
+
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult
 	if rt := d.dataplane(); rt != nil {
@@ -328,7 +341,9 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
 				linuxName, mac, networkdErr, needLinkCycleRecovery)
-			d.finishRethMemberLinkTail(linuxName, mac, rethCfg)
+			if err := d.finishRethMemberLinkTail(linuxName, mac, rethCfg); err != nil {
+				networkdErr = errors.Join(networkdErr, err)
+			}
 		}
 	}
 
@@ -589,7 +604,27 @@ func (d *Daemon) abandonLinkCycleLease() {
 // programRethMemberMAC's is: a member that needed no cycle still spends the
 // ethtool ceiling, and the lease it is burning down may have been taken by an
 // EARLIER member.
-func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr, rethCfg *config.InterfaceConfig) {
+// The returned error joins networkdErr, the "fail-closed but complete"
+// accumulator this file already uses (see applyDataplaneAndHACore's header):
+// the tail keeps going and the operator still sees the commit fail.
+//
+// #6980: it used to return nothing, and the VLAN propagation loop below read
+// `links, _ := netlink.LinkList()`. On a LinkList failure `links` is nil, the
+// loop body never runs, the RETH virtual MAC never reaches any VLAN
+// sub-interface -- and there was no log line and no commit error. The apply
+// reported success.
+//
+// On the reference topology the VLAN units are what carry traffic (reth0.50
+// transit, reth0.80 the data path), so the silent skip leaves them on the STALE
+// MAC while the parent RETH has the new one: peers ARP to an address the box no
+// longer answers on, until the entry ages out. A blackhole whose only symptom
+// is a successful commit.
+//
+// Warning alone would not be enough. The per-sub-interface failures below are
+// genuinely best-effort and warn, but those are ONE child each; a LinkList
+// failure skips EVERY child, so it is a different-sized event and belongs in
+// the channel that fails the commit.
+func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr, rethCfg *config.InterfaceConfig) error {
 	clearDadFailed(linuxName)
 	removeAutoLinkLocal(linuxName)
 	// Re-add link-local if this parent interface has IPv6 on unit 0.
@@ -613,9 +648,16 @@ func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr
 	// Propagate MAC change to VLAN sub-interfaces.
 	// Linux VLAN sub-interfaces don't always inherit the
 	// parent's MAC change after link down/up.
-	if parentLink, err := netlink.LinkByName(linuxName); err == nil {
+	if parentLink, err := rethParentLinkByName(linuxName); err == nil {
 		parentIdx := parentLink.Attrs().Index
-		links, _ := netlink.LinkList()
+		links, err := rethLinkLister()
+		if err != nil {
+			slog.Error("failed to enumerate links for RETH VLAN MAC propagation; "+
+				"every VLAN sub-interface keeps its STALE MAC while the parent has the new one, "+
+				"so peers ARP to an address this node no longer answers on until the entry ages out",
+				"parent", linuxName, "mac", mac, "err", err)
+			return fmt.Errorf("enumerate links to propagate RETH MAC from %s: %w", linuxName, err)
+		}
 		for _, l := range links {
 			if l.Attrs().ParentIndex != parentIdx {
 				continue
@@ -645,6 +687,7 @@ func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr
 		}
 	}
 	d.renewLinkCycleLease()
+	return nil
 }
 
 // reconcileAfterRethLinkCycle re-adds the VRRP VIPs and stable link-locals that
@@ -982,3 +1025,16 @@ func (d *Daemon) recordDataplaneWorkerArmDebt() {
 		r.RecordDeferredWorkerArmDebt()
 	}
 }
+
+// #6980 seams. Package-level function variables defaulting to netlink, the same
+// shape snmpLinkLister already uses, so the LinkList FAILURE path in
+// finishRethMemberLinkTail can be exercised without a privileged netdev.
+//
+// Two seams rather than one: the LinkList call is only reached when LinkByName
+// SUCCEEDS, so a test that stubs only the lister never gets there — every
+// existing test in this area names an absent interface, which is exactly why
+// this path stayed unbound long enough for the discarded error to survive.
+var (
+	rethParentLinkByName = netlink.LinkByName
+	rethLinkLister       = netlink.LinkList
+)

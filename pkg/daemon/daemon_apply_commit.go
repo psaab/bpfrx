@@ -253,6 +253,14 @@ func (d *Daemon) commitAndApply(ctx context.Context, authority configstore.Commi
 // committed config is returned alongside the error so the operator sees the
 // failure while the standby still converges.
 func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncPeer peerSyncPolicy) (*config.Config, error) {
+	// #6948: arm the commit-time session-invalidation plan BEFORE the apply.
+	// Only this caller holds the pre-commit active config — the store promoted
+	// the new one upstream — and the invalidation's candidate set has to be READ
+	// while the live rows still carry the OLD policy numbering it is derived
+	// from. applyConfigLocked takes that capture at the publication boundary;
+	// without the plan it falls back to the pre-#6948 post-apply scan, which
+	// sweeps the sessions of whichever policy inherited a deleted policy's id.
+	d.armPolicyInvalidationPlan(oldActive, compiled)
 	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
 	if applyErrSkipsPeerSync(applyErr) {
 		// Fatal (required-protocol-gate: dataplane disarmed / fail-closed) or a
@@ -521,6 +529,14 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	// Every OTHER (non-fatal, best-effort tail) error leaves the config active +
 	// the snapshot armed, so the invalidators still run and the tail error is
 	// surfaced (joined with any partial-invalidation error), not swallowed.
+	// #6948: arm the commit-time session-invalidation plan BEFORE the apply.
+	// Only this caller holds the pre-commit active config — the store promoted
+	// the new one upstream — and the invalidation's candidate set has to be READ
+	// while the live rows still carry the OLD policy numbering it is derived
+	// from. applyConfigLocked takes that capture at the publication boundary;
+	// without the plan it falls back to the pre-#6948 post-apply scan, which
+	// sweeps the sessions of whichever policy inherited a deleted policy's id.
+	d.armPolicyInvalidationPlan(oldActive, compiled)
 	applyErr := d.applyConfigLocked(d.applyCancelCtx(), compiled)
 	if applyErrSkipsPeerSync(applyErr) {
 		return nil, applyErr
@@ -767,6 +783,14 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	// the store has already been promoted to the rollback target, so the
 	// dataplane MUST be brought into agreement unconditionally — aborting here
 	// would re-open the split-brain this transaction exists to close.
+	// #6948: arm the commit-time session-invalidation plan BEFORE the apply.
+	// Only this caller holds the pre-commit active config — the store promoted
+	// the new one upstream — and the invalidation's candidate set has to be READ
+	// while the live rows still carry the OLD policy numbering it is derived
+	// from. applyConfigLocked takes that capture at the publication boundary;
+	// without the plan it falls back to the pre-#6948 post-apply scan, which
+	// sweeps the sessions of whichever policy inherited a deleted policy's id.
+	d.armPolicyInvalidationPlan(oldActive, prevCfg)
 	if err := d.applyConfigLocked(context.Background(), prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
