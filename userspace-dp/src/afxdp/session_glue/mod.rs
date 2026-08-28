@@ -984,7 +984,7 @@ pub(super) fn replicate_session_upsert(
         // #4800: ...and count the acquisitions that had to block.
         let mut pending =
             worker_queue::lock_recover_counting(commands, &SESSION_REPLICATION_LOCK_CONTENDED);
-        pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
+        worker_queue::push_bounded(&mut pending, WorkerCommand::UpsertSynced(replica.clone()));
         deepest = deepest.max(pending.len() as u64);
     }
     if deepest != 0 {
@@ -1003,7 +1003,7 @@ pub(super) fn replicate_session_delete(
         // #1807: recover-and-push — `if let Ok` silently DROPPED the
         // DeleteSynced replica for a poisoned worker queue.
         let mut pending = worker_queue::lock_recover(commands);
-        pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+        worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
     }
 }
 

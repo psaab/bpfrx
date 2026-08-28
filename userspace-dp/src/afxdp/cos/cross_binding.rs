@@ -137,7 +137,9 @@ pub(in crate::afxdp) fn redirect_local_cos_request_to_owner(
     // — poison used to read as enqueue failure, losing the cross-worker
     // shaped-TX request.
     let mut pending = crate::afxdp::worker_queue::lock_recover(commands);
-    pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+    // #6929: bounded. A dropped shaped-local redirect is a missed
+    // optimisation, not lost state, so the return is deliberately ignored.
+    crate::afxdp::worker_queue::push_bounded(&mut pending, WorkerCommand::EnqueueShapedLocal(req));
     Ok(())
 }
 #[cfg(test)]

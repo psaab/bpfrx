@@ -522,7 +522,7 @@ pub(super) fn ingest_cos_pending_tx_with_provenance(
                     // poison used to fall through to Step 2/3 and could
                     // lose the cross-worker shaped-TX request.
                     let mut pending = crate::afxdp::worker_queue::lock_recover(commands);
-                    pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+                    worker_queue::push_bounded(&mut pending, WorkerCommand::EnqueueShapedLocal(req));
                     return Ok(());
                 } else {
                     req
