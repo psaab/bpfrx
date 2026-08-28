@@ -389,7 +389,22 @@ func programRethMAC(ifName string, mac net.HardwareAddr, beforeCycle func() erro
 	}
 	if err := ops.setHardwareAddr(link, mac); err != nil {
 		ops.setUp(link) // best-effort restore
-		return false, fmt.Errorf("set mac %s: %w", ifName, err)
+		// #6915: linkCycled reports whether the link WENT DOWN AND BACK UP, not
+		// whether the MAC write succeeded. setDown returned nil on the line
+		// above, so it did — and a DOWN flushes every kernel address on the
+		// interface, including the VRRP VIPs and the stable RETH link-local.
+		// Returning false here told step 2.6b (the VIP reconcile, gated on this
+		// through needLinkCycleRecovery) that no cycle had happened, so the
+		// addresses the cycle had just removed were never re-added: the member
+		// came back UP holding the VRRP role and none of the addresses that role
+		// answers for.
+		//
+		// The two post-setDown failures now agree. The link-up failure below has
+		// always returned true for the same reason, so false here was the
+		// outlier rather than a contract — the value differed on the two sides
+		// of one `if` for outcomes that are identical in the only respect this
+		// return describes.
+		return true, fmt.Errorf("set mac %s: %w", ifName, err)
 	}
 	if err := ops.setUp(link); err != nil {
 		return true, fmt.Errorf("link up %s: %w", ifName, err)
