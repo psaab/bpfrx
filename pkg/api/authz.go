@@ -193,7 +193,9 @@ var restMutationPermissions = map[string]config.LoginClassPermission{
 // CALLER controls outright, so its cost has to be bounded in three dimensions:
 // per request (here), in aggregate across every request in flight
 // (mutationBodyBudgetBytes), and per privilege tier within that aggregate
-// (mutationBodyTierCeilings), so the bound is not itself a denial lever.
+// (mutationBodyTierCeilings), so the bound is not itself a denial lever —
+// within the scope mutationBodyTierCeilings states, which is the SYSTEM-DEFINED
+// login classes and not a custom one (#6954).
 // A blanket maxRequestBodyBytes served none of the three — 16 MiB is the
 // ceiling the ONE route that carries a whole candidate configuration needs, and
 // applying it to `POST /api/v1/diagnostics/ping` let the cheapest permission on
@@ -1084,8 +1086,12 @@ func MutationBodyWaitersForTest() int { return int(mutationBodyWaitersInFlight.L
 const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 
 // mutationBodyTierCeilings partitions that budget by the permission the ROUTE
-// requires, so exhausting it is not a way to deny someone more privileged than
-// you (#5561 round 11, finding 1).
+// requires, so exhausting one tier does not refuse the tiers above it (#5561
+// round 11, finding 1). Under the SYSTEM-DEFINED login classes that is the same
+// statement as "exhausting it is not a way to deny someone more privileged than
+// you", which is how this comment used to put it, unqualified. Under a CUSTOM
+// login class the two come apart; the scope section below says exactly where,
+// and why no assignment of the numbers in this table repairs it (#6954).
 //
 // A single undivided pool is a bound in one dimension and a denial lever in
 // another. Pass 1 guarantees only that a buffering caller is authorized for the
@@ -1110,7 +1116,9 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // refuse view-tier traffic outright. That is the correct asymmetry — a
 // privileged action crowding out a cheap one is scheduling, a cheap one
 // crowding out a privileged one is a denial primitive — and it is the whole
-// reason the shares are ordered rather than equal.
+// reason the shares are ordered rather than equal. "Privileged" and "cheap"
+// there are properties of the TIER; the premise that makes them properties of
+// the CALLER is examined in the scope section below.
 //
 // Which is exactly why VIEW gets half of what clear gets, rather than the same
 // 16 MiB round 11 first gave view, clear and control alike (#5561 round 18,
@@ -1178,6 +1186,62 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // already established that only a principal holding that permission can reach
 // this point. A super-user's pings draw on the view tier, exactly like anyone
 // else's, and cannot crowd out that same super-user's commit.
+//
+// # What "more privileged" means here, and where it stops being true (#6954)
+//
+// Everything above is about TIERS: a flood confined to one tier cannot push the
+// aggregate past the ceiling of a tier with a larger share. Making that a
+// statement about PRINCIPALS takes one more premise — that the tiers a
+// principal can reach GROW with its privilege, so holding a high permission
+// implies holding every permission whose tier sits below it. Granted that, "the
+// tiers above mine" and "the tiers of someone more privileged than me" are one
+// set, and this comment's old opening sentence follows.
+//
+// That premise is a property of config.LoginClassPermissions, not of the
+// permission model. The shipped classes are nested — read-only's tiers are a
+// subset of operator's, and both of super-user's — and
+// TestTierLadderProtectsPrivilegeOverSystemClasses_6954 asserts the guarantee
+// over exactly those classes, pair by pair, through ClassHasPermission and this
+// table rather than by restating it.
+//
+// A CUSTOM `system login class` need not be nested, and one that is not leaves
+// the ordering entirely — mapJunosPermissions maps each token through its own
+// arm, so
+//
+//	set system login class configure-only permissions configure
+//	set system login user cfgonly class configure-only
+//
+// compiles to MappedPermissions = [PermConfig] — configure WITHOUT view — and
+// commits (validateLoginClassRef accepts a class defined in the same candidate;
+// ResolveClassPermissions honours it at runtime). That principal reaches the
+// 48 MiB configure tier while holding a STRICT SUBSET of what a `permissions
+// [ configure view ]` class holds, and its flood refuses the richer principal's
+// view-tier traffic — on a route the flooder is itself answered 403 on. It
+// costs 8 MiB, not the 48 MiB its own ceiling allows: what has to be cleared is
+// the VICTIM's lowest tier, not the flooder's own.
+//
+// No assignment of the numbers below removes that: the ladder is a total order
+// over single permissions, and the object it must represent is the subset order
+// over permission SETS, which is partial. A fix has to change what the
+// reservation is KEYED on — the principal's permission set, given a share
+// strictly monotone in the subset order, or the principal itself, given a
+// bounded share per identity — and either gives up the property route-keying
+// has and those do not: a super-user's pings draw on the view tier like anyone
+// else's, so they cannot crowd out that same super-user's commit. Not made here.
+//
+// Feeding the ORDERING DERIVATION a custom-class config is NOT a fix and is
+// recorded so it is not proposed again: strictlyBelow would then separate no
+// pair at all, so the step set comes back EMPTY and every requirement
+// quantified over it passes for want of anything to check. See tierLadderSteps.
+//
+// The gap is narrow — the flooder must hold a real login class and
+// authenticate, no built-in class reaches it, and the flood is still bounded by
+// its own tier ceiling — and it is BOUNDED here, not fixed.
+// TestCustomClassEscapesTheTierLaddersPrivilegeOrder_6954 and
+// TestCustomClassSubsetRefusesItsSupersetOverREST_6954 hold this section
+// against production; the reachability walk-through is in that file's header.
+// If either starts failing the ladder has been re-keyed and this section must
+// go with it rather than be left claiming less than the code delivers.
 //
 // PermControl is deliberately ABSENT (#5561 round 19, finding 2). Round 11 gave
 // it a share equal to the clear tier's, but no route in restMutationPermissions
