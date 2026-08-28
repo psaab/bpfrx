@@ -275,6 +275,58 @@ still boots but the overwrite is no longer silent. The fix is a GATE, not a
 remapping: `LinuxIfName`'s mapping is unchanged, so every existing
 single-name config compiles exactly as before.
 
+**The authored interface-name set is NOT the kernel device-name set (#6964).**
+The #5832 gate above compares AUTHORED names only, which is not the whole
+population of device names a config claims. A logical unit that carries its own
+`tunnel` stanza gets its OWN Linux device, named by `compileInterfaces` as the
+interface's canonical name plus `u<unit>` for unit > 0 and stored verbatim in
+`unit.Tunnel.Name`. So `gr-0/0/0 unit 1` needs the device `gr-0-0-0u1`, which is
+byte-identical to the canonical name of an interface an operator is free to
+author as `gr-0/0/0u1` — `u` and digits are ordinary allowed characters
+(`ValidateInterfaceName`, #6834). The two AUTHORED keys (`gr-0/0/0u1` and
+`gr-0/0/0`) are distinct, so the authored-only walk never saw them touch and the
+config compiled with `err == nil`.
+
+The consequence is at the routing layer. `pkg/routing` keys ALL of its
+per-device state by `TunnelConfig.Name` (`tunnel.go`): the desired/owned set
+(`desired[tc.Name]`), the applied-address set (`appliedAddrs[tc.Name]`), the
+VRF claim (`appliedRI[tc.Name]`), and the keepalive runner. The two records
+collapse to ONE entry in `desired` and then reconcile the SAME device TWICE
+within one `Apply`. The second pass runs `reconcileLinkAddrsLocked` against the
+first pass's applied set, which `AddrDel`s every non-link-local address on the
+device that is absent from the second record's `Addresses` — the two records
+delete each other's addresses off the shared device — and rewrites its VRF
+claim and keepalive runner on top. Which record is "second" is the
+`cfg.Interfaces.Interfaces` MAP order (`collectAppliedTunnels`, `pkg/daemon`),
+and BOTH orders were observed within a single process (measured 174/26 over 200
+calls), so there is no stable winner.
+
+Scope of that claim, checked rather than assumed: the endpoint-comparing
+delete+recreate in `applyKernelTunnelLocked` (`legacyTunnelMatches`) is NOT the
+production path — the daemon always sets `AnchorOnly`, so `applyAnchorLocked`
+runs and `anchorReusable` ignores tunnel endpoints, reusing the TUN in place.
+The name-keyed address / VRF / keepalive overwrite is common to both paths; the
+additional link flap belongs to the standalone-CLI path only.
+
+`validateInterfaceNameCollisionStrict` therefore compares the EFFECTIVE
+DEVICE-NAME SET: every authored canonical name PLUS every per-unit tunnel
+device name, with the same IFNAMSIZ length check applied to the derived name
+(a base that fits can have a `u<unit>` derivative that does not, and that
+device silently never materializes). Two rules keep it from over-rejecting:
+
+- a unit whose tunnel device name IS its interface's own canonical name is
+  SKIPPED — that is `unit 0`, which collapses onto the base device by design;
+  reporting it would refuse the ordinary single-tunnel config.
+- the walk reads the compiler-ASSIGNED `unit.Tunnel.Name` rather than
+  re-deriving `base + "u" + N`, so the gate cannot drift from the naming scheme
+  it polices.
+
+Same strict/lenient split as #5832 (`opts.lenientIfNameCollision`): the shape
+was reachable in an already-committed config, so the tolerant load / peer-sync
+path WARNS naming the collision rather than bricking a config that predates the
+gate (#1960). The tolerant path makes the collision visible; it does not repair
+it.
+
 **Present-but-nil interface/unit slots — walk via `RangeInterfaces` /
 `RangeUnits` (#5813).** The tolerant load / HA config-sync path admits a
 present-key/nil-value `InterfaceConfig` (`cfg.Interfaces.Interfaces["ge-0/0/0"]
