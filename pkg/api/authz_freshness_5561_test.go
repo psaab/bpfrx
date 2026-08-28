@@ -815,7 +815,7 @@ func (w *withheldBody) finish(t *testing.T) (int, string) {
 func awaitMutationBodyWaiterAbove(baseline int, within time.Duration) bool {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
-		if MutationBodyWaitersForTest() > 0 {
+		if MutationBodyWaitersForTest() > baseline {
 			return true
 		}
 		time.Sleep(time.Millisecond)
