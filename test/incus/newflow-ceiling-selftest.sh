@@ -253,6 +253,20 @@ Redundancy group: <corrupt> , Failover count: 0
 node0   200      primary        yes      no       None
 '
 
+# A malformed header with NO rows after it: the stray-row path cannot see this
+# one (there is no stray row), so it isolates the unparseable-header check.
+# Without it, a group that exists but could not be read would be silently
+# excluded from "every redundancy group" and the node would read as owning all
+# of them.
+check MALFORMED_RG_HEADER_NO_ROWS_AFTER UNKNOWN 'Node name: node0
+
+Redundancy group: 0 , Failover count: 0
+node0   200      primary        yes      no       None
+node1   100      secondary      yes      no       None
+
+Redundancy group: <corrupt> , Failover count: 0
+'
+
 # --- node-token anchoring must be exact ----------------------------------
 # node1 must not answer for node10, or the anchor is a prefix match.
 # ORDER IS LOAD-BEARING: the local row comes FIRST and the prefix-colliding row
@@ -321,6 +335,26 @@ if [[ "$refuse_msg" == *"fw0:"* && "$refuse_msg" == *"fw1:"* ]]; then
 	pass=$((pass + 1)); printf 'ok   %-32s -> names both nodes\n' REFUSE_NAMES_BOTH_NODES
 else
 	fail=$((fail + 1)); printf 'FAIL %-32s -> refusal did not name both nodes: %q\n' REFUSE_NAMES_BOTH_NODES "$refuse_msg"
+fi
+
+# --- the lib must stay parseable: no apostrophes inside the awk program ---
+# The verdict is one awk program delimited by SINGLE QUOTES. An apostrophe
+# anywhere inside it — including in a comment — ends the program early and the
+# whole lib stops parsing. That happened twice while this was written, both
+# times in prose ("group\x27s", "parseNodeToken\x27s"), and both times every cell
+# below failed at once, which is loud but tells you nothing about where. This
+# names it.
+LIB_FILE="${SCRIPT_DIR}/newflow-ceiling-lib.sh"
+awk_body="$(awk "/^\tawk '\$/{flag=1;next} /^\t' <<</{flag=0} flag" "$LIB_FILE")"
+if [[ -z "${awk_body//[[:space:]]/}" ]]; then
+	fail=$((fail + 1))
+	printf 'FAIL %-32s -> could not extract the awk program from %s; this cell would pass vacuously\n' AWK_BODY_EXTRACTED "$LIB_FILE"
+elif [[ "$awk_body" == *"'"* ]]; then
+	fail=$((fail + 1))
+	printf 'FAIL %-32s -> an apostrophe inside the single-quoted awk program ends it early and breaks the whole lib\n' NO_APOSTROPHE_IN_AWK
+else
+	pass=$((pass + 1))
+	printf 'ok   %-32s -> awk program is apostrophe-free (%d lines)\n' NO_APOSTROPHE_IN_AWK "$(grep -c . <<<"$awk_body")"
 fi
 
 # --- WIRING: the harness must USE the lib, not re-inline the grep ---------
