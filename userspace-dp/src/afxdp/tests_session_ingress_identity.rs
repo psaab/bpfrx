@@ -228,6 +228,157 @@ fn split_forward_reverse(sessions: &SessionTable) -> (Vec<SessionMetadata>, Vec<
     (forward, reverse)
 }
 
+/// #6965 PRODUCER fail-on-revert: a TRANSIT forward install must publish a row
+/// into the BPF conntrack map — the map `show security flow session`
+/// enumerates.
+///
+/// This is the assertion the header of this file used to say could not be
+/// written, because the transit install had no conntrack publication to omit.
+/// It has one now, and this is the test that keeps it.
+///
+/// **The trap this fixture is built to avoid.** A test that merely proves
+/// `show security flow session` prints rows proves nothing here: it printed
+/// rows BEFORE #6965, because the host-inbound and missing-neighbor-seed
+/// installs were always mirrored. The subject has to be a TRANSIT session
+/// specifically, and `run_ingress_identity_flow` is exactly that — a permitted
+/// lan -> wan SYN, `ForwardingDisposition::ForwardCandidate`, resolved
+/// neighbor, so it reaches NONE of the three pre-existing publish sites. A
+/// record therefore can only have come from the new call.
+///
+/// **What it binds and what it does not.** The unit-test driver passes `-1`
+/// for both conntrack fds (`tests_support::txn_run_descriptor`), so no row is
+/// written to any map and there is nothing to read back. That is the right
+/// scope: the #6965 defect IS a missing call site, so the property is the CALL
+/// and the arguments it carries. The value SHAPE those arguments produce is a
+/// separate property already owned by `bpf_map_tests.rs`
+/// (`build_conntrack_value_v4/v6` copying `metadata.ingress_*` onto the row),
+/// and this test deliberately does not restate it — the two together are the
+/// chain.
+///
+/// Asserting the ARGUMENTS rather than a count is what keeps it non-vacuous: a
+/// count of 1 is also what a publish of the WRONG row produces.
+#[test]
+fn transit_forward_install_publishes_a_conntrack_row_6965() {
+    let _guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    let sessions = run_ingress_identity_flow();
+    assert_eq!(
+        sessions.len(),
+        2,
+        "fixture liveness: the transit forward + reverse companion must both \
+         install, or the publish assertions below are about nothing"
+    );
+    let published = crate::afxdp::bpf_map::conntrack_publishes();
+    assert_eq!(
+        published.len(),
+        1,
+        "a transit forward install must publish EXACTLY ONE conntrack row \
+         (got {published:?}). Zero means the #6965 gap is back: the session is \
+         installed and forwarding, but `show security flow session` enumerates \
+         the conntrack map and there is no row for it — not a row with a zeroed \
+         identity, no row at all"
+    );
+    let row = published[0];
+    assert!(
+        !row.is_reverse,
+        "the published row must be the FORWARD one; every show/clear call site \
+         skips `IsReverse != 0` before filtering, so a reverse row costs a \
+         syscall per connection and can never surface a flow"
+    );
+    // The recorded identity is the {PARENT ifindex, VLAN} PAIR, not a
+    // pre-resolved logical unit. That is #4983's contract, not an accident:
+    // `poll_descriptor` stamps `meta.ingress_ifindex` (the binding the frame
+    // was received on) and the 802.1Q tag, and the Go side resolves the pair
+    // through the same `{parent, VLAN}` map the EGRESS side uses
+    // (`pkg/cli/session_filter.go` `resolveIngressIfaces`). An earlier draft of
+    // this test asserted the LOGICAL ifindex 13 and reddened on correct code —
+    // recorded here so the next reader does not "fix" it in that direction.
+    // `poll_descriptor_transit_install_stamps_ingress_binding_4983` above pins
+    // the same pair on the in-memory entry; this pins that the MIRROR carries
+    // it, which is the half #6965 was missing.
+    assert_eq!(
+        row.ingress_ifindex, INGRESS_PARENT_IFINDEX as u32,
+        "the mirrored row must carry the ifindex of the binding the SYN \
+         arrived on — reverting the stamp to 0 makes the Go filter fall back \
+         to the zone for every transit session, which is the approximation \
+         #4983 removed"
+    );
+    assert_eq!(
+        row.ingress_vlan_id, INGRESS_VLAN_ID,
+        "…and its VLAN: the parent alone is SHARED with the egress unit \
+         reth0.80 and resolves to zone wan on its own, so only the pair names \
+         the interface the flow arrived on"
+    );
+    assert_eq!(
+        row.ingress_zone, TEST_LAN_ZONE_ID,
+        "ingress zone lan"
+    );
+    assert_eq!(
+        row.egress_zone, TEST_WAN_ZONE_ID,
+        "egress zone wan"
+    );
+    assert_ne!(
+        row.session_id, 0,
+        "#5213: the mirrored row must carry the STABLE session id resolved \
+         from the just-installed live entry, so `show security flow session` \
+         reports the same id RT_FLOW emits. A 0 here means the id was resolved \
+         before the install, or from the wrong key"
+    );
+}
+
+/// #6965 over-reach guard: the reverse companion must NOT get a conntrack row.
+///
+/// Paired with the test above, this is what makes "exactly one" a decision
+/// rather than an accident. Publishing the reverse companion is the obvious
+/// over-correction — it is installed two dozen lines later, in the same arm,
+/// with the same fds in scope — and it would cost a `bpf_map_update_elem` per
+/// connection for a row that every `show`/`clear` call site discards before it
+/// filters (`val.IsReverse != 0` precedes the filter at
+/// `pkg/cli/cli_show_flow.go`, `pkg/grpcapi/server_sessions.go`,
+/// `pkg/api/sessions.go`, and the natshow sources). The forward row already
+/// carries BOTH directions' counters (#2501), so nothing is lost.
+#[test]
+fn transit_reverse_companion_gets_no_conntrack_row_6965() {
+    let _guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    let sessions = run_ingress_identity_flow();
+    let (forward, reverse) = split_forward_reverse(&sessions);
+    assert_eq!(
+        (forward.len(), reverse.len()),
+        (1, 1),
+        "fixture liveness: the flow must install one forward and one reverse \
+         entry, or 'no reverse row was published' is true for free"
+    );
+    let published = crate::afxdp::bpf_map::conntrack_publishes();
+    assert!(
+        published.iter().all(|r| !r.is_reverse),
+        "no reverse-companion conntrack row may be published on the install \
+         path (got {published:?})"
+    );
+}
+
+/// #6965 recorder control: the pre-existing HOST-INBOUND publish site is still
+/// seen by the same recorder.
+///
+/// Without this, `transit_forward_install_publishes_a_conntrack_row_6965`
+/// could not distinguish "the transit publish landed" from "the recorder
+/// works". Reverting ONLY the transit call leaves this test green and reds the
+/// transit one, which is the pair that localises the change.
+#[test]
+fn local_miss_install_still_publishes_a_conntrack_row_6965() {
+    let _guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    let sessions = run_local_miss_identity_flow();
+    assert!(
+        sessions.len() >= 1,
+        "fixture liveness: the host-inbound miss must install a session"
+    );
+    let published = crate::afxdp::bpf_map::conntrack_publishes();
+    assert!(
+        published.iter().any(|r| !r.is_reverse),
+        "the host-inbound LocalMiss install has published a forward conntrack \
+         row since fab9230c5; if this is empty the recorder is broken and the \
+         transit assertion above proves nothing (got {published:?})"
+    );
+}
+
 /// #4983 PRODUCER fail-on-revert (transit forward install). The FORWARD
 /// session the poll installs must carry the {ifindex, VLAN} of the binding
 /// the SYN actually arrived on — parent 11, VLAN 50 — not 0, not the parent
