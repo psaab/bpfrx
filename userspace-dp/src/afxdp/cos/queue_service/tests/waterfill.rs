@@ -935,10 +935,20 @@ fn waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest() {
 ///
 /// TIME IS FROZEN, and that is the load-bearing fixture decision. `now_ns` is
 /// passed as a constant so `elapsed_since_refresh` stays 0 and `time_refresh`
-/// can never fire. `epoch_boundary` has two sources; if the clock is allowed
-/// to advance past `COS_GUARANTEE_VISIT_NS`, the time tick clears the honored
-/// bits on its own and this test passes whether or not the tail exists —
-/// measuring the fallback rather than the fix.
+/// can never fire. `epoch_boundary` has TWO sources, and the wrap is only one
+/// of them.
+///
+/// Measured, not reasoned. With the tail deleted and the resumption assertion
+/// isolated:
+///
+///   frozen  `now_ns`                -> FAILS  (the assertion has teeth)
+///   thawed  `now_ns + 10_000_000`   -> PASSES (the time tick clears the
+///                                              honored bits by itself)
+///
+/// So a version of this cell written with a running clock would have been
+/// toothless in exactly the way it looks rigorous: it would exercise the wrap,
+/// reach the resumption, and pass on the fallback path with the code under
+/// test deleted.
 #[test]
 fn waterfill_phase2_wrap_arms_epoch_boundary_and_resumes_6958() {
     // Frozen: every call uses this same instant.
