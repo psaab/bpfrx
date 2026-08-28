@@ -14,6 +14,23 @@
 // public namespace and re-exports the `pub(crate)` symbols that
 // external callers reach as `crate::nat::*`. Cross-submodule
 // internal items use `pub(super)` and are NOT re-exported here.
+//
+// #6988: `source` is itself a directory now. It reached 3315 LOC —
+// the [REFACTOR] tier is 2000 — so six clusters moved into
+// `source/{failure,expand,release,synced,nat64_ports,match_rules}.rs`
+// as PURE CODE MOTION, leaving `source/mod.rs` at 1367. The clusters
+// were chosen by dependency COST, not by name: the whole split needs
+// two visibility widenings and one respelling, all enumerated in
+// `source/mod.rs` and machine-checked by
+// `scripts/verify-nat-source-split-6988.py`, which reconstructs the
+// pre-split file byte-for-byte.
+//
+// A CAUTION this split paid for: `pub(super)` means something
+// different at each depth. `expand_pool_address` was `pub(super)` in
+// `nat::source` — i.e. visible HERE — and moving it one level deeper
+// silently narrowed it to `pub(in crate::nat::source)`, breaking
+// `tests_aggregate_budget.rs` with E0603. Anything moved deeper that
+// this module still names must be spelled `pub(in crate::nat)`.
 
 use crate::protocol::NatRuleCounterStatus;
 use rustc_hash::FxHashMap;
