@@ -107,7 +107,22 @@ where
                 ))?);
             }
             "--iface" => {
-                iface = args.next().unwrap_or_default();
+                // #6898 A1-b6-F3: use the SAME helper the other string-valued
+                // flags use. This arm was the lone exception in the match —
+                // `--iperf-json`, `--binding-flows` and `--cos-flows` all go
+                // through `parse_required_string_value`, and every numeric flag
+                // through `parse_required_numeric_value`. The inconsistency is
+                // the argument: there is no reading under which `--iface`
+                // should be the one flag that accepts a missing value.
+                //
+                // `unwrap_or_default()` failed silently in TWO ways, and the
+                // second is worse than the empty string the audit named:
+                // `--iface` as the final token left the interface `""`, and
+                // `--iface --warmup-secs 5` set the interface to the STRING
+                // "--warmup-secs" and then dropped the 5. The helper rejects
+                // both — it refuses a missing value and refuses a value that
+                // starts with `--`.
+                iface = numeric_or_string(parse_required_string_value("--iface", args.next()))?;
             }
             "--warmup-secs" => {
                 warmup_secs =
@@ -284,6 +299,67 @@ mod tests {
             Err(ParseError::HelpRequested) => panic!("expected Usage error, got HelpRequested"),
             Ok(_) => panic!("expected Usage error, got Ok"),
         }
+    }
+
+    /// #6898 A1-b6-F3: `--iface` must fail fast like every other valued flag.
+    ///
+    /// Driven through `parse_args_from`, NOT through
+    /// `parse_required_string_value`. The helper was never broken — three other
+    /// string flags already used it correctly. The defect was that this arm did
+    /// not CALL it, so a test of the helper would have passed against the
+    /// unfixed code and bound nothing.
+    ///
+    /// The module's own contract is the argument: "A silent fallback here could
+    /// seed a false PASS/FAIL from this fairness merge gate (#1630/#1614), so
+    /// the harness fails fast on an operator CLI mistake." `--iface` was the
+    /// one arm violating it.
+    #[test]
+    fn iface_flag_requires_a_value_6898() {
+        // 1. Missing value — `--iface` as the final token. Pre-fix this left
+        //    the interface as "" and parsed successfully, so the harness ran
+        //    against no interface and reported a verdict anyway.
+        // Every case carries the two REQUIRED flags (`--iperf-json`,
+        // `--binding-flows`) so the only thing under test is the `--iface`
+        // handling. Without them a reverted build still errors — with
+        // "--iperf-json is required" — and the cell would red for a reason
+        // that has nothing to do with this fix.
+        const REQ: [&str; 4] = [
+            "--iperf-json",
+            "/tmp/iperf.json",
+            "--binding-flows",
+            "/tmp/bind.tsv",
+        ];
+        let with_req = |extra: &[&str]| -> Vec<String> {
+            REQ.iter().chain(extra.iter()).map(|s| s.to_string()).collect()
+        };
+
+        let Err(ParseError::Usage(msg)) = parse_args_from(with_req(&["--iface"])) else {
+            panic!(
+                "#6898: `--iface` with no value must be a usage error, not an empty interface"
+            );
+        };
+        assert!(
+            msg.contains("--iface") && msg.contains("requires a value"),
+            "the error must name the flag and the reason; got {msg:?}"
+        );
+
+        // 2. THE WORSE CASE, which the audit item did not name: the next FLAG
+        //    swallowed as the value. Pre-fix this set the interface to the
+        //    literal string "--warmup-secs" and silently dropped the 5, so the
+        //    run used a default warmup AND a nonsense interface — two wrong
+        //    values from one typo, with no diagnostic.
+        let Err(ParseError::Usage(msg)) = parse_args_from(with_req(&["--iface", "--warmup-secs", "5"]))
+        else {
+            panic!("#6898: a following flag must not be consumed as the interface name");
+        };
+        assert!(msg.contains("--iface"), "the error must name --iface; got {msg:?}");
+
+        // 3. CONTROL — the happy path still works. Without this, "reject
+        //    everything" satisfies both assertions above.
+        let Ok(args) = parse_args_from(with_req(&["--iface", "ge-0-0-2"])) else {
+            panic!("control: a valid --iface must still parse");
+        };
+        assert_eq!(args.iface, "ge-0-0-2");
     }
 
     #[test]
