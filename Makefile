@@ -417,7 +417,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -456,6 +456,19 @@ test-cluster-lock-lib:
 # of the marker contract lives in cmd/cli/cos_apply_markers_6440_test.go.
 test-cos-apply-lib:
 	bash ./test/incus/cos-apply-lib-selftest.sh
+	go test -count=1 -run 6440 ./cmd/cli/
+
+# Self-test the #6936 FBF two-upstream steering verdicts. The defect this
+# guards is a NEGATIVE CELL THAT FAILS TO A HEALTHY VALUE: the main-table
+# pollution check counted matches, so "no leak" and "the probe returned
+# nothing" both scored 0 = PASS, and the cell certified an absence it had
+# never looked for. The verdict is now TOTAL, and the selftest table carries
+# the middle (probe-blind) row that is the only way to see the difference.
+# Hermetic — no cluster. The Go half (every test/incus script that commits
+# config through the piped CLI must use the #6440 marker gate) is
+# cmd/cli/cos_apply_markers_6440_test.go.
+test-fbf-steering-lib:
+	bash ./test/incus/fbf-steering-selftest.sh
 	go test -count=1 -run 6440 ./cmd/cli/
 
 # Self-test the shared cluster-env resolver (#5024): the HA/failover

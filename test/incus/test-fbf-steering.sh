@@ -50,6 +50,16 @@ CONFIG_FILE="${SCRIPT_DIR}/fbf-two-upstream-config.set"
 REMOTE_SETS="/tmp/fbf-two-upstream.set"
 CLI=/usr/local/sbin/cli
 
+# #6936: the CLI-transcript marker gate (#6440) and the FBF verdict helpers.
+# The `cos_` prefix is historical — those helpers are CLI-generic, and reusing
+# them is deliberate: a second copy of the marker list could drift out of step
+# with cmd/cli, and only one copy is pinned by
+# cmd/cli/cos_apply_markers_6440_test.go.
+# shellcheck source=./cos-apply-lib.sh
+. "${SCRIPT_DIR}/cos-apply-lib.sh"
+# shellcheck source=./fbf-steering-lib.sh
+. "${SCRIPT_DIR}/fbf-steering-lib.sh"
+
 info() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -68,13 +78,14 @@ fi
 
 restore() {
     info "Restoring pre-test config (rollback 1 + commit)..."
-    incus exec "$TARGET" -- "$CLI" <<EOF || echo "WARNING: rollback failed — inspect $TARGET manually" >&2
-configure
-rollback 1
-commit
-exit
-quit
-EOF
+    # #6936: this gated on the session's exit status (`<<EOF || echo WARNING`).
+    # The piped-stdin CLI is a REPL that prints `error: ...` and still exits 0
+    # (#6440), so that warning could NEVER fire — a rollback that did not land
+    # announced nothing and left this SHARED cluster on the FBF test config for
+    # the next lane to measure against. cos_rollback_one verifies the CLI's own
+    # "configuration rolled back" + "commit complete" markers.
+    cos_rollback_one "$TARGET" \
+        || echo "WARNING: rollback did NOT land — inspect $TARGET manually" >&2
 }
 
 metric_value() {
@@ -90,31 +101,39 @@ incus file push --mode 0644 "$SETS_TMP" "${TARGET}/${REMOTE_SETS}" >/dev/null
 
 CHECK_OUT="$(mktemp)"; cleanup_files+=("$CHECK_OUT")
 info "commit check on $TARGET..."
-if ! incus exec "$TARGET" -- "$CLI" > "$CHECK_OUT" 2>&1 <<EOF
+incus exec "$TARGET" -- "$CLI" > "$CHECK_OUT" 2>&1 <<EOF || true
 configure
 load merge ${REMOTE_SETS}
 commit check
 exit
 quit
 EOF
-then
-    cat "$CHECK_OUT" >&2
-    fail "commit check failed (candidate invalid; live state unchanged)"
-fi
+# #6936/#6440: gate on the CLI's own success MARKERS, not the session exit
+# status, which is 0 even when a command inside the session failed. BOTH
+# markers are required: a failed `load merge` leaves an EMPTY candidate, and an
+# empty candidate checks clean — so `commit check` alone cannot tell "the
+# fixture is valid" from "the fixture never loaded".
+cos_require_markers "commit check on $TARGET" "$CHECK_OUT" \
+    "$COS_MARKER_LOAD_MERGE" "$COS_MARKER_COMMIT_CHECK" \
+    || fail "commit check failed (candidate invalid; live state unchanged)"
 
 APPLY_OUT="$(mktemp)"; cleanup_files+=("$APPLY_OUT")
 info "committing FBF two-upstream fixture..."
-if ! incus exec "$TARGET" -- "$CLI" > "$APPLY_OUT" 2>&1 <<EOF
+incus exec "$TARGET" -- "$CLI" > "$APPLY_OUT" 2>&1 <<EOF || true
 configure
 load merge ${REMOTE_SETS}
 commit
 exit
 quit
 EOF
-then
-    cat "$APPLY_OUT" >&2
-    fail "commit failed after commit-check passed"
-fi
+# #6936/#6440: as above — the exit status proves nothing. Without this gate a
+# commit that never landed let every cell below run against the PRE-TEST
+# config, where the ISP-B default is legitimately absent: the smoke would
+# report a clean main table having never applied the fixture that could dirty
+# it, which is the exact silent under-steer #6936 wants regression cover for.
+cos_require_markers "commit on $TARGET" "$APPLY_OUT" \
+    "$COS_MARKER_LOAD_MERGE" "$COS_MARKER_COMMIT" \
+    || fail "commit failed after commit-check passed"
 # From here on, always restore on exit.
 trap 'restore; rm -f "${cleanup_files[@]}"' EXIT
 sleep 3
@@ -131,9 +150,20 @@ echo "$ROUTES" | grep -q "default via ${ISP_B_GW4}" \
     || fail "ISP-B kernel table $PBR_TABLE lacks 'default via ${ISP_B_GW4}' — FRR table rendering broken (pre-PR-2 divergence): ${ROUTES:-<empty>}"
 info "ISP-B table $PBR_TABLE holds the instance default (divergence fix OK)"
 
-MAIN_DEFAULTS="$(incus exec "$TARGET" -- sh -c "ip route show default | grep -c 'via ${ISP_B_GW4}'" || true)"
-[[ "${MAIN_DEFAULTS:-0}" -eq 0 ]] \
-    || fail "ISP-B default leaked into the MAIN table (pre-PR-2 pollution)"
+# #6936: take the route TEXT, not a count. The counting form collapsed
+# "no leak" and "the probe returned nothing" onto the same healthy verdict
+# (`grep -c` prints 0 and exits 1, so `|| true` is load-bearing; an empty
+# substitution then fell through `${MAIN_DEFAULTS:-0}` to 0 = PASS). The
+# verdict below is TOTAL and treats a blind probe as a failure, because an
+# absence cannot be certified by an instrument that returned no reading.
+# Non-empty output doubles as the positive control: this venue always carries
+# the ISP-A default, so seeing defaults at all proves the probe read the table.
+MAIN_DEFAULTS="$(incus exec "$TARGET" -- ip route show default 2>/dev/null || true)"
+LEAK_VERDICT="$(fbf_main_default_leak_verdict "$ISP_B_GW4" "$MAIN_DEFAULTS")"
+case "$LEAK_VERDICT" in
+    PASS\ *) info "${LEAK_VERDICT#PASS }" ;;
+    *)       fail "${LEAK_VERDICT#FAIL }" ;;
+esac
 
 # ---- Phase 3: steering counter ----
 BEFORE="$(metric_value)"; BEFORE="${BEFORE:-0}"
