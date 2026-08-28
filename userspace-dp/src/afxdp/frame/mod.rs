@@ -4,6 +4,7 @@ mod byte_writes;
 mod checksum;
 mod generated;
 mod headers;
+mod addr_class;
 mod inspect;
 mod tcp;
 mod wg;
