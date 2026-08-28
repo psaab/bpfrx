@@ -532,6 +532,15 @@ struct LiveCallSiteFixture {
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     dnat_fds: DnatTableFds,
     rg_epochs: [AtomicU32; MAX_RG_EPOCHS],
+    /// #6999: an event stream for the cached filter-LOG emissions to reach.
+    /// `None` on every pre-#6999 fixture, which is exactly why those two calls
+    /// were severable with the whole crate green: `worker_ctx()` handed
+    /// production a `None` sink, so both emissions ran to completion and
+    /// produced nothing any test could look at.
+    event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
+    /// The receiving half of the stream above. `try_recv` takes `&self`, so it
+    /// lives on the fixture rather than being threaded back out of the call.
+    event_rx: Option<std::sync::mpsc::Receiver<crate::event_stream::EventFrame>>,
 }
 
 impl LiveCallSiteFixture {
@@ -607,6 +616,8 @@ impl LiveCallSiteFixture {
         );
 
         Self {
+            event_stream: None,
+            event_rx: None,
             ingress_live: Arc::new(BindingLiveState::new()),
             target_live,
             ident: BindingIdentity {
@@ -701,7 +712,7 @@ impl LiveCallSiteFixture {
             shared_owner_rg_indexes: &self.shared_owner_rg_indexes,
             ike_exchanges: &self.ike_exchanges,
             slow_path: None,
-            event_stream: None,
+            event_stream: self.event_stream.as_ref(),
             local_tunnel_deliveries: &self.local_tunnel_deliveries,
             recent_exceptions: &self.recent_exceptions,
             last_resolution: &self.last_resolution,
@@ -766,6 +777,12 @@ struct StageRun {
     /// count, which is the mutation. See
     /// `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304`.
     cached_observed_bytes: Option<u64>,
+    /// #6997: the session table AFTER the call. `run_stage_with_entry` used to
+    /// build this locally and drop it unread, which is why
+    /// `sessions.account_packet(..)` and `sessions.touch_if_stale(..)` were
+    /// both severable with the whole crate green — the same "built and dropped
+    /// unread" shape `dbg` and `counters` were in before #6304 bound them.
+    sessions: SessionTable,
 }
 
 /// Drive the LIVE call site once.
@@ -804,12 +821,74 @@ fn run_stage_with_meta(
 /// `live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304` uses it to
 /// hand the same VLAN-tagged frame an UNTAGGED egress, which is the only way
 /// to reach an `InPlaceL2Rewrite` variant other than `SameLength` from here.
+impl LiveCallSiteFixture {
+    /// #6999: attach a real event stream, with rate limiting DISABLED
+    /// (`events_per_second: 0, burst: 0`) so a missing event is a missing
+    /// emission and never a throttled one.
+    fn with_event_stream(mut self) -> Self {
+        let (handle, rx) = crate::event_stream::test_worker_handle(
+            8,
+            crate::event_stream::DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        self.event_stream = Some(handle);
+        self.event_rx = Some(rx);
+        self
+    }
+}
+
+/// #6997/#6999: the two knobs the call-site binders need and no pre-existing
+/// test wanted, defaulted so every existing caller is bit-identical.
+///
+/// `session` is the load-bearing one. `sessions` starts as an EMPTY
+/// `SessionTable`, and both `account_packet` and `touch_if_stale` return
+/// immediately when the key resolves to nothing — so on the historical fixture
+/// those two production lines are no-ops REGARDLESS of whether they are called.
+/// A binder built on that fixture would stay green with them deleted: it would
+/// be a guard whose fixture omits the interaction it exists to observe.
+struct StageSeed {
+    /// Install a session for `test_key()` before the call, as
+    /// `(install_ns, protocol, tcp_flags)`.
+    session: Option<(u64, u8, u8)>,
+    /// The `now_ns` handed to `stage_flow_cache_hit`. Separate from
+    /// `install_ns` so a cell can choose whether the session is STALE at call
+    /// time, which is the only axis `touch_if_stale` branches on.
+    now_ns: u64,
+}
+
+impl Default for StageSeed {
+    fn default() -> Self {
+        // 1_000_000 is the `now_ns` every pre-#6997 caller passed inline.
+        Self { session: None, now_ns: 1_000_000 }
+    }
+}
+
 fn run_stage_with_entry(
     fixture: &LiveCallSiteFixture,
     frame: &[u8],
     meta: UserspaceDpMeta,
     entry: FlowCacheEntry,
     initial_sample_counter: u64,
+) -> StageRun {
+    run_stage_seeded(
+        fixture,
+        frame,
+        meta,
+        entry,
+        initial_sample_counter,
+        StageSeed::default(),
+    )
+}
+
+fn run_stage_seeded(
+    fixture: &LiveCallSiteFixture,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    entry: FlowCacheEntry,
+    initial_sample_counter: u64,
+    seed: StageSeed,
 ) -> StageRun {
     let mut area = MmapArea::new(2 * 1024 * 1024).expect("umem mmap");
     let frame_offset: u64 = 4096;
@@ -825,6 +904,7 @@ fn run_stage_with_entry(
         .slice(frame_offset as usize, frame.len())
         .expect("raw frame must ALIAS the UMEM, as it does in production");
 
+    let entry_for_session = entry.clone();
     let mut flow_state = WorkerFlowCacheState {
         flow_cache: FlowCache::new(),
     };
@@ -834,6 +914,23 @@ fn run_stage_with_entry(
     let mut tx_counters_state = tx_counters();
     let mut scratch_state = scratch();
     let mut sessions = SessionTable::new();
+    if let Some((install_ns, protocol, tcp_flags)) = seed.session {
+        // Install from the CACHED entry's own decision + metadata, so the
+        // session the accounting lands on is the one this cached flow
+        // describes rather than an unrelated fixture.
+        assert!(
+            sessions.install_with_protocol(
+                entry_for_session.key.clone(),
+                entry_for_session.decision.clone(),
+                entry_for_session.metadata.clone(),
+                install_ns,
+                protocol,
+                tcp_flags,
+            ),
+            "fixture invalid: the seeded session did not install, so every \
+             assertion about per-session accounting below would be vacuous"
+        );
+    }
     let mut dbg = DebugPollCounters::default();
     let mut counters = BatchCounters::default();
     let mut telemetry = TelemetryContext {
@@ -872,7 +969,7 @@ fn run_stage_with_entry(
         false,
         ValidationState::default(),
         &mut sessions,
-        1_000_000,
+        seed.now_ns,
         1,
         &fixture.worker_ctx(),
         &mut telemetry,
@@ -919,6 +1016,7 @@ fn run_stage_with_entry(
         counters,
         tx_frame,
         cached_observed_bytes,
+        sessions,
     }
 }
 
@@ -2345,5 +2443,385 @@ fn live_flow_cache_callsite_served_hit_still_counts_as_a_hit_5190() {
     assert_eq!(
         evictions, 0,
         "a served cache hit must not count as an eviction"
+    );
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #6997 / #6999: the four remaining unbound production calls at this call site.
+//
+// All four were measured by SINGLE-LINE severance on unfiltered whole-crate
+// runs at this branch's base, each leaving 4850 tests collected / 0 failed:
+//
+//   sessions.touch_if_stale(..)          sessions.account_packet(..)
+//   emit_cached_input_filter_log(..)     emit_cached_output_filter_log(..)
+//
+// WHY THE OLD FIXTURE COULD NOT HAVE CAUGHT THEM, which is the part worth
+// carrying forward. It is not that the assertions were missing — it is that the
+// fixture made all four production lines into no-ops:
+//
+//   * `sessions` was an EMPTY `SessionTable`, and both `account_packet` and
+//     `touch_if_stale` return immediately when the key resolves to nothing. A
+//     binder written on that fixture would have gone green with the calls
+//     deleted, because the calls did nothing either way.
+//   * `worker_ctx()` handed production `event_stream: None`, and the cached
+//     entry carried `input_filter_log: None` with a default `tx_selection`
+//     (so `filter_log: None`). Both emissions early-return on those.
+//
+// A guard whose fixture omits the interaction is mutation-INSENSITIVE, so the
+// fixture work below IS the test: seed a session, seed a filter-log match, and
+// attach a stream.
+
+/// A `now_ns` far enough past the seeded install that the session is stale by
+/// `touch_if_stale`'s rule (idle >= its own timeout / 4).
+const STALE_NOW_NS: u64 = 1_000_000 + 7_200_000_000_000; // install + 7200 s
+
+/// The seeded install instant. Non-zero so "the timestamp moved" cannot be
+/// satisfied by a field that was simply left at its default.
+const INSTALL_NS: u64 = 1_000_000;
+
+/// The packet's own DSCP and TCP flags, chosen to be DISTINCT from every
+/// default in the fixture: `UserspaceDpMeta::default()` leaves `dscp` at 0 and
+/// `test_meta` sets `tcp_flags` to 0x10, so an accounting call that dropped
+/// either argument, or passed a neighbouring field, lands on a different number
+/// than these.
+const PKT_DSCP: u8 = 46; // EF -> ToS byte 0xB8
+const PKT_TCP_FLAGS: u8 = 0x18; // PSH|ACK, not the fixture's bare ACK
+
+/// `test_meta` with this module's distinct DSCP / TCP flags.
+fn accounted_meta(frame: &[u8]) -> UserspaceDpMeta {
+    let mut meta = test_meta(frame);
+    meta.dscp = PKT_DSCP;
+    meta.tcp_flags = PKT_TCP_FLAGS;
+    meta
+}
+
+/// #6997: the forwarded packet must be accounted onto ITS session, with the
+/// amount it actually carried and the observation fields the SESSION_CLOSE
+/// RT_FLOW record is built from.
+///
+/// RED on revert: delete `sessions.account_packet(..)` from
+/// `stage_flow_cache_hit` and every assertion below fails — counters stay 0 and
+/// both observation fields stay at their install values.
+///
+/// The byte assertion is an EXACT equality against `meta.pkt_len`, not a
+/// non-zero check: a call site that passed a neighbouring length (an
+/// L2-stripped payload length, say) would satisfy "non-zero" while silently
+/// under-reporting every byte total an operator reads after the fact. That is
+/// the failure mode this issue names — not missing data in the security log,
+/// but WRONG data in it.
+#[test]
+fn live_flow_cache_callsite_accounts_the_packet_onto_the_session_6997() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    let meta = accounted_meta(&frame);
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        meta,
+        cached_entry(),
+        1,
+        StageSeed {
+            // Install with NO tcp flags, so every bit asserted below arrived
+            // through the accounting call rather than through the install.
+            session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
+            now_ns: INSTALL_NS,
+        },
+    );
+
+    // Control: the fixture reached the accounting point at all.
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "control: the cached flow must be consumed by the fast path, otherwise \
+         the accounting call below was never reached and every assertion here \
+         would pass or fail for an unrelated reason"
+    );
+
+    let counters = run
+        .sessions
+        .session_counters(&test_key())
+        .expect("control: the seeded session must still exist after the call");
+    assert_eq!(
+        counters.fwd_packets, 1,
+        "the flow-cache hit must account exactly ONE forward packet onto the \
+         session; 0 means `sessions.account_packet(..)` is not reached and the \
+         SESSION_CLOSE record's packet total under-reports every cached packet \
+         of every long-lived flow (#6997)"
+    );
+    assert_eq!(
+        counters.fwd_bytes,
+        u64::from(meta.pkt_len),
+        "the accounted byte count must be the packet's OWN wire length \
+         ({} here), not merely non-zero — a neighbouring length would satisfy a \
+         non-zero check and silently under-report the byte total an operator \
+         reads out of the security log (#6997)",
+        meta.pkt_len
+    );
+    assert_eq!(
+        counters.rev_packets, 0,
+        "a forward packet must not be folded onto the reverse counters"
+    );
+
+    let (flags, tos) = run
+        .sessions
+        .observed_close_fields(&test_key())
+        .expect("control: the seeded session must still exist after the call");
+    assert_eq!(
+        flags, PKT_TCP_FLAGS,
+        "the packet's TCP control bits must be OR-accumulated onto the session \
+         (#2749): the session was installed with 0x00, so 0x00 here means the \
+         `meta.tcp_flags` argument never arrived and the SESSION_CLOSE frame's \
+         tcpControlBits is a fabricated zero (#6997)"
+    );
+    assert_eq!(
+        tos, PKT_DSCP << 2,
+        "the forward-direction ToS byte must be the packet's DSCP shifted left \
+         two (#2749). 0 means the `meta.dscp` argument never arrived; any other \
+         value means a neighbouring field was passed in its place (#6997)"
+    );
+}
+
+/// #6997/#918: a session idle long enough must have its liveness timestamp
+/// refreshed by the cache-hit path, and a FRESH one must not.
+///
+/// The negative half is what makes the positive half mean something. Without
+/// it, "the timestamp equals `now_ns`" is satisfied by ANY unconditional write
+/// — including a `touch` that ignores staleness entirely and pays a wheel
+/// re-bucket on every cached packet, which is the cost `touch_if_stale` exists
+/// to avoid.
+///
+/// RED on revert: delete `sessions.touch_if_stale(..)` and the stale cell fails
+/// (the timestamp stays at the install instant) while the fresh cell keeps
+/// passing — so the pair localises the severance to the call, not to the
+/// callee's threshold.
+#[test]
+fn live_flow_cache_callsite_refreshes_only_a_stale_session_6997() {
+    let frame = tcp_v4_ack_frame();
+
+    // STALE: idle for 7200 s at call time.
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let stale = run_stage_seeded(
+        &fixture,
+        &frame,
+        accounted_meta(&frame),
+        cached_entry(),
+        1,
+        StageSeed {
+            session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
+            now_ns: STALE_NOW_NS,
+        },
+    );
+    assert!(
+        matches!(stale.outcome, FlowCacheOutcome::Consumed),
+        "control: the stale-session run must still take the cache-hit path"
+    );
+    assert_eq!(
+        stale
+            .sessions
+            .last_seen_ns(&test_key())
+            .expect("control: the seeded session must still exist"),
+        STALE_NOW_NS,
+        "a session idle far past its keepalive threshold must be refreshed to \
+         the packet's own `now_ns` by the cache-hit path. Leaving it at the \
+         install instant is the #2220 reaping bug: a low-rate flow served \
+         entirely from the cache is reaped while still forwarding (#6997)"
+    );
+
+    // FRESH: the same fixture, called one microsecond after the install.
+    let fixture2 = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let fresh = run_stage_seeded(
+        &fixture2,
+        &frame,
+        accounted_meta(&frame),
+        cached_entry(),
+        1,
+        StageSeed {
+            session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
+            now_ns: INSTALL_NS + 1_000,
+        },
+    );
+    assert!(
+        matches!(fresh.outcome, FlowCacheOutcome::Consumed),
+        "control: the fresh-session run must also take the cache-hit path"
+    );
+    assert_eq!(
+        fresh
+            .sessions
+            .last_seen_ns(&test_key())
+            .expect("control: the seeded session must still exist"),
+        INSTALL_NS,
+        "a session refreshed one microsecond ago must NOT be touched again. A \
+         timestamp that moves here means the throttle is gone and every cached \
+         packet pays a timer-wheel re-bucket — and it would also make the stale \
+         cell above pass against an unconditional write, which is what this \
+         cell exists to exclude (#6997)"
+    );
+}
+
+/// A cached descriptor carrying BOTH a `then log` input-filter match and a
+/// `then log` output-filter match, with DISTINCT filter/term ids so an
+/// assertion cannot confuse the two records.
+fn logging_cached_entry(input: bool, output: bool) -> FlowCacheEntry {
+    let mut entry = cached_entry();
+    if input {
+        entry.descriptor.input_filter_log = Some(crate::afxdp::flow_cache::CachedInputFilterLog {
+            log_match: crate::filter::FilterLogMatch {
+                filter_id: 0x1111,
+                term_id: 0x2222,
+                action: crate::filter::FilterAction::Accept,
+            },
+            ingress_zone_id: TEST_TRUST_ZONE_ID,
+        });
+    }
+    if output {
+        entry.descriptor.tx_selection.filter_log = Some(crate::filter::FilterLogMatch {
+            filter_id: 0x3333,
+            term_id: 0x4444,
+            action: crate::filter::FilterAction::Accept,
+        });
+    }
+    entry
+}
+
+/// Drain every event the run produced, decoded.
+fn drained_events(
+    fixture: &LiveCallSiteFixture,
+) -> Vec<crate::event_stream::codec::DataplaneEventPayload> {
+    let rx = fixture
+        .event_rx
+        .as_ref()
+        .expect("fixture was not built with_event_stream");
+    let mut out = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        if let Some(payload) = frame.decode_dataplane_event() {
+            out.push(payload);
+        }
+    }
+    out
+}
+
+/// #6999: the cached INPUT filter-log emission.
+///
+/// RED on revert: delete `emit_cached_input_filter_log(..)` from
+/// `stage_flow_cache_hit` and no event is produced — firewall-filter `then log`
+/// goes silent for every packet of every cached flow, i.e. most packets of
+/// every long-lived permitted flow, while the dataplane keeps forwarding
+/// correctly. The operator's log simply stops.
+///
+/// Asserts the record's FIELDS, not that "a log call happened": the neighbouring
+/// counter site in this same function was once found bound by a test asserting
+/// the wrong property, so presence alone is not evidence the right record went
+/// out.
+#[test]
+fn live_flow_cache_callsite_emits_the_cached_input_filter_log_6999() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom).with_event_stream();
+    let frame = tcp_v4_ack_frame();
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        accounted_meta(&frame),
+        logging_cached_entry(true, false),
+        1,
+        StageSeed::default(),
+    );
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "control: the cached flow must be consumed by the fast path"
+    );
+
+    let events = drained_events(&fixture);
+    let event = events
+        .iter()
+        .find(|e| e.reason == FilterLogSource::Input.wire_reason())
+        .unwrap_or_else(|| {
+            panic!(
+                "no cached INPUT filter-log record reached the event stream: {events:?}. \
+                 `then log` on an input filter stops producing RT_FLOW records for \
+                 every cached packet of every permitted flow, silently (#6999)"
+            )
+        });
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::FilterLog
+    );
+    assert_eq!(
+        event.src_ip,
+        test_key().src_ip,
+        "the record must carry the PACKET's source, not a fixture default"
+    );
+    assert_eq!(event.dst_ip, test_key().dst_ip);
+    assert_eq!(event.src_port, test_key().src_port);
+    assert_eq!(event.dst_port, test_key().dst_port);
+    assert_eq!(
+        event.ingress_zone_id, TEST_TRUST_ZONE_ID,
+        "the record must carry the ingress zone the CACHED input-filter match \
+         was resolved in"
+    );
+
+    // OVER-REACH CONTROL, in this cell's own body: the entry carried NO output
+    // filter-log, so no cached-output record may appear. Without this, an
+    // emission that fired both records unconditionally would satisfy the
+    // assertion above while making the output side's own cell vacuous.
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.reason == FilterLogSource::CachedOutput.wire_reason()),
+        "a cached-OUTPUT record was emitted for an entry whose tx_selection \
+         carries no filter_log: {events:?}"
+    );
+}
+
+/// #6999: the cached OUTPUT filter-log emission, and the #3615 truthful action
+/// it carries.
+///
+/// RED on revert: delete `emit_cached_output_filter_log(..)` and no
+/// cached-output record is produced. That emission additionally carries
+/// `output_reject_reply_enqueued`, the #3615 DENY-vs-REJECT discriminator, so a
+/// regression here also makes the logged action disagree with what the
+/// dataplane actually did.
+#[test]
+fn live_flow_cache_callsite_emits_the_cached_output_filter_log_6999() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom).with_event_stream();
+    let frame = tcp_v4_ack_frame();
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        accounted_meta(&frame),
+        logging_cached_entry(false, true),
+        1,
+        StageSeed::default(),
+    );
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "control: the cached flow must be consumed by the fast path"
+    );
+
+    let events = drained_events(&fixture);
+    let event = events
+        .iter()
+        .find(|e| e.reason == FilterLogSource::CachedOutput.wire_reason())
+        .unwrap_or_else(|| {
+            panic!(
+                "no cached OUTPUT filter-log record reached the event stream: {events:?}. \
+                 `then log` on an output filter stops producing RT_FLOW records for \
+                 every cached packet, and with it the #3615 truthful reject action \
+                 (#6999)"
+            )
+        });
+    assert_eq!(
+        event.kind,
+        crate::event_stream::codec::DataplaneEventKind::FilterLog
+    );
+    assert_eq!(event.src_ip, test_key().src_ip);
+    assert_eq!(event.dst_ip, test_key().dst_ip);
+    assert_eq!(event.dst_port, test_key().dst_port);
+
+    // Same over-reach control, mirrored: this entry carries no INPUT log.
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.reason == FilterLogSource::Input.wire_reason()),
+        "an INPUT record was emitted for an entry whose descriptor carries no \
+         input_filter_log: {events:?}"
     );
 }
