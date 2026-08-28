@@ -960,6 +960,19 @@ fn waterfill_phase2_wrap_arms_epoch_boundary_and_resumes_6958() {
     };
     prime(&mut root);
 
+    // Seed the Phase-2 cursor NON-ZERO, and that is not decoration.
+    //
+    // The cursor legitimately persists across epochs — the wrap tail is its
+    // only reset, so the descending walk advances continuously (#1743 r2), and
+    // a non-zero cursor is ordinary steady state. Starting it at 0 makes the
+    // `phase2_cursor == 0` assertion below VACUOUS: a full descending cycle
+    // returns the cursor to where it began, so 0 holds whether or not the tail
+    // writes it. Measured — with the cursor seeded at 0 this cell PASSED with
+    // `root.waterfill_phase2_cursor = 0` deleted from the tail, and the
+    // mutation matrix is what exposed it. Seeded at 1, the walk arrives at the
+    // tail still holding 1, so only the write can produce 0.
+    root.waterfill_phase2_cursor = 1;
+
     // Drive until the selector actually WRAPS. The wrap is asserted as a
     // measured precondition rather than assumed from a loop count: a fixture
     // that stops one call short of the tail exercises none of this and would
