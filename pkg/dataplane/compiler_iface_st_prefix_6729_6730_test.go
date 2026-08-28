@@ -184,21 +184,48 @@ func TestNetworkdModelsCoverAnStPrefixedNIC_6730(t *testing.T) {
 // that branch and must NOT be emitted as an ordinary physical interface — the
 // xfrmi is created by pkg/routing, not by networkd.
 func TestNetworkdModelsStillSkipARealSecureTunnel_6730(t *testing.T) {
-	cfg := stCfg6729("st0", []int{0}, "st0")
+	// #6955 re-pointed this fixture from BOUND to UNBOUND, and the reason is
+	// the point of the test rather than a detail.
+	//
+	// This cell exists to prove a secure-tunnel name does not fall through to
+	// the PHYSICAL-interface handling. It used to assert that with a VPN
+	// binding the bare `st0`, no model named `st0` was emitted — but that held
+	// only because of the #6955 defect: the branch reconstructed the netdev as
+	// `st0.0`, missed the lookup, and `continue`d. It was pinning the bug. The
+	// DOTTED spelling emitted a model from this same branch even then, so
+	// "a real secure tunnel never gets a model" was never the contract.
+	//
+	// UNBOUND is the shape that tests the stated intent. No VPN binds `st0`,
+	// so pkg/routing creates no device and the secure-tunnel branch correctly
+	// emits nothing — and if the predicate ever let the name reach the
+	// physical path, a model WOULD appear and this fails. The seeded netdev
+	// below is what gives that its teeth.
+	cfg := stCfg6729("st0", []int{0}, "")
 	// Seeded for the same reason, and here it is what gives the control its
 	// teeth: with the netdev present, a predicate that wrongly let `st0` reach
 	// the physical path WOULD emit a model, so this can actually fail.
+	// BOTH candidate names are seeded. Found by the #6955 over-reach cell:
+	// with only `st0` present, a fix that fell back to `LinuxIfName(ref)` for
+	// an unbound ref resolved `st0.0`, missed the lookup, and continued — so
+	// the over-reach was masked by an unrelated lookup miss and this test
+	// stayed green. Seeding both means ANY path that emits a model finds a
+	// device, and the assertion can actually fire.
 	result := &CompileResult{ifCache: map[string]*net.Interface{
 		"st0": {
 			Index:        98,
 			Name:         "st0",
 			HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02},
 		},
+		"st0.0": {
+			Index:        99,
+			Name:         "st0.0",
+			HardwareAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x03},
+		},
 	}}
 	buildInterfaceNetworkdModels(cfg, result, map[string]bool{})
 
 	for _, m := range result.ManagedInterfaces {
-		if m.Name == "st0" {
+		if m.Name == "st0" || m.Name == "st0.0" {
 			t.Fatalf("a real secure tunnel reached the physical-interface handling and was "+
 				"emitted as a networkd model (%q) — the xfrmi is created by pkg/routing, "+
 				"and the narrowed predicate must not widen this branch's escape hatch", m.Name)

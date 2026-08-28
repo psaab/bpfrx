@@ -57,6 +57,16 @@ use crate::protocol::ZoneFloodCounterStatus;
 /// [`ZONE_COUNTER_SLOTS`]: crate::afxdp::zone_counters::ZONE_COUNTER_SLOTS
 pub(in crate::afxdp) const FLOOD_COUNTER_SLOTS: usize = 64;
 
+/// #6946: `FloodPending::touched_slots` is a `u64` bitmask, one bit per slot.
+/// Raising the slot count past 64 would make `1u64 << slot` shift out of
+/// range — a panic in debug and a silently WRONG mask in release, dropping
+/// whole zones' flood counts with no error. Asserted at compile time so the
+/// capacity cannot be raised without widening the mask. (The sibling
+/// assertion below pins FLOOD == ZONE; this one pins the mask width, and
+/// both are needed: keeping the two counts equal does not keep either
+/// within 64.)
+const _: () = assert!(FLOOD_COUNTER_SLOTS <= 64);
+
 /// Number of assignable slots (slot 0 reserved).
 pub(in crate::afxdp) const FLOOD_COUNTER_ASSIGNABLE_SLOTS: usize = FLOOD_COUNTER_SLOTS - 1;
 
@@ -329,7 +339,12 @@ impl FloodCounterStore {
     /// atomics the slot map cached at build time. LOCK-FREE — a straight
     /// `Relaxed` `fetch_add` per touched slot; it does NOT lock `self.totals`.
     fn fold_pending(&self, pending: &FloodPending, slot_map: &FloodCounterSlotMap) {
-        for slot in 1..FLOOD_COUNTER_SLOTS {
+        // #6946: walk the touched bits rather than all 64 slots. Slot 0 is
+        // the unassigned sentinel and is never recorded into.
+        let mut mask = pending.touched_slots;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let Some(totals) = &slot_map.slot_totals[slot] else {
                 continue;
             };
@@ -354,25 +369,35 @@ impl FloodCounterStore {
 /// worker thread on the drop path; folded into the shared store per RX batch.
 struct FloodPending {
     counts: [[u64; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
-    touched: bool,
+    /// #6946: one bit per touched slot, replacing a single `touched: bool`.
+    /// See the ZonePending field of the same name; the flood case matters
+    /// more because this accumulator is fed from the screen DROP path, so it
+    /// is hot on every worker at once during precisely the flood the counter
+    /// exists to measure.
+    touched_slots: u64,
 }
 
 impl Default for FloodPending {
     fn default() -> Self {
         Self {
             counts: [[0; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
-            touched: false,
+            touched_slots: 0,
         }
     }
 }
 
 impl FloodPending {
     fn reset(&mut self) {
-        if !self.touched {
-            return;
+        // #6946: clear only the slots that moved, across every kind.
+        let mut mask = self.touched_slots;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            for counts in self.counts.iter_mut() {
+                counts[slot] = 0;
+            }
         }
-        self.counts = [[0; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS];
-        self.touched = false;
+        self.touched_slots = 0;
     }
 }
 
@@ -406,7 +431,7 @@ pub(in crate::afxdp) fn record_zone_flood_drop(
         let mut p = pending.borrow_mut();
         let s = slot as usize;
         p.counts[kind][s] = p.counts[kind][s].saturating_add(1);
-        p.touched = true;
+        p.touched_slots |= 1u64 << s;
     });
 }
 
@@ -422,7 +447,7 @@ pub(in crate::afxdp) fn flush_recorded_flood_counters(
 ) {
     FLOOD_PENDING.with(|pending| {
         let mut p = pending.borrow_mut();
-        if !p.touched {
+        if p.touched_slots == 0 {
             return;
         }
         store.fold_pending(&p, slot_map);

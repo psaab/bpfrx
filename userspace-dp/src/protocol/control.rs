@@ -782,7 +782,16 @@ pub(crate) struct ProcessStatus {
         skip_serializing_if = "crate::protocol::bool_is_false"
     )]
     pub zone_counter_overflow_active: bool,
-    #[serde(rename = "zone_traffic_counters", default)]
+    // #6947: omit the block when empty, matching BOTH the Go mirror
+    // (`json:"zone_traffic_counters,omitempty"`) and the sibling scalars in
+    // this same struct, which already carry skip_serializing_if. Without
+    // it the helper puts an empty array on the shared control socket on
+    // every 1/s status poll, forever, on a firewall that never populated it.
+    #[serde(
+        rename = "zone_traffic_counters",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub zone_traffic_counters: Vec<ZoneTrafficCounterStatus>,
     /// #3651: per-zone SYN/ICMP/UDP flood-EVENT counts, summed across every
     /// worker by the helper (one `ProcessStatus`-level pre-summed sparse block,
@@ -810,7 +819,16 @@ pub(crate) struct ProcessStatus {
         skip_serializing_if = "crate::protocol::bool_is_false"
     )]
     pub flood_counter_overflow_active: bool,
-    #[serde(rename = "zone_flood_counters", default)]
+    // #6947: omit the block when empty, matching BOTH the Go mirror
+    // (`json:"zone_flood_counters,omitempty"`) and the sibling scalars in
+    // this same struct, which already carry skip_serializing_if. Without
+    // it the helper puts an empty array on the shared control socket on
+    // every 1/s status poll, forever, on a firewall that never populated it.
+    #[serde(
+        rename = "zone_flood_counters",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub zone_flood_counters: Vec<ZoneFloodCounterStatus>,
     #[serde(rename = "three_color_policer_counters", default)]
     pub three_color_policer_counters: Vec<ThreeColorPolicerStatus>,
