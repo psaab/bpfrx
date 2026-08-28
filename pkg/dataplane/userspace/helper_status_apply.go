@@ -445,8 +445,8 @@ func (m *Manager) applyRuntimeModeLocked(ctrl *userspaceCtrlValue) {
 // pre-#6429 behaviour.
 func (m *Manager) applyPrimaryBindingRowsLocked(
 	status *ProcessStatus,
-	ctrlMap *ebpf.Map,
-	bindingsMap *ebpf.Map,
+	ctrlMap ctrlMapUpdater,
+	bindingsMap ctrlMapUpdater,
 	ctrl userspaceCtrlValue,
 	deadWorkers map[uint32]bool,
 	newBindingIndices []uint32,
@@ -515,8 +515,8 @@ func (m *Manager) applyPrimaryBindingRowsLocked(
 // applyPrimaryBindingRowsLocked.
 func (m *Manager) applyAliasBindingRowsLocked(
 	status *ProcessStatus,
-	ctrlMap *ebpf.Map,
-	bindingsMap *ebpf.Map,
+	ctrlMap ctrlMapUpdater,
+	bindingsMap ctrlMapUpdater,
 	ctrl userspaceCtrlValue,
 	deadWorkers map[uint32]bool,
 	newBindingIndices []uint32,

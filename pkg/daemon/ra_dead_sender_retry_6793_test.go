@@ -261,6 +261,28 @@ func TestReassertRechecksTheGateInsideTheSemaphore6793(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 
+	// #7075: the probe seam is installed BEFORE the goroutine starts.
+	//
+	// It used to be assigned after `<-started`, while the goroutine was already
+	// inside reassertDeadRASendersOnce -> raHasDeadSenders(), which reads
+	// `d.raHasDeadSendersFn`. The `healthy` bool was correctly guarded by
+	// probeMu; the unguarded shared state was the SEAM ASSIGNMENT itself, one
+	// level up, and `go test -race ./pkg/daemon/` reported it deterministically.
+	//
+	// Installing it first costs the test nothing. The closure returns
+	// `!healthy`, and `healthy` starts false, so the gate reads exactly as it
+	// did before the flip. What the test is about — the tick re-checking the
+	// gate INSIDE the semaphore and seeing the rebuilt sender — is unchanged:
+	// the goroutine still blocks on applySem, `healthy` still flips under
+	// probeMu before the release, and the re-check still happens after it.
+	var probeMu sync.Mutex
+	healthy := false
+	d.raHasDeadSendersFn = func() bool {
+		probeMu.Lock()
+		defer probeMu.Unlock()
+		return !healthy
+	}
+
 	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -272,13 +294,6 @@ func TestReassertRechecksTheGateInsideTheSemaphore6793(t *testing.T) {
 
 	// The tick is now blocked on the semaphore (or about to be). Simulate the
 	// commit having rebuilt the sender, then let the tick through.
-	var probeMu sync.Mutex
-	healthy := false
-	d.raHasDeadSendersFn = func() bool {
-		probeMu.Lock()
-		defer probeMu.Unlock()
-		return !healthy
-	}
 	probeMu.Lock()
 	healthy = true
 	probeMu.Unlock()

@@ -268,7 +268,7 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	return true
 }
 
-func (m *Manager) failClosedUserspaceCtrlLocked(ctrlMap *ebpf.Map, ctrl userspaceCtrlValue, cause error) error {
+func (m *Manager) failClosedUserspaceCtrlLocked(ctrlMap ctrlMapUpdater, ctrl userspaceCtrlValue, cause error) error {
 	if ctrl.Enabled != 1 {
 		return cause
 	}
@@ -303,9 +303,9 @@ func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) er
 	return m.syncInterfaceNATAddressMapsLocked(snapshot)
 }
 
-type userspaceCtrlLookupHook func(*ebpf.Map, uint32, *userspaceCtrlValue) error
+type userspaceCtrlLookupHook func(ctrlMapUpdater, uint32, *userspaceCtrlValue) error
 
-func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap *ebpf.Map, key uint32, ctrl *userspaceCtrlValue) error {
+func (m *Manager) lookupUserspaceCtrlForFailClosed(ctrlMap ctrlMapUpdater, key uint32, ctrl *userspaceCtrlValue) error {
 	if m.lookupUserspaceCtrlForFailClosedHook != nil {
 		return m.lookupUserspaceCtrlForFailClosedHook(ctrlMap, key, ctrl)
 	}
@@ -348,7 +348,7 @@ func (m *Manager) failClosedUserspaceCtrlMapLocked(snapshot *ConfigSnapshot, cau
 }
 
 func (m *Manager) blindFailClosedUserspaceCtrlLocked(
-	ctrlMap *ebpf.Map,
+	ctrlMap ctrlMapUpdater,
 	snapshot *ConfigSnapshot,
 	cause error,
 	lookupErr error,
@@ -432,12 +432,48 @@ func (m *Manager) ctrlMustStayDisabledLocked(statusEnabled bool) bool {
 // path), so it must not block or allocate beyond what the steps below already
 // do. #6429 split the per-domain steps into helper_status_apply.go; the order
 // of the steps, and what each early return skips, is unchanged.
+// helperStatusMapsLocked resolves the two shim maps applyHelperStatusLocked
+// operates on, through a map-free seam (#6994).
+//
+// WHY THIS EXISTS. applyHelperStatusLocked used to open by calling
+// m.bpfShim.Map twice and returning "userspace_ctrl map not loaded" when either
+// was absent. On an unprivileged machine — which is every machine CI runs on —
+// the shim holds no maps, so EVERY test stopped on line one and the entire body
+// behind it was bound by nothing. Measured on the pre-#6994 head: deleting
+// `m.resolveCtrlEnableLocked(status, &ctrl)` outright left both
+// pkg/dataplane/userspace and pkg/daemon fully green, which is the ctrl gate —
+// #6871's link-cycle clause included — not being reached by any test at all.
+//
+// #6871 round 9 extracted ctrlMustStayDisabledLocked so the PREDICATE could be
+// tabled unprivileged, and that binding is real: dropping
+// `|| m.linkCycleInFlight()` from it reds
+// TestCtrlMustStayDisabledDuringLinkCycle_6871. What it could not bind is
+// production still CONSULTING it. That is this seam's job, and the reason a
+// predicate table is not a substitute for it.
+//
+// Nil handling matches ctrlMapForDisableLocked: a missing map returns an
+// untyped nil, never a non-nil interface wrapping a nil *ebpf.Map, so the
+// callers' `== nil` checks behave as they did when the values were pointers.
+func (m *Manager) helperStatusMapsLocked() (ctrlMapUpdater, ctrlMapUpdater) {
+	var ctrlMap, bindingsMap ctrlMapUpdater
+	if m.helperStatusCtrlMapHook != nil {
+		ctrlMap = m.helperStatusCtrlMapHook
+	} else if cm := m.bpfShim.Map(mapNameUserspaceCtrl); cm != nil {
+		ctrlMap = cm
+	}
+	if m.helperStatusBindingsMapHook != nil {
+		bindingsMap = m.helperStatusBindingsMapHook
+	} else if bm := m.bpfShim.Map(mapNameUserspaceBindings); bm != nil {
+		bindingsMap = bm
+	}
+	return ctrlMap, bindingsMap
+}
+
 func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
-	ctrlMap := m.bpfShim.Map(mapNameUserspaceCtrl)
+	ctrlMap, bindingsMap := m.helperStatusMapsLocked()
 	if ctrlMap == nil {
 		return errors.New("userspace_ctrl map not loaded")
 	}
-	bindingsMap := m.bpfShim.Map(mapNameUserspaceBindings)
 	if bindingsMap == nil {
 		return errors.New("userspace_bindings map not loaded")
 	}
@@ -492,13 +528,16 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return err
 	}
 	m.lastBindingIndices = m.clearStaleBindingRowsLocked(bindingsMap, newBindingIndices, newBindingIndexSet)
-	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
-		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
-	}
-	if err := m.syncLocalAddressMapsLocked(m.lastSnapshot); err != nil {
-		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
-	}
-	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
+	// #6994: one call through the shared classifier-sync helper instead of the
+	// three inline calls this used to make. Behaviour-identical — that helper
+	// runs the SAME three syncs in the SAME order and returns the first error,
+	// and all three inline arms wrapped that error in the identical
+	// failClosedUserspaceCtrlLocked — while bringing this path under the #7468
+	// syncClassifierMapsHook seam. Without it the ingress-iface sync errors
+	// "userspace_ingress_ifaces map not loaded" on any unprivileged machine and
+	// applyHelperStatusLocked fail-closes before ever writing the ctrl gate, so
+	// the map-free seam above would still leave the ctrl branch untestable.
+	if err := m.syncUserspaceClassifierMapsLocked(m.lastSnapshot); err != nil {
 		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
 	// Sync userspace-forwarded packet counters into BPF counter maps so
@@ -530,7 +569,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 // the XDP shim would keep steering transit to a slot no longer backed by a
 // live worker. A successful clear removes the row from the inventory (it is
 // not in newBindingIndexSet, so it is not carried forward).
-func (m *Manager) clearStaleBindingRowsLocked(bindingsMap *ebpf.Map, newBindingIndices []uint32, newBindingIndexSet map[uint32]struct{}) []uint32 {
+func (m *Manager) clearStaleBindingRowsLocked(bindingsMap ctrlMapUpdater, newBindingIndices []uint32, newBindingIndexSet map[uint32]struct{}) []uint32 {
 	var zeroBinding userspaceBindingValue
 	for _, idx := range m.lastBindingIndices {
 		if _, keep := newBindingIndexSet[idx]; keep {

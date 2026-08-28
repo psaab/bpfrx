@@ -10,9 +10,16 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// ctrlMapUpdater is the subset of *ebpf.Map used to flip the ctrl.enabled
-// gate. *ebpf.Map satisfies it directly; tests substitute a fake to inject
-// Lookup/Update/readback faults without a privileged BPF map (#5486).
+// ctrlMapUpdater is the subset of *ebpf.Map the manager uses on the
+// userspace_ctrl and userspace_bindings maps. *ebpf.Map satisfies it directly;
+// tests substitute a fake to inject Lookup/Update/readback faults without a
+// privileged BPF map (#5486).
+//
+// #6994 widened its ROLE, not its method set: `Lookup` + `Update` is already
+// everything applyHelperStatusLocked and its five helpers call on either map
+// (measured: 4 ctrlMap.Lookup, 7 ctrlMap.Update, 2 bindingsMap.Lookup,
+// 6 bindingsMap.Update across the non-test tree), so routing that chain through
+// this interface needed no new method and no behavioural change.
 type ctrlMapUpdater interface {
 	Lookup(key, valueOut interface{}) error
 	Update(key, value interface{}, flags ebpf.MapUpdateFlags) error

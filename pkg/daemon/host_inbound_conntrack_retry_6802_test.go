@@ -33,11 +33,29 @@ import (
 )
 
 // installConntrackDeleteStub replaces the delete seam and records every call.
-func installConntrackDeleteStub(t *testing.T, err error) *int {
+// It returns an ACCESSOR, not a pointer to the counter.
+//
+// #7825: it used to take a mutex around the increment and then return
+// `&calls` — a raw *int whose mutex was captured by the closure and never
+// handed out. So the write was synchronised and every READ was not, while the
+// reassert loop the test starts was still writing. `go test -race
+// ./pkg/daemon/` reported a DATA RACE between the loop's increment and the
+// test's own `*calls` read, deterministically, in two tests.
+//
+// A mutex held on one side of a publish establishes no happens-before for a
+// reader that does not take it — the same shape as #7012 (`d.mgmt` published
+// under staleCertMu on the write side only), which was fixed by making the
+// unguarded form unrepresentable rather than by guarding the four readers then
+// known.
+//
+// Returning `func() int` does that here: there is no pointer to dereference, so
+// a caller cannot read the counter without going through the lock, and a future
+// call site cannot reintroduce the bug by omission.
+func installConntrackDeleteStub(t *testing.T, err error) func() int {
 	t.Helper()
 	orig := conntrackDeleteFilters
-	calls := 0
 	var mu sync.Mutex
+	calls := 0
 	conntrackDeleteFilters = func(netlink.InetFamily, ...netlink.CustomConntrackFilter) (uint, error) {
 		mu.Lock()
 		calls++
@@ -45,7 +63,11 @@ func installConntrackDeleteStub(t *testing.T, err error) *int {
 		return 0, err
 	}
 	t.Cleanup(func() { conntrackDeleteFilters = orig })
-	return &calls
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
 }
 
 func flushReq6802() hostInboundConntrackFlushRequest {
@@ -89,10 +111,10 @@ func TestFlushReportsItsOutcome6802(t *testing.T) {
 		// Both families must still be attempted: their stale entries are
 		// independent, and abandoning v6 because v4 failed would leave half the
 		// revocation undone for a reason unrelated to v6.
-		if *calls != 2 {
+		if calls() != 2 {
 			t.Fatalf("conntrack delete attempted %d times, want 2 (one per "+
 				"address family) — a failure in one family must not abandon the "+
-				"other", *calls)
+				"other", calls())
 		}
 	})
 
@@ -145,11 +167,11 @@ func TestRetryReDrivesTheOwedRequest6802(t *testing.T) {
 		calls := installConntrackDeleteStub(t, errors.New("still failing"))
 		d := &Daemon{applySem: semaphore.NewWeighted(1)}
 		d.noteHostInboundConntrackFlush(flushReq6802(), false)
-		before := *calls
+		before := calls()
 
 		d.retryHostInboundConntrackFlushOnce(context.Background())
 
-		if *calls <= before {
+		if calls() <= before {
 			t.Fatal("the retry owner did not re-drive the owed revocation — " +
 				"no ticker under pkg/daemon re-runs the flush, so without this " +
 				"the only re-attempt is the next externally-triggered apply (#6802)")
@@ -166,9 +188,9 @@ func TestRetryReDrivesTheOwedRequest6802(t *testing.T) {
 
 		d.retryHostInboundConntrackFlushOnce(context.Background())
 
-		if *calls != 0 {
+		if calls() != 0 {
 			t.Fatalf("the retry owner dumped conntrack %d times with NO debt "+
-				"owed — the always-on loop must be free on a healthy node", *calls)
+				"owed — the always-on loop must be free on a healthy node", calls())
 		}
 	})
 
@@ -203,7 +225,7 @@ func TestRetryRechecksTheDebtInsideTheSemaphore6802(t *testing.T) {
 	if err := d.applySem.Acquire(context.Background(), 1); err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	before := *calls
+	before := calls()
 
 	started := make(chan struct{})
 	done := make(chan struct{})
@@ -219,10 +241,10 @@ func TestRetryRechecksTheDebtInsideTheSemaphore6802(t *testing.T) {
 	d.applySem.Release(1)
 	<-done
 
-	if *calls != before {
+	if calls() != before {
 		t.Fatalf("the retry dumped conntrack %d extra times after the commit it "+
 			"queued behind had already cleared the debt — re-checking INSIDE the "+
-			"semaphore is what prevents that (#6802)", *calls-before)
+			"semaphore is what prevents that (#6802)", calls()-before)
 	}
 }
 
@@ -243,7 +265,7 @@ func TestRetryLoopTicks6802(t *testing.T) {
 	go func() { d.hostInboundConntrackReassertLoop(ctx); close(loopDone) }()
 
 	deadline := time.Now().Add(5 * time.Second)
-	for *calls == 0 {
+	for calls() == 0 {
 		if time.Now().After(deadline) {
 			cancel()
 			<-loopDone

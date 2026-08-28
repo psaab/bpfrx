@@ -410,7 +410,7 @@ func TestBlindFailClosedUserspaceCtrlAfterLookupFailure(t *testing.T) {
 			}
 
 			lookupErr := errors.New("transient ctrl lookup failed")
-			m.lookupUserspaceCtrlForFailClosedHook = func(_ *ebpf.Map, _ uint32, _ *userspaceCtrlValue) error {
+			m.lookupUserspaceCtrlForFailClosedHook = func(_ ctrlMapUpdater, _ uint32, _ *userspaceCtrlValue) error {
 				return lookupErr
 			}
 
