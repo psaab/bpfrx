@@ -2270,6 +2270,29 @@ fn reserve_synced_on_first_pool_owner<'a>(
                 continue;
             }
             saw_candidate = true;
+            // #7076: a rule carrying a `pool_failure` OWNS the translated
+            // address on paper but has no allocator a packet path will ever
+            // consult — since #6812, `resolve_pool_allocators` marks a
+            // budget-refused rule `OverBudget` while deliberately leaving
+            // `pool_mode` true, the pool fully expanded, and the DEFAULT
+            // `PortAllocator` in place. Mirror the ACTIVE node, which returns
+            // `SourceNatLookup::Unavailable` for exactly this rule and fails the
+            // flow CLOSED.
+            //
+            // SKIP THE ALLOCATOR, NOT THE CANDIDACY. `saw_candidate` is already
+            // set above, and that is load-bearing: `continue`-ing BEFORE it —
+            // the one-line fix the issue proposes — turns this outcome from
+            // `Refused` into `NothingToReserve`, which pass 2 answers by falling
+            // through to `reserve_synced_interface_identity`. Measured on
+            // master: `may_publish` flips false -> true on BOTH arms, so a
+            // pool-domain address is handed to the INTERFACE domain — the
+            // two-domains-one-identity leak the pass-2 comment forbids. Blocking
+            // the import is also what master already does, so this preserves
+            // today's behaviour while removing its dependence on the shape of
+            // `impl Default for PortAllocator`.
+            if rule.pool_failure.is_some() {
+                continue;
+            }
             if rule
                 .pool_allocator
                 .reserve_address_only(flow, rewrite_src, holder)
@@ -2295,6 +2318,13 @@ fn reserve_synced_on_first_pool_owner<'a>(
             continue;
         };
         saw_candidate = true;
+        // #7076: see the address-only arm above — skip the ALLOCATOR, keep the
+        // CANDIDACY, so a quarantined owner yields `Refused` (import blocked,
+        // mirroring the active node's `Unavailable`) and never
+        // `NothingToReserve` (which would fall through to the interface domain).
+        if rule.pool_failure.is_some() {
+            continue;
+        }
         // #5178: tag the reservation deterministic iff this rule runs a
         // deterministic CGNAT (mode 1) pool, so its release uses
         // `free_no_recycle` and the standby's recycle queue does not grow under

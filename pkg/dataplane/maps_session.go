@@ -36,7 +36,10 @@ func IsKeyNotFound(err error) bool {
 // fn receives the key and value; return false to stop iteration.
 //
 // When the userspace dataplane is active, this map contains mirrored
-// sessions written by the Rust helper's publish_bpf_conntrack_entry.
+// sessions written by the Rust helper's publish_bpf_conntrack_entry —
+// since #6965 that includes ordinary TRANSIT sessions, which previously
+// had no row here at all and were therefore invisible to every caller
+// of this function.
 // The helper periodically refreshes LastSeen (~10s) so callers see
 // reasonably accurate idle times.  Session lifetime is owned by the
 // helper, not Go GC (GC.SkipSweep is set).  See #333.

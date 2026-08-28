@@ -161,10 +161,17 @@ func useCustomClassPasswdFixture(t *testing.T) {
 // live for the rest of the caller's subtest and released when it ends.
 func parkFlood(t *testing.T, base string, want int64) {
 	t.Helper()
+	// #6977: the baseline is read before this call's own request exists. It
+	// matters here more than anywhere else: parkFlood is called twice in the
+	// same case, so a bare "some request is parked" would be satisfied by the
+	// PREVIOUS call's park and this one would proceed before its own bytes were
+	// charged — and the settle assertion below would be reading a total this
+	// call had not finished contributing to.
+	parked := MutationBodyWaitersForTest()
 	conn := openDeclaredBody(t, base, "POST /api/v1/config/load",
 		int(mutationBodyLoad), strings.Repeat("a", int(want-1)), nil)
 	_ = conn
-	waitForMutationBodyWaiter(t)
+	waitForNewMutationBodyWaiter(t, parked)
 	waitForAdmittedToSettle(t, want)
 }
 

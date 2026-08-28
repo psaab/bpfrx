@@ -3682,6 +3682,189 @@ fn flood_fold_guard_does_not_accept_the_sibling_fold_6938() {
 }
 
 
+/// #6983: the zone-TRAFFIC status publication, the twin of
+/// `status_refresh_publishes_flood_counters_6938` above.
+///
+/// WHAT THE ISSUE GOT RIGHT AND WHAT IT GOT WRONG, both measured on this
+/// branch. #6983 says the worker-loop zone fold "can be severed and nothing
+/// reds". That half is FALSE at this head: deleting
+/// `crate::afxdp::zone_counters::flush_recorded_zone_counters(...)` from the
+/// loop reds `flood_fold_is_wired_into_the_worker_loop_6938`, whose adjacency
+/// assertion looks the zone fold up as its sibling and panics with "the worker
+/// loop no longer calls flush_recorded_zone_counters". So that property is
+/// already owned, incidentally, and this file does NOT add a second pin for it.
+///
+/// The PUBLICATION half is the real gap and it is exactly the shape #6938
+/// closed for flood: replacing `state.afxdp.zone_traffic_counters()` at
+/// server/helpers/status.rs with `Vec::new()` left the entire crate green
+/// (4722 passed / 0 failed). `Coordinator::zone_traffic_counters` itself is
+/// well covered (#6843 binds the accessor's slot-loss filtering), and that is
+/// precisely why the gap survived: every one of those tests calls the accessor
+/// DIRECTLY, so none of them observes `refresh_status` calling it.
+///
+/// Rides the REAL control-socket dispatcher (`handle_stream` via
+/// `run_request`), like its flood twin — `ping` is the minimal real verb,
+/// because the dispatcher's post-match block runs `refresh_status` for every
+/// non-export request.
+///
+/// RED on revert: replace that line with `Vec::new()` (or delete it) and this
+/// fails while the request still succeeds and every other test stays green,
+/// which is exactly how the gap survived.
+#[test]
+fn status_refresh_publishes_zone_traffic_counters_6983() {
+    const Z: u16 = 50675; // config::StableZoneID("trust")
+    const BYTES: u64 = 1500;
+
+    let state = new_state(ProcessStatus::default());
+    {
+        let mut guard = state.lock().expect("state");
+        guard.afxdp.seed_zone_traffic_counter_for_test(Z, "trust", BYTES);
+        // Precondition: the wire status starts EMPTY, so a pass cannot be
+        // explained by the fixture having pre-populated it.
+        assert!(
+            guard.status.zone_traffic_counters.is_empty(),
+            "fixture invalid: status already carried zone-traffic rows before any refresh"
+        );
+    }
+
+    let response = run_request(state.clone(), req("ping"));
+    assert!(response.ok, "ping failed: {}", response.error);
+
+    // Assert on the WIRE payload the daemon actually returns: the attach is the
+    // half an operator sees.
+    let wire = response
+        .status
+        .expect("dispatcher attached no status to the reply");
+    let row = wire
+        .zone_traffic_counters
+        .iter()
+        .find(|r| r.zone_id == Z)
+        .unwrap_or_else(|| {
+            panic!(
+                "the reply's status carries no zone-traffic row for zone {Z}: {:?}. \
+                 refresh_status is not publishing the coordinator's rows, so every \
+                 per-zone byte and packet an operator reads is zero while forwarding \
+                 is perfectly healthy (#6983)",
+                wire.zone_traffic_counters
+            )
+        });
+
+    // The VALUE, not merely the row's presence. A publication that attached an
+    // empty-but-present row, or the wrong zone's totals, would satisfy an
+    // existence check — and existence standing in for content is the failure
+    // this whole family of issues is about.
+    assert!(
+        row.ingress_bytes >= BYTES,
+        "zone {Z} publishes {} ingress bytes, expected at least the {BYTES} the \
+         fixture recorded: the row reaches the wire but its totals do not (#6983)",
+        row.ingress_bytes
+    );
+}
+
+/// #6971: the two per-publish-tick counter refreshes in `worker_loop`.
+///
+/// Measured on this branch's mutation matrix: deleting EITHER line left the
+/// whole userspace-dp suite at 4850 collected / 0 failed. The callee arithmetic
+/// is now covered on both sides (`afxdp/worker/mod.rs` tests, one of which this
+/// branch adds), but a bound callee says nothing about production still calling
+/// it — which is the entire defect class here.
+///
+/// STRUCTURAL for the #6938 reason, unchanged: nothing drives `worker_loop`.
+///
+/// THE TICK ADJACENCY IS PART OF THE CLAIM, not decoration. Both refreshes must
+/// sit INSIDE the `WR_PUBLISH_INTERVAL_NS` block. Above it they would run every
+/// loop iteration — a per-packet-batch sum over every binding on the hot path,
+/// which is what the ~1 s cadence exists to avoid; in the per-RX-batch section
+/// ~32 KB further down they would leave the publish tick reading stale values.
+/// So the pin asserts position relative to the tick guard, not mere presence.
+#[test]
+fn worker_loop_refreshes_publish_tick_counters_6971() {
+    let src = include_str!("../afxdp/worker/loop_body/mod.rs");
+    let tick = "if loop_now_ns.saturating_sub(wr_last_publish_ns) >= WR_PUBLISH_INTERVAL_NS {";
+    let cos = "refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);";
+    let newflow = "refresh_worker_new_flow_install_counters(&mut wr_counters, &bindings);";
+
+    let tick_at = src.find(tick).unwrap_or_else(|| {
+        panic!(
+            "the worker loop's publish-tick guard is gone — this guard's position \
+             claim is anchored to a line that no longer exists (#6971)"
+        )
+    });
+    for (needle, what, why) in [
+        (
+            cos,
+            "refresh_worker_cos_queue_lease_runtime_counters",
+            "the #1782 CoS lease / wheel-catch-up / under-grant counters stay at \
+             zero on the wire for every worker, so the per-cause under-grant \
+             attribution an operator uses to tell a shaping ceiling from a \
+             misconfiguration reports nothing at all",
+        ),
+        (
+            newflow,
+            "refresh_worker_new_flow_install_counters",
+            "the per-worker `new_flow_installs` wire field pins at 0, and BOTH \
+             #4800 cross-worker analyzer gates key on that series — \
+             `active_workers < 3` and `max_worker_share > 0.60` — so the ceiling \
+             analyzer silently stops discriminating and reports a ceiling with a \
+             dead distribution input",
+        ),
+    ] {
+        let at = src.find(needle).unwrap_or_else(|| {
+            panic!("the worker loop does not call {what}: {why} (#6971)")
+        });
+        assert!(
+            at > tick_at,
+            "{what} is called BEFORE the publish-tick guard (offset {at} vs \
+             {tick_at}), so it runs on every loop iteration instead of once per \
+             ~1 s tick — a per-binding sum moved onto the hot path (#6971)"
+        );
+        assert!(
+            at - tick_at < 2500,
+            "{what} is {} bytes past the publish-tick guard, far enough that it \
+             is no longer inside that block — it would then run at a different \
+             cadence than the counters published alongside it (#6971)",
+            at - tick_at
+        );
+    }
+}
+
+/// OVER-REACH CONTROL for `worker_loop_refreshes_publish_tick_counters_6971`.
+///
+/// Own body, same reason as the two controls above.
+///
+/// The plausible widening here is a shared prefix: both refreshes begin
+/// `refresh_worker_`, and they sit eleven lines apart, so a needle trimmed to
+/// that prefix would match the SIBLING and report a deleted refresh as wired.
+/// This runs each of the binder's two needles against a body containing only
+/// the other, and requires no match — then the converse, so the control cannot
+/// pass by matching nothing ever.
+#[test]
+fn publish_tick_refresh_guard_does_not_accept_its_sibling_6971() {
+    const COS_ONLY: &str =
+        "refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);";
+    const NEWFLOW_ONLY: &str =
+        "refresh_worker_new_flow_install_counters(&mut wr_counters, &bindings);";
+
+    assert!(
+        COS_ONLY.find(NEWFLOW_ONLY).is_none(),
+        "the new-flow needle matches a body containing ONLY the CoS refresh, so \
+         the binder would report the new-flow refresh as wired after that line \
+         was deleted (#6971)"
+    );
+    assert!(
+        NEWFLOW_ONLY.find(COS_ONLY).is_none(),
+        "the CoS needle matches a body containing ONLY the new-flow refresh, so \
+         the binder would report the CoS refresh as wired after that line was \
+         deleted (#6971)"
+    );
+    assert!(
+        COS_ONLY.find(COS_ONLY).is_some() && NEWFLOW_ONLY.find(NEWFLOW_ONLY).is_some(),
+        "a needle does not match even a body that plainly contains it — the \
+         binder is searching for something unreachable and would pass nothing, \
+         ever"
+    );
+}
+
 /// #5189 (A1-b8-F5): the ~1 s report tick must not build its diagnostics
 /// string in a RELEASE build.
 ///

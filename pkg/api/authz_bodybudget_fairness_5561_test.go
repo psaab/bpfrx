@@ -404,8 +404,9 @@ func TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561(t *testing.T) {
 		// The waiter edge below is a process-global count, so no request from
 		// another case may still be parked in the drain.
 		waitForGateQuiescent(t)
+		parked := MutationBodyWaitersForTest() // #6977: baseline before the park
 		conn := openDeclaredBody(t, base, "POST /api/v1/diagnostics/ping", int(mutationBodySmall), "{", nil)
-		waitForMutationBodyWaiter(t)
+		waitForNewMutationBodyWaiter(t, parked)
 		// Abort: the gate's read fails and the handler never runs. The close IS
 		// the abort under test; its error is not asserted, because a failed
 		// close on a client-side test socket binds nothing in production — the

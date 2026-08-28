@@ -475,8 +475,9 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	select {
 	case peerLookupSlots <- struct{}{}:
 		go func() {
-			defer func() { <-peerLookupSlots }()
+			// #6977: ORDER IS THE INVARIANT (defers are LIFO) — pkg/api/README.md.
 			defer close(p.done)
+			defer func() { <-peerLookupSlots }()
 			p.id = s.lookupPeer(client, server)
 		}()
 	default:
