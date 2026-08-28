@@ -1027,6 +1027,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceWorkerCommandQueueDrops: prometheus.NewDesc(
+			"xpf_userspace_worker_command_queue_drops_total",
+			"worker command-queue capacity drops",
+			nil,
+			nil,
+		),
 		userspaceSharedSessionPoisonRecoveries: prometheus.NewDesc(
 			"xpf_userspace_shared_session_poison_recoveries_total",
 			"shared-session poison recoveries",
@@ -1152,6 +1158,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
 		WorkerCommandQueuePoisonRecoveries: 2,
+		// #6929: per-worker command-queue capacity drops, emitted
+		// unconditionally. Deliberately a DIFFERENT value from the poison
+		// counter above so a collector that wired one Desc to the other
+		// field fails here instead of matching by coincidence.
+		WorkerCommandQueueDrops: 9,
 		// #2402/#6641: shared-session poison-recovery counter emitted
 		// unconditionally.
 		SharedSessionPoisonRecoveries: 5,
@@ -1263,9 +1274,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// plus the #6751 PR 2/3 interface-mode SNAT identity registry trio
 	// (PAT collisions + identity exhaustion + sync-import identity-conflict
 	// drops + registry-cap exhaustion) = 44, plus the #6842
-	// gre_decap_unsupported_version_refusals_total counter = 45.
-	if len(got) != 45 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 45 metrics, got %d", len(got))
+	// gre_decap_unsupported_version_refusals_total counter = 45, plus the
+	// #6929 worker_command_queue_drops_total counter = 46.
+	if len(got) != 46 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 46 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1312,6 +1324,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceWorkerCommandQueuePoisonRecoveries, nil, 2)
+	// #6929: per-worker command-queue capacity drops emitted
+	// unconditionally — 0 is the EXPECTED value here (the consumer cannot be
+	// outrun), so an absent series would be indistinguishable from a helper
+	// that never reports one.
+	assertCounterClose(t, got, c.userspaceWorkerCommandQueueDrops, nil, 9)
 	// #2402/#6641: shared-session poison-recovery counter emitted
 	// unconditionally, so a 0 is a real "no worker panic touched HA session
 	// state" signal rather than an absent series.

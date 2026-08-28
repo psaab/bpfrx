@@ -969,6 +969,7 @@
     "three_color_policer_counters": [],
     "time_exceeded_rate_limited_total": 0,
     "wg_decap_ecn_illegal_drops_total": 0,
+    "worker_command_queue_drops": 0,
     "worker_command_queue_poison_recoveries": 0,
     "worker_heartbeats": [],
     "worker_runtime": [],
