@@ -103,6 +103,29 @@ func TestSlowReceiverAdmitsARestartedPeerWithoutRaising_6969(t *testing.T) {
 		t.Fatalf("epochRaiseDeclinedAheadOfClock = %d, want 1 — the decline must stay visible "+
 			"to an operator, or a clock fault becomes silent", got)
 	}
+	// THE THIRD WITHHOLDING, and the one that was found by the tests rather than
+	// reasoned out first. Admission normally sets epochSeen, which is the
+	// downgrade latch: after it, the peer's EPOCHLESS frames are refused. An
+	// epoch this node cannot judge against its own clock is not evidence that
+	// the peer signs epochs, and arming on it would let one captured far-future
+	// frame lock out a peer that has genuinely been rolled back to a pre-#6169
+	// build. The latch here was armed by incarnation A, legitimately; what must
+	// not happen is a DECLINED frame arming it on its own.
+	fresh := &heartbeatAuthState{}
+	if ok, _ := admitAt6969(t, fresh, receiverNow, epochA, 0xA1, 1); !ok {
+		t.Fatal("fixture: the second state did not latch incarnation A")
+	}
+	fresh.epochSeen = false // isolate: only the declined frame may re-arm it
+	if ok, _ := admitAt6969(t, fresh, receiverNow, epochB, 0xB1, 1); !ok {
+		t.Fatal("fixture: the declined frame was not admitted, so the latch assertion below " +
+			"would pass by never running the path")
+	}
+	if fresh.epochSeen {
+		t.Fatal("a frame whose epoch this node cannot verify ARMED the downgrade latch. " +
+			"After that the peer's epochless frames are refused, so one captured far-future " +
+			"frame locks out a genuinely rolled-back peer — the lockout the latch guards " +
+			"exist to prevent (#6969 F5)")
+	}
 }
 
 // TestDeclinedRaiseStillSpendsTheSessionBudget_6969 is the security half that
