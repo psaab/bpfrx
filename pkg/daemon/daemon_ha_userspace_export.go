@@ -65,12 +65,15 @@ func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(
 //
 // This is the table-truth counterpart to cluster.SessionSync.BulkSync's walk of
 // the `sessions`/`sessions_v6` BPF conntrack maps. Those maps are a best-effort
-// DISPLAY mirror: the Rust helper publishes a conntrack row only on the
-// host-inbound install, the missing-neighbor seed, and the reverse-companion
-// repair. The ordinary TRANSIT forward install — "the single place a locally
+// DISPLAY mirror. Until #6965 the Rust helper published a conntrack row only on
+// the host-inbound install, the missing-neighbor seed, and the reverse-companion
+// repair, and the ordinary TRANSIT forward install — "the single place a locally
 // learned transit forward flow is installed", userspace-dp
-// afxdp/poll_descriptor — writes only the shim steering map and the shared
-// session tables, so a transit session is STRUCTURALLY absent from that walk.
+// afxdp/poll_descriptor — wrote only the shim steering map and the shared
+// session tables, so a transit session was STRUCTURALLY absent from that walk.
+// #6965 added the transit publish; the mirror is nonetheless a best-effort copy
+// of a table the helper OWNS, so it is not table-truth however complete it is,
+// and this export stays the authoritative source.
 // Since #5085 the receiver reconciles authoritatively against the delimited
 // window and DELETES every eligible session missing from it, so a mirror-framed
 // cold prime wipes exactly the live peer-owned transit sessions the standby

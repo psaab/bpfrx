@@ -42,15 +42,15 @@ pub(crate) struct SessionMetadata {
     /// `clear ... interface <name>` tore down sibling-interface sessions —
     /// see `session/README.md` "Which surfaces this applies to".
     ///
-    /// SCOPE (#6965): "for the sessions that are mirrored" is load-bearing.
-    /// `publish_bpf_conntrack_entry` is called from only three sites in
-    /// `afxdp/poll_descriptor` — the host-inbound (LocalMiss) install, the
-    /// missing-neighbor-seed install, and the reverse-companion repair. The
-    /// ordinary TRANSIT forward install does NOT publish there (it writes the
-    /// shim's separate steering table via `publish_live_session_entry`), so a
-    /// transit session has no conntrack row at all and this stamp, though
-    /// correct on the in-memory entry, is not operator-visible for it. The gap
-    /// predates #4983 and is tracked as #6965.
+    /// SCOPE (#6965, CLOSED): `publish_bpf_conntrack_entry` is called from four
+    /// sites in `afxdp/poll_descriptor` — the TRANSIT forward install, the
+    /// host-inbound (LocalMiss) install, the missing-neighbor-seed install, and
+    /// the reverse-companion repair. The transit site is #6965; before it,
+    /// "for the sessions that are mirrored" excluded the dominant population
+    /// outright — a transit session had no conntrack row at all, so this stamp,
+    /// though correct on the in-memory entry, was not operator-visible for it.
+    /// The gap predated #4983. What reaches the mirror is the {parent ifindex,
+    /// VLAN} PAIR stamped below, resolved to a unit on the Go side.
     ///
     /// `0` means "no ingress identity carried" and is NEVER a valid ifindex.
     /// These populations legitimately carry `0`:

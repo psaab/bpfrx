@@ -37,17 +37,23 @@
 //   - the MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`);
 //   - and the REVERSE companion, whose 0 is asserted as an over-reach guard.
 //
-// SCOPE, stated plainly because it is easy to over-read: these tests bind what
-// the poll body STAMPS onto the installed session. They do not, and cannot,
-// assert that a TRANSIT session's identity reaches the operator-visible BPF
-// conntrack map — the transit install does not publish there at all (it calls
-// `publish_live_session_entry`, which writes shim steering KEYS into a
-// different map, plus `publish_shared_session`). Only the LocalMiss and
-// missing-neighbor-seed installs call `publish_bpf_conntrack_entry`, and their
-// tests below DO drive that call. The transit gap predates #4983 — it dates to
-// `fab9230c5`, the commit that first added the conntrack mirror and wired only
-// those sites — and is tracked as #6965. Read these tests as "the stamp is
-// correct", not "the operator can see it for every session".
+// SCOPE. The #4983 tests here bind what the poll body STAMPS onto the installed
+// session. Whether that stamp reaches the operator-visible BPF conntrack map is
+// a SEPARATE property, and it used to be one this file could not assert for a
+// transit flow: the transit install did not publish to the mirror at all (it
+// called only `publish_live_session_entry`, which writes shim steering KEYS
+// into a different map, plus `publish_shared_session`), so there was no call to
+// omit. That gap predated #4983 — it dated to `fab9230c5`, the commit that
+// first added the conntrack mirror and wired only the LocalMiss,
+// missing-neighbor-seed and reverse-companion sites — and it was #6965.
+//
+// #6965 is closed, and the `*_6965` tests below bind the second property for
+// the transit population: the install PUBLISHES a mirror row, it is the
+// FORWARD one only, and it carries the {parent ifindex, VLAN} pair, the zones
+// and the stable session id. They assert the publish call's ARGUMENTS rather
+// than a count, because a count of 1 is also what a publish of the WRONG row
+// produces. Read the two families together as "the stamp is correct" AND "the
+// operator can see it".
 //
 // Sibling `#[path]` test module loaded from afxdp/mod.rs, mirroring the #4840
 // split; helpers come from afxdp/tests_support.rs.

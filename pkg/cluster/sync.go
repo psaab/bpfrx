@@ -684,10 +684,14 @@ type SessionSync struct {
 	//
 	// BulkSync's ForEachV4/V6 walk reads the `sessions`/`sessions_v6` BPF
 	// conntrack maps, which under the userspace dataplane are a best-effort
-	// DISPLAY mirror, not the authoritative session set: the Rust helper's
-	// transit forward install publishes only the shim steering map and its
-	// shared session tables, never publish_bpf_conntrack_entry, so a TRANSIT
-	// session is structurally absent from that walk. Since #5085 made the
+	// DISPLAY mirror, not the authoritative session set. Until #6965 the Rust
+	// helper's transit forward install published only the shim steering map and
+	// its shared session tables, never publish_bpf_conntrack_entry, so a TRANSIT
+	// session was structurally absent from that walk; it is published now, but
+	// the mirror is still a best-effort copy of a table the helper OWNS — a
+	// publish that fails under map pressure is counted, not retried — so this
+	// source stays non-authoritative however complete it becomes. Since #5085
+	// made the
 	// receiver reconcile authoritatively against the delimited window, framing
 	// it from the mirror DELETES exactly the live peer-owned transit sessions
 	// the standby needs at failover. A table-truth source closes that.
