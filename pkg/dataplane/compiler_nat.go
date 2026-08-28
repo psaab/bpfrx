@@ -270,7 +270,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 
 		for _, rule := range rs.Rules {
 			if !rule.Then.Interface && rule.Then.PoolName == "" && !rule.Then.Off {
-				slog.Warn("SNAT rule has no action",
+				compileWarn(dp, "SNAT rule has no action",
 					"rule", rule.Name, "rule-set", rs.Name)
 				continue
 			}
@@ -304,14 +304,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								rs.Name, rule.Name, dstAddr, err)
 						}
 
-						if !isValidationPass(dp) {
-							slog.Info("source NAT off rule compiled",
-								"rule-set", rs.Name, "rule", rule.Name,
-								"from", rs.FromZone, "to", rs.ToZone,
-								"counter_id", counterID,
-								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-								"src_addr", srcAddr, "dst_addr", dstAddr)
-						}
+						compileInfo(dp, "source NAT off rule compiled",
+							"rule-set", rs.Name, "rule", rule.Name,
+							"from", rs.FromZone, "to", rs.ToZone,
+							"counter_id", counterID,
+							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+							"src_addr", srcAddr, "dst_addr", dstAddr)
 					}
 				}
 				continue
@@ -326,7 +324,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				// a pool ID, so the resolution stays load-bearing.
 				toZoneCfg, ok := cfg.Security.Zones[rs.ToZone]
 				if !ok || len(toZoneCfg.Interfaces) == 0 {
-					slog.Warn("to-zone has no interfaces",
+					compileWarn(dp, "to-zone has no interfaces",
 						"zone", rs.ToZone, "rule-set", rs.Name)
 					continue
 				}
@@ -387,18 +385,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					if unitV6 != nil {
 						v6IPs = append(v6IPs, unitV6)
 					}
-					if !isValidationPass(dp) {
-						slog.Info("SNAT egress IP resolved",
-							"interface", ifaceRef, "ifindex", physIface.Index,
-							"vlan", vlanID, "v4", unitV4, "v6", unitV6)
-					}
+					compileInfo(dp, "SNAT egress IP resolved",
+						"interface", ifaceRef, "ifindex", physIface.Index,
+						"vlan", vlanID, "v4", unitV4, "v6", unitV6)
 				}
 
 				if len(v4IPs) == 0 && len(v6IPs) == 0 {
-					if !isValidationPass(dp) {
-						slog.Warn("no IP addresses for interface SNAT",
-							"zone", rs.ToZone)
-					}
+					compileWarn(dp, "no IP addresses for interface SNAT",
+						"zone", rs.ToZone)
 					continue
 				}
 
@@ -442,7 +436,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 						ip, _, err := net.ParseCIDR(cidr)
 						if err != nil {
-							slog.Warn("invalid pool address", "addr", addr, "err", err)
+							compileWarn(dp, "invalid pool address", "addr", addr, "err", err)
 							continue
 						}
 						if ip.To4() != nil {
@@ -480,12 +474,10 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 									pnat.RegisterNATIP(addr, pool.Name)
 								}
 							}
-							if !isValidationPass(dp) {
-								slog.Info("persistent NAT pool registered",
-									"pool", pool.Name,
-									"timeout", timeout,
-									"permit", string(pool.PersistentNAT.Permit))
-							}
+							compileInfo(dp, "persistent NAT pool registered",
+								"pool", pool.Name,
+								"timeout", timeout,
+								"permit", string(pool.PersistentNAT.Permit))
 						}
 					}
 
@@ -520,15 +512,13 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							rs.Name, rule.Name, dstAddr, err)
 					}
 
-					if !isValidationPass(dp) {
-						slog.Info("source NAT rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"pool_id", curPoolID,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
-					}
+					compileInfo(dp, "source NAT rule compiled",
+						"rule-set", rs.Name, "rule", rule.Name,
+						"from", rs.FromZone, "to", rs.ToZone,
+						"pool_id", curPoolID,
+						"counter_id", counterID,
+						"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+						"src_addr", srcAddr, "dst_addr", dstAddr)
 				}
 			}
 		}
@@ -562,7 +552,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				// Validate source-address-name if present (config compatibility)
 				if rule.Match.SourceAddressName != "" {
 					if _, ok := result.AddrIDs[rule.Match.SourceAddressName]; !ok {
-						slog.Warn("DNAT source-address-name not found in address-book",
+						compileWarn(dp, "DNAT source-address-name not found in address-book",
 							"rule", rule.Name, "name", rule.Match.SourceAddressName)
 					}
 				}
@@ -570,14 +560,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				// #3229: validate destination-address-name (config compat)
 				if rule.Match.DestinationAddressName != "" {
 					if _, ok := result.AddrIDs[rule.Match.DestinationAddressName]; !ok {
-						slog.Warn("DNAT destination-address-name not found in address-book",
+						compileWarn(dp, "DNAT destination-address-name not found in address-book",
 							"rule", rule.Name, "name", rule.Match.DestinationAddressName)
 					}
 				}
 
 				// Parse match destination address
 				if rule.Match.DestinationAddress == "" {
-					slog.Warn("DNAT rule has no match destination-address",
+					compileWarn(dp, "DNAT rule has no match destination-address",
 						"rule", rule.Name)
 					continue
 				}
@@ -587,7 +577,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					// Try as plain IP
 					matchIP = net.ParseIP(rule.Match.DestinationAddress)
 					if matchIP == nil {
-						slog.Warn("invalid DNAT match address",
+						compileWarn(dp, "invalid DNAT match address",
 							"addr", rule.Match.DestinationAddress)
 						continue
 					}
@@ -605,7 +595,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				if err != nil {
 					poolIP = net.ParseIP(pool.Address)
 					if poolIP == nil {
-						slog.Warn("invalid DNAT pool address",
+						compileWarn(dp, "invalid DNAT pool address",
 							"addr", pool.Address)
 						continue
 					}
@@ -629,29 +619,27 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							// Expand application-set to individual terms
 							expanded, eerr := config.ExpandApplicationSet(rule.Match.Application, &cfg.Applications)
 							if eerr != nil {
-								slog.Warn("DNAT expand application-set failed",
+								compileWarn(dp, "DNAT expand application-set failed",
 									"rule", rule.Name, "application", rule.Match.Application, "err", eerr)
 							} else {
 								for _, termName := range expanded {
 									if _, ok := config.ResolveApplication(termName, userApps); !ok {
-										slog.Warn("DNAT application-set term not found",
+										compileWarn(dp, "DNAT application-set term not found",
 											"rule", rule.Name, "term", termName)
 									}
 								}
 							}
 						} else {
-							slog.Warn("DNAT application not found, ignoring",
+							compileWarn(dp, "DNAT application not found, ignoring",
 								"rule", rule.Name, "application", rule.Match.Application)
 						}
 					}
 				}
 
-				if !isValidationPass(dp) {
-					slog.Info("destination NAT rule compiled",
-						"rule-set", rs.Name, "rule", rule.Name,
-						"match_ip", matchIP,
-						"pool", pool.Name, "pool_ip", poolIP)
-				}
+				compileInfo(dp, "destination NAT rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"match_ip", matchIP,
+					"pool", pool.Name, "pool_ip", poolIP)
 			}
 		}
 	}
@@ -681,7 +669,7 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 				continue // handled by compileNPTv6
 			}
 			if rule.Match == "" || rule.Then == "" {
-				slog.Warn("static NAT rule missing match or then",
+				compileWarn(dp, "static NAT rule missing match or then",
 					"rule-set", rs.Name, "rule", rule.Name)
 				continue
 			}
@@ -697,7 +685,7 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			}
 			extIP, _, err := net.ParseCIDR(matchCIDR)
 			if err != nil {
-				slog.Warn("invalid static NAT match address",
+				compileWarn(dp, "invalid static NAT match address",
 					"addr", rule.Match, "err", err)
 				continue
 			}
@@ -713,7 +701,7 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			}
 			intIP, _, err := net.ParseCIDR(thenCIDR)
 			if err != nil {
-				slog.Warn("invalid static NAT then address",
+				compileWarn(dp, "invalid static NAT then address",
 					"addr", rule.Then, "err", err)
 				continue
 			}
@@ -732,16 +720,14 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			_ = assignNATCounterID(result, NATCounterTypeStatic, rs.Name, rule.Name)
 
 			count++
-			if !isValidationPass(dp) {
-				slog.Info("static NAT rule compiled",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"external", rule.Match, "internal", rule.Then)
-			}
+			compileInfo(dp, "static NAT rule compiled",
+				"rule-set", rs.Name, "rule", rule.Name,
+				"external", rule.Match, "internal", rule.Then)
 		}
 	}
 
-	if count > 0 && !isValidationPass(dp) {
-		slog.Info("static NAT compilation complete", "entries", count)
+	if count > 0 {
+		compileInfo(dp, "static NAT compilation complete", "entries", count)
 	}
 
 	return nil
@@ -823,7 +809,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			helperInstalls := nptv6HelperWouldInstall(rule.Match, rule.Then)
 			reject := func(reason string, attrs ...any) error {
 				if !installed || helperInstalls {
-					slog.Warn("nptv6: "+reason, attrs...)
+					compileWarn(dp, "nptv6: "+reason, attrs...)
 					return nil
 				}
 				return fmt.Errorf("rule-set %q rule %q: %s (match %q, nptv6-prefix %q); "+
@@ -907,17 +893,15 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			// retired map surface is removed.
 
 			count++
-			if !isValidationPass(dp) {
-				slog.Info("nptv6 rule compiled",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"external", rule.Match, "internal", rule.Then,
-					"prefix_len", extOnes)
-			}
+			compileInfo(dp, "nptv6 rule compiled",
+				"rule-set", rs.Name, "rule", rule.Name,
+				"external", rule.Match, "internal", rule.Then,
+				"prefix_len", extOnes)
 		}
 	}
 
-	if count > 0 && !isValidationPass(dp) {
-		slog.Info("nptv6 compilation complete", "rules", count)
+	if count > 0 {
+		compileInfo(dp, "nptv6 compilation complete", "rules", count)
 	}
 
 	return nil
@@ -943,7 +927,7 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	count := uint32(0)
 	for _, rs := range ruleSets {
 		if count >= 4 { // MAX_NAT64_PREFIXES
-			slog.Warn("max NAT64 prefixes exceeded, skipping", "rule-set", rs.Name)
+			compileWarn(dp, "max NAT64 prefixes exceeded, skipping", "rule-set", rs.Name)
 			break
 		}
 
@@ -1001,22 +985,16 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				return fmt.Errorf("NAT64 rule-set %q: source pool %q has no valid addresses",
 					rs.Name, pool.Name)
 			}
-			if !isValidationPass(dp) {
-				slog.Info("auto-assigned NAT64 source pool",
-					"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
-			}
+			compileInfo(dp, "auto-assigned NAT64 source pool",
+				"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
 		}
 
-		if !isValidationPass(dp) {
-			slog.Info("compiled NAT64 prefix",
-				"rule-set", rs.Name, "prefix", rs.Prefix,
-				"pool", rs.SourcePool, "pool_id", poolID)
-		}
+		compileInfo(dp, "compiled NAT64 prefix",
+			"rule-set", rs.Name, "prefix", rs.Prefix,
+			"pool", rs.SourcePool, "pool_id", poolID)
 		count++
 	}
 
-	if !isValidationPass(dp) {
-		slog.Info("NAT64 compilation complete", "prefixes", count)
-	}
+	compileInfo(dp, "NAT64 compilation complete", "prefixes", count)
 	return nil
 }

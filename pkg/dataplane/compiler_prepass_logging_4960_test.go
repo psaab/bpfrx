@@ -416,6 +416,54 @@ func TestOverReachArmCoversEveryReachableGate_4960(t *testing.T) {
 			"warnLogLines assertion in TestRealPassStillLogsItsSuccesses_4960",
 	}
 
+	// #6903 routed 20 previously-UNGATED covered-phase records through the
+	// compileInfo / compileWarn choke point. Each one is a new gate, and a gate
+	// this arm does not name can be widened to suppress both passes silently —
+	// which is the whole failure mode the test exists for. These are bound by
+	// TestValidationPassRecordCensus6903, whose fixture drives the malformed-
+	// input branches this file's valid-config fixture never reaches, and whose
+	// SET assertion reds if any of them stops being emitted on the REAL pass.
+	boundByCensus6903 := map[string]string{
+		"compiler.go:bad port for application":                       "app-badport",
+		"compiler.go:bad source-port for application":                "app-badsrcport",
+		"compiler_nat.go:to-zone has no interfaces":                  "rule-set rs2 -> zone dmz",
+		"compiler_nat.go:SNAT rule has no action":                    "rule r-noaction",
+		"compiler_nat.go:invalid pool address":                       "pool p2",
+		"compiler_nat.go:invalid static NAT match address":           "rule s-badmatch",
+		"compiler_nat.go:invalid static NAT then address":            "rule s-badthen",
+		"compiler_nat.go:static NAT rule missing match or then":      "rule s-missing",
+		"compiler_nat.go:invalid DNAT match address":                 "rule d-badmatch",
+		"compiler_nat.go:invalid DNAT pool address":                  "pool dp2",
+		"compiler_nat.go:DNAT rule has no match destination-address": "rule d-nomatch",
+		"compiler_nat.go:DNAT source-address-name not found":         "rule d-badnames",
+		"compiler_nat.go:DNAT destination-address-name not found":    "rule d-badnames",
+	}
+
+	// The residue: converted sites NEITHER fixture drives to the real pass, so
+	// widening one of these would not red anywhere. Recorded as a numbered gap
+	// rather than left out of the arithmetic — a NEW gate still reds the count
+	// below until someone deliberately files it here.
+	unboundGap6903 := map[string]string{
+		"compiler_nat.go:DNAT application not found, ignoring": "unreachable through " +
+			"a full compile: `validate applications` rejects an unresolvable DNAT " +
+			"rule application FATALLY before compileNAT runs, so this warn is dead " +
+			"on the CompileConfig path (measured — the census fixture failed to " +
+			"compile with `application \"no-such-app\" not found`)",
+		"compiler_nat.go:DNAT expand application-set failed": "needs a malformed " +
+			"application-SET; neither fixture defines one",
+		"compiler_nat.go:DNAT application-set term not found": "needs an " +
+			"application-set with a dangling term; neither fixture defines one",
+		"compiler.go:app_ranges full, falling back to HASH expansion": "needs " +
+			"MaxAppRanges large port ranges to overflow the array — a fixture cost " +
+			"out of proportion to one record",
+		"compiler_nat.go:max NAT64 prefixes exceeded, skipping": "needs more than " +
+			"the NAT64 prefix maximum; neither fixture configures NAT64",
+		"compiler_nat.go:nptv6: <reason>": "the message is BUILT at the call site " +
+			"(`\"nptv6: \"+reason`), so it cannot be a static want at all; the " +
+			"census keys on the rendered record and would see it only with an " +
+			"NPTv6 fixture",
+	}
+
 	sites := countValidationPassGates(t)
 	// FLOOR: a scan finding nothing would make the reconciliation vacuous.
 	if sites < 15 {
@@ -423,16 +471,22 @@ func TestOverReachArmCoversEveryReachableGate_4960(t *testing.T) {
 			"sources — the scan is not reaching them, so this test cannot bind "+
 			"the over-reach arm's completeness", sites)
 	}
-	if want := len(gatedRecordWants) + len(unbindable); sites != want {
-		t.Errorf("production carries %d `!isValidationPass(dp)` gate sites, but the "+
-			"over-reach arm accounts for %d (%d entries in gatedRecordWants + %d "+
-			"recorded as separately bound).\n\n"+
+	if want := len(gatedRecordWants) + len(unbindable) +
+		len(boundByCensus6903) + len(unboundGap6903); sites != want {
+		t.Errorf("production carries %d covered-phase gate sites (`isValidationPass` "+
+			"plus the #6903 compileInfo/compileWarn choke point), but the over-reach "+
+			"arm accounts for %d (%d gatedRecordWants + %d unbindable + %d "+
+			"boundByCensus6903 + %d unboundGap6903).\n\n"+
 			"A gate the over-reach arm does not name can be widened to suppress the "+
 			"record on the REAL pass too, and the whole package stays green — the "+
 			"operator loses a record and nothing notices (#6894 r9 F2). Add a want "+
 			"that this fixture actually reaches, or add the site to `unbindable` "+
-			"with the reason it cannot be driven here.",
-			sites, want, len(gatedRecordWants), len(unbindable))
+			"with the reason it cannot be driven here. A site the #6903 census "+
+			"fixture drives instead belongs in boundByCensus6903, and one NEITHER "+
+			"fixture reaches belongs in unboundGap6903 with the reason — that table "+
+			"is the honest count of gates nothing can catch a widening on.",
+			sites, want, len(gatedRecordWants), len(unbindable),
+			len(boundByCensus6903), len(unboundGap6903))
 	}
 }
 
@@ -453,7 +507,19 @@ func countValidationPassGates(t *testing.T) int {
 			if !ok {
 				return true
 			}
-			if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "isValidationPass" {
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			// #6903 moved the gate off the individual record and into the
+			// compileInfo / compileWarn choke point, so a covered-phase gate
+			// site is now a call to one of those helpers. Counting only
+			// `isValidationPass` after that change found ONE site (the
+			// ungated-by-choke-point screen record in compiler_iface.go) and
+			// the floor below caught it; the scan has to follow the mechanism
+			// or this test silently stops binding anything.
+			switch id.Name {
+			case "isValidationPass", "compileInfo", "compileWarn":
 				n++
 			}
 			return true
