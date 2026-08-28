@@ -763,21 +763,156 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
 /// and — unlike a rendezvous — it holds by CONSTRUCTION, which is what lets
 /// `reconcile_churn_completes_a_cycle_even_when_already_stopped_6633` bind it
 /// deterministically.
+///
+/// #6989/#6985/#6945: `cycles` publishes the same count LIVE, after every
+/// completed cycle, so the installer thread can wait on the reconciler's
+/// PROGRESS rather than on the scheduler. The do-while above is retained
+/// unchanged — it is what makes the count non-zero by construction; the
+/// counter is what makes the count OBSERVABLE while the loop is still
+/// running, which is the part the do-while cannot supply. `reconcile_iters`
+/// (the return value) and the final `cycles` value are the same number by
+/// construction, and the caller asserts that equality so the counter cannot
+/// silently stop tracking the loop it is supposed to report.
 fn reconcile_churn_until(
     engine: &WgEngine,
     cfg: &[WgPeerConfig],
     stop: &std::sync::atomic::AtomicBool,
+    cycles: &std::sync::atomic::AtomicU32,
 ) -> u32 {
     let mut iters = 0u32;
     loop {
         engine.reconcile_peers(&[]);
         engine.reconcile_peers(cfg);
         iters += 1;
+        // Release: the installer thread that observes this count must also
+        // observe the peer re-add that closed the cycle.
+        cycles.store(iters, Ordering::Release);
         if stop.load(Ordering::Relaxed) {
             return iters;
         }
         std::thread::yield_now();
     }
+}
+
+/// #6989/#6985/#6945: the liveness backstop for
+/// `wait_for_first_reconcile_cycle`.
+///
+/// Deliberately enormous relative to the healthy path (the reconciler
+/// publishes its first cycle in microseconds). It is a BACKSTOP, not a timing
+/// assertion: no correct build can approach it, and no amount of CPU
+/// contention should either, because the thread being waited on is unbounded
+/// and holds no dependency on the waiter. A red here means the reconcile loop
+/// stopped making progress, which is a real defect worth a red.
+///
+/// This project has been bitten before by "fixing" a wall-clock flake with a
+/// TIGHT bounded wait, which only moves the wall-clock sample: a 5s bound
+/// reddened master twice. Sixty seconds against a microsecond operation is
+/// six orders of magnitude of headroom. If a future red lands here, do not
+/// raise this constant — go find the stall.
+const RECONCILE_CYCLE_LIVENESS_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// #6989/#6985/#6945: block until the reconciler thread has published at least
+/// one COMPLETED remove/re-add cycle, and return the count observed.
+///
+/// This exists because `install_session_serializes_with_reconcile_removal`'s
+/// non-vacuity guard was reporting on the wrong thing. Its claim is "both
+/// sides made progress, so the race window was actually exercised" — but the
+/// quantity it checked (`reconcile_iters >= 1`) is satisfied by a reconciler
+/// that ran its single do-while cycle entirely AFTER the installer had already
+/// joined. That is zero overlap: the exact case the guard was written to
+/// catch, reported as healthy. Before #6633 the same quantity failed the other
+/// way, as a scheduling artifact, which is the flake #6989/#6985/#6945 filed.
+///
+/// Waiting on the OBSERVABLE fixes both directions at once. The installer does
+/// not start until the reconciler has demonstrably completed a full cycle, so
+/// every install below races live churn — established, not hoped for — and the
+/// wait itself cannot flake, because it is bounded by progress rather than by
+/// elapsed time.
+///
+/// **Why this rendezvous is safe where #6633 judged one unsafe.** #6633
+/// rejected a rendezvous on two grounds: it makes the bounded thread WAIT on
+/// the unbounded one, and the module had an open futex wedge (#6952), so it
+/// traded a false red for a possible hang. Both grounds are addressed:
+///
+///  - There is no cycle in the wait-for graph. The reconciler loops until
+///    `stop`, which the MAIN thread sets only after joining the installer, and
+///    it acquires no lock the waiting installer holds (the installer holds
+///    none while waiting). So the thread being waited on is always runnable.
+///  - This is not a futex block. It is a bounded poll that PANICS BY NAME on
+///    `RECONCILE_CYCLE_LIVENESS_DEADLINE`, the same idiom `run_bounded` uses
+///    for the #6952 sweep. A wedge here becomes a named assertion failure,
+///    never an rc=124 wedge — which was #6952's whole complaint about
+///    uninterpretable cells.
+///
+/// The deadline is a parameter rather than a hardcoded constant purely so
+/// `wait_for_first_reconcile_cycle_reds_by_name_when_progress_stalls` can pin
+/// the liveness path deterministically at 50ms instead of taking 60s.
+fn wait_for_first_reconcile_cycle(
+    cycles: &std::sync::atomic::AtomicU32,
+    deadline: std::time::Duration,
+) -> u32 {
+    let start = std::time::Instant::now();
+    loop {
+        let seen = cycles.load(Ordering::Acquire);
+        if seen >= 1 {
+            return seen;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "the reconcile loop never advanced within {:?} — this is a \
+             LIVENESS failure, not a timing one. The reconciler thread runs an \
+             unbounded loop, depends on no lock this thread holds, and \
+             publishes its first completed cycle in microseconds on a healthy \
+             build, so no amount of CPU contention reaches this deadline. Do \
+             NOT raise the deadline to make this green: it is a backstop, not \
+             a timing assertion (#6989/#6985/#6945).",
+            deadline
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// #6989 fail-on-revert, positive half: the wait returns the published count
+/// as soon as it is non-zero, without consuming its deadline.
+///
+/// The tiny deadline here is safe precisely because the counter is ALREADY
+/// non-zero — the first load returns. If someone reshapes the helper to sleep
+/// before its first load, or to return a hardcoded 1 instead of the observed
+/// count, this reds.
+#[test]
+fn wait_for_first_reconcile_cycle_returns_the_observed_count() {
+    use std::sync::atomic::AtomicU32;
+    let cycles = AtomicU32::new(7);
+    let started = std::time::Instant::now();
+    let seen = wait_for_first_reconcile_cycle(&cycles, std::time::Duration::from_millis(50));
+    assert_eq!(
+        seen, 7,
+        "the wait must report the count the reconciler published, not a \
+         constant — the caller's overlap guard reads this number"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(50),
+        "an already-satisfied wait must return on its first load, not sleep"
+    );
+}
+
+/// #6989 fail-on-revert, negative half: a reconciler that never advances must
+/// red BY NAME on the liveness backstop rather than hanging.
+///
+/// This is the cell that makes the 60s production deadline safe to ship. A
+/// bounded wait whose failure path parks the thread would turn a stalled
+/// reconciler into an rc=124 wedge, which is the uninterpretable outcome
+/// #6952 was filed over. Counter pinned at zero + a 50ms deadline makes the
+/// liveness path deterministic and fast; deleting the `assert!` inside the
+/// loop hangs this test instead of passing it, so the cell cannot go green on
+/// a revert.
+#[test]
+#[should_panic(expected = "LIVENESS failure")]
+fn wait_for_first_reconcile_cycle_reds_by_name_when_progress_stalls() {
+    use std::sync::atomic::AtomicU32;
+    let never = AtomicU32::new(0);
+    wait_for_first_reconcile_cycle(&never, std::time::Duration::from_millis(50));
 }
 
 /// #6633 fail-on-revert for `reconcile_churn_until`'s do-while shape.
@@ -812,13 +947,25 @@ fn reconcile_churn_completes_a_cycle_even_when_already_stopped_6633() {
         peers: cfg.clone(),
     });
     let stop = AtomicBool::new(true);
-    let iters = reconcile_churn_until(&engine, &cfg, &stop);
+    let cycles = std::sync::atomic::AtomicU32::new(0);
+    let iters = reconcile_churn_until(&engine, &cfg, &stop, &cycles);
     assert_eq!(
         iters, 1,
         "reconcile_churn_until must complete one full remove/re-add cycle even \
          when stop is already set (#6633); a leading `while !stop` returns 0 and \
          leaves install_session_serializes_with_reconcile_removal asserting a \
          scheduling outcome its harness never arranged"
+    );
+    // #6989: the LIVE counter the installer's rendezvous waits on must track
+    // the same cycles the return value reports. Dropping the `cycles.store`
+    // in `reconcile_churn_until` leaves `iters` correct and this zero, and
+    // the rendezvous would then wait out its full 60s backstop on every run.
+    assert_eq!(
+        cycles.load(Ordering::Acquire),
+        iters,
+        "the published cycle counter must equal the cycles actually completed \
+         (#6989); a counter that stops tracking the loop turns the installer's \
+         overlap rendezvous into a 60s stall"
     );
     // The cycle really ran: the churn ends on the re-add, so the peer is
     // published. Without this the assertion above would pass on a helper that
@@ -1029,7 +1176,7 @@ fn orphan_demux_sweep_does_not_self_deadlock_6952() {
 /// whenever the orphan interleaving fires.
 #[test]
 fn install_session_serializes_with_reconcile_removal() {
-    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AOrd};
     use std::thread;
     // #6157: serialize the heavy busy-spin engine tests (held for the whole
     // body) so a parallel `cargo test` cannot run two at once and wedge the
@@ -1081,12 +1228,25 @@ fn install_session_serializes_with_reconcile_removal() {
         ));
     }
     let stop = Arc::new(AtomicBool::new(false));
+    // #6989/#6985/#6945: the reconciler's LIVE cycle count. Thread A waits on
+    // this before its first install, which is what turns "the two threads
+    // probably overlapped" into an established precondition. See
+    // `wait_for_first_reconcile_cycle`.
+    let cycles = Arc::new(AtomicU32::new(0));
     // Thread A: install_session in a tight loop, alternating
     // with reconciles that re-add the peer so installs can
     // succeed sometimes.
     let installer = {
         let engine = engine.clone();
+        let cycles = cycles.clone();
         thread::spawn(move || {
+            // Do not begin installing until the reconciler has demonstrably
+            // completed a full remove/re-add cycle. Every install below then
+            // races LIVE churn. Bounded by the reconciler's progress, not by
+            // elapsed time; on a stall it panics by name here and the
+            // `installer.join().unwrap()` below fails this test by name.
+            let saw_cycles =
+                wait_for_first_reconcile_cycle(&cycles, RECONCILE_CYCLE_LIVENESS_DEADLINE);
             let mut ok = 0u32;
             let mut unknown = 0u32;
             let mut collision = 0u32;
@@ -1098,7 +1258,7 @@ fn install_session_serializes_with_reconcile_removal() {
                 }
                 thread::yield_now();
             }
-            (ok, unknown, collision)
+            (ok, unknown, collision, saw_cycles)
         })
     };
     // Thread B: alternate removing and re-adding the peer.
@@ -1106,24 +1266,56 @@ fn install_session_serializes_with_reconcile_removal() {
         let engine = engine.clone();
         let stop = stop.clone();
         let cfg = cfg_with_peer.clone();
-        thread::spawn(move || reconcile_churn_until(&engine, &cfg, &stop))
+        let cycles = cycles.clone();
+        thread::spawn(move || reconcile_churn_until(&engine, &cfg, &stop, &cycles))
     };
-    let (ok, unknown, collision) = installer.join().unwrap();
+    let (ok, unknown, collision, saw_cycles) = installer.join().unwrap();
     stop.store(true, AOrd::Relaxed);
     let reconcile_iters = reconciler.join().unwrap();
-    // We made progress on both sides — otherwise the test is
-    // not actually exercising the race window. #6633: the
-    // reconciler side is now ESTABLISHED by
-    // `reconcile_churn_until`'s do-while rather than hoped for,
-    // so the `reconcile_iters >= 1` assertion below can no
-    // longer trip as a scheduler artifact on a loaded machine.
     assert!(
         ok + unknown + collision == iterations,
         "every install attempt accounted for"
     );
+    // #6989 wiring bind: the counter the rendezvous waited on must be the same
+    // count the churn loop actually completed. If `reconcile_churn_until` ever
+    // stops publishing (or publishes something other than its cycle count),
+    // the rendezvous above is guarding a number that is not the reconciler's
+    // progress, and this equality is what catches that rather than a silent
+    // 60s stall.
+    assert_eq!(
+        reconcile_iters,
+        cycles.load(AOrd::Acquire),
+        "the published cycle count must equal the cycles reconcile_churn_until \
+         completed (published={}, completed={reconcile_iters}) — the installer's \
+         overlap rendezvous reads the published one",
+        cycles.load(AOrd::Acquire)
+    );
+    // The non-vacuity guard, restated as the property it always CLAIMED.
+    //
+    // This used to read `reconcile_iters >= 1`, whose message said "we made
+    // progress on both sides — otherwise the test is not actually exercising
+    // the race window". That number never established overlap. Before #6633 it
+    // could be 0 purely because the scheduler had not run thread B yet
+    // (#6989/#6985/#6945: 1-of-20 under CPU contention, always a false red);
+    // after #6633's do-while it is >= 1 by construction, including on the
+    // schedule where thread B ran its one cycle entirely AFTER thread A had
+    // finished — zero overlap, reported as healthy. Both directions are the
+    // same defect: the quantity is a PRECONDITION GUARD, and it was measuring
+    // the scheduler instead of the precondition.
+    //
+    // `saw_cycles` is the reconciler's cycle count as observed by thread A
+    // BEFORE its first install, so `>= 1` here means completed churn preceded
+    // every install in the loop. It cannot be a scheduling artifact: the
+    // rendezvous either observes progress or fails by name on a 60s liveness
+    // backstop. It is not vacuous either — replacing the bounded wait with a
+    // bare `cycles.load()` snapshot (the obvious wrong simplification) reds
+    // here on exactly the schedules the old assertion mis-reported.
     assert!(
-        reconcile_iters >= 1,
-        "reconcile loop must have completed at least one full add/remove cycle"
+        saw_cycles >= 1,
+        "the installer must have observed at least one COMPLETED reconcile \
+         cycle before its first install (saw_cycles={saw_cycles}); without \
+         that, the installs did not race live churn and the serialization \
+         property below is not on the test trajectory"
     );
     // r7 Codex hostile finding: a tautological pass shape exists
     // if the reconciler always wins the lock — every install
