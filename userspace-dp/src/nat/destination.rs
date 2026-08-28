@@ -321,7 +321,40 @@ impl DnatTable {
                     // (fail-closed, like an unparseable host destination).
                     // #4718: surface the drop loudly instead of a silent skip.
                     Err(_) => match snap.destination_address.parse::<IpAddr>() {
-                        Ok(ip) => DnatDest::Host(ip),
+                        Ok(ip) => {
+                            // #6899 (C180-023): the FALLBACK was silent. #4718
+                            // surfaced the both-unparseable DROP three lines
+                            // below, and that neighbouring `record_parse_error`
+                            // is a decoy: it fires only when the prefix AND the
+                            // address both fail. With a VALID base address the
+                            // rule installed against it and the malformed prefix
+                            // vanished — DNAT quietly targeting one host where
+                            // the operator wrote a block, with nothing in the
+                            // counters to look at.
+                            //
+                            // The fallback itself is DELIBERATE and is kept: the
+                            // comment above states it, and #4718 chose to
+                            // surface the drop, not to remove the fallback. The
+                            // defect is the silence, so this records and
+                            // continues rather than dropping a rule that is
+                            // currently forwarding.
+                            //
+                            // Reachability, stated honestly: the Go snapshot
+                            // builder already SKIPS a token that parses as
+                            // neither IP nor CIDR (nat_destination.go), so a
+                            // normal commit cannot get here. This is the
+                            // last-line arm for config drift across a
+                            // mixed-version pair or a direct control-socket
+                            // write — the same class of caller #4718's own arms
+                            // exist for.
+                            nat_counters.record_parse_error(&format!(
+                                "DNAT rule {:?}: unparseable destination prefix {:?}; \
+                                 falling back to the host destination address {:?} — \
+                                 the configured block is NOT being translated",
+                                snap.name, snap.destination_prefix, snap.destination_address
+                            ));
+                            DnatDest::Host(ip)
+                        }
                         Err(_) => {
                             nat_counters.record_parse_error(&format!(
                                 "DNAT rule {:?}: unparseable destination prefix {:?} and address {:?}",

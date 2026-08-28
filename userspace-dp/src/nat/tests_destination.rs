@@ -2359,3 +2359,129 @@ fn actionless_dnat_entry_falls_through_6823() {
          pool address: {details:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6899 (C180-023): the single-unparseable-prefix FALLBACK must be surfaced.
+// ---------------------------------------------------------------------------
+
+// FAIL-ON-REVERT: remove the #6899 `record_parse_error` from the
+// `Ok(ip) => DnatDest::Host(ip)` arm and `parse_errors()` stays 0 while the
+// rule still installs — the exact silence this item names.
+//
+// THE DECOY THIS CELL EXISTS TO DEFEAT: a `record_parse_error` already sits
+// three lines below, so grepping the symbol in this file returns a hit that
+// looks like the fix. It is the #4718 BOTH-unparseable drop and never fires
+// here. The fixture therefore uses a VALID base address, which is the only
+// input that separates the two arms — with an invalid one, the pre-existing
+// call fires and the cell would pass against unfixed code.
+#[test]
+fn dnat_6899_unparseable_prefix_with_valid_address_is_surfaced() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "garbage-prefix".to_string(),
+            // Non-empty and unparseable...
+            destination_prefix: "not-a-cidr".to_string(),
+            // ...but the base address is VALID, so the both-unparseable
+            // #4718 arm below is NOT reached.
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+
+    // The documented fallback is PRESERVED: the rule still translates the base
+    // address. This is not a fail-closed change; the defect was the silence.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                "",
+            )
+            .is_some(),
+        "the deliberate fallback to the host destination address was dropped — \
+         #6899 surfaces the silence, it does not remove the fallback"
+    );
+
+    // ...and it is no longer SILENT.
+    assert!(
+        counters.parse_errors() > 0,
+        "an unparseable destination_prefix with a VALID base address installed \
+         with NO parse error recorded — DNAT quietly targets one host where the \
+         operator configured a block, and nothing in the counters says so (#6899)"
+    );
+}
+
+// PAIRED CONTROL. Without it, "record a parse error" is satisfied by recording
+// unconditionally, which would fire on every well-formed prefix rule and bury
+// the real ones.
+#[test]
+fn dnat_6899_valid_prefix_records_nothing() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "good-prefix".to_string(),
+            destination_prefix: "203.0.113.0/24".to_string(),
+            destination_address: "203.0.113.0".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.77".parse().unwrap(),
+                80,
+                "",
+            )
+            .is_some(),
+        "a well-formed prefix rule must still install and match inside the block"
+    );
+    assert_eq!(
+        counters.parse_errors(),
+        0,
+        "a well-formed prefix rule recorded a parse error — the #6899 surfacing \
+         fires unconditionally and would bury the genuine ones"
+    );
+}
+
+// The #4718 BOTH-unparseable arm must still DROP, not fall through. This is the
+// behaviour the decoy owns, pinned so the #6899 change cannot be mistaken for a
+// licence to install on any garbage.
+#[test]
+fn dnat_6899_both_unparseable_still_drops() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "all-garbage".to_string(),
+            destination_prefix: "not-a-cidr".to_string(),
+            destination_address: "also-not-an-ip".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    assert!(
+        table
+            .lookup(PROTO_TCP, "198.51.100.1".parse().unwrap(), "203.0.113.10".parse().unwrap(), 80, "")
+            .is_none(),
+        "a rule with BOTH fields unparseable installed something (#4718 drop lost)"
+    );
+    assert!(counters.parse_errors() > 0, "#4718 drop stopped being surfaced");
+}
