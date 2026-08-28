@@ -141,6 +141,10 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // panic poisoned a command queue and it was recovered.
     state.status.worker_command_queue_poison_recoveries =
         state.afxdp.worker_command_queue_poison_recoveries_total();
+    // #6929: worker commands dropped at the per-worker queue cap. Nonzero =
+    // a producer found a full queue, which points at a worker that stopped
+    // draining rather than at a fast producer.
+    state.status.worker_command_queue_drops = state.afxdp.worker_command_queue_drops_total();
     state.status.shared_session_poison_recoveries =
         state.afxdp.shared_session_poison_recoveries_total();
     // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE

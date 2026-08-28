@@ -472,7 +472,11 @@ type xpfCollector struct {
 	// helper worker panic poisoned a command queue and it was recovered
 	// (committed-prefix + clear_poison policy) instead of going deaf.
 	userspaceWorkerCommandQueuePoisonRecoveries *prometheus.Desc
-	userspaceSharedSessionPoisonRecoveries      *prometheus.Desc
+	// #6929: worker commands dropped at the per-worker queue cap —
+	// nonzero means a producer found a full queue, which points at a
+	// worker that stopped draining rather than at a fast producer.
+	userspaceWorkerCommandQueueDrops       *prometheus.Desc
+	userspaceSharedSessionPoisonRecoveries *prometheus.Desc
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
 	// over a Not-ECT inner) — nonzero flags a misbehaving tunnel ingress
 	// that ECT-marked the outer for un-ECN inner traffic on a congested
@@ -924,6 +928,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceInterfaceSNATSyncConflictDrops
 	ch <- c.userspaceInterfaceSNATRegistryCap
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
+	ch <- c.userspaceWorkerCommandQueueDrops
 	ch <- c.userspaceSharedSessionPoisonRecoveries
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops

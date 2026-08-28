@@ -397,6 +397,16 @@ type ProcessStatus struct {
 	// Omitempty-free on the Rust side (always serialized); plain decode
 	// here defaults to 0 for older helpers.
 	WorkerCommandQueuePoisonRecoveries uint64 `json:"worker_command_queue_poison_recoveries,omitempty"`
+	// #6929: worker commands dropped because the target per-worker
+	// command queue was already at MAX_PENDING_WORKER_COMMANDS (4096).
+	// Distinct from the poison counter above on purpose: a poison
+	// recovery loses nothing, a capacity drop discards a command.
+	// Expected steady state is 0 — the consumer takes the whole deque
+	// per poll and cannot be outrun — so a rising value means a worker
+	// stopped draining (a contained #925 supervisor panic left the
+	// record, and its producers, behind). Surfaced as
+	// xpf_userspace_worker_command_queue_drops_total.
+	WorkerCommandQueueDrops uint64 `json:"worker_command_queue_drops,omitempty"`
 	// #2402/#6641: shared-session mutex poison recoveries (a worker
 	// thread panicked while holding a shared-session or owner-RG-index
 	// mutex; the committed map was recovered and the poison cleared --

@@ -502,6 +502,23 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "worker_command_queue_poison_recoveries", default)]
     pub worker_command_queue_poison_recoveries: u64,
+    /// #6929: worker commands DROPPED because the target per-worker queue
+    /// was already at `MAX_PENDING_WORKER_COMMANDS` (4096).
+    ///
+    /// Read alongside `worker_command_queue_poison_recoveries` and not in
+    /// place of it: that counter means a queue was RECOVERED with its
+    /// committed prefix intact and nothing was lost, this one means a
+    /// command was DISCARDED. The expected steady-state value is 0, because
+    /// the consumer drains the whole deque in one `core::mem::take` and so
+    /// cannot be outrun by a sustained producer. A rising value therefore
+    /// does not mean "busy"; it means some worker has stopped draining —
+    /// the #925 supervisor caught a `worker_loop` panic and the thread
+    /// exited while its record, and every producer's fan-out over it,
+    /// remained. Surfaced as the Prometheus counter
+    /// `xpf_userspace_worker_command_queue_drops_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "worker_command_queue_drops", default)]
+    pub worker_command_queue_drops: u64,
     /// #2402/#6641: total shared-session mutex poison recoveries (a
     /// worker thread panicked while holding a shared-session or
     /// owner-RG-index mutex; the committed map was recovered and the
