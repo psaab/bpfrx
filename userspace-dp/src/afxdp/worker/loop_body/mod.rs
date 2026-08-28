@@ -2427,3 +2427,211 @@ mod snapshot_refresh_ordering_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gc_reap_source_nat_release_tests_6901 {
+    //! #6901: the GC reap's `release_source_nat_allocation_for_worker` call was
+    //! UNBOUND — deleting it left the whole crate green (measured: 4670
+    //! collected, 0 failed, both with and without the call).
+    //!
+    //! `reap_expired_sessions` is the ordinary inactivity-timeout teardown, the
+    //! path that frees a source-NAT pool port for the overwhelming majority of
+    //! sessions — they age out rather than being explicitly deleted. Without the
+    //! call, every reaped translated session leaks a pool port until
+    //! `AllocatorExhausted`, and nothing in the suite noticed.
+    //!
+    //! TWO cells, because "the reap calls release" and "the reap releases the
+    //! port THIS session holds" are different claims and only the first is
+    //! bound by a count going to zero. A release that freed the wrong pool
+    //! would satisfy a single-pool fixture.
+    use super::*;
+    use crate::nat::NatDecision;
+    use crate::session::{
+        ExpiredSession, SessionDecision, SessionKey, SessionMetadata, SessionOrigin,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const POOL_A: Ipv4Addr = Ipv4Addr::new(172, 16, 80, 8);
+    const POOL_B: Ipv4Addr = Ipv4Addr::new(172, 16, 90, 9);
+
+    fn rule_snapshot(name: &str, from: &str, pool_addr: Ipv4Addr) -> crate::SourceNATRuleSnapshot {
+        crate::SourceNATRuleSnapshot {
+            name: name.to_string(),
+            from_zone: from.to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: name.to_string(),
+            pool_addresses: vec![format!("{pool_addr}/32")],
+            port_low: 1024,
+            port_high: 65535,
+            ..crate::SourceNATRuleSnapshot::default()
+        }
+    }
+
+    fn key_for(src_port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            src_port,
+            dst_port: 443,
+        }
+    }
+
+    fn nat_for(pool_addr: Ipv4Addr, port: u16) -> NatDecision {
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(pool_addr)),
+            rewrite_src_port: Some(port),
+            ..NatDecision::default()
+        }
+    }
+
+    fn metadata() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        }
+    }
+
+    fn expired_for(src_port: u16, pool_addr: Ipv4Addr, snat_port: u16) -> ExpiredSession {
+        ExpiredSession {
+            key: key_for(src_port),
+            decision: SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 12,
+                    tx_ifindex: 12,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+                    neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                    src_mac: Some([6, 7, 8, 9, 10, 11]),
+                    tx_vlan_id: 0,
+                },
+                nat: nat_for(pool_addr, snat_port),
+            },
+            metadata: metadata(),
+            origin: SessionOrigin::ForwardFlow,
+        }
+    }
+
+    fn used(forwarding: &ForwardingState, pool: &str) -> u64 {
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)
+            .into_iter()
+            .find(|s| s.pool_name == pool)
+            .unwrap_or_else(|| panic!("no pool status for {pool}"))
+            .used_ports
+    }
+
+    /// The reap returns the pool port. Fail-on-revert: delete the
+    /// `release_source_nat_allocation_for_worker` call in `reap_expired_sessions`
+    /// and this goes RED — before #6901 that deletion left the crate green.
+    #[test]
+    fn gc_reap_releases_the_source_nat_pool_port_6901() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.source_nat_rules =
+            crate::nat::parse_source_nat_rules(&[rule_snapshot("pool-a", "lan", POOL_A)]);
+
+        crate::nat::reserve_synced_source_nat_allocation(
+            &forwarding.iface_nat_allocators,
+            &forwarding.source_nat_rules,
+            &key_for(1111),
+            nat_for(POOL_A, 40000),
+            false,
+            None,
+            0,
+        );
+        assert_eq!(
+            used(&forwarding, "pool-a"),
+            1,
+            "precondition: the translated flow must hold one pool port, or the \
+             assertion below passes against a pool that was never allocated from",
+        );
+
+        reap_expired_sessions(
+            &mut [],
+            &[expired_for(1111, POOL_A, 40000)],
+            &forwarding,
+            -1,
+            -1,
+            -1,
+            1_000_000_000,
+            0,
+        );
+
+        assert_eq!(
+            used(&forwarding, "pool-a"),
+            0,
+            "the GC reap must return the pool port. Without this the ordinary \
+             inactivity teardown leaks one port per reaped translated session \
+             until AllocatorExhausted (#6901)",
+        );
+    }
+
+    /// It releases the port THIS session holds, not merely some port. A single
+    /// pool cannot tell those apart: a release that freed the wrong allocator
+    /// would still drive one count to zero.
+    #[test]
+    fn gc_reap_releases_only_the_reaped_flows_pool_6901() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+            rule_snapshot("pool-a", "lan", POOL_A),
+            rule_snapshot("pool-b", "dmz", POOL_B),
+        ]);
+
+        for (key_port, pool, snat_port) in [(1111u16, POOL_A, 40000u16), (2222, POOL_B, 40001)] {
+            crate::nat::reserve_synced_source_nat_allocation(
+                &forwarding.iface_nat_allocators,
+                &forwarding.source_nat_rules,
+                &key_for(key_port),
+                nat_for(pool, snat_port),
+                false,
+                None,
+                0,
+            );
+        }
+        assert_eq!(
+            (used(&forwarding, "pool-a"), used(&forwarding, "pool-b")),
+            (1, 1),
+            "precondition: both pools hold one port",
+        );
+
+        // Reap ONLY the pool-a flow.
+        reap_expired_sessions(
+            &mut [],
+            &[expired_for(1111, POOL_A, 40000)],
+            &forwarding,
+            -1,
+            -1,
+            -1,
+            1_000_000_000,
+            0,
+        );
+
+        assert_eq!(
+            used(&forwarding, "pool-a"),
+            0,
+            "the reaped flow's own pool must be released",
+        );
+        assert_eq!(
+            used(&forwarding, "pool-b"),
+            1,
+            "the OTHER pool must be untouched — a release that freed by count \
+             rather than by the reaped flow's own (pool, port) would free a \
+             port another live session is still forwarding through",
+        );
+    }
+}
