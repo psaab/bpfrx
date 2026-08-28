@@ -726,10 +726,17 @@ func (d *Daemon) reconcileAfterRethLinkCycle(cfg *config.Config, needLinkCycleRe
 // before it can fail on stop_workers, so a failed join leaves "the outcome is unknown" —
 // but a SUCCEEDED join leaves the workers deliberately stopped, which is the
 // same forwarding state. After it returns nil, setDown and the cycled
-// setHardwareAddr are both still fallible and both yield linkCycled=false. So
-// the gate is "did the hook RUN", not "did the hook FAIL": keying on the hook's
-// own error let those two escape with a nil commit error and no rebind, i.e. a
-// half-applied prepare under a green commit.
+// setHardwareAddr are both still fallible. So the gate is "did the hook RUN",
+// not "did the hook FAIL": keying on the hook's own error let those two escape
+// with a nil commit error and no rebind, i.e. a half-applied prepare under a
+// green commit.
+//
+// #6915: only the setDown failure still yields linkCycled=false. A failed CYCLED
+// MAC write now reports true — setDown has already succeeded by then, so the
+// link really did cycle — and is re-armed by step 2.6b2 rather than by the
+// rollback here. Both still fail the commit; the "did the hook RUN" gate is
+// unchanged, and the sentence above must not be read as a claim about the value
+// both paths return.
 //
 // A half-applied prepare has no other owner:
 //
@@ -798,13 +805,23 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 		return linkCycled, nil
 	}
 	if linkCycled {
-		// The cycle completed and only link-up failed. Fail the commit — the
-		// member is administratively down, and NOTHING repairs it: the MAC
-		// write succeeded, so every later apply early-returns on
-		// bytes.Equal(current, mac) and never attempts setUp again, and the
-		// only other nlLinkSetUp on a RETH member runs at daemon start. It
-		// stays down until a restart while step 2.6b2 rebinds AF_XDP sockets
-		// onto it.
+		// The link went DOWN and back UP. Since #6915 that is TWO outcomes, not
+		// one, and they differ in whether anything repairs the member:
+		//
+		//   - link-up failed: the MAC write SUCCEEDED, so every later apply
+		//     early-returns on bytes.Equal(current, mac) and never attempts
+		//     setUp again, and the only other nlLinkSetUp on a RETH member runs
+		//     at daemon start. The member stays administratively down until a
+		//     restart while step 2.6b2 rebinds AF_XDP sockets onto it.
+		//   - the CYCLED MAC write failed: the member is back UP (programRethMAC
+		//     does a best-effort setUp on that path) and still carries its old
+		//     MAC, so the next apply does NOT early-return and retries the whole
+		//     sequence. Recoverable, unlike the row above — do not read the
+		//     "NOTHING repairs it" sentence as covering both.
+		//
+		// Both fail the commit, and both reach here rather than the rollback
+		// below for the same reason: the cycle happened, so step 2.6b2 owns the
+		// rebind and step 2.6b owns re-adding the addresses the DOWN flushed.
 		//
 		// Leave the rebind to step 2.6b2, which owns it for every cycled
 		// member. Note that suppression is per-MEMBER while 2.6b2's gate
@@ -856,24 +873,31 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 	slog.Warn("userspace: RETH MAC link cycle did not complete after the worker join; "+
 		"rebinding AF_XDP sockets so the prepare is not left half-applied",
 		"iface", ifName, "err", err)
-	// AND THE ADDRESS GAP IS DELIBERATE (#6871 F4). One member of THIS class —
-	// join OK, setDown OK, the CYCLED MAC write refused — has already taken the
-	// link DOWN and back UP by the time it arrives here (programRethMAC's
-	// set-mac failure path does a best-effort setUp), and the kernel flushes an
-	// interface's addresses on the way down. It nonetheless returns
-	// linkCycled=false, so it contributes nothing to needLinkCycleRecovery, and
-	// step 2.6b's VIP reconcile is gated on exactly that: it is SKIPPED, and the
-	// member comes back without its VRRP VIPs until some later apply cycles it.
-	// Verified against origin/master: the pre-#5103 code returns false on that
-	// same path, so the gap predates this change and is unchanged by it.
+	// THE ADDRESS GAP IS CLOSED (#6915). This block used to record a deliberate
+	// carve-out: the "join OK, setDown OK, cycled MAC write refused" member had
+	// already taken the link DOWN and back UP by the time it arrived here, the
+	// kernel flushes an interface's addresses on the way down, and it
+	// nonetheless returned linkCycled=false — so it contributed nothing to
+	// needLinkCycleRecovery and step 2.6b's VIP reconcile was skipped for a
+	// cycle that genuinely happened. The member came back holding the VRRP role
+	// with none of the addresses that role answers for, and nothing re-added
+	// them: ReconcileVIPs has exactly ONE production caller (that gated one),
+	// the 2s reconcileRGState tick re-adds only the stable link-local in VRRP
+	// mode, and sendAdvert swallows its send error at Debug so VRRP never
+	// observes the flap and stays MASTER.
 	//
-	// It was attached to the WRONG BRANCH until round 11 — it sat in the
-	// linkCycled==true arm above, where needLinkCycleRecovery is necessarily
-	// true and the reconcile therefore DOES run, so the caveat contradicted the
-	// code it was written against. docs/reth-mac.md's outcome table has always
-	// had it on the right row ("join OK, cycled MAC write failed"), which is why
-	// that doc is the reference for the full table; the shipping artifact still
-	// has to carry the operative fact, which is why it is also here.
+	// programRethMAC now returns linkCycled=true on that path, because the value
+	// reports whether the link CYCLED and not whether the MAC write succeeded —
+	// which is what the link-up-failure row beside it has always meant. That
+	// member therefore leaves through the arm ABOVE, not this one: it arms step
+	// 2.6b (the VIP re-add) and step 2.6b2 (the rebind), and does NOT fire the
+	// local rollback, since doing both would be the double rebind this file
+	// warns gets EBUSY on mlx5 zero-copy queues.
+	//
+	// What still reaches HERE is the class where no cycle happened at all — the
+	// join failed, or setDown itself failed. Those flushed nothing, so there are
+	// no addresses to reconcile and no sockets a cycle tore down; the rollback
+	// below is the only owner of their rebind.
 
 	// NotifyLinkCycle opens with a 1s NIC-settle sleep before it takes the
 	// manager lock, and this call site is INSIDE the per-member RETH loop —

@@ -462,7 +462,24 @@ func tunnelSchemaChildren() map[string]*schemaNode {
 			validator:     ValidateIPAddress,
 			children:      nil,
 		},
-		"mode": {desc: "Tunnel mode", args: 1, placeholder: "<mode>", children: nil},
+		"mode": {
+			desc:        "Tunnel mode",
+			args:        1,
+			placeholder: "<mode>",
+			valueType:   ValueEnumOf,
+			valueDesc:   "Tunnel encapsulation mode",
+			// "ip6gre" FIRST, deliberately. The #2419 compact/block census
+			// synthesises its probe values from valueExamples[0] and [1], and
+			// the compact spelling of this site is compact-BLIND: the value is
+			// dropped and Mode falls back to the parser's default, which is
+			// "gre". An examples list starting with "gre" makes the dropped
+			// value and the fallback identical, so the divergence reads as
+			// EQUIVALENT and the inventory entry looks stale — a fixture that
+			// uses the value the bug falls back to (#2419 stays open here).
+			valueExamples: []string{"ip6gre", "gre"},
+			validator:     ValidateEnum(TunnelModeNames),
+			children:      nil,
+		},
 		"key": {
 			desc:          "Tunnel key",
 			args:          1,

@@ -31,8 +31,13 @@ import (
 //
 // "the join RAN" is the gate, not "the join FAILED": PrepareLinkCycle disables
 // ctrl and stops the workers whether it goes on to succeed or fail, and setDown
-// and the cycled MAC write can then abort the cycle underneath a SUCCESSFUL
-// join. TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103 covers those two.
+// and the cycled MAC write can then fail underneath a SUCCESSFUL join.
+// TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103 covers those two — and
+// since #6915 they no longer share an outcome: only a failed setDown aborts the
+// CYCLE (the link never goes down, so this site owns the rollback). A failed
+// cycled MAC write leaves the link already cycled, so it reports
+// linkCycled=true and hands the rebind to step 2.6b2 along with step 2.6b's
+// re-add of the addresses the DOWN flushed.
 
 // abortRecoveryLinkController counts both halves of the link-cycle protocol so a
 // test can tell a rollback rebind from no rebind at all.
@@ -218,18 +223,32 @@ func TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103(t *testing.T) {
 		step      failStep
 		wantSeq   string
 		wantCause string
+		// #6915: the two rows diverge on whether the link actually CYCLED, and
+		// therefore on who owns the rebind. setDown FAILING means the link never
+		// went down — no cycle, no address loss, and this site must roll back.
+		// The cycled MAC write failing means it DID go down and come back up, so
+		// step 2.6b2 owns the rebind (firing it here too is the double rebind
+		// that gets EBUSY on mlx5 zero-copy queues) and step 2.6b owns the VIP
+		// re-add. Sharing one expectation across both rows is what let the
+		// second one keep a value that described the first.
+		wantLinkCycled bool
+		wantNotify     int
 	}{
 		{
-			name:      "set_down_fails",
-			step:      failSetDown,
-			wantSeq:   "set-mac-live,link-down-FAILED",
-			wantCause: "link down",
+			name:           "set_down_fails",
+			step:           failSetDown,
+			wantSeq:        "set-mac-live,link-down-FAILED",
+			wantCause:      "link down",
+			wantLinkCycled: false,
+			wantNotify:     1,
 		},
 		{
-			name:      "cycled_mac_write_fails",
-			step:      failSetMACCycled,
-			wantSeq:   "set-mac-live,link-down,set-mac-cycled-FAILED,link-up",
-			wantCause: "set mac",
+			name:           "cycled_mac_write_fails",
+			step:           failSetMACCycled,
+			wantSeq:        "set-mac-live,link-down,set-mac-cycled-FAILED,link-up",
+			wantCause:      "set mac",
+			wantLinkCycled: true,
+			wantNotify:     0,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -253,15 +272,23 @@ func TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103(t *testing.T) {
 				t.Errorf("link sequence = %q, want %q — the fixture must fail the step it "+
 					"claims to", got, tc.wantSeq)
 			}
-			if linkCycled {
-				t.Error("linkCycled must be false when the cycle did not complete")
+			if linkCycled != tc.wantLinkCycled {
+				t.Errorf("linkCycled = %v, want %v — this value reports whether the link "+
+					"WENT DOWN AND BACK UP, not whether the MAC write succeeded (#6915). "+
+					"setDown failing means no cycle; the cycled MAC write failing means the "+
+					"DOWN already flushed every address on the member",
+					linkCycled, tc.wantLinkCycled)
 			}
-			if lc.notifyCalls != 1 {
-				t.Errorf("NotifyLinkCycle calls = %d, want 1: the worker join SUCCEEDED and "+
-					"the cycle then aborted, so ctrl is off and every worker is stopped with "+
-					"nothing to re-arm them — linkCycled is false so step 2.6b2's rebind is "+
-					"skipped, and rethMACPending is false for a member renamed into existence "+
-					"by this apply. Forwarding stays down on this node", lc.notifyCalls)
+			if lc.notifyCalls != tc.wantNotify {
+				t.Errorf("NotifyLinkCycle calls = %d, want %d. The join SUCCEEDED, so ctrl is "+
+					"off and every worker is stopped with nothing to re-arm them unless "+
+					"something rebinds. WHO rebinds depends on whether the link cycled: with "+
+					"linkCycled=false this site owns the rollback (step 2.6b2 is gated off and "+
+					"rethMACPending is false for a member renamed into existence by this "+
+					"apply); with linkCycled=true step 2.6b2 owns it and firing here too is "+
+					"the double rebind that gets EBUSY on mlx5 zero-copy queues. "+
+					"TestCycledMACWriteFailureArmsTheRecoveryGate6915 binds the handoff",
+					lc.notifyCalls, tc.wantNotify)
 			}
 			if commitErr == nil {
 				t.Fatal("the commit must FAIL: the dataplane was deliberately torn down and " +

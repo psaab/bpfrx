@@ -323,7 +323,15 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				// ANY of them resolves still decides whether this rule consumes
 				// a pool ID, so the resolution stays load-bearing.
 				toZoneCfg, ok := cfg.Security.Zones[rs.ToZone]
-				if !ok || len(toZoneCfg.Interfaces) == 0 {
+				// #6918: a map entry present with a NIL *ZoneConfig makes ok
+				// true, so testing ok alone falls through to the deref below and
+				// panics the compile. The sibling sweep in compiler_iface.go
+				// already treats a nil zone slot as reachable — its comment
+				// names the tolerant/programmatic and HA-peer-sync paths, which
+				// do not go through the parser that always allocates a zone.
+				// Treat nil exactly like a zone with no interfaces: this rule
+				// resolves nothing, so warn and skip.
+				if !ok || toZoneCfg == nil || len(toZoneCfg.Interfaces) == 0 {
 					compileWarn(dp, "to-zone has no interfaces",
 						"zone", rs.ToZone, "rule-set", rs.Name)
 					continue
