@@ -696,14 +696,45 @@ they repeatedly bite:
     regression. `loop { work; if stop { break } }` costs one extra
     cycle and makes the precondition unfalsifiable by the scheduler
     (`#3457` in the WG snapshot-atomicity reader; `#6633`
-    `reconcile_churn_until`). Prefer it to a RENDEZVOUS (the bounded
-    thread blocking until the unbounded one publishes a cycle): a
-    rendezvous adds a blocking edge between two test threads, which is
-    how a false red becomes a hang. It also has the better gate — the
-    do-while's contract is deterministic, so calling the helper with
-    `stop` ALREADY set is an exact fail-on-revert
+    `reconcile_churn_until`). The do-while's contract is deterministic,
+    so calling the helper with `stop` ALREADY set is an exact
+    fail-on-revert
     (`reconcile_churn_completes_a_cycle_even_when_already_stopped_6633`),
     which the scheduling assertion it replaces could never be.
+  - **But making a precondition guard true BY CONSTRUCTION does not make
+    it MEAN anything — it can convert a false red into a vacuous
+    green.** `#6633`'s do-while removed the flake in
+    `install_session_serializes_with_reconcile_removal`
+    (`#6989`/`#6985`/`#6945`) and, in the same move, made
+    `reconcile_iters >= 1` satisfiable by a reconciler that ran its one
+    cycle entirely AFTER the installer had joined. That is zero overlap:
+    exactly the case the guard exists to catch, now reporting the same
+    value as a healthy run. When the fix for a scheduling artifact is
+    "make the number always ≥ 1", ask what the number is still able to
+    distinguish. So ALSO wait on the OBSERVABLE: publish the cycle count
+    live and have the bounded thread block until it advances
+    (`wait_for_first_reconcile_cycle`, `#6989`). The do-while stays — it
+    is what makes the count non-zero; the counter is what makes it
+    visible while the loop is still running.
+  - **A rendezvous between test threads is safe when it cannot cycle and
+    cannot wedge — check both, don't assume either.** `#6633` rejected
+    one on the grounds that it adds a blocking edge and turns a false red
+    into a hang, which is the right default. It is admissible when (a)
+    there is no cycle in the wait-for graph — the awaited thread is
+    unbounded, takes no lock the waiter holds, and its `stop` is set by a
+    third thread only after the waiter is joined — and (b) the wait is
+    not a block but a bounded poll that PANICS BY NAME, so a stall is a
+    named assertion failure and never an rc=124 wedge. Record the
+    disposition at the call site: a later reader will find the older
+    "prefer the do-while to a rendezvous" rule and needs to know which
+    conditions changed.
+  - **A liveness backstop is not a timing assertion, and a red there is
+    never fixed by raising it.** Size it orders of magnitude above the
+    healthy path (60s against a microsecond publish; 30s against a
+    microsecond sweep) and say so IN THE FAILURE TEXT, because the next
+    person to see it red will be deciding whether the machine was merely
+    loaded. Tightening a bound to "make the wait meaningful" just moves
+    the wall-clock sample — a 5s bound reddened master twice.
   - **`thread_local!` is only for a TEST-ONLY global. A PRODUCTION global
     takes the guard, whatever its shape.** `DETERMINISTIC_V6_DOWNGRADE_COUNT`
     (`nat64.rs`) is an `AtomicU64` two tests assert deltas on, which looks like
@@ -789,8 +820,19 @@ they repeatedly bite:
     `engine_tests::run_bounded` runs the body on a worker thread and asserts
     completion against a deliberately loose 30s backstop (the healthy path is
     microseconds, so a loaded machine cannot flake it). The parked worker is
-    left detached on the failure path; libtest exits the process rather than
+    left detached on the deadlock path; libtest exits the process rather than
     joining it.
+  - **Such a runner must distinguish a body that PANICKED from a body that
+    PARKED.** Deciding "done" from a flag the worker sets AFTER calling the
+    body reports a panicking body as a deadlock: the flag stays false, the
+    caller burns the whole backstop, and the named failure claims the wrong
+    defect. `run_bounded` polls the join handle alongside the flag and
+    `resume_unwind`s the body's payload, so the failure names the assertion
+    that actually fired (#6989 — found when a mutation cell removing
+    `reconcile_lock` produced "found 126 … install/reconcile race left
+    orphans" and it was buried 30s later under a #6952 self-deadlock claim).
+    A body that genuinely parks never finishes, so the deadlock path is
+    untouched.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in
