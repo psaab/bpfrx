@@ -420,6 +420,48 @@ pub(in crate::afxdp) fn commit_zone_counter_prune(
     state.flood_counter_store.reconcile(&configured);
 }
 
+/// #7010: the DESTRUCTIVE half of the policy / NAT hit-counter reconcile —
+/// `commit_zone_counter_prune`'s twin, and deliberately its neighbour.
+///
+/// The additive half — `PolicyCounterStore::rule_hit_counter` and
+/// `NatCounterStore::rule_counter` get-or-creating a block per rule — stays in
+/// the fallible builder, where #6995 rolls it back on a rejected build. This
+/// half must NOT run there: a build can succeed and the apply still be rejected
+/// afterwards by a worker-thread spawn failure (#4952) or an incomplete queue
+/// bind (#5143), and pruning at build time destroyed the removed rules'
+/// cumulative hit counts for a configuration that never brought up a worker.
+///
+/// STRICTLY WORSE EXPOSURE than the #6832 zone case this copies, which is why it
+/// needed its own fix rather than riding along. `stop_inner(false)` defaults
+/// `coord.forwarding`, so the zone store lost its publisher on the
+/// `WorkerBindIncomplete` arm and only the `WorkerSpawn` arm was
+/// operator-visible. `policy_counters` and `nat_counters` are Coordinator fields
+/// `stop_inner` never touches, so BOTH arms leaked and `nat_rule_counters()`
+/// kept serving from the pruned store. Measured on the pre-fix head, both arms:
+/// `policy=["default-policy", "zone100->zone200/live-rule"] nat=[7]` — the
+/// removed rule's block already gone, and it stays gone.
+///
+/// Takes the two stores rather than the Coordinator so it can live beside its
+/// zone twin: a reader looking for "where the destructive halves commit" finds
+/// both in one place, which is the property that let the reconcile path drift
+/// from the refresh path in the first place.
+///
+/// What guards it is exactly three named tests, one per direction —
+/// `rejected_spawn_apply_does_not_prune_live_rule_counters_7010`,
+/// `rejected_bind_apply_does_not_prune_live_rule_counters_7010` and
+/// `committed_reconcile_prunes_rule_counters_for_removed_rules_7010`. They bind
+/// the call sites that EXIST; if you add an apply path, add its row.
+pub(in crate::afxdp) fn commit_rule_counter_prune(
+    policy_counters: &crate::policy::PolicyCounterStore,
+    nat_counters: &crate::nat::NatCounterStore,
+    snapshot: &ConfigSnapshot,
+) {
+    policy_counters.reconcile_rules(&snapshot.policies);
+    // #2218: drop hit counters for NAT rules removed by this config.
+    nat_counters
+        .reconcile_ids(&crate::afxdp::coordinator::snapshot_active_nat_counter_ids(snapshot));
+}
+
 /// Every fallible step of the forwarding build. Returns `Err` on any snapshot
 /// integrity violation, having touched no live ZONE-COUNTER state — see the
 /// caller for why the per-zone counter binding is deliberately not done here.

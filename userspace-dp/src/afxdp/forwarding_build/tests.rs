@@ -8070,3 +8070,254 @@ fn build_cos_state_temporal_converts_against_the_fallback_drain_rate() {
          to claim"
     );
 }
+
+// #7015: bind the counter-prune OBLIGATION — "on the `is_ok()` branch, this
+// call happens" — which nothing enforced.
+//
+// WHY NOT THE RECEIPT THE ISSUE PREFERS. #7015 ranks a prune-debt receipt first:
+// `attach_zone_counters` records "prune owed for generation N", and "a new
+// build's additive half finding a prior generation's debt still outstanding IS
+// the defect". That is UNSOUND as specified, and the reason is the very path
+// #6832 created. A rejected apply legitimately leaves the debt outstanding —
+// that is the whole point of deferring the prune past `bring_up_workers` — and
+// the next build then finds it. So the receipt fires on every
+// rejected-apply-then-retry sequence, which is a normal operator flow, not a
+// defect. `rejected_apply_then_retry_is_a_reachable_sequence_7015` below
+// demonstrates that sequence is reachable rather than hypothetical.
+//
+// So this is the issue's option (2), the structural guard — with the weakness
+// it was ranked down for removed. #7015 objects that option (2) "needs an
+// exemption list", and this board has been bitten by lists going stale. This
+// guard has no per-call-site list: it DISCOVERS the prune families from the
+// definitions and requires each to be called from the same two apply commit
+// points. A family added later is picked up with no edit — which matters
+// immediately, because #7010 adds a second one.
+//
+// The one pinned population is the set of forwarding-state PUBLISH sites, and
+// it is pinned by exact content rather than by count so a stale entry cannot
+// hide behind a coincidental total. That pin is the half that detects the third
+// apply path: a new one either calls the prunes (the family assertion fires,
+// naming what to update) or it does not (this pin fires, naming the new site).
+
+/// Every `pub(in crate::afxdp) fn commit_*_prune(` defined in
+/// `forwarding_build/mod.rs`, discovered rather than listed.
+fn discovered_prune_families() -> Vec<String> {
+    prune_families_in(include_str!("mod.rs"))
+}
+
+/// The discovery itself, over arbitrary source, so its own behaviour can be
+/// measured rather than argued.
+fn prune_families_in(src: &str) -> Vec<String> {
+    let cleaned = crate::afxdp::worker_queue::tests::blank_comments_and_strings(src);
+    let mut out = Vec::new();
+    for line in cleaned.lines() {
+        // Keyed on `fn NAME(`, NOT on the visibility modifier in front of it.
+        // An earlier revision matched the exact `pub(in crate::afxdp) fn `
+        // prefix, which meant a routine visibility widening would drop a family
+        // out of discovery silently — and with two families present the
+        // anti-vacuity floor below would still pass, leaving the widened one
+        // unguarded. That is the "fails to a value indistinguishable from
+        // healthy" shape this guard exists to avoid, so the needle does not
+        // depend on a spelling that has no bearing on the obligation.
+        let Some(idx) = line.find("fn ") else {
+            continue;
+        };
+        let Some(name) = line[idx + 3..].split('(').next() else {
+            continue;
+        };
+        let name = name.trim();
+        if name.starts_with("commit_") && name.ends_with("_prune") {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The discovery must not depend on a spelling that has no bearing on the
+/// obligation.
+///
+/// An earlier revision keyed on the exact `pub(in crate::afxdp) fn ` prefix. A
+/// routine visibility widening would then have dropped a family out of
+/// discovery SILENTLY — and with two families present (as of #7010) the
+/// anti-vacuity floor still passes, so the widened one goes unguarded while the
+/// guard reports clean. This measures the property instead of asserting it.
+#[test]
+fn prune_family_discovery_is_independent_of_visibility_7015() {
+    const SPELLINGS: &str = r#"
+pub(in crate::afxdp) fn commit_zone_counter_prune(a: u8) {}
+pub(crate) fn commit_rule_counter_prune(a: u8) {}
+fn commit_private_counter_prune(a: u8) {}
+pub fn not_a_prune_family(a: u8) {}
+fn commit_something_else(a: u8) {}
+"#;
+    let mut got = prune_families_in(SPELLINGS);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "commit_private_counter_prune".to_string(),
+            "commit_rule_counter_prune".to_string(),
+            "commit_zone_counter_prune".to_string(),
+        ],
+        "discovery must find every `commit_*_prune` regardless of visibility, and \
+         must not claim functions that are neither (#7015)"
+    );
+
+    // ...and it must still be blinded by comments, so a doc comment naming a
+    // family cannot conjure one that does not exist.
+    assert!(
+        prune_families_in("// fn commit_ghost_counter_prune(a: u8) {}\n").is_empty(),
+        "a COMMENTED-OUT definition was discovered as a real family; the scan is \
+         not blanking comments and a doc comment could satisfy it (#7015)"
+    );
+}
+
+/// Production `.rs` files under `src/afxdp`, with comments and string bodies
+/// blanked so a doc comment quoting a call cannot satisfy the scan.
+fn afxdp_production_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/afxdp");
+    let mut files = Vec::new();
+    crate::afxdp::worker_queue::tests::afxdp_rs_files(&root, &mut files);
+    let mut out = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("under src/afxdp")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if crate::afxdp::worker_queue::tests::is_fixture(&rel) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read source");
+        out.push((
+            rel,
+            crate::afxdp::worker_queue::tests::blank_comments_and_strings(&src),
+        ));
+    }
+    out
+}
+
+/// The two apply paths that commit a snapshot, and therefore the two files a
+/// counter prune must be called from.
+const APPLY_COMMIT_POINT_FILES: &[&str] =
+    &["coordinator/reconcile/mod.rs", "coordinator/snapshot_refresh.rs"];
+
+#[test]
+fn every_commit_counter_prune_is_called_from_both_apply_commit_points_7015() {
+    let families = discovered_prune_families();
+    assert!(
+        !families.is_empty(),
+        "the scan discovered NO commit_*_prune family in forwarding_build/mod.rs. \
+         Either the naming convention changed or the comment-blanking ate the \
+         definitions — either way this guard would pass while checking nothing (#7015)"
+    );
+
+    let sources = afxdp_production_sources();
+    assert!(
+        sources.len() >= 40,
+        "only {} production sources under src/afxdp were scanned; the walk or the \
+         fixture filter is broken and every absence below is vacuous",
+        sources.len()
+    );
+
+    for family in &families {
+        let needle = format!("{family}(");
+        let mut callers: Vec<String> = Vec::new();
+        for (rel, cleaned) in &sources {
+            // The definition itself is not a call site.
+            let defines = cleaned.contains(&format!("fn {needle}"));
+            let mentions = cleaned.matches(&needle).count();
+            let calls = mentions - usize::from(defines);
+            if calls > 0 {
+                callers.push(rel.clone());
+            }
+        }
+        callers.sort();
+        let want: Vec<String> = APPLY_COMMIT_POINT_FILES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            callers, want,
+            "`{family}` is called from {callers:?}, want exactly {want:?}.\n\
+             The destructive half of a counter reconcile must run at EVERY apply \
+             path's own commit point and nowhere else: earlier than that and a \
+             build whose workers fail to come up destroys live totals for a \
+             configuration that never forwarded (#6832/#7010); missing from one \
+             and that path leaks removed rows forever. If you added an apply \
+             path, call every discovered prune family at its commit point and \
+             add its file to APPLY_COMMIT_POINT_FILES (#7015)"
+        );
+    }
+}
+
+#[test]
+fn forwarding_publish_population_is_pinned_7015() {
+    // The half that DETECTS a third apply path. Pinned by content, not by
+    // count: a stale entry cannot hide behind a coincidental total.
+    let want: &[(&str, usize)] = &[
+        // Teardown reset — not an apply, publishes nothing to commit.
+        ("coordinator/mod.rs", 1),
+        // Builder staging into the fds carrier — not an apply publish.
+        ("coordinator/reconcile/mod.rs", 1),
+        // THE RECONCILE APPLY's publish. Its commit point is in reconcile/mod.rs,
+        // after bring_up_workers — deliberately not here.
+        ("coordinator/reconcile/snapshot.rs", 1),
+        // THE REFRESH APPLY's publish, which IS its own commit point.
+        ("coordinator/snapshot_refresh.rs", 1),
+    ];
+
+    let mut got: Vec<(String, usize)> = Vec::new();
+    for (rel, cleaned) in afxdp_production_sources() {
+        let n = cleaned.matches(".forwarding = ").count();
+        if n > 0 {
+            got.push((rel, n));
+        }
+    }
+    got.sort();
+    let want_owned: Vec<(String, usize)> =
+        want.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+    assert_eq!(
+        got, want_owned,
+        "the set of forwarding-state assignment sites under src/afxdp changed.\n\
+         If a new APPLY path appeared, it must call every commit_*_prune family \
+         at its own commit point (see \
+         every_commit_counter_prune_is_called_from_both_apply_commit_points_7015) \
+         — the obligation is control-flow-shaped and nothing else enforces it. \
+         If the new site is not an apply, add it here with a note saying why \
+         (#7015)"
+    );
+}
+
+/// The refutation of #7015's preferred mechanism, made concrete.
+///
+/// A prune-debt receipt would treat "a prior generation's debt is still
+/// outstanding when the next build runs" as the defect. This shows that
+/// sequence is an ordinary one: a rejected apply leaves the prune legitimately
+/// undone — that is what #6832 deferred it FOR — and the retry that follows is
+/// a normal operator response, not a bug. A receipt keyed on outstanding debt
+/// fires here.
+#[test]
+fn rejected_apply_then_retry_is_a_reachable_sequence_7015() {
+    // Both directions already exist as behavioural cells in coordinator/tests.rs
+    // (`rejected_apply_does_not_prune_live_zone_counters_6832` and
+    // `committed_reconcile_prunes_zone_counters_for_removed_zones_6832`), so
+    // what this pins is that the project treats them as ONE sequence rather than
+    // two unrelated states — i.e. that the rejected state is a resting place a
+    // retry departs from.
+    let src = include_str!("../coordinator/tests.rs");
+    let cleaned = crate::afxdp::worker_queue::tests::blank_comments_and_strings(src);
+    for needle in [
+        "fn rejected_apply_does_not_prune_live_zone_counters_6832(",
+        "fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832(",
+    ] {
+        assert!(
+            cleaned.contains(needle),
+            "{needle} is gone. The #7015 argument against a prune-debt receipt \
+             rests on the rejected-apply state being reachable AND survivable; \
+             if that cell no longer exists, re-derive the argument before \
+             relying on it"
+        );
+    }
+}

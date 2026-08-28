@@ -9,8 +9,16 @@ import subprocess, sys
 BASE = subprocess.run(['git','show','origin/master:userspace-dp/src/nat/source.rs'],
                       capture_output=True, text=True, check=True).stdout.split('\n')
 
-SEAMS=[('failure',59,215),('expand',1094,1267),('release',1580,1836),
-       ('synced',1838,2352),('nat64_ports',2354,2493),('match_rules',2495,3241)]
+# Line ranges in the CURRENT origin/master source.rs. They shift whenever master
+# lands work in the residual: #7858 (`carry_renamed_pool_reservations`, #6979 F6)
+# inserted 99 lines at ~717 and moved every seam below it by exactly that. When
+# they shift, re-derive them by CONTENT — match each seam's first and last line
+# in the new file and require the span length to be preserved — rather than by
+# arithmetic. That derivation also proves master did not touch the moved text,
+# which is the fact a modify/delete merge most needs and the one a
+# conflict-marker sweep cannot supply (this conflict produces ZERO markers).
+SEAMS=[('failure',59,215),('expand',1193,1366),('release',1679,1935),
+       ('synced',1937,2451),('nat64_ports',2453,2592),('match_rules',2594,3340)]
 
 # Two WIDENINGS (private -> pub(super)) and one RESPELLING. The respelling is
 # not a visibility change at all: `pub(super)` inside `nat::source` meant

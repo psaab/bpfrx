@@ -312,57 +312,6 @@ type peerIdentityKey struct{}
 // total rather than this long on every request the connection makes.
 const peerLookupTimeout = 5 * time.Second
 
-// maxConcurrentPeerLookups bounds accept-time peer lookups in flight at once.
-//
-// Deliberately far above any legitimate concurrency on a surface that answers a
-// handful of operator actions per second; it is a ceiling on unbounded growth,
-// not a throttle. Set for the same reason and with the same fail-closed
-// direction as the two queue caps in pkg/authz (maxPendingLookups,
-// maxHostAddrWaiters), though a quarter their size: those bound 4096 each,
-// this one 1024. "Sized like" overstated it.
-//
-// THE TRADEOFF THIS MAKES, stated so it can be disagreed with (#6645 r20).
-// The paragraph above gives the justification; these are the costs, and a
-// maintainer weighing them should not have to rediscover them:
-//
-//   - The slot is taken at ACCEPT, before authentication and before a single
-//     HTTP byte is read. An UNAUTHENTICATED client therefore consumes the
-//     budget, and consumes it by opening TCP connections alone.
-//   - Past the cap a lookup is not queued, delayed or retried — it is resolved
-//     immediately to an unattributable local identity, which DENIES. Requests
-//     that would have completed are converted into denials. That is a
-//     behaviour change under load, not only a latency cost.
-//   - The pool is process-global (see peerLookupSlots below), so HTTP, HTTPS,
-//     retiring and rebound listeners and every api.Server share one budget:
-//     saturation on any of them denies on all of them.
-//
-// It is accepted anyway because the alternative is worse, not because the cost
-// is small. The wedge this bounds is inside localAddrsFn() holding
-// localAddrCache.mu; a context cannot unblock a goroutine parked on a mutex, so
-// cancellation is unavailable and admission control is the only lever. Without
-// the cap, continued connections against a wedged enumeration accumulate
-// goroutines and their captured addresses WITHOUT LIMIT on a management plane,
-// driven by the same unauthenticated caller. Bounded denial is preferred to
-// unbounded growth.
-//
-// The refinements that would remove the cost rather than bound it — a
-// per-listener budget instead of a process-global one, and/or acquiring the
-// slot AFTER authentication so an unauthenticated client cannot spend it — are
-// tracked in #6974 and are not attempted here. Any such change must keep the
-// property this cap exists for: no unbounded goroutine accumulation while
-// localAddrsFn is wedged. Raising or removing the cap alone reinstates the
-// original defect.
-const maxConcurrentPeerLookups = 1024
-
-// peerLookupSlots is the admission token pool for those lookups. Package-level:
-// the resource being bounded is the daemon's goroutines and memory, which every
-// listener shares. That sharing is also the cost documented above — one
-// saturated listener denies on all of them.
-var peerLookupSlots = make(chan struct{}, maxConcurrentPeerLookups)
-
-// PeerLookupSlotsInUseForTest reports how many lookup slots are held. Test-only.
-func PeerLookupSlotsInUseForTest() int { return len(peerLookupSlots) }
-
 // peerWaitersInFlight counts requests currently PARKED in pendingPeer.wait
 // inside the mutation gate — i.e. requests that have reached authorizeInputs and
 // are blocked on their connection's accept-time lookup.
@@ -472,12 +421,19 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	// Past the cap the connection is resolved IMMEDIATELY to an unattributable
 	// LOCAL identity, which denies — the same answer a timed-out lookup produces,
 	// reached without spawning anything.
+	// #6974: the pool is chosen by whether this connection can reach the
+	// enumeration the budget bounds. The ACQUIRE STAYS HERE, at accept, and the
+	// slot is still held across s.lookupPeer — which is what calls
+	// authz.LookupPeer and therefore the wedge. Moving the acquire later (after
+	// authentication, say) would move it past the thing it protects and bound
+	// nothing; what moves here is only WHICH bounded pool a connection draws on.
+	pool := peerLookupPoolFor(client, server)
 	select {
-	case peerLookupSlots <- struct{}{}:
+	case pool <- struct{}{}:
 		go func() {
 			// #6977: ORDER IS THE INVARIANT (defers are LIFO) — pkg/api/README.md.
 			defer close(p.done)
-			defer func() { <-peerLookupSlots }()
+			defer func() { <-pool }()
 			p.id = s.lookupPeer(client, server)
 		}()
 	default:
