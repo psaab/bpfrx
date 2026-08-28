@@ -8341,3 +8341,169 @@ fn synced_reservation_quarantined_owner_is_not_nothing_to_reserve_7076() {
          Collapsing them hands a pool-domain address to the interface domain (#7076)"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #6979 F6: renaming a source-NAT pool discarded its live reservations.
+//
+// `previous_allocators` is keyed by `SourceNatPoolAllocatorKey` = pool NAME +
+// address vectors + port range. Two rules with identical addresses under
+// DIFFERENT pool names are two keys. Rename one onto the other's name and both
+// new rules collapse onto the surviving key — the renamed pool's allocator is
+// dropped, so its live translated identity becomes FREE and reissuable while
+// the session that owns it is still in the table.
+//
+// The fix carries the live state across the rename rather than widening the
+// key: two rules naming one pool SHOULD share one allocator, and keeping them
+// apart would give one address two independent occupancy domains, which is the
+// collision the key exists to prevent.
+// ---------------------------------------------------------------------------
+
+fn f6_rule(rule: &str, pool: &str) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
+        name: rule.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: pool.to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }
+}
+
+fn f6_flow() -> SourceNatFlowKey {
+    SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.7".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 1111,
+        dst_port: 443,
+    }
+}
+
+/// Build a generation with pools `a` and `b` over one shared address, with the
+/// SECOND holding a live translation.
+fn f6_generation_with_b_holding() -> Vec<SourceNatRule> {
+    let g1 = parse_source_nat_rules(&[f6_rule("r1", "a"), f6_rule("r2", "b")]);
+    assert_eq!(g1.len(), 2, "fixture must build both rules");
+    assert!(
+        g1[1].pool_allocator.reserve_flow(
+            f6_flow(),
+            TranslatedTuple {
+                ip: "203.0.113.1".parse().unwrap(),
+                port: 20000
+            },
+            0,
+            false,
+            0,
+            NatHolder::Untracked,
+        ),
+        "fixture must seat the live translation on pool b"
+    );
+    assert_eq!(g1[0].pool_allocator.live_flow_count(), 0, "a starts idle");
+    assert_eq!(g1[1].pool_allocator.live_flow_count(), 1, "b holds one");
+    g1
+}
+
+/// THE BINDING (#6979 F6). Renaming `b` onto `a` must not free `b`'s live
+/// translated identity.
+///
+/// RED AT MASTER: both rules come back with ZERO live flows, so
+/// `203.0.113.1:20000` is reissuable while its session is still in the table —
+/// a second flow can be handed the same reverse identity.
+#[test]
+fn renamed_pool_carries_live_reservations_6979() {
+    let counters = NatCounterStore::default();
+    let gen1 = f6_generation_with_b_holding();
+
+    // Rename b -> a. Both rules now key identically.
+    let gen2 = parse_source_nat_rules_with_previous(
+        &[f6_rule("r1", "a"), f6_rule("r2", "a")],
+        Some(&gen1),
+        &counters,
+        0,
+    );
+
+    let held: usize = gen2
+        .iter()
+        .map(|r| r.pool_allocator.live_flow_count())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        held, 1,
+        "renaming pool b onto pool a DISCARDED b's live translation. The two rules \
+         collapse onto one allocator key, and the renamed pool's allocator is dropped \
+         rather than merged — so 203.0.113.1:20000 is free and reissuable while the \
+         session that owns it is still live, and the next flow can be handed the same \
+         reverse identity (#6979 F6)"
+    );
+}
+
+/// THE PAIRED CELL. Two pools that merely SHARE an address must NOT exchange
+/// reservations.
+///
+/// This is the over-reach the first version of the fix actually had, caught by
+/// running a control: carrying between any two allocators with matching
+/// addresses copied `b`'s live flow into `a`. That copy is never released when
+/// the original is — they are separate allocators — so it leaks a phantom
+/// reservation on an address the peer pool owns.
+///
+/// The discriminator is whether the previous name SURVIVES into this
+/// generation: absent means renamed, present means a coexisting peer.
+///
+/// Note the independent fixture. Reusing the generation from the test above
+/// would measure that test's side effect, because allocator reuse shares the
+/// `Arc` and the carry mutates it in place.
+#[test]
+fn coexisting_pools_sharing_an_address_do_not_cross_pollinate_6979() {
+    let counters = NatCounterStore::default();
+    let gen1 = f6_generation_with_b_holding();
+
+    // NO rename: both pool names survive.
+    let gen2 = parse_source_nat_rules_with_previous(
+        &[f6_rule("r1", "a"), f6_rule("r2", "b")],
+        Some(&gen1),
+        &counters,
+        0,
+    );
+
+    assert_eq!(
+        gen2[0].pool_allocator.live_flow_count(),
+        0,
+        "pool a acquired a live translation it never minted. Pools a and b both survive \
+         this generation, so they are distinct peers that merely share an address — not a \
+         rename. Copying b's reservation into a leaks it: a's copy is never released when \
+         b's original is, because they are separate allocators (#6979 F6)"
+    );
+    assert_eq!(
+        gen2[1].pool_allocator.live_flow_count(),
+        1,
+        "pool b must keep its own live translation across an unrelated rebuild"
+    );
+}
+
+/// The rename also has to work when the surviving name is NEW — i.e. both old
+/// pools disappear and a third name takes their addresses. That path builds a
+/// FRESH allocator rather than reusing one, so it is a different branch of the
+/// resolver and would not be covered by the test above.
+#[test]
+fn rename_onto_a_new_pool_name_carries_live_reservations_6979() {
+    let counters = NatCounterStore::default();
+    let gen1 = f6_generation_with_b_holding();
+
+    // Both `a` and `b` vanish; `c` takes the same address and range.
+    let gen2 = parse_source_nat_rules_with_previous(
+        &[f6_rule("r1", "c")],
+        Some(&gen1),
+        &counters,
+        0,
+    );
+    assert_eq!(
+        gen2[0].pool_allocator.live_flow_count(),
+        1,
+        "renaming onto a name with no predecessor takes the FRESH-allocator branch; the \
+         live translation must still be carried, or it is freed while its session lives"
+    );
+}
