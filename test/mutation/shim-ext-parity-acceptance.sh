@@ -234,7 +234,16 @@ explain() {
   local e
   e="$(grep -m1 -oE '(\[l3=[0-9]+\] |next-header [0-9]+: )[^"]*' "${test_log}")"
   if [ -z "${e}" ]; then
-    e="$(grep -m1 -A3 -E "^thread '.*' panicked" "${test_log}" | tr '\n' ' ')"
+    # #6920: the thread-id is OPTIONAL because the toolchain started printing
+    # one. Rust 1.96 emits `thread 'NAME' (307669) panicked at ...`, so the
+    # previous `^thread '.*' panicked` — which required `panicked` immediately
+    # after the closing quote — stopped matching, and any row whose mutation
+    # PANICS instead of tripping an assertion had no extractable reason. That
+    # is not cosmetic: `fail()` exits the whole run, so row 7 (FRAGMENT read
+    # 8 -> 2, which indexes out of bounds) aborted the harness before rows
+    # 8-21 ran. Third time this file's reason-extractor has rotted against
+    # text it does not control; the header documents the other two.
+    e="$(grep -m1 -A3 -E "^thread '.*' (\([0-9]+\) )?panicked" "${test_log}" | tr '\n' ' ')"
   fi
   printf '%s' "${e}"
 }
@@ -292,8 +301,25 @@ run() {
 
   if [ ${trc} -ne 0 ]; then
     local why; why="$(explain)"
-    [ -n "${why}" ] || fail "row '${label}' is RED but no reason could be extracted from ${test_log}; the extractor no longer matches the assertion text"
-    echo "      first divergence: ${why}"
+    if [ -z "${why}" ]; then
+      # #6920: DO NOT abort here. This used to call `fail()`, which exits the
+      # whole run — so a rot in a DIAGNOSTIC path destroyed the entire matrix
+      # rather than one row's reason column. That is exactly what happened:
+      # row 7 panics instead of asserting, the panic fallback stopped matching
+      # when the toolchain began printing thread ids, and rows 8-21 silently
+      # never ran. A gate that reports on a third of its own subject is worse
+      # than one that reports a gap.
+      #
+      # The row is still SCORED — its guard columns are what prove the guards
+      # fire, and the reason text is diagnostics. The miss is counted and the
+      # run FAILS at the end with a full accounting, so the rot stays loud
+      # while the matrix stays complete.
+      echo "      first divergence: <UNAVAILABLE — extractor matched nothing; see the end-of-run accounting>"
+      extractor_misses=$((extractor_misses + 1))
+      extractor_miss_rows+=("${label}")
+    else
+      echo "      first divergence: ${why}"
+    fi
     return 1
   fi
   return 0
@@ -360,6 +386,34 @@ FRAG_READ='                let frag = read_bytes(data, data_end, offset as usize
 FRAG_ADV='                offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;'
 LOOP_HEAD='    for _ in 0..MAX_EXT_HDRS {'
 
+# #6920: THE TWO DIMENSIONS #4555 ACTUALLY DELIVERED.
+#
+# Every row above perturbs advance arithmetic, revalidation, the fragment read,
+# the L3 base or a loop statement. None of them touches `MAX_EXT_HDRS` or
+# `eh_class` — and those two ARE the deliverable: #4555 reached parity by
+# raising the resolvable chain length to 7 AND widening the generic arm to the
+# five #4517 types (Mobility 135, HIP 139, Shim6 140, experimental 253/254).
+#
+# `LOOP_HEAD` above names the bound, but only as an anchor for the
+# statement-insertion row — mutating the text around a constant is not
+# mutating the constant. So the artifact offered as "the guards fire" did not
+# exercise either half of what shipped. The guards were independently
+# confirmed to bind; this closes the EVIDENCE gap, not an unbound guard.
+MAX_HDRS_DECL='pub const MAX_EXT_HDRS: usize = 7;'
+MAX_HDRS_6="${MAX_HDRS_DECL/= 7;/= 6;}"
+MAX_HDRS_8="${MAX_HDRS_DECL/= 7;/= 8;}"
+
+# The generic arm with the five #4517 types removed — the pre-#4555 view.
+EH_GENERIC_ARM='        NEXTHDR_HOP
+        | NEXTHDR_ROUTING
+        | NEXTHDR_DEST
+        | NEXTHDR_MOBILITY
+        | NEXTHDR_HIP
+        | NEXTHDR_SHIM6
+        | NEXTHDR_EXP1
+        | NEXTHDR_EXP2 => EH_CLASS_GENERIC,'
+EH_GENERIC_NARROW='        NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => EH_CLASS_GENERIC,'
+
 # Quoted patterns, so bash treats them literally rather than as globs.
 GENERIC_ADV16="${GENERIC_ARM/"+ 1) * 8"/"+ 1) * 16"}"
 GENERIC_REVAL_M1="${GENERIC_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
@@ -391,6 +445,9 @@ LOOP_HEAD_GUARDED="${LOOP_HEAD}
             break;
         }"
 
+m_max_hdrs_6()           { spec "${MAX_HDRS_DECL}"  "${MAX_HDRS_6}"        | py_sub 1; }
+m_max_hdrs_8()           { spec "${MAX_HDRS_DECL}"  "${MAX_HDRS_8}"        | py_sub 1; }
+m_eh_class_narrow()      { spec "${EH_GENERIC_ARM}" "${EH_GENERIC_NARROW}" | py_sub 1; }
 m_generic_advance()      { spec "${GENERIC_ARM}"  "${GENERIC_ADV16}"      | py_sub 1; }
 m_generic_reval_delete() { spec "${GENERIC_ARM}"  "${GENERIC_NO_REVAL}"   | py_sub 1; }
 m_generic_reval_minus1() { spec "${GENERIC_ARM}"  "${GENERIC_REVAL_M1}"   | py_sub 1; }
@@ -473,6 +530,11 @@ m_generic_next_udp()     { spec "${GENERIC_ARM}" "${GENERIC_NEXT_UDP}"    | py_s
 rc=0
 rows_total=0
 rows_passed=0
+# #6920: rot accounting. A run that scores fewer rows than it declared, or that
+# scores a row without being able to say why it red, is a run whose result must
+# not read as clean.
+extractor_misses=0
+declare -a extractor_miss_rows=()
 declare -a row_names=()
 declare -a row_outcomes=()
 
@@ -519,17 +581,28 @@ row m_auth_adv_at_len2      red     "13. AUTH advance +4 ONLY at HdrExtLen == 2"
 row m_frag_adv_on_reserved  red     "14. FRAGMENT advance 8 -> 7 ONLY when reserved != 0"
 row m_generic_next_udp      red     "15. GENERIC carried next-header UDP propagated as TCP"
 row m_generic_reval_routing red     "16. GENERIC revalidation skipped ONLY for Routing(43)"
-row m_semantically_null     survive "17. NEG-CTL semantically null rename (must survive)"
+# #6920: the two dimensions #4555 delivered. Expected reds below are MEASURED
+# (the hostile gate on PR #6655 ran all three directly), not predicted.
+#
+# Row 19 is the one that matters most: it is the fail-OPEN direction — the shim
+# resolving a chain userspace REFUSES — which is what would bite if someone
+# later raised the cap without re-checking the verifier. The other two are
+# fail-closed drift, where the shim gives up on a chain userspace still
+# resolves, and a fast-path miss is the benign outcome.
+row m_max_hdrs_6            red     "17. MAX_EXT_HDRS 7 -> 6 (fail-closed drift)"
+row m_eh_class_narrow       red     "18. eh_class generic narrowed to {0,43,60} (pre-#4517)"
+row m_max_hdrs_8            red     "19. MAX_EXT_HDRS 7 -> 8 (FAIL-OPEN direction)"
+row m_semantically_null     survive "20. NEG-CTL semantically null rename (must survive)"
 
 cp "${GOLD}" "${WALK}"
 cmp -s "${GOLD}" "${WALK}" || fail "restore did not reproduce the pristine file"
 rows_total=$((rows_total + 1))
-if run "18. RESTORED"; then
+if run "21. RESTORED"; then
   rows_passed=$((rows_passed + 1))
-  row_names+=("18. RESTORED"); row_outcomes+=("PASS (green again)")
+  row_names+=("21. RESTORED"); row_outcomes+=("PASS (green again)")
 else
   rc=1
-  row_names+=("18. RESTORED"); row_outcomes+=("FAIL (tree not green after restore)")
+  row_names+=("21. RESTORED"); row_outcomes+=("FAIL (tree not green after restore)")
 fi
 
 echo "--- row accounting ---------------------------------------------------"
@@ -537,5 +610,24 @@ for i in "${!row_names[@]}"; do
   printf '%-56s %s\n' "${row_names[$i]}" "${row_outcomes[$i]}"
 done
 echo "rows passed: ${rows_passed}/${rows_total} (plus row 0 baseline and preflights P1/P2)"
+
+# #6920: COMPLETION CHECK. The matrix must score every row it declared. Counting
+# `row ... ` invocations from this file itself, rather than a hardcoded number,
+# so adding a row cannot leave the expectation behind — the failure mode this
+# very harness exists to prevent, one level up.
+declared_rows=$(grep -cE '^row [A-Za-z0-9_]+ +(red|survive)([[:space:]]|$)' "$0")
+declared_rows=$((declared_rows + 1))   # + the RESTORED row, which is not a `row` call
+if [ "${rows_total}" -ne "${declared_rows}" ]; then
+  echo "INCOMPLETE: ${rows_total} rows scored but ${declared_rows} declared — the run did not"
+  echo "  reach every row. A partial matrix must never read as a clean one."
+  rc=1
+fi
+if [ "${extractor_misses}" -ne 0 ]; then
+  echo "EXTRACTOR ROT: ${extractor_misses} row(s) red with no extractable reason:"
+  for r in "${extractor_miss_rows[@]}"; do echo "    ${r}"; done
+  echo "  The rows still SCORED — their guard columns are what prove the guards fire —"
+  echo "  but the reason extractor no longer matches the text it reads. Fix \`explain()\`."
+  rc=1
+fi
 echo "=== acceptance $([ ${rc} -eq 0 ] && echo PASS || echo FAIL) ==="
 exit ${rc}
