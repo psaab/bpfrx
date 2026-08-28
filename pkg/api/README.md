@@ -1656,7 +1656,8 @@ the drop fails loudly instead of going quietly vacuous.
         silence the diagnostic on the most remotely-reachable listener there is.
         `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the
         divergence, and the wildcard binds appear as MUST-STILL-WARN cells beside
-        the loopback silence cells so the suppression cannot widen unnoticed. **Accepted residual:** a rename that CROSSES the
+        the loopback silence cells so the suppression cannot widen unnoticed.
+        **Accepted residual:** a rename that CROSSES the
         qualified/unqualified boundary is diagnosed at the commit but not on any
         later boot, so it is never diagnosed at all in the two states that had
         no commit-time diagnosis behind them — a box already drifted before this
