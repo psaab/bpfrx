@@ -708,7 +708,7 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		// Parse destination port range boundaries.
 		dstLow, dstHigh, err := parsePortRange(app.DestinationPort)
 		if err != nil {
-			slog.Warn("bad port for application",
+			compileWarn(dp, "bad port for application",
 				"name", appName, "port", app.DestinationPort, "err", err)
 			continue
 		}
@@ -729,7 +729,7 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 			var srcErr error
 			srcLow, srcHigh, srcErr = parsePortRange(app.SourcePort)
 			if srcErr != nil {
-				slog.Warn("bad source-port for application",
+				compileWarn(dp, "bad source-port for application",
 					"name", appName, "port", app.SourcePort, "err", srcErr)
 				srcOK = false
 			} else {
@@ -787,7 +787,7 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		if rangeSize > 256 && rangeIdx < MaxAppRanges {
 			for _, p := range protos {
 				if rangeIdx >= MaxAppRanges {
-					slog.Warn("app_ranges full, falling back to HASH expansion",
+					compileWarn(dp, "app_ranges full, falling back to HASH expansion",
 						"name", appName)
 					break
 				}
@@ -1200,13 +1200,9 @@ func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {
 		return fmt.Errorf("set default policy: %w", err)
 	}
 	if action == ActionPermit {
-		if !isValidationPass(dp) {
-			slog.Info("default policy compiled", "action", "permit-all")
-		}
+		compileInfo(dp, "default policy compiled", "action", "permit-all")
 	} else {
-		if !isValidationPass(dp) {
-			slog.Info("default policy compiled", "action", "deny-all")
-		}
+		compileInfo(dp, "default policy compiled", "action", "deny-all")
 	}
 	return nil
 }
@@ -1239,15 +1235,13 @@ func compileFlowTimeouts(dp DataPlane, cfg *config.Config) error {
 	// compile whose result was thrown away (#6894 r8 F6).
 	for _, v := range timeouts {
 		if v > 0 {
-			if !isValidationPass(dp) {
-				slog.Info("flow timeouts compiled",
-					"tcp_established", timeouts[FlowTimeoutTCPEstablished],
-					"tcp_initial", timeouts[FlowTimeoutTCPInitial],
-					"tcp_closing", timeouts[FlowTimeoutTCPClosing],
-					"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
-					"udp", timeouts[FlowTimeoutUDP],
-					"icmp", timeouts[FlowTimeoutICMP])
-			}
+			compileInfo(dp, "flow timeouts compiled",
+				"tcp_established", timeouts[FlowTimeoutTCPEstablished],
+				"tcp_initial", timeouts[FlowTimeoutTCPInitial],
+				"tcp_closing", timeouts[FlowTimeoutTCPClosing],
+				"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
+				"udp", timeouts[FlowTimeoutUDP],
+				"icmp", timeouts[FlowTimeoutICMP])
 			break
 		}
 	}
@@ -1327,17 +1321,15 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		return err
 	}
 
-	if !isValidationPass(dp) {
-		slog.Info("flow config compiled",
-			"tcp_mss_ipsec", fc.TCPMSSIPsec,
-			"tcp_mss_gre_in", fc.TCPMSSGreIn,
-			"tcp_mss_gre_out", fc.TCPMSSGreOut,
-			"allow_dns_reply", fc.AllowDNSReply,
-			"allow_embedded_icmp", fc.AllowEmbeddedICMP,
-			"app_flags", fc.AppFlags,
-			"lo0_filter_v4", fc.Lo0FilterV4,
-			"lo0_filter_v6", fc.Lo0FilterV6)
-	}
+	compileInfo(dp, "flow config compiled",
+		"tcp_mss_ipsec", fc.TCPMSSIPsec,
+		"tcp_mss_gre_in", fc.TCPMSSGreIn,
+		"tcp_mss_gre_out", fc.TCPMSSGreOut,
+		"allow_dns_reply", fc.AllowDNSReply,
+		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
+		"app_flags", fc.AppFlags,
+		"lo0_filter_v4", fc.Lo0FilterV4,
+		"lo0_filter_v6", fc.Lo0FilterV6)
 
 	return nil
 }
