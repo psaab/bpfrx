@@ -424,6 +424,15 @@ func TestPeerGateRewriteDoesNotMutateTheCandidate_4785(t *testing.T) {
 // `gr-0-0-0u1`. `gr-0-0-0` is therefore emitted-by-NAME but absent from the
 // live device set, which is what makes name keying and identity keying
 // disagree.
+// The unit is `mode gre`, not `mode wireguard` (#6941). This fixture needs the
+// emitted endpoint's DEVICE to diverge from its record's Name — that divergence
+// is what keeps `gr-0-0-0` out of the live device set so the anchor advisory
+// fires on the dead ipip record. A unit that stays on the interface's WireGuard
+// mode now SHARES the interface device (an interface-level WireGuard interface
+// has exactly one endpoint, so at most one device can carry it), which would
+// put `gr-0-0-0` in the live set and silence the advisory this test asserts. A
+// mode-overriding unit keeps its own uN device and still diverges. Restoring
+// `mode wireguard` here reds this test rather than silently disarming it.
 const ipipPointerKeyingSyncConfig = `interfaces {
     gr-0/0/0 {
         tunnel {
@@ -431,7 +440,7 @@ const ipipPointerKeyingSyncConfig = `interfaces {
         }
         unit 1 {
             tunnel {
-                mode wireguard;
+                mode gre;
             }
         }
     }

@@ -67,9 +67,28 @@ stanza, and what that means is now defined:
   the unit's port, so the host-inbound filter opened a port that no endpoint
   ever listened on.
 
-Which Linux device that single endpoint binds to when the lowest configured
-unit carries its own `tunnel` stanza is a separate open question — see #6941.
-#7786 deliberately does not move the endpoint's ref or device.
+### Which device the unit lives on (#6941)
+
+A unit that stays on the interface's WireGuard mode **shares the interface
+device**. It does not get a `wgNuU` device of its own.
+
+That follows from the one-endpoint rule above: if the interface has exactly one
+emitted endpoint, at most one device can ever carry its WireGuard traffic. A
+per-unit device could therefore only ever hold the unit's *addresses*, with no
+endpoint behind them — and address placement follows the same name, so whenever
+the lowest configured unit was not the one carrying the tunnel stanza, the
+WireGuard engine serving a unit's peers ran on one netdev while that unit's
+address sat on another. Routing materialised the loser as an orphan.
+
+This only became reachable when #7786 made per-unit peers actually install.
+Before that they were discarded, so the orphan device referenced nothing.
+
+A unit that **overrides** the mode (`tunnel mode gre` / `mode ipip` under a
+WireGuard interface) keeps its own `wgNuU` device. It is a different kind of
+tunnel, and `pkg/routing/tunnel.go` keys its desired set by `TunnelConfig.Name`
+— sharing a name across two different *modes* would hand routing one device
+with two conflicting records, rather than the benign same-name/same-mode
+sharing that key already relies on.
 
 ## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303 / #2329)
 

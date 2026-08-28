@@ -1117,9 +1117,25 @@ func TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861(t *testing.T) {
 // and this fails at "the anchor advisory did not fire".
 func TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861(t *testing.T) {
 	cfg, err := CompileConfigLenient(ipipTree(t,
-		// Emitted, and its device DIVERGES from its record's Name.
+		// Emitted, and its device DIVERGES from its record's Name: the
+		// emitted endpoint is keyed to unit 1 and resolves to unit 1's
+		// device (gr-0-0-0u1), while the record it carries is the
+		// interface-level object named gr-0-0-0. That divergence is this
+		// test's LEVER — it is what makes name-keying and device-keying
+		// disagree, and without it the device clause decides first and the
+		// keying under test is never consulted.
+		//
+		// The unit is `mode gre` rather than `mode wireguard` (#6941). A unit
+		// that stays on the interface's WireGuard mode now SHARES the
+		// interface device, because an interface-level WireGuard interface has
+		// exactly one endpoint and so at most one device that can carry it;
+		// with `mode wireguard` here the device set would contain gr-0-0-0 and
+		// the precondition below would fail. A mode-overriding unit keeps its
+		// own uN device (routing keys its desired set by Name, and sharing a
+		// name across two different MODES would be a conflict), so it still
+		// produces the divergence this fixture needs.
 		"set interfaces gr-0/0/0 tunnel mode wireguard",
-		"set interfaces gr-0/0/0 unit 1 tunnel mode wireguard",
+		"set interfaces gr-0/0/0 unit 1 tunnel mode gre",
 		// The anchor candidate: same canonical Linux name, ipip, source but no
 		// destination so the emitter skips it entirely.
 		"set interfaces gr-0/0-0 tunnel mode ipip",
