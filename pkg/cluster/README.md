@@ -1290,6 +1290,24 @@ peer liveness (`lastSeen`) or drive election.
     BELOW the floor — keeps the generic wording deliberately: that one really is
     a replay of a retired incarnation.
 
+    **The `heartbeatAuthDecision` arms carry reasons too, and they are bound
+    (#6968).** The epoch override above only helps when `admitAuthed` ran, and
+    it does not run on a bad MAC (`if macOK { nonceFresh, epochReason = ... }`).
+    So a forged or tampered frame's reason comes from `heartbeatAuthDecision`'s
+    OWN `!macOK` arm — and that arm's correctness rests entirely on ARM ORDER:
+    a failed MAC leaves `nonceFresh` at the zero value `false`, so if the
+    `!macOK` arm is removed the frame falls through to `!nonceFresh` and an
+    attacker with the wrong PSK is reported as `stale nonce (replay)`. The
+    frame is refused either way — this is a MISATTRIBUTION, never a fail-open —
+    which is exactly why no admission test could see it. Measured on
+    `63ef1fad6`: `if !macOK` -> `if false` left `go vet` at rc=0 and the whole
+    package GREEN. `TestHeartbeatAuthDecisionReasonNamesTheArm_6968` now
+    asserts the exact reason per arm (and that the arms' strings are pairwise
+    DISTINCT, or the assertions would be vacuous), and
+    `TestForgedHeartbeatIsNotReportedAsReplay_6968` binds the same property
+    through a genuinely forged frame so `macOK` is derived rather than
+    hand-set. **Adding an arm here means adding its reason to that table.**
+
     All five are rendered on all three surfaces
     (`FormatInformation`, `FormatStatistics`, `FormatControlPlaneStatistics`)
     and bound there by `TestEveryEpochCounterIsRendered_6669`, which drives each
