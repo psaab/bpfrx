@@ -823,6 +823,20 @@ type NATRule struct {
 	Name  string
 	Match NATMatch
 	Then  NATThen
+	// thenAuthored is what ONE `then` container AUTHORED, before NATThen's
+	// scalar collapsed a repeat (#7013). NATThen carries the RESOLVED action —
+	// one pool name, one Off, one Interface — so by validation time a second
+	// authored pool is already gone and a gate that counts modes sees one. This
+	// is the occurrence state that makes the discard checkable.
+	//
+	// UNEXPORTED DELIBERATELY. It is compile-time diagnostic state, read only by
+	// validateNATTerminalActionCardinalityStrict, and it is not part of the
+	// dataplane contract. Exported, it joined the typed Config's JSON — it
+	// showed up as a golden diff across 19 cases and as an unregistered column
+	// in the #6812 axis sweep — and would have travelled in config-sync
+	// payloads. Unexported it stays inside the compiler, where the only thing
+	// that reads it lives.
+	thenAuthored natThenAuthored
 }
 
 // NATMatch defines what traffic a NAT rule matches.

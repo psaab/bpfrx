@@ -1184,13 +1184,24 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 // code ran a bare Shutdown on each server under ONE shared 5s context and never
 // reached a Close phase at all; each server now gets its own legDrainTimeout
 // AND the severing Close behind it. That is not "5s for both" becoming "5s
-// each": legDrainTimeout is a POLL deadline, and both phases put serial
-// per-connection closes in front of it — on an HTTPS leg each close_notify
-// carries a five-second write deadline of its OWN, so one stalled peer costs up
-// to five seconds, then the next, in each phase of each server. The worst case
-// grows with the number of such connections and has no fixed ceiling;
-// legDrainTimeout's comment is the authority on why. legDrainTimeout is also
-// the knob a test can shorten.
+// each": legDrainTimeout is a POLL deadline, and each phase puts serial
+// per-connection closes ahead of any deadline being consulted — inside
+// Shutdown, ahead of the poll deadline itself; after it, ahead of nothing at
+// all, since http.Server.Close takes no context.
+//
+// The five seconds is the HTTPS leg's ALONE, not "each server" (#7047).
+// s.httpsServer runs through ServeTLS, so each connection is a *tls.Conn whose
+// Close sends close_notify under a five-second write deadline of its own; one
+// stalled peer costs up to five seconds, then the next, in both of that leg's
+// phases. s.httpServer runs through plain Serve, so its c.rwc is a *net.TCPConn
+// whose Close sends no TLS alert and carries no such deadline — the HTTP leg is
+// unbounded for other reasons (serial closes, no ceiling), but not by this
+// five-second one.
+//
+// Either way the worst case grows with the number of stalled connections and
+// has no fixed ceiling; legDrainTimeout's comment is the authority on why, and
+// states the two phases separately rather than collapsing them as this summary
+// once did. legDrainTimeout is also the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
@@ -1338,6 +1349,44 @@ func bindHostWarnable(bindHost string) bool {
 		return !ip.IsLoopback() && !ip.IsUnspecified()
 	}
 	return true
+}
+
+// bindIsLoopbackOnly reports whether the HTTPS management listener can be
+// reached ONLY from this host, so no REMOTE client exists to verify anything by
+// host name (#7039).
+//
+// NOT `!bindHostWarnable(bindHost)`. That is the obvious drop-in and it is
+// wrong, because the two functions answer different questions and disagree on
+// the most remote-reachable bind there is:
+//
+//	bindHost        bindHostWarnable   bindIsLoopbackOnly
+//	""              false              false
+//	"localhost"     false              TRUE
+//	"127.0.0.1"     false              TRUE
+//	"::1"           false              TRUE
+//	"0.0.0.0"       false              false   <-- reachable from everywhere
+//	"::"            false              false   <-- reachable from everywhere
+//	"10.0.0.1"      TRUE               false
+//
+// `bindHostWarnable` asks "is there a single concrete host here worth warning
+// about if the cert misses it" — a WILDCARD bind answers no, because it names no
+// one host, not because it is unreachable. Suppressing the host-name diagnostic
+// on `!bindHostWarnable` would therefore silence it on `0.0.0.0`, where remote
+// clients certainly do exist and the host name certainly is an access identity.
+// That is over-suppression of exactly the case the diagnostic is FOR.
+// `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the divergence.
+//
+// An empty bindHost is NOT treated as loopback: the listener address could not
+// be parsed, and suppressing a diagnostic on unknown state is the wrong
+// direction to fail.
+func bindIsLoopbackOnly(bindHost string) bool {
+	if bindHost == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(bindHost); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // hostnameSANWarnable reports whether the CURRENT kernel host name is an
@@ -1580,6 +1629,23 @@ func warnStaleBindHost(leaf *x509.Certificate, bindHost string) {
 func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hostNameEvidence) {
 	if !hostnameSANWarnable(hostName) || hostName == bindHost {
 		return // uncoverable by any re-mint, or already reported as the bind host
+	}
+	// #7039: a loopback-only listener has no remote client, so nothing can
+	// verify by host name and a re-mint would fix nothing. The bind-host half of
+	// this same diagnostic already declines here — bindHostWarnable("127.0.0.1")
+	// is false — and the host-name half had no equivalent gate, so every
+	// `set system host-name` on a loopback-bound management plane warned about
+	// clients that cannot exist. That is the failure mode
+	// hostNameLikelyAccessIdentity's own doc block exists to prevent: a
+	// diagnostic that fires on a healthy box gets muted, and the true positive
+	// dies with it.
+	//
+	// Placed BEFORE the evidence gate on purpose. This is a property of the
+	// BIND, not of the name, so it composes with hostNameOperatorSet rather than
+	// contradicting it: an operator who deliberately renames a loopback-only
+	// device still has no remote client to break.
+	if bindIsLoopbackOnly(bindHost) {
+		return
 	}
 	if ev == hostNameInferred && !hostNameLikelyAccessIdentity(leaf, hostName) {
 		return

@@ -1211,15 +1211,47 @@ Scope of the fallback:
   incidental, so each has a binder in
   `pkg/dataplane/userspace/egress_zone_identity_6722_test.go` (#6722 round 12):
 
-  - **The two zone maps must not disagree.** `authoredZoneRefs` and
-    `buildInterfaceZoneMap` are built by separate code for separate consumers,
-    but they read the same operator sentences through the same canonicalizer and
-    pick a winner the same way — zone names sorted, first write wins. Rule 2
-    resolves from the first while the helper's corroboration check reads rows
-    stamped from the second, so a divergence about a reference BOTH maps hold is
-    a claim the helper will honour under a zone the operator did not write for
-    that identity. They are free to diverge in future — a move to Junos per-unit
-    zoning would want one to stop fanning up to the base — but not silently.
+  - **The two zone maps must not disagree about a UNIT reference** — and they
+    CAN disagree about a base one (#7024). `authoredZoneRefs` and
+    `buildInterfaceZoneMap` are built by separate code for separate consumers.
+    Neither synthesizes a unit reference, so both record a `<ifd>.<unit>` from
+    the operator's literal sentence and a disagreement there really is one of
+    them changing its write policy or canonicalization alone.
+
+    A BASE reference is different, and the earlier wording here — that the two
+    "pick a winner the same way" — was **false**. `buildInterfaceZoneMap` fans a
+    unit reference UP to its base (first write wins over sorted zone names);
+    `authoredZoneRefs` deliberately does not, because it is PROVENANCE: what the
+    operator literally wrote. So a bare reference in one zone plus a dotted
+    reference from an alphabetically EARLIER zone naming the same interface
+    yields two different answers, and both are right for their own consumer:
+
+    ```
+    set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24
+    set security zones security-zone aaa interfaces ge-0/0/1.0
+    set security zones security-zone zzz interfaces ge-0/0/1
+
+    authored = map[ge-0/0/1:zzz ge-0/0/1.0:aaa]
+    derived  = map[ge-0/0/1:aaa ge-0/0/1.0:aaa]
+    ```
+
+    Making them literally agree is not the fix. Fanning up in `authoredZoneRefs`
+    too would DISCARD the operator's bare sentence, destroying the provenance
+    that map exists to preserve; making `buildInterfaceZoneMap` stop fanning up
+    would break the per-row ingress attribution it exists to derive. The maps
+    SHOULD differ here; what was wrong was the claim.
+
+    What must hold instead, and is now asserted: a base divergence is tolerated
+    ONLY when the derived value is the zone of some authored unit under that
+    base (i.e. the fan-up explains it), and the ifindex then resolves
+    **fail-closed** — rule 2's conflict arm sees both zones and refuses, so
+    `EgressZone` is `""` and nothing forwards under a zone the operator did not
+    write. `TestBaseAndUnitClaimedByDifferentZonesFailsClosed_7024` pins the
+    outcome, because a tolerated divergence with nothing asserting its safety
+    would be the same defect one step along.
+
+    Reachable only on the tolerant load / HA peer-sync path (#1960): strict
+    `CompileConfig` rejects the doubly-claimed interface outright.
   - **Every answer must be order-stable.** Nothing here may depend on Go's
     randomized map iteration. An egress zone that varies with the map seed is a
     to-zone that changes across daemon restarts on an unchanged config, and a
