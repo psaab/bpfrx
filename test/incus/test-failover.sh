@@ -48,6 +48,7 @@ IPERF_TARGET="${IPERF_TARGET:-$IPERF_TARGET4}"
 IPERF_TARGET6="${IPERF_TARGET6:-2001:559:8585:80::200}"
 V6_PROBE_COUNT=5        # #6934: see check_v6_transit for why this is not 1
 V6_PROBE_MIN=3          # received replies required to call the path up
+V6_RECHECK_DELAY=30     # #6934: seconds between the two post-failover samples
 # COUPLED TO #7770 — tighten this when that is fixed.
 #
 # 3-of-5 is not a general-purpose tolerance; it is calibrated to absorb one
@@ -89,6 +90,15 @@ die() { echo "FATAL: $*" >&2; exit 2; }
 # catch — measured: during a LAN/WAN redundancy-group split the VIP answers with
 # 0% loss while transit is degraded.
 #
+# The failure message deliberately does NOT blame the neighbour cache. That was
+# this issue's first instinct for three rounds and it is measurably wrong here:
+# on this LAN host the IPv4 and IPv6 neigh parameters are byte-identical, and
+# poisoning the default gateway's entry with a bogus MAC costs 8.51s in IPv6
+# against 8.71s in IPv4 — symmetric, and 8.5s rather than the ~30/~60s the old
+# message asserted. A stale neighbour entry can produce a blackhole; it cannot
+# produce a v4/v6 ASYMMETRY on this host, and it cannot produce a ~60s one.
+# Measurements in docs/log/6934.md.
+#
 # It tolerates losing packets but not all of them, and that threshold is
 # measured rather than picked. A cross-node split costs the FIRST packet of a
 # new flow, reproducibly and without self-healing, so a `-c 1` probe would be
@@ -103,7 +113,7 @@ check_v6_transit() {
 	if [ "$recv" -ge "$V6_PROBE_MIN" ]; then
 		pass "IPv6 transit OK ${label} (${recv}/${V6_PROBE_COUNT} to ${IPERF_TARGET6})"
 	else
-		fail "IPv6 transit BLACKHOLED ${label}: only ${recv}/${V6_PROBE_COUNT} replies from ${IPERF_TARGET6}. IPv4 can stay healthy through this — ND holds a REACHABLE entry ~30s before probing, so a stale or unannounced neighbour entry blackholes v6 while ARP re-resolves in seconds (#6934)"
+		fail "IPv6 transit BLACKHOLED ${label}: only ${recv}/${V6_PROBE_COUNT} replies from ${IPERF_TARGET6}. Do NOT reach for a neighbour-cache explanation first: on this LAN host every neigh parameter is byte-identical between the families (base_reachable_time_ms 30000/30000, gc_stale_time 60/60, delay_first_probe_time 5/5, retrans_time_ms 1000/1000, ucast_solicit 3/3), and a deliberately poisoned gateway entry repairs in 8.51s for v6 against 8.71s for v4 — symmetric, and 8.5s rather than 30 or 60. A v6-ONLY failure therefore has to be somewhere the families genuinely differ, and the one place they do here is the default route: v4 is proto static, v6 is proto ra with a 180s lifetime refreshed every 10-30s. Capture ip -6 route / ip -6 neigh AND their v4 twins DURING the window (#6934, docs/log/6934.md)"
 	fi
 }
 # #7368: a PRECONDITION failure is not a failover regression, and neither is an
@@ -437,6 +447,22 @@ fi
 # above cannot see a failure here: it is one long-lived IPv4 flow, so it
 # survives on established state while a NEW IPv6 flow blackholes.
 check_v6_transit "after manual failover"
+
+# #6934: sample the window TWICE, not once. The reported symptom self-heals
+# after ~60s with no intervention, and a single probe fired immediately after
+# the failover reports a clean pass whether it landed before such a window
+# opened or after it closed — a check that cannot distinguish "healthy" from
+# "I sampled the wrong instant".
+#
+# Cost, counted rather than asserted: the 120s iperf3 starts at line ~207 and by
+# the time control reaches here the script has already spent 8 + SYNC_WAIT + 3 +
+# (reboot wait) + 20 + 5 seconds plus a 5-packet probe. With a typical reboot
+# that leaves ~35-55s of iperf3 still to run, so the wait below overlaps it and
+# Phase 5 just waits out the remainder — free. Only when the reboot consumes the
+# full REBOOT_WAIT budget does any of it become extra wall clock, and then at
+# most V6_RECHECK_DELAY of it.
+sleep "$V6_RECHECK_DELAY"
+check_v6_transit "${V6_RECHECK_DELAY}s after manual failover"
 
 # ── Phase 5: Wait for iperf3 to complete and validate results ───────
 
