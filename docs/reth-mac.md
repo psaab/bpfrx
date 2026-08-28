@@ -224,6 +224,33 @@ path where this node's forwarding is already down.
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.PrepareLinkCycle()` — the live production adapter from the daemon hook to the manager |
 | `userspace-dp/src/server/handlers/stop_workers.rs` | helper side of the join; `rebind.rs` is its inverse |
 
+### The rename site cycles the link too (#6911)
+
+`programRethMAC` is not the only place that cycles a RETH member.
+`renameRethMember` performs its own `setDown` -> `setName` -> `setUp`
+(the rename requires the link DOWN, and #3920 makes it own the UP), and
+until #6911 it did so with **no worker join** — the identical hazard,
+one function up.
+
+It now takes the same `beforeCycle func() error`, invoked once a rename
+candidate is confirmed and strictly before `setDown`, and returns `""`
+**without touching the link** if the join fails. A nil hook means "no
+join needed", matching `programRethMAC`'s contract. The daemon wires a
+real hook at the apply site; the lease `PrepareLinkCycle` takes is
+released by the `abandonLinkCycleLease` already deferred over the whole
+apply, so this adds a join rather than a new lifecycle.
+
+**The hazard is latent, not live, and the hook is there because the
+argument for that is unasserted.** `renameRethMember` runs only when
+`LinkByName(targetName)` has already failed; it matches candidates by
+the *virtual* MAC; and the dataplane cannot have resolved a binding to a
+name that did not exist. So no live binding can be torn down today. That
+chain is correct, but it rests on three separate properties of unrelated
+code and none of them is checked anywhere — a future change to any one
+would reopen #5103 silently. Making the two cycle sites symmetric turns
+that into a loud failure for the price of one hook.
+
+
 ## The Link-Cycle Lease Holds the Join Across the Cycle (#6871)
 
 The join above is a **moment, not a barrier**. `PrepareLinkCycle` takes `m.mu`,
@@ -817,7 +844,7 @@ node never terminally publishes a workerless snapshot while reporting success.
 |------|----------|
 | `pkg/cluster/reth.go` | `RethMAC(clusterID, rgID)` -- returns deterministic MAC |
 | `pkg/cluster/reth.go` | `IsVirtualRethMAC(mac)` -- detects virtual RETH pattern |
-| `pkg/daemon/daemon_reth.go` | `renameRethMember()` -- renames a member found by virtual MAC (down → rename → **up**, #3920) |
+| `pkg/daemon/daemon_reth.go` | `renameRethMember()` -- renames a member found by virtual MAC (down → rename → **up**, #3920); takes the same `beforeCycle` AF_XDP worker-join hook as `programRethMAC` (#6911) |
 | `pkg/daemon/daemon_reth.go` | `programRethMAC()` -- sets MAC via netlink (step 2.6 in applyConfig); takes the mandatory `beforeCycle` AF_XDP worker-join hook (#5103) |
 | `pkg/dataplane/compiler.go` | Skips `.link` file when RETH member has virtual MAC |
 
