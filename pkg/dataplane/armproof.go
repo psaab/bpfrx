@@ -634,64 +634,21 @@ func coverDelegated(
 		s.Detail = "vlan child: parent unresolvable: no link"
 		return s
 	}
-	if kind := lnk.Type(); kind != vlanLinkKind {
-		// NOT AN 802.1Q DEVICE — so ParentIndex is not a delegation.
-		//
-		// vishvananda/netlink folds IFLA_LINK into LinkAttrs.ParentIndex in the
-		// COMMON attribute loop, for every link kind, not just vlan. What
-		// IFLA_LINK means is per-kind: a macvlan/ipvlan's lower device, a
-		// tunnel's bound device, and — the sharp one — a veth's PEER, which for
-		// a cross-namespace pair is an ifindex in the FOREIGN namespace and can
-		// numerically alias any local interface. Reading that as a parent lets
-		// an unrelated local interface answer for this surface: alias a
-		// proven-down one and the child inherits SKIPPED; alias a covered
-		// required one and it inherits DELEGATED. Both are UNDER-counts, and an
-		// under-count hides a live forwarding surface with no shim on it, which
-		// is worse for #5275 than the over-count this file already removed.
-		//
-		// Reachable because ensureVLANSubInterface adopts ANY existing device
-		// named "<phys>.<vid>" without checking its kind, and the unmanaged
-		// sweep skips any name whose prefix before '.' is managed — so a
-		// foreign or wrong-kind squatter at that name is recorded as a
-		// delegated child, skipped by the userspace attach loop, and never
-		// cleaned up. That adoption is a separate production defect; this
-		// belt only stops the PROOF from laundering it into a covered count.
-		//
-		// UNCOVERED is the honest reading: nothing here proves a shim covers
-		// this surface. Via is deliberately left ZERO — naming a bogus parent
-		// in the record would repeat the same confusion in the operator's log.
-		s.Detail = fmt.Sprintf(
-			"vlan child: ifindex %d is a %q link, not an 802.1Q vlan — its ParentIndex is not a "+
-				"vlan delegation and proves nothing about this surface", ifidx, kind)
-		return s
-	}
-	if nsid := lnk.Attrs().NetNsID; nsid != netnsIDLocal {
-		// A GENUINE 802.1Q device whose real_dev is in ANOTHER namespace.
-		//
-		// The kind belt above passes it — it really is a vlan — but its
-		// ParentIndex is an ifindex in that foreign namespace, so using it as a
-		// key into isRequired/unarmed/direct lets an unrelated LOCAL interface
-		// that happens to hold the same number answer for this surface: alias a
-		// proven-down one and the child inherits SKIPPED, alias a covered
-		// required one and it inherits DELEGATED. Both are UNDER-counts, which
-		// is the direction that hides a live forwarding surface with no shim.
-		//
-		// And it IS live: the orphan is refused only while its foreign real_dev
-		// is DOWN. Bring that real_dev up in its own namespace and the child
-		// comes up and forwards — measured, see netnsIDLocal. Reachable by the
-		// same route as the wrong-kind squatter: ensureVLANSubInterface adopts
-		// any existing "<phys>.<vid>" without checking where its real_dev
-		// lives, the userspace attach loop skips it as a delegated child, and
-		// the unmanaged sweep leaves it alone because the name's prefix before
-		// '.' is managed.
-		//
-		// Via stays ZERO for the same reason as the wrong-kind branch: printing
-		// a foreign ifindex as a covering parent repeats the confusion in the
-		// operator's log.
-		s.Detail = fmt.Sprintf(
-			"vlan child: ifindex %d is an 802.1Q vlan whose real_dev is in ANOTHER namespace "+
-				"(link-netnsid %d) — its ParentIndex names a foreign ifindex and proves nothing "+
-				"about this surface", ifidx, nsid)
+	// #6916 single-sourced the kind and namespace rejections into
+	// vlanDelegationDefect, which is also what ensureVLANSubInterface now
+	// consults before ADOPTING a device at "<phys>.<vid>". The two must agree:
+	// this proof decides whether a surface is covered, that adoption decides
+	// whether a device becomes the surface, and a device one trusts while the
+	// other refuses it is exactly the state #5275 exists to make impossible.
+	// The long-form reasoning for each rejection moved with the code.
+	//
+	// UNCOVERED is the honest reading of either rejection: nothing here proves
+	// a shim covers this surface. Via is deliberately left ZERO — naming a
+	// bogus parent in the record would repeat the same confusion in the
+	// operator's log, and an under-count that hides a live forwarding surface
+	// is worse for #5275 than the over-count this file already removed.
+	if why := vlanDelegationDefect(lnk); why != "" {
+		s.Detail = "vlan child: " + why + " and proves nothing about this surface"
 		return s
 	}
 	parent := lnk.Attrs().ParentIndex

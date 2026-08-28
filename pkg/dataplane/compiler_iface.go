@@ -162,6 +162,28 @@ var errVLANCreateFailed = errors.New("VLAN sub-interface creation failed")
 // CAP_NET_ADMIN. Production leaves it pointing at the real function.
 var ensureVLANSubInterfaceFn = ensureVLANSubInterface
 
+// errVLANAdoptRefused marks a device that already occupies "<phys>.<vid>" but
+// failed vlanAdoptionRefusal (#6916).
+//
+// It is deliberately NOT errVLANCreateFailed. #6893 part 2 fails the whole
+// apply when LinkAdd itself refused, because the device the config asked for
+// does not exist and a filter bound to it would be silently dropped. Here the
+// config's device does not exist EITHER, but the reason is a foreign object
+// squatting the name — refusing the entire commit for that would take a far
+// larger blast radius than #6893 chose, on a condition an operator may not be
+// able to clear from the xpf side. The surface takes the existing soft skip:
+// WARN, an UnarmedSurface record naming the check that refused, and — the
+// point of the fix — the squatter never enters genericXDPIfindexes at all, so
+// it is neither adopted nor silently excluded from XDP attach.
+var errVLANAdoptRefused = errors.New("VLAN sub-interface adoption refused")
+
+// vlanLinkByNameSeam is ensureVLANSubInterface's lookup seam, mirroring
+// linkByIndexSeam in proxyarp.go and linkLister in loader.go. The #6916 proof
+// needs an EXISTING device of the wrong kind at "<phys>.<vid>", which is not
+// reachable in a unit test without netlink and CAP_NET_ADMIN. Production
+// leaves it pointing at the real function.
+var vlanLinkByNameSeam = netlink.LinkByName
+
 // ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
 // Returns the sub-interface's ifindex and whether this call CREATED it.
 //
@@ -173,7 +195,7 @@ var ensureVLANSubInterfaceFn = ensureVLANSubInterface
 // configured" would be true on every apply of a VLAN config and would report
 // nothing; it is true only when this call actually added a link.
 func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
-	parent, err := netlink.LinkByName(parentName)
+	parent, err := vlanLinkByNameSeam(parentName)
 	if err != nil {
 		return 0, false, fmt.Errorf("parent interface %s: %w", parentName, err)
 	}
@@ -181,11 +203,33 @@ func ensureVLANSubInterface(parentName string, vlanID int) (int, bool, error) {
 	subName := fmt.Sprintf("%s.%d", parentName, vlanID)
 
 	// Check if sub-interface already exists
-	existing, err := netlink.LinkByName(subName)
+	existing, err := vlanLinkByNameSeam(subName)
 	if err == nil {
+		// #6916: PROVE it is ours before adopting it. A device merely NAMED
+		// "<phys>.<vid>" is not necessarily an 802.1Q child of <phys> — see
+		// vlanAdoptionRefusal for what each check stops. Adopting one that is
+		// not puts a live foreign link into the delegated-VLAN-child set, and
+		// the attach loop then skips it on the theory that its parent covers
+		// it, which for a device that is not that parent's child means nothing
+		// covers it.
+		if why := vlanAdoptionRefusal(existing, parent.Attrs().Index, vlanID); why != "" {
+			return 0, false, fmt.Errorf("%w: %s: %s",
+				errVLANAdoptRefused, subName, why)
+		}
 		// Already exists, ensure it's up
 		if existing.Attrs().OperState != netlink.OperUp {
-			netlink.LinkSetUp(existing)
+			// The error is LOGGED, not returned. A failed nudge leaves the
+			// child DOWN, so nothing forwards through it and the #6916 harm
+			// (a live surface with no shim) does not arise; turning a
+			// transient set-up failure into a skip would instead drop a
+			// legitimate child out of the dataplane. Discarding it entirely,
+			// which is what this line did before, left the operator with no
+			// way to see why a configured child never came up.
+			if err := netlink.LinkSetUp(existing); err != nil {
+				slog.Warn("could not bring existing VLAN sub-interface up",
+					"name", subName, "parent", parentName, "vlan_id", vlanID,
+					"err", err)
+			}
 		}
 		// Not counted as a creation: the link was already present. Bringing an
 		// existing link up is a state nudge the next apply repeats idempotently,
@@ -670,9 +714,21 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			// #5275: same as above — the child was never created, so nothing
 			// forwards through it, but the config asked for it and the compile
 			// succeeds regardless.
+			//
+			// #6916: an ADOPTION REFUSAL reaches here too, and it is a
+			// different fact about the host — the name is occupied by
+			// something xpf will not touch, which is the one case where a
+			// device IS present and forwarding. Reporting it as "create
+			// failed" would be a false statement in the operator's own
+			// record, and it is the statement that would send them looking
+			// for a creation error that never happened.
+			what := "create failed"
+			if errors.Is(err, errVLANAdoptRefused) {
+				what = "not adopted"
+			}
 			result.recordUnarmedSurface(UnarmedSurface{
 				Name:   fmt.Sprintf("%s.%d", physName, vlanID),
-				Reason: fmt.Sprintf("VLAN sub-interface create failed in zone %s: %v", name, err),
+				Reason: fmt.Sprintf("VLAN sub-interface %s in zone %s: %v", what, name, err),
 			})
 			return nil
 		}
