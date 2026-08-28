@@ -178,8 +178,16 @@ func TestUnknownIncarnationPrimeChangesNothing6910(t *testing.T) {
 // notePeerBootIncarnation reports `switched` for zero -> X as well as X -> Y,
 // because both change the recorded value. Acting on the first would advance the
 // incarnation and evict the peer's OTHER fabric — a healthy same-boot
-// connection. FAIL-ON-REVERT: drop the `priorInc.known()` term in the BulkStart
-// arm and a first prime evicts a live sibling.
+// connection, the routine case #5718 protects.
+//
+// IT DRIVES handleMessage, NOT notePeerBootIncarnation. An earlier version of
+// this cell called the note function directly and the mutation matrix caught it:
+// that function never evicts anything by itself, so the cell passed whether or
+// not the guard was present. The guard lives in the BulkStart arm, so the cell
+// has to arrive through the BulkStart arm.
+//
+// FAIL-ON-REVERT: drop the `priorInc.known()` term and a first prime evicts a
+// live sibling.
 func TestFirstIncarnatedPrimeIsNotARebootEdge6910(t *testing.T) {
 	ss := newAckTestSync(t)
 	first := pipeConn(t)
@@ -187,29 +195,23 @@ func TestFirstIncarnatedPrimeIsNotARebootEdge6910(t *testing.T) {
 	second := pipeConn(t)
 	ss.installConn(1, second)
 
-	// Nothing has primed yet, so the recorded incarnation is zero.
+	// Nothing has primed yet, so the recorded incarnation is zero — this is a
+	// FIRST prime, not a reboot, even though it changes the recorded value.
 	if ss.PeerBootIncarnation().known() {
 		t.Fatal("precondition: no incarnation recorded yet")
 	}
-	prior := ss.PeerBootIncarnation()
-	inc := incarnation6910(0xC3)
-	switched := ss.notePeerBootIncarnation(inc)
 
-	if !switched {
-		t.Fatal("precondition: zero -> known must report switched; that is exactly why the " +
-			"remedy cannot key on `switched` alone")
-	}
-	if prior.known() {
-		t.Fatal("precondition: the PRIOR value must be unknown for this to be a first prime")
-	}
-	// The production guard is `switched && priorInc.known()`. With prior
-	// unknown, the remedy must not run — assert the state it would have changed.
+	// A real BulkStart carrying the first known boot id, on fabric 1.
+	ss.handleMessage(second, syncMsgBulkStart, bulkStartPayload6910(1, incarnation6910(0xC3)))
+
 	ss.mu.Lock()
 	c0, c1 := ss.conn0, ss.conn1
 	ss.mu.Unlock()
 	if c0 != first || c1 != second {
-		t.Fatal("a FIRST incarnated prime evicted a live sibling — zero -> X is a first " +
-			"prime, not a reboot (#6910)")
+		t.Fatal("a FIRST incarnated prime evicted a live sibling. zero -> X changes the " +
+			"recorded incarnation and so reports `switched`, but it is the first prime " +
+			"this SessionSync has seen, NOT a reboot — the remedy must additionally " +
+			"require that a DIFFERENT boot was known before (#6910)")
 	}
 }
 
