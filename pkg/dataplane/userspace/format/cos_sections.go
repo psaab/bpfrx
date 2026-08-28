@@ -35,6 +35,11 @@ func writeCoSInterfaceHeader(b *strings.Builder, view cosInterfaceView) {
 		fmt.Fprintf(b, "  Scheduler map:            %s\n", emptyDash(view.cosUnit.SchedulerMap))
 		fmt.Fprintf(b, "  DSCP classifier:          %s\n", emptyDash(view.cosUnit.DSCPClassifier))
 		fmt.Fprintf(b, "  IEEE 802.1 classifier:    %s\n", emptyDash(view.cosUnit.IEEE8021Classifier))
+		// #7080: the inet-precedence binding sits between the two above it in
+		// the config and was the only one of the three missing here — so the
+		// binding actually steering the traffic did not appear next to the two
+		// that were not.
+		fmt.Fprintf(b, "  IP precedence classifier: %s\n", emptyDash(view.cosUnit.INetPrecedenceClassifier))
 		fmt.Fprintf(b, "  DSCP rewrite-rule:        %s\n", emptyDash(view.cosUnit.DSCPRewriteRule))
 		fmt.Fprintf(b, "  Shaping rate:             %s\n", formatCoSRate(view.cosUnit.ShapingRateBytes))
 		fmt.Fprintf(b, "  Burst size:               %s\n", formatCoSBytes(view.cosUnit.BurstSizeBytes))

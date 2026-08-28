@@ -86,7 +86,21 @@ func classOfServiceClassifierQueueWarnings(cos *ClassOfServiceConfig, ifaceName 
 	}
 	dscpCls := cos.DSCPClassifiers[unit.DSCPClassifier]
 	ieeeCls := cos.IEEE8021Classifiers[unit.IEEE8021Classifier]
-	if dscpCls == nil && ieeeCls == nil {
+	// #7082: the THIRD behavior-aggregate arm. #6847 added inet-precedence to
+	// build_cos_iface_config, and this function's own doc comment promises the
+	// model "mirrors build_cos_iface_config EXACTLY so the warning fires iff the
+	// dataplane would have blackholed the code-point". With only two arms that
+	// sentence was false for every unit whose blackholing classifier was the
+	// inet-precedence one: the dataplane fell back to best-effort and the
+	// operator was told nothing.
+	//
+	// Defs, not the name list, is right HERE — unlike the definedness check in
+	// compiler_validate_warn.go — because this arm needs the ENTRIES to know
+	// which forwarding-classes the classifier maps to. A classifier with no
+	// entries maps no code-point and so can blackhole nothing, which is exactly
+	// the nil case below.
+	inetCls := cos.INetPrecedenceClassifierDefs[unit.INetPrecedenceClassifier]
+	if dscpCls == nil && ieeeCls == nil && inetCls == nil {
 		// No classifier attached (or the reference is undefined — flagged
 		// elsewhere): nothing can blackhole.
 		return nil
@@ -142,6 +156,13 @@ func classOfServiceClassifierQueueWarnings(cos *ClassOfServiceConfig, ifaceName 
 	}
 	if ieeeCls != nil {
 		for _, e := range ieeeCls.Entries {
+			if e != nil {
+				classify(e.ForwardingClass)
+			}
+		}
+	}
+	if inetCls != nil {
+		for _, e := range inetCls.Entries {
 			if e != nil {
 				classify(e.ForwardingClass)
 			}
