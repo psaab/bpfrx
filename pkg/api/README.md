@@ -1577,9 +1577,11 @@ the drop fails loudly instead of going quietly vacuous.
       drain arms (requested retirement AND root-context shutdown), before
       the drain, so it covers the leg from the moment the drain is decided
       through the goroutine's return (the listener closes an instant later, in
-      `Shutdown`, and already-accepted requests drain for up to `legDrainTimeout`
-      — `serving()` answers "is this the leg in front of clients", not "is every
-      byte done").
+      `Shutdown`, and already-accepted requests drain on the schedule
+      `legDrainTimeout`'s comment describes — which bounds NEITHER the drain nor
+      the `Shutdown` in wall-clock terms, being a POLL deadline with serial
+      per-connection closes in front of it. `serving()` answers "is this the leg
+      in front of clients", not "is every byte done").
       The same predicate now gates `ReconcileHTTPS`'s same-address no-op, so a
       dead leg is REBUILT rather than mistaken for a converged one (#6827 round
       6): before that, a self-terminated HTTPS leg could not be replaced by any

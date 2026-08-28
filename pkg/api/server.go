@@ -1184,13 +1184,24 @@ func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, slot *authSlot, 
 // code ran a bare Shutdown on each server under ONE shared 5s context and never
 // reached a Close phase at all; each server now gets its own legDrainTimeout
 // AND the severing Close behind it. That is not "5s for both" becoming "5s
-// each": legDrainTimeout is a POLL deadline, and both phases put serial
-// per-connection closes in front of it — on an HTTPS leg each close_notify
-// carries a five-second write deadline of its OWN, so one stalled peer costs up
-// to five seconds, then the next, in each phase of each server. The worst case
-// grows with the number of such connections and has no fixed ceiling;
-// legDrainTimeout's comment is the authority on why. legDrainTimeout is also
-// the knob a test can shorten.
+// each": legDrainTimeout is a POLL deadline, and each phase puts serial
+// per-connection closes ahead of any deadline being consulted — inside
+// Shutdown, ahead of the poll deadline itself; after it, ahead of nothing at
+// all, since http.Server.Close takes no context.
+//
+// The five seconds is the HTTPS leg's ALONE, not "each server" (#7047).
+// s.httpsServer runs through ServeTLS, so each connection is a *tls.Conn whose
+// Close sends close_notify under a five-second write deadline of its own; one
+// stalled peer costs up to five seconds, then the next, in both of that leg's
+// phases. s.httpServer runs through plain Serve, so its c.rwc is a *net.TCPConn
+// whose Close sends no TLS alert and carries no such deadline — the HTTP leg is
+// unbounded for other reasons (serial closes, no ceiling), but not by this
+// five-second one.
+//
+// Either way the worst case grows with the number of stalled connections and
+// has no fixed ceiling; legDrainTimeout's comment is the authority on why, and
+// states the two phases separately rather than collapsing them as this summary
+// once did. legDrainTimeout is also the knob a test can shorten.
 func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
