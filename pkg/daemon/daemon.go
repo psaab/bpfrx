@@ -440,6 +440,34 @@ type Daemon struct {
 	// unchanged-config reconcile should nevertheless re-apply. Mutated under
 	// applySem like the two fields above.
 	lldpUnresolved []string
+	// policyActivationSecs is CLOCK_MONOTONIC seconds captured immediately
+	// BEFORE the dataplane apply publishes a new policy set (#6948).
+	//
+	// Runtime policy ids are POSITIONAL (policySetID*MaxRulesPerPolicy +
+	// ruleIndex), so deleting a policy renumbers every later one. The
+	// commit-time invalidation sweep computes its id set from the OLD config's
+	// numbering but runs AFTER applyConfigLocked returns — and the dataplane
+	// admits sessions under the NEW numbering the moment the apply publishes it.
+	// A session admitted in that window by a policy that INHERITED a deleted
+	// policy's id matches the sweep set and is dropped although it is correctly
+	// permitted.
+	//
+	// The window is not a few instructions: the policy set goes live in
+	// applyDataplaneAndHACore, and the sweep does not run until the whole
+	// remainder of applyConfigLocked has finished, including applyTailReconciles
+	// (DNS, sudoers, sshd, IPsec, VRRP, FRR). That is easily seconds on a real
+	// box.
+	//
+	// Session rows carry no config epoch and no stable admitting-rule identity,
+	// but they DO carry Created — "seconds since boot" on the BPF side
+	// (bpf/headers/xpf_common.h) and CLOCK_MONOTONIC seconds on the Go side
+	// (daemonMonotonicSeconds), the SAME clock. So a session created strictly
+	// after this stamp was admitted under the new numbering and must not be
+	// swept by an old-numbering id set.
+	//
+	// Mutated under applySem like the fields above, and read by the sweep the
+	// same commit's caller runs while still holding it.
+	policyActivationSecs uint64
 	// scheduler is the live policy-window scheduler. It is an atomic.Pointer so
 	// the metrics collector can read it lock-free for the
 	// xpf_scheduler_republish_fail_closed SSOT gauge

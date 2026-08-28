@@ -424,6 +424,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// networkd write error for the routing rules + tail reconcile below; an
 	// error (a #2926 context abort or an ApplyConfig compile abort) bails
 	// before the tail.
+	// #6948: stamp the admission boundary IMMEDIATELY before the dataplane
+	// publishes the new policy set. Placement is the whole design: captured any
+	// earlier and sessions admitted under the OLD numbering by the policy being
+	// deleted would fall after the stamp and escape the sweep, which is the
+	// stale-authorization direction and strictly worse than the over-clear this
+	// closes. Captured here, that gap is the call itself.
+	d.policyActivationSecs = daemonMonotonicSeconds()
 	commitOverlay, networkdErr, applyErr, err := d.applyDataplaneAndHACore(ctx, cfg)
 	if err != nil {
 		// #5643 (M35): applyDataplaneAndHACore bailed at a #2926 ctx-cancellation
