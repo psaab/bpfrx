@@ -6102,3 +6102,212 @@ fn frag_assoc_config_fence_survives_the_rg_fence_6857() {
          The runtime fence is added BESIDE the config one, not instead of it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6892: the synced NAT64 reserve must pick the prefix by the SAME
+// discriminator the ACTIVE node used.
+// ---------------------------------------------------------------------------
+
+// TWO prefixes that SHARE one pool address and differ only in prefix_bytes.
+//
+// This shape is the whole test, and a single-prefix fixture cannot exercise it
+// at all: with one prefix, "first prefix whose pool_v4 contains snat_v4" and
+// "the prefix whose prefix_bytes match the v6 destination" are the same answer,
+// so the defect is invisible. Sharing the pool address is what makes the pool
+// scan ambiguous; differing prefix_bytes is what makes the v6 destination
+// decisive.
+fn shared_pool_prefixes_6892() -> Vec<NAT64RuleSnapshot> {
+    vec![
+        NAT64RuleSnapshot {
+            name: "nat64-a".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            pool_addresses: vec!["198.51.100.1".to_string()],
+            no_v6_frag_header: false,
+            ..Default::default()
+        },
+        NAT64RuleSnapshot {
+            name: "nat64-b".to_string(),
+            // A DIFFERENT Pref64 with the SAME pool address.
+            prefix: "2001:db8:64::/96".to_string(),
+            pool_addresses: vec!["198.51.100.1".to_string()],
+            no_v6_frag_header: false,
+            ..Default::default()
+        },
+    ]
+}
+
+fn synced_key_for_dst_6892(client: &str, dst_v6: &str) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(client.parse().unwrap()),
+        dst_ip: IpAddr::V6(dst_v6.parse().unwrap()),
+        src_port: 5000,
+        dst_port: 443,
+    }
+}
+
+// FAIL-ON-REVERT: drop the #6892 match_ipv6_dest narrowing and the reserve falls
+// back to "first prefix whose pool_v4 contains snat_v4", which is prefix 0 for
+// BOTH destinations. The prefix-1 assertion below then goes RED.
+//
+// This asserts WHICH ALLOCATOR holds the reservation, not merely that a
+// reservation happened — the defect is a reservation in the wrong allocator, so
+// "it reserved" is satisfied by the buggy path too.
+#[test]
+fn nat64_6892_synced_reserve_picks_the_prefix_the_active_used() {
+    let state = Nat64State::from_snapshots(&shared_pool_prefixes_6892());
+    assert_eq!(state.prefixes.len(), 2, "fixture must have two prefixes");
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // The active translated a flow whose v6 destination lies in prefix B, so it
+    // selected prefix 1 via match_ipv6_dest and reserved in prefix 1's
+    // allocator. The standby must land in the SAME one.
+    let key = synced_key_for_dst_6892("2001:db8::1", "2001:db8:64::0808:0808");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+    assert!(
+        reserve_synced_nat64_allocation(&state, &key, synced, false, 0),
+        "the synced reserve must succeed"
+    );
+
+    // Prefix 1 (the one the ACTIVE used) must now refuse a DIFFERENT flow on the
+    // same (snat, port) — that is what "the reservation lives here" means.
+    let other_flow = SourceNatFlowKey {
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "2001:db8::99".parse().unwrap(),
+        dst_ip: IpAddr::V4(dst_v4),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    assert!(
+        !reserve_nat64_pool_port(
+            &state.prefixes[1].port_allocator,
+            other_flow,
+            snat,
+            1024,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked,
+        ),
+        "prefix 1's allocator does NOT hold the synced reservation — the standby \
+         reserved in a different allocator than the active used, so the translated \
+         (pool v4, port) is still free where it matters and a post-failover local \
+         flow can be handed it (#6892)"
+    );
+
+    // And prefix 0 must be UNTOUCHED: a reservation there is the bug's signature.
+    assert!(
+        reserve_nat64_pool_port(
+            &state.prefixes[0].port_allocator,
+            other_flow,
+            snat,
+            1024,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked,
+        ),
+        "prefix 0's allocator holds a reservation it should never have taken — the \
+         synced path selected by pool_v4 membership instead of the v6 destination (#6892)"
+    );
+}
+
+// The MIRROR case, and it is what stops the fix being "always pick prefix 1".
+// Same fixture, same pool address, destination in prefix A: the reservation must
+// land in prefix 0. Without this cell, hard-coding either index passes.
+#[test]
+fn nat64_6892_synced_reserve_follows_the_destination_prefix_both_ways() {
+    let state = Nat64State::from_snapshots(&shared_pool_prefixes_6892());
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let key = synced_key_for_dst_6892("2001:db8::1", "64:ff9b::0808:0808");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 2048);
+    assert!(reserve_synced_nat64_allocation(&state, &key, synced, false, 0));
+
+    let other_flow = SourceNatFlowKey {
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "2001:db8::99".parse().unwrap(),
+        dst_ip: IpAddr::V4(dst_v4),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    assert!(
+        !reserve_nat64_pool_port(
+            &state.prefixes[0].port_allocator,
+            other_flow,
+            snat,
+            2048,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked,
+        ),
+        "a destination in prefix A did not reserve in prefix 0's allocator (#6892)"
+    );
+    assert!(
+        reserve_nat64_pool_port(
+            &state.prefixes[1].port_allocator,
+            other_flow,
+            snat,
+            2048,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked,
+        ),
+        "prefix 1 took a reservation for a destination in prefix A (#6892)"
+    );
+}
+
+// The FALLBACK must survive. A key whose destination matches NO configured
+// prefix (config drift between nodes, or an old peer that synced a v4-keyed
+// tuple) must still reach the pool scan rather than silently reserving nothing —
+// narrowing is an added discriminator, not a replacement gate.
+#[test]
+fn nat64_6892_unmatched_destination_still_falls_back_to_the_pool_scan() {
+    let state = Nat64State::from_snapshots(&shared_pool_prefixes_6892());
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // A destination in NEITHER Pref64.
+    let key = synced_key_for_dst_6892("2001:db8::1", "2001:dead:beef::0808:0808");
+    assert!(
+        state
+            .match_ipv6_dest("2001:dead:beef::0808:0808".parse().unwrap())
+            .is_none(),
+        "fixture precondition: this destination must match no prefix, or the cell \
+         is not exercising the fallback"
+    );
+
+    let synced = Nat64State::forward_decision(snat, dst_v4, 4096);
+    assert!(
+        reserve_synced_nat64_allocation(&state, &key, synced, false, 0),
+        "an unmatched destination must still reserve via the pool scan — dropping \
+         the fallback would leave the translated port free on the standby (#6892)"
+    );
+
+    // The scan takes the first pool owner, which is prefix 0.
+    let other_flow = SourceNatFlowKey {
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "2001:db8::99".parse().unwrap(),
+        dst_ip: IpAddr::V4(dst_v4),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    assert!(
+        !reserve_nat64_pool_port(
+            &state.prefixes[0].port_allocator,
+            other_flow,
+            snat,
+            4096,
+            0,
+            false,
+            0,
+            crate::nat::NatHolder::Untracked,
+        ),
+        "the fallback scan did not reserve anywhere (#6892)"
+    );
+}

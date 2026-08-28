@@ -1896,6 +1896,49 @@ fn reserve_synced_nat64_allocation_with_holder(
         src_port: key.src_port,
         dst_port: key.dst_port,
     };
+    // #6892: narrow to the prefix the ACTIVE node would have used, by the SAME
+    // discriminator it uses, BEFORE falling back to the pool scan below.
+    //
+    // The scan alone takes the first prefix whose `pool_v4` contains `snat_v4`
+    // -- the #6211 shape. That is not merely too loose: each `Nat64Prefix` owns
+    // its OWN `port_allocator`, and the active selected its prefix with
+    // `match_ipv6_dest`, i.e. on `prefix_bytes` against the IPv6 destination.
+    // Two prefixes sharing one pool address therefore diverge because the
+    // standby is matching on the WRONG FIELD, and a divergent pick reserves in a
+    // different allocator than the one the session actually occupies -- so the
+    // port stays free in the allocator that matters and a post-failover local
+    // flow can be handed the same translated `(pool v4, port)`.
+    //
+    // `key.dst_ip` is the PRE-translation synthetic IPv6 destination, not the
+    // extracted v4: a NAT64 forward flow is always keyed on the original IPv6
+    // 5-tuple (`build_nat64_reverse_rebuild` in the server helpers already
+    // extracts the RFC 6052 embedded v4 out of this same field), and
+    // `forward_wire_key` exists precisely because the post-translation view is a
+    // DIFFERENT key. That is also why `flow.dst_ip` above substitutes
+    // `nat.rewrite_dst` for it.
+    //
+    // The scan is kept as a fallback rather than replaced: a v4-keyed or
+    // prefix-less key (config drift between nodes, an old peer) still gets
+    // today's behaviour instead of silently reserving nothing.
+    let narrowed = match key.dst_ip {
+        IpAddr::V6(dst_v6) => nat64.match_ipv6_dest(dst_v6).map(|(idx, _)| idx),
+        IpAddr::V4(_) => None,
+    };
+    if let Some(prefix) = narrowed.and_then(|idx| nat64.prefixes.get(idx)) {
+        if let Some(addr_index) = prefix.pool_v4.iter().position(|a| *a == snat_v4) {
+            return reserve_nat64_pool_port(
+                &prefix.port_allocator,
+                flow,
+                snat_v4,
+                port,
+                addr_index,
+                prefix.deterministic_v6.is_some(),
+                now_ns,
+                holder,
+            );
+        }
+    }
+
     for prefix in &nat64.prefixes {
         // The NAT64 allocator is sized to `pool_v4.len()` with
         // `family_offset == 0`, so the absolute allocator index equals the
