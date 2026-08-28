@@ -48,6 +48,22 @@ IPERF_TARGET="${IPERF_TARGET:-$IPERF_TARGET4}"
 IPERF_TARGET6="${IPERF_TARGET6:-2001:559:8585:80::200}"
 V6_PROBE_COUNT=5        # #6934: see check_v6_transit for why this is not 1
 V6_PROBE_MIN=3          # received replies required to call the path up
+# COUPLED TO #7770 — tighten this when that is fixed.
+#
+# 3-of-5 is not a general-purpose tolerance; it is calibrated to absorb one
+# specific KNOWN defect. #7770: a LAN/WAN redundancy-group split drops the first
+# packet of every new flow, symmetrically in v4 and v6, and does not self-heal
+# (measured 12.5% on 8 packets, still 12.5% on a fresh probe 45s later, against
+# 0% for a full failover). A 0%-loss assertion here would red on that rather
+# than on anything this gate is scoped to.
+#
+# So once #7770 lands, this threshold is LOOSER than it needs to be and would
+# hide a one-packet regression. Raise V6_PROBE_MIN to V6_PROBE_COUNT then.
+#
+# Written down because a tolerance whose reason is undocumented is
+# indistinguishable from a tolerance nobody thought about — the next reader
+# cannot tell "3 of 5 because a known defect costs exactly one packet" from
+# "3 of 5 because the author was not sure", and only the first has an expiry.
 IPERF_DURATION=120      # seconds — long enough to span retries + reboot + failback
 IPERF_STREAMS=8
 MIN_SESSIONS=4          # minimum established sessions (control + some data streams)
