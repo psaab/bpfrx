@@ -2,6 +2,7 @@ Interface: reth0.80
   Scheduler map:            bandwidth-limit
   DSCP classifier:          wan-classifier
   IEEE 802.1 classifier:    wan-pcp
+  IP precedence classifier: -
   DSCP rewrite-rule:        -
   Shaping rate:             15.00 Mb/s
   Burst size:               64.00 KiB

@@ -229,6 +229,41 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 		}
 	}
 
+	// #7080: the third behavior-aggregate classifier. #6847 made
+	// `classifiers inet-precedence` a LIVE classifier -- it compiles, crosses
+	// the wire as inet_precedence_classifiers, and the dataplane selects the
+	// egress queue and loss-priority from the top 3 bits of the DS field -- and
+	// no operational command showed any of it. A configured, enforced
+	// classifier rendered as "No class-of-service classifiers configured",
+	// which is not a gap in detail but a statement that contradicts the running
+	// config.
+	//
+	// Three bits, like ieee-802.1, so the existing cpRow rendering needs no
+	// change. The type filter accepts the same token the config uses.
+	if typeFilter == "" || typeFilter == "inet-precedence" {
+		for _, name := range sortedMapKeys(cos.INetPrecedenceClassifierDefs) {
+			if nameFilter != "" && name != nameFilter {
+				continue
+			}
+			c := cos.INetPrecedenceClassifierDefs[name]
+			blk := classifierBlock{name: name, cpType: "inet-precedence"}
+			for _, e := range c.Entries {
+				if e == nil {
+					continue
+				}
+				for _, cp := range e.Precedences {
+					blk.rows = append(blk.rows, cpRow{
+						value: uint16(cp),
+						bits:  3,
+						fc:    e.ForwardingClass,
+						lp:    lossPriorityOrDefault(e.LossPriority),
+					})
+				}
+			}
+			blocks = append(blocks, blk)
+		}
+	}
+
 	if len(blocks) == 0 {
 		if nameFilter != "" || typeFilter != "" {
 			return "No class-of-service classifier matches the given filter\n"

@@ -252,6 +252,12 @@ var OperationalTree = map[string]*Node{
 				"type": {Desc: "Filter by code-point type", Children: map[string]*Node{
 					"dscp":       {Desc: "DSCP classifiers"},
 					"ieee-802.1": {Desc: "IEEE 802.1p classifiers"},
+					// #7080: the third ENFORCED behavior-aggregate classifier
+					// (#6847). Without this value the filter could not name it,
+					// and FormatCoSClassifiers had no arm for it either — so
+					// the one classifier type the operator could not inspect
+					// was the one steering their queueing.
+					"inet-precedence": {Desc: "IP-precedence classifiers"},
 				}},
 			}},
 			"scheduler-map": {Desc: "Show configured CoS scheduler-maps", DynamicFn: func(cfg *config.Config) []string {

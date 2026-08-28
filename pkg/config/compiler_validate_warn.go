@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -1476,6 +1477,30 @@ func ValidateConfig(cfg *Config) []string {
 						warnings = append(warnings, fmt.Sprintf(
 							"class-of-service interface %s unit %d references undefined ieee-802.1 classifier %q",
 							iface.Name, unit.Unit, unit.IEEE8021Classifier))
+					}
+				}
+				// #7081: the third behavior-aggregate classifier. #6847 added
+				// the binding site and the enforcement, and this warning list --
+				// which covers every OTHER CoS binding a unit can carry -- was
+				// not extended with it, so a dangling inet-precedence reference
+				// was the only one that committed silently.
+				//
+				// DEFINEDNESS comes from INetPrecedenceClassifiers, the NAME
+				// list, not from INetPrecedenceClassifierDefs. The Defs map is
+				// populated only `if len(classifier.Entries) > 0`
+				// (compiler_class_of_service.go), so a classifier defined with
+				// an empty or wholly-rejected body is absent from it while being
+				// perfectly well defined. Keying on Defs would report
+				// "references undefined ... classifier" for a classifier the
+				// operator can see in their own config -- a confident wrong
+				// name, which is worse than the silence being fixed. A
+				// defined-but-empty classifier is a separate condition and not
+				// this warning's subject.
+				if unit.INetPrecedenceClassifier != "" {
+					if !slices.Contains(cos.INetPrecedenceClassifiers, unit.INetPrecedenceClassifier) {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined inet-precedence classifier %q",
+							iface.Name, unit.Unit, unit.INetPrecedenceClassifier))
 					}
 				}
 				if unit.DSCPRewriteRule != "" {
