@@ -483,8 +483,13 @@ system {
 ```
 
 The reason is that the runtime resolves a **name**, not a block:
-`pkg/cli/permissions.go` `resolveClassPerms` walks the class list and returns
-the **first** entry whose name matches. Folding only the offending block leaves
+`config.ResolveClassPermissions` (`pkg/config/login_perms.go`) consults the
+system-defined table first and then walks the configured classes, returning the
+**first** entry whose name matches. Since #5561 that walk is no longer in
+`resolveClassPerms` (`pkg/cli/permissions.go`), which is now a five-line
+store-bound adapter reading `store.ActiveConfig()` and delegating (#7057) —
+elsewhere on this page `resolveClassPerms` names the runtime *call site*, which
+is still accurate, but the lookup itself lives one layer down. Folding only the offending block leaves
 whichever *other* block the reader happens to pick holding its full permission
 set — `permissions all` above — so the deny statement is again attached to a
 class the box does not enforce. Both orderings failed open before this was
@@ -564,12 +569,36 @@ for a class *name*, not that any actual login is bound to a built-in.
 #### Recovery if you already committed such a config
 
 An upgraded box that loads a persisted config carrying these statements emits
-the warning above and keeps the class usable for repair:
+the warning above. **If the class already held `configure` (or `all`)**, it
+stays usable for repair:
 
 1. Log in and run `configure` (retained by the fold).
 2. `delete system login class <name> deny-configuration` (and/or
    `deny-commands`).
 3. `commit` — this is the first commit the strict gate lets through.
+
+**If it did not, this procedure is unavailable and you need the out-of-band
+shell** (#7058). The fold is an INTERSECTION — `{view, configure} ∩ what the
+class already held` — and per the "Never widens" rule above it does not grant a
+bucket the class lacked. A class whose Junos permission tokens map to neither
+`view` nor `configure` therefore folds to the **empty set**, and step 1 cannot
+run. Measured against `repairableFloorFold`
+(`pkg/config/compiler_login_deny.go`):
+
+| class holds | folds to |
+|---|---|
+| `maintenance`, `clear` | **empty** — no repair path |
+| `clear`, `control` | **empty** — no repair path |
+| `view` | `view` — can look, cannot repair |
+| `configure` | `configure` — repair path holds |
+| `all` | `view` + `configure` |
+
+The preceding paragraph and this one are each correct and were jointly
+inconsistent until #7058: "keeps the class usable for repair" was stated
+unconditionally, while the design deliberately never widens. The forcing
+function below is unchanged — but on a box in the empty-fold case the forcing
+function has nothing to force *with*, which is the situation the out-of-band
+shell exists for.
 
 Nothing else about the box can be committed until that statement is gone; that
 is the forcing function, not an accident.
