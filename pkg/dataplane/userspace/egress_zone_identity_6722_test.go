@@ -703,7 +703,7 @@ func TestTwoAuthoredZonesOnOneCoherentNetdevFailClosed_6722(t *testing.T) {
 // the conjunct is irrelevant to it.
 //
 // The clause only bites for a reth with NO configured unit. A member-named reth
-// that carries units is already refused by the `firstConfiguredUnit` conjunct,
+// that carries units is already refused by the `hasConfiguredUnit` conjunct,
 // which is why every fixture written before this one reached the answer through
 // a different clause and this one stayed unbound.
 //
@@ -735,13 +735,13 @@ func TestUnitlessRethNamedAsAMemberFailsClosedOnTheLenientPath_6722(t *testing.T
 	snaps := buildInterfaceSnapshots(cfg)
 
 	// The precondition that makes the clause the ONLY thing answering: reth1
-	// carries no configured unit, so `firstConfiguredUnit` does not refuse it
+	// carries no configured unit, so `hasConfiguredUnit` does not refuse it
 	// and `ifc.Tunnel` is nil.
 	if member := cfg.Interfaces.Interfaces["reth1"]; member == nil {
 		t.Fatalf("precondition: reth1 is absent from the compiled config")
-	} else if _, hasUnit := firstConfiguredUnit(member); hasUnit {
+	} else if hasConfiguredUnit(member) {
 		t.Fatalf("precondition: reth1 carries a configured unit, so the " +
-			"firstConfiguredUnit conjunct refuses it and the reth-prefix clause is " +
+			"hasConfiguredUnit conjunct refuses it and the reth-prefix clause is " +
 			"not what this cell measures")
 	}
 	base := snapByName6722(t, snaps, "reth0")
@@ -1278,7 +1278,7 @@ func truncate6722(s string, n int) string {
 //	authoredZoneRefs drops CanonicalInterfaceUnitRef              -> R (and P)
 //	unanimousUnitZone drops `if z == "" { continue }`             -> S
 //	unanimousUnitZone drops `if seen != "" && seen != z`          -> T
-//	firstConfiguredUnit drops `if unit == nil { continue }`       -> U
+//	hasConfiguredUnit drops its `unit != nil` skip                -> U
 //	unanimousUnitZone drops `if unit == nil { continue }`         -> V
 //	egressRethMemberOf drops `ifc.RedundantParent != reth`        -> W
 //	egressIdentitiesCohere drops `len(identities) > 2`            -> E/reth-as-member-plus-canonical-collision, but ONLY after the
@@ -1313,12 +1313,13 @@ func truncate6722(s string, n int) string {
 //	  cannot fire without the same edit that breaks the pairing, so no mutation
 //	  of the assert alone is observable. A construction invariant, not a guard.
 //
-//	`num < lowest` in firstConfiguredUnit. Reversing it to `num > lowest`
-//	  changes nothing because the int result has NO consumer: the sole
-//	  production call site is `_, hasUnit := firstConfiguredUnit(ifc)` in
-//	  egressMemberIsBarePort, and the only test call reads `hasUnit` too. The
-//	  selection is dead, not merely unbound — worth collapsing to a bool
-//	  predicate in a round that is allowed to move production.
+//	`num < lowest` in firstConfiguredUnit. RESOLVED in #7026, so this row no
+//	  longer describes the tree. The selection was dead rather than unbound —
+//	  the int had no consumer at any of its three call sites — and this row
+//	  said it was worth collapsing in a round allowed to move production.
+//	  #7026 was that round: the function is now `hasConfiguredUnit(ifc) bool`
+//	  and there is no selection left to mutate. Kept as a row so the next
+//	  reader of this table sees the disposition rather than re-deriving it.
 //
 //	`if rawIface == "" { continue }` in authoredZoneRefs. No `set` line produces
 //	  an empty zone-interface reference, so the clause is unreachable from the
@@ -1684,7 +1685,7 @@ func TestTrunkCarrierWithDisagreeingUnitsFailsClosed_6722(t *testing.T) {
 // U: a PRESENT-BUT-NIL unit slot on a reth member does not give it an L3
 // identity.
 //
-// `egressMemberIsBarePort` asks `firstConfiguredUnit`, which skips a nil unit
+// `egressMemberIsBarePort` asks `hasConfiguredUnit`, which skips a nil unit
 // slot — the tolerant load / HA config-sync shape of #3494/#5068, a key present
 // in `ifc.Units` with a nil value. That skip decides, in the PERMISSIVE
 // direction, whether such a member is still a bare port; it is the input to
@@ -1721,8 +1722,8 @@ func TestNilUnitSlotOnARethMemberIsNotAnL3Identity_6722(t *testing.T) {
 		t.Fatalf("precondition: ge-0/0/1 Units[7] present=%v nil=%v, want a "+
 			"PRESENT slot holding nil", ok, u == nil)
 	}
-	if _, hasUnit := firstConfiguredUnit(member); hasUnit {
-		t.Fatalf("firstConfiguredUnit reports a configured unit on a member whose " +
+	if hasConfiguredUnit(member) {
+		t.Fatalf("hasConfiguredUnit reports a configured unit on a member whose " +
 			"only unit slot is nil; a nil slot is an artefact of the tolerant " +
 			"load, not an operator statement, and treating it as one makes the " +
 			"member an L3 identity of its own")

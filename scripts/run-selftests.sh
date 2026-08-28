@@ -38,6 +38,37 @@ faill() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); FAILED_LEGS="$FAILED_LEGS $
 
 # run_shell <script> [args...] — run a shell self-test. Exit 0 = PASS,
 # exit 77 = SKIP (a leg self-reported a missing tool), anything else = FAIL.
+# run_bash: like run_shell, but invokes the script with bash.
+#
+# run_shell forces `sh` regardless of the script's shebang, which is correct
+# for the POSIX self-tests it was written for. A self-test that legitimately
+# needs bash (arrays, [[ ]], <<< herestrings, ${var//pat/}) fails under dash
+# with "Bad substitution" — a syntax error, not a real result. Rather than
+# rewrite a bash library into POSIX so its own test can run, run it with the
+# interpreter it is written for, and SKIP rather than fail when bash is absent.
+run_bash() {
+	script=$1
+	shift
+	if [ ! -f "$script" ]; then
+		skipl "$script (not present)"
+		return
+	fi
+	if ! command -v bash >/dev/null 2>&1; then
+		skipl "$script (bash not installed)"
+		return
+	fi
+	out=$(bash "$script" "$@" 2>&1)
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		passl "$script"
+	elif [ "$rc" -eq 77 ]; then
+		skipl "$script ($(echo "$out" | grep -m1 -i skip || echo 'tool unavailable'))"
+	else
+		faill "$script"
+		echo "$out" | sed 's/^/      /'
+	fi
+}
+
 run_shell() {
 	script=$1
 	shift
@@ -98,6 +129,9 @@ scripts/dist/selftest.sh
 scripts/dist/install.sh
 scripts/dist/build-apt-repo.sh
 scripts/run-selftests.sh
+test/incus/fbf-steering-lib.sh
+test/incus/fbf-steering-selftest.sh
+test/incus/test-fbf-steering.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -172,6 +206,10 @@ run_shell test/xsk-repro/selftest-probe-filter_6898.sh
 # BPF_ANY positive control so an ENOENT cannot come from a broken fixture.
 # SKIPs without cc, passwordless sudo, or CAP_BPF.
 run_shell test/mutation/selftest-bpf-exist-cannot-create_6923.sh
+# #6936: FBF two-upstream steering verdicts. Hermetic — no incus, no cluster,
+# no network. Guards a negative cell that used to fail to a HEALTHY value:
+# "no leak" and "the probe returned nothing" both scored PASS. Needs bash.
+run_bash test/incus/fbf-steering-selftest.sh
 
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'

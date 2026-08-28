@@ -121,6 +121,15 @@ make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:
                      #   and still exits 0, so apply-cos-config.sh verifies the
                      #   CLI's success markers, not the session exit status.
                      #   Hermetic (mocked incus) + the Go marker contract.
+make test-fbf-steering-lib # Self-test the #6936 FBF two-upstream steering
+                     #   verdicts. The defect it guards is a NEGATIVE CELL
+                     #   THAT FAILS TO A HEALTHY VALUE: the main-table
+                     #   pollution check counted matches, so "no leak" and
+                     #   "the probe returned nothing" both scored 0 = PASS.
+                     #   The verdict is now TOTAL and the selftest table
+                     #   carries the probe-blind middle row. Hermetic + the
+                     #   Go predicate that every config-committing smoke uses
+                     #   the #6440 marker gate.
 make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
                      #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
                      #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)
