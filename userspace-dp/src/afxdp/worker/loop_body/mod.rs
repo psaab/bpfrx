@@ -2635,3 +2635,200 @@ mod gc_reap_source_nat_release_tests_6901 {
         );
     }
 }
+
+#[cfg(test)]
+mod gc_reap_nat64_release_tests_7740 {
+    //! #7740: the GC reap's `release_nat64_allocation_for_worker` call is
+    //! UNBOUND — the sibling of the source-NAT release #6901 bound, two lines
+    //! below it in the same loop. Measured: neutering it leaves the crate green
+    //! at the full collection.
+    //!
+    //! There ARE NAT64 release tests (`nat64_tests.rs`), but they call
+    //! `release_nat64_allocation` DIRECTLY. The function is bound; its reap
+    //! call site is not — which is the same shape as #6901 in a different
+    //! allocator, and the reason "the function has tests" is not an answer to
+    //! "the call site is unbound".
+    //!
+    //! TWO cells, mirroring #6901: that the reap releases at all, and that it
+    //! releases the allocation THIS session holds. The second is what a
+    //! single-flow fixture cannot see.
+    use super::*;
+    use crate::nat64::Nat64State;
+    use crate::session::{ExpiredSession, SessionDecision, SessionKey, SessionOrigin};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const DST_V4: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+
+    fn prefix() -> crate::NAT64RuleSnapshot {
+        crate::NAT64RuleSnapshot {
+            name: "nat64-single".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            // One address, so only the translated PORT can disambiguate two
+            // flows — which is what makes the second cell meaningful.
+            pool_addresses: vec!["198.51.100.1".to_string()],
+            no_v6_frag_header: false,
+            ..Default::default()
+        }
+    }
+
+    fn client(n: u16) -> Ipv6Addr {
+        format!("2001:db8::{n}").parse().unwrap()
+    }
+
+    fn key_for(c: Ipv6Addr, src_port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V6(c),
+            dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+            src_port,
+            dst_port: 443,
+        }
+    }
+
+    fn metadata() -> crate::session::SessionMetadata {
+        crate::session::SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        }
+    }
+
+    fn expired(key: SessionKey, nat: crate::nat::NatDecision) -> ExpiredSession {
+        ExpiredSession {
+            key,
+            decision: SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 12,
+                    tx_ifindex: 12,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+                    neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                    src_mac: Some([6, 7, 8, 9, 10, 11]),
+                    tx_vlan_id: 0,
+                },
+                nat,
+            },
+            metadata: metadata(),
+            origin: SessionOrigin::ForwardFlow,
+        }
+    }
+
+    fn reap(forwarding: &ForwardingState, entries: &[ExpiredSession]) {
+        reap_expired_sessions(&mut [], entries, forwarding, -1, -1, -1, 1_000_000_000, 0);
+    }
+
+    /// The reap returns the NAT64 translated port. The observable is the one
+    /// `nat64_4381_release_untracks_flow` already uses: while the flow is live
+    /// a re-allocation is IDEMPOTENT, and after release a fresh port is issued.
+    ///
+    /// Fail-on-revert: neuter `release_nat64_allocation_for_worker` in
+    /// `reap_expired_sessions` and this goes RED — before #7740 that left the
+    /// crate green.
+    #[test]
+    fn gc_reap_releases_the_nat64_allocation_7740() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.nat64 = Nat64State::from_snapshots(&[prefix()]);
+        let c = client(1);
+
+        let (snat, port) = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c, DST_V4, 5000, 443, 1)
+            .expect("allocate");
+        assert_eq!(
+            forwarding
+                .nat64
+                .allocate_source(0, PROTO_TCP, c, DST_V4, 5000, 443, 1)
+                .expect("re-allocate"),
+            (snat, port),
+            "precondition: while live the mapping is idempotent, so a DIFFERENT \
+             port after the reap is the release and nothing else",
+        );
+
+        reap(
+            &forwarding,
+            &[expired(
+                key_for(c, 5000),
+                Nat64State::forward_decision(snat, DST_V4, port),
+            )],
+        );
+
+        let (snat2, port2) = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c, DST_V4, 5000, 443, 3)
+            .expect("post-reap allocate");
+        assert_eq!(snat2, snat, "same one-address pool");
+        assert_ne!(
+            port2, port,
+            "the GC reap must release the NAT64 translated port. An idempotent \
+             re-allocation means the flow is still live — the reaped session \
+             leaked its port (#7740)",
+        );
+    }
+
+    /// It releases the allocation THIS session holds. With a one-address pool
+    /// only the port disambiguates, so a release that freed by count — or freed
+    /// the wrong flow — would still let the first cell pass.
+    #[test]
+    fn gc_reap_releases_only_the_reaped_nat64_flow_7740() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.nat64 = Nat64State::from_snapshots(&[prefix()]);
+        let (c1, c2) = (client(1), client(2));
+
+        let (snat1, port1) = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c1, DST_V4, 5000, 443, 1)
+            .expect("allocate c1");
+        let (snat2, port2) = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c2, DST_V4, 5001, 443, 1)
+            .expect("allocate c2");
+        assert_ne!(
+            port1, port2,
+            "precondition: two live flows hold two distinct translated ports",
+        );
+
+        // Reap ONLY the first flow.
+        reap(
+            &forwarding,
+            &[expired(
+                key_for(c1, 5000),
+                Nat64State::forward_decision(snat1, DST_V4, port1),
+            )],
+        );
+
+        let fresh1 = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c1, DST_V4, 5000, 443, 3)
+            .expect("post-reap allocate c1");
+        assert_ne!(
+            fresh1.1, port1,
+            "the reaped flow's own allocation must be released",
+        );
+
+        let still2 = forwarding
+            .nat64
+            .allocate_source(0, PROTO_TCP, c2, DST_V4, 5001, 443, 3)
+            .expect("allocate c2 again");
+        assert_eq!(
+            still2,
+            (snat2, port2),
+            "the OTHER flow must still be live and idempotent — a release keyed \
+             on anything but the reaped flow's own (client, port) would free a \
+             translation another live session is still forwarding through",
+        );
+    }
+}
