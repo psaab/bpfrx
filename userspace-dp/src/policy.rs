@@ -775,6 +775,38 @@ impl PolicyCounterStore {
         }
     }
 
+    /// #6995: the stored rule ids, for the rejected-build rollback in
+    /// `forwarding_build`.
+    ///
+    /// `rule_hit_counter` below GET-OR-CREATES, and it runs inside the fallible
+    /// builder AHEAD of the NPTv6, filter and CoS belts — so a build those
+    /// belts reject used to leave a block per candidate-only rule behind in
+    /// this live, `Arc`-shared store. The builder captures this set before it
+    /// starts and hands it back to `retain_rule_ids` on the `Err` path.
+    pub(crate) fn tracked_rule_ids(&self) -> Vec<String> {
+        let Ok(counters) = self.counters.lock() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = counters.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// #6995: restore the registry to a previously captured id set.
+    ///
+    /// Deliberately NOT `clear()`. The rollback must leave every block that
+    /// existed before the rejected build exactly where it was — those carry the
+    /// cumulative totals of the RUNNING configuration, and dropping them would
+    /// reset `show security policies detail` hit counts on a commit that never
+    /// applied, which is the #5716 defect in a new place. Retaining a superset
+    /// is the safe direction: it can only fail to evict, never destroy.
+    pub(crate) fn retain_rule_ids(&self, keep: &[String]) {
+        let keep: FxHashSet<&str> = keep.iter().map(String::as_str).collect();
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.retain(|rule_id, _| keep.contains(rule_id.as_str()));
+        }
+    }
+
     fn rule_hit_counter(&self, rule_id: &str) -> Arc<PolicyRuleCounter> {
         let mut counters = self.counters.lock().expect("policy counter store poisoned");
         if let Some(counter) = counters.get(rule_id) {
@@ -798,10 +830,12 @@ impl PolicyCounterStore {
     /// distinguish "block never created" from "store empty".
     #[cfg(test)]
     pub(crate) fn tracked_rule_ids_for_test(&self) -> Vec<String> {
-        let counters = self.counters.lock().expect("policy counter store poisoned");
-        let mut ids: Vec<String> = counters.keys().cloned().collect();
-        ids.sort();
-        ids
+        // #6995: an ALIAS of the production accessor, not a second
+        // implementation. Single-sourcing it keeps the #6832 zone-era tests that
+        // call this name guarding the SAME registry view the rollback uses; two
+        // copies could drift and the older tests would silently stop covering
+        // what their names claim.
+        self.tracked_rule_ids()
     }
 }
 
