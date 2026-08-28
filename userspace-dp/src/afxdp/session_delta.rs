@@ -10,6 +10,10 @@
 // sibling-submodule item from afxdp.rs into scope.
 
 use super::*;
+// #6949: the single-source HA attribution shared with the binary open-frame
+// producer. Named explicitly rather than left to the glob so the coupling
+// between the two session-delta legs is visible at the top of this file.
+use crate::session::{SessionSyncAttribution, nat64_snat_v4_string};
 
 /// #5290: fairly drain up to `max` session deltas across `bindings` using a
 /// rotating cursor and a per-binding quantum, instead of handing the whole
@@ -131,6 +135,19 @@ pub(in crate::afxdp) fn session_delta_info(
         .get(&delta.metadata.egress_zone)
         .cloned()
         .unwrap_or_default();
+    // #6949: the HA-carried policy attribution comes from the SAME helper the
+    // binary open frame uses (`event_stream::codec::encode_session_open`), so
+    // the two legs cannot describe one session differently. The destructure is
+    // EXHAUSTIVE on purpose — no `..` — so a field added to
+    // `SessionSyncAttribution` fails to compile here until this leg carries it
+    // too. Before #6949 this leg carried none of these five.
+    let SessionSyncAttribution {
+        policy_id,
+        policy_counter_idx,
+        inactivity_timeout_secs,
+        nat64,
+        nat64_snat_v4,
+    } = SessionSyncAttribution::from_session(&delta.decision, &delta.metadata);
     SessionDeltaInfo {
         timestamp: Utc::now(),
         slot: ident.slot,
@@ -213,6 +230,22 @@ pub(in crate::afxdp) fn session_delta_info(
         // cross-node correlation. 0 (a synthesized delta with no backing entry)
         // keeps the legacy "peer allocates a fresh local id" behaviour.
         rt_flow_session_id: delta.session_id,
+        // #6949: carry the admitting policy's firewall metadata on the JSON leg
+        // too. The binary open frame has carried policy_id/policy_counter_idx
+        // since #3301 and the app timeout since #3227; this leg carried none,
+        // so a session recovered through the drain fallback or a FullResync
+        // export imported policy 0 (rendered `unattributed`, and excluded from
+        // the commit-time deletion-clear and the #4234 policy-rematch because
+        // id 0 is skipped there), no per-rule hit counter, and the global idle
+        // timeout instead of its per-application one.
+        policy_id,
+        policy_counter_idx,
+        app_timeout: inactivity_timeout_secs,
+        // #6949/#4565: without the pool source a NAT64 session promoted from
+        // this leg cannot rebuild its reverse v4->v6 BIB at all — the standby
+        // cannot derive it from the synced forward v6 key.
+        nat64,
+        nat64_snat_v4: nat64_snat_v4_string(nat64_snat_v4),
     }
 }
 

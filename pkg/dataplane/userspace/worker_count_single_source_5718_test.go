@@ -233,22 +233,40 @@ func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 			"heartbeat loop came to describe the same quantity differently", rawReads, rawPos)
 	}
 
-	// (5) no direct clamp-helper call — every representation goes via the plan.
+	// (5) no clamp helper REFERENCED AT ALL — every representation goes via the
+	// plan.
+	//
+	// #7003: this used to match only call.Fun.(*ast.Ident), i.e. a prohibited
+	// helper recognised solely as the direct callee of a call expression. So
+	//
+	//	f := heartbeatZeroSlots
+	//	f(...)
+	//
+	// invoked the helper while the only reference to its name sat on an
+	// assignment RHS, which that matcher never inspected. The identical family
+	// was compiled and MEASURED as a live escape in
+	// link_cycle_acquisition_site_6871_test.go during #6871 round 13.
+	//
+	// The fix is not a longer list of call shapes to recognise. It is to drop
+	// the position condition: the property is "this function does not reach
+	// around the plan", and a reference in ANY position — callee, method value,
+	// argument, assignment RHS — is a reach-around. That also makes this guard
+	// match its own sibling above, the cfg.Workers count, which has always been
+	// position-free and is the reason that one has no bypass.
 	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
+		id, ok := n.(*ast.Ident)
 		if !ok {
 			return true
 		}
-		id, ok := call.Fun.(*ast.Ident)
-		if !ok {
+		if id.Name != "heartbeatZeroSlots" && id.Name != "effectiveWorkers" {
 			return true
 		}
-		if id.Name == "heartbeatZeroSlots" || id.Name == "effectiveWorkers" {
-			t.Fatalf("programBootstrapMapsLocked calls %s directly at %s. Reaching around the "+
-				"plan re-creates an independent derivation of the worker count — the exact "+
-				"drift planUserspaceWorkers exists to prevent — without reading cfg.Workers "+
-				"a second time", id.Name, fset.Position(call.Pos()))
-		}
+		t.Fatalf("programBootstrapMapsLocked references %s at %s. Reaching around the "+
+			"plan re-creates an independent derivation of the worker count — the exact "+
+			"drift planUserspaceWorkers exists to prevent — without reading cfg.Workers "+
+			"a second time. Any reference counts, not just a direct call: taking the "+
+			"helper as a value and invoking it later derives the same number by the same "+
+			"route (#7003)", id.Name, fset.Position(id.Pos()))
 		return true
 	})
 

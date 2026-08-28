@@ -53,6 +53,11 @@ mod entry;
 pub(crate) use entry::*;
 mod ctx;
 pub(crate) use ctx::*;
+// #6949: the HA-carried policy attribution (policy_id, counter idx, app
+// timeout, NAT64 pool source) derived ONCE for BOTH session-delta producers —
+// the binary open frame and the JSON RPC-fallback delta.
+mod sync_attribution;
+pub(crate) use sync_attribution::*;
 mod wheel;
 use wheel::SessionWheel;
 

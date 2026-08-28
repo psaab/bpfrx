@@ -1584,6 +1584,11 @@ carries it (self-signaling — non-empty ⟹ NAT64):
 - **Event stream (Rust → Go active):** `FLAG_NAT64` (bit `1<<5`) on the SESSION_OPEN
   frame + a trailing 4-byte `snat_v4` (after the #3301 fields). Decoded to
   `SessionDeltaInfo.Nat64` / `Nat64SnatV4` (`eventstream.go`).
+- **JSON RPC-fallback delta (Rust → Go active), since #6949:** the `nat64` and
+  `nat64_snat_v4` keys on the same `SessionDeltaInfo`. Until #6949 this leg —
+  `drain_session_deltas` polling and the owner-RG FullResync export — carried
+  NEITHER, so a NAT64 session learned through it could not rebuild its reverse
+  BIB at all. See "Policy attribution on BOTH session-delta legs (#6949)" below.
 - **Shadow + cluster sync (Go active → Go standby):** stamped onto
   `SessionValueV6.Nat64SnatV4` (`daemon_ha_userspace.go`), a userspace-sync-only
   field carried as a length-gated trailing field in `encodeSessionV6Payload`
@@ -1826,6 +1831,60 @@ These deltas are **not** blindly mirrored. Filtering in
 
 The filtering fields on `SessionDeltaInfo` are `FabricRedirect` and
 `FabricIngress` (boolean flags), not a single combined field.
+
+#### Policy attribution on BOTH session-delta legs (#6949)
+
+"Fallback" undersells how much traffic this leg carries. `eventStreamFallbackLoop`
+drains it every **100 ms** while the binary event stream is down and every **5 s**
+even while it is up, and `ExportOwnerRGSessions` re-serializes the whole owned
+table through the same `SessionDeltaInfo` on **every** helper-requested
+FullResync. A helper restart or an event-stream reconnect on any clustered node
+reaches it.
+
+Until #6949 the JSON leg's Rust producer (`SessionDeltaInfo` in
+`userspace-dp/src/protocol/binding.rs`, built by `afxdp::session_delta_info`)
+carried **none** of the five policy-attribution values the binary open frame had
+carried since #3301/#4565:
+
+| Field | Binary open frame | JSON leg before #6949 |
+|-------|-------------------|-----------------------|
+| `policy_id` (#3056/#3301) | trailing `[+0:+4]` | absent |
+| `policy_counter_idx` (#3073) | trailing `[+4:+8]` | absent |
+| app inactivity timeout (#3227) | trailing `[+8:+12]`, seconds | absent |
+| `nat64` (#4565) | `FLAG_NAT64`, flags bit `1<<5` | absent |
+| `nat64_snat_v4` (#4565) | trailing `[+12:+16]` | absent |
+
+The Go consumer declared and read all five unconditionally, so a session learned
+through the JSON leg imported `PolicyID = 0`, `PolicyCounterIdx = 0`, no
+application timeout and no pool source. Consequences: it rendered
+`unattributed`; it was exempt from the commit-time deletion-clear and the #4234
+policy-rematch (both skip id 0); it accrued no per-rule hit count after a
+promotion; it aged on the global per-protocol timeout; a NAT64 session could not
+rebuild its reverse v4→v6 BIB at all; and because each reconciliation copy
+carries a fresh #2170 install generation, a later JSON copy could **overwrite an
+earlier, correct, event-derived copy on the peer** under latest-generation-wins.
+
+Nothing surfaced it: a rendered id of 0 displays as `unattributed` (#6851),
+exactly like a session no policy admitted — three states (attributed to N,
+attributed to 0, attribution dropped) crushed into two.
+
+**The fix is a single source, not a second copy.** Both producers now derive
+these five from one helper, `session::SessionSyncAttribution::from_session`
+(`userspace-dp/src/session/sync_attribution.rs`), which also owns the two
+non-trivial conversions — the saturating ns→s timeout and the
+`(nat64, rewrite_src)` pool-source selection. Both destructure it
+**exhaustively** (no `..`), so a field added to the struct fails to COMPILE
+until both legs carry it. Guards:
+
+- `session_delta_json_and_binary_agree_on_policy_attribution_6949` — one session,
+  both wires, asserts the two legs AGREE (neither side pinned to a literal).
+- `session_delta_info_zero_attribution_is_present_not_absent_6949` — a genuinely
+  unattributed session must emit the keys carrying an explicit 0, so
+  "attributed to policy 0" stays distinguishable from "field dropped".
+- `sync_attribution_exhaustive_destructure_6949` — forbids `..` at either
+  destructure, since that would restore the silent-divergence escape hatch.
+- `TestSessionDeltaPolicyAttributionWireKeysLockstepWithRust6949` (Go) — pins the
+  Go struct tags to the serde renames parsed out of `binding.rs`.
 
 ### Bulk Owner-RG Export (FullResync republish)
 

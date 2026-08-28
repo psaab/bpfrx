@@ -976,6 +976,55 @@ omits the fields decodes to `false` (no per-policy log) — bit-identical to
 pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
 `protocol/binding.rs`) carries the same fields at parity with the binary frame.
 
+### Policy attribution is single-sourced across both session-delta legs (#6949)
+
+A session delta leaves the helper on two wires, and both must describe the same
+session identically:
+
+* the BINARY `MSG_SESSION_OPEN` frame (`event_stream::codec::encode_session_open`)
+  — the primary HA path; and
+* the JSON RPC-fallback `SessionDeltaInfo` (`afxdp::session_delta_info`) — what
+  `drain_session_deltas` puts on the control-plane RPC every 100 ms while the
+  binary stream is down, every 5 s while it is up, and what every
+  helper-requested FullResync exports through `ExportOwnerRGSessions`.
+
+Until #6949 they had diverged on five fields. The binary frame carried
+`policy_id` (#3056/#3301), `policy_counter_idx` (#3073), the per-application
+inactivity timeout (#3227, ns→s), the `FLAG_NAT64` marker and the NAT64
+`snat_v4` pool source (#4565). The JSON leg carried **none** of them, while the
+Go consumer read all five unconditionally — so every session learned through
+that leg imported policy 0, counter 0, the global idle timeout and no pool
+source. It rendered `unattributed`, was skipped by the commit-time
+deletion-clear and the #4234 policy-rematch (both exclude id 0), accrued no
+per-rule hit count after a promotion, and — the one that is not a
+mis-attribution — a NAT64 session could not rebuild its reverse v4→v6 BIB,
+because `snat_v4` is chosen by `allocate_source` and is not derivable from the
+synced forward v6 key. Worse, each reconciliation copy carries a fresh #2170
+install generation, so a later JSON copy could OVERWRITE an earlier, correct,
+event-derived copy on the peer.
+
+It stayed invisible for four releases because a rendered `policy_id` of 0 shows
+as `unattributed` (#6851) — identical to a session no policy admitted.
+
+A divergence between the two producers is ALWAYS a bug (they describe one
+session for one peer), so the derivation is **single-sourced** in
+`session::SessionSyncAttribution::from_session` (`session/sync_attribution.rs`)
+rather than written twice and held in agreement by a test. That helper also owns
+the two non-trivial conversions — the saturating ns→s timeout and the
+`(nat64, rewrite_src)` pool-source selection — which would otherwise have been a
+second divergence waiting to happen. Both producers destructure it
+EXHAUSTIVELY (no `..`), so a new field carried by only one leg does not compile;
+`sync_attribution_exhaustive_destructure_6949` pins the absence of `..`, and
+`session_delta_json_and_binary_agree_on_policy_attribution_6949` asserts the two
+legs AGREE on one session rather than pinning either side to a literal.
+
+`serde(default)` / `omitempty` keep it rolling-upgrade safe in both directions:
+an old helper omits the keys and they decode to 0/""/false — precisely the
+pre-#6949 behaviour of this leg — and an old daemon ignores keys it does not
+know. Making that parity DURABLE across a mixed-version cluster (fail-closed
+capability negotiation, and the canonical-schema equivalence test that would
+have caught this whole class) is tracked separately as #7194.
+
 ### True ingress-interface identity on the session (#4983)
 
 A session records the interface its FIRST packet arrived on. At install
@@ -1406,7 +1455,9 @@ the lookup result is held → RED).
 handle ride the shared-session map and sibling-worker replicas automatically.
 #3301 carries the (positional) `policy_id` scalar on the cross-node HA
 `SessionDeltaInfo` / `SessionSyncRequest` wire, so a peer-PROMOTED session
-resolves the admitting policy after failover. But the **peer holds no local bound
+resolves the admitting policy after failover. That was true of the BINARY
+event-stream open frame only until #6949 — see "Policy attribution is
+single-sourced across both session-delta legs (#6949)" below. But the **peer holds no local bound
 handle** (the binding is local derived state, not serialized), so a reorder AFTER
 a session was synced still shows a stale id ON THE PEER until the session ages
 out. Fixing that needs a rule-id-on-wire identity change (three two-sided wire
