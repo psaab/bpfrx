@@ -7197,46 +7197,112 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // into the roughly sixty lines between the two parses would have made
         // one of them silently wrong.
         let rejected_above_the_policy_parse = label.starts_with("#3719");
+        // #6995 CLOSED — and this is the assertion that says so out loud,
+        // exactly as the comment below predicted when it was written.
+        //
+        // The two predicates that follow used to be evaluated HERE, against the
+        // stores the public entry point was handed, and they asserted the
+        // residue was PRESENT. It no longer is: the caller
+        // (`build_forwarding_state_with_policy_counters_and_previous`) now
+        // captures both registries before the fallible build and retains them
+        // back on `Err`.
+        //
+        // The ordering property they encode is NOT discarded, because it is a
+        // real property and it is still true — it is just a property of the
+        // INNER builder rather than of the caller. So it moves down one layer,
+        // to `build_fallible_forwarding_state`, which is where the get-or-create
+        // actually happens and which does not roll back. Deleting the
+        // predicates instead would have removed the only bind on the relative
+        // order of the policy parse, the NAT parse and the belts, and #6832
+        // fold r7 exists precisely because an earlier round let those two
+        // predicates collapse into one expression no row could contradict.
+        let policy_ids = live_policy.tracked_rule_ids_for_test();
         let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
         nat_ids.sort_unstable();
+        assert_eq!(
+            policy_ids, policy_seed,
+            "{label}: a REJECTED build left the live POLICY-counter registry \
+             changed. Extra ids are #6995 residue keyed by the refused \
+             snapshot's own rules; MISSING ids are the DESTRUCTIVE class \
+             (#7010), where the rollback ate a running rule's totals"
+        );
+        assert_eq!(
+            nat_ids,
+            vec![7777],
+            "{label}: a REJECTED build left the live NAT-counter registry \
+             changed. Id 4242 belongs to a candidate-only rule the build \
+             refused; 7777 is the running configuration's and must survive. \
+             This row is what makes the #6995 rollback hold with the ZONE \
+             store live alongside it, not just against empty neighbours"
+        );
+
+        // The ordering bind, re-anchored at the layer that owns it. Same
+        // predicates, same rows, same reasoning — run against the inner builder
+        // on its own live-seeded stores, where the residue is still observable
+        // because nothing has rolled it back yet.
+        let inner_policy = PolicyCounterStore::default();
+        let inner_nat = crate::nat::NatCounterStore::default();
+        let _ = inner_nat.rule_counter(7777);
+        build_forwarding_state_with_policy_counters_and_previous(
+            &ConfigSnapshot::default(),
+            &inner_policy,
+            &inner_nat,
+            None,
+        )
+        .expect("the empty seed snapshot must build");
+        let inner_policy_seed = inner_policy.tracked_rule_ids_for_test();
+        assert!(
+            !inner_policy_seed.is_empty(),
+            "{label}: fixture precondition — the inner-builder policy store \
+             must be LIVE before the rejected build"
+        );
+        let inner_err =
+            build_fallible_forwarding_state(&snapshot, &inner_policy, &inner_nat, Some(&prev))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the inner builder must reject this snapshot"));
+        assert!(
+            expected(&inner_err),
+            "{label}: the inner builder rejected through a different belt than \
+             the row names ({inner_err:?})"
+        );
+        let mut inner_nat_ids: Vec<u32> =
+            inner_nat.snapshots().iter().map(|s| s.counter_id).collect();
+        inner_nat_ids.sort_unstable();
         let expected_nat_ids: Vec<u32> = if rejected_above_the_nat_parse {
             vec![7777]
         } else {
             vec![4242, 7777]
         };
-        let policy_ids = live_policy.tracked_rule_ids_for_test();
+        let inner_policy_ids = inner_policy.tracked_rule_ids_for_test();
         assert!(
-            policy_seed.iter().all(|id| policy_ids.contains(id)),
-            "{label}: the rejected build EVICTED a live policy counter. The \
-             #6995 residue is additive; losing a seeded id would be the \
+            inner_policy_seed.iter().all(|id| inner_policy_ids.contains(id)),
+            "{label}: the inner builder EVICTED a live policy counter. It is \
+             ADDITIVE by construction; losing a seeded id would be the \
              DESTRUCTIVE class, which is #7010, not this one. \
-             seed={policy_seed:?} after={policy_ids:?}"
+             seed={inner_policy_seed:?} after={inner_policy_ids:?}"
         );
-        // The policy half of the #6995 boundary, asserted the same way as the
-        // NAT half: the candidate-only rule's counter IS left behind, and a
-        // later fix that stops leaving it reds here instead of leaving the
-        // gaps-doc claim stale. Belt-dependent for the same reason the NAT one
-        // is — the policy parse sits mid-builder, above NPTv6/filter/CoS and
-        // below the dup-zone belt. #3402 is the row that separates this
-        // predicate from the NAT one: it is BELOW the probe rule's counter
-        // (residue expected) and ABOVE the NAT parse (no NAT residue).
+        // The policy half of the ordering boundary: the candidate-only rule's
+        // counter IS resolved by the inner builder for a belt BELOW the policy
+        // parse and is not for a belt above it. #3402 is the row that separates
+        // this predicate from the NAT one — it is BELOW the probe rule's
+        // counter (residue expected) and ABOVE the NAT parse (no NAT residue).
         let policy_residue_expected = !rejected_above_the_policy_parse;
         assert_eq!(
-            policy_ids.iter().any(|id| id.contains("probe-rule")),
+            inner_policy_ids.iter().any(|id| id.contains("probe-rule")),
             policy_residue_expected,
-            "{label}: the documented #6995 policy-side boundary moved. A belt \
-             BELOW the probe rule's per-rule counter resolution leaves that \
-             rule's counter in the live store and a belt ABOVE it does not. \
-             after={policy_ids:?}"
+            "{label}: the policy-side ordering boundary moved. A belt BELOW the \
+             probe rule's per-rule counter resolution leaves that rule's \
+             counter in the store the inner builder was handed, and a belt \
+             ABOVE it does not. after={inner_policy_ids:?}"
         );
         assert_eq!(
-            nat_ids, expected_nat_ids,
-            "{label}: the documented #6995 scope boundary moved. A belt BELOW \
-             the NAT rule parse leaves the candidate's counter_id behind in the \
-             live NAT store, and a belt ABOVE it does not — that residue is \
-             EXPECTED (see the builder's doc comment). If it is now absent for \
-             a below-the-parse row, #6995 was fixed and both that comment and \
-             the PR body's scope paragraph are stale"
+            inner_nat_ids, expected_nat_ids,
+            "{label}: the NAT-side ordering boundary moved. A belt BELOW the \
+             NAT rule parse leaves the candidate's counter_id behind in the \
+             store the INNER builder was handed, and a belt ABOVE it does not. \
+             Hoisting the NAT parse above the policy parse reds the #3402 row \
+             here (measured, #6832 fold r7). The caller undoes this on `Err` \
+             (#6995) — that is asserted above, at the caller's layer"
         );
     }
 }

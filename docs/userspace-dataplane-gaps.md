@@ -695,15 +695,39 @@ zone with no traffic / no flood events alike.
   `rejected_apply_does_not_prune_live_zone_counters_6832` (negative) plus
   `committed_reconcile_…` / `committed_refresh_…` (one per call site).
 
-  Scope note: this is the ZONE-counter store only. The same rejected build
-  still leaves get-or-create residue in the shared `PolicyCounterStore` and
-  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**,
-  and now asserted rather than only described, by
-  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`: it
-  drives the four belts with all three stores LIVE (the other rejection tests
+  Scope note: #6832 was the ZONE-counter store only. The same rejected build
+  also left get-or-create residue in the shared `PolicyCounterStore` and
+  `NatCounterStore` — pre-existing, untouched by #6832, and tracked as
+  **#6995**. **#6995 is now CLOSED**, by a different mechanism: those two
+  bindings cannot be deferred the way the zone binding was (the handles are
+  embedded in `PolicyState` and the NAT tables at construction), so
+  `build_forwarding_state_with_policy_counters_and_previous` instead CAPTURES
+  both registries before the fallible build and retains them back to the
+  captured sets on `Err`. A retain to the pre-build set evicts only ids that
+  build created and cannot drop a row carrying live totals.
+
+  The NAT half was the operator-visible one: `NatCounterStore::snapshots()`
+  emits a row per stored id regardless of value, feeding
+  `ProcessStatus.nat_rule_counters`, so a refused commit put phantom NAT
+  rule-counter rows on the status surface until the next successful commit
+  evicted them. Bound by
+  `rejected_build_does_not_leave_policy_blocks_in_the_live_store_6995`,
+  `rejected_build_does_not_leave_nat_rows_in_the_live_store_6995` and
+  `rejected_build_leaves_no_phantom_rows_on_the_nat_status_surface_6995` — the
+  store and the surface asserted SEPARATELY, because a fix that filtered
+  zero-valued rows out of `snapshots()` would satisfy the surface one while
+  leaving the store dirty.
+
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`
+  still drives the belts with all three stores LIVE (the other rejection tests
   pass fresh siblings, so they prove the zone guarantee only against empty
-  neighbours) and pins the residue in BOTH sibling stores, so a later fix to
-  either half of #6995 reds it instead of leaving this note stale.
+  neighbours). Its residue predicates — which pin the relative ORDER of the
+  policy parse, the NAT parse and the belts — moved down one layer to
+  `build_fallible_forwarding_state`, where the get-or-create happens and where
+  nothing has rolled back yet; at the caller's layer the row now asserts both
+  sibling stores come back UNCHANGED. The comment that said "a later fix to
+  either half of #6995 reds it instead of leaving this note stale" did exactly
+  that: the fix reddened the row, and this is the note it was protecting.
 
   "Both" is load-bearing and was not true when first written: the row seeded
   only the NAT store and left the policy store a bare `default()`, so the
