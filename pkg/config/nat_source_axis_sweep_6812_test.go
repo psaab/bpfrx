@@ -964,6 +964,20 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 		"Rule.Then.Interface", "Rule.Then.Off",
 	),
 	fixtureConstantAxes6812(
+		"#7013 compile-time diagnostic state: what ONE `then` container authored, kept "+
+			"so validateNATTerminalActionCardinalityStrict can see a pool the resolved "+
+			"NATThen scalar already discarded. Constant at exactly one authored pool "+
+			"here because every rule in this fixture is plain pool-mode source NAT — in "+
+			"production it is 0 for an `interface` or `off` rule, so this is a real blind "+
+			"spot and NOT production-constant. It is registered rather than varied "+
+			"because nothing sorts or compares on it: it is read once by the strict gate "+
+			"and never reaches the dataplane. If that ever changes, vary it instead.\n"+
+			"Only the LENGTH columns are registered: the pool NAMES vary rule to rule "+
+			"here, so `.all`/`[0]` are guarded and registering them was rejected as "+
+			"over-reach by this table's own stale-entry check.",
+		"Rule.thenAuthored.Pools.len", "Rule.thenAuthored.Pools.nil",
+	),
+	fixtureConstantAxes6812(
 		"pool fields this fixture never configures. Address/Port/PortRaw are the DNAT "+
 			"compatibility scalars, PortRangeInvalidSpec is the #5457 rejected-range "+
 			"marker (every range here is valid), and no pool is routing-instance-scoped, "+

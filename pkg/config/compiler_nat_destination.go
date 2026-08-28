@@ -241,6 +241,17 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 				}
 			}
 
+			// #7013: record what ONE `then` container authored, so a block that
+			// named the same pool twice is still visible after NATThen's scalar
+			// collapsed it. Kept PER CONTAINER, not summed: duplicate `then`
+			// containers are #3850's accepted last-wins, and summing across them
+			// false-rejects a config the suite already pins as legal. The worst
+			// single container is the one worth reporting.
+			for _, thenNode := range ruleInst.node.FindChildren("then") {
+				if c := natThenAuthoredOccurrences(thenNode, "destination-nat"); len(c.distinctPools()) > len(rule.thenAuthored.distinctPools()) {
+					rule.thenAuthored = c
+				}
+			}
 			rules = append(rules, rule)
 		}
 
