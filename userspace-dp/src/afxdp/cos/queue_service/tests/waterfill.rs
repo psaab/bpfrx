@@ -912,3 +912,113 @@ fn waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest() {
          re-serving it"
     );
 }
+
+/// #6958: the Phase-2 WRAP tail arms the epoch boundary, and the next call
+/// resumes selection.
+///
+/// The tail — three writes and a `None` at the end of
+/// `select_exact_cos_guarantee_queue_waterfill` — had ZERO binding coverage.
+/// Deleting all three left the whole bin suite green, and a `panic!` probe in
+/// its place fails exactly one test
+/// (`waterfill_guarantee_rate_skips_non_exact_queues`), which reaches the tail
+/// incidentally while asserting nothing about its effects. Reached once,
+/// checked never. Re-derived at master before writing this.
+///
+/// What the writes are FOR: `epoch_boundary = time_refresh ||
+/// waterfill_epoch_wrap_pending` in `refill_waterfill_epoch` is what clears
+/// `waterfill_honored_epoch_bits`. Lose the tail and `pass1_remaining` stays
+/// non-zero (so the `exhausted` trigger never fires), `epoch_wrap_pending`
+/// stays false, the honored bitset is never cleared, and every class honored
+/// in Phase 1 is skipped by BOTH phases — a `guarantee-rate` interface with
+/// fully backlogged queues goes idle for up to a whole epoch, silently, with
+/// no counter recording it.
+///
+/// TIME IS FROZEN, and that is the load-bearing fixture decision. `now_ns` is
+/// passed as a constant so `elapsed_since_refresh` stays 0 and `time_refresh`
+/// can never fire. `epoch_boundary` has two sources; if the clock is allowed
+/// to advance past `COS_GUARANTEE_VISIT_NS`, the time tick clears the honored
+/// bits on its own and this test passes whether or not the tail exists —
+/// measuring the fallback rather than the fix.
+#[test]
+fn waterfill_phase2_wrap_arms_epoch_boundary_and_resumes_6958() {
+    // Frozen: every call uses this same instant.
+    const NOW_NS: u64 = 1;
+    const TOKENS: u64 = 128 * 1024;
+
+    let mut root = test_mixed_class_root_with_primed_queues();
+    root.oversubscription_policy = CoSOversubscriptionPolicy::GuaranteeRate;
+    root.oversubscription_guarantee_fraction = 0.5;
+    root.exact_queues_by_rate_ascending = (0..root.queues.len())
+        .filter(|&idx| root.queues[idx].config.exact && root.queues[idx].config.guarantee_enabled)
+        .collect();
+    let prime = |root: &mut CoSInterfaceRuntime| {
+        for queue in &mut root.queues {
+            if queue.config.exact {
+                queue.hot.tokens = TOKENS;
+            }
+        }
+    };
+    prime(&mut root);
+
+    // Drive until the selector actually WRAPS. The wrap is asserted as a
+    // measured precondition rather than assumed from a loop count: a fixture
+    // that stops one call short of the tail exercises none of this and would
+    // pass with the tail deleted.
+    let mut wrapped = false;
+    for _ in 0..64 {
+        let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+        if select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], NOW_NS, &mut tel)
+            .is_none()
+        {
+            wrapped = true;
+            break;
+        }
+    }
+    assert!(
+        wrapped,
+        "fixture never reached the Phase-2 wrap tail, so nothing below is being \
+         measured (#6958)"
+    );
+
+    // The three writes, individually, so a partial loss localizes.
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes, 0,
+        "the wrap must zero pass1_remaining; left non-zero, refill_waterfill_epoch's \
+         `exhausted` trigger never fires and the epoch never refills (#6958)"
+    );
+    assert_eq!(
+        root.waterfill_phase2_cursor, 0,
+        "the wrap must reset the Phase-2 cursor — it is the ONLY site that does, \
+         and neither refill path touches it (#1743 r2)"
+    );
+    assert!(
+        root.waterfill_epoch_wrap_pending,
+        "the wrap must arm epoch_wrap_pending; it is what makes the next refill a \
+         genuine epoch boundary and clears the honored bitset (#6958)"
+    );
+
+    // The CONSEQUENCE, which is why those three writes exist. Asserting the
+    // fields alone pins plumbing; this pins the behaviour they buy.
+    //
+    // Re-prime tokens first: after the drain the queues are empty, and a `None`
+    // from an out-of-tokens queue would look identical to a `None` from an
+    // unarmed epoch boundary. Without this the assertion could fail for a
+    // reason that has nothing to do with the tail.
+    prime(&mut root);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let resumed =
+        select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], NOW_NS, &mut tel);
+    assert!(
+        resumed.is_some(),
+        "the selector stayed idle after the wrap. With the clock frozen, the ONLY \
+         thing that can clear waterfill_honored_epoch_bits is the epoch boundary the \
+         wrap tail arms — so every class honored in Phase 1 is now skipped by both \
+         phases and a fully backlogged guarantee-rate interface transmits nothing \
+         until the 200us tick (#6958)"
+    );
+    assert!(
+        !root.waterfill_epoch_wrap_pending,
+        "the refill must consume epoch_wrap_pending; leaving it armed would clear the \
+         honored bitset on every subsequent refill, not just at a genuine boundary"
+    );
+}
