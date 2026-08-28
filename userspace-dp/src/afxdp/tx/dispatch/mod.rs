@@ -336,6 +336,203 @@ fn compute_forwarded_egress_ptb(
     }
     (ptb_reply, mtu_signalled)
 }
+/// The immutable per-request inputs the copy fallback reads.
+///
+/// Bundled by REFERENCE, and the reason is the module discipline rather than
+/// taste. The helper below needs eleven inputs; `docs/engineering-style.md`
+/// draws a line at eight parameters, and shipping a signature over it silently
+/// is worse than either fixing it or declaring it. This fixes it: the struct is
+/// stack-only and holds only borrows, so the no-allocation hot-path invariant is
+/// untouched, and the three `&mut` receivers stay separate parameters because
+/// folding them in would borrow-conflict at the call sites.
+struct CopyFallbackInputs<'a> {
+    source_frame: &'a [u8],
+    request: &'a PendingForwardRequest,
+    expected_ports: Option<(u16, u16)>,
+    is_nat64: bool,
+    forwarding: &'a ForwardingState,
+    ingress_ident: &'a BindingIdentity,
+    recent_exceptions: &'a Arc<Mutex<ExceptionEventRing>>,
+}
+
+/// Build the forwarded frame into a `Vec` and enqueue it, returning
+/// `(build_failed, fallback_to_slow_path)` for the caller's finalizer flags.
+///
+/// #6922: this was written TWICE, verbatim -- 102 lines agreeing on 100, the
+/// only differences being an enclosing `None => match` versus a bare `match`
+/// and one local's name. Two independently-fixed behaviours lived in both: the
+/// NAT64 build-`None` drop attribution (#5625 ext-header eligibility, #2562
+/// fragment guards) and the #2208 oversized / enqueue-fail recycle handling.
+///
+/// SINGLE-SOURCED rather than bound by an agreement test, because a divergence
+/// between the two copies is ALWAYS a bug: they are the same fallback, for the
+/// same frame, with the same semantics, and the two call sites differ only in
+/// which upstream condition sent them here. A NAT64 drop attributed differently
+/// depending on whether the in-place rewrite returned `None` or direct TX was
+/// unavailable would classify one packet by an unrelated TX-path condition, and
+/// an operator reading the counters could not tell which had happened.
+///
+/// The rationale for the attribution ORDER now lives with the code instead of
+/// being an English cross-reference between two copies -- and the copy that
+/// held it was the DEAD one (see
+/// `nat64_never_reaches_the_in_place_rewrite_path_6922`). It mirrors the
+/// translator's own guard order: `write_v6_to_v4_into` applies the #5625
+/// eligibility gate BEFORE the #2562 fragment guards, so an AH / active-Routing
+/// / Mobility / HIP / Shim6 packet is attributed to `nat64_exthdr_ineligible`
+/// and only a genuine non-ext-header fragment drop falls through to
+/// `nat64_frag_dropped`. Bound by
+/// `nat64_build_none_attributes_exthdr_before_fragment_6922`, on a fixture BOTH
+/// predicates match -- the order is unobservable on any frame only one matches.
+///
+/// `#[inline(always)]`: this is the hottest TX path in the dataplane and the two
+/// call sites are the only ones. Outlining it would add a call per copy-fallback
+/// packet for no benefit; #4404 is the precedent for not splitting this cascade.
+#[inline(always)]
+fn enqueue_copy_fallback_frame(
+    inputs: &CopyFallbackInputs<'_>,
+    target_binding: &mut BindingWorker,
+    flow_key: &mut Option<SessionKey>,
+    dbg: &mut DebugPollCounters,
+    counters: &mut BatchCounters,
+) -> (bool, bool) {
+    let CopyFallbackInputs {
+        source_frame,
+        request,
+        expected_ports,
+        is_nat64,
+        forwarding,
+        ingress_ident,
+        recent_exceptions,
+    } = *inputs;
+    let mut build_failed = false;
+    let mut fallback_to_slow_path = false;
+    match if is_nat64 {
+        build_nat64_forwarded_frame(
+            source_frame,
+            request.meta,
+            &request.decision,
+            request.nat64_reverse.as_ref(),
+            forwarding.nat64.no_v6_frag_header,
+        )
+    } else {
+        build_forwarded_frame_from_frame(
+            source_frame,
+            request.meta,
+            &request.decision,
+            forwarding,
+            request.apply_nat_on_fabric,
+            expected_ports,
+        )
+    } {
+        Some(frame) => {
+            if cfg!(feature = "debug-log") {
+                if let Some(reason) = forward_tuple_mismatch_reason(
+                    live_frame_ports_from_meta_bytes(
+                        source_frame,
+                        request.meta,
+                    ),
+                    expected_ports,
+                    live_frame_ports_bytes(
+                        &frame,
+                        request.meta.addr_family,
+                        request.meta.protocol,
+                    ),
+                ) {
+                    record_exception_owned(
+                recent_exceptions,
+                ingress_ident,
+                &reason,
+                frame.len() as u32,
+                Some(request.meta.into()),
+                None,
+            );
+                    // Don't continue — the frame was built successfully,
+                    // forward it anyway. Mismatch is diagnostic only.
+                }
+            }
+            let copy_len = frame.len();
+            if copy_frame_is_oversized(copy_len) {
+                record_exception(
+                    recent_exceptions,
+                    ingress_ident,
+                    "oversized_forward_frame",
+                    copy_len as u32,
+                    Some(request.meta.into()),
+                    None,
+                    forwarding,
+                );
+                // #2208: oversized fallback-copy frame —
+                // undeliverable. Fall through to the
+                // finalizer (recycle the ingress
+                // descriptor); the bare `continue;` here
+                // leaked it. Drop-and-recycle, no slow-path
+                // reinject (the frame is already oversized).
+                build_failed = true;
+            } else {
+                let req = TxRequest {
+                    bytes: frame,
+                    expected_ports,
+                    expected_addr_family: request.meta.addr_family,
+                    expected_protocol: request.meta.protocol,
+                    flow_key: flow_key.take(),
+                    egress_ifindex: request.decision.resolution.egress_ifindex,
+                    cos_queue_id: request.cos_queue_id,
+                    dscp_rewrite: request.dscp_rewrite,
+                    mirror_clone: false,
+                    enqueue_ns: 0,
+                };
+                if enqueue_local_request_to_target_or_owner(target_binding, req)
+                    .is_err()
+                {
+                    // #2208: cross-binding CoS-owner queue
+                    // full (TX congestion). Set the
+                    // build-failure flags and FALL THROUGH
+                    // to the finalizer instead of the old
+                    // bare `continue;`, which skipped both
+                    // handle_forward_build_failure (the
+                    // slow-path reinject the flags request)
+                    // AND recycle_ingress_frame (leaking the
+                    // ingress descriptor under congestion).
+                    build_failed = true;
+                    fallback_to_slow_path = true;
+                } else {
+                    dbg.enqueue_ok += 1;
+                    dbg.enqueue_copy += 1;
+                    target_binding.tx_counters.pending_copy_tx_packets += 1;
+                    dbg.tx_bytes_total += copy_len as u64;
+                    if (copy_len as u32) > dbg.tx_max_frame {
+                        dbg.tx_max_frame = copy_len as u32;
+                    }
+                }
+            }
+        }
+        None => {
+            build_failed = true;
+            fallback_to_slow_path = true;
+            // Attribute a NAT64 build-`None` to a distinct
+            // fail-closed drop counter — #5625 ext-header
+            // ineligibility first, else #2562 fragment drop
+            // (same SSOT predicates + translator-order
+            // rationale as the direct/in-place copy path
+            // above).
+            if is_nat64 {
+                if crate::nat64::frame_is_nat64_exthdr_ineligible(
+                    source_frame,
+                    request.meta.addr_family as i32,
+                ) {
+                    counters.record_nat64_exthdr_ineligible();
+                } else if crate::nat64::frame_is_nat64_fragment_drop(
+                    source_frame,
+                    request.meta.addr_family as i32,
+                ) {
+                    counters.record_nat64_frag_dropped();
+                }
+            }
+        }
+    }
+    (build_failed, fallback_to_slow_path)
+}
+
 
 pub(in crate::afxdp) fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
@@ -817,144 +1014,25 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             }
                             retained_source_frame = true;
                         }
-                        None => match if is_nat64 {
-                            build_nat64_forwarded_frame(
-                                source_frame,
-                                request.meta,
-                                &request.decision,
-                                request.nat64_reverse.as_ref(),
-                                forwarding.nat64.no_v6_frag_header,
-                            )
-                        } else {
-                            build_forwarded_frame_from_frame(
-                                source_frame,
-                                request.meta,
-                                &request.decision,
-                                forwarding,
-                                request.apply_nat_on_fabric,
-                                expected_ports,
-                            )
-                        } {
-                            Some(frame) => {
-                                if cfg!(feature = "debug-log") {
-                                    if let Some(reason) = forward_tuple_mismatch_reason(
-                                        live_frame_ports_from_meta_bytes(
-                                            source_frame,
-                                            request.meta,
-                                        ),
-                                        expected_ports,
-                                        live_frame_ports_bytes(
-                                            &frame,
-                                            request.meta.addr_family,
-                                            request.meta.protocol,
-                                        ),
-                                    ) {
-                                        record_exception_owned(
-                                    recent_exceptions,
+                        None => {
+                            let (bf, fs) = enqueue_copy_fallback_frame(
+                                &CopyFallbackInputs {
+                                    source_frame,
+                                    request,
+                                    expected_ports,
+                                    is_nat64,
+                                    forwarding,
                                     ingress_ident,
-                                    &reason,
-                                    frame.len() as u32,
-                                    Some(request.meta.into()),
-                                    None,
-                                );
-                                        // Don't continue — the frame was built successfully,
-                                        // forward it anyway. Mismatch is diagnostic only.
-                                    }
-                                }
-                                let cp1_len = frame.len();
-                                if copy_frame_is_oversized(cp1_len) {
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        "oversized_forward_frame",
-                                        cp1_len as u32,
-                                        Some(request.meta.into()),
-                                        None,
-                                        forwarding,
-                                    );
-                                    // #2208: an oversized built frame is
-                                    // undeliverable. Fall through to the
-                                    // finalizer so the ingress descriptor is
-                                    // recycled to the fill ring (the bare
-                                    // `continue;` here leaked it). Do NOT set
-                                    // fallback_to_slow_path — reinjecting an
-                                    // already-oversized frame to the kernel
-                                    // slow path is pointless; matching the
-                                    // direct-TX oversized branch above, we
-                                    // drop-and-recycle.
-                                    build_failed = true;
-                                } else {
-                                    let req = TxRequest {
-                                        bytes: frame,
-                                        expected_ports,
-                                        expected_addr_family: request.meta.addr_family,
-                                        expected_protocol: request.meta.protocol,
-                                        flow_key: flow_key.take(),
-                                        egress_ifindex: request.decision.resolution.egress_ifindex,
-                                        cos_queue_id: request.cos_queue_id,
-                                        dscp_rewrite: request.dscp_rewrite,
-                                        mirror_clone: false,
-                                        enqueue_ns: 0,
-                                    };
-                                    if enqueue_local_request_to_target_or_owner(target_binding, req)
-                                        .is_err()
-                                    {
-                                        // #2208: a full cross-binding CoS-owner
-                                        // queue (TX congestion) returns Err and
-                                        // drops the TxRequest. Set the
-                                        // build-failure flags and FALL THROUGH
-                                        // to the finalizer — the old bare
-                                        // `continue;` skipped both
-                                        // handle_forward_build_failure (no
-                                        // slow-path reinject, contradicting the
-                                        // flags) AND recycle_ingress_frame
-                                        // (leaking the ingress descriptor). The
-                                        // finalizer reinjects from source_frame,
-                                        // so the dropped req is irrelevant.
-                                        build_failed = true;
-                                        fallback_to_slow_path = true;
-                                    } else {
-                                        dbg.enqueue_ok += 1;
-                                        dbg.enqueue_copy += 1;
-                                        target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                        dbg.tx_bytes_total += cp1_len as u64;
-                                        if (cp1_len as u32) > dbg.tx_max_frame {
-                                            dbg.tx_max_frame = cp1_len as u32;
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                build_failed = true;
-                                fallback_to_slow_path = true;
-                                // Attribute a NAT64 build-`None` to a distinct
-                                // fail-closed drop counter. The order mirrors the
-                                // translator's own guard order: #5625's RFC 7915
-                                // §5.1 ext-header eligibility gate runs BEFORE the
-                                // #2562 fragment guards inside `write_v6_to_v4_into`,
-                                // so an AH / active-Routing / Mobility / HIP / Shim6
-                                // packet is attributed to `nat64_exthdr_ineligible`
-                                // and only a non-ext-header fragment drop (a
-                                // non-first fragment, or a real ICMP/ICMPv6 fragment
-                                // whose checksum covers the whole datagram) falls
-                                // through to `nat64_frag_dropped`. Each SSOT
-                                // predicate mirrors its translator guard — an
-                                // unrelated build failure is counted by neither.
-                                if is_nat64 {
-                                    if crate::nat64::frame_is_nat64_exthdr_ineligible(
-                                        source_frame,
-                                        request.meta.addr_family as i32,
-                                    ) {
-                                        counters.record_nat64_exthdr_ineligible();
-                                    } else if crate::nat64::frame_is_nat64_fragment_drop(
-                                        source_frame,
-                                        request.meta.addr_family as i32,
-                                    ) {
-                                        counters.record_nat64_frag_dropped();
-                                    }
-                                }
-                            }
-                        },
+                                    recent_exceptions,
+                                },
+                                target_binding,
+                                &mut flow_key,
+                                dbg,
+                                counters,
+                            );
+                            build_failed |= bf;
+                            fallback_to_slow_path |= fs;
+                        }
                     }
                 } else {
                     enum DirectTxFallbackReason {
@@ -1153,130 +1231,23 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             }
                             None => {}
                         }
-                        match if is_nat64 {
-                            build_nat64_forwarded_frame(
+                        let (bf, fs) = enqueue_copy_fallback_frame(
+                            &CopyFallbackInputs {
                                 source_frame,
-                                request.meta,
-                                &request.decision,
-                                request.nat64_reverse.as_ref(),
-                                forwarding.nat64.no_v6_frag_header,
-                            )
-                        } else {
-                            build_forwarded_frame_from_frame(
-                                source_frame,
-                                request.meta,
-                                &request.decision,
-                                forwarding,
-                                request.apply_nat_on_fabric,
+                                request,
                                 expected_ports,
-                            )
-                        } {
-                            Some(frame) => {
-                                if cfg!(feature = "debug-log") {
-                                    if let Some(reason) = forward_tuple_mismatch_reason(
-                                        live_frame_ports_from_meta_bytes(
-                                            source_frame,
-                                            request.meta,
-                                        ),
-                                        expected_ports,
-                                        live_frame_ports_bytes(
-                                            &frame,
-                                            request.meta.addr_family,
-                                            request.meta.protocol,
-                                        ),
-                                    ) {
-                                        record_exception_owned(
-                                    recent_exceptions,
-                                    ingress_ident,
-                                    &reason,
-                                    frame.len() as u32,
-                                    Some(request.meta.into()),
-                                    None,
-                                );
-                                        // Don't continue — the frame was built successfully,
-                                        // forward it anyway. Mismatch is diagnostic only.
-                                    }
-                                }
-                                let cp2_len = frame.len();
-                                if copy_frame_is_oversized(cp2_len) {
-                                    record_exception(
-                                        recent_exceptions,
-                                        ingress_ident,
-                                        "oversized_forward_frame",
-                                        cp2_len as u32,
-                                        Some(request.meta.into()),
-                                        None,
-                                        forwarding,
-                                    );
-                                    // #2208: oversized fallback-copy frame —
-                                    // undeliverable. Fall through to the
-                                    // finalizer (recycle the ingress
-                                    // descriptor); the bare `continue;` here
-                                    // leaked it. Drop-and-recycle, no slow-path
-                                    // reinject (the frame is already oversized).
-                                    build_failed = true;
-                                } else {
-                                    let req = TxRequest {
-                                        bytes: frame,
-                                        expected_ports,
-                                        expected_addr_family: request.meta.addr_family,
-                                        expected_protocol: request.meta.protocol,
-                                        flow_key: flow_key.take(),
-                                        egress_ifindex: request.decision.resolution.egress_ifindex,
-                                        cos_queue_id: request.cos_queue_id,
-                                        dscp_rewrite: request.dscp_rewrite,
-                                        mirror_clone: false,
-                                        enqueue_ns: 0,
-                                    };
-                                    if enqueue_local_request_to_target_or_owner(target_binding, req)
-                                        .is_err()
-                                    {
-                                        // #2208: cross-binding CoS-owner queue
-                                        // full (TX congestion). Set the
-                                        // build-failure flags and FALL THROUGH
-                                        // to the finalizer instead of the old
-                                        // bare `continue;`, which skipped both
-                                        // handle_forward_build_failure (the
-                                        // slow-path reinject the flags request)
-                                        // AND recycle_ingress_frame (leaking the
-                                        // ingress descriptor under congestion).
-                                        build_failed = true;
-                                        fallback_to_slow_path = true;
-                                    } else {
-                                        dbg.enqueue_ok += 1;
-                                        dbg.enqueue_copy += 1;
-                                        target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                        dbg.tx_bytes_total += cp2_len as u64;
-                                        if (cp2_len as u32) > dbg.tx_max_frame {
-                                            dbg.tx_max_frame = cp2_len as u32;
-                                        }
-                                    }
-                                }
-                            }
-                            None => {
-                                build_failed = true;
-                                fallback_to_slow_path = true;
-                                // Attribute a NAT64 build-`None` to a distinct
-                                // fail-closed drop counter — #5625 ext-header
-                                // ineligibility first, else #2562 fragment drop
-                                // (same SSOT predicates + translator-order
-                                // rationale as the direct/in-place copy path
-                                // above).
-                                if is_nat64 {
-                                    if crate::nat64::frame_is_nat64_exthdr_ineligible(
-                                        source_frame,
-                                        request.meta.addr_family as i32,
-                                    ) {
-                                        counters.record_nat64_exthdr_ineligible();
-                                    } else if crate::nat64::frame_is_nat64_fragment_drop(
-                                        source_frame,
-                                        request.meta.addr_family as i32,
-                                    ) {
-                                        counters.record_nat64_frag_dropped();
-                                    }
-                                }
-                            }
-                        }
+                                is_nat64,
+                                forwarding,
+                                ingress_ident,
+                                recent_exceptions,
+                            },
+                            target_binding,
+                            &mut flow_key,
+                            dbg,
+                            counters,
+                        );
+                        build_failed |= bf;
+                        fallback_to_slow_path |= fs;
                     }
                 }
                 } // close `if !mtu_signalled` (#2301 egress-MTU PTB)
