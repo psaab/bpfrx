@@ -434,12 +434,34 @@ mutation proof; each was added because its absence was a live bypass.
   request. Deferring it lets the caller pick the moment — and pick to make it
   fail (see the precedence rule below).
 
-Those accept-time lookups are **admission-controlled**: a package-global pool of
+Those accept-time lookups are **admission-controlled**: a pool of
 `maxConcurrentPeerLookups` (1024) tokens bounds how many run at once, because the
 wedge that motivates the bound is inside the interface enumeration holding its
 own mutex, where a context would not help — only admission control would. Past
 the cap a connection resolves IMMEDIATELY to an unattributable local identity,
 which DENIES, reached without spawning anything.
+
+**There are TWO such pools, split by whether a connection can reach that
+enumeration (#6974).** `authz.couldBeLocal` short-circuits on loopback delivery
+and returns *before* `isLocalAddr`, so a loopback-delivered connection never
+takes `localAddrCache.mu` — it cannot participate in the wedge, and it draws on
+`peerLookupLoopbackSlots` instead of the pool defending the connections that can.
+On the default `127.0.0.1` posture that is every connection, which is what stops
+an on-box unprivileged process exhausting the routable listeners' budget by
+opening TCP connections alone, unauthenticated and without sending one HTTP byte.
+
+The acquire stays **at accept** and the slot is still held across the lookup —
+that call *is* the wedge, so moving the acquire after authentication would move
+it past the thing it protects. A **per-listener** split (the other refinement
+#6974 proposed) was declined: `localAddrCache.mu` is process-global, so under a
+real wedge every listener blocks on the same mutex whatever the partitioning is,
+and per-listener pools would multiply the goroutine bound while buying no
+isolation. Splitting on *reachability of the mutex* does buy it, because the two
+classes contend for different things. The predicate is
+`authz.LoopbackDeliveryCannotEnumerate`, single-sourced with the short-circuit it
+depends on so the two cannot drift; that it really does avoid the enumeration is
+measured in `pkg/authz/peer_loopback_noenumerate_6974_test.go`, with a negative
+row so the claim is not vacuous.
 
 The pool's accounting has three rules and all three are load-bearing: a running
 lookup HOLDS a token, a finished one RETURNS it, and a connection REFUSED

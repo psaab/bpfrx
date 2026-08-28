@@ -345,23 +345,92 @@ const peerLookupTimeout = 5 * time.Second
 // driven by the same unauthenticated caller. Bounded denial is preferred to
 // unbounded growth.
 //
-// The refinements that would remove the cost rather than bound it — a
-// per-listener budget instead of a process-global one, and/or acquiring the
-// slot AFTER authentication so an unauthenticated client cannot spend it — are
-// tracked in #6974 and are not attempted here. Any such change must keep the
-// property this cap exists for: no unbounded goroutine accumulation while
-// localAddrsFn is wedged. Raising or removing the cap alone reinstates the
-// original defect.
+// #6974 ADDRESSED THE FIRST TWO OF THOSE COSTS IN ONE MOVE, and declined the
+// refinement the issue proposed for the second. The budget is now SPLIT BY
+// WHETHER A CONNECTION CAN REACH THE ENUMERATION (peerLookupLoopbackSlots
+// below): authz.couldBeLocal short-circuits on loopback delivery and returns
+// before isLocalAddr, so a loopback-delivered connection never takes
+// localAddrCache.mu and cannot participate in the wedge. It therefore no longer
+// spends the pool that defends the connections which can — and on the default
+// 127.0.0.1 posture that is every connection, so an on-box unprivileged process
+// can no longer exhaust the routable listeners' budget by opening TCP alone.
+//
+// The acquire STAYS AT ACCEPT and the slot is still held across s.lookupPeer,
+// which is the call that wedges: moving it after authentication would move it
+// past the thing it protects. A PER-LISTENER split — #6974's other proposal —
+// was declined and the reason is recorded rather than defaulted:
+// localAddrCache.mu is process-global, so under a real wedge every listener
+// blocks on the same mutex whatever the partitioning is; per-listener pools
+// would multiply the goroutine bound while buying no isolation. The third cost
+// (denies rather than queues) is not removable — queuing IS the unbounded
+// accumulation the cap exists to prevent.
+//
+// Any further change must keep the property this cap exists for: no unbounded
+// goroutine accumulation while localAddrsFn is wedged. Raising or removing the
+// cap alone reinstates the original defect.
 const maxConcurrentPeerLookups = 1024
 
-// peerLookupSlots is the admission token pool for those lookups. Package-level:
-// the resource being bounded is the daemon's goroutines and memory, which every
-// listener shares. That sharing is also the cost documented above — one
-// saturated listener denies on all of them.
+// peerLookupSlots is the admission token pool for the lookups that CAN reach the
+// enumeration. Package-level: the resource being bounded is the daemon's
+// goroutines and memory, which every listener shares.
 var peerLookupSlots = make(chan struct{}, maxConcurrentPeerLookups)
 
-// PeerLookupSlotsInUseForTest reports how many lookup slots are held. Test-only.
-func PeerLookupSlotsInUseForTest() int { return len(peerLookupSlots) }
+// peerLookupLoopbackSlots is the SECOND pool, for connections that provably
+// cannot reach the wedge (#6974 cost 1).
+//
+// authz.couldBeLocal short-circuits on loopback delivery and returns BEFORE
+// isLocalAddr, so a loopback-delivered connection never takes localAddrCache.mu
+// and never calls localAddrsFn. Such a connection cannot participate in the
+// wedge this budget exists to bound, and until now it spent that budget anyway
+// — which is how an on-box unprivileged process, unauthenticated and without
+// sending one HTTP byte, could exhaust the slots that defend the ROUTABLE
+// listeners.
+//
+// THE SPLIT IS BY REACHABILITY OF THE BOUNDED RESOURCE, not by listener. A
+// per-listener split was the other refinement #6974 proposes and it does not
+// hold up: localAddrCache.mu is process-global, so under a real wedge every
+// listener's lookups block on the same mutex whatever the budget partitioning
+// is — partitioning would multiply the goroutine bound without buying the
+// isolation it claims. Partitioning by "can this connection reach the mutex"
+// does buy it, because the two classes contend for different things.
+//
+// BOTH POOLS ARE STILL BOUNDED. This one exists to keep a goroutine ceiling on
+// the loopback path, not because that path is trusted: the property the cap is
+// for — no unbounded goroutine accumulation — is preserved on both sides, and
+// the wedge-facing pool's size is unchanged, so the bound on the wedge itself is
+// exactly what it was.
+var peerLookupLoopbackSlots = make(chan struct{}, maxConcurrentPeerLookups)
+
+// peerLookupPoolFor picks the pool a connection's lookup must be admitted
+// through. The predicate is authz's own, so it cannot drift from the
+// short-circuit that makes the split sound (see
+// authz.LoopbackDeliveryCannotEnumerate).
+func peerLookupPoolFor(client, server net.Addr) chan struct{} {
+	if authz.LoopbackDeliveryCannotEnumerate(client, server) {
+		return peerLookupLoopbackSlots
+	}
+	return peerLookupSlots
+}
+
+// PeerLookupSlotsInUseForTest reports how many lookup slots are held, ACROSS
+// BOTH POOLS. Test-only.
+//
+// The sum, not the wedge-facing pool alone (#6974). Several cases use "zero
+// slots in use" as a quiescence edge meaning "no lookup is in flight anywhere"
+// — waitSlots, waitForPeerLookupsToFinish — and a reading that covered only one
+// pool would report quiescence while loopback lookups were still running. That
+// is the same class of defect as the #6977 waiter edge: an observation about
+// part of the state, read as if it were about all of it.
+func PeerLookupSlotsInUseForTest() int {
+	return len(peerLookupSlots) + len(peerLookupLoopbackSlots)
+}
+
+// PeerLookupPoolForTest exposes the pool a connection between these addresses
+// draws on, so a case that needs to SATURATE the budget can fill the one its own
+// fixture will use rather than guessing. Test-only.
+func PeerLookupPoolForTest(client, server net.Addr) chan struct{} {
+	return peerLookupPoolFor(client, server)
+}
 
 // peerWaitersInFlight counts requests currently PARKED in pendingPeer.wait
 // inside the mutation gate — i.e. requests that have reached authorizeInputs and
@@ -472,12 +541,19 @@ func (s *Server) connContext(ctx context.Context, c net.Conn) context.Context {
 	// Past the cap the connection is resolved IMMEDIATELY to an unattributable
 	// LOCAL identity, which denies — the same answer a timed-out lookup produces,
 	// reached without spawning anything.
+	// #6974: the pool is chosen by whether this connection can reach the
+	// enumeration the budget bounds. The ACQUIRE STAYS HERE, at accept, and the
+	// slot is still held across s.lookupPeer — which is what calls
+	// authz.LookupPeer and therefore the wedge. Moving the acquire later (after
+	// authentication, say) would move it past the thing it protects and bound
+	// nothing; what moves here is only WHICH bounded pool a connection draws on.
+	pool := peerLookupPoolFor(client, server)
 	select {
-	case peerLookupSlots <- struct{}{}:
+	case pool <- struct{}{}:
 		go func() {
 			// #6977: ORDER IS THE INVARIANT (defers are LIFO) — pkg/api/README.md.
 			defer close(p.done)
-			defer func() { <-peerLookupSlots }()
+			defer func() { <-pool }()
 			p.id = s.lookupPeer(client, server)
 		}()
 	default:

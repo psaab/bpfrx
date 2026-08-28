@@ -1654,20 +1654,31 @@ func TestAcceptTimeVerdictIsNotDiscarded_5561(t *testing.T) {
 func TestWedgedLookupsDoNotAccumulate_5561(t *testing.T) {
 	usePasswdFixture(t)
 
-	// Fill the pool, as a wedged enumeration would.
-	held := 0
+	// Fill BOTH pools, as a wedged enumeration would (#6974). There are two
+	// since the budget was split by whether a connection can reach the
+	// enumeration: this fixture's server is on 127.0.0.1, so its connections are
+	// loopback-delivered and draw on the loopback pool — filling only the
+	// wedge-facing one would leave the fixture's own path unbounded and the case
+	// would fail while nothing was wrong. Both are filled so the assertion below
+	// still means "the accept-time goroutine is bounded", whichever pool this
+	// connection uses.
+	held := map[chan struct{}]int{}
 	defer func() {
-		for i := 0; i < held; i++ {
-			<-peerLookupSlots
+		for pool, n := range held {
+			for i := 0; i < n; i++ {
+				<-pool
+			}
 		}
 	}()
-	for held < maxConcurrentPeerLookups {
-		select {
-		case peerLookupSlots <- struct{}{}:
-			held++
-		default:
-			t.Fatalf("could not fill the lookup pool; %d of %d taken before it refused",
-				held, maxConcurrentPeerLookups)
+	for _, pool := range []chan struct{}{peerLookupSlots, peerLookupLoopbackSlots} {
+		for held[pool] < maxConcurrentPeerLookups {
+			select {
+			case pool <- struct{}{}:
+				held[pool]++
+			default:
+				t.Fatalf("could not fill a lookup pool; %d of %d taken before it refused",
+					held[pool], maxConcurrentPeerLookups)
+			}
 		}
 	}
 
@@ -1702,7 +1713,14 @@ func TestWedgedLookupsDoNotAccumulate_5561(t *testing.T) {
 			"one blocked goroutine per connection for as long as callers keep connecting")
 	}
 
-	if n := PeerLookupSlotsInUseForTest(); n > maxConcurrentPeerLookups {
-		t.Fatalf("in-flight lookups grew to %d, past the %d cap", n, maxConcurrentPeerLookups)
+	// The ceiling is the SUM of the pools' capacities, derived rather than
+	// written down: #6974 split the budget in two, and a literal here would
+	// either have to be updated by hand or would silently stop bounding when a
+	// pool is resized. What the case asserts is unchanged — in-flight lookups
+	// never exceed what the budgets allow.
+	ceiling := cap(peerLookupSlots) + cap(peerLookupLoopbackSlots)
+	if n := PeerLookupSlotsInUseForTest(); n > ceiling {
+		t.Fatalf("in-flight lookups grew to %d, past the %d total cap across %d pools",
+			n, ceiling, 2)
 	}
 }
