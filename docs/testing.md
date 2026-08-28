@@ -347,6 +347,53 @@ incus exec xpf-fw -- xpfd cleanup
 
 ## Debugging Techniques
 
+### When an instrument answers "nothing", ask whether it means "I cannot see"
+
+The failure below has now bitten five separate investigations in this repo, and
+it is worth naming as a class before the individual instances.
+
+**An instrument that cannot observe something usually reports a well-formed,
+plausible negative** — zero rows, zero packets, zero failures — with no error and
+no "unavailable" marker. That negative is indistinguishable from a real one. And
+it is most dangerous on exactly the investigations where a negative is the
+expected finding, because there it reads as confirmation.
+
+The instances so far:
+
+| instrument | reported | actually meant |
+|---|---|---|
+| `tcpdump` on `ge-*-0-1` / `ge-*-0-2` (#7770) | 4-14 frames of 15 sent | AF_XDP consumes packets before the `AF_PACKET` tap; it saw nothing |
+| `show security policies hit-count` (#7776) | `0 packets / 0 bytes` on every row | the surface is not fed on this path; policies were matching |
+| packet capture across an RG failover (#6934) | "zero unsolicited NAs reach the wire" | measured on a redundancy group that never transitioned |
+| a mutation harness (#6937 v1) | marker checked, then probed anyway | the lever had not applied; the probe measured the unchanged config |
+| the struct auditor's own Rust scanner (#6937) | no row for `ForwardingState` | an unhandled `pub(in path)` visibility prefix made it invisible |
+
+The last one is the most instructive: it was the blind spot of a tool built to
+find blind spots, and neither of its two defects was visible in its own output.
+What exposed them was a field count someone else had measured independently.
+
+**What actually helps, in order of strength:**
+
+1. **A positive control from OUTSIDE the instrument.** Prove the instrument can
+   see a thing you know is there before believing it when it sees nothing. The
+   `ForwardingState` bugs were caught only by an externally-stated count; the
+   #6934 capture was believed for two rounds because nothing external contradicted
+   it.
+2. **A marker check that GATES rather than annotates.** #6937's first harness
+   verified that its config lever had applied and then ran the probe regardless.
+   A check whose result does not stop the next step is decoration.
+3. **Make "could not see" a distinct outcome from "saw nothing".** Prefer an
+   instrument that errors, or that reports coverage alongside its result, over one
+   that renders a clean zero. Where the instrument cannot be changed, write the
+   blind spot down beside it — as the AF_XDP section below does.
+4. **State a negative as "not measured", not "no evidence found."** They license
+   different conclusions, and only the second is a finding.
+
+> Whether this belongs in `docs/engineering-style.md` — which is an
+> agent-behaviour contract rather than an operations guide — is a call for the
+> repository owner. It is recorded here, next to the concrete instances, so it is
+> usable either way.
+
 ### Packet capture is BLIND on the AF_XDP data interfaces (#7770)
 
 **`tcpdump` on `ge-*-0-1` / `ge-*-0-2` of the loss userspace cluster does not see
