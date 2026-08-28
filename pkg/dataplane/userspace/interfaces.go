@@ -1258,24 +1258,31 @@ func egressMemberIsBarePort(name string, ifc *config.InterfaceConfig) bool {
 	if ifc.Tunnel != nil {
 		return false
 	}
-	_, hasUnit := firstConfiguredUnit(ifc)
-	return !hasUnit
+	return !hasConfiguredUnit(ifc)
 }
 
-// firstConfiguredUnit reports the lowest configured (non-nil) logical unit of
-// ifc. A present-but-nil unit slot (tolerant load / HA config-sync, #3494/#5068)
-// is not a configured unit.
-func firstConfiguredUnit(ifc *config.InterfaceConfig) (int, bool) {
-	lowest, found := 0, false
-	for num, unit := range ifc.Units {
-		if unit == nil {
-			continue
-		}
-		if !found || num < lowest {
-			lowest, found = num, true
+// hasConfiguredUnit reports whether ifc carries any configured (non-nil)
+// logical unit. A present-but-nil unit slot (tolerant load / HA config-sync,
+// #3494/#5068) is not a configured unit.
+//
+// This was firstConfiguredUnit, returning (int, bool). The int had no consumer
+// -- the sole production call site and both test call sites read only the bool
+// -- so the lowest-unit selection it performed was dead code, not merely
+// unbound: reversing `num < lowest` to `num > lowest` left the whole Go suite
+// green. The #6722 round-12 mutation table recorded that and deliberately left
+// it alone, being a claims-only round; #7026 carried it forward. Collapsed here.
+//
+// The sibling firstUnitNumber (pkg/config/compiler_validate_strict_reth_member.go)
+// keeps its int and its determinism requirement: it names the offending unit in
+// the commit-check message, so its selection is load-bearing. Only this copy
+// was dead.
+func hasConfiguredUnit(ifc *config.InterfaceConfig) bool {
+	for _, unit := range ifc.Units {
+		if unit != nil {
+			return true
 		}
 	}
-	return lowest, found
+	return false
 }
 
 // unanimousUnitZone implements rule 3 of stampEgressZones: the zone that every

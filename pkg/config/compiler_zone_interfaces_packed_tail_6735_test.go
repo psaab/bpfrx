@@ -158,11 +158,33 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 			//
 			// SCOPE, also measured, so nobody reads more into this than it
 			// carries: this assertion does NOT independently bind the override.
-			// That same empty-value edit reds 26 assertions that predate this
-			// branch (#6391 ×9, #5248, #3362, #3703, #4544, #4818, #3226,
-			// #4455), which already pin override CONTENT for these very shapes.
-			// It is here so the accept table states what it means; the binding
-			// is done elsewhere. See the mutation table in _Log.md.
+			// That same empty-value edit reds a large set of assertions that
+			// predate this branch and already pin override CONTENT for these
+			// very shapes. It is here so the accept table states what it means;
+			// the binding is done elsewhere.
+			//
+			// Deliberately not a census. This comment used to read "26
+			// assertions ... (#6391 ×9, #5248, #3362, #3703, #4544, #4818,
+			// #3226, #4455)" and both halves had gone stale: re-measured at
+			// 560544992 the #6391 group is ELEVEN, not nine, and the red set
+			// had grown four tags the enumeration never named (#6640 ×2, #2419,
+			// #7484, plus the untagged TestSlotEscapeTable). The population
+			// changes whenever any sibling round adds or removes an override
+			// assertion, so a hand-maintained number goes stale by construction
+			// and a corrected one would only reset the clock (#7030).
+			//
+			// The claim that matters is the PREDICATE, which does not rot: the
+			// override's content is pinned by assertions outside this table, so
+			// this row can be deleted without leaving the override unbound.
+			// Re-measure rather than trust a number — replace
+			// `cloneHostInbound(hib)` with `&HostInboundTraffic{}` at the
+			// per-interface override site in compileZones
+			// (pkg/config/compiler_security_zones.go) and run:
+			//
+			//	go test -count=1 -v ./pkg/config/ 2>&1 | grep -c '^--- FAIL'
+			//
+			// At 560544992 that is 28 top-level tests, 27 of them predating
+			// this branch. See the mutation table in _Log.md.
 			wantHIB map[string][]string
 		}{
 			{
