@@ -79,18 +79,26 @@ func (c *leaseTracingLinkController) PrepareLinkCycle() error {
 		err = c.prepareErrSeq[0]
 		c.prepareErrSeq = c.prepareErrSeq[1:]
 	}
-	if err != nil {
-		// Production takes the lease BEFORE the work that can fail only on the
-		// paths that get that far; a PrepareLinkCycle that errors has not armed
-		// it. Model that faithfully — an over-generous fake would hide the bug.
-		c.trace = append(c.trace, "prepare-failed")
-		return err
-	}
+	// The lease is taken BEFORE the fallible work, so a PrepareLinkCycle that
+	// ERRORS still holds one. That is production's documented acquire point —
+	// "the window that needs covering opens at the ctrl disable, not at the
+	// successful join" (process_linkcycle.go), pinned by
+	// TestPrepareLinkCycleHoldsTheLeaseWhenTheJoinFails_6871.
+	//
+	// An earlier version of this fake released on the error path, on the guess
+	// that a failed prepare arms nothing. That guess made the abort-only fixture
+	// below hold NO lease at all, so it had nothing to leak and mutation cell R2
+	// — delete the end-of-apply release — passed against it. The fixture was
+	// certifying an arm it never reached.
 	if c.notifyCalls > 0 {
 		c.acquiresAfter++
 	}
 	c.held = true
 	c.everHeld = true
+	if err != nil {
+		c.trace = append(c.trace, "acquire(then prepare FAILED — lease still held)")
+		return err
+	}
 	c.trace = append(c.trace, "acquire")
 	return nil
 }
