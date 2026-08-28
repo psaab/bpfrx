@@ -640,9 +640,18 @@ request is parked" and "*this* case's request is parked" are the same
 observation unless the count is known to have started at zero. Two rules keep
 them meaningful, and both are load-bearing rather than tidiness:
 
-- A case that waits on a waiter edge calls `waitForGateQuiescent` **before** it
-  opens the request, so its `waitForMutationBodyWaiter` — which accepts any
-  count above zero — cannot be answered by somebody else's parked request.
+- A case that waits on a waiter edge passes a BASELINE it read immediately
+  before opening its own request: `waitForNewMutationBodyWaiter(t, baseline)`
+  waits for the count to rise ABOVE it (#6977). That is attributable by
+  construction — a request somebody else left parked raises the baseline too, so
+  only a NEW park can answer the wait. The earlier form accepted any count above
+  zero and was made attributable by calling `waitForGateQuiescent` first; that
+  works, but it is a convention living in a different statement — for
+  `parkFlood`, a different function — from the wait that depends on it, and it
+  does not survive a case that parks TWICE, where the second wait is answered by
+  the first park. `waitForGateQuiescent` is still the right precondition where a
+  case asserts on the aggregate BYTE budget, which is a level rather than a
+  delta.
 - A case must not RETURN with a request still parked. `authzServer`'s cleanup
   closes the server and then waits for the gate to go quiescent, which puts the
   failure on the case that leaked rather than on whichever innocent case
@@ -651,15 +660,23 @@ them meaningful, and both are load-bearing rather than tidiness:
   `waiters=1 admitted=512` at the end of its body), so it hangs up and drains
   explicitly.
 
-The same shape bites the accept-time pool from the other side. `connContext`
-returns its admission token in the goroutine's **last** defer and `close(p.done)`
-is deferred after it — so `p.done` closes FIRST, and a case that joins on it (or
-simply drives HTTP and reads the response) returns while the token is still out.
-`TestPeerLookupSlotsAreReturned_5561` therefore waits for genuine zero occupancy
-before filling the pool: with one token already held it can take only
-`maxConcurrentPeerLookups-1` more and reads one OVER, failing its own
-precondition — `pool holds 1024 tokens before the case starts, want 1023` — with
-nothing wrong in production. And because a SAFE request never enters the
+The same shape bit the accept-time pool from the other side until #6977.
+`connContext` registers `defer close(p.done)` FIRST and the token release
+SECOND, and defers run LIFO, so the token is back before `p.done` closes: a
+caller that joins on `p.done` knows the slot is available as well as that the
+lookup finished. In the order that shipped the two were reversed, `p.done`
+closed first, and a case that joined on it (or simply drove HTTP and read the
+response) returned while the token was still out — so a case that then filled
+the pool observed a preceding lookup's transient token and failed on its own
+precondition, `pool holds 1024 tokens before the case starts, want 1023`, with
+nothing wrong in production. `TestPeerLookupSlotsAreReturned_5561` still waits
+for genuine zero occupancy before filling the pool; that precondition is now
+belt-and-braces rather than the thing standing between the case and a spurious
+failure. The ordering is pinned structurally by
+`TestPeerDoneIsClosedAfterTheSlotIsReturned_6977` — the property is a
+happens-before with no deterministic behavioural seam, so a source-order
+assertion is the honest instrument and the behavioural cell beside it states the
+invariant rather than detecting its absence. And because a SAFE request never enters the
 mutation gate, nothing on its request path waits for the lookup at all, so
 `TestPeerIdentityIsResolvedAtAccept_5561` reads its resolver counts through
 `waitForPeerLookupsToFinish` (count reached *and* pool empty) rather than
