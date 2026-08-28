@@ -131,7 +131,9 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 			}
 			if mlNode := aeoNode.FindChild("minimum-links"); mlNode != nil {
 				if v := nodeVal(mlNode); v != "" {
-					opts.MinimumLinks, _ = strconv.Atoi(v)
+					if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" aggregated-ether-options minimum-links", v); ok {
+						opts.MinimumLinks = n
+					}
 				}
 			}
 			ifc.AggregatedEtherOpts = opts
@@ -437,15 +439,21 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 									switch prop.Name() {
 									case "lease-time":
 										if v := nodeVal(prop); v != "" {
-											opts.LeaseTime, _ = strconv.Atoi(v)
+											if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" dhcp lease-time", v); ok {
+												opts.LeaseTime = n
+											}
 										}
 									case "retransmission-attempt":
 										if v := nodeVal(prop); v != "" {
-											opts.RetransmissionAttempt, _ = strconv.Atoi(v)
+											if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" dhcp retransmission-attempt", v); ok {
+												opts.RetransmissionAttempt = n
+											}
 										}
 									case "retransmission-interval":
 										if v := nodeVal(prop); v != "" {
-											opts.RetransmissionInterval, _ = strconv.Atoi(v)
+											if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" dhcp retransmission-interval", v); ok {
+												opts.RetransmissionInterval = n
+											}
 										}
 									case "force-discover":
 										opts.ForceDiscover = true
@@ -566,12 +574,16 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 								case "prefix-delegating":
 									if plNode := prop.FindChild("preferred-prefix-length"); plNode != nil {
 										if v := nodeVal(plNode); v != "" {
-											dc.PrefixDelegatingPrefixLen, _ = strconv.Atoi(v)
+											if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" dhcpv6-client prefix-delegating preferred-prefix-length", v); ok {
+												dc.PrefixDelegatingPrefixLen = n
+											}
 										}
 									}
 									if slNode := prop.FindChild("sub-prefix-length"); slNode != nil {
 										if v := nodeVal(slNode); v != "" {
-											dc.PrefixDelegatingSubPrefLen, _ = strconv.Atoi(v)
+											if n, ok := parseIntLeaf(warnings, "interfaces "+ifName+" dhcpv6-client prefix-delegating sub-prefix-length", v); ok {
+												dc.PrefixDelegatingSubPrefLen = n
+											}
 										}
 									}
 								case "req-option":

@@ -84,7 +84,9 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			}
 			if thNode := child.FindChild("threshold"); thNode != nil {
 				if v := nodeVal(thNode); v != "" {
-					sys.NTPThreshold, _ = strconv.Atoi(v)
+					if n, ok := parseIntLeaf(&cfg.Warnings, "system ntp threshold", v); ok {
+						sys.NTPThreshold = n
+					}
 				}
 				// Check for inline: threshold 400 action accept;
 				for i := 2; i < len(thNode.Keys)-1; i++ {
@@ -279,7 +281,9 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				}
 				if tiNode := cfgNode.FindChild("transfer-interval"); tiNode != nil {
 					if v := nodeVal(tiNode); v != "" {
-						sys.Archival.TransferInterval, _ = strconv.Atoi(v)
+						if n, ok := parseIntLeaf(&cfg.Warnings, "system archival configuration transfer-interval", v); ok {
+							sys.Archival.TransferInterval = n
+						}
 					}
 				}
 				for _, asNode := range cfgNode.FindChildren("archive-sites") {
@@ -336,7 +340,7 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 				if sys.UserspaceDataplane == nil {
 					sys.UserspaceDataplane = &UserspaceConfig{}
 				}
-				if err := compileUserspaceDataplane(child, sys.UserspaceDataplane); err != nil {
+				if err := compileUserspaceDataplane(child, sys.UserspaceDataplane, &cfg.Warnings); err != nil {
 					return err
 				}
 			case dataplaneTypeEBPF:
@@ -873,7 +877,7 @@ func hasDNSProxyChild(node *Node) bool {
 	return false
 }
 
-func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
+func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig, warnings *[]string) error {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "userspace":
@@ -895,7 +899,7 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 					IsLeaf:   child.IsLeaf,
 				}
 				synthParent := &Node{Children: []*Node{synthetic}}
-				if err := compileUserspaceDataplane(synthParent, cfg); err != nil {
+				if err := compileUserspaceDataplane(synthParent, cfg, warnings); err != nil {
 					return err
 				}
 			}
@@ -913,11 +917,15 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			cfg.StateFile = nodeVal(child)
 		case "workers":
 			if v := nodeVal(child); v != "" {
-				cfg.Workers, _ = strconv.Atoi(v)
+				if n, ok := parseIntLeaf(warnings, "system dataplane workers", v); ok {
+					cfg.Workers = n
+				}
 			}
 		case "ring-entries":
 			if v := nodeVal(child); v != "" {
-				cfg.RingEntries, _ = strconv.Atoi(v)
+				if n, ok := parseIntLeaf(warnings, "system dataplane ring-entries", v); ok {
+					cfg.RingEntries = n
+				}
 			}
 		case "poll-mode":
 			if v := nodeVal(child); v == "interrupt" || v == "busy-poll" {
@@ -949,7 +957,9 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			cfg.CPUGovernor = nodeVal(child)
 		case "netdev-budget":
 			if v := nodeVal(child); v != "" {
-				cfg.NetdevBudget, _ = strconv.Atoi(v)
+				if n, ok := parseIntLeaf(warnings, "system dataplane netdev-budget", v); ok {
+					cfg.NetdevBudget = n
+				}
 			}
 		case "coalescence":
 			// `coalescence adaptive enable|disable`, `coalescence
@@ -975,11 +985,15 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 					}
 				case "rx-usecs":
 					if v := nodeVal(sub); v != "" {
-						cfg.CoalescenceRXUsecs, _ = strconv.Atoi(v)
+						if n, ok := parseIntLeaf(warnings, "system dataplane coalescence rx-usecs", v); ok {
+							cfg.CoalescenceRXUsecs = n
+						}
 					}
 				case "tx-usecs":
 					if v := nodeVal(sub); v != "" {
-						cfg.CoalescenceTXUsecs, _ = strconv.Atoi(v)
+						if n, ok := parseIntLeaf(warnings, "system dataplane coalescence tx-usecs", v); ok {
+							cfg.CoalescenceTXUsecs = n
+						}
 					}
 				}
 			}
