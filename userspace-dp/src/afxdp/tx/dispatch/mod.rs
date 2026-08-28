@@ -511,10 +511,17 @@ fn enqueue_copy_fallback_frame(
             fallback_to_slow_path = true;
             // Attribute a NAT64 build-`None` to a distinct
             // fail-closed drop counter — #5625 ext-header
-            // ineligibility first, else #2562 fragment drop
-            // (same SSOT predicates + translator-order
-            // rationale as the direct/in-place copy path
-            // above).
+            // ineligibility first, else #2562 fragment drop.
+            //
+            // This comment used to end "(same SSOT predicates +
+            // translator-order rationale as the direct/in-place
+            // copy path above)". There is no longer an "above":
+            // #6922 collapsed the two copies into this one owner,
+            // and the rationale it pointed at now lives in this
+            // function's doc comment, with the code it explains.
+            // Left as a cross-reference it would name a copy that
+            // does not exist — the stale-pointer half of the
+            // defect this change closes.
             if is_nat64 {
                 if crate::nat64::frame_is_nat64_exthdr_ineligible(
                     source_frame,
