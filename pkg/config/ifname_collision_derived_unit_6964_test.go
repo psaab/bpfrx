@@ -184,15 +184,20 @@ func TestOrdinaryPerUnitTunnelsAccepted_6964(t *testing.T) {
 	}
 	// The cell is only meaningful if the fixture actually produced the derived
 	// "uN" devices the gate walks; assert the population it was screened on.
-	for ref, want := range map[string]string{
-		"gr-0/0/0#1": "gr-0-0-0u1",
-		"gr-0/0/0#2": "gr-0-0-0u2",
-		"gr-0/0/1#1": "gr-0-0-1u1",
+	// Without this the test would still pass on a config that built no per-unit
+	// tunnels at all, and would be screening an empty set.
+	for _, want := range []struct {
+		iface  string
+		unit   int
+		device string
+	}{
+		{"gr-0/0/0", 1, "gr-0-0-0u1"},
+		{"gr-0/0/0", 2, "gr-0-0-0u2"},
+		{"gr-0/0/1", 1, "gr-0-0-1u1"},
 	} {
-		name, unit := ref[:len(ref)-2], int(ref[len(ref)-1]-'0')
-		got := cfg.Interfaces.Interfaces[name].Units[unit].Tunnel.Name
-		if got != want {
-			t.Errorf("%s unit %d device = %q, want %q", name, unit, got, want)
+		got := cfg.Interfaces.Interfaces[want.iface].Units[want.unit].Tunnel.Name
+		if got != want.device {
+			t.Errorf("%s unit %d device = %q, want %q", want.iface, want.unit, got, want.device)
 		}
 	}
 }
