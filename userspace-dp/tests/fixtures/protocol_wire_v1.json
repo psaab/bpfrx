@@ -973,9 +973,7 @@
     "worker_command_queue_poison_recoveries": 0,
     "worker_heartbeats": [],
     "worker_runtime": [],
-    "workers": 0,
-    "zone_flood_counters": [],
-    "zone_traffic_counters": []
+    "workers": 0
   },
   "queue_control_request": {
     "armed": false,
