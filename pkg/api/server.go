@@ -1376,9 +1376,17 @@ func bindHostWarnable(bindHost string) bool {
 // That is over-suppression of exactly the case the diagnostic is FOR.
 // `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the divergence.
 //
-// An empty bindHost is NOT treated as loopback: the listener address could not
-// be parsed, and suppressing a diagnostic on unknown state is the wrong
-// direction to fail.
+// An empty bindHost is NOT treated as loopback, and the reason is stronger than
+// "suppressing on unknown state fails the wrong way". `":8443"` — the bare-port
+// form, an ordinary way to spell a listener on every interface — splits to an
+// EMPTY host, so `""` most often means WILDCARD rather than unparseable. This
+// module's own README already records that reading for the bind-host half:
+// "wildcard (`:8443` → empty) / non-encodable bind host is skipped". Treating
+// `""` as loopback would therefore suppress the diagnostic on a maximally
+// reachable listener — the same error as the `!bindHostWarnable` drop-in,
+// reached from a different direction.
+// `TestWarnStaleMgmtCertForHostName_6827/wildcard_bind_host_still_diagnoses_the_name`
+// binds that shape; it uses exactly a `":8443"` listener.
 func bindIsLoopbackOnly(bindHost string) bool {
 	if bindHost == "localhost" {
 		return true

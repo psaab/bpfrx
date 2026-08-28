@@ -1657,6 +1657,10 @@ the drop fails loudly instead of going quietly vacuous.
         `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the
         divergence, and the wildcard binds appear as MUST-STILL-WARN cells beside
         the loopback silence cells so the suppression cannot widen unnoticed.
+        An **empty** bind host is likewise not loopback: `":8443"` splits to an
+        empty host, so `""` usually means WILDCARD (the same reading the bind-host
+        bullet above already uses), and suppressing there would silence the
+        diagnostic on a listener reachable from every interface.
         **Accepted residual:** a rename that CROSSES the
         qualified/unqualified boundary is diagnosed at the commit but not on any
         later boot, so it is never diagnosed at all in the two states that had
