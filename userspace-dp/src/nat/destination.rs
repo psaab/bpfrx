@@ -282,6 +282,22 @@ enum DnatDest {
 }
 
 impl DnatTable {
+    /// #6899 test-only: total installed entries across BOTH the exact-host map
+    /// and the prefix map.
+    ///
+    /// It exists because "the rule was dropped" is NOT observable through
+    /// `lookup`: a dropped rule and a rule installed under a DIFFERENT key both
+    /// answer `None` for any address the test happens to probe. A cell asserting
+    /// the #4718 both-unparseable DROP therefore passes for the wrong reason
+    /// unless it can see that nothing was installed AT ALL — which is what this
+    /// reports, without the cell needing to guess which key a broken
+    /// implementation would have chosen.
+    #[cfg(test)]
+    pub(crate) fn installed_entry_count(&self) -> usize {
+        self.entries.values().map(|v| v.len()).sum::<usize>()
+            + self.prefix_entries.values().map(|v| v.len()).sum::<usize>()
+    }
+
     pub(crate) fn from_snapshots(
         snaps: &[DestinationNATRuleSnapshot],
         nat_counters: &NatCounterStore,

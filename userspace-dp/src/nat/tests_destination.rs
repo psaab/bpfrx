@@ -2477,11 +2477,18 @@ fn dnat_6899_both_unparseable_still_drops() {
         }],
         &counters,
     );
-    assert!(
-        table
-            .lookup(PROTO_TCP, "198.51.100.1".parse().unwrap(), "203.0.113.10".parse().unwrap(), 80, "")
-            .is_none(),
-        "a rule with BOTH fields unparseable installed something (#4718 drop lost)"
+    // NOT a `lookup(...).is_none()` assertion. A dropped rule and a rule
+    // installed under a DIFFERENT key both answer None for whatever address the
+    // cell probes — measured: mutating the #4718 `continue` into a fall-through
+    // installs under 127.0.0.1 and a probe for 203.0.113.10 still returns None,
+    // so the cell passed against the mutation. Count what was installed instead;
+    // that cannot be satisfied by a wrong key.
+    assert_eq!(
+        table.installed_entry_count(),
+        0,
+        "a rule with BOTH destination fields unparseable installed an entry — the \
+         #4718 fail-closed drop is gone, and the entry is keyed on whatever the \
+         broken path chose (#6899)"
     );
     assert!(counters.parse_errors() > 0, "#4718 drop stopped being surfaced");
 }
