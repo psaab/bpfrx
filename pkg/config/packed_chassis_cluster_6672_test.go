@@ -70,14 +70,18 @@ var clusterOracleValues = map[string]string{
 
 // clusterCompilerOnlyStatements are compiled by compileChassis but NOT declared
 // in schemaChassis, so they have no tab completion and no typed-leaf validator.
-// That is a live #6663-class divergence, tracked separately rather than folded
-// into this fix. This set exists so the agreement test below can be an EQUALITY
-// rather than a one-sided containment: when the schema gains these leaves, the
-// test fails and the entry must be deleted here in the same change.
-var clusterCompilerOnlyStatements = map[string]bool{
-	"fabric1-interface":    true,
-	"fabric1-peer-address": true,
-}
+// This set exists so the agreement test below can be an EQUALITY rather than a
+// one-sided containment: when the schema gains these leaves, the test fails and
+// the entry must be deleted here in the same change.
+//
+// EMPTY since #7448. It held `fabric1-interface` and `fabric1-peer-address`,
+// the last two #6663-class divergences under `chassis cluster`; declaring them
+// in schemaChassis is what emptied it. The equality half below did exactly what
+// it was built to do — it fired on that commit and named both entries — so the
+// set is kept, empty, rather than deleted along with its mechanism. An empty
+// exception set is the correct steady state for a seam whose whole purpose is
+// to make the NEXT divergence declare itself.
+var clusterCompilerOnlyStatements = map[string]bool{}
 
 func clusterSchemaChildren(t *testing.T) map[string]*schemaNode {
 	t.Helper()

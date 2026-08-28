@@ -149,7 +149,12 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // Measured at 6b47801de. Raising a ceiling is a real decision: it says a leaf
 // the #2419 class can hide in was added on purpose.
 // ---------------------------------------------------------------------------
-const gateCoverageFloor = 687
+// #7448 raised this 687 -> 689. Declaring `chassis cluster fabric1-interface`
+// and `fabric1-peer-address` in schemaChassis added two leaves that COMPARE —
+// neither landed in a blind class, so no ceiling moved. That is the shape a
+// coverage ratchet is supposed to see when a gap is closed rather than papered
+// over: the floor rises and the blind spots stay put.
+const gateCoverageFloor = 689
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
