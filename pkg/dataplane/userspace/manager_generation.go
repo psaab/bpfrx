@@ -131,3 +131,68 @@ func (m *Manager) BumpFIBGeneration() (uint32, error) {
 	}
 	return newGen, shimErr
 }
+
+// advanceGenerationAfterPartialUpdateLocked performs the post-publish
+// bookkeeping shared by the two PARTIAL-update writebacks —
+// RegenerateNeighborSnapshot (after `update_neighbors`) and
+// persistResolvedFabricsLocked (after `update_fabrics`).
+//
+// Both mutate one slice of m.lastSnapshot and bump the generation so the
+// partial-rebuild publish paths carry the mutation forward. Neither sends an
+// apply_snapshot: the helper has the neighbor replace or the fabric update, not
+// the full snapshot.
+//
+// #6986: that is why publishedSnapshot may only be advanced from a state where
+// it was ALREADY at the high-water mark.
+//
+// Compile's pendingXSKStartup branch (manager_compile.go) deliberately stores
+// m.lastSnapshot WITHOUT publishing it — the publish is deferred, not skipped —
+// which leaves publishedSnapshot < lastSnapshot.Generation. That inequality is
+// the level-triggered predicate the status tick uses to drive syncSnapshotLocked
+// later. The old unconditional writeback here closed it:
+//
+//	before:  lastSnapshot.Generation = 10  publishedSnapshot = 7   (gen 10 never sent)
+//	regen:   generation++ -> 11; lastSnapshot.Generation = 11; publishedSnapshot = 11
+//	after:   publishedSnapshot == lastSnapshot.Generation -> the tick's gate is FALSE
+//
+// The deferred full snapshot — policies, routes, interfaces, NAT — was then
+// never apply_snapshot'd, while the manager's bookkeeping said it had been.
+//
+// The guard makes that UNREPRESENTABLE rather than rarer: publishedSnapshot can
+// only move from a value that already equals the high-water, so it can never
+// leapfrog an unpublished generation, on any interleaving. It is not a narrower
+// window — there is no window.
+//
+// lastSnapshotHash is gated by the SAME condition, and that is load-bearing
+// rather than tidiness. The hash is a SECOND, independent kill: syncSnapshotLocked
+// re-hashes m.lastSnapshot and returns without sending when it matches
+// lastSnapshotHash (process_status.go). Refreshing it here from a snapshot that
+// was never published would make the dedup gate suppress the publish even if the
+// generation gate were open, so fixing only the generation half would leave the
+// content swallowed anyway. Left stale, the hash correctly describes the last
+// content the helper actually received, and the comparison then differs.
+//
+// When the full snapshot IS published, the behaviour is unchanged from the
+// original Copilot-review rationale: advance both, so the status loop does not
+// see the bumped generation as unpublished and force a redundant apply_snapshot,
+// and so churn in filtered-out rows cannot leak through the hash dedup.
+//
+// Caller holds m.mu and has already verified m.lastSnapshot != nil.
+func (m *Manager) advanceGenerationAfterPartialUpdateLocked() {
+	// Sampled BEFORE the bump: after it, lastSnapshot.Generation has moved and
+	// the comparison would be meaningless.
+	fullSnapshotWasPublished := m.publishedSnapshot >= m.lastSnapshot.Generation
+	m.generation++
+	m.lastSnapshot.Generation = m.generation
+	if !fullSnapshotWasPublished {
+		// A full-snapshot publish is outstanding. Leave publishedSnapshot and
+		// lastSnapshotHash alone so the status tick still sees work to do —
+		// and so the publish it eventually makes carries THIS partial update
+		// too, since it reads the same m.lastSnapshot.
+		return
+	}
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
+}
