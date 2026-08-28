@@ -116,11 +116,13 @@ func TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561(t *testing.T) {
 					// the real one rather than an artefact of the gate buffering on
 					// some handler's behalf — a route in the mutationBodyNone class
 					// answers without entering it at all.
+					// #6977: baseline before the request exists.
+					parked := MutationBodyWaitersForTest()
 					req := openWithheldBody(t, base, "POST /api/v1/config/set", tc.hdrs)
 
 					// Authorized, and now parked reading a body the caller has not
 					// sent. This is the window, and the caller holds it open.
-					waitForMutationBodyWaiter(t)
+					waitForNewMutationBodyWaiter(t, parked)
 					if change {
 						s.ReplaceAuth(tc.change)
 					}
@@ -276,7 +278,15 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 
 	for _, route := range noBody {
 		t.Run(route, func(t *testing.T) {
-			// A 16 MiB declaration with ONE byte sent and the rest withheld.
+			// #6977: this is an ABSENCE assertion on a PROCESS-GLOBAL counter,
+			// and it is the property this case exists to state — the other
+			// class-A sites use the counter as a precondition. The direction of
+			// its contamination is therefore the opposite one: a request some
+			// other case left parked does not make this pass early, it makes it
+			// RED, naming a route that parked nothing. Compare against a
+			// baseline read before this request exists, so what is asserted is
+			// "this route added no park", which is what the sentence means.
+			parked := MutationBodyWaitersForTest()
 			conn := openDeclaredBody(t, base, route, 16<<20, "{", nil)
 
 			if _, got := readStatus(t, conn, 10*time.Second); !got {
@@ -285,9 +295,10 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 					"server — decides how long the daemon holds that buffer, once per "+
 					"connection, until the 30s read timeout", route)
 			}
-			if n := MutationBodyWaitersForTest(); n != 0 {
+			if n := MutationBodyWaitersForTest(); n != parked {
 				t.Fatalf("%d requests are parked reading a body inside the gate after a "+
-					"no-body route answered; want 0", n)
+					"no-body route answered, up from %d before it opened; want no change. "+
+					"A no-body route must not enter the gate's drain at all", n, parked)
 			}
 		})
 	}

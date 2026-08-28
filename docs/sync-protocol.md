@@ -1110,10 +1110,14 @@ framed unconditionally, so an override can never re-send empty markers.
 #### Table-truth window source (#6031)
 
 The window's session SOURCE is no longer the shim `sessions`/`sessions_v6` BPF
-maps. Under the userspace dataplane those are a best-effort **display mirror**:
-the helper publishes a conntrack row only on the host-inbound install, the
-missing-neighbor seed, and the reverse-companion repair, so a **transit** session
-— which is what an HA firewall is actually protecting — has no row there at all.
+maps. Under the userspace dataplane those are a best-effort **display mirror**.
+When this was written the helper published a conntrack row only on the
+host-inbound install, the missing-neighbor seed, and the reverse-companion
+repair, so a **transit** session — which is what an HA firewall is actually
+protecting — had no row there at all. #6965 added the transit publish, but the
+reason for moving the window source stands without it: the mirror is a
+best-effort copy of a table the helper owns, so it is not table-truth however
+complete it becomes.
 Combined with the authoritative reconcile above (absent from the window ⇒
 DELETED), framing the window from that mirror deleted the standby's live
 peer-owned transit sessions on every cold prime, survivor re-drive, and forced

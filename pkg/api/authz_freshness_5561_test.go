@@ -201,6 +201,10 @@ func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 					// headers synchronously, so the request reaches the gate
 					// immediately.
 					const body = `{"input":"set system host-name r18"}`
+					// #6977: the baseline for THIS case's park, read before the
+					// request exists, so the wait below cannot be satisfied by
+					// anyone else's.
+					parked := MutationBodyWaitersForTest()
 					conn := openDeclaredBody(t, base, "POST /api/v1/config/set", len(body), "", nil)
 
 					// Wait for the accept-time lookup to start...
@@ -231,7 +235,7 @@ func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 						// drain, and stays there rather than being answered. If
 						// it did not park, the revoked arm's prompt 403 would
 						// prove nothing about WHERE the denial came from.
-						waitForMutationBodyWaiter(t)
+						waitForNewMutationBodyWaiter(t, parked)
 						if status, answered := readStatus(t, conn, time.Second); answered {
 							t.Fatalf("the CONTROL answered %d with its body still withheld — a "+
 								"super-user with no intervening commit must be admitted by pass "+
@@ -489,6 +493,8 @@ func TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561(t *testing.T) {
 					// request that gets past pass 1 parks in the gate's drain
 					// instead of being answered.
 					const body = `{"input":"set system host-name r22"}`
+					// #6977: baseline before this case's own request exists.
+					parked := MutationBodyWaitersForTest()
 					conn := openDeclaredBody(t, base, "POST /api/v1/config/set", len(body), "", tc.hdrs)
 
 					// The request has authenticated against the LIVE snapshot,
@@ -512,7 +518,7 @@ func TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561(t *testing.T) {
 						// Positive then negative: the request got PAST pass 1
 						// into the gate's body drain, and stays there rather
 						// than being answered.
-						waitForMutationBodyWaiter(t)
+						waitForNewMutationBodyWaiter(t, parked)
 						if status, answered := readStatus(t, conn, time.Second); answered {
 							t.Fatalf("the CONTROL answered %d with its body still withheld — "+
 								"an off-box caller holding a VALID credential must be admitted "+
@@ -801,28 +807,55 @@ func (w *withheldBody) finish(t *testing.T) (int, string) {
 	return resp.StatusCode, r.Error
 }
 
-// waitForMutationBodyWaiter blocks until a request is parked reading its
-// caller's body inside the mutation gate — the happens-before edge that says
-// "the first adjudication has finished and the second has not started".
-//
-// PRECONDITION: the gate must be QUIESCENT when the case opens the request this
-// is waiting for. The counter behind it is PROCESS-GLOBAL and this accepts any
-// value above zero, so a request some other case left parked reads as this
-// one's — and under -shuffle the two need not even be adjacent in the source.
-// waitForGateQuiescent establishes that precondition; authzServer's cleanup is
-// what makes it cheap to establish, by refusing to let a case return with a
-// request still parked.
-func waitForMutationBodyWaiter(t *testing.T) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+// awaitMutationBodyWaiterAbove reports whether the count of requests parked
+// reading a caller's body inside the mutation gate ROSE above baseline within
+// `within`. It is the predicate half of waitForNewMutationBodyWaiter, split out
+// so a test can drive it with its own deadline and observe a wait that must NOT
+// return — t.Fatal from a helper goroutine is not available (#6977).
+func awaitMutationBodyWaiterAbove(baseline int, within time.Duration) bool {
+	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
-		if MutationBodyWaitersForTest() > 0 {
-			return
+		if MutationBodyWaitersForTest() > baseline {
+			return true
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("no request ever parked reading its body inside the gate, so the case never " +
-		"reached the window it tests")
+	return false
+}
+
+// waitForNewMutationBodyWaiter blocks until a request the CALLER opened is
+// parked reading its body inside the mutation gate — the happens-before edge
+// that says "the first adjudication has finished and the second has not
+// started".
+//
+// baseline is the count read IMMEDIATELY BEFORE the caller opened that request,
+// and the delta is what makes the edge the caller's own (#6977). The counter is
+// PROCESS-GLOBAL: every api.Server in the process adds to it. The earlier form
+// of this helper accepted any value above zero, so a request some other case
+// left parked — or one the SAME case parked a moment earlier, which is the
+// commoner shape — satisfied a wait it had nothing to do with, and the case
+// proceeded before its own request had reached the gate. Under -shuffle the two
+// cases need not even be adjacent in the source.
+//
+// A bare `> 0` can be made attributable by establishing quiescence first, and
+// every call site did exactly that. But that is a convention a caller has to
+// remember: the precondition lives in a different statement, sometimes a
+// different function, from the wait that depends on it. A delta is attributable
+// by construction — a leftover park raises the baseline too, so only a NEW park
+// can satisfy the wait — and it needs nothing remembered.
+//
+// waitForGateQuiescent is still the right postcondition for a case that parks a
+// request (authzServer's cleanup runs it), and still the right precondition
+// where a case asserts on the aggregate BYTE budget, which is a level rather
+// than a delta.
+func waitForNewMutationBodyWaiter(t *testing.T, baseline int) {
+	t.Helper()
+	if awaitMutationBodyWaiterAbove(baseline, 10*time.Second) {
+		return
+	}
+	t.Fatalf("no request the case opened ever parked reading its body inside the gate "+
+		"(%d parked, baseline %d), so the case never reached the window it tests",
+		MutationBodyWaitersForTest(), baseline)
 }
 
 // waitForGateQuiescent blocks until NO request is parked in the gate's body
@@ -935,12 +968,14 @@ func TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561(t *testing.T) {
 					// and not an artefact of the gate buffering on a handler's
 					// behalf. A route in the mutationBodyNone class would answer
 					// without ever entering it.
+					// #6977: baseline before the request exists.
+					parked := MutationBodyWaitersForTest()
 					req := openWithheldBody(t, base, "POST /api/v1/config/set", tc.hdrs)
 
 					// The request has been authorized and is now parked reading the
 					// body it has not sent. This is the window, and it is the caller
 					// that holds it open.
-					waitForMutationBodyWaiter(t)
+					waitForNewMutationBodyWaiter(t, parked)
 					if revoke {
 						if tc.credentialRow {
 							// Exactly what `delete system services web-management

@@ -491,14 +491,20 @@ pub(crate) fn worker_loop(
                 refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);
                 // #4800: per-worker transit new-flow install count.
                 //
-                // NOT REACHABILITY-BOUND (#6971). The callee is covered by
-                // `refresh_worker_new_flow_install_counters_sums_across_bindings`,
-                // but nothing drives `worker_loop` in any test, so deleting
-                // THIS LINE leaves the whole suite green while the wire field
-                // pins at 0 and both #4800 cross-worker analyzer gates
-                // (`active_workers < 3`, `max_worker_share > 0.60`) silently
-                // stop discriminating. The `refresh_worker_cos_queue_lease_*`
-                // call above it has the same gap; one harness binds both.
+                // REACHABILITY-BOUND SINCE #6971, structurally. Nothing drives
+                // `worker_loop` in any test, so deleting THIS LINE used to leave
+                // the whole suite green while the wire field pinned at 0 and both
+                // #4800 cross-worker analyzer gates (`active_workers < 3`,
+                // `max_worker_share > 0.60`) silently stopped discriminating. The
+                // `refresh_worker_cos_queue_lease_*` call above it had the same
+                // gap. Both are now pinned by
+                // `worker_loop_refreshes_publish_tick_counters_6971`
+                // (server/tests.rs), which also asserts they sit INSIDE this
+                // publish-tick block rather than merely existing — a source pin,
+                // because `worker_loop` takes five heavyweight parameters and is
+                // spawned only from coordinator bringup against real AF_XDP
+                // sockets, so no test can drive it and inventing a seam would
+                // just move the unbound boundary up one level.
                 refresh_worker_new_flow_install_counters(&mut wr_counters, &bindings);
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;

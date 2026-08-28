@@ -1041,12 +1041,20 @@ plane reads them as `dataplane.SessionValue.IngressIfindex` /
 the helper's in-memory `SessionEntry`, and that is a different question from
 what `show security flow session` can see. That command enumerates the BPF
 conntrack map (`pkg/dataplane/maps_session.go`'s `Manager.IterateSessions`
-over `m.maps["sessions"]`), and inside the HELPER only three install sites ever
-write it: `publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` —
-the host-inbound `LocalMiss` install, the `MissingNeighborSeed` install, and the
-reverse-companion repair on the session-hit path (that third row is
-`is_reverse != 0`, which every `show`/`clear` call site skips before filtering,
-so it never surfaces a flow on its own).
+over `m.maps["sessions"]`), and inside the HELPER **four** install sites write
+it: `publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` — the
+TRANSIT forward install (#6965), the host-inbound `LocalMiss` install, the
+`MissingNeighborSeed` install, and the reverse-companion repair on the
+session-hit path (that fourth row is `is_reverse != 0`, which every
+`show`/`clear` call site skips before filtering, so it never surfaces a flow on
+its own).
+
+**The transit site is #6965 and it is the one that matters for volume.** Until
+it existed the mirror carried only the host-inbound and neighbor-seed
+populations, so for the DOMINANT population — ordinary transit flows — `show
+security flow session` showed nothing at all. Not a row with a zeroed identity:
+no row. #6656 records the shape that produced, a node carrying 4.6M rx packets
+while showing 33 sessions.
 
 "Inside the helper" is load-bearing, because the map has a writer OUTSIDE it
 (#6928 review). Every HA peer-synced row reaches the same `sessions` /
@@ -1054,27 +1062,42 @@ so it never surfaces a flow on its own).
 `Manager.SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/manager_sessions.go`)
 call `bpfShim.SetSessionV4`/`V6`, which is `maps_session.go`'s
 `m.maps["sessions"].Update`. That is the "for peer-synced sessions the Go side
-installs directly" case named below; the three-site count is a claim about the
-Rust helper's publication sites, never about the map's writers. The ordinary TRANSIT forward
-install does NOT publish there: it calls `publish_live_session_entry`, which
-writes the shim's steering table (`session_map_fd`, a 40-byte key with a
-one-byte action value — a different map from the 144-byte conntrack value),
-plus `publish_shared_session` for the shared/HA maps.
+installs directly" case named below; the four-site count is a claim about the
+Rust helper's publication sites, never about the map's writers.
+
+The transit forward install publishes the mirror row IN ADDITION to the shim's
+steering table, not instead of it. The two are different maps and always were:
+`publish_live_session_entry` writes `session_map_fd`, a 40-byte key with a
+one-byte action value, and the mirror carries the 144-byte conntrack value.
+`publish_shared_session` for the shared/HA maps is unchanged.
+
+FORWARD ONLY, deliberately. The reverse companion installed in the same arm
+gets no mirror row: every `show`/`clear` call site skips `IsReverse != 0`
+before filtering, so a reverse row would cost a `bpf_map_update_elem` per
+connection for something that can never surface a flow, and the forward row
+already carries BOTH directions' counters (#2501). Pinned by
+`transit_reverse_companion_gets_no_conntrack_row_6965`.
 
 So the identity is stamped on every forward session installed from a RECEIVED
 FRAME — the three frame-driven install sites, the only ones with an observed
 binding to copy. (The two forward installs that carry `0`, host-outbound GRE
 and the HA peer import, are not exceptions: neither has an observed local
 ingress. Both are enumerated under "`0` means no ingress identity carried"
-below.) Of those stamps, the identity reaches the operator
-surface only for the host-inbound and missing-neighbor-seed populations, and
-for peer-synced sessions the Go side installs directly. Transit sessions are
-absent from that map entirely — not carrying a zeroed identity, but having no
-row at all — so `show`/`clear ... interface <name>` cannot select them either
-way. That gap is PRE-EXISTING (it dates to `fab9230c5`, the commit that first
-added the conntrack mirror and wired only these three sites) and is tracked as
-**#6965**; #4983 neither introduced nor widened it. Closing #6965 is what makes
-this datum operator-visible for the dominant population.
+below.) Since #6965 the identity reaches the operator
+surface for the TRANSIT population too, alongside the host-inbound and
+missing-neighbor-seed ones and the peer-synced sessions the Go side installs
+directly. Before it, transit sessions were absent from that map entirely — not
+carrying a zeroed identity, but having no row at all — so `show`/`clear ...
+interface <name>` could not select them either way. That gap dated to
+`fab9230c5`, the commit that first added the conntrack mirror and wired only
+three sites; #4983 neither introduced nor widened it.
+
+What the mirror carries is the {PARENT ifindex, VLAN} PAIR, not a pre-resolved
+logical unit — the Go side resolves the pair through the same map the egress
+side uses. Both halves are pinned end to end:
+`poll_descriptor_transit_install_stamps_ingress_binding_4983` on the in-memory
+entry and `transit_forward_install_publishes_a_conntrack_row_6965` on the
+mirrored row.
 
 Before this the session carried only its ingress ZONE, so
 `show security flow session interface <name>` and the matching `clear` had to

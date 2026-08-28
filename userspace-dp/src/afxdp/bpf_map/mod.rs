@@ -372,6 +372,74 @@ const SESS_STATE_ESTABLISHED: u8 = 4;
 ///
 /// `conntrack_v4_fd` / `conntrack_v6_fd`: FDs for the pinned `sessions` / `sessions_v6`
 /// BPF HASH maps. Pass -1 if unavailable (will be a no-op).
+/// #6965 fail-on-revert instrumentation: every `publish_bpf_conntrack_entry`
+/// call, recorded with enough of its arguments to say WHICH population it came
+/// from.
+///
+/// A bare counter would not do the job here. The test driver
+/// (`tests_support::txn_run_descriptor`) passes `-1` for both conntrack fds, so
+/// no row is ever written in a unit test and there is nothing in a map to read
+/// back. What the #6965 defect actually IS, though, is a MISSING CALL SITE —
+/// the transit forward install never called this function at all — so the
+/// property to bind is the call and its arguments, not the map write. The value
+/// SHAPE this function produces from those arguments is a different property
+/// and is already owned by `bpf_map_tests.rs`
+/// (`build_conntrack_value_v4`/`_v6`); this recorder deliberately does not
+/// restate it.
+///
+/// Recording the ingress identity and `is_reverse` rather than counting is what
+/// makes the transit assertion non-vacuous: a count of 1 is also what you get
+/// from a publish of the WRONG row, and the three pre-existing call sites all
+/// publish rows this fixture must not be satisfied by.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConntrackPublishRecord {
+    pub(super) is_reverse: bool,
+    pub(super) ingress_ifindex: u32,
+    pub(super) ingress_vlan_id: u16,
+    pub(super) ingress_zone: u16,
+    pub(super) egress_zone: u16,
+    pub(super) app_id: u16,
+    pub(super) session_id: u64,
+}
+
+#[cfg(test)]
+pub(super) static CONNTRACK_PUBLISHES: std::sync::Mutex<Vec<ConntrackPublishRecord>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// #6965: the ONE mutex that serializes tests SAMPLING `CONNTRACK_PUBLISHES`.
+///
+/// Module scope for the same reason as `checksum::DNAT_COUNTER_GUARD` (#6872):
+/// a `static` declared inside a test function body is unnameable from any other
+/// function, so two tests each declaring one lock private mutexes and exclude
+/// nobody. This does NOT mutually exclude the writer below — that is production
+/// code on the install path and must not take a lock — it serializes the
+/// samplers against each other, which is the shape that breaks.
+#[cfg(test)]
+pub(super) static CONNTRACK_PUBLISH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #6965: clear the recorder and return the guard, so a sampling test cannot
+/// forget either half.
+#[cfg(test)]
+pub(super) fn take_conntrack_publish_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = CONNTRACK_PUBLISH_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    CONNTRACK_PUBLISHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    guard
+}
+
+#[cfg(test)]
+pub(super) fn conntrack_publishes() -> Vec<ConntrackPublishRecord> {
+    CONNTRACK_PUBLISHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 pub(super) fn publish_bpf_conntrack_entry(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -395,6 +463,25 @@ pub(super) fn publish_bpf_conntrack_entry(
     // unknown (no live entry) — the Go render then keeps the legacy ordinal.
     session_id: u64,
 ) {
+    // #6965: record the call BEFORE the `fd >= 0` gate below. The gate is what
+    // makes this a no-op under a unit test's `-1` fds, and the property the
+    // #6965 tests bind is that the call SITE exists on the transit install
+    // path — which is fd-independent.
+    #[cfg(test)]
+    {
+        CONNTRACK_PUBLISHES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ConntrackPublishRecord {
+                is_reverse: metadata.is_reverse,
+                ingress_ifindex: metadata.ingress_ifindex,
+                ingress_vlan_id: metadata.ingress_vlan_id,
+                ingress_zone: metadata.ingress_zone,
+                egress_zone: metadata.egress_zone,
+                app_id,
+                session_id,
+            });
+    }
     // #919: zones are now u16 in SessionMetadata; the round-trip
     // name→id lookup the old code did is gone.
     let ingress_zone_id = metadata.ingress_zone;

@@ -407,14 +407,26 @@ framed VERBATIM — see "Why the window is not framed from the BPF mirror" below
 
 `BulkSync()`'s `ForEachV4/V6` walk reads the pinned `sessions` / `sessions_v6`
 BPF **conntrack** maps. Under the userspace dataplane those maps are a
-best-effort **display mirror**, not the authoritative session set. The Rust
-helper publishes a conntrack row (`publish_bpf_conntrack_entry`) from only three
-sites in `afxdp/poll_descriptor`: the host-inbound (LocalMiss) install, the
-missing-neighbor seed, and the reverse-companion repair. The ordinary **transit**
-forward install — the site labelled "#4800: the single place a locally learned
-transit forward flow is installed" — writes only the shim steering map
-(`publish_live_session_entry`) and the shared session tables. **A transit session
-therefore has no conntrack row at all**, and the store walk cannot see it.
+best-effort **display mirror**, not the authoritative session set.
+
+When #6031 was written the gap was total: the Rust helper published a conntrack
+row (`publish_bpf_conntrack_entry`) from only three sites in
+`afxdp/poll_descriptor` — the host-inbound (LocalMiss) install, the
+missing-neighbor seed, and the reverse-companion repair — and the ordinary
+**transit** forward install, the site labelled "#4800: the single place a
+locally learned transit forward flow is installed", wrote only the shim
+steering map (`publish_live_session_entry`) and the shared session tables. **A
+transit session therefore had no conntrack row at all**, and the store walk
+could not see it.
+
+**#6965 added the transit publish, so that particular blindness is gone — and
+#6031's conclusion is unchanged anyway.** The mirror is still a DISPLAY mirror
+rather than table-truth, for a reason that has nothing to do with which sites
+publish: the helper owns session lifetime in its own `SessionTable`, the mirror
+is written best-effort (a publish that fails under map pressure is counted, not
+retried), and the Go GC has `SkipSweep` set precisely because the map is not
+authoritative. Framing the window from it would still be framing it from a
+copy. The table-truth window source stays.
 
 The standby's copy of that same session IS in its mirror, because the Go receive
 path writes it (`userspace.Manager.SetClusterSyncedSessionV4` →
@@ -998,10 +1010,18 @@ guard. The blast radius is display-only.
 
 **What it does NOT close**, so the claim is not over-stated: synthesized reverse
 companions still carry `session_id: 0` (they are not displayed — the CLI skips
-reverse rows), and #6965 means an ordinary TRANSIT session has no conntrack row
-at all, so the population this improves is the peer-synced, host-inbound and
-neighbor-seed sets. If #6965 is ever closed, the transit population lands in the
-mirror with helper-minted ids and this two-writer surface widens sharply.
+reverse rows), and until #6965 an ordinary TRANSIT session had no conntrack row
+at all, so the population this improved was the peer-synced, host-inbound and
+neighbor-seed sets.
+
+**#6965 IS now closed, and this is the widening it predicted.** The transit
+population lands in the mirror with helper-minted ids, so the two-writer
+surface described above now covers the dominant population rather than a
+minority of it. The safety argument is unchanged and is what makes the widening
+tolerable: #6311 gave every id a node discriminator bit, so an adopted peer id
+cannot collide with a locally minted one, and nothing keys on the id — a sweep
+of every non-test `SessionID` reference finds no map key, index, dedup or
+generation guard. The blast radius stays display-only, at a larger scale.
 
 ## Sync Readiness and Bulk Priming
 
