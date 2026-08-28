@@ -1324,3 +1324,9 @@ fn overlay_shared_cos_queue_lease_statuses(
 #[cfg(test)]
 #[path = "status_tests.rs"]
 mod tests;
+
+// #6961: the WorkerRuntimeStatus mapping hop — arg-swap binding plus the
+// add-a-field ratchet. Its own file because it drives a live Coordinator.
+#[cfg(test)]
+#[path = "status_mapping_6961_tests.rs"]
+mod status_mapping_6961_tests;
