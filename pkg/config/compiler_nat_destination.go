@@ -195,6 +195,12 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 			// translation-mode fields (#3850 review).
 			for _, thenNode := range ruleInst.node.FindChildren("then") {
 				rule.Then = NATThen{}
+				// #7014: the fully-compact `then destination-nat off;` packs
+				// every token onto the `then` node itself, leaving no
+				// `destination-nat` CHILD for the loop below and an EMPTY action
+				// set that the zero-action arm rejects. See the source-NAT call
+				// site for why this reads the same way as the packed child.
+				applyPackedNATThenTokens7014(&rule.Then, thenNode.Keys, "destination-nat", NATDestination)
 				for _, t := range thenNode.Children {
 					if t.Name() == "destination-nat" {
 						// #3844: `then destination-nat off` is a no-translate
