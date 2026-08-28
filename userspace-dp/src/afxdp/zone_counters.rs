@@ -63,6 +63,14 @@ use crate::protocol::ZoneTrafficCounterStatus;
 /// accumulator small (64 × 4 × 8 = 2 KiB).
 pub(in crate::afxdp) const ZONE_COUNTER_SLOTS: usize = 64;
 
+/// #6946: `ZonePending::touched_slots` is a `u64` bitmask, one bit per slot.
+/// Raising the slot count past 64 would make `1u64 << slot` shift out of
+/// range — a panic in debug and a silently WRONG mask in release, which
+/// would drop whole zones' counters with no error. The bound is asserted at
+/// compile time so the capacity cannot be raised without also widening the
+/// mask.
+const _: () = assert!(ZONE_COUNTER_SLOTS <= 64);
+
 /// Number of assignable slots (slot 0 reserved).
 pub(in crate::afxdp) const ZONE_COUNTER_ASSIGNABLE_SLOTS: usize = ZONE_COUNTER_SLOTS - 1;
 
@@ -362,7 +370,12 @@ impl ZoneCounterStore {
     /// fold and the intervening `record_zone_traffic` calls always read the SAME
     /// slot map).
     fn fold_pending(&self, pending: &ZonePending, slot_map: &ZoneCounterSlotMap) {
-        for slot in 1..ZONE_COUNTER_SLOTS {
+        // #6946: walk the touched bits instead of all 64 slots. Slot 0 is the
+        // unassigned sentinel and is never recorded into, so it cannot be set.
+        let mut mask = pending.touched_slots;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
             let Some(totals) = &slot_map.slot_totals[slot] else {
                 continue;
             };
@@ -414,7 +427,14 @@ struct ZonePending {
     ingress_bytes: [u64; ZONE_COUNTER_SLOTS],
     egress_packets: [u64; ZONE_COUNTER_SLOTS],
     egress_bytes: [u64; ZONE_COUNTER_SLOTS],
-    touched: bool,
+    /// #6946: one bit per touched slot, replacing a single `touched: bool`.
+    ///
+    /// The bool made both per-batch operations O(SLOTS) regardless of how
+    /// many slots actually moved: `reset` cleared 4 x [u64; 64] = 2048 B and
+    /// `fold_pending` scanned all 64 slots, to flush what is typically ONE
+    /// zone. The cost that matters is cache, not cycles — 32 dirtied lines
+    /// per flush per worker per RX batch.
+    touched_slots: u64,
 }
 
 impl Default for ZonePending {
@@ -424,21 +444,25 @@ impl Default for ZonePending {
             ingress_bytes: [0; ZONE_COUNTER_SLOTS],
             egress_packets: [0; ZONE_COUNTER_SLOTS],
             egress_bytes: [0; ZONE_COUNTER_SLOTS],
-            touched: false,
+            touched_slots: 0,
         }
     }
 }
 
 impl ZonePending {
     fn reset(&mut self) {
-        if !self.touched {
-            return;
+        // #6946: clear only the slots that moved. Whole-array assignment
+        // dirtied every line whether or not it held a delta.
+        let mut mask = self.touched_slots;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.ingress_packets[slot] = 0;
+            self.ingress_bytes[slot] = 0;
+            self.egress_packets[slot] = 0;
+            self.egress_bytes[slot] = 0;
         }
-        self.ingress_packets = [0; ZONE_COUNTER_SLOTS];
-        self.ingress_bytes = [0; ZONE_COUNTER_SLOTS];
-        self.egress_packets = [0; ZONE_COUNTER_SLOTS];
-        self.egress_bytes = [0; ZONE_COUNTER_SLOTS];
-        self.touched = false;
+        self.touched_slots = 0;
     }
 }
 
@@ -469,13 +493,13 @@ pub(in crate::afxdp) fn record_zone_traffic(
             let s = ingress_slot as usize;
             p.ingress_packets[s] = p.ingress_packets[s].saturating_add(1);
             p.ingress_bytes[s] = p.ingress_bytes[s].saturating_add(packet_bytes);
-            p.touched = true;
+            p.touched_slots |= 1u64 << s;
         }
         if egress_slot != 0 {
             let s = egress_slot as usize;
             p.egress_packets[s] = p.egress_packets[s].saturating_add(1);
             p.egress_bytes[s] = p.egress_bytes[s].saturating_add(packet_bytes);
-            p.touched = true;
+            p.touched_slots |= 1u64 << s;
         }
     });
 }
@@ -498,7 +522,7 @@ pub(in crate::afxdp) fn flush_recorded_zone_counters(
 ) {
     ZONE_PENDING.with(|pending| {
         let mut p = pending.borrow_mut();
-        if !p.touched {
+        if p.touched_slots == 0 {
             return;
         }
         store.fold_pending(&p, slot_map);
@@ -512,6 +536,84 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// #6946: the touched-slot bitmask must clear every slot it folded, and
+    /// must reach the HIGHEST assignable slot.
+    ///
+    /// The dangerous regression is not "a delta is lost" — it is "a delta is
+    /// folded but not cleared", because the stale value then folds AGAIN on
+    /// the next batch and the counter silently double-counts. A test that
+    /// records once and checks the total arrives cannot see that; it needs a
+    /// SECOND batch that touches a different slot, so the first slot's
+    /// residue would be re-folded if reset missed it.
+    #[test]
+    fn touched_slot_mask_clears_what_it_folded_6946() {
+        let store = ZoneCounterStore::default();
+        let map = ZoneCounterSlotMap::build(&[11, 22], &store);
+
+        // Batch 1: traffic on zone 11 only.
+        record_zone_traffic(&map, 11, 0, 100);
+        flush_recorded_zone_counters(&store, &map);
+
+        // Batch 2: traffic on zone 22 only. If reset() failed to clear slot
+        // 11, its batch-1 delta folds a second time here.
+        record_zone_traffic(&map, 22, 0, 500);
+        flush_recorded_zone_counters(&store, &map);
+
+        let rows = store.snapshot();
+        let z11 = rows
+            .iter()
+            .find(|r| r.zone_id == 11)
+            .expect("zone 11 must be counted");
+        assert_eq!(
+            (z11.ingress_packets, z11.ingress_bytes),
+            (1, 100),
+            "zone 11 folded twice — reset() did not clear the slot it folded, so \
+             the stale delta was re-added on the next batch (#6946)"
+        );
+        let z22 = rows
+            .iter()
+            .find(|r| r.zone_id == 22)
+            .expect("zone 22 must be counted");
+        assert_eq!((z22.ingress_packets, z22.ingress_bytes), (1, 500));
+    }
+
+    /// #6946: the mask is a u64, so the capacity must never exceed 64 — a
+    /// larger slot count makes `1u64 << slot` shift out of range, which is a
+    /// panic in debug and a silently WRONG mask in release.
+    ///
+    /// This asserts the CEILING, not the floor. Filling slots and checking
+    /// they arrive passes identically with no bound at all; what would break
+    /// is a slot ABOVE the mask width, and the compile-time
+    /// `const _: () = assert!(ZONE_COUNTER_SLOTS <= 64)` is what prevents it.
+    /// This runtime cell fails loudly if that guard is ever deleted along
+    /// with the const it protects.
+    #[test]
+    fn slot_capacity_fits_the_touched_mask_6946() {
+        assert!(
+            ZONE_COUNTER_SLOTS <= 64,
+            "ZONE_COUNTER_SLOTS = {ZONE_COUNTER_SLOTS} exceeds the 64 bits of \
+             ZonePending::touched_slots; `1u64 << slot` would shift out of range \
+             and whole zones would stop being folded (#6946)"
+        );
+        assert!(
+            crate::afxdp::flood_counters::FLOOD_COUNTER_SLOTS <= 64,
+            "FLOOD_COUNTER_SLOTS exceeds the 64 bits of FloodPending::touched_slots"
+        );
+        // The top assignable slot must round-trip through the mask: bit 63 is
+        // the one an off-by-one in the shift would lose.
+        let mut p = ZonePending::default();
+        let top = ZONE_COUNTER_SLOTS - 1;
+        p.ingress_packets[top] = 7;
+        p.touched_slots |= 1u64 << top;
+        p.reset();
+        assert_eq!(
+            p.ingress_packets[top], 0,
+            "the highest slot was not cleared by reset(); an off-by-one in the \
+             mask width loses exactly this slot"
+        );
+        assert_eq!(p.touched_slots, 0, "reset() must clear the mask");
+    }
 
     #[test]
     fn build_assigns_slots_for_wide_stable_hash_zone_ids() {
