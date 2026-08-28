@@ -263,11 +263,16 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
 /// every `.get()` below is `None` and the JSON side reads as 0/""/false against
 /// a binary side carrying 4242/9/1800/true/203.0.113.5.
 ///
-/// A shared-derivation mutation (return `policy_id: 0` from
-/// `SessionSyncAttribution::from_session`) moves BOTH legs together and this
-/// test stays green — which is the point of single-sourcing, and why the codec
-/// tests that pin the binary leg's own values (#3301/#4565) are the other half
-/// of the guard and must not be deleted.
+/// NOTE on what an agreement assertion can and cannot see. A mutation INSIDE
+/// the shared derivation (return `policy_id: 0` from
+/// `SessionSyncAttribution::from_session`) moves BOTH legs together, so the
+/// five equality assertions below all still hold — two legs can agree on a
+/// wrong value. Measured as cell M6 of the #6949 matrix: what actually reds is
+/// the POSITIVE CONTROL at the end (`want.policy_id == 4242`), alongside the
+/// pre-existing binary-side `test_encode_session_open_carries_policy_fields_3301`.
+/// That is why the controls are assertions and not a comment, and why the
+/// #3301/#4565 codec tests that pin the binary leg's own values are the other
+/// half of this guard and must not be deleted.
 #[test]
 fn session_delta_json_and_binary_agree_on_policy_attribution_6949() {
     let delta = delta_with_attribution();
