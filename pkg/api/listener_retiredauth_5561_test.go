@@ -58,13 +58,31 @@ func retireTestServer(t *testing.T, boot *AuthConfig) *Server {
 
 func retireTestServerWithHold(t *testing.T, boot *AuthConfig) (*Server, func()) {
 	t.Helper()
+	s, _, release := retireTestServerWithHoldEntered(t, boot)
+	return s, release
+}
+
+// retireTestServerWithHoldEntered additionally returns a channel closed when a
+// /hold request has ENTERED the handler (#6993).
+//
+// That is the moment http.Server.Shutdown starts waiting for, and it is the
+// only edge that makes "the leg cannot finish draining" true rather than
+// likely. The previous fixture wrote the request and slept 50ms; if the server
+// had not accepted and entered the handler by then, Shutdown had nothing to
+// wait for, the leg could drain at any later point, and the test failed on its
+// round-7 revocation assertion with a message about a revocation that was never
+// broken.
+func retireTestServerWithHoldEntered(t *testing.T, boot *AuthConfig) (*Server, <-chan struct{}, func()) {
+	t.Helper()
 	s := &Server{}
 	held := make(chan struct{})
-	var releaseOnce sync.Once
+	entered := make(chan struct{})
+	var releaseOnce, enteredOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(held) }) }
 	t.Cleanup(release)
 	s.sharedBase = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/hold" {
+			enteredOnce.Do(func() { close(entered) })
 			<-held
 		}
 		w.WriteHeader(http.StatusOK)
@@ -92,7 +110,7 @@ func retireTestServerWithHold(t *testing.T, boot *AuthConfig) (*Server, func()) 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	s.rootCtx = ctx
-	return s, release
+	return s, entered, release
 }
 
 // startHeldRequest7667 puts a request IN FLIGHT on ln and returns once the
@@ -104,28 +122,64 @@ func retireTestServerWithHold(t *testing.T, boot *AuthConfig) (*Server, func()) 
 // it UNABLE to finish. The test then measures the property it names — that a
 // leg which is still retiring honours a revocation — instead of measuring which
 // goroutine the scheduler picked.
-func startHeldRequest7667(t *testing.T, ln net.Listener) {
+func startHeldRequest7667(t *testing.T, ln net.Listener, entered <-chan struct{}) {
 	t.Helper()
-	entered := make(chan struct{})
+	written := make(chan struct{})
 	go func() {
+		defer close(written)
 		c, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
-			close(entered)
 			return
 		}
 		t.Cleanup(func() { _ = c.Close() })
 		req := "GET /hold HTTP/1.1\r\nHost: x\r\nAuthorization: Basic " +
 			base64.StdEncoding.EncodeToString([]byte("admin:secret-a")) + "\r\n\r\n"
 		_, _ = c.Write([]byte(req))
-		close(entered)
 	}()
-	<-entered
-	// The write has been issued; give the server goroutine the chance to accept
-	// and enter the handler. This sleep is NOT the synchronisation — the held
-	// channel is. It only narrows the window before the drain is requested; if
-	// it were too short the caller's explicit !drained precondition fails
-	// loudly by name rather than producing a confusing revocation failure.
-	time.Sleep(50 * time.Millisecond)
+	<-written
+	// #6993: wait for the handler to have ENTERED, not for a sleep to elapse.
+	// Shutdown waits for requests it has already dispatched; a request that has
+	// been WRITTEN but not yet dispatched is not one of them, so with a sleep
+	// here the leg could still drain — and it drained AFTER the caller's
+	// !drained precondition had already been sampled, which is why the failure
+	// surfaced as a revocation defect instead of as the fixture losing a race.
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the held request never entered the handler, so http.Server.Shutdown has " +
+			"nothing to wait for and the retired leg can finish draining at any point. The " +
+			"case would then measure a leg the server has already reaped (#6993/#7667)")
+	}
+}
+
+// retiredRevocationFailure6993 chooses WHICH failure the round-7 revocation
+// assertion reports, from the one fact that separates the two meanings: whether
+// the leg had finished draining by the time the probe ran.
+//
+// It is a function rather than an inline branch so the classification can be
+// tested directly. The behaviour it encodes is only observable when a drain
+// actually wins, which the held request exists to prevent — so an inline branch
+// would be a correctness claim no cell could red.
+//
+// drained==true is NOT a revocation defect: pruneRetiredLocked drops a drained
+// leg from the retiring list, so ReplaceAuth never tightens it and secret-a
+// survives for a reason that has nothing to do with revocation. A leg the
+// server has already reaped is deliberately no longer maintained — see the
+// drainLeg commentary. Reporting that under the round-7 message is what made
+// the #7667/#6993 flake read as a security defect, and it is the reason the
+// obvious "fix" (relaxing the assertion) would have left a test that passes
+// forever while guarding nothing.
+func retiredRevocationFailure6993(drained bool) string {
+	if drained {
+		return "the retired leg finished draining between the precondition above and " +
+			"ReplaceAuth, so it was pruned from the retiring list and never tightened. " +
+			"This is the FIXTURE losing a race, not a revocation defect: a leg the server " +
+			"has already reaped is deliberately no longer maintained (see the drainLeg " +
+			"commentary). The held request exists to make this impossible — if this fires, " +
+			"that hold stopped working (#6993/#7667)"
+	}
+	return "secret-a still authenticates on the retired listener — a retiring leg must " +
+		"still honour a revocation immediately (#5561 round 7)"
 }
 
 // A commit that MOVES the management bind and ROTATES the credential must not
@@ -136,7 +190,8 @@ func startHeldRequest7667(t *testing.T, ln net.Listener) {
 // FAIL-ON-REVERT: drop the pin in stopLegLocked (let the retired leg keep
 // following s.auth) and secret-b authenticates on the retired listener.
 func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
-	s := retireTestServer(t, &AuthConfig{Users: map[string]string{"admin": "secret-a"}})
+	s, entered, _ := retireTestServerWithHoldEntered(t,
+		&AuthConfig{Users: map[string]string{"admin": "secret-a"}})
 
 	// Boot the first leg at some address, then rebind (which retires it).
 	s.lifeMu.Lock()
@@ -162,7 +217,7 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 	// under load — reporting "a revocation did not land" when nothing about
 	// revocation was broken. Measured: forcing drained=true before ReplaceAuth
 	// reproduces the exact failure, and leaving it false does not.
-	startHeldRequest7667(t, ln)
+	startHeldRequest7667(t, ln, entered)
 
 	if err := s.ReconcileHTTP("10.0.0.2:8080"); err != nil {
 		t.Fatalf("ReconcileHTTP: %v", err)
@@ -196,8 +251,16 @@ func TestRetiredLegNeverGainsARotatedCredential_5561(t *testing.T) {
 	}
 	// The revocation half still lands there: round 7's property is not traded away.
 	if legProbe(t, retired, "admin", "secret-a") {
-		t.Fatal("secret-a still authenticates on the retired listener — a retiring leg must " +
-			"still honour a revocation immediately (#5561 round 7)")
+		// #6993: classify BEFORE accusing the revocation path. The precondition
+		// above samples `drained` at ONE instant, and the window that matters
+		// runs from there to ReplaceAuth — a drain that completes inside it
+		// leaves the leg off the retiring list, so ReplaceAuth never tightens it
+		// and secret-a survives for a reason that has nothing to do with
+		// revocation. That is the failure recorded in #7667, reported under this
+		// message, and the reason it read as a security defect. The held request
+		// is what makes the drain impossible; this re-read is what makes the
+		// classification TOTAL if it ever becomes possible again.
+		t.Fatal(retiredRevocationFailure6993(retired.drained.Load()))
 	}
 	// The live leg gets the whole committed set, as before.
 	if !legProbe(t, live, "admin", "secret-b") {

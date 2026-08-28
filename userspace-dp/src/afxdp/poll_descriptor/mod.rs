@@ -2683,6 +2683,71 @@ pub(super) fn poll_binding_process_descriptor(
                                             .live
                                             .new_flow_installs
                                             .fetch_add(1, Ordering::Relaxed);
+                                        // #6965: mirror the TRANSIT forward
+                                        // session into the kernel-visible
+                                        // conntrack map. Until this call
+                                        // existed, `publish_bpf_conntrack_entry`
+                                        // was reached only from the host-inbound
+                                        // LocalMiss install, the
+                                        // MissingNeighborSeed install and the
+                                        // reverse-companion repair — so the
+                                        // DOMINANT population, ordinary transit
+                                        // flows, had NO row in the map that
+                                        // `show security flow session`
+                                        // enumerates. Not a row with a zeroed
+                                        // identity: no row at all, which is why
+                                        // #6656 saw 33 sessions on a node
+                                        // carrying 4.6M rx packets.
+                                        //
+                                        // FORWARD ONLY. The reverse companion
+                                        // installed below deliberately gets no
+                                        // row: every `show`/`clear` call site
+                                        // skips `IsReverse != 0` before
+                                        // filtering, so a reverse row costs a
+                                        // syscall per connection and can never
+                                        // surface a flow. The forward row
+                                        // already carries BOTH directions'
+                                        // counters (#2501).
+                                        //
+                                        // Cost: one `bpf_map_update_elem` on
+                                        // the new-flow path, which already
+                                        // performs several (the steering
+                                        // publish above is 1-4, `dnat_table`
+                                        // below is 1). Measured at ~1.1-1.4us,
+                                        // indistinguishable per-call from the
+                                        // steering writes it joins — see
+                                        // docs/log/6965.md.
+                                        //
+                                        // #2008 M5 / #3321 / #3416: directional
+                                        // app resolution off the POST-DNAT
+                                        // destination, identical to the
+                                        // neighbor-seed site.
+                                        let ct_app_id = worker_ctx
+                                            .forwarding
+                                            .app_catalog
+                                            .lookup_admitted(
+                                                flow.forward_key.protocol,
+                                                flow.forward_key.src_port,
+                                                flow.forward_key.dst_port,
+                                                forward_entry.metadata.is_reverse,
+                                                decision.nat.rewrite_dst_port,
+                                            );
+                                        // #5213: the stable id of the session
+                                        // just installed, so the mirrored row
+                                        // reports the SAME id RT_FLOW emits.
+                                        let ct_session_id =
+                                            sessions.session_id_for(&flow.forward_key);
+                                        publish_bpf_conntrack_entry(
+                                            conntrack_v4_fd,
+                                            conntrack_v6_fd,
+                                            &flow.forward_key,
+                                            decision,
+                                            &forward_entry.metadata,
+                                            &worker_ctx.forwarding.zone_name_to_id,
+                                            worker_ctx.forwarding.alg_disable_flags,
+                                            ct_app_id,
+                                            ct_session_id,
+                                        );
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
                                             worker_ctx.shared_nat_sessions,
