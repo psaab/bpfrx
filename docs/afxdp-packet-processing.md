@@ -107,8 +107,28 @@ The shim checks several conditions before redirecting a packet to userspace:
    for local/control-plane delivery; the shim no longer tail-calls through
    `userspace_fallback_progs`.
 6. Local-destination traffic (matching `userspace_local_v4`/`userspace_local_v6`) passes to kernel.
-7. Non-SYN TCP without a live entry in `userspace_sessions` BPF map is dropped
-   (not fallen back -- legacy BPF would generate RSTs that kill the real connection).
+7. A session MISS is **not** decided by the shim. It redirects the packet to the
+   userspace dataplane, which evaluates policy and either creates a session or
+   drops (`lib.rs`: *"Let all session misses through to the userspace dataplane"*).
+   This item previously said non-SYN TCP without a live `userspace_sessions`
+   entry is **dropped by the shim**; that described the retired eBPF pipeline
+   (#6899 / C180-021) and would lead an operator to expect a drop where the
+   packet is in fact delivered.
+
+   The session-miss guard now lives in the userspace dataplane, and **the action
+   differs by disposition** — which is the part the old wording lost:
+   - **Transit** dispositions DROP a bare RST/FIN first packet (#4400), and a
+     single `has_syn` gate additionally declines the pure-PSH / null / URG
+     residual (#4539, subsuming #2151 and #4487).
+   - **Host-inbound `LocalDelivery` does NOT drop.** The same gate declines to
+     *cache* a session off a non-SYN first packet, but the packet still reaches
+     the local stack through the LocalDelivery reinject chokepoint — deliberately,
+     so a peer RST/FIN tearing down a firewall-ORIGINATED flow (BGP-active,
+     syslog-TCP/TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused RST
+     for the firewall's own outbound SYN, is not lost. Declining to cache never
+     skips policy: a later real SYN to a firewall IP is re-evaluated by the
+     `to-zone junos-host` mandatory-teardown gate that runs on every
+     LocalDelivery session hit.
 8. When helper/XSK state is degraded (`ctrl.enabled=0`, missing/not-ready
    binding, stale heartbeat, redirect failure), only the local/control cases
    above may reach the kernel. Transit drops and increments
