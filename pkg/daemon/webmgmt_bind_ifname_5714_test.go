@@ -85,9 +85,9 @@ func TestWebMgmtBindUnresolvableLogsLoudError_5714(t *testing.T) {
 		return nil, fmt.Errorf("no such kernel interface: %s", kernelName)
 	}
 
-	var recs []captureRecord
+	sink := newCaptureSink()
 	prevLog := slog.Default()
-	slog.SetDefault(slog.New(capturingHandler{recs: &recs}))
+	slog.SetDefault(slog.New(capturingHandler{sink: sink}))
 	defer slog.SetDefault(prevLog)
 
 	d := &Daemon{}
@@ -95,7 +95,7 @@ func TestWebMgmtBindUnresolvableLogsLoudError_5714(t *testing.T) {
 	d.resolveAPIBinds(&apiCfg, webmgmtIfnameCfg("ge-0/0/9.0"))
 
 	var loud bool
-	for _, r := range recs {
+	for _, r := range sink.records() {
 		if r.level == slog.LevelError && r.attrs["interface"] == "ge-0/0/9.0" {
 			loud = true
 			break
@@ -103,7 +103,7 @@ func TestWebMgmtBindUnresolvableLogsLoudError_5714(t *testing.T) {
 	}
 	if !loud {
 		t.Fatalf("unresolvable web-mgmt interface must log a LOUD ERROR naming the interface, "+
-			"not a silent fallback; got records: %+v", recs)
+			"not a silent fallback; got records: %+v", sink.records())
 	}
 	// Fallback is retained (loopback), so the mgmt API still serves locally —
 	// on the canonical web-mgmt port (#5715), since `web-management http` is

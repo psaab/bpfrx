@@ -38,16 +38,16 @@ func ambiguousDaemonCfg(differ bool) *config.Config {
 // on ENTRY (not every apply), and an INFO on RECOVERY once the ambiguity is
 // resolved. An identical-service duplicate must never warn.
 func TestLogHostInboundAmbiguousTransitions(t *testing.T) {
-	var recs []captureRecord
+	sink := newCaptureSink()
 	prev := slog.Default()
-	slog.SetDefault(slog.New(capturingHandler{recs: &recs}))
+	slog.SetDefault(slog.New(capturingHandler{sink: sink}))
 	defer slog.SetDefault(prev)
 
 	d := &Daemon{}
 
 	warnsFor := func(addr string) int {
 		n := 0
-		for _, r := range recs {
+		for _, r := range sink.records() {
 			if r.level == slog.LevelWarn && r.attrs["address"] == addr {
 				n++
 			}
@@ -56,7 +56,7 @@ func TestLogHostInboundAmbiguousTransitions(t *testing.T) {
 	}
 	infos := func() int {
 		n := 0
-		for _, r := range recs {
+		for _, r := range sink.records() {
 			if r.level == slog.LevelInfo && r.msg == "host-inbound address ambiguity resolved — the address no longer has an order-dependent host-inbound verdict" {
 				n++
 			}
