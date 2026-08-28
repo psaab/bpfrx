@@ -1497,22 +1497,28 @@ func TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039(t *testing.T) {
 		{"10.0.0.1", true, false},
 		{"fw.example.com", true, false},
 	}
-	diverged := false
+	// Anti-vacuity backstop. It is NOT enough that SOME row has both predicates
+	// false: the empty bindHost does too, and that row is a parse FAILURE, not a
+	// reachable listener. The claim this table exists to support is specifically
+	// that a WILDCARD bind — reachable from everywhere — is suppressed by the
+	// `!bindHostWarnable` drop-in and not by this predicate. So the backstop
+	// requires a row that actually parses as an unspecified address.
+	divergedOnWildcard := false
 	for _, tc := range cases {
 		gotW, gotL := bindHostWarnable(tc.bindHost), bindIsLoopbackOnly(tc.bindHost)
 		if gotW != tc.wantWarnable || gotL != tc.wantLoopbackOnly {
 			t.Errorf("bindHost %q: bindHostWarnable=%v (want %v) bindIsLoopbackOnly=%v (want %v)",
 				tc.bindHost, gotW, tc.wantWarnable, gotL, tc.wantLoopbackOnly)
 		}
-		// A bind where BOTH are false is one the drop-in would suppress and this
-		// predicate does not — the over-suppression the pairing above catches.
-		if !gotW && !gotL {
-			diverged = true
+		ip := net.ParseIP(tc.bindHost)
+		if ip != nil && ip.IsUnspecified() && !gotW && !gotL {
+			divergedOnWildcard = true
 		}
 	}
-	if !diverged {
-		t.Fatal("no case had bindHostWarnable=false AND bindIsLoopbackOnly=false, so " +
-			"this table no longer demonstrates that `!bindHostWarnable` would " +
-			"over-suppress — the wildcard binds are the point of it (#7039)")
+	if !divergedOnWildcard {
+		t.Fatal("no WILDCARD bind (an address that parses and is unspecified) had " +
+			"bindHostWarnable=false AND bindIsLoopbackOnly=false, so this table no " +
+			"longer demonstrates that the `!bindHostWarnable` drop-in would " +
+			"over-suppress the most remote-reachable listener there is (#7039)")
 	}
 }
