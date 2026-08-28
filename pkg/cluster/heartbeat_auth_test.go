@@ -476,3 +476,132 @@ func TestManagerHeartbeatPeerAuthSeen(t *testing.T) {
 		t.Error("#5086: a freshly installed receiver must inherit the armed guard")
 	}
 }
+
+// #6968: the reason a rejected heartbeat carries must NAME THE ARM that
+// refused it, and nothing bound that.
+//
+// THE SHAPE OF THE DEFECT IS MISATTRIBUTION, NOT ADMISSION. A forged or
+// tampered frame is rejected either way — this was never a fail-open — so a
+// test that asserts "rejected" passes identically against the working code and
+// against the broken code. The only observable that separates them is WHICH
+// reason string comes back, and until now no test in this package asserted any
+// of them: `grep -rn "hmac verification failed" pkg/cluster/*_test.go` returned
+// zero hits.
+//
+// WHY THE ARM CAN VANISH SILENTLY. `heartbeatAuthDecision`'s correctness here
+// rests entirely on ARM ORDER. The caller computes
+//
+//	if macOK { nonceFresh, epochReason = r.auth.admitAuthed(...) }
+//
+// so a frame that fails its MAC leaves `nonceFresh` at the zero value FALSE and
+// `epochReason` empty. Delete or disable the `!macOK` arm and the frame falls
+// through to `!nonceFresh`, and a forged frame — a wrong key, a flipped byte, an
+// active on-link attacker — is reported to the operator as `stale nonce
+// (replay)`. The epoch gate's `epochReason` override cannot save it: on a bad
+// MAC `admitAuthed` never runs, so there is no epoch reason to prefer.
+//
+// Measured on origin/master 63ef1fad6: changing `if !macOK` to `if false` left
+// `go vet` at rc=0 and the ENTIRE pkg/cluster suite GREEN. That is the gap this
+// test closes; it reds that mutation by name.
+//
+// The operator cost is the point. "Replay" points at a retired peer incarnation
+// and the anti-replay machinery; a bad MAC points at a key mismatch or an
+// attacker holding the wrong PSK. Sending someone to audit nonces while an
+// on-link forger is active is the failure this reason exists to prevent.
+func TestHeartbeatAuthDecisionReasonNamesTheArm_6968(t *testing.T) {
+	const (
+		reasonBadMAC  = "hmac verification failed"
+		reasonReplay  = "stale nonce (replay)"
+		reasonMissing = "missing auth trailer (enforced: peer previously authenticated)"
+	)
+	// The binding is only as good as the strings being DIFFERENT. If two arms
+	// ever returned the same text, every assertion below would still pass while
+	// the arms became indistinguishable again — the exact property under test.
+	for _, pair := range [][2]string{
+		{reasonBadMAC, reasonReplay},
+		{reasonBadMAC, reasonMissing},
+		{reasonReplay, reasonMissing},
+	} {
+		if pair[0] == pair[1] {
+			t.Fatalf("two arms share the reason %q; the arms are indistinguishable "+
+				"and every assertion in this test is vacuous", pair[0])
+		}
+	}
+
+	cases := []struct {
+		name                                                string
+		keyConfigured, present, macOK, nonceFresh, peerSeen bool
+		wantAccept                                          bool
+		wantReason                                          string
+	}{
+		{"no-key/legacy", false, false, false, false, false, true, ""},
+		{"no-key/authed-frame", false, true, false, false, false, true, ""},
+		{"key/good-hmac-fresh", true, true, true, true, false, true, ""},
+
+		// THE CELL THIS TEST EXISTS FOR. macOK=false forces nonceFresh=false in
+		// the real caller, so both rejecting arms are live at once and only the
+		// ORDER decides the reason. `if !macOK` -> `if false` reds here.
+		{"key/bad-hmac", true, true, false, false, false, false, reasonBadMAC},
+		// ...and its discriminating partner: a frame whose MAC is GOOD and whose
+		// nonce is stale must still say replay. Without this row the test could
+		// be satisfied by returning the bad-MAC reason unconditionally.
+		{"key/good-hmac-replay", true, true, true, false, true, false, reasonReplay},
+
+		{"key/legacy-peer-not-yet-authed", true, false, false, false, false, true, ""},
+		{"key/legacy-after-peer-authed", true, false, false, false, true, false, reasonMissing},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := heartbeatAuthDecision(tc.keyConfigured, tc.present, tc.macOK, tc.nonceFresh, tc.peerSeen)
+			if got != tc.wantAccept {
+				t.Fatalf("accept = %v (reason %q), want %v", got, reason, tc.wantAccept)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q. The frame's admission is unchanged either "+
+					"way — this is the operator-facing CAUSE, and a wrong one sends them "+
+					"hunting the wrong fault (#6968)", reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestForgedHeartbeatIsNotReportedAsReplay_6968 binds the same property through
+// a REAL forged frame rather than hand-set booleans.
+//
+// `macOK` here is DERIVED — the frame is signed with an attacker's key and
+// verified against the real one — so this covers the frame -> trailer -> MAC ->
+// reason chain, not just the decision function's truth table. The hand-set
+// version cannot see a regression that makes `verifyHeartbeatMAC` succeed on a
+// forged frame; this one reds on both that and on the arm removal.
+//
+// `nonceFresh` is passed FALSE because that is what the production caller
+// necessarily passes when the MAC fails (`admitAuthed` is called only under
+// `if macOK`). Passing true here would describe a state the receiver cannot
+// produce and would let the bad-MAC arm look load-bearing when it is not.
+func TestForgedHeartbeatIsNotReportedAsReplay_6968(t *testing.T) {
+	realKey := []byte("real-cluster-psk")
+	forged := MarshalHeartbeatAuth(samplePkt(), []byte("attacker-psk"), 9, 1)
+
+	_, _, present := heartbeatAuthTrailer(forged)
+	macOK := present && verifyHeartbeatMAC(forged, realKey)
+	if !present {
+		t.Fatal("forged frame carries no auth trailer — fixture does not reach the arm")
+	}
+	if macOK {
+		t.Fatal("forged frame verified under the real key — HMAC broken")
+	}
+
+	accept, reason := heartbeatAuthDecision(true, present, macOK, false, true)
+	if accept {
+		t.Fatalf("forged heartbeat accepted (reason %q)", reason)
+	}
+	if reason == "stale nonce (replay)" {
+		t.Fatal("a FORGED heartbeat is reported as `stale nonce (replay)`. The frame is " +
+			"still refused, so admission is unaffected — but the operator is pointed at a " +
+			"retired peer incarnation and the anti-replay machinery instead of at a key " +
+			"mismatch or an on-link attacker holding the wrong PSK (#6968)")
+	}
+	if reason != "hmac verification failed" {
+		t.Fatalf("reason = %q, want %q", reason, "hmac verification failed")
+	}
+}
