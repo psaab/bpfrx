@@ -1,0 +1,274 @@
+// #6922 — the NAT64 build-`None` drop attribution at the TX copy-fallback site.
+//
+// WHY THIS FILE EXISTS AT ALL. The issue's release condition asked for the
+// cp1/cp2 and NAT64-attribution cells to be DEMONSTRATED to bind before the
+// de-duplication is dispatched. Demonstrated at master, three of the four
+// escape: swapping the two NAT64 guards' order in EITHER copy left the whole
+// suite green (4816 passed, 0 failed, same collection as the control), and so
+// did inverting the cp1 oversized guard. Only the cp2 oversized/enqueue
+// behaviour binds, through `enqueue_failure.rs`.
+//
+// So the attribution — the thing the duplication is actually about — had no
+// test at either copy. `nat64_tests.rs` binds the two PREDICATES standalone;
+// nothing bound WHICH predicate the dispatcher consults first or WHICH counter
+// it records. Collapsing two copies of code nothing checks would have produced
+// one copy nothing checks.
+//
+// WHAT IS ASSERTED. The order is the whole rationale: `write_v6_to_v4_into`
+// applies the #5625 ext-header eligibility gate BEFORE the #2562 fragment
+// guards, so an AH / active-Routing / Mobility / HIP / Shim6 packet must be
+// attributed to `nat64_exthdr_ineligible`, and only a genuine non-ext-header
+// fragment drop may fall through to `nat64_frag_dropped`. A dispatcher that
+// tested the fragment predicate first would attribute an AH packet to the wrong
+// counter, and an operator reading the drop reason would chase a fragmentation
+// problem that does not exist.
+
+use super::*;
+use std::sync::atomic::Ordering;
+
+/// The DISCRIMINATING frame: IPv6 → Fragment header (non-first) → AH → TCP.
+///
+/// Both SSOT predicates answer TRUE for it — it is a non-first fragment AND it
+/// carries an Authentication Header — and that is the entire point. The guard
+/// ORDER is only observable on a frame both predicates match; on a frame only
+/// one matches, `if A {a} else if B {b}` and `if B {b} else if A {a}` produce
+/// the identical counter, so an order swap is a no-op and the cell measures
+/// nothing.
+///
+/// This was learned the hard way: the first version of this file used a plain
+/// AH frame (not a fragment), and swapping the dispatcher's guard order left
+/// the full suite green at 4818 passed / 0 failed. The precondition test below
+/// is what makes that impossible to ship unnoticed.
+fn ah_fragment_v6_frame_6922() -> Vec<u8> {
+    let src = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let dst = std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0201);
+    // AH block: next-header TCP, length, then the SPI/sequence words.
+    let ah: [u8; 12] = [PROTO_TCP, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+    let payload = b"hi";
+    let tcp_len = 20 + payload.len();
+    // Fragment header: next-header AH(51), reserved, offset<<3 (offset units
+    // 1 = a NON-first fragment, which is a fragment drop for ANY protocol),
+    // then the identification word.
+    let frag: [u8; 8] = [51, 0, 0x00, 0x08, 0, 0, 0, 1];
+
+    let mut l3 = vec![0u8; 40 + frag.len() + ah.len() + tcp_len];
+    l3[0] = 0x60;
+    l3[4..6].copy_from_slice(&((frag.len() + ah.len() + tcp_len) as u16).to_be_bytes());
+    l3[6] = 44; // next header = Fragment
+    l3[7] = 64; // hop limit
+    l3[8..24].copy_from_slice(&src.octets());
+    l3[24..40].copy_from_slice(&dst.octets());
+    l3[40..40 + frag.len()].copy_from_slice(&frag);
+    let a = 40 + frag.len();
+    l3[a..a + ah.len()].copy_from_slice(&ah);
+    let t = a + ah.len();
+    l3[t..t + 2].copy_from_slice(&12345u16.to_be_bytes());
+    l3[t + 2..t + 4].copy_from_slice(&80u16.to_be_bytes());
+    l3[t + 12] = 0x50;
+    l3[t + 13] = 0x02;
+    l3[t + 14..t + 16].copy_from_slice(&1024u16.to_be_bytes());
+    l3[t + 20..t + 20 + payload.len()].copy_from_slice(payload);
+
+    let mut frame = vec![0u8; 14];
+    frame[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
+    frame.extend_from_slice(&l3);
+    frame
+}
+
+/// PRECONDITION, and it is the assertion that makes the ordering cell mean
+/// anything: BOTH predicates must answer true for this frame.
+///
+/// If only one matched, the two guard orders would record the same counter and
+/// the cell below would pass against a dispatcher with the order reversed —
+/// measured, not hypothesised. If neither matched, both counters would stay at
+/// zero and the cell would assert an attribution the frame cannot produce.
+#[test]
+fn discriminating_frame_matches_both_nat64_predicates_6922() {
+    let frame = ah_fragment_v6_frame_6922();
+    assert!(
+        crate::nat64::frame_is_nat64_exthdr_ineligible(&frame, libc::AF_INET6),
+        "fixture must carry an ext-header the translator refuses (#5625)"
+    );
+    assert!(
+        crate::nat64::frame_is_nat64_fragment_drop(&frame, libc::AF_INET6),
+        "fixture must ALSO be a fragment drop (#2562) — the guard ORDER is only \
+         observable when both predicates match. With only one matching, \
+         `if A else if B` and `if B else if A` record the same counter and an \
+         order swap escapes"
+    );
+}
+
+#[test]
+fn nat64_build_none_attributes_exthdr_before_fragment_6922() {
+    let mut bindings = vec![
+        BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+        BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+    ];
+    let frame = ah_fragment_v6_frame_6922();
+    unsafe { bindings[0].umem.area().slice_mut_unchecked(0, frame.len()) }
+        .expect("ingress frame")
+        .copy_from_slice(&frame);
+    // Drain the egress free-TX pool so direct TX is unavailable and dispatch
+    // takes the Vec-copy fallback, where the attribution lives.
+    bindings[1].tx_pipeline.free_tx_frames.clear();
+
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+
+    let mut decision = test_forwarding_decision_to_bound_ifindex(22);
+    decision.nat.nat64 = true;
+    let mut request = test_live_forward_request_for_frame(frame.len(), decision);
+    request.meta.addr_family = libc::AF_INET6 as u8;
+    let mut pending = vec![request];
+
+    let mut post_recycles = Vec::new();
+    let ingress_ident = bindings[0].identity();
+    let ingress_live = &*bindings[0].live as *const BindingLiveState;
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>> =
+        Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let mut dbg = DebugPollCounters::default();
+    let mut counters = BatchCounters::default();
+
+    let (left, rest) = bindings.split_at_mut(0);
+    let (ingress, right) = rest.split_first_mut().expect("ingress binding");
+    enqueue_pending_forwards(
+        left,
+        0,
+        ingress,
+        right,
+        &lookup,
+        &mirror_targets,
+        &mut pending,
+        &mut post_recycles,
+        1,
+        &forwarding,
+        &ingress_ident,
+        unsafe { &*ingress_live },
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        &mut counters,
+        0,
+        &worker_commands_by_id,
+    );
+
+    // NON-VACUITY. If the build had SUCCEEDED there would be no drop to
+    // attribute, and "exthdr == 1, frag == 0" would be a claim about a branch
+    // that never ran.
+    assert_eq!(
+        dbg.build_fail, 1,
+        "the NAT64 build must have returned None for an AH-bearing frame — with a \
+         successful build there is no drop to attribute and the counters below \
+         measure nothing"
+    );
+    assert_eq!(
+        dbg.enqueue_ok, 0,
+        "no TX enqueue may have succeeded for a frame the translator refused"
+    );
+
+    assert_eq!(
+        counters.nat64_exthdr_ineligible, 1,
+        "an AH-bearing frame whose NAT64 build returned None must be attributed to \
+         nat64_exthdr_ineligible (#5625). The dispatcher's guard order mirrors the \
+         translator's: write_v6_to_v4_into applies the ext-header eligibility gate \
+         BEFORE the #2562 fragment guards"
+    );
+    assert_eq!(
+        counters.nat64_frag_dropped, 0,
+        "an ext-header-ineligible frame must NOT be attributed to nat64_frag_dropped. \
+         Testing the fragment predicate first sends an operator chasing a \
+         fragmentation problem that does not exist"
+    );
+
+    // The ingress descriptor still has to come back exactly once — the #2208
+    // property, restated here so a change to the attribution cannot quietly
+    // reintroduce the leak on the NAT64 branch specifically.
+    assert_eq!(
+        ingress_recycled_count(&bindings[0]),
+        1,
+        "ingress descriptor must be recycled exactly once on a NAT64 build failure"
+    );
+    assert_eq!(
+        bindings[0].live.slow_path_drops.load(Ordering::Relaxed),
+        1,
+        "a NAT64 build failure must still reach the slow-path reinject"
+    );
+}
+
+/// The OTHER copy's NAT64 attribution is DEAD CODE, and this pins the invariant
+/// that makes it dead.
+///
+/// `tx/dispatch/mod.rs` carries the copy fallback twice — 102 lines agreeing on
+/// 100 (#6922). The first copy sits inside `if can_rewrite_in_place { ... }`,
+/// and `can_rewrite_in_place` requires `!is_nat64`. `is_nat64` is bound once and
+/// never reassigned, so inside that copy it is provably FALSE: its
+/// `if is_nat64 { ... }` attribution block, and the `build_nat64_forwarded_frame`
+/// call it guards, can never run.
+///
+/// That is worse than plain duplication, because the AUTHORITATIVE rationale for
+/// the guard order lives in the dead copy and the LIVE copy carries a comment
+/// pointing at it ("same SSOT predicates + translator-order rationale as the
+/// direct/in-place copy path above"). A reader auditing the attribution finds a
+/// cross-reference to a comment attached to unreachable code.
+///
+/// It also explains the escape measured at master: swapping the guard order in
+/// the first copy left the whole suite green because nothing reaches it.
+///
+/// If someone drops `!is_nat64` from `can_rewrite_in_place`, NAT64 frames would
+/// start taking the in-place path — a far larger change than a refactor — and
+/// this test makes that deliberate rather than incidental.
+#[test]
+fn nat64_never_reaches_the_in_place_rewrite_path_6922() {
+    let src = include_str!("../mod.rs");
+
+    // Strip comments first: the paragraphs above and in mod.rs discuss
+    // `!is_nat64` at length, and a scan that a doc comment can satisfy is not
+    // a scan of the code.
+    let mut code = String::with_capacity(src.len());
+    let mut in_block = false;
+    for line in src.lines() {
+        let mut l = line;
+        if in_block {
+            match l.find("*/") {
+                Some(i) => {
+                    in_block = false;
+                    l = &l[i + 2..];
+                }
+                None => continue,
+            }
+        }
+        if let Some(i) = l.find("/*") {
+            in_block = true;
+            l = &l[..i];
+        }
+        if let Some(i) = l.find("//") {
+            l = &l[..i];
+        }
+        code.push_str(l);
+        code.push('\n');
+    }
+
+    // NON-VACUITY: the stripper must not have eaten the code.
+    let gate = code
+        .find("let can_rewrite_in_place")
+        .expect("can_rewrite_in_place binding not found in the stripped source — the \
+                 comment stripper or the dispatcher changed shape, so this guard is \
+                 not reading what it claims to read");
+    let tail = &code[gate..];
+    let end = tail
+        .find(';')
+        .expect("can_rewrite_in_place binding has no terminator");
+    let expr = &tail[..end];
+
+    assert!(
+        expr.contains("!is_nat64"),
+        "`can_rewrite_in_place` no longer excludes NAT64. The first copy of the TX \
+         copy fallback is only dead code for NAT64 BECAUSE of that term; without it, \
+         NAT64 frames take the in-place rewrite path and its long-unreachable \
+         attribution block becomes live. Expression was:\n{expr}"
+    );
+}
