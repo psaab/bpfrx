@@ -98,9 +98,58 @@ func validateWireguardPeersStrict(cfg *Config, lenient bool) ([]string, error) {
 			if err := emit(label, validateOneWireguardTunnel(unit.Tunnel)); err != nil {
 				return warnings, err
 			}
+			if err := emit(label, unitWireguardIdentityOverride(ifc, unit.Tunnel)); err != nil {
+				return warnings, err
+			}
 		}
 	}
 	return warnings, nil
+}
+
+// unitWireguardIdentityOverride refuses a unit that changes the local
+// WireGuard IDENTITY of an interface-level tunnel (#7786).
+//
+// TunnelConfig states the model: WgListenPort and WgLocalPrivkeyHex are
+// TUNNEL-level -- "one kernel UDP socket, one local identity per WG interface"
+// -- while WgPeers is the per-peer set. A unit under an interface-level
+// `tunnel mode wireguard` therefore contributes PEERS, which are merged into
+// the interface's single emitted endpoint (EmitTunnelEndpointNames). A unit
+// that overrides the listen port or the private key is asking for a SECOND
+// local identity on one logical interface, which that model has no
+// representation for.
+//
+// It is refused rather than implemented because the shape is half-wired today
+// in a way that misleads: routing materialises the unit's TUN and
+// WireGuardListenPorts() already collects the unit's port, so the host-inbound
+// filter opens it -- and no endpoint is ever emitted for it, so nothing
+// listens on a port the firewall advertises as open. Merging it instead would
+// be worse than refusing: it would fold a DIFFERENT identity's peers into the
+// parent endpoint, where they would be offered the parent's key.
+//
+// Scope is deliberately narrow. This fires only under an interface-level
+// WireGuard tunnel. `interfaces wgN unit 0 tunnel mode wireguard` with no
+// interface-level stanza is the canonical per-unit spelling, it emits its own
+// endpoint through the per-unit branch, and it is untouched here.
+func unitWireguardIdentityOverride(ifc *InterfaceConfig, unitTunnel *TunnelConfig) error {
+	if ifc == nil || ifc.Tunnel == nil || ifc.Tunnel.Mode != "wireguard" || unitTunnel == nil {
+		return nil
+	}
+	if unitTunnel.WgListenPort != ifc.Tunnel.WgListenPort {
+		return fmt.Errorf("unit overrides the WireGuard listen-port of the interface-level "+
+			"tunnel (%d vs %d); listen-port and private-key are properties of the WireGuard "+
+			"interface, which is ONE UDP socket and ONE local identity, so a unit may add "+
+			"`peer` entries but cannot define a second identity. Configure the second "+
+			"identity on its own interface",
+			unitTunnel.WgListenPort, ifc.Tunnel.WgListenPort)
+	}
+	if unitTunnel.WgLocalPrivkeyHex != ifc.Tunnel.WgLocalPrivkeyHex {
+		return fmt.Errorf("unit overrides the WireGuard private-key of the interface-level " +
+			"tunnel; listen-port and private-key are properties of the WireGuard interface, " +
+			"which is ONE UDP socket and ONE local identity, so a unit may add `peer` " +
+			"entries but cannot define a second identity. Configure the second identity on " +
+			"its own interface")
+	}
+	return nil
 }
 
 // tunnelLabel renders an operator-facing identifier for a WG tunnel in
