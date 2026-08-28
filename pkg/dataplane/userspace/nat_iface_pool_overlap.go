@@ -231,22 +231,60 @@ func detectInterfaceSNATPoolOverlaps(snap *ConfigSnapshot) []interfaceSNATPoolOv
 }
 
 // reportInterfaceSNATPoolOverlaps runs the detector over a freshly built
-// snapshot, logs one warning per finding, and records the counters.
+// snapshot, QUARANTINES each overlapping pool, logs one warning per finding,
+// and records the counters.
 //
 // It ALWAYS bumps the scan counter, including when nothing overlaps — that is
 // what lets a reader tell "no overlap" from "detector never ran".
+//
+// #7717 part 2: the quarantine is enabled HERE, in the same change as the
+// dataplane drain that makes it safe. Shipping it earlier would have marked
+// pools unusable with nothing draining, which the merged config gate names as
+// stranding live sessions — and a quarantine wired but disabled could not have
+// been mutation-tested, because nothing would make it fire.
+//
+// `PoolUnusable` is the SHIPPED transport for this: the Rust side already maps
+// it onto `pool_failure`, which already refuses new mints. What the drain adds
+// is that the quarantined pool's allocator is now RETAINED so its live flows
+// can still release, and that interface-mode mints on the address fail closed
+// until that drain completes.
 func reportInterfaceSNATPoolOverlaps(snap *ConfigSnapshot) {
 	overlaps := detectInterfaceSNATPoolOverlaps(snap)
 	snatOverlapScans.Add(1)
 	snatOverlapAddresses.Store(uint64(len(overlaps)))
+	if len(overlaps) == 0 {
+		return
+	}
+
+	quarantined := make(map[string]struct{}, len(overlaps))
 	for _, o := range overlaps {
-		slog.Warn("source-NAT pool overlaps an interface-SNAT egress address; "+
-			"two allocators can mint the same (address, port) for different flows",
+		quarantined[o.PoolRule] = struct{}{}
+	}
+	for i := range snap.SourceNAT {
+		if _, hit := quarantined[snap.SourceNAT[i].Name]; !hit {
+			continue
+		}
+		snap.SourceNAT[i].PoolUnusable = true
+		// Preserve an existing reason: a pool already unusable for its own
+		// sake (empty, invalid range) stays reported as that. Overwriting it
+		// would replace a specific diagnosis with a less specific one.
+		if snap.SourceNAT[i].PoolUnusableReason == "" {
+			snap.SourceNAT[i].PoolUnusableReason = poolUnusableReasonIfaceOverlap
+		}
+	}
+
+	for _, o := range overlaps {
+		slog.Warn("source-NAT pool overlaps an interface-SNAT egress address and has been "+
+			"QUARANTINED; its live flows drain and interface-mode mints on the address "+
+			"fail closed until they do",
 			"address", o.Address,
 			"pool_rule", o.PoolRule,
 			"interface_rule", o.InterfaceRule,
 			"issue", "#7717",
-			"note", "detection only — the pool is NOT quarantined; pool members "+
-				"expressed as ranges or prefixes are not compared")
+			"note", "pool members expressed as ranges or prefixes are not compared")
 	}
 }
+
+// poolUnusableReasonIfaceOverlap is the snapshot reason string for a pool
+// quarantined because its address is also an interface-SNAT egress address.
+const poolUnusableReasonIfaceOverlap = "iface_snat_egress_overlap"

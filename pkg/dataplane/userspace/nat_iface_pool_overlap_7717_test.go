@@ -1,6 +1,9 @@
 package userspace
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -253,5 +256,106 @@ func TestBuilderDetectsOverlapEndToEnd(t *testing.T) {
 	}
 	if got[0].Address != overlapEgress {
 		t.Errorf("overlap names %q, want %q", got[0].Address, overlapEgress)
+	}
+}
+
+// TestBuilderQuarantinesTheOverlappingPool is the Go half of the acceptance
+// control, and it drives the SNAPSHOT BUILDER — not the unit-level pin, which
+// cannot invert because it constructs a healthy pool directly (#7730).
+//
+// Paired: the same builder, the same shapes, differing only in whether the pool
+// address coincides with the interface egress address. Without the second row a
+// builder that quarantined every pool would pass.
+func TestBuilderQuarantinesTheOverlappingPool(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		poolAddr string
+		wantQuar bool
+	}{
+		{"pool address IS the interface egress", overlapEgress, true},
+		{"pool address does NOT coincide", "198.51.100.7", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+				"ge-0/0/2": {Name: "ge-0/0/2", Units: map[int]*config.InterfaceUnit{
+					0: {Number: 0, Addresses: []string{overlapEgress + "/24"}},
+				}},
+			}
+			cfg.Security.Zones = map[string]*config.ZoneConfig{
+				"wan": {Name: "wan", Interfaces: []string{"ge-0/0/2.0"}},
+			}
+			cfg.Security.NAT.SourcePools = map[string]*config.NATPool{
+				"P": {Name: "P", Addresses: []string{tc.poolAddr}},
+			}
+			cfg.Security.NAT.Source = []*config.NATRuleSet{
+				{Name: "rs-iface", FromZone: "lan", ToZone: "wan", Rules: []*config.NATRule{{
+					Name: "iface-snat",
+					Then: config.NATThen{Type: config.NATSource, Interface: true},
+				}}},
+				{Name: "rs-pool", FromZone: "lan", ToZone: "wan", Rules: []*config.NATRule{{
+					Name: "pool-snat",
+					Then: config.NATThen{Type: config.NATSource, PoolName: "P"},
+				}}},
+			}
+
+			snap := mustBuildSnapshot(t, cfg, config.UserspaceConfig{}, 1, 0)
+
+			var poolRule *SourceNATRuleSnapshot
+			for i := range snap.SourceNAT {
+				if !snap.SourceNAT[i].InterfaceMode && snap.SourceNAT[i].PoolName == "P" {
+					poolRule = &snap.SourceNAT[i]
+				}
+			}
+			if poolRule == nil {
+				t.Fatal("the builder emitted no pool rule — fixture is not exercising the path")
+			}
+			if poolRule.PoolUnusable != tc.wantQuar {
+				t.Fatalf("PoolUnusable = %v, want %v. The builder is where the runtime overlap "+
+					"becomes a quarantine; the dataplane only honours what it is told",
+					poolRule.PoolUnusable, tc.wantQuar)
+			}
+			if tc.wantQuar && poolRule.PoolUnusableReason != poolUnusableReasonIfaceOverlap {
+				t.Fatalf("PoolUnusableReason = %q, want %q — the reason is what selects the "+
+					"DRAIN-retaining failure variant in the dataplane; any other string maps to "+
+					"the catch-all and the pool's allocator is dropped instead of drained",
+					poolRule.PoolUnusableReason, poolUnusableReasonIfaceOverlap)
+			}
+		})
+	}
+}
+
+// TestPoolUnusableReasonLockstepWithRust pins the reason STRING to the dataplane
+// arm that consumes it.
+//
+// Neither side is pinned to a literal by hand: the Go constant is read from the
+// package, and the Rust arm is read out of the source. A mismatch does not fail
+// anything loudly — `source_nat_failure_reason_from_snapshot` has a catch-all
+// that maps an unknown string to `InvalidPool`, which is still fail-closed but
+// does NOT retain the allocator. So the pool would be quarantined and its live
+// flows stranded: the exact outcome the drain exists to prevent, reached by a
+// typo, with every test green.
+func TestPoolUnusableReasonLockstepWithRust(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "userspace-dp", "src", "nat", "source.rs")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	// Strip comments first: this file's own prose names the reason string, and
+	// so does the Rust doc comment on the variant.
+	var code []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		code = append(code, line)
+	}
+	want := `"` + poolUnusableReasonIfaceOverlap + `" => SourceNatFailureReason::PoolIfaceEgressOverlap`
+	if !strings.Contains(strings.Join(code, "\n"), want) {
+		t.Fatalf("userspace-dp/src/nat/source.rs has no arm mapping %q to "+
+			"PoolIfaceEgressOverlap. Without it the reason falls to the catch-all "+
+			"(InvalidPool), which does NOT retain the allocator — the pool is quarantined and "+
+			"its live flows are stranded, which is what the drain exists to prevent",
+			poolUnusableReasonIfaceOverlap)
 	}
 }
