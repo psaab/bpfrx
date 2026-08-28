@@ -306,6 +306,16 @@ type Manager struct {
 	// readback faults without a privileged BPF map (#5486). Production leaves
 	// it nil.
 	disableCtrlMapHook ctrlMapUpdater
+	// helperStatusCtrlMapHook / helperStatusBindingsMapHook, when non-nil,
+	// replace the two bpfShim maps applyHelperStatusLocked operates on, so its
+	// ctrl-gate decision is reachable without a privileged BPF map (#6994).
+	// Production leaves both nil. This is the SAME map-free seam
+	// disableCtrlMapHook establishes for the disable path (#5486); #6994 exists
+	// because applyHelperStatusLocked lacked it, which made its whole body —
+	// including the #6871 link-cycle gate — unreachable to every unprivileged
+	// test and therefore bound by nothing CI runs.
+	helperStatusCtrlMapHook     ctrlMapUpdater
+	helperStatusBindingsMapHook ctrlMapUpdater
 	// syncClassifierMapsHook, when non-nil, replaces the ingress/local/
 	// interface-NAT classifier map writes in unit tests (#7468). Nil in
 	// production.
