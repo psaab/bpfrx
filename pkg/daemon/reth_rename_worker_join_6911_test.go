@@ -179,3 +179,58 @@ func TestDaemonPassesRenameRethMemberBeforeCycleHook_6911(t *testing.T) {
 			"is watching a function the daemon no longer calls.", calls)
 	}
 }
+
+// TestRenameRethMemberHookRunsOnTheCallersGoroutine_6911 is the behavioural
+// proof that the #6871 acquisition-site allowlist requires for this call site.
+//
+// The daemon's renameJoin hook takes a link-cycle lease, and the ONLY thing
+// bounding that lease is applyDataplaneAndHACore's deferred
+// abandonLinkCycleLease. The hook is written as a func literal, so no AST fact
+// establishes that it runs inside that defer's extent — being inside it is a
+// property of renameRethMember invoking the callback SYNCHRONOUSLY. A hook that
+// outlived the renameRethMember call could take the lease after the defer has
+// run, and since #6871 round 8 the lease renews itself, so that would suppress
+// the 1 Hz reconcile for the life of the process rather than for one TTL.
+//
+// This is the same obligation, and the same proof, as
+// TestRethMACHookRunsOnTheCallersGoroutine_6871 carries for programRethMAC.
+func TestRenameRethMemberHookRunsOnTheCallersGoroutine_6911(t *testing.T) {
+	mac, err := net.ParseMAC("02:bf:72:01:01:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := &fakeRethLink{attrs: netlink.LinkAttrs{Index: 7, Name: "enp8s0", HardwareAddr: mac}}
+	adminUp := true
+	var ops []string
+	installFakeRethLinkOps(t, link, &adminUp, &ops, false)
+
+	caller := goIDFromStack()
+	if caller == 0 {
+		t.Fatal("fixture: could not read the test goroutine's id from the runtime.Stack " +
+			"header, so the identity comparison below would compare 0 against 0")
+	}
+
+	ran := false
+	var hookGoID uint64
+	old := renameRethMember("ge-0-0-1", mac, func() error {
+		ran = true
+		hookGoID = goIDFromStack()
+		return nil
+	})
+	if old != "enp8s0" {
+		t.Fatalf("renameRethMember returned %q; on any other path the hook is not "+
+			"invoked at all and this test would assert nothing", old)
+	}
+	if !ran {
+		t.Fatal("the beforeCycle hook never ran on the rename path")
+	}
+	if hookGoID != caller {
+		t.Fatalf("beforeCycle ran on goroutine %d but renameRethMember was called from %d.\n"+
+			"The daemon takes its link-cycle lease inside this hook, and the only thing "+
+			"bounding that lease is applyDataplaneAndHACore's deferred "+
+			"abandonLinkCycleLease. A hook that does not complete within the "+
+			"renameRethMember call can take the lease after that defer has run, and "+
+			"since #6871 round 8 the lease renews itself — so it would suppress the "+
+			"1 Hz reconcile for the life of the process (#6911)", hookGoID, caller)
+	}
+}
