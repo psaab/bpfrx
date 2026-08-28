@@ -29,11 +29,22 @@
 // IS the test. `distinct_seed` below is injective by construction and
 // `seeds_are_distinct_6961` asserts that rather than assuming it.
 //
-// WHY THE SOURCE IS THE ATOMICS AND NOT THE COUNTERS SNAPSHOT. There are TWO
-// unbound hops in this chain, not one: `WorkerRuntimeAtomics::snapshot()`
-// (atomics -> `WorkerRuntimeCounters`) has the identical arg-swap shape and
-// was equally unbound. Seeding the atomics and asserting on the wire status
-// binds BOTH, so a swap in either reds.
+// WHY THE SOURCE IS THE ATOMICS AND NOT THE COUNTERS SNAPSHOT. The chain has
+// TWO hops with the same arg-swap shape: `WorkerRuntimeAtomics::snapshot()`
+// (atomics -> `WorkerRuntimeCounters`) and then the literal above. Seeding the
+// ATOMICS and asserting on the wire status covers both end-to-end, so a swap in
+// either reds here.
+//
+// CORRECTION, measured. An earlier revision of this comment said the upstream
+// hop "was equally unbound". That is FALSE and the #6961 mutation matrix caught
+// it: cell B1 swaps a field inside `snapshot()` and reds the pre-existing
+// `worker_runtime::tests::snapshot_roundtrip` alongside this file's binding.
+// That test publishes a fixture whose values are all distinct and asserts each
+// field round-trips, which is a sound arg-swap guard for that hop and predates
+// #6961. The hop that was genuinely unbound is the ONE THIS FILE IS ABOUT —
+// the `worker_runtime_snapshots` literal. Covering the upstream hop too is
+// belt-and-braces, not a discovery, and `snapshot_roundtrip` must not be
+// deleted on the strength of this file.
 
 use super::*;
 use crate::afxdp::worker_runtime::WorkerRuntimeAtomics;
