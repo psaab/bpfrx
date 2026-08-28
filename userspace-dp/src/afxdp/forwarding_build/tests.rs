@@ -6673,6 +6673,305 @@ fn policy_parse_interior_rejection_row() -> (
     )
 }
 
+/// #6995: the three fallible belts that fire AFTER both the policy-counter and
+/// NAT-counter bindings, each carrying rules that create a block in each store.
+///
+/// Deliberately NOT reusing `zone_counter_rejection_rows()` wholesale. That
+/// table's first row (#3719 duplicate zone id) rejects at the builder's FIRST
+/// fallible step — ABOVE `parse_policy_state_with_counters` and the NAT
+/// reconcilers — so it produces no residue whether the rollback exists or not.
+/// Including it would add a row that is green for the wrong reason and dilute
+/// the matrix. The three below bracket the region that matters: every
+/// straight-line position where the counter bindings sit has one of these `?`s
+/// beneath it.
+fn counter_residue_rejection_rows() -> Vec<(
+    &'static str,
+    ConfigSnapshot,
+    fn(&crate::policy::SnapshotIntegrityError) -> bool,
+)> {
+    fn base() -> ConfigSnapshot {
+        let mut snap = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+        // A candidate-only policy rule: its stable rule id is not in the live
+        // store, so `rule_hit_counter` GET-CREATES a block for it.
+        snap.policies = vec![crate::PolicyRuleSnapshot {
+            name: "probe-rule".into(),
+            from_zone: "zone100".into(),
+            to_zone: "zone300".into(),
+            action: "permit".into(),
+            ..Default::default()
+        }];
+        // A candidate-only static-NAT rule with a counter id the live store has
+        // never seen, so `rule_counter` GET-INSERTS a row for it. Addresses must
+        // PARSE: `StaticNatTable::from_snapshots` `continue`s past an
+        // unparseable rule before it ever reaches the counter, which would make
+        // the NAT half of every assertion below pass for free.
+        snap.static_nat_rules = vec![crate::StaticNATRuleSnapshot {
+            name: "probe-static".into(),
+            counter_id: COUNTER_RESIDUE_CANDIDATE_NAT_ID,
+            external_ip: "198.51.100.7".into(),
+            internal_ip: "10.9.9.7".into(),
+            ..Default::default()
+        }];
+        snap
+    }
+
+    let mut nptv6 = base();
+    // #2240: unparseable internal prefix — the FIRST belt below the bindings.
+    nptv6.nptv6_rules = vec![crate::Nptv6RuleSnapshot {
+        name: "bad-parse".into(),
+        from_zone: String::new(),
+        internal_prefix: "not-a-prefix".into(),
+        external_prefix: "2001:db8:9::/48".into(),
+    }];
+
+    let mut filter = base();
+    // #3367: the Go side could not parse the term's tcp-flags expression.
+    filter.filters = vec![FirewallFilterSnapshot {
+        name: "f".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            tcp_flags_unparseable: true,
+            ..Default::default()
+        }],
+    }];
+
+    let mut cos = base();
+    // #2410: a forwarding-class queue id outside 0..=255. The LAST fallible
+    // step — nothing fallible follows it, so this row observes a relocation of
+    // the counter bindings to ANY position in the builder.
+    cos.interfaces = vec![InterfaceSnapshot {
+        ifindex: 60,
+        cos_shaping_rate_bytes_per_sec: 1,
+        ..Default::default()
+    }];
+    cos.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "voice".into(),
+            queue: 256,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        inet_precedence_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    });
+
+    vec![
+        ("#2240 NPTv6 unparseable rule", nptv6, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::Nptv6UnparseableRule { .. }
+                )
+            }
+        }),
+        ("#3367 filter tcp-flags unparseable", filter, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::UnrepresentableFilterTCPFlags { .. }
+                )
+            }
+        }),
+        ("#2410 CoS queue id out of range (last fallible step)", cos, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange { .. }
+                )
+            }
+        }),
+    ]
+}
+
+/// The NAT counter id only the CANDIDATE carries.
+const COUNTER_RESIDUE_CANDIDATE_NAT_ID: u32 = 4242;
+/// The NAT counter id the LIVE store is already carrying when the rejected
+/// build runs. It must SURVIVE — see the tests.
+const COUNTER_RESIDUE_LIVE_NAT_ID: u32 = 7;
+/// The policy rule id the LIVE store is already carrying. Must SURVIVE.
+const COUNTER_RESIDUE_LIVE_POLICY_ID: &str = "live-zone-a->live-zone-b/live-rule";
+
+/// Seed both live stores so a rejected build has something to DESTROY as well
+/// as something to create.
+///
+/// This is the half that makes the two tests below distinguish a rollback from
+/// a `clear()`. A test that only asserted "the candidate id is absent" would
+/// pass against a fix that emptied the store outright — which would reset the
+/// running configuration's cumulative hit counts on a commit that never
+/// applied, i.e. the #5716 defect reintroduced in a new store.
+fn seed_live_counter_stores() -> (PolicyCounterStore, crate::nat::NatCounterStore) {
+    let policy = PolicyCounterStore::default();
+    let nat = crate::nat::NatCounterStore::default();
+    // Reach the private get-or-create through the public parse entry point the
+    // production builder uses, so the seeding path is the production path.
+    let live_rules = vec![crate::PolicyRuleSnapshot {
+        name: "live-rule".into(),
+        from_zone: "live-zone-a".into(),
+        to_zone: "live-zone-b".into(),
+        action: "permit".into(),
+        ..Default::default()
+    }];
+    let mut zone_map = rustc_hash::FxHashMap::default();
+    zone_map.insert("live-zone-a".to_string(), 100u16);
+    zone_map.insert("live-zone-b".to_string(), 200u16);
+    crate::policy::parse_policy_state_with_counters(
+        "deny",
+        &live_rules,
+        &zone_map,
+        &[],
+        &policy,
+    )
+    .expect("the live seed policy must parse");
+    let _ = nat.rule_counter(COUNTER_RESIDUE_LIVE_NAT_ID);
+    assert!(
+        policy
+            .tracked_rule_ids()
+            .iter()
+            .any(|id| id == COUNTER_RESIDUE_LIVE_POLICY_ID),
+        "fixture: the live policy rule id must be seeded, or 'it survived' is \
+         vacuous. Got {:?}",
+        policy.tracked_rule_ids()
+    );
+    assert_eq!(
+        nat.tracked_ids(),
+        vec![COUNTER_RESIDUE_LIVE_NAT_ID],
+        "fixture: the live NAT counter id must be seeded"
+    );
+    (policy, nat)
+}
+
+/// #6995 PROPERTY 1 (the STORE): a rejected build must leave no block behind in
+/// the live `PolicyCounterStore`, and must not disturb the ones already there.
+///
+/// `PolicyCounterStore::rule_hit_counter` GET-OR-CREATES out of the live,
+/// `Arc`-shared store, and it runs inside `build_fallible_forwarding_state`
+/// ahead of the NPTv6, filter and CoS belts. Before the rollback, a build those
+/// belts rejected left one block per candidate-only rule — plus the reserved
+/// default-policy id — in a store the discarded build's caller never asked to
+/// mutate.
+///
+/// This half is memory-only: `Coordinator::policy_rule_counters` reads the
+/// PUBLISHED forwarding state, not the store, so the residue is invisible to
+/// operators. It is bound anyway because "invisible" is a property of today's
+/// readers, not of the store — and because the NAT sibling proves the same
+/// mechanism does reach an operator surface.
+#[test]
+fn rejected_build_does_not_leave_policy_blocks_in_the_live_store_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+        let before = policy.tracked_rule_ids();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            expected(&err),
+            "{label}: rejected through a different belt than the row names \
+             ({err:?}) — the row is no longer exercising the belt it is here for"
+        );
+
+        assert_eq!(
+            policy.tracked_rule_ids(),
+            before,
+            "{label}: a REJECTED build changed the live policy-counter registry. \
+             Extra ids are residue keyed by the refused snapshot's own rules; \
+             MISSING ids mean the rollback destroyed a running rule's cumulative \
+             hit count on a commit that never applied"
+        );
+    }
+}
+
+/// #6995 PROPERTY 1 (the STORE), NAT half.
+///
+/// Same mechanism through `NatCounterStore::rule_counter`, which GET-OR-INSERTS
+/// one row per NAT rule from the source / static / destination reconcilers.
+#[test]
+fn rejected_build_does_not_leave_nat_rows_in_the_live_store_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(expected(&err), "{label}: wrong belt ({err:?})");
+
+        assert_eq!(
+            nat.tracked_ids(),
+            vec![COUNTER_RESIDUE_LIVE_NAT_ID],
+            "{label}: a REJECTED build changed the live NAT-counter registry. \
+             Id {COUNTER_RESIDUE_CANDIDATE_NAT_ID} belongs to a rule the build \
+             refused and never installed; id {COUNTER_RESIDUE_LIVE_NAT_ID} is \
+             the running configuration's and must survive"
+        );
+    }
+}
+
+/// #6995 PROPERTY 2 (the OPERATOR SURFACE): a rejected build must put no
+/// phantom row on `ProcessStatus.nat_rule_counters`.
+///
+/// This is a SEPARATE property from the store assertion above, and it is bound
+/// separately on purpose. `NatCounterStore::snapshots()` emits one row per
+/// stored id *regardless of whether its packet/byte value is zero*, and that
+/// feeds `server/helpers/status.rs` -> `ProcessStatus.nat_rule_counters` -> Go
+/// `NATRuleCounters`. So the NAT half of this residue was operator-visible: a
+/// refused commit put rows for a configuration that was never installed on the
+/// status surface until the next successful commit evicted them.
+///
+/// The two assertions are not interchangeable. A "fix" that filtered
+/// zero-valued rows out of `snapshots()` would satisfy THIS test while leaving
+/// the store dirty — and would also hide legitimately-zero rows for rules that
+/// really are installed. Binding the store first is what makes this one a
+/// consequence rather than the whole claim.
+#[test]
+fn rejected_build_leaves_no_phantom_rows_on_the_nat_status_surface_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(expected(&err), "{label}: wrong belt ({err:?})");
+
+        let rows = nat.snapshots();
+        assert!(
+            rows.iter()
+                .all(|r| r.counter_id != COUNTER_RESIDUE_CANDIDATE_NAT_ID),
+            "{label}: the status surface carries a NAT rule-counter row for id \
+             {COUNTER_RESIDUE_CANDIDATE_NAT_ID}, which belongs to a commit that \
+             was REFUSED and never installed. Rows: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.counter_id == COUNTER_RESIDUE_LIVE_NAT_ID),
+            "{label}: the running configuration's NAT rule-counter row \
+             disappeared from the status surface after a build that was \
+             rejected. Rows: {rows:?}"
+        );
+    }
+}
+
 #[test]
 fn rejected_build_does_not_prune_live_zone_counters() {
     // `ZoneCounterStore` is `Arc`-backed, so the build's carry-forward
@@ -6898,46 +7197,112 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // into the roughly sixty lines between the two parses would have made
         // one of them silently wrong.
         let rejected_above_the_policy_parse = label.starts_with("#3719");
+        // #6995 CLOSED — and this is the assertion that says so out loud,
+        // exactly as the comment below predicted when it was written.
+        //
+        // The two predicates that follow used to be evaluated HERE, against the
+        // stores the public entry point was handed, and they asserted the
+        // residue was PRESENT. It no longer is: the caller
+        // (`build_forwarding_state_with_policy_counters_and_previous`) now
+        // captures both registries before the fallible build and retains them
+        // back on `Err`.
+        //
+        // The ordering property they encode is NOT discarded, because it is a
+        // real property and it is still true — it is just a property of the
+        // INNER builder rather than of the caller. So it moves down one layer,
+        // to `build_fallible_forwarding_state`, which is where the get-or-create
+        // actually happens and which does not roll back. Deleting the
+        // predicates instead would have removed the only bind on the relative
+        // order of the policy parse, the NAT parse and the belts, and #6832
+        // fold r7 exists precisely because an earlier round let those two
+        // predicates collapse into one expression no row could contradict.
+        let policy_ids = live_policy.tracked_rule_ids_for_test();
         let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
         nat_ids.sort_unstable();
+        assert_eq!(
+            policy_ids, policy_seed,
+            "{label}: a REJECTED build left the live POLICY-counter registry \
+             changed. Extra ids are #6995 residue keyed by the refused \
+             snapshot's own rules; MISSING ids are the DESTRUCTIVE class \
+             (#7010), where the rollback ate a running rule's totals"
+        );
+        assert_eq!(
+            nat_ids,
+            vec![7777],
+            "{label}: a REJECTED build left the live NAT-counter registry \
+             changed. Id 4242 belongs to a candidate-only rule the build \
+             refused; 7777 is the running configuration's and must survive. \
+             This row is what makes the #6995 rollback hold with the ZONE \
+             store live alongside it, not just against empty neighbours"
+        );
+
+        // The ordering bind, re-anchored at the layer that owns it. Same
+        // predicates, same rows, same reasoning — run against the inner builder
+        // on its own live-seeded stores, where the residue is still observable
+        // because nothing has rolled it back yet.
+        let inner_policy = PolicyCounterStore::default();
+        let inner_nat = crate::nat::NatCounterStore::default();
+        let _ = inner_nat.rule_counter(7777);
+        build_forwarding_state_with_policy_counters_and_previous(
+            &ConfigSnapshot::default(),
+            &inner_policy,
+            &inner_nat,
+            None,
+        )
+        .expect("the empty seed snapshot must build");
+        let inner_policy_seed = inner_policy.tracked_rule_ids_for_test();
+        assert!(
+            !inner_policy_seed.is_empty(),
+            "{label}: fixture precondition — the inner-builder policy store \
+             must be LIVE before the rejected build"
+        );
+        let inner_err =
+            build_fallible_forwarding_state(&snapshot, &inner_policy, &inner_nat, Some(&prev))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the inner builder must reject this snapshot"));
+        assert!(
+            expected(&inner_err),
+            "{label}: the inner builder rejected through a different belt than \
+             the row names ({inner_err:?})"
+        );
+        let mut inner_nat_ids: Vec<u32> =
+            inner_nat.snapshots().iter().map(|s| s.counter_id).collect();
+        inner_nat_ids.sort_unstable();
         let expected_nat_ids: Vec<u32> = if rejected_above_the_nat_parse {
             vec![7777]
         } else {
             vec![4242, 7777]
         };
-        let policy_ids = live_policy.tracked_rule_ids_for_test();
+        let inner_policy_ids = inner_policy.tracked_rule_ids_for_test();
         assert!(
-            policy_seed.iter().all(|id| policy_ids.contains(id)),
-            "{label}: the rejected build EVICTED a live policy counter. The \
-             #6995 residue is additive; losing a seeded id would be the \
+            inner_policy_seed.iter().all(|id| inner_policy_ids.contains(id)),
+            "{label}: the inner builder EVICTED a live policy counter. It is \
+             ADDITIVE by construction; losing a seeded id would be the \
              DESTRUCTIVE class, which is #7010, not this one. \
-             seed={policy_seed:?} after={policy_ids:?}"
+             seed={inner_policy_seed:?} after={inner_policy_ids:?}"
         );
-        // The policy half of the #6995 boundary, asserted the same way as the
-        // NAT half: the candidate-only rule's counter IS left behind, and a
-        // later fix that stops leaving it reds here instead of leaving the
-        // gaps-doc claim stale. Belt-dependent for the same reason the NAT one
-        // is — the policy parse sits mid-builder, above NPTv6/filter/CoS and
-        // below the dup-zone belt. #3402 is the row that separates this
-        // predicate from the NAT one: it is BELOW the probe rule's counter
-        // (residue expected) and ABOVE the NAT parse (no NAT residue).
+        // The policy half of the ordering boundary: the candidate-only rule's
+        // counter IS resolved by the inner builder for a belt BELOW the policy
+        // parse and is not for a belt above it. #3402 is the row that separates
+        // this predicate from the NAT one — it is BELOW the probe rule's
+        // counter (residue expected) and ABOVE the NAT parse (no NAT residue).
         let policy_residue_expected = !rejected_above_the_policy_parse;
         assert_eq!(
-            policy_ids.iter().any(|id| id.contains("probe-rule")),
+            inner_policy_ids.iter().any(|id| id.contains("probe-rule")),
             policy_residue_expected,
-            "{label}: the documented #6995 policy-side boundary moved. A belt \
-             BELOW the probe rule's per-rule counter resolution leaves that \
-             rule's counter in the live store and a belt ABOVE it does not. \
-             after={policy_ids:?}"
+            "{label}: the policy-side ordering boundary moved. A belt BELOW the \
+             probe rule's per-rule counter resolution leaves that rule's \
+             counter in the store the inner builder was handed, and a belt \
+             ABOVE it does not. after={inner_policy_ids:?}"
         );
         assert_eq!(
-            nat_ids, expected_nat_ids,
-            "{label}: the documented #6995 scope boundary moved. A belt BELOW \
-             the NAT rule parse leaves the candidate's counter_id behind in the \
-             live NAT store, and a belt ABOVE it does not — that residue is \
-             EXPECTED (see the builder's doc comment). If it is now absent for \
-             a below-the-parse row, #6995 was fixed and both that comment and \
-             the PR body's scope paragraph are stale"
+            inner_nat_ids, expected_nat_ids,
+            "{label}: the NAT-side ordering boundary moved. A belt BELOW the \
+             NAT rule parse leaves the candidate's counter_id behind in the \
+             store the INNER builder was handed, and a belt ABOVE it does not. \
+             Hoisting the NAT parse above the policy parse reds the #3402 row \
+             here (measured, #6832 fold r7). The caller undoes this on `Err` \
+             (#6995) — that is asserted above, at the caller's layer"
         );
     }
 }

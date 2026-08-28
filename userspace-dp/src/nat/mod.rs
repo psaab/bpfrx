@@ -331,9 +331,34 @@ impl NatCounterStore {
         Some(counter)
     }
 
+    /// #6995: the stored counter ids, for the rejected-build rollback in
+    /// `forwarding_build`.
+    ///
+    /// `rule_counter` GET-OR-INSERTS, and the source / static / destination NAT
+    /// reconcilers call it inside the fallible builder AHEAD of the NPTv6,
+    /// filter and CoS belts — so a build those belts reject used to leave a row
+    /// per candidate-only NAT rule behind here. Unlike the policy half that is
+    /// NOT memory-only: `snapshots()` below emits one row per stored id
+    /// regardless of value, and that feeds `ProcessStatus.nat_rule_counters`,
+    /// so the residue reached the operator status surface. The builder captures
+    /// this set before it starts and restores it via `reconcile_ids` on `Err`.
+    pub(crate) fn tracked_ids(&self) -> Vec<u32> {
+        let Ok(counters) = self.counters.lock() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u32> = counters.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Retain only counters whose id is in `active_ids`, dropping the
     /// `Arc<NatRuleCounter>` for rules removed by a config change. Mirrors
     /// `PolicyCounterStore::reconcile_rules`.
+    ///
+    /// #6995 also uses this as the rejected-build ROLLBACK, passing the id set
+    /// captured before the build. That reuse is sound because the operation is
+    /// a retain: handing it the pre-build set can only evict ids the rejected
+    /// build itself created, never a row carrying live cumulative totals.
     pub(crate) fn reconcile_ids(&self, active_ids: &[u32]) {
         let active: rustc_hash::FxHashSet<u32> =
             active_ids.iter().copied().filter(|&id| id != 0).collect();
