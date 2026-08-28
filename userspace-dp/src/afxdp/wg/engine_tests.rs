@@ -832,6 +832,172 @@ fn reconcile_churn_completes_a_cycle_even_when_already_stopped_6633() {
     );
 }
 
+/// #6952: run `f` on a worker thread and fail — BY NAME, in bounded time — if
+/// it does not finish.
+///
+/// The bodies this wraps can SELF-DEADLOCK a single thread (see
+/// `assert_no_orphan_demux_entries`). Without this wrapper such a deadlock
+/// parks a libtest worker forever: the run never completes, `cargo test` is
+/// killed at its timeout, and the exit code is 124 — which is neither "the
+/// assertion held" nor "the assertion failed". #6952 was filed because a
+/// mutation cell that lands on that outcome is uninterpretable, and scoring it
+/// as either polarity manufactures evidence. A named assertion failure is
+/// always readable; a wedge never is.
+///
+/// The deadline is deliberately loose (30s against a body that takes
+/// microseconds when healthy) — it is a liveness backstop, not a timing
+/// assertion, so a loaded machine cannot turn it into a flake. On the failure
+/// path the worker thread stays parked; that is intentional and harmless,
+/// because libtest exits the process rather than joining detached threads.
+fn run_bounded<F>(what: &str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let done = done.clone();
+        thread::spawn(move || {
+            f();
+            done.store(true, AOrd::SeqCst);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done.load(AOrd::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not finish within 30s — the worker thread is parked, \
+             which for this body means a same-thread RwLock self-deadlock \
+             (#6952). It did NOT merely run slowly: the healthy path is \
+             microseconds."
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// #6952: the orphan-demux post-condition sweep, shared by
+/// `install_session_serializes_with_reconcile_removal` (where it is the real
+/// post-condition) and by
+/// `orphan_demux_sweep_does_not_self_deadlock_6952` (where it is the subject).
+///
+/// THE SCOPE AROUND THE FIRST READ GUARD IS LOAD-BEARING. `reconcile_peers`
+/// takes the WRITE guard on `sessions_by_local_index` whenever the peer it is
+/// removing still owns a live `current`/`previous`/`next` session, and
+/// `std::sync::RwLock` is not reentrant — so a read guard still alive at the
+/// `reconcile_peers(&[])` below deadlocks the calling thread outright.
+///
+/// The shipped defect was subtler than a plain double-lock: the second
+/// `let by_index = ...` SHADOWS the first binding but does NOT drop its guard.
+/// A shadowed value lives to the end of the enclosing block, so the first
+/// guard was still held across the reconcile. Only the explicit scope ends it.
+///
+/// It was INTERMITTENT because the write is conditional: `reconcile_peers`
+/// takes it only when `dropped_indices` is non-empty, i.e. only when the
+/// removed peer still owns a live session. In the racing caller that needs a
+/// narrow window. `reconcile_churn_until` always ends its cycle on the RE-ADD,
+/// and a removal drops the `Arc<Peer>` (a later re-add builds a fresh one, see
+/// the `existing` branch of `reconcile_peers`), so a reconciler that runs even
+/// one more full cycle after the installer's last successful install leaves a
+/// SESSIONLESS peer and the sweep never reaches the write. The deadlock needs
+/// the reconciler to observe `stop` with ZERO further cycles, while the peer it
+/// last re-added still carries the install. CPU contention deschedules the
+/// reconciler and widens that window, which is why the wedge tracked machine
+/// load. `--test-threads=1` does not remove the hazard — the two racing threads
+/// are spawned by the test, not by libtest — it only shifts the odds.
+fn assert_no_orphan_demux_entries(engine: &WgEngine, cfg_with_peer: &[WgPeerConfig]) {
+    engine.reconcile_peers(cfg_with_peer);
+    let table = engine.load_table();
+    {
+        let by_index = engine.sessions_by_local_index.read().unwrap();
+        for (local_index, session) in by_index.iter() {
+            assert!(
+                table.peer_index_by_pubkey.contains_key(&session.peer_pubkey),
+                "demux entry {local_index:#x} references unknown peer pubkey \
+                 — orphan from install/reconcile race"
+            );
+        }
+    }
+    // Now flip the peer out one more time. Reconcile's drain
+    // path must remove every session belonging to that peer; any
+    // surviving entry would prove the orphan slipped through.
+    engine.reconcile_peers(&[]);
+    let by_index = engine.sessions_by_local_index.read().unwrap();
+    assert!(
+        by_index.is_empty(),
+        "after removing the only peer, no demux entries should remain; \
+         found {} — install/reconcile race left orphans",
+        by_index.len()
+    );
+}
+
+/// #6952 FAIL-ON-REVERT for the scope around the first read guard in
+/// `assert_no_orphan_demux_entries`.
+///
+/// `install_session_serializes_with_reconcile_removal` reaches the deadlock
+/// only on the subset of schedules that leave a live session on the surviving
+/// peer, so it cannot pin the hazard: on most runs its `reconcile_peers(&[])`
+/// finds `dropped_indices` empty, never takes the demux write lock, and passes
+/// with the bug fully present. This test arranges the deciding precondition
+/// DETERMINISTICALLY instead of racing for it — install one session on the only
+/// peer, assert the demux map is non-empty, and only then run the sweep — so
+/// removing the scope reds it on every run rather than one in six.
+///
+/// Deleting the braces in `assert_no_orphan_demux_entries` restores the shipped
+/// shadowing shape, and this test then fails by name on the 30s liveness
+/// backstop in `run_bounded`.
+#[test]
+fn orphan_demux_sweep_does_not_self_deadlock_6952() {
+    use std::sync::Arc;
+    let (init_priv, _init_pub) = keypair();
+    let (peer_priv, peer_pub) = keypair();
+    let cfg_with_peer = vec![WgPeerConfig {
+        pubkey: peer_pub,
+        endpoint: None,
+        persistent_keepalive: 0,
+        allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        preshared_key: [0u8; 32].into(),
+    }];
+    let engine = Arc::new(WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv.into(),
+        listen_port: 51820,
+        peers: cfg_with_peer.clone(),
+    }));
+    let peer_engine = WgEngine::new(WgEngineConfig {
+        local_private_key: peer_priv.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: [0u8; 32],
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
+    });
+    let session = make_session_for(&engine, peer_pub, &peer_engine, 0x6952_0001, 6952);
+    engine
+        .install_session(&peer_pub, session)
+        .expect("install must succeed against the configured peer");
+    // The DECIDING precondition, asserted rather than hoped for: the peer owns
+    // a live session, so the sweep's `reconcile_peers(&[])` WILL find
+    // `dropped_indices` non-empty and WILL take the demux write lock. Without
+    // this the sweep never reaches the write and the test would pass on the
+    // reverted code — a green that proves nothing.
+    assert_eq!(
+        engine.sessions_by_local_index.read().unwrap().len(),
+        1,
+        "precondition: the peer must own a live demux entry, or the sweep \
+         never takes the write lock this test exists to cross"
+    );
+    let cfg = cfg_with_peer.clone();
+    let e = engine.clone();
+    run_bounded("orphan demux sweep", move || {
+        assert_no_orphan_demux_entries(&e, &cfg)
+    });
+}
+
 /// r6 regression: `install_session` and `reconcile_peers` must
 /// serialize so a removed peer cannot orphan a freshly-installed
 /// demux entry.
@@ -984,26 +1150,14 @@ fn install_session_serializes_with_reconcile_removal() {
     // `session.peer_pubkey` that is not in the index map of any
     // future snapshot — and we can detect it by re-reconciling
     // the peer back in and checking the index map directly.
-    engine.reconcile_peers(&cfg_with_peer);
-    let table = engine.load_table();
-    let by_index = engine.sessions_by_local_index.read().unwrap();
-    for (local_index, session) in by_index.iter() {
-        assert!(
-            table.peer_index_by_pubkey.contains_key(&session.peer_pubkey),
-            "demux entry {local_index:#x} references unknown peer pubkey \
-             — orphan from install/reconcile race"
-        );
-    }
-    // Now flip the peer out one more time. Reconcile's drain
-    // path must remove every session belonging to that peer; any
-    // surviving entry would prove the orphan slipped through.
-    engine.reconcile_peers(&[]);
-    let by_index = engine.sessions_by_local_index.read().unwrap();
-    assert!(
-        by_index.is_empty(),
-        "after removing the only peer, no demux entries should remain; \
-         found {} — install/reconcile race left orphans",
-        by_index.len()
+    //
+    // #6952: run the sweep through `run_bounded` so a reintroduced
+    // self-deadlock inside it fails THIS test by name instead of parking the
+    // thread forever and wedging the whole binary at rc=124.
+    let cfg = cfg_with_peer.clone();
+    run_bounded(
+        "install_session_serializes_with_reconcile_removal orphan sweep",
+        move || assert_no_orphan_demux_entries(&engine, &cfg),
     );
 }
 

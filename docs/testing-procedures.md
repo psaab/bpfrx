@@ -46,6 +46,27 @@ make target or CI job runs `cargo bench`, and only `prefix_set_lookup` and
 measurements for a human and exits 0 regardless, so a `cargo bench` exit
 status is not a perf gate.
 
+**What `--test-threads=1` does and does not buy you (#6952).** It
+serializes libtest's test SLOTS; it does not serialize threads a test body
+spawns, so it cannot make an intra-test deadlock safe. Read it as a rate
+reducer for the socket-test hang, never as a correctness guarantee, and
+never as evidence that a wedge is a parallelism artifact. A second wedge
+that this flag appeared to "fix" — three `wg::engine` tests hanging under
+a plain parallel `cargo test` — was root-caused (2026-08-28) as a
+single-thread `RwLock` self-deadlock (a read guard held across a
+`reconcile_peers` that takes the write guard on the same lock) and is now
+FIXED rather than worked around.
+
+**When a run wedges (`rc=124`), measure before theorising.** Sample
+`utime+stime` from `/proc/<pid>/stat` over 5s: non-zero means spinning
+(oversubscription/starvation), ZERO means every thread is parked and it is
+a real deadlock that no thread-count change will fix. Then dump
+`gdb -p <pid> -batch -ex 'thread apply all bt'` and name the actual wait.
+`/proc/<pid>/task/*/comm` carries the libtest test name (truncated to 15
+chars) and is inherited by threads the test spawns, so it identifies which
+test owns each parked thread. Details and the `run_bounded` pattern that
+turns such a wedge into a NAMED failure: `docs/engineering-style.md`.
+
 **Must pass before any commit.**
 
 ### 2. Connectivity Tests (`make test-connectivity` or `./test/incus/test-connectivity.sh`)
