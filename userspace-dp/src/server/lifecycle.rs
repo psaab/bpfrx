@@ -245,6 +245,7 @@ pub(crate) fn run() -> Result<(), String> {
             interface_snat_sync_identity_conflict_drops_total: 0,
             interface_snat_registry_cap_exhaustion_total: 0,
             worker_command_queue_poison_recoveries: 0,
+            worker_command_queue_drops: 0,
             shared_session_poison_recoveries: 0,
             gre_decap_ecn_illegal_drops_total: 0,
             wg_decap_ecn_illegal_drops_total: 0,

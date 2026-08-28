@@ -360,6 +360,20 @@ impl super::Coordinator {
         crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_POISON_RECOVERIES.load(Ordering::Relaxed)
     }
 
+    /// #6929: total worker commands refused because the target per-worker
+    /// queue was already at `MAX_PENDING_WORKER_COMMANDS`.
+    ///
+    /// Deliberately NOT folded into the poison counter above: that one says
+    /// a queue was recovered and nothing was lost, this one says a command
+    /// was discarded, and the two have opposite remediations. Surfaced as
+    /// `xpf_userspace_worker_command_queue_drops_total`. A nonzero value
+    /// means a producer found a full queue, which — since the consumer
+    /// takes the whole deque per poll — points at a worker that stopped
+    /// draining rather than at a fast producer.
+    pub fn worker_command_queue_drops_total(&self) -> u64 {
+        crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #2402/#6641: total shared-session mutex poison recoveries across
     /// every shared-session and owner-RG-index site (publish, remove,
     /// lookups, index maintenance, and the #5154 HA import

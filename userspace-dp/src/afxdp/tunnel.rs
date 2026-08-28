@@ -777,9 +777,9 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
         // committed prefix (forward only); commands are self-contained.
         {
             let mut pending = worker_queue::lock_recover(pending);
-            pending.push_back(WorkerCommand::UpsertLocal(entry.clone()));
+            worker_queue::push_bounded(&mut pending, WorkerCommand::UpsertLocal(entry.clone()));
             if let Some(reverse) = &plan.reverse_session_entry {
-                pending.push_back(WorkerCommand::UpsertLocal(reverse.clone()));
+                worker_queue::push_bounded(&mut pending, WorkerCommand::UpsertLocal(reverse.clone()));
             }
         }
     }

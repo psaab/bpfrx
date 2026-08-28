@@ -793,6 +793,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.WorkerCommandQueuePoisonRecoveries),
 	)
 
+	// #6929: per-worker command-queue capacity drops. Emitted
+	// unconditionally for the same reason as its #1807 neighbour: 0 is the
+	// expected value and a real signal, so an absent series would be
+	// indistinguishable from a helper that never reports.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceWorkerCommandQueueDrops,
+		prometheus.CounterValue,
+		float64(status.WorkerCommandQueueDrops),
+	)
+
 	// #2402/#6641: shared-session poison recoveries. Emitted
 	// unconditionally for the same reason as its #1807 twin above: a 0 is
 	// a real "no worker panic touched HA session state" signal, and an
