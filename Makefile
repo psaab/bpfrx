@@ -496,11 +496,14 @@ test-iperf-throughput-lib:
 # pairs only; no incus, cluster, network or helper. Also builds and unit-
 # tests the connection-rate generator, which lives outside the dataplane
 # workspaces so `cargo test` at the root does not reach it.
-# Run this after touching newflow_ceiling_analyze.py or newflow-gen.
+# Run this after touching newflow_ceiling_analyze.py, newflow-gen, or the
+# harness's node selection (#6962 — newflow-ceiling-lib.sh + its selftest).
 test-newflow-ceiling-lib:
 	cd test/incus && python3 -m unittest newflow_ceiling_analyze_test
 	cargo test --release --manifest-path test/incus/newflow-gen/Cargo.toml
 	bash -n ./test/incus/newflow-ceiling-harness.sh
+	bash -n ./test/incus/newflow-ceiling-lib.sh
+	bash ./test/incus/newflow-ceiling-selftest.sh
 
 test-ssh:
 	./test/incus/setup.sh ssh
