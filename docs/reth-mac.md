@@ -124,7 +124,9 @@ retries; cycling out from under live workers is not recoverable.
 hook fails, `PrepareLinkCycle` has already disabled `ctrl` (and cleared every
 binding row if that disable could not be verified), and the helper may or may not
 have joined its workers. Nothing downstream re-arms that: the post-cycle rebind is
-gated on `linkCycled` (false — the cycle was aborted), and
+gated on `linkCycled`, false here because the cycle was aborted *before*
+`setDown` — a failed hook never reaches it (#6915: a failure AFTER a successful
+`setDown` does report true, and is re-armed by step 2.6b2), and
 `reapplyAfterDeferredMAC` is gated on `rethMACPending`, which is computed *before*
 `networkd.Apply` — so it is false for an apply whose only member needing a MAC was
 renamed into its config name by that same `networkd.Apply`. (`rethMACPending` is
@@ -160,11 +162,16 @@ failure path — a `stop_workers` that never reaches the helper joins nothing). 
 *successful* join therefore leaves the member just as un-forwarding as a failed
 one — and
 `setDown` and the cycled `setHardwareAddr` are both still fallible after it
-returns. Both of those yield `linkCycled=false`, i.e. exactly the state above:
-prepare applied, cycle not completed, and neither `linkCycled` nor
-`rethMACPending` able to re-arm it. Keying the rollback on the hook's own error
-let those two escape with a nil commit error and no rebind — `ctrl` off, transit
-dropped, commit green. So `programRethMACWithWorkerJoin` records that the hook
+returns. Keying the rollback on the hook's own error let both escape with a nil
+commit error and no rebind — `ctrl` off, transit dropped, commit green.
+
+Of those two, only a failed `setDown` still yields `linkCycled=false` and the
+state above (prepare applied, cycle not completed, neither `linkCycled` nor
+`rethMACPending` able to re-arm it). Since #6915 a failed *cycled* MAC write
+reports `linkCycled=true`, because by then `setDown` has succeeded and the link
+really has cycled; it is re-armed by step 2.6b2 rather than by the rollback here.
+Both still fail the commit, which is what this section is about — the rollback
+gate is "the hook RAN", and that is unchanged. So `programRethMACWithWorkerJoin` records that the hook
 ran (after its `d.dp == nil` guard, which keeps the rollback unreachable with no
 dataplane attached) and rolls back on any subsequent failure:
 
@@ -174,17 +181,44 @@ dataplane attached) and rolls back on any subsequent failure:
 | member lookup failed | false | no (hook never ran) | OK — warn-only |
 | join failed | false | `NotifyLinkCycle()` | FAIL |
 | join OK, `setDown` failed | false | `NotifyLinkCycle()` | FAIL |
-| join OK, cycled MAC write failed | false | `NotifyLinkCycle()` | FAIL |
+| join OK, cycled MAC write failed | **true** (#6915) | no — step 2.6b2 owns it | FAIL |
 | join OK, cycle ran, `link-up` failed | **true** | no — step 2.6b2 owns it | FAIL |
 | join OK, cycle completed | true | no — step 2.6b2 owns it | OK |
 
-The last-but-one row is the only failure in the class that does *not* roll back
-here: the cycle completed, so step 2.6b2 already rebinds off `linkCycled`, and
-firing `NotifyLinkCycle()` too would be the double rebind that gets `EBUSY` on
-mlx5 zero-copy queues. It still fails the commit — the member is left
-administratively DOWN after a deliberate teardown. Note that step 2.6b's VIP
-reconcile is likewise gated on `linkCycled`, so a cycled-MAC-write failure still
-skips it; that gap predates #5103 and is unchanged here.
+The last **three** rows are the failures in the class that do *not* roll back
+here: the link cycled, so step 2.6b2 already rebinds off `linkCycled`, and firing
+`NotifyLinkCycle()` too would be the double rebind that gets `EBUSY` on mlx5
+zero-copy queues. They still fail the commit.
+
+`linkCycled` reports whether the link **went DOWN and back UP**, not whether the
+MAC write succeeded (#6915). Those differ in exactly one row — "join OK, cycled
+MAC write failed" — which returned `false` until #6915 even though `setDown` had
+returned nil. A DOWN flushes every kernel address on the member, so that row lost
+the VRRP VIPs and the stable RETH link-local, and step 2.6b's reconcile is gated
+on this same value through `needLinkCycleRecovery`: it was **skipped for a cycle
+that genuinely happened**, and the member came back holding the VRRP role while
+answering for none of its addresses.
+
+Nothing else re-added them, which is why the gate was the whole fix:
+`ReconcileVIPs` has exactly **one** production caller (step 2.6b's), the 2s
+`reconcileRGState` tick re-adds only the *stable link-local* in VRRP mode, and
+`sendAdvert` swallows its send error at `Debug` so VRRP never observes the flap
+and stays MASTER. **Direct (no-VRRP) mode was never exposed**: the same tick calls
+`reconcileDirectVIPOwnership` → `addDirectVIPs` unconditionally, which is
+idempotent and re-adds what the DOWN removed, announcing on `added > 0`. So the
+defect was VRRP-mode only and unbounded there — the addresses returned on the
+next apply that cycled the member, not on any timer.
+
+The two rows that remain `false` are the ones where **no cycle happened at all**:
+a failed join, and a failed `setDown`. Those flushed nothing, so there is nothing
+for step 2.6b to reconcile and no torn-down sockets for step 2.6b2 to rebind —
+which is why the rollback below stays their only owner.
+
+Note the remaining `link-up failed` and `cycled MAC write failed` rows differ in
+recoverability even though both now report `true`: the first wrote the MAC, so
+every later apply early-returns on `bytes.Equal(current, mac)` and never retries
+`setUp` — the member stays administratively DOWN until a restart. The second did
+not, so the next apply retries the whole sequence.
 
 Suppression is per-MEMBER, while step 2.6b2's gate is a per-APPLY accumulator, so
 an apply that mixes an aborted member with a cycled one pays two rebinds. Which
