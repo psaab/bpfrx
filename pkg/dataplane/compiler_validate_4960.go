@@ -137,6 +137,7 @@ package dataplane
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 
 	"github.com/vishvananda/netlink"
@@ -524,6 +525,41 @@ func newValidationResult() *CompileResult {
 		ethtoolApplied:      make(map[string]bool),
 		genericXDPIfindexes: make(map[int]bool),
 	}
+}
+
+// compileInfo / compileWarn are the CHOKE POINT for log records emitted inside
+// the validation pre-pass's phases (#6903).
+//
+// The pre-pass runs `validationPhases` against a discarding shim before the
+// real pass runs the same phases against the real dataplane, so any record a
+// covered phase emits unconditionally is printed TWICE for one apply — and the
+// two copies can disagree, which is the operator-facing harm #6894 fixed for
+// `lo0_filter_v4`.
+//
+// A helper rather than ~19 inline `if !isValidationPass(dp)` blocks, because
+// the failure this issue documents is an OMISSION: #6894's gate was correct
+// where wired and simply incomplete, and nothing detected the gap. Inline
+// blocks leave every future site equally forgettable; a helper plus the guard
+// in compiler_validation_gate_6903_test.go makes the omission a test failure.
+//
+// NOT for every log site in these files. A phase the pre-pass does NOT run —
+// `compilePortMirroring`, or `CompileConfig` itself — emits its record exactly
+// once, and routing it through here would DELETE that record rather than
+// de-duplicate it. The predicate is "reached by the pre-pass", which is the
+// `validationPhases` table, not "has dp in scope".
+func compileInfo(dp DataPlane, msg string, args ...any) {
+	if isValidationPass(dp) {
+		return
+	}
+	slog.Info(msg, args...)
+}
+
+// compileWarn is compileInfo for WARN records. See compileInfo.
+func compileWarn(dp DataPlane, msg string, args ...any) {
+	if isValidationPass(dp) {
+		return
+	}
+	slog.Warn(msg, args...)
 }
 
 // isValidationPass reports whether dp is the pre-pass's discarding shim.
