@@ -8,7 +8,12 @@ import (
 const (
 	wg7786Priv  = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	wg7786Priv2 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-	wg7786PeerX = "1111111111111111111111111111111111111111111111111111111111111111"
+	// PeerX sorts AFTER the unit peers on purpose. The merge appends the
+	// interface-level peers first, so a fixture whose pubkeys ascend in that
+	// same order is already sorted by coincidence and CANNOT detect the sort
+	// being removed. Measured: with X="1111..." deleting the sort left every
+	// assertion green.
+	wg7786PeerX = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	wg7786PeerA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	wg7786PeerB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
