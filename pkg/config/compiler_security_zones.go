@@ -391,6 +391,13 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 // member node's own KEYS instead (zoneInterfaceMemberKeys), which separates the
 // two shapes (#6391).
 func zoneInterfaceMembers(iface *Node) []string {
+	// #7029: the node itself may BE a meta statement. At the call site the
+	// member nodes come straight from zoneInterfaceMemberNodes, so
+	// `apply-groups-except G;` arrives here as `iface`, not as a child — which
+	// is why guarding only the child loop below left the reject in place.
+	if zoneInterfaceApplyMetaKeyword(iface.Name()) {
+		return nil
+	}
 	names, hasBody := zoneInterfaceKeysBeforeBody(iface)
 	if hasBody {
 		// A body keyword landed on this node's OWN Keys, which means the
@@ -407,9 +414,43 @@ func zoneInterfaceMembers(iface *Node) []string {
 		if zoneInterfaceBodyKeywords[child.Name()] {
 			continue
 		}
+		// #7029: Junos permits apply-groups / apply-groups-except /
+		// apply-macro at ANY point in the hierarchy, and ExpandGroups removes
+		// only apply-groups -- the other two survive expansion as live nodes.
+		// In the member slot they were read as interface NAMES, compiled as
+		// phantom members, and the zone-interface-DEFINED gate then rejected
+		// the commit:
+		//
+		//   REJECT security zone "Z" references interface
+		//   "apply-groups-except", which is not defined under `interfaces`
+		//
+		// Fail-LOUD over-rejection, not a silent membership loss, but it
+		// refuses a legal Junos config. zoneInterfaceNonMemberToken already
+		// knew these three; this walk was the one place that did not ask it.
+		if zoneInterfaceApplyMetaKeyword(child.Name()) {
+			continue
+		}
 		names = append(names, zoneInterfaceMembers(child)...)
 	}
 	return names
+}
+
+// zoneInterfaceApplyMetaKeyword reports whether tok is one of the three Junos
+// meta statements that may appear at any hierarchy point and are never an
+// interface name (#7029).
+//
+// Deliberately NOT zoneInterfaceNonMemberToken, which is a superset: that one
+// also covers the host-inbound body keywords, and the member walk already
+// handles those through zoneInterfaceBodyKeywords with different semantics (a
+// body keyword on the node's OWN Keys terminates the walk; a meta keyword is
+// simply skipped). Widening the walk to the superset would conflate the two and
+// change what a packed body does.
+func zoneInterfaceApplyMetaKeyword(tok string) bool {
+	switch tok {
+	case "apply-groups", "apply-groups-except", "apply-macro":
+		return true
+	}
+	return false
 }
 
 // zoneInterfaceBodyKeywords is the set of tokens that may legally appear UNDER a
