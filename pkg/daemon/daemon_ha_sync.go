@@ -721,7 +721,15 @@ func (d *Daemon) snapshotFabricRefreshChans() (chan struct{}, chan struct{}) {
 // present at publish time. Bumping the counter here means a constructor from a
 // prior epoch (still resolving addresses) is already superseded before this
 // call returns, so its later publish is dropped.
-func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context, uint64) {
+//
+// #7071: the cancel func is returned as well, so a caller that discovers its
+// epoch was superseded before it wired anything can release the sub-context it
+// just created. It cannot reach that cancel through the field: a newer epoch has
+// by then overwritten `clusterCommsCancel` with its OWN, and calling that would
+// tear down the live epoch instead.
+func (d *Daemon) beginClusterCommsEpoch(
+	parent context.Context,
+) (context.Context, uint64, context.CancelFunc) {
 	commsCtx, commsCancel := context.WithCancel(parent)
 	d.clusterCommsMu.Lock()
 	d.clusterCommsGen++
@@ -729,7 +737,7 @@ func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context
 	d.clusterCommsCancel = commsCancel
 	d.clusterCommsCtx = commsCtx
 	d.clusterCommsMu.Unlock()
-	return commsCtx, gen
+	return commsCtx, gen, commsCancel
 }
 
 // publishSessionSyncIfCurrent installs ss as the live session-sync object iff
@@ -816,8 +824,28 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// a constructor goroutine from a superseded epoch (still resolving its sync
 	// address) drops its publish instead of clobbering this epoch's state
 	// (#4958).
-	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
-	d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg))
+	commsCtx, commsGen, commsCancel := d.beginClusterCommsEpoch(ctx)
+	// #7071: consume the drop signal, as both sibling publishers already do
+	// (`publishSessionSyncIfCurrent`, `publishFabricRefreshChansIfCurrent`).
+	//
+	// A false return means this epoch was superseded between the line above and
+	// this one, so everything below would wire a DEAD epoch: the VRF resolve,
+	// the HA watchdog heartbeat, the control heartbeat goroutine and the
+	// session-sync constructor. Their own publishes are epoch-gated and would
+	// drop, so nothing incorrect is installed — but the goroutines are not
+	// merely wasted work. They run on `commsCtx`, whose cancel the newer epoch
+	// has already overwritten in `clusterCommsCancel`, so nothing can cancel
+	// them: `stopClusterComms` would call the NEWER epoch's cancel. They would
+	// live until the daemon context dies, i.e. for the life of the process.
+	//
+	// Cancelling our own sub-context on the way out is the other half. Returning
+	// without it leaks the context itself (nothing else holds that cancel), and
+	// cancelling here is safe precisely because we have launched nothing on it
+	// yet — this is the first statement after the epoch opens.
+	if !d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg)) {
+		commsCancel()
+		return
+	}
 
 	vrfDevice := d.resolveClusterVRFDevice(cc)
 
@@ -1219,6 +1247,38 @@ func (d *Daemon) stopClusterComms() {
 	d.sessionSync = nil
 	d.fabricRefreshCh = nil
 	d.fabricRefreshCh1 = nil
+	// #7072: activeClusterTransport is DELIBERATELY NOT cleared here, and the
+	// issue that asked for it is refuted by measurement rather than argument.
+	//
+	// Its premise was that the stale value is unreachable because the only
+	// stopClusterComms call site is step 20's, which starts comms again on the
+	// next line. There is a SECOND site: bootstrap.go's rollback teardown stops
+	// comms and RETURNS. That path is real, and on it this field is the only
+	// memory of which transport comms were using.
+	//
+	// Measured on the bootstrap-rollback shape — stop, then a corrected commit
+	// carrying a DIFFERENT transport key — by driving the real applyTailReconciles
+	// with a counting startClusterCommsFn:
+	//
+	//     field retained (today):  restarts=1  -> comms recover
+	//     field cleared:           restarts=0  -> comms stay down
+	//
+	// Step 20's guard is `active != zero && newTransport != active`. Clearing
+	// makes the FIRST conjunct false, so it fails in both directions, and the only
+	// other production startClusterComms call site is daemon_run.go's boot path —
+	// so the node would hold a valid cluster config with no heartbeat, no session
+	// sync and no fabric refresh until the process restarts.
+	//
+	// The field therefore carries TWO meanings, and the name only says one:
+	// "which transport the running comms use", and "comms have run at least once,
+	// so step 20 may act". The second is load-bearing in the other direction too —
+	// the boot applyConfig runs BEFORE daemon_run.go:405's startClusterComms, so
+	// `active != zero` is what keeps step 20 out of the boot window that line is
+	// deliberately positioned after. Read it as LAST PUBLISHED transport, not as
+	// "comms are up"; `sessionSync == nil` is what says comms are down.
+	//
+	// Bound by TestBootstrapRollbackThenCorrectedCommitRecovers_7072 (this is the
+	// cell a clear fails) and TestStepTwentyIgnoresANeverStartedNode_7072.
 	d.clusterCommsMu.Unlock()
 
 	if ss != nil {

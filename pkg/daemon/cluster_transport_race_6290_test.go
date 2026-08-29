@@ -122,7 +122,7 @@ func TestSetActiveTransportDropsStaleEpoch(t *testing.T) {
 	stale := clusterTransportKey{ControlInterface: "STALE", PeerAddress: "10.99.9.9"}
 
 	// Open an epoch and publish under it: the live state.
-	_, gen := d.beginClusterCommsEpoch(context.Background())
+	_, gen, _ := d.beginClusterCommsEpoch(context.Background())
 	if !d.setActiveTransportIfCurrent(gen, fresh) {
 		t.Fatal("publish under the CURRENT epoch must be accepted")
 	}
@@ -131,7 +131,7 @@ func TestSetActiveTransportDropsStaleEpoch(t *testing.T) {
 	}
 
 	// A restart supersedes it. The prior epoch's publish must now be dropped.
-	_, newGen := d.beginClusterCommsEpoch(context.Background())
+	_, newGen, _ := d.beginClusterCommsEpoch(context.Background())
 	if newGen == gen {
 		t.Fatal("precondition: beginClusterCommsEpoch must advance the generation")
 	}

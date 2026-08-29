@@ -26,12 +26,12 @@ func TestStartClusterCommsPublishDropsStaleEpoch(t *testing.T) {
 	d := &Daemon{}
 
 	// Epoch 1: a constructor goroutine starts resolving its sync address.
-	_, gen1 := d.beginClusterCommsEpoch(context.Background())
+	_, gen1, _ := d.beginClusterCommsEpoch(context.Background())
 	ss1 := &cluster.SessionSync{} // what the slow epoch-1 constructor would publish
 
 	// A transport-change commit restarts comms: a new epoch supersedes epoch 1
 	// while its constructor is still resolving.
-	_, gen2 := d.beginClusterCommsEpoch(context.Background())
+	_, gen2, _ := d.beginClusterCommsEpoch(context.Background())
 	if gen2 == gen1 {
 		t.Fatalf("beginClusterCommsEpoch did not advance the generation: gen1=%d gen2=%d", gen1, gen2)
 	}
@@ -64,7 +64,7 @@ func TestStartClusterCommsPublishDropsStaleEpoch(t *testing.T) {
 func TestStopClusterCommsSupersedesInflightConstructor(t *testing.T) {
 	d := &Daemon{}
 
-	_, gen1 := d.beginClusterCommsEpoch(context.Background())
+	_, gen1, _ := d.beginClusterCommsEpoch(context.Background())
 	ss1 := &cluster.SessionSync{}
 
 	// Tear comms down (no cluster/sessionSync wired yet — the constructor is
@@ -85,11 +85,11 @@ func TestStopClusterCommsSupersedesInflightConstructor(t *testing.T) {
 func TestPublishFabricRefreshChansDropsStaleEpoch(t *testing.T) {
 	d := &Daemon{}
 
-	_, gen1 := d.beginClusterCommsEpoch(context.Background())
+	_, gen1, _ := d.beginClusterCommsEpoch(context.Background())
 	stale0 := make(chan struct{}, 1)
 	stale1 := make(chan struct{}, 1)
 
-	_, gen2 := d.beginClusterCommsEpoch(context.Background())
+	_, gen2, _ := d.beginClusterCommsEpoch(context.Background())
 	live0 := make(chan struct{}, 1)
 	live1 := make(chan struct{}, 1)
 
@@ -113,7 +113,7 @@ func TestPublishFabricRefreshChansDropsStaleEpoch(t *testing.T) {
 func TestClusterCommsPublishConcurrentIsRaceFree(t *testing.T) {
 	d := &Daemon{}
 
-	_, liveGen := d.beginClusterCommsEpoch(context.Background())
+	_, liveGen, _ := d.beginClusterCommsEpoch(context.Background())
 	live := &cluster.SessionSync{}
 	if !d.publishSessionSyncIfCurrent(liveGen, live) {
 		t.Fatal("failed to publish the live epoch")
