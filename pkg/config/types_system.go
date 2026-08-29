@@ -12,20 +12,29 @@ import (
 
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
-	HostName           string
-	DomainName         string   // system domain-name (e.g. "example.com")
-	DomainSearch       []string // system domain-search (search domains)
-	TimeZone           string
-	NameServers        []string // DNS server addresses
-	NTPServers         []string // NTP server addresses
-	NTPThreshold       int      // NTP threshold in seconds (0 = default)
-	NTPThresholdAction string   // "accept" or "reject"
-	NoRedirects        bool     // disable ICMP redirects
-	BackupRouter       string   // backup default gateway IP
-	BackupRouterDst    string   // backup router destination prefix
-	Lo0FilterInputV4   string   // lo0 unit 0 family inet filter input (host-bound filtering)
-	Lo0FilterInputV6   string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType      string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
+	HostName     string
+	DomainName   string   // system domain-name (e.g. "example.com")
+	DomainSearch []string // system domain-search (search domains)
+	TimeZone     string
+	NameServers  []string // DNS server addresses
+	NTPServers   []string // NTP server addresses
+	// NTPServerOptions carries the Junos per-server MODIFIERS, keyed by the
+	// server address they follow (#7132). Empty for a server authored without
+	// modifiers, which is the common case.
+	//
+	// Kept BESIDE NTPServers rather than replacing it with a struct slice: every
+	// existing consumer reads the address list and none of them needed changing,
+	// so widening the shared field would have been churn in three packages to
+	// serve one of them.
+	NTPServerOptions   map[string]NTPServerOption
+	NTPThreshold       int    // NTP threshold in seconds (0 = default)
+	NTPThresholdAction string // "accept" or "reject"
+	NoRedirects        bool   // disable ICMP redirects
+	BackupRouter       string // backup default gateway IP
+	BackupRouterDst    string // backup router destination prefix
+	Lo0FilterInputV4   string // lo0 unit 0 family inet filter input (host-bound filtering)
+	Lo0FilterInputV6   string // lo0 unit 0 family inet6 filter input (host-bound filtering)
+	DataplaneType      string // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
 	UserspaceDataplane *UserspaceConfig
 	InternetOptions    *InternetOptionsConfig
 	Services           *SystemServicesConfig
@@ -1932,4 +1941,25 @@ type DHCPStaticBinding struct {
 	// HostName is the optional reservation hostname (Kea `hostname`). Empty
 	// when not configured.
 	HostName string
+}
+
+// NTPServerOption is the set of Junos `system ntp server <addr>` per-server
+// modifiers (#7132). Before #7132 these were absorbed into the server address
+// list as if they were additional servers — `prefer` is a syntactically valid
+// hostname, so validation accepted it — and a hand-written keyword table in the
+// compiler existed solely to skip them. They are now modeled in setSchema as
+// modifier children of the `server` leaf, so the compiler reads them from the
+// AST instead of pattern-matching keywords.
+type NTPServerOption struct {
+	// Prefer marks this source preferred to chrony.
+	Prefer bool
+	// Key is the authentication key id (0 = unset).
+	Key int
+	// Version is the NTP protocol version to use (0 = chrony default).
+	Version int
+	// RoutingInstance is the VRF the server is reached in ("" = default).
+	// Recorded but not yet honoured by the chrony renderer — chrony has no
+	// per-source VRF directive, so acting on it needs a routing change rather
+	// than a config one.
+	RoutingInstance string
 }

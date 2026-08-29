@@ -22,7 +22,7 @@ func TestRenderChronySources_SkipsInjected_4902(t *testing.T) {
 		"pool.example.net",                  // valid hostname
 		"pool.example.net local stratum 10", // embedded space -> skip
 		"evil.example\nmakestep 1 -1",       // newline -> skip
-	})
+	}, nil)
 	// Valid servers still render.
 	if !strings.Contains(got, "server 10.0.0.1 iburst\n") {
 		t.Errorf("valid IP server dropped; got:\n%s", got)

@@ -154,7 +154,14 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // neither landed in a blind class, so no ceiling moved. That is the shape a
 // coverage ratchet is supposed to see when a gap is closed rather than papered
 // over: the floor rises and the blind spots stay put.
-const gateCoverageFloor = 689
+//
+// #7132 raised it 689 -> 691. Modeling the `system ntp server` modifiers as
+// schema children made `key`, `version` and `routing-instance` COMPARE (+3),
+// while `prefer` moved into `flag` (+1 there, see the ceiling below) — a net
+// +2 here. The gate itself asked for this: it reports a floor it can now beat
+// as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
+// leaving it slack would let a later regression drop back to 689 unnoticed.
+const gateCoverageFloor = 691
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -183,7 +190,22 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// TestStreamSourceInterfaceIsValidated_6875, and both apply paths by the
 	// daemon and CLI cells; it is blind to THIS instrument only.
 	gateBlindUnreachable: 144,
-	gateBlindFlag:        175,
+	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
+	//
+	// Raised deliberately, and it is the one kind of raise that is not a
+	// concession: this class is "read, but value-less", and the spelling
+	// differential works by VARYING a leaf's value. Junos `prefer` takes no
+	// argument, so it has no value to vary — it cannot be made to compare by
+	// any change to the gate or to the schema, the way a #7492-style
+	// parent-stanza fix can rescue an `unreachable` leaf. It is in this class
+	// by construction, not by omission.
+	//
+	// It is not untested: both spellings of `prefer` are pinned by the #7132
+	// cells, which is also how its compact-spelling blindness was found. That
+	// blindness was invisible to TestCompactBlockEquivalenceInventory2419 for
+	// exactly the reason it is invisible here — that gate detects "the compact
+	// spelling drops the VALUE", and a value-less flag has none to drop.
+	gateBlindFlag:        176,
 	gateBlindErr:         43,
 	gateBlindValueMoves:  1,
 }

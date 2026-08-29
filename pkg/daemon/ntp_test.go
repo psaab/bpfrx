@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderChronySources(t *testing.T) {
-	got := renderChronySources([]string{"10.0.0.1", "pool.example.net"})
+	got := renderChronySources([]string{"10.0.0.1", "pool.example.net"}, nil)
 	want := "server 10.0.0.1 iburst\npool pool.example.net iburst\n"
 	if got != want {
 		t.Fatalf("renderChronySources() = %q, want %q", got, want)

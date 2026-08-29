@@ -368,7 +368,6 @@ system login user xpfarg authentication ssh-rsa
 system login user xpfarg class
 system master-password pseudorandom-function
 system name-server
-system ntp server
 system root-authentication encrypted-password
 system root-authentication ssh-dsa
 system root-authentication ssh-ed25519
