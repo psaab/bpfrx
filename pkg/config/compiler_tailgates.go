@@ -105,7 +105,14 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// the session identity (Track B — a routing-domain id in SessionKey) is an
 	// OPEN #2387 decision, so the warning states the limitation and points at
 	// the issue rather than promising a fix.
-	cfg.Warnings = append(cfg.Warnings, validateVRFOverlap(cfg)...)
+	// #7924: now returns an error for the NARROW cross-tenant case (overlap AND a
+	// PBR `then routing-instance` term). The warnings are appended either way, so
+	// the lenient path keeps the pre-#7924 advisory verbatim.
+	vrfOverlapWarnings, err := validateVRFOverlap(cfg, opts.lenientVRFOverlapPBR)
+	cfg.Warnings = append(cfg.Warnings, vrfOverlapWarnings...)
+	if err != nil {
+		return err
+	}
 
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
