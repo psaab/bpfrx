@@ -85,10 +85,14 @@ const (
 // routing-instances for overlap (net/netip Prefix.Overlaps — contains-or-equal).
 // Deterministic ordering (sorted RI names, sorted filter names, sorted
 // prefixes) so the warning set is stable across commits.
-func validateVRFOverlap(cfg *Config, lenientPBR bool) ([]string, error) {
+func validateVRFOverlap(cfg *Config, lenientPBR bool) ([]string, []VRFOverlapAdmission, error) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
+	// #7991: the structured findings the runtime reporter exports. Built at the
+	// SAME points the warnings are, and the warnings are rendered FROM them, so a
+	// metric and an advisory can never describe different detections.
+	var admissions []VRFOverlapAdmission
 	// #7924: does ANY PBR term steer into a routing-instance? This is the second
 	// half of the narrow rejection condition, and it is deliberately a
 	// config-level fact rather than a property of the overlapping pair.
@@ -243,25 +247,13 @@ Scan:
 						truncated = true
 						break Scan
 					}
-					if a.prefix == b.prefix {
-						warnings = append(warnings, fmt.Sprintf(
-							"routing-instance %q (%s) and %q (%s) both carry %s: "+
-								"overlapping L3 across routing-instances is forwarded via "+
-								"PBR but is NOT session-isolated (#2387) — the session "+
-								"identity carries no routing-instance discriminator, so "+
-								"colliding 5-tuples may cross-forward. See #2387 for the "+
-								"status of this limitation",
-							riA, a.origin, riB, b.origin, a.prefix))
-					} else {
-						warnings = append(warnings, fmt.Sprintf(
-							"routing-instance %q (%s, %s) and %q (%s, %s) carry "+
-								"overlapping L3: overlapping L3 across routing-instances is "+
-								"forwarded via PBR but is NOT session-isolated (#2387) — the "+
-								"session identity carries no routing-instance discriminator, "+
-								"so colliding 5-tuples may cross-forward. See #2387 for the "+
-								"status of this limitation",
-							riA, a.origin, a.prefix, riB, b.origin, b.prefix))
+					found := VRFOverlapAdmission{
+						InstanceA: riA, InstanceB: riB,
+						PrefixA: a.prefix.String(), PrefixB: b.prefix.String(),
+						OriginA: a.origin, OriginB: b.origin,
 					}
+					admissions = append(admissions, found)
+					warnings = append(warnings, found.warning())
 				}
 			}
 		}
@@ -284,7 +276,7 @@ Scan:
 	// currently forward correctly; it does not make that configuration work, and
 	// it must not become a substitute for #7160.
 	if len(warnings) > 0 && sawPBRRoutingInstance && !lenientPBR {
-		return warnings, fmt.Errorf(
+		return warnings, admissions, fmt.Errorf(
 			"overlapping L3 across routing-instances combined with a PBR `then "+
 				"routing-instance` term is refused: the session identity carries no "+
 				"routing-instance discriminator, and the established-session fast path "+
@@ -294,5 +286,89 @@ Scan:
 				"Overlapping VRF address space WITHOUT PBR steering still commits with a "+
 				"warning. First overlap: %s", warnings[0])
 	}
-	return warnings, nil
+	// #7991: the findings are reported ONLY when PBR steering is present — that
+	// is the combination the strict path refuses, and therefore the only one a
+	// tolerant load can be said to have ADMITTED. Plain VRF overlap with no PBR
+	// term commits on the strict path too, so reporting it would make the metric
+	// fire on configurations that are not in the tolerant-admitted state at all.
+	if !sawPBRRoutingInstance {
+		admissions = nil
+	}
+	return warnings, admissions, nil
+}
+
+// VRFOverlapAdmission is one cross-routing-instance L3 overlap that the STRICT
+// commit path refuses when combined with PBR `then routing-instance` steering,
+// but that a TOLERANT load (an already-persisted config at upgrade, or HA
+// peer-sync — `lenientVRFOverlapPBR`) admits (#7991).
+//
+// It exists so the tolerant-admitted state has a machine-readable runtime
+// signal, mirroring #3718's AmbiguousHostInboundAddress. #3718 is the
+// structurally identical case — "the tolerant path admitted something strict
+// rejects" — and it has a metric; an operator who knows to look for that metric
+// reads its absence here as the condition being absent, when it means nobody
+// exported it.
+type VRFOverlapAdmission struct {
+	// InstanceA, InstanceB are the two routing-instance names, in the scan's
+	// deterministic (sorted) order.
+	InstanceA, InstanceB string
+	// PrefixA, PrefixB are the overlapping prefixes, masked. Equal when the two
+	// instances carry the identical prefix.
+	PrefixA, PrefixB string
+	// OriginA, OriginB record where each prefix came from (a member interface,
+	// or a PBR `then routing-instance` term), for the warning text.
+	OriginA, OriginB string
+}
+
+// warning renders the operator-facing advisory for one overlap. The warning and
+// the metric are produced from the SAME finding so they can never disagree about
+// what was detected — the failure mode that a second copy of the scan would
+// have, and the reason this is a formatter rather than an inline Sprintf.
+func (o VRFOverlapAdmission) warning() string {
+	if o.PrefixA == o.PrefixB {
+		return fmt.Sprintf(
+			"routing-instance %q (%s) and %q (%s) both carry %s: "+
+				"overlapping L3 across routing-instances is forwarded via "+
+				"PBR but is NOT session-isolated (#2387) — the session "+
+				"identity carries no routing-instance discriminator, so "+
+				"colliding 5-tuples may cross-forward. See #2387 for the "+
+				"status of this limitation",
+			o.InstanceA, o.OriginA, o.InstanceB, o.OriginB, o.PrefixA)
+	}
+	return fmt.Sprintf(
+		"routing-instance %q (%s, %s) and %q (%s, %s) carry "+
+			"overlapping L3: overlapping L3 across routing-instances is "+
+			"forwarded via PBR but is NOT session-isolated (#2387) — the "+
+			"session identity carries no routing-instance discriminator, "+
+			"so colliding 5-tuples may cross-forward. See #2387 for the "+
+			"status of this limitation",
+		o.InstanceA, o.OriginA, o.PrefixA, o.InstanceB, o.OriginB, o.PrefixB)
+}
+
+// TolerantVRFOverlapAdmissions returns the overlaps that make this config one
+// the STRICT commit path would refuse — cross-routing-instance L3 overlap AND a
+// PBR `then routing-instance` term — in the detector's deterministic order.
+// Empty for every config the strict path would accept.
+//
+// WHAT A NON-EMPTY RESULT MEANS, because a metric nobody can interpret is not an
+// improvement: on such a box a second flow sharing a 5-tuple hits the FIRST
+// flow's conntrack entry and inherits its cached egress, NAT and POLICY
+// decision. The established-session fast path runs before the PBR table override
+// and has no policy call at all, and the per-packet re-checks that do run use
+// the session's CACHED zone. So tenant-b's packets leave via tenant-a's egress
+// with tenant-a's NAT, never adjudicated by any policy. That is a cross-tenant
+// forwarding path, not a configuration-hygiene advisory.
+//
+// Runs the SAME detector the commit gate runs (leniently, so it reports rather
+// than errors), for the reason #3718's reporter states about its own builder:
+// the observability signal can never disagree with what the gate decided,
+// because there is only one scan. It is bounded by the same
+// vrfOverlapMaxComparisons budget, so a pathological config cannot make a
+// metrics scrape expensive.
+func TolerantVRFOverlapAdmissions(cfg *Config) []VRFOverlapAdmission {
+	if cfg == nil {
+		return nil
+	}
+	_, admissions, _ := validateVRFOverlap(cfg, true)
+	return admissions
 }

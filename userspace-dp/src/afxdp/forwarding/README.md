@@ -344,9 +344,27 @@ limitation, tracked by #2387.
 - **Interim mitigation + candidate real fix (UNDECIDED).** The Go compiler
   emits a commit WARNING (`validateVRFOverlap`, `pkg/config`) when two
   distinct routing-instances carry overlapping L3 address space, so the
-  operator is told the topology is not session-isolated (the config still
-  commits — an overlapping-subnet PBR VRF is a legitimate working design).
-  That warning states the limitation and points at #2387; it deliberately
+  operator is told the topology is not session-isolated. Plain overlap still
+  COMMITS — an overlapping-subnet PBR VRF is a legitimate working design —
+  but since **#7924** the narrow COMBINATION of overlap *and* a PBR `then
+  routing-instance` term is a strict-path **rejection**, because that
+  combination is the one the dataplane cannot forward correctly.
+
+  The strict rejection is not the whole story, and the residual is what
+  **#7991** surfaces. The tolerant load / peer-sync path
+  (`lenientVRFOverlapPBR`, #1960 no-brick) still admits the combination — a
+  config persisted before #7924 and loaded at upgrade, or one arriving from a
+  peer — so the condition is live on exactly the boxes that upgrade INTO the
+  fix. `config.TolerantVRFOverlapAdmissions` + the
+  `xpf_vrf_overlap_pbr_admitted{instance_a,instance_b,prefix}` gauge make that
+  state observable rather than a log line on apply, mirroring what #3718 does
+  for the structurally identical host-inbound case. Alert with
+  `max_over_time(xpf_vrf_overlap_pbr_admitted[1h]) > 0`; the reporter shares
+  the commit gate's detector, so the metric and the advisory can never describe
+  different detections. If #7160's Option B lands, the metric goes to zero and
+  stays there, which is itself the confirmation.
+
+  The warning states the limitation and points at #2387; it deliberately
   does NOT promise a fix, because none is committed to. The candidate fix
   (Track B) *would* add a **symmetric routing-domain id** to `SessionKey` +
   `FlowCacheLookup` + the reverse-key transforms — if taken, the

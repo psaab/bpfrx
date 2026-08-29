@@ -119,6 +119,31 @@ func (c *xpfCollector) initHostInboundDescriptors() {
 			"address and family.",
 		[]string{"address", "family"}, nil,
 	)
+	// #7991: 1 per cross-routing-instance L3 overlap on a box whose config also
+	// carries a PBR `then routing-instance` term. That COMBINATION is what the
+	// strict commit gate refuses (#7924); a tolerant / peer-synced load admits
+	// it, and until #7991 the only surface was a log line on apply.
+	//
+	// It is not a hygiene advisory. On an affected box a second flow sharing a
+	// 5-tuple hits the FIRST flow's conntrack entry: the established-session
+	// fast path runs BEFORE the PBR table override and makes no policy call at
+	// all, so tenant-b's packets leave via tenant-a's egress with tenant-a's NAT
+	// having never been adjudicated by any policy. The HELP text says so,
+	// because a metric whose meaning lives only in an issue is a metric nobody
+	// can act on. Absent = the config is not in the tolerant-admitted state.
+	c.vrfOverlapPBRAdmitted = prometheus.NewDesc(
+		"xpf_vrf_overlap_pbr_admitted",
+		"1 per cross-routing-instance L3 overlap admitted together with PBR "+
+			"`then routing-instance` steering — a combination the strict commit "+
+			"path REFUSES (#7924) and only a tolerant/peer-synced load admits. "+
+			"Sessions are keyed on the bare 5-tuple with no routing-instance "+
+			"discriminator and the established-session fast path runs before the "+
+			"PBR table override with no policy call, so a colliding 5-tuple in "+
+			"the second instance is forwarded out the FIRST instance's egress "+
+			"with its NAT and without policy adjudication (#2387/#7160). "+
+			"Labeled by the two routing instances and the overlapping prefix.",
+		[]string{"instance_a", "instance_b", "prefix"}, nil,
+	)
 	// #4422: per-`then count` hit counters for the kernel lo0 loopback input
 	// filter (`inet xpf_lo0` table). lo0 host-inbound traffic is enforced by
 	// the KERNEL nftables chain (not the userspace fast path), so its
