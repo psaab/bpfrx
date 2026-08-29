@@ -235,6 +235,28 @@ type SessionValue struct {
 	// Also part of the on-map C conntrack ABI.
 	IngressVlanID uint16
 
+	// IngressIfaceFold is the #7095 CLUSTER-STABLE fold of the session's
+	// ingress interface name, carried on the HA session-sync wire so the
+	// #4983 identity survives a failover.
+	//
+	// It exists because IngressIfindex cannot cross the wire: an ifindex is
+	// NODE-LOCAL, so the originating node's value names a different NIC on the
+	// importing node. This is instead a fold of the RETH-RELATIVE name
+	// (config.StableIfaceID over config.ClusterStableIfaceName), which both
+	// chassis agree on by construction and each resolves to its own member.
+	//
+	// ZERO MEANS UNKNOWN, and three different things produce it on purpose:
+	// a legacy peer that sends no field at all (the wire slot is length-gated,
+	// the #2170 Generation pattern), a session whose ingress interface has no
+	// cluster-stable name, and a fabric-redirected session, which records no
+	// ingress identity at all because the fabric stamp carries a u16 zone id
+	// and nothing else (#7096). The consumer's answer to all three is the same:
+	// fall back to the #4792 zone approximation rather than name a device.
+	//
+	// It is HA-wire metadata only and is not part of the on-map C conntrack
+	// ABI.
+	IngressIfaceFold uint32
+
 	// Generation is a per-(sender,key) monotonic install generation used
 	// by the HA session-sync deferred-delete guard (#2170). It is
 	// userspace-sync-only metadata — like the LogFlagUserspace* bits — and
@@ -599,6 +621,18 @@ type SessionValueV6 struct {
 	// (rolling-upgrade safe). A real id is never 0 (the allocator counter starts
 	// at 1), so the sentinel is unambiguous.
 	RTFlowSessionID uint64
+
+	// IngressIfaceFold is the #7095 cluster-stable ingress-interface fold, the
+	// v6 twin of the field on SessionValue. Same contract: a fold of the
+	// RETH-RELATIVE name (node-local ifindexes cannot cross the wire), carried
+	// as a length-gated trailing wire field, and 0 means unknown — legacy peer,
+	// no cluster-stable name, or a fabric-redirected session (#7096) — with the
+	// #4792 zone approximation as the consumer fallback for all three.
+	//
+	// It is a SEPARATE field on a SEPARATE type because v6 sessions travel
+	// through their own encoder and decoder; wiring only the v4 pair leaves
+	// every IPv6 session degraded after a failover.
+	IngressIfaceFold uint32
 }
 
 // ZoneConfig mirrors the C struct zone_config.
