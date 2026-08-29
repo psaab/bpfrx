@@ -104,7 +104,7 @@ func (c *ctl) cancelCmd() bool {
 func (c *ctl) dispatch(line string) error {
 	// Extract pipe filter (| match, | except, | find, | count, | last, | no-more).
 	// Skip | display set and | compare.
-	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
+	if cmd, pipeType, pipeArg, ok := cliterm.SplitPipe(line); ok {
 		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
 	}
 
@@ -115,26 +115,6 @@ func (c *ctl) dispatch(line string) error {
 }
 
 // extractPipe splits a line at the last "| <filter>" expression.
-func extractPipe(line string) (string, string, string, bool) {
-	idx := strings.LastIndex(line, " | ")
-	if idx < 0 {
-		return line, "", "", false
-	}
-	cmd := strings.TrimSpace(line[:idx])
-	pipe := strings.TrimSpace(line[idx+3:])
-	parts := strings.SplitN(pipe, " ", 2)
-	pipeType := parts[0]
-	var pipeArg string
-	if len(parts) > 1 {
-		pipeArg = parts[1]
-	}
-	switch pipeType {
-	case "match", "grep", "except", "find", "count", "last", "no-more":
-		return cmd, pipeType, pipeArg, true
-	default:
-		return line, "", "", false
-	}
-}
 
 // dispatchWithPipe runs the command and applies the pipe filter.
 //

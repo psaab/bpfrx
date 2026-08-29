@@ -25,6 +25,50 @@ import (
 // time; count keeps only a running tally; last keeps a bounded ring. None
 // buffers the full output (#4731, #7210).
 
+// SplitPipe splits a Junos command line into the command and its output-pipe
+// suffix, e.g. `show interfaces | match ge-` -> ("show interfaces", "match",
+// "ge-", true). Returns the line unchanged with ok=false when there is no pipe,
+// or when the token after `|` is not a filter this CLI implements.
+//
+// WHY THIS IS HERE AND NOT DUPLICATED, same argument as FilterStream below it,
+// and it is not hypothetical: the two surfaces carried byte-identical copies of
+// this splitter while the FILTER they feed was unified by #7210 — so the half
+// with a documented divergence bug (#4968: the remote copy lowercased both
+// operands, so `| match Foo` matched `foo` remotely and not locally) got one
+// implementation, and the half that decides WHERE THE COMMAND ENDS kept two.
+//
+// That half is now load-bearing for authorization. #7172 matches login-class
+// deny regexes against the command, and Junos matches the pipe as part of it —
+// `show configuration | save /tmp/x` writes a file, `| display set` reformats
+// output a deny may be withholding. If the authorization gate and the
+// dispatcher split the same line differently, they disagree about what the
+// operator ran, and that disagreement IS the bypass. Two copies can drift; one
+// cannot.
+//
+// The split is on the LAST " | " so a filter argument may itself contain a
+// pipe (`| match "a | b"`), and an unrecognized filter word returns the ORIGINAL
+// line untouched rather than a truncated command — the fail-safe direction for
+// a caller that is about to authorize what it gets back.
+func SplitPipe(line string) (cmd, pipeType, pipeArg string, ok bool) {
+	idx := strings.LastIndex(line, " | ")
+	if idx < 0 {
+		return line, "", "", false
+	}
+	cmd = strings.TrimSpace(line[:idx])
+	pipe := strings.TrimSpace(line[idx+3:])
+	parts := strings.SplitN(pipe, " ", 2)
+	pipeType = parts[0]
+	if len(parts) > 1 {
+		pipeArg = parts[1]
+	}
+	switch pipeType {
+	case "match", "grep", "except", "find", "count", "last", "no-more":
+		return cmd, pipeType, pipeArg, true
+	default:
+		return line, "", "", false
+	}
+}
+
 // MaxTailLines bounds the ring the `| last N` filter retains and grows,
 // independent of the operator-supplied N (#5037). `show` is a read-only
 // (PermView) command, so without a bound a viewer could run
