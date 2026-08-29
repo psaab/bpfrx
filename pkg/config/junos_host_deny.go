@@ -731,6 +731,20 @@ func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, 
 	}
 	// Per-netdev accumulation of the effective coarse verdict across every
 	// interface ref whose host-bound traffic arrives on it.
+	//
+	// #7173: this UNIONS the verdicts of VLAN siblings that share one physical
+	// parent — addRow calls note(parent, ...) for every unit — so a parent's
+	// entry is the union of what each of its units admits, not any single
+	// unit's. That is deliberate and it errs toward OVER-shielding: an
+	// exemption one unit needs is applied to the parent, so a sibling unit is
+	// shielded where it did not strictly have to be. It is safe in the
+	// direction that matters because the exempted services are authenticated
+	// (IKE) or self-limiting (ident-reset) and the units share a zone, so the
+	// union cannot admit anything the zone's own policy does not already allow.
+	//
+	// Recorded here rather than only in the issue: the natural "fix" is to make
+	// the parent entry per-unit, which would narrow the shield and is the wrong
+	// direction for a defense-in-depth surface.
 	type verdict struct{ ike, ident, fullAdmit bool }
 	byNetdev := make(map[string]*verdict, len(netdevs))
 	note := func(nd, ref string) {

@@ -108,6 +108,18 @@ func BuildProbePins(rpmCfg *config.RPMConfig, rethMap map[string]string) []Probe
 // physical member, slashes become dashes, and the default ".0" unit
 // suffix is stripped (VLAN units like ".50" are real kernel names and
 // are preserved). Mirrors the FRR static-route name translation.
+//
+// #7173: on a rethMap MISS the RETH base falls through to
+// config.LinuxIfName(base) — the raw translated Junos name — rather than
+// failing here. That is the safe direction and is deliberate: the resulting
+// name will not resolve, and the downstream LinkByName failure HOLDS the probe
+// instead of letting it run unpinned. A probe that is held is visibly broken; a
+// probe that silently ran against the wrong interface, or against no interface
+// at all, would report reachability it never measured and drive
+// ip-monitoring route injection off it.
+//
+// So do not "fix" the miss by substituting a default interface or by dropping
+// the pin — either turns a held probe into a false-passing one.
 func ResolveProbeInterface(name string, rethMap map[string]string) string {
 	if name == "" {
 		return ""
