@@ -301,11 +301,12 @@ func (s dataPlaneSessionStore) putClusterSyncedV4Raw(key SessionKey, val Session
 	if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 		return installer.SetClusterSyncedSessionV4(key, val)
 	}
-	val.FibIfindex = 0
-	val.FibVlanID = 0
-	val.FibDmac = [6]byte{}
-	val.FibSmac = [6]byte{}
-	val.FibGen = 0
+	// The row belongs to the PEER: strip every field that is meaningful only on
+	// the node that produced it before it lands in this node's maps. The list
+	// is single-sourced (#7097) — see ScrubNodeLocal in session_node_local.go
+	// for which fields and why, and for what went wrong when each install site
+	// kept its own copy.
+	val.ScrubNodeLocal()
 	return s.dp.SetSessionV4(key, val)
 }
 
@@ -356,11 +357,8 @@ func (s dataPlaneSessionStore) putClusterSyncedV6Raw(key SessionKeyV6, val Sessi
 	if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 		return installer.SetClusterSyncedSessionV6(key, val)
 	}
-	val.FibIfindex = 0
-	val.FibVlanID = 0
-	val.FibDmac = [6]byte{}
-	val.FibSmac = [6]byte{}
-	val.FibGen = 0
+	// IPv6 twin of the peer-owned scrub in putClusterSyncedV4Raw (#7097).
+	val.ScrubNodeLocal()
 	return s.dp.SetSessionV6(key, val)
 }
 
