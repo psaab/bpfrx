@@ -151,6 +151,21 @@ pub(crate) struct BindingWorker {
     /// cross-core sync; lazy allocation.
     pub(crate) pending_neigh:
         super::types::FastMap<(i32, std::net::IpAddr), PendingNeighPacket>,
+    /// #7156: deadline-ordered arming for `pending_neigh`. The map above stays
+    /// authoritative for packet state; this only decides WHEN each key is next
+    /// looked at, so a sweep with nothing due costs one heap peek instead of a
+    /// walk of every unresolved key. Exactly one entry per live map key --
+    /// see `neigh_schedule`'s header for why no tombstone can arise.
+    pub(crate) pending_neigh_schedule: crate::afxdp::neigh_schedule::PendingNeighSchedule,
+    /// #7156: last `ShardedNeighborMap::insert_generation` this worker acted on.
+    /// When it still matches, no neighbour has been inserted since the last
+    /// sweep, so no buffered key can have become resolvable and the sweep skips
+    /// the walk over every pending key entirely.
+    pub(crate) last_neigh_generation: (u64, usize),
+    /// #7156: reused key scratch for the resolution walk, so the walk that does
+    /// happen still allocates nothing steady-state (the old sweep built a fresh
+    /// Vec of every key on EVERY sweep — ~98 KiB per sweep at the cap).
+    pub(crate) pending_neigh_scan: Vec<(i32, std::net::IpAddr)>,
     /// #1651 B3: dead-host negative neighbor cache. Key
     /// `(egress_ifindex, next_hop)`; value = insertion `now_ns`. A dst is
     /// recorded when it times out in `pending_neigh` without resolving;
@@ -579,6 +594,9 @@ impl BindingWorker {
             // idle. Start at 0 capacity and let VecDeque grow on push as
             // packets actually queue up.
             pending_neigh: super::types::FastMap::default(),
+            pending_neigh_schedule: Default::default(),
+            last_neigh_generation: (0, 0),
+            pending_neigh_scan: Vec::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),
@@ -724,6 +742,9 @@ impl BindingWorker {
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
             pending_neigh: super::types::FastMap::default(),
+            pending_neigh_schedule: Default::default(),
+            last_neigh_generation: (0, 0),
+            pending_neigh_scan: Vec::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),
@@ -848,6 +869,9 @@ impl BindingWorker {
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
             pending_neigh: super::types::FastMap::default(),
+            pending_neigh_schedule: Default::default(),
+            last_neigh_generation: (0, 0),
+            pending_neigh_scan: Vec::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),

@@ -1302,6 +1302,7 @@ use neighbor_latency::NeighborLatencyTelemetry;
 
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.
+mod neigh_schedule;
 mod neighbor_dispatch;
 use neighbor_dispatch::{
     PendingNeighAdmission, build_missing_neighbor_session_metadata,
