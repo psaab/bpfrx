@@ -198,6 +198,26 @@ fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
     if parts.len() != 2 {
         return None;
     }
+    // #7077: DIGITS ONLY. `u8::from_str` accepts a leading `+`, so this
+    // parsed "2001:db8::/+48" as prefix_len 48 while Go's net.ParseCIDR --
+    // whose mask goes through `dtoi`, digits only -- rejects the same string.
+    // The two planes therefore disagreed about whether a rule installs, in the
+    // direction that matters: the Go pre-pass refused a config the helper would
+    // have accepted, and #6894 r9 had inferred "the helper rejects this" from
+    // "Go cannot parse this".
+    //
+    // Tightened HERE rather than loosened on the Go side because Go's grammar
+    // is the one an operator's config is written against and the one Junos
+    // parity is measured by. `+48` is not a mask length anyone means to write.
+    //
+    // Rejecting non-digits also settles the neighbouring shapes the same way
+    // Go already does: `-48`, `48+`, whitespace, `_` separators, `0x30`, and
+    // non-ASCII digits. Only the leading `+` actually changed behaviour; the
+    // rest were already refused by `u8::from_str` and are now refused one step
+    // earlier, by the same rule.
+    if parts[1].is_empty() || !parts[1].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let prefix_len: u8 = parts[1].parse().ok()?;
     let prefix_words = match prefix_len {
         48 => 3,

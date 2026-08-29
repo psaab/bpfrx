@@ -814,7 +814,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			// writes the retired eBPF map surface, while buildNptv6Snapshots
 			// copies Match/Then out of the config independently, so the rule
 			// still reaches the helper and is still installed.
-			helperInstalls := nptv6HelperWouldInstall(rule.Match, rule.Then)
+			helperInstalls := nptv6HelperWouldInstallFn(rule.Match, rule.Then)
 			reject := func(reason string, attrs ...any) error {
 				if !installed || helperInstalls {
 					compileWarn(dp, "nptv6: "+reason, attrs...)
