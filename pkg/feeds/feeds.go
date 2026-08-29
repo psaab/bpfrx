@@ -167,6 +167,11 @@ type feedState struct {
 	staleSince  time.Time // set when a fetch fails while a good snapshot is retained
 
 	cancel context.CancelFunc
+	// done is closed by refreshLoop on exit. #7174 C12a: StopAll waits on it,
+	// mirroring pkg/dhcp's dc.done and pkg/rpm's m.wg — the two sibling managers
+	// in this daemon that already cancel-and-JOIN. feeds was the only one that
+	// cancelled and returned, which made "stopped" mean "asked to stop".
+	done chan struct{}
 }
 
 // New creates a new feed manager.
@@ -366,6 +371,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 			url:          p.url,
 			holdInterval: p.hold,
 			cancel:       cancel,
+			done:         make(chan struct{}),
 		}
 		// Persisted feed (same name survives the reconfigure): inherit the
 		// last-good snapshot so there is no fail-open window (#5282).
@@ -429,15 +435,44 @@ func carryForwardSnapshot(dst, src *feedState) {
 }
 
 // StopAll cancels all running feed refresh goroutines.
+// #7174 C12a: cancel AND JOIN, mirroring pkg/dhcp's StopAll (`dc.cancel();
+// <-dc.done`) and pkg/rpm's (`m.cancel(); m.wg.Wait()`). feeds was the third
+// spelling of shutdown in one daemon, and the only one where StopAll could
+// return with its goroutines still running.
+//
+// THE RISK IS CONFIG REPLACEMENT, NOT SHUTDOWN. On daemon exit an unjoined
+// fetcher races process teardown and is mostly harmless. On a commit that
+// REMOVES a feed, StopAll cleared m.feeds and returned while that feed's fetch
+// was still in flight — so it could complete afterwards and install a snapshot
+// for a feed the operator had just removed. A shutdown-framed reading of this
+// misses that entirely, because teardown hides the window.
+//
+// Joining is cheap here and that is why it is the right answer rather than a
+// bounded-wait hedge: the fetch runs under `http.NewRequestWithContext`, so
+// cancelling ABORTS the in-flight request instead of waiting out the client
+// timeout. The usual "joining could block for the HTTP timeout" objection is
+// not true of this code.
+//
+// The snapshot-then-join shape (rather than joining under m.mu) is deliberate:
+// refreshLoop takes m.mu to install a snapshot, so waiting for it while holding
+// the lock would deadlock against the very goroutine being waited on.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
+	stopping := make([]*feedState, 0, len(m.feeds))
 	for _, fs := range m.feeds {
 		if fs.cancel != nil {
 			fs.cancel()
 		}
+		stopping = append(stopping, fs)
 	}
 	m.feeds = make(map[string]*feedState)
 	m.mu.Unlock()
+
+	for _, fs := range stopping {
+		if fs.done != nil {
+			<-fs.done
+		}
+	}
 }
 
 // GetPrefixes returns the current enforced prefixes for a named feed.
@@ -612,6 +647,13 @@ type FeedInfo struct {
 }
 
 func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.Duration) {
+	// #7174 C12a: signal StopAll that this goroutine has genuinely finished.
+	// Deferred so it closes on EVERY exit path, including a panic — a join that
+	// a panicking producer can strand is a hang, which is worse than the
+	// unjoined behaviour it replaced.
+	if fs.done != nil {
+		defer close(fs.done)
+	}
 	// Initial fetch
 	m.fetchFeed(ctx, fs)
 
