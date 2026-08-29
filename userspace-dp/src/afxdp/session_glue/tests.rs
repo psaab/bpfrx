@@ -806,7 +806,16 @@ fn lookup_forward_nat_across_scopes_returns_shared_nat_entry() {
         .expect("shared nat lock")
         .insert(reply_key.clone(), entry.clone());
 
-    let hit = lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &reply_key)
+    let hit = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared_nat_sessions,
+        &reply_key,
+        // #7169: these cells predate the ingress revalidation and test
+        // TUPLE matching, which is a separate property. Unconstrained keeps
+        // each one asserting exactly what it asserted before; the new check
+        // has its own cells.
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+    )
         .expect("shared forward nat hit");
     assert_eq!(hit.key, entry.key);
     assert_eq!(hit.decision, entry.decision);
@@ -858,7 +867,16 @@ fn lookup_forward_nat_across_scopes_prefers_shared_entry_over_fabric_wire_placeh
         .expect("shared nat lock")
         .insert(reply_key.clone(), shared_entry.clone());
 
-    let hit = lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &reply_key)
+    let hit = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared_nat_sessions,
+        &reply_key,
+        // #7169: these cells predate the ingress revalidation and test
+        // TUPLE matching, which is a separate property. Unconstrained keeps
+        // each one asserting exactly what it asserted before; the new check
+        // has its own cells.
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+    )
         .expect("shared nat hit");
     assert_eq!(hit.key, shared_entry.key);
     assert_eq!(hit.decision, shared_entry.decision);
@@ -896,7 +914,16 @@ fn lookup_forward_nat_across_scopes_ignores_fabric_wire_placeholder_without_shar
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
 
     assert!(
-        lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &reply_key).is_none()
+        lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared_nat_sessions,
+        &reply_key,
+        // #7169: these cells predate the ingress revalidation and test
+        // TUPLE matching, which is a separate property. Unconstrained keeps
+        // each one asserting exactly what it asserted before; the new check
+        // has its own cells.
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+    ).is_none()
     );
 }
 
@@ -930,7 +957,16 @@ fn lookup_forward_nat_across_scopes_returns_shared_canonical_reverse_entry() {
         .expect("shared nat lock")
         .insert(canonical_reply.clone(), entry.clone());
 
-    let hit = lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &canonical_reply)
+    let hit = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared_nat_sessions,
+        &canonical_reply,
+        // #7169: these cells predate the ingress revalidation and test
+        // TUPLE matching, which is a separate property. Unconstrained keeps
+        // each one asserting exactly what it asserted before; the new check
+        // has its own cells.
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+    )
         .expect("shared canonical reverse hit");
     assert_eq!(hit.key, entry.key);
     assert_eq!(hit.decision, entry.decision);
@@ -7448,4 +7484,249 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
          first-hit `break`, strands one of them"
     );
     assert_eq!(deleted_keys, vec![key], "control: the key was recorded (#6457)");
+}
+
+// ---------------------------------------------------------------------------
+// #7169: reverse-canonical matches are revalidated against the ARRIVAL zone.
+// ---------------------------------------------------------------------------
+
+/// One forward-NAT'd session in the shared scope, plus the reverse-canonical
+/// key that matches it. `test_metadata()` is ingress_zone 1 -> egress_zone 2, so
+/// a legitimate reply arrives in zone 2.
+fn nat_reverse_fixture_7169() -> (
+    SessionTable,
+    Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    SessionKey,
+) {
+    let sessions = SessionTable::new();
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4("10.0.61.5".parse().unwrap()),
+        dst_ip: IpAddr::V4("203.0.113.9".parse().unwrap()),
+        src_port: 40000,
+        dst_port: 443,
+    };
+    let decision = SessionDecision {
+        resolution: test_resolution(),
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4("198.51.100.8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    };
+    let reply_key = reverse_session_key(&key, decision.nat);
+    let shared = Arc::new(Mutex::new(FastMap::default()));
+    shared
+        .lock()
+        .expect("shared nat lock")
+        .insert(reply_key.clone(), entry);
+    (sessions, shared, reply_key)
+}
+
+/// #7169 fail-on-revert: a reverse-canonical match must be REJECTED when the
+/// packet arrived in a zone the forward flow did not egress to.
+///
+/// The index is keyed on the PRE-NAT reply tuple, so a match establishes only
+/// that this 5-tuple equals a live session's private-side reply tuple. Before
+/// this check, that alone installed a reverse session carrying the ORIGINAL
+/// flow's zone pair — so a packet injected from any segment where the client's
+/// private address is routable was adjudicated in a zone it never arrived in,
+/// and the installed session then took the established fast path with no policy
+/// evaluation for the rest of the flow's life.
+///
+/// The reply must arrive from the zone the forward flow EGRESSED to (2 here);
+/// zone 7 is the attacker's segment.
+///
+/// FAIL-ON-REVERT: delete the `ReverseIngress::Zone` arm's equality test in
+/// `revalidate_reverse_ingress` (or make it return `Some(m)` unconditionally)
+/// and this goes RED.
+#[test]
+fn a_reverse_match_from_the_wrong_zone_is_rejected_7169() {
+    let (sessions, shared, reply_key) = nat_reverse_fixture_7169();
+
+    // Positive control FIRST: the same lookup from the RIGHT zone matches, so
+    // the rejection below is the ingress check and not a broken fixture.
+    let ok = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared,
+        &reply_key,
+        crate::afxdp::shared_ops::ReverseIngress::Zone(2),
+    );
+    assert!(
+        ok.is_some(),
+        "control: a reply arriving in the forward flow's EGRESS zone must match"
+    );
+
+    let hijack = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared,
+        &reply_key,
+        crate::afxdp::shared_ops::ReverseIngress::Zone(7),
+    );
+    assert!(
+        hijack.is_none(),
+        "a packet matching a session's pre-NAT reply tuple but arriving in a \
+         zone the flow never egressed to must NOT match. Accepting it installs \
+         a reverse session adjudicated in the original flow's zone pair, which \
+         subsequent packets then ride past policy entirely (#7169)"
+    );
+}
+
+/// #7169: an arrival interface with no zone mapping fails CLOSED.
+///
+/// This is the arm that would otherwise be the whole hole again. Resolving the
+/// zone with a map lookup makes "no entry" the natural default, and treating
+/// that as "no constraint" would exempt exactly the traffic least accounted
+/// for. `Unzoned` exists so that outcome cannot be reached by accident — it is
+/// a distinct state from the deliberate exemption below.
+#[test]
+fn an_unzoned_arrival_interface_matches_nothing_7169() {
+    let (sessions, shared, reply_key) = nat_reverse_fixture_7169();
+    let out = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared,
+        &reply_key,
+        crate::afxdp::shared_ops::ReverseIngress::Unzoned,
+    );
+    assert!(
+        out.is_none(),
+        "an unmapped arrival interface gives nothing to revalidate against, so \
+         no reverse match may be synthesized"
+    );
+}
+
+/// #7169: the deliberate exemption still works, and is distinguishable from
+/// `Unzoned`.
+///
+/// Without this the two could be collapsed into one "no constraint" state, and
+/// the ICMP embedded-error path (which installs no session, and where an error
+/// may legitimately originate off-path) would be broken by the fix — or, worse,
+/// `Unzoned` would be made permissive to keep it working.
+#[test]
+fn an_unconstrained_caller_is_exempt_7169() {
+    let (sessions, shared, reply_key) = nat_reverse_fixture_7169();
+    let out = lookup_forward_nat_across_scopes(
+        &sessions,
+        &shared,
+        &reply_key,
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+    );
+    assert!(
+        out.is_some(),
+        "the ICMP embedded-error rewriters install no session and must keep \
+         matching; constraining them would break PMTUD"
+    );
+}
+
+/// #7169 / #7917: the synthesized reverse session's `ingress_ifindex` must stay
+/// 0 — "unobserved" — and must never be populated from the forward match.
+///
+/// #7169 was filed listing this zero as part of the defect. It is not, and the
+/// tempting repair is a regression: the forward flow's ingress is a PREDICTION
+/// of where a reply will arrive, not an OBSERVATION of where it did, so
+/// inheriting it makes the row confidently wrong. This guard exists because the
+/// issue text itself points at the wrong line.
+#[test]
+fn a_synthesized_reverse_records_no_ingress_ifindex_7169() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("afxdp")
+            .join("shared_ops.rs"),
+    )
+    .expect("shared_ops.rs must be readable");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Non-vacuity: if the builder moved or was renamed, the scan below proves
+    // nothing and must say so rather than pass.
+    assert!(
+        code.contains("fn build_reverse_session_from_forward_match"),
+        "build_reverse_session_from_forward_match not found — this guard is \
+         scanning for something that no longer exists"
+    );
+    assert!(
+        code.contains("ingress_ifindex: 0,"),
+        "the synthesized reverse session must record ingress_ifindex 0"
+    );
+    assert!(
+        !code.contains("ingress_ifindex: forward_match"),
+        "ingress_ifindex must NOT be inherited from the forward match: the \
+         forward ingress is where a reply was PREDICTED to arrive, not where it \
+         did (#7917). 0 means unobserved, which is truthful; a wrong interface \
+         is strictly worse than none (#6928)"
+    );
+}
+
+/// #7169 wiring guard: the MAIN packet path must resolve the arrival zone and
+/// hand it to the lookup.
+///
+/// The cells above drive `lookup_forward_nat_across_scopes` directly with an
+/// explicit `ReverseIngress`, so they bind the revalidation FUNCTION. They
+/// cannot see the thing that actually protects the dataplane: that
+/// `resolve_flow_session_decision` — the one caller that INSTALLS a reverse
+/// session from the match — passes a real zone rather than `Unconstrained`.
+/// Changing that one argument to `Unconstrained` reopens the hole completely
+/// and leaves every cell above green.
+///
+/// Source-shape because a behavioural cell would need to drive a ~20-argument
+/// function through a full session install; the property here is which argument
+/// the call site passes, which is exactly what source shape can state.
+/// Comments are stripped: this file names the symbols, and an unstripped scan
+/// would match the prose describing the invariant rather than the invariant.
+#[test]
+fn the_main_path_passes_a_resolved_arrival_zone_7169() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("afxdp")
+            .join("session_glue")
+            .join("mod.rs"),
+    )
+    .expect("session_glue/mod.rs must be readable");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Non-vacuity first: if the call moved or was renamed, everything below
+    // passes for free.
+    assert!(
+        code.contains("lookup_forward_nat_across_scopes("),
+        "session_glue/mod.rs no longer calls lookup_forward_nat_across_scopes — \
+         this guard is scanning for something that no longer exists"
+    );
+    assert!(
+        code.contains("ifindex_to_zone_id.get(&ingress_ifindex)"),
+        "the main path must resolve the ARRIVAL interface to a zone. Without \
+         this the reverse-canonical match is decided by tuple equality alone \
+         (#7169)"
+    );
+    assert!(
+        code.contains("ReverseIngress::Unzoned"),
+        "an unmapped arrival interface must fail CLOSED. If the resolution \
+         defaults to Unconstrained on a lookup miss, the check is bypassed for \
+         exactly the traffic least accounted for"
+    );
+    // The one exemption on this path is fabric ingress, and it must be
+    // conditional. An unconditional Unconstrained here is the whole hole.
+    assert!(
+        code.contains("if fabric_ingress {"),
+        "the only exemption on the installing path is fabric ingress, and it \
+         must be gated on it — an unconditional Unconstrained reopens #7169"
+    );
 }

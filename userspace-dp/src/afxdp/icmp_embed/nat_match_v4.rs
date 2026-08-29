@@ -39,7 +39,19 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
     // reply direction of a forward-NAT'd session. Recover the original
     // pre-NAT src + port from the forward key.
     if let Some(fwd) =
-        lookup_forward_nat_across_scopes(ctx.sessions, ctx.shared_nat_sessions, &reverse_key)
+        lookup_forward_nat_across_scopes(
+            ctx.sessions,
+            ctx.shared_nat_sessions,
+            &reverse_key,
+            // #7169: no ingress constraint here, and the reason is not
+            // that it is inconvenient. This path installs NO session — it
+            // uses the match only to recover the pre-NAT tuple for
+            // rewriting an embedded ICMP error — so there is no durable
+            // state to endorse a spoof. And an ICMP error may legitimately
+            // originate off-path from an intermediate router, so requiring
+            // it to arrive from the flow's egress zone would break PMTUD.
+            crate::afxdp::shared_ops::ReverseIngress::Unconstrained,
+        )
     {
         let nat = fwd.decision.nat;
         let original_src = fwd.key.src_ip;

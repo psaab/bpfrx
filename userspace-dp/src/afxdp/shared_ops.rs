@@ -699,7 +699,77 @@ pub(super) fn lookup_session_across_scopes(
         })
 }
 
+/// #7169: what the caller knows about where the packet being matched actually
+/// ARRIVED, so a reverse-canonical match can be revalidated against it.
+///
+/// The reverse-canonical index is keyed on a session's PRE-NAT reply tuple, so a
+/// match means only "this 5-tuple equals a live session's private-side reply
+/// tuple". Nothing about that establishes the packet came from where the reply
+/// was expected — and on the main path a match installs a reverse session
+/// carrying the original flow's zone pair, which then takes the established fast
+/// path with no policy evaluation. Tuple equality alone was deciding both.
+///
+/// Three states, deliberately, with no variant that silently means "skip":
+/// a lookup miss must not fail open into the same hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReverseIngress {
+    /// The zone the packet actually arrived in. A match is accepted only if the
+    /// forward session EGRESSED to this zone — a reply must come back from
+    /// where the flow went.
+    ///
+    /// Zone, not ifindex, on purpose: a zone can legitimately span interfaces,
+    /// so a reply may arrive on a different member (LAG, ECMP, a route change)
+    /// and still be the same flow. Ifindex equality would reject those. Zone is
+    /// also the granularity policy is written against, which is what the
+    /// synthesized session's metadata gets wrong.
+    Zone(u16),
+    /// The arrival interface has no zone mapping, so there is nothing to
+    /// revalidate against. Fails CLOSED: no reverse match is synthesized.
+    /// Distinct from `Unconstrained` precisely so an unmapped ifindex cannot
+    /// reach the same outcome as a deliberate exemption.
+    Unzoned,
+    /// The caller asserts no ingress constraint, and owes a reason at the call
+    /// site. Two hold today:
+    ///
+    /// * the ICMP embedded-error rewriters, which use the match only to recover
+    ///   a pre-NAT tuple and install NO session — and where an error may
+    ///   legitimately originate off-path (an intermediate router), so
+    ///   constraining the arrival zone would break PMTUD;
+    /// * a FABRIC-ingress packet, which arrives on the fabric link from the
+    ///   peer node rather than in its logical ingress zone, so its arrival zone
+    ///   is structurally not the flow's.
+    Unconstrained,
+}
+
+/// Apply the #7169 ingress revalidation to a candidate match.
+fn revalidate_reverse_ingress(
+    m: ForwardSessionMatch,
+    ingress: ReverseIngress,
+) -> Option<ForwardSessionMatch> {
+    match ingress {
+        ReverseIngress::Unconstrained => Some(m),
+        ReverseIngress::Unzoned => None,
+        // The reply must arrive from the zone the forward flow egressed to.
+        // On mismatch this returns NO MATCH rather than dropping: the packet
+        // then falls through to ordinary policy evaluation IN THE ZONE IT
+        // ACTUALLY ARRIVED IN, which is the correct adjudication. Dropping here
+        // would substitute one unconsidered verdict for another.
+        ReverseIngress::Zone(z) if m.metadata.egress_zone == z => Some(m),
+        ReverseIngress::Zone(_) => None,
+    }
+}
+
 pub(super) fn lookup_forward_nat_across_scopes(
+    sessions: &SessionTable,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    reply_key: &SessionKey,
+    ingress: ReverseIngress,
+) -> Option<ForwardSessionMatch> {
+    let m = lookup_forward_nat_across_scopes_inner(sessions, shared_nat_sessions, reply_key)?;
+    revalidate_reverse_ingress(m, ingress)
+}
+
+fn lookup_forward_nat_across_scopes_inner(
     sessions: &SessionTable,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
@@ -751,8 +821,29 @@ pub(super) fn build_reverse_session_from_forward_match(
             && now_secs <= ha_startup_grace_until_secs,
     );
     let metadata = SessionMetadata {
+        // #7169: this zone pair comes from the STORED forward session, i.e.
+        // from where the ORIGINAL flow went — not from where this packet
+        // arrived. That is safe only because the caller now revalidates the
+        // arrival zone against `metadata.egress_zone` before a match is
+        // returned (see `ReverseIngress`), so by the time this runs the two are
+        // necessarily equal. Remove that check and this line silently
+        // adjudicates a packet in a zone it never arrived in.
         ingress_zone: forward_match.metadata.egress_zone,
         egress_zone: forward_match.metadata.ingress_zone,
+        // #7917: DELIBERATELY 0, and not to be "fixed" by inheriting
+        // `forward_match.metadata.ingress_ifindex`.
+        //
+        // A synthesized reverse companion must not take the forward
+        // direction's ingress identity: the forward flow's ingress is a
+        // PREDICTION of where a reply will arrive, not an OBSERVATION of where
+        // it did. 0 means "unobserved", which is truthful; inheriting would
+        // make the row confidently wrong, which #6928 refused on the grounds
+        // that a wrong interface is strictly worse than none.
+        //
+        // #7169 was filed listing this zero as part of the defect. It is not.
+        // The defect was that nothing checked the ARRIVAL against the session
+        // being synthesized, which is a different repair — and the tempting one
+        // makes the record worse while leaving the hole open.
         ingress_ifindex: 0,
         ingress_vlan_id: 0,
         // Reverse companions are owned by the RG that currently owns the
