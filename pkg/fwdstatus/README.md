@@ -41,7 +41,16 @@ Three things about it are easy to break:
   discipline as `BufferKnown` beside `BufferPercent`.
 - `Format` renders **nothing** when there is no episode. The record is wiped on
   a successful restart, so the block reports the current crash episode, never a
-  history.
+  history. #5838's "last restart timestamp" is unbacked for that reason and is
+  tracked in #7967; every other field it names renders a row.
+- The headline is four named states over (`RestartPending` x `CrashLooping`),
+  and `RestartPending` picks it — a stopped helper reads "stopped", never
+  "CRASH LOOPING", because the loop predicate stays true after an intentional
+  stop.
+- `Format` is exported and takes a flat struct, so its guards must hold for
+  structs `Build` did not produce. Two mutations escaped the first matrix
+  because every cell reached the guard *through* `Build`, which sanitizes on the
+  way in; the cells that catch them construct `ForwardingStatus` directly.
 
 Both frontends must expose the accessor on their `forwardingStatus*Userspace*`
 adapter or the probe silently misses with **no compile error** —

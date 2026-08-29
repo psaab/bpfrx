@@ -811,6 +811,113 @@ func TestStoppedHelperIsNotRenderedAsRestartPending7250(t *testing.T) {
 		t.Errorf("the render must SAY that no retry is armed rather than staying "+
 			"silent about it.\n--- got ---\n%s", out)
 	}
+	// The HEADLINE must be "stopped", not the loop verdict. An operator reads
+	// the first line and acts on it, and "CRASH LOOPING" here sends them
+	// hunting a crash that is not currently happening.
+	if strings.Contains(out, "CRASH LOOPING") {
+		t.Errorf("a stopped helper was headlined as CRASH LOOPING. The loop predicate "+
+			"is true here (backoff is at the cap and LastExitWasCrash survives a stop), "+
+			"but the actionable fact is that nothing is retrying.\n--- got ---\n%s", out)
+	}
+	if !strings.Contains(out, "stopped") {
+		t.Errorf("a helper with no armed retry must be headlined as stopped.\n"+
+			"--- got ---\n%s", out)
+	}
+	// The loop history is still worth carrying, subordinate to the headline.
+	if !strings.Contains(out, "after a crash loop") {
+		t.Errorf("the crash-loop history was dropped entirely; it is subordinate "+
+			"detail, not noise.\n--- got ---\n%s", out)
+	}
+}
+
+// #5838's "crash-loop reason", satisfied BY DERIVATION rather than by a stored
+// string: CrashLooping() is `LastExitWasCrash && helperRestartDelay(Restarts)
+// >= helperRestartBackoffMax`, so the reason is determined by the restart count
+// plus the schedule reaching its ceiling — both already on the struct. A
+// derived reason cannot drift from the predicate it explains.
+func TestCrashLoopReasonIsDerivedFromTheRestartCount7250(t *testing.T) {
+	now := time.Now()
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("helper not running"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash: true,
+			RestartPending:   true,
+			Restarts:         9,
+			ExitCode:         101,
+			NextRestart:      now.Add(time.Minute),
+		},
+	}
+	fs := crashBuild(t, dp)
+	if !fs.HelperCrashLooping {
+		t.Fatalf("precondition: Restarts=9 must reach the backoff cap")
+	}
+	out := Format(fs)
+	if !strings.Contains(out, "Helper crash-loop reason") {
+		t.Errorf("no crash-loop reason rendered.\n--- got ---\n%s", out)
+	}
+	// The COUNT must appear: that is the input the derivation is built from,
+	// and a hardcoded sentence would pass a mere "reason row exists" check.
+	if !strings.Contains(out, "9 restarts") {
+		t.Errorf("the reason must name the restart count it was derived from, so an "+
+			"operator can see WHY the verdict fired rather than being asserted at.\n"+
+			"--- got ---\n%s", out)
+	}
+
+	// And it must NOT appear when the helper is not looping — otherwise the
+	// row is decoration rather than a verdict.
+	quiet := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("helper not running"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash: true, RestartPending: true, Restarts: 1, ExitCode: 101,
+		},
+	}
+	qfs := crashBuild(t, quiet)
+	if qfs.HelperCrashLooping {
+		t.Fatalf("precondition: Restarts=1 must NOT reach the backoff cap")
+	}
+	if strings.Contains(Format(qfs), "crash-loop reason") {
+		t.Error("a crash-loop reason was rendered for a helper that is not looping")
+	}
+}
+
+// THE MIDDLE ROW. A healthy box and an `exit status 101` crash are the two
+// ends, and a two-row table passes against a total flip of the discriminator.
+// The fixture that actually separates "keyed on the crash flag" from "keyed on
+// the exit code being non-zero" is a GENUINE crash whose exit code is 0.
+func TestAGenuineCrashWithExitCodeZeroStillRenders7250(t *testing.T) {
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("helper not running"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash: true,
+			RestartPending:   true,
+			ExitCode:         0, // the helper exited 0 when it should not have
+			Detail:           "exit status 0",
+			PID:              4242,
+			Restarts:         1,
+		},
+	}
+	out := Format(crashBuild(t, dp))
+	if !strings.Contains(out, "Helper exit code") {
+		t.Errorf("a real crash with exit code 0 rendered NO exit code row. The row must "+
+			"be gated on the crash being real, not on the code being non-zero — an "+
+			"unexpected clean exit is still an unexpected exit.\n--- got ---\n%s", out)
+	}
+	if !strings.Contains(out, "restart pending") {
+		t.Errorf("a real crash with exit code 0 was not reported as a crash at all.\n"+
+			"--- got ---\n%s", out)
+	}
 }
 
 // Signal is the discriminator: exactly one of ExitCode >= 0 and Signal != "" is

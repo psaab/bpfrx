@@ -699,19 +699,34 @@ would blackhole every flow handed to it.
     `ExitCode >= 0` discriminator, so a renderer keyed on the record
     alone prints "exit code 0" for a helper that never crashed. Same
     discipline as `BufferKnown` beside `BufferPercent`.
-  - The verdict row is **tri-state**, pairing the crash-loop verdict with
-    `RestartPending`. `CrashLooping()` stays true after an intentional
-    stop — `LastExitWasCrash` survives a stop by design and `Restarts`
-    survives with it — so a bare "CRASH LOOPING" banner would reassert at
-    the surface exactly the conflation #7250's data half removed from the
-    data.
+  - The headline is one of **four named states** over
+    (`RestartPending` x `CrashLooping()`), and **`RestartPending` picks
+    it**. `CrashLooping()` stays true after an intentional stop —
+    `LastExitWasCrash` survives a stop by design and `Restarts` survives
+    with it — so a helper that is merely stopped is headlined
+    **"stopped — after a crash loop"**, with the loop history as
+    subordinate detail. An operator reads the first line and acts on it,
+    and "CRASH LOOPING" on a stopped helper sends them hunting a crash
+    that is not currently happening. Same shape as
+    `firewallEffectiveLiveness`, whose third arm carries an explicit
+    reason rather than a flag.
+  - The crash-loop **reason** is **derived, not stored**.
+    `CrashLooping()` is
+    `LastExitWasCrash && helperRestartDelay(Restarts) >= helperRestartBackoffMax`,
+    so the reason is fully determined by the restart count plus the
+    schedule reaching its ceiling, and is rendered as
+    "restart backoff reached its maximum after N restarts". A reason
+    computed from visible inputs cannot drift from the predicate it
+    explains, which a string captured at decision time can.
 
-Still open from #5838's acceptance bullet: it asks for "last exit/**restart**
-timestamps" and a crash-loop **reason**. There is no last-restart timestamp,
-and there cannot be one inside this record — it is wiped wholesale on a
-successful restart — so the surface renders the last **exit** time, the restart
-**count**, and the next-restart deadline instead. `Detail` is the reason for the
-exit, not for the loop.
+**#5838's acceptance bullet is NOT fully closed, and the surface says so.**
+The crash-loop *reason* is satisfied by derivation (above). The **last-restart
+timestamp is not, and cannot be** with this data model: `restartHelperAfterCrash`
+zeroes the whole record on a successful restart, so such a field would be wiped
+by the very event it records. That makes it a question about where crash history
+lives rather than a field addition — tracked in **#7967**, not folded silently
+into the rendering change. Do not mark the bullet done: every other named field
+renders a row, so the missing one is invisible from the output.
 
 ## Armed-state admission contract (#2114 A3)
 

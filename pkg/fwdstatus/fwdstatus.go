@@ -193,6 +193,10 @@ func Format(fs *ForwardingStatus) string {
 // It follows that this surface describes the CURRENT crash episode, not a
 // history: once the helper recovers, the exit that preceded it is gone from the
 // record and cannot be rendered. Correlate with journald via the PID row.
+//
+// #5838's "last restart timestamp" is NOT rendered and cannot be: the record is
+// zeroed on a successful restart, so no such field could survive inside it.
+// Tracked in #7967 rather than papered over.
 func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 	// HelperCrashKnown first: a zero HelperCrashRecord is byte-identical to a
 	// healthy one, so without this gate an unreachable manager and a
@@ -204,24 +208,44 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 		return
 	}
 
-	// The verdict row is TRI-STATE, not a crash-looping boolean, because
-	// CrashLooping() stays true after an intentional stop: LastExitWasCrash
-	// survives a stop (the retry path reads it as debt) and Restarts survives
-	// with it, so the predicate keeps reporting "not coming back" when the
-	// real reason is "stopped", not "backoff exhausted". Pairing the verdict
-	// with RestartPending is what keeps those apart — a bare CRASH LOOPING
-	// banner here would re-create at the surface exactly the conflation the
-	// #7250 data half removed from the data.
+	// FOUR NAMED STATES over (RestartPending x HelperCrashLooping), not a
+	// crash-looping boolean with qualifiers.
+	//
+	// CrashLooping() stays true after an intentional stop — LastExitWasCrash
+	// survives a stop because the retry path reads it as debt, and Restarts
+	// survives with it — so the predicate keeps reporting "not coming back"
+	// when the real reason is "stopped", not "backoff exhausted".
+	//
+	// RestartPending therefore picks the HEADLINE and the loop verdict only
+	// refines it. An operator reads the first line and acts on it, so
+	// "CRASH LOOPING" on a stopped helper sends them hunting a crash that is
+	// not currently happening. "stopped, after a crash loop" is its own state
+	// rather than a qualifier bolted onto the loop state, following
+	// firewallEffectiveLiveness, whose third arm carries an explicit reason
+	// instead of a flag.
 	switch {
-	case fs.HelperCrashLooping && fs.RestartPending:
-		writeRow(b, "Helper", "CRASH LOOPING — retrying at the backoff cap")
+	case fs.RestartPending && fs.HelperCrashLooping:
+		writeRow(b, "Helper", "CRASH LOOPING — retrying at the backoff maximum")
 	case fs.RestartPending:
 		writeRow(b, "Helper", "crashed — restart pending")
+	case fs.HelperCrashLooping:
+		writeRow(b, "Helper", "stopped — after a crash loop, no restart armed")
 	default:
-		// LastExitWasCrash with no armed retry: the generation the timer was
-		// fenced on has been superseded, which is what an intentional stop
-		// does. Say so rather than implying a restart is coming.
-		writeRow(b, "Helper", "last exit was a crash — no restart armed")
+		writeRow(b, "Helper", "stopped — last exit was a crash, no restart armed")
+	}
+
+	// The crash-loop REASON, #5838's last-named field, rendered as a
+	// DERIVATION rather than a stored string.
+	//
+	// CrashLooping() is `LastExitWasCrash && helperRestartDelay(Restarts) >=
+	// helperRestartBackoffMax`, so the reason is fully determined by inputs
+	// already on this struct: the restart count, and the fact that the
+	// schedule reached its ceiling. Deriving it here cannot drift from the
+	// predicate it explains, which a string captured at decision time can.
+	if fs.HelperCrashLooping {
+		writeRow(b, "Helper crash-loop reason",
+			fmt.Sprintf("restart backoff reached its maximum after %d restarts",
+				fs.HelperRestarts))
 	}
 
 	if !fs.HelperLastExit.IsZero() {
