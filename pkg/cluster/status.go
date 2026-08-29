@@ -429,6 +429,21 @@ func (m *Manager) FormatInformation() string {
 			action = "disabled"
 		}
 		fmt.Fprintf(&b, "  Action: %s\n", action)
+		// #7147: under the acknowledged policy the counters are the only place
+		// the guarantee's actual delivery rate is visible. An operator who
+		// selected `disable-rg-confirmed` gets a fail-open takeover whenever
+		// the ack does not arrive, and without this line a cluster that failed
+		// open on EVERY takeover renders identically to one that was confirmed
+		// every time — the "Attempts:" history would have to be read line by
+		// line to tell them apart. Shown whenever the policy is armed or any
+		// ack traffic has ever happened, so a disarmed-but-used history keeps
+		// its numbers.
+		if syncStats != nil && (fenceAction == PeerFencingDisableRGConfirmed ||
+			syncStats.FenceAcksSent > 0 || syncStats.FenceAcksReceived > 0 ||
+			syncStats.FenceAcksTimedOut > 0) {
+			fmt.Fprintf(&b, "  Confirmations: received %d, timed out %d, sent to peer %d\n",
+				syncStats.FenceAcksReceived, syncStats.FenceAcksTimedOut, syncStats.FenceAcksSent)
+		}
 		if len(fenceEvents) == 0 {
 			fmt.Fprintln(&b, "  Attempts: none")
 		} else {

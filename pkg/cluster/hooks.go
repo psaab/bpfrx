@@ -1,5 +1,7 @@
 package cluster
 
+import "time"
+
 // SetPreManualFailoverHook registers a callback that runs before ManualFailover
 // changes local RG ownership.
 func (m *Manager) SetPreManualFailoverHook(fn func(rgID int) error) {
@@ -63,6 +65,15 @@ func (m *Manager) SetPeerFenceFunc(fn func() error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.peerFenceFn = fn
+}
+
+// SetPeerFenceConfirmFunc sets the callback used to send a SEQUENCED fence and
+// wait for the peer's confirmation of what it disabled (#7147). Consulted only
+// under `peer-fencing disable-rg-confirmed`.
+func (m *Manager) SetPeerFenceConfirmFunc(fn func(timeout time.Duration) (FenceAck, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFenceConfirmFn = fn
 }
 
 // SetPeerTimeoutGuard sets a callback that can suppress heartbeat-driven

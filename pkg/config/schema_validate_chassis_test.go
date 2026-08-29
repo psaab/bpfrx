@@ -90,8 +90,17 @@ var chassisLeafMatrix = []chassisLeafCase{
 		name:     "peer-fencing",
 		leaf:     "peer-fencing",
 		template: "set chassis cluster peer-fencing %s",
-		accept:   []string{"disable-rg"},
-		reject:   []string{"disable", "DISABLE-RG", "fence", ""},
+		// #7147 added disable-rg-confirmed. It MUST be in accept: without a
+		// row here the schema could reject the value the runtime branches on
+		// and the whole policy would be uncommittable, while every test that
+		// uses the Go constant directly stayed green.
+		accept: []string{"disable-rg", "disable-rg-confirmed"},
+		// The near-misses are deliberate: "disable-rg-confirm" and
+		// "disable-rg confirmed" are the two spellings an operator actually
+		// types, and a validator loosened to a prefix or substring match would
+		// accept both while still passing every accept row above.
+		reject: []string{"disable", "DISABLE-RG", "fence", "disable-rg-confirm",
+			"disable-rg-confirmedx", "confirmed", ""},
 	},
 	{
 		name:     "redundancy-group node priority",

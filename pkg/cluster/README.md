@@ -203,9 +203,12 @@ comms restart key.
   `FenceStatus()`: the CURRENTLY configured action (`disabled` when the
   `peer-fencing` leaf is absent, which can differ from the action past
   events were recorded under) plus every `EventFence` attempt and its
-  result. Do not confuse it with the "Install fence:" block above it —
-  that one is the bulk-sync install barrier (`LastFenceSeq`), not the
-  peer split-brain fence.
+  result. Under `disable-rg-confirmed` (#7147) it also renders a
+  `Confirmations:` line off `SyncStats` — `timed out` there counts
+  takeovers that proceeded WITHOUT the confirmation the operator asked
+  for, which no other counter distinguishes. Do not confuse it with the
+  "Install fence:" block above it — that one is the bulk-sync install
+  barrier (`LastFenceSeq`), not the peer split-brain fence.
 - `triggerGARP` (no-op/log hook today — native VRRP owns GARP),
   plus the gratuitous-ARP / unsolicited-NA burst senders — `garp.go`.
   `SendGratuitousARPBurst` / `SendGratuitousIPv6Burst` send the first
@@ -2641,6 +2644,33 @@ standby can re-initiate the primary's tunnels on takeover:
   self-clearing.
 
 ## DHCP-server lease sync (#2239)
+
+### Peer-fence acknowledgement (#7147)
+
+`peer-fencing disable-rg-confirmed` gates takeover on a peer-confirmed fence.
+The mechanism lives in `sync_fence_ack_7147.go` (wire + waiter) and
+`fence_confirm_7147.go` (policy); `docs/ha-failover-status.md` carries the
+operator-facing table.
+
+- **Wire** — one additive message type `syncMsgFenceAck = 35` carries
+  `{seq u64, status u8, rgs_fenced u16, rgs_total u16}` LE. `syncMsgFence`
+  gains an optional 8-byte sequence; seq 0 is RESERVED and means "no ack
+  requested", which is what a pre-#7147 sender's empty payload decodes to. A
+  capability bit rides the trailing byte of `syncMsgPeerCapabilities` (#6650),
+  which is why `sendCapabilities` is now unconditional — see its comment.
+  No `SessionSyncWireVersion` / `CurrentHAProtocolVersion` bump, for the same
+  reason as #2239 and #6650 below: `MinCompatHAProtocolVersion ==
+  CurrentHAProtocolVersion`, so the accepted window is a single point and a
+  bump would make `GateMixedBaseSwap` refuse the rolling upgrade.
+- **The ack means peer-CONFIRMED, not received.** It is written only after the
+  receiver's `fenceAllRedundancyGroups` returns, and reports what that
+  achieved. The decoder REFUSES a short frame rather than zero-filling it:
+  status 0 is `FenceAckOK`, so a lenient decode would turn fabric corruption
+  into a fabricated confirmation.
+- **It always fails open.** No connection, no capability, write error, timeout,
+  or a negative ack all proceed with the takeover, each recorded to
+  `EventFence` with its reason. `SendFenceAwait` returns immediately when there
+  is no active connection, so the ordinary dead-peer takeover pays nothing.
 
 DHCP-server (Kea) leases ride the SAME session-sync channel and follow the
 IPsec-SA-sync precedent (`QueueIPsecSA` / `peerIPsecSAs` /

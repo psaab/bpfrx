@@ -951,6 +951,14 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	}
 	connected := s.conn0 != nil || s.conn1 != nil
 	s.stats.Connected.Store(connected)
+	// #7147: release fence-ack waiters on ANY fabric drop, not only a full
+	// disconnect. The peer answers a fence on the connection it RECEIVED it
+	// on (sendFenceAck is handed the receive loop's conn), so once that
+	// connection is gone the ack can never arrive — the surviving fabric will
+	// not carry it. Leaving the waiter registered would make the takeover burn
+	// the whole FenceConfirmTimeout for an answer that is already impossible.
+	// Fail-open is preserved either way; this is what makes it immediate.
+	s.abortFenceAckWaiters()
 	if !connected {
 		pendingBarriers := s.barrierSeq.Load()
 		ackedBarriers := s.barrierAckSeq.Load()
@@ -1012,6 +1020,11 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// for), so a retained capability would authorise a push the new
 		// incarnation cannot represent.
 		s.peerSnapshotProtocol.Store(0)
+		// #7147: the capability flags are scoped to the same peer incarnation
+		// for the same reason, and a retained fence-ack bit is worse than a
+		// retained version: it would make every confirmed-fence takeover wait
+		// out its full timeout against a downgraded peer that cannot answer.
+		s.peerCapabilityFlags.Store(0)
 		// #5718 C01a: peerHeartbeatAckEver is a capability probe of the peer
 		// PROCESS, not of this node, so it must be scoped to the peer
 		// incarnation exactly like clockSynced above. Full disconnect ends

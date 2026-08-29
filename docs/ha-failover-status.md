@@ -472,17 +472,70 @@ Peer fencing:
 `disabled` when the leaf is absent — which can differ from the action the listed
 attempts were recorded under, because the event history outlives a config
 change. Each attempt line is one `handlePeerTimeout` fence decision and its
-outcome: `sent to peer`, `Fence failed: <err>` (the sync channel was down — the
-node still takes over on the heartbeat timeout), or `Fence skipped: sync not
-available` (no session-sync peer-fence function was armed).
+outcome.
 
-The fence is **best-effort and unacknowledged**: `SessionSync.SendFence`
-(`pkg/cluster/sync_failover.go`) writes `syncMsgFence` and returns; there is no
-fence-ack message on the wire. A `sent to peer` line therefore means the write
-reached the socket, not that the peer disabled its redundancy groups. Local
-takeover is consequently NOT gated on the fence — `handlePeerTimeout` runs
-`electSingleNode()` before it attempts the fence, so a dead peer (fence
+### `disable-rg` — best-effort, unacknowledged
+
+`SessionSync.SendFence` (`pkg/cluster/sync_failover.go`) writes `syncMsgFence`
+and returns; nothing is sent back. A `sent to peer` line therefore means the
+write reached the socket, not that the peer disabled its redundancy groups.
+Local takeover is consequently NOT gated on the fence — `handlePeerTimeout`
+runs `electSingleNode()` BEFORE it attempts the fence, so a dead peer (fence
 unreachable) can never block the survivor from forwarding.
+
+Attempt lines: `Fence disable-rg sent to peer`, `Fence failed: <err>` (the sync
+channel was down — the node still takes over on the heartbeat timeout), or
+`Fence skipped: sync not available` (no session-sync peer-fence function was
+armed).
+
+### `disable-rg-confirmed` — acknowledged, bounded, fail-open (#7147)
+
+`set chassis cluster peer-fencing disable-rg-confirmed` sends a SEQUENCED fence
+BEFORE the election and waits, bounded, for the peer to report what it
+disabled. `SendFenceAwait` (`pkg/cluster/sync_fence_ack_7147.go`) writes
+`syncMsgFence` carrying an 8-byte sequence number; the peer runs its fence and
+replies `syncMsgFenceAck` (type 35) carrying that sequence, a status, and the
+number of redundancy groups it drove to `rg_active=false` out of the number in
+its live config.
+
+**"Fenced" means peer-confirmed, not merely acknowledged.** The ack is written
+only after the receiver's `fenceAllRedundancyGroups` has run, and only a
+full-success result is reported as confirmed. A peer in config-only mode (no
+published dataplane) replies `unavailable` rather than a vacuous success over
+an empty RG set.
+
+**The gate never withholds ownership.** Every negative outcome proceeds with the
+takeover:
+
+| Situation | Cost | Attempt line |
+|---|---|---|
+| Peer not connected | none — returns immediately | `Fence unconfirmed, took over anyway: peer not connected` |
+| Peer predates #7147 | none — capability not advertised | `Fence unconfirmed, took over anyway: peer does not support fence acknowledgement` |
+| Sync channel dropped mid-wait | none — waiter released at once | `Fence unconfirmed, took over anyway: session sync disconnected...` |
+| Socket alive, peer silent | up to `FenceConfirmTimeout` (250 ms) | `Fence unconfirmed, took over anyway: timed out after 250ms...` |
+| Peer partly fenced | none | `Fence NOT confirmed (peer disabled only 1/3 redundancy groups), took over anyway` |
+| Peer confirmed | one fabric round trip | `Fence confirmed by peer (peer disabled 4/4 redundancy groups)` |
+
+The only row that spends the timeout is a peer whose TCP socket has not yet
+noticed it is gone. The ordinary dead-peer takeover costs nothing extra,
+because `SendFenceAwait` returns immediately when there is no active
+connection — there is nothing to wait for.
+
+A `Confirmations: received N, timed out N, sent to peer N` line accompanies
+`Action` whenever the policy is armed or any ack traffic has occurred. Read
+`timed out` as "takeovers that proceeded without the guarantee you selected";
+it is the only place that number appears, since `Fences sent` counts a
+confirmed and an unconfirmed takeover identically.
+
+**Mixed-version clusters are safe and need no coordinated upgrade.** Both wire
+changes are additive: `syncMsgFenceAck` is a new type that an old peer skips
+via the receive switch's missing `default` arm, and the fence sequence is
+trailing data on an existing type whose old receiver reads no payload. A
+fence-ack capability bit rides the trailing byte of `syncMsgPeerCapabilities`
+(#6650). Neither `SessionSyncWireVersion` nor `CurrentHAProtocolVersion` is
+bumped — bumping would push `GateMixedBaseSwap`'s single-point compatibility
+window off the peer's version and refuse the rolling upgrade this has to
+survive. A mixed pair degrades exactly to `disable-rg` behaviour on both sides.
 
 Do not read this block as the **Install fence:** block that appears above it in
 the same output — that one reports the bulk-sync install barrier sequence
