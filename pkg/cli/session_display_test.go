@@ -15,15 +15,28 @@ func TestSessionDisplayVLANID(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to unit number", func(t *testing.T) {
+	// #7153: it must NOT fall back to the unit number. A unit with no
+	// `vlan-id` is UNTAGGED on the wire — the compiler takes vlanID from
+	// unit.VlanID and networkd builds a `.N` sub-interface only when that is
+	// > 0 — so session rows for it carry VID 0. Keying under the NUMBER built
+	// {ifindex, 80} against rows that key {ifindex, 0}: a permanent miss.
+	t.Run("does not fall back to unit number: unset vlan-id is untagged", func(t *testing.T) {
 		unit := &config.InterfaceUnit{Number: 80}
-		if got := sessionDisplayVLANID(unit); got != 80 {
-			t.Fatalf("sessionDisplayVLANID() = %d, want 80", got)
+		if got := sessionDisplayVLANID(unit); got != 0 {
+			t.Fatalf("sessionDisplayVLANID() = %d, want 0 — a unit with no vlan-id is "+
+				"untagged on the wire, and a key of %d can never match a session row", got, got)
 		}
 	})
 }
 
-func TestBuildSessionEgressIfaces_UsesUnitNumberWhenVlanIDUnset(t *testing.T) {
+// #7153: renamed and re-pointed. It was TestBuildSessionEgressIfaces_UsesUnitNumberWhenVlanIDUnset
+// and synthesized `50: {Number: 50}` with no VlanID — a config the compiler
+// treats as UNTAGGED, so it asserted a map shape no session row could match.
+//
+// The cluster it cites does not have that shape: docs/ha-cluster-userspace.conf
+// sets `vlan-id 50` and `vlan-id 80` explicitly. The fixture now matches the
+// real config, so the test proves what its name claims.
+func TestBuildSessionEgressIfaces_KeysOnWireVLANID_7153(t *testing.T) {
 	cfg := &config.Config{
 		Chassis: config.ChassisConfig{
 			Cluster: &config.ClusterConfig{NodeID: 0},
@@ -33,8 +46,8 @@ func TestBuildSessionEgressIfaces_UsesUnitNumberWhenVlanIDUnset(t *testing.T) {
 				"reth0": {
 					Name: "reth0",
 					Units: map[int]*config.InterfaceUnit{
-						50: {Number: 50},
-						80: {Number: 80},
+						50: {Number: 50, VlanID: 50},
+						80: {Number: 80, VlanID: 80},
 					},
 				},
 				"ge-0/0/2": {
