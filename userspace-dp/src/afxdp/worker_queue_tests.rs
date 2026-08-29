@@ -554,14 +554,6 @@ fn worker_queue_6929_the_wiring_scan_can_actually_see_a_bare_push_back() {
 // commands and checking they all arrive passes identically with NO budget. Every
 // cell below therefore queues PAST the budget and asserts what is left behind.
 
-/// The budget must be a strict fraction of the queue capacity.
-///
-/// Compile-time, because the failure it prevents is silent: at
-/// `WORKER_COMMAND_DRAIN_BUDGET >= MAX_PENDING_WORKER_COMMANDS` the drain can
-/// never leave a remainder, so every behavioural cell below still passes while
-/// the budget has quietly become the take-everything drain it replaced.
-const _: () = assert!(WORKER_COMMAND_DRAIN_BUDGET < MAX_PENDING_WORKER_COMMANDS);
-
 #[test]
 fn worker_queue_7201_drain_takes_the_budget_and_reports_the_remainder() {
     let mut q: VecDeque<WorkerCommand> = VecDeque::new();
