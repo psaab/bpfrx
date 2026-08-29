@@ -263,11 +263,6 @@ pub(super) fn build_local_time_exceeded_request(
         .get(&ingress_ident.ifindex)
         .copied()
         .unwrap_or(0);
-    if !allow_generated_error_zoned(forwarding, GeneratedErrorReason::TimeExceeded, from_zone_id) {
-        counters.touched = true;
-        return None;
-    }
-
     let now_ns = monotonic_nanos();
     // #2238: classify the GENERATED ICMP/ICMPv6 error by its OWN egress
     // 5-tuple, NOT the triggering inbound packet's tuple/ingress. Pre-#2238
@@ -301,6 +296,32 @@ pub(super) fn build_local_time_exceeded_request(
         }
         return None;
     }
+
+    // #7174 M04: consume the rate-limit token LAST, once this reply is known to
+    // be one we will actually send.
+    //
+    // This gate used to run before `classify_generated_reply` above, so a reply
+    // an output filter was going to DISCARD still spent a token. The budget
+    // exists to bound what this box EMITS, and a reply that never leaves emits
+    // nothing — so charging for it lets a filtered stream starve the errors that
+    // would have gone out, and does it invisibly: the drop is attributed to the
+    // filter counter while the missing errors are attributed to the limiter.
+    //
+    // Same principle as the #3656 H11 "build-before-consume" ordering recorded
+    // above, applied to the branch it did not cover — that change stopped an
+    // UNBUILDABLE attempt spending a token, this stops an unsendable one. The
+    // trigger-packet disposition is unchanged either way: a rate-limited attempt
+    // still returns None.
+    //
+    // Ordering between the two drops is deliberate. A reply that is BOTH
+    // filtered and over budget is attributed to the FILTER, because that
+    // decision is deterministic and the limiter should only meter traffic that
+    // would otherwise have gone out.
+    if !allow_generated_error_zoned(forwarding, GeneratedErrorReason::TimeExceeded, from_zone_id) {
+        counters.touched = true;
+        return None;
+    }
+
     Some(PendingForwardRequest {
         target_ifindex,
         target_binding_index: None,
