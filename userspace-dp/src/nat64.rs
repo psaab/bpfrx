@@ -183,7 +183,7 @@ use crate::nat::{
 };
 use crate::session::SessionDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// #4381: NAT64 translated-port allocation range. RFC 6146 does not mandate a
@@ -390,6 +390,39 @@ pub(crate) struct Nat64ReverseInfo {
 // ===========================================================================
 
 /// Number of independent shards. Power of two so the shard index is a mask.
+/// #7056 (#5798 required-fix #5): fragment-association misses caused by the
+/// #5798 key REFUSING an alias, split by which field refused it.
+///
+/// The fail-closed behaviour these count was delivered by #6835 — a cross-domain
+/// or protocol-aliased fragment builds a different key, misses, and dies on the
+/// Pref64 gate or the #6122 discriminator. What was missing is the ability to
+/// SEE it: every such miss landed on `nat64_frag_dropped` /
+/// `nat_frag_untranslated_dropped` alongside reorders, TTL straddles, shard
+/// evictions and config-generation bumps.
+///
+/// Those causes are not interchangeable to an operator. A reorder or TTL straddle
+/// is a path-MTU / cache-pressure story; a refused alias is a TRAFFIC story, and
+/// the only one of the group that can indicate an attempt to ride another
+/// domain's association. One drop counter answers neither question — the same
+/// failure as a diagnostic that names the wrong condition.
+///
+/// TWO counters, not one "alias refused" total, because they are different
+/// operator stories:
+///
+///   - `CROSS_DOMAIN` — a same-datagram entry exists under a DIFFERENT ingress
+///     `FragAuthority`: the #5798 defect proper, a fragment in one security
+///     domain probing an association minted in another.
+///   - `PROTOCOL_ALIAS` — same authority, different upper-layer protocol: a TCP
+///     and a UDP datagram colliding on `(src, dst, ident)`, which required-fix
+///     #2 added `protocol` to the key to separate.
+///
+/// Cumulative and process-global, like `INTERFACE_SNAT_PAT_COLLISIONS`, so tests
+/// read them as a delta.
+pub(crate) static NAT64_FRAG_CROSS_DOMAIN_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// See `NAT64_FRAG_CROSS_DOMAIN_MISSES`.
+pub(crate) static NAT64_FRAG_PROTOCOL_ALIAS_MISSES: AtomicU64 = AtomicU64::new(0);
+
 const NAT64_FRAG_SHARDS: usize = 16;
 /// Fixed per-shard entry cap (LRU eviction on overflow). Total ceiling is
 /// `NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD` = 1024 entries; each entry is
@@ -751,7 +784,44 @@ impl Nat64FragAssoc {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         shard.retain(|e| e.deadline_ns > now_ns);
-        let pos = shard.iter().position(|e| e.key == *key)?;
+        let Some(pos) = shard.iter().position(|e| e.key == *key) else {
+            // #7056 (#5798 required-fix #5): classify the miss before returning
+            // it. A full-key miss has several causes with very different
+            // meanings, and until now every one landed on the same
+            // `nat64_frag_dropped` / `nat_frag_untranslated_dropped` counter: a
+            // reorder, a TTL straddle, a shard eviction, a config-generation
+            // bump — and an ALIASING ATTEMPT the #5798 key deliberately refused.
+            //
+            // The last is the only one that says something about the TRAFFIC
+            // rather than about cache pressure, and the one required-fix #5 asks
+            // to be distinguishable.
+            //
+            // The scan is single-shard BY CONSTRUCTION, which is why it belongs
+            // here rather than at a call site: `nat64_frag_shard_index`
+            // deliberately digests only `(family, src, dst, ident)`, excluding
+            // `authority` and `protocol` precisely so same-datagram candidates
+            // stay CO-LOCATED. Every alias candidate is already in the bucket
+            // this function has locked and just scanned.
+            //
+            // Ordering matters: this runs only on a FULL-KEY miss, so the
+            // generation and owner-RG fences below cannot reach it. A
+            // config-generation eviction is an ordinary commit invalidating the
+            // cache and must NOT be reported as an alias.
+            let alias = shard.iter().find(|e| {
+                e.key.addr_family == key.addr_family
+                    && e.key.src == key.src
+                    && e.key.dst == key.dst
+                    && e.key.ident == key.ident
+            });
+            if let Some(e) = alias {
+                if e.key.authority != key.authority {
+                    NAT64_FRAG_CROSS_DOMAIN_MISSES.fetch_add(1, Ordering::Relaxed);
+                } else if e.key.protocol != key.protocol {
+                    NAT64_FRAG_PROTOCOL_ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return None;
+        };
         // Config-generation guard (#5624): a match minted under a stale config
         // generation is evicted and reported as a miss, so a commit that
         // changed deny/NAT64 rules invalidates the association instead of
