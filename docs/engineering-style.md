@@ -516,6 +516,58 @@ Rules of thumb:
   table. If the metric doesn't move, say so.
 - **Deferred**: named follow-ups with tracking issue numbers. Not
   "TODO later".
+
+### A closing keyword cannot be negated
+
+GitHub's parser does not read negation. `Does not close #N`,
+`why this does not close #N` and `merging this must not close #N` each
+contain a live `close #N` token, and the issue is closed the instant the PR
+merges — against the explicit written intent of the sentence it appears in.
+
+**To scope an issue OUT of a PR, drop the verb.** Write `Refs #N`, or
+`#N is out of scope, see below`. `advances #N` and `part 1 of 2 for #N` are
+also safe. Never `close`/`closes`/`closed`/`fix`/`fixes`/`fixed`/
+`resolve`/`resolves`/`resolved` adjacent to `#N` unless you mean it.
+
+**One correct form does not neutralise an incorrect one elsewhere in the same
+body.** A PR that ended with `Refs #7406` still closed #7406, because a
+scope-explaining sentence earlier in the body said "Does not close #7406."
+
+**Watch the heading/first-line pair.** A `## What this does NOT close` heading
+followed by a paragraph beginning `` `#NNNN` `` reads to the parser as
+`close #NNNN` across the blank line.
+
+**Merge pre-flight — run it on the FLATTENED body.** These phrases wrap across
+lines and carry `**` mid-token, so a line-based `grep` misses them; that is how
+this got past a reviewer who was specifically looking for it:
+
+```bash
+gh pr view <n> --json body -q .body | tr '\n' ' ' | sed 's/[*_`]//g' \
+  | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) +#[0-9]+'
+```
+
+Every hit must be an issue you intend to close. Also check every commit
+message body — GitHub scans those on the default branch too, so a clean PR
+body does not save you.
+
+**Why this is worth a section.** The failure is invisible after the fact: the
+wrongly-closed issue reads `COMPLETED`, so every subsequent sweep for open work
+skips it forever, and the only contradicting evidence is a one-second gap
+between the merge and the close on an issue the PR itself disclaimed. Six
+issues have been recovered this way — #6683, #7406, #5192, #5084, #7033, #6979
+— none by anyone noticing, all by a periodic sweep:
+
+```bash
+gh pr list --state merged --limit 400 --json number,body,mergedAt \
+  -q '.[]|"===PR\(.number)|\(.mergedAt)===\(.body)"'
+# flatten each body, then match:
+#   \b(not|never|without)\b[^.#]{0,45}?\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b\s+#(\d+)
+# a hit whose issue closed within ~2s of mergedAt is a victim
+```
+
+**Check the gap before reopening.** A real auto-close is within a second or
+two. One candidate closed 4.6 hours after its merge and was a deliberate close;
+reopening a legitimately-closed issue is its own kind of damage.
 - **Refs**: every related issue.
 
 ### Commit messages
