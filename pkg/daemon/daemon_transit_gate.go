@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"github.com/psaab/xpf/pkg/cluster"
 	"log/slog"
 	"os"
 	"strings"
@@ -138,7 +139,42 @@ func (d *Daemon) DataplaneArmed() bool { return d.dataplaneArmed.Load() }
 func (d *Daemon) markDataplaneArmed(stage string) {
 	d.dataplaneArmed.Store(true)
 	writeTransitForwardSysctls(true)
+	d.applyDataplaneArmTrack(true)
 	slog.Info("dataplane armed; kernel transit forwarding enabled", "stage", stage)
+}
+
+// applyDataplaneArmTrack mirrors the arm state into redundancy-group weight so
+// a node that cannot forward stops outbidding a peer that can (#7178).
+//
+// Before this, a failed arm left the node fully eligible: it could win or retain
+// RG mastership, take the RETH VIPs from a peer with a WORKING dataplane, and go
+// on attracting traffic it then drops (#5275 closes kernel transit forwarding,
+// so the node is a black hole rather than an unpoliced forwarder). "Let the peer
+// have it" is the obvious answer on a cluster, and this is the mechanism that
+// expresses it.
+//
+// It rides the EXISTING interface-monitor debt path rather than adding a rule to
+// the election. The alternative — refusing MASTER outright — has to interact
+// with priority-0 takeover and the ungated masterDownTimer, which is where the
+// ~60ms failover budget lives; a synthetic monitor adds a debt CONTRIBUTOR and
+// no new path into electRG.
+//
+// The cost is sub-total ON PURPOSE (see cluster.DataplaneArmMonitorCost): the
+// node lands at weight 1, not 0, so an armed peer at 255 wins while a STANDALONE
+// unarmed node stays primary. Demoting a lone node would not make it safe, only
+// absent — nothing else takes the VIPs, and the operator may be reaching the box
+// on one.
+//
+// Idempotent and safe with no cluster configured: SetMonitorWeight is a no-op
+// for an unknown RG, and a nil manager short-circuits here.
+func (d *Daemon) applyDataplaneArmTrack(armed bool) {
+	if d.cluster == nil {
+		return
+	}
+	for _, rg := range d.cluster.GroupStates() {
+		d.cluster.SetMonitorWeight(rg.GroupID, cluster.DataplaneArmMonitorIface,
+			!armed, cluster.DataplaneArmMonitorCost)
+	}
 }
 
 // markDataplaneArmFailed records an arm FAILURE and closes kernel transit
@@ -151,6 +187,7 @@ func (d *Daemon) markDataplaneArmed(stage string) {
 func (d *Daemon) markDataplaneArmFailed(stage, remediation string, err error) {
 	d.dataplaneArmed.Store(false)
 	writeTransitForwardSysctls(false)
+	d.applyDataplaneArmTrack(false)
 	slog.Error("dataplane arm FAILED; kernel transit forwarding DISABLED (fail-closed, degraded): "+
 		"nothing adjudicates transit on this node, so it forwards none — management (SSH/CLI/gRPC/REST) "+
 		"stays up so the config can be corrected in-band",
@@ -177,6 +214,13 @@ func (d *Daemon) markDataplaneArmFailed(stage, remediation string, err error) {
 func (d *Daemon) markDataplaneNotArmed(stage, reason string) {
 	d.dataplaneArmed.Store(false)
 	writeTransitForwardSysctls(false)
+	// #7178: DELIBERATE and FAILED are the same fact to a peer — this node
+	// forwards no transit either way, so it must not outbid one that does. The
+	// distinction is why this logs at Info while the failure path logs at Error;
+	// it is not a reason to keep mastership. On a bootstrap boot there is no
+	// cluster yet and applyDataplaneArmTrack is a no-op; the case this covers is
+	// config-only mode on a node that already has a cluster configured.
+	d.applyDataplaneArmTrack(false)
 	slog.Info("dataplane not armed; kernel transit forwarding disabled (fail-closed)",
 		"stage", stage, "reason", reason)
 }
