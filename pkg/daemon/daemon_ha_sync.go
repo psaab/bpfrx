@@ -721,7 +721,15 @@ func (d *Daemon) snapshotFabricRefreshChans() (chan struct{}, chan struct{}) {
 // present at publish time. Bumping the counter here means a constructor from a
 // prior epoch (still resolving addresses) is already superseded before this
 // call returns, so its later publish is dropped.
-func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context, uint64) {
+//
+// #7071: the cancel func is returned as well, so a caller that discovers its
+// epoch was superseded before it wired anything can release the sub-context it
+// just created. It cannot reach that cancel through the field: a newer epoch has
+// by then overwritten `clusterCommsCancel` with its OWN, and calling that would
+// tear down the live epoch instead.
+func (d *Daemon) beginClusterCommsEpoch(
+	parent context.Context,
+) (context.Context, uint64, context.CancelFunc) {
 	commsCtx, commsCancel := context.WithCancel(parent)
 	d.clusterCommsMu.Lock()
 	d.clusterCommsGen++
@@ -729,7 +737,7 @@ func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context
 	d.clusterCommsCancel = commsCancel
 	d.clusterCommsCtx = commsCtx
 	d.clusterCommsMu.Unlock()
-	return commsCtx, gen
+	return commsCtx, gen, commsCancel
 }
 
 // publishSessionSyncIfCurrent installs ss as the live session-sync object iff
@@ -816,8 +824,28 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// a constructor goroutine from a superseded epoch (still resolving its sync
 	// address) drops its publish instead of clobbering this epoch's state
 	// (#4958).
-	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
-	d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg))
+	commsCtx, commsGen, commsCancel := d.beginClusterCommsEpoch(ctx)
+	// #7071: consume the drop signal, as both sibling publishers already do
+	// (`publishSessionSyncIfCurrent`, `publishFabricRefreshChansIfCurrent`).
+	//
+	// A false return means this epoch was superseded between the line above and
+	// this one, so everything below would wire a DEAD epoch: the VRF resolve,
+	// the HA watchdog heartbeat, the control heartbeat goroutine and the
+	// session-sync constructor. Their own publishes are epoch-gated and would
+	// drop, so nothing incorrect is installed — but the goroutines are not
+	// merely wasted work. They run on `commsCtx`, whose cancel the newer epoch
+	// has already overwritten in `clusterCommsCancel`, so nothing can cancel
+	// them: `stopClusterComms` would call the NEWER epoch's cancel. They would
+	// live until the daemon context dies, i.e. for the life of the process.
+	//
+	// Cancelling our own sub-context on the way out is the other half. Returning
+	// without it leaks the context itself (nothing else holds that cancel), and
+	// cancelling here is safe precisely because we have launched nothing on it
+	// yet — this is the first statement after the epoch opens.
+	if !d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg)) {
+		commsCancel()
+		return
+	}
 
 	vrfDevice := d.resolveClusterVRFDevice(cc)
 
@@ -1219,6 +1247,28 @@ func (d *Daemon) stopClusterComms() {
 	d.sessionSync = nil
 	d.fabricRefreshCh = nil
 	d.fabricRefreshCh1 = nil
+	// #7072: the transport key is part of the epoch tuple and must be torn down
+	// with the rest of it. #6290 joined it to the epoch on the PUBLISH side and
+	// left the teardown side alone, so after a stop the field kept naming the
+	// transport of the epoch that was just destroyed, and `activeTransport()`
+	// reported a live-looking key for comms that are stopped.
+	//
+	// WHAT THIS DOES AND DOES NOT FIX, because the issue's rationale needs one
+	// correction. Step 20's guard is
+	// `active != zero && newTransport != active` — that is RESTART-ON-CHANGE,
+	// not START-IF-STOPPED. So on a hypothetical stop-without-start path:
+	//
+	//   stale field: config unchanged -> no restart (comms stay down);
+	//                config changed   -> restart (comms come back).
+	//   cleared:     either way       -> no restart, because the first
+	//                                    conjunct is now false.
+	//
+	// Clearing therefore does not rescue a stop-only path; it changes WHICH
+	// restart is skipped. What it does is stop the field from LYING, which is
+	// the precondition for reasoning about such a path at all — anyone adding
+	// one owes it an explicit start, and must not read `activeTransport()`
+	// being non-zero as "comms are up".
+	d.activeClusterTransport = clusterTransportKey{}
 	d.clusterCommsMu.Unlock()
 
 	if ss != nil {
