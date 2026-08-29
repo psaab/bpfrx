@@ -458,10 +458,40 @@ func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSel
 		return nil
 	}
 	if len(vpn.TrafficSelectors) == 0 {
+		// Render-side belt for the #8003 commit gate, and the same two-layer
+		// shape this file already uses for sanitizeSwanctlValue: commit rejects
+		// it, the belt keeps an already-persisted or peer-synced value inert on
+		// the lenient load path (#1960 fail-closed-on-load class).
+		//
+		// LocalID/RemoteID are populated from `local-identity`/`remote-identity`,
+		// which in Junos are IDENTITIES and are normally an FQDN or a DN, while
+		// this fallback renders them as swanctl local_ts/remote_ts. Measured on
+		// strongSwan 6.0.5, a value that is not a selector shape does not
+		// degrade the child, it discards the ENTIRE connection:
+		//
+		//   loading connection 'm_fqdnts' failed: invalid value for: local_ts,
+		//   config discarded
+		//
+		// Dropping a non-selector value is therefore strictly better than
+		// passing it through. The key is then omitted, strongSwan applies its
+		// documented `dynamic` default (the tunnel outer address — verified on
+		// the same run, NOT 0.0.0.0/0 as was long assumed), and the VPN comes up
+		// narrow instead of not at all. A working narrow tunnel is recoverable
+		// and visible; a discarded connection is neither.
+		//
+		// config.IsTrafficSelectorShape is the SAME predicate the commit gate
+		// applies, deliberately shared rather than re-derived here.
+		local, remote := vpn.LocalID, vpn.RemoteID
+		if local != "" && !config.IsTrafficSelectorShape(local) {
+			local = ""
+		}
+		if remote != "" && !config.IsTrafficSelectorShape(remote) {
+			remote = ""
+		}
 		return []childSelector{{
 			Name:     connName,
-			LocalTS:  vpn.LocalID,
-			RemoteTS: vpn.RemoteID,
+			LocalTS:  local,
+			RemoteTS: remote,
 		}}
 	}
 

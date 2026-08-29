@@ -140,6 +140,52 @@ func validateIPsecTrafficSelectorsStrict(nodes []*Node, lenient bool) ([]string,
 						}
 					}
 				}
+
+				// #8003: `local-identity` / `remote-identity` under the VPN are
+				// rendered as swanctl selectors too. effectiveTrafficSelectors
+				// falls back to them verbatim when the VPN declares no
+				// traffic-selector, so they reach `local_ts = <value>` by exactly
+				// the path gated above — but nothing examined them, because this
+				// walk only ever descended into `traffic-selector` children.
+				//
+				// Measured on strongSwan 6.0.5: a non-selector value here does not
+				// degrade, it takes the WHOLE connection with it.
+				//
+				//   loading connection 'm_fqdnts' failed: invalid value for:
+				//   local_ts, config discarded
+				//
+				// "config discarded" is the entire connection, so the VPN never
+				// establishes — the same signature policy.go already records for
+				// #7165 item 2, in the same generated block, and charon's log is
+				// not a place an operator looks.
+				//
+				// The trap is that the field is named for one thing and filled from
+				// a statement meaning another: IPsecVPN.LocalID is declared "local
+				// traffic selector (CIDR)", but the only statement that populates it
+				// is spelled `local-identity`, which in Junos is an IDENTITY and is
+				// normally an FQDN or DN. The operator who writes the Junos-shaped
+				// value is the one who gets a silently dead tunnel.
+				for _, leafName := range []string{"local-identity", "remote-identity"} {
+					for _, leaf := range vpnInst.node.FindChildren(leafName) {
+						for _, val := range trafficSelectorValues(leaf) {
+							reason := trafficSelectorValueReject(val)
+							if reason == "" {
+								continue
+							}
+							if err := emit(
+								"security ipsec vpn %q %s %q %s — this value is rendered as "+
+									"the swanctl local_ts/remote_ts when the VPN declares no "+
+									"traffic-selector, and strongSwan DISCARDS THE WHOLE "+
+									"CONNECTION for a non-selector value, so the tunnel "+
+									"silently never establishes; use a CIDR prefix, host "+
+									"address, or IP range (#8003)",
+								vpnInst.name, leafName, val, reason,
+							); err != nil {
+								return err
+							}
+						}
+					}
+				}
 			}
 			return nil
 		})
@@ -190,6 +236,13 @@ func trafficSelectorValueReject(v string) string {
 	}
 	return ""
 }
+
+// IsTrafficSelectorShape is the exported form of isTrafficSelectorShape, for
+// the render-side belt in pkg/ipsec (#8003). That belt and this commit gate
+// MUST apply the SAME rule: two surfaces enforcing one rule from two
+// predicates is how they drift, which is the exact defect diagcmd.MaxArgLen
+// was created to end (#6904). One predicate, both callers.
+func IsTrafficSelectorShape(v string) bool { return isTrafficSelectorShape(v) }
 
 // isTrafficSelectorShape reports whether v is a CIDR prefix (v4/v6), a bare
 // host address (v4/v6), or an inclusive IP range `start-end` — the shapes a
