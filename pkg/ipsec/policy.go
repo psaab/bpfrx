@@ -236,10 +236,24 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string
 			b.WriteString("    rand_time = 0s\n")
 		}
 
-		// Start immediately?
-		if vpn.EstablishTunnels == "immediately" {
-			b.WriteString("    start_action = start\n")
-		}
+		// #7165: `start_action` is a CHILD setting in swanctl.conf, not a
+		// connection setting. It used to be emitted here as well as in the
+		// child below, and strongSwan rejects the connection outright:
+		//
+		//   loading connection 'vpn-a' failed: unknown option: start_action,
+		//   config discarded
+		//   loaded 0 of 1 connections, 1 failed to load
+		//
+		// "config discarded" is the whole connection, not the one line — so
+		// every VPN configured with `establish-tunnels immediately` produced a
+		// config that strongSwan refused in its entirety, and IPsec did not come
+		// up at all. The child-level emit below is the correct one and is
+		// sufficient on its own; nothing here replaces it.
+		//
+		// This survived because nothing ever LOADED the generated config: the
+		// renderer's tests assert on the emitted text, and text assertions
+		// cannot know which keys strongSwan accepts. Found by #7165 item 2,
+		// whose entire subject was the absence of that proof.
 
 		// Compute XFRM interface ID from bind-interface name
 		ifID := xfrmiIfID(vpn.BindInterface)
