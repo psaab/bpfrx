@@ -36,9 +36,17 @@ import (
 
 // nodeLocalSessionFields are the fields a peer-owned row must NOT inherit.
 // FIB* are the resolved EGRESS of a lookup the ORIGINATING node performed;
-// Ingress* are the #4983 ingress-binding identity, node-local for the same
-// reason (node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different numbers for
-// one logical RETH member).
+// IngressIfindex / IngressVlanID are the #4983 ingress-binding identity,
+// node-local for the same reason (node 0's `ge-0-0-1` and node 1's `ge-7-0-1`
+// are different numbers for one logical RETH member).
+//
+// IngressIfaceFold (#7095) is deliberately NOT here, and the distinction is the
+// whole reason that field exists. It is a fold of the RETH-RELATIVE name
+// (`reth0.50`), which both chassis agree on by construction — it is the one
+// ingress-identity field that is MEANT to survive the wire, and the receiving
+// node resolves it back to its own {ifindex, vlan}. Scrubbing it would delete
+// the peer's answer and put every synced session back on the #4792 zone
+// approximation, which is exactly what #7095 removed.
 var nodeLocalSessionFields = map[string]bool{
 	"FibIfindex":     true,
 	"FibVlanID":      true,
@@ -193,8 +201,11 @@ func TestSessionValueFieldCountIsPinned7097(t *testing.T) {
 		typ  reflect.Type
 		want int
 	}{
-		{"SessionValue", reflect.TypeOf(SessionValue{}), 35},
-		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 36},
+		// 36/37 since #7095 added IngressIfaceFold. Classified as NOT node-local
+		// and therefore absent from ScrubNodeLocal / nodeLocalSessionFields — see
+		// the note on nodeLocalSessionFields.
+		{"SessionValue", reflect.TypeOf(SessionValue{}), 36},
+		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 37},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.typ.NumField(); got != tc.want {
