@@ -2262,11 +2262,11 @@ fn post_dnat_source_nat_matches_translated_destination() {
 // claim covers port-MATCHING terms and silently generalises to port-EXCEPTING
 // ones, where it inverts.
 //
-// This is a MEASUREMENT, not a guard. Its only assertion is the premise (the
-// filter must be TX-eligible, or both arms are vacuous); the two arms are
-// printed rather than pinned, deliberately, because asserting today's values
-// would pin the defect. Whoever fixes it should convert ARM B's print into an
-// assertion that it equals ARM A.
+// FIXED in #7992, and this is now a GUARD rather than a measurement: ARM B is
+// asserted to equal ARM A. The fix gave the flowless arm a PORTLESS evaluator
+// (`evaluate_filter_ref_tx_selection_cached_portless`) which takes no port
+// arguments at all, so the literal `0, 0` that caused this is unrepresentable
+// at that call site rather than merely discouraged.
 //
 // The fix is NOT to loosen the gate back toward `l4_present`: that was tried and
 // reverted, because the flow-cache path passes real `SessionKey` ports with
@@ -2407,13 +2407,23 @@ fn measure_c19_flowless_reaches_cached_filter_7174() {
 
     // ARM B -- the SUBJECT, flowless: exactly what a non-first fragment presents.
     let flowless = crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, None);
-    println!(
-        "#7174 ARM B (flow_key = None, the fragment case): drop={} reject={}",
-        flowless.drop, flowless.reject
-    );
-    println!(
-        "#7174 => flowless packets {} the cached evaluator",
-        if flowless.drop != with_flow.drop { "REACH (and get a different verdict from)" } else { "produce the same verdict as" }
+    // #7992: ARM B must now agree with ARM A. This was a print while the defect
+    // was open; it is the assertion the fix owes.
+    //
+    // The two arms differ ONLY in whether a flow key is available. The packet,
+    // the filter and the interface are identical, so any disagreement is the
+    // evaluator inventing port information the flowless arm does not have —
+    // which is exactly what literal `0, 0` did against a
+    // `destination-port-except 22` term.
+    assert_eq!(
+        (flowless.drop, flowless.reject),
+        (with_flow.drop, with_flow.reject),
+        "the flowless arm must reach the same verdict as the flow-keyed arm for \
+         the same packet. It does not, which means a port-bearing term matched \
+         against fabricated ports: `destination-port-except 22` matches \
+         everything that is not 22, and literal 0 is not 22, so an egress `then \
+         discard` fires on a packet whose real port was excepted (#7174 C19 / \
+         #7992)"
     );
     let _ = FilterAction::Accept;
 }

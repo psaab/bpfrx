@@ -450,6 +450,27 @@ pub(crate) struct TermMatchExtra<'a> {
     /// post-IP bytes are payload, not an L4 header) => a layer-4 flex term fails
     /// closed. A layer-3 flex term ignores this and uses `flex_l3`.
     pub(crate) flex_l4: Option<&'a [u8]>,
+    /// #7992: the caller has NO port information at all — not "ports are zero",
+    /// but "there is no flow to take ports from".
+    ///
+    /// Polarity is deliberate. `false` is the default, so every existing caller
+    /// keeps today's behaviour and only the site that genuinely lacks ports
+    /// opts in. The one such site is the FLOWLESS arm of
+    /// `resolve_cached_cos_tx_selection_impl`, which passed literal `0, 0`.
+    ///
+    /// This cannot be expressed with `l4_present`, which is why that was tried
+    /// and reverted: the flow-cache path passes REAL `SessionKey` ports with
+    /// `l4_present: false`, so the flag is ambiguous between "no L4 header" and
+    /// "cached flow with real ports" — and gating ports on it red 11+ tests
+    /// (`a_cached_flow_still_matches_a_port_term_despite_no_l4_present_7174`).
+    /// This flag is unambiguous by construction: only a caller with no ports
+    /// sets it.
+    ///
+    /// It follows the gating rule this struct already states for tcp-flags and
+    /// icmp-type/code — gate on a FLAG, never on the byte value, because a
+    /// zeroed value is indistinguishable from a real one. Ports were the case
+    /// that rule had not been applied to.
+    pub(crate) ports_unknown: bool,
 }
 
 impl<'a> TermMatchExtra<'a> {
@@ -468,6 +489,7 @@ impl<'a> TermMatchExtra<'a> {
             is_fragment: self.is_fragment,
             icmp_type: self.icmp_type,
             icmp_code: self.icmp_code,
+            ports_unknown: self.ports_unknown,
             l4_present: self.l4_present,
             flex_l3: None,
             // #3232: drop the borrowed L4 slice too — a deferred path cannot

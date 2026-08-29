@@ -225,13 +225,19 @@ fn resolve_cached_cos_tx_selection_impl(
             is_v6,
         ) && let Some((src_ip, dst_ip)) = ForwardPacketMeta::from(meta).l3_addrs()
         {
-            let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
+            // #7992: the PORTLESS evaluator. This arm has no flow, so it has no
+            // ports — and literal `0, 0` is not "no port", it is a port value a
+            // term can match on. `destination-port-except 22` matches everything
+            // that is not 22, and 0 is not 22, so the exception matched and an
+            // egress `then discard` fired on a packet whose real port was
+            // excepted. Port-bearing terms now DECLINE here in both directions,
+            // which matches this arm's stated contract that only L3-only terms
+            // take effect.
+            let output_result = crate::filter::evaluate_filter_ref_tx_selection_cached_portless(
                 output_filter,
                 src_ip,
                 dst_ip,
                 meta.protocol,
-                0,
-                0,
                 meta.dscp,
             );
             drop = output_result.action != crate::filter::FilterAction::Accept;
