@@ -598,6 +598,21 @@ const DefaultTakeoverHoldTime = 0
 // the length of an outage. A node that is not ready two minutes after boot is
 // not "still starting"; something is wrong, and forwarding degraded beats
 // forwarding nothing once there is no peer to take over instead.
+// #7962 COUPLING — read this before changing the value. The cluster deploy's
+// post-deploy primary reassert WAITS on this fallback: on an idle cluster it is
+// the only path to convergence, because XSK liveness cannot self-prove on a node
+// holding a data RG (shouldAutoProveIdleStandbyXSKLocked requires
+// !hasActiveDataRGLocked, and node0 holds RG1) and nothing is driving traffic.
+//
+// So `DEPLOY_REASSERT_FALLBACK_BUDGET_S` in test/incus/deploy-lib.sh must exceed
+// this. It did not — 30s against 120s — and the gate therefore failed BY
+// CONSTRUCTION on a restarted idle cluster, with both its passes and its
+// failures being timing artifacts indistinguishable from an HA regression in
+// whatever branch deployed next (#7688, #7939, #7962).
+//
+// TestDeployReassertBudgetExceedsDegradedFallback7962 reads that shell default
+// and asserts the relationship, so raising this value fails a test rather than
+// silently reopening the gap.
 const DefaultDegradedPromoteTimeout = 2 * time.Minute
 const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond

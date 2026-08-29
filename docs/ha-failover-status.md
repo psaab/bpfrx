@@ -115,6 +115,31 @@ yet. Here is what is true today:
   an unrelated event happened to trigger one — bounded in name only. The RETH
   sibling meets the same obligation with `triggerPreemptNow()`.
 
+  **Deploy-tooling coupling (#7962).** `cluster-deploy`'s post-deploy primary
+  reassert waits on this fallback, because on an idle cluster it is the only
+  path to convergence: XSK liveness cannot self-prove on a node holding a data
+  RG (`shouldAutoProveIdleStandbyXSKLocked` requires `!hasActiveDataRGLocked()`,
+  and node0 holds RG1), and nothing is driving traffic. The reassert's budget
+  was 30s against a 120s fallback, so it failed **by construction** on a
+  restarted idle cluster — and both its passes and its failures were timing
+  artifacts, indistinguishable from an HA regression in whatever branch happened
+  to deploy next (#7688, #7939).
+
+  The reassert now (a) PRIMES liveness with a little LAN→WAN traffic, which is
+  what an operator does by hand and converges the common case in seconds rather
+  than waiting out the fallback, and (b) falls back to a budget derived from
+  `DefaultDegradedPromoteTimeout` only when priming was impossible — so a
+  failing deploy is not routinely slower. `DEPLOY_REASSERT_FALLBACK_BUDGET_S`
+  (`test/incus/deploy-lib.sh`) and this constant are coupled by
+  `TestDeployReassertBudgetExceedsDegradedFallback7962`, which reads the shell
+  default and fails if either side moves such that the budget stops covering the
+  fallback.
+
+  Its failure message now distinguishes the two states it used to crush into
+  one: *traffic was driven and the dataplane still did not prove liveness* (a
+  real signal) versus *traffic could not be driven, so the precondition was
+  absent* (not an HA regression).
+
   Interaction with #7161: on a cold boot the readiness gate now applies, so the
   hold and the gate compose — the node holds secondary for the hold window, then
   promotes when readiness recomputes. The #7161 degraded-promotion fallback
