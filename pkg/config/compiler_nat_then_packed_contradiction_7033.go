@@ -31,12 +31,22 @@ import "strings"
 // gate reads that. A config that commits today either commits unchanged or is
 // rejected; none resolves differently.
 //
-// ORDERING: this runs AFTER the resolved-field count, deliberately. A block that
-// LOWERS two actions is already rejected there, with a message this project has
-// iterated on across #6820, #7034 and #7035. Running first would replace that
-// message for every such config. Running after means the only configs that reach
-// this check are the ones the field count cannot see, so no currently-rejected
-// config's diagnostic changes and the change is purely additive.
+// ORDERING: a block that LOWERS two actions is already rejected by the
+// resolved-field count, with a message this project has iterated on across
+// #6820, #7034 and #7035, and a block that lowers none is rejected there too.
+// Neither must start reporting a packed contradiction instead, so this check
+// applies to the n == 1 class ONLY — the configs that count cannot see.
+//
+// TWO THINGS ENFORCE THAT, AND EITHER ALONE WOULD DO IT, which is worth stating
+// because it means a mutation of one is invisible: the call site sits after the
+// count's switch, whose n == 0 and n >= 2 arms both return, AND
+// natThenPackedContradictionModes refuses any rule whose resolved count is not
+// exactly one. The redundancy is deliberate rather than accidental — the
+// predicate is also called by natTerminalActionCardinalityOffenders, which has
+// no such switch around it, so the guard has to live in the predicate for it to
+// be correct standalone. Proving the property is guarded therefore takes a
+// COMPOUND mutation (move the call AND drop the guard); a single-site mutation
+// is masked by the other site, which is what redundancy means, not a gap.
 //
 // WHAT STAYS ACCEPTED, each pinned by a test:
 //
@@ -64,8 +74,10 @@ func natThenPackedContradictionModes(rule *NATRule) []string {
 	if rule == nil {
 		return nil
 	}
-	// Only the n == 1 class. n == 0 and n >= 2 are the field count's, and it
-	// reports them with its own text.
+	// Only the n == 1 class. n == 0 and n >= 2 belong to the resolved-field
+	// count, which reports them with its own text. This guard is what makes the
+	// predicate correct for natTerminalActionCardinalityOffenders too, which
+	// calls it without the count's switch around it.
 	if natThenTerminalActionCount(rule.Then) != 1 {
 		return nil
 	}

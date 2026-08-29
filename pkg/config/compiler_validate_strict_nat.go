@@ -3287,10 +3287,12 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 				}
 				// #7033: the PACKED cross-mode contradiction, which the count
 				// above cannot see. Two modes written as tokens on one run lower
-				// to a single field, so n == 1 and the switch falls through. This
-				// runs after it so a block that LOWERS two actions keeps that
-				// message; the only configs reaching here are the ones the field
-				// count is blind to.
+				// to a single field, so n == 1 and the switch falls through.
+				// Placed after it so a block that LOWERS two actions keeps its
+				// own message — though the predicate ALSO refuses any rule whose
+				// resolved count is not one, so the class restriction survives
+				// either site being moved. See the file comment on
+				// natThenPackedContradictionModes.
 				if modes := natThenPackedContradictionModes(rule); len(modes) > 0 {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: one `then` block packs %d "+
