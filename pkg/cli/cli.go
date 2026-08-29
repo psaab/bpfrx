@@ -116,8 +116,18 @@ type CLI struct {
 	hostname              string
 	username              string
 	userClass             string
-	version               string
-	startTime             time.Time
+	// pendingPipeSuffix carries the output-pipe suffix that cliterm.SplitPipe
+	// removed, so the #7172 command gate can match the command as the operator
+	// typed it. Junos counts the pipe as part of the command, and a gate that
+	// cannot see past `|` cannot restrict `show configuration | save /tmp/x`.
+	//
+	// Set and cleared by dispatchWithPipe around its single recursive dispatch;
+	// it is never read outside that window. A field rather than a parameter
+	// because dispatchOperational has five callers and the suffix is relevant
+	// to exactly one of them.
+	pendingPipeSuffix string
+	version           string
+	startTime         time.Time
 
 	vrrpMgr *vrrp.Manager
 
