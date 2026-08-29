@@ -137,6 +137,15 @@ pub(in crate::afxdp) struct TokenBucket {
 }
 
 impl TokenBucket {
+    /// #7174 M04 test observable. `theoretical_arrival_ns` IS the limiter state:
+    /// consuming a token advances it, declining to consume leaves it alone. So
+    /// "did this path spend a token?" is exactly "did this value move?", which
+    /// is a precise question a burst-exhaustion probe can only approximate.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn arrival_ns(&self) -> u64 {
+        self.theoretical_arrival_ns.load(Ordering::Relaxed)
+    }
+
     pub(in crate::afxdp) const fn new() -> Self {
         TokenBucket {
             theoretical_arrival_ns: AtomicU64::new(0),
