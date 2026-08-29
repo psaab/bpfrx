@@ -44,11 +44,28 @@ package config
 // the survivor reds against a correct compiler and a buggy one alike, for
 // opposite reasons, which invites "fixing" the assertion.
 //
-// ONLY POOLS ARE RECORDED. `off` and `interface` carry no value, so writing
-// either twice discards nothing — the config means what it says and there is
-// nothing to report. Counting them would reject an idempotent typo. A rule
-// mixing DIFFERENT modes is still caught, by the mode count that follows this
-// check.
+// POOL NAMES AND MODES ARE BOTH RECORDED, and they answer two different
+// questions — this paragraph used to say only pools were recorded, which #7033
+// made false.
+//
+// The asymmetry is the part worth stating, because "`off` carries no value, so
+// repeating it discards nothing" is true and is NOT a reason to ignore `off`:
+//
+//   - `off off` in one block discards nothing. Both spellings mean the same
+//     exemption, so it is a redundancy and commits. distinctModes is what makes
+//     that so, exactly as distinctPools does for `pool P pool P`.
+//   - `off pool P` in one block DOES discard something. Two different modes
+//     packed onto one run lower to a single field, and the one that loses is
+//     gone with no diagnostic — and when the loser is `off`, what the dataplane
+//     enforces is the inverse of what was authored. That is #7033, checked on
+//     the recorded MODES.
+//
+// So "carries no value" justifies ignoring a REPEAT of one valueless mode. It
+// never justified ignoring the mode itself.
+//
+// A rule that LOWERS two distinct modes is caught earlier still, by the
+// resolved-field count; the modes recorded here are for the packed case that
+// count cannot see.
 
 // natThenAuthored is what ONE `then` container authored, before NATThen's
 // scalar collapsed it.
@@ -104,6 +121,24 @@ func (a natThenAuthored) distinctModes() []string {
 		out = append(out, m)
 	}
 	return out
+}
+
+// worseThan reports whether c records a more serious authored contradiction than
+// a, and is how a rule with several `then` containers picks the one to report.
+//
+// MODES RANK FIRST, POOLS SECOND, and getting that wrong is not a matter of
+// which message you get. The original ranking compared distinct POOLS only, so a
+// container with no pool at all — `then { source-nat interface off; }` — never
+// beat the zero-valued starting record, was never stored, and its packed
+// cross-mode contradiction was never seen. That rule authors an exemption and
+// publishes an interface translation: the same inversion #7033 exists to reject,
+// silently missed because every fixture in the first draft happened to name a
+// pool. Ranking on modes is what makes a pool-less contradiction visible.
+func (c natThenAuthored) worseThan(a natThenAuthored) bool {
+	if cm, am := len(c.distinctModes()), len(a.distinctModes()); cm != am {
+		return cm > am
+	}
+	return len(c.distinctPools()) > len(a.distinctPools())
 }
 
 // natThenAuthoredOccurrences records every pool and every terminal action mode
