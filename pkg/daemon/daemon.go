@@ -1030,6 +1030,19 @@ type Daemon struct {
 	// nil selects the real method; production never sets it.
 	startClusterCommsFn func(context.Context)
 
+	// afterEpochBeginForTest, when non-nil, runs inside startClusterComms
+	// immediately after beginClusterCommsEpoch and before the transport
+	// publish, receiving that epoch's context and generation.
+	//
+	// It exists because the #7071 drop path is otherwise unreachable from a
+	// test: the publish only drops when another epoch supersedes this one
+	// BETWEEN those two statements, a window no external caller can hit
+	// deterministically. A test that opens two epochs by hand and cancels one
+	// proves a property of context.WithCancel, not of this function — measured:
+	// such a test stays green with the early return AND the cancel both
+	// deleted. Same seam idiom as startClusterCommsFn above.
+	afterEpochBeginForTest func(context.Context, uint64)
+
 	// clusterCommsMu guards the cluster-comms epoch state that is published
 	// asynchronously by the startClusterComms constructor goroutine and torn
 	// down by stopClusterComms: sessionSync, fabricRefreshCh/fabricRefreshCh1,

@@ -41,6 +41,30 @@ func transportTestDaemon7071(t *testing.T) *Daemon {
 	return d
 }
 
+// commitClusterCfg7071 commits a cluster config so startClusterComms gets past
+// its `d.store.ActiveConfig()` guard.
+func commitClusterCfg7071(t *testing.T, d *Daemon, ctl string) {
+	t.Helper()
+	if err := d.store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	// The auth key is required at commit (the control channel fails open
+	// without one) and is deliberately NOT part of clusterTransportKey (#5078),
+	// so it does not disturb what this fixture measures.
+	sets := "set chassis cluster control-interface " + ctl + "\n" +
+		"set chassis cluster authentication-key a-real-cluster-psk-7071\n"
+	if _, err := d.store.LoadSet(sets); err != nil {
+		t.Fatalf("LoadSet: %v", err)
+	}
+	if _, err := d.store.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if cfg := d.store.ActiveConfig(); cfg == nil || cfg.Chassis.Cluster == nil {
+		t.Fatal("precondition: startClusterComms early-returns without a committed " +
+			"cluster config, so the drop path would be unreachable")
+	}
+}
+
 func clusterCfgCtl7071(ctl string) *config.Config {
 	cfg := &config.Config{}
 	cfg.Chassis.Cluster = &config.ClusterConfig{ControlInterface: ctl}
@@ -123,48 +147,54 @@ func TestStopOnlyTeardownDoesNotResurrectComms_7072(t *testing.T) {
 
 // --- #7071: the drop signal is consumed -------------------------------------
 
-// TestSupersededStartClusterCommsReleasesItsContext_7071 is the half that made
-// this worth doing beyond matching the siblings.
+// TestSupersededStartClusterCommsReleasesItsContext_7071 drives the REAL
+// startClusterComms through its drop path.
 //
-// When an epoch is superseded by ANOTHER beginClusterCommsEpoch rather than by a
-// stopClusterComms, its context is ORPHANED: the newer epoch has overwritten
-// clusterCommsCancel with its own, so no later stopClusterComms can cancel this
-// one. startHAWatchdogHeartbeat binds a 500ms ticker goroutine to that context,
-// so continuing past the dropped publish leaves it running for the life of the
-// daemon, writing for an epoch nobody owns.
+// It has to, and that is the point. An earlier version of this cell opened two
+// epochs by hand and cancelled one — and stayed GREEN with both the early return
+// and the cancel deleted, because it was asserting a property of
+// context.WithCancel at a site production never executes. The supersession must
+// land BETWEEN beginClusterCommsEpoch and the publish, a window no external
+// caller can hit, which is what afterEpochBeginForTest exists for.
 //
-// The assertion is that the superseded context ends up CANCELLED, which is what
-// makes the leak impossible rather than merely unlikely.
+// The assertion is that the epoch's context ends up CANCELLED. When the
+// supersession comes from another beginClusterCommsEpoch rather than a
+// stopClusterComms, the newer epoch has overwritten clusterCommsCancel with its
+// own, so nothing else can ever cancel this one — and startHAWatchdogHeartbeat
+// binds a 500ms ticker goroutine to it. Leaving it live leaks that goroutine for
+// the life of the daemon.
 func TestSupersededStartClusterCommsReleasesItsContext_7071(t *testing.T) {
 	d := transportTestDaemon7071(t)
+	// startClusterComms early-returns unless a cluster config is COMMITTED, so
+	// the drop path is unreachable without one. control-interface only: a
+	// non-zero transport key that still starts no heartbeat (needs peer-address
+	// too) and no session sync (falls back to fabric, which is empty).
+	commitClusterCfg7071(t, d, "em0")
 
-	// Epoch N, as startClusterComms opens it.
-	ctxN, genN, cancelN := d.beginClusterCommsEpoch(context.Background())
-	// Epoch N+1 supersedes it WITHOUT a stopClusterComms, so cancelN is now
-	// unreachable through the field — the shape that orphans the context.
-	if _, genNext, _ := d.beginClusterCommsEpoch(context.Background()); genNext <= genN {
-		t.Fatalf("precondition: the second epoch must supersede the first (%d <= %d)",
-			genNext, genN)
+	var epochCtx context.Context
+	d.afterEpochBeginForTest = func(ctx context.Context, gen uint64) {
+		epochCtx = ctx
+		// Supersede WITHOUT a stopClusterComms: that is the shape that orphans
+		// the context, because stopClusterComms would have cancelled it.
+		d.beginClusterCommsEpoch(context.Background())
+	}
+
+	d.startClusterComms(context.Background())
+
+	if epochCtx == nil {
+		t.Fatal("startClusterComms never opened an epoch — it early-returned before " +
+			"the drop path, so this cell measured nothing")
 	}
 	select {
-	case <-ctxN.Done():
-		t.Fatal("precondition: the superseded context must still be live here; if it is " +
-			"already cancelled this test cannot tell a released context from an orphaned one")
-	default:
+	case <-epochCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the superseded epoch's context is still live after startClusterComms " +
+			"returned. Nothing else can cancel it — the newer epoch overwrote " +
+			"clusterCommsCancel — so any goroutine bound to it, including the " +
+			"watchdog's 500ms ticker, runs for the life of the daemon (#7071)")
 	}
-
-	// What startClusterComms now does on a dropped publish.
-	if d.setActiveTransportIfCurrent(genN, clusterTransportFromConfig(clusterCfgCtl7071("em0"))) {
-		t.Fatal("precondition: the publish for a superseded epoch must be dropped")
-	}
-	cancelN()
-
-	select {
-	case <-ctxN.Done():
-	case <-time.After(time.Second):
-		t.Fatal("the superseded epoch's context is still live. Nothing else can cancel it " +
-			"— the newer epoch overwrote clusterCommsCancel — so any goroutine bound to it " +
-			"runs for the life of the daemon (#7071)")
+	if got := d.activeTransport(); got != (clusterTransportKey{}) {
+		t.Fatalf("the superseded epoch published its transport key anyway: %+v", got)
 	}
 }
 

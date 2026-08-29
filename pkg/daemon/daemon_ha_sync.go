@@ -824,6 +824,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// address) drops its publish instead of clobbering this epoch's state
 	// (#4958).
 	commsCtx, commsGen, commsCancel := d.beginClusterCommsEpoch(ctx)
+	if hook := d.afterEpochBeginForTest; hook != nil {
+		hook(commsCtx, commsGen)
+	}
 	if !d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg)) {
 		// #7071: consume the drop signal, as both sibling publishers already do
 		// (publishSessionSyncIfCurrent, publishFabricRefreshChansIfCurrent).
