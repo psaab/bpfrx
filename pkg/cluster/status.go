@@ -616,8 +616,15 @@ func (m *Manager) FormatStatistics() string {
 			fmt.Fprintf(&b, "    %-32s %-12s %d\n", "DHCP leases seeded",
 				"", syncStats.DHCPLeasesSeeded)
 		}
-		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
-			syncStats.BulkSyncs, syncStats.BulkSyncs)
+		// #7176 (C179-077): BulkSyncs is an OUTBOUND-only counter — sync_bulk.go
+		// increments it once per bulk sync this node SENT, after writing
+		// syncMsgBulkEnd. There is no inbound counterpart, so printing it in the
+		// Received column too invented a number. Rendered like "Sessions
+		// installed" below: the value in its real column, the other left blank.
+		// Every neighbouring row here is a genuine Sent/Received pair, which is
+		// exactly why the duplicate read as data rather than as a bug.
+		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Bulk syncs (sent)",
+			syncStats.BulkSyncs, "")
 		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
 			"", syncStats.SessionsInstalled)
 		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
@@ -762,8 +769,9 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "DHCP leases seeded",
 			"", syncStats.DHCPLeasesSeeded)
 	}
-	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
-		syncStats.BulkSyncs, syncStats.BulkSyncs)
+	// #7176 (C179-077): outbound-only; see the sibling render above.
+	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Bulk syncs (sent)",
+		syncStats.BulkSyncs, "")
 	fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
 		"", syncStats.SessionsInstalled)
 	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
