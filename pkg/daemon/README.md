@@ -1114,9 +1114,18 @@ this. A received peer fence writes `SetRGActive(rg, false)` directly; before
 the fix a fenced primary never came back, because the reconcile pass that
 exists precisely to restore it could not see that anything had changed. (The
 fence itself is opt-in on the SENDING node — `set chassis cluster peer-fencing
-disable-rg`, `heartbeat_manager.go` — but the RECEIVING side is wired
-unconditionally, so a node with no fencing configured is still exposed to a
-peer that has it.)
+disable-rg` or `disable-rg-confirmed`, `heartbeat_manager.go` — but the
+RECEIVING side is wired unconditionally, so a node with no fencing configured
+is still exposed to a peer that has it.)
+
+#7147: `fenceAllRedundancyGroups` now RETURNS a `cluster.FenceResult` reporting
+how many RGs it drove to `rg_active=false` out of how many the live config
+holds, so a sequenced fence can be acknowledged truthfully. Two rules for
+anyone editing it: count a group only on a CLEAN `SetRGActive`, matching the
+"not known to have converged" reading the `InvalidateApplied` rule below
+already takes; and leave `DataplaneAvailable` false on the config-only path
+rather than returning a vacuous 0-of-0 success, which the peer would read as
+"this node is safely dark" when nothing was attempted.
 
 The fix is the class, not the call site: `rgStateMachine.InvalidateApplied()`
 re-arms the retry, and the fence calls it after each write. Rules for any

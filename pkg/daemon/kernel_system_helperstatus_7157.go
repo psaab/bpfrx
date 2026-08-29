@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"github.com/psaab/xpf/pkg/config"
 	"time"
 
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -35,11 +36,23 @@ import (
 // (dpuserspace.DefaultControlSocketPath(nil), bootstrap.go) rather than from the
 // active config: this runs on a promotion/self-recover path where the config may
 // not have compiled.
+// #7157: config.IsManagementIfName is passed as the beacon's management-interface
+// classifier. It is the #7515 SSOT for exactly this question — the same function
+// the vrf-mgmt binder (managementVRFIfaceSet), the networkd `VRF=` emitter and
+// the ip-monitoring next-hop validator use — so this becomes a fourth consumer of
+// one rule rather than a fourth copy of three prefixes. #7515 records that a
+// divergence between those consumers is always a bug.
+//
+// Its known looseness (`emergency0`, `fabric0` and `fxpanything` all match — the
+// defect is acknowledged in ifname_class_6731.go) is safe in THIS direction: the
+// beacon uses the predicate only to REFUSE a target, so a false positive costs a
+// fail-safe revert, never a promotion on an unproven kernel.
 func daemonKernelSystem() upgrade.KernelSystem {
 	return upgrade.NewKernelSystemWithHelperStatus(
 		nil,
 		daemonUpgradeHelperStatus,
 		dpuserspace.DefaultControlSocketPath(nil),
+		config.IsManagementIfName,
 	)
 }
 

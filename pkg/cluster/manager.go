@@ -440,6 +440,12 @@ type Manager struct {
 	// Set by daemon after sessionSync creation.
 	peerFenceFn func() error
 
+	// peerFenceConfirmFn sends a SEQUENCED fence and waits for the peer to
+	// report what it disabled (#7147). Used only by the
+	// `disable-rg-confirmed` policy; `disable-rg` keeps peerFenceFn's
+	// fire-and-forget behaviour unchanged.
+	peerFenceConfirmFn func(timeout time.Duration) (FenceAck, error)
+
 	// peerTimeoutGuardFn can suppress heartbeat-driven peer loss when an
 	// external signal proves the peer is still alive (for example, recent
 	// session-sync traffic on the control link).

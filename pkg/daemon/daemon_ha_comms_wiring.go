@@ -428,7 +428,12 @@ func (d *Daemon) wireClusterFenceCallbacks(commsCtx context.Context, ss *cluster
 	// Wire peer fencing: on heartbeat timeout, cluster sends
 	// fence via sync; on receive, disable all local RGs.
 	d.cluster.SetPeerFenceFunc(ss.SendFence)
-	ss.OnFenceReceived = func() {
+	// #7147: the CONFIRMED variant of the same outbound fence, used only by
+	// `peer-fencing disable-rg-confirmed`. Wired beside the best-effort one
+	// because they share a lifecycle; the Manager picks between them off the
+	// committed policy, so `disable-rg` still takes the unsequenced path.
+	d.cluster.SetPeerFenceConfirmFunc(ss.SendFenceAwait)
+	ss.OnFenceReceived = func() cluster.FenceResult {
 		slog.Warn("cluster: fence received from peer")
 		// #3917: fence the CURRENT redundancy-group set, not the
 		// `cfg` snapshot captured in this closure at
@@ -440,7 +445,7 @@ func (d *Daemon) wireClusterFenceCallbacks(commsCtx context.Context, ss *cluster
 		// becomes active for it -> split-brain dual-active. The
 		// dp==nil (config-only) and nil-cluster guards live in
 		// fenceAllRedundancyGroups.
-		d.fenceAllRedundancyGroups(commsCtx)
+		return d.fenceAllRedundancyGroups(commsCtx)
 	}
 }
 

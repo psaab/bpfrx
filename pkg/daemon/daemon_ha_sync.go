@@ -1106,7 +1106,12 @@ func (d *Daemon) currentRedundancyGroups() []*config.RedundancyGroup {
 // the live config here (via currentRedundancyGroups) ensures day-2 RGs are
 // fenced too. Safe when the dataplane is nil (config-only mode) or the
 // config has no cluster/RGs.
-func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
+//
+// #7147: it now REPORTS what it achieved so a sequenced fence can be
+// acknowledged truthfully. The counts are what the peer's confirmed-fence gate
+// consults, so "fenced" means every RG in this node's live config was actually
+// driven to rg_active=false — not merely that the fence message arrived.
+func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) cluster.FenceResult {
 	// Guard the published dataplane: the daemon can run in config-only mode
 	// (no published dataplane)
 	// when the runtime dataplane factory rejects the configured backend —
@@ -1122,14 +1127,25 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
 			"action", "skip_rg_deactivation",
 			"remediation", "set system dataplane-type userspace and restart xpfd",
 		)
-		return
+		// #7147: DataplaneAvailable stays false, which the peer reads as
+		// FenceAckUnavailable. Reporting a vacuous "0 of 0 fenced, OK" here
+		// would tell the surviving node this peer is safely dark when in fact
+		// nothing was even attempted.
+		return cluster.FenceResult{}
 	}
 	rgs := d.currentRedundancyGroups()
+	res := cluster.FenceResult{RGsTotal: len(rgs), DataplaneAvailable: true}
 	slog.Warn("cluster: fence: disabling all RGs", "rg_count", len(rgs))
 	for _, rg := range rgs {
 		if err := rt.HA().SetRGActive(ctx, rg.ID, false); err != nil {
 			slog.Warn("cluster: fence: failed to disable rg_active",
 				"rg", rg.ID, "err", err)
+		} else {
+			// #7147: counted only on a CLEAN write. A failed SetRGActive may
+			// have partially landed, and the honest reading of "not known to
+			// have converged" is that this RG is not confirmed fenced — the
+			// same posture the InvalidateApplied call below takes.
+			res.RGsFenced++
 		}
 		// #6530: this write bypasses the RG state machine's transition
 		// path, so without re-arming, reconcileRGState's desired-vs-applied
@@ -1141,6 +1157,7 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) {
 		// once the cluster state says this node owns the RG again.
 		d.getOrCreateRGState(rg.ID).InvalidateApplied()
 	}
+	return res
 }
 
 // startHeartbeatWithRetry resolves the control-link local address and starts

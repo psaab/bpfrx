@@ -160,16 +160,24 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 			children:      nil,
 		},
 		"hitless-restart": {desc: "Keep dataplane forwarding active during daemon shutdown (HA default is fail-closed)", children: nil},
-		// xpf extension. Only "disable-rg" is acted on by the runtime
-		// (pkg/cluster/heartbeat_manager.go:362, failover.go:166); any
+		// xpf extension. Only the two values below are acted on by the
+		// runtime (pkg/cluster/heartbeat_manager.go handlePeerTimeout); any
 		// other string compiled silently no-ops — the enum closes that.
+		//
+		// "disable-rg" is best-effort and UNACKNOWLEDGED: the fence is sent
+		// after the local election and never gates ownership.
+		// "disable-rg-confirmed" (#7147) sends a sequenced fence BEFORE the
+		// election and waits, bounded and fail-open, for the peer to confirm
+		// it disabled every redundancy group. Both are kept because they are
+		// genuinely different trades, and "disable-rg" must not change
+		// behaviour for configs already deployed against it.
 		"peer-fencing": {
-			desc:          "Fencing action sent to the peer when its heartbeats are lost (disable-rg)",
+			desc:          "Fencing action sent to the peer when its heartbeats are lost (disable-rg, disable-rg-confirmed)",
 			args:          1,
 			valueType:     ValueEnumOf,
-			valueDesc:     "Fencing action on heartbeat timeout (disable-rg)",
-			valueExamples: []string{"disable-rg"},
-			validator:     ValidateEnum([]string{"disable-rg"}),
+			valueDesc:     "Fencing action on heartbeat timeout (disable-rg = best-effort, disable-rg-confirmed = wait for peer acknowledgement)",
+			valueExamples: []string{"disable-rg", "disable-rg-confirmed"},
+			validator:     ValidateEnum([]string{"disable-rg", "disable-rg-confirmed"}),
 			children:      nil,
 		},
 		// Milliseconds, xpf extension. 0 = immediate takeover once

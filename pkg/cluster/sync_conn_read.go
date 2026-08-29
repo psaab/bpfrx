@@ -613,10 +613,37 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.completeFailoverBatchCommitWait(failoverBatchKey(rgIDs), reqID, failoverAck{status: status, detail: detail})
 	case syncMsgFence:
 		s.stats.FencesReceived.Add(1)
-		slog.Warn("cluster sync: fence received from peer — disabling all RGs")
-		if s.OnFenceReceived != nil {
-			s.OnFenceReceived()
+		// #7147: a fence may carry an 8-byte sequence number asking for a
+		// confirmation. A pre-#7147 sender writes a nil payload, which decodes
+		// to seq 0 = "no ack requested" — the reserved value SendFenceAwait
+		// never allocates (its sequences start at 1). Reading the payload
+		// leniently is what makes the new field additive on an existing type.
+		var fenceSeq uint64
+		if len(payload) >= 8 {
+			fenceSeq = binary.LittleEndian.Uint64(payload[:8])
 		}
+		slog.Warn("cluster sync: fence received from peer — disabling all RGs", "seq", fenceSeq)
+		var fenceRes FenceResult
+		if s.OnFenceReceived != nil {
+			// Synchronous on purpose: the ack below must not claim a fence
+			// that has not been applied yet.
+			fenceRes = s.OnFenceReceived()
+		}
+		if fenceSeq != 0 {
+			s.sendFenceAck(conn, fenceSeq, fenceRes)
+		}
+	case syncMsgFenceAck:
+		// #7147. A malformed or truncated ack is DROPPED rather than partially
+		// decoded: a short frame zero-filled into RGsFenced/RGsTotal/Status
+		// would decode to status 0 == FenceAckOK, i.e. a corrupt frame would
+		// read as a successful confirmation. The sender's timeout covers the
+		// drop and fails open.
+		ack, ok := decodeFenceAckPayload(payload)
+		if !ok {
+			slog.Warn("cluster sync: fence ack message too short", "len", len(payload))
+			return
+		}
+		s.completeFenceAckWait(ack)
 	case syncMsgPeerCapabilities:
 		// #6650. Length-gated with the #2170 trailing-field discipline: a
 		// SHORTER frame than we expect is a peer we cannot interpret, so it is
@@ -628,7 +655,15 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 		peerProto := binary.LittleEndian.Uint16(payload[:2])
 		s.peerSnapshotProtocol.Store(uint32(peerProto))
-		slog.Info("cluster sync: peer advertised config-snapshot protocol version", "version", peerProto)
+		// #7147: capability flags ride in the trailing byte under the same
+		// discipline — a 2-byte frame is a pre-#7147 peer, and 0 flags is the
+		// correct reading of it (advertises no capabilities).
+		var peerFlags uint8
+		if len(payload) >= 3 {
+			peerFlags = payload[2]
+		}
+		s.peerCapabilityFlags.Store(uint32(peerFlags))
+		slog.Info("cluster sync: peer advertised capabilities", "version", peerProto, "flags", peerFlags)
 	case syncMsgClockSync:
 		if len(payload) < 8 {
 			slog.Warn("cluster sync: clock sync message too short")

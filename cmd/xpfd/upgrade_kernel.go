@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/upgrade/lock"
 )
@@ -258,12 +259,18 @@ func newKernelConfig(journalPath string, strictWatchdog bool, beaconDeadline tim
 		// xpf-kernel-promote.service, not an operator command line), and
 		// upgradeControlSock already falls back to the default socket path when
 		// that dir is absent or unreadable.
+		//
+		// #7157: config.IsManagementIfName is the beacon's management-interface
+		// classifier — the #7515 SSOT already shared by the vrf-mgmt binder, the
+		// networkd `VRF=` emitter and the ip-monitoring next-hop validator, so
+		// this is a fourth CONSUMER of one rule rather than a fourth copy of it.
 		Sys: upgrade.NewKernelSystemWithHelperStatus(
 			func(ctx context.Context) (bool, error) {
 				return upgradeUnitActive(ctx, upgrade.DefaultUnit)
 			},
 			upgradeHelperStatus,
 			upgradeControlSock(upgrade.DefaultConfigDBDir),
+			config.IsManagementIfName,
 		),
 		Logf: func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
 	}
