@@ -71,6 +71,28 @@ const FenceConfirmTimeout = 250 * time.Millisecond
 // history with the reason, because the operator selected this policy expecting
 // a guarantee and the one case where they did not get it must be visible. It is
 // also counted in SyncStats.FenceAcksTimedOut for the timeout case.
+//
+// TWO CONSEQUENCES OF RELEASING m.mu HERE, both deliberate.
+//
+// First, this widens a window that `disable-rg` does not have. Under
+// `disable-rg` the peer-loss decision and electSingleNode run under one
+// unbroken hold of m.mu; here the lock is released between them, so a peer
+// heartbeat can land during the wait and set peerAlive back to true before the
+// election runs. This function does NOT abort on that, and must not: by the
+// time it could notice, the fence has already been delivered and the peer has
+// disabled every RG it owns. Aborting the takeover at that point would leave
+// the peer dark AND this node passive — a total outage, and a strictly worse
+// outcome than the momentary dual-primary the abort would be trying to avoid.
+// Having fenced, committing to the takeover is the only safe direction. (The
+// #2080 pre-guard re-check at the top of handlePeerTimeout still applies; it
+// runs BEFORE anything has been fenced, which is what makes aborting safe
+// there and unsafe here.)
+//
+// Second, handlePeerTimeout runs on the heartbeat receive path, so the wait
+// also delays heartbeat processing by up to FenceConfirmTimeout. That is
+// bounded, opt-in, and confined to the peer-loss event itself, which is why it
+// is accepted rather than moved to a goroutine — a fence that completed
+// asynchronously could not gate the election it exists to precede.
 func (m *Manager) awaitPeerFenceLocked() {
 	fn := m.peerFenceConfirmFn
 	if fn == nil {
