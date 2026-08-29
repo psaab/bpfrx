@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +8,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/psaab/xpf/pkg/cliterm"
 )
 
 var errExit = fmt.Errorf("exit")
@@ -86,107 +87,32 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	return cmdErr
 }
 
-// filterStream reads newline-delimited output from src and applies a Junos-style
-// output filter, writing the result to out as each line is read. It reuses the
-// #4709 lineSource line splitting so the emitted lines are byte-identical to the
-// previous strings.Split(output, "\n")-with-trailing-empty-dropped path for any
-// input. match/except/find/no-more hold at most one line at a time; count keeps
-// only a running tally; last keeps a bounded ring buffer of the last n lines —
-// none buffers the full output (#4731).
-// maxTailLines bounds the ring the `| last N` filter retains and grows,
-// independent of the operator-supplied N (#5037). `show` is a read-only
-// (PermView) command, so without a bound a viewer could run
-// `show ... | last 2000000000` and force a ~32 GiB up-front []string
-// allocation, OOM-killing the in-process xpfd before any output is produced.
-// 100,000 lines is far more tail than any operator needs, yet caps the ring's
-// worst-case slice header at ~1.6 MiB (64-bit) plus the retained line strings.
-const maxTailLines = 100_000
-
-// parseLastCount parses the `| last N` operand. It defaults to 10, ignores a
-// non-positive or unparseable N (Junos-compatible leniency), and clamps N to
-// maxTailLines so the retained/grown ring is bounded by a fixed operator cap
-// rather than an untrusted operand (#5037).
-func parseLastCount(arg string) int {
-	n := 10
-	if arg != "" {
-		if v, err := strconv.Atoi(arg); err == nil && v > 0 {
-			n = v
-		}
-	}
-	if n > maxTailLines {
-		n = maxTailLines
-	}
-	return n
+// filterStream applies a Junos-style output filter to src, writing to out as
+// each line is read.
+//
+// #7210: the implementation now lives in pkg/cliterm and is SHARED with the
+// remote CLI client (cmd/cli). It used to live here, and the remote surface
+// carried its own copy — which drifted, producing the #4968 case-folding
+// divergence where `| match Foo` matched `foo` on remote but not local. A
+// divergence between the two surfaces is always a bug, never a legitimate
+// difference, so there is now one implementation rather than an agreement to
+// maintain between two.
+//
+// This wrapper is kept deliberately: it preserves this package's call sites and
+// keeps the #4731 / #5037 / #5069 regression tests exercising the real code path
+// rather than being decommissioned by the move.
+func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
+	cliterm.FilterStream(src, out, pipeType, pipeArg)
 }
 
-func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
-	ls := &lineSource{r: bufio.NewReader(src)}
+// maxTailLines is an ALIAS for the shared cap, not a second copy of the number.
+// Pinning the literal again here would let the two drift silently, which is the
+// failure this consolidation exists to remove.
+const maxTailLines = cliterm.MaxTailLines
 
-	switch pipeType {
-	case "match", "grep":
-		for ls.hasMore() {
-			line, _ := ls.next()
-			if strings.Contains(line, pipeArg) {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "except":
-		for ls.hasMore() {
-			line, _ := ls.next()
-			if !strings.Contains(line, pipeArg) {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "find":
-		found := false
-		for ls.hasMore() {
-			line, _ := ls.next()
-			if !found && strings.Contains(line, pipeArg) {
-				found = true
-			}
-			if found {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "count":
-		count := 0
-		for ls.hasMore() {
-			ls.next()
-			count++
-		}
-		fmt.Fprintf(out, "Count: %d lines\n", count)
-	case "last":
-		n := parseLastCount(pipeArg)
-		// Circular buffer of the last n lines: slot i%n holds the i-th
-		// line, overwriting the oldest once more than n have arrived. The
-		// ring GROWS LAZILY (append until it holds n lines, then overwrite)
-		// so its memory is O(min(n, lines produced)) — never O(operand),
-		// never pre-allocated from an untrusted N (#5037). Only n lines are
-		// ever retained, not the whole output.
-		ring := make([]string, 0)
-		count := 0
-		for ls.hasMore() {
-			line, _ := ls.next()
-			if len(ring) < n {
-				ring = append(ring, line)
-			} else {
-				ring[count%n] = line
-			}
-			count++
-		}
-		total := count
-		if total > n {
-			total = n
-		}
-		for i := count - total; i < count; i++ {
-			fmt.Fprintln(out, ring[i%n])
-		}
-	case "no-more":
-		for ls.hasMore() {
-			line, _ := ls.next()
-			fmt.Fprintln(out, line)
-		}
-	}
+// parseLastCount delegates to the shared parser (see filterStream).
+func parseLastCount(arg string) int {
+	return cliterm.ParseLastCount(arg)
 }
 
 // dispatchWithPager runs a "show" command and pages its output. The command
@@ -259,12 +185,12 @@ func pageStream(src io.Reader, out io.Writer, keys io.Reader, pageSize int) {
 	if pageSize < 1 {
 		pageSize = 1
 	}
-	ls := &lineSource{r: bufio.NewReader(src)}
+	ls := cliterm.NewLineSource(src)
 
-	for ls.hasMore() {
+	for ls.HasMore() {
 		printed := 0
 		for printed < pageSize {
-			l, ok := ls.next()
+			l, ok := ls.Next()
 			if !ok {
 				break
 			}
@@ -272,7 +198,7 @@ func pageStream(src io.Reader, out io.Writer, keys io.Reader, pageSize int) {
 			printed++
 		}
 
-		if !ls.hasMore() {
+		if !ls.HasMore() {
 			break
 		}
 
@@ -287,7 +213,7 @@ func pageStream(src io.Reader, out io.Writer, keys io.Reader, pageSize int) {
 			io.Copy(io.Discard, src)
 			return
 		case '\n', '\r':
-			if l, ok := ls.next(); ok {
+			if l, ok := ls.Next(); ok {
 				fmt.Fprintln(out, l)
 			}
 			continue
@@ -302,53 +228,6 @@ func pageStream(src io.Reader, out io.Writer, keys io.Reader, pageSize int) {
 // produce a phantom empty line, while an unterminated final line is returned as
 // its own line. Only "\n" is treated as the delimiter, so a trailing "\r" stays
 // on the line exactly as the previous strings.Split did.
-type lineSource struct {
-	r       *bufio.Reader
-	peeked  string
-	hasPeek bool
-	done    bool
-}
-
-// read pulls the next line directly from the underlying reader.
-func (ls *lineSource) read() (string, bool) {
-	line, err := ls.r.ReadString('\n')
-	if len(line) == 0 && err != nil {
-		ls.done = true
-		return "", false
-	}
-	if err != nil {
-		ls.done = true
-	}
-	return strings.TrimSuffix(line, "\n"), true
-}
-
-// next returns the next line, or ("", false) at end of input.
-func (ls *lineSource) next() (string, bool) {
-	if ls.hasPeek {
-		ls.hasPeek = false
-		return ls.peeked, true
-	}
-	return ls.read()
-}
-
-// hasMore reports whether another line is available, buffering it for the next
-// next() call.
-func (ls *lineSource) hasMore() bool {
-	if ls.hasPeek {
-		return true
-	}
-	if ls.done {
-		return false
-	}
-	l, ok := ls.read()
-	if !ok {
-		return false
-	}
-	ls.peeked = l
-	ls.hasPeek = true
-	return true
-}
-
 var operationalCommands = []string{
 	"configure", "show", "clear", "ping", "test", "traceroute",
 	"monitor", "request", "quit", "exit",

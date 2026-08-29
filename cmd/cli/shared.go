@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/psaab/xpf/pkg/cliterm"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
@@ -137,6 +137,21 @@ func extractPipe(line string) (string, string, string, bool) {
 }
 
 // dispatchWithPipe runs the command and applies the pipe filter.
+//
+// #7210: the filter runs CONCURRENTLY with the command, reading its output from
+// r as it is produced and writing the filtered result straight to the real
+// stdout. Previously this did io.ReadAll into a []byte and then
+// strings.Split into a []string — materializing the entire output TWICE before
+// the filter ran, so `show log messages | match error` against a large syslog
+// buffer, or `show route | count` on a big table, could OOM the operator's own
+// cli process on a memory-constrained jump host. (Client-side only: the daemon
+// streams normally and was never affected.)
+//
+// The filter itself is pkg/cliterm.FilterStream, the SAME implementation the
+// in-process CLI uses. That is the other half of the fix: the remote surface
+// used to carry its own copy, and it drifted (#4968). Every filter reads to EOF
+// — which arrives when w is closed — so no early-return drain is needed to
+// unblock the writer.
 func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -145,90 +160,19 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 	os.Stdout = w
 
-	outputCh := make(chan []byte, 1)
+	done := make(chan struct{})
 	go func() {
-		output, _ := io.ReadAll(r)
+		cliterm.FilterStream(r, origStdout, pipeType, pipeArg)
 		r.Close()
-		outputCh <- output
+		close(done)
 	}()
 
 	cmdErr := c.dispatch(cmd)
 	w.Close()
 	os.Stdout = origStdout
+	<-done
 
-	output := <-outputCh
-
-	lines := strings.Split(string(output), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-
-	applyPipeFilter(lines, origStdout, pipeType, pipeArg)
 	return cmdErr
-}
-
-// applyPipeFilter applies a Junos-style output filter (| match/grep/except/find/
-// count/last/no-more) to lines, writing the filtered result to out.
-//
-// match/grep/except/find are CASE-SENSITIVE, matching the local CLI's
-// pkg/cli.filterStream (which uses a bare strings.Contains(line, pipeArg)).
-// Junos `| match` never case-folds, so the remote and local surfaces must
-// agree — the earlier strings.ToLower on both operands made `| match Foo`
-// match `foo` on remote but not local, a silent semantic divergence (#4968).
-func applyPipeFilter(lines []string, out io.Writer, pipeType, pipeArg string) {
-	switch pipeType {
-	case "match", "grep":
-		for _, line := range lines {
-			if strings.Contains(line, pipeArg) {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "except":
-		for _, line := range lines {
-			if !strings.Contains(line, pipeArg) {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "find":
-		found := false
-		for _, line := range lines {
-			if !found && strings.Contains(line, pipeArg) {
-				found = true
-			}
-			if found {
-				fmt.Fprintln(out, line)
-			}
-		}
-	case "count":
-		fmt.Fprintf(out, "Count: %d lines\n", len(lines))
-	case "last":
-		// Clamp N to the same cap the local CLI enforces
-		// (pkg/cli.maxTailLines, #5037) so `| last N` behaves identically on
-		// both surfaces (#4968 local/remote harmony). This branch slices
-		// lines[start:] rather than pre-allocating from N, so it is not the
-		// OOM vector the local filterStream was — the clamp is for parity.
-		const maxTailLines = 100_000
-		n := 10
-		if pipeArg != "" {
-			if v, err := strconv.Atoi(pipeArg); err == nil && v > 0 {
-				n = v
-			}
-		}
-		if n > maxTailLines {
-			n = maxTailLines
-		}
-		start := len(lines) - n
-		if start < 0 {
-			start = 0
-		}
-		for _, line := range lines[start:] {
-			fmt.Fprintln(out, line)
-		}
-	case "no-more":
-		for _, line := range lines {
-			fmt.Fprintln(out, line)
-		}
-	}
 }
 
 func (c *ctl) dispatchOperational(line string) error {
