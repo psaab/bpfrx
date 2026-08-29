@@ -220,10 +220,16 @@ type SyncStats struct {
 	// MalformedRecordsDropped counts sync records REJECTED by the #7175 decode
 	// contract: a session record truncated before its policy/zone/NAT block, or
 	// a DHCP full-set push that did not decode completely. Before #7175 these
-	// decoded ok=true and installed partial state — a session with PolicyID 0
-	// and zone ids (0,0), which a `from-zone any to-zone any permit` rule
-	// matches with no zone guard (#6682), or a lease set silently truncated to
-	// a prefix. The rejection is now countable because the failure mode it
+	// decoded ok=true and installed partial state — a session whose SessionID,
+	// PolicyID, zone ids and NAT fields were all fabricated zeros, or a lease
+	// set silently truncated to a prefix.
+	//
+	// CORRECTION: this doc previously cited #6682 for the claim that zone pair
+	// (0,0) is matched by a wildcard permit. #3110 fenced every rule tier against
+	// zone 0 and #6682 made an unzoned ingress an explicit deny, so a wildcard
+	// never reaches a zero pair. The counter's
+	// purpose is unchanged — a silently skipped install is how corruption hides
+	// — but it does not rest on that claim. The rejection is now countable because the failure mode it
 	// replaces was invisible: nothing distinguished a corrupt frame from a
 	// legitimately small one.
 	MalformedRecordsDropped atomic.Uint64
