@@ -55,9 +55,9 @@ var rustParsePrefixTable = []nptv6HelperGrammarCase{
 	{"2001:db8::/048", true, 3},
 	{"2001:db8::/00048", true, 3},
 	// The divergence this issue is about: Rust's u8::from_str takes ONE sign.
-	{"2001:db8::/+48", true, 3},
-	{"2001:db8::/+64", true, 4},
-	{"2001:db8::/+048", true, 3},
+	{"2001:db8::/+48", false, 0},
+	{"2001:db8::/+64", false, 0},
+	{"2001:db8::/+048", false, 0},
 
 	// --- refused: mask token ---
 	{"2001:db8::/++48", false, 0}, // one sign only

@@ -86,10 +86,12 @@ func nptv6HelperPrefixWords(s string) (int, bool) {
 		return 0, false
 	}
 
+	// #7077: DIGITS ONLY, on both planes. This used to TrimPrefix a single '+'
+	// because Rust's `u8::from_str` accepted one and this mirror exists to match
+	// the helper, not to be independently correct. parse_prefix now rejects a
+	// non-digit mask token, so the sign handling goes with it -- and the two
+	// grammars converge on Go's original rule rather than on Rust's.
 	maskTok := parts[1]
-	maskTok = strings.TrimPrefix(maskTok, "+")
-	// TrimPrefix removes at most one, but a second '+' must still be refused:
-	// Rust's `u8::from_str` accepts ONE sign, so "++48" is an error there.
 	if maskTok == "" || !isASCIIDigits(maskTok) {
 		return 0, false
 	}
