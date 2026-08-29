@@ -98,11 +98,15 @@ func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.Se
 
 func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
 	installVal := val
-	installVal.FibIfindex = 0
-	installVal.FibVlanID = 0
-	installVal.FibDmac = [6]byte{}
-	installVal.FibSmac = [6]byte{}
-	installVal.FibGen = 0
+	// The peer owns this row: strip every node-local field before it reaches
+	// this node's maps or the helper. Single-sourced in
+	// dataplane.SessionValue.ScrubNodeLocal (#7097) — this site kept its own
+	// copy of the list and it silently stopped covering the #4983 ingress
+	// identity when #6928 added it to the ABI. THIS is the site production
+	// reaches: the session_store.go fallback runs only when the dataplane does
+	// not implement clusterSyncedSessionInstaller, which the userspace manager
+	// does.
+	installVal.ScrubNodeLocal()
 	// The helper already synthesizes the correct reverse companion from the
 	// forward cluster-synced entry using local forwarding and HA state. An
 	// explicit reverse cluster update can overwrite that locally-derived
@@ -252,11 +256,15 @@ func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.
 
 func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
 	installVal := val
-	installVal.FibIfindex = 0
-	installVal.FibVlanID = 0
-	installVal.FibDmac = [6]byte{}
-	installVal.FibSmac = [6]byte{}
-	installVal.FibGen = 0
+	// The peer owns this row: strip every node-local field before it reaches
+	// this node's maps or the helper. Single-sourced in
+	// dataplane.SessionValue.ScrubNodeLocal (#7097) — this site kept its own
+	// copy of the list and it silently stopped covering the #4983 ingress
+	// identity when #6928 added it to the ABI. THIS is the site production
+	// reaches: the session_store.go fallback runs only when the dataplane does
+	// not implement clusterSyncedSessionInstaller, which the userspace manager
+	// does.
+	installVal.ScrubNodeLocal()
 	// Reverse entries are never mirrored (see SetClusterSyncedSessionV4): write
 	// the BPF mirror and return — no mirror failure to compensate.
 	if !shouldMirrorUserspaceSession(val.IsReverse) {

@@ -88,8 +88,33 @@ installed into both places:
 - the Rust helper session table via the userspace manager RPC path
 
 `SetClusterSyncedSessionV4()` / `SetClusterSyncedSessionV6()` do both. Before
-install, they clear the cached FIB result so the receiving node recomputes
-node-local forwarding.
+install they strip every NODE-LOCAL field from the peer's row — the cached FIB
+result, so the receiving node recomputes forwarding, and the #4983 ingress
+identity, so the row lands in the documented `0` branch rather than naming a
+NIC by the peer's number.
+
+That strip is single-sourced in `dataplane.SessionValue.ScrubNodeLocal()` /
+`SessionValueV6.ScrubNodeLocal()` (`pkg/dataplane/session_node_local.go`,
+#7097). It has four callers: these two userspace-manager installers — the pair
+production reaches — and the `putClusterSyncedV4Raw` / `putClusterSyncedV6Raw`
+fallbacks in `pkg/dataplane/session_store.go`, which run only when the dataplane
+does not implement `clusterSyncedSessionInstaller`. Before #7097 each of the
+four kept its own hand-written list, and all four listed the five FIB fields and
+not the ingress pair that #6928 had added to the ABI: the lists went incomplete
+together, in one change, with nothing to notice. Nothing reached any site with a
+non-zero value — the session wire below never encodes `IngressIfindex` /
+`IngressVlanID`, so a decoded peer row carries `0` — so the gap was latent, not
+live. `TestScrubNodeLocalCoversExactlyTheNodeLocalFields7097` (a reflection
+census, both directions, plus a struct field-count pin) and
+`TestClusterSyncedInstallSitesDelegateTheScrub7097` (an AST pin that every
+peer-install site delegates and none has re-grown a private list) are what keep
+the one list complete.
+
+The reverse COMPANION that `mirrorSessionPairV4` / `...V6` synthesize is a
+different case and deliberately does not use this helper: it resets fields
+because the reverse direction has not been OBSERVED yet, not because they belong
+to another node. Folding the two would make a future node-local field
+automatically a reverse-companion reset, which does not follow.
 
 **#7581 — a synced import with no pool to reserve from is not a collision.**
 Before publishing a peer-synced session the helper reserves its translated NAT
