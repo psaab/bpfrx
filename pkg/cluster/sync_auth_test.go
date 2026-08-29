@@ -221,9 +221,16 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	// plus `key == nil` would still pass if the connection died for an
 	// unrelated reason and never reached the legacy-peer arm at all. This
 	// string is also the operator-facing diagnostic that arm exists to emit.
-	if !strings.Contains(ar.err.Error(), "missing auth handshake") {
-		t.Fatalf("rejection must come from the legacy-peer arm and name the cause; "+
-			"got %q, want it to contain %q", ar.err.Error(), "missing auth handshake")
+	// #7163: the reason string moved with the construction. The property the
+	// original assertion protected is UNCHANGED and still asserted — the
+	// rejection must be attributable to the handshake refusing this peer's
+	// frame, not to an unrelated death (a read timeout, a write failure), all
+	// of which also produce an error and empty keys. Under Noise the
+	// attributable diagnostic is the frame the peer sent where a Noise message
+	// was required.
+	if !strings.Contains(ar.err.Error(), "noise") {
+		t.Fatalf("rejection must come from the Noise handshake and name the cause; "+
+			"got %q, want it to mention the noise exchange", ar.err.Error())
 	}
 	if len(ar.key.readKey) != 0 || len(ar.key.writeKey) != 0 {
 		t.Fatalf("a rejected handshake must yield no frame key")
@@ -302,9 +309,13 @@ func TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer(t *testing.T) {
 	// timeout, a short HELLO, a write failure all look identical here — so
 	// `err != nil` alone would still pass if the connection died before ever
 	// reaching the keyed=0 arm.
-	if !strings.Contains(ar.err.Error(), "missing auth handshake") {
-		t.Fatalf("rejection must come from the unkeyed-peer arm and name the cause; "+
-			"got %q, want it to contain %q", ar.err.Error(), "missing auth handshake")
+	// #7163: see the note in the legacy-peer test above. An unkeyed peer can no
+	// longer announce itself with a keyed=0 flag — there is no such field in a
+	// Noise exchange — so it simply cannot produce a valid msg2, and that is
+	// what the rejection must be attributable to.
+	if !strings.Contains(ar.err.Error(), "noise") {
+		t.Fatalf("rejection must come from the Noise handshake and name the cause; "+
+			"got %q, want it to mention the noise exchange", ar.err.Error())
 	}
 	if ar.mode != syncAuthUnauthenticated {
 		t.Fatalf("a rejected keyed=0 peer must not negotiate an authenticated mode, got %d", ar.mode)

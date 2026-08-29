@@ -275,6 +275,30 @@ func TestInPlaceUpgradeWithMismatchedKeysSwitchesNothing6628(t *testing.T) {
 	if a.ac.authPSK != nil || b.ac.authPSK != nil {
 		t.Fatal("a failed upgrade must leave the connection recorded as unauthenticated")
 	}
+
+	// POSITIVE CONTROL (#7163). Everything above asserts that NOTHING switched,
+	// which a completely broken exchange satisfies just as well as a correctly
+	// refusing one. Without this, changing the handshake underneath — as #7163
+	// does — could leave the whole test passing for the wrong reason while the
+	// mechanism it guards had stopped working entirely.
+	//
+	// So: the SAME pump sequence, with MATCHING keys, must switch both ends.
+	// That is what makes the negative result above mean "refused" rather than
+	// "never ran".
+	c := newUpgEnd(t, "key-alpha-6628")
+	d := newUpgEnd(t, "key-alpha-6628")
+	c.sealedOut = c.ac.writeAuthed()
+	c.s.ReconcileConnectionAuth("test")
+	pump(t, c, d)
+	pump(t, d, c)
+	pump(t, c, d)
+	pump(t, d, c)
+	if !c.ac.authed() || !d.ac.authed() {
+		t.Fatalf("positive control FAILED: matching keys did not complete the upgrade "+
+			"(c.read=%v c.write=%v d.read=%v d.write=%v). The negative assertions above "+
+			"therefore prove nothing — they would hold for an exchange that never runs.",
+			c.ac.readAuthed(), c.ac.writeAuthed(), d.ac.readAuthed(), d.ac.writeAuthed())
+	}
 }
 
 // TestInPlaceUpgradeIsSilentAgainstAnUnkeyedPeer6628: the rolling-upgrade case.

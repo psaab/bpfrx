@@ -2,8 +2,11 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
 	"net"
 	"testing"
+
+	"github.com/flynn/noise"
 	"time"
 )
 
@@ -43,22 +46,20 @@ func TestAcceptLoopHandshakeDoesNotBlockOthers(t *testing.T) {
 	defer cancel()
 	go s.acceptLoop(ctx, ln, 0)
 
-	// Client A: connect, consume the server HELLO, then stall.
+	// #7163 INVERTED THE OPENING TURN, and the test follows it rather than
+	// working around it. Under Noise the accepter is the RESPONDER: it speaks
+	// only after reading the initiator's msg1. So the way a client parks the
+	// server's handshake is to connect and say NOTHING — which is the truer
+	// form of this hazard anyway, since a silent client is what a stalled or
+	// hostile peer actually looks like.
+	//
+	// Client A: connect and stall by silence. The server is now parked reading
+	// A's msg1 for the full syncHandshakeTimeout.
 	connA, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial A: %v", err)
 	}
 	defer connA.Close()
-	if err := connA.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("A set deadline: %v", err)
-	}
-	if typ, _, err := readSyncFrameRaw(connA); err != nil {
-		t.Fatalf("A did not receive server HELLO: %v", err)
-	} else if typ != syncMsgAuthHello {
-		t.Fatalf("A: expected server HELLO type %d, got %d", syncMsgAuthHello, typ)
-	}
-	// A now holds the server's handshake read; on the pre-fix synchronous accept
-	// loop the loop is stuck here for the full syncHandshakeTimeout.
 
 	// Client B: connect after the server is committed to A. The accept loop must
 	// still accept B and start its handshake promptly.
@@ -71,13 +72,41 @@ func TestAcceptLoopHandshakeDoesNotBlockOthers(t *testing.T) {
 		t.Fatalf("B set deadline: %v", err)
 	}
 	start := time.Now()
+	// B plays the initiator with the REAL PSK and the server's role-ordered
+	// prologue (server is node 0 and the responder, so the initiator is node 1).
+	//
+	// Both are required, and a first draft of this test got it wrong in an
+	// instructive way: under psk0 the FIRST message already carries a tag, so a
+	// wrong PSK is refused at msg1 and the server closes — which reads as
+	// "the accept loop stalled" when it actually means "B was rejected". The
+	// property under test is that the server ANSWERS PROMPTLY while A's
+	// handshake is parked, so B has to get far enough to be answered.
+	bhs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:           syncNoiseCipherSuite,
+		Pattern:               noise.HandshakeNN,
+		Initiator:             true,
+		Prologue:              syncNoisePrologue(22, 1, 0, 0),
+		PresharedKey:          syncNoisePSK(key),
+		PresharedKeyPlacement: 0,
+		Random:                rand.Reader,
+	})
+	if err != nil {
+		t.Fatalf("B handshake init: %v", err)
+	}
+	msg1, _, _, err := bhs.WriteMessage(nil, nil)
+	if err != nil {
+		t.Fatalf("B msg1: %v", err)
+	}
+	if err := writeMsg(connB, syncMsgAuthHello, msg1); err != nil {
+		t.Fatalf("B failed to send msg1: %v", err)
+	}
 	typ, _, err := readSyncFrameRaw(connB)
 	if err != nil {
-		t.Fatalf("B did not receive server HELLO while A's handshake was in flight "+
+		t.Fatalf("B did not receive the server's reply while A's handshake was in flight "+
 			"(accept loop stalled on A?): %v", err)
 	}
-	if typ != syncMsgAuthHello {
-		t.Fatalf("B: expected server HELLO type %d, got %d", syncMsgAuthHello, typ)
+	if typ != syncMsgAuthProof {
+		t.Fatalf("B: expected the server's noise msg2 (type %d), got %d", syncMsgAuthProof, typ)
 	}
 	if elapsed := time.Since(start); elapsed > 1*time.Second {
 		t.Fatalf("B's handshake started too late (%v) — accept loop appears serialized on A", elapsed)
