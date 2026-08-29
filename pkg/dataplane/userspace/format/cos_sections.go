@@ -31,6 +31,28 @@ import (
 // runtime worker/queue/timer/waterfill lines from the snapshot. When the
 // interface has no runtime state it emits the single "unavailable" line.
 func writeCoSInterfaceHeader(b *strings.Builder, view cosInterfaceView) {
+	// #7065: a `class-of-service interfaces` stanza whose interface/unit has no
+	// counterpart under `interfaces` commits clean, and buildInterfaceSnapshots
+	// walks cfg.Interfaces.Interfaces — so NOTHING below reaches the dataplane.
+	// Rendered as a fully-fledged block it was indistinguishable from a live
+	// one, which is the #6858 failure class (an unanswered question turned into
+	// a confidently wrong answer) inside a second command.
+	//
+	// The row is annotated rather than DROPPED. Hiding it would make the
+	// operator's own committed stanza invisible from the command that exists to
+	// show it — the likeliest cause here is a typo in the interface name, and an
+	// empty output sends them looking for the wrong thing. The reference is
+	// quoted for the reason cosRewriteRuleEnforcement quotes its own: a bare
+	// "not applied" reads as "you forgot to configure it" to an operator who did
+	// configure it, just under a name with a typo in it.
+	//
+	// Placed FIRST so it qualifies the bindings printed beneath it. A reader who
+	// stops after the first line has still been told the block is inert.
+	if view.interfaceUnit == nil {
+		fmt.Fprintf(b, "  %-26s%s\n", "Dataplane:",
+			fmt.Sprintf("not applied (interfaces %s unit %d is not configured, so none of "+
+				"the bindings below reach the dataplane)", view.ifName, view.unit))
+	}
 	if view.cosUnit != nil {
 		fmt.Fprintf(b, "  Scheduler map:            %s\n", emptyDash(view.cosUnit.SchedulerMap))
 		fmt.Fprintf(b, "  DSCP classifier:          %s\n", emptyDash(view.cosUnit.DSCPClassifier))
@@ -408,6 +430,7 @@ func configuredCoSInterfaceViews(cfg *config.Config, status *userspace.ProcessSt
 			}
 			views = append(views, cosInterfaceView{
 				name:           logicalName,
+				ifName:         ifName,
 				unit:           unitNum,
 				cosUnit:        cosUnit,
 				interfaceUnit:  interfaceUnit,
