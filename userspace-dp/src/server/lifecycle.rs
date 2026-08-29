@@ -224,6 +224,8 @@ pub(crate) fn run() -> Result<(), String> {
             neg_neigh_fast_fail_total: 0,
             pending_neigh_duplicate_drops_total: 0,
             pending_neigh_decap_drops_total: 0,
+            io_uring_retained_buffers_total: 0,
+            io_uring_retained_bytes_total: 0,
             pending_neigh_capacity_drops_total: 0,
             dynamic_neighbor_learn_cap_drops_total: 0,
             session_publish_errors_total: 0,

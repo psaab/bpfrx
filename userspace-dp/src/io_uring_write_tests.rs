@@ -711,3 +711,222 @@ fn drain_empty_is_noop() {
     assert_eq!(ring.cancel_calls, 0);
     assert_eq!(ring.wait_calls, 0);
 }
+
+// ---------------------------------------------------------------------------
+// #7106 measurement: what does the ceiling-during-teardown residual actually
+// cost, and what would the proposed `mem::forget` hardening leak?
+// ---------------------------------------------------------------------------
+
+/// #7106 MEASUREMENT (not an assertion): how many entries can be live in the
+/// registry at teardown, and how many bytes would the proposed leak retain?
+///
+/// #7106 asks whether to give `InflightRegistry` a `Drop` that `mem::forget`s
+/// any entry the teardown drain could not prove terminal, making the #5800
+/// buffer-lifetime invariant hold unconditionally at the cost of a leak. The
+/// issue's own framing says to weigh "how many entries can actually be live at
+/// teardown (`reap_ready` runs at the top of every write, so the steady-state
+/// answer is 0)".
+///
+/// That parenthetical is right about steady state and is not the question the
+/// leak has to survive. `reap_ready` reclaims entries whose CQE has SURFACED;
+/// during the storm that produces deferrals, none has. So this measures the
+/// accumulation directly rather than reasoning about it.
+#[test]
+#[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+fn measure_teardown_residual_7106() {
+    // Payload sizes of the two real ring users:
+    //   slowpath.rs:590   ring.write(fd, bytes, false, "slow-path")  -- one packet
+    //   state_writer.rs:436 ring.write(fd, data, true, "state")      -- a snapshot
+    const SLOW_PATH_PKT: usize = 1500;
+    const STATE_SNAPSHOT: usize = 256 * 1024;
+
+    println!("\n#7106: registry accumulation under a sustained EINTR storm");
+    println!("(every write defers: its CQE never surfaces, so reap_ready reclaims nothing)");
+    println!(" writes   inflight_len   slow-path bytes   state bytes");
+    let mut reg = InflightRegistry::new();
+    let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EINTR);
+    for n in 1..=64usize {
+        let out = write_all(&mut ring, &mut reg, vec![0u8; 64], false, "slow-path");
+        assert!(
+            matches!(out, WriteResult::Deferred { .. }),
+            "write {n} must defer for this measurement to mean anything"
+        );
+        if n == 1 || n == 8 || n == 16 || n == 32 || n == 64 {
+            let len = reg.inflight_len();
+            println!(
+                "{n:7}   {len:12}   {:15}   {:11}",
+                len * SLOW_PATH_PKT,
+                len * STATE_SNAPSHOT
+            );
+        }
+    }
+
+    // Does the accumulation drain once the storm ends? This is what decides
+    // whether it is a transient spike or a monotonic leak in normal operation.
+    let before = reg.inflight_len();
+    ring.complete_inflight_now(64);
+    reg.reap_ready(&mut ring);
+    println!(
+        "\nafter the storm ends and completions surface: {before} -> {} live",
+        reg.inflight_len()
+    );
+
+    // And the state-writer ring, whose SQ is only 8 entries deep (RingWriter::new(8))
+    // versus the slow path's 256 (slowpath.rs:522) -- does the SQ depth bound
+    // the registry?
+    let mut reg2 = InflightRegistry::new();
+    let mut ring2 = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EINTR);
+    for _ in 0..32 {
+        let _ = write_all(&mut ring2, &mut reg2, vec![0u8; 64], true, "state");
+    }
+    println!(
+        "state-ring shape after 32 deferred writes: inflight_len={} (SQ depth is 8)",
+        reg2.inflight_len()
+    );
+}
+
+/// #7106 fail-on-revert (the hardening #6168 left on the board): a buffer the
+/// teardown drain could not PROVE terminal must be retained, not returned to
+/// the allocator, when the registry drops.
+///
+/// Before this, such a buffer was freed by `Vec`'s own `Drop`. `RingWriter`'s
+/// field order closes the ring fd first, but `close()` does not wait —
+/// `io_uring_release` only queues `io_ring_exit_work` — so a write still
+/// executing in io-wq could be writing into that allocation as it returned to
+/// the allocator. Field order narrows the window; it is not a barrier.
+///
+/// Observed through the production counters, which are also the operator signal
+/// the condition otherwise has none of. They are process-global and cumulative,
+/// so this asserts a DELTA. Exact equality is correct under the project's
+/// mandated `-- --test-threads=1` (parallel `cargo test` deadlocks this crate
+/// anyway); a concurrent registry drop is the only thing that could inflate it.
+///
+/// FAIL-ON-REVERT: delete `impl Drop for InflightRegistry` and `Vec`'s Drop
+/// frees the buffer again — both deltas are 0 and this goes RED.
+#[test]
+fn unproven_buffers_are_retained_not_freed_7106() {
+    const PAYLOAD: usize = 4096;
+    let before_bufs = super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+    let before_bytes = super::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        // A fatal ring: every wait returns the permanent error, so the drain
+        // can prove nothing and retains the entry.
+        let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EBADF);
+        let mut reg = InflightRegistry::new();
+        let out = write_all(&mut ring, &mut reg, vec![0u8; PAYLOAD], false, "slow-path");
+        assert!(
+            matches!(out, WriteResult::Deferred { fatal_ring: true, .. }),
+            "precondition: a fatal ring must defer the buffer"
+        );
+        assert_eq!(
+            reg.drain_for_teardown(&mut ring),
+            0,
+            "precondition: a fatal ring cannot prove release, so the drain frees nothing"
+        );
+        assert_eq!(reg.inflight_len(), 1, "precondition: the entry is retained");
+    } // the registry drops HERE — this is the subject.
+
+    assert_eq!(
+        super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) - before_bufs,
+        1,
+        "the unproven buffer must be RETAINED at registry drop, not freed. \
+         Freeing it hands an allocation the kernel may still be writing into \
+         back to the allocator (#7106)"
+    );
+    assert_eq!(
+        super::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before_bytes,
+        PAYLOAD as u64,
+        "the retained BYTES must be accounted too — the count alone does not \
+         tell an operator how much memory a retiring ring abandoned"
+    );
+}
+
+/// #7106: the leak is confined to unproven entries. A drain that PROVES every
+/// entry terminal must free them normally and retain nothing.
+///
+/// Without this, `unproven_buffers_are_retained_not_freed_7106` is satisfied by
+/// a `Drop` that leaks unconditionally — which would turn every ordinary ring
+/// retirement into a leak, including the overwhelmingly common case where the
+/// drain works.
+#[test]
+fn a_proven_drain_retains_nothing_7106() {
+    let before_bufs = super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EINTR);
+        let mut reg = InflightRegistry::new();
+        let out = write_all(&mut ring, &mut reg, vec![0u8; 64], false, "slow-path");
+        assert!(matches!(out, WriteResult::Deferred { .. }));
+        // The storm ends: the write's terminal CQE surfaces and is reaped.
+        ring.complete_inflight_now(64);
+        reg.reap_ready(&mut ring);
+        assert_eq!(
+            reg.inflight_len(),
+            0,
+            "precondition: a proven-terminal entry is released before drop"
+        );
+    }
+    assert_eq!(
+        super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed),
+        before_bufs,
+        "a registry that proved every entry terminal must leak NOTHING; a \
+         Drop that forgets unconditionally would leak on every ordinary ring \
+         retirement"
+    );
+}
+
+/// #7106 (#6168 task 3): `RingWriter`'s field DECLARATION ORDER is load-bearing
+/// and was guarded only by a comment.
+///
+/// Rust drops struct fields in declaration order, so `ring` before `inflight`
+/// means the ring fd closes — starting the kernel's teardown — before the
+/// registry drops. Swapping the two declarations compiles, passes every
+/// behavioural test, and silently removes that ordering.
+///
+/// Source-text rather than behavioural because Rust cannot reflect declaration
+/// order: there is no runtime observable to assert on. Same instrument as the
+/// existing `*_doc_guard` tests. Comments are stripped first, because this
+/// file and the struct's own comment both NAME the fields and an unstripped
+/// scan would match the prose describing the invariant rather than the
+/// invariant.
+#[test]
+fn ring_writer_drops_the_ring_before_the_registry_7106() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("io_uring_write.rs"),
+    )
+    .expect("io_uring_write.rs must be readable");
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let start = code
+        .find("pub(crate) struct RingWriter {")
+        .expect(
+            "struct RingWriter not found — either it was renamed, in which case \
+             this guard is scanning for something that no longer exists, or the \
+             drop-order invariant moved. Either way this is not evidence.",
+        );
+    let body_end = code[start..]
+        .find('}')
+        .expect("unterminated struct RingWriter");
+    let body = &code[start..start + body_end];
+
+    let ring_at = body
+        .find("ring:")
+        .expect("RingWriter has no `ring` field; the guard cannot speak for it");
+    let inflight_at = body
+        .find("inflight:")
+        .expect("RingWriter has no `inflight` field; the guard cannot speak for it");
+
+    assert!(
+        ring_at < inflight_at,
+        "`ring` must be DECLARED before `inflight`. Rust drops fields in \
+         declaration order, so this ordering is what closes the ring fd — \
+         starting the kernel's teardown — before the registry drops and \
+         releases buffers. Swapping them compiles and passes every behavioural \
+         test while silently widening the #6168 window (#7106)"
+    );
+}
