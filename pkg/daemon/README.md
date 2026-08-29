@@ -959,7 +959,30 @@ are read/written only under that lock; every reader goes through
   constructor), cancels the context, **joins the constructor** via
   `clusterCommsWG`, then nils the shared state and `Stop()`s the old session
   sync. The join runs outside the lock (the constructor's publish path also
-  takes it), so there is no deadlock.
+  takes it), so there is no deadlock. Since **#7072** the nilled state includes
+  `activeClusterTransport`: the field means "the transport the comms CURRENTLY
+  RUNNING use", so a non-zero value after a teardown is false. It is not only an
+  inaccuracy — step 20 restarts on `active != zero && new != active`, so a commit
+  landing after a **stop-only** teardown with a CHANGED transport used to pass
+  both halves and bring comms back up. The stop-only site is
+  `relinquishClusterForBootstrap`, which stops comms precisely so the peer stops
+  seeing a healthy node whose dataplane is about to be detached; restarting them
+  re-creates that hybrid. Clearing does NOT make step 20 start comms after a
+  stop-only teardown — `active != zero` fails either way — and nothing else does
+  either; if that should change, it is a separate question from this field.
+- `startClusterComms` **consumes** the publish's drop signal since **#7071**,
+  matching its two sibling publishers. A `false` return means another epoch
+  superseded this one between `beginClusterCommsEpoch` and the publish, so it
+  cancels its own sub-context and returns. The cancel matters beyond skipping
+  dead work: when the supersession came from another `beginClusterCommsEpoch`
+  rather than a `stopClusterComms`, the newer epoch has already overwritten
+  `clusterCommsCancel`, so **no later `stopClusterComms` can cancel this
+  context** — and `startHAWatchdogHeartbeat` binds a 500ms ticker goroutine to
+  it. `beginClusterCommsEpoch` therefore returns the `CancelFunc` too; the field
+  cannot supply it, and calling what the field holds would tear down the LIVE
+  epoch. The drop path is reachable from a test only through the
+  `afterEpochBeginForTest` seam, because the window is between two consecutive
+  statements inside the function.
 
 - `activeClusterTransport` joined the epoch in **#6290** and publishes the same
   way, via `setActiveTransportIfCurrent(gen, key)`. It had been written by
