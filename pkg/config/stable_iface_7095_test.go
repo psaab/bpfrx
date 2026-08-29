@@ -24,8 +24,12 @@ func clusterCfg7095(nodeID, slot int) *Config {
 		}
 	}
 	// node 0 uses FPC 0, node 1 uses FPC 7 — the loss-cluster shape.
-	wan := "ge-" + itoa7095(slot) + "-0-2"
-	lan := "ge-" + itoa7095(slot) + "-0-1"
+	// Config carries the JUNOS spelling; the lookups below use the LINUX one,
+	// which is what an ifindex resolves to. If the two are not normalised the
+	// members never match a reth and both nodes fold their own local name —
+	// silently, since an unmatched name is still a name.
+	wan := "ge-" + itoa7095(slot) + "/0/2"
+	lan := "ge-" + itoa7095(slot) + "/0/1"
 	member(wan, "reth0")
 	member(lan, "reth1")
 	c.Interfaces.Interfaces["reth0"] = &InterfaceConfig{
@@ -54,9 +58,9 @@ func TestStableIfaceNameAgreesAcrossNodes_7095(t *testing.T) {
 		vlan       uint16
 		wantLocal1 string
 	}{
-		{"reth0_vlan50", "ge-0-0-2", 50, "ge-7-0-2.50"},
-		{"reth0_vlan80", "ge-0-0-2", 80, "ge-7-0-2.80"},
-		{"reth1_untagged", "ge-0-0-1", 0, "ge-7-0-1"},
+		{"reth0_vlan50", "ge-0-0-2", 50, "ge-7/0/2.50"},
+		{"reth0_vlan80", "ge-0-0-2", 80, "ge-7/0/2.80"},
+		{"reth1_untagged", "ge-0-0-1", 0, "ge-7/0/1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stable0 := n0.ClusterStableIfaceName(tc.localOn0, tc.vlan)

@@ -228,6 +228,14 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		ss.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
 	}
 
+	// 2.21. #7095: rebuild the cluster-stable ingress-interface resolver the
+	// session-sync sender stamps outgoing sessions with. Rebuilt here rather
+	// than held, because it closes over BOTH the config (reth → local member)
+	// and an ifindex snapshot, and a commit can change either.
+	if ss := d.getSessionSync(); ss != nil {
+		ss.SetIngressFoldFn(buildIngressFoldFn(cfg))
+	}
+
 	// 2.45. #1956 V-4: managed->unmapped teardown MUST run BEFORE
 	// networkd.Apply so its stale-file sweep has nothing to half-clean.
 	// No-op idempotent when nothing transitioned (zero churn on an

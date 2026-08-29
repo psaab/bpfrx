@@ -72,9 +72,20 @@ func (c *Config) ClusterStableIfaceName(local string, vlan uint16) string {
 	if i := strings.IndexByte(base, '.'); i >= 0 {
 		base = base[:i]
 	}
+	// The caller's name may be either spelling: config carries the Junos form
+	// (`ge-0/0/1`) while the kernel — and therefore anything derived from an
+	// ifindex — carries the Linux one (`ge-0-0-1`). Compare in the Linux form so
+	// both land on the same member.
+	//
+	// Getting this wrong does not fail loudly: an unmatched member keeps its own
+	// name, so node 0 would fold `ge-0-0-1` while node 1 folds `ge-7-0-1`, the
+	// folds would disagree, the peer would resolve nothing, and every session
+	// would silently degrade to the zone approximation — the exact outcome this
+	// change exists to remove, with no error anywhere.
+	baseLinux := LinuxIfName(base)
 	stable := base
 	for reth, member := range c.RethToPhysical() {
-		if member == base {
+		if LinuxIfName(member) == baseLinux {
 			stable = reth
 			break
 		}
