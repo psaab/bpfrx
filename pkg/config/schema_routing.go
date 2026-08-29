@@ -186,7 +186,14 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// leaf instead of replacing the previous one (#2008 H18 /
 				// Copilot #2011). A single-value leaf collapses separate set
 				// commands down to only the last protocol.
-				"protocol": {desc: "Protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
+				// #7121: valueExamples is the operator-facing completion list AND what the
+				// #2419 compact/block equivalence probe synthesizes from. Without it the
+				// probe used a placeholder the new strict gate rejects, so every spelling
+				// failed identically and the cell went blind — it would have reported
+				// "compiles equivalently" for a leaf it could no longer observe at all.
+				// The domain itself is config.FRRRoutingProtocolKeyword; these are two
+				// members of it, not a second copy.
+				"protocol": {desc: "Protocol (direct, static, ospf, ospf6, bgp, rip, ripng, isis, kernel)", args: 1, multi: true, placeholder: "<protocol>", valueExamples: []string{"bgp", "ospf"}, children: nil},
 				// prefix-list / route-filter / community / as-path may all be
 				// repeated within one term (Junos OR's repeated same-type `from`
 				// matches). Mark them multi so SetPath keeps every flat-set

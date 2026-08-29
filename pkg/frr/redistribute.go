@@ -25,9 +25,12 @@ import (
 // ospf6 / ripng are the FRR keywords for OSPFv3 / RIPng redistribution;
 // without them a bare `export ospf6` / `export ripng` falls through to the
 // skip-and-warn path and IPv6 IGP redistribution cannot be expressed (#2943).
-var knownRedistProtocols = map[string]bool{
-	"connected": true, "static": true, "ospf": true, "ospf6": true,
-	"bgp": true, "rip": true, "ripng": true, "isis": true, "kernel": true,
+// #7121: the domain moved to config.FRRRoutingProtocolKeyword so the COMMIT
+// gate can consult it. It lived here, where a commit-time validator could not
+// reach it (pkg/frr imports pkg/config, not the reverse), which is why an
+// unknown `from protocol` token committed clean and degraded the reload.
+func knownRedistProtocol(name string) bool {
+	return config.RoutingProtocolResolvable(name)
 }
 
 // resolveRedistribute converts a Junos export value into FRR redistribute commands.
@@ -73,7 +76,7 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 	if export == "direct" {
 		export = "connected"
 	}
-	if knownRedistProtocols[export] {
+	if knownRedistProtocol(export) {
 		// A protocol can never redistribute itself: FRR rejects
 		// `redistribute ospf` under `router ospf` (etc.), and ONE
 		// rejected line degrades the WHOLE managed reload (#1880/#2223).

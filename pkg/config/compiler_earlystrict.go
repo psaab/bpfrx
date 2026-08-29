@@ -158,6 +158,12 @@ func runEarlyStrictAndFolds(cfg *Config, opts compileOpts) error {
 	if err := validateIPMonitoringStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
+	// #7121: a routing-policy `from protocol` token is rendered verbatim as
+	// ` match source-protocol` and ONE FRR-rejected line degrades the whole
+	// managed reload, so an unknown token cannot be left to the render side.
+	if err := validateRoutingPolicyProtocolsStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
 	// #1830 (e): the #1733 equal-flow worker-cap validator
 	// (validateEqualFlowWorkerCapStrict / MaxEqualFlowWorkers) is retired.
 	// The v8 lease rotation now sizes its per-worker scratch from the true
