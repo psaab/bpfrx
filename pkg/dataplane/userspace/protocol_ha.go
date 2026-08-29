@@ -146,19 +146,8 @@ type SessionDeltaInfo struct {
 	// event-stream payload (bytes [21],[22] u8 → u16 here for symmetry
 	// with SessionSyncRequest). The HA delta path prefers these IDs;
 	// the legacy strings stay populated when JSON callers fill them.
-	IngressZoneID uint16 `json:"ingress_zone_id,omitempty"`
-	EgressZoneID  uint16 `json:"egress_zone_id,omitempty"`
-	// #7095: the LOCAL ingress identity a peer-imported session should carry,
-	// resolved on THIS node from the cluster-stable fold the sender put on the
-	// wire. #6928 deliberately imported 0 because the sender's IFINDEX is
-	// node-local and would name a different NIC here; these are this node's own
-	// numbers for the interface the peer named, so they are safe to store.
-	//
-	// Additive and omitempty, like the zone-id mirrors above: an older helper
-	// decodes them via serde(default) to 0 and keeps the pre-#7095 behaviour of
-	// recording no ingress identity.
-	IngressIfindex   int    `json:"ingress_ifindex,omitempty"`
-	IngressVLANID    uint16 `json:"ingress_vlan_id,omitempty"`
+	IngressZoneID    uint16 `json:"ingress_zone_id,omitempty"`
+	EgressZoneID     uint16 `json:"egress_zone_id,omitempty"`
 	OwnerRGID        int    `json:"owner_rg_id,omitempty"`
 	Disposition      string `json:"disposition,omitempty"`
 	Origin           string `json:"origin,omitempty"`
