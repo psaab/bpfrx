@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +107,77 @@ func TestStepTwentyDoesNotRestartOnAClearedTransport_7072(t *testing.T) {
 			"\"comms were previously started\"; firing on a zero baseline would restart "+
 			"comms that were never up, and would make the #7072 clear a behaviour change "+
 			"rather than a truthfulness fix", restarts, before, gen())
+	}
+}
+
+// #7071 CALL-SITE guard — and it exists because my first attempt at binding
+// this was measured GREEN under the revert.
+//
+// `TestSupersededEpochPublishIsRefused_7071` below asserts that
+// setActiveTransportIfCurrent REFUSES a superseded epoch. That is true with the
+// fix and true without it: the gate is unchanged either way. Reverting the call
+// site to `d.setActiveTransportIfCurrent(...)` with the result discarded left
+// the whole pkg/daemon suite green — 2192 collected, 0 named failures. The test
+// was adjacent to the property, not on it.
+//
+// The property is that the CALL SITE consumes the bool, and it cannot be driven
+// behaviourally without a seam: the drop needs the epoch to advance between
+// `beginClusterCommsEpoch` and the publish on the next line, a window no test
+// can schedule. Rather than add a production seam whose only consumer is a test,
+// this asserts the call site's SHAPE — the same instrument
+// `TestDaemonPassesRethBeforeCycleHook_5103` uses for "programRethMemberMAC has
+// exactly one call site and its result is assigned back", and
+// `TestCompileRoutesPublishThroughFailClosedHelper4959` uses for "this publish
+// goes through the fail-closed helper".
+//
+// Comments are stripped before matching. A source-scanning guard that reads its
+// own explanatory prose is satisfied by the sentence describing the thing it is
+// meant to find.
+func TestStartClusterCommsConsumesTheDropSignal_7071(t *testing.T) {
+	src, err := os.ReadFile("daemon_ha_sync.go")
+	if err != nil {
+		t.Fatalf("read daemon_ha_sync.go: %v", err)
+	}
+	const fn = "func (d *Daemon) startClusterComms("
+	start := strings.Index(string(src), fn)
+	if start < 0 {
+		t.Fatalf("startClusterComms not found — this guard is scanning for a name that " +
+			"no longer exists, which is not evidence that the call site is correct")
+	}
+	rest := string(src)[start+len(fn):]
+	if end := strings.Index(rest, "\nfunc "); end >= 0 {
+		rest = rest[:end]
+	}
+	var code []string
+	for _, line := range strings.Split(rest, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		code = append(code, line)
+	}
+	body := strings.Join(code, "\n")
+
+	// Non-vacuity: the call must be in there at all. Without this the shape
+	// assertion below would pass for free on a body that never publishes.
+	if !strings.Contains(body, "setActiveTransportIfCurrent(") {
+		t.Fatalf("startClusterComms no longer calls setActiveTransportIfCurrent at all, " +
+			"so the transport is never published and step 20's `active != zero` guard " +
+			"never passes")
+	}
+	if !strings.Contains(body, "if !d.setActiveTransportIfCurrent(") {
+		t.Errorf("startClusterComms DISCARDS setActiveTransportIfCurrent's drop signal.\n"+
+			"Both sibling publishers gate on theirs (publishSessionSyncIfCurrent, "+
+			"publishFabricRefreshChansIfCurrent). A false return means this epoch was "+
+			"superseded, so everything below wires a DEAD epoch onto `commsCtx` — whose "+
+			"cancel the newer epoch has already overwritten in clusterCommsCancel, so "+
+			"nothing can cancel those goroutines and they outlive the epoch that spawned "+
+			"them.\nbody:\n%s", body)
+	}
+	if !strings.Contains(body, "commsCancel()") {
+		t.Errorf("the drop path does not cancel its own sub-context. Returning without " +
+			"it leaks the context — nothing else holds that cancel, since the field now " +
+			"names the newer epoch's — and cancelling here is safe precisely because " +
+			"nothing has been launched on it yet")
 	}
 }
 
