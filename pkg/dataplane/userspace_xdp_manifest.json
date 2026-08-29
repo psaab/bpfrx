@@ -44,11 +44,11 @@
     },
     {
       "path": "userspace-xdp/src/ipv6_ext_walk.rs",
-      "sha256": "73a60e84e0689d360a25b59cc23a58dc4edc7697a1e8c15f02ce61948ac9e862"
+      "sha256": "d13b712adc935b13b28e1be58b868f3541e726dfaee8ec75a11e449f4714afae"
     },
     {
       "path": "userspace-xdp/src/lib.rs",
-      "sha256": "adcd8fe0b9838cdf249d7644f199684e12e8d33cccc63c05a5bff53642c8c6bd"
+      "sha256": "509d397634952332cf65c2cb48f14c07563b9458e52a32e6e4d15fcf1008c7c8"
     }
   ]
 }
