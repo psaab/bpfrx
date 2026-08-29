@@ -74,6 +74,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // outer-frame/inner-meta pairing must never reach the in-place
     // retry TX path).
     state.status.pending_neigh_decap_drops_total = state.afxdp.pending_neigh_decap_drops_total();
+    // #7106: process-global, not per-binding — a registry that retains buffers
+    // is being dropped, so the count has to outlive it.
+    state.status.io_uring_retained_buffers_total =
+        crate::io_uring_write::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+    state.status.io_uring_retained_bytes_total =
+        crate::io_uring_write::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     // #2375: distinct-hop capacity-drop gate at pending_neigh admission
     // (a NEW unresolved hop refused because the map is at
     // MAX_PENDING_NEIGH) — the scan/upstream-outage failure mode, kept

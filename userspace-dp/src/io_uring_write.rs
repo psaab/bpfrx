@@ -106,6 +106,7 @@
 //!     reported as [`WriteResult::Deferred`] with `fatal_ring = true` (the buffer
 //!     is retained pending teardown), transient ones retry after a `yield_now`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use io_uring::{IoUring, opcode, types};
 use std::io;
 
@@ -208,6 +209,73 @@ pub(crate) struct InflightRegistry {
     next_id: u64,
     /// Owned buffers for writes still considered in flight.
     inflight: Vec<InFlightWrite>,
+}
+
+/// #7106: buffers this process has RETAINED rather than freed, because the
+/// teardown drain could not prove the kernel was done with them. Cumulative and
+/// process-global: a registry that leaks is being dropped, so a per-registry
+/// counter would be destroyed with the thing it describes.
+///
+/// There is otherwise no operator-visible signal that a ring abandoned buffers
+/// — the condition is silent by construction, since the whole point is that
+/// nothing further will be heard about those writes.
+pub(crate) static RETAINED_BUFFERS: AtomicU64 = AtomicU64::new(0);
+/// Bytes held by [`RETAINED_BUFFERS`].
+pub(crate) static RETAINED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// #7106: leak, rather than free, any entry the teardown drain could not prove
+/// terminal.
+///
+/// ## Why leaking is the correct answer and not a cop-out
+///
+/// `drain_for_teardown` is the proof path: every buffer it releases has had its
+/// target write's terminal CQE observed. What reaches this `Drop` is the
+/// remainder — entries for which the kernel may STILL hold a pointer, because
+/// the drain hit its `MAX_WAIT_RETRIES` ceiling or the ring went fatally dead.
+///
+/// Freeing those is a use-after-free waiting to happen. `RingWriter`'s field
+/// order closes the ring fd before this registry drops, but `close()` does not
+/// wait: `io_uring_release` only QUEUES `io_ring_exit_work`, so a write already
+/// executing in io-wq can still be writing into that allocation at the instant
+/// it returns to the allocator (#6168). Field order narrows the window; it is
+/// not a barrier. Leaking removes the dependence on kernel teardown timing
+/// entirely, which is the standard io_uring idiom for a buffer whose release
+/// cannot be proven.
+///
+/// ## What it costs, measured
+///
+/// The registry accumulates one entry per DEFERRED write and is not bounded by
+/// the ring's submission-queue depth (measured: 32 entries on the state ring,
+/// whose SQ is 8). So the leak is unbounded in SIZE.
+///
+/// It is bounded in FREQUENCY, which is what makes the trade acceptable: a
+/// `RingWriter` drops when its ring is retired to the sync fallback, and
+/// `retire_ring_to_sync` does not re-promote (no flapping), so this runs at most
+/// once per ring per process — on a ring already being abandoned as broken — or
+/// at process exit, where a leak is irrelevant. A bounded number of leaks on an
+/// already-failed path is a better trade than heap corruption by the kernel.
+///
+/// The unbounded accumulation itself is a separate, pre-existing concern: it is
+/// a memory-growth vector during a storm whether or not anything leaks.
+impl Drop for InflightRegistry {
+    fn drop(&mut self) {
+        if self.inflight.is_empty() {
+            return;
+        }
+        let mut bytes = 0u64;
+        let count = self.inflight.len() as u64;
+        for entry in self.inflight.drain(..) {
+            bytes += entry.bytes.len() as u64;
+            // The allocation is deliberately never returned to the allocator:
+            // the kernel may still write into it.
+            std::mem::forget(entry);
+        }
+        RETAINED_BUFFERS.fetch_add(count, Ordering::Relaxed);
+        RETAINED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        eprintln!(
+            "xpf-userspace-dp: io_uring teardown retained {count} unproven buffer(s)              ({bytes} bytes) — the kernel may still reference them, so they are              leaked rather than freed (#7106)"
+        );
+    }
 }
 
 /// Bound on wait retries so a pathological always-EINTR storm cannot wedge a

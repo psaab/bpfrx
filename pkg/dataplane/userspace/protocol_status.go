@@ -240,6 +240,13 @@ type ProcessStatus struct {
 	// inner meta would retry-TX a mis-rewritten outer packet once the
 	// neighbor resolves.
 	PendingNeighDecapDropsTotal uint64 `json:"pending_neigh_decap_drops_total,omitempty"`
+	// #7106: buffers the helper RETAINED (leaked) at io_uring ring teardown
+	// because the bounded drain could not prove the kernel had finished with
+	// them. Normally 0; non-zero means a ring was retired with writes it could
+	// not prove terminal, and their buffers were deliberately not freed rather
+	// than risk the kernel writing into a freed allocation.
+	IoUringRetainedBuffersTotal uint64 `json:"io_uring_retained_buffers_total,omitempty"`
+	IoUringRetainedBytesTotal   uint64 `json:"io_uring_retained_bytes_total,omitempty"`
 	// #2375: MissingNeighbor packets for a NEW distinct (egress_ifindex,
 	// next_hop) refused because pending_neigh is at MAX_PENDING_NEIGH
 	// distinct hops (distinct-hop neighbor exhaustion — the

@@ -883,6 +883,8 @@
     "io_uring_last_error": "",
     "io_uring_mode": "",
     "io_uring_planned": false,
+    "io_uring_retained_buffers_total": 0,
+    "io_uring_retained_bytes_total": 0,
     "last_cache_flush_at": 0,
     "last_fib_generation": 0,
     "last_snapshot_generation": 0,

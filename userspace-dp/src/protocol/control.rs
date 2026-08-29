@@ -393,6 +393,19 @@ pub(crate) struct ProcessStatus {
     /// packet). Additive / defaulted for backward compatibility.
     #[serde(rename = "pending_neigh_decap_drops_total", default)]
     pub pending_neigh_decap_drops_total: u64,
+    /// #7106: buffers this process RETAINED (leaked) at io_uring ring teardown
+    /// because the bounded drain could not prove the kernel was done with them.
+    ///
+    /// Cumulative and normally 0. Non-zero means a ring was retired while
+    /// writes it had submitted could not be proven terminal, so their buffers
+    /// were deliberately not returned to the allocator. Without this the
+    /// condition is silent by construction: the whole point is that nothing
+    /// further is ever heard about those writes.
+    #[serde(rename = "io_uring_retained_buffers_total", default)]
+    pub io_uring_retained_buffers_total: u64,
+    /// Bytes held by `io_uring_retained_buffers_total`.
+    #[serde(rename = "io_uring_retained_bytes_total", default)]
+    pub io_uring_retained_bytes_total: u64,
     /// #2375: MissingNeighbor packets for a NEW distinct
     /// `(egress_ifindex, next_hop)` refused because `pending_neigh` is at
     /// `MAX_PENDING_NEIGH` distinct hops (distinct-hop neighbor
