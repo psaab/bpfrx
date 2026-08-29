@@ -139,6 +139,22 @@ func CompileLoginRegexes(
 		out.allow, out.allowSrc, out.allowSet = re, allow, true
 	}
 	if denyPresent {
+		// NO EMPTY-PATTERN GUARD HERE, AND ITS ABSENCE IS THE POINT.
+		//
+		// The sibling this borrows its dialect from — ValidASPathRegex in
+		// pkg/config/aspath_regex.go — opens with
+		// `if strings.TrimSpace(regex) == "" { return error }`. Diffing the two
+		// functions, the natural conclusion is that this one is missing a guard.
+		// It is not.
+		//
+		// An empty POSIX regex matches EVERY string. For an AS-path filter that
+		// is a useless pattern worth rejecting. For a DENY leaf it is the most
+		// restrictive thing the grammar can express — deny everything — and it
+		// is a spelling operators actually use. Rejecting it, or treating it as
+		// "no restriction", converts a total lockout into a total permit.
+		//
+		// So the two functions must disagree, and this one must not grow that
+		// guard. See TestEmptyDenyPatternDeniesEverything7172.
 		re, err := regexp.CompilePOSIX(deny)
 		if err != nil {
 			return CompiledLoginRegexes{}, fmt.Errorf(
@@ -249,7 +265,21 @@ func (c CompiledLoginRegexes) Evaluate(command string) LoginRegexDecision {
 	if allowLen >= 0 && denyLen >= 0 {
 		switch {
 		case c.allowSrc == c.denySrc:
-			// Tier 1.
+			// TIER 1 — UPSTREAM-DOCUMENTED. DO NOT "HARDEN" THIS TO DENY.
+			//
+			// Juniper: "if you configure the same command for both the
+			// allow-commands and deny-commands statements, then the allow
+			// operation takes precedence over the deny operation."
+			//
+			// Allow winning here reads like a fail-open and is not one. It is
+			// the deny-with-exceptions idiom the feature exists to support, and
+			// flipping it would be a parity break in the single case the vendor
+			// documents BY NAME — found by the first operator who copies the
+			// example out of Juniper's docs and watches it behave differently
+			// here. "We made it safer" is a poor answer to that.
+			//
+			// Contrast tier 3 below, which IS ours to choose because upstream
+			// says nothing about it.
 			winner := c.family.IdenticalPatternWinner
 			return LoginRegexDecision{
 				Allowed:   winner == LoginRegexAllow,
@@ -272,7 +302,19 @@ func (c CompiledLoginRegexes) Evaluate(command string) LoginRegexDecision {
 					"deny matched a longer extent than allow (%d > %d characters)",
 					denyLen, allowLen)}
 		default:
-			// Tier 3 — ours.
+			// TIER 3 — OURS, AND DELIBERATELY FAIL-CLOSED.
+			//
+			// Upstream is genuinely silent here: Juniper addresses identical
+			// patterns (tier 1) and differing matched lengths (tier 2), but not
+			// a length TIE between two DIFFERENT patterns. So there is no parity
+			// answer to be faithful to, and the choice is ours to make.
+			//
+			// Denying is the fail-closed direction, which is the right default
+			// for an authorization decision nobody has specified. It is surfaced
+			// as xpf's interpretation in the Reason string and recorded as ours
+			// in docs/system-login.md, so a reader with a real Junos box knows
+			// this is the sentence to go and verify rather than assuming we
+			// copied it from somewhere.
 			return LoginRegexDecision{Allowed: false, DecidedBy: LoginRegexDeny,
 				Reason: fmt.Sprintf(
 					"allow and deny matched equal extents (%d characters) with different "+
