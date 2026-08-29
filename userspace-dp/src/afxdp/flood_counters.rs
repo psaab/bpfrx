@@ -2,7 +2,8 @@
 //!
 //! The sibling of [`crate::afxdp::zone_counters`], for the other half of the
 //! dead per-zone counter families the #3643 HIDE marked "not available". Where
-//! the traffic half accounts forwarded VOLUME, this one accounts flood DROPS:
+//! the traffic half accounts forwarded VOLUME, this one accounts flood EVENTS
+//! — as two separate triples, DROPS and (#7086) ALARMS:
 //! the counts `show security screen ids-option statistics` renders as
 //! "SYN flood events" / "ICMP flood events" / "UDP flood events" per zone
 //! (`dataplane.FloodState.SynCount/ICMPCount/UDPCount`).
@@ -17,11 +18,26 @@
 //! per zone. So there was nothing to publish: this module is the per-zone tally
 //! itself, added on the drop path.
 //!
-//! ## Drop path, not forward path — but still coalesced
+//! ## Two arms, never merged
 //!
 //! [`record_zone_flood_drop`] is called only from
 //! [`crate::afxdp::BatchCounters::record_screen_drop`], i.e. only when a screen
 //! check has already decided to DROP. That is off the forwarding fast path.
+//!
+//! [`record_zone_flood_alarm`] (#7086) is its counterpart on the
+//! `alarm-without-drop` arm of `stage_screen_check`: the check TRIPPED, the
+//! drop was suppressed, a log-only alarm was raised and the packet was
+//! PERMITTED and forwarded. It accumulates into a SEPARATE triple and is never
+//! folded into the drop counts — a counter whose name and call-site contract
+//! say DROP must not report forwarded packets. Junos `alarm-without-drop`
+//! suppresses the drop, not the statistic, so both arms are real flood events;
+//! what differs is the disposition, and the surface needs to tell them apart.
+//!
+//! Note the alarm arm is the HOTTER of the two: `alarm-without-drop` is a
+//! per-ZONE profile flag, so a zone in alarm mode suppresses every flood drop
+//! it would take, and a volumetric flood runs that path per packet on every
+//! worker with no drop thinning it. Both arms share the LUT, the per-zone
+//! atomic block and the per-batch fold; only the destination triple differs.
 //!
 //! It is nevertheless coalesced per RX batch rather than `fetch_add`ing
 //! directly, because a screen drop is not rare when it matters: a SYN flood is
@@ -230,6 +246,14 @@ struct FloodTotalsAtomic {
     syn: AtomicU64,
     icmp: AtomicU64,
     udp: AtomicU64,
+    /// #7086: the same three families counted on the ALARM arm — a flood
+    /// check tripped, `alarm-without-drop` suppressed the drop, and the
+    /// packet was PERMITTED and forwarded. Kept in a separate triple from
+    /// the drop counts above, never folded into them: a counter whose name
+    /// and call-site contract say DROP must not report permitted packets.
+    syn_alarms: AtomicU64,
+    icmp_alarms: AtomicU64,
+    udp_alarms: AtomicU64,
 }
 
 impl FloodTotalsAtomic {
@@ -243,6 +267,30 @@ impl FloodTotalsAtomic {
             1 => self.icmp.fetch_add(count, Ordering::Relaxed),
             _ => self.udp.fetch_add(count, Ordering::Relaxed),
         };
+    }
+
+    /// #7086: the alarm-arm sibling of [`Self::add`]. Separate fields, so a
+    /// zone that is alarming and permitting can never be read as dropping.
+    #[inline]
+    fn add_alarm(&self, kind: usize, count: u64) {
+        if count == 0 {
+            return;
+        }
+        match kind {
+            0 => self.syn_alarms.fetch_add(count, Ordering::Relaxed),
+            1 => self.icmp_alarms.fetch_add(count, Ordering::Relaxed),
+            _ => self.udp_alarms.fetch_add(count, Ordering::Relaxed),
+        };
+    }
+
+    /// #7086: alarm-arm counterpart of [`Self::load`], same relaxed contract.
+    #[cfg(test)]
+    fn load_alarms(&self) -> (u64, u64, u64) {
+        (
+            self.syn_alarms.load(Ordering::Relaxed),
+            self.icmp_alarms.load(Ordering::Relaxed),
+            self.udp_alarms.load(Ordering::Relaxed),
+        )
     }
 
     /// Independent relaxed loads. Each field is exact; the triple is
@@ -263,6 +311,12 @@ impl FloodTotalsAtomic {
         self.syn.store(0, Ordering::Relaxed);
         self.icmp.store(0, Ordering::Relaxed);
         self.udp.store(0, Ordering::Relaxed);
+        // #7086: the operator clear is one action over the whole per-zone
+        // flood block. Zeroing only the drop triple would leave a cleared
+        // zone reporting pre-clear alarm totals.
+        self.syn_alarms.store(0, Ordering::Relaxed);
+        self.icmp_alarms.store(0, Ordering::Relaxed);
+        self.udp_alarms.store(0, Ordering::Relaxed);
     }
 }
 
@@ -286,6 +340,24 @@ impl FloodCounterStore {
 
     /// Sparse snapshot for the status wire: one row per zone with any flood
     /// events. Deterministic order (sorted by zone id) for a stable wire.
+    ///
+    /// ## #7086: still DROPS-only, deliberately
+    ///
+    /// The alarm triple is NOT part of this predicate and is not on the wire
+    /// yet. Widening the predicate to emit a row for an alarm-only zone,
+    /// without also teaching the Go render about alarms, would strictly
+    /// WORSEN the surface: `Manager.ReadFloodCounters` returns
+    /// `ErrCounterNotPopulated` only when the offset map has no row, so a row
+    /// of zeroed drop counts renders "SYN flood events: 0" on a zone that is
+    /// actively alarming — a confident wrong answer replacing an honest
+    /// "not available".
+    ///
+    /// That is not hypothetical for some zones and safe for others:
+    /// `alarm-without-drop` is a per-ZONE profile flag, so an alarming zone
+    /// has zero drops BY CONSTRUCTION and is exactly the row this predicate
+    /// omits. Predicate and render must therefore change together, in the
+    /// follow-up that gives the flood surface the same cause-naming treatment
+    /// #7907 gave the zone half.
     pub(in crate::afxdp) fn snapshot(&self) -> Vec<ZoneFloodCounterStatus> {
         let totals = self.totals.lock().expect("flood counter store poisoned");
         let mut out: Vec<ZoneFloodCounterStatus> = totals
@@ -351,7 +423,25 @@ impl FloodCounterStore {
             for (kind, counts) in pending.counts.iter().enumerate() {
                 totals.add(kind, counts[slot]);
             }
+            for (kind, alarms) in pending.alarms.iter().enumerate() {
+                totals.add_alarm(kind, alarms[slot]);
+            }
         }
+    }
+
+    /// #7086 test-only read of a zone's ALARM triple. Deliberately not on
+    /// `snapshot`: see the note there for why the wire stays drops-only until
+    /// the surface can render the alarming-and-permitting state.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn alarm_zones_for_test(&self) -> Vec<(u16, (u64, u64, u64))> {
+        let totals = self.totals.lock().expect("flood counter store poisoned");
+        let mut out: Vec<(u16, (u64, u64, u64))> = totals
+            .iter()
+            .map(|(&zone_id, t)| (zone_id, t.load_alarms()))
+            .filter(|(_, (s, i, u))| *s != 0 || *i != 0 || *u != 0)
+            .collect();
+        out.sort_unstable_by_key(|(zone_id, _)| *zone_id);
+        out
     }
 
     /// Test-only handle to the map mutex, so a test can hold the shared store
@@ -369,6 +459,10 @@ impl FloodCounterStore {
 /// worker thread on the drop path; folded into the shared store per RX batch.
 struct FloodPending {
     counts: [[u64; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
+    /// #7086: alarm-arm deltas, same slot/kind indexing as `counts`. Shares
+    /// `touched_slots` with it — a slot is touched if EITHER arm recorded,
+    /// so the fold and the reset stay one walk over one bitmask.
+    alarms: [[u64; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
     /// #6946: one bit per touched slot, replacing a single `touched: bool`.
     /// See the ZonePending field of the same name; the flood case matters
     /// more because this accumulator is fed from the screen DROP path, so it
@@ -381,6 +475,7 @@ impl Default for FloodPending {
     fn default() -> Self {
         Self {
             counts: [[0; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
+            alarms: [[0; FLOOD_COUNTER_SLOTS]; FLOOD_KINDS],
             touched_slots: 0,
         }
     }
@@ -395,6 +490,12 @@ impl FloodPending {
             mask &= mask - 1;
             for counts in self.counts.iter_mut() {
                 counts[slot] = 0;
+            }
+            // #7086: a touched slot may carry an alarm delta, a drop delta or
+            // both. Clearing only `counts` would re-fold stale alarm deltas
+            // into the next batch.
+            for alarms in self.alarms.iter_mut() {
+                alarms[slot] = 0;
             }
         }
         self.touched_slots = 0;
@@ -431,6 +532,53 @@ pub(in crate::afxdp) fn record_zone_flood_drop(
         let mut p = pending.borrow_mut();
         let s = slot as usize;
         p.counts[kind][s] = p.counts[kind][s].saturating_add(1);
+        p.touched_slots |= 1u64 << s;
+    });
+}
+
+/// #7086: record one flood check that TRIPPED but was suppressed by the zone's
+/// `alarm-without-drop` profile — a log-only alarm was raised and the packet
+/// was PERMITTED and forwarded.
+///
+/// ## Why this is a separate tally and not a call into `record_zone_flood_drop`
+///
+/// Feeding the alarm arm into the drop counter would make a counter whose
+/// name, module doc and call-site contract all say DROP report packets that
+/// were forwarded. An operator reading "N flood drops" on a zone where nothing
+/// was dropped is worse off than one reading "not available". So the alarm arm
+/// gets its own triple, and the surface can distinguish three states: dropping
+/// / alarming-and-permitting / nothing recorded.
+///
+/// ## Why it is batched, like the drop path and more so
+///
+/// `alarm-without-drop` is a per-ZONE profile flag (`ScreenProfile`), so a zone
+/// in alarm mode suppresses EVERY flood drop it would otherwise take. Under a
+/// volumetric flood this path therefore runs per packet on every worker at
+/// once, with no drop to thin the traffic out — strictly hotter than the drop
+/// path this mirrors, and exactly the MESI ping-pong against the coordinator's
+/// status reads that #1187 documents. Hence the same flat-LUT lookup plus
+/// thread-local accumulate, folded once per RX batch: no hash, no atomic, no
+/// allocation on the packet path.
+///
+/// A non-flood reason, an unzoned packet, or a zone with no slot contributes
+/// nothing, identically to the drop recorder.
+#[inline]
+pub(in crate::afxdp) fn record_zone_flood_alarm(
+    slot_map: &FloodCounterSlotMap,
+    zone_id: u16,
+    reason: &str,
+) {
+    let Some(kind) = flood_reason_index(reason) else {
+        return;
+    };
+    let slot = slot_map.slot_of(zone_id);
+    if slot == 0 {
+        return;
+    }
+    FLOOD_PENDING.with(|pending| {
+        let mut p = pending.borrow_mut();
+        let s = slot as usize;
+        p.alarms[kind][s] = p.alarms[kind][s].saturating_add(1);
         p.touched_slots |= 1u64 << s;
     });
 }
@@ -832,5 +980,116 @@ mod tests {
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].syn_flood_events, 1);
+    }
+
+    // ---------------- #7086: the alarm arm ----------------
+
+    /// The operator clear is one action over a zone's whole flood block. If
+    /// `FloodTotalsAtomic::reset` zeroes only the drop triple, a cleared zone
+    /// keeps reporting pre-clear alarm totals for ever — the counters never
+    /// decay on their own.
+    #[test]
+    fn clear_zeroes_the_alarm_triple_too_7086() {
+        const Z: u16 = 4242;
+        let store = FloodCounterStore::default();
+        let map = FloodCounterSlotMap::build(&[Z], &store);
+
+        record_zone_flood_alarm(&map, Z, "udp-flood");
+        record_zone_flood_alarm(&map, Z, "syn-flood");
+        flush_recorded_flood_counters(&store, &map);
+        assert_eq!(
+            store.alarm_zones_for_test(),
+            vec![(Z, (1, 0, 1))],
+            "precondition: the alarms must be there to be cleared"
+        );
+
+        store.clear();
+        assert!(
+            store.alarm_zones_for_test().is_empty(),
+            "clear must zero the ALARM triple as well as the drop triple"
+        );
+    }
+
+    /// `FloodPending::reset` clears the per-slot deltas of every TOUCHED slot.
+    /// A slot can be touched by either arm, so a reset that clears only
+    /// `counts` leaves the alarm delta in place and the NEXT batch folds it a
+    /// second time.
+    ///
+    /// The shape matters: the second batch records a DROP on the same slot, so
+    /// the slot is touched and folded again. A test that simply flushed twice
+    /// would return early on `touched_slots == 0` and never re-fold — passing
+    /// against the broken reset.
+    #[test]
+    fn a_flushed_alarm_delta_is_not_refolded_by_the_next_batch_7086() {
+        const Z: u16 = 909;
+        let store = FloodCounterStore::default();
+        let map = FloodCounterSlotMap::build(&[Z], &store);
+
+        record_zone_flood_alarm(&map, Z, "icmp-flood");
+        flush_recorded_flood_counters(&store, &map);
+        assert_eq!(store.alarm_zones_for_test(), vec![(Z, (0, 1, 0))]);
+
+        // Second batch: a DROP on the same slot, so the slot is touched and
+        // the fold walks it again.
+        record_zone_flood_drop(&map, Z, "icmp-flood");
+        flush_recorded_flood_counters(&store, &map);
+
+        assert_eq!(
+            store.alarm_zones_for_test(),
+            vec![(Z, (0, 1, 0))],
+            "the alarm delta was already folded in the first batch; folding it \
+             again would double-count every alarm on any zone that later takes \
+             a drop in the same slot"
+        );
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].icmp_flood_events, 1,
+            "the second batch's drop must land exactly once"
+        );
+    }
+
+    /// The alarm arm must apply the same reason filter as the drop arm: a
+    /// non-flood screen reason is a real alarm but not a FLOOD alarm, and
+    /// folding it into one of the three families would make "UDP flood alarms"
+    /// silently include port scans.
+    #[test]
+    fn a_non_flood_reason_contributes_no_zone_alarm_7086() {
+        const Z: u16 = 77;
+        let store = FloodCounterStore::default();
+        let map = FloodCounterSlotMap::build(&[Z], &store);
+
+        record_zone_flood_alarm(&map, Z, "port-scan");
+        record_zone_flood_alarm(&map, Z, "teardrop");
+        record_zone_flood_alarm(&map, Z, "syn-cookie");
+        flush_recorded_flood_counters(&store, &map);
+
+        assert!(
+            store.alarm_zones_for_test().is_empty(),
+            "only the three flood families may enter the per-zone alarm tally"
+        );
+    }
+
+    /// An unzoned packet or a zone with no hot-path slot contributes nothing,
+    /// identically to the drop recorder — the `slot == 0` sentinel guard.
+    #[test]
+    fn an_unslotted_zone_contributes_no_alarm_7086() {
+        const MAPPED: u16 = 11;
+        const UNMAPPED: u16 = 12;
+        let store = FloodCounterStore::default();
+        let map = FloodCounterSlotMap::build(&[MAPPED], &store);
+
+        record_zone_flood_alarm(&map, UNMAPPED, "syn-flood");
+        flush_recorded_flood_counters(&store, &map);
+        assert!(
+            store.alarm_zones_for_test().is_empty(),
+            "a zone with no slot must not attribute its alarms to slot 0"
+        );
+
+        // Positive control: the SAME call on a mapped zone does record, so the
+        // emptiness above is the slot guard and not a broken fixture.
+        record_zone_flood_alarm(&map, MAPPED, "syn-flood");
+        flush_recorded_flood_counters(&store, &map);
+        assert_eq!(store.alarm_zones_for_test(), vec![(MAPPED, (1, 0, 0))]);
     }
 }

@@ -2135,6 +2135,25 @@ fn run_stage_screen_capture(
     flow: Option<&SessionFlow>,
 ) -> (bool, u64, Vec<crate::event_stream::codec::DataplaneEventPayload>) {
     let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+    run_stage_screen_capture_in(&forwarding, screen, frame, meta, flow)
+}
+
+/// #7086: the same live drive, against a CALLER-OWNED forwarding state.
+///
+/// `run_stage_screen_capture` builds a fresh `ForwardingState` per call, which
+/// also means a fresh `FloodCounterStore` per call. That is invisible to a test
+/// asserting a verdict, but fatal to one asserting an accumulated per-zone
+/// tally: the thread-local accumulator survives across calls while the store it
+/// would fold into does not, so there is no run in which N packets and their
+/// totals meet. Owning the state lets a test drive the stage repeatedly and
+/// then flush ONCE into the store those packets actually accumulated against.
+fn run_stage_screen_capture_in(
+    forwarding: &ForwardingState,
+    screen: &mut ScreenState,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: Option<&SessionFlow>,
+) -> (bool, u64, Vec<crate::event_stream::codec::DataplaneEventPayload>) {
     let ident = BindingIdentity {
         slot: 0,
         queue_id: 0,
@@ -2168,7 +2187,7 @@ fn run_stage_screen_capture(
         ident: &ident,
         binding_lookup: &binding_lookup,
         mirror_targets: &mirror_targets,
-        forwarding: &forwarding,
+        forwarding,
         ha_state: &ha_state,
         dynamic_neighbors: &dynamic_neighbors,
         neighbor_resolver: None,
@@ -2550,6 +2569,194 @@ fn fabric_ingress_skips_rate_flood_direct_still_counts_4155() {
     assert!(
         d3 && c3 == 1,
         "3rd direct packet crosses udp-flood threshold 2 and DROPS"
+    );
+}
+
+/// Zone `lan` UDP-flood screen at threshold `n`, PLUS the Junos profile-wide
+/// `alarm-without-drop` audit modifier. Same profile as `udp_flood_screen`
+/// otherwise, so the pair differs on exactly the axis under test (#7086).
+fn udp_flood_screen_alarm_without_drop(n: u32) -> ScreenState {
+    let mut profiles = FxHashMap::default();
+    profiles.insert(
+        "lan".to_string(),
+        ScreenProfile {
+            udp_flood_threshold: n,
+            alarm_without_drop: true,
+            ..ScreenProfile::default()
+        },
+    );
+    let mut screen = ScreenState::new();
+    screen.update_profiles(profiles);
+    screen
+}
+
+/// #7086 fail-on-revert: a zone under `alarm-without-drop` that is tripping a
+/// flood check must accumulate per-zone flood ALARMS, and must NOT accumulate
+/// per-zone flood DROPS.
+///
+/// This is the issue's exact statement, driven through the LIVE
+/// `stage_screen_check` rather than through `record_zone_flood_alarm` directly:
+/// the defect was that the alarm arm never reached the tally at all, so a test
+/// that calls the recorder itself would pass against the broken tree. What is
+/// under test is the WIRING of the three alarm arms, not the recorder.
+///
+/// The two legs differ on exactly one axis — `alarm_without_drop` — and the
+/// drop leg is the positive control: it proves the fixture really crosses the
+/// UDP-flood threshold, so the alarm leg's empty drop snapshot is the
+/// suppression under test and not a flood that never happened. Without it,
+/// a fixture that tripped nothing would produce an identical "no drops" row.
+///
+/// It also binds the SEPARATION both ways: drop mode records drops and zero
+/// alarms, alarm mode records alarms and zero drops. Folding the alarm arm
+/// into the drop counter — the obvious fix this issue rejects — turns the
+/// alarm leg's `snapshot().is_empty()` assertion RED.
+#[test]
+fn alarm_without_drop_flood_tallies_zone_alarms_not_drops_7086() {
+    use crate::afxdp::flood_counters::flush_recorded_flood_counters;
+    const FRAG_PROTO_UDP: u8 = 17;
+    // Same benign flowless non-first UDP fragment the #4155 test uses: it
+    // trips NO L3 fragment screen, so only the source-independent UDP flood
+    // counter can act on it and the reason is unambiguously "udp-flood".
+    let frame = ipv4_fragment_frame(0x00B9, FRAG_PROTO_UDP, 100);
+    let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+    assert!(
+        parse_session_flow_from_bytes(&frame, meta).is_none(),
+        "the fragment must be flowless so the flowless screen path runs"
+    );
+
+    // --- Leg 1, POSITIVE CONTROL: no alarm modifier. Threshold 2, four
+    // packets, so packets 3 and 4 cross and DROP.
+    let drop_fwd = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+    let mut drop_screen = udp_flood_screen(2);
+    let mut observed_drops = 0u64;
+    for _ in 0..4 {
+        let (_, drops, _) =
+            run_stage_screen_capture_in(&drop_fwd, &mut drop_screen, &frame, meta, None);
+        observed_drops += drops;
+    }
+    assert_eq!(
+        observed_drops, 2,
+        "control: threshold 2 over four packets must DROP exactly the 3rd \
+         and 4th. If this is 0 the fixture never reached the flood check and \
+         the alarm leg below would prove nothing"
+    );
+    flush_recorded_flood_counters(
+        &drop_fwd.flood_counter_store,
+        &drop_fwd.flood_counter_slot_map,
+    );
+    let drop_rows = drop_fwd.flood_counter_store.snapshot();
+    assert_eq!(
+        drop_rows.len(),
+        1,
+        "control: exactly one zone must carry per-zone flood DROPS"
+    );
+    assert_eq!(
+        drop_rows[0].udp_flood_events, 2,
+        "control: both suppressible drops are attributed to the ingress zone"
+    );
+    assert!(
+        drop_fwd.flood_counter_store.alarm_zones_for_test().is_empty(),
+        "control: a DROPPING zone raises no alarms, so the alarm triple must \
+         stay empty — the two arms are separate tallies, not one renamed"
+    );
+
+    // --- Leg 2, THE SUBJECT: identical inputs plus `alarm-without-drop`.
+    let alarm_fwd = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+    let mut alarm_screen = udp_flood_screen_alarm_without_drop(2);
+    for i in 0..4 {
+        let (dropped, drops, _) =
+            run_stage_screen_capture_in(&alarm_fwd, &mut alarm_screen, &frame, meta, None);
+        assert!(
+            !dropped && drops == 0,
+            "iteration {i}: alarm-without-drop must FORWARD and take no drop"
+        );
+    }
+    assert_eq!(
+        alarm_screen.alarm_without_drop_events(),
+        2,
+        "the same two packets that dropped in the control must raise two \
+         suppressed-drop alarms here"
+    );
+    flush_recorded_flood_counters(
+        &alarm_fwd.flood_counter_store,
+        &alarm_fwd.flood_counter_slot_map,
+    );
+
+    // The reported gap: before #7086 this zone had NOTHING published, so
+    // ReadFloodCounters returned ErrCounterNotPopulated and every surface
+    // rendered "the zone has recorded no flood events" during a live flood.
+    let alarm_rows = alarm_fwd.flood_counter_store.alarm_zones_for_test();
+    assert_eq!(
+        alarm_rows.len(),
+        1,
+        "a zone under a live flood ALARM must appear in the per-zone alarm \
+         tally; empty here is the #7086 defect (nothing published, surface \
+         renders \"not available\")"
+    );
+    assert_eq!(
+        alarm_rows[0].1,
+        (0, 0, 2),
+        "both alarms must land in the UDP family of the alarming zone"
+    );
+    assert!(
+        alarm_fwd.flood_counter_store.snapshot().is_empty(),
+        "an ALARMING zone dropped nothing, so the DROP triple must stay \
+         empty. Feeding the alarm arm into record_zone_flood_drop — the \
+         obvious fix #7086 rejects — reds here: it would make a counter \
+         whose name and call-site contract say DROP report packets that \
+         were permitted and forwarded"
+    );
+}
+
+/// #7086 drift guard: EVERY `alarm-without-drop` arm must record a per-zone
+/// flood alarm.
+///
+/// The drop side cannot drift, because every screen drop site funnels through
+/// the one `BatchCounters::record_screen_drop` method and the tally hangs off
+/// that. The alarm side has no such funnel — the suppression is decided inline
+/// in three separate arms of `stage_screen_check`, and `record_alarm_without_drop`
+/// lives in the `screen` module, which cannot see the afxdp slot map. So the
+/// per-zone call is made at each arm, and nothing but this test stops a fourth
+/// arm from being added with the alarm event and without the tally, which is
+/// #7086 re-created for whatever check that arm serves.
+///
+/// Asserts the pairing, not a magic number: the count is derived from the arms
+/// themselves, so adding a properly-wired arm keeps this green.
+#[test]
+fn every_alarm_without_drop_arm_records_a_zone_flood_alarm_7086() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("afxdp")
+            .join("poll_stages.rs"),
+    )
+    .expect("poll_stages.rs must be readable");
+    // Strip line comments: this test file and the call sites both NAME the
+    // symbols below, and a scan satisfied by prose describing what it should
+    // find would pass against arms that record nothing.
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let arms = code.matches("screen.record_alarm_without_drop();").count();
+    let tallies = code.matches("record_zone_flood_alarm(").count();
+
+    // Non-vacuity first: if the alarm arms were restructured away, the
+    // equality below holds at 0 == 0 and this guard silently stops guarding.
+    assert!(
+        arms > 0,
+        "found no alarm-without-drop arms in poll_stages.rs — either the \
+         suppression moved, in which case this guard scans the wrong file, or \
+         it was removed. Either way it is not evidence the arms are wired"
+    );
+    assert_eq!(
+        arms, tallies,
+        "{arms} alarm-without-drop arm(s) but {tallies} per-zone flood alarm \
+         tally call(s): an arm suppresses a flood drop without recording it, \
+         so that zone publishes nothing and every flood surface renders \
+         \"the zone has recorded no flood events\" during a live alarm (#7086)"
     );
 }
 
