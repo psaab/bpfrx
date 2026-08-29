@@ -79,12 +79,24 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		close(done)
 	}()
 
-	cmdErr := c.dispatch(cmd)
-	w.Close()
-	os.Stdout = origStdout
-	<-done
+	// Restore stdout and reap the reader in ONE deferred block (#7171) so no
+	// exit path can leave the daemon's stdout pointing at the pipe. The
+	// failure this was filed for -- a panic between the swap and the restore
+	// -- is NOT reachable today: nothing on this path recovers, so a panic
+	// takes the process down and a leaked swap cannot be observed. The class
+	// that IS reachable is an early return: this function is short enough
+	// that adding an error check between the swap and the restore is a
+	// natural edit, and such a return would have left every later write going
+	// into a pipe nobody drains AND leaked the reader goroutine blocked on
+	// read. Closing w must precede <-done or the reader never sees EOF and
+	// this deadlocks.
+	defer func() {
+		w.Close()
+		os.Stdout = origStdout
+		<-done
+	}()
 
-	return cmdErr
+	return c.dispatch(cmd)
 }
 
 // filterStream applies a Junos-style output filter to src, writing to out as
@@ -167,11 +179,24 @@ func (c *CLI) dispatchWithPager(line string) error {
 		close(done)
 	}()
 
-	cmdErr := c.dispatchOperational(line)
-	w.Close()
-	os.Stdout = origStdout
-	<-done
-	return cmdErr
+	// Restore stdout and reap the reader in ONE deferred block (#7171) so no
+	// exit path can leave the daemon's stdout pointing at the pipe. The
+	// failure this was filed for -- a panic between the swap and the restore
+	// -- is NOT reachable today: nothing on this path recovers, so a panic
+	// takes the process down and a leaked swap cannot be observed. The class
+	// that IS reachable is an early return: this function is short enough
+	// that adding an error check between the swap and the restore is a
+	// natural edit, and such a return would have left every later write going
+	// into a pipe nobody drains AND leaked the reader goroutine blocked on
+	// read. Closing w must precede <-done or the reader never sees EOF and
+	// this deadlocks.
+	defer func() {
+		w.Close()
+		os.Stdout = origStdout
+		<-done
+	}()
+
+	return c.dispatchOperational(line)
 }
 
 // pageStream reads newline-delimited output from src and writes it to out one

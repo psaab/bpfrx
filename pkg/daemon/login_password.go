@@ -236,10 +236,34 @@ func lookupUIDErr(name string) (uid int, found bool, err error) {
 }
 
 // markerPathIn returns the provenance marker file path for name inside dir.
-// names are validated OS usernames here (created via useradd), but Clean+Base
-// the name defensively so a marker can never escape the directory.
+// names are validated OS usernames here (created via useradd), but the name is
+// reduced defensively so a marker can never escape the directory.
+//
+// Clean+Base alone did NOT deliver that (#7171). Base(Clean(x)) keeps a bare
+// traversal element -- Base(Clean("..")) is ".." -- so Join(dir, "..") yielded
+// dir's PARENT, and Base(Clean(".")) / Base(Clean("/")) yielded dir ITSELF.
+// The latter matters as much as the escape: the deprovision path calls
+// os.Remove on this result, so a name of "." aimed a remove at the whole
+// provenance registry directory rather than at one marker inside it.
+//
+// The old containment test could not see any of this: every input it sampled
+// ("../../etc/shadow", "/etc/passwd", "a/b/c") ends in a real component, so
+// Base returns "shadow"/"passwd"/"c" and containment holds under any
+// implementation. Those inputs cannot distinguish a correct reduction from a
+// broken one; only a name that cleans to a bare traversal element can.
 func markerPathIn(dir, name string) string {
-	return filepath.Join(dir, filepath.Base(filepath.Clean(name)))
+	base := filepath.Base(filepath.Clean(name))
+	switch base {
+	case ".", "..", string(filepath.Separator):
+		// A name that reduces to a traversal element is not a username and
+		// must not address dir or anything above it. Map it to a single
+		// reserved, contained filename: two such names colliding is
+		// irrelevant (neither is a legal account), whereas either escaping
+		// is not. Containment is now true by construction rather than by
+		// the caller happening to pass a well-formed name.
+		base = "_invalid-name"
+	}
+	return filepath.Join(dir, base)
 }
 
 // markerPath is markerPathIn for the account/enumeration registry. Kept as the

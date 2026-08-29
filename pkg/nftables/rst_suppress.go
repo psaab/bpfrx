@@ -56,19 +56,12 @@ func InstallRSTSuppression(v4Addrs []netip.Addr, v6Addrs []netip.Addr) error {
 	return nil
 }
 
-// RemoveRSTSuppression removes the RST suppression table.
-func RemoveRSTSuppression() {
-	c, err := nftables.New()
-	if err != nil {
-		return
-	}
-	tableExists, err := rstTableExists(c)
-	if err != nil || !tableExists {
-		return
-	}
-	removeRSTTable(c)
-	_ = c.Flush()
-}
+// RemoveRSTSuppression was removed in #7171: it had zero production callers
+// and swallowed the outcome of its own teardown (`_ = c.Flush()`), so had a
+// caller ever appeared it would have reported success for a table that was
+// still installed. removeRSTTable below is the live teardown, used by the
+// install path's rebuild. A future explicit teardown entry point should return
+// an error rather than restore this shape.
 
 func removeRSTTable(c *nftables.Conn) {
 	c.DelTable(&nftables.Table{

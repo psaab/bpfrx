@@ -285,10 +285,21 @@ func classifyWriteErr(err error) UnsupportedKind {
 // to make a cross-probe collision negligible.
 func makeNonce() []byte {
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure is effectively impossible on Linux; fall back
-		// to a fixed marker so the probe still has a stable Data field.
-		copy(b, []byte("xpf-ka00"))
-	}
+	// No error branch, and deliberately no fallback value (#7171). The
+	// nonce is the anti-spoof discriminator: a reply is matched on Seq +
+	// nonce precisely so an off-path forgery cannot pass as a reply to
+	// THIS probe. The previous code fell back to a FIXED marker
+	// ("xpf-ka00") if rand.Read failed, which would have dissolved that
+	// property silently -- every probe carrying a nonce an attacker can
+	// predict, so a spoofed echo reply holds a dead tunnel UP.
+	//
+	// That fallback was also unreachable: since Go 1.24 crypto/rand.Read
+	// never returns an error. A failure of the system entropy source is
+	// fatal (the runtime crashes the process, see go.dev/issue/66821), so
+	// there is no observable error for a caller to handle. Keeping the
+	// branch bought nothing and left a predictable-nonce path in the
+	// source for a future reader to "restore". Having no fallback at all
+	// makes the weak nonce unrepresentable rather than merely improbable.
+	rand.Read(b)
 	return b
 }

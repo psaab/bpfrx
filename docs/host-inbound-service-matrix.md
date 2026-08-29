@@ -1167,6 +1167,16 @@ an interface's admission routes through the former — the kernel nft view build
 (`ClassifyHostInboundForInterface`), the commit-time advisories, the
 duplicate-host-address gate, and all six display surfaces.
 
+`UnionHostInboundTokens` dedups on the CASE-FOLDED token and emits the token as
+the operator authored it (#7171). Service tokens are matched case-insensitively
+everywhere downstream, so a zone spelling a service `ssh` and an interface
+spelling it `SSH` describe one admission, not two; keying the dedup on the raw
+token rendered both and made the display disagree with the single service
+actually admitted. Folding the key without folding the value keeps the authored
+case these surfaces are meant to echo back. This is deliberately NOT shared with
+the case-fold in `junos_host_deny.go`: that one folds to MATCH enforcement
+(#5557), while this one folds only to DEDUP and must preserve the spelling.
+
 ### The advisory consumes the enforcer's view, it does not model it (#6640)
 
 `config.EffectiveHostInboundTokens` settles the zone-vs-interface choice, but it

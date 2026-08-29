@@ -101,6 +101,20 @@ func Generate() (KeyPair, error) {
 	if _, err := rand.Read(raw); err != nil {
 		return KeyPair{}, fmt.Errorf("wgkey: read random: %w", err)
 	}
+	// Wipe the raw scalar once both derived forms exist (#7171). Scope
+	// this honestly: it clears the RAW clamped scalar from this buffer, it
+	// does NOT make the private key unrecoverable from process memory. The
+	// returned PrivateKey is a base64 string, and Go strings are immutable
+	// and GC-managed, so that copy cannot be wiped here or by the caller;
+	// the runtime may also have copied raw while growing a stack. The value
+	// is narrow and real -- one fewer long-lived copy of the scalar in its
+	// rawest form -- and it is not a substitute for the caller keeping the
+	// returned string out of logs and off disk.
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
 	clamp(raw)
 	pub, err := PublicKeyFromPrivate(raw)
 	if err != nil {
