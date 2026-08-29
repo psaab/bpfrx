@@ -85,6 +85,7 @@ mod forwarding_build;
 mod frame;
 #[path = "gre.rs"]
 mod gre;
+mod gre_discriminator;
 mod ha;
 // #6785: the control handler needs the synced-import outcome type and its
 // refusal-token prefix.
