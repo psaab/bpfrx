@@ -35,7 +35,7 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		// and this is where it becomes a local number again. Unresolvable (0, an
 		// unknown fold, or a collision) leaves both fields 0 and the consumer
 		// falls back to the #4792 zone approximation, exactly as before #7095.
-		if ifindex, vlan, ok := m.resolveIngressFold(val.IngressIfaceFold); ok {
+		if ifindex, vlan, ok := m.resolveIngressFoldLocked(val.IngressIfaceFold); ok {
 			req.IngressIfindex = int(ifindex)
 			req.IngressVLANID = vlan
 		}
@@ -121,7 +121,7 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		// and this is where it becomes a local number again. Unresolvable (0, an
 		// unknown fold, or a collision) leaves both fields 0 and the consumer
 		// falls back to the #4792 zone approximation, exactly as before #7095.
-		if ifindex, vlan, ok := m.resolveIngressFold(val.IngressIfaceFold); ok {
+		if ifindex, vlan, ok := m.resolveIngressFoldLocked(val.IngressIfaceFold); ok {
 			req.IngressIfindex = int(ifindex)
 			req.IngressVLANID = vlan
 		}
@@ -346,7 +346,7 @@ func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex i
 	return InterfaceSnapshot{}, false
 }
 
-// resolveIngressFold maps a peer's #7095 cluster-stable ingress fold to this
+// resolveIngressFoldLocked maps a peer's #7095 cluster-stable ingress fold to this
 // node's own {ifindex, vlan}.
 //
 // The resolver is injected (the daemon owns the config and the ifindex
@@ -354,13 +354,20 @@ func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex i
 // not an error. Returning ok=false for an unknown or ambiguous fold is
 // deliberate: naming no interface costs the zone approximation, while naming the
 // wrong one is the confidently-wrong rendering #6928 refused to ship.
-func (m *Manager) resolveIngressFold(fold uint32) (uint32, uint16, bool) {
+// The caller MUST already hold m.mu. Both call sites are
+// buildSessionSyncRequest{V4,V6}, which are themselves `...Locked`-contract
+// helpers reached with the manager mutex held — from SetClusterSyncedSessionV4/V6
+// (the peer-import path, via syncSessionV{4,6}Locked) and from
+// mirrorSessionPairV{4,6} (the local-install path). An earlier revision took
+// m.mu here, which SELF-DEADLOCKED on the non-reentrant sync.Mutex the moment a
+// session carried a non-zero fold — and it locked before reading the resolver,
+// so a nil resolver did not save it. The lock was never needed at this depth:
+// every caller already holds it, which is exactly what makes the read safe.
+func (m *Manager) resolveIngressFoldLocked(fold uint32) (uint32, uint16, bool) {
 	if m == nil || fold == 0 {
 		return 0, 0, false
 	}
-	m.mu.Lock()
 	fn := m.ingressFoldResolver
-	m.mu.Unlock()
 	if fn == nil {
 		return 0, 0, false
 	}
