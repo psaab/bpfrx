@@ -417,6 +417,34 @@ and therefore cannot host this guard, so no `config_epoch` field is added to
 `TestConfigEpochNoRejectAgainstZeroBaseline5274` in
 `pkg/cluster/sync_config_epoch_5274_test.go`.
 
+## Ingress Interface Identity (#7095)
+
+Every **session** message carries a length-gated trailing `IngressIfaceFold
+uint32` after `RTFlowSessionID`. An old decoder stops before it and reads
+`IngressIfaceFold == 0` (`if off+4 <= len(payload)`); there is no
+`SessionSyncWireVersion` bump, for the same reason #2239/#3931 did not need one.
+
+**It is not an ifindex.** An ifindex is node-local — node 0's `ge-0-0-1` and node
+1's `ge-7-0-1` are the same logical RETH member with different numbers — so
+#6928 synced nothing rather than name the wrong NIC on the peer. What rides the
+wire is `config.StableIfaceID` over the RETH-RELATIVE name (`reth0.50`), which is
+byte-identical on both chassis because zones bind to it and `RethToPhysical`
+resolves it per node. The receiver resolves the fold back to its OWN
+`{ifindex, vlan}` before the helper stores it.
+
+**Zero is the unknown sentinel, and one encoding serves every producer of it:** a
+legacy peer emits no field at all, an interface with no cluster-stable name folds
+to 0, and a fabric-redirected session records no identity because the fabric
+stamp carries a u16 zone id and nothing else (#7096). All three fall back to the
+#4792 zone approximation on display. An unknown or ambiguous fold on the
+receiving side resolves to nothing for the same reason — the zone is honest where
+a guess is not.
+
+Adding this field moved every mixed-version truncation constant in
+`pkg/cluster/*_test.go` by 4 bytes. That is the standing cost of the trailing-field
+pattern: those cells cut a payload back by a hard-coded width to simulate an old
+peer, so each new trailing field has to be added to each count.
+
 ## RT_FLOW Session Id (#5212)
 
 Every **session** message carries a length-gated trailing `RTFlowSessionID

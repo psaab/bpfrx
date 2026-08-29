@@ -61,15 +61,36 @@ metadata carried as length-gated trailing wire fields; none is part of the on-ma
 BPF conntrack ABI (`bpfSessionValue`).
 
 `IngressIfindex` / `IngressVlanID` (#4983 — the interface a session's first
-packet arrived on) are the opposite case on both counts: they ARE part of the
-on-map C conntrack ABI, and they are deliberately NOT synced. An ifindex is
-node-local — node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different numbers
-for the same logical RETH member — so carrying the originating node's value
-would make `show security flow session interface <name>` name the WRONG
-interface on the importing node, which is worse than approximating. A
-peer-synced session therefore lands in the "no ingress identity carried" (`0`)
-branch — alongside the reverse companion and the host-outbound GRE path — and
-the CLI answers it from the ingress zone, exactly as it did before #4983.
+packet arrived on) are part of the on-map C conntrack ABI, and the IFINDEX
+itself is still never synced. An ifindex is node-local — node 0's `ge-0-0-1` and
+node 1's `ge-7-0-1` are different numbers for the same logical RETH member — so
+carrying the originating node's value would make
+`show security flow session interface <name>` name the WRONG interface on the
+importing node, which is worse than approximating.
+
+**What IS synced, since #7095, is a cluster-stable FOLD of the interface's
+name.** The reth-relative name (`reth0.50`) is byte-identical on both chassis —
+zones bind to it, and `RethToPhysical` resolves it to each node's own member — so
+`config.StableIfaceID` over that name is agreed by construction.
+`IngressIfaceFold` rides as a length-gated trailing u32 (the #2170 pattern, no
+`SessionSyncWireVersion` bump), and the RECEIVER resolves it back to its OWN
+`{ifindex, vlan}` before the helper stores it. Nothing node-local crosses the
+wire; the importing node ends up with its own numbers for the interface the peer
+named. Before #7095 every peer-synced session degraded to the zone
+approximation, which meant half the sessions on a two-node cluster at all times
+and all of them immediately after an RG transition — the diagnostic stopped
+working exactly when it was most needed.
+
+`0` still means "no ingress identity carried", and it now arrives from four
+places that all want the same fallback: the reverse companion, the
+host-outbound GRE path, a legacy peer whose frame stops before the field, and a
+session whose interface has no cluster-stable name — including a
+fabric-redirected one, which records nothing at all because the fabric stamp
+carries a u16 zone id and nothing else (#7096). An UNKNOWN or AMBIGUOUS fold
+resolves to nothing rather than to a device: a fold this node cannot place, or
+one two stable names collide on, falls back to the zone, because naming no
+interface costs an approximation while naming the wrong one is the confidently
+wrong rendering #6928 refused to ship.
 
 That branch does NOT include "a pre-#4983 session" (#6928, corrected): a new
 daemon can never read one. `sessions` / `sessions_v6` are in the shim ABI
