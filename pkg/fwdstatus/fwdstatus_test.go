@@ -716,6 +716,43 @@ func TestUnknownCrashStateRendersNothingRatherThanHealth7250(t *testing.T) {
 	}
 }
 
+// Format is EXPORTED and takes a flat struct, so it must be correct for any
+// ForwardingStatus it is handed — not only for one Build produced.
+//
+// This cell exists because a mutation ESCAPED without it. Deleting
+// `if !fs.HelperCrashKnown { return }` from writeHelperCrash left the whole
+// suite green, because every other cell reaches that gate THROUGH Build, and
+// Build never populates LastExitWasCrash/RestartPending unless known is true —
+// so the renderer's second gate absorbed the mutation and the first one was
+// never actually bound. The record fields are set here directly, which is the
+// only way to reach the site the production path sanitizes on the way in.
+func TestFormatDoesNotRenderAnUnvouchedRecordEvenIfPopulated7250(t *testing.T) {
+	fs := &ForwardingStatus{
+		State:            StateUnknown,
+		HelperCrashKnown: false, // "could not ask" — NOT a claim of health
+		// Populated as if a crash had been recorded. A caller that set these
+		// without vouching for them must not get a crash render.
+		LastExitWasCrash:  true,
+		RestartPending:    true,
+		HelperExitCode:    101,
+		HelperPID:         4242,
+		HelperRestarts:    3,
+		HelperNextRestart: time.Now().Add(time.Second),
+	}
+	out := Format(fs)
+	for _, unwanted := range []string{
+		"Helper exit code", "4242", "Helper restart attempts",
+		"Helper next restart", "restart pending",
+	} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("Format rendered %q from a record the caller did not vouch for "+
+				"(HelperCrashKnown=false). The renderer must gate on that flag itself; "+
+				"relying on Build to sanitize leaves Format wrong for every other "+
+				"caller.\n--- got ---\n%s", unwanted, out)
+		}
+	}
+}
+
 // A dataplane with no crash accessor at all — every pre-#7250 implementor, and
 // the eBPF path. Build must not panic and must not invent a crash.
 func TestDataPlaneWithoutTheCrashAccessorIsTolerated7250(t *testing.T) {
@@ -802,6 +839,33 @@ func TestSignalAndExitCodeAreRenderedExclusively7250(t *testing.T) {
 	if strings.Contains(signalled, "Helper exit code") {
 		t.Errorf("signalled exit ALSO rendered an exit code; ExitCode is -1 here, so the "+
 			"row would read \"exit code -1\".\n--- got ---\n%s", signalled)
+	}
+
+	// The `else` in the render is only OBSERVABLE when both fields are set at
+	// once — and the producer never does that (`exitCodeAndSignal` returns
+	// (-1, sig) or (code, "")), so the two cells above pass identically with
+	// the discriminator removed. A second escaped mutation found exactly that:
+	// the fixtures used the values production emits, so the guard they were
+	// written for was never exercised.
+	//
+	// Format is exported and takes a flat struct, so it owes a defined answer
+	// for a state its usual producer cannot construct. Signal wins.
+	both := Format(&ForwardingStatus{
+		State:            StateUnknown,
+		HelperCrashKnown: true,
+		LastExitWasCrash: true,
+		RestartPending:   true,
+		HelperSignal:     "killed",
+		HelperExitCode:   101, // contradictory on purpose
+		HelperRestarts:   1,
+	})
+	if !strings.Contains(both, "Helper exit signal") {
+		t.Errorf("signal must win when both are set.\n--- got ---\n%s", both)
+	}
+	if strings.Contains(both, "Helper exit code") {
+		t.Errorf("both an exit signal and an exit code were rendered. Signal is the "+
+			"discriminator — exactly one of the two is meaningful — so rendering both "+
+			"tells an operator the helper did two contradictory things.\n--- got ---\n%s", both)
 	}
 
 	exited := base(userspace.HelperCrashRecord{
