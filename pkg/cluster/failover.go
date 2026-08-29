@@ -638,14 +638,38 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 		return preHookErr
 	}
 
-	now := time.Now()
+	// #7176 (C179-065): a member REMOVED from config during the unlocked
+	// pre-hook window must be reported, not silently skipped. The singular
+	// ManualFailover returns "redundancy group %d not found" for exactly this
+	// condition after its own re-lock (see above); the batch used to `continue`,
+	// so the same condition on the same path reported full success. There is no
+	// contract behind the batch's side of that split — it is the one place the
+	// two genuinely diverge — and reporting it makes them agree.
+	//
+	// Resolved BEFORE any member is mutated, and the resolved pointers are what
+	// the commit loop iterates: the whole commit half runs under one lock, so
+	// the pre-scan is atomic with the writes and an unknown member can never
+	// leave the batch half-applied.
+	//
+	// The SUPERSEDE skip below deliberately keeps its `continue`. That is #5246
+	// working as designed — the reset wins — and it is pinned by name in
+	// failover_races_5245_5246_test.go ("ManualFailover should return without
+	// error when superseded"). The singular path does the same thing, so it is
+	// not a batch defect. The operator-facing consequence of reporting success
+	// for a partially-applied BATCH is real and is tracked separately by #8000;
+	// it needs an API change, not a silent reversal of a pinned contract.
+	resolved := make([]*RedundancyGroupState, 0, len(ids))
 	for _, rgID := range ids {
 		rg := m.groups[rgID]
 		if rg == nil {
-			// Group was removed from config during the unlocked pre-hook
-			// window; nothing to transfer out.
-			continue
+			return fmt.Errorf("redundancy group %d not found", rgID)
 		}
+		resolved = append(resolved, rg)
+	}
+
+	now := time.Now()
+	for i, rgID := range ids {
+		rg := resolved[i]
 		// A ResetFailover on this member during the unlocked window bumped
 		// its failover generation — its reset wins; skip the SecondaryHold
 		// write so we don't clobber it (#5246).
