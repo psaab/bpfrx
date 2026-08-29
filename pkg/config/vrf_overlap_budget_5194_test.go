@@ -40,7 +40,7 @@ func TestValidateVRFOverlapWarningCap_5194(t *testing.T) {
 		"fb": {Name: "fb", Terms: mkTerms("vrfB")},
 	}
 
-	warnings, _ := validateVRFOverlap(cfg, true /* #7924: budget test measures WARNINGS, not the reject */)
+	warnings, _, _ := validateVRFOverlap(cfg, true /* #7924: budget test measures WARNINGS, not the reject */)
 
 	// Overlap advisories are capped, plus exactly one truncation notice.
 	if len(warnings) != vrfOverlapMaxWarnings+1 {
@@ -70,7 +70,7 @@ func TestValidateVRFOverlapUnderCapNoTruncation_5194(t *testing.T) {
 			{Name: "b", RoutingInstance: "vrfB", SourceAddresses: []string{"10.0.0.0/24"}},
 		}},
 	}
-	warnings, _ := validateVRFOverlap(cfg, true /* #7924: budget test measures WARNINGS, not the reject */)
+	warnings, _, _ := validateVRFOverlap(cfg, true /* #7924: budget test measures WARNINGS, not the reject */)
 	if len(warnings) != 1 {
 		t.Fatalf("one overlap => 1 warning, got %d: %v", len(warnings), warnings)
 	}

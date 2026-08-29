@@ -361,6 +361,32 @@ func (c *xpfCollector) collectHostInboundAmbiguousAddresses(ch chan<- prometheus
 	}
 }
 
+// collectVRFOverlapPBRAdmitted emits xpf_vrf_overlap_pbr_admitted (#7991): a 1
+// per cross-routing-instance L3 overlap on a config that also carries a PBR
+// `then routing-instance` term — the combination the strict commit gate refuses
+// (#7924) and a tolerant / peer-synced load (#1960) admits.
+//
+// Mirrors collectHostInboundAmbiguousAddresses above in every respect that
+// matters, because it is the structurally identical situation: the tolerant path
+// admitted something strict rejects, the condition is NOT self-healing, and the
+// signal is config-derived so Collect calls this BEFORE the dataplane gate. The
+// SSOT is config.TolerantVRFOverlapAdmissions, which runs the SAME detector the
+// commit gate runs — so the metric and the commit advisory can never describe
+// different detections.
+func (c *xpfCollector) collectVRFOverlapPBRAdmitted(ch chan<- prometheus.Metric) {
+	if c.srv == nil || c.srv.store == nil {
+		return
+	}
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	for _, o := range config.TolerantVRFOverlapAdmissions(cfg) {
+		ch <- prometheus.MustNewConstMetric(c.vrfOverlapPBRAdmitted,
+			prometheus.GaugeValue, 1, o.InstanceA, o.InstanceB, o.PrefixA)
+	}
+}
+
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	// #3345: on a counter-read failure, SKIP emitting the sample instead of
 	// reporting a misleading 0, and bump xpf_counter_read_errors_total. A
@@ -541,11 +567,11 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 	// buy is the direct-call test path, where a collector method is invoked
 	// without going through Collect().
 	//
-	// Counted, not pattern-matched -- and the count is NINE pre-gate collectors,
+	// Counted, not pattern-matched -- and the count is TEN pre-gate collectors,
 	// which partition into three sets, not two:
 	//   - touch c.srv/c.srv.store AND guard: collectPBRStatus,
 	//     collectHostInboundAddresslessZones, collectHostInboundAddresslessInterfaces,
-	//     collectHostInboundAmbiguousAddresses.
+	//     collectHostInboundAmbiguousAddresses, collectVRFOverlapPBRAdmitted (#7991).
 	//   - touch NEITHER field, so need no guard: collectLo0Counters and the
 	//     collectHostInbound{KernelDenies,JunosHostDenies,ICMPNDAccepts} readers.
 	//   - touches c.srv and does NOT guard: collectFlowExportMetrics

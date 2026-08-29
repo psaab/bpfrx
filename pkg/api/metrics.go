@@ -67,6 +67,7 @@ type xpfCollector struct {
 	hostInboundAddresslessZones  *prometheus.Desc
 	hostInboundAddresslessIface  *prometheus.Desc
 	hostInboundAmbiguousAddrs    *prometheus.Desc
+	vrfOverlapPBRAdmitted        *prometheus.Desc
 	lo0CounterHits               *prometheus.Desc
 	pbrRulesInstalled            *prometheus.Desc
 	pbrDegradedTerms             *prometheus.Desc
@@ -747,6 +748,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundAddresslessZones
 	ch <- c.hostInboundAddresslessIface
 	ch <- c.hostInboundAmbiguousAddrs
+	ch <- c.vrfOverlapPBRAdmitted
 	ch <- c.lo0CounterHits
 	ch <- c.pbrRulesInstalled
 	ch <- c.pbrDegradedTerms
@@ -1353,6 +1355,15 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// addressless window, NOT self-healing — so emit it BEFORE the dataplane gate
 	// so it stays visible in a config-only / degraded boot too.
 	c.collectHostInboundAmbiguousAddresses(ch)
+
+	// #7991: cross-routing-instance L3 overlap combined with PBR `then
+	// routing-instance` — the combination the STRICT commit path refuses (#7924)
+	// and a tolerant / peer-synced load admits. Config-derived, and NOT
+	// self-healing, so it belongs above the dataplane gate for the same reason
+	// #3718 does: it is exactly the degraded/config-only boot on which an
+	// operator most needs to discover the state, and below the gate the series
+	// would vanish there.
+	c.collectVRFOverlapPBRAdmitted(ch)
 
 	// #4422: kernel nftables lo0 loopback input-filter `then count` hits. The
 	// `inet xpf_lo0` chain is installed by the daemon INDEPENDENT of dataplane

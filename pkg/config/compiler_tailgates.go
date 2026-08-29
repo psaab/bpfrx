@@ -108,7 +108,7 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// #7924: now returns an error for the NARROW cross-tenant case (overlap AND a
 	// PBR `then routing-instance` term). The warnings are appended either way, so
 	// the lenient path keeps the pre-#7924 advisory verbatim.
-	vrfOverlapWarnings, err := validateVRFOverlap(cfg, opts.lenientVRFOverlapPBR)
+	vrfOverlapWarnings, _, err := validateVRFOverlap(cfg, opts.lenientVRFOverlapPBR)
 	cfg.Warnings = append(cfg.Warnings, vrfOverlapWarnings...)
 	if err != nil {
 		return err
