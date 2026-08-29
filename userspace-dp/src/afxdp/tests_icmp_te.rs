@@ -205,8 +205,11 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
 /// never consulted).
 #[test]
 fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
-    // #5567: the reply must be built + pass the token before the output-filter
-    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    // #5567 needed a non-empty bucket here because the token was consumed
+    // BEFORE the output-filter classify. #7174 M04 reversed that — the token is
+    // consumed last, only for a reply that will actually be sent — so this test
+    // no longer depends on bucket state. The lock stays because the fallback
+    // bucket is a shared static and these tests must not race.
     let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
@@ -266,6 +269,21 @@ fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
         },
     );
 
+    // #7174 M04: give this zone its OWN bucket so the token observation below is
+    // isolated from the shared static fallback (and from every other test).
+    // Key the bucket on the zone the code will ACTUALLY resolve. `from_zone_id`
+    // comes from `forwarding.ifindex_to_zone_id[ingress_ident.ifindex]`, so
+    // binding it here is what makes the bucket reachable — inserting under a
+    // zone the lookup never produces leaves the code on the shared static
+    // fallback and both assertions below pass vacuously. The control cell caught
+    // exactly that on its first run.
+    forwarding.ifindex_to_zone_id.insert(5, TEST_LAN_ZONE_ID);
+    let te_bucket = std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new());
+    forwarding
+        .time_exceeded_buckets
+        .insert(TEST_LAN_ZONE_ID, te_bucket.clone());
+    let arrival_before = te_bucket.arrival_ns();
+
     let mut counters = BatchCounters::default();
     let request = build_local_time_exceeded_request(
         &frame,
@@ -283,6 +301,17 @@ fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
     assert!(
         request.is_none(),
         "egress output-filter `then discard` (protocol icmp) must reject the generated ICMP reply"
+    );
+    // #7174 M04: and it must not have COST anything. The budget bounds what this
+    // box emits; a reply the filter discards emits nothing, so charging for it
+    // lets a filtered stream starve the errors that would have gone out — and
+    // does it invisibly, because the drop is attributed to the filter counter
+    // while the missing errors are attributed to the limiter.
+    assert_eq!(
+        te_bucket.arrival_ns(),
+        arrival_before,
+        "a filter-DROPPED ICMP Time Exceeded must not spend a rate-limit token \
+         (#7174 M04); the bucket state moved, so it did"
     );
     assert_eq!(
         counters.time_exceeded_output_filter_drops, 1,
@@ -354,6 +383,23 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
         },
     );
 
+    // #7174 M04 CONTROL. The sibling drop-path cell asserts a filtered reply
+    // spends NO token; that assertion is only meaningful if a reply which IS
+    // sent DOES spend one. Without this, "the bucket did not move" would be
+    // satisfied by a bucket nothing ever consults.
+    // Key the bucket on the zone the code will ACTUALLY resolve. `from_zone_id`
+    // comes from `forwarding.ifindex_to_zone_id[ingress_ident.ifindex]`, so
+    // binding it here is what makes the bucket reachable — inserting under a
+    // zone the lookup never produces leaves the code on the shared static
+    // fallback and both assertions below pass vacuously. The control cell caught
+    // exactly that on its first run.
+    forwarding.ifindex_to_zone_id.insert(5, TEST_LAN_ZONE_ID);
+    let te_bucket = std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new());
+    forwarding
+        .time_exceeded_buckets
+        .insert(TEST_LAN_ZONE_ID, te_bucket.clone());
+    let arrival_before = te_bucket.arrival_ns();
+
     let mut counters = BatchCounters::default();
     let request = build_local_time_exceeded_request(
         &frame,
@@ -368,6 +414,12 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
         &mut counters,
     );
 
+    assert_ne!(
+        te_bucket.arrival_ns(),
+        arrival_before,
+        "a reply that IS sent must spend a rate-limit token — otherwise the \
+         drop-path cell's 'no token spent' assertion proves nothing (#7174 M04)"
+    );
     assert!(
         request.is_some(),
         "an output filter matching the UDP trigger must NOT drop the generated ICMP reply"
@@ -403,8 +455,11 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
 /// never pass vacuously.
 #[test]
 fn build_local_time_exceeded_request_resolves_logical_ingress_for_classify_6102() {
-    // #5567: the reply must be built + pass the token before the output-filter
-    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    // #5567 needed a non-empty bucket here because the token was consumed
+    // BEFORE the output-filter classify. #7174 M04 reversed that — the token is
+    // consumed last, only for a reply that will actually be sent — so this test
+    // no longer depends on bucket state. The lock stays because the fallback
+    // bucket is a shared static and these tests must not race.
     let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
