@@ -173,39 +173,6 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	// activeClusterTransport that step 20 requires before it will restart.
 	d.activeClusterTransport = clusterTransportFromConfig(transport())
 
-	// #7072: RE-SEED before each subtest, because stopClusterComms now clears
-	// this field as part of tearing the epoch tuple down.
-	//
-	// The subtests used to inherit the one seed above, and the comment on the
-	// third said they were order-independent "because none of them REWRITES
-	// d.activeClusterTransport". That was true of the subtests and is no longer
-	// true of the code they drive: the second subtest's step 20 reaches
-	// stopClusterComms, which zeroes the field, and this fixture's
-	// startClusterComms early-returns (its store deliberately holds no committed
-	// cluster stanza) so nothing republishes it. The third subtest then found a
-	// ZERO active transport, step 20's `active != zero` conjunct was false, and
-	// it failed for a reason that had nothing to do with keying.
-	//
-	// Production is unaffected: a clustered node's startClusterComms does not
-	// early-return, so the republish at its epoch-open restores the field
-	// immediately after step 20's stop.
-	//
-	// Seeding the SAME unkeyed baseline in every subtest is deliberate. The
-	// third subtest's note explains why seeding a KEYED value there would be
-	// wrong — under a mutation that adds ControlLinkAuthKey to
-	// clusterTransportKey it masked key_commit_must_not_restart. This writes the
-	// identical value the fixture already seeded, so it establishes each
-	// subtest's precondition without introducing that shape.
-	seedActiveTransport := func(t *testing.T) {
-		t.Helper()
-		d.activeClusterTransport = clusterTransportFromConfig(transport())
-		if d.activeClusterTransport == (clusterTransportKey{}) {
-			t.Fatalf("premise: the seeded transport must be NON-zero, or step 20's " +
-				"`active != zero` conjunct is false and every subtest below passes or " +
-				"fails for the wrong reason")
-		}
-	}
-
 	gen := func() uint64 {
 		d.clusterCommsMu.Lock()
 		defer d.clusterCommsMu.Unlock()
@@ -213,7 +180,6 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	}
 
 	t.Run("key_commit_must_not_restart", func(t *testing.T) {
-		seedActiveTransport(t)
 		keyed := transport()
 		keyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
 
@@ -233,7 +199,6 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	// Positive control: an endpoint change MUST still restart, or the assertion
 	// above is satisfied by a step 20 that never fires at all.
 	t.Run("endpoint_change_must_restart", func(t *testing.T) {
-		seedActiveTransport(t)
 		moved := transport()
 		moved.Chassis.Cluster.PeerAddress = "10.99.0.9"
 
@@ -287,7 +252,6 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	//
 	// Tracked as #6878. Do not read "must still restart" as bound end to end.
 	t.Run("keyed_endpoint_change_must_still_restart", func(t *testing.T) {
-		seedActiveTransport(t)
 		movedKeyed := transport()
 		movedKeyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
 		movedKeyed.Chassis.Cluster.PeerAddress = "10.99.0.9"
@@ -301,10 +265,7 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 		// inside a subtest: under a mutation that DOES add ControlLinkAuthKey
 		// to clusterTransportKey, that write masked key_commit_must_not_restart
 		// when this subtest ran first (measured). The three subtests are
-		// order-independent because each now RE-SEEDS `d.activeClusterTransport`
-		// (see seedActiveTransport above) — before #7072 they relied on none of
-		// them rewriting it, which stopped being true once stopClusterComms
-		// began clearing the field.
+		// order-independent because none of them REWRITES `d.activeClusterTransport`.
 		// They do mutate `d` — applyTailReconciles reaches stopClusterComms, which
 		// increments d.clusterCommsGen, and that is the very thing each subtest
 		// measures. The distinction matters: a shared counter every subtest reads

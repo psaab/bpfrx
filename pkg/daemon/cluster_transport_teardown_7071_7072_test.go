@@ -5,108 +5,114 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/networkd"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
-// #7072: stopClusterComms must clear `activeClusterTransport`, so the field
-// stops naming the transport of an epoch that has been torn down.
+// #7072 is REFUTED, and this is the cell that refutes it.
 //
-// This is a STATE claim, so it is asserted as one: the field's VALUE after
-// teardown. "Teardown ran" is not the property — the epoch generation already
-// binds that, and it advances whether or not the field is cleared.
+// The issue asked for `stopClusterComms` to clear `activeClusterTransport`,
+// on the premise that the stale value is unreachable — "the only
+// stopClusterComms call site is step 20's, immediately followed by a start".
+// There is a SECOND: bootstrap.go's rollback teardown stops comms and RETURNS.
 //
-// The fixture has to make the seed NON-ZERO or the assertion is zero == zero and
-// passes against a build with the clear removed. `clusterTransportFromConfig`
-// derives the key from ControlInterface / PeerAddress / the fabric fields, and
-// the pre-existing #6290 fixture sets none of them; `clusteredStore7066` sets
-// control-interface, which yields a non-zero key while starting no goroutines
-// (the heartbeat needs control-interface AND peer-address, and
-// clusterSyncTransport falls back to the empty fabric pair when either is
-// missing).
-func TestStopClusterCommsClearsTheActiveTransport_7072(t *testing.T) {
+// On that path the stale field is the ONLY memory of which transport comms were
+// using, and step 20's `active != zero && newTransport != active` needs it to
+// notice a corrected commit. Measured both ways with a counting
+// startClusterCommsFn:
+//
+//	field retained (today):  restarts=1  -> comms recover
+//	field cleared:           restarts=0  -> comms stay down
+//
+// This test is the retained side. It FAILS on the naive fix, which is the whole
+// reason it exists: the first version of this file asserted the cleared
+// behaviour as correct, and that assertion was a probe keyed to the repair
+// rather than to the property.
+//
+// The fixture must reach step 20, which is gated on `d.cluster != nil` — an
+// earlier draft omitted the cluster manager and measured restarts=0 in BOTH
+// arms, which looks exactly like a confirmed regression and is not.
+func TestBootstrapRollbackThenCorrectedCommitRecovers_7072(t *testing.T) {
 	store := clusteredStore7066(t)
-	d := &Daemon{store: store, opts: Options{NoDataplane: true}}
+	d := &Daemon{
+		store:     store,
+		networkd:  networkd.NewInDir(t.TempDir()),
+		vrrpMgr:   vrrp.NewManager(),
+		cluster:   cluster.NewManager(0, 1),
+		daemonCtx: context.Background(),
+		opts:      Options{NoDataplane: true},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.startClusterComms(ctx)
-
-	seeded := d.activeTransport()
-	if seeded == (clusterTransportKey{}) {
-		t.Fatalf("premise broken: the transport key is the ZERO value after " +
-			"startClusterComms, so the assertion below is zero == zero and would pass " +
-			"against a build that never clears it")
+	if d.activeTransport() == (clusterTransportKey{}) {
+		t.Fatal("premise: comms must publish a NON-ZERO transport, or step 20's " +
+			"`active != zero` conjunct is false for a reason unrelated to teardown")
 	}
 
+	// The bootstrap-rollback shape: stop, and do NOT start.
 	d.stopClusterComms()
 
-	if got := d.activeTransport(); got != (clusterTransportKey{}) {
-		t.Errorf("stopClusterComms left activeClusterTransport naming a torn-down "+
-			"transport: %+v (seeded %+v).\nThe field is part of the epoch tuple — "+
-			"sessionSync, fabricRefreshCh, fabricRefreshCh1 and the comms context are "+
-			"all nilled in the same locked section — and #6290 joined it to the epoch on "+
-			"the PUBLISH side only. Left stale, activeTransport() reports a live-looking "+
-			"key for comms that are stopped", got, seeded)
+	restarts := 0
+	d.startClusterCommsFn = func(context.Context) { restarts++ }
+
+	moved := store.ActiveConfig()
+	moved.Chassis.Cluster.PeerAddress = "10.99.0.9"
+	_ = d.applyTailReconciles(moved, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	if restarts != 1 {
+		t.Errorf("a corrected commit after a bootstrap rollback did not restart comms "+
+			"(restarts=%d, activeTransport=%+v).\nThis is what clearing "+
+			"activeClusterTransport in stopClusterComms costs: step 20's first conjunct "+
+			"becomes false, and the only other production startClusterComms call site is "+
+			"the daemon_run.go boot path — so the node holds a valid cluster config with "+
+			"no heartbeat, no session sync and no fabric refresh until the process "+
+			"restarts (#7072)", restarts, d.activeTransport())
 	}
 }
 
-// #7072, the CONSEQUENCE — and it corrects the issue's stated rationale.
+// #7072, the other direction: a node that has NEVER started comms must not have
+// step 20 act for it.
 //
-// The issue says a stale field means "step 20 would compare the next commit
-// against a dead baseline and skip a restart it should perform". That is only
-// half true, and the half it misses matters for anyone who later adds the
-// stop-only path the issue is written against.
+// `active != zero` is not a redundant "have we started" convenience. The boot
+// applyConfig runs BEFORE daemon_run.go:405's startClusterComms — which is
+// deliberately positioned after the event fanout to avoid an HA startup race —
+// so step 20 runs during boot with the field still zero. Relaxing the guard to
+// just `newTransport != active`, the obvious repair once the field is cleared,
+// reintroduces that race with a truth table that looks perfect.
 //
-// Step 20's guard is `active != zero && newTransport != active`. Read it as what
-// it is — RESTART-ON-CHANGE, not START-IF-STOPPED:
-//
-//	stale field: config unchanged -> no restart (comms stay down)
-//	             config changed   -> restart    (comms come back)
-//	cleared:     either way       -> no restart, first conjunct is false
-//
-// So clearing does not rescue a stop-only path; it changes WHICH restart is
-// skipped. What it buys is that the field stops LYING, which is the precondition
-// for reasoning about such a path — not a substitute for giving it a start.
-//
-// This binds the half that is now load-bearing: with the field cleared, step 20
-// takes no action, so a future stop-only path cannot be built on the assumption
-// that step 20 will notice and restart for it.
-func TestStepTwentyDoesNotRestartOnAClearedTransport_7072(t *testing.T) {
+// Together with the cell above this brackets the guard: it must act after comms
+// have run, and must not before.
+func TestStepTwentyIgnoresANeverStartedNode_7072(t *testing.T) {
 	store := clusteredStore7066(t)
-	d := &Daemon{store: store, opts: Options{NoDataplane: true}}
-	d.daemonCtx = context.Background()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.startClusterComms(ctx)
-	d.stopClusterComms()
-
-	if got := d.activeTransport(); got != (clusterTransportKey{}) {
-		t.Fatalf("premise: the teardown must leave a ZERO transport, or this cell is "+
-			"about the stale-field path instead of the cleared one (got %+v)", got)
+	d := &Daemon{
+		store:     store,
+		networkd:  networkd.NewInDir(t.TempDir()),
+		vrrpMgr:   vrrp.NewManager(),
+		cluster:   cluster.NewManager(0, 1),
+		daemonCtx: context.Background(),
+		opts:      Options{NoDataplane: true},
+	}
+	if d.activeTransport() != (clusterTransportKey{}) {
+		t.Fatalf("premise: a never-started node must hold a ZERO transport, got %+v",
+			d.activeTransport())
 	}
 
 	restarts := 0
 	d.startClusterCommsFn = func(context.Context) { restarts++ }
 
-	// A config whose transport DIFFERS from the (now zero) baseline. Under the
-	// stale-field behaviour this is the case that restarted.
-	moved := store.ActiveConfig()
-	moved.Chassis.Cluster.PeerAddress = "10.99.0.9"
+	cfg := store.ActiveConfig()
+	cfg.Chassis.Cluster.PeerAddress = "10.99.0.9"
+	_ = d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
-	gen := func() uint64 {
-		d.clusterCommsMu.Lock()
-		defer d.clusterCommsMu.Unlock()
-		return d.clusterCommsGen
-	}
-	before := gen()
-	_ = d.applyTailReconciles(moved, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-
-	if restarts != 0 || gen() != before {
-		t.Errorf("step 20 restarted comms off a CLEARED transport baseline "+
-			"(restarts=%d, gen %d -> %d). The `active != zero` conjunct exists to mean "+
-			"\"comms were previously started\"; firing on a zero baseline would restart "+
-			"comms that were never up, and would make the #7072 clear a behaviour change "+
-			"rather than a truthfulness fix", restarts, before, gen())
+	if restarts != 0 {
+		t.Errorf("step 20 acted for a node whose comms have never started "+
+			"(restarts=%d). The boot applyConfig runs before startClusterComms, so this "+
+			"would fire inside the HA startup window daemon_run.go:405 is positioned "+
+			"after (#7072)", restarts)
 	}
 }
 

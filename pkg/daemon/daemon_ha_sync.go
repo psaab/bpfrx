@@ -1247,28 +1247,38 @@ func (d *Daemon) stopClusterComms() {
 	d.sessionSync = nil
 	d.fabricRefreshCh = nil
 	d.fabricRefreshCh1 = nil
-	// #7072: the transport key is part of the epoch tuple and must be torn down
-	// with the rest of it. #6290 joined it to the epoch on the PUBLISH side and
-	// left the teardown side alone, so after a stop the field kept naming the
-	// transport of the epoch that was just destroyed, and `activeTransport()`
-	// reported a live-looking key for comms that are stopped.
+	// #7072: activeClusterTransport is DELIBERATELY NOT cleared here, and the
+	// issue that asked for it is refuted by measurement rather than argument.
 	//
-	// WHAT THIS DOES AND DOES NOT FIX, because the issue's rationale needs one
-	// correction. Step 20's guard is
-	// `active != zero && newTransport != active` — that is RESTART-ON-CHANGE,
-	// not START-IF-STOPPED. So on a hypothetical stop-without-start path:
+	// Its premise was that the stale value is unreachable because the only
+	// stopClusterComms call site is step 20's, which starts comms again on the
+	// next line. There is a SECOND site: bootstrap.go's rollback teardown stops
+	// comms and RETURNS. That path is real, and on it this field is the only
+	// memory of which transport comms were using.
 	//
-	//   stale field: config unchanged -> no restart (comms stay down);
-	//                config changed   -> restart (comms come back).
-	//   cleared:     either way       -> no restart, because the first
-	//                                    conjunct is now false.
+	// Measured on the bootstrap-rollback shape — stop, then a corrected commit
+	// carrying a DIFFERENT transport key — by driving the real applyTailReconciles
+	// with a counting startClusterCommsFn:
 	//
-	// Clearing therefore does not rescue a stop-only path; it changes WHICH
-	// restart is skipped. What it does is stop the field from LYING, which is
-	// the precondition for reasoning about such a path at all — anyone adding
-	// one owes it an explicit start, and must not read `activeTransport()`
-	// being non-zero as "comms are up".
-	d.activeClusterTransport = clusterTransportKey{}
+	//     field retained (today):  restarts=1  -> comms recover
+	//     field cleared:           restarts=0  -> comms stay down
+	//
+	// Step 20's guard is `active != zero && newTransport != active`. Clearing
+	// makes the FIRST conjunct false, so it fails in both directions, and the only
+	// other production startClusterComms call site is daemon_run.go's boot path —
+	// so the node would hold a valid cluster config with no heartbeat, no session
+	// sync and no fabric refresh until the process restarts.
+	//
+	// The field therefore carries TWO meanings, and the name only says one:
+	// "which transport the running comms use", and "comms have run at least once,
+	// so step 20 may act". The second is load-bearing in the other direction too —
+	// the boot applyConfig runs BEFORE daemon_run.go:405's startClusterComms, so
+	// `active != zero` is what keeps step 20 out of the boot window that line is
+	// deliberately positioned after. Read it as LAST PUBLISHED transport, not as
+	// "comms are up"; `sessionSync == nil` is what says comms are down.
+	//
+	// Bound by TestBootstrapRollbackThenCorrectedCommitRecovers_7072 (this is the
+	// cell a clear fails) and TestStepTwentyIgnoresANeverStartedNode_7072.
 	d.clusterCommsMu.Unlock()
 
 	if ss != nil {
