@@ -148,10 +148,18 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 // one set of literals. An unconditional field shifts both by the same 8 bytes,
 // so re-measuring both is the guard being ANSWERED. `size_of` stays 2304 — the
 // bytes came out of tail padding, again.
+//
+// #7156 re-measured all three moving literals (size 2304 -> 2368, offsets
+// 2168 -> 2176 and 2296 -> 2304) when the unconditional `pending_neigh_visits`
+// counter joined that run. Same lockstep, and verified the way the paragraph
+// above says it must be: BOTH build configurations green on one set of
+// literals, which a `#[cfg(test)]` field could not achieve. Unlike #6664 and
+// #7054, `size_of` DID move this time — the tail padding is now full, so the
+// struct grew a whole 64-byte alignment unit.
 fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304() {
     assert_eq!(
         std::mem::size_of::<BindingLiveState>(),
-        2304,
+        2368,
         "#6304: the `cfg(test)` admission-attempt instrument must not change \
          `BindingLiveState`'s SIZE — the same literal is asserted at compile \
          time in `binding_state/mod.rs`, which is where the production build \
@@ -164,14 +172,14 @@ fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304(
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
-        2168,
+        2176,
         "#6304/#6114: ...nor the OFFSET of the admission counter whose \
          cacheline this is all about. A `cfg(test)` field ahead of it moves \
          this to 2160 while leaving the size assert above satisfied"
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, delta_loss_pending),
-        2296,
+        2304,
         "#6304: ...nor the offset of the last-declared field, which is the \
          sentinel for a `cfg(test)` member appended at the END of the struct — \
          that shape moves this to 2288 and trips nothing else"

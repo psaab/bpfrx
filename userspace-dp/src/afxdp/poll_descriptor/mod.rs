@@ -5523,6 +5523,27 @@ pub(super) fn poll_binding_process_descriptor(
                                                     probe_attempts: 0,
                                                 },
                                             );
+                                            // #7156: arm the deadline queue in
+                                            // the SAME branch that inserts. This
+                                            // is the only production insert, and
+                                            // an insert that skipped the arm
+                                            // would strand the key: nothing else
+                                            // ever visits it, so its UMEM frame
+                                            // would never be recycled and its
+                                            // packet never dispatched or timed
+                                            // out.
+                                            binding.pending_neigh_schedule.arm(
+                                                pending_key,
+                                                crate::afxdp::neigh_schedule::next_due_for_pending(
+                                                    now_ns,
+                                                    now_ns,
+                                                    0,
+                                                    crate::afxdp::neighbor_dispatch::effective_pending_neigh_timeout_ns(
+                                                        worker_ctx.forwarding,
+                                                    ),
+                                                    crate::afxdp::neighbor_dispatch::PROBE_SCHEDULE_NS,
+                                                ),
+                                            );
                                             recycle_now = false;
                                         }
                                         PendingNeighAdmission::CapacityDrop => {

@@ -103,6 +103,24 @@ impl PaddedShard {
 /// 64-shard mutex map for the dynamic neighbor cache.
 pub(crate) struct ShardedNeighborMap {
     shards: [PaddedShard; NUM_SHARDS],
+    /// #7156: monotonic count of neighbour INSERTS across all shards.
+    ///
+    /// Read by each worker's `pending_neigh` sweep to answer one question in a
+    /// single relaxed load: "could any buffered next-hop have become resolvable
+    /// since I last looked?" If not, the sweep skips the resolution walk over
+    /// every pending key -- which is where its whole O(all-keys) cost lived,
+    /// one shard MUTEX per key.
+    ///
+    /// Deliberately a COUNTER over the whole map, not a per-shard epoch. It is
+    /// read once per sweep and never keyed, so per-shard resolution would buy
+    /// nothing: a worker cannot know which shard a pending key hashes to
+    /// without walking its keys, which is the walk being avoided.
+    ///
+    /// Distinct from the per-shard `mac_change_epoch` above, which fires only
+    /// when an EXISTING neighbour's hwaddr is replaced. That is the wrong
+    /// signal here: a pending key is waiting for its neighbour to APPEAR, and
+    /// a first insert changes no existing hwaddr, so it bumps no epoch.
+    insert_generation: AtomicU64,
     /// #5147: PER-SHARD monotonic MAC-change epochs. Bumped ONLY when a
     /// kernel ARP/NDP update REPLACES an existing neighbor's hwaddr with a
     /// different MAC (gateway VRRP failover, host NIC swap, upstream MAC
@@ -172,6 +190,7 @@ impl ShardedNeighborMap {
             shards: std::array::from_fn(|_| PaddedShard::new()),
             shard_mac_epochs: std::array::from_fn(|_| AtomicU32::new(0)),
             learn_cap_drops: AtomicU64::new(0),
+            insert_generation: AtomicU64::new(0),
         }
     }
 
@@ -278,8 +297,18 @@ impl ShardedNeighborMap {
     }
 
     /// Insert (or overwrite) `key → val`. Unit-returning.
+    /// #7156: read the map-wide insert generation. One relaxed load; see the
+    /// field for why the pending-neigh sweep gates its resolution walk on it.
+    #[inline]
+    pub(crate) fn insert_generation(&self) -> u64 {
+        self.insert_generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn insert(&self, key: (i32, IpAddr), val: NeighborEntry) {
         self.lock_shard(shard_idx(&key)).insert(key, val);
+        // #7156: AFTER the map write, Release-ordered — a worker that observes
+        // this generation is guaranteed to see the entry it announces.
+        self.insert_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Remove `key` if present. Unit-returning.
@@ -332,6 +361,9 @@ impl ShardedNeighborMap {
             self.bump_shard_epoch(idx);
         }
         shard.insert(key, val);
+        // #7156: AFTER the map write, Release-ordered — a worker that observes
+        // this generation is guaranteed to see the entry it announces.
+        self.insert_generation.fetch_add(1, Ordering::Release);
         true
     }
 
@@ -375,6 +407,9 @@ impl ShardedNeighborMap {
             self.bump_shard_epoch(idx);
         }
         shard.insert(key, val);
+        // #7156: AFTER the map write, Release-ordered — a worker that observes
+        // this generation is guaranteed to see the entry it announces.
+        self.insert_generation.fetch_add(1, Ordering::Release);
         true
     }
 

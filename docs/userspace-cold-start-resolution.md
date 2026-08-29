@@ -326,6 +326,39 @@ by #1636 (see accuracy note at the top of this file).
    TCP retransmit). Checking the buffer on every poll wake (1ms) is
    critical for sub-10ms cold start.
 
+   **But checking the buffer is not the same as walking it (#7156).**
+   Because this runs on every poll (twice — the RX-empty branch and the
+   post-batch call), the per-sweep cost is multiplied by the poll rate.
+   The sweep used to snapshot every unresolved key into a fresh `Vec`
+   and walk all of them, bounded only by an empty-map early-out:
+
+   | pending keys | ns/sweep | Vec bytes/sweep |
+   |--------------|----------|-----------------|
+   | 0            | 8        | 0               |
+   | 1 024        | 40 709   | 24 576          |
+   | 4 096 (cap)  | 182 207  | 98 304          |
+
+   A healthy binding holds zero pending keys and pays 8 ns, which is why
+   this never showed up in profiling. At the `MAX_PENDING_NEIGH` cap it
+   is ~364 us and ~196 KiB per poll iteration — an idle worker core
+   spent on hops whose packets are already being dropped and negatively
+   cached, and reachable by scanning distinct unresolved next-hops.
+
+   It is now deadline-ordered and budgeted (`afxdp/neigh_schedule.rs`):
+   nothing due costs one heap peek (~20 ns, flat in the population), and
+   at most `PENDING_NEIGH_SWEEP_BUDGET` keys are serviced per sweep.
+
+   Freshness is preserved by a separate mechanism, because deadline
+   order alone would break it: a key has nothing scheduled between its
+   last probe (queued + 260 ms) and its timeout, so a neighbour
+   resolving at 300 ms would go unnoticed until the packet was DROPPED
+   as never-resolved. `ShardedNeighborMap` therefore carries an insert
+   generation, and a sweep that observes it change walks every pending
+   key on that sweep — so a resolved packet dispatches with exactly the
+   latency it always had. Filling the pending cap resolves nothing, so
+   it triggers no walks: the attack path pays the bounded cost, the
+   legitimate path pays none of it.
+
 5. **Create sessions on MissingNeighbor** — without the forward session,
    the reverse direction (SYN-ACK) can't find the NAT match and gets
    policy-denied. The session must exist before the SYN-ACK arrives.

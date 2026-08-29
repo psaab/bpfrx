@@ -486,6 +486,18 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `Coordinator::pending_neigh_decap_drops_total()` (Prometheus
     /// `xpf_userspace_pending_neigh_decap_drops_total`).
     pub(super) pending_neigh_decap_drops: AtomicU64,
+    /// #7156: pending-neigh keys VISITED by the retry sweep, cumulative.
+    ///
+    /// The budget-exhaustion / backlog signal. The sweep used to visit every
+    /// unresolved key on every poll, so this would have tracked
+    /// `pending_neigh.len()` x polls; it now tracks actual serviced work, and
+    /// the gap between it and the queue depth gauge is the backlog.
+    ///
+    /// Also the only way to observe that a sweep with nothing due did NO
+    /// per-key work: that state is defined by the ABSENCE of side effects, so
+    /// removals and recycles cannot distinguish "visited every key and found
+    /// nothing to do" from "visited nothing".
+    pub(super) pending_neigh_visits: AtomicU64,
     /// #2375: per-binding count of `pending_neigh` admissions REFUSED
     /// because the map already holds `MAX_PENDING_NEIGH` distinct
     /// unresolved `(egress_ifindex, next_hop)` hops — the capacity-drop
@@ -831,10 +843,23 @@ pub(in crate::afxdp) struct BindingLiveState {
 // for a second u64. Recorded so the next reader does not treat an unchanged
 // 2304 as evidence their field failed to land — check the OFFSETS, which did
 // move.
-const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
+// #7156 re-measured all three moving literals (size 2304 -> 2368, offsets
+// 2168 -> 2176 and 2296 -> 2304) when `pending_neigh_visits` joined the
+// cold-counter run. Same legitimate case as #6664 and #7054: the field is
+// UNCONDITIONAL, so the production and test builds shift by the same 8 bytes
+// and one pair of literals makes both green — the guard reporting a real layout
+// change and being answered, not defeated. Verified by building BOTH
+// configurations, since agreement between them is the whole discriminator
+// against the `#[cfg(test)]` hazard above.
+//
+// This is the addition the #6664 note predicted and #7054 found had not yet
+// happened: the tail padding is now full, so `size_of` moved a whole 64-byte
+// alignment unit rather than absorbing the field. An unchanged 2304 would now
+// be the surprising result.
+const _: [(); 2368] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
-const _: [(); 2168] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2296] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+const _: [(); 2176] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2304] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -956,6 +981,7 @@ impl BindingLiveState {
             neg_neigh_fast_fail: AtomicU64::new(0),
             pending_neigh_duplicate_drops: AtomicU64::new(0),
             pending_neigh_decap_drops: AtomicU64::new(0),
+            pending_neigh_visits: AtomicU64::new(0),
             pending_neigh_capacity_drops: AtomicU64::new(0),
             pending_neigh_keys: AtomicU64::new(0),
             neg_neigh_keys: AtomicU64::new(0),

@@ -19,6 +19,9 @@
 // Pure relocation. `use super::*;` brings every type, helper,
 // and sibling-submodule item from afxdp.rs into scope.
 
+use crate::afxdp::neigh_schedule::{
+    next_due_for_pending, PENDING_NEIGH_SWEEP_BUDGET,
+};
 use super::*;
 
 /// GEMINI-NEXT.md Section 3 cold-start: re-fire ARP/NDP solicitation
@@ -33,11 +36,30 @@ use super::*;
 /// 260 ms total. The deltas (10, 50, 200 ms) match the cold-start
 /// exponential design in GEMINI-NEXT.md and give the kernel three
 /// retransmits if the first solicitation is dropped.
-const PROBE_SCHEDULE_NS: &[u64] = &[
+pub(super) const PROBE_SCHEDULE_NS: &[u64] = &[
     10_000_000,  // first retry at queued + 10 ms
     60_000_000,  // second retry at queued + 60 ms (delta 50 ms)
     260_000_000, // third retry at queued + 260 ms (delta 200 ms)
 ];
+
+/// #1636 option D: the drop timeout comes per snapshot from the kernel
+/// retrans_time_ms sysctls (800 ms when fast-retrans is confirmed, else
+/// 2000 ms). `0` means a snapshot predating the field (e.g. a test-built
+/// `ForwardingState::default()`) — fall back to the compile-time constant.
+///
+/// #7156: extracted because the deadline-queue ARM site (`poll_descriptor`'s
+/// MissingNeighbor arm) and this sweep must compute the same timeout. If the
+/// arm used a longer one the key would be visited only after it had already
+/// timed out; if shorter, it would be popped, found not-yet-timed-out, and
+/// re-armed — burning budget for nothing.
+#[inline]
+pub(super) fn effective_pending_neigh_timeout_ns(forwarding: &ForwardingState) -> u64 {
+    if forwarding.pending_neigh_timeout_ns != 0 {
+        forwarding.pending_neigh_timeout_ns
+    } else {
+        PENDING_NEIGH_TIMEOUT_NS
+    }
+}
 
 /// Returns true when the next scheduled probe is due. Pure function —
 /// no side effects, easy to unit-test the schedule edges.
@@ -189,24 +211,114 @@ pub(super) fn retry_pending_neigh(
     // confirmed, else 2000ms). `0` means a snapshot that predates the
     // field (e.g. a test-built ForwardingState::default()) — fall back
     // to the compile-time PENDING_NEIGH_TIMEOUT_NS.
-    let pending_neigh_timeout_ns = if forwarding.pending_neigh_timeout_ns != 0 {
-        forwarding.pending_neigh_timeout_ns
-    } else {
-        PENDING_NEIGH_TIMEOUT_NS
-    };
+    let pending_neigh_timeout_ns = effective_pending_neigh_timeout_ns(forwarding);
     // #1771 §2.2: pending_neigh is keyed by (egress_ifindex, next_hop) with
     // ONE representative packet per hop, so the per-sweep probe-dedup
-    // BTreeSet is gone (each hop fires at most one probe naturally) and the
-    // old O(n²) pop_front/push_back rotation is replaced by a key sweep.
-    // Snapshot the keys (Copy; bounded by distinct unresolved next-hops, not
-    // packet count — tiny on this cold path) so the map is not borrowed while
-    // the resolved-dispatch tail needs `&mut binding`.
-    let keys: Vec<(i32, IpAddr)> = binding.pending_neigh.keys().copied().collect();
-    for key in keys {
+    // BTreeSet is gone (each hop fires at most one probe naturally).
+    //
+    // #7156: and the key sweep that replaced the old O(n²) rotation is itself
+    // now deadline-driven and budgeted. It used to collect EVERY unresolved key
+    // into a fresh Vec and walk all of them on every sweep, twice per poll —
+    // measured at ~182 us and ~98 KiB per sweep at the MAX_PENDING_NEIGH cap,
+    // against 8 ns for the empty-map early-out above. See `neigh_schedule` for
+    // the table and for why the heap needs no tombstone handling.
+    //
+    // Nothing due costs one heap peek. The budget bounds the worst case, and
+    // because the heap is deadline-ordered a truncated sweep leaves the
+    // LATEST-deadline keys unvisited: timeouts and due probes always win.
+    // #7156: has any neighbour been INSERTED since this worker last swept?
+    //
+    // This is the whole point. The old sweep's cost was a resolution check per
+    // pending key — a `forwarding.neighbors` hash lookup plus a
+    // `dynamic_neighbors` lookup that takes a shard MUTEX — and it ran whether
+    // or not anything had resolved. One relaxed-Acquire load answers "could any
+    // buffered next-hop have become resolvable?", and when the answer is no the
+    // sweep only services deadline-due keys: timeouts and probes.
+    //
+    // That is exactly the attacker's case. Filling MAX_PENDING_NEIGH with
+    // distinct unresolvable hops produces NO neighbour inserts, so it now buys
+    // no walks at all — where before it bought a full 4096-key walk twice per
+    // poll, ~182 us each.
+    //
+    // And when a neighbour DOES appear, the walk is the old one: every pending
+    // key is re-checked on that very sweep, so a resolved packet is dispatched
+    // with the same latency as before. Deadline order alone could not do that —
+    // a key has nothing scheduled between its last probe (queued + 260 ms) and
+    // its timeout, so a neighbour resolving at 300 ms would go unnoticed until
+    // the key timed out and its packet was DROPPED.
+    //
+    // Known residual, not closed here: an on-link attacker who can force real
+    // neighbour churn (answering ARP/NDP for many addresses) can drive walks.
+    // That is a strictly harder position than the one this issue describes — it
+    // requires answering probes rather than merely being unreachable — and it
+    // is separately bounded by MAX_DYNAMIC_NEIGHBORS_PER_SHARD and the #5673
+    // learn cap.
+    // Two signals, because there are two neighbour maps and the sweep consults
+    // both in `lookup_neighbor_entry` order. `dynamic_neighbors` is the runtime
+    // learn/resolve path and carries a true insert counter. `forwarding.neighbors`
+    // is the STATIC/permanent config-derived map, rebuilt wholesale on commit and
+    // reaching the worker as a fresh snapshot, so it has no counter to bump — its
+    // length stands in, which is exact for the add and remove that a config change
+    // actually performs. A same-size REPLACEMENT is the one static edit this misses,
+    // and RESOLUTION_RECHECK_INTERVAL_NS is the backstop for it: 50 ms, against a
+    // pending timeout of 800 ms-2 s, so such a packet still dispatches rather than
+    // being dropped. Stated rather than papered over — the dynamic path, which is
+    // the one on the packet-latency critical path, is exact.
+    let neigh_generation = (
+        dynamic_neighbors.insert_generation(),
+        forwarding.neighbors.len(),
+    );
+    let resolution_pass = neigh_generation != binding.last_neigh_generation;
+    binding.last_neigh_generation = neigh_generation;
+    if resolution_pass {
+        // Reuse the scratch so the walk allocates nothing steady-state. The old
+        // sweep built a fresh Vec of every key on EVERY sweep (~98 KiB at the
+        // cap, ~196 KiB per poll); this one reuses its capacity and only runs
+        // when a neighbour actually appeared. `mem::take` because the fill
+        // borrows `pending_neigh` while writing `pending_neigh_scan`.
+        let mut scan = std::mem::take(&mut binding.pending_neigh_scan);
+        scan.clear();
+        scan.extend(binding.pending_neigh.keys().copied());
+        binding.pending_neigh_scan = scan;
+    }
+    let mut scan_idx = 0usize;
+    let mut budget = PENDING_NEIGH_SWEEP_BUDGET;
+    loop {
+        let key = if resolution_pass {
+            // A resolution pass covers every key: it is the path that must not
+            // miss a newly-resolvable hop, and it is rare by construction.
+            let next = binding.pending_neigh_scan.get(scan_idx).copied();
+            scan_idx += 1;
+            match next {
+                Some(k) => k,
+                None => break,
+            }
+        } else {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            match binding.pending_neigh_schedule.pop_due(now_ns) {
+                Some(k) => k,
+                None => break,
+            }
+        };
+        // #7156: count the visit before any early-out, so this measures work
+        // ATTEMPTED per sweep rather than work that happened to find something.
+        binding
+            .live
+            .pending_neigh_visits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Peek queued_ns / probe_attempts without holding a borrow across
         // the dispatch tail.
         let (queued_ns, probe_attempts) = match binding.pending_neigh.get(&key) {
             Some(p) => (p.queued_ns, p.probe_attempts),
+            // A removal during a RESOLUTION PASS leaves its heap entry behind,
+            // since that path does not pop. This is where such an entry is
+            // discarded. Self-limiting rather than an unbounded tombstone leak:
+            // at most one entry per removal, and each is reclaimed the first
+            // time its own deadline comes up, which is bounded by the key's
+            // timeout.
             None => continue,
         };
         // Timeout: recycle frame and drop.
@@ -280,6 +392,34 @@ pub(super) fn retry_pending_neigh(
                 }
                 // else: iface lookup miss → no probe fires, probe_attempts
                 // NOT advanced; the key retries this slot next sweep.
+            }
+            // #7156: this is the ONLY path on which the key stays in the map,
+            // so it is the only re-arm. Both removals below drop the key, and
+            // no path in the dispatch tail re-inserts it (every failure there
+            // recycles the frame), so re-arming anywhere else would create the
+            // stale entry this design otherwise cannot produce.
+            //
+            // Re-read probe_attempts rather than reusing the value peeked
+            // above: a probe may have just advanced it, and arming against the
+            // stale count would re-arm on the slot that has already fired.
+            let attempts_now = binding
+                .pending_neigh
+                .get(&key)
+                .map_or(probe_attempts, |p| p.probe_attempts);
+            // Only the deadline path re-arms. A resolution pass reaches keys by
+            // walking the map WITHOUT popping them, so their heap entry is still
+            // live; arming again there would put a second entry on one key and
+            // manufacture exactly the duplicate this design otherwise cannot
+            // produce.
+            if !resolution_pass {
+                let due = next_due_for_pending(
+                    now_ns,
+                    queued_ns,
+                    attempts_now,
+                    pending_neigh_timeout_ns,
+                    PROBE_SCHEDULE_NS,
+                );
+                binding.pending_neigh_schedule.arm(key, due);
             }
             continue;
         };
@@ -670,505 +810,8 @@ pub(super) fn build_missing_neighbor_session_metadata(
 }
 
 #[cfg(test)]
-mod mirror_tests {
-    use super::*;
-    use crate::afxdp::tx::test_support::{build_ipv4_test_packet, test_session_key};
-    use std::sync::atomic::Ordering;
-
-    /// #1771 §2.2: `pending_neigh` is keyed by `(egress_ifindex, next_hop)`.
-    /// Test helper that buffers one packet under its derived key, preserving
-    /// the old `push_back`-one-packet ergonomics for the retry-sweep tests.
-    ///
-    /// NOTE: this is single-entry seeding — it `insert`s (last-write-wins),
-    /// NOT the production admission keep-oldest+recycle-duplicate semantics
-    /// (poll_descriptor). Every test here seeds one packet per distinct key,
-    /// so the distinction never bites; do not reuse this to model duplicate
-    /// admission.
-    fn push_pending(b: &mut BindingWorker, pkt: PendingNeighPacket) {
-        let key = (
-            pkt.decision.resolution.egress_ifindex,
-            pkt.decision
-                .resolution
-                .next_hop
-                .expect("test pending pkt has a next_hop"),
-        );
-        b.pending_neigh.insert(key, pkt);
-    }
-
-    fn resolved_neighbor_decision(next_hop: IpAddr) -> SessionDecision {
-        SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::MissingNeighbor,
-                local_ifindex: 0,
-                egress_ifindex: 80,
-                tx_ifindex: 22,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(next_hop),
-                neighbor_mac: None,
-                src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x00, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision::default(),
-        }
-    }
-
-    fn pending_neighbor_meta(frame_len: usize) -> UserspaceDpMeta {
-        UserspaceDpMeta {
-            ingress_ifindex: 11,
-            l3_offset: 14,
-            l4_offset: 34,
-            pkt_len: frame_len as u16,
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            ..UserspaceDpMeta::default()
-        }
-    }
-
-    #[test]
-    fn retry_pending_neighbor_mirrors_original_frame_before_rewrite() {
-        let mut bindings = vec![
-            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
-            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
-            BindingWorker::new_for_mirror_test(2, 0, 33, 0),
-        ];
-        let original_frame = build_ipv4_test_packet(0);
-        // SAFETY: single-threaded test over a UMEM created just above; no
-        // other borrow into [0, len) exists and the mutable slice is
-        // consumed by the immediate copy_from_slice before anything else
-        // touches the area.
-        unsafe {
-            bindings[0]
-                .umem
-                .area()
-                .slice_mut_unchecked(0, original_frame.len())
-        }
-        .expect("ingress frame")
-        .copy_from_slice(&original_frame);
-
-        let next_hop = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(
-            &mut bindings[0],
-            PendingNeighPacket {
-                addr: 0,
-                desc: XdpDesc {
-                    addr: 0,
-                    len: original_frame.len() as u32,
-                    options: 0,
-                },
-                meta,
-                decision: resolved_neighbor_decision(next_hop),
-                flow_key: Some(test_session_key(12345, 443)),
-                queued_ns: 0,
-                probe_attempts: 0,
-            },
-        );
-
-        let mut forwarding = ForwardingState::default();
-        forwarding.neighbors.insert(
-            (80, next_hop),
-            NeighborEntry {
-                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-            },
-        );
-        forwarding.mirror_configs.insert(
-            11,
-            MirrorRuntimeConfig {
-                output_ifindex: 33,
-                rate: 0,
-            },
-        );
-
-        let lookup = WorkerBindingLookup::from_bindings(&bindings);
-        let mirror_targets = MirrorTargetMap::default();
-        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-        let mut shared_recycles = Vec::new();
-        let area = bindings[0].umem.area() as *const MmapArea;
-        let (left, rest) = bindings.split_at_mut(0);
-        let (binding, right) = rest.split_first_mut().expect("ingress binding");
-
-        retry_pending_neigh(
-            binding,
-            left,
-            0,
-            right,
-            &lookup,
-            &mirror_targets,
-            &forwarding,
-            &dynamic_neighbors,
-            None,
-            1,
-            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
-            // bindings[0].umem just above; the Rc-backed allocation lives
-            // past this call, the split_at_mut borrows cover disjoint
-            // binding state (not the umem area), and the test is
-            // single-threaded.
-            unsafe { &*area },
-            &mut shared_recycles,
-        );
-
-        assert!(bindings[0].pending_neigh.is_empty());
-        assert_eq!(bindings[0].live.mirrored_packets.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            bindings[0].live.mirrored_bytes.load(Ordering::Relaxed),
-            original_frame.len() as u64
-        );
-
-        let mirror_req = bindings[2]
-            .tx_pipeline
-            .pending_tx_prepared
-            .front()
-            .expect("mirror prepared request");
-        assert!(mirror_req.mirror_clone);
-        assert_eq!(mirror_req.egress_ifindex, 33);
-        assert_eq!(mirror_req.len, original_frame.len() as u32);
-        assert_eq!(
-            bindings[2]
-                .umem
-                .area()
-                .slice(mirror_req.offset as usize, mirror_req.len as usize)
-                .expect("mirrored frame"),
-            original_frame.as_slice(),
-            "deferred neighbor path must mirror pre-rewrite L2 bytes",
-        );
-
-        let forwarded_req = bindings[1]
-            .tx_pipeline
-            .pending_tx_prepared
-            .front()
-            .expect("forwarded prepared request");
-        assert!(
-            !forwarded_req.mirror_clone,
-            "primary forwarding request must not inherit mirror identity",
-        );
-    }
-
-    /// #1651 B3: a never-resolving pending packet that crosses the timeout
-    /// must (a) be dropped (recycled, removed from the queue) and (b) record
-    /// its (egress_ifindex, next_hop) in the binding's negative cache so
-    /// subsequent cold packets to the same dead host fast-fail.
-    #[test]
-    fn timed_out_pending_neighbor_records_negative_cache() {
-        let mut bindings = vec![
-            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
-            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
-        ];
-        let original_frame = build_ipv4_test_packet(0);
-        // SAFETY: single-threaded test over a UMEM created just above; no
-        // other borrow into [0, len) exists and the mutable slice is
-        // consumed by the immediate copy_from_slice before anything else
-        // touches the area.
-        unsafe {
-            bindings[0]
-                .umem
-                .area()
-                .slice_mut_unchecked(0, original_frame.len())
-        }
-        .expect("ingress frame")
-        .copy_from_slice(&original_frame);
-
-        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 137));
-        let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(
-            &mut bindings[0],
-            PendingNeighPacket {
-                addr: 0,
-                desc: XdpDesc {
-                    addr: 0,
-                    len: original_frame.len() as u32,
-                    options: 0,
-                },
-                meta,
-                decision: resolved_neighbor_decision(next_hop),
-                flow_key: Some(test_session_key(12345, 443)),
-                queued_ns: 0,
-                // All probes already fired; the dst never resolved.
-                probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
-            },
-        );
-
-        // No neighbor for `next_hop` anywhere → unresolved. Use the
-        // compile-time fallback timeout (default ForwardingState leaves
-        // pending_neigh_timeout_ns == 0).
-        let forwarding = ForwardingState::default();
-        let lookup = WorkerBindingLookup::from_bindings(&bindings);
-        let mirror_targets = MirrorTargetMap::default();
-        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-        let mut shared_recycles = Vec::new();
-        let area = bindings[0].umem.area() as *const MmapArea;
-        let (left, rest) = bindings.split_at_mut(0);
-        let (binding, right) = rest.split_first_mut().expect("ingress binding");
-
-        // now_ns just past the 2s fallback timeout.
-        let now_ns = PENDING_NEIGH_TIMEOUT_NS + 1;
-        retry_pending_neigh(
-            binding,
-            left,
-            0,
-            right,
-            &lookup,
-            &mirror_targets,
-            &forwarding,
-            &dynamic_neighbors,
-            None,
-            now_ns,
-            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
-            // bindings[0].umem just above; the Rc-backed allocation lives
-            // past this call, the split_at_mut borrows cover disjoint
-            // binding state (not the umem area), and the test is
-            // single-threaded.
-            unsafe { &*area },
-            &mut shared_recycles,
-        );
-
-        // The packet was dropped (recycled to fill ring, queue drained).
-        assert!(
-            bindings[0].pending_neigh.is_empty(),
-            "timed-out pending packet must be dropped",
-        );
-        // The dead-host key was recorded and is active.
-        let key = (80i32, next_hop); // egress_ifindex 80 per resolved_neighbor_decision
-        assert!(
-            crate::afxdp::neg_neigh::neg_neigh_active(
-                &mut bindings[0].neg_neigh_cache,
-                &key,
-                now_ns,
-            ),
-            "timed-out dst must be negatively cached",
-        );
-    }
-
-    // #6710 lives in its own file (neighbor_dispatch/mirror_tests/) so
-    // appending it does not push this one past the 1500 LOC [WATCH] modularity
-    // floor (pkg/refactoraudit). A child module can see this module's private
-    // helpers, so `push_pending`, `resolved_neighbor_decision` and friends are
-    // reachable unchanged via `use super::*`.
-    mod xfrmi_6710_tests;
-
-    /// #1772: build a worker-facing `NeighborResolver` handle wired to a
-    /// fresh latency-telemetry set, so a test can pass it into
-    /// `retry_pending_neigh` and read back the recorded dwell / drop /
-    /// depth. The channel `rx` is returned so the producer end is not
-    /// dropped (which would mark every enqueue Disconnected).
-    fn resolver_with_latency() -> (
-        Arc<NeighborResolver>,
-        std::sync::mpsc::Receiver<crate::afxdp::neighbor_resolver::ResolveItem>,
-        Arc<crate::afxdp::neighbor_latency::NeighborLatencyHist>,
-        Arc<AtomicU64>,
-        Arc<AtomicU64>,
-    ) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::afxdp::neighbor_resolver::ResolveItem>(
-            crate::afxdp::neighbor_resolver::RESOLVER_QUEUE_DEPTH,
-        );
-        let dwell = Arc::new(crate::afxdp::neighbor_latency::NeighborLatencyHist::default());
-        let drops = Arc::new(AtomicU64::new(0));
-        let depth = Arc::new(AtomicU64::new(0));
-        let resolver = Arc::new(NeighborResolver::new(
-            tx,
-            Arc::new(crate::afxdp::neighbor_resolver::ResolverCounters::default()),
-            Arc::new(AtomicU64::new(0)),
-            dwell.clone(),
-            drops.clone(),
-            depth.clone(),
-        ));
-        (resolver, rx, dwell, drops, depth)
-    }
-
-    /// #1772 acceptance: a buffered packet with a known `queued_ns` that
-    /// resolves at a later `now_ns` records its dwell into the histogram
-    /// (correct bucket + count) AND the max-depth high-water gauge is set.
-    #[test]
-    fn resolved_pending_neighbor_records_dwell_and_depth() {
-        let mut bindings = vec![
-            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
-            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
-        ];
-        let original_frame = build_ipv4_test_packet(0);
-        // SAFETY: single-threaded test over a UMEM created just above; no
-        // other borrow into [0, len) exists and the mutable slice is
-        // consumed by the immediate copy_from_slice before anything else
-        // touches the area.
-        unsafe {
-            bindings[0]
-                .umem
-                .area()
-                .slice_mut_unchecked(0, original_frame.len())
-        }
-        .expect("ingress frame")
-        .copy_from_slice(&original_frame);
-
-        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
-        let meta = pending_neighbor_meta(original_frame.len());
-        // Buffered at queued_ns = 1_000_000 ns; resolves at a now_ns that
-        // gives a 500 ms dwell — well under the 2 s PENDING_NEIGH_TIMEOUT
-        // so the packet DISPATCHES (and records its dwell) rather than
-        // timing out. The 3 s → tail-bucket mapping is covered by the
-        // neighbor_latency unit tests; here we verify the record fires on
-        // the real dispatch path with the correct sum + bucket.
-        let queued_ns = 1_000_000u64;
-        let dwell_ns = 500_000_000u64; // 500 ms
-        push_pending(
-            &mut bindings[0],
-            PendingNeighPacket {
-                addr: 0,
-                desc: XdpDesc {
-                    addr: 0,
-                    len: original_frame.len() as u32,
-                    options: 0,
-                },
-                meta,
-                decision: resolved_neighbor_decision(next_hop),
-                flow_key: Some(test_session_key(12345, 443)),
-                queued_ns,
-                probe_attempts: 0,
-            },
-        );
-
-        let mut forwarding = ForwardingState::default();
-        // Neighbor IS resolved now → the retry sweep dispatches it and
-        // records the dwell.
-        forwarding.neighbors.insert(
-            (80, next_hop),
-            NeighborEntry {
-                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-            },
-        );
-
-        let lookup = WorkerBindingLookup::from_bindings(&bindings);
-        let mirror_targets = MirrorTargetMap::default();
-        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-        let mut shared_recycles = Vec::new();
-        let (resolver, _rx, dwell, _drops, depth) = resolver_with_latency();
-        let area = bindings[0].umem.area() as *const MmapArea;
-        let (left, rest) = bindings.split_at_mut(0);
-        let (binding, right) = rest.split_first_mut().expect("ingress binding");
-
-        let now_ns = queued_ns + dwell_ns;
-        retry_pending_neigh(
-            binding,
-            left,
-            0,
-            right,
-            &lookup,
-            &mirror_targets,
-            &forwarding,
-            &dynamic_neighbors,
-            Some(&resolver),
-            now_ns,
-            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
-            // bindings[0].umem just above; the Rc-backed allocation lives
-            // past this call, the split_at_mut borrows cover disjoint
-            // binding state (not the umem area), and the test is
-            // single-threaded.
-            unsafe { &*area },
-            &mut shared_recycles,
-        );
-
-        assert!(bindings[0].pending_neigh.is_empty(), "packet must dispatch");
-        let snap = dwell.snapshot();
-        assert_eq!(snap.count, 1, "exactly one dwell sample recorded");
-        assert_eq!(snap.sum_ns, dwell_ns, "sum is the recorded dwell");
-        let expect_bucket = crate::afxdp::neighbor_latency::neigh_latency_bucket_index(dwell_ns);
-        assert_eq!(
-            snap.buckets[expect_bucket], 1,
-            "500 ms dwell recorded into its pow2-ns bucket",
-        );
-        assert_eq!(
-            depth.load(Ordering::Relaxed),
-            1,
-            "max-depth high-water must reflect the 1 queued packet",
-        );
-    }
-
-    /// #1772: a never-resolving packet that crosses the timeout records a
-    /// timeout-drop and records NO dwell sample.
-    #[test]
-    fn timed_out_pending_neighbor_records_timeout_drop_not_dwell() {
-        let mut bindings = vec![
-            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
-            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
-        ];
-        let original_frame = build_ipv4_test_packet(0);
-        // SAFETY: single-threaded test over a UMEM created just above; no
-        // other borrow into [0, len) exists and the mutable slice is
-        // consumed by the immediate copy_from_slice before anything else
-        // touches the area.
-        unsafe {
-            bindings[0]
-                .umem
-                .area()
-                .slice_mut_unchecked(0, original_frame.len())
-        }
-        .expect("ingress frame")
-        .copy_from_slice(&original_frame);
-
-        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 138));
-        let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(
-            &mut bindings[0],
-            PendingNeighPacket {
-                addr: 0,
-                desc: XdpDesc {
-                    addr: 0,
-                    len: original_frame.len() as u32,
-                    options: 0,
-                },
-                meta,
-                decision: resolved_neighbor_decision(next_hop),
-                flow_key: Some(test_session_key(12345, 443)),
-                queued_ns: 0,
-                probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
-            },
-        );
-
-        // No neighbor anywhere → never resolves → timeout drop.
-        let forwarding = ForwardingState::default();
-        let lookup = WorkerBindingLookup::from_bindings(&bindings);
-        let mirror_targets = MirrorTargetMap::default();
-        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
-        let mut shared_recycles = Vec::new();
-        let (resolver, _rx, dwell, drops, _depth) = resolver_with_latency();
-        let area = bindings[0].umem.area() as *const MmapArea;
-        let (left, rest) = bindings.split_at_mut(0);
-        let (binding, right) = rest.split_first_mut().expect("ingress binding");
-
-        let now_ns = PENDING_NEIGH_TIMEOUT_NS + 1;
-        retry_pending_neigh(
-            binding,
-            left,
-            0,
-            right,
-            &lookup,
-            &mirror_targets,
-            &forwarding,
-            &dynamic_neighbors,
-            Some(&resolver),
-            now_ns,
-            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
-            // bindings[0].umem just above; the Rc-backed allocation lives
-            // past this call, the split_at_mut borrows cover disjoint
-            // binding state (not the umem area), and the test is
-            // single-threaded.
-            unsafe { &*area },
-            &mut shared_recycles,
-        );
-
-        assert!(
-            bindings[0].pending_neigh.is_empty(),
-            "timed-out pkt dropped"
-        );
-        assert_eq!(
-            drops.load(Ordering::Relaxed),
-            1,
-            "one timeout-drop must be counted",
-        );
-        assert_eq!(
-            dwell.snapshot().count,
-            0,
-            "a timed-out (never-resolved) packet must NOT record a dwell sample",
-        );
-    }
-}
+#[path = "neighbor_dispatch_mirror_tests.rs"]
+mod mirror_tests;
 
 #[cfg(test)]
 mod cold_start_probe_schedule_tests {
