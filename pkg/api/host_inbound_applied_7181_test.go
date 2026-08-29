@@ -1,6 +1,12 @@
 package api
 
-import "testing"
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/dataplane"
+)
 
 // #7181: the tri-state must not collapse.
 //
@@ -68,5 +74,68 @@ func TestHostInboundAppliedCarriesItsEvidence7181(t *testing.T) {
 		t.Error("GapFenceActive lost. A box enforcing through the additive gap fence " +
 			"is in a different state from one whose main table covers everything, and an " +
 			"operator diagnosing reachability needs to know which table is answering")
+	}
+}
+
+// #7181 WIRING: zonesHandler must actually CALL the mapper.
+//
+// This cell exists because a mutation escaped without it. The tri-state tests
+// above drive `hostInboundAppliedInfo` directly, so deleting the call from
+// zonesHandler left every one of them green while the feature was completely
+// disconnected — a REST consumer would have seen no `host_inbound_applied` key
+// at all and had no way to tell that from "the daemon was not asked".
+//
+// Testing the mapper proves the mapping. Only reaching it THROUGH the handler
+// proves the projection renders it.
+func TestZonesHandlerRendersTheAppliedState7181(t *testing.T) {
+	s := &Server{
+		store: nilZoneValueAPIStore(t),
+		dp: &schedulerCounterAPIDP{
+			Manager:  dataplane.New(),
+			counters: map[uint32]dataplane.CounterValue{},
+		},
+		// The STALE state deliberately: it is the row a renderer keyed on the
+		// sticky bool gets wrong, so if the handler ever renders from
+		// Established alone this fixture catches it here too.
+		hostInboundAppliedFn: func() HostInboundAppliedSnapshot {
+			return HostInboundAppliedSnapshot{
+				Known: true, Established: true, LastApplyFailed: true, Generation: 9,
+			}
+		},
+	}
+	rr := httptest.NewRecorder()
+	s.zonesHandler(rr, httptest.NewRequest("GET", "/api/v1/security/zones", nil))
+	if rr.Code != 200 {
+		t.Fatalf("zonesHandler status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"host_inbound_applied"`) {
+		t.Fatalf("zonesHandler rendered NO host_inbound_applied key. The mapper is "+
+			"correct in isolation but nothing calls it, so the applied state never "+
+			"reaches a REST consumer (#7181).\n--- body ---\n%s", body)
+	}
+	if !strings.Contains(body, `"stale"`) {
+		t.Errorf("the rendered state is not %q. A handler that renders from the sticky "+
+			"Established bool alone reports this box as enforcing while its latest "+
+			"render failed.\n--- body ---\n%s", "stale", body)
+	}
+}
+
+// The unwired case must render NOTHING rather than a false verdict. An absent
+// key claims nothing; a `"state":"not-established"` from a daemon that was
+// never asked is a claim, and a wrong one.
+func TestZonesHandlerOmitsAppliedStateWhenUnwired7181(t *testing.T) {
+	s := &Server{
+		store: nilZoneValueAPIStore(t),
+		dp: &schedulerCounterAPIDP{
+			Manager:  dataplane.New(),
+			counters: map[uint32]dataplane.CounterValue{},
+		},
+	}
+	rr := httptest.NewRecorder()
+	s.zonesHandler(rr, httptest.NewRequest("GET", "/api/v1/security/zones", nil))
+	if strings.Contains(rr.Body.String(), "host_inbound_applied") {
+		t.Errorf("an unwired callback still rendered an applied state. Absence must "+
+			"claim nothing.\n--- body ---\n%s", rr.Body.String())
 	}
 }
