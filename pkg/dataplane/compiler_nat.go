@@ -908,6 +908,38 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 		}
 	}
 
+	// #7078: the CROSS-RULE overlap class, the residual named in
+	// compiler_validate_4960.go's header. Everything above is per-rule; the
+	// helper additionally refuses the WHOLE snapshot when two rules' prefixes
+	// overlap within a conflicting zone scope (#2241, zone-partitioned per
+	// #5176). Without this the #4960 pre-pass ACCEPTS such a config, compileZones
+	// mutates the host, and the helper then rejects at
+	// publishSnapshotFailClosedLocked with no rollback — the exact shape the
+	// pre-pass exists to prevent, still live for this input.
+	//
+	// This is checked AFTER the per-rule loop because it is a property of the
+	// SET, not of a rule, which is also why it could not live in
+	// nptv6HelperWouldInstall (#7077's per-rule seam says so explicitly).
+	//
+	// The three #4960 over-rejection properties are preserved, and the predicate
+	// carries them rather than this call site:
+	//
+	//   - config.NPTv6OverlapConflict skips rules the snapshot builder DROPS
+	//     (NPTv6ScopeUnsupported), so a dropped rule cannot trigger a hard error
+	//     for a rejection the helper never makes.
+	//   - It skips rules whose prefixes do not parse or whose lengths disagree,
+	//     because the helper refuses those on an earlier arm — reporting them as
+	//     overlaps would name the wrong reason for a correct rejection.
+	//   - It partitions by zone exactly as `zones_conflict` does, so the #5176
+	//     split-horizon configurations the helper installs are NOT rejected.
+	//     Reusing validateNPTv6Strict's older overlap check would have failed
+	//     precisely those working configs: its `seenPrefix` carries no zone.
+	if conflict := config.NPTv6OverlapConflict(cfg); conflict != "" {
+		return fmt.Errorf("%s; the userspace helper rejects the whole NPTv6 snapshot "+
+			"on an overlapping prefix pair (#2241), so the apply cannot succeed -- "+
+			"correct or remove one of the rules", conflict)
+	}
+
 	if count > 0 {
 		compileInfo(dp, "nptv6 compilation complete", "rules", count)
 	}
