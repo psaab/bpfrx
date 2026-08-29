@@ -2131,7 +2131,7 @@ a probe of a non-listening port on a firewall-local address comes back as an
 **RST** if host-inbound admitted it and as **nothing at all** if host-inbound
 dropped it. Collapsing those two — which is what a bare `nc -z` exit status
 does — would make every negative cell in the smoke unfalsifiable. The prober
-(`host-inbound-probe.py`) therefore reports `OPEN` / `REFUSED` / `TIMEOUT` /
+(`host_inbound_probe.py`) therefore reports `OPEN` / `REFUSED` / `TIMEOUT` /
 `ERROR` as a raw observation, and `host-inbound-lib.sh` maps them onto
 `ADMITTED` / `SILENT` / `UNREACHED` / `BLIND`.
 

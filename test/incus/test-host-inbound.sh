@@ -100,8 +100,8 @@ done
 
 HI_PROBE_TIMEOUT="${HI_PROBE_TIMEOUT:-3}"
 HI_SETTLE="${HI_SETTLE:-8}"
-PROBE_SRC="${SCRIPT_DIR}/host-inbound-probe.py"
-REMOTE_PROBE="/tmp/xpf-host-inbound-probe.py"
+PROBE_SRC="${SCRIPT_DIR}/host_inbound_probe.py"
+REMOTE_PROBE="/tmp/xpf-host_inbound_probe.py"
 CLI=/usr/local/sbin/cli
 
 PASS=0

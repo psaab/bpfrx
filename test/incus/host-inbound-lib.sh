@@ -47,7 +47,7 @@
 #   Reduce the prober's raw output to one word of the admission vocabulary.
 #   TOTAL: always prints exactly one of ADMITTED / SILENT / UNREACHED / BLIND.
 #
-#   The prober (host-inbound-probe.py) emits one line per cell:
+#   The prober (host_inbound_probe.py) emits one line per cell:
 #       PROBE <target> <port> <OPEN|REFUSED|TIMEOUT|ERROR> <elapsed>
 #   Missing line, unparseable line, or an unknown result word all read as
 #   BLIND — never as SILENT, because "the prober said nothing about this cell"

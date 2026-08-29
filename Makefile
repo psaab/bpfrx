@@ -481,13 +481,21 @@ test-fbf-steering-lib:
 # cluster, no incus, no network. Run this after touching
 # test-host-inbound.sh or host-inbound-lib.sh.
 #
+# The prober leg was `py_compile` — a SYNTAX check, which an unresolvable
+# import, a renamed exception class or a changed output format all pass while
+# failing later on the cluster. It now RUNS the prober: the OPEN/REFUSED/
+# TIMEOUT/ERROR mapping (the discriminator the whole smoke rests on, and the one
+# thing the shell lib structurally cannot see — it only ever sees the word the
+# prober printed) and the positional output format that host-inbound-lib.sh
+# awk-parses. Hermetic: loopback only, ~0.15s.
+#
 # cluster-cell-selftest.sh is included because the smoke's #1875 lock wiring is
 # asserted there (its destructive-script detector picks up test-host-inbound.sh
 # automatically since #6936), so this target stands alone rather than relying
 # on whoever changes the smoke also remembering to run test-cluster-lock-lib.
 test-host-inbound-lib:
 	bash ./test/incus/host-inbound-selftest.sh
-	python3 -c "import py_compile; py_compile.compile('test/incus/host-inbound-probe.py', doraise=True)"
+	python3 -m unittest discover -s test/incus -p 'host_inbound_probe_test.py'
 	bash ./test/incus/cluster-cell-selftest.sh
 
 # The on-wire host-inbound smoke itself (#6936 — needs the loss userspace
