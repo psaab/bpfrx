@@ -6,6 +6,13 @@ import "log/slog"
 type SyncStatsProvider interface {
 	Stats() SyncStatsSnapshot
 	IsConnected() bool
+	// PeerSessionSyncWireVersion is #7990's peer sync-wire advertisement, 0
+	// when the peer has not advertised one. It is on THIS interface rather
+	// than reached through an optional type assertion on purpose: an
+	// assertion that silently fails renders no version and makes the LANE-1
+	// drain gate unable to fire, which is indistinguishable from a healthy
+	// pair. The compiler asks the question instead.
+	PeerSessionSyncWireVersion() uint16
 }
 
 // SetSyncReady marks session sync as ready (bulk sync received, or the
@@ -112,4 +119,24 @@ func (m *Manager) IsSyncConnected() bool {
 		return false
 	}
 	return p.IsConnected()
+}
+
+// PeerSessionSyncWireVersion reports the peer's advertised session-sync wire
+// version through the sync-stats provider, or 0 when no provider is set or the
+// peer has not advertised one (#7990).
+//
+// Both zero cases mean the same thing to a caller — "not known to differ" — and
+// SessionSyncWireCompatible maps that to PERMIT. That is deliberate: a Manager
+// with no provider is a node with no session sync to be incompatible about.
+func (m *Manager) PeerSessionSyncWireVersion() uint16 {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	p := m.syncStats
+	m.mu.RUnlock()
+	if p == nil {
+		return 0
+	}
+	return p.PeerSessionSyncWireVersion()
 }

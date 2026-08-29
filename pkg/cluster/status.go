@@ -68,12 +68,26 @@ func (m *Manager) FormatStatus() string {
 		fmt.Fprintf(&b, "Software version: %s\n", localVersion)
 	}
 	fmt.Fprintf(&b, "HA protocol version: %d\n", localProtocol)
+	// #7990: the session-sync WIRE version is a SEPARATE counter from the HA
+	// protocol version (#7925), and the LANE-1 rolling drain gate reads these
+	// lines to decide whether a handover can carry sessions. Rendered next to
+	// the HA lines because an operator comparing two nodes needs both, and
+	// because they are exactly the pair the mixed-base image gate compares.
+	fmt.Fprintf(&b, "Session-sync wire version: %d\n", SessionSyncWireVersion)
 	if peerAlive {
 		if peerVersion == "" {
 			peerVersion = "unknown"
 		}
 		fmt.Fprintf(&b, "Peer software version: %s\n", peerVersion)
 		fmt.Fprintf(&b, "Peer HA protocol version: %d\n", peerProtocol)
+		// 0 renders as "unknown" rather than "0": there is no valid sync wire
+		// version 0, so printing the number would invite a reader (or a parser)
+		// to compare it as one. A peer that advertises nothing predates #7990.
+		if pw := m.PeerSessionSyncWireVersion(); pw == 0 {
+			fmt.Fprintf(&b, "Peer session-sync wire version: unknown\n")
+		} else {
+			fmt.Fprintf(&b, "Peer session-sync wire version: %d\n", pw)
+		}
 	}
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "%-6s %-8s %-14s %-8s %-8s %s\n",

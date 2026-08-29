@@ -292,9 +292,20 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 // The receiver's 0-means-incapable default already fails closed.
 func (s *SessionSync) sendCapabilities(conn net.Conn) {
 	v := s.localSnapshotProtocol.Load()
-	var buf [3]byte
+	var buf [5]byte
 	binary.LittleEndian.PutUint16(buf[:2], uint16(v))
 	buf[2] = localCapabilityFlags
+	// #7990: the sender's session-sync WIRE version, as a trailing u16 under
+	// the same #2170 discipline the flags byte rides. Advertised from the
+	// compile-time constant rather than a settable field on purpose — there is
+	// no bring-up call to forget, and no way for the advertised value to
+	// disagree with the frames this process actually writes.
+	//
+	// This does NOT bump SessionSyncWireVersion. Bumping the version in order
+	// to advertise the version would be self-defeating: the mixed-base gate
+	// compares it for exact equality, so the bump would refuse session sync
+	// across exactly the upgrade that first carries the field.
+	binary.LittleEndian.PutUint16(buf[3:5], SessionSyncWireVersion)
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgPeerCapabilities, buf[:])
 	s.writeMu.Unlock()

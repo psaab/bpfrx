@@ -567,8 +567,16 @@ error-classification only; failover timing and the VRRP/session-sync
 state machines are untouched.
 
 1. assert peer alive + session sync established + HA protocol compatible
-   (`CurrentHAProtocolVersion`) — else ABORT to image-replace (Path C),
+   (`CurrentHAProtocolVersion`) + session-sync WIRE version compatible
+   (`SessionSyncWireVersion`, #7990) — else ABORT to image-replace (Path C),
    never drop connections.
+
+   Note the third and fourth are different questions. "Session sync
+   established" means the sync LINK is up; the wire-version check means the
+   peer can actually DECODE the frames this node sends. Before #7990 only the
+   first was asked on this path, and since #7925 the two versions are separate
+   counters — so a peer with a matching HA version could still be unable to
+   decode a single session frame.
 2. **peer-takeover-ready precheck BEFORE demoting** — demoting a node
    whose peer cannot take over strands VIPs.
 3. `ForceSecondary()` to start the drain.
@@ -878,6 +886,49 @@ confirms the peer ACTUALLY holds primary for EVERY RG; if it does not
 within the deadline, the rolling driver fails back and ABORTS WITHOUT
 cutting. A peer that cannot take over therefore never leads to a cut — at
 worst the drain times out and the local node is restored to forwarding.
+
+## Session-sync wire version on the in-place path (#7990)
+
+The LANE-1 in-place rolling path had **no session-sync version check at all**
+until #7990, and the gap was structural rather than an oversight: there was no
+channel. `SessionSyncWireVersion` was advertised only in the image manifest
+(`xpfd protocol-versions`) and consumed only by `GateMixedBaseSwap` — the
+LANE-2 image-replace gate. The heartbeat carries `HAProtocolVersion` and nothing
+about the sync wire, and the session-sync frame header has no on-wire version
+field.
+
+**Why that mattered more than it sounds.** Roll a pair across a
+`SessionSyncWireVersion` change and heartbeat, election and failover all keep
+working, because the HA protocol never moved. The cluster is UP and looks
+healthy. What is broken is session synchronisation — invisible until a failover
+needs it, and indistinguishable from a cluster that has simply not synced
+anything yet. The operator discovers it by losing every established flow after a
+rolling upgrade that reported success.
+
+**The channel.** The version now rides `syncMsgPeerCapabilities` (id 29) as a
+trailing `u16`, beside #6650's config-snapshot version and #7147's capability
+flags, under the #2170 trailing-field discipline. It is on the same connection
+whose compatibility is in question, so "peer reachable" and "peer version known"
+share one lifecycle — the same three reasons #6650 chose this channel over the
+heartbeat, which apply with more force here. **No version bump**, and here that
+is forced rather than merely convenient: bumping `SessionSyncWireVersion` in
+order to advertise `SessionSyncWireVersion` would make the mixed-base gate —
+which compares it for exact equality — refuse session sync across precisely the
+upgrade that first carries the field.
+
+**The honest limitation.** A peer that advertises nothing predates #7990, and
+the gate PERMITS that case. Refusing would fire on every roll from the previous
+release and on no real skew. So this gate cannot protect the first roll that
+carries it; it protects every roll after — which is every roll that could
+actually move the constant. That is the same dual-accept shape #4107 (heartbeat
+auth) and #4126 (VRRP checksum) used: accept both wire forms during the upgrade
+window, enforce once both sides speak the new one.
+
+`show chassis cluster status` now renders `Session-sync wire version` and
+`Peer session-sync wire version` beside the HA protocol lines. The peer line
+reads `unknown` rather than `0` for a peer that has not advertised: there is no
+valid wire version 0, so printing a number would invite a reader — or a parser —
+to compare it as one.
 
 ## Rolling protocol-bump limitation
 

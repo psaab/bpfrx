@@ -1025,6 +1025,11 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// retained version: it would make every confirmed-fence takeover wait
 		// out its full timeout against a downgraded peer that cannot answer.
 		s.peerCapabilityFlags.Store(0)
+		// #7990: same incarnation scoping. A retained sync-wire version is the
+		// worst of the three to keep: it would let the LANE-1 drain gate certify
+		// compatibility against a version the reconnected (possibly downgraded)
+		// peer no longer speaks.
+		s.peerSessionSyncWire.Store(0)
 		// #5718 C01a: peerHeartbeatAckEver is a capability probe of the peer
 		// PROCESS, not of this node, so it must be scoped to the peer
 		// incarnation exactly like clockSynced above. Full disconnect ends

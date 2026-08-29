@@ -15,10 +15,22 @@ type RollingCluster interface {
 	PeerAlive() (bool, error)
 	// SyncEstablished reports whether session-sync is established/clean.
 	SyncEstablished() (bool, error)
-	// HAProtocolCompatible reports whether the local and peer HA/session-
-	// sync protocol versions are mutually compatible (else the release is
-	// not rolling-upgradable; the driver aborts to Path C image-replace).
+	// HAProtocolCompatible reports whether the local and peer HA protocol
+	// versions are mutually compatible (else the release is not
+	// rolling-upgradable; the driver aborts to Path C image-replace).
+	//
+	// #7990: this used to say "HA/session-sync protocol versions". It does not
+	// and never did look at the session-sync wire version — parseHAProtocolCompatible
+	// reads only the two "HA protocol version" lines — and since #7925 the two
+	// are separate counters, so the claim was not merely loose but wrong. The
+	// session-sync half is SessionSyncWireCompatible below.
 	HAProtocolCompatible() (bool, error)
+	// SessionSyncWireCompatible reports whether the peer's session-sync WIRE
+	// version is known to be compatible with this node's, plus a reason for
+	// the log (#7990). An UNKNOWN peer version permits — see
+	// cluster.SessionSyncWireCompatible for why refusing there would fire on
+	// every roll from a pre-#7990 release and on no real skew.
+	SessionSyncWireCompatible() (bool, string, error)
 	// PeerTakeoverReady reports whether the PEER is ready to take over
 	// (peer healthy, interface monitors green, not blocked by a hold) —
 	// checked BEFORE demoting the local node so VIPs are never stranded.

@@ -43,6 +43,12 @@ type fakeCluster struct {
 	// poll (persistent transport failure), so a deadline miss must surface it.
 	peerAliveErr error
 	syncErr      error
+	// #7990 seams. syncWireIncompat makes SessionSyncWireCompatible refuse;
+	// syncWireErr makes it fail transport-side. Both default to the healthy
+	// value so every pre-#7990 case keeps exercising what it was written for.
+	syncWireIncompat bool
+	syncWireErr      error
+	syncWireChecks   int
 }
 
 func (f *fakeCluster) PeerAlive() (bool, error) { return f.peerAlive, f.peerAliveErr }
@@ -61,8 +67,18 @@ func (f *fakeCluster) SyncEstablished() (bool, error) {
 	return f.synced, nil
 }
 func (f *fakeCluster) HAProtocolCompatible() (bool, error) { return f.compatible, nil }
-func (f *fakeCluster) PeerTakeoverReady() (bool, error)    { return f.peerReady, nil }
-func (f *fakeCluster) ForceSecondary() error               { f.forced = true; return nil }
+func (f *fakeCluster) SessionSyncWireCompatible() (bool, string, error) {
+	f.syncWireChecks++
+	if f.syncWireErr != nil {
+		return false, "", f.syncWireErr
+	}
+	if f.syncWireIncompat {
+		return false, "peer session-sync wire version differs", nil
+	}
+	return true, "peer session-sync wire version matches", nil
+}
+func (f *fakeCluster) PeerTakeoverReady() (bool, error) { return f.peerReady, nil }
+func (f *fakeCluster) ForceSecondary() error            { f.forced = true; return nil }
 func (f *fakeCluster) DrainComplete() (bool, error) {
 	f.drainPolls++
 	return f.drainPolls >= f.drainAfter, nil
