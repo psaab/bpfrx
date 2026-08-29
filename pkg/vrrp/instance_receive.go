@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -39,8 +40,36 @@ func isTimeoutError(err error) bool {
 // combination that omits the control message — the VRID/TTL/self-IP gates still
 // apply. expectedIfindex <= 0 (an instance with no resolved interface index, as
 // in some unit-test constructions) also fails open.
+// unreportedArrivalIfindexWarn fires at most once per process when the
+// platform does not report an arrival interface for a VRRP advert (#7171).
+//
+// The fail-open above is deliberate and stays. What was missing is any way to
+// know it is happening: on a kernel/socket combination that omits the
+// interface control message, EVERY advert takes the fail-open path, so the
+// #2886 cross-processing guard is silently inactive for the life of the
+// process. That is precisely the configuration #2886 exists for -- two VLAN
+// sub-interfaces on a shared parent running the same VRID -- and the symptom
+// without this line is state corruption and BACKUP flapping with nothing
+// pointing at the disabled guard.
+//
+// sync.Once, not a per-packet log: RETH instances advertise every 30ms, so an
+// unguarded log here would flood journald (CLAUDE.md logging rules).
+var unreportedArrivalIfindexWarn sync.Once
+
 func acceptArrivalIfindex(arrivalIfindex, expectedIfindex int) bool {
 	if arrivalIfindex <= 0 || expectedIfindex <= 0 {
+		// Only the platform-side case is worth reporting. expectedIfindex <= 0
+		// is an instance with no resolved index, which is a test construction
+		// rather than something an operator can act on.
+		if arrivalIfindex <= 0 && expectedIfindex > 0 {
+			unreportedArrivalIfindexWarn.Do(func() {
+				slog.Warn("vrrp: kernel did not report an arrival interface for a "+
+					"VRRP advert; per-interface advert isolation (#2886) is inactive "+
+					"on this platform, so instances sharing a VRID across VLAN "+
+					"sub-interfaces of one parent may cross-process adverts",
+					"expected_ifindex", expectedIfindex)
+			})
+		}
 		return true
 	}
 	return arrivalIfindex == expectedIfindex
