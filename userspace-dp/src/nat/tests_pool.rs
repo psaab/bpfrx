@@ -7058,6 +7058,156 @@ fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
     );
 }
 
+// #7092: `PortAllocator::retire_worker` — the reclaim path for a holder that
+// will never run its own release (a panicked worker, or an id a replan retired).
+//
+// THE HAZARD THIS IS SHAPED AROUND. Clearing a dead worker's bit is only sound
+// if an EMPTY mask really means no live holder remains. Under #6211 F2 it did
+// not: the allocating worker recorded no bit, so the mask named every worker
+// EXCEPT the one forwarding, and emptying it would have freed a port still in
+// use — worse than the leak. #6522 made the owner a holder of its own
+// allocation, which is what makes this operation safe, and the first two cells
+// below are what hold that line: retiring one of two holders must free NOTHING.
+#[test]
+fn retire_worker_frees_only_when_it_was_the_last_holder_7092() {
+    let rules = holder_pool_rules_6211_f2();
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let nat = holder_synced_nat_6211_f2();
+
+    for worker in [0u32, 1u32] {
+        reserve_synced_source_nat_allocation_for_worker(
+            &InterfaceNatAllocators::default(),
+            &rules,
+            &key,
+            nat,
+            false,
+            None,
+            0,
+            worker,
+        );
+    }
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "fixture: the port must be reserved before any retire, or every \
+         assertion below passes against an allocator that never held it"
+    );
+
+    // FIXTURE ADEQUACY — does this really create TWO holders? The mask has no
+    // test accessor, so it is established two ways rather than assumed.
+    //
+    // 1. `reserve_synced_source_nat_allocation_for_worker` is the path where
+    //    workers 2..N actually land: it reaches `reserve_flow`'s idempotent
+    //    early return, which ORs the caller's bit into the existing record.
+    //    Two `allocate_source_for_worker` calls would NOT do this — the live-hit
+    //    path returns the existing translation without taking a second bit — so
+    //    an allocate-twice fixture cannot create the state this cell is about
+    //    and would fail in the flattering direction (#7094 hit exactly that).
+    // 2. The first assertion below is SELF-VERIFYING in the direction that
+    //    matters: with only ONE holder, `retire_worker(0)` would empty the mask
+    //    and free, returning 1, and `assert_eq!(.., 0)` would fail. It passing
+    //    REQUIRES worker 1's bit to be present.
+    //
+    // Confirmed a third way by measurement: mutation cell M1 ("free on ANY
+    // holder") reds this test. With a single holder, M1 and the real code
+    // behave identically — retiring the sole holder frees either way — so M1
+    // reddening is only possible if the fixture holds at least two bits.
+
+    // ONE OF TWO — must free nothing. This is the cell that would have caught
+    // this operation being written against the pre-#6522 mask.
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(0, 2_000),
+        0,
+        "retiring one of TWO holders must free no record — the other worker is \
+         still forwarding through that (pool_addr, port) (#7092)"
+    );
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "...and the port must still be occupied. Freeing here is the \
+         over-release the holder mask exists to prevent"
+    );
+
+    // A worker that HOLDS NOTHING must not disturb the surviving holder.
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(7, 2_001),
+        0,
+        "retiring a worker that never held a bit must free nothing"
+    );
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "...and must leave the record alone"
+    );
+
+    // THE LAST holder — now the mask empties and the port comes back.
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(1, 2_002),
+        1,
+        "retiring the LAST holder must free exactly one record (#7092)"
+    );
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "the pool port must be reclaimed once no holder remains — without this \
+         path a panicked worker strands one port per synced pool-SNAT session \
+         for the life of the allocator, with no sweep, TTL or reconcile to \
+         recover it (#7092)"
+    );
+}
+
+// #7092: idempotence and the out-of-range guard.
+//
+// A retire is driven by an OBSERVATION (a `.dead` flag, a replan), and an
+// observation can repeat. A second retire of the same worker must be a no-op
+// rather than a second free — the failure mode a naive walk would have is
+// double-freeing a port that a NEW flow has since been handed.
+#[test]
+fn retire_worker_is_idempotent_and_ignores_out_of_range_ids_7092() {
+    let rules = holder_pool_rules_6211_f2();
+    let key = session_key_from_src("10.0.61.51", 40001, "8.8.8.8", 443);
+    let nat = holder_synced_nat_6211_f2();
+
+    reserve_synced_source_nat_allocation_for_worker(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        nat,
+        false,
+        None,
+        0,
+        3,
+    );
+    assert!(rules[0].pool_allocator.debug_is_port_occupied(0, 10000), "fixture");
+
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(3, 2_000),
+        1,
+        "the sole holder's retire frees the record"
+    );
+    assert_eq!(
+        rules[0].pool_allocator.retire_worker(3, 2_001),
+        0,
+        "a REPEATED retire of the same worker must free nothing — the record is \
+         gone and a second free would return a port a new flow may already own"
+    );
+
+    // An id too wide for the mask never set a bit, so it holds nothing. It must
+    // return 0 rather than panic on `NatHolder::bit()`'s debug_assert.
+    //
+    // HONEST SCOPE: this assertion does NOT bind the guard under `make
+    // test-rust`, which runs `--release`. Measured — mutation cell M3 removes
+    // the `worker_id >= MAX_NAT_HOLDER_WORKERS` early return and the whole
+    // release suite stays green, because `checked_shl(128)` on a u128 already
+    // yields 0 and the holder filter then matches nothing. What the guard buys
+    // is a DEBUG-profile run, where `debug_assert!` would panic instead. The
+    // cell is kept as a statement of intent with its limit named, rather than
+    // presented as a guard it is not.
+    assert_eq!(
+        rules[0]
+            .pool_allocator
+            .retire_worker(crate::nat::MAX_NAT_HOLDER_WORKERS, 2_002),
+        0,
+        "an id at the mask boundary holds no bit and must retire nothing"
+    );
+}
+
 // #6211 F2 REFRESH CELL — the cell a bare COUNTER fails.
 //
 // `reserve_flow`'s idempotent early return is not only where workers 2..N land;

@@ -237,10 +237,16 @@ pub(crate) struct ReseedOutcome {
 /// #6211 F2: which worker is taking or dropping a reservation.
 ///
 /// `Untracked` reproduces the pre-#6211-F2 contract exactly — a reserve sets no
-/// holder bit and a release frees on the first call. It is what every LOCAL
-/// allocation path (`allocate_translation` and friends) uses, because RSS steers
-/// a given 5-tuple to exactly ONE worker so a local allocation has exactly one
-/// holder by construction.
+/// holder bit and a release frees on the first call.
+///
+/// #7093: it is NOT "what every LOCAL allocation path uses", and the reason
+/// given for that — "RSS steers a given 5-tuple to exactly ONE worker so a local
+/// allocation has exactly one holder" — is false. A locally-born session is
+/// replicated to every OTHER worker and each sibling reserves against the
+/// owner's record, so the mask named every worker except the one forwarding.
+/// #6522 fixed that: `allocate_translation` and friends now take a `holder` and
+/// production passes `Worker(id)`. `Untracked` is what the `#[cfg(test)]` entry
+/// points and the read-only fragment probe pass, and nothing else.
 ///
 /// `Worker(id)` is used by the HA-synced reservation path, where the SAME
 /// `(flow, translated)` is reserved once per worker: `handle_upsert_synced` runs
@@ -1686,12 +1692,21 @@ impl PortAllocator {
     /// stays claimed for the holders that remain.
     ///
     /// Returns `false` (proceed to free) in exactly two cases:
-    ///   - `holders == 0`, an UNTRACKED local allocation. RSS steers a 5-tuple
-    ///     to one worker, so a local allocation has a single holder by
-    ///     construction and the first release frees it — the pre-#6211-F2
-    ///     contract, bit-identical.
+    ///   - `holders == 0`, an untracked record — one nothing has ever claimed a
+    ///     bit on. #7093: an earlier revision of this line justified that arm
+    ///     with "RSS steers a 5-tuple to one worker, so a local allocation has a
+    ///     single holder by construction". **That premise is false and #6522
+    ///     refuted it**: a locally-born session is replicated to every OTHER
+    ///     worker (`replicate_session_upsert` over `peer_worker_commands`, a
+    ///     list built with `.filter(|(id, _)| **id != worker_id)`), and
+    ///     `SessionOrigin::is_peer_synced()` is TRUE for `WorkerLocalImport`, so
+    ///     every sibling reserved and took a bit on the owner's record while the
+    ///     owner held none. Since #6522 the allocating worker records its own
+    ///     bit, so no PRODUCTION path reaches this arm any more — every reserve
+    ///     names a `Worker(id)`. It survives for the `#[cfg(test)]` entry points
+    ///     and the read-only fragment probe, which pass `Untracked`.
     ///   - clearing this holder's bit empties the mask: the LAST worker holding
-    ///     an HA-synced reservation is releasing it.
+    ///     the reservation is releasing it.
     ///
     /// [`NatHolder::Untracked`] contributes no bit, so an untracked release of a
     /// TRACKED reservation keeps it. That is the deliberate direction for a
@@ -1852,6 +1867,102 @@ impl PortAllocator {
             self.gc_expired_chunked(now_ns, RELEASE_GC_BUDGET);
         }
         true
+    }
+
+    /// #7092: clear `worker_id`'s holder bit across every live allocation, and
+    /// free any record the clear empties. Returns the number of records freed.
+    ///
+    /// THE LEAK THIS EXISTS FOR. A bit is SET on reserve and cleared only when
+    /// that same worker later runs its own release. A worker that never runs one
+    /// strands every reservation it holds for the life of the allocator, and
+    /// both ways that happens are reachable:
+    ///
+    ///   * PANIC. `spawn_supervised_worker` (`coordinator/supervisor.rs`)
+    ///     catches the unwind, sets `runtime_atomics.dead = true` and lets the
+    ///     thread exit. Nothing respawns it — the only other consumer of `.dead`
+    ///     is `coordinator/status.rs`, which REPORTS it — so its `SessionTable`
+    ///     dies with the thread and never reaps.
+    ///   * REPLAN. `worker_id` is minted as `queue_id % workers`
+    ///     (`server/helpers/planning.rs`), so a plan that shrinks the worker set
+    ///     retires ids that still hold bits. The allocator itself is carried
+    ///     forward across the reload by `parse_source_nat_rules_with_previous`,
+    ///     so the bits survive with it.
+    ///
+    /// There is no sweep, no TTL and no reconcile that clears them, so the pool
+    /// addresses' occupancy bitmap never gets those ports back and SNAT for new
+    /// flows eventually fails `AllocatorExhausted`.
+    ///
+    /// WHY THIS IS SAFE TO DO, and why it would NOT have been before #6522.
+    /// Clearing one holder's bit is only sound if an empty mask really means no
+    /// live holder remains. Under #6211 F2 it did not: the allocating worker
+    /// recorded NO bit, so the mask named every worker EXCEPT the one actually
+    /// forwarding, and emptying it would have freed a `(pool_addr, port)` still
+    /// in use — the over-release this whole mechanism exists to prevent. #6522
+    /// made the owner a holder of its own allocation, so an empty mask now means
+    /// exactly what it says. This function is the last-holder release path
+    /// applied to a worker that will never call it.
+    ///
+    /// UNTRACKED RECORDS ARE NOT TOUCHED. `holders == 0` is a record no worker
+    /// ever claimed; `bit & 0 == 0`, so the filter below skips it and no
+    /// `Untracked` allocation can be freed by a retirement it never joined.
+    ///
+    /// NOT WIRED YET, and that is stated rather than implied: this PR lands the
+    /// reclaim operation and the invariant that makes it sound; nothing calls it
+    /// on a production path, so **#7092's leak is not closed by this change
+    /// alone**. Choosing the call site is its own decision with its own hazard —
+    /// `coordinator/status.rs` has both `forwarding.iface_nat_allocators` and the
+    /// `.dead` flag in scope, but retiring from the 1 Hz status tick would walk
+    /// `live_by_flow` under the alloc mutex on every tick unless it also carries
+    /// "already retired" state, and the replan path that retires ids
+    /// deterministically does not hold the allocator. Landing the primitive
+    /// first mirrors how #6765 split its re-seed primitive from wiring it into
+    /// both rebuild sites.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn retire_worker(&self, worker_id: u32, now_ns: u64) -> usize {
+        // An id too wide for the mask never SET a bit, so it holds nothing to
+        // clear. Checked HERE rather than through `NatHolder::bit()`, whose
+        // `debug_assert!` would fire on the very id this arm exists to tolerate.
+        // `planning.rs` refuses a plan that would mint one, so this is a
+        // total-function guard rather than a live case.
+        //
+        // ITS VALUE IS PROFILE-DEPENDENT, measured rather than assumed. In a
+        // RELEASE build it is redundant: `debug_assert!` is compiled out and
+        // `1u128.checked_shl(id >= 128)` returns `None` -> `unwrap_or(0)`, so the
+        // `holders & 0 != 0` filter matches nothing and the walk frees nothing
+        // anyway. Deleting these three lines leaves the whole release suite green
+        // (mutation cell M3). In a DEBUG profile the `debug_assert!` panics, so
+        // the guard is what keeps this function total there. Stated because the
+        // boundary assertion in
+        // `retire_worker_is_idempotent_and_ignores_out_of_range_ids_7092`
+        // documents that intent without binding it under `make test-rust`, which
+        // runs `--release`.
+        if worker_id >= MAX_NAT_HOLDER_WORKERS {
+            return 0;
+        }
+        let bit = NatHolder::Worker(worker_id).bit();
+        let mut live = self.lock_live();
+        let held: Vec<(SourceNatFlowKey, LiveAllocation)> = live
+            .live_by_flow
+            .iter()
+            .filter(|(_, alloc)| alloc.holders & bit != 0)
+            .map(|(flow, alloc)| (flow.clone(), *alloc))
+            .collect();
+        let mut freed = 0usize;
+        for (flow, existing) in held {
+            let remaining = existing.holders & !bit;
+            if remaining != 0 {
+                if let Some(slot) = live.live_by_flow.get_mut(&flow) {
+                    slot.holders = remaining;
+                }
+                continue;
+            }
+            // Last holder retired: the same unlink + lease completion
+            // `release_flow` performs, so the two cannot drift.
+            self.unlink_live_allocation_locked(&mut live, &flow, existing);
+            Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
+            freed += 1;
+        }
+        freed
     }
 
     pub(super) fn rollback_flow(
