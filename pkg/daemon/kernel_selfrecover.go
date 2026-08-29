@@ -26,7 +26,7 @@ func (d *Daemon) newKernelRunner() (*upgrade.KernelRunner, error) {
 	if d.kernelRunnerFn != nil {
 		return d.kernelRunnerFn()
 	}
-	return upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+	return upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: daemonKernelSystem()})
 }
 
 // newKernelSystem builds the KernelSystem used by the hold-reconcile promotion
@@ -35,7 +35,7 @@ func (d *Daemon) newKernelSystem() upgrade.KernelSystem {
 	if d.kernelSystemFn != nil {
 		return d.kernelSystemFn()
 	}
-	return upgrade.NewKernelSystem()
+	return daemonKernelSystem()
 }
 
 // holdSecondaryIfKernelCandidateArmed keeps a CANDIDATE-TRIAL boot SECONDARY
@@ -226,7 +226,7 @@ func (d *Daemon) startKernelSelfRecovery(ctx context.Context) {
 		// Refuse self-recovery while a candidate trial is still ARMED — even if
 		// the orchestrator lease expired (r2 AGY long-hanging-roll TTL split-brain).
 		Armed: func() (bool, error) {
-			r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+			r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: daemonKernelSystem()})
 			if err != nil {
 				return false, err
 			}
