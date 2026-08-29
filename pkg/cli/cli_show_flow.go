@@ -984,14 +984,17 @@ func (c *CLI) showFlowTimeouts() error {
 			fmt.Println("  allow-embedded-icmp:           enabled")
 		}
 		if flow.GREPerformanceAcceleration {
-			// #5804: do NOT render this as a plain "enabled". The flag reaches
-			// ForwardingState.gre_acceleration and no packet path reads it, so
-			// an unqualified "enabled" tells an operator a tunnel-aware
-			// identity is in force when GRE sessions are still keyed on the
-			// bare 5-tuple. The commit-time advisory
-			// (validateSecurityFlowAcceptedOnly) says the same thing; this is
-			// the surface an operator reads AFTER committing.
-			fmt.Println("  gre-performance-acceleration:  configured (accepted-only; GRE sessions remain 5-tuple keyed — #5804)")
+			// #7188 cut 1: still do NOT render a plain "enabled", but the
+			// reason changed. This used to say GRE sessions "remain 5-tuple
+			// keyed", which stopped being true when transit GRE started
+			// resolving a discriminator-keyed flow. It is now partially in
+			// force: keyed locally, NOT keyed across HA sync, because
+			// build_synced_session_key zeroes the discriminator on a
+			// peer-synced key. An operator who reads "enabled" here and plans
+			// per-tunnel separation through a failover gets aliasing on the
+			// standby. Keep this in lockstep with the commit-time advisory in
+			// validateSecurityFlowAcceptedOnly.
+			fmt.Println("  gre-performance-acceleration:  configured (partial; transit GRE keyed on the RFC 2890 discriminator locally, NOT across HA sync — per-tunnel identity does not survive failover — #7188)")
 		}
 		if flow.PowerModeDisable {
 			fmt.Println("  power-mode-disable:            yes")

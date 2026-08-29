@@ -31,9 +31,14 @@ func TestGREPerformanceAccelerationAdvisory_5804(t *testing.T) {
 		t.Fatalf("no advisory names the knob; an operator is told nothing and believes "+
 			"per-tunnel identity is in force. warnings=%v", cfg.Warnings)
 	}
-	if !warn167Has(cfg, "#5804") {
-		t.Fatalf("the advisory must cite #5804 so the operator can find the tracking issue; "+
-			"warnings=%v", cfg.Warnings)
+	// The cited issue MOVED with the work. #5804 is closed; #7188 is the
+	// successor that carries the dataplane half, and it is the issue an
+	// operator reading this advisory needs to find. Pinning the closed one
+	// would send them to a thread whose Problem statement describes behaviour
+	// that no longer exists.
+	if !warn167Has(cfg, "#7188") {
+		t.Fatalf("the advisory must cite #7188, the CURRENT tracking issue, so the operator "+
+			"can find the remaining gap; warnings=%v", cfg.Warnings)
 	}
 
 	// The advisory must state the CONSEQUENCE, not just "not enforced". An
@@ -47,10 +52,33 @@ func TestGREPerformanceAccelerationAdvisory_5804(t *testing.T) {
 			break
 		}
 	}
-	for _, want := range []string{"5-tuple", "one session"} {
+	// #7188 cut 1 CHANGED WHAT IS TRUE HERE, and this assertion had to change
+	// with it. It used to require the words "5-tuple" and "one session",
+	// pinning #5804's claim that the knob was inert. That claim became false
+	// the moment transit GRE started resolving a discriminator-keyed flow, and
+	// the pin then actively defended the falsehood — a test written to hold
+	// today's behaviour becomes a test demanding yesterday's.
+	//
+	// The property now asserted is the one that survives: the advisory must
+	// name the REMAINING gap rather than the closed one. It must NOT claim the
+	// knob is inert, and it MUST say per-tunnel identity does not cross HA
+	// sync, because build_synced_session_key zeroes the discriminator on a
+	// peer-synced key and an operator planning around a failover is the one
+	// who gets hurt.
+	for _, want := range []string{"discriminator", "HA session sync", "failover"} {
 		if !strings.Contains(advisory, want) {
-			t.Errorf("advisory does not say %q, so it states that the knob is inert without "+
-				"stating what goes wrong: %q", want, advisory)
+			t.Errorf("advisory does not say %q, so it does not tell an operator which half "+
+				"of this feature is in force: %q", want, advisory)
+		}
+	}
+	// The inverse, and the half a keyword check alone would miss: the advisory
+	// must not still be asserting the pre-#7188 claim. A message that gained
+	// the new words while keeping the old sentence reads as self-contradictory
+	// and leaves the operator with the wrong model.
+	for _, stale := range []string{"accepted-only", "no packet path", "still share one session"} {
+		if strings.Contains(advisory, stale) {
+			t.Errorf("advisory still carries the pre-#7188 claim %q, which stopped being "+
+				"true when transit GRE became discriminator-keyed: %q", stale, advisory)
 		}
 	}
 }
