@@ -163,6 +163,24 @@ func isASCIIDigits(s string) bool {
 // here is that this function can return true for a rule the helper later
 // refuses for an unrelated reason -- which is the SAFE direction, because it
 // keeps the pre-#4960 warn-and-skip rather than inventing a new hard error.
+// nptv6HelperWouldInstallFn is the seam compileNPTv6 actually calls.
+//
+// It exists because #7077 CLOSED the last live divergence between the two
+// grammars. `/+48` was the only string the helper accepted and Go's
+// net.ParseCIDR rejected, and it was the sole fixture for the `|| helperInstalls`
+// arm of compileNPTv6's reject closure — the #6894 r9 regression fix. Tightening
+// parse_prefix therefore removed the only test input that could exercise the
+// defence against divergence.
+//
+// Keeping a defect alive so a test has something to assert would be backwards.
+// Instead the divergence is INJECTED: a test stubs this seam to accept a string
+// Go refuses, and asserts the apply is skipped rather than rejected. That binds
+// the property — "a rule the helper would install must not fail the apply" —
+// without depending on a live disagreement that should not exist.
+//
+// Production assigns this once, here. A test that stubs it must restore it.
+var nptv6HelperWouldInstallFn = nptv6HelperWouldInstall
+
 func nptv6HelperWouldInstall(match, then string) bool {
 	extWords, extOK := nptv6HelperPrefixWords(match)
 	if !extOK {

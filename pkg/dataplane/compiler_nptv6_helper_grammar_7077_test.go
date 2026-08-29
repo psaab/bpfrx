@@ -16,6 +16,7 @@ package dataplane
 // keeps warn-and-skip, the refused class keeps the hard error.
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -147,8 +148,13 @@ func TestNPTv6HelperWouldInstallPairsLengths_7077(t *testing.T) {
 	}{
 		{"both /48", "2001:db8::/48", "fd00:9::/48", true},
 		{"both /64", "2001:db8:0:1::/64", "fd00:9:0:1::/64", true},
-		{"both /48, one with a + mask", "2001:db8::/48", "fd00:9::/+48", true},
-		{"both /48, both with + masks", "2001:db8::/+48", "fd00:9::/+48", true},
+		// #7077: these two were `true` — `/+48` was the one string the helper
+		// accepted and Go rejected. parse_prefix is digits-only now, so the
+		// helper refuses them too and the grammars agree. Kept rather than
+		// deleted: they are the regression rows for the `+` grammar
+		// specifically, and a re-loosened parse_prefix must red here.
+		{"both /48, one with a + mask", "2001:db8::/48", "fd00:9::/+48", false},
+		{"both /48, both with + masks", "2001:db8::/+48", "fd00:9::/+48", false},
 		{"/64 vs /48", "2001:db8:0:1::/64", "fd00:9::/48", false},
 		{"/48 vs /64", "2001:db8::/48", "fd00:9:0:1::/64", false},
 		{"match unparseable", "not-a-prefix", "fd00:9::/48", false},
@@ -208,8 +214,36 @@ func nptv6GrammarConfig(match, then string) *config.Config {
 // "the apply was REJECTED for an NPTv6 rule the helper ACCEPTS" -- an
 // ASSERTION, not a build break: the revert removes no symbol this file names.
 func TestHelperAcceptedNPTv6PrefixIsSkippedNotRejected_7077(t *testing.T) {
-	// The helper accepts `/+48` on both sides; Go's net.ParseCIDR does not.
-	cfg := nptv6GrammarConfig("2001:db8:9::/48", "fd00:9::/+48")
+	// The divergence is INJECTED, not live. #7077 closed the last real one:
+	// `/+48` was the only string the helper accepted and Go rejected, and it was
+	// this cell's only fixture. Keeping that defect alive so this test had
+	// something to assert would be backwards, so the seam is stubbed instead.
+	//
+	// The property under test is unchanged and is the #6894 r9 regression fix:
+	// a rule the HELPER would install must be warn-and-SKIPPED, never rejected,
+	// because rejecting fails an apply that succeeds today (#1960 no-brick).
+	// Whether any live string reaches that state is a separate question from
+	// whether the arm works when one does.
+	restore := nptv6HelperWouldInstallFn
+	t.Cleanup(func() { nptv6HelperWouldInstallFn = restore })
+	nptv6HelperWouldInstallFn = func(match, then string) bool { return true }
+
+	// PREMISE: Go must genuinely refuse this, or the cell proves nothing — a
+	// string both planes accept never reaches the reject closure at all.
+	const goRefused = "fd00:9::/+48"
+	if _, _, err := net.ParseCIDR(goRefused); err == nil {
+		t.Fatalf("premise broken: net.ParseCIDR accepts %q, so the reject closure is "+
+			"never reached and the stub above is asserting nothing", goRefused)
+	}
+	// And the REAL predicate must refuse it too — otherwise the stub is
+	// redundant and this cell would still pass with the seam removed, which is
+	// the failure mode the stub exists to avoid.
+	if nptv6HelperWouldInstall("2001:db8:9::/48", goRefused) {
+		t.Fatalf("premise broken: the real grammar still accepts %q, so #7077's "+
+			"tightening did not land and this cell is testing the old world", goRefused)
+	}
+
+	cfg := nptv6GrammarConfig("2001:db8:9::/48", goRefused)
 
 	if err := validateBeforeMutate(cfg); err != nil {
 		t.Fatalf("the apply was REJECTED for an NPTv6 rule the helper ACCEPTS, so "+
@@ -392,8 +426,33 @@ func TestStrictCommitStillRejectsHelperAcceptedMalformedPrefix_7077(t *testing.T
 			cfg.Warnings)
 	}
 
-	// End of the chain: that retained config must now APPLY.
+	// End of the chain, and #7077 SPLIT it into two facts that used to be one.
+	//
+	// Before the tightening, `/+48` was a live divergence: the helper installed
+	// it, so the retained config had to apply. Now the grammars agree, so the
+	// same string is a rule the helper REFUSES — and refusing the apply is the
+	// correct disposition for it, the one TestHelperRefusedNPTv6PrefixStillHardErrors_7077
+	// asserts for every other refused class.
+	if err := validateBeforeMutate(cfg); err == nil {
+		t.Error("the retained config APPLIED. Since #7077 the helper refuses `/+48` " +
+			"too, so this is a rule the helper rejects and the pre-pass must hard-error " +
+			"on it — applying would be the #6894 r9 defect back, the pre-pass passing a " +
+			"config the helper will reject post-mutation")
+	} else if !strings.Contains(err.Error(), "invalid nptv6-prefix") {
+		t.Errorf("the apply failed for the wrong reason: %v", err)
+	}
+
+	// The no-brick property is UNCHANGED and still bound — just no longer by a
+	// live divergence. With one injected, the retained config must still apply:
+	// a rule the HELPER would install must be warn-and-skipped, never rejected.
+	// Without this arm, closing the divergence would silently retire the
+	// #6894 r9 guard along with its last fixture.
+	restore := nptv6HelperWouldInstallFn
+	t.Cleanup(func() { nptv6HelperWouldInstallFn = restore })
+	nptv6HelperWouldInstallFn = func(match, then string) bool { return true }
 	if err := validateBeforeMutate(cfg); err != nil {
-		t.Errorf("the config the lenient path produced does not apply: %v", err)
+		t.Errorf("with the helper accepting the rule, the apply was REJECTED: %v\n"+
+			"That is the #1960 no-brick regression — a config whose apply succeeds "+
+			"today would start failing", err)
 	}
 }
