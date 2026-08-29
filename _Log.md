@@ -107071,17 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-- **Timestamp**: 2026-08-29
-  **Action**: #7147 — add peer-fence acknowledgement (`syncMsgFenceAck = 35`),
-  the `peer-fencing disable-rg-confirmed` policy that gates takeover on a
-  peer-confirmed fence with a bounded fail-open wait, and a capability flags
-  byte on `syncMsgPeerCapabilities`. Additive wire: no `SessionSyncWireVersion`
-  / `CurrentHAProtocolVersion` bump.
-  **File(s)**: pkg/cluster/sync_fence_ack_7147.go, pkg/cluster/fence_confirm_7147.go,
-  pkg/cluster/sync.go, pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_read.go,
-  pkg/cluster/sync_conn_write.go, pkg/cluster/heartbeat_manager.go,
-  pkg/cluster/manager.go, pkg/cluster/hooks.go, pkg/cluster/status.go,
-  pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_comms_wiring.go,
-  pkg/config/schema_chassis.go, pkg/config/types_chassis.go,
-  docs/ha-failover-status.md, pkg/cluster/README.md, pkg/daemon/README.md
