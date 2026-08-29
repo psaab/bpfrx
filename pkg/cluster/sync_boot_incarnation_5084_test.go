@@ -669,7 +669,7 @@ func TestUnkeyedConnectionStampsTheIncarnation5084(t *testing.T) {
 	// exchange). net.Pipe is unbuffered, so drain them or the install blocks.
 	drain := make(chan syncFrame, 32)
 	readFramesInto(cli, drain)
-	go s.handleNewConnection(context.Background(), 0, srv)
+	go s.handleNewConnection(context.Background(), 0, srv, true)
 
 	if err := writeMsg(cli, syncMsgBulkStart, bulkStartPayload(7, &incA)); err != nil {
 		t.Fatalf("write BulkStart: %v", err)

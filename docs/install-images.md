@@ -571,6 +571,43 @@ clustered node. There is no separate `xpf-upgrade` wrapper. See
 `docs/in-place-upgrade.md` for the full state machine and rollback
 contract (`test/incus/cluster-setup.sh deploy_vm()` exercises it).
 
+### #7163 — session-sync is a FLAG DAY at wire version 2
+
+**Upgrading to a build carrying #7163 DROPS SYNCED SESSIONS. Both nodes must
+move; there is no rolling window.**
+
+#7163 replaced the session-sync authentication handshake with Noise_NNpsk0 to
+close the #5078 vector-B proof oracle. A pre-#7163 peer sends the old HELLO,
+which is not a valid Noise message, so a mixed pair does not establish a
+session-sync connection at all — every frame type on that stream stops, not just
+the handshake.
+
+The gate is already wired, and it fails CLOSED rather than letting an operator
+discover this as a fabric that will not come up: `cluster.SessionSyncWireVersion`
+went 1 → 2, and `upgrade.GateMixedBaseSwap` matches the session-sync protocol
+EXACTLY, so a LANE-2 image-replace of the second node returns
+`SessionsSurvive=false` with `session-sync protocol differs (peer 1, new image
+2)`. `deploy_rolling()` therefore refuses the session-preserving path and tells
+you to replace both nodes.
+
+`CurrentHAProtocolVersion` is deliberately NOT bumped. Bumping it would
+additionally refuse the peer over heartbeat/failover semantics #7163 does not
+touch — a second, unnecessary failure on top of the one the change genuinely
+costs. #7925 split the two counters precisely so a session-wire change stops
+dragging the HA protocol out from under its own compat floor.
+
+What this means in practice:
+
+- Plan the upgrade as a maintenance window, not a rolling one. Sessions
+  established before the swap do not survive it.
+- Traffic still fails over: VRRP, the heartbeat and the fabric gRPC listener are
+  unaffected. What is lost is the SYNCED SESSION TABLE, so flows crossing the
+  failover are re-established rather than preserved.
+- Do not key a cluster for the first time during this upgrade. Keying a live
+  cluster relies on the established session-sync connection carrying the key to
+  a read-only secondary (`pkg/cluster/README.md`, "Rollout"), and there is no
+  established connection across a mixed pair.
+
 ## Recovery
 
 - Lost mgmt connectivity after a bad commit: use the hypervisor

@@ -48,7 +48,23 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 // change. A change to both bumps both. They are equal today (1) and that
 // equality is a coincidence of history, NOT an invariant — do not write a test
 // that pins them to each other.
-const SessionSyncWireVersion = uint16(1)
+// #7163 bumped this from 1 to 2. The session-sync handshake was replaced with
+// Noise_NNpsk0 (sync_auth_noise_7163.go), which a pre-#7163 peer cannot speak:
+// its HELLO is not a valid Noise msg1 and its proof is not a valid msg2. That
+// is a FLAG DAY — both nodes must run the new build and sessions drop on the
+// upgrade.
+//
+// The bump is deliberately on THIS counter and not on
+// CurrentHAProtocolVersion. GateMixedBaseSwap treats them differently:
+// session-sync must match EXACTLY, so bumping here is what makes the mixed-base
+// swap refuse up front instead of letting an operator discover a fabric that
+// will not come up. The HA protocol is accepted over a window
+// [MinCompat, Current] that is a single point today, so bumping THAT as well
+// would additionally refuse a peer at N over heartbeat/failover semantics this
+// change does not touch — a second, unnecessary failure on top of the one this
+// change genuinely costs. #7925 split the counters precisely so a session-wire
+// change stops dragging the HA protocol out from under its own compat floor.
+const SessionSyncWireVersion = uint16(2)
 
 const (
 	syncMsgSessionV4              = 1
@@ -168,7 +184,8 @@ const (
 	syncMsgConfigEncrypted = 31
 
 	// syncMsgAuthUpgradeHello / syncMsgAuthUpgradeProof carry the #6628
-	// IN-PLACE authentication upgrade over an ESTABLISHED connection.
+	// IN-PLACE authentication upgrade over an ESTABLISHED connection, which
+	// #7163 moved onto the same Noise_NNpsk0 exchange as the connect handshake.
 	//
 	// Distinct from syncMsgAuthHello (27) / syncMsgAuthProof (28), which are
 	// PRE-INSTALL handshake frames read by readSyncFrameRaw before the
@@ -177,26 +194,40 @@ const (
 	// post-install frame of type 27 means the nack, and a receiver has no way
 	// to tell the two apart.
 	//
-	// Hello payload: {version: u8, nonce: [32]byte}
-	// Proof payload: {version: u8, proof: [32]byte, nonce: [32]byte}
+	// Hello payload: {version: u8, noise msg1: [48]byte}  initiator -> responder
+	// Proof payload: {version: u8, noise msg2: [48]byte}  responder -> initiator
 	//
-	// ADDITIVE and version-bump-free on the #2239/#6650 precedent: the receive
-	// switch has no default arm, so a peer that predates them ignores the
-	// frames, never answers, and is left un-upgraded — which is exactly the
-	// intended mixed-version behaviour, not a failure. Bumping
-	// SessionSyncWireVersion would make the #1930 INC-3 mixed-base gate refuse
-	// SESSION sync across the rolling upgrade this exists to serve.
+	// #6628 argued these were ADDITIVE and version-bump-free so a rolling
+	// upgrade would leave an old peer un-upgraded rather than broken. #7163
+	// removes that constraint rather than violating it: it IS a flag day
+	// (SessionSyncWireVersion is 2 and a pre-#7163 peer cannot complete the
+	// connect handshake at all), so there is no mixed pair left for the
+	// argument to protect.
 	syncMsgAuthUpgradeHello = 32
 	syncMsgAuthUpgradeProof = 33
 
-	// syncMsgAuthUpgradeAck is the fourth frame of the #6628 exchange. It
-	// exists so the RESPONDER does not switch its write direction until it has
-	// verified the initiator's proof — without it, two nodes holding different
-	// keys desync the stream and the "never drops" property is lost. See the
-	// four-frame rationale in sync_auth_upgrade.go.
+	// 34 was syncMsgAuthUpgradeAck, the FOURTH frame of the pre-#7163 exchange.
+	// It existed because the responder had proven nothing when it answered, so
+	// it could not switch its write direction until the initiator's proof
+	// arrived. Under Noise_NNpsk0 the initiator's msg1 is already AEAD-tagged
+	// over the transcript, so the responder authenticates the initiator BEFORE
+	// it answers and the fourth frame has nothing left to do. The number is
+	// left unused rather than recycled: a frame numbered 34 meant something
+	// else in every build before this one.
+
+	// syncMsgAuthUpgradeConfirm is the third and last frame of the #7163
+	// exchange: the initiator's proof that it completed the handshake, and the
+	// frame that is the responder's read boundary.
+	//
+	// Payload: {version: u8, HMAC-SHA256 over the Noise channel binding: [32]byte}
+	syncMsgAuthUpgradeConfirm = 36
+
+	// syncMsgAuthUpgradeRequest is the responder-role node's prompt. Role comes
+	// from node id, so the higher-id node cannot start the exchange itself; it
+	// asks. Carries no key material and moves no boundary.
 	//
 	// Payload: {version: u8}
-	syncMsgAuthUpgradeAck = 34
+	syncMsgAuthUpgradeRequest = 37
 )
 
 // syncHeader is the wire header for each sync message.

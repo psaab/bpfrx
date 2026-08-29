@@ -393,7 +393,12 @@ func configureSessionSyncConn(conn net.Conn) {
 	}
 }
 
-func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
+// initiator is the #7163 role input, and it comes from the TRANSPORT: the side
+// that dialed is the Noise initiator, the side that accepted is the responder.
+// That is the only role source the peer cannot assert — a role carried on the
+// wire would be an attacker-chosen input to our own key derivation, which is
+// the mistake the pre-#7163 proof made with its nonce.
+func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn, initiator bool) {
 	// #5303: the caller (acceptLoop / fabricConnectLoop) already admitted this
 	// connection into its pre-auth setup window via beginSetup. NOTE: the large
 	// 256 KiB socket buffers are NOT sized here — configureConnFn is deferred
@@ -405,7 +410,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// closes the connection; the accept/connect loops retry, so this never
 	// bricks a keyed↔keyed reconnect during failover (both nodes are up and
 	// keyed → the handshake completes in milliseconds).
-	mode, frameKey, err := s.performSyncHandshake(conn)
+	mode, keys, err := s.performSyncHandshake(conn, initiator, fabricIdx)
 	// #5303: release the pre-auth admission slot (and the setup-tracking entry)
 	// the moment the handshake resolves — an admitted slot must cover only the
 	// brief pre-auth window, never the subsequent bulk sync. Post-auth the
@@ -423,7 +428,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	configureConnFn(conn)
 	// Wrap so writeFull seals and receiveLoop verifies per-frame auth when the
 	// connection authenticated; an unauthenticated wrapper is a pass-through.
-	conn = s.wrapSyncConn(fabricIdx, conn, mode, frameKey)
+	conn = s.wrapSyncConn(fabricIdx, conn, mode, keys)
 	// #4962: install the connection and DECIDE cold-prime atomically under
 	// s.mu. Computing the decision after unlock (the pre-#4962 shape) let a
 	// racing same-fabric accept supersede this connection between the unlock and
@@ -871,7 +876,8 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.handleNewConnection(ctx, fabricIdx, conn)
+			// Accepted: this node is the Noise RESPONDER.
+			s.handleNewConnection(ctx, fabricIdx, conn, false)
 		}()
 	}
 }
@@ -918,7 +924,8 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 		// inbound admission cap — beginSetup(inbound=false) never rejects and does
 		// not consume a counted slot.
 		s.beginSetup(conn, false)
-		s.handleNewConnection(ctx, fabricIdx, conn)
+		// Dialed: this node is the Noise INITIATOR.
+		s.handleNewConnection(ctx, fabricIdx, conn, true)
 	}
 }
 func (s *SessionSync) handleDisconnect(conn net.Conn) {

@@ -449,14 +449,18 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.handleConfigPayload(conn, plaintext)
 	case syncMsgConfigKeyExchange:
 		s.handleConfigKeyExchange(conn, payload)
+	case syncMsgAuthUpgradeRequest:
+		// #6628: the responder-role peer committed a key and is asking THIS
+		// node (the initiator by node id) to start the exchange.
+		s.handleAuthUpgradeRequest(conn, payload)
 	case syncMsgAuthUpgradeHello:
 		// #6628: the peer committed a key and is offering to authenticate this
 		// established connection in place. Never drops it.
 		s.handleAuthUpgradeHello(conn, payload)
 	case syncMsgAuthUpgradeProof:
 		s.handleAuthUpgradeProof(conn, payload)
-	case syncMsgAuthUpgradeAck:
-		s.handleAuthUpgradeAck(conn, payload)
+	case syncMsgAuthUpgradeConfirm:
+		s.handleAuthUpgradeConfirm(conn, payload)
 	case syncMsgIPsecSA:
 		s.stats.IPsecSAReceived.Add(1)
 		// #5706: split off the (incarnation, seq) ordering trailer and admit

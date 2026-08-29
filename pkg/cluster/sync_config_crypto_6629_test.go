@@ -453,7 +453,7 @@ func TestConfigKeyExchangeSentOnConnectionInstall6629(t *testing.T) {
 	if !s.beginSetup(srv, true) {
 		t.Fatal("beginSetup should admit the first inbound connection")
 	}
-	go s.handleNewConnection(context.Background(), 0, srv)
+	go s.handleNewConnection(context.Background(), 0, srv, true)
 
 	if err := cli.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set read deadline: %v", err)

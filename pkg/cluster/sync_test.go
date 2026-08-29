@@ -3044,7 +3044,7 @@ func TestForceResyncConsumeReconnectSurvivesRearmDuringBulk(t *testing.T) {
 	// shouldColdPrime branch runs doBulkSync. handleNewConnection returns once the
 	// synchronous bulk completes; the receiveLoop it spawns blocks on the capture
 	// conn's Read until Close.
-	prim.handleNewConnection(ctx, 0, cap)
+	prim.handleNewConnection(ctx, 0, cap, true)
 
 	if !rearmed {
 		t.Fatal("precondition: BulkSyncOverride did not re-arm forceResync during the bulk")
@@ -3373,7 +3373,7 @@ func TestHandleNewConnectionSkipsBulkSyncOnActiveFabricChange(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ss.handleNewConnection(ctx, 0, newLocal)
+	ss.handleNewConnection(ctx, 0, newLocal, true)
 
 	// Active fabric changed from 1→0 but this should NOT trigger bulk sync.
 	_, _, ok := ss.PendingBulkAck()
@@ -3407,7 +3407,7 @@ func TestHandleNewConnectionDoesNotBulkSyncForNonActiveRedundantPath(t *testing.
 	ss.stats.Connected.Store(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ss.handleNewConnection(ctx, 1, redundantLocal)
+	ss.handleNewConnection(ctx, 1, redundantLocal, true)
 	if _, _, ok := ss.PendingBulkAck(); ok {
 		t.Fatal("did not expect pending bulk ack when adding non-active redundant connection")
 	}
@@ -4443,7 +4443,7 @@ func TestHandleNewConnectionColdStartTriggersBulkSync(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ss.handleNewConnection(ctx, 0, local)
+	ss.handleNewConnection(ctx, 0, local, true)
 
 	// Cold start: bulkEverCompleted is false, so bulk should fire.
 	epoch, _, ok := ss.PendingBulkAck()
@@ -4519,7 +4519,7 @@ func TestHandleNewConnectionReconnectRePrimesBulkSync(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// wasDisconnected=true (no existing connections). Even though
 	// bulkEverCompleted is sticky-true, the survivor must re-prime the peer.
-	ss.handleNewConnection(ctx, 0, local)
+	ss.handleNewConnection(ctx, 0, local, true)
 
 	epoch, _, ok := ss.PendingBulkAck()
 	if !ok {
@@ -4649,7 +4649,7 @@ func TestReceiveLoopClosesSilentConnection(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ss.handleNewConnection(ctx, 0, clientConn)
+	ss.handleNewConnection(ctx, 0, clientConn, true)
 
 	select {
 	case <-heartbeatAcked:
@@ -4750,7 +4750,7 @@ func TestReceiveLoopKeepsConnectionAliveWithoutHeartbeatAckSupport(t *testing.T)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ss.handleNewConnection(ctx, 0, clientConn)
+	ss.handleNewConnection(ctx, 0, clientConn, true)
 
 	select {
 	case <-heartbeatSeen:
@@ -4864,7 +4864,7 @@ func TestReceiveLoopDisconnectsSilentConnectionAfterAckCapableReconnect(t *testi
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ss.handleNewConnection(ctx, 0, clientConn)
+	ss.handleNewConnection(ctx, 0, clientConn, true)
 
 	select {
 	case <-heartbeatSeen:
@@ -4970,7 +4970,7 @@ func TestReceiveLoopKeepsConnectionAliveWithHeartbeatAck(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ss.handleNewConnection(ctx, 0, clientConn)
+	ss.handleNewConnection(ctx, 0, clientConn, true)
 
 	select {
 	case <-heartbeatSeen:

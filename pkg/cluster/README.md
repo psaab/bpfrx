@@ -436,71 +436,78 @@ slot. Two changes close it:
   again. There is now no path by which an unadmitted connection executes
   anything.
 
-### Degenerate handshake nonces are refused (partial #5078)
+### Session-sync authentication is Noise_NNpsk0 (#7163, closing #5078)
 
-Separate from the dual-accept bypass above, `performSyncHandshake` calls
-`syncCheckPeerNonce` before it computes a proof, and drops the connection when
-the peer's challenge nonce is either **equal to our own** or **all zero**.
+Both session-sync admission paths — the connection-setup handshake
+(`performSyncHandshake`) and the #6628 in-place upgrade of an established
+connection (`sync_auth_upgrade.go`) — run **Noise_NNpsk0** from
+`github.com/flynn/noise`, keyed by the control-link PSK.
 
-The equal case is the live one. `syncAuthProof` is `HMAC(key, tag ‖ challenge)`
-— no role, no node identity, no transcript — and the accept test is
-`hmac.Equal(peerProof, syncAuthProof(key, localNonce))`. So a PSK-less attacker
-that ECHOES every byte back authenticates: our HELLO returns as the peer HELLO
-with `peerNonce == localNonce`, we compute and send `HMAC(key, tag ‖
-localNonce)` first, and the attacker replays that value as the peer proof.
-Measured on `a77d5568c` a pure byte-mirror negotiated
-`syncAuthAuthenticated` with a derived frame key. Because
-`syncDeriveFrameKey` sorts the two nonces canonically, the resulting key is
-UNDIRECTED, so the attacker could also reflect our own sealed frames back into
-our `receiveLoop` and have them verify.
+**What it replaced, and why nothing smaller would do.** The old proof was
+`syncAuthProof(key, challenge)` = `HMAC(key, tag ‖ challenge)`: no
+initiator/responder role, no node or endpoint identity, no transcript. The
+frame key came from `syncDeriveFrameKey`, which sorted the two nonces
+canonically, so BOTH directions derived one key and `wrapSyncConn` wrote those
+same bytes into `readKey` and `writeKey`. Two consequences:
 
-The all-zero case is hygiene: it is not an entropy test (entropy is
-unmeasurable from one sample), only a refusal of the single value a peer with
-an unseeded CSPRNG emits.
+- **The two-connection oracle (vector B).** An attacker with no PSK opens a
+  second keyed connection and relays a proof computed over connection α's nonce
+  onto connection β. The nonces differ per connection, so the equal-nonce
+  rejection never fired. Both nodes share ONE PSK, so the oracle can be the PEER
+  NODE ITSELF, which no per-node nonce bookkeeping can observe.
+- **Self-fencing.** Because `readKey == writeKey`, a frame the victim SENT
+  verifies when echoed straight back on the same connection, and the anti-replay
+  counter cannot see it (`verifyFrame` compares against that connection's
+  RECEIVE counter, independent of its send counter). The worst reflectable frame
+  is `syncMsgFence`: empty payload, and on receipt the victim disables all of
+  its own redundancy groups.
 
-**This is NECESSARY, NOT SUFFICIENT, and #5078 stays open for the rest.** The
-two-connection variant uses a SECOND keyed connection as a proof oracle — a
-proof computed over connection α's local nonce is relayed onto connection β —
-and there the nonces on each connection differ, so nothing here fires. Since
-both nodes share ONE PSK, that oracle can be the PEER node, which no
-per-node nonce bookkeeping could see either. Closing it requires the proof to
-be bound to role + identity + transcript, i.e. a new proof construction and a
-keyed↔keyed wire flag-day. Do not read the guard, or its tests, as closing the
-reflection issue.
+Composing this in-house produced three separate findings — #5078 (reflection),
+#7152 (equal-nonce) and this one. Role binding, identity binding and transcript
+binding are what a standard construction supplies BY DEFINITION, and they are
+exactly the three the old proof omitted. This is the appliance's first
+third-party crypto dependency, accepted deliberately.
 
-Both comparisons are variable-time on purpose: challenge nonces travel in
-cleartext in the HELLO, so there is no secret for a timing side channel to
-leak, and `hmac.Equal` here would imply one exists.
+**Where each binding comes from**, so the claim can be checked rather than
+taken:
 
-Why this needed **no migration window**, unlike everything else in #5078: it
-adds no field, bumps no version, and changes not one emitted byte. It only
-NARROWS what is accepted, and the values it refuses are ones two honest
-`crypto/rand` peers hit with probability ~2^-256. An old-build node and a
-new-build node interoperate exactly as before, in both directions, so there is
-no state in which a keyed pair cannot converge.
+- **Role** — initiator and responder are structural in the pattern. On the
+  connect handshake the TCP *dialer* is the initiator; on the in-place upgrade
+  the *lower node id* is. Neither is a field the peer can assert.
+- **Transcript** — the handshake hash covers every message AND the prologue.
+- **Identity** — protocol version, a PHASE byte (connect vs in-place upgrade),
+  cluster id, ROLE-ORDERED node ids and the fabric index go in the prologue, so
+  they are inside that hash. Two ends that disagree on any of them derive
+  different keys and the handshake fails.
+- **Direction** — `Split()` returns two CipherStates, one per direction. This is
+  the specific replacement for the canonical nonce sort, and
+  `TestInPlaceUpgradeInstallsDirectionalKeys7163` asserts the consequence that
+  mattered: a node's own sealed fence, echoed back at it, is REFUSED.
 
-**No relaxation knob, deliberately** — but read the rollout constraint below
-before concluding that is easy.
+**Why psk0 and not a static-key pattern.** The existing trust model is a
+config-derived shared PSK with no static-keypair infrastructure, no CA, no
+certificate lifecycle and no trust-anchor distribution. A psk0-family pattern
+authenticates from that PSK directly; introducing static keys would import
+exactly the lifecycle question that ruled out TLS, and it does not become free
+by being called Noise.
 
-An earlier draft shipped a bounded `authentication-migration-window`. It had to
-bound a connection's LIFETIME rather than just its admission (an admitted
-pass-through stream outlived the deadline and could still fence the node), it
-had to stop an admitted peer re-arming it through config-sync, and its
-in-memory arming meant a crash loop granted a fresh interval on every restart.
-A relaxation needing three guards of its own does not belong inside the fix that
-closes the hole, so it was removed.
+**The PSK is DERIVED, not passed through.** Noise mandates a 256-bit preshared
+key and `ControlLinkAuthKey` is an operator-authored string of arbitrary length,
+so `syncNoisePSK` derives 32 bytes with a labelled SHA-256. Not truncation
+(which collapses two keys sharing a 32-byte prefix) and not zero-padding (which
+leaves most of the PSK constant). The label keeps this derivation from colliding
+with any other use of the same config secret — the heartbeat authenticates off
+it too.
 
-What remains is the property a security appliance should have: **for a
-connection established AFTER keying, a node must possess the key to join a
-keyed cluster.**
-
-That qualifier is not pedantry. Verification is gated per-connection on
-`ac.authed()`, fixed at handshake time, so a connection established BEFORE the
-key was committed stays unauthenticated for its whole lifetime and keeps having
-its frames accepted with no HMAC. See "Rolling it onto a live unkeyed cluster"
-below for the operator consequence — the restart there is not optional — and
-**#6628** for the open residual — it covers any auth-key CHANGE and subsumes
-the narrower unkeyed→keyed case. It is PRE-EXISTING, not introduced by #5078.
+**This is a FLAG DAY.** A pre-#7163 peer sends the old HELLO, which is not a
+valid Noise message, so the handshake fails and the connection drops.
+`SessionSyncWireVersion` is bumped 1 → 2 so `GateMixedBaseSwap` refuses a
+mixed-base swap up front instead of letting an operator discover it as a fabric
+that will not come up. `CurrentHAProtocolVersion` is deliberately NOT bumped:
+that would additionally refuse the peer over heartbeat/failover semantics this
+change does not touch (#7925 split the two counters precisely so a session-wire
+change stops dragging the HA protocol out from under its own compat floor).
+Sessions drop on upgrade; both nodes must be on the new build.
 
 ### Rollout: a secondary whose gate is ARMED cannot be keyed locally
 
@@ -1886,24 +1893,26 @@ setup** that negotiates — BEFORE any session frame flows — whether the
 connection is authenticated, then seals every subsequent frame.
 
 - **Handshake (`performSyncHandshake`).** Only a node that holds the PSK
-  initiates it. Each keyed side sends a HELLO (`syncMsgAuthHello`, type 27)
-  advertising a fresh 32-byte challenge nonce; when BOTH peers are keyed
-  each proves possession with `syncMsgAuthProof` (type 28) =
-  `HMAC-SHA256(key, tag ‖ peer-nonce)` (mutual challenge-response). Fresh
-  per-connection nonces make the proof replay-safe at setup. A peer nonce that
-  is EQUAL TO OUR OWN or ALL ZERO is refused before any proof is emitted
-  (`syncCheckPeerNonce`) — that kills the byte-echo reflection attack but NOT
-  the two-connection proof-oracle variant; see "Degenerate handshake nonces are
-  refused (partial #5078)" above. HELLO/PROOF
-  are written CONCURRENTLY with reading the peer's frame so the handshake
-  does not deadlock on a fully-synchronous transport (`net.Pipe` in tests /
-  a strict write-then-read on two symmetric peers). Types 27/28 sit above
-  the legacy set so an old peer ignores them (default receive case).
+  runs it. Since #7163 it is **Noise_NNpsk0**: the dialer writes msg1 in a
+  `syncMsgAuthHello` (type 27) frame and the accepter answers with msg2 in a
+  `syncMsgAuthProof` (type 28) frame. The frame TYPES are unchanged; their
+  payloads are not, and neither is the turn order — under Noise the accepter is
+  the RESPONDER and speaks only after reading msg1, where the old handshake had
+  both symmetric peers writing a HELLO concurrently. See "Session-sync
+  authentication is Noise_NNpsk0 (#7163, closing #5078)" above for what each
+  binding comes from, and for why this is a flag day rather than an additive
+  change. The nonce exchange, `syncAuthProof`, `syncCheckPeerNonce` and
+  `syncDeriveFrameKey` are DELETED, not left unreferenced: every one of them
+  existed to approximate a property the pattern now supplies by construction,
+  and an unused HMAC-over-a-nonce helper is what the next author reaches for.
 - **Per-frame seal (`authConn.sealFrame` / `verifyFrame`).** On an
   AUTHENTICATED connection every frame gets an 8-byte per-connection
-  monotonic sequence + a 32-byte HMAC keyed by a per-connection key derived
-  from the PSK and BOTH handshake nonces (`syncDeriveFrameKey`, canonical
-  nonce order so both peers derive the same key). The receiver rejects a bad
+  monotonic sequence + a 32-byte HMAC keyed by a per-connection, **per
+  direction** key — since #7163 the two keys `Split()` returns, where the
+  pre-#7163 derivation handed both directions the same bytes. The frame FORMAT
+  is deliberately unchanged: the defect being closed is the KEY, not the seal,
+  and replacing both in one flag day would put two independent wire changes in
+  one change. The receiver rejects a bad
   HMAC (forgery/tamper) or a non-increasing sequence (replay/regression) and
   drops the connection. `writeFull` is the single chokepoint that seals (all
   writers hold `s.writeMu`, so sequence order equals wire order);
@@ -2241,10 +2250,35 @@ picked the key up immediately (both read the live key per frame / per RPC);
 only session sync was connection-scoped.
 
 A commit now triggers an **in-place upgrade** over the established connection
-(`sync_auth_upgrade.go`): a four-frame exchange promotes it to authenticated,
-and re-derives its frame key on a rotation, with no reconnect. It only ever
-promotes and never drops, so a peer that cannot participate is left exactly as
-it was.
+(`sync_auth_upgrade.go`): a three-frame Noise_NNpsk0 exchange promotes it to
+authenticated, and re-derives BOTH directional frame keys on a rotation, with no
+reconnect. It only ever promotes and never drops, so a peer that cannot
+participate is left exactly as it was.
+
+Since #7163 it runs the same construction as the connect handshake, separated by
+a phase byte in the prologue, and the role is the LOWER NODE ID rather than the
+smaller nonce — a nonce is peer-supplied, and role must not be an
+attacker-chosen input to our own key derivation. The higher-id node therefore
+cannot open the exchange; when it is the one that becomes keyed first it sends
+an `AuthUpgradeRequest` (type 37), which carries no key material and moves no
+boundary. The exchange dropped from four frames to three because psk0 tags the
+initiator's FIRST message, so the responder authenticates the initiator before
+it answers — the whole reason the fourth frame existed. See
+`docs/session-sync-architecture.md` for the frame diagram.
+
+A round is NOT replaceable while the peer may have committed to it. A msg1 is 48
+bytes of cleartext on the not-yet-sealed stream this mechanism exists to fix,
+and its tag covers only the prologue and the initiator's ephemeral, so a
+captured Hello re-verifies; answering a replayed one would strand the msg2 the
+initiator has already derived from, and drop the connection. The responder
+therefore refuses a msg1 while it is awaiting a Confirm, the initiator never
+supersedes an incomplete round even for a rotation, and the responder stays
+silent rather than prompting in that window. A rotation is not stranded by this:
+a Request from the peer disturbs the round, and a round that completes under a
+retired key re-triggers itself. A Request carries no MAC, so it is treated as a
+hint rather than an instruction — one for a round still outstanding under the
+same key re-sends that round's Hello byte for byte instead of minting a new
+round, which is what keeps a forged Request from discarding one.
 
 **What is still open, and it is the reason to keep reading:** a HOSTILE stream
 admitted before the commit declines the upgrade by staying silent, and a
