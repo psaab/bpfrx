@@ -123,6 +123,10 @@ pub(super) fn wg_control_loop(
     listen_port: u16,
     outer_mtu: usize,
     per_peer_outer_mtu: std::collections::HashMap<[u8; 32], usize>,
+    // #7158: peers whose endpoint was authored as a DNS hostname, as
+    // (pubkey, authored `host:port`). Empty for a tunnel of IP literals,
+    // which starts no resolver thread at all.
+    endpoint_hosts: Vec<([u8; 32], String)>,
     recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -185,6 +189,19 @@ pub(super) fn wg_control_loop(
         return;
     }
 
+    // #7158: spawn the endpoint resolver HERE rather than at the supervisor,
+    // because it needs `socket_is_v6` to filter answers to the family this
+    // interface's single UDP socket can actually send from — and that is only
+    // known once the bind above has chosen it (the v6 bind falls back to v4).
+    //
+    // Dropped when this function returns, which joins the thread, so the
+    // resolver's lifetime is exactly the control thread's.
+    let endpoint_resolver = crate::afxdp::wg::endpoint_resolver::WgEndpointResolver::spawn(
+        &tunnel_name,
+        endpoint_hosts,
+        socket_is_v6,
+    );
+
     run_wg_control_loop(
         &tunnel_name,
         &engine,
@@ -193,6 +210,7 @@ pub(super) fn wg_control_loop(
         tun,
         outer_mtu,
         &per_peer_outer_mtu,
+        endpoint_resolver.as_ref(),
         &recent_exceptions,
         &stop,
     );
@@ -213,6 +231,7 @@ fn run_wg_control_loop(
     mut tun: std::fs::File,
     outer_mtu: usize,
     per_peer_outer_mtu: &std::collections::HashMap<[u8; 32], usize>,
+    endpoint_resolver: Option<&crate::afxdp::wg::endpoint_resolver::WgEndpointResolver>,
     recent_exceptions: &Arc<Mutex<ExceptionEventRing>>,
     stop: &AtomicBool,
 ) {
@@ -226,6 +245,10 @@ fn run_wg_control_loop(
     // peer drives its own keepalive/rekey timers.
     let peer_pubkeys: Vec<[u8; 32]> = engine.peer_pubkeys();
     let mut effective_endpoints: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+    // #7158: last authenticated inbound datagram per peer, for the DNS/roam
+    // precedence rule. Empty means "never heard from", which is exactly the
+    // state in which a resolved address should be adopted immediately.
+    let mut last_authenticated_rx: HashMap<[u8; 32], u64> = HashMap::new();
     for (pk, ep) in engine.peer_endpoints() {
         if let Some(ep) = ep {
             effective_endpoints.insert(pk, ep);
@@ -315,6 +338,11 @@ fn run_wg_control_loop(
                     // peer's traffic.
                     if let Some(peer) = outcome.peer() {
                         effective_endpoints.insert(peer, canonicalize_endpoint(from));
+                        // #7158: stamp WHEN this peer was last heard from,
+                        // authenticated. The endpoint resolver uses it to stay
+                        // out of the way of a live roam — see
+                        // `apply_resolved_endpoints`.
+                        last_authenticated_rx.insert(peer, monotonic_nanos());
                     }
                     // Completion-site cleanup (plan v9, Codex r5/r6):
                     // a handshake completion obsoletes any request
@@ -470,6 +498,17 @@ fn run_wg_control_loop(
             // Session expiry is engine-wide (sweeps every peer's
             // sessions); run it once per pass, not per peer.
             engine.expire_sessions(now);
+            // #7158: adopt freshly-resolved hostname endpoints before driving
+            // the per-peer timers, so an initiation this pass uses the newest
+            // address rather than the previous one.
+            apply_resolved_endpoints(
+                endpoint_resolver,
+                &peer_pubkeys,
+                &mut effective_endpoints,
+                &last_authenticated_rx,
+                now,
+                tunnel_name,
+            );
             // #1434: drive each peer's keepalive/rekey timers and
             // attempt machine independently. The earliest deadline
             // across ALL peers gates the poll timeout.
@@ -535,3 +574,165 @@ fn run_wg_control_loop(
 #[cfg(test)]
 #[path = "wg_control_tests.rs"]
 mod tests;
+
+/// #7158: how long an authenticated datagram pins a peer's endpoint against a
+/// DNS re-resolution.
+///
+/// One full handshake attempt window (`REKEY_ATTEMPT_TIME`, 90 s). While a peer
+/// is actually talking to us, DNS must not move it: the authenticated source
+/// address is where the peer REALLY is, including whatever NAT it is behind,
+/// whereas a DNS answer is only where it CLAIMS to be reachable. Overwriting a
+/// working roamed endpoint with an A record would break a tunnel that is
+/// carrying traffic, which is the opposite of the point.
+///
+/// Once the peer has been silent for longer than a whole attempt window, the
+/// learned address has stopped being evidence of anything — an attempt window
+/// has already elapsed without it producing a handshake — and the DNS answer
+/// takes over. That is the case this feature exists for: the peer's dynamic WAN
+/// address changed, so the old learned address is dead and the new one is only
+/// discoverable through the name.
+const WG_ENDPOINT_ROAM_HOLD_NS: u64 = crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+
+/// Adopt resolver answers into `effective_endpoints`, subject to the roam-hold
+/// rule above. Never blocks: `latest` is a map read, never a lookup.
+fn apply_resolved_endpoints(
+    resolver: Option<&crate::afxdp::wg::endpoint_resolver::WgEndpointResolver>,
+    peer_pubkeys: &[[u8; 32]],
+    effective_endpoints: &mut std::collections::HashMap<[u8; 32], SocketAddr>,
+    last_authenticated_rx: &std::collections::HashMap<[u8; 32], u64>,
+    now_ns: u64,
+    tunnel_name: &str,
+) {
+    let Some(resolver) = resolver else {
+        return;
+    };
+    for pk in peer_pubkeys {
+        let Some(resolved) = resolver.latest(pk) else {
+            continue;
+        };
+        if effective_endpoints.get(pk) == Some(&resolved) {
+            continue;
+        }
+        // Roam hold: a peer heard from recently keeps the address it is
+        // actually reachable at.
+        if let Some(&heard) = last_authenticated_rx.get(pk) {
+            if now_ns.saturating_sub(heard) < WG_ENDPOINT_ROAM_HOLD_NS {
+                continue;
+            }
+        }
+        let prior = effective_endpoints.insert(*pk, resolved);
+        // Rare by construction (a DDNS move, or first resolution at bring-up),
+        // so this is not a hot-path log. It is the operator's account of WHY a
+        // peer's endpoint moved without a commit.
+        eprintln!(
+            "xpf-userspace-dp: wg {tunnel_name}: peer endpoint resolved to {resolved}{}",
+            match prior {
+                Some(p) => format!(" (was {p})"),
+                None => String::new(),
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_adoption_7158_tests {
+    use super::*;
+    use crate::afxdp::wg::endpoint_resolver::WgEndpointResolver;
+    use std::collections::HashMap;
+
+    const PK: [u8; 32] = [7u8; 32];
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("test address")
+    }
+
+    /// #7158 acceptance 2/3: a resolved address is adopted, so a peer whose
+    /// DDNS name moved is reached without a commit or a daemon restart.
+    #[test]
+    fn a_resolved_endpoint_is_adopted_when_the_peer_is_silent_7158() {
+        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+        effective.insert(PK, addr("198.51.100.1:51820"));
+        // Never heard from: no roam to protect.
+        let heard: HashMap<[u8; 32], u64> = HashMap::new();
+
+        apply_resolved_endpoints(Some(&resolver), &[PK], &mut effective, &heard, 1_000, "wg0");
+
+        assert_eq!(
+            effective.get(&PK).copied(),
+            Some(addr("203.0.113.9:51820")),
+            "a peer we have never heard from must take the resolved address; \
+             this is the DDNS move the feature exists for (#7158)"
+        );
+    }
+
+    /// #7158: a peer we are CURRENTLY hearing from keeps the address it is
+    /// actually reachable at.
+    ///
+    /// The authenticated source is where the peer really is, including whatever
+    /// NAT it sits behind; a DNS answer is only where it claims to be
+    /// reachable. Letting a re-resolve overwrite a live roamed endpoint would
+    /// break a tunnel that is carrying traffic — the feature actively harming
+    /// the case that already worked.
+    ///
+    /// FAIL-ON-REVERT: delete the roam-hold branch in
+    /// `apply_resolved_endpoints` and the roamed address is clobbered.
+    #[test]
+    fn a_live_roam_is_not_clobbered_by_dns_7158() {
+        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+        // The roamed address: learned from an authenticated datagram.
+        effective.insert(PK, addr("198.51.100.77:33445"));
+        let mut heard: HashMap<[u8; 32], u64> = HashMap::new();
+        let now = 10 * WG_ENDPOINT_ROAM_HOLD_NS;
+        // Heard from one nanosecond ago.
+        heard.insert(PK, now - 1);
+
+        apply_resolved_endpoints(Some(&resolver), &[PK], &mut effective, &heard, now, "wg0");
+
+        assert_eq!(
+            effective.get(&PK).copied(),
+            Some(addr("198.51.100.77:33445")),
+            "DNS must not move a peer we are actively hearing from"
+        );
+    }
+
+    /// #7158: once the peer has been silent for longer than a whole handshake
+    /// attempt window, the learned address has stopped being evidence and DNS
+    /// takes over.
+    ///
+    /// This is the boundary that makes the hold a HOLD rather than a permanent
+    /// veto: without it, a peer that ever roamed could never be recovered
+    /// through its name after its dynamic address changed — the exact topology
+    /// #7158 is for.
+    #[test]
+    fn a_stale_roam_yields_to_dns_7158() {
+        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+        effective.insert(PK, addr("198.51.100.77:33445"));
+        let mut heard: HashMap<[u8; 32], u64> = HashMap::new();
+        let now = 10 * WG_ENDPOINT_ROAM_HOLD_NS;
+        // Silent for exactly the hold: the boundary is inclusive-yields.
+        heard.insert(PK, now - WG_ENDPOINT_ROAM_HOLD_NS);
+
+        apply_resolved_endpoints(Some(&resolver), &[PK], &mut effective, &heard, now, "wg0");
+
+        assert_eq!(
+            effective.get(&PK).copied(),
+            Some(addr("203.0.113.9:51820")),
+            "after a full attempt window of silence the learned address has \
+             already failed to produce a handshake; DNS must be allowed to \
+             recover the peer"
+        );
+    }
+
+    /// #7158 acceptance 6: with no resolver — every tunnel of IP literals —
+    /// adoption is a no-op.
+    #[test]
+    fn no_resolver_means_no_change_7158() {
+        let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+        effective.insert(PK, addr("198.51.100.1:51820"));
+        let heard: HashMap<[u8; 32], u64> = HashMap::new();
+        apply_resolved_endpoints(None, &[PK], &mut effective, &heard, 1_000, "wg0");
+        assert_eq!(effective.get(&PK).copied(), Some(addr("198.51.100.1:51820")));
+    }
+}

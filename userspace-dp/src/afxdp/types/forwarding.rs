@@ -1048,6 +1048,16 @@ pub(in crate::afxdp) struct WgRuntimePeer {
     pub(in crate::afxdp) pubkey: [u8; 32],
     pub(in crate::afxdp) allowed_ips: Vec<ipnet::IpNet>,
     pub(in crate::afxdp) endpoint: Option<std::net::SocketAddr>,
+    /// #7158: the authored `host:port` when the endpoint is a DNS HOSTNAME
+    /// rather than a literal, so a peer behind a dynamic WAN (DDNS) is
+    /// authorable. `None` for a literal endpoint, which is every peer that
+    /// existed before #7158.
+    ///
+    /// `endpoint` stays `None` for such a peer until the tunnel's resolver
+    /// produces an address — the same state a learn-only/roaming peer is in at
+    /// spawn, which the per-peer outer-MTU resolution already handles by
+    /// falling back to the interface MTU.
+    pub(in crate::afxdp) endpoint_host: Option<String>,
     pub(in crate::afxdp) keepalive_secs: u16,
     /// Per-peer preshared key (#1434 B2), hex-decoded. 32 zero bytes =
     /// no PSK. Zeroized on drop; redacted in the Debug impl. Must never

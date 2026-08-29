@@ -1,0 +1,59 @@
+# #7158: the ONE source of truth for which WireGuard peer endpoint spellings are
+# accepted, and how each is classified.
+#
+# Two independent implementations must agree on this set:
+#
+#   Go   pkg/config/compiler_validate_wireguard.go  endpointFamily/isDNSHostname
+#          -- decides what COMMITS.
+#   Rust userspace-dp/src/afxdp/forwarding_build/tunnels.rs
+#          -- decides what HYDRATES (SocketAddr parse, else the hostname shape
+#             check, else the row is dropped).
+#
+# They must accept the same set in both directions. An endpoint the Go gate
+# accepts but the Rust hydrate drops is a config that commits clean and then
+# silently loses the peer -- the exact silent degradation #5182 hardened the
+# hydrate against. An endpoint Rust would accept but Go rejects is merely
+# unauthorable, but still a disagreement worth catching.
+#
+# Both sides read THIS file in their tests, so the agreement is asserted rather
+# than restated as two literal tables that can drift apart independently.
+#
+# Format: <endpoint><TAB><verdict>
+#   v4        accepted, IP literal, family IPv4 (constrains the mixed-family gate)
+#   v6        accepted, IP literal, family IPv6 (constrains the mixed-family gate)
+#   hostname  accepted, DNS name, family unknown at commit (does NOT constrain)
+#   reject    rejected at commit AND dropped at hydrate
+
+# --- IP literals: unchanged by #7158 ---
+203.0.113.7:51820	v4
+[2001:db8::1]:51820	v6
+[::1]:1	v6
+127.0.0.1:65535	v4
+
+# --- hostnames: the #7158 addition ---
+unifi.example.ui.com:51820	hostname
+a.b:1	hostname
+host-with-hyphens.example.com:51820	hostname
+UPPER.Example.COM:51820	hostname
+trailing-dot.example.com.:51820	hostname
+xn--bcher-kva.example:51820	hostname
+h1.example.com:65535	hostname
+
+# --- port rules stay strict: knowable at commit, and a bad port can never
+# --- initiate no matter what DNS returns ---
+203.0.113.7	reject
+example.com	reject
+203.0.113.7:0	reject
+example.com:0	reject
+example.com:65536	reject
+example.com:	reject
+example.com:notanumber	reject
+:51820	reject
+
+# --- malformed hosts ---
+-leading.example.com:51820	reject
+trailing-.example.com:51820	reject
+double..dot.example.com:51820	reject
+has space.example.com:51820	reject
+10.0.0.999:51820	reject
+[2001:db8::1:51820	reject
