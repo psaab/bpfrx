@@ -2625,22 +2625,38 @@ pub(super) fn poll_binding_process_descriptor(
                                                 meta,
                                                 frag_authority_zone_override,
                                             );
-                                            nat64_install_forward_fragment_assoc(
+                                            // #7054: both installs report
+                                            // whether they had to sacrifice a
+                                            // still-LIVE association to a full
+                                            // shard. Counting it separates
+                                            // capacity pressure from the
+                                            // ordinary reorder/orphan miss the
+                                            // victim's later fragments will be
+                                            // dropped as.
+                                            if nat64_install_forward_fragment_assoc(
                                                 worker_ctx.forwarding,
                                                 l3_packet,
                                                 meta.addr_family as i32,
                                                 frag_authority,
                                                 &decision,
                                                 now_ns,
-                                            );
-                                            nat_install_forward_fragment_assoc(
+                                            ) {
+                                                telemetry
+                                                    .counters
+                                                    .record_nat64_frag_assoc_evicted();
+                                            }
+                                            if nat_install_forward_fragment_assoc(
                                                 worker_ctx.forwarding,
                                                 l3_packet,
                                                 meta.addr_family as i32,
                                                 frag_authority,
                                                 &decision,
                                                 now_ns,
-                                            );
+                                            ) {
+                                                telemetry
+                                                    .counters
+                                                    .record_nat64_frag_assoc_evicted();
+                                            }
                                         }
                                         let forward_entry = SyncedSessionEntry {
                                             key: flow.forward_key.clone(),
