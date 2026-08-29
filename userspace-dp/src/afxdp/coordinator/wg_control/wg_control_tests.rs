@@ -214,6 +214,10 @@ fn spawn_poll_loop(
             // #5291: no per-peer overrides in the idle poll-loop tests —
             // every peer falls back to the scalar (WG_DEFAULT_OUTER_MTU).
             &std::collections::HashMap::new(),
+            // #7158: no hostname endpoints in these fixtures, so no resolver.
+            // `None` is also the production shape for every literal-only
+            // tunnel, so these tests keep exercising the unchanged path.
+            None,
             &exceptions,
             &stop,
         );
@@ -372,6 +376,10 @@ fn wg_tun_origin_egress_uses_per_peer_outer_mtu_5291() {
             tun,
             outer_mtu,
             &per_peer,
+            // #7158: no hostname endpoints in these fixtures, so no resolver.
+            // `None` is also the production shape for every literal-only
+            // tunnel, so these tests keep exercising the unchanged path.
+            None,
             &exceptions,
             &stop_thread,
         );

@@ -698,12 +698,16 @@ func (tc *TunnelConfig) WgOuterFamilyV6() bool {
 		if p.Endpoint == "" {
 			continue
 		}
-		// The strict commit gate (endpointIsV6) now requires a concrete
+		// The strict commit gate (endpointFamily) requires a concrete
 		// `host:port` (IPv6 as `[addr]:port`), and the lexer preserves the
 		// bracketed literal whole (#5182), so SplitHostPort recovers the
 		// host for classification. The bare-IP fallback is retained as
 		// defense-in-depth for a leniently-loaded config that never went
 		// through the strict gate.
+		//
+		// #7158: the host may now be a DNS HOSTNAME as well as a literal, so
+		// a failed ParseIP below is no longer evidence of a malformed
+		// endpoint.
 		if host, _, err := net.SplitHostPort(p.Endpoint); err == nil {
 			if ip := net.ParseIP(host); ip != nil {
 				return ip.To4() == nil

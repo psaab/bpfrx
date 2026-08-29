@@ -7304,12 +7304,31 @@ reserved for whole-dataplane selection where a rewrite shim
   every compile/load/HA-sync path funnels through. The gate also
   hard-rejects a WG tunnel with zero peers, a duplicate or malformed
   (non-64-hex) peer pubkey, a malformed preshared-key,
-  a peer `endpoint` that is not a concrete `host:port` (IPv6 authored as
-  `[addr]:port`) with a numeric UDP port in `1..65535` and an IP-literal
-  host — the Rust `hydrate_wg_identity` turns it into a `SocketAddr`
-  (`wg_endpoint.parse::<SocketAddr>()`, no DNS), so a port-less/zero-port
-  or hostname endpoint that COMMITTED CLEAN would hydrate the peer
-  RESPONDER-ONLY (unable to initiate handshakes/keepalives). The lexer
+  a peer `endpoint` that is not a `host:port` (IPv6 authored as
+  `[addr]:port`) with a numeric UDP port in `1..65535`. The host may be an
+  IP literal **or a DNS hostname** (#7158): a peer behind a dynamic WAN is
+  reachable only by a DDNS name, and rejecting that made the topology
+  unauthorable. The port half stays strict because it IS knowable at
+  commit — a port-less or zero-port endpoint can never initiate no matter
+  what DNS returns.
+
+  The #5182 invariant is preserved, restated at the time of USE rather
+  than of commit: every accepted endpoint becomes a real `SocketAddr` with
+  the authored port before the peer initiates. A hostname is resolved by
+  the tunnel's endpoint resolver thread, NOT at commit — a lookup in a
+  config transaction would hang commits on a broken resolver, and an
+  answer cached at commit is stale the moment the DDNS name moves, which
+  is the whole reason for using one. Commit therefore validates SHAPE
+  only; `classify_wg_endpoint` in the Rust hydrate decides the same
+  question, and both sides are asserted to agree against the shared
+  fixture `test/fixtures/wg-endpoint-shape.txt`.
+
+  A hostname's family is not knowable at commit, so it does NOT
+  participate in the mixed-family gate below; literals still pin the
+  family between themselves, so every config that gate rejected before it
+  still rejects. The family a name actually resolves to is enforced where
+  it becomes knowable: the resolver keeps only answers matching the
+  interface socket's family and counts the rest. The lexer
   preserves the bracketed `[v6]:port` literal as one scalar (#5182) — it
   previously split it on the address's inner colons and dropped the port,
   so every IPv6 peer silently degraded; the dataplane now DROPS the row

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // validateWireguardPeersStrict enforces the multi-peer WireGuard
@@ -225,14 +226,40 @@ func validateOneWireguardTunnel(tc *TunnelConfig) error {
 		}
 
 		if p.Endpoint != "" {
-			v6, err := endpointIsV6(p.Endpoint)
+			fam, err := endpointFamily(p.Endpoint)
 			if err != nil {
 				return fmt.Errorf("peer %q has an invalid endpoint %q: %w", p.PublicKeyHex, p.Endpoint, err)
 			}
-			if endpointFamilyV6 == nil {
-				endpointFamilyV6 = &v6
-			} else if *endpointFamilyV6 != v6 {
-				return fmt.Errorf("peers declare endpoints of mixed address family; a WireGuard interface binds one UDP socket, so all endpoint-bearing peers must use the same outer family (IPv4 or IPv6)")
+			// #7158: a HOSTNAME endpoint returns nil and does not participate
+			// in this gate. Its family is not knowable at commit, and a guess
+			// would be wrong in both directions: assuming v4 rejects a valid
+			// dual-stack config, and assuming "matches whatever is there"
+			// accepts a config that cannot work.
+			//
+			// This preserves the gate exactly for every config that reached it
+			// before. Hostnames were a hard reject until now, so no previously
+			// ACCEPTED config gains a peer here and no previously REJECTED
+			// mixed-literal config starts passing — the literals still pin the
+			// family between themselves.
+			//
+			// The family a hostname actually resolves to is enforced where it
+			// becomes knowable: the control thread's resolver keeps only
+			// answers matching the interface socket's family, and counts the
+			// ones it discards, so a name that resolves to the wrong family is
+			// visible rather than a silent no-initiate.
+			//
+			// NOT `continue`: this block sits inside the per-peer loop, above
+			// the allowed-ips validation, so skipping the rest of the iteration
+			// would exempt every hostname-endpoint peer from the malformed-CIDR
+			// and duplicate-prefix gates — commit-clean, then dropped at
+			// hydrate, which is the silent-degradation shape this whole
+			// validator exists to prevent.
+			if fam != nil {
+				if endpointFamilyV6 == nil {
+					endpointFamilyV6 = fam
+				} else if *endpointFamilyV6 != *fam {
+					return fmt.Errorf("peers declare endpoints of mixed address family; a WireGuard interface binds one UDP socket, so all endpoint-bearing peers must use the same outer family (IPv4 or IPv6)")
+				}
 			}
 		}
 
@@ -304,31 +331,117 @@ func isWireguardKeyHex(s string) bool {
 	return true
 }
 
-// endpointIsV6 validates a WireGuard peer endpoint and reports whether its
-// address is IPv6. The endpoint MUST be a concrete `host:port` (IPv6 as
-// `[addr]:port`) with a numeric UDP port in 1..65535 and an IP-literal
-// host — exactly what the Rust hydrate can turn into a `SocketAddr`
-// (`wg_endpoint.parse::<SocketAddr>()`; it does NOT resolve DNS and rejects
-// a missing/zero port). Rejecting a port-less, zero-port, or hostname
-// endpoint here upholds the invariant that every non-empty endpoint the
-// strict commit ACCEPTS hydrates to `Some(SocketAddr)` with the authored
-// port and can therefore INITIATE (#5182). Before the lexer preserved the
-// bracketed `[v6]:port` token, a v6 endpoint arrived port-stripped and had
-// to be accepted as a bare IP — that leniency is what silently degraded
-// every IPv6 peer to responder-only. The bool return classifies the outer
-// family for the one-UDP-socket mixed-family gate.
-func endpointIsV6(endpoint string) (bool, error) {
+// endpointFamily validates a WireGuard peer endpoint and classifies its outer
+// address family. The endpoint MUST be a `host:port` (IPv6 as `[addr]:port`)
+// with a numeric UDP port in 1..65535. The host may be an IP literal or a DNS
+// hostname.
+//
+// The return is nil for a hostname, whose family is not knowable at commit —
+// see the mixed-family gate at the call site for why that is the correct
+// answer rather than a guess.
+//
+// # Why the port rules stay strict (#5182)
+//
+// The pre-#7158 gate additionally required an IP LITERAL, to uphold: every
+// endpoint the strict commit ACCEPTS hydrates to a real `SocketAddr` with the
+// authored port and can therefore INITIATE. That invariant is preserved, not
+// relaxed — it is restated in terms of the time of USE rather than the time of
+// commit: an accepted endpoint resolves to a `SocketAddr` when the WireGuard
+// control thread comes to initiate. What is dropped is only the claim that the
+// address is knowable at commit, which was never true for a DDNS peer.
+//
+// The port half is unchanged and still strict, because it IS knowable at
+// commit: a port-less or zero-port endpoint can never initiate no matter what
+// DNS returns. Before the lexer preserved the bracketed `[v6]:port` token, a v6
+// endpoint arrived port-stripped and had to be accepted as a bare IP — that
+// leniency is what silently degraded every IPv6 peer to responder-only.
+//
+// # Why this does NOT resolve
+//
+// Deliberately no DNS lookup here. Two independent reasons, either sufficient:
+//
+//   - A commit is a config transaction. A lookup in it is a blocking network
+//     call whose latency is an unreachable resolver's timeout, so a broken
+//     resolver would hang commits — including the commit that would FIX the
+//     resolver.
+//   - Resolving at commit and caching the answer is wrong even when it works.
+//     A DDNS endpoint changes; that is the entire reason for using one. A
+//     commit-time answer is correct at commit and silently stale a day later,
+//     which is a worse failure than not resolving, because it looks configured.
+//
+// So the address is resolved where it is used, by the WireGuard control
+// thread's resolver, and re-resolved on a bounded schedule.
+func endpointFamily(endpoint string) (*bool, error) {
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return false, fmt.Errorf("must be host:port (IPv6 as [addr]:port): %w", err)
+		return nil, fmt.Errorf("must be host:port (IPv6 as [addr]:port): %w", err)
 	}
 	port, perr := strconv.Atoi(portStr)
 	if perr != nil || port < 1 || port > 65535 {
-		return false, fmt.Errorf("UDP port %q is not a number in 1..65535", portStr)
+		return nil, fmt.Errorf("UDP port %q is not a number in 1..65535", portStr)
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false, fmt.Errorf("host %q is not an IP literal (a WireGuard endpoint must be a numeric address, not a hostname; the dataplane does not resolve DNS)", host)
+	if ip := net.ParseIP(host); ip != nil {
+		v6 := ip.To4() == nil
+		return &v6, nil
 	}
-	return ip.To4() == nil, nil
+	if !isDNSHostname(host) {
+		return nil, fmt.Errorf("host %q is neither an IP literal nor a valid DNS hostname", host)
+	}
+	return nil, nil
+}
+
+// isDNSHostname reports whether s is a syntactically valid DNS hostname
+// (RFC 1123): 1..253 characters, dot-separated labels of 1..63 characters,
+// each label alphanumeric-or-hyphen and not starting or ending with a hyphen.
+//
+// Syntax only, on purpose. This must not consult DNS — see endpointFamily.
+// It exists so an obvious typo (an empty label, a space, a stray bracket) is
+// still a commit error rather than a peer that can never initiate and whose
+// only symptom is a resolver counter.
+//
+// A single trailing dot (the fully-qualified form) is accepted and normalized
+// away before the label walk; Go's resolver accepts it, so rejecting it here
+// would refuse a name the dataplane can in fact use.
+func isDNSHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" {
+		return false
+	}
+	// A name consisting only of digits and dots is a malformed IP literal, not
+	// a hostname: net.ParseIP already rejected it, and treating it as a name
+	// would accept "10.0.0.999:51820" as a DDNS endpoint and defer a certain
+	// failure to the resolver.
+	allDigitsAndDots := true
+	for i := 0; i < len(s); i++ {
+		if (s[i] < '0' || s[i] > '9') && s[i] != '.' {
+			allDigitsAndDots = false
+			break
+		}
+	}
+	if allDigitsAndDots {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z':
+			case c >= 'A' && c <= 'Z':
+			case c >= '0' && c <= '9':
+			case c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }

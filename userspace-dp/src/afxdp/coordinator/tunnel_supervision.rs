@@ -834,6 +834,20 @@ impl super::Coordinator {
         let recent_exceptions = self.recent_exceptions.clone();
         let thread_tunnel_name = tunnel_name.clone();
         let thread_per_peer_outer_mtu = per_peer_outer_mtu.clone();
+        // #7158: peers authored with a DNS hostname endpoint. Empty for a
+        // literal-only tunnel, which then starts no resolver thread — every
+        // tunnel that existed before #7158 is unchanged.
+        let endpoint_hosts: Vec<([u8; 32], String)> = self
+            .forwarding
+            .tunnel_endpoints
+            .get(&id)
+            .map(|e| {
+                e.wg_peers
+                    .iter()
+                    .filter_map(|p| p.endpoint_host.as_ref().map(|h| (p.pubkey, h.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         eprintln!(
             "xpf-userspace-dp: spawning WG control thread endpoint={id} tun={tunnel_name} port={listen_port}"
         );
@@ -847,6 +861,7 @@ impl super::Coordinator {
                     listen_port,
                     outer_mtu,
                     thread_per_peer_outer_mtu,
+                    endpoint_hosts,
                     recent_exceptions,
                     stop_clone,
                 );
