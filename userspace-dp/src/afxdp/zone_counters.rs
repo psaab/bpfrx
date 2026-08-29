@@ -475,6 +475,18 @@ thread_local! {
 /// forwarding resolution), so this is two flat-LUT reads plus a thread-local
 /// accumulate — no hash, no atomic, no allocation. An unassigned zone (slot 0)
 /// contributes nothing.
+///
+/// #7173: the two slots are gated INDEPENDENTLY — a call with one side
+/// unzoned still attributes the other. That is deliberate: if the ingress zone
+/// is known and the egress is not, counting the ingress is correct, because
+/// each slot is a per-zone traffic counter and not half of a flow record.
+/// Requiring both would discard true information about the known side to avoid
+/// an incompleteness no consumer reads that way.
+///
+/// So do not "fix" this by gating both slots on both zones being resolved. The
+/// result would be silently lower per-zone totals on exactly the traffic whose
+/// other half could not be resolved — a counter that undercounts is worse than
+/// one that is candid about counting each side on its own knowledge.
 #[inline]
 pub(in crate::afxdp) fn record_zone_traffic(
     slot_map: &ZoneCounterSlotMap,
