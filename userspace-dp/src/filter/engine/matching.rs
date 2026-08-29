@@ -206,20 +206,7 @@ pub(super) fn term_matches_v4(
     ) {
         return false;
     }
-    if !port_match(
-        term.source_port_constrained,
-        term.source_port_except,
-        &term.source_ports,
-        src_port,
-    ) {
-        return false;
-    }
-    if !port_match(
-        term.dest_port_constrained,
-        term.dest_port_except,
-        &term.dest_ports,
-        dst_port,
-    ) {
+    if !port_terms_match(term, extra, src_port, dst_port) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
@@ -307,6 +294,72 @@ fn nets_match_v6(constrained: bool, except: bool, nets: &[PrefixV6], ip: Ipv6Add
 ///   plain positive membership; `except == true` matches every port NOT in the
 ///   set.
 #[inline(always)]
+/// #7174 (C19): a port constraint must not be evaluated against the SYNTHETIC
+/// ports of a non-first fragment.
+///
+/// A non-first fragment carries no L4 header and its ports arrive as 0. Matching
+/// that against a real `source-port` / `destination-port` term was already
+/// dubious; against a `*-port-except` term it INVERTED the verdict, because
+/// `port_match` is `matcher.matches(port) ^ except` — port 0 is not in the set,
+/// so the `except` arm returned TRUE and the fragment spuriously MATCHED.
+/// Concretely, `from destination-port-except 22; then discard;` discarded every
+/// non-first fragment of a port-22 flow.
+///
+/// THE GATE IS `is_fragment && !l4_present`, NOT `!l4_present` ALONE, AND THAT
+/// IS THE WHOLE DESIGN. `term_matches_v4/v6` is shared by two callers with
+/// different contracts:
+///
+///   - the COLD path builds `TermMatchExtra` from a real packet, so
+///     `l4_present` genuinely means "this packet has an L4 header";
+///   - the FLOW-CACHE path (`filter/engine/cache_sensitive.rs`) evaluates real
+///     cached flows with `TermMatchExtra::default()`, i.e. `l4_present: false`
+///     unconditionally, because the ports it passes come from the flow's
+///     5-tuple SessionKey and are real. `FilterTerm::has_per_packet_l4_match`
+///     spells out why ports are not in the cache-sensitive set: those conditions
+///     are the ones "not part of the 5-tuple SessionKey", and ports ARE part of
+///     it.
+///
+/// So gating on `!l4_present` alone would stop every port-constrained term
+/// matching on every cached flow — a large silent forwarding change. Measured:
+/// it reds 11+ tests across `cos_classify`, `frame` and `tests_bind_forward`.
+///
+/// `is_fragment` discriminates because it is L3-derived and valid regardless of
+/// `l4_present`: a non-first fragment carries `is_fragment: true, l4_present:
+/// false`, while a cached flow carries `false, false`. That pair is the only
+/// thing that separates "ports are synthetic" from "ports came from the key".
+///
+/// SCOPE, stated because it is narrower than "gate ports on l4_present": this
+/// fixes the fragment case. Other cold-path `!l4_present` shapes — a truncated
+/// ICMP or TCP header (`inspect.rs`: `l4_present` also drops for
+/// `l4_truncated_icmp` / `l4_truncated_tcp`) — are NOT covered, because they
+/// carry `is_fragment: false` and are indistinguishable here from a cached flow.
+/// Whether their ports are equally synthetic is a separate question that needs
+/// its own measurement; it is not silently included.
+fn port_terms_match(
+    term: &FilterTerm,
+    extra: TermMatchExtra<'_>,
+    src_port: u16,
+    dst_port: u16,
+) -> bool {
+    if (term.source_port_constrained || term.dest_port_constrained)
+        && extra.is_fragment
+        && !extra.l4_present
+    {
+        return false;
+    }
+    port_match(
+        term.source_port_constrained,
+        term.source_port_except,
+        &term.source_ports,
+        src_port,
+    ) && port_match(
+        term.dest_port_constrained,
+        term.dest_port_except,
+        &term.dest_ports,
+        dst_port,
+    )
+}
+
 fn port_match(constrained: bool, except: bool, matcher: &PortMatcher, port: u16) -> bool {
     if constrained && matches!(matcher, PortMatcher::Any) {
         // Constrained but no range survived parsing (every token unparseable).
@@ -350,20 +403,7 @@ pub(super) fn term_matches_v6(
     ) {
         return false;
     }
-    if !port_match(
-        term.source_port_constrained,
-        term.source_port_except,
-        &term.source_ports,
-        src_port,
-    ) {
-        return false;
-    }
-    if !port_match(
-        term.dest_port_constrained,
-        term.dest_port_except,
-        &term.dest_ports,
-        dst_port,
-    ) {
+    if !port_terms_match(term, extra, src_port, dst_port) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {

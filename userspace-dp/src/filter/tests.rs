@@ -10255,3 +10255,159 @@ fn no_production_caller_of_the_test_only_routing_instance_wrapper_7053() {
          by #7053 need revisiting — they say it is not on a production path"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #7174 (C19): a non-first fragment's SYNTHETIC ports must not be matched
+// against a port-constrained term.
+//
+// A non-first fragment carries no L4 header; its ports arrive as 0. Against a
+// `*-port-except` term that INVERTED the verdict, because port_match is
+// `matcher.matches(port) ^ except` — 0 is not in the except set, so the term
+// spuriously MATCHED. `from destination-port-except 22; then discard;`
+// discarded every non-first fragment of a port-22 flow.
+//
+// THE THIRD CELL IS THE ONE THAT MATTERS. The obvious fix — gate ports on
+// `l4_present` the way tcp-flags / icmp-type already are — is WRONG, and
+// measured wrong: it reds 11+ tests. `term_matches_v4/v6` is shared with the
+// flow-cache path, which evaluates real cached flows with
+// `TermMatchExtra::default()` (l4_present: false) while passing ports that came
+// from the flow's 5-tuple SessionKey and are real. Gating on l4_present alone
+// stops every port-constrained term matching on every cached flow.
+//
+// `is_fragment` is what discriminates: L3-derived and valid regardless of
+// l4_present, so a non-first fragment is (true, false) while a cached flow is
+// (false, false).
+// ---------------------------------------------------------------------------
+
+fn dport_except_22_filter_7174(family: &str) -> Vec<FirewallFilterSnapshot> {
+    vec![FirewallFilterSnapshot {
+        name: "dport-except-7174".into(),
+        family: family.into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "deny-except-22".into(),
+            protocols: vec!["tcp".into()],
+            action: "discard".into(),
+            destination_ports_except: vec!["22".into()],
+            ..Default::default()
+        }],
+    }]
+}
+
+#[test]
+fn non_first_fragment_does_not_match_a_port_except_term_v4_7174() {
+    let state = make_filter_state(&dport_except_22_filter_7174("inet"), &[]);
+    // A non-first fragment: no L4 header, synthetic port 0, is_fragment set.
+    let frag = TermMatchExtra {
+        is_fragment: true,
+        l4_present: false,
+        ..Default::default()
+    };
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except-7174",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        0,
+        0,
+        0,
+        frag,
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "a non-first fragment has no ports, so a destination-port-except term must not \
+         match it. Matching turned `except 22` into a discard for every fragment of a \
+         port-22 flow, because 0 is not 22 (#7174 C19)"
+    );
+}
+
+#[test]
+fn non_first_fragment_does_not_match_a_port_except_term_v6_7174() {
+    let state = make_filter_state(&dport_except_22_filter_7174("inet6"), &[]);
+    let frag = TermMatchExtra {
+        is_fragment: true,
+        l4_present: false,
+        ..Default::default()
+    };
+    let result = evaluate_filter(
+        &state,
+        "inet6:dport-except-7174",
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        0,
+        0,
+        0,
+        frag,
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "the v6 matcher is a structural copy of the v4 one, so a gate present in one and \
+         not the other is the failure mode (#7174 C19)"
+    );
+}
+
+// THE CONTROL. A cached flow presents l4_present: false with REAL ports taken
+// from its 5-tuple SessionKey, and is_fragment: false. It must still match.
+//
+// This is the assertion the obvious fix fails. Without it, gating ports on
+// l4_present alone passes both cells above while silently disabling port
+// filtering for every established flow.
+#[test]
+fn a_cached_flow_still_matches_a_port_term_despite_no_l4_present_7174() {
+    let state = make_filter_state(&dport_except_22_filter_7174("inet"), &[]);
+    // The flow-cache shape: TermMatchExtra::default() -> l4_present false,
+    // is_fragment false; ports supplied by the caller from the SessionKey.
+    let cached = TermMatchExtra::default();
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except-7174",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        12345,
+        0,
+        cached,
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Discard,
+        "a CACHED flow carries l4_present: false but REAL ports from its SessionKey, so a \
+         port-except term must still match. If this is Accept, ports were gated on \
+         l4_present alone and port filtering is now silently dead for every established \
+         flow — the mistake the narrow is_fragment gate exists to avoid (#7174 C19)"
+    );
+}
+
+// And the positive control for the fragment cells: the SAME filter must still
+// discard a real non-fragment packet on a non-excepted port. Without it, a
+// matcher that rejected everything would satisfy both fragment assertions.
+#[test]
+fn a_whole_packet_still_matches_the_port_except_term_7174() {
+    let state = make_filter_state(&dport_except_22_filter_7174("inet"), &[]);
+    let whole = TermMatchExtra {
+        l4_present: true,
+        ..Default::default()
+    };
+    let result = evaluate_filter(
+        &state,
+        "inet:dport-except-7174",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        54321,
+        12345,
+        0,
+        whole,
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Discard,
+        "port 12345 is not in the except list, so a whole packet must still be discarded — \
+         otherwise the fragment cells pass against a matcher that rejects everything"
+    );
+}
