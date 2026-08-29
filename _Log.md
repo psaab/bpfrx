@@ -107071,14 +107071,3 @@ prose edit above them added. No diff falls in the new test body.
   - **File(s)**: pkg/daemon/external_hostname_watch_6863.go, pkg/daemon/mgmt_listener_reassert.go, pkg/daemon/management.go, pkg/daemon/daemon.go
 
 <!-- LOG-CLOSED-SENTINEL-6874: nothing may be appended below this line. Write to docs/log/<issue>.md instead. -->
-
-- **Timestamp**: 2026-08-29 19:40 UTC
-  - **Action**: Document that a GitHub closing keyword cannot be negated, in
-    the PR-discipline section of docs/engineering-style.md. Six issues have
-    been auto-closed against the explicit written intent of the PRs that
-    closed them, and were recovered only by an ad-hoc sweep. Includes the
-    merge pre-flight (which must run on the FLATTENED body, because these
-    phrases wrap across lines), the periodic victim sweep, and the
-    merge/close timestamp-gap test that distinguishes a parser accident
-    from a deliberate close.
-  - **File(s)**: docs/engineering-style.md
