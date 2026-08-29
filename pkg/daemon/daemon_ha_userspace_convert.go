@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/binary"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -316,6 +317,15 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	src := net.ParseIP(delta.SrcIP).To4()
 	dst := net.ParseIP(delta.DstIP).To4()
 	if src == nil || dst == nil {
+		// #7171: these four conversion drops were SILENT while the V4
+		// delta filters in daemon_ha_userspace_stream.go logged every
+		// reason at Debug. A session dropped here never reaches the peer,
+		// so it is simply missing after a failover with nothing in the log
+		// to say a session was seen and discarded. Debug, not Info: this
+		// is a per-session path (CLAUDE.md logging rules), and it matches
+		// the level the V4 stream-side filters already use.
+		slog.Debug("userspace delta: dropped (v4 address unparseable)",
+			"src", delta.SrcIP, "dst", delta.DstIP, "proto", delta.Protocol)
 		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
 	}
 	var key dataplane.SessionKey
@@ -338,6 +348,10 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		egressZone = zoneIDs[delta.EgressZone]
 	}
 	if ingressZone == 0 || egressZone == 0 {
+		slog.Debug("userspace delta: dropped (v4 zone unresolved)",
+			"ingress_zone", delta.IngressZone, "egress_zone", delta.EgressZone,
+			"ingress_zone_id", ingressZone, "egress_zone_id", egressZone,
+			"src", delta.SrcIP, "dst", delta.DstIP)
 		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
 	}
 
@@ -450,6 +464,8 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	src := net.ParseIP(delta.SrcIP).To16()
 	dst := net.ParseIP(delta.DstIP).To16()
 	if src == nil || dst == nil {
+		slog.Debug("userspace delta: dropped (v6 address unparseable)",
+			"src", delta.SrcIP, "dst", delta.DstIP, "proto", delta.Protocol)
 		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
 	}
 	var key dataplane.SessionKeyV6
@@ -470,6 +486,10 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		egressZone = zoneIDs[delta.EgressZone]
 	}
 	if ingressZone == 0 || egressZone == 0 {
+		slog.Debug("userspace delta: dropped (v6 zone unresolved)",
+			"ingress_zone", delta.IngressZone, "egress_zone", delta.EgressZone,
+			"ingress_zone_id", ingressZone, "egress_zone_id", egressZone,
+			"src", delta.SrcIP, "dst", delta.DstIP)
 		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
 	}
 
