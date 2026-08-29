@@ -6765,3 +6765,125 @@ fn nat64_6982_charge_uses_the_allocators_own_capacity_formula() {
     // The values are non-trivial, so the agreement above is not two zeros.
     assert!(nat64_prefix_charge(1).port_capacity > 60_000);
 }
+
+// --- #7094: the NAT64 rollback path's holder semantics --------------------
+//
+// `rollback_nat64_allocation_for_worker` had FOUR production call sites
+// (install-failure, admission-refusal and two ICMP-error-bounce paths) and not
+// one test caller. Its `#[cfg(test)]` `Untracked` twin had no caller either,
+// which is what surfaced as a dead-code warning — and the twin's existence made
+// the family look covered when the path production actually takes was not
+// exercised at all. Deleting the twin without adding this would have closed the
+// warning and left that hole exactly where it was.
+//
+// The property is the one the #6211 F2 guard exists to protect: a rollback
+// releases only THIS worker's hold. Every worker that forwarded the flow holds
+// the same reservation, so a single-holder release would free a `(pool_v4,
+// port)` the siblings are still using — the tuple would then be handed to a
+// fresh flow while the original is live, and the 1:N reverse index mis-demuxes
+// the replies.
+
+#[test]
+fn nat64_7094_rollback_for_worker_frees_only_that_holder() {
+    // MULTI-HOLDER STATE COMES FROM THE SYNCED RESERVE, not from two local
+    // allocations, and that distinction is why the first version of this cell
+    // failed. Two `allocate_source_for_worker` calls for one flow do NOT create
+    // two holders: the live-hit path returns the existing translation and gives
+    // back the port it just claimed WITHOUT OR-ing in the second worker's bit
+    // (allocator.rs, "Idempotent re-entry for an already-allocated flow"). So
+    // that fixture had a single holder, the first rollback freeing it was
+    // CORRECT, and the assertion was wrong rather than the code.
+    //
+    // `reserve_flow` is where workers 2..N land — `slot.holders |= holder.bit()`,
+    // commented as exactly that — so the HA-synced reservation is the state in
+    // which "release only THIS worker's hold" is observable at all.
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let synced_key = nat64_synced_key("2001:db8::1");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 0, 0),
+        "precondition: worker 0 must reserve the synced flow"
+    );
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 0, 1),
+        "precondition: worker 1 must join the SAME reservation — this is the \
+         early-return path that ORs its holder bit in, and without it there is \
+         only one holder and nothing below discriminates"
+    );
+
+    // Worker 0 rolls back. Worker 1 still holds it, so the port stays claimed:
+    // a fresh, unrelated local flow must NOT be handed 1024.
+    rollback_nat64_allocation_for_worker(&state, &synced_key, synced, false, 2, 0);
+    let after_first = state
+        .allocate_source_for_worker(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            "2001:db8::77".parse().unwrap(),
+            dst_v4,
+            6000,
+            443,
+            3,
+            0,
+        )
+        .expect("a fresh flow still allocates");
+    assert_ne!(
+        after_first,
+        (snat, 1024),
+        "worker 0's rollback freed a reservation worker 1 still holds: {:?} was \
+         handed to a fresh flow while the synced one is live. The 1:N reverse \
+         index then mis-demuxes the server's replies — the collision #6211 F2 \
+         exists to prevent (#7094)",
+        after_first
+    );
+
+    // The LAST holder lets go. Now the port must come back to the pool.
+    rollback_nat64_allocation_for_worker(&state, &synced_key, synced, false, 4, 1);
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 5, 0),
+        "after the last holder rolled back, the same tuple must be reservable \
+         again; if this fails the rollback path never frees and the pool leaks a \
+         port per rolled-back synced flow"
+    );
+}
+
+#[test]
+fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
+    // Mirrors nat64_4381_reverse_entry_release_is_noop for the rollback path:
+    // only the FORWARD entry owns the allocation, so a reverse-entry rollback
+    // must not release it. Without this, the is_reverse guard could be deleted
+    // and the test above would still pass — it only ever passes is_reverse=false.
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let (snat, pa) = state
+        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 1, 0)
+        .unwrap();
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(c),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    rollback_nat64_allocation_for_worker(
+        &state,
+        &key,
+        Nat64State::forward_decision(snat, dst_v4, pa),
+        true, // is_reverse
+        2,
+        0,
+    );
+    let again = state
+        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 3, 0)
+        .unwrap();
+    assert_eq!(
+        again,
+        (snat, pa),
+        "a REVERSE-entry rollback released the forward entry's allocation; only \
+         the forward entry owns it"
+    );
+}
