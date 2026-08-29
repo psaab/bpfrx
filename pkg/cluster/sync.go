@@ -24,16 +24,31 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 // the version the #1930 INC-3 mixed-base image-replace gate must compare across
 // a mixed-base cluster: two nodes can only sync sessions if they speak the same
 // sync wire schema. Bump this whenever the `syncMsg*` set or `syncHeader`
-// changes incompatibly. The header has no on-wire version field today
-// (compatibility has ridden the HA protocol version); this constant makes the
-// sync schema version explicit for the gate. It tracks CurrentHAProtocolVersion
-// (NOT LegacyHAProtocolVersion): the sync wire schema and the HA protocol have
-// evolved together, so a CurrentHAProtocolVersion bump that changes the
-// `syncMsg*`/`syncHeader` format carries the sync version with it. Deriving
-// from the fixed Legacy constant would silently pin the gate to the stale
-// schema version after an HA bump (Copilot). If the sync wire format ever
-// diverges from the HA protocol version, replace this with its own counter.
-const SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)
+// changes incompatibly. The header has no on-wire version field today, so a
+// changed layout cannot be negotiated per-message — this constant is what makes
+// the schema version visible to the gate at all.
+//
+// #7925: this is now its OWN counter, no longer `uint16(CurrentHAProtocolVersion)`.
+// It tracked the HA version because the two had always evolved together, and
+// `sync.go` named the exit condition itself: "if the sync wire format ever
+// diverges from the HA protocol version, replace this with its own counter."
+// Widening the session key (#7160) is that divergence — it changes THIS wire and
+// leaves heartbeat/failover semantics alone.
+//
+// The split matters because the mixed-base gate checks the two DIFFERENTLY
+// (upgrade.GateMixedBaseSwap, mirrored in scripts/deploy/xpf-deploy.py):
+// the HA protocol is accepted over a WINDOW [MinCompatHAProtocolVersion,
+// CurrentHAProtocolVersion], while the session-sync version must match EXACTLY.
+// Welded together, a session-wire-only change was forced to push the HA version
+// out from under its own floor as a side effect, failing the window for peers
+// that remained fully compatible on everything that had not changed.
+//
+// So: bump THIS when the `syncMsg*` set or `syncHeader` changes. Bump
+// CurrentHAProtocolVersion when heartbeat / failover / RG-handoff semantics
+// change. A change to both bumps both. They are equal today (1) and that
+// equality is a coincidence of history, NOT an invariant — do not write a test
+// that pins them to each other.
+const SessionSyncWireVersion = uint16(1)
 
 const (
 	syncMsgSessionV4              = 1
