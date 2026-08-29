@@ -53,6 +53,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.nat64_no_source_pool = 0;
         binding.nat64_pool_exhausted = 0;
         binding.nat64_frag_dropped = 0;
+        binding.nat64_frag_assoc_evicted = 0;
         binding.nat64_ineligible_source = 0;
         binding.nat64_ineligible_dest = 0;
         binding.nat64_exthdr_ineligible = 0;

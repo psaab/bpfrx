@@ -466,6 +466,8 @@ type xpfCollector struct {
 	// outcomes — PAT'd collisions, identity exhaustion, registry-cap
 	// exhaustion.
 	userspaceInterfaceSNATPATCollisions      *prometheus.Desc
+	userspaceNAT64FragCrossDomainMisses      *prometheus.Desc
+	userspaceNAT64FragProtocolAliasMisses    *prometheus.Desc
 	userspaceInterfaceSNATIdentityExhaustion *prometheus.Desc
 	userspaceInterfaceSNATSyncConflictDrops  *prometheus.Desc
 	userspaceInterfaceSNATRegistryCap        *prometheus.Desc
@@ -926,6 +928,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSyncedImportCapDrops
 	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceInterfaceSNATPATCollisions
+	ch <- c.userspaceNAT64FragCrossDomainMisses
+	ch <- c.userspaceNAT64FragProtocolAliasMisses
 	ch <- c.userspaceInterfaceSNATIdentityExhaustion
 	ch <- c.userspaceInterfaceSNATSyncConflictDrops
 	ch <- c.userspaceInterfaceSNATRegistryCap

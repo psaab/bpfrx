@@ -5219,6 +5219,13 @@ Three properties bound the scan, each with its own cell in
   `frobnicate { off; }` keeps its ZERO-action rejection instead of yielding an
   exemption nobody wrote.
 
+A packed contradiction need not involve a pool. `then { source-nat interface
+off; }` authors an exemption and publishes an interface translation, and it is
+rejected on the same footing as the pool rows — the per-container record is
+ranked by distinct MODES first and pool names second, so a container naming no
+pool is still captured. Ranking on pool names alone made that whole class
+invisible while every pool-bearing row was correctly rejected.
+
 The check applies to the `n == 1` class only, so a block that lowers two actions
 (or none) keeps the diagnostic it already had. Two sites enforce that and either
 alone suffices — the call sits after the count's switch, and the predicate
@@ -5248,9 +5255,15 @@ this does not disturb #3850 or #7035:
 - **The same pool named twice in one block** — nothing is discarded, so it is a
   redundancy rather than an error.
 
-`off` and `interface` are not recorded at all: they carry no value, so repeating
-either discards nothing. `compiler_nat_then_occurrences_7013_test.go` pins every
-row above, including the three legal ones.
+Repeating `off` or `interface` is likewise a redundancy: they carry no value, so
+`off off` means the same exemption twice and commits. **That is a statement about
+a REPEAT, not about the mode.** `off pool P` packs two DIFFERENT modes onto one
+run, one of them is discarded, and #7033 rejects it — the asymmetry is why the
+authored record carries modes as well as pool names.
+`compiler_nat_then_occurrences_7013_test.go` pins every row above, including the
+three legal ones, and
+`TestRepeatedValuelessModeIsARedundancyNotAContradiction_7033` pins both halves
+of the asymmetry side by side.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

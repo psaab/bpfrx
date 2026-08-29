@@ -5138,6 +5138,104 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
 }
 
 #[test]
+fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
+    // #7054: the shard-cap eviction of a still-LIVE association was SILENT. The
+    // eviction itself is correct — a fixed ceiling has to sacrifice something —
+    // but the victim's non-first fragments then miss and are dropped
+    // fail-closed, and the only trace was a `nat64_frag_dropped` bump
+    // indistinguishable from an ordinary reorder/orphan. `install` now reports
+    // it so the caller can count it.
+    //
+    // REACHABILITY IS ALREADY PROVEN and is not re-proven here:
+    // `nat64_frag_assoc_install_all_live_still_evicts_oldest` below drives an
+    // all-live shard at cap and shows the front entry evicted. What this cell
+    // adds is the SIGNAL.
+    //
+    // THE FALSE CASES ARE THE POINT. `assert!(evicted)` alone passes against a
+    // function that returns `true` unconditionally — and a counter that fires on
+    // every install is worse than no counter, because it reads as constant
+    // capacity pressure. So the three ordinary paths are asserted false: a plain
+    // install into a shard with room, a REFRESH of an existing key, and an
+    // install that reclaimed an EXPIRED slot (the #5447 prune, which must not be
+    // reported as a live eviction).
+    let src = IpAddr::V6("2001:db8::7054".parse().unwrap());
+    let dst = IpAddr::V6("64:ff9b::0707:0707".parse().unwrap());
+    let family = libc::AF_INET6 as u8;
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 7),
+        Ipv4Addr::new(7, 7, 7, 7),
+        5007,
+    ));
+    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 2);
+    let mk = |ident: u32| Nat64FragKey {
+        addr_family: family,
+        src,
+        dst,
+        ident,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
+    };
+
+    let cache = Nat64FragAssoc::new();
+
+    // FALSE 1 — a plain install with room in the shard.
+    assert!(
+        !cache.install(mk(idents[0]), decision, None, 1_000, 1, 0),
+        "an install into a shard with room evicted nothing and must report false"
+    );
+    // FALSE 2 — a REFRESH of the same key. It takes the early return and cannot
+    // evict; reporting true here would count every retransmitted first fragment.
+    assert!(
+        !cache.install(mk(idents[0]), decision, None, 2_000, 1, 0),
+        "a same-key refresh evicts nothing and must report false"
+    );
+
+    for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
+        assert!(
+            !cache.install(mk(ident), decision, None, 1_000, 1, 0),
+            "filling the shard must not report an eviction until it is full"
+        );
+    }
+    assert_eq!(
+        cache.len(),
+        NAT64_FRAG_CAP_PER_SHARD,
+        "fixture: the shard must be exactly at cap, or the cell below is not \
+         exercising the eviction branch at all"
+    );
+
+    // TRUE — every entry live, shard at cap: the oldest live entry is sacrificed.
+    assert!(
+        cache.install(mk(idents[NAT64_FRAG_CAP_PER_SHARD]), decision, None, 1_000, 1, 0),
+        "an install that evicted a still-LIVE association must report it — this \
+         is the condition #7054 exists to make observable"
+    );
+    assert!(
+        cache
+            .lookup(&mk(idents[0]), 1_000, 1, |_| true)
+            .is_none(),
+        "control: the reported eviction really did remove the front entry"
+    );
+
+    // FALSE 3 — the #5447 prune path. Advance past the TTL so every entry is
+    // expired; the install then reclaims a dead slot and must NOT be reported as
+    // a live eviction.
+    let past_ttl = 1_000 + NAT64_FRAG_TTL_NS + 1;
+    assert!(
+        !cache.install(
+            mk(idents[NAT64_FRAG_CAP_PER_SHARD + 1]),
+            decision,
+            None,
+            past_ttl,
+            1,
+            0
+        ),
+        "an install that reclaimed EXPIRED slots sacrificed no live association \
+         and must report false — otherwise the counter fires on ordinary TTL \
+         turnover and tells an operator nothing (#5447/#7054)"
+    );
+}
+
+#[test]
 fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
     // Control / capacity-bound preservation: when EVERY entry in a full shard is
     // LIVE, pruning reclaims nothing, so `install` still evicts the OLDEST
@@ -6666,4 +6764,302 @@ fn nat64_6982_charge_uses_the_allocators_own_capacity_formula() {
     }
     // The values are non-trivial, so the agreement above is not two zeros.
     assert!(nat64_prefix_charge(1).port_capacity > 60_000);
+}
+
+// --- #7094: the NAT64 rollback path's holder semantics --------------------
+//
+// `rollback_nat64_allocation_for_worker` had FOUR production call sites
+// (install-failure, admission-refusal and two ICMP-error-bounce paths) and not
+// one test caller. Its `#[cfg(test)]` `Untracked` twin had no caller either,
+// which is what surfaced as a dead-code warning — and the twin's existence made
+// the family look covered when the path production actually takes was not
+// exercised at all. Deleting the twin without adding this would have closed the
+// warning and left that hole exactly where it was.
+//
+// The property is the one the #6211 F2 guard exists to protect: a rollback
+// releases only THIS worker's hold. Every worker that forwarded the flow holds
+// the same reservation, so a single-holder release would free a `(pool_v4,
+// port)` the siblings are still using — the tuple would then be handed to a
+// fresh flow while the original is live, and the 1:N reverse index mis-demuxes
+// the replies.
+
+#[test]
+fn nat64_7094_rollback_for_worker_frees_only_that_holder() {
+    // MULTI-HOLDER STATE COMES FROM THE SYNCED RESERVE, not from two local
+    // allocations, and that distinction is why the first version of this cell
+    // failed. Two `allocate_source_for_worker` calls for one flow do NOT create
+    // two holders: the live-hit path returns the existing translation and gives
+    // back the port it just claimed WITHOUT OR-ing in the second worker's bit
+    // (allocator.rs, "Idempotent re-entry for an already-allocated flow"). So
+    // that fixture had a single holder, the first rollback freeing it was
+    // CORRECT, and the assertion was wrong rather than the code.
+    //
+    // `reserve_flow` is where workers 2..N land — `slot.holders |= holder.bit()`,
+    // commented as exactly that — so the HA-synced reservation is the state in
+    // which "release only THIS worker's hold" is observable at all.
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let synced_key = nat64_synced_key("2001:db8::1");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 0, 0),
+        "precondition: worker 0 must reserve the synced flow"
+    );
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 0, 1),
+        "precondition: worker 1 must join the SAME reservation — this is the \
+         early-return path that ORs its holder bit in, and without it there is \
+         only one holder and nothing below discriminates"
+    );
+
+    // Worker 0 rolls back. Worker 1 still holds it, so the port stays claimed:
+    // a fresh, unrelated local flow must NOT be handed 1024.
+    rollback_nat64_allocation_for_worker(&state, &synced_key, synced, false, 2, 0);
+    let after_first = state
+        .allocate_source_for_worker(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            "2001:db8::77".parse().unwrap(),
+            dst_v4,
+            6000,
+            443,
+            3,
+            0,
+        )
+        .expect("a fresh flow still allocates");
+    assert_ne!(
+        after_first,
+        (snat, 1024),
+        "worker 0's rollback freed a reservation worker 1 still holds: {:?} was \
+         handed to a fresh flow while the synced one is live. The 1:N reverse \
+         index then mis-demuxes the server's replies — the collision #6211 F2 \
+         exists to prevent (#7094)",
+        after_first
+    );
+
+    // The LAST holder lets go. Now the port must come back to the pool.
+    rollback_nat64_allocation_for_worker(&state, &synced_key, synced, false, 4, 1);
+    assert!(
+        reserve_synced_nat64_allocation_for_worker(&state, &synced_key, synced, false, 5, 0),
+        "after the last holder rolled back, the same tuple must be reservable \
+         again; if this fails the rollback path never frees and the pool leaks a \
+         port per rolled-back synced flow"
+    );
+}
+
+#[test]
+fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
+    // Mirrors nat64_4381_reverse_entry_release_is_noop for the rollback path:
+    // only the FORWARD entry owns the allocation, so a reverse-entry rollback
+    // must not release it. Without this, the is_reverse guard could be deleted
+    // and the test above would still pass — it only ever passes is_reverse=false.
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let (snat, pa) = state
+        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 1, 0)
+        .unwrap();
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(c),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 6000,
+        dst_port: 443,
+    };
+    rollback_nat64_allocation_for_worker(
+        &state,
+        &key,
+        Nat64State::forward_decision(snat, dst_v4, pa),
+        true, // is_reverse
+        2,
+        0,
+    );
+    let again = state
+        .allocate_source_for_worker(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 6000, 443, 3, 0)
+        .unwrap();
+    assert_eq!(
+        again,
+        (snat, pa),
+        "a REVERSE-entry rollback released the forward entry's allocation; only \
+         the forward entry owns it"
+    );
+}
+
+// ---- #7056 (#5798 required-fix #5): the distinct refused-alias counters ----
+
+fn frag_alias_counts_7056() -> (u64, u64) {
+    (
+        NAT64_FRAG_CROSS_DOMAIN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        NAT64_FRAG_PROTOCOL_ALIAS_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn frag_key_7056(protocol: u8, authority: FragAuthority) -> Nat64FragKey {
+    Nat64FragKey {
+        addr_family: libc::AF_INET6 as u8,
+        src: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        ident: 0xfeed,
+        protocol,
+        authority,
+    }
+}
+
+/// #7056: a fragment-association miss has several causes with very different
+/// meanings, and before this they all landed on the same drop counter. This is
+/// the table that separates them, and the MIDDLE ROW is what makes it a test
+/// rather than a demonstration: an ordinary miss — no entry at all — must count
+/// as NEITHER. A classifier that simply counted every miss would satisfy the two
+/// interesting rows and fail this one.
+#[test]
+fn refused_alias_misses_are_counted_distinctly_7056() {
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+
+    // (1) CROSS-DOMAIN: installed under one authority, consulted under another.
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1,
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_other_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(
+        hit.is_none(),
+        "precondition: a cross-domain consult must MISS (the #5798 fail-closed \
+         behaviour); if it hits, this test is measuring the wrong thing"
+    );
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (1, 0),
+        "a cross-domain refusal must advance the CROSS-DOMAIN counter and only \
+         that one — it is the one miss cause that describes the traffic rather \
+         than cache pressure (#7056)"
+    );
+
+    // (2) PROTOCOL ALIAS: same authority, TCP vs UDP on one (src, dst, ident).
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1,
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_TCP, frag_test_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: a protocol-aliased consult must MISS");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 1),
+        "a protocol-alias refusal must advance the PROTOCOL counter and only that \
+         one. Folding the two into a single \"alias refused\" total would answer \
+         neither operator question: cross-domain means another security domain's \
+         association was probed, protocol-alias means TCP and UDP collided on \
+         (src, dst, ident) (#7056)"
+    );
+
+    // (3) THE MIDDLE ROW — an ordinary miss, no entry at all. Neither counter.
+    let cache = Nat64FragAssoc::new();
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_test_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: an empty cache must miss");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "an ORDINARY miss — reorder, TTL straddle, eviction, cold cache — must \
+         advance NEITHER counter. This is the row that distinguishes a real \
+         classifier from one that counts every miss, and counting every miss is \
+         exactly the lumping #7056 exists to undo"
+    );
+
+    // (4) A HIT must not count either, or the counters measure consult volume.
+    let cache = Nat64FragAssoc::new();
+    let key = frag_key_7056(PROTO_UDP, frag_test_authority());
+    cache.install(key, decision, None, 1_000, 1, 0);
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(&key, 2_000, 1, |_| true);
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_some(), "precondition: the matching consult must HIT");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "a HIT must advance neither counter"
+    );
+}
+
+/// #7056: the classification must survive the entry it is classifying against
+/// being evicted for an unrelated reason. A config-generation bump evicts the
+/// entry and returns a miss BEFORE the alias scan would run, so that miss is a
+/// generation miss — not a refused alias — even though the stale entry differed
+/// in authority too.
+///
+/// Without this, the classifier could attribute every generation-fenced miss to
+/// cross-domain aliasing on a box that had simply committed a config change,
+/// which is the false-positive direction: it would make the one counter that is
+/// supposed to mean "something is probing another domain" fire on an ordinary
+/// commit.
+#[test]
+fn a_generation_fenced_miss_is_not_reported_as_an_alias_7056() {
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1, // generation 1
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    // SAME key, but the config generation moved on.
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_test_authority()),
+        2_000,
+        2, // generation 2
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: a stale-generation entry must miss");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "a CONFIG-GENERATION miss must not be reported as a refused alias — it is \
+         an ordinary commit invalidating the cache, and attributing it to \
+         cross-domain probing would make that counter fire on every config \
+         change (#7056)"
+    );
 }

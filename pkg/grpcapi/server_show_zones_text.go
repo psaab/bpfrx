@@ -100,8 +100,8 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 				// this renderer previously had NO #6845 overflow
 				// specialisation, so the same cluster reported slot exhaustion
 				// on the local CLI and the generic three-cause line here.
-				buf.WriteString(zonecounters.UnavailableLine(
-					s.zoneCounterOverflowActive()) + "\n")
+				buf.WriteString(zonecounters.UnavailableLineFor(
+					s.zoneCounterLayoutVersion(), s.zoneCounterOverflowActive()) + "\n")
 			case errIn == nil && errOut == nil:
 				buf.WriteString("  Traffic statistics:\n")
 				fmt.Fprintf(buf, "    Input:  %d packets, %d bytes\n", ingress.Packets, ingress.Bytes)
@@ -351,4 +351,27 @@ func (s *Server) zoneCounterOverflowActive() bool {
 		return false
 	}
 	return status.ZoneCounterOverflowActive
+}
+
+// zoneCounterLayoutVersion mirrors zoneCounterOverflowActive for the layout
+// version, returning the SENTINEL rather than 0 when no status could be read
+// (#7087): 0 means a pre-#3651 helper on this wire, so a read failure must not
+// render as one.
+func (s *Server) zoneCounterLayoutVersion() uint32 {
+	// Through dpProbe(), never the stored dp field — same #2114 reason as the
+	// sibling above: under the live indirection an assertion on the field
+	// answers "capability absent" for a healthy backend, which here would
+	// report LayoutVersionUnknown and render the generic line on a box whose
+	// helper version is perfectly readable.
+	provider, ok := s.dpProbe().(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return zonecounters.LayoutVersionUnknown
+	}
+	status, err := provider.Status()
+	if err != nil {
+		return zonecounters.LayoutVersionUnknown
+	}
+	return status.ZoneCounterLayoutVersion
 }

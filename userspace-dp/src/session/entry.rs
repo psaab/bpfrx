@@ -20,6 +20,51 @@ pub(crate) struct SessionDecision {
 /// existing `UserspaceDpMeta.ingress_zone` default at afxdp/types/mod.rs:64).
 /// Removing the `Arc<str>` saves 28 bytes per `SessionMetadata` and
 /// eliminates the `LOCK XADD` atomic on every `metadata.clone()`.
+/// #7096: the `{ingress_ifindex, ingress_vlan_id}` pair a session should be
+/// STAMPED with, given whether its first packet arrived over the HA fabric.
+///
+/// For a fabric-redirected packet the two halves of the ingress record come from
+/// different places and name different interfaces. The ZONE is overridden to the
+/// peer-encoded ORIGINAL ingress zone (`stage_classify_fabric_ingress` →
+/// `zone_pair_ids_for_flow_with_override`), which is correct: the flow logically
+/// arrived on the peer's WAN. But `meta.ingress_ifindex` is whatever the XDP shim
+/// stamped from `ctx->ingress_ifindex`, and NOTHING in production rewrites it —
+/// verified by sweep: every `meta.ingress_ifindex = ...` assignment in the tree
+/// is in a `#[cfg(test)]` fixture. So it is the LOCAL fabric member's netdev.
+///
+/// The peer's real ingress interface is NOT KNOWABLE here, and that is structural
+/// rather than an omission: the fabric stamp carries a u16 zone id and nothing
+/// else — two bytes big-endian in the synthetic fabric MAC
+/// (`parse_zone_encoded_fabric_ingress_from_frame`, #3075). There is no interface
+/// identity on the wire to recover.
+///
+/// So the honest stamp is NONE. Zero means "no ingress identity recorded" and the
+/// Go consumers fall back to the #4792 zone approximation — which is exactly what
+/// they already do for a peer-imported session, and what they do TODAY for this
+/// case by accident. Naming the local fabric member instead would be a
+/// confidently WRONG answer: `show security flow session interface ge-0-0-0`
+/// would select flows that arrived on the peer's WAN, and `interface reth0.50`
+/// would stop selecting them. Being a `clear` filter too, that is a wrong-session
+/// deletion (#6975 / #6987 family).
+///
+/// Why this was latent rather than live, and why that is not a reason to leave
+/// it: `buildSessionEgressIfaces` only keys an interface that has at least one
+/// UNIT, and the shipped wiring gives the fabric member none — it appears only
+/// inside `fab0 { fabric-options { member-interfaces { ge-0/0/0; } } }`. So the
+/// lookup misses and the CLI falls back. The trigger is one config line
+/// (`set interfaces ge-0/0/0 unit 0 ...`). The inertness rested on an operator
+/// not writing it, and nothing in the tree bound that.
+pub(crate) fn stamped_ingress_identity(
+    ingress_ifindex: u32,
+    ingress_vlan_id: u16,
+    fabric_ingress: bool,
+) -> (u32, u16) {
+    if fabric_ingress {
+        return (0, 0);
+    }
+    (ingress_ifindex, ingress_vlan_id)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: u16,

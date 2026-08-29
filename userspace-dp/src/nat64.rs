@@ -183,7 +183,7 @@ use crate::nat::{
 };
 use crate::session::SessionDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// #4381: NAT64 translated-port allocation range. RFC 6146 does not mandate a
@@ -390,6 +390,39 @@ pub(crate) struct Nat64ReverseInfo {
 // ===========================================================================
 
 /// Number of independent shards. Power of two so the shard index is a mask.
+/// #7056 (#5798 required-fix #5): fragment-association misses caused by the
+/// #5798 key REFUSING an alias, split by which field refused it.
+///
+/// The fail-closed behaviour these count was delivered by #6835 — a cross-domain
+/// or protocol-aliased fragment builds a different key, misses, and dies on the
+/// Pref64 gate or the #6122 discriminator. What was missing is the ability to
+/// SEE it: every such miss landed on `nat64_frag_dropped` /
+/// `nat_frag_untranslated_dropped` alongside reorders, TTL straddles, shard
+/// evictions and config-generation bumps.
+///
+/// Those causes are not interchangeable to an operator. A reorder or TTL straddle
+/// is a path-MTU / cache-pressure story; a refused alias is a TRAFFIC story, and
+/// the only one of the group that can indicate an attempt to ride another
+/// domain's association. One drop counter answers neither question — the same
+/// failure as a diagnostic that names the wrong condition.
+///
+/// TWO counters, not one "alias refused" total, because they are different
+/// operator stories:
+///
+///   - `CROSS_DOMAIN` — a same-datagram entry exists under a DIFFERENT ingress
+///     `FragAuthority`: the #5798 defect proper, a fragment in one security
+///     domain probing an association minted in another.
+///   - `PROTOCOL_ALIAS` — same authority, different upper-layer protocol: a TCP
+///     and a UDP datagram colliding on `(src, dst, ident)`, which required-fix
+///     #2 added `protocol` to the key to separate.
+///
+/// Cumulative and process-global, like `INTERFACE_SNAT_PAT_COLLISIONS`, so tests
+/// read them as a delta.
+pub(crate) static NAT64_FRAG_CROSS_DOMAIN_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// See `NAT64_FRAG_CROSS_DOMAIN_MISSES`.
+pub(crate) static NAT64_FRAG_PROTOCOL_ALIAS_MISSES: AtomicU64 = AtomicU64::new(0);
+
 const NAT64_FRAG_SHARDS: usize = 16;
 /// Fixed per-shard entry cap (LRU eviction on overflow). Total ceiling is
 /// `NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD` = 1024 entries; each entry is
@@ -427,11 +460,37 @@ const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
 /// that DETERMINES the gates a hit bypasses — the interface input filter is
 /// bound per logical interface, so two interfaces in the SAME zone can carry
 /// DIFFERENT filters and keying on zone alone would still alias them. `zone`
-/// and `routing_table` are functions of that interface, but they are carried
-/// explicitly because the enforcement arm reads them directly (a zone override
-/// or a fabric-origin packet can make the effective zone differ from the one
-/// the raw ifindex would imply), and a key must be derived from EXACTLY the
+/// is a function of that interface but is carried EXPLICITLY, because it can
+/// differ from the interface-implied value: a fabric/tunnel
+/// `ingress_zone_override` re-homes a packet's zone, the enforcement arm reads
+/// the overridden value directly, and a key must be derived from EXACTLY the
 /// ingress inputs enforcement uses for "same key <=> same domain" to hold.
+///
+/// `routing_table` does NOT earn its place the same way, and #7051 is the issue
+/// that asked. The asymmetry is measurable in `prerouting_ingress_scope`:
+/// `zone_name` consults `zone_override` FIRST, while `routing_instance` is read
+/// unconditionally from `ifindex_to_routing_instance[logical_ifindex]` — there
+/// is no routing-instance override anywhere on the path. That map is populated
+/// one entry per interface (`forwarding_build/interfaces.rs`), so the VRF is a
+/// PURE FUNCTION of the logical unit, and this key already carries that unit.
+/// Even populated correctly the field could not separate two authorities that
+/// `ingress_ifindex` + `ingress_vlan_id` do not already separate.
+///
+/// It is also INERT today: `meta.routing_table` is a literal 0 at both of its
+/// only assignments — the shim writer (`userspace-xdp/src/lib.rs`) and the
+/// `Default` impl (`afxdp/types/mod.rs`) — so no real packet carries a non-zero
+/// value into `frag_ingress_authority`. That is CHECKED rather than asserted in
+/// prose, by `frag_authority_routing_table_is_inert_in_production_7051`.
+///
+/// So count THREE live dimensions here, not four — which is what #7051 reported
+/// and what an auditor reading the previous wording got wrong. The field is
+/// nevertheless KEPT rather than dropped, a deliberate decision already recorded
+/// by #6927 r2 at
+/// `tests_nat64_tunnel::nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`:
+/// the key is ready if the shim ever stamps it, and the direction is safe — a
+/// stamped value can only make the key FINER, which is a MISS and therefore
+/// fail-closed, never a false inherit. If it is ever made live, relabel that
+/// test's fabricated case and drive it from a real ingress.
 ///
 /// NOT included: the config/FIB generation, which `Nat64FragEntry.generation`
 /// already fences (#5624), and direction, which is constant — the cache is
@@ -498,7 +557,17 @@ pub(crate) struct FragAuthority {
     /// already-admitted-flow property the flow-backed session table has across
     /// an RG transition; do not describe it as bounded by a shorter lifetime.
     pub(crate) ingress_zone: u16,
-    /// Routing instance / VRF the ingress resolves in.
+    /// Routing instance / VRF the ingress resolves in — **inert in production**
+    /// (#7051): every assignment of `meta.routing_table` is a literal 0, so on a
+    /// real packet this is always 0.
+    ///
+    /// Kept rather than dropped, and it costs nothing in discrimination either
+    /// way: the VRF is a pure function of the logical ingress unit
+    /// (`ifindex_to_routing_instance` is keyed by ifindex and, unlike
+    /// `ingress_zone`, has no override), so `ingress_ifindex` already separates
+    /// two ingresses in different routing instances. Full reasoning in the
+    /// type's doc block above; the guard that keeps this comment honest is
+    /// `frag_authority_routing_table_is_inert_in_production_7051`.
     pub(crate) routing_table: u32,
 }
 
@@ -667,8 +736,11 @@ impl Nat64FragAssoc {
         // #6857: owner RG of the resolution this fragment was admitted under;
         // 0 when no RG-bound interface owns it.
         owner_rg: i32,
-    ) {
+    ) -> bool {
         let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        // #7054: did this install sacrifice a LIVE association? Reported to the
+        // caller so the condition is observable; see the note above the eviction.
+        let mut evicted_live = false;
         let idx = nat64_frag_shard_index(&key);
         let mut shard = self.shards[idx]
             .lock()
@@ -690,7 +762,7 @@ impl Nat64FragAssoc {
             // would leave the entry stamped with the old value.
             e.owner_rg = owner_rg;
             shard.push(e);
-            return;
+            return false;
         }
         if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
             // Reclaim EXPIRED slots before touching a live one. Under a flood of
@@ -706,6 +778,7 @@ impl Nat64FragAssoc {
             shard.retain(|e| e.deadline_ns > now_ns);
             if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
                 shard.remove(0);
+                evicted_live = true;
             }
         }
         shard.push(Nat64FragEntry {
@@ -716,6 +789,7 @@ impl Nat64FragAssoc {
             generation,
             owner_rg,
         });
+        evicted_live
     }
 
     /// Consult the association for a NON-first fragment. Prunes expired entries
@@ -751,7 +825,44 @@ impl Nat64FragAssoc {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         shard.retain(|e| e.deadline_ns > now_ns);
-        let pos = shard.iter().position(|e| e.key == *key)?;
+        let Some(pos) = shard.iter().position(|e| e.key == *key) else {
+            // #7056 (#5798 required-fix #5): classify the miss before returning
+            // it. A full-key miss has several causes with very different
+            // meanings, and until now every one landed on the same
+            // `nat64_frag_dropped` / `nat_frag_untranslated_dropped` counter: a
+            // reorder, a TTL straddle, a shard eviction, a config-generation
+            // bump — and an ALIASING ATTEMPT the #5798 key deliberately refused.
+            //
+            // The last is the only one that says something about the TRAFFIC
+            // rather than about cache pressure, and the one required-fix #5 asks
+            // to be distinguishable.
+            //
+            // The scan is single-shard BY CONSTRUCTION, which is why it belongs
+            // here rather than at a call site: `nat64_frag_shard_index`
+            // deliberately digests only `(family, src, dst, ident)`, excluding
+            // `authority` and `protocol` precisely so same-datagram candidates
+            // stay CO-LOCATED. Every alias candidate is already in the bucket
+            // this function has locked and just scanned.
+            //
+            // Ordering matters: this runs only on a FULL-KEY miss, so the
+            // generation and owner-RG fences below cannot reach it. A
+            // config-generation eviction is an ordinary commit invalidating the
+            // cache and must NOT be reported as an alias.
+            let alias = shard.iter().find(|e| {
+                e.key.addr_family == key.addr_family
+                    && e.key.src == key.src
+                    && e.key.dst == key.dst
+                    && e.key.ident == key.ident
+            });
+            if let Some(e) = alias {
+                if e.key.authority != key.authority {
+                    NAT64_FRAG_CROSS_DOMAIN_MISSES.fetch_add(1, Ordering::Relaxed);
+                } else if e.key.protocol != key.protocol {
+                    NAT64_FRAG_PROTOCOL_ALIAS_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return None;
+        };
         // Config-generation guard (#5624): a match minted under a stale config
         // generation is evicted and reported as a miss, so a commit that
         // changed deny/NAT64 rules invalidates the association instead of
@@ -1954,33 +2065,20 @@ pub(crate) fn release_nat64_allocation_for_worker(
 
 /// #4381: roll back a NAT64 forward flow's translated pool port on an
 /// install-failure / admission-refusal / ICMP-error-bounce path, mirroring
-/// `rollback_source_nat_allocation`.
-/// Compile-time completeness guard for #6211 F2: this untracked entry point is
-/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
-/// BUILD FAILURE in the non-test profile rather than a silent single-holder
-/// release of a reservation every worker holds. Production uses the
-/// `_for_worker` twin.
-#[cfg(test)]
-pub(crate) fn rollback_nat64_allocation(
-    nat64: &Nat64State,
-    key: &crate::session::SessionKey,
-    nat: NatDecision,
-    is_reverse: bool,
-    now_ns: u64,
-) {
-    release_nat64_allocation_with_mode(
-        nat64,
-        key,
-        nat,
-        is_reverse,
-        now_ns,
-        true,
-        crate::nat::NatHolder::Untracked,
-    );
-}
-
-/// #6211 F2: roll back THIS worker's hold on a NAT64 reservation. The
-/// holder-aware twin of [`rollback_nat64_allocation`].
+/// `rollback_source_nat_allocation_for_worker`.
+///
+/// #7094: this used to have an `Untracked` twin, kept `#[cfg(test)]` as the
+/// #6211 F2 completeness guard — a production caller that forgot to thread its
+/// `worker_id` would fail the non-test build rather than silently release a
+/// reservation every worker holds. The twin had no caller left, in tests or
+/// anywhere else, and rustc warned. Deleting it does not weaken that guard: an
+/// undefined name is a build failure in every profile, which is strictly
+/// stronger than a name that exists under `cfg(test)`.
+///
+/// The holder argument is the whole point and is bound by
+/// `nat64_7094_rollback_for_worker_frees_only_that_holder`: a rollback releases
+/// only THIS worker's hold, so a reservation several workers share survives
+/// until the last one lets go.
 pub(crate) fn rollback_nat64_allocation_for_worker(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,

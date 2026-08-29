@@ -241,6 +241,8 @@ pub(crate) fn run() -> Result<(), String> {
             nat_reverse_key_shared_displacements_total: 0,
             // #6751 PR 2/3: interface-mode SNAT identity registry counters.
             interface_snat_pat_collisions_total: 0,
+            nat64_frag_cross_domain_misses_total: 0,
+            nat64_frag_protocol_alias_misses_total: 0,
             interface_snat_identity_exhaustion_total: 0,
             interface_snat_sync_identity_conflict_drops_total: 0,
             interface_snat_registry_cap_exhaustion_total: 0,

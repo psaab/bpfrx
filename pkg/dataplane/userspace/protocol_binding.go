@@ -214,6 +214,10 @@ type BindingStatus struct {
 	// omitempty + the Rust serde `default` keep cross-version wire safety (an
 	// older helper omits it → 0).
 	Nat64FragDropped uint64 `json:"nat64_frag_dropped,omitempty"`
+	// #7054: first-fragment installs that evicted a still-LIVE fragment
+	// association (shard at cap, nothing expired to reclaim). Separates capacity
+	// pressure from ordinary reorder/orphan drops.
+	Nat64FragAssocEvicted uint64 `json:"nat64_frag_assoc_evicted,omitempty"`
 	// #5623: fail-closed NAT64 SOURCE-ineligibility drops — an incoming IPv6
 	// packet whose SOURCE lies within a configured Pref64 (a looping/synthesized
 	// "already-translated" source, the RFC 6146 §5 hairpin construction — plus
