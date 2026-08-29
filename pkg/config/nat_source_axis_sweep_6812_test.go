@@ -978,6 +978,19 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 		"Rule.thenAuthored.Pools.len", "Rule.thenAuthored.Pools.nil",
 	),
 	fixtureConstantAxes6812(
+		"#7033 authored terminal action MODES, the companion of the pool names above. "+
+			"Every rule in this fixture is plain pool-mode source NAT, so the recorded "+
+			"mode list is exactly [pool] for all of them and all four columns are "+
+			"constant — unlike the pool NAMES, which vary. In production it varies on "+
+			"both axes: `off` and `interface` rules record a different mode, and a "+
+			"packed cross-mode contradiction records two before the strict gate refuses "+
+			"the commit. So this is a real blind spot, not a production constant. "+
+			"Nothing sorts or compares on it — it is read by the packed-contradiction "+
+			"gate and its lenient enumerator and never reaches the dataplane.",
+		"Rule.thenAuthored.Modes.len", "Rule.thenAuthored.Modes.nil",
+		"Rule.thenAuthored.Modes.all", "Rule.thenAuthored.Modes[0]",
+	),
+	fixtureConstantAxes6812(
 		"pool fields this fixture never configures. Address/Port/PortRaw are the DNAT "+
 			"compatibility scalars, PortRangeInvalidSpec is the #5457 rejected-range "+
 			"marker (every range here is valid), and no pool is routing-instance-scoped, "+

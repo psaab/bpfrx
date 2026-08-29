@@ -56,6 +56,12 @@ type natThenAuthored struct {
 	// Pools is every authored pool NAME in encounter order, so the diagnostic
 	// can name the discarded one rather than only the survivor.
 	Pools []string
+	// Modes is every terminal action MODE the container authored, in encounter
+	// order: "pool", "off", "interface" (#7033). Two distinct modes packed onto
+	// one token run lower to a single field, so the mode COUNT taken from the
+	// resolved NATThen sees one and the contradiction commits. This is the
+	// authored view the packed-contradiction gate reads.
+	Modes []string
 }
 
 // distinctPools returns the authored pool names with repeats removed, in
@@ -81,8 +87,27 @@ func (a natThenAuthored) distinctPools() []string {
 	return out
 }
 
-// natThenAuthoredOccurrences records every pool of `kind` that thenNode
-// authored.
+// distinctModes returns the authored modes with repeats removed, in encounter
+// order. Repeats of ONE mode are #7013's subject and are not a contradiction;
+// two DIFFERENT modes are #7033's.
+func (a natThenAuthored) distinctModes() []string {
+	if len(a.Modes) < 2 {
+		return a.Modes
+	}
+	seen := make(map[string]struct{}, len(a.Modes))
+	out := make([]string, 0, len(a.Modes))
+	for _, m := range a.Modes {
+		if _, ok := seen[m]; ok {
+			continue
+		}
+		seen[m] = struct{}{}
+		out = append(out, m)
+	}
+	return out
+}
+
+// natThenAuthoredOccurrences records every pool and every terminal action mode
+// of `kind` that thenNode authored.
 //
 // THREE SHAPES, and all three have to be walked here or the gate is blind to
 // one spelling of the same defect:
@@ -101,35 +126,79 @@ func natThenAuthoredOccurrences(thenNode *Node, kind string) natThenAuthored {
 	}
 	// Shape 1: `then <kind> <action> ...` — the kind sits at Keys[1].
 	if len(thenNode.Keys) > 1 && thenNode.Keys[1] == kind {
-		a.scanKeys(thenNode.Keys, 2)
+		a.scanRun(thenNode.Keys, 2)
 	}
 	for _, t := range thenNode.Children {
 		if t == nil || t.Name() != kind {
 			continue
 		}
 		// Shape 2: the run continues on the kind child, after Keys[0].
-		a.scanKeys(t.Keys, 1)
-		// Shape 3: one node per action below the kind node.
-		for _, c := range t.Children {
-			if c == nil || c.Name() != "pool" {
-				continue
-			}
-			a.addPoolNode(c)
-		}
+		a.scanRun(t.Keys, 1)
+		// Shape 3: one node per action below the kind node, which may be a
+		// SIBLING list (`{ pool P; off; }`) or a CHAIN (the flat-set path builds
+		// `pool P` with `off` as its child). walkActionChain covers both and
+		// refuses to descend past a token it does not recognise.
+		a.walkActionChain(t.Children)
 	}
 	return a
 }
 
-// scanKeys records each `pool <name>` pair in a flat token run from index from.
+// scanRun records the terminal actions in a flat token run from index from, and
+// STOPS at the first token it does not recognise.
 //
-// A trailing bare `pool` is malformed rather than a second authored pool: other
-// gates report it, and counting it here would answer a syntax error with a
-// duplicate-pool message.
-func (a *natThenAuthored) scanKeys(keys []string, from int) {
+// THE STOP IS THE WHOLE SAFETY ARGUMENT (#7033). The `then <kind>` subtree is
+// deliberately open-world (#4313): `source-nat pool P persistent-nat permit
+// any-remote-host` is valid, and everything from `persistent-nat` onward belongs
+// to a sub-grammar this scan knows nothing about. A scan that kept going would
+// read those trailing values as terminal actions the moment one of them happened
+// to be spelled `off` — inventing a contradiction in a valid config. Round 6 of
+// #6820 was reverted for the mirror-image of that mistake, fabricating an
+// exemption out of tokens under an unrecognised container.
+//
+// `pool` consumes EXACTLY ONE value token, which is what keeps a pool
+// legitimately named `off` resolving as a name: `pool off` is one pool, not a
+// pool plus an exemption. A trailing bare `pool` is malformed rather than an
+// authored pool — other gates report it, and recording it here would answer a
+// syntax error with a contradiction message.
+func (a *natThenAuthored) scanRun(keys []string, from int) {
 	for i := from; i < len(keys); i++ {
-		if keys[i] == "pool" && i+1 < len(keys) {
+		switch keys[i] {
+		case "pool":
+			if i+1 >= len(keys) {
+				return
+			}
 			a.Pools = append(a.Pools, keys[i+1])
+			a.Modes = append(a.Modes, "pool")
 			i++
+		case "off", "interface":
+			a.Modes = append(a.Modes, keys[i])
+		default:
+			// Unrecognised: an open-world tail, not an action. Stop here.
+			return
+		}
+	}
+}
+
+// walkActionChain records the actions carried by a list of nodes below the kind
+// node, following each recognised node into its own children.
+//
+// It descends ONLY through recognised action names. A node named anything else
+// ends that branch without recording: its subtree belongs to a grammar this walk
+// does not model, and reading an `off` out of it would fabricate an exemption
+// the operator never authored — the exact regression that reverted #6820 round
+// 6 (`then { source-nat { frobnicate { off; } } }` resolving to `{Off:true}`).
+func (a *natThenAuthored) walkActionChain(children []*Node) {
+	for _, c := range children {
+		if c == nil {
+			continue
+		}
+		switch c.Name() {
+		case "pool":
+			a.addPoolNode(c)
+		case "off", "interface":
+			a.Modes = append(a.Modes, c.Name())
+			a.scanRun(c.Keys, 1)
+			a.walkActionChain(c.Children)
 		}
 	}
 }
@@ -157,13 +226,13 @@ func (a *natThenAuthored) addPoolNode(c *Node) {
 	if len(c.Keys) > 1 {
 		// Repeats can also collapse onto this leaf's Keys (#2419), so scan the
 		// whole run rather than reading Keys[1].
-		a.scanKeys(c.Keys, 0)
+		a.scanRun(c.Keys, 0)
 	} else if name := nodeVal(c); name != "" {
 		a.Pools = append(a.Pools, name)
+		a.Modes = append(a.Modes, "pool")
 	}
-	for _, g := range c.Children {
-		if g != nil && g.Name() == "pool" {
-			a.addPoolNode(g)
-		}
-	}
+	// The chain continues below a pool node in the flat-set spelling
+	// (`pool P` carrying `off` as its child). The name node itself — `pool { P; }`
+	// — is not a recognised action name, so it ends the branch without recording.
+	a.walkActionChain(c.Children)
 }

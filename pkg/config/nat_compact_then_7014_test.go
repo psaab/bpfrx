@@ -114,15 +114,16 @@ func TestFlatSetThenIsUnaffected_7014(t *testing.T) {
 }
 
 // The packed CONTRADICTION in the compact spelling must behave exactly as it
-// does one level down in `then { source-nat pool P off; }` — first token wins,
-// counted as ONE action, committed. That uniformity is the reason the compact
-// reader takes the first token instead of accumulating: #7033 owns the packed
-// class, its gate message names it as the open case, and narrowing it in one
-// spelling only would make that message half-false.
+// does one level down in `then { source-nat pool P off; }`. THE PROPERTY IS
+// UNIFORMITY, and it is what survives #7033: both spellings are now REJECTED,
+// and both still LOWER the same way — first token wins, counted as ONE action.
 //
-// If #7033 is fixed, this expectation changes with it — update this case
-// together with TestNATTerminalActionPackedContradictionCommits_7034 and the
-// gate's message; do not delete it.
+// #7033 is closed and this case was updated with it rather than deleted, as the
+// previous version required. The reason the compact reader takes the first token
+// instead of accumulating is unchanged: #7033 was fixed by DETECTION, in a check
+// that reads the authored tokens alongside the resolved NATThen, so neither
+// spelling resolves differently than it did. Narrowing it in one spelling only
+// would still make the gate message half-false, which is why both rows are here.
 func TestCompactThenPackedContradictionMatchesTheChildSpelling_7014(t *testing.T) {
 	src := func(then string) string {
 		return `
@@ -141,11 +142,19 @@ security { nat { source {
 			if len(errs) > 0 {
 				t.Fatalf("parse: %v", errs)
 			}
-			cfg, err := CompileConfig(tree)
+			if _, err := CompileConfig(tree); err == nil {
+				t.Fatalf("strict CompileConfig ACCEPTED %q; #7033 is closed and a packed "+
+					"cross-mode contradiction must be rejected in BOTH spellings — a "+
+					"rejection in one only is the half-false state this case exists to "+
+					"prevent", tc.then)
+			}
+			// The lenient path is where the resolution is still observable, and
+			// asserting it is what keeps this a uniformity test rather than a
+			// pair of rejection checks: the two spellings must still LOWER
+			// identically, or the #7033 fix changed the lowering after all.
+			cfg, err := CompileConfigLenient(tree)
 			if err != nil {
-				t.Fatalf("strict CompileConfig REJECTED %q; if #7033 is fixed, update this "+
-					"case with TestNATTerminalActionPackedContradictionCommits_7034 and the "+
-					"gate message: %v", tc.then, err)
+				t.Fatalf("lenient compile failed: %v", err)
 			}
 			got := cfg.Security.NAT.Source[0].Rules[0].Then
 			if got.PoolName != "P" || got.Off {

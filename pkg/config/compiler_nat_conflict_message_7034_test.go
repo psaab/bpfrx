@@ -19,10 +19,20 @@ import "testing"
 // rest, so the operator gets a green commit for a rule whose authored `off`
 // exemption was silently discarded, or whose pool was.
 //
-// This test pins a GAP, deliberately. The gap is #7033, and closing it flips
-// every "want accept" here to a rejection — that is the point: the flip has to
-// be a deliberate edit to this file, not a silent divergence from the message.
-func TestNATTerminalActionPackedContradictionCommits_7034(t *testing.T) {
+// #7033 IS NOW CLOSED, and this test was flipped rather than deleted, as its
+// previous version demanded.
+//
+// What it pinned was a GAP: every case below used to COMMIT under strict. They
+// are now rejected. The resolved values it asserted are kept, and that is the
+// substance of the flip rather than a courtesy to the old test: #7033 was fixed
+// by DETECTION, not by changing what a packed run lowers to, and these
+// assertions are the evidence. Two rounds of #6820 tried to fix it in the
+// lowering and each was reverted for resolving something new — round 5 made
+// `destination-nat interface pool PD` resolve as a pool translation, round 6
+// fabricated an exemption from an unrecognised container. Reading the resolved
+// Then off the LENIENT path (the strict path now returns no config) shows every
+// packed run still lowers exactly as it did before the fix.
+func TestNATTerminalActionPackedContradictionRejected_7034_7033(t *testing.T) {
 	snat := func(then string) string {
 		return `
 security {
@@ -42,6 +52,19 @@ security {
 }`
 	}
 
+	lenientThen := func(t *testing.T, cfgText string) NATThen {
+		t.Helper()
+		tree, perrs := NewParser(cfgText).Parse()
+		if len(perrs) > 0 {
+			t.Fatalf("Parse: %v", perrs)
+		}
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("lenient compile failed: %v", err)
+		}
+		return cfg.Security.NAT.Source[0].Rules[0].Then
+	}
+
 	for _, tc := range []struct {
 		name     string
 		then     string
@@ -55,46 +78,49 @@ security {
 		// Same contradiction one level down, packed onto the child's keys.
 		{"packed child node", "then { source-nat { pool P off; } }", false, "P"},
 	} {
-		cfg, err := compileHier5628(t, snat(tc.then))
-		if err != nil {
-			t.Fatalf("%s: strict CompileConfig REJECTED %q. If #7033 is now fixed, this "+
-				"test and the gate's message (which names #7033 as the open case) must "+
-				"both be updated — do not just delete the case: %v", tc.name, tc.then, err)
+		if _, err := compileHier5628(t, snat(tc.then)); err == nil {
+			t.Errorf("%s: strict CompileConfig ACCEPTED %q. #7033 is closed; a packed "+
+				"cross-mode contradiction must be rejected", tc.name, tc.then)
 		}
-		got := cfg.Security.NAT.Source[0].Rules[0].Then
+		got := lenientThen(t, snat(tc.then))
 		if got.Off != tc.wantOff || got.PoolName != tc.wantPool {
-			t.Errorf("%s: resolved Then={Off:%v Interface:%v PoolName:%q}, want "+
-				"{Off:%v PoolName:%q} — the packed branch's single-key read is what "+
-				"makes the count one",
+			t.Errorf("%s: LENIENT resolved Then={Off:%v Interface:%v PoolName:%q}, want "+
+				"{Off:%v PoolName:%q}. The #7033 fix must not change what a packed run "+
+				"lowers to — that is what separates it from the two reverted attempts "+
+				"to fix it in the lowering",
 				tc.name, got.Off, got.Interface, got.PoolName, tc.wantOff, tc.wantPool)
 		}
 		if n := natThenTerminalActionCount(got); n != 1 {
-			t.Errorf("%s: natThenTerminalActionCount=%d, want 1 — this test exists "+
-				"because the packed contradiction is counted as ONE action", tc.name, n)
+			t.Errorf("%s: natThenTerminalActionCount=%d, want 1 — the packed "+
+				"contradiction is still counted as ONE action, which is exactly why "+
+				"the resolved-field count cannot see it and a separate check must",
+				tc.name, n)
 		}
 	}
 
 	// The flat `set` spelling packs the same way, and is the shape an operator
 	// actually types.
-	flat := buildTree(t, []string{
+	flatLines := []string{
 		"set security nat source pool P address 203.0.113.5",
 		"set security nat source rule-set RS from zone trust",
 		"set security nat source rule-set RS to zone untrust",
 		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
 		"set security nat source rule-set RS rule R1 then source-nat pool P off",
-	})
-	cfg, err := CompileConfig(flat)
-	if err != nil {
-		t.Fatalf("flat `then source-nat pool P off`: strict CompileConfig REJECTED it; "+
-			"if #7033 is fixed, update the gate message too: %v", err)
 	}
-	if got := cfg.Security.NAT.Source[0].Rules[0].Then; got.PoolName != "P" || got.Off {
-		t.Errorf("flat packed: Then={Off:%v PoolName:%q}, want {false P}", got.Off, got.PoolName)
+	if _, err := CompileConfig(buildTree(t, flatLines)); err == nil {
+		t.Error("flat `then source-nat pool P off`: strict CompileConfig ACCEPTED it")
+	}
+	flatCfg, err := CompileConfigLenient(buildTree(t, flatLines))
+	if err != nil {
+		t.Fatalf("flat lenient compile failed: %v", err)
+	}
+	if got := flatCfg.Security.NAT.Source[0].Rules[0].Then; got.PoolName != "P" || got.Off {
+		t.Errorf("flat packed lenient: Then={Off:%v PoolName:%q}, want {false P}", got.Off, got.PoolName)
 	}
 
-	// Destination NAT packs identically — the corrected message is shared by
-	// both kinds, so the claim it makes has to be true of both.
-	dnat, err := compileHier5628(t, `
+	// Destination NAT packs identically — the rejection is shared by both kinds,
+	// so the claim it makes has to be true of both.
+	dnatText := `
 security {
     nat {
         destination {
@@ -108,13 +134,20 @@ security {
             }
         }
     }
-}`)
+}`
+	if _, err := compileHier5628(t, dnatText); err == nil {
+		t.Error("packed DNAT contradiction: strict CompileConfig ACCEPTED it")
+	}
+	dtree, perrs := NewParser(dnatText).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("Parse: %v", perrs)
+	}
+	dnat, err := CompileConfigLenient(dtree)
 	if err != nil {
-		t.Fatalf("packed DNAT contradiction: strict CompileConfig REJECTED it; if #7033 "+
-			"is fixed, update the gate message too: %v", err)
+		t.Fatalf("DNAT lenient compile failed: %v", err)
 	}
 	if got := dnat.Security.NAT.Destination.RuleSets[0].Rules[0].Then; got.PoolName != "PD" || got.Off {
-		t.Errorf("packed DNAT: Then={Off:%v PoolName:%q}, want {false PD}", got.Off, got.PoolName)
+		t.Errorf("packed DNAT lenient: Then={Off:%v PoolName:%q}, want {false PD}", got.Off, got.PoolName)
 	}
 }
 
