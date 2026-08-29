@@ -171,7 +171,27 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	}
 	// Comms are "already up" on the base transport — the non-zero
 	// activeClusterTransport that step 20 requires before it will restart.
-	d.activeClusterTransport = clusterTransportFromConfig(transport())
+	// #7072: stopClusterComms now clears activeClusterTransport as part of the
+	// epoch teardown, so the seat is no longer a once-per-test setup — a subtest
+	// whose step 20 restarts comms leaves the field ZERO for the next one, and
+	// step 20 will not restart from a zero baseline. In production the restart's
+	// startClusterComms republishes the key immediately; this fixture's store
+	// deliberately holds no committed cluster config (see above), so the real
+	// startClusterComms early-returns and never republishes. Re-seat per subtest
+	// instead, which is what makes them order-independent now.
+	//
+	// The seat is deliberately the UNKEYED transport, the same value the
+	// once-per-test seat used. Seating a KEYED one was measured to MASK
+	// key_commit_must_not_restart under the mutation that adds
+	// ControlLinkAuthKey to clusterTransportKey; seating the unkeyed value
+	// leaves that mutation visible, because the keyed candidate still differs
+	// from the unkeyed active exactly as it did before.
+	seatActiveTransport := func() {
+		d.clusterCommsMu.Lock()
+		d.activeClusterTransport = clusterTransportFromConfig(transport())
+		d.clusterCommsMu.Unlock()
+	}
+	seatActiveTransport()
 
 	gen := func() uint64 {
 		d.clusterCommsMu.Lock()
@@ -180,6 +200,7 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	}
 
 	t.Run("key_commit_must_not_restart", func(t *testing.T) {
+		seatActiveTransport()
 		keyed := transport()
 		keyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
 
@@ -199,6 +220,7 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	// Positive control: an endpoint change MUST still restart, or the assertion
 	// above is satisfied by a step 20 that never fires at all.
 	t.Run("endpoint_change_must_restart", func(t *testing.T) {
+		seatActiveTransport()
 		moved := transport()
 		moved.Chassis.Cluster.PeerAddress = "10.99.0.9"
 
@@ -252,6 +274,7 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	//
 	// Tracked as #6878. Do not read "must still restart" as bound end to end.
 	t.Run("keyed_endpoint_change_must_still_restart", func(t *testing.T) {
+		seatActiveTransport()
 		movedKeyed := transport()
 		movedKeyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
 		movedKeyed.Chassis.Cluster.PeerAddress = "10.99.0.9"
@@ -265,7 +288,8 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 		// inside a subtest: under a mutation that DOES add ControlLinkAuthKey
 		// to clusterTransportKey, that write masked key_commit_must_not_restart
 		// when this subtest ran first (measured). The three subtests are
-		// order-independent because none of them REWRITES `d.activeClusterTransport`.
+		// order-independent because each RE-SEATS `d.activeClusterTransport` to the
+		// same unkeyed value on entry (#7072 made the teardown clear it).
 		// They do mutate `d` — applyTailReconciles reaches stopClusterComms, which
 		// increments d.clusterCommsGen, and that is the very thing each subtest
 		// measures. The distinction matters: a shared counter every subtest reads

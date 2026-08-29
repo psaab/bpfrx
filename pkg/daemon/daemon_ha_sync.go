@@ -721,7 +721,14 @@ func (d *Daemon) snapshotFabricRefreshChans() (chan struct{}, chan struct{}) {
 // present at publish time. Bumping the counter here means a constructor from a
 // prior epoch (still resolving addresses) is already superseded before this
 // call returns, so its later publish is dropped.
-func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context, uint64) {
+// #7071: the CancelFunc is returned as well, so a caller that learns its epoch
+// was superseded before it wired anything can release the sub-context it just
+// created. It cannot reach that cancel through the field: by then a newer epoch
+// has overwritten clusterCommsCancel with its OWN, and calling that would tear
+// down the LIVE epoch instead of this dead one.
+func (d *Daemon) beginClusterCommsEpoch(
+	parent context.Context,
+) (context.Context, uint64, context.CancelFunc) {
 	commsCtx, commsCancel := context.WithCancel(parent)
 	d.clusterCommsMu.Lock()
 	d.clusterCommsGen++
@@ -729,7 +736,7 @@ func (d *Daemon) beginClusterCommsEpoch(parent context.Context) (context.Context
 	d.clusterCommsCancel = commsCancel
 	d.clusterCommsCtx = commsCtx
 	d.clusterCommsMu.Unlock()
-	return commsCtx, gen
+	return commsCtx, gen, commsCancel
 }
 
 // publishSessionSyncIfCurrent installs ss as the live session-sync object iff
@@ -816,8 +823,32 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// a constructor goroutine from a superseded epoch (still resolving its sync
 	// address) drops its publish instead of clobbering this epoch's state
 	// (#4958).
-	commsCtx, commsGen := d.beginClusterCommsEpoch(ctx)
-	d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg))
+	commsCtx, commsGen, commsCancel := d.beginClusterCommsEpoch(ctx)
+	if !d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg)) {
+		// #7071: consume the drop signal, as both sibling publishers already do
+		// (publishSessionSyncIfCurrent, publishFabricRefreshChansIfCurrent).
+		//
+		// A false return means another epoch superseded this one between the
+		// beginClusterCommsEpoch above and this line. Everything below wires
+		// state for THIS epoch, and the later publishes are themselves
+		// epoch-gated, so continuing installs nothing — but it is not merely
+		// wasted work. startHAWatchdogHeartbeat and startHeartbeatWithRetry
+		// launch goroutines bound to commsCtx, and when the supersession came
+		// from another beginClusterCommsEpoch rather than a stopClusterComms,
+		// this context is ORPHANED: the newer epoch overwrote
+		// clusterCommsCancel with its own, so no later stopClusterComms can
+		// ever cancel this one. The watchdog's 500ms ticker would then run for
+		// the life of the daemon, writing for an epoch nobody owns.
+		//
+		// Cancelling here is what releases it, and it is safe precisely because
+		// the epoch is dead: nothing else holds this context. On the live path
+		// the cancel is NOT called — it stays in clusterCommsCancel for
+		// stopClusterComms, exactly as before.
+		commsCancel()
+		slog.Debug("cluster: comms epoch superseded before wiring, dropping start",
+			"generation", commsGen)
+		return
+	}
 
 	vrfDevice := d.resolveClusterVRFDevice(cc)
 
@@ -1219,6 +1250,26 @@ func (d *Daemon) stopClusterComms() {
 	d.sessionSync = nil
 	d.fabricRefreshCh = nil
 	d.fabricRefreshCh1 = nil
+	// #7072: the transport key is part of the epoch tuple and is torn down
+	// with it. activeClusterTransport documents itself as "the transport
+	// config used by the comms that are currently running", so after this
+	// teardown a non-zero value is simply false — nothing is running.
+	//
+	// Leaving it set had a consequence, not just an inaccuracy: apply-tail
+	// step 20 restarts comms on `active != zero && new != active`, so a
+	// commit landing after a stop-only teardown with a CHANGED transport
+	// would RESURRECT comms that were deliberately torn down. The one
+	// stop-only site is the bootstrap rollback
+	// (relinquishClusterForBootstrap), which stops comms precisely so the
+	// peer stops seeing a healthy node whose dataplane is about to be
+	// detached; bringing them back re-creates that hybrid.
+	//
+	// What this does NOT do is make step 20 start comms after a stop-only
+	// teardown: `active != zero` fails either way, so an unchanged-transport
+	// commit does not restart them before this change or after it. If
+	// something ought to restart comms post-rollback, it is not step 20 —
+	// that is a separate question and out of scope here.
+	d.activeClusterTransport = clusterTransportKey{}
 	d.clusterCommsMu.Unlock()
 
 	if ss != nil {
