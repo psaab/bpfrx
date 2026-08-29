@@ -1272,6 +1272,20 @@ pub(crate) struct SessionSyncRequest {
     pub ingress_zone_id: u16,
     #[serde(rename = "egress_zone_id", default)]
     pub egress_zone_id: u16,
+    /// #7095: the LOCAL ingress identity a peer-imported session should carry.
+    ///
+    /// The originating node could not send its own `ingress_ifindex` — an
+    /// ifindex is node-local and would name a different NIC here, which is why
+    /// #6928 imported 0 — so it sent a fold of the RETH-RELATIVE name both
+    /// chassis agree on, and the Go side resolved that fold to THIS node's own
+    /// numbers before building this request. They are therefore safe to store.
+    ///
+    /// `default` keeps an older daemon's request decoding to 0, which is the
+    /// pre-#7095 behaviour: no ingress identity, zone approximation on display.
+    #[serde(rename = "ingress_ifindex", default)]
+    pub ingress_ifindex: i32,
+    #[serde(rename = "ingress_vlan_id", default)]
+    pub ingress_vlan_id: u16,
     #[serde(rename = "owner_rg_id", default)]
     pub owner_rg_id: i32,
     #[serde(rename = "egress_ifindex", default)]

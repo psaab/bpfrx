@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"net"
+	"strconv"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -28,6 +30,69 @@ import (
 // the next commit — it degrades, it does not lie. (A RECYCLED ifindex is the
 // one case that could name the wrong device; that is #6987, which predates this
 // change and is tracked separately for the local display path as well.)
+func buildIngressFoldResolver(cfg *config.Config) func(uint32) (uint32, uint16, bool) {
+	if cfg == nil {
+		return nil
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	indexByLinuxName := make(map[string]uint32, len(ifaces))
+	for _, ifc := range ifaces {
+		if ifc.Index > 0 {
+			indexByLinuxName[ifc.Name] = uint32(ifc.Index)
+		}
+	}
+	// Pre-fold this node's own stable names once. The reverse direction runs per
+	// imported session, and a bulk sync imports the peer's whole table.
+	type local struct {
+		ifindex uint32
+		vlan    uint16
+	}
+	byFold := make(map[uint32]local)
+	ambiguous := make(map[uint32]struct{})
+	for _, stable := range cfg.ClusterStableIfaceNames() {
+		fold := config.StableIfaceID(stable)
+		if fold == 0 {
+			continue
+		}
+		localName, ok := cfg.LocalIfaceForStableID(fold)
+		if !ok {
+			// LocalIfaceForStableID already refuses a collision; record it so a
+			// later lookup does not silently take the other name's device.
+			ambiguous[fold] = struct{}{}
+			continue
+		}
+		base, vlan := localName, uint16(0)
+		if i := strings.LastIndexByte(localName, '.'); i >= 0 {
+			if v, err := strconv.ParseUint(localName[i+1:], 10, 16); err == nil {
+				base, vlan = localName[:i], uint16(v)
+			}
+		}
+		idx, ok := indexByLinuxName[config.LinuxIfName(base)]
+		if !ok || idx == 0 {
+			// This node does not currently have the device. Not an error: the
+			// peer may be ahead of us, and the session degrades to the zone.
+			continue
+		}
+		byFold[fold] = local{ifindex: idx, vlan: vlan}
+	}
+	return func(fold uint32) (uint32, uint16, bool) {
+		if fold == 0 {
+			return 0, 0, false
+		}
+		if _, bad := ambiguous[fold]; bad {
+			return 0, 0, false
+		}
+		l, ok := byFold[fold]
+		if !ok {
+			return 0, 0, false
+		}
+		return l.ifindex, l.vlan, true
+	}
+}
+
 func buildIngressFoldFn(cfg *config.Config) func(ifindex uint32, vlan uint16) uint32 {
 	if cfg == nil {
 		return nil
