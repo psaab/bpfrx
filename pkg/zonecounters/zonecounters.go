@@ -43,6 +43,14 @@ const (
 		"per-zone accounting, the zone exceeded the dataplane's " +
 		"hot-path slot capacity, or the zone is idle)"
 
+	unavailablePreDatingHelper = "  Traffic statistics: not available " +
+		"(the running dataplane helper predates per-zone accounting, so it " +
+		"publishes no per-zone volume at all; upgrade the helper)"
+
+	unavailableIdle = "  Traffic statistics: not available " +
+		"(the helper publishes per-zone volume and has slot capacity for this " +
+		"zone, but has recorded none: the zone is idle)"
+
 	unavailableOverflow = "  Traffic statistics: not available " +
 		"(the dataplane's per-zone hot-path slot capacity is " +
 		"EXHAUSTED, so this zone's traffic is not being counted " +
@@ -60,9 +68,57 @@ const (
 //
 // It carries NO trailing newline, so callers that print a line and callers that
 // assemble a buffer both use it unchanged.
+//
+// Deprecated for new callers: prefer UnavailableLineFor, which also consumes the
+// layout version and can therefore name the pre-#3651-helper cause instead of
+// folding it into the generic line (#7087). Kept so existing callers that have
+// only the overflow bit compile unchanged; it delegates.
 func UnavailableLine(overflowActive bool) string {
-	if overflowActive {
+	return UnavailableLineFor(unknownLayoutVersion, overflowActive)
+}
+
+// unknownLayoutVersion is the sentinel UnavailableLine passes when its caller
+// has no layout version to give. It is deliberately NOT 0: 0 is a MEANINGFUL
+// value on this wire (absent field = pre-#3651 helper), so reusing it would make
+// a caller that simply lacks the datum indistinguishable from one reporting an
+// old helper — the exact conflation #7087 is about, reintroduced in the shim.
+const unknownLayoutVersion = LayoutVersionUnknown
+
+// LayoutVersionUnknown is what a caller passes when it could not read a status
+// at all. Exported because the accessors that feed UnavailableLineFor need to
+// distinguish "no status" from "layout version 0" (a pre-#3651 helper), and
+// those are different sentences.
+const LayoutVersionUnknown = ^uint32(0)
+
+// UnavailableLineFor names WHICH of the three causes applies, when the wire says.
+//
+// #7087: the doc above this file's constants said the three causes are
+// "genuinely indistinguishable at this layer and naming one would be a guess."
+// That was true only because the layout-version field had no reader. It does
+// carry the answer:
+//
+//	layoutVersion == 0   the helper predates per-zone accounting — KNOWN, and
+//	                     not actionable on this box: it needs a helper upgrade.
+//	overflowActive       the slot table is exhausted — KNOWN and actionable.
+//	otherwise            a helper that publishes, with room, reporting nothing
+//	                     for this zone: the zone is IDLE. Also known.
+//
+// So with both fields all three are distinguishable and none is a guess. The
+// generic line survives only for callers that cannot supply a layout version.
+//
+// Order matters: an old helper publishes no overflow bit either, so the version
+// check must come first or an upgrade-needed box would be reported as
+// slot-exhausted — a wrong AND actionable diagnosis, which is worse than an
+// ambiguous one.
+func UnavailableLineFor(layoutVersion uint32, overflowActive bool) string {
+	switch {
+	case layoutVersion == 0:
+		return unavailablePreDatingHelper
+	case overflowActive:
 		return unavailableOverflow
+	case layoutVersion == unknownLayoutVersion:
+		return unavailableGeneric
+	default:
+		return unavailableIdle
 	}
-	return unavailableGeneric
 }
