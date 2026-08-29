@@ -605,53 +605,80 @@ func TestUpgradeMsg1IsAuthenticated7163(t *testing.T) {
 	})
 }
 
-// TestUpgradePhaseSeparationRefusesAConnectMessage7163 binds the phase byte in
-// the prologue.
+// TestUpgradePrologueBindsEveryField7163 binds the prologue field by field.
 //
-// Both exchanges run under the same PSK, and a CONNECT msg1 travels in
-// cleartext on a fresh TCP connection where anyone on the fabric can read it.
-// Without the phase byte that captured message is also a well-formed upgrade
-// Hello: replayed into an established unauthenticated stream, the responder
-// would answer and switch its write direction to a key derived from an
-// ephemeral nobody holds, and the legitimate peer could no longer read a frame.
-// The connection would DROP — the one thing this mechanism promises it never
-// does.
+// The prologue is where every identity binding lives, and it is never PARSED —
+// both ends construct it independently and the handshake hash compares them —
+// so a field that stopped being mixed in would not surface as a decode error.
+// It would surface as nothing at all: both ends would drop it together and the
+// handshake would still succeed, with the binding silently absent. Only a
+// fixture that feeds a DIFFERENT value for one field at a time can see that.
 //
-// PAIRED: the connect-phase message must be refused AND the upgrade-phase
-// message accepted, so a responder that refuses everything cannot pass.
-func TestUpgradePhaseSeparationRefusesAConnectMessage7163(t *testing.T) {
-	const psk = "phase-separation-psk-7163"
-	deliver := func(t *testing.T, phase byte) *upgEnd {
-		t.Helper()
-		b := newUpgEnd(t, psk, 1)
-		hs, err := noise.NewHandshakeState(noise.Config{
-			CipherSuite:  syncNoiseCipherSuite,
-			Pattern:      noise.HandshakeNN,
-			Initiator:    true,
-			Prologue:     syncNoisePrologue(phase, upgClusterID, 0, 1, 0),
-			PresharedKey: syncNoisePSK([]byte(psk)),
-			Random:       rand.Reader,
-		})
-		if err != nil {
-			t.Fatalf("build msg1: %v", err)
-		}
-		msg1, _, _, err := hs.WriteMessage(nil, nil)
-		if err != nil {
-			t.Fatalf("write msg1: %v", err)
-		}
-		b.s.handleMessage(b.ac, syncMsgAuthUpgradeHello,
-			append([]byte{syncAuthUpgradeVersion}, msg1...))
-		return b
-	}
+// The PHASE row is the one with a concrete attack behind it. Both exchanges run
+// under the same PSK, and a CONNECT msg1 travels in cleartext on a fresh TCP
+// connection where anyone on the fabric can read it. Without the phase byte that
+// captured message is also a well-formed upgrade Hello: replayed into an
+// established unauthenticated stream, the responder would answer and switch its
+// write direction to a key derived from an ephemeral nobody holds — not the
+// attacker (no PSK) and not the legitimate initiator (it never sent that msg1) —
+// and the peer could no longer read a frame. The connection would DROP, which is
+// the one thing this mechanism promises it never does.
+//
+// The table's FIRST row is the correct prologue and must be ACCEPTED. Without
+// it the whole table is satisfied by a responder that refuses everything.
+func TestUpgradePrologueBindsEveryField7163(t *testing.T) {
+	const psk = "prologue-binding-psk-7163"
+	// The responder under test is node 1, cluster upgClusterID, on fabric 0, so
+	// its own prologue is (upgrade, upgClusterID, initiator 0, responder 1, 0).
+	for _, tc := range []struct {
+		name          string
+		phase         byte
+		cluster       int
+		initiatorNode int
+		responderNode int
+		fabric        int
+		wantAccepted  bool
+	}{
+		{"the responder's own prologue", syncNoisePhaseUpgrade, upgClusterID, 0, 1, 0, true},
+		{"connect phase", syncNoisePhaseConnect, upgClusterID, 0, 1, 0, false},
+		{"another cluster id", syncNoisePhaseUpgrade, upgClusterID + 1, 0, 1, 0, false},
+		{"another initiator node", syncNoisePhaseUpgrade, upgClusterID, 5, 1, 0, false},
+		{"another responder node", syncNoisePhaseUpgrade, upgClusterID, 0, 0, 0, false},
+		{"another fabric index", syncNoisePhaseUpgrade, upgClusterID, 0, 1, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newUpgEnd(t, psk, 1)
+			hs, err := noise.NewHandshakeState(noise.Config{
+				CipherSuite: syncNoiseCipherSuite,
+				Pattern:     noise.HandshakeNN,
+				Initiator:   true,
+				Prologue: syncNoisePrologue(tc.phase, tc.cluster,
+					tc.initiatorNode, tc.responderNode, tc.fabric),
+				PresharedKey: syncNoisePSK([]byte(psk)),
+				Random:       rand.Reader,
+			})
+			if err != nil {
+				t.Fatalf("build msg1: %v", err)
+			}
+			msg1, _, _, err := hs.WriteMessage(nil, nil)
+			if err != nil {
+				t.Fatalf("write msg1: %v", err)
+			}
+			b.s.handleMessage(b.ac, syncMsgAuthUpgradeHello,
+				append([]byte{syncAuthUpgradeVersion}, msg1...))
 
-	if b := deliver(t, syncNoisePhaseConnect); b.ac.writeAuthed() {
-		t.Fatal("a CONNECT-phase msg1 was accepted as an in-place upgrade Hello. A msg1 " +
-			"captured off a fresh connection can then be replayed into an established " +
-			"stream to make this node seal under a key nobody holds.")
-	}
-	if b := deliver(t, syncNoisePhaseUpgrade); !b.ac.writeAuthed() {
-		t.Fatal("the UPGRADE-phase msg1 must be accepted, or the refusal above says nothing " +
-			"about the phase byte")
+			if got := b.ac.writeAuthed(); got != tc.wantAccepted {
+				if tc.wantAccepted {
+					t.Fatal("the responder's OWN prologue was refused. Every refusal in " +
+						"this table is then satisfied by a responder that refuses " +
+						"everything, and none of the bindings is actually pinned.")
+				}
+				t.Fatal("a msg1 built with a DIFFERENT value for this field was accepted, " +
+					"so the field is not mixed into the prologue. It would not surface " +
+					"as a decode error either: both ends would drop it together and the " +
+					"handshake would still succeed with the binding silently absent.")
+			}
+		})
 	}
 }
 
@@ -795,6 +822,96 @@ func TestUpgradeConfirmForgeryDoesNotMoveTheReadBoundary7163(t *testing.T) {
 	if !a.ac.authed() || !b.ac.authed() {
 		t.Fatal("the exchange must complete")
 	}
+}
+
+// TestUpgradeCompletingFramesAreNotGatedOnTheLiveKey7163 binds the one place a
+// mid-round config change could break the NEVER DROPS property.
+//
+// The Proof and the Confirm are COMPLETING frames: by the time each arrives,
+// the peer that sent it has ALREADY switched the matching direction — the
+// responder installs its write key immediately after emitting the Proof, and the
+// initiator installs its write key immediately after emitting the Confirm.
+// Refusing one of them therefore does not "stay safe"; it leaves the peer
+// sealing into a reader that never moved, which is precisely the desync the
+// switch-point discipline exists to prevent.
+//
+// So neither handler may consult the LIVE control-link key. A rotation that
+// lands between the Hello and the completing frame is a normal operator action;
+// it must not be able to cause that desync.
+//
+// FAIL-ON-REVERT: re-add `if len(key)==0 { return }` or a
+// `bytes.Equal(st.forPSK, key)` test to either handler and the matching
+// sub-test reds.
+func TestUpgradeCompletingFramesAreNotGatedOnTheLiveKey7163(t *testing.T) {
+	const first = "completing-frame-first-psk-7163"
+	const second = "completing-frame-second-psk-7163"
+
+	t.Run("the initiator installs on a Proof after a local rotation", func(t *testing.T) {
+		a := newUpgEnd(t, first, 0)
+		b := newUpgEnd(t, first, 1)
+		a.sealedOut = a.ac.writeAuthed()
+		a.s.ReconcileConnectionAuth("test")
+		pump(t, a, b) // Hello a -> b; b installs its write key on answering
+
+		// The operator rotates on THIS node while the Proof is in flight.
+		a.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 0, cluster: upgClusterID})
+		pump(t, b, a) // Proof b -> a
+
+		if !a.ac.readAuthed() {
+			t.Fatal("the initiator refused a Proof because the live key had changed. The " +
+				"responder switched its write direction when it emitted that frame, so " +
+				"every frame it sends from here on is sealed into a reader that never " +
+				"moved — the connection drops.")
+		}
+		if !bytes.Equal(a.ac.readKey, b.ac.writeKey) {
+			t.Fatal("the initiator must install the key THIS ROUND derived")
+		}
+		// And the stamp records the round's key, not the live one, so the
+		// reconciler can still see that a rotation is owed.
+		if !bytes.Equal(a.ac.authPSK, []byte(first)) {
+			t.Fatalf("authPSK must record the key the round authenticated under (%q), not "+
+				"the live one; stamping the live key makes a connection running on a "+
+				"RETIRED key look current and the rotation is never re-driven",
+				first)
+		}
+		// Let the round finish (the Confirm is already on the wire), then the
+		// reconciler must start a FRESH round for the rotated key.
+		if typ := pump(t, a, b); typ != syncMsgAuthUpgradeConfirm {
+			t.Fatalf("expected the Confirm, got frame type %d", typ)
+		}
+		a.sealedOut = a.ac.writeAuthed()
+		a.s.ReconcileConnectionAuth("post-rotation")
+		if typ := pump(t, a, b); typ != syncMsgAuthUpgradeHello {
+			t.Fatalf("the reconciler must start a fresh round for the rotated key; got "+
+				"frame type %d. A connection left running on a RETIRED PSK is the second "+
+				"property #6628 names.", typ)
+		}
+	})
+
+	t.Run("the responder installs on a Confirm after a local rotation", func(t *testing.T) {
+		a := newUpgEnd(t, first, 0)
+		b := newUpgEnd(t, first, 1)
+		a.sealedOut = a.ac.writeAuthed()
+		a.s.ReconcileConnectionAuth("test")
+		pump(t, a, b) // Hello
+		pump(t, b, a) // Proof; a installs BOTH and the Confirm goes on the wire
+
+		// The operator rotates on the RESPONDER while the Confirm is in flight.
+		b.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 1, cluster: upgClusterID})
+		pump(t, a, b) // Confirm
+
+		if !b.ac.readAuthed() {
+			t.Fatal("the responder refused a Confirm because the live key had changed. The " +
+				"initiator switched its write direction when it emitted that frame, so " +
+				"the connection desyncs on its next frame.")
+		}
+		if !bytes.Equal(b.ac.readKey, a.ac.writeKey) {
+			t.Fatal("the responder must install the key THIS ROUND derived")
+		}
+		if !bytes.Equal(b.ac.authPSK, []byte(first)) {
+			t.Fatalf("authPSK must record the round's key (%q), not the live one", first)
+		}
+	})
 }
 
 // TestInPlaceUpgradeIsSilentAgainstAnUnkeyedPeer6628: the rolling-upgrade case.
