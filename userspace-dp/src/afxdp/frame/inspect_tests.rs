@@ -872,3 +872,130 @@ fn metadata_tuple_complete_refuses_unresolved_ipv6_ext_protocols_even_with_ports
          otherwise pass vacuously"
     );
 }
+
+// ---- #7055: which l3_session_flow_from_meta None legs are REACHABLE ----
+//
+// The fragment-association HIT arm and the session-miss arm both wrap their
+// entire per-packet enforcement block (interface input filter, PBR
+// `then { routing-instance X; discard; }`) in
+// `if let Some(l3_flow) = l3_ctx.as_ref()`. So every `None` is a packet
+// forwarded with NO filter evaluation, and which `None`s are reachable decides
+// whether that is a latent seam or a live fail-open.
+//
+// #7055 asserted `None` is "a test-fixture shape, not a production shape". These
+// cells pin the measurement that says that is only half true: the addr_family
+// leg is a fixture shape, the unspecified-source leg is not. Both the comment
+// #7055 corrects and #7055's own correction reason from "the shim stamps the
+// field" to "the value is usable", and that step does not hold.
+
+// Counter deltas, read the way INTERFACE_SNAT_PAT_COLLISIONS' tests do: these
+// are process-global and cumulative, so an absolute value would be order- and
+// parallelism-dependent. `make test-rust` runs --test-threads=1, so a delta
+// taken around a single call is exact.
+fn l3_none_counts_7055() -> (u64, u64) {
+    (
+        L3_CTX_NONE_UNKNOWN_FAMILY.load(std::sync::atomic::Ordering::Relaxed),
+        L3_CTX_NONE_UNSPECIFIED_ADDR.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[test]
+fn l3_ctx_none_on_unknown_family_is_the_unreachable_leg_7055() {
+    // The shim writes `addr_family: parsed.addr_family`, and `parsed` only ever
+    // comes from parse_ipv4/parse_ipv6, which hard-code AF_INET/AF_INET6. A
+    // packet whose parse fails never receives metadata at all. So this leg is a
+    // FIXTURE shape: constructible here, not constructible by the shim.
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_UNIX as u8,
+        flow_src_addr: [1u8; 16],
+        flow_dst_addr: [2u8; 16],
+        ..UserspaceDpMeta::default()
+    };
+    let (fam0, uns0) = l3_none_counts_7055();
+    assert!(
+        l3_session_flow_from_meta(meta).is_none(),
+        "a non-v4/v6 addr_family must yield None"
+    );
+    let (fam1, uns1) = l3_none_counts_7055();
+    assert_eq!(
+        fam1 - fam0,
+        1,
+        "the UNKNOWN-FAMILY counter must advance for this leg"
+    );
+    assert_eq!(
+        uns1 - uns0,
+        0,
+        "the UNSPECIFIED-ADDR counter must NOT advance for a family miss. The two \
+         legs mean opposite things — unknown-family should be ZERO in production \
+         and is a bug report, unspecified-addr is reachable traffic — so a \
+         counter that cannot tell them apart tells a future reader nothing \
+         actionable (#7055)"
+    );
+}
+
+#[test]
+fn l3_ctx_none_on_unspecified_source_is_the_reachable_leg_7055() {
+    // THE CELL THAT MATTERS. A fully-parsed IPv4 packet whose header carries
+    // 0.0.0.0 as the source: the shim stamps that faithfully, so this is a
+    // PRODUCTION shape, not a fixture artefact. Nothing upstream rejects it —
+    // routing keys on destination, `is_martian_dst` only sub-classifies an
+    // already-decided NoRoute, and the addr_class source predicates gate
+    // ICMP-error generation and neighbour learning rather than transit.
+    let mut src_zero = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        ..UserspaceDpMeta::default()
+    };
+    src_zero.flow_src_addr[..4].copy_from_slice(&[0, 0, 0, 0]);
+    src_zero.flow_dst_addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+    let (fam0, uns0) = l3_none_counts_7055();
+    assert!(
+        l3_session_flow_from_meta(src_zero).is_none(),
+        "an unspecified IPv4 SOURCE with a valid destination must yield None — \
+         this is the leg #7055 called a fixture shape and it is reachable: the \
+         enforcement block is skipped for such a packet on both the hit and \
+         miss arms"
+    );
+    let (fam1, uns1) = l3_none_counts_7055();
+    assert_eq!(uns1 - uns0, 1, "the UNSPECIFIED-ADDR counter must advance");
+    assert_eq!(
+        fam1 - fam0,
+        0,
+        "the family counter must NOT advance — the family was valid AF_INET"
+    );
+
+    // Same for IPv6 (`::` source), the DAD shape.
+    let mut v6_src_zero = UserspaceDpMeta {
+        addr_family: libc::AF_INET6 as u8,
+        ..UserspaceDpMeta::default()
+    };
+    v6_src_zero.flow_dst_addr = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ];
+    assert!(
+        l3_session_flow_from_meta(v6_src_zero).is_none(),
+        "an unspecified IPv6 source must yield None"
+    );
+
+    // POSITIVE CONTROL, on the same family and the same builder: a specified
+    // source DOES yield Some. Without this the two assertions above would pass
+    // on a function that returned None for everything, and the reachability
+    // claim would be vacuous.
+    let mut ok = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        ..UserspaceDpMeta::default()
+    };
+    ok.flow_src_addr[..4].copy_from_slice(&[192, 0, 2, 1]);
+    ok.flow_dst_addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+    let (fam2, uns2) = l3_none_counts_7055();
+    let flow = l3_session_flow_from_meta(ok)
+        .expect("a fully specified v4 pair must yield Some — else these cells are vacuous");
+    assert_eq!(flow.forward_key.src_port, 0, "flowless: no L4 ports (#3291)");
+    let (fam3, uns3) = l3_none_counts_7055();
+    assert_eq!(
+        (fam3 - fam2, uns3 - uns2),
+        (0, 0),
+        "a SUCCESSFUL derivation must advance neither counter, or the counters \
+         measure call volume rather than the skipped-enforcement events they \
+         exist to report"
+    );
+}

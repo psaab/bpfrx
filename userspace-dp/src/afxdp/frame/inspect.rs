@@ -7,6 +7,7 @@
 //! that operate on a frame slice without mutating it.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // #989: TCP-specific inspection helpers (frame_has_tcp_rst,
 // extract_tcp_flags_and_window, extract_tcp_window) and tcp_flags_str
@@ -1618,6 +1619,48 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
 /// and the deny/log records. Returns `None` when the meta carries no usable L3
 /// address (unspecified or non-IP family), in which case the caller leaves the
 /// packet's existing (resolve-only) flowless behavior unchanged.
+/// #7055: how many times a per-packet enforcement site was skipped because no
+/// L3 identity could be derived from the metadata, split by WHICH leg fired.
+///
+/// The name says the leg deliberately. A single "no L3 identity" counter would
+/// tell a future reader nothing about what to do, because the two legs have
+/// opposite meanings:
+///
+///   - `L3_CTX_NONE_UNKNOWN_FAMILY` should stay at ZERO in production. The shim
+///     writes `addr_family: parsed.addr_family` and `parsed` only ever comes
+///     from `parse_ipv4`/`parse_ipv6`, which hard-code AF_INET/AF_INET6; a
+///     packet whose parse fails never receives metadata at all. A non-zero value
+///     here means that invariant broke — a metadata-layout or shim change — and
+///     is a bug report, not a traffic observation.
+///   - `L3_CTX_NONE_UNSPECIFIED_ADDR` is REACHABLE with ordinary (if unusual)
+///     packets: the shim stamps `flow_{src,dst}_addr` faithfully, so an IP
+///     header carrying `0.0.0.0`/`::` produces `None` from a fully parsed
+///     packet. A dst-unspecified packet dies at NoRoute, but a SRC-unspecified
+///     one with a valid destination routes normally. A non-zero value here is a
+///     traffic observation, and on the fragment-association arms it means an
+///     operator-configured control (`from is-fragment then discard`, the PBR
+///     `then { routing-instance X; discard; }` term) was not evaluated.
+///
+/// Cumulative and process-global, like `INTERFACE_SNAT_PAT_COLLISIONS`, so tests
+/// read them as a delta.
+///
+/// These COUNT; they do not change disposition. The callers still forward, and
+/// deliberately so: the same `if let Some(l3_flow)` gate exists on the
+/// association-HIT arm, the session-MISS arm and the MissingNeighbor policy arm,
+/// and the hit/miss pair carries an explicit invariant that they must not
+/// diverge on what the filter sees. Making one arm discard would break that
+/// invariant while leaving the bypass reachable through the others. The
+/// disposition question is tracked separately in #7890 (which covers all three
+/// sites — the hit arm, the miss arm, and the MissingNeighbor policy arm — since
+/// changing one alone would break the stated hit/miss parity invariant while
+/// leaving the bypass reachable through the others). This counter exists so the
+/// seam cannot be silently widened by a future metadata change.
+pub(in crate::afxdp) static L3_CTX_NONE_UNKNOWN_FAMILY: AtomicU64 = AtomicU64::new(0);
+
+/// See `L3_CTX_NONE_UNKNOWN_FAMILY`. This is the leg that is reachable in
+/// production (#7055).
+pub(in crate::afxdp) static L3_CTX_NONE_UNSPECIFIED_ADDR: AtomicU64 = AtomicU64::new(0);
+
 pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Option<SessionFlow> {
     let (src_ip, dst_ip) = match meta.addr_family as i32 {
         libc::AF_INET => {
@@ -1632,9 +1675,17 @@ pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Opti
             IpAddr::V6(Ipv6Addr::from(meta.flow_src_addr)),
             IpAddr::V6(Ipv6Addr::from(meta.flow_dst_addr)),
         ),
-        _ => return None,
+        _ => {
+            // #7055: the UNREACHABLE leg — see the counter's doc block.
+            L3_CTX_NONE_UNKNOWN_FAMILY.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     };
     if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+        // #7055: the REACHABLE leg — an IP header carrying 0.0.0.0/:: from a
+        // fully parsed packet. On the fragment-association arms this is an
+        // operator-configured filter term not being evaluated.
+        L3_CTX_NONE_UNSPECIFIED_ADDR.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     Some(SessionFlow {
