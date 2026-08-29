@@ -2671,6 +2671,15 @@ operator-facing table.
   or a negative ack all proceed with the takeover, each recorded to
   `EventFence` with its reason. `SendFenceAwait` returns immediately when there
   is no active connection, so the ordinary dead-peer takeover pays nothing.
+- **It REDUCES the split-brain window; it does not eliminate it.** The residual
+  is a partition where the sync socket is live but blackholed — TCP has not
+  timed out, so the fence is written and no ack returns, and after the bound
+  this node takes over while the peer may still be forwarding. Failing CLOSED
+  instead would be worse for an appliance (a partition that never resolves
+  leaves nobody forwarding), so this is a deliberate trade. The policy NAME
+  overclaims; `docs/ha-failover-status.md` states the residual, and the
+  `EventFence` line is the only surface that distinguishes a confirmed fence
+  from a fail-open — the configured action renders identically either way.
 
 DHCP-server (Kea) leases ride the SAME session-sync channel and follow the
 IPsec-SA-sync precedent (`QueueIPsecSA` / `peerIPsecSAs` /

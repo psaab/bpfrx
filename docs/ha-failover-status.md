@@ -547,6 +547,54 @@ A `Confirmations: received N, timed out N, sent to peer N` line accompanies
 it is the only place that number appears, since `Fences sent` counts a
 confirmed and an unconfirmed takeover identically.
 
+### What `disable-rg-confirmed` does NOT give you
+
+**It reduces the split-brain window. It does not eliminate it, and the policy
+name overclaims slightly — read this section, not the name.**
+
+The residual is a partition in which the sync socket is LIVE BUT BLACKHOLED:
+packets are being dropped, TCP has not yet timed out, so the connection is not
+nil and the fence is written successfully, but no ack can come back. After
+`FenceConfirmTimeout` this node takes over anyway while the peer may still be
+alive and still forwarding. That is split-brain, and it is exactly the scenario
+a fence exists to prevent.
+
+**This is a deliberate trade, not an oversight.** The alternative — failing
+CLOSED, refusing to take over without a confirmation — has the worse failure
+mode for an appliance: a partition that never resolves leaves NOBODY
+forwarding, and an HA pair that will not fail over has lost the property it
+exists for. A bounded delay plus a smaller split-brain window is the trade on
+offer here; a guarantee is not.
+
+So an operator selecting this mode is buying:
+
+- **confirmation when confirmation was available** — which is the common case,
+  because the ack only has to arrive when the socket is genuinely healthy, and
+  there a fabric round trip is milliseconds; and
+- **ordering** in that case: this node does not claim the groups until the peer
+  says it released them.
+
+They are NOT buying "the peer is always confirmed down before I take over".
+
+### Telling a confirmed fence from a fail-open — the event line is the only way
+
+**The config knob cannot express the difference.** `Action: disable-rg-confirmed`
+renders identically whether every takeover was confirmed or every one of them
+fell open, so an operator reading only the configured action will assume the
+stronger property. The `EventFence` attempt line is the discriminator, and it
+is the ONLY one:
+
+| Attempt line | What actually happened |
+|---|---|
+| `Fence confirmed by peer (peer disabled N/N redundancy groups)` | The guarantee held. The peer acknowledged relinquishing every RG before this node claimed them. |
+| `Fence unconfirmed, took over anyway: <reason>` | **No confirmation.** Takeover proceeded regardless. The reason names which path — not connected, peer predates #7147, disconnected mid-wait, or timed out. |
+| `Fence NOT confirmed (<detail>), took over anyway` | The peer ANSWERED but reported it had not fully complied (partial, or no dataplane). |
+
+The `Confirmations: received N, timed out N, sent to peer N` line summarises the
+same thing in aggregate; `timed out` is the count of takeovers that proceeded
+without the guarantee. Neither `Fences sent` nor the configured action
+distinguishes them, which is why both surfaces exist.
+
 **Mixed-version clusters are safe and need no coordinated upgrade.** Both wire
 changes are additive: `syncMsgFenceAck` is a new type that an old peer skips
 via the receive switch's missing `default` arm, and the fence sequence is
