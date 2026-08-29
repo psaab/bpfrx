@@ -790,7 +790,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 #[inline(never)]
 fn classify_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket) -> u8 {
     let gre_offset = outer.l4_offset as usize;
-    let Some(gre) = read_bytes(data, data_end, gre_offset, 4) else {
+    let Some(gre) = (unsafe { read_bytes(data, data_end, gre_offset, 4) }) else {
         return 0;
     };
     if gre[0] != 0 || gre[1] != 0 {
@@ -809,7 +809,7 @@ fn classify_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket)
 
 #[inline(never)]
 fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize) -> u8 {
-    let Some(iph) = read_bytes(data, data_end, l3_offset, 20) else {
+    let Some(iph) = (unsafe { read_bytes(data, data_end, l3_offset, 20) }) else {
         return 0;
     };
     let version_ihl = iph[0];
@@ -820,7 +820,7 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     if ihl < 20 {
         return 0;
     }
-    if read_bytes(data, data_end, l3_offset, ihl).is_none() {
+    if unsafe { read_bytes(data, data_end, l3_offset, ihl) }.is_none() {
         return 0;
     }
     let protocol = iph[9];
@@ -844,21 +844,21 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     let mut icmp_type = 0u8;
     match protocol {
         PROTO_TCP => {
-            let Some(tcp) = read_bytes(data, data_end, l4_offset, 14) else {
+            let Some(tcp) = (unsafe { read_bytes(data, data_end, l4_offset, 14) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
             key.dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
         }
         PROTO_UDP => {
-            let Some(udp) = read_bytes(data, data_end, l4_offset, 8) else {
+            let Some(udp) = (unsafe { read_bytes(data, data_end, l4_offset, 8) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([udp[0], udp[1]]);
             key.dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         }
         PROTO_ICMP => {
-            let Some(icmp) = read_bytes(data, data_end, l4_offset, 8) else {
+            let Some(icmp) = (unsafe { read_bytes(data, data_end, l4_offset, 8) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
@@ -947,7 +947,7 @@ fn dnat_lookup_v6(protocol: u8, dst_ip: &[u8; 16], dst_port: u16) -> Option<Dnat
 
 #[inline(never)]
 fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize) -> u8 {
-    let Some(ip6) = read_bytes(data, data_end, l3_offset, 40) else {
+    let Some(ip6) = (unsafe { read_bytes(data, data_end, l3_offset, 40) }) else {
         return 0;
     };
     if (ip6[0] >> 4) != 6 {
@@ -991,21 +991,21 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
     let mut icmp_type = 0u8;
     match protocol {
         PROTO_TCP => {
-            let Some(tcp) = read_bytes(data, data_end, l4_offset, 14) else {
+            let Some(tcp) = (unsafe { read_bytes(data, data_end, l4_offset, 14) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
             key.dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
         }
         PROTO_UDP => {
-            let Some(udp) = read_bytes(data, data_end, l4_offset, 8) else {
+            let Some(udp) = (unsafe { read_bytes(data, data_end, l4_offset, 8) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([udp[0], udp[1]]);
             key.dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         }
         PROTO_ICMPV6 => {
-            let Some(icmp) = read_bytes(data, data_end, l4_offset, 8) else {
+            let Some(icmp) = (unsafe { read_bytes(data, data_end, l4_offset, 8) }) else {
                 return 0;
             };
             key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
@@ -1224,7 +1224,7 @@ struct ParsedPacket {
 }
 
 fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u8, bool, u16)> {
-    let eth = read_bytes(data, data_end, 0, 14)?;
+    let eth = unsafe { read_bytes(data, data_end, 0, 14) }?;
     let mut eth_proto = u16::from_be_bytes([eth[12], eth[13]]);
     let mut l3_offset = mem::size_of::<EthHdr>() as u16;
     let mut vlan_id = 0u16;
@@ -1232,7 +1232,7 @@ fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u8, bool, u16)> {
     let mut vlan_present = false;
 
     if eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD {
-        let vlan = read_bytes(data, data_end, l3_offset as usize, 4)?;
+        let vlan = unsafe { read_bytes(data, data_end, l3_offset as usize, 4) }?;
         let tci = u16::from_be_bytes([vlan[0], vlan[1]]);
         vlan_id = tci & 0x0fff;
         vlan_pcp = ((tci >> 13) & 0x07) as u8;
@@ -1253,7 +1253,7 @@ fn parse_ipv4(
     vlan_present: bool,
     l3_offset: u16,
 ) -> Option<ParsedPacket> {
-    let iph = read_bytes(data, data_end, l3_offset as usize, 20)?;
+    let iph = unsafe { read_bytes(data, data_end, l3_offset as usize, 20) }?;
     let version_ihl = iph[0];
     if (version_ihl >> 4) != 4 {
         return None;
@@ -1262,14 +1262,14 @@ fn parse_ipv4(
     if ihl < 20 {
         return None;
     }
-    read_bytes(data, data_end, l3_offset as usize, ihl)?;
+    unsafe { read_bytes(data, data_end, l3_offset as usize, ihl) }?;
     let protocol = iph[9];
     let tos = iph[1];
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
         parse_l4(data, data_end, l4_offset, protocol)?;
-    let src_bytes = read_bytes(data, data_end, l3_offset as usize + 12, 4)?;
-    let dst_bytes = read_bytes(data, data_end, l3_offset as usize + 16, 4)?;
+    let src_bytes = unsafe { read_bytes(data, data_end, l3_offset as usize + 12, 4) }?;
+    let dst_bytes = unsafe { read_bytes(data, data_end, l3_offset as usize + 16, 4) }?;
     let mut src_addr = [0u8; 16];
     src_addr[..4].copy_from_slice(src_bytes);
     let mut dst_addr = [0u8; 16];
@@ -1303,7 +1303,7 @@ fn parse_ipv6(
     vlan_present: bool,
     l3_offset: u16,
 ) -> Option<ParsedPacket> {
-    let ip6 = read_bytes(data, data_end, l3_offset as usize, 40)?;
+    let ip6 = unsafe { read_bytes(data, data_end, l3_offset as usize, 40) }?;
     let version_priority = ip6[0];
     if (version_priority >> 4) != 6 {
         return None;
@@ -1336,9 +1336,9 @@ fn parse_ipv6(
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =
         parse_l4(data, data_end, offset, protocol)?;
     let mut src_addr = [0u8; 16];
-    src_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 8, 16)?);
+    src_addr.copy_from_slice(unsafe { read_bytes(data, data_end, l3_offset as usize + 8, 16) }?);
     let mut dst_addr = [0u8; 16];
-    dst_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
+    dst_addr.copy_from_slice(unsafe { read_bytes(data, data_end, l3_offset as usize + 24, 16) }?);
     Some(ParsedPacket {
         vlan_id,
         vlan_pcp,
@@ -1510,12 +1510,12 @@ fn parse_l4(
 ) -> Option<(u16, u8, u16, u16, u8)> {
     match protocol {
         PROTO_TCP => {
-            let bytes = read_bytes(data, data_end, l4_offset as usize, 14)?;
+            let bytes = unsafe { read_bytes(data, data_end, l4_offset as usize, 14) }?;
             let data_offset = ((bytes[12] >> 4) as u16) * 4;
             if data_offset < 20 {
                 return None;
             }
-            read_bytes(data, data_end, l4_offset as usize, data_offset as usize)?;
+            unsafe { read_bytes(data, data_end, l4_offset as usize, data_offset as usize) }?;
             Some((
                 l4_offset.checked_add(data_offset)?,
                 bytes[13],
@@ -1525,7 +1525,7 @@ fn parse_l4(
             ))
         }
         PROTO_UDP => {
-            let bytes = read_bytes(data, data_end, l4_offset as usize, 8)?;
+            let bytes = unsafe { read_bytes(data, data_end, l4_offset as usize, 8) }?;
             Some((
                 l4_offset.checked_add(8)?,
                 0,
@@ -1535,7 +1535,7 @@ fn parse_l4(
             ))
         }
         PROTO_ICMP | PROTO_ICMPV6 => {
-            let bytes = read_bytes(data, data_end, l4_offset as usize, 8)?;
+            let bytes = unsafe { read_bytes(data, data_end, l4_offset as usize, 8) }?;
             Some((
                 l4_offset.checked_add(8)?,
                 0,
