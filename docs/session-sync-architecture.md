@@ -308,12 +308,27 @@ no encoder version has ever omitted them — so a payload that stops before them
 is malformed, not old. Before #7175 the decoder accepted one anyway, returning
 `ok=true` with every one of those fields left at **zero**.
 
-Zero is not "missing" here, it is a *value the standby forwards against*, and
-zone id 0 against zone id 0 is matched by a `from-zone any to-zone any permit`
-rule with no zone guard (#6682). So a truncated frame did not degrade to "no
-session" — it seeded one that a wildcard rule affirmatively permits, carrying no
-NAT and no policy attribution, which became live forwarding state on the next
-failover. The precondition is a malformed frame no legitimate encoder emits
+Zero is not "missing" here — these are *values the standby installs and carries*,
+and they become live forwarding state on the next failover. A decoder must not
+report success for input it did not decode.
+
+> **Correction.** An earlier version of this section claimed that zone id 0
+> against zone id 0 is matched by a `from-zone any to-zone any permit` rule with
+> no zone guard, citing #6682. That was the **problem statement of a closed
+> issue**, not current behaviour. **Two** mechanisms make it false: #3110 fenced
+> every rule tier against zone 0 — `policy.rs` records that the rule-tier block
+> "is skipped entirely when either zone id is 0, which correctly stops every rule
+> tier — zone-pair, from-any, to-any, both-any and junos-global — from matching"
+> — and #6682 then made an unzoned **ingress** an explicit deny. A zero zone pair
+> does **not** reach a wildcard permit.
+>
+> The corrected version was already recorded in this repo, at
+> `compiler_wireguard_plaintext_warn_5618_test.go`, before the superseded claim
+> was written here.
+>
+> The decode contract does not depend on that claim and is unchanged. What a
+> zero-zone session does downstream once installed is **not** established here
+> and should be measured rather than asserted. The precondition is a malformed frame no legitimate encoder emits
 (fabric corruption, a version-skewed or buggy peer, a compromised peer), which is
 narrow — and is exactly the case where fail-open decoding is worst, because the
 receiving node has no other check.

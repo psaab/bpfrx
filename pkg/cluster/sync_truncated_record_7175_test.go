@@ -11,13 +11,26 @@ import (
 // #7175: a truncated-but-framed session-sync record must not decode ok=true
 // with its policy/zone/NAT fields left at zero.
 //
-// WHY ZERO IS NOT "MISSING". A zeroed PolicyID and zone ids are not absent
-// values, they are VALUES the standby forwards against, and zone id 0 against
-// zone id 0 is matched by a `from-zone any to-zone any permit` rule with no zone
-// guard (#6682). So the pre-fix behaviour did not degrade a truncated frame to
-// "no session" — it seeded one that a wildcard rule affirmatively permits,
-// carrying no NAT and no policy attribution, which became live forwarding state
-// on the next failover.
+// WHY ZERO IS NOT "MISSING". A zeroed SessionID, PolicyID, zone pair and NAT
+// tuple are not absent values — they are VALUES the standby installs and
+// carries, and they become live forwarding state on the next failover.
+//
+// CORRECTION to the original #7175 rationale: this said zone id 0 against zone
+// id 0 is matched by a `from-zone any to-zone any permit` rule with no zone
+// guard, citing #6682. That was the PROBLEM STATEMENT of a CLOSED issue, not
+// current behaviour. Two mechanisms make it false: #3110 fenced every rule
+// tier against zone 0, so a wildcard never reaches a zero pair, and #6682 then
+// made an unzoned INGRESS an explicit deny. The corrected version was ALREADY
+// written in this repo — compiler_wireguard_plaintext_warn_5618_test.go says
+// the older claim "was wrong" — before I asserted the superseded one.
+//
+// The assertions below are unchanged and still correct, because they never
+// depended on that claim: they assert that no ACCEPTED prefix may carry zeroed
+// forwarding fields, which is a property of the decoder. A decoder must not
+// report success for input it did not decode. What is deliberately NOT asserted
+// here is any downstream consequence of an installed zero-zone session — that
+// would need measuring, and asserting it unmeasured is how the original error
+// got in.
 //
 // WHY A FULL PREFIX SWEEP RATHER THAN A FEW BOUNDARY CASES. The property is not
 // "these particular lengths are rejected", it is "no accepted length yields
@@ -71,8 +84,8 @@ func TestTruncatedV4RecordNeverDecodesWithZeroedForwardingFields7175(t *testing.
 				"record must not be accepted with a zeroed policy id (#7175)", n, got.PolicyID, val.PolicyID)
 		}
 		if got.IngressZone != val.IngressZone || got.EgressZone != val.EgressZone {
-			t.Fatalf("prefix of %d bytes decoded ok=true with zones (%d,%d), want (%d,%d) — zone id 0 "+
-				"is matched by a from-zone any to-zone any permit rule with no zone guard (#6682)",
+			t.Fatalf("prefix of %d bytes decoded ok=true with zones (%d,%d), want (%d,%d) — a "+
+				"decoder must not report success for a record whose zone identity it never read",
 				n, got.IngressZone, got.EgressZone, val.IngressZone, val.EgressZone)
 		}
 		if got.NATSrcIP != val.NATSrcIP || got.NATDstIP != val.NATDstIP ||

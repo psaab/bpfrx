@@ -427,12 +427,31 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 	// — the values the session MEANS — and no encoder version has ever omitted
 	// them (every length-gated extension sits after the counters block; see
 	// encodeSessionV4Payload). Accepting a short read here returned ok=true with
-	// all of them left at ZERO, and zero is not "missing": zone id 0 against
-	// zone id 0 is matched by a `from-zone any to-zone any permit` rule with no
-	// zone guard (#6682). So a truncated frame did not degrade to "no session" —
-	// it seeded one a wildcard rule affirmatively permits, carrying no NAT and
-	// no policy attribution, which became live forwarding state on the next
-	// failover.
+	// all of them left at ZERO, and zero is not "missing": these are values the
+	// standby installs and carries, and they become live forwarding state on the
+	// next failover.
+	//
+	// CORRECTION (was wrong in the original #7175 comment): this used to cite
+	// #6682 for the claim that zone id 0 against zone id 0 is matched by a
+	// `from-zone any to-zone any permit` rule with no zone guard. TWO mechanisms make it false, and both
+	// predate #7175: #3110 fenced every rule tier against zone 0, so a wildcard
+	// never reaches a zero pair in the first place, and #6682 then made an unzoned
+	// INGRESS an explicit deny before the implicit default. `policy.rs`'s own
+	// comment records the first — the rule-tier block "is skipped entirely when
+	// either zone id is 0, which correctly stops every rule tier ... from
+	// matching". The claim I cited was the PROBLEM STATEMENT of a closed issue.
+	//
+	// The corrected version was already written down in this repo, at
+	// compiler_wireguard_plaintext_warn_5618_test.go, before I asserted the
+	// superseded one.
+	//
+	// The fix stands on its own terms without it: a decoder must not report
+	// success for input it did not decode, and installing a session whose
+	// identity, policy attribution and NAT translation are all fabricated zeros
+	// is wrong state regardless of what any one downstream consumer then does
+	// with it. What is NOT established — and must not be asserted without
+	// measuring — is whether an installed zero-zone session's subsequent packets
+	// re-enter policy evaluation at all or take a session fast path.
 	if off+48 > len(payload) {
 		return key, val, false
 	}
