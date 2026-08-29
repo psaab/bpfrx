@@ -3776,11 +3776,38 @@ pub(super) fn poll_binding_process_descriptor(
                     // fragment counter.
                     //
                     // The destination comes from the FRAME, not from `l3_ctx`.
-                    // `l3_ctx` is built from `meta.flow_{src,dst}_addr`, which
-                    // the shim stamps but a flowless packet need not carry — it
-                    // is `None` for exactly the meta-less fragments this gate
-                    // exists to stop, so gating on it would have left the leak
-                    // open on the majority of them. Placed after the transit
+                    // The reason is that the frame is the packet's own header
+                    // and does not depend on the flow-address stamp — NOT, as
+                    // this comment previously claimed, that `l3_ctx` is `None`
+                    // "for exactly the meta-less fragments this gate exists to
+                    // stop". That claim was wrong, and wrong in a way that would
+                    // have made the Element-2 guard ~500 lines above inert on
+                    // most real fragments if it had been true (#7055).
+                    //
+                    // Measured. `l3_session_flow_from_meta` returns `None` on
+                    // exactly two legs, and they differ:
+                    //
+                    //   - A non-v4/v6 `addr_family`: UNREACHABLE here. The shim
+                    //     writes `addr_family: parsed.addr_family` and `parsed`
+                    //     only ever comes from `parse_ipv4`/`parse_ipv6`, which
+                    //     hard-code AF_INET/AF_INET6; a packet whose parse fails
+                    //     never receives metadata at all.
+                    //   - An unspecified source or destination: REACHABLE, and
+                    //     nothing upstream drops it. The shim stamps
+                    //     `flow_{src,dst}_addr` faithfully from the IP header,
+                    //     so a header carrying `0.0.0.0`/`::` yields `None` from
+                    //     a fully-parsed packet. A dst-unspecified packet dies
+                    //     at NoRoute, but a SRC-unspecified one with a valid
+                    //     destination routes normally: `is_martian_dst` only
+                    //     sub-classifies an already-decided NoRoute, and the
+                    //     `addr_class` source predicates gate ICMP-error
+                    //     generation and neighbour learning, not transit.
+                    //
+                    // So a fragment IS normally `Some` — the shim stamps the
+                    // addresses for every packet that got this far — but "the
+                    // field is stamped" does not imply "the value is usable",
+                    // which is the step both the old comment and the issue that
+                    // corrected it skipped. Placed after the transit
                     // policy block (not inside it) for the same reason, and
                     // scoped to ForwardCandidate: NoRoute/MissingNeighbor/
                     // HAInactive/LocalDelivery have their own arms and none of
