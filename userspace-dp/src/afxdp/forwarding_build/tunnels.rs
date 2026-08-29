@@ -313,6 +313,7 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
             }
         }
         let mut endpoint: Option<SocketAddr> = None;
+        let mut endpoint_host: Option<String> = None;
         if !wire.wg_endpoint.is_empty() {
             // A non-empty endpoint that does not parse to a concrete
             // SocketAddr must fail the ROW closed rather than silently
@@ -322,13 +323,29 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
             // degradation the Go commit gate now rejects; the dataplane
             // keeps defense-in-depth in agreement so a leniently-loaded
             // config fails loudly (drop) instead of quietly.
-            let Ok(parsed) = wire.wg_endpoint.parse::<SocketAddr>() else {
-                return None;
-            };
-            // Canonicalize (unmap ::ffff:a.b.c.d) so a configured
-            // v4-mapped literal gets the same logical-v4 treatment as a
-            // learned endpoint (#1736).
-            endpoint = Some(crate::afxdp::wg::canonicalize_endpoint(parsed));
+            match classify_wg_endpoint(&wire.wg_endpoint) {
+                WgEndpointForm::Literal(addr) => {
+                    // Canonicalize (unmap ::ffff:a.b.c.d) so a configured
+                    // v4-mapped literal gets the same logical-v4 treatment as
+                    // a learned endpoint (#1736).
+                    endpoint = Some(crate::afxdp::wg::canonicalize_endpoint(addr));
+                }
+                // #7158: a well-formed `host:port` with a DNS hostname is now
+                // ACCEPTED and resolved by the tunnel's endpoint resolver; the
+                // peer starts endpoint-less (exactly the learn-only/roaming
+                // state) until an answer arrives.
+                //
+                // The #5182 invariant is preserved, restated at the time of
+                // USE: an accepted endpoint becomes a real SocketAddr with the
+                // authored port before the peer initiates.
+                WgEndpointForm::Hostname => {
+                    endpoint_host = Some(wire.wg_endpoint.clone());
+                }
+                // Neither a usable literal nor a resolvable-shaped host:port:
+                // drop the ROW rather than coercing the peer to
+                // responder-only.
+                WgEndpointForm::Invalid => return None,
+            }
         }
         // PSK is OPTIONAL: an empty hex hydrates to the all-zero key
         // (no PSK). A malformed non-empty PSK drops the row (fail
@@ -343,6 +360,7 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
         peers.push(WgRuntimePeer {
             pubkey: peer_pubkey,
             allowed_ips,
+            endpoint_host,
             endpoint,
             keepalive_secs: wire.wg_keepalive_secs,
             preshared_key,
@@ -376,5 +394,202 @@ fn hex_nibble(c: u8) -> Result<u8, ()> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         _ => Err(()),
+    }
+}
+
+/// #7158: how the dataplane reads one authored WireGuard peer endpoint.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WgEndpointForm {
+    /// A usable IP literal with a non-zero port.
+    Literal(SocketAddr),
+    /// A well-formed `host:port` whose host is a DNS name, to be resolved by
+    /// the tunnel's endpoint resolver.
+    Hostname,
+    /// Unusable: the peer row is dropped (fail closed).
+    Invalid,
+}
+
+/// The single endpoint decision, used by the hydrate AND by the cross-language
+/// agreement test. One function, so the test binds what production does rather
+/// than re-deriving it — a test that called `parse::<SocketAddr>()` itself
+/// would be testing the standard library and would have missed the zero-port
+/// hole below.
+pub(super) fn classify_wg_endpoint(s: &str) -> WgEndpointForm {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        // `parse::<SocketAddr>()` ACCEPTS port 0 — "1.2.3.4:0" parses fine.
+        // Both this hydrate and the Go commit gate documented that it "rejects
+        // a missing/zero port"; the missing-port half is true, the zero-port
+        // half never was. The strict commit gate does reject port 0, so this
+        // only ever mattered on the TOLERANT load path, which downgrades that
+        // check to a warning — precisely the path this fail-closed hydrate
+        // exists to backstop (#5182). A port-0 peer "can initiate" to nowhere.
+        //
+        // Found by the cross-language agreement test, which is the only thing
+        // that COMPARES the two gates rather than each restating its own
+        // belief about the other.
+        if addr.port() == 0 {
+            return WgEndpointForm::Invalid;
+        }
+        return WgEndpointForm::Literal(addr);
+    }
+    if wg_endpoint_hostname_shape_ok(s) {
+        return WgEndpointForm::Hostname;
+    }
+    WgEndpointForm::Invalid
+}
+
+/// Does `s` look like a `host:port` whose host is a DNS name the
+/// endpoint resolver could plausibly resolve?
+///
+/// This is the dataplane half of a two-sided agreement: `endpointFamily` /
+/// `isDNSHostname` in `pkg/config/compiler_validate_wireguard.go` decide the
+/// same question at commit. The two must accept the same set, or a config
+/// commits clean and then silently drops the peer row here — the exact
+/// silent-degradation shape #5182 hardened this hydrate against.
+///
+/// Syntax only, and deliberately no DNS: this runs on the config-apply path,
+/// where a blocking lookup would stall the apply.
+pub(super) fn wg_endpoint_hostname_shape_ok(s: &str) -> bool {
+    // Reject a bracketed form here: `[..]:port` is the IPv6 literal spelling,
+    // so if it did not parse as a SocketAddr above it is a malformed literal,
+    // not a hostname.
+    if s.starts_with('[') {
+        return false;
+    }
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    match port.parse::<u16>() {
+        Ok(p) if p >= 1 => {}
+        _ => return false,
+    }
+    wg_endpoint_host_is_dns_name(host)
+}
+
+/// RFC 1123 hostname syntax, mirroring `isDNSHostname` on the Go side.
+fn wg_endpoint_host_is_dns_name(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() {
+        return false;
+    }
+    // All-digits-and-dots is a malformed IP literal, not a name. Accepting it
+    // would defer a certain failure to the resolver.
+    if host.bytes().all(|c| c.is_ascii_digit() || c == b'.') {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    })
+}
+
+#[cfg(test)]
+mod wg_endpoint_shape_7158_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// #7158: the dataplane half of the cross-language agreement.
+    ///
+    /// Reads the SAME fixture as
+    /// `pkg/config`'s `TestWireguardEndpointShapeMatchesTheSharedFixture_7158`.
+    /// Two implementations decide which endpoint spellings are usable — the Go
+    /// commit gate and this hydrate — and they must accept the same set. An
+    /// endpoint Go accepts but this drops commits clean and then silently loses
+    /// the peer, which is the failure #5182 hardened the hydrate against.
+    ///
+    /// Binding both sides to one file is the point: two literal tables would
+    /// pass independently while disagreeing, which is exactly the bug.
+    #[test]
+    fn hydrate_accepts_the_same_endpoints_the_commit_gate_does_7158() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("test")
+            .join("fixtures")
+            .join("wg-endpoint-shape.txt");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "the shared #7158 agreement fixture must be readable at {}: {e}. \
+                 Without it this test silently checks nothing",
+                path.display()
+            )
+        });
+
+        let mut checked = 0usize;
+        for line in text.lines() {
+            let line = line.trim_end();
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let (endpoint, verdict) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("malformed fixture line {line:?}"));
+            checked += 1;
+
+            // Drive the PRODUCTION decision, not `parse` — see
+            // `classify_wg_endpoint`.
+            let form = classify_wg_endpoint(endpoint);
+            let literal = matches!(form, WgEndpointForm::Literal(_));
+            let hostname = form == WgEndpointForm::Hostname;
+            let accepted = literal || hostname;
+
+            match verdict {
+                "v4" | "v6" => {
+                    assert!(
+                        literal,
+                        "{endpoint:?}: the commit gate classifies this as an IP \
+                         literal of family {verdict}, but the hydrate cannot \
+                         parse it as a SocketAddr — the peer row would be dropped"
+                    );
+                    let WgEndpointForm::Literal(addr) = form else {
+                        unreachable!("checked literal above")
+                    };
+                    let want_v6 = verdict == "v6";
+                    assert_eq!(
+                        addr.is_ipv6(),
+                        want_v6,
+                        "{endpoint:?}: family disagreement between the commit \
+                         gate and the hydrate"
+                    );
+                }
+                "hostname" => {
+                    assert!(
+                        !literal,
+                        "{endpoint:?}: the fixture calls this a hostname but it \
+                         parses as a SocketAddr; the commit gate would classify \
+                         its family and constrain the mixed-family gate"
+                    );
+                    assert!(
+                        hostname,
+                        "{endpoint:?}: the commit gate ACCEPTS this as a DNS \
+                         hostname and the hydrate REJECTS it. That config commits \
+                         clean and then loses the peer with no diagnostic (#7158)"
+                    );
+                }
+                "reject" => {
+                    assert!(
+                        !accepted,
+                        "{endpoint:?}: the commit gate rejects this, but the \
+                         hydrate would accept it — a spelling the dataplane \
+                         honours and the operator cannot author"
+                    );
+                }
+                other => panic!("unknown verdict {other:?} in the shared fixture"),
+            }
+        }
+        // Non-vacuity: a fixture that failed to parse would leave every
+        // assertion above unrun and this test green.
+        assert!(
+            checked >= 20,
+            "only {checked} fixture cases were checked; the file is supposed to \
+             cover literals, hostnames, port rules and malformed hosts"
+        );
     }
 }

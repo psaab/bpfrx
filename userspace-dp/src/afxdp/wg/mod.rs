@@ -89,6 +89,7 @@ pub(crate) mod counters;
 // MAC2) is PR-B; the inbound type-3 arm stays drop-only here.
 pub(crate) mod cookie;
 pub(crate) mod dscp;
+pub(crate) mod endpoint_resolver;
 pub(crate) mod engine;
 pub(crate) mod framing;
 // WireGuard S1 (#1709): on-wire handshake-message framing (type 1/2,
