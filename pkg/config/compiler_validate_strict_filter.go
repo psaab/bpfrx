@@ -1827,3 +1827,103 @@ func ProtocolIsPortBearing(token string) bool {
 func FilterProtocolResolvable(token string) bool {
 	return filterProtocolResolvable(token)
 }
+
+// validateFirewallPrefixListEntriesStrict rejects a malformed entry inside a
+// `policy-options prefix-list` that a firewall filter term references.
+//
+// #7273, the residual of #6463. #6463 closed the partial-list narrowing on the
+// userspace filter wire by marking a term `AddressUnrepresentable` when it
+// carries a malformed address token — but that marker is derived from
+// `term.UnknownAddresses`, which is populated from LITERAL `from
+// source-address` / `destination-address` tokens only. A malformed entry
+// arriving by prefix-list REFERENCE has a different provenance and was covered
+// by neither half:
+//
+//   - validateFilterAddressLiteralsStrict (#3433) walks the literals.
+//   - validateFirewallPrefixListReferencesStrict checks the name RESOLVES, not
+//     that its entries PARSE.
+//
+// So nothing looked at PrefixList.Prefixes, the term's UnknownAddresses stayed
+// empty, `AddressUnrepresentable` stayed false, and the resolver contributed
+// only the entries that happened to parse. A filter term scoped to a list of
+// five prefixes, one of them a typo, silently narrowed to four — fail-open or
+// fail-closed depending on the action, and invisible either way.
+//
+// SCOPE IS DELIBERATELY THE REFERENCED LISTS, not every prefix-list. This gate
+// belongs to the firewall family, and a list used only by routing policy has
+// its own consumers and its own tolerance; rejecting a commit here for an entry
+// no filter reads would be a behaviour change to configs this issue is not
+// about. The routing-side equivalent is a separate question and deliberately
+// not answered here.
+//
+// Strict on commit / commit-check, lenient (warn) on load / peer-sync via the
+// caller's lenientFirewallRefs, mirroring the reference gate it sits beside.
+func validateFirewallPrefixListEntriesStrict(cfg *Config) error {
+	if cfg == nil || cfg.PolicyOptions.PrefixLists == nil {
+		return nil
+	}
+	// Collect the referenced names first so the error names the filter and term
+	// an operator has to edit, not merely the list.
+	type ref struct{ family, filter, term, leaf string }
+	referenced := map[string][]ref{}
+	note := func(family string, filters map[string]*FirewallFilter) {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				for _, r := range term.SourcePrefixLists {
+					referenced[r.Name] = append(referenced[r.Name],
+						ref{family, name, term.Name, "source-prefix-list"})
+				}
+				for _, r := range term.DestPrefixLists {
+					referenced[r.Name] = append(referenced[r.Name],
+						ref{family, name, term.Name, "destination-prefix-list"})
+				}
+			}
+		}
+	}
+	note("inet", cfg.Firewall.FiltersInet)
+	note("inet6", cfg.Firewall.FiltersInet6)
+
+	listNames := make([]string, 0, len(referenced))
+	for name := range referenced {
+		listNames = append(listNames, name)
+	}
+	sort.Strings(listNames)
+
+	for _, listName := range listNames {
+		pl := cfg.PolicyOptions.PrefixLists[listName]
+		if pl == nil {
+			// An unresolved reference is validateFirewallPrefixListReferencesStrict's
+			// error to report, not this one. Reporting it here too would make the
+			// same typo produce two different messages depending on gate order.
+			continue
+		}
+		for _, entry := range pl.Prefixes {
+			if entry == "" {
+				continue
+			}
+			if _, ok := classifyFilterAddrFamily(entry); ok {
+				continue
+			}
+			r := referenced[listName][0]
+			return fmt.Errorf(
+				"policy-options prefix-list %q contains malformed entry %q, and firewall "+
+					"family %s filter %q term %q references it as %s — the term's address "+
+					"scope would silently narrow to the entries that happen to parse "+
+					"(use a valid address or CIDR prefix)",
+				listName, entry, r.family, r.filter, r.term, r.leaf)
+		}
+	}
+	return nil
+}

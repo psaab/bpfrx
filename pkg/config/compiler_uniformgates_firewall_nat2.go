@@ -70,6 +70,21 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 		}
 	}
 
+	// #7273: the reference gate above proves the NAME resolves; this one proves
+	// its ENTRIES parse. Without it a filter term scoped to a referenced list
+	// silently narrows to the entries that happen to parse, because the
+	// #6463 AddressUnrepresentable marker is derived from literal tokens only
+	// and a prefix-list entry has a different provenance. Same strict/lenient
+	// split, so an already-persisted or peer-synced config still boots.
+	if err := validateFirewallPrefixListEntriesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall prefix-list entry (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #5456: firewall-filter term rule-expansion advisory. A term whose
 	// source×destination×dest-port×src-port cross-product (prefix-list prefixes
 	// folded into src/dst) exceeds MaxFilterTermExpansion is COMMITTED, not
