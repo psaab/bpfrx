@@ -156,7 +156,17 @@ func TestMarkerPathContainment(t *testing.T) {
 	provisionedUsersDir = "/var/lib/xpf/provisioned-users"
 	t.Cleanup(func() { provisionedUsersDir = old })
 
-	for _, name := range []string{"../../etc/shadow", "/etc/passwd", "a/b/c"} {
+	// The first three inputs all end in a real component, so Base(Clean(x))
+	// yields "shadow"/"passwd"/"c" and containment holds however it is
+	// implemented -- they cannot distinguish a correct implementation from
+	// a broken one. The names that clean to a bare traversal element are
+	// the ones that actually probe the property this test claims to
+	// verify: Base(Clean("..")) is "..", and Join(dir, "..") is dir's
+	// PARENT (#7171).
+	for _, name := range []string{
+		"../../etc/shadow", "/etc/passwd", "a/b/c",
+		"..", "../..", "a/../..", ".", "/",
+	} {
 		got := markerPath(name)
 		if dir := filepath.Dir(got); dir != provisionedUsersDir {
 			t.Errorf("markerPath(%q) = %q escaped %q", name, got, provisionedUsersDir)

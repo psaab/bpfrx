@@ -143,29 +143,16 @@ func (s *Server) clusterSession() ClusterSessionService {
 	return s.clusterSessionFn()
 }
 
-func queryInt(r *http.Request, key string, def int) int {
-	v := r.URL.Query().Get(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return def
-	}
-	return n
-}
-
-func queryUint16(r *http.Request, key string, def uint16) uint16 {
-	v := r.URL.Query().Get(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.ParseUint(v, 10, 16)
-	if err != nil {
-		return def
-	}
-	return uint16(n)
-}
+// The lenient queryInt/queryUint16 helpers that used to sit here are gone
+// (#7171). They had zero callers -- every REST handler was moved to the
+// FAILS-CLOSED queryIntStrict/queryUint16Strict variants below (#2934, #3443,
+// #4926) -- but they were left in place next to their strict replacements,
+// which is the failure mode: the two differ only by a suffix, the lenient one
+// silently returns the caller's default on a malformed value, and that default
+// is routinely a filter sentinel meaning "no filter". A future handler picking
+// the shorter name by reflex would reintroduce exactly the cross-zone
+// observability widening those three issues each closed by hand. Deleting them
+// makes the wrong choice unavailable rather than merely discouraged.
 
 // queryUint16Strict parses a uint16 query parameter and FAILS CLOSED on a
 // malformed/out-of-range non-empty value. Filter sentinels such as

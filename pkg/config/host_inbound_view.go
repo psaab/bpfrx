@@ -43,10 +43,21 @@ func UnionHostInboundTokens(zone, iface []string) []string {
 	add := func(src []string) {
 		for _, t := range src {
 			t = strings.TrimSpace(t)
-			if t == "" || seen[t] {
+			// Dedup on the CASE-FOLDED token, append the AUTHORED one
+			// (#7171). Keying on the raw token made `ssh` and `SSH`
+			// two distinct members, so a zone and an interface (or two
+			// repeated host-inbound-traffic blocks) spelling one service
+			// differently rendered it TWICE. Every membership predicate
+			// downstream is case-insensitive, so both spellings resolve to
+			// the same admission -- the duplicate exists only in the
+			// display, which is precisely where this function's output
+			// goes. Folding the KEY without folding the VALUE keeps the
+			// authored case this function documents itself as preserving.
+			k := strings.ToLower(t)
+			if t == "" || seen[k] {
 				continue
 			}
-			seen[t] = true
+			seen[k] = true
 			out = append(out, t)
 		}
 	}
