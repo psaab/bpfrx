@@ -1,8 +1,6 @@
 package config
 
-import (
-	"strings"
-)
+import ()
 
 // compiler_ipsec_plaintext_warn.go carries the #5619 commit-time WARNING that
 // a route-based IPsec VPN's decrypted plaintext is not zone-adjudicated.
@@ -10,9 +8,10 @@ import (
 // The defect it makes visible: route-based IPsec decrypts in the KERNEL XFRM
 // stack, which delivers the plaintext on the xfrmi netdev. xpf's userspace
 // dataplane does not adjudicate that interface — it is excluded from the
-// ingress-adjudication map and the AF_XDP binding plan
-// (userspaceSkipsIngressInterface / include_userspace_binding_interface, both
-// keyed off IsSecureTunnelIfName) because there is no path to hand a plaintext
+// ingress-adjudication map (userspaceSkipsIngressInterface, which reads the
+// snapshot's SecureTunnel flag; #6691 round 5 stopped it calling
+// IsSecureTunnelIfName, and the Rust mirror is_secure_tunnel_ifname was
+// deleted rather than re-derived) because there is no path to hand a plaintext
 // frame back INTO an xfrmi for the egress direction. xpf installs only
 // `hook input` nftables chains and force-enables ip_forward, so the plaintext
 // is forwarded by the kernel with no zone policy, no session, no NAT and no
@@ -74,11 +73,29 @@ import (
 // posture — which is worse than an unimplemented feature, and is what this
 // warning corrects.
 //
-// Coupling. The warning keys off the SAME predicate as the dataplane exclusion
-// (IsSecureTunnelIfName), so the two cannot drift apart into a state where the
-// dataplane adjudicates the tunnel while the warning still claims it does not,
-// or vice versa. When the dataplane learns to own an xfrmi end-to-end, the
-// exclusion arms and this warning are keyed off one name and go together.
+// Coupling, restated in #7090 because the old wording named a mechanism that
+// no longer exists. It said the warning keys off the SAME predicate as the
+// dataplane exclusion (IsSecureTunnelIfName) "so the two cannot drift". That
+// stopped being true in #6691 round 5: the exclusion now runs
+// userspaceSkipsIngressInterface -> userspaceUnbindableNetdev -> the
+// SecureTunnel class -> matchesSecureTunnelClass -> iface.SecureTunnel, which
+// the snapshot builder sets from snapshotSecureTunnel (config ownership via
+// SecureTunnelNetdevForRef, UNION a live xfrm device). xfrmi.go says it
+// outright: IsSecureTunnelIfName "is NOT the ownership test and no longer
+// gates any dataplane set".
+//
+// What actually keeps the two populations coincident is the if_id, not a
+// shared predicate: pkg/routing/xfrm.go creates an xfrmi for exactly
+// vpn.BindInterface via XFRMIfNameAndID and skips ifID == 0, and the
+// dataplane's ownership join reaches the same devices through that id. So the
+// conclusion the old comment drew still holds — it was the stated reason that
+// had gone stale, which is the more dangerous half, because a later reader
+// relies on the reason instead of re-deriving it.
+//
+// This is a coincidence of populations, NOT a mechanical binding. If a real
+// anti-drift guard is wanted it has to be a test asserting the two populations
+// agree; it cannot live here, because snapshotSecureTunnel is unexported in
+// pkg/dataplane/userspace.
 //
 // An AST pre-walk (like validateSecureTunnelBindInterfaceAST) rather than a
 // typed-Config pass, so it runs on the group-expanded, inactive-pruned tree in
@@ -115,20 +132,16 @@ func warnSecureTunnelPlaintextUnadjudicatedAST(nodes []*Node) []string {
 				if ifID == 0 {
 					continue
 				}
-				// Split the unit suffix off exactly as XFRMIfNameAndID does,
-				// so the predicate below sees the same base name the device
-				// derivation does.
-				base := bindIface
-				if i := strings.IndexByte(base, '.'); i >= 0 {
-					base = base[:i]
-				}
-				// Keyed off the SAME predicate as the dataplane exclusion, so
-				// the warning and the behaviour it describes cannot drift.
-				// Today every valid secure tunnel is non-adjudicable; this
-				// stays correct if that ever becomes conditional.
-				if !IsSecureTunnelIfName(base) {
-					continue
-				}
+				// #7090: there is deliberately no IsSecureTunnelIfName check
+				// here. It used to follow, justified as keying the advisory off
+				// the same predicate as the dataplane exclusion — but it could
+				// not fire for any input, because a non-zero ifID ALREADY
+				// implies it: XFRMIfNameAndID returns non-zero only after
+				// secureTunnelIndex succeeds on the base name, and
+				// IsSecureTunnelIfName IS secureTunnelIndex on that same base.
+				// TestNonZeroIfIDImpliesSecureTunnelName_7090 binds the
+				// implication, so if that ever stops holding this population
+				// widens and the test says so.
 				key := inst.name + "\x00" + bindIface
 				if _, dup := seen[key]; dup {
 					continue

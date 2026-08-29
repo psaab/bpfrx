@@ -1129,9 +1129,16 @@ their security posture, which is worse than an unimplemented feature.
 
 Two wordings, on purpose: a ZONED tunnel reads as an escalation, because a
 specific untrue thing was asserted; an unzoned tunnel gets a plain statement of
-the gap. The advisory keys off the SAME predicate as the dataplane exclusion
-(`IsSecureTunnelIfName`), so the two cannot drift into a state where the
-dataplane adjudicates the tunnel while the warning still says it does not. It
+the gap. The advisory's population is the set of `bind-interface` refs for which
+`XFRMIfNameAndID` builds a device (a non-zero if_id) — the same set
+`pkg/routing/xfrm.go` creates xfrmis for, since it skips `ifID == 0`. It does
+NOT key off `IsSecureTunnelIfName`, and saying so was a stale claim corrected in
+#7090: since #6691 round 5 the dataplane exclusion reads the snapshot's
+`SecureTunnel` flag (`snapshotSecureTunnel`), and `xfrmi.go` states that the
+predicate "is NOT the ownership test and no longer gates any dataplane set". The
+two populations still coincide, but through the shared if_id rather than a
+shared call — a coincidence, not a mechanical binding, and a real anti-drift
+guard would have to be a test asserting the populations agree. It
 fires on all four compile entry points — strict, lenient, and both node-aware
 variants — because the operator who most needs it is the one whose config
 arrives by restart or peer-sync and who never re-commits.
