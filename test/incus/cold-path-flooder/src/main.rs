@@ -1046,6 +1046,11 @@ struct WorkerCtx {
     /// store per worker), read by main at summary time to subtract
     /// warmup work from final tx_packets. (CODEX code-r1 finding 2.)
     warmup_baseline: Arc<AtomicU64>,
+    // #7174 C15: the BATCH baseline, captured at the same instant as the packet
+    // one. Without it tx_packets was warmup-subtracted while tx_batches stayed
+    // cumulative-since-start IN THE SAME RECORD, so packets-per-batch derived
+    // from that record was wrong and nothing in it said so.
+    warmup_baseline_batches: Arc<AtomicU64>,
 }
 
 /// Total number of unique 5-tuples a run can generate, given the span
@@ -1145,8 +1150,14 @@ fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
         // subtract warmup work from the final summary. (CODEX code-r1
         // finding 2.) One store per worker.
         if !warmup_baseline_published && now >= ctx.warmup_end {
+            // #7174 C15: both baselines at ONE instant. Reading them at
+            // different times would reintroduce the mismatch this fixes, in a
+            // smaller and harder-to-see form.
             let baseline = ctx.stats.tx_packets.load(Ordering::Relaxed);
+            let baseline_batches = ctx.stats.tx_batches.load(Ordering::Relaxed);
             ctx.warmup_baseline.store(baseline, Ordering::Relaxed);
+            ctx.warmup_baseline_batches
+                .store(baseline_batches, Ordering::Relaxed);
             warmup_baseline_published = true;
         }
 
@@ -1343,6 +1354,8 @@ fn run_multi_threaded(
     // observed yet; worker writes its baseline at warmup-end).
     let warmup_baselines: Vec<Arc<AtomicU64>> =
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let warmup_baselines_batches: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     // Shared deadlines so every worker uses the same window.
     let start_at = Instant::now() + Duration::from_millis(50);
     let warmup_end = start_at + args.warmup;
@@ -1390,6 +1403,7 @@ fn run_multi_threaded(
             warmup_end,
             total_deadline,
             warmup_baseline: warmup_baselines[tid].clone(),
+            warmup_baseline_batches: warmup_baselines_batches[tid].clone(),
         };
         let args_owned = args.clone();
         // std::thread::Builder is mandatory (#1615 plan-v4 §3.9 +
@@ -1477,15 +1491,28 @@ fn run_multi_threaded(
     }
 
     // Collect per-thread snapshots and subtract warmup baselines so
-    // the reported tx_packets reflect only the run-phase work. (CODEX
-    // code-r1 finding 2.) The other counters (err_*) are NOT subtracted
-    // because warmup errors are a legitimate diagnostic signal — if
-    // EAGAIN was high during warmup it indicates the device backed up.
+    // the reported tx_packets AND tx_batches reflect only the run-phase
+    // work. (CODEX code-r1 finding 2; batches added by #7174 C15 — they
+    // are the denominator of packets-per-batch and must share the
+    // numerator's window.)
+    //
+    // The err_* counters are deliberately NOT subtracted, because warmup
+    // errors are a legitimate diagnostic signal — if EAGAIN was high during
+    // warmup it indicates the device backed up. That is a DIFFERENT window on
+    // purpose and is documented here so the record's mixed accounting is a
+    // stated choice rather than the silent one C15 found.
     let mut per_thread: Vec<RunStats> = Vec::with_capacity(stats_slots.len());
     for (i, s) in stats_slots.iter().enumerate() {
         let mut snap = s.snapshot();
         let baseline = warmup_baselines[i].load(Ordering::Relaxed);
         snap.tx_packets = snap.tx_packets.saturating_sub(baseline);
+        // #7174 C15: tx_batches shares tx_packets' accounting window. It used
+        // to stay cumulative-since-start alongside a warmup-subtracted
+        // tx_packets in the SAME record, so packets-per-batch read off that
+        // record was wrong — understated by however many batches the warmup
+        // sent — and the record carried nothing to reveal the mix.
+        let baseline_batches = warmup_baselines_batches[i].load(Ordering::Relaxed);
+        snap.tx_batches = snap.tx_batches.saturating_sub(baseline_batches);
         per_thread.push(snap);
     }
     // Aggregate from the warmup-adjusted per-thread Vec to keep both
@@ -1585,7 +1612,24 @@ fn main() {
         match read_iface_mac(probe_fd, &args.iface) {
             Ok(mac) => args.src_mac = mac,
             Err(e) => {
-                eprintln!("warning: could not read iface MAC ({}); using zeros", e);
+                // #7174 C16: FAIL CLOSED. This used to warn and continue with
+                // an all-zero source MAC, which is not a valid measurement —
+                // frames sourced from 00:00:00:00:00:00 are not what the
+                // device under test would ever see, and the run still printed
+                // a summary record as though it were.
+                //
+                // A harness that reports a wrong number without saying so is
+                // worse than one that refuses, because every conclusion drawn
+                // from it inherits the error silently and the warning scrolls
+                // past in a log nobody re-reads. Refusing costs one obvious
+                // failure; continuing costs an unknown number of wrong results.
+                eprintln!(
+                    "cold-path-flooder: could not read the MAC of {} ({}). Refusing to \
+                     run with an all-zero source MAC — the result would not be a valid \
+                     measurement. Pass --src-mac explicitly to override.",
+                    args.iface, e
+                );
+                std::process::exit(2);
             }
         }
     }
