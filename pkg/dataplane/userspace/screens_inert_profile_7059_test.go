@@ -26,6 +26,27 @@ func compileScreenCfg7059(t *testing.T, lines []string) *config.Config {
 	return cfg
 }
 
+func compileScreenCfgLenient7059(t *testing.T, lines []string) *config.Config {
+	t.Helper()
+	tree := &config.ConfigTree{}
+	for _, line := range lines {
+		path, err := config.ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	// The UNDEFINED state is strict-REJECTED, so the only way to build it is the
+	// tolerant path this whole #5806 surface exists to cover.
+	cfg, err := config.CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	return cfg
+}
+
 // TestScreenReferenceHasThreeStates_7059 is the table the whole issue is about,
 // and the MIDDLE ROW is the one that carries it.
 //
@@ -38,10 +59,26 @@ func TestScreenReferenceHasThreeStates_7059(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		lines         []string
+		lenient       bool
 		wantSnapshots int
 		wantMissing   int
 		wantInert     int
 	}{
+		{
+			// The state the SHIPPED surfaces already cover. It is here so the
+			// table separates "unresolved" from "inert" rather than assuming
+			// they cannot be confused: a predicate that reported undefined
+			// profiles as inert too would blur two states with different
+			// operator remedies (define the profile vs. add a check to it).
+			// Strict commit REJECTS this, so it must be built leniently — which
+			// is also the only way production reaches it.
+			name: "referenced_profile_undefined",
+			lines: []string{
+				"set security zones security-zone trust screen ghost",
+			},
+			lenient:       true,
+			wantSnapshots: 0, wantMissing: 1, wantInert: 0,
+		},
 		{
 			// THE MIDDLE ROW. Passes strict commit with zero warnings.
 			name: "defined_but_enables_no_checks",
@@ -72,7 +109,11 @@ func TestScreenReferenceHasThreeStates_7059(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := compileScreenCfg7059(t, tc.lines)
+			compile := compileScreenCfg7059
+			if tc.lenient {
+				compile = compileScreenCfgLenient7059
+			}
+			cfg := compile(t, tc.lines)
 			if got := len(buildScreenSnapshots(cfg)); got != tc.wantSnapshots {
 				t.Errorf("published snapshots = %d, want %d", got, tc.wantSnapshots)
 			}
@@ -208,4 +249,49 @@ func TestInertBlockRendersBeforeTheAnchor_7059(t *testing.T) {
 				"otherwise report a green it never earned")
 		}
 	})
+}
+
+// TestUnresolvedAndInertAreDisjoint_7059 pins that the two surfaces never both
+// claim the same zone. They carry DIFFERENT operator remedies — define the
+// missing profile, versus add a check to the profile you did define — so a zone
+// appearing in both would tell an operator to do two contradictory things, and a
+// zone appearing in neither while unenforced is the original #7059 defect.
+//
+// Added because mutation cell M3 (deleting the undefined-skip from the inert
+// predicate) was caught only by a PRE-EXISTING renderer test and by none of the
+// cells written for this change — the table above had no undefined row at all.
+func TestUnresolvedAndInertAreDisjoint_7059(t *testing.T) {
+	// One zone of each kind, in ONE config, so the disjointness is observed on
+	// the same input rather than inferred across two runs.
+	cfg := compileScreenCfgLenient7059(t, []string{
+		"set security zones security-zone ghosted screen ghost",
+		"set security screen ids-option inert alarm-without-drop",
+		"set security zones security-zone stranded screen inert",
+		"set security screen ids-option live tcp land",
+		"set security zones security-zone healthy screen live",
+	})
+	missing := map[string]bool{}
+	for _, r := range ScreenMissingProfileRefs(cfg) {
+		missing[r.Zone] = true
+	}
+	inert := map[string]bool{}
+	for _, r := range ScreenInertProfileRefs(cfg) {
+		inert[r.Zone] = true
+	}
+	if !missing["ghosted"] {
+		t.Errorf("the zone whose profile is UNDEFINED must be in the unresolved set; got %v", missing)
+	}
+	if !inert["stranded"] {
+		t.Errorf("the zone whose profile is DEFINED-but-empty must be in the inert set; got %v", inert)
+	}
+	if missing["healthy"] || inert["healthy"] {
+		t.Errorf("the ENFORCING zone must be in neither set; missing=%v inert=%v", missing, inert)
+	}
+	for z := range missing {
+		if inert[z] {
+			t.Fatalf("zone %q is reported BOTH unresolved and inert. The two carry "+
+				"different remedies — define the profile, versus add a check to it — "+
+				"so an operator is told to do two contradictory things (#7059)", z)
+		}
+	}
 }
