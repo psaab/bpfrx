@@ -171,7 +171,7 @@ func TestHelperCrashIsReapedAndFailsClosed5838(t *testing.T) {
 	if proc != nil {
 		t.Error("m.proc is still set after the helper died; every `m.proc == nil` liveness test still reads TRUE")
 	}
-	if !crash.Crashed {
+	if !crash.LastExitWasCrash {
 		t.Error("no crash recorded for an unexpected exit")
 	}
 	if !strings.Contains(crash.Detail, "signal") {
@@ -256,7 +256,7 @@ func TestIntentionalStopDoesNotScheduleRestart5838(t *testing.T) {
 	m.mu.Lock()
 	crash := m.helperCrash
 	m.mu.Unlock()
-	if crash.Crashed {
+	if crash.LastExitWasCrash {
 		t.Errorf("an INTENTIONAL stop was recorded as a crash: %+v", crash)
 	}
 	if len(rec.snapshot()) != 0 {
@@ -293,7 +293,7 @@ func TestStaleWaiterCannotMutateNewerGeneration5838(t *testing.T) {
 	if sup != live {
 		t.Error("a stale waiter replaced the live generation's supervisor record")
 	}
-	if crash.Crashed {
+	if crash.LastExitWasCrash {
 		t.Errorf("a stale waiter recorded a crash against the live generation: %+v", crash)
 	}
 	if len(rec.snapshot()) != 0 {
@@ -359,7 +359,7 @@ func TestFailedRestartRetainsDebtAndStaysFailClosed5838(t *testing.T) {
 	m.mu.Lock()
 	crash := m.helperCrash
 	m.mu.Unlock()
-	if !crash.Crashed {
+	if !crash.LastExitWasCrash {
 		t.Error("a FAILED restart cleared the crash state; the node would advertise itself ready again")
 	}
 	if ready, _ := m.TakeoverReady(); ready {
@@ -566,7 +566,7 @@ func TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838(t *testing.T) {
 	if oldSocket == newSocket {
 		t.Fatal("premise broken: the two configs are not distinguishable")
 	}
-	if !crash.Crashed {
+	if !crash.LastExitWasCrash {
 		t.Error("the failed restart cleared the crash state")
 	}
 	// It really did attempt a spawn with the NEW config: the attempt count grew

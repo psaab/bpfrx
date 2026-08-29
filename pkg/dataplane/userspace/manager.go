@@ -105,7 +105,7 @@ type Manager struct {
 	procGen uint64
 	// helperCrash records the last UNEXPECTED helper exit for the operator and
 	// drives the restart backoff. Zero value means "no crash on record".
-	helperCrash helperCrashState
+	helperCrash HelperCrashRecord
 	// restartTimerFn overrides how a crash restart is armed. Production leaves
 	// it nil (time.AfterFunc); a test injects a synchronous or recording timer.
 	// Per-Manager, not a package var — see scheduleRestartTimer.

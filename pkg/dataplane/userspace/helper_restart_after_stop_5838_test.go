@@ -3,7 +3,7 @@
 //
 // The supervisor added in #7228 arms a bounded-backoff restart after an
 // unexpected helper exit and fences the attempt on
-// `(m.procGen != gen || m.proc != nil || !m.helperCrash.Crashed)`. An
+// `(m.procGen != gen || m.proc != nil || !m.helperCrash.LastExitWasCrash)`. An
 // intentional stop satisfied none of those: `stopLocked` clears `m.proc` and
 // `m.procSup` but never advances `m.procGen` and never clears `m.helperCrash`.
 // And the stop that FOLLOWS a crash takes `stopLocked`'s `m.proc == nil` early
@@ -75,10 +75,10 @@ func TestHelperCrashRestartCancelledByIntentionalStop_5838(t *testing.T) {
 	// Crash it and let the supervisor reap and arm the restart.
 	_ = child.Process.Kill()
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && !m.HelperCrashState().Crashed {
+	for time.Now().Before(deadline) && !m.HelperCrashState().LastExitWasCrash {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !m.HelperCrashState().Crashed {
+	if !m.HelperCrashState().LastExitWasCrash {
 		t.Fatal("supervisor never recorded the crash — the rest of this test would be vacuous")
 	}
 	mu.Lock()
@@ -93,7 +93,7 @@ func TestHelperCrashRestartCancelledByIntentionalStop_5838(t *testing.T) {
 	m.stopLocked()
 	m.mu.Unlock()
 
-	// NOTE: `HelperCrashState().Crashed` deliberately survives the stop. The
+	// NOTE: `HelperCrashState().LastExitWasCrash` deliberately survives the stop. The
 	// record is the retry debt `ensureProcessLocked`'s own failure path depends
 	// on (it calls stopLocked when a spawn misses its readiness wait), so
 	// clearing it here would make a failed restart forget it was retrying. What
@@ -162,10 +162,10 @@ func TestHelperCrashRestartStillRunsWithoutAStop_5838(t *testing.T) {
 
 	_ = child.Process.Kill()
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && !m.HelperCrashState().Crashed {
+	for time.Now().Before(deadline) && !m.HelperCrashState().LastExitWasCrash {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !m.HelperCrashState().Crashed {
+	if !m.HelperCrashState().LastExitWasCrash {
 		t.Fatal("supervisor never recorded the crash")
 	}
 
