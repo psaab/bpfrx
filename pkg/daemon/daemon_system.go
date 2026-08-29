@@ -570,7 +570,9 @@ var (
 	chronyThresholdPath = "/etc/chrony/conf.d/xpf-threshold.conf"
 )
 
-func renderChronySources(servers []string) string {
+// renderChronySources renders the chrony source lines. opts carries the #7132
+// per-server modifiers keyed by address; a nil map renders exactly as before.
+func renderChronySources(servers []string, opts map[string]config.NTPServerOption) string {
 	var b strings.Builder
 	for _, server := range servers {
 		// #4902 render belt: a leniently-loaded / peer-synced value that is not
@@ -587,7 +589,23 @@ func renderChronySources(servers []string) string {
 		if net.ParseIP(server) != nil {
 			directive = "server"
 		}
-		fmt.Fprintf(&b, "%s %s iburst\n", directive, server)
+		// #7132: per-server modifiers. Before #7132 these were absorbed into the
+		// address list as if they were extra servers, so `prefer` reached this
+		// function AS A SERVER NAME and was rendered as its own source line.
+		// `version`/`key` take chrony's own spellings; `routing-instance` has no
+		// chrony equivalent and is recorded in the typed config only.
+		opt := opts[server]
+		line := fmt.Sprintf("%s %s iburst", directive, server)
+		if opt.Version > 0 {
+			line += fmt.Sprintf(" version %d", opt.Version)
+		}
+		if opt.Key > 0 {
+			line += fmt.Sprintf(" key %d", opt.Key)
+		}
+		if opt.Prefer {
+			line += " prefer"
+		}
+		fmt.Fprintf(&b, "%s\n", line)
 	}
 	return b.String()
 }
@@ -748,7 +766,7 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 		return
 	}
 
-	sourcesChanged, err := reconcileManagedFile(chronySourcesPath, renderChronySources(cfg.System.NTPServers))
+	sourcesChanged, err := reconcileManagedFile(chronySourcesPath, renderChronySources(cfg.System.NTPServers, cfg.System.NTPServerOptions))
 	if err != nil {
 		slog.Warn("failed to reconcile chrony sources", "err", err)
 		return

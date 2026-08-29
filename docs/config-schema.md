@@ -3966,11 +3966,37 @@ mis-nest the second gateway as an orphan child. `next-hop` therefore sets
 `valueList: true`, which tells `SetPath` (`ast_edit.go`) to absorb a trailing
 value list (tokens that are neither a sibling nor a known child) onto the leaf
 while STILL descending into the container when the next token names the
-`interface` child. Only `next-hop` sets it; every other `multi`+children node
-(the CoS named containers) is unchanged — the guard `children == nil ||
-valueList` keeps them on the container path. The compiler reads every gateway
+`interface` child. Since #7132 `system ntp server` sets it too, and the pair is now the
+pattern rather than a one-off exception: a leaf that takes a VALUE and also
+accepts trailing MODIFIER keywords is exactly this shape. `server` is
+`multi: true` (so `server [ 1.1.1.1 2.2.2.2 ]` collapses onto one leaf) with
+`prefer`/`key`/`version`/`routing-instance` modifier children.
+
+That replaced `ntpServerOptionArgs`, a hand-written keyword-to-argcount table
+that existed only because the schema was believed unable to express the shape.
+It could, and had been able to since #3872 — so #7132 asked for a design
+decision whose answer was already shipped. The argcount now comes from the
+schema's own `args`, which is the point: a second source of truth for one
+grammar is what the table was.
+
+Every other `multi`+children node (the CoS named containers) is unchanged — the
+guard `children == nil || valueList` keeps them on the container path. The compiler reads every gateway
 from `Keys[1:]` (skipping an inline `interface <if>` pair) plus the `interface`
-child. This is DISTINCT from a `qualified-next-hop`, which is a separate
+child.
+
+**Both spellings, or neither (#2419).** A `valueList` leaf's modifiers arrive in
+two shapes and the compiler must read both: the COMPACT spelling puts the
+modifier and its argument on the stanza's own `Keys`
+(`server A key 5` -> `Keys=[server A key 5]`), the BLOCK spelling files them as
+a child (`server A { key 5; }` -> `Keys=[server A]` + child `[key 5]`). A reader
+that captures one and returns before applying the other is compact-blind, which
+is the #2419 class.
+
+Note what the #2419 gate can and cannot see: it detects "the compact spelling
+drops the VALUE", so a VALUE-LESS modifier is invisible to it. #7132's `prefer`
+was compact-blind alongside `key`/`version`/`routing-instance` and the gate
+reported only the other three. A value-less modifier needs its own equivalence
+cell. This is DISTINCT from a `qualified-next-hop`, which is a separate
 floating-backup leaf carrying its own per-next-hop preference (#3871): a plain
 `next-hop` list is equal-cost ECMP, a `qualified-next-hop` is a distance-N
 backup.

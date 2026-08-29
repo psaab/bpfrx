@@ -1100,6 +1100,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -2368,6 +2369,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -3635,6 +3637,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -4902,6 +4905,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -6170,6 +6174,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -7437,6 +7442,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -8394,6 +8400,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -9370,6 +9377,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -10345,6 +10353,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -11320,6 +11329,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -12296,6 +12306,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -13271,6 +13282,7 @@
           "1.1.1.1"
         ],
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -13684,6 +13696,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -13964,6 +13977,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -14244,6 +14258,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -14591,6 +14606,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -14927,6 +14943,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,
@@ -15263,6 +15280,7 @@
         "TimeZone": "",
         "NameServers": null,
         "NTPServers": null,
+        "NTPServerOptions": null,
         "NTPThreshold": 0,
         "NTPThresholdAction": "",
         "NoRedirects": false,

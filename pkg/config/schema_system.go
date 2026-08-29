@@ -167,7 +167,29 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// `server`/`pool` directive. Type it as an IP-or-hostname so a
 		// space/control/malformed value cannot inject a second chrony directive
 		// token or fail the chrony reload.
-		"server": {desc: "NTP server", args: 1, multi: true, valueType: ValueHostname, valueDesc: "NTP server IP address or hostname", valueExamples: []string{"192.0.2.1", "pool.ntp.org"}, validator: ValidateNTPServer, placeholder: "<address>", children: nil},
+		// #7132: the four Junos per-server MODIFIERS are modeled as children, and
+		// the leaf opts into `valueList` so it keeps absorbing a bracket list of
+		// SERVERS while descending into the container when the next token names a
+		// modifier.
+		//
+		// Before this, `children: nil` made the two indistinguishable in the AST —
+		// measured: `server 1.1.1.1 prefer` and `server [ 1.1.1.1 2.2.2.2 ]` both
+		// produced a leaf whose Keys were ["server", <tok>, <tok>], so nothing
+		// downstream could tell a modifier from a second server. `prefer` is a
+		// syntactically valid hostname, so ValidateNTPServer accepted it too.
+		//
+		// `valueList` is the existing mechanism for exactly this shape (#3872), not
+		// a new one: static `route next-hop` already carries a value slot AND an
+		// `interface` modifier child the same way. The SetPath absorber checks
+		// `childSchema.children[nextToken]` first (ast_edit.go), so a modeled
+		// modifier attaches as a child and everything else is absorbed as a value.
+		"server": {desc: "NTP server", args: 1, multi: true, valueList: true, valueType: ValueHostname, valueDesc: "NTP server IP address or hostname", valueExamples: []string{"192.0.2.1", "pool.ntp.org"}, validator: ValidateNTPServer, placeholder: "<address>",
+			children: map[string]*schemaNode{
+				"prefer":           {desc: "Prefer this server", children: nil},
+				"key":              {desc: "Authentication key id for this server", args: 1, placeholder: "<key-id>", valueType: ValueInteger, children: nil},
+				"version":          {desc: "NTP version for this server", args: 1, placeholder: "<version>", valueType: ValueInteger, children: nil},
+				"routing-instance": {desc: "Routing instance to reach this server in", args: 1, placeholder: "<instance>", children: nil},
+			}},
 		"threshold": {desc: "Threshold", args: 1, placeholder: "<seconds>",
 			valueType: ValueInteger, valueDesc: "NTP step threshold in seconds (>= 1; 0 means 'use the default')",
 			valueExamples: []string{"128", "600"},

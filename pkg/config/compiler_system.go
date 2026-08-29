@@ -108,7 +108,14 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			// second NTP server and rendered verbatim into a chrony directive
 			// (#4902 types the value for exactly that reason).
 			for _, ntpChild := range child.FindChildren("server") {
-				sys.NTPServers = append(sys.NTPServers, ntpServerValues(ntpChild)...)
+				ntpServers, ntpOpts := ntpServerValues(ntpChild)
+				sys.NTPServers = append(sys.NTPServers, ntpServers...)
+				for addr, opt := range ntpOpts {
+					if sys.NTPServerOptions == nil {
+						sys.NTPServerOptions = map[string]NTPServerOption{}
+					}
+					sys.NTPServerOptions[addr] = opt
+				}
 			}
 			if thNode := child.FindChild("threshold"); thNode != nil {
 				if v := nodeVal(thNode); v != "" {
@@ -3044,73 +3051,144 @@ func validateBackupRouterDst(cfg *Config, lenient bool) ([]string, error) {
 	return nil, fmt.Errorf("%s", msg)
 }
 
-// ntpServerOptionArgs maps each Junos per-server option keyword that may
-// follow `system ntp server <address>` to the number of argument tokens it
-// consumes. These are the tokens that can legally appear AFTER the server
-// address on the same statement, so they must never be mistaken for a second
-// server address.
+// ntpServerModifierNames returns the modifier keywords modeled as children of
+// the `system ntp server` leaf in setSchema (#7132).
 //
-// The schema types `system ntp server` as a single-argument multi:true leaf
-// (schema_system.go), which means SetPath and the block parser both absorb any
-// trailing tokens onto the node's Keys without complaint — `prefer` is even a
-// syntactically valid hostname, so ValidateNTPServer accepts it. The compiler
-// is therefore the only place the distinction can be drawn.
-var ntpServerOptionArgs = map[string]int{
-	"prefer":           0,
-	"key":              1,
-	"version":          1,
-	"routing-instance": 1,
+// This REPLACES ntpServerOptionArgs, a hand-written keyword->argcount table that
+// existed only because the schema could not express "a value leaf that also has
+// modifiers". It can: `valueList: true` plus modifier children is the #3872
+// shape that static `route next-hop` already uses. The table was a second source
+// of truth for the same grammar, and every future leaf in this shape would have
+// grown its own copy.
+func ntpServerModifierNames() map[string]int {
+	out := map[string]int{}
+	sys, ok := setSchema.children["system"]
+	if !ok || sys == nil {
+		return out
+	}
+	ntp, ok := sys.children["ntp"]
+	if !ok || ntp == nil {
+		return out
+	}
+	server, ok := ntp.children["server"]
+	if !ok || server == nil {
+		return out
+	}
+	for name, child := range server.children {
+		// The ARGUMENT COUNT matters as much as the name, and losing it was a
+		// real regression caught by Test_6690_NTPServerOptionTokensAreNotServers:
+		// the HIERARCHICAL spelling puts `server 1.1.1.1 key 5` on ONE node's
+		// Keys, so skipping only the keyword leaves `5` to be read as a second
+		// server. That argcount is exactly what the retired ntpServerOptionArgs
+		// table carried — it now comes from the schema's own `args`, which is the
+		// point of the retirement: one source of truth, not two.
+		n := 0
+		if child != nil {
+			n = child.args
+		}
+		out[name] = n
+	}
+	return out
 }
 
-// ntpServerValues returns every NTP server address carried by one `server`
-// node, across all five spellings the parser can produce (#6690):
+// ntpServerValues returns the NTP server addresses carried by one `server` node,
+// and the per-server modifiers attached to them (#7132).
 //
-//   - hierarchical block, one leaf child per server
-//     `ntp { server { a; b; } }`  → Keys=["server"], children ["a"], ["b"]
-//   - hierarchical bracket list
-//     `ntp { server [ a b ]; }`   → Keys=["server","a","b"], no children
-//   - hierarchical repeated leaf
-//     `ntp { server a; server b; }` → two sibling nodes, one address each
-//     (the caller's FindChildren("server") loop visits both)
-//   - flat-set repeated leaf       → same as above
-//   - flat-set bracket list
-//     `set system ntp server [ a b ]` → Keys=["server","a","b"]
+// Since #7132 a modifier is a schema-modeled CHILD, so the two are separable in
+// the AST: `server 1.1.1.1 prefer` files Keys=["server","1.1.1.1"] with a child
+// ["prefer"], while `server [ 1.1.1.1 2.2.2.2 ]` still collapses both addresses
+// onto Keys. Before that they were byte-identical — Keys=["server",<tok>,<tok>]
+// either way — which is why a keyword table was the only available remedy.
 //
-// and skips the per-server option tokens in ntpServerOptionArgs together with
-// their arguments, so `server 1.1.1.1 prefer;`, `server 1.1.1.1 key 5;` and
-// `server 1.1.1.1 { prefer; }` still compile to exactly one server.
-//
-// The option skip counter deliberately carries across the Keys→Children
-// boundary: an option whose argument was split onto a child node must not
-// leak that argument into the server list.
-func ntpServerValues(n *Node) []string {
+// The modifiers attach to the LAST address on the node, matching Junos: the
+// modifier follows the server it qualifies.
+func ntpServerValues(n *Node) ([]string, map[string]NTPServerOption) {
 	if n == nil {
-		return nil
+		return nil, nil
 	}
+	modifiers := ntpServerModifierNames()
 	var servers []string
-	skip := 0
-	consume := func(tokens []string) {
-		for _, tok := range tokens {
-			if skip > 0 {
-				skip--
-				continue
+	opts := map[string]NTPServerOption{}
+	// The COMPACT spelling puts a modifier and its argument on the parent's Keys
+	// (`server 1.1.1.1 key 5;`), while the block spelling files them as a child
+	// (`server 1.1.1.1 { key 5; }`). Both must produce the same compiled config —
+	// that equivalence is the #2419 contract, and TestCompactBlockEquivalence-
+	// Inventory2419 caught this reader dropping the compact value when it merely
+	// SKIPPED modifiers here instead of capturing them.
+	keyTokens := n.Keys[1:]
+	for i := 0; i < len(keyTokens); i++ {
+		tok := keyTokens[i]
+		if nargs, isMod := modifiers[tok]; isMod {
+			arg := ""
+			if nargs > 0 && i+1 < len(keyTokens) {
+				arg = keyTokens[i+1]
 			}
-			if nargs, isOption := ntpServerOptionArgs[tok]; isOption {
-				skip = nargs
-				continue
+			i += nargs
+			if len(servers) > 0 {
+				target := servers[len(servers)-1]
+				cur := opts[target]
+				applyNTPServerModifier(&cur, tok, arg)
+				opts[target] = cur
 			}
-			if tok != "" {
-				servers = append(servers, tok)
-			}
+			continue
+		}
+		if tok != "" {
+			servers = append(servers, tok)
 		}
 	}
-	if len(n.Keys) > 1 {
-		consume(n.Keys[1:])
-	}
+	// The child walk runs UNCONDITIONALLY, before any modifier is attached.
+	//
+	// It used to early-return when Keys carried no server, which silently dropped
+	// the #6689 nested-BLOCK spelling — `server { 1.1.1.1; 2.2.2.2; }` files both
+	// addresses as CHILDREN and leaves Keys with just "server", so the early
+	// return discarded every server on that shape. Caught by
+	// Test_6690_NTPServerEveryHierarchicalSpelling. The block is the third shape
+	// docs/config-schema.md warns about, and it is exactly the one an
+	// early-return on Keys cannot see.
+	var mods []*Node
 	for _, child := range n.Children {
-		consume(child.Keys)
+		if child == nil || len(child.Keys) == 0 {
+			continue
+		}
+		if _, isMod := modifiers[child.Keys[0]]; isMod {
+			mods = append(mods, child)
+			continue
+		}
+		// A bracket-list member or a nested-block server, not a modifier.
+		servers = append(servers, child.Keys...)
 	}
-	return servers
+	if len(servers) == 0 {
+		return servers, nil
+	}
+	target := servers[len(servers)-1]
+	cur := opts[target]
+	touched := false
+	for _, child := range mods {
+		name := child.Keys[0]
+		touched = true
+		arg := ""
+		if len(child.Keys) > 1 {
+			arg = child.Keys[1]
+		}
+		applyNTPServerModifier(&cur, name, arg)
+	}
+	// `touched` records only whether a CHILD modifier was applied to `cur`, so
+	// it must not gate the return: the COMPACT spelling files its modifiers on
+	// the parent's Keys, and the loop above has already written them into
+	// `opts`. Returning nil here because no CHILD was seen discarded every
+	// compact-spelled modifier — which is exactly the #2419 divergence this
+	// reader was changed to close, reappearing one line below the fix for it.
+	//
+	// Write `cur` back only when a child actually contributed, so a plain
+	// `server 1.1.1.1` with no modifiers at all still yields nil rather than a
+	// map holding an all-zero option.
+	if touched {
+		opts[target] = cur
+	}
+	if len(opts) == 0 {
+		return servers, nil
+	}
+	return servers, opts
 }
 
 // archiveSite is one authored `system archival configuration archive-sites`
@@ -3193,4 +3271,24 @@ func archiveSiteEntries(n *Node) []archiveSite {
 		out = append(out, sites...)
 	}
 	return out
+}
+
+// applyNTPServerModifier records one per-server modifier (#7132). Shared by the
+// COMPACT (parent Keys) and BLOCK (child node) spellings so the two cannot
+// diverge — the divergence being exactly what #2419 is about.
+func applyNTPServerModifier(opt *NTPServerOption, name, arg string) {
+	switch name {
+	case "prefer":
+		opt.Prefer = true
+	case "key":
+		if v, err := strconv.Atoi(arg); err == nil {
+			opt.Key = v
+		}
+	case "version":
+		if v, err := strconv.Atoi(arg); err == nil {
+			opt.Version = v
+		}
+	case "routing-instance":
+		opt.RoutingInstance = arg
+	}
 }
