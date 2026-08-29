@@ -922,6 +922,21 @@ func (m *Manager) armDegradedTimerLocked(rg *RedundancyGroupState) {
 // a stale one. Caller must hold m.mu.
 func (m *Manager) clearDegradedStateLocked(rg *RedundancyGroupState) {
 	rg.NotReadySince = time.Time{}
+	// #7942: DegradedPromoted had TWO setters (electSingleNode and, since
+	// #7939, runElection) and NO clearer, so once an RG was promoted while not
+	// ready it reported that for the life of the process — including after it
+	// became ready and was re-promoted normally. The flag answers "is this RG
+	// forwarding while not ready", which is a statement about NOW, not a
+	// permanent record of something that once happened.
+	//
+	// This is the natural home for the reset: this function already runs on the
+	// become-ready edge, which is exactly when the claim stops being true.
+	//
+	// Latent rather than live when found — the field has no production reader
+	// yet, only tests — but that is precisely why it needed fixing now. A field
+	// with two setters and no reset is correct only until someone renders it,
+	// and then it reads "degraded" on a healthy cluster.
+	rg.DegradedPromoted = false
 	if rg.degradedTimer != nil {
 		rg.degradedTimer.Stop()
 		rg.degradedTimer = nil
