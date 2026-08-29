@@ -449,6 +449,13 @@ func sortedVPNNames(vpns map[string]*config.IPsecVPN) []string {
 	return names
 }
 
+// routeBasedDefaultTS is the traffic selector a route-based (XFRM-interface)
+// VPN gets when nothing else specifies one. Both families are offered because
+// xpf is dual-stack and routing, not the selector, decides what enters the
+// tunnel; strongSwan narrows the pair during negotiation, so a v4-only peer
+// simply agrees on the v4 half.
+const routeBasedDefaultTS = "0.0.0.0/0,::/0"
+
 func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSelector {
 	// A nil VPN has no traffic selectors and no LocalID/RemoteID to fall
 	// back to — return no children rather than dereferencing vpn. The
@@ -487,6 +494,36 @@ func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSel
 		}
 		if remote != "" && !config.IsTrafficSelectorShape(remote) {
 			remote = ""
+		}
+		// Route-based (bind-interface set -> if_id emitted): default the
+		// selectors to the whole address space, which is what Junos does for an
+		// st0-bound VPN's proxy ID. Routing decides what enters a route-based
+		// tunnel, not the selector, so a narrow selector here is not a security
+		// boundary -- it is just a smaller hole than the operator asked for.
+		//
+		// MEASURED, on strongSwan 6.0.5 on the cluster, reading the XFRM policy
+		// the kernel actually enforces rather than a status view. With no
+		// selector rendered (the `dynamic` default) charon installs:
+		//
+		//   src 10.99.12.1/32 dst 10.99.12.2/32  dir out  if_id 0x1092
+		//
+		// -- the tunnel ENDPOINTS, /32 to /32. Transit traffic does not match
+		// that policy and so never enters the tunnel. With 0.0.0.0/0 on both
+		// sides the same connection installs:
+		//
+		//   src 0.0.0.0/0 dst 0.0.0.0/0          dir out  if_id 0x1092
+		//
+		// So a route-based VPN configured the ordinary Junos way -- bind-interface,
+		// no traffic-selector -- carried endpoint traffic only, silently.
+		//
+		// Scope is deliberately narrow. This applies ONLY when if_id > 0. For a
+		// POLICY-based VPN the selector IS the enforcement boundary, and
+		// widening it there would be a real widening, so that case still renders
+		// nothing and keeps strongSwan's `dynamic` default. An explicitly
+		// configured traffic-selector, and a selector-shaped local-identity,
+		// both still win over this default -- the operator said what they wanted.
+		if local == "" && remote == "" && xfrmiIfID(vpn.BindInterface) > 0 {
+			local, remote = routeBasedDefaultTS, routeBasedDefaultTS
 		}
 		return []childSelector{{
 			Name:     connName,

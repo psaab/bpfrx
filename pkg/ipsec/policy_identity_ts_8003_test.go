@@ -73,3 +73,89 @@ func TestIdentityBeltRendersNoSelectorKey(t *testing.T) {
 		t.Fatalf("belt did not clear the identity selectors: %+v", sels[0])
 	}
 }
+
+// TestRouteBasedDefaultTrafficSelector covers the route-based default (#7171
+// row 70).
+//
+// MEASURED on strongSwan 6.0.5, reading the XFRM policy the kernel enforces
+// rather than a status view. Rendering no selector (the `dynamic` default)
+// installs the tunnel ENDPOINTS, /32 to /32:
+//
+//	src 10.99.12.1/32 dst 10.99.12.2/32  dir out  if_id 0x1092
+//
+// so transit traffic never matches and never enters the tunnel. Rendering
+// 0.0.0.0/0 on both sides installs a wildcard on the same connection. A
+// route-based VPN configured the ordinary Junos way therefore carried endpoint
+// traffic only, silently.
+//
+// The negative cases carry the weight here, because this default WIDENS what
+// is negotiated. It must not reach a policy-based VPN, where the selector IS
+// the enforcement boundary, and it must not override anything the operator
+// actually configured.
+func TestRouteBasedDefaultTrafficSelector(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		bindIface                 string
+		localID, remoteID         string
+		wantLocalTS, wantRemoteTS string
+	}{
+		// The subject: route-based, nothing else specified.
+		{"route-based, no selector", "st0.0", "", "", routeBasedDefaultTS, routeBasedDefaultTS},
+		{"route-based, unit-less bind", "st0", "", "", routeBasedDefaultTS, routeBasedDefaultTS},
+
+		// POLICY-based: no if_id, so the selector is the enforcement boundary
+		// and this default must NOT apply. Widening here would be a real
+		// widening rather than a correction.
+		{"policy-based stays dynamic", "", "", "", "", ""},
+
+		// A bind-interface that is not a secure-tunnel name yields if_id 0, so
+		// it is policy-based as far as this decision is concerned.
+		{"non-st bind is policy-based", "ge-0/0/0.0", "", "", "", ""},
+
+		// The operator said what they wanted: a selector-shaped identity still
+		// wins over the default, on either side independently.
+		{"identity wins over default", "st0.0", "10.0.0.0/24", "10.1.0.0/24", "10.0.0.0/24", "10.1.0.0/24"},
+		{"local identity only", "st0.0", "10.0.0.0/24", "", "10.0.0.0/24", ""},
+
+		// A non-selector identity is dropped by the belt, and because BOTH
+		// sides then end up empty the route-based default applies -- which is
+		// the desired outcome: an FQDN identity on a route-based VPN yields a
+		// working wildcard tunnel instead of a discarded connection.
+		{"fqdn identity falls through to default", "st0.0", "vpn.example.com", "peer.example.com", routeBasedDefaultTS, routeBasedDefaultTS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vpn := &config.IPsecVPN{
+				BindInterface: tc.bindIface,
+				LocalID:       tc.localID,
+				RemoteID:      tc.remoteID,
+			}
+			got := effectiveTrafficSelectors("v1", vpn)
+			if len(got) != 1 {
+				t.Fatalf("returned %d children, want 1", len(got))
+			}
+			if got[0].LocalTS != tc.wantLocalTS {
+				t.Errorf("LocalTS = %q, want %q", got[0].LocalTS, tc.wantLocalTS)
+			}
+			if got[0].RemoteTS != tc.wantRemoteTS {
+				t.Errorf("RemoteTS = %q, want %q", got[0].RemoteTS, tc.wantRemoteTS)
+			}
+		})
+	}
+}
+
+// TestRouteBasedDefaultNotAppliedWithExplicitSelectors guards the other way in:
+// a VPN that declares a traffic-selector never reaches the fallback at all, so
+// the route-based default must not appear anywhere in its rendered children.
+func TestRouteBasedDefaultNotAppliedWithExplicitSelectors(t *testing.T) {
+	vpn := &config.IPsecVPN{
+		BindInterface: "st0.0",
+		TrafficSelectors: map[string]*config.IPsecTrafficSelector{
+			"ts1": {LocalIP: "10.0.0.0/24", RemoteIP: "10.1.0.0/24"},
+		},
+	}
+	for _, sel := range effectiveTrafficSelectors("v1", vpn) {
+		if sel.LocalTS == routeBasedDefaultTS || sel.RemoteTS == routeBasedDefaultTS {
+			t.Fatalf("route-based default overrode an explicit traffic-selector: %+v", sel)
+		}
+	}
+}
