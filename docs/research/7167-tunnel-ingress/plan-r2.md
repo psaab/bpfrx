@@ -10,6 +10,35 @@ the two config shapes.**
 
 ---
 
+## 0. THE BINDING CONSTRAINT — read this before proposing any design
+
+**A capture mechanism MUST supply a logical ifindex that RESOLVES. An
+unresolvable one does not fail closed — it reinjects to the kernel.**
+
+`resolve_ifindex` (`forwarding_build/fib.rs:446`) returns `None` for a name it
+cannot find, and `.unwrap_or((0, 0))` (`:381`, v6 `:405`) collapses that miss
+into a **legal-looking ifindex 0**. Nothing between there and
+`if ifindex <= 0 { return no_route_resolution(...) }` (`forwarding/fib.rs:546`)
+can distinguish "no such interface" from "interface 0", and `NoRoute` is
+slow-path eligible (`tests_slow_path_disposition.rs:100`).
+
+This eliminates a whole family of designs, so it is stated first rather than
+derived later in §2:
+
+- A design that **names** a capture interface without guaranteeing the name
+  resolves in `names` or `linux_names` silently does nothing. It looks wired,
+  reports no error, and reinjects every packet to the kernel — the exact
+  behaviour the issue exists to remove.
+- Any "fail closed on capability failure" requirement (issue requirement 7)
+  cannot be satisfied by the ifindex path as it stands, because the failure mode
+  of that path is fail-OPEN by construction. Either the resolver must gain a
+  distinguishable error at the consumption boundary, or the capture mechanism
+  must validate resolution at attach time and refuse to arm.
+- Acceptance for any candidate must therefore include a **negative** case: an
+  unresolvable capture target must be observably refused, not merely absent.
+
+---
+
 ## 1. What r1 left blocking, and what the issue thread had already done
 
 r1 §3 said the hinge was "is the outbound (LAN → tunnel) direction already
