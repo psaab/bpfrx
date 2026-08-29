@@ -378,6 +378,17 @@ func testStoreWithSetConfig(t *testing.T, lines []string) *configstore.Store {
 // 0781f7a60 and takeover readiness is now VIP ownership alone. #110 tracks
 // whether it should return — if it does, this test and its sibling red, which
 // is the point.
+//
+// #7162 UPDATE: takeover readiness here is NO LONGER "VIP ownership alone" — a
+// bounded startup hold (Daemon.armNoRethSyncHold) is now a term in
+// checkNoRethTakeoverReadiness. This test and its sibling still pass, and still
+// pin something true and load-bearing: the gate is the HOLD, never this FLAG.
+// The distinction is the whole of #110 — the hold is bounded, the flag is not,
+// and a flag-based conjunct would block promotion indefinitely with sync down.
+// These fixtures never arm the hold, so they isolate the flag, which is exactly
+// what makes them the right guard for that claim. The sentence above about this
+// test redding if the gate returns is therefore superseded: it reds if the FLAG
+// becomes a gate, which is still the thing to prevent.
 func TestTakeoverReadinessForRG_NoRethIgnoresClusterSyncReady(t *testing.T) {
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",

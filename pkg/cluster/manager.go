@@ -497,6 +497,16 @@ type Manager struct {
 	// once readiness is established.
 	takeoverHoldTime time.Duration
 
+	// #7162 startup sync-hold status, fed by the daemon. The hold itself lives
+	// in the daemon (no-RETH) or in vrrp.Manager (RETH); this is the reporting
+	// mirror so `show chassis cluster information` can say why promotion was
+	// suppressed at startup and how the suppression ended. Before #7162 the
+	// VRRP hold recorded a reason (`bulk-sync-complete` / `timeout-degraded`)
+	// and surfaced it NOWHERE.
+	startupHoldMode   string // "reth-vrrp" | "no-reth" | ""
+	startupHoldActive bool
+	startupHoldReason string // set once the hold ends
+
 	// degradedPromoteTimeout bounds how long the #7161 cold-boot readiness gate
 	// may hold an RG secondary. After this much CONTINUOUS not-readiness the RG
 	// promotes anyway, with the reason surfaced, so a readiness bug can never
@@ -510,13 +520,13 @@ type Manager struct {
 	degradedPromoteTimeout time.Duration
 
 	// syncReady is true once bulk session sync has been received (or the
-	// readiness timeout released the hold). It gates NOTHING: no consumer
-	// reads it to decide RG promotion, in private-rg-election / no-reth-vrrp
-	// mode or any other (#7102). It was the no-RETH equivalent of the VRRP
-	// sync-hold until 0781f7a60 removed that gate; today its only production
-	// readers are the readiness timeout in pkg/daemon/daemon_ha_sync.go and
-	// two log fields. See SetSyncReady in sync_state.go for the full account
-	// and #110 for whether the gate should return.
+	// readiness timeout released it). See SetSyncReady in sync_state.go for the
+	// full account of what it does and does not gate.
+	//
+	// #7162: startup promotion in no-RETH / private-rg-election mode IS now
+	// gated — by Daemon.armNoRethSyncHold's BOUNDED hold, not by this flag.
+	// This flag remains unbounded while the sync channel is down and must not
+	// become a readiness conjunct (#110).
 	syncReady bool
 
 	// syncTransport records whether session sync uses "fabric" or

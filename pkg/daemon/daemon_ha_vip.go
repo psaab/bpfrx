@@ -33,7 +33,23 @@ func (d *Daemon) checkVIPReadiness(rgID int) (bool, []string) {
 }
 
 func (d *Daemon) checkNoRethTakeoverReadiness(rgID int) (bool, []string) {
-	return d.checkVIPReadiness(rgID)
+	ready, reasons := d.checkVIPReadiness(rgID)
+	// #7162: the bounded STARTUP hold. RETH VRRP mode suppresses preemption
+	// until bulk session sync completes; this is the no-RETH equivalent, and
+	// without it a node here promotes an RG before any conntrack/NAT state has
+	// arrived and resets every established flow.
+	//
+	// This is a bounded hold, NOT a `cluster.IsSyncReady()` conjunct. The
+	// difference is the whole of #110: a continuous sync term has no bound while
+	// the sync channel is down, so it blocks promotion indefinitely in exactly
+	// the degraded-peer case preemption exists for. This term goes false on its
+	// own after noRethSyncHoldTimeout regardless of sync state or peer state.
+	if d.inNoRethSyncHold() {
+		ready = false
+		reasons = append(reasons,
+			"session sync startup hold: bulk sync not yet complete")
+	}
+	return ready, reasons
 }
 
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG

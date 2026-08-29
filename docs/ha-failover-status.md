@@ -82,6 +82,53 @@ yet. Here is what is true today:
     cold-boot RG starts not-ready and may never see a readiness TRANSITION, so
     arming from the transition branch would leave it unarmed in precisely the
     case it exists for.
+- Bounded startup promotion hold for `no-reth-vrrp` / `private-rg-election`
+  (#7162). RETH VRRP mode has suppressed startup preemption since #466
+  (`vrrp.Manager.SetSyncHold`, 30s, armed once at bringup, released by bulk
+  session sync or its own timer). These modes had no equivalent —
+  `checkNoRethTakeoverReadiness` was VIP ownership and nothing else — so a node
+  could promote an RG before bulk sync delivered any conntrack/NAT state and
+  every established flow reset on the transition.
+
+  `Daemon.armNoRethSyncHold` (`pkg/daemon/daemon_ha_noreth_hold.go`) is the
+  sibling: same 30s bound, armed at the same bringup site, consulted by
+  `checkNoRethTakeoverReadiness`, released by bulk sync
+  (`bulk-sync-complete`) or its own timer (`timeout-degraded`).
+
+  **It is a bounded HOLD, not a `cluster.IsSyncReady()` conjunct, and the
+  difference is the whole of #110.** `syncReady` has no bound while the
+  session-sync channel is down (`armSyncReadyTimer` early-returns unless
+  `syncPeerConnected`), and the election blocks a not-ready RG whenever the peer
+  is alive — so a sync-flag conjunct blocks promotion INDEFINITELY when the peer
+  is up on the control link with session sync down, which is exactly the
+  degraded-peer case preemption exists for. Two properties keep this one
+  bounded, and both are pinned by tests:
+  - the timer callback consults NO peer condition — not `syncPeerConnected`, not
+    `peerAlive`, not `IsSyncReady()`. A release that depended on the peer would
+    be no release at all, because the peer being absent is why the hold is still
+    held.
+  - it is armed EXACTLY ONCE at bringup and never re-armed on reconnect, which
+    keeps it a startup hold rather than a mid-life block.
+
+  Releasing the hold DRIVES a reconcile (`triggerReconcile`). Readiness is
+  recomputed per reconcile pass, so without that the RG would sit secondary until
+  an unrelated event happened to trigger one — bounded in name only. The RETH
+  sibling meets the same obligation with `triggerPreemptNow()`.
+
+  Interaction with #7161: on a cold boot the readiness gate now applies, so the
+  hold and the gate compose — the node holds secondary for the hold window, then
+  promotes when readiness recomputes. The #7161 degraded-promotion fallback
+  (2 min) is a strictly longer backstop, so the 30s hold is the binding
+  constraint.
+
+  **Observability:** `show chassis cluster information` gains a
+  `Startup promotion hold:` block reporting the mode (`reth-vrrp` / `no-reth`),
+  whether it is still holding, and how it ended. The RETH hold had recorded
+  `bulk-sync-complete` / `timeout-degraded` since #466 and surfaced it NOWHERE,
+  so an operator could not distinguish a normal startup from one that promoted
+  degraded because sync never arrived — which is precisely the explanation for a
+  flow reset after a boot. While the hold is active it also appears in the RG's
+  `Takeover ready: no (...)` reasons.
 - Blackhole routes skipped in userspace mode (#354)
 - Helper watchdog threshold aligned with sync cadence (#349)
 - Reverse companions pre-installed via sync path (#310)

@@ -228,14 +228,30 @@ func (d *Daemon) initManagers(configCompileFailed bool) error {
 		cc := cfg.Chassis.Cluster
 		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP && !cc.PrivateRGElection {
 			d.vrrpMgr.SetSyncHold(30 * time.Second)
+			if d.cluster != nil {
+				d.cluster.SetStartupSyncHoldStatus("reth-vrrp", true, "")
+			}
+		} else if cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+			// #7162: the no-RETH sibling of the hold above. These modes route
+			// takeover readiness through checkNoRethTakeoverReadiness, which is
+			// VIP ownership alone, so without this a node promotes an RG before
+			// bulk session sync has delivered any conntrack/NAT state and every
+			// established flow resets. Bounded and armed ONCE, like SetSyncHold
+			// — see daemon_ha_noreth_hold.go for why it must not become a
+			// continuous IsSyncReady() conjunct (#110).
+			d.armNoRethSyncHold(noRethSyncHoldTimeout)
 		}
 		// Private-rg-election mode takes no VRRP sync-hold (the branch
-		// above excludes it), so arm the sync-ready timeout instead. Be
-		// exact about what that buys (#7102): cluster.Manager.syncReady
-		// does NOT gate RG promotion in this mode — takeover readiness
-		// here is VIP ownership alone (checkNoRethTakeoverReadiness) and
-		// the readiness conjunction has no sync term — so this is a bound
-		// on a reported/logged state, not on takeover. It is also not the
+		// above excludes it), so arm the sync-ready timeout too. Be exact
+		// about what THAT buys (#7102): cluster.Manager.syncReady still
+		// does NOT gate RG promotion — it bounds a reported/logged state.
+		//
+		// #7162: startup promotion in this mode IS gated now, by the
+		// bounded armNoRethSyncHold above, which is a DIFFERENT mechanism
+		// with a different bound. Do not read the two as one; the hold
+		// releases on its own timer regardless of sync or peer state,
+		// while this timer's callback returns early while no sync peer is
+		// connected. It is also not the
 		// only arm: the cold-start branch of onSessionSyncPeerConnected
 		// re-arms the timer (bumping syncReadyTimerGen, which supersedes
 		// this one), and this timer's callback returns early while no sync
