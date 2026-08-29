@@ -818,6 +818,40 @@ test_reassert_dies_when_role_not_achieved() {
 	fi
 }
 
+# #7962: the failure message must say WHICH failure this is. A gate that fails
+# identically whether the helper is broken or whether nothing asked it to
+# forward a packet carries no information, and its failures get read as HA
+# regressions in whatever branch happened to deploy next.
+test_reassert_failure_names_the_missing_precondition_7962() {
+	reset_cli_mock
+	CLI_STATUS_RESPONSES=("$STATUS_INVERTED_RG0")
+	# No LAN host reachable, so liveness CANNOT be primed: the fallback is the
+	# only mechanism and the diagnosis must say the precondition was absent.
+	local out rc=0
+	out=$( CLUSTER_LAN_HOST= IPERF_TARGET4= \
+		deploy_reassert_primary_node0 "fake:vm0" 2>&1 ) || rc=$?
+	if (( rc != 0 )) && printf '%s' "$out" | grep -q "precondition was absent"; then
+		ok "reassert: unprimed failure names the ABSENT PRECONDITION, not an HA regression"
+	else
+		bad "reassert: unprimed failure did not distinguish 'nothing drove traffic' from 'the dataplane is broken' (rc=$rc)"
+	fi
+}
+
+# The other half of the same split: when traffic WAS driven and the state still
+# did not converge, the gate must say so affirmatively — that one IS a signal.
+test_reassert_failure_names_a_real_signal_when_primed_7962() {
+	reset_cli_mock
+	CLI_STATUS_RESPONSES=("$STATUS_INVERTED_RG0")
+	local out rc=0
+	out=$( CLUSTER_LAN_HOST="fake:lan" IPERF_TARGET4="10.0.0.1" \
+		deploy_reassert_primary_node0 "fake:vm0" 2>&1 ) || rc=$?
+	if (( rc != 0 )) && printf '%s' "$out" | grep -q "REAL dataplane/HA signal"; then
+		ok "reassert: primed failure is reported as a REAL signal"
+	else
+		bad "reassert: primed failure did not report itself as a real signal (rc=$rc)"
+	fi
+}
+
 test_reassert_issues_reset_transfer_reset_per_rg() {
 	reset_cli_mock
 	CLI_STATUS_RESPONSES=("$STATUS_BOTH_RG_NODE0_PRIMARY")
@@ -1057,6 +1091,8 @@ test_reassert_dies_when_status_never_readable
 test_reassert_retries_status_read_until_settled
 test_reassert_dies_when_role_not_achieved
 test_reassert_issues_reset_transfer_reset_per_rg
+test_reassert_failure_names_the_missing_precondition_7962
+test_reassert_failure_names_a_real_signal_when_primed_7962
 test_reassert_transfer_rc_is_not_the_verdict
 test_reassert_is_wired_into_both_deploy_paths
 test_reassert_clears_the_peer_manual_pin

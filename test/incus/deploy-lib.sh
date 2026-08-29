@@ -298,6 +298,57 @@ DEPLOY_REASSERT_READ_DELAY="${DEPLOY_REASSERT_READ_DELAY:-2}"
 DEPLOY_REASSERT_VERIFY_TRIES="${DEPLOY_REASSERT_VERIFY_TRIES:-15}"
 DEPLOY_REASSERT_VERIFY_DELAY="${DEPLOY_REASSERT_VERIFY_DELAY:-2}"
 
+# #7962: the verify budget when the degraded-promotion FALLBACK is the only path
+# to convergence.
+#
+# On an idle cluster, XSK liveness cannot self-prove on the node this reassert
+# checks. `shouldAutoProveIdleStandbyXSKLocked` requires `!hasActiveDataRGLocked()`
+# and node0 holds RG1, so the auto-prove arm is unreachable there; with no traffic
+# `currentRX` stays 0 and the RG waits out
+# `cluster.DefaultDegradedPromoteTimeout` (120s). The old budget was
+# TRIES*DELAY = 30s, so the gate could not pass on a restarted idle cluster
+# unless traffic happened to flow inside its window — it failed BY CONSTRUCTION,
+# and both its passes and its failures were timing artifacts (#7688, #7939, #7962).
+#
+# This number MUST exceed that fallback. It is not independently chosen and must
+# not be tuned on its own: TestDeployReassertBudgetExceedsDegradedFallback7962
+# (pkg/cluster) reads this default out of this file and fails if either side
+# moves such that the budget no longer covers the fallback. Change one, that test
+# tells you about the other.
+DEPLOY_REASSERT_FALLBACK_BUDGET_S="${DEPLOY_REASSERT_FALLBACK_BUDGET_S:-150}"
+
+# Whether to PRIME dataplane liveness with a little traffic before verifying.
+#
+# This is what an operator does by hand, and it is the difference between asking
+# the system for proof it cannot produce and supplying the precondition. A
+# handful of packets LAN->WAN makes the node log `XSK liveness proven` in
+# seconds, so the common idle case converges immediately instead of waiting out
+# the 120s fallback. Set to 0 to skip (the self-test does).
+DEPLOY_REASSERT_PRIME_LIVENESS="${DEPLOY_REASSERT_PRIME_LIVENESS:-1}"
+DEPLOY_REASSERT_PRIME_COUNT="${DEPLOY_REASSERT_PRIME_COUNT:-20}"
+
+# deploy_reassert_prime_liveness drives a few packets through the data path so
+# the helper can prove XSK liveness. Returns 0 if traffic was actually sent, 1 if
+# it could not be (no LAN host, no target, unreachable).
+#
+# The RETURN VALUE is load-bearing and is not about success of the ping: it
+# records whether the precondition was SUPPLIED, which is what lets the failure
+# message below tell "the helper did not prove liveness despite forwarded
+# traffic" apart from "nothing ever asked it to forward a packet". Those are the
+# two states this gate used to crush into one, and the reason its failures cost
+# lanes an afternoon.
+deploy_reassert_prime_liveness() {
+	local lan="${CLUSTER_LAN_HOST:-}" target="${IPERF_TARGET4:-${IPERF_TARGET:-}}"
+	[[ "$DEPLOY_REASSERT_PRIME_LIVENESS" == "1" ]] || return 1
+	[[ -n "$lan" && -n "$target" ]] || return 1
+	incus exec "$lan" -- ping -c "$DEPLOY_REASSERT_PRIME_COUNT" -i 0.05 -W 1 "$target" \
+		>/dev/null 2>&1 || true
+	# Ping REPLIES are not required: a one-way packet still drives RX on the
+	# firewall, which is all liveness needs. What matters is that we were able
+	# to issue traffic at all.
+	return 0
+}
+
 # deploy_reassert_primary_node0 leaves node0 the primary for EVERY redundancy
 # group after a deploy, so downstream smoke (apply-cos-config, test-failover)
 # starts from the documented node0-primary steady state regardless of preempt
@@ -366,15 +417,46 @@ deploy_reassert_primary_node0() {
 	# observed role, not the exit code of any one CLI call. A transfer that
 	# returns non-zero but lands is fine; one that returns zero and does not
 	# land is not — and only this read can tell them apart.
-	for (( try = 0; try < DEPLOY_REASSERT_VERIFY_TRIES; try++ )); do
+	# #7962: supply the precondition before demanding the proof. On an idle
+	# cluster liveness cannot self-prove on this node, so without traffic the
+	# only path to convergence is the 120s degraded fallback.
+	local primed=0 tries="$DEPLOY_REASSERT_VERIFY_TRIES" regime="primed"
+	if deploy_reassert_prime_liveness; then
+		primed=1
+	else
+		# Priming was not possible, so the fallback IS the mechanism and the
+		# budget must cover it. Derived, not independently chosen — see
+		# DEPLOY_REASSERT_FALLBACK_BUDGET_S.
+		regime="fallback"
+		# Guard the divisor. The self-test runs with DELAY=0 so it never sleeps;
+		# dividing by it aborts the function under `set -e` and turns every
+		# should-succeed case into a failure — which is exactly what it did on
+		# the first run of this change.
+		if (( DEPLOY_REASSERT_VERIFY_DELAY > 0 )); then
+			tries=$(( DEPLOY_REASSERT_FALLBACK_BUDGET_S / DEPLOY_REASSERT_VERIFY_DELAY ))
+			(( tries > DEPLOY_REASSERT_VERIFY_TRIES )) || tries="$DEPLOY_REASSERT_VERIFY_TRIES"
+		fi
+	fi
+
+	for (( try = 0; try < tries; try++ )); do
 		status=$(incus exec "$rinst" -- cli -c "show chassis cluster status" 2>/dev/null || true)
 		if printf '%s\n' "$status" | deploy_reassert_node0_primary_ok; then
-			info "Re-asserted node0 primary for all redundancy groups (post-deploy, verified)."
+			info "Re-asserted node0 primary for all redundancy groups (post-deploy, verified; ${regime} regime)."
 			return 0
 		fi
 		sleep "$DEPLOY_REASSERT_VERIFY_DELAY"
 	done
-	die "post-deploy primary reassert FAILED: node0 is not primary for every redundancy group after ${DEPLOY_REASSERT_VERIFY_TRIES} verification attempts. The cluster is left in whatever state the transfer produced; do NOT run an HA smoke against it and read the failure as an HA regression. Last status from $rinst:
+
+	# #7962: say WHICH failure this is. A gate that fails identically whether
+	# the helper is broken or whether nothing asked it to forward a packet
+	# carries no information, and its failures get read as HA regressions.
+	local diagnosis
+	if (( primed == 1 )); then
+		diagnosis="Traffic WAS driven through the data path before this wait (${DEPLOY_REASSERT_PRIME_COUNT} packets to ${IPERF_TARGET4:-${IPERF_TARGET:-the smoke target}}), so the dataplane had the opportunity to prove XSK liveness and did not take it. Treat this as a REAL dataplane/HA signal."
+	else
+		diagnosis="Traffic could NOT be driven (no reachable LAN host/target), so liveness had no opportunity to be proven and this wait depended entirely on the ${DEPLOY_REASSERT_FALLBACK_BUDGET_S}s degraded-promotion fallback. If the status below says 'userspace XSK liveness not proven', the precondition was absent rather than the dataplane broken — that is NOT an HA regression (#7962)."
+	fi
+	die "post-deploy primary reassert FAILED: node0 is not primary for every redundancy group after ${tries} verification attempts (${regime} regime). ${diagnosis} The cluster is left in whatever state the transfer produced. Last status from $rinst:
 ${status}"
 }
 
