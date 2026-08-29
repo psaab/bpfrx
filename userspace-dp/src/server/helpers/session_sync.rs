@@ -234,19 +234,39 @@ pub(crate) fn build_synced_session_entry(
             },
         },
         metadata: crate::session::SessionMetadata {
-            // #4983: a peer-imported session carries NO ingress identity, and
-            // this is deliberate rather than unfinished. An ifindex is
-            // NODE-LOCAL -- node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are
-            // different numbers for the same logical RETH member -- so the
-            // originating node's value would name a different NIC here. It is
-            // therefore not put on the cluster wire at all, and 0 is the
-            // honest answer: the Go consumer falls back to the zone
-            // approximation, which is approximate but never confidently wrong.
+            // #4983/#7095: a peer-imported session now carries an ingress
+            // identity again -- but a LOCALLY RESOLVED one.
+            //
+            // #6928 imported 0 here on purpose: an ifindex is NODE-LOCAL, so
+            // node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different numbers
+            // for one logical RETH member, and shipping the originating node's
+            // value would name a different NIC here -- confidently wrong, which
+            // is worse than the zone approximation.
+            //
+            // #7095 does not ship the ifindex. The sender ships a FOLD of the
+            // reth-relative name (`reth0.50`), which both chassis agree on by
+            // construction, and the Go side resolves that fold against THIS
+            // node's config and ifindex table before building this request. So
+            // these are this node's own numbers for the interface the peer
+            // named, and storing them is safe.
+            //
+            // Zero still arrives and still means unknown: a legacy peer sends
+            // no wire field, a session whose interface has no cluster-stable
+            // name folds to 0, and a fabric-redirected session records no
+            // identity at all (#7096, because the fabric stamp carries a u16
+            // zone id and nothing else). All three keep the pre-#7095
+            // behaviour -- the Go consumer falls back to the zone
+            // approximation.
+            //
             // Note this install is `is_reverse: req.is_reverse`, so a FORWARD
-            // peer session lands here with 0 too -- see the scope note in
+            // peer session lands here too -- see the scope note in
             // pkg/dataplane/types.go.
-            ingress_ifindex: 0,
-            ingress_vlan_id: 0,
+            ingress_ifindex: if req.ingress_ifindex > 0 {
+                req.ingress_ifindex as u32
+            } else {
+                0
+            },
+            ingress_vlan_id: req.ingress_vlan_id,
             // #919: prefer the wire u16 IDs when populated; fall back
             // to name lookup for older peers that only sent strings.
             ingress_zone: if req.ingress_zone_id != 0 {

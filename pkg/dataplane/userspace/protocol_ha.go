@@ -44,8 +44,19 @@ type SessionSyncRequest struct {
 	// prefers the IDs when nonzero and falls back to the legacy
 	// name strings otherwise. Old peers without these fields
 	// continue to work (Rust serde sets the IDs to 0).
-	IngressZoneID    uint16 `json:"ingress_zone_id,omitempty"`
-	EgressZoneID     uint16 `json:"egress_zone_id,omitempty"`
+	IngressZoneID uint16 `json:"ingress_zone_id,omitempty"`
+	EgressZoneID  uint16 `json:"egress_zone_id,omitempty"`
+	// #7095: the LOCAL ingress identity a peer-imported session should carry,
+	// resolved on THIS node from the cluster-stable fold the sender put on the
+	// wire. #6928 deliberately imported 0 because the sender's IFINDEX is
+	// node-local and would name a different NIC here; these are this node's own
+	// numbers for the interface the peer named, so they are safe to store.
+	//
+	// Additive and omitempty, like the zone-id mirrors above: an older helper
+	// decodes them via serde(default) to 0 and keeps the pre-#7095 behaviour of
+	// recording no ingress identity.
+	IngressIfindex   int    `json:"ingress_ifindex,omitempty"`
+	IngressVLANID    uint16 `json:"ingress_vlan_id,omitempty"`
 	OwnerRGID        int    `json:"owner_rg_id,omitempty"`
 	EgressIfindex    int    `json:"egress_ifindex,omitempty"`
 	TXIfindex        int    `json:"tx_ifindex,omitempty"`

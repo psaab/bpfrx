@@ -120,6 +120,11 @@ func (g *fullSetSeqGuard) reset() {
 func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane.SessionValue) {
 	g := s.nextInstallGen()
 	val.Generation = g
+	// #7095: stamp the cluster-stable ingress fold on the same pass that
+	// stamps the generation — one place per family, covering both the
+	// incremental and the bulk send paths, which both call this immediately
+	// before encoding.
+	val.IngressIfaceFold = s.stampIngressIfaceFold(val.IngressIfindex, val.IngressVlanID)
 	// #5274: stamp the admitting config epoch = the config-sync generation
 	// (#3931) this node currently holds. A session still present in the local
 	// table when it is queued has survived this node's own config-apply
@@ -165,6 +170,11 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 func (s *SessionSync) stampInstallGenV6(key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) {
 	g := s.nextInstallGen()
 	val.Generation = g
+	// #7095: stamp the cluster-stable ingress fold on the same pass that
+	// stamps the generation — one place per family, covering both the
+	// incremental and the bulk send paths, which both call this immediately
+	// before encoding.
+	val.IngressIfaceFold = s.stampIngressIfaceFold(val.IngressIfindex, val.IngressVlanID)
 	// #5274: stamp the admitting config epoch (see stampInstallGenV4).
 	val.ConfigEpoch = s.configGenCounter.Load()
 	s.genSentMu.Lock()

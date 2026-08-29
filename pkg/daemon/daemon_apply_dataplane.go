@@ -15,6 +15,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
@@ -226,6 +227,26 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// 2.2. Build zone→RG map for per-RG session sync.
 	if ss := d.getSessionSync(); ss != nil && applyResult != nil {
 		ss.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
+	}
+
+	// 2.21. #7095: rebuild the cluster-stable ingress-interface resolver the
+	// session-sync sender stamps outgoing sessions with. Rebuilt here rather
+	// than held, because it closes over BOTH the config (reth → local member)
+	// and an ifindex snapshot, and a commit can change either.
+	if ss := d.getSessionSync(); ss != nil {
+		ss.SetIngressFoldFn(buildIngressFoldFn(cfg))
+	}
+	// And the reverse direction, used when a peer's session is imported: the
+	// fold the peer sent becomes THIS node's ifindex. Both closures share the
+	// same apply-time ifindex snapshot rationale.
+	if rt := d.dataplane(); rt != nil {
+		if adapter, ok := rt.(interface {
+			Manager() *dpuserspace.Manager
+		}); ok {
+			if mgr := adapter.Manager(); mgr != nil {
+				mgr.SetIngressFoldResolver(buildIngressFoldResolver(cfg))
+			}
+		}
 	}
 
 	// 2.45. #1956 V-4: managed->unmapped teardown MUST run BEFORE

@@ -97,9 +97,10 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	valSize := 160
 	// +8 for the #2170 install Generation, +8 for the #3301 trailing
 	// AppTimeout(u32)+PolicyCounterIdx(u32), +8 for the #5274 ConfigEpoch, +8 for
-	// the #5212 RTFlowSessionID. All length-gated: an old decoder stops after the
-	// field it knows and ignores the rest.
-	buf := make([]byte, keySize+valSize+8+8+8+8)
+	// the #5212 RTFlowSessionID, +4 for the #7095 IngressIfaceFold. All
+	// length-gated: an old decoder stops after the field it knows and ignores
+	// the rest.
+	buf := make([]byte, keySize+valSize+8+8+8+8+4)
 	off := 0
 	copy(buf[off:], key.SrcIP[:])
 	off += 4
@@ -203,6 +204,16 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	// it; absent => 0 (legacy peer / fresh-local-id fallback).
 	binary.LittleEndian.PutUint64(buf[off:], val.RTFlowSessionID)
 	off += 8
+	// #7095: the CLUSTER-STABLE fold of the session's ingress interface name
+	// (length-gated trailing field). The #4983 ingress identity is an
+	// IFINDEX, which is node-local and would name a different NIC on the
+	// importing node, so what rides the wire is a fold of the RETH-RELATIVE
+	// name both chassis agree on. Old decoders stop after RTFlowSessionID and
+	// ignore it; absent => 0, which is also what a session with no
+	// cluster-stable ingress name and a fabric-redirected session (#7096)
+	// send. All three fall back to the #4792 zone approximation.
+	binary.LittleEndian.PutUint32(buf[off:], val.IngressIfaceFold)
+	off += 4
 	return buf[:off]
 }
 func encodeSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) []byte {
@@ -320,6 +331,16 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	// absent => 0 (legacy peer / fresh-local-id fallback on import).
 	binary.LittleEndian.PutUint64(buf[off:], val.RTFlowSessionID)
 	off += 8
+	// #7095: the CLUSTER-STABLE fold of the session's ingress interface name
+	// (length-gated trailing field). The #4983 ingress identity is an
+	// IFINDEX, which is node-local and would name a different NIC on the
+	// importing node, so what rides the wire is a fold of the RETH-RELATIVE
+	// name both chassis agree on. Old decoders stop after RTFlowSessionID and
+	// ignore it; absent => 0, which is also what a session with no
+	// cluster-stable ingress name and a fabric-redirected session (#7096)
+	// send. All three fall back to the #4792 zone approximation.
+	binary.LittleEndian.PutUint32(buf[off:], val.IngressIfaceFold)
+	off += 4
 	return buf[:off]
 }
 
@@ -494,6 +515,13 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
 	}
+	// #7095: cluster-stable ingress-interface fold (length-gated; absent → 0 =
+	// legacy peer / no stable name / fabric-redirected, all of which fall back
+	// to the zone approximation).
+	if off+4 <= len(payload) {
+		val.IngressIfaceFold = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
 	return key, val, true
 }
 
@@ -630,6 +658,13 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	if off+8 <= len(payload) {
 		val.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
+	}
+	// #7095: cluster-stable ingress-interface fold (length-gated; absent → 0 =
+	// legacy peer / no stable name / fabric-redirected, all of which fall back
+	// to the zone approximation).
+	if off+4 <= len(payload) {
+		val.IngressIfaceFold = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
 	}
 	return key, val, true
 }

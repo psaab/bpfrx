@@ -193,7 +193,13 @@ type Manager struct {
 	// haWatchdogMapWrite. nil-safe at the call site: it defaults to
 	// buildFabricSnapshots when unset (so bare &Manager{} literals still work).
 	fabricSnapshotBuilder func(*config.Config) []FabricSnapshot
-	lastIngressIfaces     []uint32
+
+	// ingressFoldResolver maps a peer's #7095 cluster-stable ingress fold to
+	// this node's own {ifindex, vlan}. Injected by the daemon, which owns both
+	// the config (reth -> local member) and the ifindex snapshot. Nil resolves
+	// nothing, which is the pre-#7095 import behaviour.
+	ingressFoldResolver func(uint32) (uint32, uint16, bool)
+	lastIngressIfaces   []uint32
 	// ingressInventoryAdopted records whether this Manager has reconciled
 	// lastIngressIfaces against the rows actually present in the PINNED
 	// userspace_ingress_ifaces map (#6784). It is false on a freshly

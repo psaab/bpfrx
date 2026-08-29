@@ -4298,3 +4298,75 @@ fn refresh_status_projects_interface_snat_registry_counters_6751() {
         "the sync-import conflict counter must reach its own status field"
     );
 }
+
+// --- #7095: a peer-imported session carries a LOCALLY RESOLVED ingress identity
+
+/// #6928 imported `ingress_ifindex: 0` on purpose: the originating node's
+/// ifindex is node-local and would name a different NIC here. #7095 does not
+/// ship an ifindex — it ships a fold of the reth-relative name both chassis
+/// agree on, and the Go side resolves it against THIS node's config and ifindex
+/// table before building the request. So what arrives here is already local, and
+/// storing it is what makes the identity survive a failover.
+#[test]
+fn session_sync_import_stores_locally_resolved_ingress_7095() {
+    let zones = rustc_hash::FxHashMap::default();
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 5001,
+        dst_port: 80,
+        ingress_zone_id: 2,
+        egress_zone_id: 3,
+        ingress_ifindex: 42,
+        ingress_vlan_id: 50,
+        ..SessionSyncRequest::default()
+    };
+    let entry = build_synced_session_entry(&req, &zones).expect("build entry");
+    assert_eq!(
+        entry.metadata.ingress_ifindex, 42,
+        "a peer-imported session must carry the ingress ifindex the Go side \
+         resolved LOCALLY from the peer's cluster-stable fold; dropping it here \
+         is what made every synced session fall back to the zone approximation \
+         after a failover (#7095)"
+    );
+    assert_eq!(
+        entry.metadata.ingress_vlan_id, 50,
+        "the VLAN is half the identity: {{ifindex, vlan}} is the key the CLI \
+         resolves an interface name by, so two units of one trunk NIC alias \
+         onto each other without it"
+    );
+}
+
+/// The unknown case still imports nothing, and it arrives from three places
+/// that all want the same answer: a legacy peer that sent no wire field, an
+/// interface with no cluster-stable name, and a fabric-redirected session, whose
+/// ingress interface is not knowable on this node at all (#7096 — the fabric
+/// stamp carries a u16 zone id and nothing else).
+#[test]
+fn session_sync_import_keeps_zero_ingress_when_unknown_7095() {
+    let zones = rustc_hash::FxHashMap::default();
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 5001,
+        dst_port: 80,
+        ingress_zone_id: 2,
+        egress_zone_id: 3,
+        // No ingress_ifindex / ingress_vlan_id: exactly what an older daemon
+        // sends, since serde defaults them.
+        ..SessionSyncRequest::default()
+    };
+    let entry = build_synced_session_entry(&req, &zones).expect("build entry");
+    assert_eq!(
+        entry.metadata.ingress_ifindex, 0,
+        "an absent ingress identity must stay 0 — the consumer falls back to the \
+         zone approximation, which is approximate but never confidently wrong"
+    );
+    assert_eq!(entry.metadata.ingress_vlan_id, 0);
+}

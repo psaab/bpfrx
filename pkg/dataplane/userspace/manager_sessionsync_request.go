@@ -29,6 +29,16 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		// #919/#922: forward the raw u16 IDs alongside the legacy
 		// strings; the Rust daemon prefers IDs when nonzero.
 		req.IngressZoneID = val.IngressZone
+		// #7095: resolve the peer's cluster-stable ingress fold to THIS node's
+		// ifindex. The sender could not ship its own ifindex — it is node-local
+		// — so it shipped a fold of the reth-relative name both nodes agree on,
+		// and this is where it becomes a local number again. Unresolvable (0, an
+		// unknown fold, or a collision) leaves both fields 0 and the consumer
+		// falls back to the #4792 zone approximation, exactly as before #7095.
+		if ifindex, vlan, ok := m.resolveIngressFold(val.IngressIfaceFold); ok {
+			req.IngressIfindex = int(ifindex)
+			req.IngressVLANID = vlan
+		}
 		req.EgressZoneID = val.EgressZone
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
@@ -105,6 +115,16 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		// #919/#922: forward the raw u16 IDs alongside the legacy
 		// strings; the Rust daemon prefers IDs when nonzero.
 		req.IngressZoneID = val.IngressZone
+		// #7095: resolve the peer's cluster-stable ingress fold to THIS node's
+		// ifindex. The sender could not ship its own ifindex — it is node-local
+		// — so it shipped a fold of the reth-relative name both nodes agree on,
+		// and this is where it becomes a local number again. Unresolvable (0, an
+		// unknown fold, or a collision) leaves both fields 0 and the consumer
+		// falls back to the #4792 zone approximation, exactly as before #7095.
+		if ifindex, vlan, ok := m.resolveIngressFold(val.IngressIfaceFold); ok {
+			req.IngressIfindex = int(ifindex)
+			req.IngressVLANID = vlan
+		}
 		req.EgressZoneID = val.EgressZone
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
@@ -324,4 +344,36 @@ func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex i
 		}
 	}
 	return InterfaceSnapshot{}, false
+}
+
+// resolveIngressFold maps a peer's #7095 cluster-stable ingress fold to this
+// node's own {ifindex, vlan}.
+//
+// The resolver is injected (the daemon owns the config and the ifindex
+// snapshot); an unset one resolves nothing, which is the pre-#7095 behaviour and
+// not an error. Returning ok=false for an unknown or ambiguous fold is
+// deliberate: naming no interface costs the zone approximation, while naming the
+// wrong one is the confidently-wrong rendering #6928 refused to ship.
+func (m *Manager) resolveIngressFold(fold uint32) (uint32, uint16, bool) {
+	if m == nil || fold == 0 {
+		return 0, 0, false
+	}
+	m.mu.Lock()
+	fn := m.ingressFoldResolver
+	m.mu.Unlock()
+	if fn == nil {
+		return 0, 0, false
+	}
+	return fn(fold)
+}
+
+// SetIngressFoldResolver wires the #7095 fold -> local {ifindex, vlan} lookup.
+// Passing nil restores the pre-#7095 behaviour of importing no ingress identity.
+func (m *Manager) SetIngressFoldResolver(fn func(uint32) (uint32, uint16, bool)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.ingressFoldResolver = fn
+	m.mu.Unlock()
 }

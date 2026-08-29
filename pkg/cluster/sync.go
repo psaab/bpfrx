@@ -777,10 +777,22 @@ type SessionSync struct {
 	peerSnapshotProtocol atomic.Uint32
 	zoneRGMu             sync.RWMutex
 	zoneRGMap            map[uint16]int
-	deleteJournalMu      sync.Mutex
-	deleteJournal        [][]byte
-	deleteJournalCap     int
-	lastPeerRxMono       atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+
+	// ingressFoldFn resolves a session's LOCAL ingress identity to the
+	// #7095 cluster-stable fold that rides the sync wire. Injected by the
+	// daemon, which owns the config; pkg/cluster deliberately holds no
+	// config of its own.
+	//
+	// NIL IS THE UNKNOWN CASE, not an error: an unset resolver stamps 0,
+	// which is the same value a legacy peer sends and a fabric-redirected
+	// session records, and the consumer falls back to the zone
+	// approximation for all three. So a node that has not wired it yet
+	// syncs exactly what it synced before #7095.
+	ingressFoldFn    func(ifindex uint32, vlan uint16) uint32
+	deleteJournalMu  sync.Mutex
+	deleteJournal    [][]byte
+	deleteJournalCap int
+	lastPeerRxMono   atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
 	// peerHeartbeatAckEver latches when the CURRENTLY connected peer proves it
 	// understands syncMsgHeartbeat by replying syncMsgHeartbeatAck. It gates
 	// the two enforcement paths that would otherwise punish a legacy peer that
@@ -1288,6 +1300,35 @@ func (s *SessionSync) SetZoneRGMap(m map[uint16]int) {
 	s.zoneRGMu.Lock()
 	s.zoneRGMap = m
 	s.zoneRGMu.Unlock()
+}
+
+// SetIngressFoldFn wires the #7095 cluster-stable ingress-interface resolver.
+//
+// It is guarded by zoneRGMu because it is read on the send path exactly where
+// the zone map is, and passing nil restores the pre-#7095 behaviour of stamping
+// nothing — which the wire already treats as "unknown".
+func (s *SessionSync) SetIngressFoldFn(fn func(ifindex uint32, vlan uint16) uint32) {
+	s.zoneRGMu.Lock()
+	s.ingressFoldFn = fn
+	s.zoneRGMu.Unlock()
+}
+
+// stampIngressIfaceFold fills in the #7095 wire field from the session's
+// node-local ingress identity, just before it is encoded.
+//
+// It runs on the SEND path only. The fold is computed from THIS node's
+// {ifindex, vlan} against THIS node's config, so the name it folds is the one
+// this node would display — and the peer resolves that same fold to its own
+// device. A session with no local identity (ifindex 0, the #7096
+// fabric-redirected case among them) folds to 0 and stays unknown.
+func (s *SessionSync) stampIngressIfaceFold(ifindex uint32, vlan uint16) uint32 {
+	s.zoneRGMu.Lock()
+	fn := s.ingressFoldFn
+	s.zoneRGMu.Unlock()
+	if fn == nil || ifindex == 0 {
+		return 0
+	}
+	return fn(ifindex, vlan)
 }
 
 // SetRuntime wires the backend-neutral runtime used by SessionSync.
