@@ -416,6 +416,8 @@ func (m *Manager) FormatInformation() string {
 	// remote CLI (both render this same function). Suppressed entirely when
 	// fencing was never configured and never fired, matching the
 	// conditional style of the sections around it.
+	b.WriteString(m.formatStartupSyncHold())
+
 	fenceAction, fenceEvents := m.FenceStatus()
 	if fenceAction != "" || len(fenceEvents) > 0 {
 		fmt.Fprintln(&b, "Peer fencing:")
@@ -1102,4 +1104,61 @@ func epochlessExposureNote(s HeartbeatStats) string {
 		return "  (downgrade latch armed; count is historical)"
 	}
 	return "  (peer not signing boot epochs - replay protection is ring-only; rotate the control-link PSK once both nodes are upgraded)"
+}
+
+// SetStartupSyncHoldStatus records the startup promotion-hold state for
+// `show chassis cluster information` (#7162).
+//
+// The hold mechanisms live outside this package — vrrp.Manager for RETH VRRP
+// mode, the daemon for no-reth-vrrp / private-rg-election — so this is a
+// reporting mirror rather than the state itself. `mode` names which one, `active`
+// is whether it is still holding, and `reason` is why it ended
+// ("bulk-sync-complete" or "timeout-degraded"), empty while it is still active.
+//
+// Both paths report here because before #7162 neither was visible: the VRRP hold
+// had recorded a reason since #466 and rendered it nowhere, so an operator could
+// not distinguish "startup sync completed normally" from "sync never arrived and
+// we promoted degraded" — which is exactly the distinction that explains a flow
+// reset after a boot.
+func (m *Manager) SetStartupSyncHoldStatus(mode string, active bool, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.startupHoldMode = mode
+	m.startupHoldActive = active
+	if reason != "" {
+		m.startupHoldReason = reason
+	}
+}
+
+// StartupSyncHoldStatus returns the recorded startup hold state.
+func (m *Manager) StartupSyncHoldStatus() (mode string, active bool, reason string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.startupHoldMode, m.startupHoldActive, m.startupHoldReason
+}
+
+// formatStartupSyncHold renders the startup promotion hold block, or nothing
+// when no hold was ever armed (this node is standalone, or predates the arming
+// path) — matching the conditional style of the sections around it.
+func (m *Manager) formatStartupSyncHold() string {
+	mode, active, reason := m.StartupSyncHoldStatus()
+	if mode == "" {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintln(&b, "Startup promotion hold:")
+	fmt.Fprintf(&b, "  Mode: %s\n", mode)
+	switch {
+	case active:
+		fmt.Fprintln(&b, "  State: HOLDING (waiting for bulk session sync)")
+	case reason == "timeout-degraded":
+		fmt.Fprintln(&b, "  State: released DEGRADED (bulk sync did not complete "+
+			"within the hold; promotion proceeded without synced session state)")
+	case reason != "":
+		fmt.Fprintf(&b, "  State: released (%s)\n", reason)
+	default:
+		fmt.Fprintln(&b, "  State: released")
+	}
+	fmt.Fprintln(&b)
+	return b.String()
 }

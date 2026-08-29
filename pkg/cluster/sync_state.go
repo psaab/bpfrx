@@ -13,13 +13,24 @@ type SyncStatsProvider interface {
 //
 // It does NOT gate RG promotion, in private-rg-election mode or any other
 // (#7102). Say that plainly, because the opposite belief is the one #110 was
-// filed to prevent and this comment used to assert it: promotion readiness in
-// no-RETH / private-rg-election mode is VIP ownership ALONE
-// (checkNoRethTakeoverReadiness -> checkVIPReadiness, pkg/daemon), and the
-// readiness conjunction that consumes it — ifReady && takeoverGateReady &&
-// fabricReady && userspaceReady, in daemon_ha_userspace_readiness.go — carries
-// no sync term. A node in this mode can therefore take over an RG before bulk
-// session sync has completed.
+// filed to prevent and this comment used to assert it: this FLAG is not a term
+// in the readiness conjunction (ifReady && takeoverGateReady && fabricReady &&
+// userspaceReady, in daemon_ha_userspace_readiness.go).
+//
+// #7162 UPDATE — read this before concluding that startup promotion is
+// ungated. It no longer is, but the gate is NOT this flag. no-RETH /
+// private-rg-election mode now takes a BOUNDED startup hold
+// (Daemon.armNoRethSyncHold, pkg/daemon/daemon_ha_noreth_hold.go), which
+// checkNoRethTakeoverReadiness consults, so a node does not promote before bulk
+// session sync during the hold window.
+//
+// The distinction is the entire point and must not be collapsed: the hold
+// releases itself after a fixed duration whatever sync does, whereas THIS flag
+// has no bound while the sync channel is down (armSyncReadyTimer early-returns
+// unless syncPeerConnected). Making this flag a readiness conjunct would block
+// promotion indefinitely with the peer alive on the control link and session
+// sync down — including the degraded-peer case preemption exists for. That is
+// what #110 measured and rejected. Do not "simplify" the hold into this flag.
 //
 // The gate DID exist: reconcileRGState set vrrpReady = d.cluster.IsSyncReady()
 // in no-RETH mode and reported "session sync not ready" as a takeover blocker,

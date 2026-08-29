@@ -94,7 +94,20 @@ func (d *Daemon) onSessionSyncBulkReceived() {
 	d.stopSyncReadyTimer()
 	if d.vrrpMgr != nil {
 		d.vrrpMgr.ReleaseSyncHold()
+		// #7162: the VRRP hold has recorded a reason since #466 and surfaced it
+		// nowhere. Mirror it so an operator can tell a normal startup from one
+		// that promoted degraded because sync never arrived.
+		if d.cluster != nil {
+			if r := d.vrrpMgr.SyncHoldReason(); r != "" {
+				d.cluster.SetStartupSyncHoldStatus("reth-vrrp", d.vrrpMgr.InSyncHold(), r)
+			}
+		}
 	}
+	// #7162: the no-RETH sibling release. Unconditional, exactly like the VRRP
+	// one above — a hold that is only released when some other subsystem is
+	// present is a hold that outlives its purpose in the configuration that
+	// needs it most.
+	d.releaseNoRethSyncHold("bulk-sync-complete")
 	if d.cluster != nil {
 		d.cluster.SetSyncReady(true)
 	}

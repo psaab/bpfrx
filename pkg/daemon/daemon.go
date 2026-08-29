@@ -557,6 +557,23 @@ type Daemon struct {
 	syncReadyTimer     *time.Timer
 	syncReadyTimeout   time.Duration
 
+	// #7162 no-RETH startup promotion hold. RETH VRRP mode suppresses
+	// preemption at startup until bulk session sync completes
+	// (vrrp.Manager.SetSyncHold); no-reth-vrrp and private-rg-election mode had
+	// no equivalent, so a node in those modes could take over an RG before any
+	// conntrack/NAT state had arrived and reset every established flow.
+	//
+	// This is a BOUNDED hold, not a sync-readiness conjunct. The distinction is
+	// the whole point of #110: a continuous `IsSyncReady()` term in the
+	// readiness AND has no bound when the session-sync channel is down, so a
+	// peer alive on the control link with sync down blocks promotion FOREVER —
+	// including the degraded-peer case preemption exists for. This holds for a
+	// fixed duration and then releases itself no matter what.
+	noRethSyncHoldMu     sync.Mutex
+	noRethSyncHoldTimer  *time.Timer
+	noRethSyncHold       atomic.Bool
+	noRethSyncHoldReason atomic.Value // string: why the hold ended
+
 	// #5863: config-sync to a reconnecting peer is level-triggered, not a
 	// one-shot connect edge. syncPeerConnEpoch is bumped on every peer sync
 	// (re)connect so the reconciler can tell one live connection from the
