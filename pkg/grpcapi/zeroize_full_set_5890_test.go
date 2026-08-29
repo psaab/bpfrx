@@ -101,7 +101,11 @@ func TestPerformZeroizeWipeErasesFullSecretSet_5890(t *testing.T) {
 	mustWriteFile(t, archiveSnap, []byte("system { services { ssh; } }\n"+secret))
 
 	// === Drive the SHARED primitive the console delegates to. ===
-	if err := PerformZeroizeWipe(configDir, configBase); err != nil {
+	// #7173: the archive dir is now a PARAMETER, not read from the package
+	// default. Passing "" here would mean "archival disabled" and silently skip
+	// the archive leg this test exists to assert — the erasure would not be
+	// tested and the test would still pass its other legs.
+	if err := PerformZeroizeWipe(configDir, configBase, archiveDir); err != nil {
 		t.Fatalf("PerformZeroizeWipe returned error (reset reported incomplete): %v", err)
 	}
 

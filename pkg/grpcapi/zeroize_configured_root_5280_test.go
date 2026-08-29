@@ -38,7 +38,7 @@ func TestZeroizeTargetsConfiguredRootNotHardcoded(t *testing.T) {
 
 	var gotDir, gotBase string
 	var called bool
-	performZeroizeWipe = func(configDir, configBase string) error {
+	performZeroizeWipe = func(configDir, configBase, _ string) error {
 		called = true
 		gotDir, gotBase = configDir, configBase
 		return nil
@@ -86,7 +86,7 @@ func TestZeroizeFailsClosedWithoutConfigRoot(t *testing.T) {
 	})
 
 	var wiped, stopped bool
-	performZeroizeWipe = func(_, _ string) error { wiped = true; return nil }
+	performZeroizeWipe = func(_, _, _ string) error { wiped = true; return nil }
 	scheduleStopDaemon = func() { stopped = true }
 
 	s := &Server{} // no store => config root undeterminable

@@ -32,7 +32,7 @@ func TestConsoleZeroizeRoutesThroughDaemonTransaction_5871(t *testing.T) {
 	var enteredTransaction, wipedAtAll, wipedInsideTransaction, stopped bool
 	origWipe, origStop := zeroizeFullWipe, zeroizeStopDaemon
 	t.Cleanup(func() { zeroizeFullWipe, zeroizeStopDaemon = origWipe, origStop })
-	zeroizeFullWipe = func(string, string) error {
+	zeroizeFullWipe = func(string, string, string) error {
 		wipedAtAll = true
 		// Records that the wipe ran only AFTER the transaction was entered —
 		// proving fencing (apply-gate + reset generation) precedes erasure.
@@ -85,7 +85,7 @@ func TestConsoleZeroizeSurfacesTransactionFailure_5871(t *testing.T) {
 	var enteredTransaction, stopped bool
 	origWipe, origStop := zeroizeFullWipe, zeroizeStopDaemon
 	t.Cleanup(func() { zeroizeFullWipe, zeroizeStopDaemon = origWipe, origStop })
-	zeroizeFullWipe = func(string, string) error { return removalErr }
+	zeroizeFullWipe = func(string, string, string) error { return removalErr }
 	zeroizeStopDaemon = func() error { stopped = true; return nil }
 
 	c.factoryResetFn = func(_ context.Context, wipe func() error) error {
@@ -120,7 +120,7 @@ func TestConsoleZeroizeSurfacesGateAcquireFailure_5871(t *testing.T) {
 	var wiped, stopped bool
 	origWipe, origStop := zeroizeFullWipe, zeroizeStopDaemon
 	t.Cleanup(func() { zeroizeFullWipe, zeroizeStopDaemon = origWipe, origStop })
-	zeroizeFullWipe = func(string, string) error { wiped = true; return nil }
+	zeroizeFullWipe = func(string, string, string) error { wiped = true; return nil }
 	zeroizeStopDaemon = func() error { stopped = true; return nil }
 
 	// The transaction fails to enter the gate and never invokes the wipe closure.
@@ -152,7 +152,7 @@ func TestConsoleZeroizeOfflineFallbackUngatedWipe_5871(t *testing.T) {
 	var wiped, stopped bool
 	origWipe, origStop := zeroizeFullWipe, zeroizeStopDaemon
 	t.Cleanup(func() { zeroizeFullWipe, zeroizeStopDaemon = origWipe, origStop })
-	zeroizeFullWipe = func(string, string) error { wiped = true; return nil }
+	zeroizeFullWipe = func(string, string, string) error { wiped = true; return nil }
 	zeroizeStopDaemon = func() error { stopped = true; return nil }
 
 	if err := c.performConsoleZeroize(); err != nil {

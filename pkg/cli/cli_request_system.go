@@ -138,6 +138,25 @@ func (c *CLI) zeroizeConfigRoot() (configDir, configBase string, err error) {
 // (#5890) — a package var so a test can spy the delegation without wiping real
 // system paths. It defaults to grpcapi.PerformZeroizeWipe, the SAME primitive the
 // gRPC zeroize path runs.
+// cliZeroizeArchiveDir returns the archive directory the CONSOLE zeroize path
+// erases (#7173).
+//
+// The console path is a recovery surface: it runs when the daemon may be down
+// and the committed config may be unreadable, so it cannot ask the store what
+// `system archival archive-dir` was set to. It therefore erases the xpf-owned
+// DEFAULT, which is provably safe, and a custom archive dir is left for the
+// operator — the same disposition FactoryResetArchiveDir would reach anyway,
+// since it refuses to erase a directory whose ownership it cannot prove.
+//
+// The difference from the gRPC path is honest and worth stating: there, the
+// configured directory is known and a skip is reported as an incomplete reset.
+// Here it is not known, so a custom archive is not merely skipped but never
+// seen. An operator who zeroizes from the console with a custom archive-dir
+// must erase it by hand.
+func cliZeroizeArchiveDir() string {
+	return configstore.DefaultArchiveDir
+}
+
 var zeroizeFullWipe = grpcapi.PerformZeroizeWipe
 
 // zeroizeStopDaemon stops xpfd so it releases interface/dataplane state; a
@@ -179,7 +198,7 @@ func (c *CLI) performConsoleZeroize() error {
 	// The shared full factory-reset wipe primitive (config state + tls/ +
 	// rendered service configs [frr/swanctl/kea] + provisioned login accounts +
 	// config archive + BPF pins + networkd), #5890.
-	wipe := func() error { return zeroizeFullWipe(configDir, configBase) }
+	wipe := func() error { return zeroizeFullWipe(configDir, configBase, cliZeroizeArchiveDir()) }
 
 	// Route through the daemon's coordinated transaction when wired. When it is
 	// nil the CLI is spawned OUTSIDE the daemon (offline recovery / unit test) —

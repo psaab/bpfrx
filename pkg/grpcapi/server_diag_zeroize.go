@@ -1053,11 +1053,19 @@ var (
 // leave secret residue on a re-tenanted device. configDir/configBase are the
 // CONFIGURED config root (see performZeroizeWipe); the caller resolves+validates
 // them (cli.zeroizeConfigRoot / grpcapi.zeroizeConfigRoot) before delegating.
-func PerformZeroizeWipe(configDir, configBase string) error {
-	return performZeroizeWipe(configDir, configBase)
+// #7173: archiveDir is the CONFIGURED archive directory, not the compiled-in
+// default. Passing the default unconditionally meant the ownership guard inside
+// FactoryResetArchiveDir could never fire — the caller handed it exactly the
+// value the guard compares against — so a box with a custom
+// `system archival archive-dir` had a path wiped that held nothing while the
+// real archive, carrying cleartext IKE PSKs, WireGuard keys and SNMP
+// communities, was never examined and the reset reported clean. Pass "" to mean
+// "archival disabled, nothing to erase".
+func PerformZeroizeWipe(configDir, configBase, archiveDir string) error {
+	return performZeroizeWipe(configDir, configBase, archiveDir)
 }
 
-var performZeroizeWipe = func(configDir, configBase string) error {
+var performZeroizeWipe = func(configDir, configBase, archiveDir string) error {
 	// Config state FIRST — the security-critical erasure. A failure here can
 	// leave prior-tenant config/secrets on disk, so it is surfaced to the
 	// caller (#4576).
@@ -1099,8 +1107,17 @@ var performZeroizeWipe = func(configDir, configBase string) error {
 	// erases ONLY the xpf-owned default path, never a custom/remote/compliance
 	// archive destination. Also security-critical, so fold its first error into
 	// the surfaced result.
-	if e := configstore.FactoryResetArchiveDir(configstore.DefaultArchiveDir); e != nil && err == nil {
-		err = e
+	//
+	// #7173: the CONFIGURED dir. A skip is reported as an
+	// *configstore.ArchiveDirSkippedError and folded into the surfaced result
+	// like any other secret-bearing failure — the reset genuinely is incomplete
+	// and the operator has a directory to erase by hand. It is NOT a reason to
+	// stop: everything else must still be wiped, which is why it is folded in
+	// rather than returned early.
+	if archiveDir != "" {
+		if e := configstore.FactoryResetArchiveDir(archiveDir); e != nil && err == nil {
+			err = e
+		}
 	}
 
 	// BPF pins + managed networkd files carry no secret material, so their
