@@ -549,7 +549,7 @@ fn nb_full_write_succeeds_single_call() {
         calls += 1;
         assert_eq!(buf_len, len, "writer must always be handed the full packet");
         buf_len as isize
-    });
+    }, || {});
     assert!(res.is_ok());
     assert_eq!(calls, 1, "a full write must not loop");
 }
@@ -569,7 +569,7 @@ fn nb_short_write_drops_no_remainder() {
     let res = write_packet_atomic_nonblocking(len, |buf_len| {
         observed_lens.push(buf_len);
         40 // partial: 40 of 100
-    });
+    }, || {});
     let err = res.unwrap_err();
     assert_eq!(
         err.raw_os_error(),
@@ -607,7 +607,7 @@ fn nb_wouldblock_retries_whole_packet() {
         } else {
             buf_len as isize
         }
-    });
+    }, || {});
     assert!(res.is_ok(), "WouldBlock must retry, not drop");
     assert_eq!(
         observed_lens,
@@ -632,7 +632,7 @@ fn nb_eintr_retries_whole_packet() {
         } else {
             buf_len as isize
         }
-    });
+    }, || {});
     assert!(res.is_ok(), "EINTR must retry, not fail");
     assert_eq!(
         observed_lens,
@@ -659,7 +659,7 @@ fn nb_wouldblock_budget_is_bounded_and_drops() {
         }
         set_errno(libc::EAGAIN);
         -1
-    });
+    }, || {});
     let err = res.unwrap_err();
     assert_eq!(
         err.raw_os_error(),
@@ -681,7 +681,7 @@ fn nb_hard_error_preserves_errno() {
     let res = write_packet_atomic_nonblocking(100, |_| {
         set_errno(libc::EBADF);
         -1
-    });
+    }, || {});
     assert_eq!(
         res.unwrap_err().raw_os_error(),
         Some(libc::EBADF),
@@ -1106,4 +1106,82 @@ fn transient_outcome_does_not_demote_write_mode() {
         "status.mode must remain io_uring when no terminal failure occurred"
     );
     assert_eq!(status.snapshot().injected_packets, 1);
+}
+
+/// #7174 M05: every WouldBlock retry must WAIT for the device, not re-ask
+/// immediately.
+///
+/// The arm used to be a bare `continue`, so a full TUN queue produced up to
+/// NONBLOCK_WOULDBLOCK_RETRY_BUDGET back-to-back EAGAIN syscalls before the
+/// packet was dropped — a tight spin that burns a core under sustained
+/// backpressure, once per dropped packet.
+///
+/// WHY THIS ASSERTS THE WAIT COUNT RATHER THAN TIMING. The wait is injected as
+/// a closure precisely so it is observable: a poll() buried inside the function
+/// could not be asked whether it happened, and a timing assertion would be a
+/// flake on a loaded box. Counting the injected waits binds the WIRING — remove
+/// the `wait_writable()` call and this reds, while every pre-existing
+/// WouldBlock test stays green because they only ever asserted the retry count.
+#[test]
+fn nb_wouldblock_waits_between_retries_7174() {
+    let len = 100usize;
+    let mut writes = 0usize;
+    let mut waits = 0usize;
+    // Two EAGAINs, then success.
+    let res = write_packet_atomic_nonblocking(
+        len,
+        |buf_len| {
+            writes += 1;
+            if writes <= 2 {
+                unsafe { *libc::__errno_location() = libc::EAGAIN };
+                return -1;
+            }
+            buf_len as isize
+        },
+        || waits += 1,
+    );
+    assert!(res.is_ok(), "the write must succeed once the device drains");
+    assert_eq!(writes, 3, "two EAGAINs then one successful write");
+    assert_eq!(
+        waits, 2,
+        "each WouldBlock must be followed by a wait — one per retry. Zero waits \
+         means the arm is spinning on the device again (#7174 M05)"
+    );
+}
+
+/// Control: a write that succeeds first time must NOT wait. Without this, a
+/// change that waited unconditionally would satisfy the cell above while adding
+/// a poll to every single packet on the fast path.
+#[test]
+fn nb_successful_write_does_not_wait_7174() {
+    let mut waits = 0usize;
+    let res = write_packet_atomic_nonblocking(100, |buf_len| buf_len as isize, || waits += 1);
+    assert!(res.is_ok());
+    assert_eq!(
+        waits, 0,
+        "a write that never blocked must not poll — waiting unconditionally would \
+         put a syscall on every packet"
+    );
+}
+
+/// And the budget still bounds a genuinely wedged device: persistent EAGAIN
+/// must terminate rather than wait forever, with one wait per retry.
+#[test]
+fn nb_wedged_device_still_terminates_with_bounded_waits_7174() {
+    let mut waits = 0usize;
+    let res = write_packet_atomic_nonblocking(
+        100,
+        |_| {
+            unsafe { *libc::__errno_location() = libc::EAGAIN };
+            -1
+        },
+        || waits += 1,
+    );
+    assert!(res.is_err(), "a permanently wedged device must give up, not hang");
+    assert!(
+        waits as u32 <= NONBLOCK_WOULDBLOCK_RETRY_BUDGET + 1,
+        "waits must be bounded by the retry budget — the budget is what stops the \
+         wait becoming an unbounded block, which would trade a CPU-burn for a \
+         head-of-line stall. got {waits}"
+    );
 }
