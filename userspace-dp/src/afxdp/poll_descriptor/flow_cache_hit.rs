@@ -584,3 +584,10 @@ pub(super) fn stage_flow_cache_hit(
 #[cfg(test)]
 #[path = "flow_cache_hit_tests.rs"]
 mod flow_cache_hit_tests;
+
+// #7091: the WIRING guard lives beside the #6304 stage tests it complements —
+// those bind what the stage does with the counter it is HANDED, this binds which
+// counter the poll loop hands it.
+#[cfg(test)]
+#[path = "mirror_wiring_7091_tests.rs"]
+mod mirror_wiring_7091_tests;
