@@ -145,21 +145,8 @@ func TestBuildMonitorTrafficArgvFilterReachesTcpdump(t *testing.T) {
 	}
 }
 
-func TestStripSurroundingQuotes(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{`"tcp port 80"`, "tcp port 80"},
-		{`'udp or tcp'`, "udp or tcp"},
-		{"icmp", "icmp"},
-		{"tcp port 80", "tcp port 80"},
-		{`"unbalanced`, `"unbalanced`},
-		{`mismatched"`, `mismatched"`},
-		{`"`, `"`},
-		{"", ""},
-		{`""`, ""},
-	}
-	for _, tt := range tests {
-		if got := stripSurroundingQuotes(tt.in); got != tt.want {
-			t.Errorf("stripSurroundingQuotes(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
+// TestStripSurroundingQuotes MOVED to quote_strip_7171_test.go when the helper
+// moved out of this file to be shared with the commit/annotate comment paths.
+// Every case it asserted for #4005 is preserved there verbatim; the move keeps
+// the test next to the code rather than leaving it guarding a helper that no
+// longer lives here.

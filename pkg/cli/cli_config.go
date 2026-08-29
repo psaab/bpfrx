@@ -219,8 +219,7 @@ func (c *CLI) handleCommit(args []string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: commit comment \"description\"")
 		}
-		desc := strings.Join(args[1:], " ")
-		desc = strings.Trim(desc, "\"'")
+		desc := commitCommentFromArgs(args[1:])
 
 		diffSummary := c.store.CommitDiffSummary()
 
