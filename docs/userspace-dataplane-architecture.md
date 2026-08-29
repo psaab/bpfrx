@@ -2349,7 +2349,7 @@ system {
 | control-socket | — | Unix socket for control protocol (typed leaf: absolute, no `.`/`..` component, ≤107 octets — see below) |
 | state-file | — | JSON state persistence path |
 
-### Socket path handling (#5273, #5839)
+### Socket path handling (#5273, #5839, #7139)
 
 `control-socket` is operator-supplied and xpfd runs as root, so both helper
 sockets are treated as untrusted paths at every bring-up.
@@ -2365,8 +2365,11 @@ never relies on it.
 is the single implementation of stale-socket removal for BOTH the control socket
 and the event socket. Before it unlinks anything it:
 
-1. `Lstat`s the path, tolerating "does not exist" (the normal first boot) and
-   judging a symlink on its own inode rather than following it;
+1. opens the socket's DIRECTORY once (`O_PATH|O_DIRECTORY`) and does everything
+   below relative to that descriptor, then `fstatat`s the final component with
+   `AT_SYMLINK_NOFOLLOW` — tolerating "does not exist" for either the socket or
+   the directory (the normal first boot) and judging a symlink on its own inode
+   rather than following it;
 2. refuses any path that is not a Unix socket — a regular file, directory,
    FIFO, device, or symlink is preserved, not deleted;
 3. refuses a socket the kernel Unix socket table still lists, i.e. one a LIVE
@@ -2376,17 +2379,39 @@ and the event socket. Before it unlinks anything it:
    AF_XDP queues. An unreadable `/proc/net/unix` is inconclusive and fails
    closed. The probe is non-invasive by design: DIALING the event socket would
    make the daemon accept the probe as its new helper and drop the real one;
-4. surfaces an `os.Remove` failure instead of discarding it.
+4. surfaces an `unlinkat` failure instead of discarding it.
 
-**Known residual (#7139).** Those checks judge a path STRING, and the unlink is
-a separate syscall on that same string. A live socket reached through a
-different spelling of the same file — most plausibly a symlinked parent
-directory — is not matched in `/proc/net/unix` and so reads as stale, and the
-target or its parent can be swapped between the check and the unlink. Closing
-either needs the trusted-directory rework (`openat2` with `RESOLVE_BENEATH`, or
-an inode-keyed liveness decision) that #7139 tracks. The typed `control-socket`
-leaf removes the spelling most likely to be written by hand (a `.`/`..`
-component) from any strict commit, but does not close the alias.
+**#7139 closed two ways, neither a stricter string test.**
+
+*The parent is pinned.* Every check and the unlink act on one directory
+descriptor, so a parent component cannot be re-pointed between them. That
+window was reachable — `ValidateUnixSocketPath` accepts any absolute path, so a
+committed `/tmp/xpf.sock` puts the parent in a world-writable directory — but
+the primitive was bounded: `unlink(2)` does not follow a symlink in the FINAL
+component, so it was "delete the configured basename in a directory of my
+choosing", plus a way to defeat the live-listener refusal, not arbitrary file
+deletion. What remains is a swap of the final component WITHIN the pinned
+directory, which is inherent to removing by name (`unlinkat` takes a name, not
+a descriptor) and requires the attacker to already be able to write the
+socket's own directory.
+
+*Liveness is keyed on the canonical path.* `/proc/net/unix` lists the string the
+LISTENER passed to `bind()`, which need not be the spelling xpf holds — and
+`/var/run` -> `/run` is a symlink on every systemd distro, so a LIVE socket read
+as stale and was unlinked out from under its listener. Both sides are now
+canonicalised, and only for entries whose basename already matches so a host
+with thousands of Unix sockets does not pay a symlink resolution each. Only the
+DIRECTORY is resolved: following a symlink at the socket NAME would equate two
+distinct sockets, so a live listener on one would refuse the unlink of the other.
+
+*Not inode-keyed*, which #7139 suggested: the socket file's filesystem inode and
+the socket's own inode in sockfs are different objects (measured: 23374170 vs
+773414179 for one live socket), so that comparison matches nothing and would
+judge every live socket stale.
+
+*Still open:* pinning both sockets under an xpfd-owned `/run/xpf` and dropping
+the arbitrary path. That subsumes the class but is an operator-visible config
+change needing its own #1960 no-brick analysis.
 
 `EventStream.Start` additionally holds a sidecar `flock` across the call, which
 serializes daemon-side owners of the socket it binds. The control socket has no
