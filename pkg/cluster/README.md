@@ -2266,6 +2266,20 @@ initiator's FIRST message, so the responder authenticates the initiator before
 it answers — the whole reason the fourth frame existed. See
 `docs/session-sync-architecture.md` for the frame diagram.
 
+A round is NOT replaceable while the peer may have committed to it. A msg1 is 48
+bytes of cleartext on the not-yet-sealed stream this mechanism exists to fix,
+and its tag covers only the prologue and the initiator's ephemeral, so a
+captured Hello re-verifies; answering a replayed one would strand the msg2 the
+initiator has already derived from, and drop the connection. The responder
+therefore refuses a msg1 while it is awaiting a Confirm, the initiator never
+supersedes an incomplete round even for a rotation, and the responder stays
+silent rather than prompting in that window. A rotation is not stranded by this:
+a Request from the peer disturbs the round, and a round that completes under a
+retired key re-triggers itself. A Request carries no MAC, so it is treated as a
+hint rather than an instruction — one for a round still outstanding under the
+same key re-sends that round's Hello byte for byte instead of minting a new
+round, which is what keeps a forged Request from discarding one.
+
 **What is still open, and it is the reason to keep reading:** a HOSTILE stream
 admitted before the commit declines the upgrade by staying silent, and a
 decliner is indistinguishable from a legitimate peer that is not keyed yet —

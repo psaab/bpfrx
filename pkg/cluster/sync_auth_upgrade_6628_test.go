@@ -99,20 +99,37 @@ func newUpgEnd(t *testing.T, key string, node int) *upgEnd {
 // about which frame is the boundary for each direction's key switch, and a
 // harness that let both sides run free could not distinguish "switched at the
 // right frame" from "settled correctly eventually".
-func pump(t *testing.T, from *upgEnd, to *upgEnd) uint8 {
+// readUpgradeFrame reads one frame off e's wire WITHOUT delivering it, draining the
+// auth trailer when sealed says the writer was sealing as it wrote.
+//
+// Separate from pump because a single handler can emit two frames at DIFFERENT
+// postures — handleAuthUpgradeProof writes the Confirm unsealed and then, if a
+// rotation is pending, a Hello that IS sealed — and one sticky flag cannot
+// model both.
+func readUpgradeFrame(t *testing.T, e *upgEnd, sealed bool) (uint8, []byte) {
 	t.Helper()
-	_ = from.wire.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = e.wire.SetReadDeadline(time.Now().Add(3 * time.Second))
 	hdr := make([]byte, syncHeaderSize)
-	if _, err := io.ReadFull(from.wire, hdr); err != nil {
+	if _, err := io.ReadFull(e.wire, hdr); err != nil {
 		t.Fatalf("read frame header: %v", err)
 	}
 	length := binary.LittleEndian.Uint32(hdr[8:12])
 	body := make([]byte, length)
 	if length > 0 {
-		if _, err := io.ReadFull(from.wire, body); err != nil {
+		if _, err := io.ReadFull(e.wire, body); err != nil {
 			t.Fatalf("read frame body: %v", err)
 		}
 	}
+	if sealed {
+		if _, err := io.ReadFull(e.wire, make([]byte, syncAuthFrameTrailerSize)); err != nil {
+			t.Fatalf("read frame trailer: %v", err)
+		}
+	}
+	return hdr[4], body
+}
+
+func pump(t *testing.T, from *upgEnd, to *upgEnd) uint8 {
+	t.Helper()
 	// The trailer is drained only when the writer was ALREADY sealing before
 	// it wrote this frame, which is what makes this an assertion rather than a
 	// convenience: every switch in the exchange happens AFTER the frame that
@@ -122,15 +139,10 @@ func pump(t *testing.T, from *upgEnd, to *upgEnd) uint8 {
 	// drain goes wrong by exactly one trailer — the step below then fails on a
 	// bogus message type, which is the same desync the ordering contract
 	// exists to prevent, surfaced here instead of on a live cluster.
-	if from.sealedOut {
-		trailer := make([]byte, syncAuthFrameTrailerSize)
-		if _, err := io.ReadFull(from.wire, trailer); err != nil {
-			t.Fatalf("read frame trailer: %v", err)
-		}
-	}
+	typ, body := readUpgradeFrame(t, from, from.sealedOut)
 	to.sealedOut = to.ac.writeAuthed()
-	to.s.handleMessage(to.ac, hdr[4], body)
-	return hdr[4]
+	to.s.handleMessage(to.ac, typ, body)
+	return typ
 }
 
 // expectSilence asserts that e has written nothing.
@@ -426,44 +438,73 @@ func TestUpgradeInstallPointsAreAnchoredToTheirFrames7163(t *testing.T) {
 	})
 }
 
-// TestUpgradeInFlightExchangeDoesNotBlockARotation6628 binds the other half of
-// the in-flight guard, which has to be BOTH idempotent and non-sticky.
+// TestUpgradeRotationWaitsForAnOutstandingRoundAndHealsOnTheRequest7163 pins
+// the rule that keeps a replayed or superseding Hello from dropping the
+// connection, and pins the two escapes that keep the rule affordable.
 //
-// The reconciler runs on every commit, so re-emitting a Hello for a key whose
-// exchange is already in flight would mint a second ephemeral and leave the
-// peer answering a handshake this node no longer holds. But an exchange the
-// peer never answered — it was not keyed yet — must not then block the exchange
-// for a key the operator rotates to, or the connection is stuck on a Hello
-// nobody will ever reply to for the rest of its life.
+// THE RULE. An INCOMPLETE round is never superseded, not even by a rotation.
+// The responder may already have answered our Hello and switched its write
+// direction, and only that round's handshake state can read the msg2 it sent;
+// discarding it strands the peer sealing under a key this node can no longer
+// derive. #6628 was immune to this because its round state was set-once nonce
+// state a second Hello could not clobber. Noise state is not, so the refusal is
+// explicit.
 //
-// FAIL-ON-REVERT: make the in-flight test key-agnostic (drop the forPSK
-// comparison) and the rotation below puts nothing on the wire.
-func TestUpgradeInFlightExchangeDoesNotBlockARotation6628(t *testing.T) {
-	const first = "in-flight-first-psk-6628"
-	const second = "in-flight-second-psk-6628"
+// THE ESCAPES, without which the rule would strand a rotation forever against a
+// peer that never answers:
+//
+//   - a peer that was simply not keyed yet says so with a REQUEST. A Request
+//     for a round outstanding under the SAME key RE-SENDS that round's Hello
+//     rather than replacing it, so nothing is lost even when the Request was
+//     forged; only a Request that arrives while the outstanding round belongs
+//     to a RETIRED key mints a fresh one, which is the case this test drives;
+//   - a round that COMPLETES under a retired key re-triggers itself, which
+//     TestUpgradeCompletingFramesAreNotGatedOnTheLiveKey7163 covers.
+//
+// FAIL-ON-REVERT: let beginAuthUpgrade supersede an incomplete round and the
+// silence assertion reds; drop the Request supersession and the heal reds.
+func TestUpgradeRotationWaitsForAnOutstandingRoundAndHealsOnTheRequest7163(t *testing.T) {
+	const first = "outstanding-round-first-psk-7163"
+	const second = "outstanding-round-second-psk-7163"
 	a := newUpgEnd(t, first, 0)
-	b := newUpgEnd(t, "", 1) // not keyed yet: it will never answer
+	b := newUpgEnd(t, "", 1) // not keyed yet: it will not answer
 
 	a.sealedOut = a.ac.writeAuthed()
 	a.s.ReconcileConnectionAuth("first-commit")
 	if typ := pump(t, a, b); typ != syncMsgAuthUpgradeHello {
 		t.Fatalf("expected a Hello, got frame type %d", typ)
 	}
-	// Idempotent: a second commit under the SAME key must add nothing.
+	// Idempotent: a second commit under the SAME key adds nothing.
 	a.s.ReconcileConnectionAuth("unrelated-commit")
-	expectSilence(t, a, "a commit under the same key must not re-emit a Hello while an "+
-		"exchange for that key is already in flight; a second ephemeral leaves the peer "+
-		"answering a handshake this node no longer holds")
+	expectSilence(t, a, "a commit under the same key must not re-emit a Hello while a round "+
+		"is already in flight; a second ephemeral leaves the peer answering a handshake "+
+		"this node no longer holds")
 
-	// Rotate. The in-flight state belongs to the retired key and must not
-	// survive as a veto.
+	// The operator rotates. The round is OUTSTANDING — this node cannot know
+	// whether the peer has already answered it — so it must NOT be superseded.
 	a.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 0, cluster: upgClusterID})
-	b.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 1, cluster: upgClusterID})
-	a.sealedOut = a.ac.writeAuthed()
 	a.s.ReconcileConnectionAuth("rotation")
+	expectSilence(t, a, "a rotation superseded an OUTSTANDING round. If the responder had "+
+		"already answered the first Hello it switched its write direction there, and this "+
+		"node has just discarded the only state that can read that msg2 — the peer seals "+
+		"under a key this node cannot derive and the connection drops")
+
+	// The peer becomes keyed and prompts. A Request is what disturbs the
+	// outstanding round — and here it must MINT a fresh one rather than
+	// re-send, because the round on the wire belongs to the RETIRED key and the
+	// peer would refuse its msg1. (A Request for a round outstanding under the
+	// SAME key re-sends instead; see
+	// TestUpgradeRequestReSendsTheOutstandingHello7163.)
+	b.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 1, cluster: upgClusterID})
+	b.sealedOut = b.ac.writeAuthed()
+	b.s.ReconcileConnectionAuth("peer-keyed")
+	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeRequest {
+		t.Fatalf("expected a Request, got frame type %d", typ)
+	}
 	if typ := pump(t, a, b); typ != syncMsgAuthUpgradeHello {
-		t.Fatalf("a rotation must start a fresh exchange even though one for the RETIRED "+
-			"key is still in flight; got frame type %d", typ)
+		t.Fatalf("a Request must supersede the outstanding round and emit a fresh Hello "+
+			"under the rotated key; got frame type %d. Without this the rotation waits "+
+			"for an unrelated commit that may never come.", typ)
 	}
 	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeProof {
 		t.Fatalf("expected a Proof, got frame type %d", typ)
@@ -472,10 +513,198 @@ func TestUpgradeInFlightExchangeDoesNotBlockARotation6628(t *testing.T) {
 		t.Fatalf("expected a Confirm, got frame type %d", typ)
 	}
 	if !a.ac.authed() || !b.ac.authed() {
-		t.Fatal("the rotated exchange must complete both directions")
+		t.Fatal("the healed exchange must complete both directions")
 	}
 	if !bytes.Equal(a.ac.authPSK, []byte(second)) {
 		t.Fatal("the connection must record the key it is now authenticated under")
+	}
+	if !bytes.Equal(a.ac.writeKey, b.ac.readKey) || !bytes.Equal(b.ac.writeKey, a.ac.readKey) {
+		t.Fatal("both ends must agree on both directions")
+	}
+}
+
+// TestUpgradeReplayedHelloCannotStrandTheResponder7163 is the attack the
+// answeredAwaitingConfirm guard exists for, driven end to end.
+//
+// A msg1 is 48 bytes of CLEARTEXT on a not-yet-sealed stream — which is the only
+// stream an in-place upgrade ever starts on — and its AEAD tag covers the
+// prologue and the initiator's ephemeral, neither of which changes on a replay.
+// So a captured Hello RE-VERIFIES. Without the guard the responder mints a
+// second round on top of a commitment it has already made:
+//
+//  1. R answers Hello_1 and installs writeKey = r2i_1.
+//  2. The attacker replays Hello_1. R answers again and installs r2i_1'.
+//  3. I completes round 1, installs writeKey = i2r_1, sends Confirm_1.
+//  4. R checks Confirm_1 against round 1' -> MAC fails -> R never installs a
+//     read key, while I is already sealing.
+//  5. Both directions desync. The connection DROPS, which is the one outcome
+//     this mechanism promises never happens.
+//
+// PAIRED: the replay must change nothing AND the legitimate exchange must still
+// complete afterwards, so a responder that ignored every Hello cannot pass.
+func TestUpgradeReplayedHelloCannotStrandTheResponder7163(t *testing.T) {
+	const psk = "replayed-hello-psk-7163"
+	a := newUpgEnd(t, psk, 0)
+	b := newUpgEnd(t, psk, 1)
+
+	a.sealedOut = a.ac.writeAuthed()
+	a.s.ReconcileConnectionAuth("test")
+	typ, hello := readUpgradeFrame(t, a, false)
+	if typ != syncMsgAuthUpgradeHello {
+		t.Fatalf("expected a Hello, got frame type %d", typ)
+	}
+	b.s.handleMessage(b.ac, syncMsgAuthUpgradeHello, hello)
+	if !b.ac.writeAuthed() {
+		t.Fatal("precondition: the responder must have answered and installed its write key")
+	}
+	committed := append([]byte(nil), b.ac.writeKey...)
+	ptyp, msg2 := readUpgradeFrame(t, b, false)
+	if ptyp != syncMsgAuthUpgradeProof {
+		t.Fatalf("expected a Proof, got frame type %d", ptyp)
+	}
+
+	// THE REPLAY: the exact same bytes, again.
+	b.s.handleMessage(b.ac, syncMsgAuthUpgradeHello, hello)
+	if !bytes.Equal(b.ac.writeKey, committed) {
+		t.Fatal("a replayed Hello re-keyed the responder's write direction. The initiator " +
+			"derived the FIRST round's key and cannot read a byte from here on.")
+	}
+	expectSilence(t, b, "a replayed Hello must not be answered; the second msg2 would be "+
+		"sealed under the committed key and carry an ephemeral the initiator never sees")
+
+	// The legitimate exchange must still complete — otherwise the refusal above
+	// is indistinguishable from a responder that ignores every Hello.
+	a.s.handleMessage(a.ac, syncMsgAuthUpgradeProof, msg2)
+	ctyp, confirm := readUpgradeFrame(t, a, false)
+	if ctyp != syncMsgAuthUpgradeConfirm {
+		t.Fatalf("expected a Confirm, got frame type %d", ctyp)
+	}
+	b.s.handleMessage(b.ac, syncMsgAuthUpgradeConfirm, confirm)
+	if !a.ac.authed() || !b.ac.authed() {
+		t.Fatalf("the legitimate exchange must complete through the replay "+
+			"(a.read=%v a.write=%v b.read=%v b.write=%v)",
+			a.ac.readAuthed(), a.ac.writeAuthed(), b.ac.readAuthed(), b.ac.writeAuthed())
+	}
+	if !bytes.Equal(a.ac.writeKey, b.ac.readKey) || !bytes.Equal(b.ac.writeKey, a.ac.readKey) {
+		t.Fatal("both ends must agree on both directions")
+	}
+}
+
+// TestUpgradeRequestReSendsTheOutstandingHello7163 pins the property that makes
+// a FORGED Request harmless.
+//
+// A Request carries no MAC — on a not-yet-sealed stream there is nothing to key
+// one with that a replay would not also carry — so an on-path attacker can
+// inject one. If that made the initiator mint a FRESH round, it would discard
+// the handshake state a msg2 already in flight needs, and the responder would be
+// left sealing under a key the initiator can no longer derive: the same drop as
+// the replayed Hello, reached from the other side.
+//
+// So a Request for a round that is still outstanding under the SAME key
+// re-emits that round's Hello BYTE FOR BYTE instead. The byte comparison is the
+// assertion: a fresh round would carry a different ephemeral, and asserting only
+// on the frame TYPE would pass either way.
+//
+// PAIRED: the re-send must be identical AND the exchange must still complete, so
+// a node that answered a Request with nothing at all cannot pass.
+func TestUpgradeRequestReSendsTheOutstandingHello7163(t *testing.T) {
+	const psk = "request-resend-psk-7163"
+	a := newUpgEnd(t, psk, 0)
+	b := newUpgEnd(t, "", 1) // not keyed yet, so the first Hello goes unanswered
+
+	a.sealedOut = a.ac.writeAuthed()
+	a.s.ReconcileConnectionAuth("first-commit")
+	typ, hello1 := readUpgradeFrame(t, a, false)
+	if typ != syncMsgAuthUpgradeHello {
+		t.Fatalf("expected a Hello, got frame type %d", typ)
+	}
+
+	// The peer becomes keyed and prompts, under the SAME key.
+	b.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(psk), node: 1, cluster: upgClusterID})
+	b.sealedOut = b.ac.writeAuthed()
+	b.s.ReconcileConnectionAuth("peer-keyed")
+	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeRequest {
+		t.Fatalf("expected a Request, got frame type %d", typ)
+	}
+
+	typ, hello2 := readUpgradeFrame(t, a, false)
+	if typ != syncMsgAuthUpgradeHello {
+		t.Fatalf("a Request must produce a Hello, got frame type %d", typ)
+	}
+	if !bytes.Equal(hello1, hello2) {
+		t.Fatal("the Request minted a FRESH round instead of re-sending the outstanding " +
+			"one. A Request carries no MAC, so an on-path attacker can forge one; if it " +
+			"discards the round, a msg2 already in flight can no longer be read and the " +
+			"responder is left sealing under a key this node cannot derive.")
+	}
+
+	// The re-sent Hello must still work, or the byte equality above is
+	// satisfied by re-sending something inert.
+	b.s.handleMessage(b.ac, syncMsgAuthUpgradeHello, hello2)
+	if !b.ac.writeAuthed() {
+		t.Fatal("the re-sent Hello must be answered by the now-keyed peer")
+	}
+	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeProof {
+		t.Fatalf("expected a Proof, got frame type %d", typ)
+	}
+	if typ := pump(t, a, b); typ != syncMsgAuthUpgradeConfirm {
+		t.Fatalf("expected a Confirm, got frame type %d", typ)
+	}
+	if !a.ac.authed() || !b.ac.authed() {
+		t.Fatalf("the exchange must complete through the re-send "+
+			"(a.read=%v a.write=%v b.read=%v b.write=%v)",
+			a.ac.readAuthed(), a.ac.writeAuthed(), b.ac.readAuthed(), b.ac.writeAuthed())
+	}
+	if !bytes.Equal(a.ac.writeKey, b.ac.readKey) || !bytes.Equal(b.ac.writeKey, a.ac.readKey) {
+		t.Fatal("both ends must agree on both directions")
+	}
+}
+
+// TestUpgradeResponderPromptIsDeferredUntilItsRoundCompletes7163 pins the
+// silence that makes a Request meaningful.
+//
+// A Request tells the initiator to SUPERSEDE. If the responder could send one
+// while awaiting a Confirm, it would be asking the initiator to discard a round
+// the responder itself has already committed to — the same drop as the replay
+// above, self-inflicted. So the prompt is deferred, and because it is deferred
+// it must then actually FIRE once the round completes, or a rotation that
+// landed mid-round is stranded.
+//
+// PAIRED, and the pairing is the point: silence at the first step alone is
+// satisfied by a node that never prompts at all.
+func TestUpgradeResponderPromptIsDeferredUntilItsRoundCompletes7163(t *testing.T) {
+	const first = "deferred-prompt-first-psk-7163"
+	const second = "deferred-prompt-second-psk-7163"
+	a := newUpgEnd(t, first, 0)
+	b := newUpgEnd(t, first, 1)
+
+	a.sealedOut = a.ac.writeAuthed()
+	a.s.ReconcileConnectionAuth("test")
+	pump(t, a, b) // Hello  a -> b; b answers and is now awaiting the Confirm
+	pump(t, b, a) // Proof  b -> a; a completes its side and writes the Confirm
+	if b.ac.readAuthed() {
+		t.Fatal("precondition: the responder must still be awaiting the Confirm")
+	}
+
+	// The operator rotates on the RESPONDER, mid-round.
+	b.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 1, cluster: upgClusterID})
+	b.s.ReconcileConnectionAuth("rotation")
+	expectSilence(t, b, "the responder prompted while awaiting a Confirm. A Request makes "+
+		"the initiator supersede, and superseding here discards the round this node has "+
+		"already committed its write direction to")
+
+	// The Confirm lands; the round completes; the deferred prompt must fire.
+	if typ := pump(t, a, b); typ != syncMsgAuthUpgradeConfirm {
+		t.Fatalf("expected the Confirm, got frame type %d", typ)
+	}
+	if !b.ac.readAuthed() {
+		t.Fatal("the Confirm must complete the responder's read direction")
+	}
+	b.sealedOut = b.ac.writeAuthed()
+	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeRequest {
+		t.Fatalf("the deferred prompt must fire once the round completes; got frame type "+
+			"%d. Without it the rotation waits for an unrelated commit that may never "+
+			"come, and the connection keeps sealing under the retired PSK.", typ)
 	}
 }
 
@@ -749,10 +978,6 @@ func TestUpgradeResponderPromptStartsTheExchange7163(t *testing.T) {
 	a := newUpgEnd(t, psk, 0) // initiator by id
 	b := newUpgEnd(t, psk, 1) // responder by id, keyed second
 
-	// a reconciles while b is not keyed yet: nothing can complete.
-	unkeyed := newUpgEnd(t, "", 1)
-	_ = unkeyed
-
 	b.sealedOut = b.ac.writeAuthed()
 	b.s.ReconcileConnectionAuth("test")
 	if typ := pump(t, b, a); typ != syncMsgAuthUpgradeRequest {
@@ -853,8 +1078,13 @@ func TestUpgradeCompletingFramesAreNotGatedOnTheLiveKey7163(t *testing.T) {
 		a.s.ReconcileConnectionAuth("test")
 		pump(t, a, b) // Hello a -> b; b installs its write key on answering
 
-		// The operator rotates on THIS node while the Proof is in flight.
+		// The operator rotates on THIS node while the Proof is in flight. The
+		// round is OUTSTANDING, so the rotation must not supersede it — this
+		// node cannot know whether the responder has already answered.
 		a.s.SetAuthProvider(&fakeSyncAuthProvider{key: []byte(second), node: 0, cluster: upgClusterID})
+		a.s.ReconcileConnectionAuth("rotation")
+		expectSilence(t, a, "a rotation must not supersede an outstanding round; the "+
+			"responder may already have committed to it")
 		pump(t, b, a) // Proof b -> a
 
 		if !a.ac.readAuthed() {
@@ -874,17 +1104,20 @@ func TestUpgradeCompletingFramesAreNotGatedOnTheLiveKey7163(t *testing.T) {
 				"RETIRED key look current and the rotation is never re-driven",
 				first)
 		}
-		// Let the round finish (the Confirm is already on the wire), then the
-		// reconciler must start a FRESH round for the rotated key.
-		if typ := pump(t, a, b); typ != syncMsgAuthUpgradeConfirm {
+		// The deferred rotation is driven by the round's own completion, with
+		// no further commit: the Confirm goes out unsealed, then the fresh
+		// Hello goes out SEALED under the key this round just installed. Two
+		// frames from one handler at two postures, which is why they are read
+		// with readUpgradeFrame rather than pump.
+		if typ, _ := readUpgradeFrame(t, a, false); typ != syncMsgAuthUpgradeConfirm {
 			t.Fatalf("expected the Confirm, got frame type %d", typ)
 		}
-		a.sealedOut = a.ac.writeAuthed()
-		a.s.ReconcileConnectionAuth("post-rotation")
-		if typ := pump(t, a, b); typ != syncMsgAuthUpgradeHello {
-			t.Fatalf("the reconciler must start a fresh round for the rotated key; got "+
-				"frame type %d. A connection left running on a RETIRED PSK is the second "+
-				"property #6628 names.", typ)
+		if typ, _ := readUpgradeFrame(t, a, true); typ != syncMsgAuthUpgradeHello {
+			t.Fatalf("a round that completes under a RETIRED key must re-trigger itself; "+
+				"got frame type %d. Without that, a rotation that landed while the round "+
+				"was in flight could not supersede it and would then wait for an "+
+				"unrelated commit that may never come — leaving the connection sealing "+
+				"under the retired PSK, which is the second property #6628 names.", typ)
 		}
 	})
 

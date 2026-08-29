@@ -439,6 +439,33 @@ The higher-id node therefore cannot open the exchange; when it is the one that
 becomes keyed first it sends an `AuthUpgradeRequest`, which carries no key
 material and moves no boundary.
 
+**A round is not replaceable while the peer may have committed to it.** A msg1
+is 48 bytes of cleartext on a not-yet-sealed stream and its tag covers only the
+prologue and the initiator's ephemeral, so a captured Hello RE-VERIFIES.
+Answering a replayed one would mint a second round on top of a commitment
+already made — the initiator derived its keys from the FIRST msg2 — and the
+connection would desync in both directions. #6628 was immune because its round
+state was set-once nonce state; Noise state is not. Three guards implement the
+rule: the responder refuses a msg1 while awaiting a Confirm, the initiator never
+supersedes an incomplete round (not even for a rotation), and the responder
+stays silent rather than prompting in that window. The two escapes that keep a
+rotation from stranding are an `AuthUpgradeRequest` from the peer and a round
+that completes under a retired key re-triggering itself. Neither is a timer, and
+a fourth frame would not help: the initiator's write install is unilateral
+either way, so the fix is that the state a commitment depends on cannot be taken
+away.
+
+A Request carries no MAC — on a not-yet-sealed stream there is nothing to key
+one with that a replay would not also carry — so it is treated as a hint, not an
+instruction: a Request for a round still outstanding under the same key
+RE-SENDS that round's Hello byte for byte rather than minting a new one. A
+forged Request therefore cannot discard a round either. A rotation still starts
+a fresh round, since the peer would refuse the old key's msg1; that narrow case
+is the residual named in `sync_auth_upgrade.go` under NEVER DROPS, and its
+precondition — frame injection on an unauthenticated session-sync stream — is
+one where the attacker can already send `Fence` and disable every redundancy
+group the victim owns.
+
 **Two install points per direction, not one.** `Split()` returns two independent
 keys where `syncDeriveFrameKey` returned one shared value, so read and write are
 installed separately in each direction. They cannot land out of order: each is

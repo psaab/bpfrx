@@ -47,9 +47,23 @@ package cluster
 // without persisting its deadline. Tracked separately; not attempted here.
 //
 // NEVER DROPS. Every failure path — no key, wrong key, malformed frame, a
-// forged confirmation, a peer that does not answer — leaves the connection
-// exactly as it was. That is the property that makes this a strict improvement
-// rather than a trade, and it is what constrains every ordering decision below.
+// forged confirmation, a replayed Hello, a peer that does not answer — leaves
+// the connection exactly as it was. That is the property that makes this a
+// strict improvement rather than a trade, and it is what constrains every
+// ordering decision below.
+//
+// It is a property about FAILURE MODES and legitimate-peer behaviour, and the
+// boundary is worth stating rather than leaving to be discovered. One narrow
+// case survives: an on-path attacker that can inject frames into a
+// not-yet-sealed stream can forge a Request, and a Request that arrives while a
+// round for a DIFFERENT key is outstanding does start a fresh round, which can
+// strand a msg2 in flight. Closing it needs per-round state pinning, and it
+// buys nothing: the precondition is frame injection on an unauthenticated
+// session-sync stream, where the same attacker can already send syncMsgFence
+// and disable every redundancy group the victim owns. That is the residual
+// #6628 already names — a hostile stream admitted before the commit — not a new
+// one. On an authenticated stream (a rotation) every frame is sealed and none
+// of this is reachable.
 //
 // THIS IS A MID-STREAM KEY SWITCH, not merely an "upgrade". There is a live
 // frame stream in both directions and the switch point has to be exact.
@@ -133,6 +147,48 @@ package cluster
 // ping-pong, because the answer to a Request is a Hello and the answer to a
 // Hello is a Proof.
 //
+// A ROUND IS NOT REPLACEABLE WHILE THE PEER MAY HAVE COMMITTED TO IT. This is
+// the subtlest rule in the file and the one that keeps NEVER DROPS true, so it
+// is stated as a whole rather than left to the three guards that implement it.
+//
+// A msg1 is 48 bytes of CLEARTEXT on a not-yet-sealed stream — the only stream
+// an in-place upgrade ever starts on — and its AEAD tag covers the prologue and
+// the initiator's ephemeral, neither of which changes on a replay. So a
+// captured Hello RE-VERIFIES. If the responder answered it, it would mint a
+// second round on top of a commitment it had already made: the initiator
+// installed its read key at the FIRST msg2 and will install its write key the
+// instant it emits the Confirm, and only the first round's keys and binding can
+// verify that Confirm. The result is a desync in BOTH directions and a dropped
+// connection. #6628 was immune to this because its round state was set-once
+// nonce state a second Hello could not clobber; Noise handshake state is not,
+// so the refusal is explicit.
+//
+// The rule and the three guards that implement it:
+//
+//   - the RESPONDER refuses a msg1 while answeredAwaitingConfirm() — it has
+//     answered and switched its write direction, and the Confirm it is waiting
+//     for can only be verified with the state it holds now;
+//   - the INITIATOR never supersedes an incomplete round, not even for a
+//     rotation, because the responder may already have answered and only this
+//     round's handshake state can read that msg2;
+//   - the RESPONDER stays silent — no Request — while awaiting a Confirm, which
+//     is what makes a Request, on arrival at the initiator, a PROOF that no
+//     msg2 is in flight. TCP orders the responder's stream, so anything it sent
+//     before that Request was read before it.
+//
+// Without an escape the second guard would strand a rotation forever against a
+// peer that never answers, so there are two, and they are exactly the two cases
+// in which superseding is safe: a Request from the peer (the proof above), and
+// a round that COMPLETES under a retired key, which re-triggers itself at the
+// end of handleAuthUpgradeProof. Neither is a timer.
+//
+// The four-frame variant does NOT avoid this, and that was checked before
+// reaching for it. Moving the responder's commitment to an Ack only moves the
+// exposure: the initiator's write install at the Confirm is still unilateral,
+// and the responder still needs un-clobbered round state to honour it. Someone
+// commits first either way, so the fix is that the state a commitment depends
+// on cannot be taken away.
+//
 // CONCURRENCY. writeKey and the exchange state are written under
 // SessionSync.writeMu — already the invariant serialising every write to a
 // connection — inside the same critical section as the frame that precedes the
@@ -187,6 +243,12 @@ type authUpgradeState struct {
 	// belongs to the other role is rejected rather than half-processed.
 	initiator bool
 
+	// hello is the exact Hello payload this INITIATOR round put on the wire.
+	// Cached so a peer Request can RE-SEND it rather than mint a fresh round:
+	// re-sending preserves the handshake state a msg2 already in flight needs,
+	// where minting would discard it. See handleAuthUpgradeRequest.
+	hello []byte
+
 	// binding is the Noise handshake hash once the handshake has completed on
 	// this side. It is what the confirmation MAC is computed over, and both
 	// ends reach the same value only if they ran the same transcript.
@@ -209,13 +271,32 @@ type authUpgradeState struct {
 	forPSK []byte
 }
 
-// upgradeExchangeInFlightLocked reports whether an exchange for exactly this
-// key is already running, which is what makes the level-triggered reconciler
-// idempotent.
+// complete reports whether both directions of this round have been installed.
+func (st *authUpgradeState) complete() bool {
+	return st != nil && st.readDone && st.writeDone
+}
+
+// answeredAwaitingConfirm reports whether this is a RESPONDER round that has
+// emitted its msg2 — and so has already switched its write direction — but has
+// not yet verified the initiator's Confirm.
 //
-// Caller holds SessionSync.writeMu.
-func (a *authConn) upgradeExchangeInFlightLocked(key []byte) bool {
-	return a.upgrade != nil && bytes.Equal(a.upgrade.forPSK, key)
+// This is the window in which this node's round state is LOAD-BEARING FOR THE
+// PEER. The initiator installed its read key at that msg2 and will install its
+// write key the instant it emits the Confirm; only this round's keys and
+// binding can verify that Confirm. Replacing the state here is not a failed
+// upgrade, it is a DROPPED CONNECTION in both directions: the responder cannot
+// verify the Confirm, so it never installs its read key while the initiator is
+// already sealing, and the responder is meanwhile sealing under a key derived
+// from an ephemeral the initiator never saw.
+//
+// That is reachable by REPLAY, not only by a race. A msg1 is 48 bytes of
+// cleartext on a not-yet-sealed stream; anyone who can inject a frame can
+// capture one and send it again. It re-verifies — its tag covers the prologue
+// and the initiator's ephemeral, neither of which changes — so without this
+// predicate a replayed Hello would make the responder mint a second round on
+// top of a commitment it had already made.
+func (st *authUpgradeState) answeredAwaitingConfirm() bool {
+	return st != nil && !st.initiator && st.haveKeys && !st.readDone
 }
 
 // upgradeConfirmMAC computes the confirmation MAC: HMAC-SHA256 over the Noise
@@ -325,12 +406,17 @@ func (s *SessionSync) beginAuthUpgrade(conn net.Conn, fabricIdx int, key []byte,
 		return errUpgradeNotApplicable
 	}
 	if !initiator {
-		// Responder role. Prompt the peer and touch NOTHING else — in
-		// particular, do not clear an in-flight exchange. A responder that
-		// discarded its handshake state here would fail the confirmation MAC
-		// of an exchange whose msg2 it had already answered, leaving the
-		// initiator sealing into a reader that never switched: a desync, on
-		// the one path that must never drop.
+		// Responder role: prompt, and touch NOTHING else.
+		//
+		// NOT while awaiting a Confirm, and this is load-bearing rather than
+		// tidy. A Request makes the initiator SUPERSEDE its current round (see
+		// handleAuthUpgradeRequest), and superseding while this node is
+		// awaiting a Confirm strands the msg2 it has already committed to.
+		// Staying silent here is what makes a Request a PROOF, on arrival at
+		// the initiator, that no msg2 is in flight.
+		if ac.upgrade.answeredAwaitingConfirm() {
+			return errUpgradeNotApplicable
+		}
 		if err := writeMsg(ac, syncMsgAuthUpgradeRequest, []byte{syncAuthUpgradeVersion}); err != nil {
 			return err
 		}
@@ -339,11 +425,27 @@ func (s *SessionSync) beginAuthUpgrade(conn net.Conn, fabricIdx int, key []byte,
 			"remote", connRemoteAddrString(conn))
 		return nil
 	}
-	if ac.upgradeExchangeInFlightLocked(key) {
-		// An exchange for THIS key is already in flight. Re-emitting a Hello
-		// would mint a second ephemeral and leave the peer answering a
-		// handshake we no longer hold. State from an exchange for an OLDER key
-		// does not match, so a rotation is not blocked by it.
+	if ac.upgrade != nil && !ac.upgrade.complete() {
+		// An INCOMPLETE round is never superseded, not even by a rotation, and
+		// the reason is stronger than idempotence: the responder may already
+		// have answered our Hello and switched its write direction, and only
+		// this round's handshake state can read that msg2. Discarding it
+		// strands the peer sealing under a key this node can no longer derive
+		// — the same drop answeredAwaitingConfirm() prevents, seen from the
+		// other end.
+		//
+		// This does NOT strand a rotation, and the two escapes are what make
+		// the rule affordable:
+		//
+		//   - a round that COMPLETES under a retired key re-triggers itself at
+		//     the end of handleAuthUpgradeProof, where superseding is safe;
+		//   - a peer that simply was not keyed yet — the round nobody will ever
+		//     answer — says so with a Request, which is the one signal that
+		//     proves no msg2 is in flight.
+		//
+		// A COMPLETE round is safe to supersede: the responder installed its
+		// read key while processing our Confirm, and TCP puts that Confirm
+		// ahead of the Hello below.
 		return errUpgradeNotApplicable
 	}
 	if err := s.emitUpgradeHelloLocked(ac, fabricIdx, key); err != nil {
@@ -385,6 +487,7 @@ func (s *SessionSync) emitUpgradeHelloLocked(ac *authConn, fabricIdx int, key []
 	ac.upgrade = &authUpgradeState{
 		hs:        hs,
 		initiator: true,
+		hello:     payload,
 		forPSK:    append([]byte(nil), key...),
 	}
 	return nil
@@ -431,6 +534,30 @@ func (s *SessionSync) handleAuthUpgradeRequest(conn net.Conn, payload []byte) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if bytes.Equal(ac.authPSK, key) {
+		return
+	}
+	// A Request is the only thing that may disturb an outstanding round, and
+	// even then it RE-SENDS rather than replaces whenever it can.
+	//
+	// Re-sending is what makes a FORGED Request harmless. A Request carries no
+	// MAC — on a not-yet-sealed stream there is nothing to key one with that a
+	// replay would not also carry — so an on-path attacker can inject one. If
+	// that made this node mint a fresh round, it would discard the handshake
+	// state a msg2 already in flight needs, and the responder would be left
+	// sealing under a key this node can no longer derive. Re-emitting the SAME
+	// Hello keeps the round intact: a responder awaiting a Confirm refuses the
+	// duplicate, and a responder that never answered gets exactly the message
+	// it missed, which is the whole reason the Request exists.
+	//
+	// A round for a DIFFERENT key cannot be re-sent — the peer would refuse its
+	// msg1 — so a rotation still starts a fresh one. That narrow case is the
+	// residual named under NEVER DROPS in the file header.
+	if st := ac.upgrade; st != nil && st.initiator && !st.complete() &&
+		len(st.hello) > 0 && bytes.Equal(st.forPSK, key) {
+		if err := writeMsg(ac, syncMsgAuthUpgradeHello, st.hello); err != nil {
+			slog.Warn("cluster sync: could not re-send the auth-upgrade hello the peer "+
+				"asked for; the connection stays as it is (#6628)", "err", err)
+		}
 		return
 	}
 	if err := s.emitUpgradeHelloLocked(ac, fabricIdx, key); err != nil {
@@ -485,11 +612,34 @@ func (s *SessionSync) handleAuthUpgradeHello(conn net.Conn, payload []byte) {
 		return
 	}
 
-	// Build and run the responder half in LOCALS. Nothing touches ac until the
-	// whole step has succeeded: a msg1 that fails its tag — an injection, or a
-	// peer on a different key — must leave an in-flight exchange from an
-	// earlier round intact, or a Confirm still in flight for that round would
-	// arrive at a responder that had discarded the state to verify it.
+	// writeMu is held across the WHOLE responder step, the Noise arithmetic
+	// included. That is deliberate: whether this msg1 may be accepted depends
+	// on the round state, and the msg2 write plus the writeKey install have to
+	// sit in the same critical section as that decision — splitting them
+	// reopens the window the guard below exists to close. The cost is one
+	// X25519 keygen and one AEAD open, on a path that runs at config-commit
+	// rate, not per packet.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// A round this node has ALREADY ANSWERED may not be replaced. See
+	// answeredAwaitingConfirm for what breaks if it is: the initiator has
+	// committed to that msg2 and only this state can verify the Confirm that
+	// is coming. A REPLAYED Hello is exactly how an attacker gets one replaced
+	// — msg1 is 48 cleartext bytes on a not-yet-sealed stream and re-verifies,
+	// because its tag covers the prologue and the initiator's ephemeral,
+	// neither of which changes on a replay.
+	if ac.upgrade.answeredAwaitingConfirm() {
+		slog.Warn("cluster sync: refusing an auth-upgrade hello while awaiting the "+
+			"initiator's confirm — the round already in flight is what verifies it, and "+
+			"replacing it would strand a msg2 this node has committed to (#6628/#7163)",
+			"remote", connRemoteAddrString(conn))
+		return
+	}
+
+	// Nothing else touches ac until the whole step has succeeded: a msg1 that
+	// fails its tag — an injection, or a peer on a different key — must leave
+	// the existing round intact.
 	hs, err := s.newSyncNoiseState(key, false, syncNoisePhaseUpgrade, fabricIdx)
 	if err != nil {
 		slog.Warn("cluster sync: auth-upgrade responder setup failed; the connection stays "+
@@ -521,8 +671,6 @@ func (s *SessionSync) handleAuthUpgradeHello(conn net.Conn, payload []byte) {
 	payloadOut = append(payloadOut, syncAuthUpgradeVersion)
 	payloadOut = append(payloadOut, msg2...)
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	// Through ac, not ac.Conn — see emitUpgradeHelloLocked for why.
 	if err := writeMsg(ac, syncMsgAuthUpgradeProof, payloadOut); err != nil {
 		// The msg2 did not go out, so the initiator will not switch its read
@@ -564,6 +712,10 @@ func (s *SessionSync) handleAuthUpgradeProof(conn net.Conn, payload []byte) {
 			"connection as it is (#6628)", "len", len(payload))
 		return
 	}
+	// Resolved before the lock: fabricIndexOf takes s.mu, and s.mu is never
+	// acquired under writeMu anywhere in this package.
+	fabricIdx, haveFabric := s.fabricIndexOf(conn)
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -632,6 +784,23 @@ func (s *SessionSync) handleAuthUpgradeProof(conn net.Conn, payload []byte) {
 	ac.authPSK = append([]byte(nil), st.forPSK...)
 	slog.Info("cluster sync: in-place auth upgrade complete — this connection is now "+
 		"authenticated in both directions (#6628)", "remote", connRemoteAddrString(conn))
+
+	// SELF-RETRIGGER. A rotation that landed while this round was outstanding
+	// could not supersede it — an outstanding round is the one thing
+	// beginAuthUpgrade refuses to replace, because the responder may already
+	// have committed to it. The round is COMPLETE now, so superseding is safe
+	// and the deferred rotation is driven here rather than left waiting for an
+	// unrelated commit. Level-triggered, exactly like the reconciler: the test
+	// is the live key against the key this round authenticated under. The
+	// Hello below is written AFTER the Confirm above, which is the order the
+	// responder needs to install its read key before reading it.
+	if live := s.authKey(); len(live) > 0 && !bytes.Equal(st.forPSK, live) && haveFabric {
+		if err := s.emitUpgradeHelloLocked(ac, fabricIdx, live); err != nil {
+			slog.Warn("cluster sync: could not start the rotation round deferred while this "+
+				"exchange was in flight; the connection stays authenticated under the "+
+				"previous key until the next commit (#6628)", "err", err)
+		}
+	}
 }
 
 // handleAuthUpgradeConfirm completes the exchange at the RESPONDER: the
@@ -683,6 +852,18 @@ func (s *SessionSync) handleAuthUpgradeConfirm(conn net.Conn, payload []byte) {
 	}
 	slog.Info("cluster sync: in-place auth upgrade complete — this connection is now "+
 		"authenticated in both directions (#6628)", "remote", connRemoteAddrString(conn))
+
+	// SELF-RETRIGGER, the responder's half. A rotation that landed while this
+	// round was in flight left this node unable to prompt — beginAuthUpgrade
+	// stays silent while awaiting a Confirm, precisely so a prompt cannot make
+	// the initiator supersede a round this node has committed to. That is over
+	// now, so prompt.
+	if live := s.authKey(); len(live) > 0 && !bytes.Equal(ac.authPSK, live) {
+		if err := writeMsg(ac, syncMsgAuthUpgradeRequest, []byte{syncAuthUpgradeVersion}); err != nil {
+			slog.Warn("cluster sync: could not prompt for the rotation round deferred while "+
+				"this exchange was in flight (#6628)", "err", err)
+		}
+	}
 }
 
 // readUpgradeMsg2 reads the responder's msg2 into the initiator's handshake and
