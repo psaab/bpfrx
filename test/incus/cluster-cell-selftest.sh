@@ -44,7 +44,21 @@ waitfor() { # waitfor <seconds> <desc> <cmd...>
 # These are the scripts whose Makefile targets reboot / force-stop /
 # fail over / restart a node on the SHARED loss cluster. Each MUST
 # source cluster-cell.sh and call the entry helper in its preamble.
-DESTRUCTIVE=(
+#
+# #6936: the set is now DERIVED, not enumerated. It used to be the
+# hardcoded list below, which is a floor rather than a census: a NEW
+# destructive smoke is covered only if whoever wrote it also remembered
+# to add its name here, and a guard that has to be told about its own
+# subject is the shape that let test-fbf-steering.sh go ungated (#7798).
+# The detector that decides "is line N a node mutation" already existed
+# further down for the ordering assertion; running it over every
+# test-*.sh makes it decide membership too.
+#
+# KNOWN_DESTRUCTIVE stays as a FLOOR assertion in the other direction:
+# each named script must still be DETECTED as destructive, so a
+# regression in the detector (a changed heredoc shape, a renamed verb)
+# reports as a missing script rather than as a silently empty scan.
+KNOWN_DESTRUCTIVE=(
 	test-failover.sh
 	test-ha-crash.sh
 	test-double-failover.sh
@@ -54,6 +68,62 @@ DESTRUCTIVE=(
 	test-restart-connectivity.sh
 	test-private-rg.sh
 )
+
+# xpf_first_mutation_line <script> — prints the first non-comment line number
+# that reboots / force-stops / fails over / restarts a node, or the literal
+# NONE when the script does none of those. `failover reset` is skipped: it
+# clears a manual latch and moves nothing.
+#
+# FAIL-CLOSED, deliberately. The obvious form is `awk ... || true`, printing
+# the line number or nothing — but then "this script performs no node
+# mutation" and "awk did not run" are the SAME empty string, and the second
+# one silently DROPS a destructive script out of the scanned set. This is now
+# the predicate that decides membership, so a fail-open detector would quietly
+# stop guarding scripts rather than say so.
+#
+# That is not hypothetical: during #6936 one run of this file reported
+# test-private-rg.sh as "not matched" while the machine was saturated by a
+# concurrent `go test ./...`, and every re-run under a quiet machine passed.
+# With the old fail-open form the failure is not diagnosable after the fact —
+# an awk that could not fork is indistinguishable from a clean non-match — so
+# the shape is fixed rather than the (unreproducible) instance explained.
+# An empty return now means the helper itself failed, and callers fail on it.
+xpf_first_mutation_line() {
+	local out
+	out="$(awk '
+		/^[[:space:]]*#/ { next }
+		/failover reset/ { next }
+		/incus (stop|start|restart) |sysrq|systemctl (stop|restart)|request chassis cluster failover redundancy-group/ { print NR; found = 1; exit }
+		END { if (!found) print "NONE" }
+	' "$1")" || return 1
+	[[ -n "$out" ]] || return 1
+	printf '%s\n' "$out"
+}
+
+DESTRUCTIVE=()
+for p in "${SCRIPT_DIR}"/test-*.sh; do
+	[[ -f "$p" ]] || continue
+	_mut="$(xpf_first_mutation_line "$p")" \
+		|| fail "static: the destructive-script detector could not read $(basename "$p") — refusing to treat an unread script as non-destructive"
+	[[ "$_mut" == NONE ]] && continue
+	DESTRUCTIVE+=("$(basename "$p")")
+done
+(( ${#DESTRUCTIVE[@]} > 0 )) \
+	|| fail "static: the destructive-script detector matched 0 of $(ls -1 "${SCRIPT_DIR}"/test-*.sh | wc -l) test-*.sh scripts — a scan that reaches nothing passes clean while guarding nothing"
+for known in "${KNOWN_DESTRUCTIVE[@]}"; do
+	[[ -f "${SCRIPT_DIR}/${known}" ]] || fail "static: missing destructive smoke script $known"
+	# Pure-bash membership. `printf ... | grep -q` would be the idiomatic form,
+	# but `grep -q` exits at the first match and SIGPIPEs the writer, which
+	# under `set -o pipefail` reports the WRITER's failure — the exact shape
+	# that broke the instance-liveness check in test-host-inbound.sh. It was
+	# NOT observed to fire on a list this short; the pipe is avoided on
+	# principle, not on evidence.
+	_found=no
+	for d in "${DESTRUCTIVE[@]}"; do [[ "$d" == "$known" ]] && _found=yes; done
+	[[ "$_found" == yes ]] \
+		|| fail "static: $known is a known destructive smoke but the detector did not match it — the detector regressed, and every UNLISTED destructive script it also stopped matching is now unguarded"
+done
+ok "static: detector matched ${#DESTRUCTIVE[@]} destructive test-*.sh scripts (covers all ${#KNOWN_DESTRUCTIVE[@]} known ones)"
 
 for s in "${DESTRUCTIVE[@]}"; do
 	p="${SCRIPT_DIR}/${s}"
@@ -73,11 +143,9 @@ for s in "${DESTRUCTIVE[@]}"; do
 	# node. The lock call must precede it so we never mutate the shared
 	# cluster before acquiring the lock. Skip comment lines so a "Phase
 	# 1: incus stop --force" doc line is not mistaken for a real op.
-	mut_line=$(awk '
-		/^[[:space:]]*#/ { next }
-		/failover reset/ { next }
-		/incus (stop|start|restart) |sysrq|systemctl (stop|restart)|request chassis cluster failover redundancy-group/ { print NR; exit }
-	' "$p" || true)
+	mut_line=$(xpf_first_mutation_line "$p") \
+		|| fail "static: the destructive-script detector could not read $s"
+	[[ "$mut_line" == NONE ]] && mut_line=""
 	if [[ -n "$mut_line" ]]; then
 		(( call_line < mut_line )) \
 			|| fail "static: $s mutates the cluster (line $mut_line) before taking the lock (line $call_line)"

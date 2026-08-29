@@ -2090,6 +2090,90 @@ the `to-zone junos-host` mandatory-teardown gate that runs on EVERY
 LocalDelivery session hit (`poll_descriptor`), so declining to cache never skips
 policy.
 
+## On-wire coverage: what a compile-side test structurally cannot show (#6936)
+
+Everything above is enforced by `pkg/config` / `pkg/daemon` / `userspace-dp`
+tests that inspect what the compiler **produced**. None of them can show what
+the box **admitted**. `test/incus/test-host-inbound.sh` closes the two on-wire
+legs #6936 named — host-inbound resolved on a **tagged VLAN sub-unit**, and
+admission **unchanged across an HA failover** — against the loss userspace
+cluster.
+
+It commits nothing. It reads the already-committed config in `display set`
+form, derives its probe targets from it, and refuses to run if the zone posture
+its expectations depend on has changed. A shared cluster's config is not the
+smoke's to own, and an expectation table that has silently gone stale reports a
+clean pass while asserting the wrong thing.
+
+### The matrix, as measured on `loss:xpf-userspace-fw0`
+
+`lan` admits `ssh` + `ping`; `wan` admits `ping` + `gre` and owns the two
+tagged sub-units `reth0.50` / `reth0.80`. Probed from `cluster-userspace-host`:
+
+| target | interface | zone | tcp/22 | tcp/23 | icmp |
+|---|---|---|---|---|---|
+| `10.0.61.1` | `reth1.0` (untagged) | lan | RST → **admitted** | timeout → denied | reply |
+| `2001:559:8585:ef00::1` | `reth1.0` (untagged) | lan | RST → **admitted** | timeout → denied | reply |
+| `172.16.50.8` | `reth0.50` (**VLAN 50**) | wan | timeout → **denied** | timeout → denied | reply |
+| `2001:559:8585:50::8` | `reth0.50` (**VLAN 50**) | wan | timeout → **denied** | timeout → denied | reply |
+| `172.16.80.8` | `reth0.80` (**VLAN 80**) | wan | timeout → **denied** | timeout → denied | reply |
+| `2001:559:8585:80::8` | `reth0.80` (**VLAN 80**) | wan | timeout → **denied** | timeout → denied | reply |
+
+The lan row and the wan rows differ on tcp/22 while agreeing on icmp, and both
+lan rows admit tcp/22 while denying tcp/23 at the *same address*. That pair is
+what makes the VLAN cells load-bearing: no routing or reachability story
+explains a reading where one port at an address answers and another does not.
+
+### Why the RST matters
+
+`xpfd` binds its own listeners (gRPC 50051, HTTP 8080) on `127.0.0.1` only, so
+a probe of a non-listening port on a firewall-local address comes back as an
+**RST** if host-inbound admitted it and as **nothing at all** if host-inbound
+dropped it. Collapsing those two — which is what a bare `nc -z` exit status
+does — would make every negative cell in the smoke unfalsifiable. The prober
+(`host-inbound-probe.py`) therefore reports `OPEN` / `REFUSED` / `TIMEOUT` /
+`ERROR` as a raw observation, and `host-inbound-lib.sh` maps them onto
+`ADMITTED` / `SILENT` / `UNREACHED` / `BLIND`.
+
+Note the vocabulary has no state called `DENIED`. **A probe cannot observe a
+deny.** It observes silence, and "the firewall dropped it" and "my prober never
+reached the firewall" are the same reading. Silence is promoted to a deny only
+by a positive control at the **same address, same family, same run, same
+prober** — the ICMP cell at that address. A same-family-but-different-address
+control would not do: a route that stopped reaching one VLAN address would make
+every deny cell at it pass for the wrong reason. `make test-host-inbound-lib`
+drives that middle row (identical expectation, identical observation, only the
+control differs) hermetically.
+
+### The failover leg asserts a diff, not a pass
+
+`--with-failover` moves RG1 (WAN/`reth0`) and RG2 (LAN/`reth1`) to node1,
+re-runs the matrix, fails back, and re-runs it again. The assertion is that the
+matrix is **identical**, not that it still passes: a run in which every
+admission silently died still satisfies every DENY cell, so re-scoring alone
+cannot see the regression this leg exists for. `hi_matrix_stable_verdict` also
+fails an empty run rather than reading it as "unchanged".
+
+Failing back is explicit. `request chassis cluster failover reset` only clears
+the manual latch; with preempt disabled the current master keeps the group, so
+a reset alone leaves the shared cluster inverted for the next lane.
+
+### What is still not covered on the wire, and why
+
+The duplicate-host-local-address leg #6936 also listed has **no reachable
+venue**, and the reason is the product's own gate rather than the lab's: the
+ambiguous topology is hard-rejected at commit and commit-check by
+`validateDuplicateHostLocalAddressStrict` (§ "Duplicate host-local-address
+ambiguity (#3718, Option B)"). A smoke cannot apply the config it would need to
+observe. The state is reachable only through the tolerant `load` / peer-sync
+path — a deliberate #1960 no-brick concession — and that path's runtime surface
+is already covered where it is observable, by
+`pkg/daemon/host_inbound_ambiguous_3718_test.go` and
+`pkg/api/metrics_host_inbound_ambiguous_3718_test.go`. Reaching it on the wire
+would mean writing the rejected config straight into the config DB and
+restarting, which measures a state the product refuses to enter rather than one
+an operator can reach.
+
 ## Adding a new host-inbound service
 
 Adding or changing a token is a coordinated edit across all three surfaces so the

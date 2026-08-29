@@ -417,7 +417,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -470,6 +470,35 @@ test-cos-apply-lib:
 test-fbf-steering-lib:
 	bash ./test/incus/fbf-steering-selftest.sh
 	go test -count=1 -run 6440 ./cmd/cli/
+
+# Self-test the #6936 on-wire host-inbound verdicts. The defect class it
+# guards is the one a probe CANNOT see: a probe never observes a deny, it
+# observes SILENCE, and "the firewall dropped it" and "my prober never reached
+# the firewall" are the same reading. So every DENY cell is scored against a
+# positive control at the SAME address in the SAME run, and the selftest table
+# carries the middle row (same expectation, same observation, only the control
+# differs) that is the only way to tell those two apart. Hermetic — no
+# cluster, no incus, no network. Run this after touching
+# test-host-inbound.sh or host-inbound-lib.sh.
+#
+# cluster-cell-selftest.sh is included because the smoke's #1875 lock wiring is
+# asserted there (its destructive-script detector picks up test-host-inbound.sh
+# automatically since #6936), so this target stands alone rather than relying
+# on whoever changes the smoke also remembering to run test-cluster-lock-lib.
+test-host-inbound-lib:
+	bash ./test/incus/host-inbound-selftest.sh
+	python3 -c "import py_compile; py_compile.compile('test/incus/host-inbound-probe.py', doraise=True)"
+	bash ./test/incus/cluster-cell-selftest.sh
+
+# The on-wire host-inbound smoke itself (#6936 — needs the loss userspace
+# cluster). Reads the already-committed config, derives its probe targets from
+# it, and commits NOTHING. `--with-failover` adds the HA leg, which moves RG1
+# and RG2 to the peer and back under the #1875 lock.
+test-host-inbound:
+	./test/incus/test-host-inbound.sh
+
+test-host-inbound-failover:
+	./test/incus/test-host-inbound.sh --with-failover
 
 # Self-test the shared cluster-env resolver (#5024): the HA/failover
 # smoke scripts read $FW0/$FW1/$CLUSTER_LAN_HOST, which cluster-env.sh
