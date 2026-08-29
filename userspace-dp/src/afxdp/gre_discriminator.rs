@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use super::gre::{GRE_FLAG_CHECKSUM, GRE_FLAG_KEY};
+use super::types::{SessionFlow, UserspaceDpMeta};
 use crate::session::TunnelDiscriminator;
 
 /// RFC 1701 Routing Present. RFC 2890 declares the bit reserved-zero; a frame
@@ -263,6 +264,132 @@ mod tests {
         );
     }
 
+    /// A GRE frame with a full IPv4 header, so `outer_datagram_end` and the
+    /// metadata flow builder both have real material to work from.
+    fn gre_v4_frame(flags: u16, options: &[u32]) -> (Vec<u8>, UserspaceDpMeta) {
+        let mut f = vec![0u8; 20];
+        f[0] = 0x45; // IPv4, IHL 5
+        f[9] = crate::ip_proto::PROTO_GRE;
+        f[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+        f[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+        f.extend_from_slice(&flags.to_be_bytes());
+        f.extend_from_slice(&0x0800u16.to_be_bytes());
+        for w in options {
+            f.extend_from_slice(&w.to_be_bytes());
+        }
+        let total = f.len() as u16;
+        f[2..4].copy_from_slice(&total.to_be_bytes()); // IP total_len
+        let mut meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol: crate::ip_proto::PROTO_GRE,
+            l3_offset: 0,
+            l4_offset: 20,
+            ..Default::default()
+        };
+        meta.flow_src_addr[..4].copy_from_slice(&[10, 0, 0, 1]);
+        meta.flow_dst_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+        (f, meta)
+    }
+
+    /// The feature: two RFC 2890 keys between the SAME outer endpoints must not
+    /// share an identity. Everything else in the tuple is identical here, so the
+    /// discriminator is the only thing that can separate them.
+    #[test]
+    fn two_keys_same_endpoints_are_distinct_flows_7188() {
+        let (a, ma) = gre_v4_frame(K, &[0x0000_002a]);
+        let (b, mb) = gre_v4_frame(K, &[0x0000_002b]);
+        let fa = gre_keyed_session_flow(&a, ma).expect("keyed GRE must produce a flow");
+        let fb = gre_keyed_session_flow(&b, mb).expect("keyed GRE must produce a flow");
+        assert_eq!(fa.forward_key.src_ip, fb.forward_key.src_ip);
+        assert_eq!(fa.forward_key.dst_ip, fb.forward_key.dst_ip);
+        assert_ne!(
+            fa.forward_key, fb.forward_key,
+            "two tunnels between one endpoint pair must not share a SessionKey — \
+             that is the whole feature (#7188)"
+        );
+    }
+
+    /// Decision 5: the discriminator is NOT a port. Ports stay honestly zero, so
+    /// every port consumer (show, RT_FLOW, clear filters, NAT alias matching)
+    /// keeps reporting the truth rather than a fabricated transport port.
+    #[test]
+    fn keyed_gre_reports_no_fake_ports_7188() {
+        let (f, m) = gre_v4_frame(K, &[0xdead_beef]);
+        let flow = gre_keyed_session_flow(&f, m).expect("flow");
+        assert_eq!(flow.forward_key.src_port, 0);
+        assert_eq!(flow.forward_key.dst_port, 0);
+        assert_eq!(
+            flow.forward_key.discriminator,
+            TunnelDiscriminator::Keyed(0xdead_beef)
+        );
+    }
+
+    /// Unkeyed GRE still gets an identity, and it is NOT the keyed-zero one.
+    #[test]
+    fn unkeyed_and_keyed_zero_are_distinct_flows_7188() {
+        let (u, mu) = gre_v4_frame(0, &[]);
+        let (z, mz) = gre_v4_frame(K, &[0]);
+        let fu = gre_keyed_session_flow(&u, mu).expect("unkeyed flow");
+        let fz = gre_keyed_session_flow(&z, mz).expect("keyed-zero flow");
+        assert_ne!(fu.forward_key, fz.forward_key);
+    }
+
+    /// Fail closed: a header we could not read gets NO session, so it cannot
+    /// alias a legitimate one. It is also what such a packet does today.
+    #[test]
+    fn unparseable_stays_flowless_7188() {
+        let (v1, mv1) = gre_v4_frame(K | 1, &[0x0000_0055]); // version 1
+        assert!(gre_keyed_session_flow(&v1, mv1).is_none());
+        let (rt, mrt) = gre_v4_frame(K | R, &[0x0000_0055]); // routing present
+        assert!(gre_keyed_session_flow(&rt, mrt).is_none());
+        let (tr, mtr) = gre_v4_frame(K, &[]); // truncated key
+        assert!(gre_keyed_session_flow(&tr, mtr).is_none());
+    }
+
+    /// Non-GRE never reaches this arm even if called: the caller gates on the
+    /// knob, and this gates on the protocol.
+    #[test]
+    fn non_gre_is_never_keyed_7188() {
+        let (f, mut m) = gre_v4_frame(K, &[0x0000_0001]);
+        m.protocol = crate::ip_proto::PROTO_TCP;
+        assert!(gre_keyed_session_flow(&f, m).is_none());
+    }
+
+    /// INERTNESS with acceleration OFF, demonstrated rather than asserted.
+    ///
+    /// With the knob off, `stage_parse_flow_and_learn` returns exactly what
+    /// `parse_session_flow_from_bytes` returned — the keyed arm is behind
+    /// `None if worker_ctx.forwarding.gre_acceleration`. So the acceleration-off
+    /// behaviour IS this function's behaviour, and this cell pins that #6837's
+    /// flowless treatment of transit GRE is untouched by #7188.
+    ///
+    /// If this ever returns `Some`, the knob has stopped being a switch: GRE
+    /// would be getting a session on the default path, which is the zero-ported
+    /// aliasing #6837 removed.
+    #[test]
+    fn acceleration_off_leaves_transit_gre_flowless_7188() {
+        for (label, flags, opts) in [
+            ("keyed", K, &[0x0000_002a][..]),
+            ("unkeyed", 0, &[][..]),
+            ("keyed-zero", K, &[0][..]),
+        ] {
+            let (f, m) = gre_v4_frame(flags, opts);
+            assert!(
+                crate::afxdp::frame::parse_session_flow_from_bytes(&f, m).is_none(),
+                "{label} transit GRE must stay FLOWLESS on the acceleration-off path \
+                 (#6837); a Some here means the knob is not a switch and GRE is \
+                 getting a session by default"
+            );
+            // Control: the same frame DOES yield a flow through the keyed arm,
+            // so the None above is the knob's doing and not an inert fixture.
+            assert!(
+                gre_keyed_session_flow(&f, m).is_some(),
+                "{label} fixture must be capable of producing a keyed flow, or the \
+                 assertion above passes for the wrong reason"
+            );
+        }
+    }
+
     #[test]
     fn default_is_none_so_existing_protocols_are_unchanged_7188() {
         assert_eq!(TunnelDiscriminator::default(), TunnelDiscriminator::None);
@@ -271,4 +398,45 @@ mod tests {
         assert!(!TunnelDiscriminator::Keyed(0).is_none());
         assert!(!TunnelDiscriminator::Unparseable.is_none());
     }
+}
+
+/// Build the keyed-GRE session flow for a transit packet, or `None` to leave it
+/// flowless (#7188 cut 1c).
+///
+/// This is an ADDITIVE arm, deliberately. It does not touch
+/// `metadata_tuple_complete`, which #6837 set to refuse protocol 47 and whose
+/// comment warns the discriminator "must not come back as a metadata-side
+/// default". The shim does not parse GRE, so the metadata side has no
+/// discriminator to offer and must keep refusing; this arm supplies the identity
+/// from the FRAME, which is the only side that can have read it.
+///
+/// With `gre-performance-acceleration` off the caller never reaches here, so the
+/// packet path is bit-identical to #6837's flowless behaviour.
+///
+/// `Unparseable` returns `None` — flowless. A header we could not read gets no
+/// session at all, which is a stronger form of decision 6's "must not merge into
+/// a legitimate session" than giving it an identity of its own would be: a
+/// packet with no session cannot alias anything, and this is also exactly what
+/// such a packet does today.
+pub(in crate::afxdp) fn gre_keyed_session_flow(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
+    if meta.protocol != crate::ip_proto::PROTO_GRE {
+        return None;
+    }
+    let outer_end = super::gre::outer_datagram_end(frame, meta)?;
+    let discriminator = gre_transit_discriminator(frame, meta.l4_offset as usize, outer_end);
+    match discriminator {
+        TunnelDiscriminator::Unparseable | TunnelDiscriminator::None => return None,
+        TunnelDiscriminator::Unkeyed | TunnelDiscriminator::Keyed(_) => {}
+    }
+    let mut flow = super::frame::parse_session_flow_from_meta(meta)?;
+    // GRE has no ports and never gains fake ones (#7188 decision 5): identity
+    // comes from the discriminator alone, and every port consumer keeps seeing
+    // the honest zero.
+    flow.forward_key.src_port = 0;
+    flow.forward_key.dst_port = 0;
+    flow.forward_key.discriminator = discriminator;
+    Some(flow)
 }

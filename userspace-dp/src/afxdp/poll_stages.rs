@@ -356,6 +356,23 @@ pub(super) fn stage_parse_flow_and_learn(
     worker_ctx: &WorkerContext,
 ) -> Option<SessionFlow> {
     let flow = parse_session_flow_from_bytes(packet_frame, meta);
+    // #7188: transit GRE has no 5-tuple identity, so #6837 leaves it FLOWLESS —
+    // `metadata_tuple_complete` refuses protocol 47 on both arms. With
+    // `gre-performance-acceleration` on, give it an identity keyed on the RFC
+    // 2890 discriminator instead.
+    //
+    // ADDITIVE and knob-gated: with acceleration off this expression is
+    // `flow` unchanged, so the path is bit-identical to today. It also leaves
+    // #6837's gate untouched at its own site — the discriminator arrives from
+    // the FRAME, which is the only side that can have read it, and never as a
+    // metadata-side default (the shim does not parse GRE).
+    let flow = match flow {
+        Some(flow) => Some(flow),
+        None if worker_ctx.forwarding.gre_acceleration => {
+            crate::afxdp::gre_discriminator::gre_keyed_session_flow(packet_frame, meta)
+        }
+        None => None,
+    };
     if learn_from_live_frame && let Some(flow) = flow.as_ref() {
         learn_dynamic_neighbor_from_packet(
             area,
