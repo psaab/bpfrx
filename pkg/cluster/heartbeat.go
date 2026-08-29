@@ -181,6 +181,60 @@ const maxHeartbeatSoftwareVersionSize = 255
 // unguarded per-send log would flood journald (#4434).
 var oversizeHeartbeatGroupsWarn sync.Once
 
+// monitorTruncationDetector is the monitor-section counterpart to
+// oversizeHeartbeatGroupsWarn (#7171), with one deliberate difference: the
+// DECISION that a truncation happened is separated from the once-guarded
+// EMISSION of the warning.
+//
+// The group warning above is a bare sync.Once, and a bare Once cannot be
+// tested. Whether it fires depends on which test ran first in the package
+// binary rather than on the input under test, so a cell asserting it passes or
+// fails on test ORDER. That is why the #4434 warning has never been asserted,
+// and repeating the shape would have shipped this file's own subject -- a
+// silent guard -- one level up: if the condition were unreachable, or not the
+// shape expected here, the operator would get exactly the silence this exists
+// to remove and nothing would say so.
+//
+// Splitting them also fixes something the once-guard alone gets wrong for the
+// operator. A condition that RECURS is different information from one that
+// happened once, and a Once reports both identically. observe counts every
+// occurrence while the log still emits once, so the count is the thing tests
+// and future status surfaces can read.
+//
+// Silence is the wrong default here because the effect is not local: the peer
+// consumes NumMonitors to compute weight-based failover, so a node whose
+// monitor list did not fit advertises a SMALLER monitored set than it actually
+// has, and the peer's arithmetic runs on an incomplete picture.
+type monitorTruncationDetector struct {
+	occurrences atomic.Uint64
+	warn        sync.Once
+}
+
+// observe records one marshal outcome and reports whether the monitor section
+// was truncated. advertised is what was written, want is what the caller had.
+// The log is once per process -- the heartbeat sender runs every
+// heartbeat-interval and an unguarded log here would flood journald
+// (CLAUDE.md logging rules) -- but the count advances on every occurrence.
+func (d *monitorTruncationDetector) observe(want, advertised int) bool {
+	if advertised >= want {
+		return false
+	}
+	d.occurrences.Add(1)
+	d.warn.Do(func() {
+		slog.Warn("cluster: monitored-interface list exceeds heartbeat wire "+
+			"limit; advertising only the entries that fit",
+			"monitors", want, "advertised", advertised,
+			"wire_limit", maxHeartbeatSize)
+	})
+	return true
+}
+
+// count returns how many truncations have been observed, across all
+// occurrences rather than only the first.
+func (d *monitorTruncationDetector) count() uint64 { return d.occurrences.Load() }
+
+var heartbeatMonitorTruncations monitorTruncationDetector
+
 func normalizeHAProtocolVersion(version uint16) uint16 {
 	if version == 0 {
 		return LegacyHAProtocolVersion
@@ -280,6 +334,7 @@ func marshalHeartbeatBody(pkt *HeartbeatPacket, tailReserve int) []byte {
 		off += len(nameBytes)
 		numMon++
 	}
+	heartbeatMonitorTruncations.observe(len(pkt.Monitors), numMon)
 	buf[monCountOff] = uint8(numMon)
 	if off+versionReserve+tailReserve <= maxHeartbeatSize {
 		buf[off] = uint8(len(version))
