@@ -102,6 +102,23 @@ type CompileHealthSnapshot struct {
 // so pkg/api -> pkg/daemon stays a one-way edge (#4184). The daemon injects a
 // callback returning this; /health surfaces the day-0 config-import outcome so
 // a failed bootstrap import is visible beyond a single journald WARN.
+// HostInboundAppliedSnapshot mirrors daemon.HostInboundAppliedState without the
+// import, keeping pkg/api -> pkg/daemon a one-way edge (#4184).
+//
+// #7181: every zone projection until now rendered host-inbound from CONFIG --
+// the DESIRED state -- with no way to say whether the kernel surface enforcing
+// it is in place. Established is STICKY (a later failed render does not clear
+// it), so it must never be rendered alone as "enforcement is in force"; paired
+// with LastApplyFailed it separates never-established / current / stale.
+type HostInboundAppliedSnapshot struct {
+	Known              bool // false = the daemon could not be asked; claims NOTHING
+	Established        bool
+	Generation         uint64
+	LastApplyFailed    bool
+	LastFailureUnixSec int64
+	GapFenceActive     bool
+}
+
 type BootstrapImportSnapshot struct {
 	Status  string // "ok" | "loaded-from-db" | "no-config" | "import-failed" | ""
 	Error   string // detail when Status == "import-failed"
@@ -171,6 +188,11 @@ type Config struct {
 	// is the goal — not pulling a still-reachable box from a probe-gated
 	// rotation. Optional; if nil, the field is omitted.
 	BootstrapImportFn func() BootstrapImportSnapshot
+
+	// HostInboundAppliedFn returns the #7181 APPLIED state of the host-inbound
+	// nftables surface. nil renders desired-only, exactly as before #7181 -- an
+	// unwired callback must never be reported as healthy.
+	HostInboundAppliedFn func() HostInboundAppliedSnapshot
 	// ConfigPersistDegradedFn surfaces the configstore's persist-degraded
 	// state via /health and the xpf_daemon_config_persist_degraded gauge
 	// (#1799, mirrors the CompileHealthFn pattern). Returning true means
@@ -440,6 +462,8 @@ type Server struct {
 	commitConfirmedFn                    func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
 	compileHealthFn                      func() CompileHealthSnapshot
 	bootstrapImportFn                    func() BootstrapImportSnapshot
+	// #7181: applied state of the host-inbound nft surface; nil = unwired.
+	hostInboundAppliedFn                 func() HostInboundAppliedSnapshot
 	configPersistDegradedFn              func() bool
 	rollbackHistoryDegradedFn            func() bool
 	neighborPhaseAgeFn                   func() map[string]float64
@@ -550,6 +574,7 @@ func NewServer(cfg Config) *Server {
 		commitConfirmedFn:                    cfg.CommitConfirmedFn,
 		compileHealthFn:                      cfg.CompileHealthFn,
 		bootstrapImportFn:                    cfg.BootstrapImportFn,
+		hostInboundAppliedFn:                 cfg.HostInboundAppliedFn,
 		configPersistDegradedFn:              cfg.ConfigPersistDegradedFn,
 		rollbackHistoryDegradedFn:            cfg.RollbackHistoryDegradedFn,
 		neighborPhaseAgeFn:                   cfg.NeighborPhaseAgeFn,

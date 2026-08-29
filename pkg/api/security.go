@@ -127,6 +127,15 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 				}
 			}
 		}
+		// #7181: attach the APPLIED state of the host-inbound surface. The stanza
+		// rendered above is DESIRED config; without this a zone reports its
+		// host-inbound posture as configured while no kernel table may exist.
+		// Omitted when the callback is unwired, so an absent daemon claims nothing.
+		if s.hostInboundAppliedFn != nil {
+			if snap := s.hostInboundAppliedFn(); snap.Known {
+				zi.HostInboundApplied = hostInboundAppliedInfo(snap)
+			}
+		}
 		zones = append(zones, zi)
 	}
 	if readErr != nil {
@@ -977,4 +986,27 @@ func policyActionStr(a config.PolicyAction) string {
 // renders as "no checks" rather than panicking on p.TCP.SynFlood (#3476).
 func screenChecks(p *config.ScreenProfile) []string {
 	return config.ScreenChecks(p)
+}
+
+// hostInboundAppliedInfo maps the daemon's applied-state snapshot to the REST
+// projection.
+//
+// The ORDER of these arms is the whole point. `Established` is sticky-true, so
+// testing it first and reporting "current" would render a box whose latest
+// render FAILED as healthy — the exact conflation #7181 exists to remove.
+func hostInboundAppliedInfo(snap HostInboundAppliedSnapshot) *HostInboundAppliedInfo {
+	out := &HostInboundAppliedInfo{
+		Generation:         snap.Generation,
+		LastFailureUnixSec: snap.LastFailureUnixSec,
+		GapFenceActive:     snap.GapFenceActive,
+	}
+	switch {
+	case !snap.Established:
+		out.State = HostInboundAppliedNotEstablished
+	case snap.LastApplyFailed:
+		out.State = HostInboundAppliedStale
+	default:
+		out.State = HostInboundAppliedCurrent
+	}
+	return out
 }

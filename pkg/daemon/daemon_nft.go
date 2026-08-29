@@ -559,6 +559,12 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		// Serialized under applySem with the Store(true) sites and every later apply,
 		// so this cannot race a subsequent install.
 		d.hostInboundEnforced.Store(false)
+		// #7181: both tables are gone, so no gap fence stands and the last
+		// attempt succeeded. Leaving the staleness flag set here would render a
+		// deliberate teardown as a failed render.
+		d.hostInboundGapFenceActive.Store(false)
+		d.hostInboundLastApplyFailed.Store(false)
+		d.hostInboundLastFailureUnixNano.Store(0)
 		d.hostInboundCoveredAddrs = nil
 		return nil
 	}
@@ -626,16 +632,32 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 			uncoveredV4, uncoveredV6 := hostInboundUncoveredDropAddrs(views, unzonedV4, unzonedV6, d.hostInboundCoveredAddrs)
 			if len(uncoveredV4) > 0 || len(uncoveredV6) > 0 {
 				if gapErr := d.installHostInboundGapFence(uncoveredV4, uncoveredV6, wgListenPorts); gapErr != nil {
+					// #7181: the apply failed AND the gap could not be installed.
+					// Record the staleness before returning -- this is the worst
+					// applied state and the one an operator most needs surfaced.
+					d.noteHostInboundApplyFailed(time.Now())
 					return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), gapErr)
 				}
+				// #7181: a gap fence is now standing beside the retained real
+				// table. Part of the applied truth -- this box enforces through
+				// TWO tables until the next successful real install.
+				d.hostInboundGapFenceActive.Store(true)
 			}
 		}
+		// #7181: the retained generation is unchanged and may still be
+		// protecting, so this marks the applied state STALE rather than
+		// clearing Established -- exactly the distinction a sticky bool cannot
+		// express.
+		d.noteHostInboundApplyFailed(time.Now())
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
 	// A real host-inbound table is now installed. Record the historical success;
 	// a later failed install retains that exact generation and therefore skips the
 	// cold-boot fallback. This does not prove current table presence (#5790).
 	d.hostInboundEnforced.Store(true)
+	// #7181: advance the applied generation and clear the staleness flag and any
+	// gap-fence marker -- the real table now covers the desired set on its own.
+	d.noteHostInboundApplySucceeded()
 	// #5789: the retained generation now covers EXACTLY this desired drop set.
 	// Record it so a later failed rerender can tell which destinations a
 	// subsequently-appeared address left uncovered.

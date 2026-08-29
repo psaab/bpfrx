@@ -174,6 +174,13 @@ type ZoneInfo struct {
 	// "genuinely zero traffic"; without it the endpoint reported a misleading 0
 	// (or, for a stable-hash zone id >= MaxZones, 500'd the whole response).
 	PerZoneCountersAvailable bool `json:"per_zone_counters_available"`
+
+	// HostInboundApplied (#7181) reports the APPLIED state of the host-inbound
+	// nftables surface enforcing this zone's host-inbound-traffic stanza, as
+	// opposed to the desired configuration rendered above. Omitted entirely when
+	// the daemon could not be asked, because an absent field claims nothing while
+	// a false one would claim "not enforced".
+	HostInboundApplied *HostInboundAppliedInfo `json:"host_inbound_applied,omitempty"`
 }
 
 // ZoneInterfaceHostInbound is a per-interface host-inbound-traffic override
@@ -921,3 +928,34 @@ type AnnotateRequest struct {
 	Path    string `json:"path"`    // space-separated config path
 	Comment string `json:"comment"` // annotation text
 }
+
+// HostInboundAppliedInfo is the #7181 applied-state projection of the
+// host-inbound nftables surface.
+//
+// State is TRI-STATE rather than a boolean because the underlying latch is
+// sticky-true and cannot, alone, tell "enforcement is in force" from
+// "enforcement loaded once and the latest render failed":
+//
+//	"not-established" — nothing has ever published a host-inbound DROP, so a
+//	                    configured default-deny is NOT in force. This is the
+//	                    cold-boot case codex-review-182:4394 named, where
+//	                    diagnostics could report default-deny with no table.
+//	"current"         — the most recent real render succeeded.
+//	"stale"           — a later render FAILED. The retained generation still
+//	                    stands but covers only what it covered when it loaded;
+//	                    an address that appeared since may be covered only by
+//	                    the additive gap fence, or not at all.
+type HostInboundAppliedInfo struct {
+	State              string `json:"state"`
+	Generation         uint64 `json:"generation"`
+	LastFailureUnixSec int64  `json:"last_failure_unix_sec,omitempty"`
+	GapFenceActive     bool   `json:"gap_fence_active,omitempty"`
+}
+
+// Applied-state values, exported so consumers compare against a constant
+// rather than a string literal that can drift.
+const (
+	HostInboundAppliedNotEstablished = "not-established"
+	HostInboundAppliedCurrent        = "current"
+	HostInboundAppliedStale          = "stale"
+)

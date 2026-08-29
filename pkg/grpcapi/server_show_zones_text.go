@@ -79,6 +79,21 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 			buf.WriteString(line)
 			buf.WriteString("\n")
 		}
+		// #7181: the lines above are DESIRED config. This one is what the kernel
+		// is actually enforcing. Rendered next to the stanza deliberately -- an
+		// operator reading a default-deny posture needs the applied state in the
+		// same glance, because "configured" and "in force" were previously
+		// indistinguishable here.
+		if s.hostInboundAppliedFn != nil {
+			if ap := s.hostInboundAppliedFn(); ap.Known {
+				fmt.Fprintf(buf, "  Host-inbound applied: %s (generation %d)\n",
+					ap.AppliedStateLabel(), ap.Generation)
+				if ap.GapFenceActive {
+					buf.WriteString("  Host-inbound gap fence: ACTIVE " +
+						"(an address is denied by the additive fence, not the main table)\n")
+				}
+			}
+		}
 		// Traffic counters
 		if s.dp != nil && s.dp.IsLoaded() && zoneID > 0 {
 			ingress, errIn := s.dp.ReadZoneCounters(zoneID, 0)
