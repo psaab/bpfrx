@@ -327,6 +327,19 @@ type SyncStats struct {
 	// #7147 confirmed fence. FenceAcksTimedOut is the one that matters
 	// operationally: it counts takeovers that proceeded WITHOUT the
 	// confirmation the operator asked for, which is invisible in FencesSent.
+	//
+	// Directions and exact semantics, because two of these are easy to
+	// misread:
+	//   - FenceAcksSent counts acks THIS node sent, i.e. times this node was
+	//     the one being fenced. The other two are the outbound direction.
+	//   - FenceAcksReceived counts acks that reached a LIVE waiter. An ack
+	//     that arrives after its wait already timed out is dropped by the seq
+	//     match and is NOT counted here — it did not confirm anything the
+	//     takeover could act on, and counting it would make
+	//     received+timed_out exceed the number of fences sent.
+	//   - FenceAcksReceived includes NEGATIVE acks (partial/unavailable): it
+	//     counts fences the peer ANSWERED, not fences it satisfied. The
+	//     EventFence history distinguishes those.
 	FenceAcksSent     atomic.Uint64
 	FenceAcksReceived atomic.Uint64
 	FenceAcksTimedOut atomic.Uint64
