@@ -220,11 +220,18 @@ func validateLoginClassDenyStrict(cfg *Config) error {
 //	set system login class noc-admin deny-configuration "security policies"
 //	set system login user root class noc-admin
 //
-// pkg/daemon/daemon_run.go assigns the CONFIGURED class to any OS user whose
-// name matches a `system login user` (`if u.Name == osUser {
-// shell.SetUserClass(u.Class) }`), and `root` is a name the username validator
-// accepts. Account PROVISIONING skips root (daemon_system.go); the CLI class
-// assignment does not. So the console operator above runs as `noc-admin`, and
+// pkg/daemon/daemon_run.go:742 -> applyCLILoginClass (pkg/daemon/cli_rbac.go)
+// -> cli.ResolveLoginClass (pkg/cli/identity.go) -> configuredClass assigns the
+// CONFIGURED class to the invoking OS credential, and `root` is a name the
+// username validator accepts.
+// Account PROVISIONING skips root (daemon_system.go); the CLI class assignment
+// does not. The old inline `if u.Name == osUser` loop this comment used to quote
+// has not existed since #6701 and survives only as a historical quote in
+// cli_rbac.go and identity.go (#7057); configuredClass is not a bare equality —
+// it walks candidateNames(id) including passwd aliases, returns the FIRST user
+// block carrying a NON-EMPTY class, and gives a root listed with no class
+// ClassRootDefault ("super-user") rather than an empty one. The premise the
+// repair floor rests on is unchanged and, if anything, broader. So the console operator above runs as `noc-admin`, and
 // a view-only collapse takes `configure` away from the only login that could
 // delete the offending stanza — while validateLoginClassDenyStrict rejects
 // every commit until it IS deleted. A configure-only class collapses to the

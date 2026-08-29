@@ -745,3 +745,95 @@ fn frag_assoc_authority_binds_the_fabric_zone_stamp_5798() {
          one of their own"
     );
 }
+
+/// #7050: an ingress_zone_override that names a zone the snapshot does not
+/// carry must NOT reach `FragAuthority.ingress_zone` raw.
+///
+/// The defect was a disagreement between the association key and enforcement.
+/// Both sibling consumers of this value validate the override against
+/// `zone_id_to_name` — `prerouting_ingress_scope` resolves id->name and falls
+/// through on a miss, `filter_log_ingress_zone_id` applies a `contains_key`
+/// filter — so for an unknown id enforcement normalizes it away and uses the
+/// logical unit's configured zone. `frag_ingress_authority` took it verbatim, so
+/// two fragments of ONE datagram carrying two DIFFERENT unknown ids built two
+/// DIFFERENT keys. That over-scopes: the second fragment misses the association
+/// and is dropped fail-closed, for a datagram enforcement treats as one domain.
+///
+/// Not reachable in production today — the sole binding of the override comes
+/// from `parse_zone_encoded_fabric_ingress_from_frame`, which already rejects an
+/// unknown id, and every later shadow can only narrow `Some -> None`. This test
+/// therefore guards the CONSUMER's own contract, so the three consumers agree by
+/// construction rather than by a property of one producer that a fourth producer
+/// would not have to share.
+///
+/// Both directions are asserted. Checking only that two unknown ids now agree
+/// would pass against an implementation that ignored the override entirely, and
+/// checking only that a known override still wins would pass against the
+/// unvalidated code this replaces.
+#[test]
+fn unknown_zone_override_does_not_reach_the_frag_authority_7050() {
+    let forwarding = build_forwarding_state(&frag_stamp_snapshot());
+    let meta = stamped_fabric_frag_meta();
+
+    const UNKNOWN_A: u16 = 65000;
+    const UNKNOWN_B: u16 = 65001;
+
+    // PREMISE. If either id were configured this test would be comparing two
+    // honored overrides and would pass for the wrong reason.
+    assert!(
+        !forwarding.zone_id_to_name.contains_key(&UNKNOWN_A)
+            && !forwarding.zone_id_to_name.contains_key(&UNKNOWN_B),
+        "premise broken: the fixture now configures one of the ids this test needs to be \
+         UNKNOWN, so it can no longer distinguish a validated override from a raw one"
+    );
+    // PREMISE. A known id must be present, or the positive control below is
+    // vacuous and this test degenerates into "nothing is ever honored".
+    assert!(
+        forwarding.zone_id_to_name.contains_key(&TEST_LAN_ZONE_ID),
+        "premise broken: TEST_LAN_ZONE_ID is not configured in this fixture, so the \
+         positive control cannot show that a VALID override still wins"
+    );
+
+    let authority = |o: Option<u16>| {
+        crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(&forwarding, meta, o)
+    };
+
+    let none = authority(None);
+    let a = authority(Some(UNKNOWN_A));
+    let b = authority(Some(UNKNOWN_B));
+
+    // THE DEFECT: two fragments of one datagram, two unknown ids, one authority.
+    assert_eq!(
+        a, b,
+        "two DIFFERENT unknown zone overrides still build DIFFERENT frag authorities, so the \
+         second fragment of a datagram misses the association the first installed and is \
+         dropped fail-closed — while enforcement, which normalizes both ids away, treats the \
+         two as the same domain (a={a:?} b={b:?})"
+    );
+    // And the value they collapse ONTO is the fallback, not some third answer:
+    // an unknown override must be indistinguishable from no override at all.
+    assert_eq!(
+        a, none,
+        "an unknown override produced an authority differing from the no-override one, so it \
+         is still contributing to the key. It must fall through to the LOGICAL unit's \
+         configured zone, which is what enforcement does with it (a={a:?} none={none:?})"
+    );
+
+    // POSITIVE CONTROL, and the reason this is not simply `override.take()`: a
+    // CONFIGURED override must still win. Without this row the assertions above
+    // are satisfied by ignoring the parameter, which would silently undo the
+    // fabric zone stamp that
+    // `fabric_frag_association_is_scoped_by_the_stamped_zone` exists to protect.
+    let known = authority(Some(TEST_LAN_ZONE_ID));
+    assert_eq!(
+        known.ingress_zone, TEST_LAN_ZONE_ID,
+        "a VALID zone override no longer reaches the frag authority: the validation went too \
+         far and now drops every override, collapsing the fabric zone stamp"
+    );
+    assert_ne!(
+        known.ingress_zone, none.ingress_zone,
+        "the fixture's configured ingress zone equals TEST_LAN_ZONE_ID, so the positive \
+         control cannot tell an honored override from the fallback. Pick an override zone the \
+         fabric interface does not already resolve to"
+    );
+}

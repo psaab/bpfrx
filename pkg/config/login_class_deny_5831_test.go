@@ -298,10 +298,12 @@ func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
 // TestLoginClassDenyFoldKeepsTheRepairPath is the counter-example to
 // "the fold cannot lock an operator out".
 //
-// pkg/daemon/daemon_run.go assigns the CONFIGURED login class to any OS user
-// whose name matches a `system login user` entry, and `root` is a name the
+// pkg/daemon/daemon_run.go:742 -> applyCLILoginClass (pkg/daemon/cli_rbac.go)
+// -> cli.ResolveLoginClass (pkg/cli/identity.go) -> configuredClass assigns the
+// CONFIGURED login class to the invoking OS credential, and `root` is a name the
 // username validator accepts (account PROVISIONING skips root; the CLI class
-// assignment does not). So the config below binds the CONSOLE operator to a
+// assignment does not). The inline loop this comment used to describe is gone
+// since #6701 (#7057). So the config below binds the CONSOLE operator to a
 // custom class. If the tolerant fold collapsed that class to view-only, the
 // only login that can delete the offending statement would lose `configure` —
 // while validateLoginClassDenyStrict rejects every commit until it IS deleted.

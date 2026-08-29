@@ -1351,6 +1351,52 @@ func bindHostWarnable(bindHost string) bool {
 	return true
 }
 
+// bindIsLoopbackOnly reports whether the HTTPS management listener can be
+// reached ONLY from this host, so no REMOTE client exists to verify anything by
+// host name (#7039).
+//
+// NOT `!bindHostWarnable(bindHost)`. That is the obvious drop-in and it is
+// wrong, because the two functions answer different questions and disagree on
+// the most remote-reachable bind there is:
+//
+//	bindHost        bindHostWarnable   bindIsLoopbackOnly
+//	""              false              false
+//	"localhost"     false              TRUE
+//	"127.0.0.1"     false              TRUE
+//	"::1"           false              TRUE
+//	"0.0.0.0"       false              false   <-- reachable from everywhere
+//	"::"            false              false   <-- reachable from everywhere
+//	"10.0.0.1"      TRUE               false
+//
+// `bindHostWarnable` asks "is there a single concrete host here worth warning
+// about if the cert misses it" — a WILDCARD bind answers no, because it names no
+// one host, not because it is unreachable. Suppressing the host-name diagnostic
+// on `!bindHostWarnable` would therefore silence it on `0.0.0.0`, where remote
+// clients certainly do exist and the host name certainly is an access identity.
+// That is over-suppression of exactly the case the diagnostic is FOR.
+// `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the divergence.
+//
+// An empty bindHost is NOT treated as loopback, and the reason is stronger than
+// "suppressing on unknown state fails the wrong way". `":8443"` — the bare-port
+// form, an ordinary way to spell a listener on every interface — splits to an
+// EMPTY host, so `""` most often means WILDCARD rather than unparseable. This
+// module's own README already records that reading for the bind-host half:
+// "wildcard (`:8443` → empty) / non-encodable bind host is skipped". Treating
+// `""` as loopback would therefore suppress the diagnostic on a maximally
+// reachable listener — the same error as the `!bindHostWarnable` drop-in,
+// reached from a different direction.
+// `TestWarnStaleMgmtCertForHostName_6827/wildcard_bind_host_still_diagnoses_the_name`
+// binds that shape; it uses exactly a `":8443"` listener.
+func bindIsLoopbackOnly(bindHost string) bool {
+	if bindHost == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(bindHost); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // hostnameSANWarnable reports whether the CURRENT kernel host name is an
 // identity worth warning about when a loaded on-disk cert does not cover it.
 //
@@ -1591,6 +1637,23 @@ func warnStaleBindHost(leaf *x509.Certificate, bindHost string) {
 func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hostNameEvidence) {
 	if !hostnameSANWarnable(hostName) || hostName == bindHost {
 		return // uncoverable by any re-mint, or already reported as the bind host
+	}
+	// #7039: a loopback-only listener has no remote client, so nothing can
+	// verify by host name and a re-mint would fix nothing. The bind-host half of
+	// this same diagnostic already declines here — bindHostWarnable("127.0.0.1")
+	// is false — and the host-name half had no equivalent gate, so every
+	// `set system host-name` on a loopback-bound management plane warned about
+	// clients that cannot exist. That is the failure mode
+	// hostNameLikelyAccessIdentity's own doc block exists to prevent: a
+	// diagnostic that fires on a healthy box gets muted, and the true positive
+	// dies with it.
+	//
+	// Placed BEFORE the evidence gate on purpose. This is a property of the
+	// BIND, not of the name, so it composes with hostNameOperatorSet rather than
+	// contradicting it: an operator who deliberately renames a loopback-only
+	// device still has no remote client to break.
+	if bindIsLoopbackOnly(bindHost) {
+		return
 	}
 	if ev == hostNameInferred && !hostNameLikelyAccessIdentity(leaf, hostName) {
 		return

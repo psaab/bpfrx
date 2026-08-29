@@ -1403,3 +1403,122 @@ func TestServeBoundSeversInFlightResponses_6827(t *testing.T) {
 	// one statement to a bare Shutdown left both packages green.
 	assertConnSevered(t, tlsConn, "HTTPS leg: "+severed)
 }
+
+// #7039: the rename-path host-name WARN fired on a loopback-only HTTPS bind,
+// where the BIND-HOST half of the same diagnostic already declines
+// (`bindHostWarnable("127.0.0.1")` is false). On that plane no remote client
+// exists, so nothing can verify by host name and a re-mint would fix nothing.
+//
+// THE FIX IS A SUPPRESSION, so the cells that matter are the ones proving it did
+// not over-suppress. A test showing only "loopback no longer warns" is satisfied
+// by deleting the warning outright, so every silence cell below is paired with a
+// bind on which the warning MUST still fire, through the same call, with every
+// other condition held identical.
+func TestLoopbackOnlyBindSuppressesTheRenameHostNameWarn_7039(t *testing.T) {
+	// A cert covering the OLD name plus the loopback SANs the mint path always
+	// adds — the shape a loopback-bound appliance actually serves.
+	for _, bind := range []string{"127.0.0.1:443", "[::1]:443", "localhost:443"} {
+		t.Run("silent_on_"+bind, func(t *testing.T) {
+			s := legServing(mintCert(t, "old-fw", "127.0.0.1"), bind)
+			out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+			if strings.Contains(out, hostNameMsg) {
+				t.Fatalf("a rename on a LOOPBACK-only management bind warned about "+
+					"clients verifying by host-name, but no remote client exists on "+
+					"that plane — this is the diagnostic firing on a healthy box, "+
+					"which is how the true positive gets muted (#7039); got %q", out)
+			}
+		})
+	}
+
+	// THE PAIRED CELLS. Same call, same cert shape, same rename — only the bind
+	// differs, and on each of these the warning MUST still fire.
+	for _, tc := range []struct {
+		name, bind, why string
+	}{
+		{
+			"routable_ip", "10.0.0.1:8443",
+			"a routable management bind has remote clients, and the host name is " +
+				"exactly the identity they would verify",
+		},
+		{
+			// The cell that separates this fix from the obvious drop-in.
+			// bindHostWarnable("0.0.0.0") is FALSE, so suppressing on
+			// !bindHostWarnable would silence the diagnostic on the most
+			// remote-reachable bind there is.
+			"wildcard_v4", "0.0.0.0:8443",
+			"a WILDCARD bind is reachable from every interface. bindHostWarnable " +
+				"answers false for it — because it names no single host, not because " +
+				"it is unreachable — so a fix written as !bindHostWarnable would " +
+				"suppress precisely the case the diagnostic exists for",
+		},
+		{
+			"wildcard_v6", "[::]:8443",
+			"the v6 wildcard, same reasoning as 0.0.0.0",
+		},
+	} {
+		t.Run("still_warns_on_"+tc.name, func(t *testing.T) {
+			s := legServing(mintCert(t, "old-fw", "127.0.0.1"), tc.bind)
+			out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+			if !strings.Contains(out, hostNameMsg) {
+				t.Fatalf("OVER-SUPPRESSED: a rename on %s must still warn — %s. "+
+					"got %q", tc.bind, tc.why, out)
+			}
+			if !strings.Contains(out, "new-fw") {
+				t.Fatalf("the surviving warning must still name the NEW host name; got %q", out)
+			}
+		})
+	}
+}
+
+// #7039: `bindIsLoopbackOnly` is NOT the complement of `bindHostWarnable`, and
+// this pins the divergence rather than leaving it to a comment.
+//
+// The two answer different questions — "can only this host reach the listener"
+// versus "is there a single concrete host worth warning about" — and they
+// disagree on the wildcard binds, which is the disagreement that matters: a fix
+// written as `!bindHostWarnable(bindHost)` would silence the host-name
+// diagnostic on `0.0.0.0`.
+//
+// If someone later makes them coincide, this fails and they have to decide
+// deliberately rather than discovering it through a muted warning.
+func TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039(t *testing.T) {
+	cases := []struct {
+		bindHost         string
+		wantWarnable     bool
+		wantLoopbackOnly bool
+	}{
+		{"", false, false},
+		{"localhost", false, true},
+		{"127.0.0.1", false, true},
+		{"127.0.0.53", false, true},
+		{"::1", false, true},
+		{"0.0.0.0", false, false},
+		{"::", false, false},
+		{"10.0.0.1", true, false},
+		{"fw.example.com", true, false},
+	}
+	// Anti-vacuity backstop. It is NOT enough that SOME row has both predicates
+	// false: the empty bindHost does too, and that row is a parse FAILURE, not a
+	// reachable listener. The claim this table exists to support is specifically
+	// that a WILDCARD bind — reachable from everywhere — is suppressed by the
+	// `!bindHostWarnable` drop-in and not by this predicate. So the backstop
+	// requires a row that actually parses as an unspecified address.
+	divergedOnWildcard := false
+	for _, tc := range cases {
+		gotW, gotL := bindHostWarnable(tc.bindHost), bindIsLoopbackOnly(tc.bindHost)
+		if gotW != tc.wantWarnable || gotL != tc.wantLoopbackOnly {
+			t.Errorf("bindHost %q: bindHostWarnable=%v (want %v) bindIsLoopbackOnly=%v (want %v)",
+				tc.bindHost, gotW, tc.wantWarnable, gotL, tc.wantLoopbackOnly)
+		}
+		ip := net.ParseIP(tc.bindHost)
+		if ip != nil && ip.IsUnspecified() && !gotW && !gotL {
+			divergedOnWildcard = true
+		}
+	}
+	if !divergedOnWildcard {
+		t.Fatal("no WILDCARD bind (an address that parses and is unspecified) had " +
+			"bindHostWarnable=false AND bindIsLoopbackOnly=false, so this table no " +
+			"longer demonstrates that the `!bindHostWarnable` drop-in would " +
+			"over-suppress the most remote-reachable listener there is (#7039)")
+	}
+}

@@ -10,7 +10,12 @@ import (
 )
 
 type cosInterfaceView struct {
-	name           string
+	name string
+	// ifName is the PHYSICAL interface the class-of-service stanza names, kept
+	// alongside the rendered logical `name` so the #7065 advisory can quote the
+	// operator's own `interfaces <ifName> unit <unit>` path rather than making
+	// them re-derive it from "ge-9-9-9.0".
+	ifName         string
 	unit           int
 	cosUnit        *config.CoSInterfaceUnit
 	interfaceUnit  *config.InterfaceUnit
