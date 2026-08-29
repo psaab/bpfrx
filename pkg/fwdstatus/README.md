@@ -15,7 +15,48 @@ fixed-width table.
 
 ## Callers
 
-`pkg/grpcapi` (show command), `pkg/daemon` (status sampling).
+`pkg/grpcapi` (show command), `pkg/cli` (in-process console), `pkg/daemon`
+(status sampling). Both show frontends render from THIS package precisely so
+one recorded fact cannot render two different ways.
+
+## Helper crash block (#7250)
+
+`Build` probes the dataplane for
+`HelperCrashState() (userspace.HelperCrashRecord, bool)` — an anonymous
+interface, matching the existing `Status()` probe, so `DataPlaneAccessor` stays
+the two-method surface every caller and test already implements.
+
+Three things about it are easy to break:
+
+- The probe is **not** gated on `Status()` succeeding. A crash runs
+  `resetAfterHelperGoneLocked` → `clearLastStatusLocked`, so `Status()` starts
+  erroring — which is the exact case the block exists to explain. Gating it the
+  way the Buffer% block is gated would blank the crash surface whenever a
+  helper crashed. (`isUserspace` is a type assertion, not a `Status()` outcome,
+  which is what keeps the probe reachable across a crash.)
+- `HelperCrashKnown` is **not** redundant with `LastExitWasCrash`. A zero
+  `HelperCrashRecord` is byte-identical to a healthy one, and `ExitCode: 0`
+  satisfies the `ExitCode >= 0` discriminator, so a renderer keyed on the
+  record alone prints "exit code 0" for a helper that never crashed. Same
+  discipline as `BufferKnown` beside `BufferPercent`.
+- `Format` renders **nothing** when there is no episode. The record is wiped on
+  a successful restart, so the block reports the current crash episode, never a
+  history. #5838's "last restart timestamp" is unbacked for that reason and is
+  tracked in #7967; every other field it names renders a row.
+- The headline is four named states over (`RestartPending` x `CrashLooping`),
+  and `RestartPending` picks it — a stopped helper reads "stopped", never
+  "CRASH LOOPING", because the loop predicate stays true after an intentional
+  stop.
+- `Format` is exported and takes a flat struct, so its guards must hold for
+  structs `Build` did not produce. Two mutations escaped the first matrix
+  because every cell reached the guard *through* `Build`, which sanitizes on the
+  way in; the cells that catch them construct `ForwardingStatus` directly.
+
+Both frontends must expose the accessor on their `forwardingStatus*Userspace*`
+adapter or the probe silently misses with **no compile error** —
+`cli_show_chassis_adapter_test.go` and `server_show_forwarding_adapter_test.go`
+each carry a cell that reds on that deletion, because this package's own tests
+cannot see the wiring.
 
 ## Dependencies
 

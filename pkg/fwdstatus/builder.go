@@ -210,6 +210,41 @@ func Build(
 		}
 	}
 
+	// --- Helper crash/restart record (#7250) ---------------------
+	//
+	// Probed as an anonymous interface, matching the Status() probe above, so
+	// DataPlaneAccessor stays the two-method surface every caller and test
+	// already implements.
+	//
+	// This is deliberately NOT gated on `usErr == nil`. The crash record lives
+	// on the Manager, not in the helper's published status, and a crash runs
+	// `resetAfterHelperGoneLocked` -> `clearLastStatusLocked` so `Status()`
+	// starts erroring — which is precisely the case this block exists to
+	// explain. Gating it the way the Buffer% block above is gated would make
+	// the crash surface go blank exactly when a helper crashed.
+	//
+	// `isUserspace` is a type assertion rather than a Status() outcome, so it
+	// stays true across a crash; that is what keeps this reachable.
+	if dp != nil && isUserspace {
+		if acc, ok := dp.(interface {
+			HelperCrashState() (userspace.HelperCrashRecord, bool)
+		}); ok {
+			if rec, known := acc.HelperCrashState(); known {
+				fs.HelperCrashKnown = true
+				fs.LastExitWasCrash = rec.LastExitWasCrash
+				fs.RestartPending = rec.RestartPending
+				fs.HelperCrashLooping = rec.CrashLooping()
+				fs.HelperExitCode = rec.ExitCode
+				fs.HelperSignal = rec.Signal
+				fs.HelperExitDetail = rec.Detail
+				fs.HelperPID = rec.PID
+				fs.HelperLastExit = rec.At
+				fs.HelperRestarts = rec.Restarts
+				fs.HelperNextRestart = rec.NextRestart
+			}
+		}
+	}
+
 	// --- State ---------------------------------------------------
 	switch {
 	case dp == nil || !dp.IsLoaded():

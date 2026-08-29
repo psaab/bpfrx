@@ -669,10 +669,64 @@ would blackhole every flow handed to it.
   capability / event-stream readiness gates all still run before
   forwarding is re-armed.
 
-Not covered here, tracked separately: the operator-facing surface for
-the crash record (exit code/signal, restart count, backoff deadline and
-crash-loop reason are recorded in `helperCrashState` but not yet
-rendered by any `show` command), and a named crash-loop state.
+- **Named crash-loop state (#7250).** `HelperCrashRecord.CrashLooping()`
+  is the predicate an operator or a health surface reads as "this helper
+  is not coming back". It is **backoff at the cap**, not a raw restart
+  count: a count is time-blind, and twenty restarts over a week and
+  twenty in a minute are different situations. With the shipped 1s base
+  and 60s cap it trips at seven consecutive attempts.
+- **Operator surface (#7250).** `show chassis forwarding` renders the
+  crash block, via `pkg/fwdstatus` so the in-process CLI and the remote
+  `cli` binary share one implementation. It was chosen over the other
+  candidates because it is the surface that owns the `State` row, and
+  during a crash loop `State  Unknown` was the *only* thing an operator
+  saw — `resetAfterHelperGoneLocked` clears the cached `ProcessStatus`,
+  so every other surface degrades to a generic "unavailable" and none of
+  them can separate "crashed and retrying" from "never started" from
+  "intentionally stopped".
+
+  Three properties of that render are load-bearing:
+
+  - It is **silent when there is nothing to report**. A successful
+    restart assigns a fresh `HelperCrashRecord{}`, so a recovered helper
+    holds the zero value and there is no episode to describe. It follows
+    that the surface describes the **current** crash episode, never a
+    history — once the helper recovers, the exit that preceded it is
+    gone from the record.
+  - `ForwardingStatus.HelperCrashKnown` gates every field, and is **not**
+    redundant with `LastExitWasCrash`. A zero `HelperCrashRecord` is
+    byte-identical to a healthy one, and `ExitCode: 0` satisfies the
+    `ExitCode >= 0` discriminator, so a renderer keyed on the record
+    alone prints "exit code 0" for a helper that never crashed. Same
+    discipline as `BufferKnown` beside `BufferPercent`.
+  - The headline is one of **four named states** over
+    (`RestartPending` x `CrashLooping()`), and **`RestartPending` picks
+    it**. `CrashLooping()` stays true after an intentional stop —
+    `LastExitWasCrash` survives a stop by design and `Restarts` survives
+    with it — so a helper that is merely stopped is headlined
+    **"stopped — after a crash loop"**, with the loop history as
+    subordinate detail. An operator reads the first line and acts on it,
+    and "CRASH LOOPING" on a stopped helper sends them hunting a crash
+    that is not currently happening. Same shape as
+    `firewallEffectiveLiveness`, whose third arm carries an explicit
+    reason rather than a flag.
+  - The crash-loop **reason** is **derived, not stored**.
+    `CrashLooping()` is
+    `LastExitWasCrash && helperRestartDelay(Restarts) >= helperRestartBackoffMax`,
+    so the reason is fully determined by the restart count plus the
+    schedule reaching its ceiling, and is rendered as
+    "restart backoff reached its maximum after N restarts". A reason
+    computed from visible inputs cannot drift from the predicate it
+    explains, which a string captured at decision time can.
+
+**#5838's acceptance bullet is NOT fully closed, and the surface says so.**
+The crash-loop *reason* is satisfied by derivation (above). The **last-restart
+timestamp is not, and cannot be** with this data model: `restartHelperAfterCrash`
+zeroes the whole record on a successful restart, so such a field would be wiped
+by the very event it records. That makes it a question about where crash history
+lives rather than a field addition — tracked in **#7967**, not folded silently
+into the rendering change. Do not mark the bullet done: every other named field
+renders a row, so the missing one is invisible from the output.
 
 ## Armed-state admission contract (#2114 A3)
 

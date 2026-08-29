@@ -109,3 +109,66 @@ func TestForwardingStatusDataplaneUsesUserspaceStatusAdapter(t *testing.T) {
 		t.Fatalf("Status() = %#v, want injected userspace status", got)
 	}
 }
+
+// --- #7250: the crash accessor must be WIRED on the gRPC side too ---------
+//
+// The remote `cli` binary lands here, not on pkg/cli. Two frontends render the
+// same fact from one implementation (the pkg/bootstrapshow rule), so both
+// adapters need the method and both need a cell — binding one would leave the
+// other free to regress silently.
+
+type forwardingStatusServerCrashTestDP struct {
+	*forwardingStatusServerUserspaceTestDP
+
+	rec        dpuserspace.HelperCrashRecord
+	known      bool
+	crashCalls int
+}
+
+func (f *forwardingStatusServerCrashTestDP) HelperCrashState() (dpuserspace.HelperCrashRecord, bool) {
+	f.crashCalls++
+	return f.rec, f.known
+}
+
+func TestForwardingStatusServerAdapterExposesTheCrashAccessor7250(t *testing.T) {
+	base := &forwardingStatusServerTestDP{loaded: true}
+	dp := &forwardingStatusServerCrashTestDP{
+		forwardingStatusServerUserspaceTestDP: &forwardingStatusServerUserspaceTestDP{
+			forwardingStatusServerTestDP: base,
+		},
+		known: true,
+		rec: dpuserspace.HelperCrashRecord{
+			LastExitWasCrash: true,
+			RestartPending:   true,
+			Signal:           "killed",
+			ExitCode:         -1,
+			Restarts:         7,
+		},
+	}
+
+	s := &Server{dp: dp}
+	acc := s.forwardingStatusDataplane()
+	if acc == nil {
+		t.Fatal("forwardingStatusDataplane returned nil for a userspace backend")
+	}
+
+	probe, ok := acc.(interface {
+		HelperCrashState() (dpuserspace.HelperCrashRecord, bool)
+	})
+	if !ok {
+		t.Fatal("the gRPC forwarding-status adapter does not expose HelperCrashState, so " +
+			"the remote `cli` binary renders no crash block for `show chassis " +
+			"forwarding` (#7250)")
+	}
+
+	got, known := probe.HelperCrashState()
+	if !known {
+		t.Fatal("adapter reported the crash state as unknown for a backend that answers it")
+	}
+	if got.Signal != "killed" || got.Restarts != 7 {
+		t.Errorf("adapter did not pass the record through unchanged: %+v", got)
+	}
+	if dp.crashCalls == 0 {
+		t.Error("adapter never called through to the backend")
+	}
+}
