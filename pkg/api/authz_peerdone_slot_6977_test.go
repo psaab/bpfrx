@@ -154,9 +154,18 @@ func TestPeerDoneIsClosedAfterTheSlotIsReturned_6977(t *testing.T) {
 				if !isUnary || u.Op != token.ARROW {
 					return true
 				}
-				if id, isIdent := u.X.(*ast.Ident); isIdent && id.Name == "peerLookupSlots" {
-					if !releaseAt.IsValid() {
-						releaseAt = ds.Pos()
+				// #6974 split the budget into two pools, so the deferred receive
+				// is from the CHOSEN pool rather than from the package variable
+				// by name. What this guard pins is the defer ORDER, not the
+				// operand's spelling, so any of the three names counts — and the
+				// set is explicit rather than "any receive", so a defer that
+				// received from something unrelated could not satisfy it.
+				if id, isIdent := u.X.(*ast.Ident); isIdent {
+					switch id.Name {
+					case "peerLookupSlots", "peerLookupLoopbackSlots", "pool":
+						if !releaseAt.IsValid() {
+							releaseAt = ds.Pos()
+						}
 					}
 				}
 				return true
@@ -174,7 +183,7 @@ func TestPeerDoneIsClosedAfterTheSlotIsReturned_6977(t *testing.T) {
 			"completed by a deferred close, so re-derive what p.done now promises (#6977)")
 	}
 	if !releaseAt.IsValid() {
-		t.Fatal("no deferred `<-peerLookupSlots` found in connContext — the admission token " +
+		t.Fatal("no deferred receive from a lookup pool found in connContext — the admission token " +
 			"is no longer returned by a defer in the lookup goroutine, so re-derive the " +
 			"ordering this guard pins (#6977)")
 	}

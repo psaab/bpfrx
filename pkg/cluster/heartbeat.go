@@ -1049,7 +1049,7 @@ type heartbeatAuthState struct {
 	// epochDowngradeRejected.
 	epochSessionCollision atomic.Uint64
 
-	// epochOutOfBandRejected and epochAheadOfClockRejected count the two epoch
+	// epochOutOfBandRejected and epochRaiseDeclinedAheadOfClock count the two epoch
 	// refusals that are NOT replays, and that is the whole reason they are
 	// separate counters rather than folded into a general "epoch rejected"
 	// total. Both arms used to be silent AND mislabelled: they returned a bare
@@ -1061,21 +1061,28 @@ type heartbeatAuthState struct {
 	//     refineBootEpoch refuses to chain to such a value, clock-independently
 	//     — so a non-zero count means a corrupt state file on the peer or a peer
 	//     running something that is not this build. Check the PEER.
-	//   - epochAheadOfClockRejected: the epoch is more than bootEpochMaxSkew
+	//   - epochRaiseDeclinedAheadOfClock: the epoch is more than bootEpochMaxSkew
 	//     ahead of OUR clock (epochWithinForwardBound). This is the one that is
 	//     routinely a healthy peer: either its clock runs fast or ours runs
 	//     slow. It is a CLOCK fault and the action is NTP on both nodes, not an
 	//     incident response. It gates only the raise path, so a peer already at
 	//     the floor keeps being accepted while this climbs — which is why it can
 	//     climb with liveness perfectly healthy.
+	//     #6969 F5: the two arms this counts are no longer the same event. From
+	//     an ESTABLISHED receiver (highEpoch != 0) the frame is ADMITTED and only
+	//     the raise is declined, so the floor is held and liveness is preserved;
+	//     from a FRESH one (highEpoch == 0) it is still refused outright, because
+	//     there is no established peer to strand. Both increment this, because
+	//     both mean the same thing to an operator: the peer's epoch is ahead of
+	//     this node's clock.
 	//
 	// The third silent arm, `epoch < s.highEpoch`, deliberately has neither a
 	// counter nor a distinct reason: a frame below the floor IS a replay of a
 	// retired incarnation, so "stale nonce (replay)" is already the true
 	// statement, and the lockout case it can also mean (#6711) is metered by the
 	// floor itself rather than by a rejection count.
-	epochOutOfBandRejected    atomic.Uint64
-	epochAheadOfClockRejected atomic.Uint64
+	epochOutOfBandRejected         atomic.Uint64
+	epochRaiseDeclinedAheadOfClock atomic.Uint64
 
 	// peerAuthSeen is sticky and READ cross-goroutine
 	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to

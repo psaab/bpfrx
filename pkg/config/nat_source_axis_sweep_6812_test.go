@@ -964,6 +964,33 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 		"Rule.Then.Interface", "Rule.Then.Off",
 	),
 	fixtureConstantAxes6812(
+		"#7013 compile-time diagnostic state: what ONE `then` container authored, kept "+
+			"so validateNATTerminalActionCardinalityStrict can see a pool the resolved "+
+			"NATThen scalar already discarded. Constant at exactly one authored pool "+
+			"here because every rule in this fixture is plain pool-mode source NAT — in "+
+			"production it is 0 for an `interface` or `off` rule, so this is a real blind "+
+			"spot and NOT production-constant. It is registered rather than varied "+
+			"because nothing sorts or compares on it: it is read once by the strict gate "+
+			"and never reaches the dataplane. If that ever changes, vary it instead.\n"+
+			"Only the LENGTH columns are registered: the pool NAMES vary rule to rule "+
+			"here, so `.all`/`[0]` are guarded and registering them was rejected as "+
+			"over-reach by this table's own stale-entry check.",
+		"Rule.thenAuthored.Pools.len", "Rule.thenAuthored.Pools.nil",
+	),
+	fixtureConstantAxes6812(
+		"#7033 authored terminal action MODES, the companion of the pool names above. "+
+			"Every rule in this fixture is plain pool-mode source NAT, so the recorded "+
+			"mode list is exactly [pool] for all of them and all four columns are "+
+			"constant — unlike the pool NAMES, which vary. In production it varies on "+
+			"both axes: `off` and `interface` rules record a different mode, and a "+
+			"packed cross-mode contradiction records two before the strict gate refuses "+
+			"the commit. So this is a real blind spot, not a production constant. "+
+			"Nothing sorts or compares on it — it is read by the packed-contradiction "+
+			"gate and its lenient enumerator and never reaches the dataplane.",
+		"Rule.thenAuthored.Modes.len", "Rule.thenAuthored.Modes.nil",
+		"Rule.thenAuthored.Modes.all", "Rule.thenAuthored.Modes[0]",
+	),
+	fixtureConstantAxes6812(
 		"pool fields this fixture never configures. Address/Port/PortRaw are the DNAT "+
 			"compatibility scalars, PortRangeInvalidSpec is the #5457 rejected-range "+
 			"marker (every range here is valid), and no pool is routing-instance-scoped, "+

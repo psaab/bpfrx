@@ -259,6 +259,7 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Named pools
+	overBudgetPools := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		// Config-derived fallback for capacity (used only when the helper has
 		// no runtime entry for this pool — e.g. before the first apply lands).
@@ -269,7 +270,15 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		addrCount := len(pool.Addresses)
+		// #7000: the CONFIG-derived fallback (used when the helper has no
+		// runtime entry, or reports 0) now comes from the compiler's verdict.
+		// `len(pool.Addresses)` reported capacity for a pool the dataplane
+		// REFUSED — and because the `rp.AddressCount > 0` guard below PRESERVES
+		// this value when the runtime says 0, a refused pool's fabricated count
+		// survived even once the helper was running and had told us it installed
+		// nothing. It also under-reported every prefix member and missed the
+		// singular `address` field.
+		addrCount, _ := config.SourceNATPoolReportableAddresses(pool, name, overBudgetPools)
 		used := 0
 
 		if rp, ok := runtime[name]; ok {

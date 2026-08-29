@@ -271,7 +271,7 @@ func TestEpochDowngradeIsRaisedOnTheRealReceivePath_6169(t *testing.T) {
 //     operator hunting an on-link attacker during what is an NTP problem.
 //
 // RED-on-revert: drop either `s.epochOutOfBandRejected.Add(1)` /
-// `s.epochAheadOfClockRejected.Add(1)`, or collapse either arm's reason back to
+// `s.epochRaiseDeclinedAheadOfClock.Add(1)`, or collapse either arm's reason back to
 // a bare `return false, ""`.
 func TestNonReplayEpochRefusalsAreNamedAndCounted_6669(t *testing.T) {
 	t.Run("out_of_band_epoch", func(t *testing.T) {
@@ -294,7 +294,7 @@ func TestNonReplayEpochRefusalsAreNamedAndCounted_6669(t *testing.T) {
 			t.Fatalf("the out-of-band reason does not name the range: %q", reason)
 		}
 		// The OTHER counter must not move — the two arms are distinguishable.
-		if got := s.epochAheadOfClockRejected.Load(); got != 0 {
+		if got := s.epochRaiseDeclinedAheadOfClock.Load(); got != 0 {
 			t.Fatalf("the clock-skew counter moved (%d) on an out-of-band refusal; the two "+
 				"arms must be separable or the split buys nothing", got)
 		}
@@ -311,8 +311,8 @@ func TestNonReplayEpochRefusalsAreNamedAndCounted_6669(t *testing.T) {
 		if ok {
 			t.Fatal("an epoch beyond the forward bound must be refused")
 		}
-		if got := s.epochAheadOfClockRejected.Load(); got != 1 {
-			t.Fatalf("epochAheadOfClockRejected = %d, want 1", got)
+		if got := s.epochRaiseDeclinedAheadOfClock.Load(); got != 1 {
+			t.Fatalf("epochRaiseDeclinedAheadOfClock = %d, want 1", got)
 		}
 		if reason == "" {
 			t.Fatal("#6669: an epoch past the forward bound was refused with NO reason, so " +
@@ -346,7 +346,7 @@ func TestNonReplayEpochRefusalsAreNamedAndCounted_6669(t *testing.T) {
 			t.Fatalf("a below-floor frame IS a replay of a retired incarnation, so it must "+
 				"keep the generic replay wording; got a distinct reason %q", reason)
 		}
-		if s.epochOutOfBandRejected.Load() != 0 || s.epochAheadOfClockRejected.Load() != 0 {
+		if s.epochOutOfBandRejected.Load() != 0 || s.epochRaiseDeclinedAheadOfClock.Load() != 0 {
 			t.Fatal("a below-floor replay moved one of the two non-replay counters")
 		}
 	})

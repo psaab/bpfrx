@@ -336,10 +336,37 @@ func TestBuilderQuarantinesTheOverlappingPool(t *testing.T) {
 // flows stranded: the exact outcome the drain exists to prevent, reached by a
 // typo, with every test green.
 func TestPoolUnusableReasonLockstepWithRust(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "userspace-dp", "src", "nat", "source.rs")
-	raw, err := os.ReadFile(path)
+	// #6988: read the whole `nat/source` MODULE rather than a single file.
+	//
+	// This used to name `nat/source.rs` directly, and the #6988 split — which
+	// moved SourceNatFailureReason and its snapshot mapper into
+	// `source/failure.rs` — turned that literal into a missing file, reddening
+	// this test with a path error rather than a lockstep error. Scanning the
+	// directory binds the property that actually matters ("the Rust side maps
+	// this string") to wherever in the module it lives, so the next reshuffle
+	// inside `source/` cannot break it either.
+	dir := filepath.Join("..", "..", "..", "userspace-dp", "src", "nat", "source")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var raw []byte
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".rs") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", filepath.Join(dir, e.Name()), err)
+		}
+		raw = append(append(raw, b...), '\n')
+	}
+	// A directory that reads clean but yields nothing would make the Contains
+	// check below fail for the WRONG reason — "the arm is missing" when the
+	// truth is "the scan found no Rust at all". Separate the two.
+	if len(raw) == 0 {
+		t.Fatalf("no .rs files under %s: this test would otherwise report a missing "+
+			"lockstep arm when what actually happened is that it scanned nothing", dir)
 	}
 	// Strip comments first: this file's own prose names the reason string, and
 	// so does the Rust doc comment on the variant.
@@ -352,7 +379,7 @@ func TestPoolUnusableReasonLockstepWithRust(t *testing.T) {
 	}
 	want := `"` + poolUnusableReasonIfaceOverlap + `" => SourceNatFailureReason::PoolIfaceEgressOverlap`
 	if !strings.Contains(strings.Join(code, "\n"), want) {
-		t.Fatalf("userspace-dp/src/nat/source.rs has no arm mapping %q to "+
+		t.Fatalf("userspace-dp/src/nat/source/ has no arm mapping %q to "+
 			"PoolIfaceEgressOverlap. Without it the reason falls to the catch-all "+
 			"(InvalidPool), which does NOT retain the allocator — the pool is quarantined and "+
 			"its live flows are stranded, which is what the drain exists to prevent",

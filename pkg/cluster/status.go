@@ -333,7 +333,8 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "  Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintf(&b, "  Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
-	fmt.Fprintf(&b, "  Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
+	fmt.Fprintf(&b, "  Epoch raises declined:      %d%s\n",
+		hbStats.EpochRaiseDeclinedAheadOfClock, epochRaiseDeclineNote(hbStats))
 	fmt.Fprintln(&b)
 
 	// Sync link statistics.
@@ -561,7 +562,8 @@ func (m *Manager) FormatStatistics() string {
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
-	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
+	fmt.Fprintf(&b, "    Epoch raises declined:      %d%s\n",
+		hbStats.EpochRaiseDeclinedAheadOfClock, epochRaiseDeclineNote(hbStats))
 	fmt.Fprintln(&b)
 
 	// Services synchronized table.
@@ -614,7 +616,8 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
 	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
-	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
+	fmt.Fprintf(&b, "    Epoch raises declined:      %d%s\n",
+		hbStats.EpochRaiseDeclinedAheadOfClock, epochRaiseDeclineNote(hbStats))
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	// #6630: the rotation line appears ONLY while an additional key is
 	// configured. A permanent line reading "no rotation in progress" would be
@@ -1052,6 +1055,22 @@ func (m *Manager) FormatInterfaces(input InterfacesInput) string {
 // the counter still at 0 — and reported "replay protection is ring-only" when
 // it was not. The exposure the note describes ends when the latch arms, so the
 // latch is what it must test.
+// epochRaiseDeclineNote carries the operator guidance that used to travel on
+// the REJECTION reason string for this arm (#6969 F5). The frame is no longer
+// rejected — declining the raise while admitting the frame is the fix — so the
+// reason string is gone, and the counter is the only place the diagnosis can
+// live. Rendering it bare would lose the one thing an operator needs from it:
+// this is a CLOCK fault, and reading it as a replay sends them hunting an
+// on-link attacker during an NTP problem.
+func epochRaiseDeclineNote(s HeartbeatStats) string {
+	if s.EpochRaiseDeclinedAheadOfClock == 0 {
+		return ""
+	}
+	return "  (peer boot epoch is more than bootEpochMaxSkew ahead of THIS node's " +
+		"clock — check NTP on BOTH nodes; the frames are still admitted, only the " +
+		"floor is held)"
+}
+
 func epochlessExposureNote(s HeartbeatStats) string {
 	if s.EpochlessAdmitted == 0 {
 		return ""

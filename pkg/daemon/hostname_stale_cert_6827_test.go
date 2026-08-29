@@ -983,14 +983,23 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 
-		want := m.committedDesired(nil)
-		httpOnly := want
-		httpOnly.TLS, httpOnly.HTTPSAddr = false, ""
+		// #7039: bind the management plane to a ROUTABLE address.
+		//
+		// This subtest is about GENERATION SAFETY, and it uses the stale-cert
+		// WARN as its observable for "the outstanding debt settled". That
+		// diagnostic is now correctly SILENT on a loopback-only listener — no
+		// remote client exists there to verify by host name — and
+		// `web-management https` with no `interface` resolves to 127.0.0.1:443,
+		// so this fixture was measuring the generation property THROUGH the very
+		// defect #7039 fixes. A routable bind restores the observable without
+		// weakening what the cell asserts.
+		want := cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)
+		httpOnly := cfgFor(reg, "10.0.0.1:8080", false, "", nil)
 		if err := m.startTo(ctx, httpOnly); err != nil {
 			t.Fatalf("start HTTP leg: %v", err)
 		}
 		dir := t.TempDir()
-		seedDurableCert(t, dir, "old-fw-6827", "127.0.0.1")
+		seedDurableCert(t, dir, "old-fw-6827", "10.0.0.1")
 		m.srv.SetTLSCertDirForTest(dir)
 
 		// Debt #1, incurred while nothing serves a certificate.

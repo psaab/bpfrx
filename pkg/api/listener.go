@@ -45,10 +45,10 @@ type listenerLeg struct {
 	// It means "nothing this leg accepted is still being served" — no further
 	// request can be admitted AND no response is still in flight (#6827 round 8;
 	// round 7 stated only the first half, which is the half Shutdown alone
-	// already provides, so it understated what the flag has to promise). Modulo
-	// HIJACKED connections, which Go excludes from both Shutdown and Close and
-	// which this package has none of today — a tripwire, not a gate; see
-	// drainLeg.
+	// already provides, so it understated what the flag has to promise).
+	// WITHOUT QUALIFICATION since #7011: hijacked connections used to be
+	// excluded here, and drainLeg now closes them too, so this no longer needs
+	// a "modulo" clause for a reader to reason around.
 	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
 	// being tightened by ReplaceAuth because there is nothing left for a
 	// revocation to reach. That reading is only true because EVERY exit path now
@@ -179,8 +179,8 @@ var legDrainTimeout = 5 * time.Second
 
 // drainLeg takes srv out of service and does not return until nothing it
 // accepted is still being served: no further request can be admitted, and any
-// response still in flight has been severed. HIJACKED connections are the one
-// exception and they are excluded by construction, not by accident — see below.
+// response still in flight has been severed — hijacked connections included
+// since #7011, which is what removed the exception this sentence used to make.
 //
 // None of what follows weakens why the drain exists at all. The defect that
 // motivated it (#6827 round 7) was an exit arm that called NO Shutdown
@@ -222,31 +222,28 @@ var legDrainTimeout = 5 * time.Second
 // in-flight half is the data story: a response authorized under the old policy
 // goes on delivering after the box believes the socket is gone.
 //
-// HIJACKED CONNECTIONS ARE OUT OF SCOPE, deliberately — and the exclusion is
-// only PARTLY enforced, which is the honest version of what round 8 claimed
-// (#6827 round 9). Go excludes them from BOTH calls — Shutdown "does not
-// attempt to close nor wait for hijacked connections", Close "does not even
-// know about" them — and a hijacked conn is removed from srv.activeConn, so it
-// can outlive this function with `drained` set. Adding the force-close does not
-// fix that; nothing here can, because the handle is gone.
+// HIJACKED CONNECTIONS ARE IN SCOPE SINCE #7011, and that is what removed the
+// caveat this paragraph used to carry. Go excludes them from BOTH calls —
+// Shutdown "does not attempt to close nor wait for hijacked connections", Close
+// "does not even know about" them, and a hijacked conn is removed from
+// srv.activeConn — so neither can reach one. The ConnState hook can: it fires
+// with StateHijacked and hands over the net.Conn at the moment the server loses
+// track of it. Every leg constructor installs that hook (trackHijackedConns)
+// and this function closes what it recorded, so `drained` is true outright.
 //
-// This package has no hijacker today, and TestNoHijackerInThisPackage_6827 is a
-// TRIPWIRE for the two forms it can take LOCALLY — a type assertion to
-// http.Hijacker, or a call to Hijack — plus an import of a package known to
-// hijack internally. It is NOT a proof of absence and must not be read as one:
-// a dependency that hijacks inside its own handler is invisible to a local AST
-// walk. `golang.org/x/net/websocket` is a direct dependency of this module and
-// its Server does exactly that, so `mux.Handle("/ws", websocket.Handler(h))`
-// would introduce the case with nothing in this package's syntax to catch —
-// which is why the import check exists and why even together they are a
-// tripwire rather than a gate. Reverse proxies, upgrade helpers, aliases and
-// reflection escape identically.
+// The previous approach was a tripwire that ENUMERATED hijacking types and
+// asserted none was reachable from this package. It was defeated three times —
+// golang.org/x/net/websocket, http2/h2c, and net/rpc, a STANDARD LIBRARY
+// hijacker. The last one is why the enumeration was retired rather than
+// re-keyed: the hijacker set is a function of the TOOLCHAIN, not of go.mod, so
+// the corpus it was derived over moved with nothing in the repository changing.
 //
-// If a hijacking endpoint is added, drainLeg has to grow per-connection
-// tracking (an http.Server.ConnState hook fires with StateHijacked and hands
-// you the net.Conn) and close those conns itself; otherwise the invariant here,
-// at listenerLeg.drained and in pkg/api/README.md must be narrowed to exclude
-// that endpoint.
+// WHAT THIS DOES NOT CLAIM: the connection is closed, not the goroutine the
+// hijacking handler started. Nothing can join that — the handler owns it and
+// exposes no handle. The guarantee is about what is still being SERVED on
+// connections this leg accepted, and a closed conn serves nothing, which is the
+// same standard Close already meets for the non-hijacked in-flight case.
+//
 // It returns the Shutdown error so a caller that reports one can keep doing so
 // (Server.serveBound). The leg paths discard it deliberately: a leg's exit is
 // not something anybody returns, and a drain that reached its deadline and
@@ -262,6 +259,18 @@ func drainLeg(srv *http.Server) error {
 		// line goes.
 		_ = srv.Close()
 	}
+	// #7011: sever the HIJACKED connections too. Neither Shutdown nor Close
+	// reaches them — a hijacked conn is removed from srv.activeConn and the
+	// server no longer knows about it — so this is the only place they can be
+	// closed, and it runs on BOTH the graceful and the deadline path because
+	// the guarantee ("nothing this leg accepted is still being served") is the
+	// same either way. Unconditional rather than under the error branch: a
+	// Shutdown that returned nil still left a hijacked conn open.
+	if n := hijackTrackerFor(srv).closeAll(); n > 0 {
+		slog.Warn("api: severed hijacked connections at leg drain",
+			"addr", srv.Addr, "count", n)
+	}
+	releaseHijackTracker(srv)
 	return err
 }
 
@@ -544,6 +553,10 @@ func (s *Server) ReconcileHTTP(addr string) error {
 // and serving BEFORE any old one is retired. A cert or bind failure retains the
 // previous HTTPS state (fail-closed) and returns the error for retry debt.
 //
+// The default arm BINDS BEFORE IT BUILDS (#7041) — see the comment on that arm
+// for why, and for the two consequences it carries (the listener is closed if
+// the build then fails; the bind error wins when both fail).
+//
 // The same-addr no-op tests listenerLeg.serving(), NOT a non-nil pointer
 // (#6827 round 6). An unexpected serve exit marks the leg `dead` and leaves it
 // INSTALLED in s.httpsLeg, so a pointer test called that address converged and
@@ -567,13 +580,36 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	case s.httpsLeg.serving() && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
-		plan, err := s.planHTTPSLeg(addr)
-		if err != nil {
-			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
-		}
+		// BIND FIRST, BUILD SECOND (#7041). Building loads the durable
+		// certificate — certGen has no cache, so LoadX509KeyPair re-reads the
+		// on-disk pair and warnStaleLoadedCert re-runs on every call. The #6827
+		// liveness disjunct in the daemon's reconciler re-enters this arm on
+		// EVERY commit while HTTPS is wanted and not serving (that is the point
+		// of it), so with the old order a box whose bind fails persistently and
+		// whose cert is stale re-emitted the whole stale-cert diagnostic per
+		// commit, forever. A leg that cannot bind serves no client, so there is
+		// nothing a certificate can be stale FOR until the bind succeeds — the
+		// same reachability argument as #7039's loopback gate. The suppression
+		// is bounded in time, not permanent: the first commit that binds emits
+		// the diagnostic.
+		//
+		// The bind failure itself is unaffected — it is still returned on every
+		// attempt, so the caller's retry debt and the daemon's own reconcile
+		// warnings are untouched. Only the CERT diagnostic, which describes a
+		// client that cannot exist yet, stops repeating.
 		ln, err := s.listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("api: bind HTTPS listener %q: %w", addr, err)
+		}
+		plan, err := s.planHTTPSLeg(addr)
+		if err != nil {
+			// The socket is already held. Closing it is not tidiness: a retained
+			// listener keeps the port, so every later retry would fail
+			// EADDRINUSE and a transient cert fault would become a permanent
+			// bind failure — manufacturing exactly the never-converging state
+			// this reordering exists to stop.
+			ln.Close()
+			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
 		}
 		old := s.httpsLeg
 		s.httpsLeg = s.serveLegLocked(plan, ln, true)

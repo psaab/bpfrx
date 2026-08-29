@@ -898,6 +898,38 @@ peer liveness (`lastSeen`) or drive election.
     would cover every successor and is declined: waiting out the dead-peer
     interval between captures is free, so it hands the attacker back the
     unbounded churn the bound exists to stop.
+
+    **Admission triage, measured at `20a6068b4` (#6969).** Three of the four
+    findings that issue collects are LIVE, and one is not. Driving
+    `heartbeatAuthState.admitAuthed` directly with a pinned `epochNowNanos`:
+
+    | finding | state | site | measured |
+    |---|---|---|---|
+    | F3 third session at an unchanged epoch | **live** | `heartbeat.go:711`, `heartbeat_epoch_admit.go:263`, `:372` | sessions 1,2 admitted; 3 and 4 refused `"too many peer sessions at one boot epoch"`, `highEpochSessionCount` pinned at 2 |
+    | F5 healthy peer, receiver >`bootEpochMaxSkew` slow | **FIXED by #6969** (live when measured) | `heartbeat_epoch_admit.go` | was: raise beyond the forward bound → `ok=false`. Now: an ESTABLISHED receiver admits the frame and declines the RAISE; a FRESH one still refuses. See the forward-bound section above |
+    | F7 below-floor incarnation cannot progress | **live** | `heartbeat_epoch_admit.go:246` | three below-floor frames all refused, floor unchanged; `highEpoch` has one write site (`:351`, the raise path) |
+    | F4 backward step persists a lower epoch | **not live as filed** | `heartbeat_epoch.go:1236` | #6711's `bootEpochPreserveMaxSkew` preserves an intact predecessor across the 2h step the issue names; only a step **beyond 30 days** still heals over one |
+
+    F5's SCOPE is already right — the guard is `epoch > s.highEpoch && !epochWithinForwardBound(...)`,
+    so equality frames are not gated. The live gap is its EFFECT: when the bound
+    fires it returns false, rejecting the frame outright rather than admitting it
+    *without* raising the floor. Any remedy that admits such a frame routes it
+    into the same bounded per-value session budget F3 is about, so the two cannot
+    be sized independently — and "raise the cap" is not available, because the
+    security property is that the budget stays finite and non-refilling (a `k`
+    larger than the ring restores exactly the sustained churn it closes; see
+    `heartbeat.go:701-710`). F7 looks separable: it needs a re-read or re-raise
+    path at `highEpoch`'s single write site rather than a change to the budget.
+
+    **The healing side is load-bearing and hangs the suite if it is traded away.**
+    Making the preserve branch unconditional — the shape "stop overwriting an
+    intact higher persisted epoch" naturally takes — reds
+    `TestPersistedEpochHealsOnlyWhenClockCredible_6169` and then HANGS
+    `TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`
+    (`heartbeat_epoch_clock_sample_6669_test.go:146`), so the package run ends at
+    the 600s timeout with a third of its tests never collected. #6967 records
+    that the obvious fix "broke two tests and hung a third" without naming which;
+    this is which.
     (`TestEqualEpochsCannotChurnTheRing_6669`,
     `TestEqualEpochSuccessorIsAdmitted_6669`,
     `TestFloorRebindsToTheRaisingIncarnation_6669`.)
@@ -1153,6 +1185,37 @@ peer liveness (`lastSeen`) or drive election.
     the whole cost — equality cannot move the floor, so the one-way door is
     untouched, and the session binding above already refuses every other
     session at that value.
+
+    **When the bound DOES fire on a raise, it declines the raise rather than
+    rejecting the frame (#6969 F5).** The same defect the equality relaxation
+    above fixed had a second half: a peer that RESTARTS while this receiver's
+    clock is more than `bootEpochMaxSkew` slow presents a NEW epoch, so the
+    equality exemption does not cover it, and the frame was rejected BEFORE the
+    monotonic `lastSeen` update — the peer declared dead in ~500ms, dual-master,
+    over a clock fault on THIS node. The bound now does what its own comment
+    always said it did, gating only the irreversible operation. From an
+    ESTABLISHED receiver the frame is admitted, the FLOOR IS HELD, the downgrade
+    latch is NOT armed (an epoch this node cannot judge is not evidence that the
+    peer signs epochs), and the session spends one slot of the same finite,
+    non-refilling per-value budget an equality frame spends. From a FRESH
+    receiver (`highEpoch == 0`) it is still refused outright: with no floor
+    there is no established peer to strand, so refusing costs nothing and every
+    fresh-state guard — refuse, never latch, leave the floor at 0 — keeps full
+    strength. Recovery is automatic; once the clocks agree the next frame raises
+    the floor normally, with no restart on either node.
+
+    **What this ADMITS that was refused before**, because the change loosens a
+    gate and the benefit is not the safety argument: an authenticated,
+    ring-fresh, inside-the-absolute-band frame whose epoch is above the floor and
+    beyond the clock's forward bound, seen by a receiver that already has a
+    floor. It cannot move the floor, cannot arm the latch, and cannot churn the
+    ring. Its remaining power is forged liveness from a captured frame — already
+    reachable through the equality path and the post-restart archived-frame path
+    (residual 5), and retired by the same PSK rotation. The one genuine widening:
+    a capture from an incarnation whose epoch sits far ahead of this node's clock
+    was previously unusable and is now usable for liveness and for one budget
+    slot. `Epoch raises declined` in `show chassis cluster` counts both arms and
+    carries the NTP guidance the rejection reason used to.
 
     The forward bound is applied ONLY when the receiver's own clock is itself
     credible (`epochClockSaneFloor`, year 2020). An appliance with a dead RTC

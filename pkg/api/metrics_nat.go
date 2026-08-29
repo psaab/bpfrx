@@ -20,6 +20,11 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 		return
 	}
 
+	// #7000: this gauge is the DENOMINATOR of pool-utilisation alerts, so
+	// reporting a figure for a pool the dataplane refused is a monitoring-visible
+	// contract break — the alert reads capacity for something that can allocate
+	// nothing. Capacity now comes from the compiler's verdict.
+	overBudget := config.SourceNATAggregateOverBudgetPools(cfg)
 	for name, pool := range cfg.Security.NAT.SourcePools {
 		portLow, portHigh := pool.PortLow, pool.PortHigh
 		if portLow == 0 {
@@ -28,7 +33,8 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := int(config.NATPoolTotalPorts(portLow, portHigh, len(pool.Addresses))) // #6553
+		ports, _ := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, overBudget)
+		totalPorts := int(ports)
 		ch <- prometheus.MustNewConstMetric(c.natPoolTotalPorts, prometheus.GaugeValue,
 			float64(totalPorts), name)
 
@@ -51,7 +57,7 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 			ch <- prometheus.MustNewConstMetric(c.natPoolDeterministicInfo, prometheus.GaugeValue,
 				1.0, name,
 				strconv.Itoa(pool.Deterministic.BlockSize),
-				strconv.Itoa(deterministicSubscriberCapacity(pool)))
+				strconv.Itoa(deterministicSubscriberCapacity(pool, name, overBudget)))
 
 			// #4752: deterministic-pool block utilization. The pool-wide
 			// used-ports counter is meaningless for a deterministic pool
@@ -64,9 +70,9 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 			// never exceeds 1.0 (the compiler already rejects an over-provisioned
 			// IPv4 pool; the clamp is defensive and also covers the IPv6 case
 			// where every block is provisioned).
-			totalBlocks := deterministicPoolBlockCapacity(pool)
+			totalBlocks := deterministicPoolBlockCapacity(pool, name, overBudget)
 			if totalBlocks > 0 {
-				allocated := deterministicSubscriberCapacity(pool)
+				allocated := deterministicSubscriberCapacity(pool, name, overBudget)
 				if allocated > totalBlocks {
 					allocated = totalBlocks
 				}
@@ -86,8 +92,14 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 // (compiler_nat.go) and the dataplane NATPoolConfig.BlocksPerIP field. Returns
 // 0 when the pool is not a valid deterministic pool (nil, non-positive block
 // size, or block size larger than the port range).
-func deterministicPoolBlockCapacity(pool *config.NATPool) int {
+func deterministicPoolBlockCapacity(pool *config.NATPool, poolName string, overBudget map[string]bool) int {
 	if pool == nil || pool.Deterministic == nil {
+		return 0
+	}
+	// #7000: a refused pool installs no allocator, so it has no blocks — and a
+	// prefix member expands, so the address count is not `len(pool.Addresses)`.
+	addrs, unusable := config.SourceNATPoolReportableAddresses(pool, poolName, overBudget)
+	if unusable != "" {
 		return 0
 	}
 	bs := pool.Deterministic.BlockSize
@@ -106,7 +118,7 @@ func deterministicPoolBlockCapacity(pool *config.NATPool) int {
 	if portRange <= 0 || bs > portRange {
 		return 0
 	}
-	return len(pool.Addresses) * (portRange / bs)
+	return addrs * (portRange / bs)
 }
 
 // deterministicSubscriberCapacity returns the value reported in the
@@ -119,7 +131,7 @@ func deterministicPoolBlockCapacity(pool *config.NATPool) int {
 // host CIDR), report the pool's block/subscriber capacity: blocksPerIP =
 // portRange/blockSize, totalBlocks = len(addresses)*blocksPerIP. Returns 0
 // when the host CIDR is unparseable or the block size is non-positive.
-func deterministicSubscriberCapacity(pool *config.NATPool) int {
+func deterministicSubscriberCapacity(pool *config.NATPool, poolName string, overBudget map[string]bool) int {
 	if pool == nil || pool.Deterministic == nil {
 		return 0
 	}
@@ -134,5 +146,5 @@ func deterministicSubscriberCapacity(pool *config.NATPool) int {
 	}
 	// IPv6 — 1<<(128-ones) overflows Go's shift width. Mirror the compiler,
 	// which caps the IPv6 subscriber count by pool block capacity.
-	return deterministicPoolBlockCapacity(pool)
+	return deterministicPoolBlockCapacity(pool, poolName, overBudget)
 }

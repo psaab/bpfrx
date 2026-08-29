@@ -3037,6 +3037,101 @@ fn ifindex_to_zone_id_populated_from_snapshot_at_build_time() {
     assert_eq!(state.ifindex_to_zone_id.get(&42).copied(), Some(7));
 }
 
+/// #7025: `EgressInterface::zone_id` is a MIRROR of
+/// `ifindex_unambiguous_zone_id`, and must stay one.
+///
+/// The field has no production reader in a default build — deleting it yields
+/// seven `E0609` reads, all in test files; `--features debug-log` adds exactly
+/// one, the `FWD_STATE: egress[..]` dump. It is retained so that debug line is
+/// self-describing, and this cell is what stops it from becoming the "stale
+/// copy that looks like a second opinion" #7025 was filed about: a future edit
+/// that sources it from anywhere but the ledger reds here.
+///
+/// THE TABLE NEEDS BOTH ROWS. A fixture whose interfaces all resolve to zone 0
+/// cannot distinguish a correct mirror from a field hardcoded to 0 — every
+/// comparison passes. So the snapshot carries a ZONED interface (non-zero) and
+/// an UNZONED one (zero), and the cell asserts both cases occur before
+/// comparing.
+///
+/// WHAT IT CATCHES, MEASURED — and what it does NOT, which matters more.
+///
+/// Severing the mirror (`zone_id` hardcoded to 0) reds this cell. It also reds
+/// FOUR pre-existing tests, so on that mutation this cell is not the only guard.
+///
+/// Re-pointing `populate_egress` at the row-derived `ifindex_to_zone_id` — the
+/// map #6722 replaced, and the realistic regression — reds two pre-existing
+/// tests (`unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722`
+/// and `unzoned_interface_with_egress_row_stays_zone_zero_6713`) and does NOT
+/// red this one. That is a property of the FIXTURE: the two maps agree for both
+/// interfaces here, so the mutation is a no-op on this input. An earlier
+/// revision of this comment claimed the opposite; it was measured and was
+/// wrong, and it is recorded rather than quietly corrected because a guard's
+/// stated scope is a claim like any other.
+///
+/// So what this cell adds is not extra coverage of those two mutations — it is
+/// the STRUCTURAL invariant, asserted over every egress row rather than over a
+/// fixture's expected zone values. The pre-existing tests pin what specific
+/// interfaces should resolve to; this pins that the field and
+/// `egress_zone_id()` can never disagree, which is the property the doc on the
+/// field promises a reader.
+#[test]
+fn egress_zone_id_mirrors_the_unambiguous_ledger_7025() {
+    use crate::ZoneSnapshot;
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "wan".into(),
+            id: 11,
+            ..Default::default()
+        }],
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/1".into(),
+                zone: "wan".into(),
+                egress_zone: "wan".into(),
+                ifindex: 99,
+                hardware_addr: "02:00:00:00:00:99".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/2".into(),
+                ifindex: 77,
+                hardware_addr: "02:00:00:00:00:77".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    // Precondition: BOTH cases are present, or the comparison below is
+    // satisfied by everything being zero.
+    let zoned = state.egress.get(&99).expect("zoned egress row");
+    let unzoned = state.egress.get(&77).expect("unzoned egress row");
+    assert_ne!(
+        zoned.zone_id, 0,
+        "fixture invalid: the zoned interface resolved to zone 0, so this cell \
+         would compare 0 against 0 for every row and pass against a field \
+         hardcoded to 0 (#7025)"
+    );
+    assert_eq!(
+        unzoned.zone_id, 0,
+        "fixture invalid: the unzoned interface must resolve to 0, so the table \
+         covers both sides of the mirror"
+    );
+
+    for (ifidx, eg) in &state.egress {
+        assert_eq!(
+            eg.zone_id,
+            state.egress_zone_id(*ifidx),
+            "EgressInterface::zone_id for ifindex {ifidx} disagrees with \
+             ForwardingState::egress_zone_id. The field is a DEBUG-ONLY MIRROR of \
+             ifindex_unambiguous_zone_id (#7025) and the debug dump renders a \
+             zone name from it — a divergence prints a zone the dataplane is not \
+             using, which is worse than printing nothing"
+        );
+    }
+}
+
 /// #921: EgressInterface.zone_id is set from the snapshot at
 /// config build time.
 #[test]
@@ -6673,6 +6768,305 @@ fn policy_parse_interior_rejection_row() -> (
     )
 }
 
+/// #6995: the three fallible belts that fire AFTER both the policy-counter and
+/// NAT-counter bindings, each carrying rules that create a block in each store.
+///
+/// Deliberately NOT reusing `zone_counter_rejection_rows()` wholesale. That
+/// table's first row (#3719 duplicate zone id) rejects at the builder's FIRST
+/// fallible step — ABOVE `parse_policy_state_with_counters` and the NAT
+/// reconcilers — so it produces no residue whether the rollback exists or not.
+/// Including it would add a row that is green for the wrong reason and dilute
+/// the matrix. The three below bracket the region that matters: every
+/// straight-line position where the counter bindings sit has one of these `?`s
+/// beneath it.
+fn counter_residue_rejection_rows() -> Vec<(
+    &'static str,
+    ConfigSnapshot,
+    fn(&crate::policy::SnapshotIntegrityError) -> bool,
+)> {
+    fn base() -> ConfigSnapshot {
+        let mut snap = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+        // A candidate-only policy rule: its stable rule id is not in the live
+        // store, so `rule_hit_counter` GET-CREATES a block for it.
+        snap.policies = vec![crate::PolicyRuleSnapshot {
+            name: "probe-rule".into(),
+            from_zone: "zone100".into(),
+            to_zone: "zone300".into(),
+            action: "permit".into(),
+            ..Default::default()
+        }];
+        // A candidate-only static-NAT rule with a counter id the live store has
+        // never seen, so `rule_counter` GET-INSERTS a row for it. Addresses must
+        // PARSE: `StaticNatTable::from_snapshots` `continue`s past an
+        // unparseable rule before it ever reaches the counter, which would make
+        // the NAT half of every assertion below pass for free.
+        snap.static_nat_rules = vec![crate::StaticNATRuleSnapshot {
+            name: "probe-static".into(),
+            counter_id: COUNTER_RESIDUE_CANDIDATE_NAT_ID,
+            external_ip: "198.51.100.7".into(),
+            internal_ip: "10.9.9.7".into(),
+            ..Default::default()
+        }];
+        snap
+    }
+
+    let mut nptv6 = base();
+    // #2240: unparseable internal prefix — the FIRST belt below the bindings.
+    nptv6.nptv6_rules = vec![crate::Nptv6RuleSnapshot {
+        name: "bad-parse".into(),
+        from_zone: String::new(),
+        internal_prefix: "not-a-prefix".into(),
+        external_prefix: "2001:db8:9::/48".into(),
+    }];
+
+    let mut filter = base();
+    // #3367: the Go side could not parse the term's tcp-flags expression.
+    filter.filters = vec![FirewallFilterSnapshot {
+        name: "f".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            tcp_flags_unparseable: true,
+            ..Default::default()
+        }],
+    }];
+
+    let mut cos = base();
+    // #2410: a forwarding-class queue id outside 0..=255. The LAST fallible
+    // step — nothing fallible follows it, so this row observes a relocation of
+    // the counter bindings to ANY position in the builder.
+    cos.interfaces = vec![InterfaceSnapshot {
+        ifindex: 60,
+        cos_shaping_rate_bytes_per_sec: 1,
+        ..Default::default()
+    }];
+    cos.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "voice".into(),
+            queue: 256,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        inet_precedence_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    });
+
+    vec![
+        ("#2240 NPTv6 unparseable rule", nptv6, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::Nptv6UnparseableRule { .. }
+                )
+            }
+        }),
+        ("#3367 filter tcp-flags unparseable", filter, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::UnrepresentableFilterTCPFlags { .. }
+                )
+            }
+        }),
+        ("#2410 CoS queue id out of range (last fallible step)", cos, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange { .. }
+                )
+            }
+        }),
+    ]
+}
+
+/// The NAT counter id only the CANDIDATE carries.
+const COUNTER_RESIDUE_CANDIDATE_NAT_ID: u32 = 4242;
+/// The NAT counter id the LIVE store is already carrying when the rejected
+/// build runs. It must SURVIVE — see the tests.
+const COUNTER_RESIDUE_LIVE_NAT_ID: u32 = 7;
+/// The policy rule id the LIVE store is already carrying. Must SURVIVE.
+const COUNTER_RESIDUE_LIVE_POLICY_ID: &str = "live-zone-a->live-zone-b/live-rule";
+
+/// Seed both live stores so a rejected build has something to DESTROY as well
+/// as something to create.
+///
+/// This is the half that makes the two tests below distinguish a rollback from
+/// a `clear()`. A test that only asserted "the candidate id is absent" would
+/// pass against a fix that emptied the store outright — which would reset the
+/// running configuration's cumulative hit counts on a commit that never
+/// applied, i.e. the #5716 defect reintroduced in a new store.
+fn seed_live_counter_stores() -> (PolicyCounterStore, crate::nat::NatCounterStore) {
+    let policy = PolicyCounterStore::default();
+    let nat = crate::nat::NatCounterStore::default();
+    // Reach the private get-or-create through the public parse entry point the
+    // production builder uses, so the seeding path is the production path.
+    let live_rules = vec![crate::PolicyRuleSnapshot {
+        name: "live-rule".into(),
+        from_zone: "live-zone-a".into(),
+        to_zone: "live-zone-b".into(),
+        action: "permit".into(),
+        ..Default::default()
+    }];
+    let mut zone_map = rustc_hash::FxHashMap::default();
+    zone_map.insert("live-zone-a".to_string(), 100u16);
+    zone_map.insert("live-zone-b".to_string(), 200u16);
+    crate::policy::parse_policy_state_with_counters(
+        "deny",
+        &live_rules,
+        &zone_map,
+        &[],
+        &policy,
+    )
+    .expect("the live seed policy must parse");
+    let _ = nat.rule_counter(COUNTER_RESIDUE_LIVE_NAT_ID);
+    assert!(
+        policy
+            .tracked_rule_ids()
+            .iter()
+            .any(|id| id == COUNTER_RESIDUE_LIVE_POLICY_ID),
+        "fixture: the live policy rule id must be seeded, or 'it survived' is \
+         vacuous. Got {:?}",
+        policy.tracked_rule_ids()
+    );
+    assert_eq!(
+        nat.tracked_ids(),
+        vec![COUNTER_RESIDUE_LIVE_NAT_ID],
+        "fixture: the live NAT counter id must be seeded"
+    );
+    (policy, nat)
+}
+
+/// #6995 PROPERTY 1 (the STORE): a rejected build must leave no block behind in
+/// the live `PolicyCounterStore`, and must not disturb the ones already there.
+///
+/// `PolicyCounterStore::rule_hit_counter` GET-OR-CREATES out of the live,
+/// `Arc`-shared store, and it runs inside `build_fallible_forwarding_state`
+/// ahead of the NPTv6, filter and CoS belts. Before the rollback, a build those
+/// belts rejected left one block per candidate-only rule — plus the reserved
+/// default-policy id — in a store the discarded build's caller never asked to
+/// mutate.
+///
+/// This half is memory-only: `Coordinator::policy_rule_counters` reads the
+/// PUBLISHED forwarding state, not the store, so the residue is invisible to
+/// operators. It is bound anyway because "invisible" is a property of today's
+/// readers, not of the store — and because the NAT sibling proves the same
+/// mechanism does reach an operator surface.
+#[test]
+fn rejected_build_does_not_leave_policy_blocks_in_the_live_store_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+        let before = policy.tracked_rule_ids();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            expected(&err),
+            "{label}: rejected through a different belt than the row names \
+             ({err:?}) — the row is no longer exercising the belt it is here for"
+        );
+
+        assert_eq!(
+            policy.tracked_rule_ids(),
+            before,
+            "{label}: a REJECTED build changed the live policy-counter registry. \
+             Extra ids are residue keyed by the refused snapshot's own rules; \
+             MISSING ids mean the rollback destroyed a running rule's cumulative \
+             hit count on a commit that never applied"
+        );
+    }
+}
+
+/// #6995 PROPERTY 1 (the STORE), NAT half.
+///
+/// Same mechanism through `NatCounterStore::rule_counter`, which GET-OR-INSERTS
+/// one row per NAT rule from the source / static / destination reconcilers.
+#[test]
+fn rejected_build_does_not_leave_nat_rows_in_the_live_store_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(expected(&err), "{label}: wrong belt ({err:?})");
+
+        assert_eq!(
+            nat.tracked_ids(),
+            vec![COUNTER_RESIDUE_LIVE_NAT_ID],
+            "{label}: a REJECTED build changed the live NAT-counter registry. \
+             Id {COUNTER_RESIDUE_CANDIDATE_NAT_ID} belongs to a rule the build \
+             refused and never installed; id {COUNTER_RESIDUE_LIVE_NAT_ID} is \
+             the running configuration's and must survive"
+        );
+    }
+}
+
+/// #6995 PROPERTY 2 (the OPERATOR SURFACE): a rejected build must put no
+/// phantom row on `ProcessStatus.nat_rule_counters`.
+///
+/// This is a SEPARATE property from the store assertion above, and it is bound
+/// separately on purpose. `NatCounterStore::snapshots()` emits one row per
+/// stored id *regardless of whether its packet/byte value is zero*, and that
+/// feeds `server/helpers/status.rs` -> `ProcessStatus.nat_rule_counters` -> Go
+/// `NATRuleCounters`. So the NAT half of this residue was operator-visible: a
+/// refused commit put rows for a configuration that was never installed on the
+/// status surface until the next successful commit evicted them.
+///
+/// The two assertions are not interchangeable. A "fix" that filtered
+/// zero-valued rows out of `snapshots()` would satisfy THIS test while leaving
+/// the store dirty — and would also hide legitimately-zero rows for rules that
+/// really are installed. Binding the store first is what makes this one a
+/// consequence rather than the whole claim.
+#[test]
+fn rejected_build_leaves_no_phantom_rows_on_the_nat_status_surface_6995() {
+    for (label, snapshot, expected) in counter_residue_rejection_rows() {
+        let (policy, nat) = seed_live_counter_stores();
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &policy,
+            &nat,
+            Some(&zone_counter_prev_state()),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(expected(&err), "{label}: wrong belt ({err:?})");
+
+        let rows = nat.snapshots();
+        assert!(
+            rows.iter()
+                .all(|r| r.counter_id != COUNTER_RESIDUE_CANDIDATE_NAT_ID),
+            "{label}: the status surface carries a NAT rule-counter row for id \
+             {COUNTER_RESIDUE_CANDIDATE_NAT_ID}, which belongs to a commit that \
+             was REFUSED and never installed. Rows: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.counter_id == COUNTER_RESIDUE_LIVE_NAT_ID),
+            "{label}: the running configuration's NAT rule-counter row \
+             disappeared from the status surface after a build that was \
+             rejected. Rows: {rows:?}"
+        );
+    }
+}
+
 #[test]
 fn rejected_build_does_not_prune_live_zone_counters() {
     // `ZoneCounterStore` is `Arc`-backed, so the build's carry-forward
@@ -6898,46 +7292,112 @@ fn rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores() {
         // into the roughly sixty lines between the two parses would have made
         // one of them silently wrong.
         let rejected_above_the_policy_parse = label.starts_with("#3719");
+        // #6995 CLOSED — and this is the assertion that says so out loud,
+        // exactly as the comment below predicted when it was written.
+        //
+        // The two predicates that follow used to be evaluated HERE, against the
+        // stores the public entry point was handed, and they asserted the
+        // residue was PRESENT. It no longer is: the caller
+        // (`build_forwarding_state_with_policy_counters_and_previous`) now
+        // captures both registries before the fallible build and retains them
+        // back on `Err`.
+        //
+        // The ordering property they encode is NOT discarded, because it is a
+        // real property and it is still true — it is just a property of the
+        // INNER builder rather than of the caller. So it moves down one layer,
+        // to `build_fallible_forwarding_state`, which is where the get-or-create
+        // actually happens and which does not roll back. Deleting the
+        // predicates instead would have removed the only bind on the relative
+        // order of the policy parse, the NAT parse and the belts, and #6832
+        // fold r7 exists precisely because an earlier round let those two
+        // predicates collapse into one expression no row could contradict.
+        let policy_ids = live_policy.tracked_rule_ids_for_test();
         let mut nat_ids: Vec<u32> = live_nat.snapshots().iter().map(|s| s.counter_id).collect();
         nat_ids.sort_unstable();
+        assert_eq!(
+            policy_ids, policy_seed,
+            "{label}: a REJECTED build left the live POLICY-counter registry \
+             changed. Extra ids are #6995 residue keyed by the refused \
+             snapshot's own rules; MISSING ids are the DESTRUCTIVE class \
+             (#7010), where the rollback ate a running rule's totals"
+        );
+        assert_eq!(
+            nat_ids,
+            vec![7777],
+            "{label}: a REJECTED build left the live NAT-counter registry \
+             changed. Id 4242 belongs to a candidate-only rule the build \
+             refused; 7777 is the running configuration's and must survive. \
+             This row is what makes the #6995 rollback hold with the ZONE \
+             store live alongside it, not just against empty neighbours"
+        );
+
+        // The ordering bind, re-anchored at the layer that owns it. Same
+        // predicates, same rows, same reasoning — run against the inner builder
+        // on its own live-seeded stores, where the residue is still observable
+        // because nothing has rolled it back yet.
+        let inner_policy = PolicyCounterStore::default();
+        let inner_nat = crate::nat::NatCounterStore::default();
+        let _ = inner_nat.rule_counter(7777);
+        build_forwarding_state_with_policy_counters_and_previous(
+            &ConfigSnapshot::default(),
+            &inner_policy,
+            &inner_nat,
+            None,
+        )
+        .expect("the empty seed snapshot must build");
+        let inner_policy_seed = inner_policy.tracked_rule_ids_for_test();
+        assert!(
+            !inner_policy_seed.is_empty(),
+            "{label}: fixture precondition — the inner-builder policy store \
+             must be LIVE before the rejected build"
+        );
+        let inner_err =
+            build_fallible_forwarding_state(&snapshot, &inner_policy, &inner_nat, Some(&prev))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the inner builder must reject this snapshot"));
+        assert!(
+            expected(&inner_err),
+            "{label}: the inner builder rejected through a different belt than \
+             the row names ({inner_err:?})"
+        );
+        let mut inner_nat_ids: Vec<u32> =
+            inner_nat.snapshots().iter().map(|s| s.counter_id).collect();
+        inner_nat_ids.sort_unstable();
         let expected_nat_ids: Vec<u32> = if rejected_above_the_nat_parse {
             vec![7777]
         } else {
             vec![4242, 7777]
         };
-        let policy_ids = live_policy.tracked_rule_ids_for_test();
+        let inner_policy_ids = inner_policy.tracked_rule_ids_for_test();
         assert!(
-            policy_seed.iter().all(|id| policy_ids.contains(id)),
-            "{label}: the rejected build EVICTED a live policy counter. The \
-             #6995 residue is additive; losing a seeded id would be the \
+            inner_policy_seed.iter().all(|id| inner_policy_ids.contains(id)),
+            "{label}: the inner builder EVICTED a live policy counter. It is \
+             ADDITIVE by construction; losing a seeded id would be the \
              DESTRUCTIVE class, which is #7010, not this one. \
-             seed={policy_seed:?} after={policy_ids:?}"
+             seed={inner_policy_seed:?} after={inner_policy_ids:?}"
         );
-        // The policy half of the #6995 boundary, asserted the same way as the
-        // NAT half: the candidate-only rule's counter IS left behind, and a
-        // later fix that stops leaving it reds here instead of leaving the
-        // gaps-doc claim stale. Belt-dependent for the same reason the NAT one
-        // is — the policy parse sits mid-builder, above NPTv6/filter/CoS and
-        // below the dup-zone belt. #3402 is the row that separates this
-        // predicate from the NAT one: it is BELOW the probe rule's counter
-        // (residue expected) and ABOVE the NAT parse (no NAT residue).
+        // The policy half of the ordering boundary: the candidate-only rule's
+        // counter IS resolved by the inner builder for a belt BELOW the policy
+        // parse and is not for a belt above it. #3402 is the row that separates
+        // this predicate from the NAT one — it is BELOW the probe rule's
+        // counter (residue expected) and ABOVE the NAT parse (no NAT residue).
         let policy_residue_expected = !rejected_above_the_policy_parse;
         assert_eq!(
-            policy_ids.iter().any(|id| id.contains("probe-rule")),
+            inner_policy_ids.iter().any(|id| id.contains("probe-rule")),
             policy_residue_expected,
-            "{label}: the documented #6995 policy-side boundary moved. A belt \
-             BELOW the probe rule's per-rule counter resolution leaves that \
-             rule's counter in the live store and a belt ABOVE it does not. \
-             after={policy_ids:?}"
+            "{label}: the policy-side ordering boundary moved. A belt BELOW the \
+             probe rule's per-rule counter resolution leaves that rule's \
+             counter in the store the inner builder was handed, and a belt \
+             ABOVE it does not. after={inner_policy_ids:?}"
         );
         assert_eq!(
-            nat_ids, expected_nat_ids,
-            "{label}: the documented #6995 scope boundary moved. A belt BELOW \
-             the NAT rule parse leaves the candidate's counter_id behind in the \
-             live NAT store, and a belt ABOVE it does not — that residue is \
-             EXPECTED (see the builder's doc comment). If it is now absent for \
-             a below-the-parse row, #6995 was fixed and both that comment and \
-             the PR body's scope paragraph are stale"
+            inner_nat_ids, expected_nat_ids,
+            "{label}: the NAT-side ordering boundary moved. A belt BELOW the \
+             NAT rule parse leaves the candidate's counter_id behind in the \
+             store the INNER builder was handed, and a belt ABOVE it does not. \
+             Hoisting the NAT parse above the policy parse reds the #3402 row \
+             here (measured, #6832 fold r7). The caller undoes this on `Err` \
+             (#6995) — that is asserted above, at the caller's layer"
         );
     }
 }
@@ -7704,4 +8164,255 @@ fn build_cos_state_temporal_converts_against_the_fallback_drain_rate() {
          temporal really was inert here — which is what the commit advisory used \
          to claim"
     );
+}
+
+// #7015: bind the counter-prune OBLIGATION — "on the `is_ok()` branch, this
+// call happens" — which nothing enforced.
+//
+// WHY NOT THE RECEIPT THE ISSUE PREFERS. #7015 ranks a prune-debt receipt first:
+// `attach_zone_counters` records "prune owed for generation N", and "a new
+// build's additive half finding a prior generation's debt still outstanding IS
+// the defect". That is UNSOUND as specified, and the reason is the very path
+// #6832 created. A rejected apply legitimately leaves the debt outstanding —
+// that is the whole point of deferring the prune past `bring_up_workers` — and
+// the next build then finds it. So the receipt fires on every
+// rejected-apply-then-retry sequence, which is a normal operator flow, not a
+// defect. `rejected_apply_then_retry_is_a_reachable_sequence_7015` below
+// demonstrates that sequence is reachable rather than hypothetical.
+//
+// So this is the issue's option (2), the structural guard — with the weakness
+// it was ranked down for removed. #7015 objects that option (2) "needs an
+// exemption list", and this board has been bitten by lists going stale. This
+// guard has no per-call-site list: it DISCOVERS the prune families from the
+// definitions and requires each to be called from the same two apply commit
+// points. A family added later is picked up with no edit — which matters
+// immediately, because #7010 adds a second one.
+//
+// The one pinned population is the set of forwarding-state PUBLISH sites, and
+// it is pinned by exact content rather than by count so a stale entry cannot
+// hide behind a coincidental total. That pin is the half that detects the third
+// apply path: a new one either calls the prunes (the family assertion fires,
+// naming what to update) or it does not (this pin fires, naming the new site).
+
+/// Every `pub(in crate::afxdp) fn commit_*_prune(` defined in
+/// `forwarding_build/mod.rs`, discovered rather than listed.
+fn discovered_prune_families() -> Vec<String> {
+    prune_families_in(include_str!("mod.rs"))
+}
+
+/// The discovery itself, over arbitrary source, so its own behaviour can be
+/// measured rather than argued.
+fn prune_families_in(src: &str) -> Vec<String> {
+    let cleaned = crate::afxdp::worker_queue::tests::blank_comments_and_strings(src);
+    let mut out = Vec::new();
+    for line in cleaned.lines() {
+        // Keyed on `fn NAME(`, NOT on the visibility modifier in front of it.
+        // An earlier revision matched the exact `pub(in crate::afxdp) fn `
+        // prefix, which meant a routine visibility widening would drop a family
+        // out of discovery silently — and with two families present the
+        // anti-vacuity floor below would still pass, leaving the widened one
+        // unguarded. That is the "fails to a value indistinguishable from
+        // healthy" shape this guard exists to avoid, so the needle does not
+        // depend on a spelling that has no bearing on the obligation.
+        let Some(idx) = line.find("fn ") else {
+            continue;
+        };
+        let Some(name) = line[idx + 3..].split('(').next() else {
+            continue;
+        };
+        let name = name.trim();
+        if name.starts_with("commit_") && name.ends_with("_prune") {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The discovery must not depend on a spelling that has no bearing on the
+/// obligation.
+///
+/// An earlier revision keyed on the exact `pub(in crate::afxdp) fn ` prefix. A
+/// routine visibility widening would then have dropped a family out of
+/// discovery SILENTLY — and with two families present (as of #7010) the
+/// anti-vacuity floor still passes, so the widened one goes unguarded while the
+/// guard reports clean. This measures the property instead of asserting it.
+#[test]
+fn prune_family_discovery_is_independent_of_visibility_7015() {
+    const SPELLINGS: &str = r#"
+pub(in crate::afxdp) fn commit_zone_counter_prune(a: u8) {}
+pub(crate) fn commit_rule_counter_prune(a: u8) {}
+fn commit_private_counter_prune(a: u8) {}
+pub fn not_a_prune_family(a: u8) {}
+fn commit_something_else(a: u8) {}
+"#;
+    let mut got = prune_families_in(SPELLINGS);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "commit_private_counter_prune".to_string(),
+            "commit_rule_counter_prune".to_string(),
+            "commit_zone_counter_prune".to_string(),
+        ],
+        "discovery must find every `commit_*_prune` regardless of visibility, and \
+         must not claim functions that are neither (#7015)"
+    );
+
+    // ...and it must still be blinded by comments, so a doc comment naming a
+    // family cannot conjure one that does not exist.
+    assert!(
+        prune_families_in("// fn commit_ghost_counter_prune(a: u8) {}\n").is_empty(),
+        "a COMMENTED-OUT definition was discovered as a real family; the scan is \
+         not blanking comments and a doc comment could satisfy it (#7015)"
+    );
+}
+
+/// Production `.rs` files under `src/afxdp`, with comments and string bodies
+/// blanked so a doc comment quoting a call cannot satisfy the scan.
+fn afxdp_production_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/afxdp");
+    let mut files = Vec::new();
+    crate::afxdp::worker_queue::tests::afxdp_rs_files(&root, &mut files);
+    let mut out = Vec::new();
+    for path in files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("under src/afxdp")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if crate::afxdp::worker_queue::tests::is_fixture(&rel) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read source");
+        out.push((
+            rel,
+            crate::afxdp::worker_queue::tests::blank_comments_and_strings(&src),
+        ));
+    }
+    out
+}
+
+/// The two apply paths that commit a snapshot, and therefore the two files a
+/// counter prune must be called from.
+const APPLY_COMMIT_POINT_FILES: &[&str] =
+    &["coordinator/reconcile/mod.rs", "coordinator/snapshot_refresh.rs"];
+
+#[test]
+fn every_commit_counter_prune_is_called_from_both_apply_commit_points_7015() {
+    let families = discovered_prune_families();
+    assert!(
+        !families.is_empty(),
+        "the scan discovered NO commit_*_prune family in forwarding_build/mod.rs. \
+         Either the naming convention changed or the comment-blanking ate the \
+         definitions — either way this guard would pass while checking nothing (#7015)"
+    );
+
+    let sources = afxdp_production_sources();
+    assert!(
+        sources.len() >= 40,
+        "only {} production sources under src/afxdp were scanned; the walk or the \
+         fixture filter is broken and every absence below is vacuous",
+        sources.len()
+    );
+
+    for family in &families {
+        let needle = format!("{family}(");
+        let mut callers: Vec<String> = Vec::new();
+        for (rel, cleaned) in &sources {
+            // The definition itself is not a call site.
+            let defines = cleaned.contains(&format!("fn {needle}"));
+            let mentions = cleaned.matches(&needle).count();
+            let calls = mentions - usize::from(defines);
+            if calls > 0 {
+                callers.push(rel.clone());
+            }
+        }
+        callers.sort();
+        let want: Vec<String> = APPLY_COMMIT_POINT_FILES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            callers, want,
+            "`{family}` is called from {callers:?}, want exactly {want:?}.\n\
+             The destructive half of a counter reconcile must run at EVERY apply \
+             path's own commit point and nowhere else: earlier than that and a \
+             build whose workers fail to come up destroys live totals for a \
+             configuration that never forwarded (#6832/#7010); missing from one \
+             and that path leaks removed rows forever. If you added an apply \
+             path, call every discovered prune family at its commit point and \
+             add its file to APPLY_COMMIT_POINT_FILES (#7015)"
+        );
+    }
+}
+
+#[test]
+fn forwarding_publish_population_is_pinned_7015() {
+    // The half that DETECTS a third apply path. Pinned by content, not by
+    // count: a stale entry cannot hide behind a coincidental total.
+    let want: &[(&str, usize)] = &[
+        // Teardown reset — not an apply, publishes nothing to commit.
+        ("coordinator/mod.rs", 1),
+        // Builder staging into the fds carrier — not an apply publish.
+        ("coordinator/reconcile/mod.rs", 1),
+        // THE RECONCILE APPLY's publish. Its commit point is in reconcile/mod.rs,
+        // after bring_up_workers — deliberately not here.
+        ("coordinator/reconcile/snapshot.rs", 1),
+        // THE REFRESH APPLY's publish, which IS its own commit point.
+        ("coordinator/snapshot_refresh.rs", 1),
+    ];
+
+    let mut got: Vec<(String, usize)> = Vec::new();
+    for (rel, cleaned) in afxdp_production_sources() {
+        let n = cleaned.matches(".forwarding = ").count();
+        if n > 0 {
+            got.push((rel, n));
+        }
+    }
+    got.sort();
+    let want_owned: Vec<(String, usize)> =
+        want.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+    assert_eq!(
+        got, want_owned,
+        "the set of forwarding-state assignment sites under src/afxdp changed.\n\
+         If a new APPLY path appeared, it must call every commit_*_prune family \
+         at its own commit point (see \
+         every_commit_counter_prune_is_called_from_both_apply_commit_points_7015) \
+         — the obligation is control-flow-shaped and nothing else enforces it. \
+         If the new site is not an apply, add it here with a note saying why \
+         (#7015)"
+    );
+}
+
+/// The refutation of #7015's preferred mechanism, made concrete.
+///
+/// A prune-debt receipt would treat "a prior generation's debt is still
+/// outstanding when the next build runs" as the defect. This shows that
+/// sequence is an ordinary one: a rejected apply leaves the prune legitimately
+/// undone — that is what #6832 deferred it FOR — and the retry that follows is
+/// a normal operator response, not a bug. A receipt keyed on outstanding debt
+/// fires here.
+#[test]
+fn rejected_apply_then_retry_is_a_reachable_sequence_7015() {
+    // Both directions already exist as behavioural cells in coordinator/tests.rs
+    // (`rejected_apply_does_not_prune_live_zone_counters_6832` and
+    // `committed_reconcile_prunes_zone_counters_for_removed_zones_6832`), so
+    // what this pins is that the project treats them as ONE sequence rather than
+    // two unrelated states — i.e. that the rejected state is a resting place a
+    // retry departs from.
+    let src = include_str!("../coordinator/tests.rs");
+    let cleaned = crate::afxdp::worker_queue::tests::blank_comments_and_strings(src);
+    for needle in [
+        "fn rejected_apply_does_not_prune_live_zone_counters_6832(",
+        "fn committed_reconcile_prunes_zone_counters_for_removed_zones_6832(",
+    ] {
+        assert!(
+            cleaned.contains(needle),
+            "{needle} is gone. The #7015 argument against a prune-debt receipt \
+             rests on the rejected-apply state being reachable AND survivable; \
+             if that cell no longer exists, re-derive the argument before \
+             relying on it"
+        );
+    }
 }

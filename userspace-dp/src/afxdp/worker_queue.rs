@@ -162,4 +162,13 @@ pub(in crate::afxdp) fn try_lock_recover(
 
 #[cfg(test)]
 #[path = "worker_queue_tests.rs"]
-mod tests;
+// #7015: `pub(in crate::afxdp)` so the source-scan helpers this module owns
+// (`blank_comments_and_strings`, `afxdp_rs_files`, `is_fixture`) can be shared
+// with the prune-obligation guard in forwarding_build/tests.rs rather than
+// copied. A second implementation of comment-blanking is the shape where a
+// source-scanning gate quietly stops seeing what it is meant to see.
+// #7053: widened again from `pub(in crate::afxdp)` — the routing-instance
+// pairing guard lives in `filter/tests.rs`, outside this module tree, and a
+// second copy of comment-blanking is exactly where a source-scanning gate
+// quietly stops seeing what it is meant to.
+pub(crate) mod tests;

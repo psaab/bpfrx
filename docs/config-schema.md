@@ -5190,11 +5190,67 @@ can see (#7034). The packed branch of those compilers reads a single key
 `then { source-nat off pool P; }`, `then { source-nat pool P off; }`,
 `then { source-nat { pool P off; } }`, or the flat
 `set … then source-nat pool P off` — lowers to a single field, counts as one
-action and COMMITS under strict, with the dropped action silently gone. The
-same holds for `destination-nat`. That is the behaviour gap #7033; the
-rejection message names it rather than claiming the block-level case is
-covered. `TestNATTerminalActionPackedContradictionCommits_7034` pins each
-spelling, so closing #7033 has to update this text too.
+action. The same holds for `destination-nat`. That was the behaviour gap #7033,
+and it is **closed**: those rows no longer commit. A separate check —
+`natThenPackedContradictionModes`, reading the authored MODES recorded beside the
+resolved `NATThen` — rejects them at strict commit, and the resolved-field
+count's message now names that check instead of naming an open issue.
+`TestNATTerminalActionPackedContradictionRejected_7034_7033` pins each spelling.
+
+The fix is DETECTION, not accumulation in the lowering, and the distinction is
+the reason it holds. Two rounds of #6820 tried to make the lowering read every
+packed token and each was reverted for a regression in the ACCEPTING direction:
+round 5 made `then { destination-nat interface pool PD; }` resolve as a pool
+translation, round 6 fabricated an exemption out of
+`then { source-nat { frobnicate { off; } } }`. Nothing about what a packed run
+lowers to has changed — the flipped #7034 test asserts the same resolved values
+it always did, now read off the lenient path.
+
+Three properties bound the scan, each with its own cell in
+`compiler_nat_then_packed_contradiction_7033_test.go`:
+
+- **`pool` consumes exactly one value token**, so `pool off` stays a pool NAMED
+  `off` rather than becoming a pool plus an exemption.
+- **The scan stops at the first unrecognised token**, so #4313's open-world
+  trailing grammar survives — including the adversarial case where the tail
+  itself contains the word `off`, which is the smallest shape in which the stop
+  rule changes an outcome.
+- **The walk does not descend past an unrecognised container**, so round 6's
+  `frobnicate { off; }` keeps its ZERO-action rejection instead of yielding an
+  exemption nobody wrote.
+
+The check applies to the `n == 1` class only, so a block that lowers two actions
+(or none) keeps the diagnostic it already had. Two sites enforce that and either
+alone suffices — the call sits after the count's switch, and the predicate
+independently refuses any rule whose resolved count is not one — which means only
+a compound mutation can demonstrate the restriction is guarded.
+
+*Same-mode repeats are a separate check (#7013).* A packed `off pool P` still
+collapses to one field — #7033 rejects it on the authored modes rather than by
+changing that. A block naming the SAME mode twice is no
+longer invisible: `then destination-nat pool PD pool PD2` and
+`then { destination-nat { pool PD; pool PD2; } }` are rejected at strict commit
+by an occurrence check that runs BEFORE the mode count, reading a per-container
+record of the authored pool NAMES (`natThenAuthored`, unexported on `NATRule`,
+built by `natThenAuthoredOccurrences` at both lowering sites). Where the collapse
+happens the FIRST authored pool is the one that takes effect, in both spellings.
+
+Three neighbouring shapes stay legal, and the distinction is the whole of why
+this does not disturb #3850 or #7035:
+
+- **Duplicate `then` CONTAINERS** — last-container-wins, unchanged. The record is
+  scoped to ONE container precisely so summing cannot false-reject them.
+- **Two separate `set … then destination-nat pool X` lines** — NOT a collapse.
+  The second REPLACES the leaf in the candidate tree, as a single-value leaf
+  should, so only one pool ever reaches the compiler and `show configuration`
+  displays what will be enforced. #7013's body described this as the same defect;
+  it is ordinary leaf replacement at a different layer.
+- **The same pool named twice in one block** — nothing is discarded, so it is a
+  redundancy rather than an error.
+
+`off` and `interface` are not recorded at all: they carry no value, so repeating
+either discards nothing. `compiler_nat_then_occurrences_7013_test.go` pins every
+row above, including the three legal ones.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

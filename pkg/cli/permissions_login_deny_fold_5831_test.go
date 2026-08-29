@@ -20,10 +20,12 @@ import (
 // repair floor. Before #5831 the deny leaf was inert, so this committed
 // cleanly and `noc-admin` held view + configure.
 //
-// pkg/daemon/daemon_run.go assigns the CONFIGURED class to any OS user whose
-// name matches a `system login user` (`if u.Name == osUser {
-// shell.SetUserClass(u.Class) }`). Account provisioning skips root; that
-// assignment does not. So `user root class noc-admin` binds the CONSOLE
+// pkg/daemon/daemon_run.go:742 -> applyCLILoginClass (pkg/daemon/cli_rbac.go)
+// -> cli.ResolveLoginClass (pkg/cli/identity.go) -> configuredClass assigns the
+// CONFIGURED class to the invoking OS credential, and `root` is a name the
+// username validator accepts.
+// Account provisioning skips root; that assignment does not. (The inline
+// `if u.Name == osUser` loop this used to quote is gone since #6701 — #7057.) So `user root class noc-admin` binds the CONSOLE
 // operator to a custom class, and whatever the fold leaves that class holding
 // is the total access available to repair the box.
 const syncedLoginConfig = `

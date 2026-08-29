@@ -2996,6 +2996,15 @@ func natTerminalActionCardinalityOffenders(cfg *Config) []LenientNATTerminalActi
 					out = append(out, LenientNATTerminalActionRule{
 						Kind: kind, RuleSet: rs.Name, Rule: rule.Name, Actions: n,
 					})
+				} else if modes := natThenPackedContradictionModes(rule); len(modes) > 0 {
+					// #7033: a PACKED contradiction resolves to one field, so the
+					// count above reads 1 and this rule would be missing from the
+					// gauge while a commit refuses it. Actions is the AUTHORED
+					// count, which is what the operator wrote and what the strict
+					// error reports.
+					out = append(out, LenientNATTerminalActionRule{
+						Kind: kind, RuleSet: rs.Name, Rule: rule.Name, Actions: len(modes),
+					})
 				}
 			}
 		}
@@ -3208,6 +3217,47 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 				if rule == nil {
 					continue
 				}
+				// #7013: ONE `then` BLOCK NAMING TWO POOLS, which the mode count
+				// below cannot see. NATThen resolves a single pool name, so
+				// `pool PD pool PD2` arrives here as n == 1. The per-container
+				// occurrence record kept at lowering is what makes the discarded
+				// pool checkable.
+				//
+				// Checked BEFORE the mode count so the message names the actual
+				// defect: a rule that authored two pools AND an `off` is
+				// reported as the duplicate first, because "you wrote pool
+				// twice" is the more specific and more actionable of the two.
+				//
+				// This fires only where ONE container carries both occurrences:
+				// a packed run (`pool PD pool PD2`) or hierarchical braces
+				// (`destination-nat { pool PD; pool PD2; }`), measured at this
+				// head to keep the FIRST in both. Three shapes deliberately stay
+				// legal, and each of them is already pinned elsewhere in the
+				// suite:
+				//
+				//   - DUPLICATE `then` CONTAINERS — #3850 last-wins, whether
+				//     they name the same pool or different actions. Summing
+				//     across containers false-rejects both, so the record is
+				//     kept per container.
+				//   - TWO SEPARATE `set ... pool X` LINES — the second REPLACES
+				//     the leaf in the candidate tree, exactly as a single-value
+				//     leaf is meant to behave, so only one pool ever reaches the
+				//     compiler and `show configuration` displays what will be
+				//     enforced. Rejecting it would break the ordinary way an
+				//     operator edits a pool.
+				//   - THE SAME POOL NAMED TWICE in one block — nothing is
+				//     discarded, so there is nothing to report; distinctPools
+				//     is what makes that a redundancy rather than an error.
+				if names := rule.thenAuthored.distinctPools(); len(names) >= 2 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: one `then` block names %d different pools "+
+							"(%s), but a rule carries ONE translation action per mode — the FIRST "+
+							"is the one that takes effect and the rest are silently discarded "+
+							"before anything validates them, so the firewall translates "+
+							"differently from the configuration as written and nothing says so. "+
+							"Name one, or split them into separate rules",
+						kind, rs.Name, rule.Name, len(names), strings.Join(names, ", "))
+				}
 				switch n := natThenTerminalActionCount(rule.Then); {
 				case n == 0:
 					return fmt.Errorf(
@@ -3230,9 +3280,29 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 							"WHICH contradiction you get here. This gate counts the actions the "+
 							"rule RESOLVED to, so it catches a block that LOWERS two distinct "+
 							"actions; a contradiction whose tokens are PACKED onto one node, as "+
-							"in `pool <p> off`, lowers to a single action, is counted as one and "+
-							"is NOT caught here — tracked as #7033.)",
+							"in `pool <p> off`, lowers to a single action and is counted as one, "+
+							"so it is rejected by the packed-contradiction check that follows "+
+							"this one rather than here — #7033.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)
+				}
+				// #7033: the PACKED cross-mode contradiction, which the count
+				// above cannot see. Two modes written as tokens on one run lower
+				// to a single field, so n == 1 and the switch falls through.
+				// Placed after it so a block that LOWERS two actions keeps its
+				// own message — though the predicate ALSO refuses any rule whose
+				// resolved count is not one, so the class restriction survives
+				// either site being moved. See the file comment on
+				// natThenPackedContradictionModes.
+				if modes := natThenPackedContradictionModes(rule); len(modes) > 0 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: one `then` block packs %d "+
+							"mutually-exclusive translation actions onto a single run (%s), "+
+							"but a rule carries exactly one (expected one of %s). Packed that "+
+							"way they lower to a SINGLE action, so the rule is counted as "+
+							"carrying one and nothing else reports it: %s. Author one action, "+
+							"or split them into separate rules",
+						kind, rs.Name, rule.Name, len(modes), strings.Join(modes, ", "),
+						actions, natPackedContradictionDetail(modes))
 				}
 			}
 		}

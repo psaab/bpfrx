@@ -630,7 +630,8 @@ zone with no traffic / no flood events alike.
   carry-forward `clone()` in
   `build_forwarding_state_with_policy_counters_and_previous` is a handle on the
   LIVE map, not a copy. Binding a candidate to it mutates it **two** ways:
-  `ZoneCounterSlotMap::build` GET-OR-CREATES a block per configured zone, and
+  `ZoneCounterSlotMap::build` GET-OR-CREATES a block per SLOT-ASSIGNED zone —
+  a SUBSET of the configured set, not one per configured zone (#7040) — and
   `reconcile` DROPS the blocks for zones the candidate no longer configures. A
   snapshot the reconcile/refresh preflight REJECTS ("keeping previous forwarding
   state") must do neither — the prune would zero an operator's
@@ -638,6 +639,27 @@ zone with no traffic / no flood events alike.
   get-or-create would leave a zero-valued block behind for a candidate-only
   zone (invisible to the sparse status snapshot, but accumulating one block per
   rejected commit under ordinary config churn).
+
+  The SUBSET qualifier is load-bearing and was corrected in three code sites by
+  the same PR that introduced this block (#6832), which left the doc behind.
+  `build` filters zone id 0 out of its input and `break`s once
+  `ZONE_COUNTER_ASSIGNABLE_SLOTS` are taken, setting `overflow_active`; every
+  configured zone past that point is assigned no slot and therefore gets no
+  block. So the get-or-create half of the mutation is bounded PER APPLY by the
+  slot capacity rather than by the size of the candidate's zone set. It is not
+  bounded ACROSS applies — successive rejected commits naming different
+  candidate-only zone ids each add up to that many blocks to the zone-id-keyed
+  store — so the accumulation described above stands; only its per-commit
+  magnitude was overstated.
+
+  Code of record: `ZoneCounterSlotMap::build`
+  (`userspace-dp/src/afxdp/zone_counters.rs`), whose own doc comment states the
+  same qualifier, as do `attach_zone_counters`
+  (`afxdp/forwarding_build/mod.rs`) and `afxdp/coordinator/reconcile/snapshot.rs`.
+  The capacity stop and the `overflow_active` flag are already bound by tests in
+  `afxdp/flood_counters.rs` (`flood_and_traffic_slot_maps_cover_the_same_zones`
+  and the overflow assertions around it), so this correction needs no new test —
+  the code fact was never in doubt, only its restatement here.
 
   Both mutations therefore live in `attach_zone_counters`, which the public
   entry point calls **after** the fallible `build_fallible_forwarding_state`
@@ -695,15 +717,39 @@ zone with no traffic / no flood events alike.
   `rejected_apply_does_not_prune_live_zone_counters_6832` (negative) plus
   `committed_reconcile_…` / `committed_refresh_…` (one per call site).
 
-  Scope note: this is the ZONE-counter store only. The same rejected build
-  still leaves get-or-create residue in the shared `PolicyCounterStore` and
-  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**,
-  and now asserted rather than only described, by
-  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`: it
-  drives the four belts with all three stores LIVE (the other rejection tests
+  Scope note: #6832 was the ZONE-counter store only. The same rejected build
+  also left get-or-create residue in the shared `PolicyCounterStore` and
+  `NatCounterStore` — pre-existing, untouched by #6832, and tracked as
+  **#6995**. **#6995 is now CLOSED**, by a different mechanism: those two
+  bindings cannot be deferred the way the zone binding was (the handles are
+  embedded in `PolicyState` and the NAT tables at construction), so
+  `build_forwarding_state_with_policy_counters_and_previous` instead CAPTURES
+  both registries before the fallible build and retains them back to the
+  captured sets on `Err`. A retain to the pre-build set evicts only ids that
+  build created and cannot drop a row carrying live totals.
+
+  The NAT half was the operator-visible one: `NatCounterStore::snapshots()`
+  emits a row per stored id regardless of value, feeding
+  `ProcessStatus.nat_rule_counters`, so a refused commit put phantom NAT
+  rule-counter rows on the status surface until the next successful commit
+  evicted them. Bound by
+  `rejected_build_does_not_leave_policy_blocks_in_the_live_store_6995`,
+  `rejected_build_does_not_leave_nat_rows_in_the_live_store_6995` and
+  `rejected_build_leaves_no_phantom_rows_on_the_nat_status_surface_6995` — the
+  store and the surface asserted SEPARATELY, because a fix that filtered
+  zero-valued rows out of `snapshots()` would satisfy the surface one while
+  leaving the store dirty.
+
+  `rejected_build_leaves_the_zone_store_clean_against_live_sibling_stores`
+  still drives the belts with all three stores LIVE (the other rejection tests
   pass fresh siblings, so they prove the zone guarantee only against empty
-  neighbours) and pins the residue in BOTH sibling stores, so a later fix to
-  either half of #6995 reds it instead of leaving this note stale.
+  neighbours). Its residue predicates — which pin the relative ORDER of the
+  policy parse, the NAT parse and the belts — moved down one layer to
+  `build_fallible_forwarding_state`, where the get-or-create happens and where
+  nothing has rolled back yet; at the caller's layer the row now asserts both
+  sibling stores come back UNCHANGED. The comment that said "a later fix to
+  either half of #6995 reds it instead of leaving this note stale" did exactly
+  that: the fix reddened the row, and this is the note it was protecting.
 
   "Both" is load-bearing and was not true when first written: the row seeded
   only the NAT store and left the policy store a bare `default()`, so the
@@ -711,8 +757,35 @@ zone with no traffic / no flood events alike.
   It now seeds the policy store through the production path (a clean build,
   which get-or-creates the reserved default-policy counter), carries a
   candidate-only `probe-rule` so the residue is distinguishable from the seed,
-  and asserts both halves belt-by-belt — the dup-zone belt sits above both
-  parses and leaves neither, the other three sit below and leave both.
+  and asserts both halves belt-by-belt. The enumeration is by POSITION relative
+  to the two counter-binding call sites — the policy parse
+  (`parse_policy_state_with_counters`) and the source-NAT parse
+  (`parse_source_nat_rules_with_previous`, about sixty lines below it) — and
+  since #6832 round 7 it is a THREE-way split, not two (#7042):
+
+  | belt | position | policy residue | NAT residue |
+  |---|---|---|---|
+  | `#3719` duplicate zone id | above both parses | absent | absent |
+  | `#3402` unresolvable policy zone | **between** them | **present** | **absent** |
+  | `#2240` NPTv6 | below both | present | present |
+  | `#3367` filter | below both | present | present |
+  | `#2410` CoS queue id | below both | present | present |
+
+  The middle row is the point of the set, not an extra. Over the other four the
+  two residue predicates are the SAME expression — every one of them sits either
+  above both parses or below both — so the table could not tell them apart, and
+  that was true only by coincidence of the current builder layout. A belt landing
+  anywhere in the region BETWEEN the two parses makes one of the two assertions
+  wrong, and none of the four could detect it.
+
+  `#3402`'s `UnresolvableZoneReference` rejects INSIDE the policy parse's rule
+  loop — downstream of the per-rule `rule_hit_counter` that resolves the probe
+  rule's counter, upstream of the source-NAT parse — so it occupies that region
+  and the two predicates can no longer be written as one expression without a row
+  contradicting them. It lives in `policy_parse_interior_rejection_row` and is
+  deliberately NOT folded into `zone_counter_rejection_rows`, whose four rows are
+  chosen by a different argument (span over the fallible region) that this row
+  would blur.
 
 - **POPULATE flood (#3651) now ships too.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting, not a snapshot of existing state: the
