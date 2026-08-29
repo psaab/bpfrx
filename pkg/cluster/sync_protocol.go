@@ -422,8 +422,19 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 	off++
 	val.IsReverse = payload[off]
 	off += 5
+	// #7175: a payload that stops here is MALFORMED, not a legacy peer. This
+	// block carries SessionID, PolicyID, both zone ids and all four NAT fields
+	// — the values the session MEANS — and no encoder version has ever omitted
+	// them (every length-gated extension sits after the counters block; see
+	// encodeSessionV4Payload). Accepting a short read here returned ok=true with
+	// all of them left at ZERO, and zero is not "missing": zone id 0 against
+	// zone id 0 is matched by a `from-zone any to-zone any permit` rule with no
+	// zone guard (#6682). So a truncated frame did not degrade to "no session" —
+	// it seeded one a wildcard rule affirmatively permits, carrying no NAT and
+	// no policy attribution, which became live forwarding state on the next
+	// failover.
 	if off+48 > len(payload) {
-		return key, val, true
+		return key, val, false
 	}
 	val.SessionID = binary.LittleEndian.Uint64(payload[off:])
 	off += 8
@@ -557,8 +568,11 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	off++
 	val.IsReverse = payload[off]
 	off += 5
+	// #7175: mandatory — see decodeSessionV4Payload for the reasoning. SessionID,
+	// PolicyID and both zone ids; a short read here zeroed every one of them and
+	// still reported success.
 	if off+48 > len(payload) {
-		return key, val, true
+		return key, val, false
 	}
 	val.SessionID = binary.LittleEndian.Uint64(payload[off:])
 	off += 8
@@ -574,8 +588,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	off += 2
 	val.EgressZone = binary.LittleEndian.Uint16(payload[off:])
 	off += 2
+	// #7175: mandatory. v6 gives NAT its own block because the addresses are 16
+	// bytes; it is the same forwarding-semantic data the v4 48-byte block carries
+	// inline, so it gets the same treatment. A short read here left the session
+	// with no NAT translation while reporting success.
 	if off+36 > len(payload) {
-		return key, val, true
+		return key, val, false
 	}
 	copy(val.NATSrcIP[:], payload[off:off+16])
 	off += 16
@@ -1087,12 +1105,19 @@ func encodeDHCPLeasePayload(leases []dhcpserver.SyncLease) []byte {
 // decodeDHCPLeasePayload parses a full-set lease push. A truncated payload
 // stops decoding at the last complete record (fail-safe: a partial message
 // yields the leases that fully arrived rather than erroring the whole push).
-func decodeDHCPLeasePayload(payload []byte) []dhcpserver.SyncLease {
+// #7175 (C179-075): the bool reports whether the payload decoded COMPLETELY.
+// A full-set push REPLACES the peer lease set, so returning a truncated prefix
+// silently deleted every lease past the truncation point on the standby. The
+// caller must retain its prior set when this is false rather than storing a
+// partial one — the same disposition the stale-sequence guard already applies
+// one branch above ("standby retains newer set").
+func decodeDHCPLeasePayload(payload []byte) ([]dhcpserver.SyncLease, bool) {
 	if len(payload) < 4 {
-		return nil
+		return nil, false
 	}
 	count := int(binary.LittleEndian.Uint32(payload[:4]))
 	off := 4
+	malformed := false
 	// Clamp the preallocation to what the payload can physically hold: count
 	// is untrusted on-wire data, and each record consumes at least its 4-byte
 	// length prefix, so there can be at most len(payload)/4 records. Without
@@ -1100,21 +1125,42 @@ func decodeDHCPLeasePayload(payload []byte) []dhcpserver.SyncLease {
 	// a ~hundreds-of-GB make() (SyncLease is ~160 bytes) and panic before the
 	// loop's truncation guard fires. Valid payloads are unaffected (a real
 	// count is always <= len(payload)/4). Clamping count also bounds the loop.
+	// #7175: a count exceeding what the payload can physically hold is not a
+	// short valid set — no encoder produces it. The clamp still bounds the
+	// allocation, and the frame is now reported as malformed rather than
+	// silently reduced to whatever fit.
 	if maxRecords := len(payload) / 4; count > maxRecords {
 		count = maxRecords
+		malformed = true
 	}
 	out := make([]dhcpserver.SyncLease, 0, count)
 	for i := 0; i < count; i++ {
 		if off+4 > len(payload) {
+			// The buffer ended while the count still expected records. Every
+			// record that DID arrive is whole — only the sender's count was
+			// wrong — so this stays recoverable, which is the contract
+			// TestDHCPLeasePayload_TruncatedStream pins. Deliberately NOT
+			// promoted to malformed: nothing was lost mid-record.
 			break
 		}
 		recLen := int(binary.LittleEndian.Uint32(payload[off:]))
 		off += 4
 		if recLen < 0 || off+recLen > len(payload) {
+			// A record is CUT: its declared length runs past the buffer, so
+			// part of a lease is gone. This is the C179-075 case — the full-set
+			// push REPLACES the peer set, so returning the prefix would delete
+			// every lease after the cut on the standby.
+			malformed = true
 			break
 		}
 		out = append(out, decodeOneLease(payload[off:off+recLen]))
 		off += recLen
 	}
-	return out
+	// NOTE: trailing bytes after the last record are NOT malformed. The #5073
+	// full-set seq trailer is appended exactly so an old decoder walks its
+	// records and ignores the remainder (TestFullSetSeqDHCPTrailerIgnoredByOldDecoder).
+	if malformed {
+		return nil, false
+	}
+	return out, true
 }

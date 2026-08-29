@@ -293,6 +293,52 @@ deterministic side initiates per fabric. `TCP_NODELAY` is enabled.
 [8:12]  Payload length (uint32, little-endian)
 ```
 
+### Decode Contract: which short reads are legitimate (#7175)
+
+A session payload may legitimately be SHORT — that is how the wire is extended.
+Every field appended since the original format is length-gated, so a newer peer's
+record decodes on an older node, which stops after the last field it knows:
+`Generation` (#2170), `AppTimeout`/`PolicyCounterIdx` (#3301), `ConfigEpoch`
+(#5274), `RTFlowSessionID` (#5212), `IngressIfaceFold` (#7095). An absent
+extension reads as 0, meaning "legacy peer", and that is not an error.
+
+**But a short read is only legitimate PAST the forwarding-semantic block.**
+`SessionID`, `PolicyID`, both zone ids and the NAT fields are not extensions —
+no encoder version has ever omitted them — so a payload that stops before them
+is malformed, not old. Before #7175 the decoder accepted one anyway, returning
+`ok=true` with every one of those fields left at **zero**.
+
+Zero is not "missing" here, it is a *value the standby forwards against*, and
+zone id 0 against zone id 0 is matched by a `from-zone any to-zone any permit`
+rule with no zone guard (#6682). So a truncated frame did not degrade to "no
+session" — it seeded one that a wildcard rule affirmatively permits, carrying no
+NAT and no policy attribution, which became live forwarding state on the next
+failover. The precondition is a malformed frame no legitimate encoder emits
+(fabric corruption, a version-skewed or buggy peer, a compromised peer), which is
+narrow — and is exactly the case where fail-open decoding is worst, because the
+receiving node has no other check.
+
+`decodeSessionV4Payload` / `decodeSessionV6Payload` now return `ok=false` for a
+payload truncated before that block; v6 has TWO such blocks because its 16-byte
+NAT addresses are carried separately. Everything from the counters block onward
+remains length-gated. Rejections increment `SyncStats.MalformedRecordsDropped`
+and log — a silently skipped install is how corruption hides.
+
+The same contract applies to the DHCP full-set push
+(`decodeDHCPLeasePayload`), which returns an `ok` flag. It matters more there
+than it looks: a full-set push **replaces** the peer lease set, so returning a
+truncated prefix deletes every lease past the cut on the standby. Two cases are
+distinguished deliberately:
+
+| frame | disposition | why |
+|---|---|---|
+| a record CUT mid-stream (declared length overruns the buffer) | **reject**, retain prior set | part of a lease is gone |
+| count over-declared, every shipped record whole | accept | no data lost, only the count is wrong |
+| trailing bytes after the last record | accept | the #5073 full-set seq trailer is appended exactly so old decoders ignore it |
+
+The retain-prior-set disposition mirrors the stale-sequence guard in the same
+switch ("standby retains newer set").
+
 ### Message Types
 
 | Type | Name | Direction | Purpose |

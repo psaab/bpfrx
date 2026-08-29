@@ -61,7 +61,10 @@ func TestFullSetSeqDHCPTrailerIgnoredByOldDecoder(t *testing.T) {
 	stamped := appendFullSetSeq(encodeDHCPLeasePayload(leases), 999, 7)
 	// An OLD receiver calls decodeDHCPLeasePayload on the WHOLE frame (it does
 	// not know to strip a trailer). It must still recover exactly the 2 leases.
-	got := decodeDHCPLeasePayload(stamped)
+	got, okDecode := decodeDHCPLeasePayload(stamped)
+	if !okDecode {
+		t.Fatal("a well-formed stamped frame must decode completely (#7175)")
+	}
 	if len(got) != 2 {
 		t.Fatalf("old decoder on stamped DHCP frame: got %d leases, want 2 (trailer must be ignored)", len(got))
 	}
@@ -383,7 +386,7 @@ func TestFullSetSeqDHCPBaseEndingInMagicSafe(t *testing.T) {
 	if !bytes.Equal(gotBase, base) {
 		t.Fatalf("DHCP base must round-trip byte-exact through one stamp/strip; got %d bytes want %d", len(gotBase), len(base))
 	}
-	if got := decodeDHCPLeasePayload(gotBase); len(got) != 1 || got[0].Address != "10.0.0.5" {
+	if got, ok := decodeDHCPLeasePayload(gotBase); !ok || len(got) != 1 || got[0].Address != "10.0.0.5" {
 		t.Fatalf("recovered base must decode to the original lease set, got %+v", got)
 	}
 

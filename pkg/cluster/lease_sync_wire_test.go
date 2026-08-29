@@ -81,7 +81,10 @@ func TestDHCPLeaseEncode_OversizedFieldFailsClosed(t *testing.T) {
 		ValidLife: 7200, Remaining: 6000, Hostname: "host-2", FQDNRev: true,
 	}
 	payload := encodeDHCPLeasePayload([]dhcpserver.SyncLease{normal1, oversized, normal2})
-	out := decodeDHCPLeasePayload(payload)
+	out, okDecode := decodeDHCPLeasePayload(payload)
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if len(out) != 2 {
 		t.Fatalf("payload decoded %d leases, want 2 (the oversized lease must be dropped, "+
 			"not emitted misframed): %+v", len(out), out)
@@ -118,7 +121,10 @@ func TestDHCPLeasePayload_RoundTrip(t *testing.T) {
 		},
 	}
 	payload := encodeDHCPLeasePayload(in)
-	out := decodeDHCPLeasePayload(payload)
+	out, okDecode := decodeDHCPLeasePayload(payload)
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("round-trip mismatch:\n in=%+v\nout=%+v", in, out)
 	}
@@ -131,7 +137,10 @@ func TestDHCPLeasePayload_Empty(t *testing.T) {
 	if len(payload) != 4 {
 		t.Fatalf("empty payload len = %d, want 4", len(payload))
 	}
-	out := decodeDHCPLeasePayload(payload)
+	out, okDecode := decodeDHCPLeasePayload(payload)
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if len(out) != 0 {
 		t.Fatalf("decoded empty payload to %d leases", len(out))
 	}
@@ -193,7 +202,10 @@ func TestDHCPLeasePayload_TruncatedStream(t *testing.T) {
 	// Lie about the count to 5 but only ship the real 2 records: the decoder
 	// must stop at the end of the buffer, returning the 2 complete records.
 	binary.LittleEndian.PutUint32(payload[:4], 5)
-	out := decodeDHCPLeasePayload(payload)
+	out, okDecode := decodeDHCPLeasePayload(payload)
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if len(out) != 2 {
 		t.Fatalf("over-counted truncated stream decoded %d, want 2", len(out))
 	}
@@ -296,7 +308,11 @@ func TestDHCPLeasePayload_HugeCountDoesNotOverAllocate(t *testing.T) {
 	}()
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, 0xFFFFFFFF)
-	out := decodeDHCPLeasePayload(payload)
+	out, okDecode := decodeDHCPLeasePayload(payload)
+	if okDecode {
+		t.Error("#7175: a count exceeding what the payload can hold must be reported " +
+			"as malformed, not silently clamped to a short valid set")
+	}
 	if len(out) != 0 {
 		t.Errorf("huge-count empty-body frame: got %d leases, want 0", len(out))
 	}
@@ -332,7 +348,10 @@ func TestDHCPLease_PreferredRemaining_RoundTrip(t *testing.T) {
 			ValidLife: 3600, Remaining: 3000, PreferredRemaining: 3000,
 		},
 	}
-	out := decodeDHCPLeasePayload(encodeDHCPLeasePayload(in))
+	out, okDecode := decodeDHCPLeasePayload(encodeDHCPLeasePayload(in))
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if !reflect.DeepEqual(in, out) {
 		t.Fatalf("PreferredRemaining round-trip mismatch:\n in=%+v\nout=%+v", in, out)
 	}
@@ -403,7 +422,10 @@ func TestDHCPLease_FramingSkipsNewerLongerRecord(t *testing.T) {
 		HWAddress: "aa:bb", ValidLife: 600, Remaining: 500, PreferredRemaining: 500,
 		Hostname: "second",
 	}
-	out := decodeDHCPLeasePayload(encodeDHCPLeasePayload([]dhcpserver.SyncLease{first, second}))
+	out, okDecode := decodeDHCPLeasePayload(encodeDHCPLeasePayload([]dhcpserver.SyncLease{first, second}))
+	if !okDecode {
+		t.Fatalf("decodeDHCPLeasePayload reported an incomplete decode (#7175)")
+	}
 	if len(out) != 2 {
 		t.Fatalf("got %d leases, want 2 (recLen framing must step past the longer first record)", len(out))
 	}

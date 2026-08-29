@@ -107,7 +107,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			}
 		}
 		if s.sessions != nil {
-			if key, val, ok := decodeSessionV4Payload(payload); ok {
+			key, val, ok := decodeSessionV4Payload(payload)
+			if !ok {
+				// #7175: a truncated record used to decode ok=true with PolicyID,
+				// both zone ids and the NAT fields left at zero. It is now
+				// rejected — and counted, because a silently skipped install is
+				// how fabric corruption or a version-skewed peer hides.
+				s.stats.MalformedRecordsDropped.Add(1)
+				slog.Warn("cluster sync: dropping malformed v4 session record — no session installed",
+					"bytes", len(payload))
+			} else {
 				if val.IsReverse == 0 {
 					s.bulkMu.Lock()
 					if s.bulkInProgress {
@@ -133,7 +142,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			}
 		}
 		if s.sessions != nil {
-			if key, val, ok := decodeSessionV6Payload(payload); ok {
+			key, val, ok := decodeSessionV6Payload(payload)
+			if !ok {
+				// #7175: a truncated record used to decode ok=true with PolicyID,
+				// both zone ids and the NAT fields left at zero. It is now
+				// rejected — and counted, because a silently skipped install is
+				// how fabric corruption or a version-skewed peer hides.
+				s.stats.MalformedRecordsDropped.Add(1)
+				slog.Warn("cluster sync: dropping malformed v6 session record — no session installed",
+					"bytes", len(payload))
+			} else {
 				if val.IsReverse == 0 {
 					s.bulkMu.Lock()
 					if s.bulkInProgress {
@@ -479,7 +497,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				"incarnation", incarnation, "seq", seq)
 			return
 		}
-		leases := decodeDHCPLeasePayload(base)
+		leases, ok := decodeDHCPLeasePayload(base)
+		if !ok {
+			// #7175: a full-set push REPLACES the set, so storing a truncated
+			// prefix would delete every lease past the truncation point. Retain
+			// the prior set, exactly as the stale-sequence guard above does.
+			s.stats.MalformedRecordsDropped.Add(1)
+			slog.Warn("cluster sync: dropping malformed DHCP v4 lease set — standby retains previous set",
+				"incarnation", incarnation, "seq", seq, "bytes", len(base))
+			return
+		}
 		s.storePeerDHCPLeases(4, leases)
 		slog.Debug("cluster sync: received DHCP v4 lease set", "count", len(leases), "incarnation", incarnation, "seq", seq)
 		if s.OnDHCPLeasesReceived != nil {
@@ -497,7 +524,16 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				"incarnation", incarnation, "seq", seq)
 			return
 		}
-		leases := decodeDHCPLeasePayload(base)
+		leases, ok := decodeDHCPLeasePayload(base)
+		if !ok {
+			// #7175: a full-set push REPLACES the set, so storing a truncated
+			// prefix would delete every lease past the truncation point. Retain
+			// the prior set, exactly as the stale-sequence guard above does.
+			s.stats.MalformedRecordsDropped.Add(1)
+			slog.Warn("cluster sync: dropping malformed DHCP v6 lease set — standby retains previous set",
+				"incarnation", incarnation, "seq", seq, "bytes", len(base))
+			return
+		}
 		s.storePeerDHCPLeases(6, leases)
 		slog.Debug("cluster sync: received DHCP v6 lease set", "count", len(leases), "incarnation", incarnation, "seq", seq)
 		if s.OnDHCPLeasesReceived != nil {

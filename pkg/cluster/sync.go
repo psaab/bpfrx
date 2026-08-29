@@ -215,14 +215,24 @@ const syncPeerSilenceTimeout = 30 * time.Second
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
-	SessionsSent      atomic.Uint64
-	SessionsReceived  atomic.Uint64
-	SessionsInstalled atomic.Uint64
-	DeletesSent       atomic.Uint64
-	DeletesReceived   atomic.Uint64
-	BulkSyncs         atomic.Uint64
-	ConfigsSent       atomic.Uint64
-	ConfigsReceived   atomic.Uint64
+	SessionsSent     atomic.Uint64
+	SessionsReceived atomic.Uint64
+	// MalformedRecordsDropped counts sync records REJECTED by the #7175 decode
+	// contract: a session record truncated before its policy/zone/NAT block, or
+	// a DHCP full-set push that did not decode completely. Before #7175 these
+	// decoded ok=true and installed partial state — a session with PolicyID 0
+	// and zone ids (0,0), which a `from-zone any to-zone any permit` rule
+	// matches with no zone guard (#6682), or a lease set silently truncated to
+	// a prefix. The rejection is now countable because the failure mode it
+	// replaces was invisible: nothing distinguished a corrupt frame from a
+	// legitimately small one.
+	MalformedRecordsDropped atomic.Uint64
+	SessionsInstalled       atomic.Uint64
+	DeletesSent             atomic.Uint64
+	DeletesReceived         atomic.Uint64
+	BulkSyncs               atomic.Uint64
+	ConfigsSent             atomic.Uint64
+	ConfigsReceived         atomic.Uint64
 	// ConfigsStaleIgnored counts config-sync messages dropped by the #3931
 	// config-generation ordering guard: an incoming config whose monotonic
 	// generation was NOT strictly newer than the last-applied one (an
