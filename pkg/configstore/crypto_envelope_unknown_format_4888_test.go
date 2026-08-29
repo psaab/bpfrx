@@ -83,7 +83,7 @@ func TestStoreLoadUnknownInnerEnvelopeFailsClosed_4888(t *testing.T) {
 	// ConfigTree with all fields dropped -> empty tree, no error.
 	inner := `{"format":"xpf-master-password-v2","prf":"sha256",` +
 		`"salt":"AAAA","nonce":"AAAA","data":"AAAA"}`
-	body := wrapEnvelope([]byte(inner), "9.9.9", true)
+	body := wrapEnvelope([]byte(inner), "9.9.9", true, EnvelopeMinReaderVersion)
 	if err := os.WriteFile(filepath.Join(dbDir, "active.json"), body, 0644); err != nil {
 		t.Fatal(err)
 	}

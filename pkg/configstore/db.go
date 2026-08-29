@@ -209,7 +209,7 @@ func (db *DB) WriteConfirm(rec *confirmRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshal confirm state: %w", err)
 	}
-	data, err = db.maybeEncryptTreeJSON(data, rec.PrevTree)
+	data, err = db.maybeEncryptTreeJSON(data, rec.PrevTree, nil)
 	if err != nil {
 		return fmt.Errorf("encrypt confirm state: %w", err)
 	}
@@ -247,7 +247,7 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 		}
 		return nil, fmt.Errorf("read confirm state: %w", err)
 	}
-	data, _, err = db.maybeDecryptTreeJSON(data)
+	data, _, err = db.maybeDecryptTreeJSON(data, nil)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt confirm state: %w", err)
 	}
@@ -336,16 +336,29 @@ func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 	// with no envelope is a pre-floor (legacy) DB and is read unchanged
 	// (committed defaults true — migration rule C3).
 	committed := true
+	// #7176 (C179-053): the AAD for the body is the stored header line, but
+	// ONLY for envelopes stamped at or above envelopeAADFormatVersion. Below
+	// that the body was sealed with nil AAD and must be opened the same way.
+	//
+	// The gate reads the STORED v=, not this build's constant, and that is what
+	// makes a forced downgrade fail closed: rewriting a v2 header to v=1 selects
+	// the nil-AAD path against a ciphertext sealed with AAD, so the tag check
+	// fails. Editing anything else in a v2 header — the committed= marker
+	// included — changes the AAD and fails the same way.
+	var aad []byte
 	if hasEnvelope(data) {
 		body, hdr, eerr := stripEnvelope(data)
 		if eerr != nil {
 			return nil, true, fmt.Errorf("read %s: %w", path, eerr)
 		}
+		if hdr.FormatVersion >= envelopeAADFormatVersion {
+			aad = envelopeHeaderLineBytes(data)
+		}
 		data = body
 		committed = hdr.Committed
 	}
 
-	data, decrypted, err := db.maybeDecryptTreeJSON(data)
+	data, decrypted, err := db.maybeDecryptTreeJSON(data, aad)
 	if err != nil {
 		return nil, true, fmt.Errorf("decrypt %s: %w", path, err)
 	}
@@ -437,7 +450,30 @@ func (db *DB) writeTreeMarked(path string, tree *config.ConfigTree, committed bo
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	data, err = db.maybeEncryptTreeJSON(data, tree)
+	// #7176 (C179-053): the header must exist BEFORE the seal, because it IS
+	// the AAD. Encryption-ness is known here (the same predicate
+	// maybeEncryptTreeJSON uses), which also lets min-reader be exact: only an
+	// ENCRYPTED v2 envelope is unreadable by a pre-v2 build, so only that case
+	// raises the floor. An unencrypted v2 envelope has no ciphertext to bind
+	// and stays readable by an older reader — stamping min-reader=2 on it would
+	// refuse a downgrade for no reason.
+	//
+	// The alternative — leaving min-reader at 1 always — is also fail-closed,
+	// but an old build would report an opaque "decrypt config tree" failure
+	// instead of the envelope layer's explicit "too new" message. A confusing
+	// error during a rollback is the worst time for one.
+	encrypted := masterPasswordPRF(tree) != ""
+	minReader := EnvelopeMinReaderVersion
+	if encrypted {
+		minReader = envelopeAADFormatVersion
+	}
+	header := buildEnvelopeHeaderLine(db.writerVersion, committed, minReader)
+
+	var aad []byte
+	if encrypted {
+		aad = header
+	}
+	data, err = db.maybeEncryptTreeJSON(data, tree, aad)
 	if err != nil {
 		return fmt.Errorf("encrypt config: %w", err)
 	}
@@ -447,7 +483,9 @@ func (db *DB) writeTreeMarked(path string, tree *config.ConfigTree, committed bo
 	// reader fail closed (its json.Unmarshal rejects a leading '#'), so a
 	// future format bump can never silently empty-load on an old reader.
 	// committed stamps the #1922 step-0 marker.
-	data = wrapEnvelope(data, db.writerVersion, committed)
+	out := make([]byte, 0, len(header)+len(data))
+	out = append(out, header...)
+	data = append(out, data...)
 
 	// Owner-only 0600 (#4056): active.json / candidate.json /
 	// rollback.N.json carry the full config, including secret leaves (IKE

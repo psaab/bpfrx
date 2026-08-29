@@ -62,7 +62,7 @@ func TestAtRestKeyTravelsWithTheConfigDirectory6856(t *testing.T) {
 		t.Fatalf("fixture broken: masterPasswordPRF resolved empty, so nothing " +
 			"would be encrypted and both cells below would prove nothing")
 	}
-	body, err := origin.maybeEncryptTreeJSON(plaintext, tree)
+	body, err := origin.maybeEncryptTreeJSON(plaintext, tree, nil)
 	if err != nil {
 		t.Fatalf("maybeEncryptTreeJSON: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestAtRestKeyTravelsWithTheConfigDirectory6856(t *testing.T) {
 		}
 		stolen := &DB{dir: stolenDir}
 
-		got, decrypted, err := stolen.maybeDecryptTreeJSON(body)
+		got, decrypted, err := stolen.maybeDecryptTreeJSON(body, nil)
 		if err != nil {
 			t.Fatalf("a copied .configdb directory failed to decrypt (%v) — if this "+
 				"is an intentional hardening change, the README's threat-model "+
@@ -114,7 +114,7 @@ func TestAtRestKeyTravelsWithTheConfigDirectory6856(t *testing.T) {
 		// encryption actually defends.
 		bodyOnly := &DB{dir: t.TempDir()} // no master.key written
 
-		got, decrypted, err := bodyOnly.maybeDecryptTreeJSON(body)
+		got, decrypted, err := bodyOnly.maybeDecryptTreeJSON(body, nil)
 		if err == nil {
 			t.Fatalf("body decrypted without master.key (decrypted=%t, got=%q) — "+
 				"at-rest encryption would then protect nothing at all", decrypted, got)
