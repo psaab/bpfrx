@@ -38,21 +38,81 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[inline(always)]
 pub(super) fn write_ipv4_src(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
+    // Executable form of the module-level precondition (#7171). These
+    // helpers are documented as having NO length guard -- the caller must
+    // have validated the IPv4 header is present -- but until now that
+    // contract lived only in a comment, so a caller that got it wrong got a
+    // bare slice-index panic naming this file rather than the site that
+    // actually failed to bounds-check. This is a DIAGNOSTIC, not a safety
+    // fix: the indexing below is already memory-safe and panics on a short
+    // frame either way. debug_assert keeps the release fast path
+    // byte-identical.
+    debug_assert!(
+        packet.len() >= ip + 20,
+        "write_ipv4_src: packet.len()={} < ip={} + 20",
+        packet.len(),
+        ip
+    );
     packet[ip + 12..ip + 16].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
 pub(super) fn write_ipv4_dst(packet: &mut [u8], ip: usize, addr: Ipv4Addr) {
+    // Executable form of the module-level precondition (#7171). These
+    // helpers are documented as having NO length guard -- the caller must
+    // have validated the IPv4 header is present -- but until now that
+    // contract lived only in a comment, so a caller that got it wrong got a
+    // bare slice-index panic naming this file rather than the site that
+    // actually failed to bounds-check. This is a DIAGNOSTIC, not a safety
+    // fix: the indexing below is already memory-safe and panics on a short
+    // frame either way. debug_assert keeps the release fast path
+    // byte-identical.
+    debug_assert!(
+        packet.len() >= ip + 20,
+        "write_ipv4_dst: packet.len()={} < ip={} + 20",
+        packet.len(),
+        ip
+    );
     packet[ip + 16..ip + 20].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
 pub(super) fn write_ipv6_src(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
+    // Executable form of the module-level precondition (#7171). These
+    // helpers are documented as having NO length guard -- the caller must
+    // have validated the IPv6 header is present -- but until now that
+    // contract lived only in a comment, so a caller that got it wrong got a
+    // bare slice-index panic naming this file rather than the site that
+    // actually failed to bounds-check. This is a DIAGNOSTIC, not a safety
+    // fix: the indexing below is already memory-safe and panics on a short
+    // frame either way. debug_assert keeps the release fast path
+    // byte-identical.
+    debug_assert!(
+        packet.len() >= ip + 40,
+        "write_ipv6_src: packet.len()={} < ip={} + 40",
+        packet.len(),
+        ip
+    );
     packet[ip + 8..ip + 24].copy_from_slice(&addr.octets());
 }
 
 #[inline(always)]
 pub(super) fn write_ipv6_dst(packet: &mut [u8], ip: usize, addr: Ipv6Addr) {
+    // Executable form of the module-level precondition (#7171). These
+    // helpers are documented as having NO length guard -- the caller must
+    // have validated the IPv6 header is present -- but until now that
+    // contract lived only in a comment, so a caller that got it wrong got a
+    // bare slice-index panic naming this file rather than the site that
+    // actually failed to bounds-check. This is a DIAGNOSTIC, not a safety
+    // fix: the indexing below is already memory-safe and panics on a short
+    // frame either way. debug_assert keeps the release fast path
+    // byte-identical.
+    debug_assert!(
+        packet.len() >= ip + 40,
+        "write_ipv6_dst: packet.len()={} < ip={} + 40",
+        packet.len(),
+        ip
+    );
     packet[ip + 24..ip + 40].copy_from_slice(&addr.octets());
 }
 
