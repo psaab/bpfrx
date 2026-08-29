@@ -177,6 +177,34 @@ func TestOpenWorldTrailingGrammarStillCommits_7033(t *testing.T) {
 	}
 }
 
+// TestOpenWorldTailContainingOffStillCommits_7033 is the adversarial version of
+// the case above, and it is the one that actually bites.
+//
+// A realistic open-world tail (`persistent-nat permit any-remote-host`) contains
+// no action keyword, so a scan that failed to stop would still record one mode
+// and that fixture would pass anyway. Putting the token `off` IN the tail is the
+// smallest shape where "stop at the first unrecognised token" changes an
+// outcome: without the stop, this legal config is rejected as a contradiction
+// the operator never wrote. #4313 makes the trailing grammar open-world, so the
+// scan cannot assume a tail is free of words it recognises.
+func TestOpenWorldTailContainingOffStillCommits_7033(t *testing.T) {
+	txt := snat7033("then { source-nat pool P persistent-nat permit off; }")
+	tree, perr := NewParser(txt).Parse()
+	if len(perr) != 0 {
+		t.Fatalf("fixture did not parse: %v", perr)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("an open-world tail that happens to contain the token `off` must still "+
+			"commit, got: %v.\nEverything after `persistent-nat` belongs to a sub-grammar "+
+			"the action scan does not model — reading it as actions invents a "+
+			"contradiction in a valid config", err)
+	}
+	if got := cfg.Security.NAT.Source[0].Rules[0].Then; got.PoolName != "P" || got.Off {
+		t.Fatalf("resolved Then={Off:%v PoolName:%q}, want {false P}", got.Off, got.PoolName)
+	}
+}
+
 // TestPoolNamedOffIsAPoolNotAnExemption_7033: `pool` consumes exactly one value
 // token, so a pool legitimately NAMED `off` resolves as a name.
 //
