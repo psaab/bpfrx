@@ -48,7 +48,23 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 // change. A change to both bumps both. They are equal today (1) and that
 // equality is a coincidence of history, NOT an invariant — do not write a test
 // that pins them to each other.
-const SessionSyncWireVersion = uint16(1)
+// #7163 bumped this from 1 to 2. The session-sync handshake was replaced with
+// Noise_NNpsk0 (sync_auth_noise_7163.go), which a pre-#7163 peer cannot speak:
+// its HELLO is not a valid Noise msg1 and its proof is not a valid msg2. That
+// is a FLAG DAY — both nodes must run the new build and sessions drop on the
+// upgrade.
+//
+// The bump is deliberately on THIS counter and not on
+// CurrentHAProtocolVersion. GateMixedBaseSwap treats them differently:
+// session-sync must match EXACTLY, so bumping here is what makes the mixed-base
+// swap refuse up front instead of letting an operator discover a fabric that
+// will not come up. The HA protocol is accepted over a window
+// [MinCompat, Current] that is a single point today, so bumping THAT as well
+// would additionally refuse a peer at N over heartbeat/failover semantics this
+// change does not touch — a second, unnecessary failure on top of the one this
+// change genuinely costs. #7925 split the counters precisely so a session-wire
+// change stops dragging the HA protocol out from under its own compat floor.
+const SessionSyncWireVersion = uint16(2)
 
 const (
 	syncMsgSessionV4              = 1

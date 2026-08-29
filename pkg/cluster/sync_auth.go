@@ -52,7 +52,6 @@ package cluster
 import (
 	"bytes"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -518,114 +517,36 @@ func readSyncFrameRaw(conn net.Conn) (typ uint8, payload []byte, err error) {
 // HELLO and PROOF are written concurrently with reading the peer's frame so the
 // handshake works over a fully-synchronous transport (net.Pipe in tests): a
 // strict write-then-read on both symmetric peers would deadlock.
-func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte, error) {
+func (s *SessionSync) performSyncHandshake(conn net.Conn, initiator bool, fabricIdx int) (syncAuthMode, syncNoiseKeys, error) {
 	key := s.authKey()
 	if len(key) == 0 {
-		// No local key ⇒ no handshake; legacy behavior (dual-accept).
-		return syncAuthUnauthenticated, nil, nil
+		// No local key => no handshake; legacy behavior (dual-accept).
+		return syncAuthUnauthenticated, syncNoiseKeys{}, nil
 	}
 
 	if err := conn.SetDeadline(time.Now().Add(syncHandshakeTimeout)); err != nil {
-		return syncAuthUnauthenticated, nil, err
+		return syncAuthUnauthenticated, syncNoiseKeys{}, err
 	}
 	defer conn.SetDeadline(time.Time{})
 
-	localNonce := make([]byte, syncAuthNonceSize)
-	if _, err := rand.Read(localNonce); err != nil {
-		return syncAuthUnauthenticated, nil, fmt.Errorf("cluster sync: handshake nonce: %w", err)
-	}
-	hello := make([]byte, 0, 2+syncAuthNonceSize)
-	hello = append(hello, syncAuthVersion, 1) // version, keyed=1
-	hello = append(hello, localNonce...)
-
-	writeErr := make(chan error, 1)
-	go func() { writeErr <- writeMsg(conn, syncMsgAuthHello, hello) }()
-
-	typ, payload, err := readSyncFrameRaw(conn)
+	// #7163: the whole custom challenge-response is replaced by Noise_NNpsk0.
+	// What used to live here — a nonce exchange, syncAuthProof over the peer's
+	// nonce, syncCheckPeerNonce, and syncDeriveFrameKey's canonical sort — is
+	// gone rather than reordered, because every one of those pieces existed to
+	// approximate a property the pattern now supplies by construction. See
+	// sync_auth_noise_7163.go for which binding comes from where.
+	//
+	// The legacy arms are gone with it, and that is a DELIBERATE
+	// INCOMPATIBILITY, not an oversight: this is a flag day. A pre-#7163 peer
+	// sends the old HELLO, which is not a valid Noise msg1, so the handshake
+	// fails and the connection drops. SessionSyncWireVersion is bumped so
+	// GateMixedBaseSwap refuses the mixed-base swap up front rather than
+	// letting an operator discover it as a fabric that will not come up.
+	keys, err := s.performNoiseHandshake(conn, key, initiator, fabricIdx)
 	if err != nil {
-		<-writeErr
-		return syncAuthUnauthenticated, nil, err
+		return syncAuthUnauthenticated, syncNoiseKeys{}, err
 	}
-	if werr := <-writeErr; werr != nil {
-		return syncAuthUnauthenticated, nil, werr
-	}
-
-	if typ != syncMsgAuthHello {
-		// Peer sent a real frame, not a HELLO ⇒ legacy or unkeyed peer. This
-		// node is keyed (the len(key)==0 early return is above), so the frame
-		// is discarded unread and the connection dropped. This arm rejects
-		// UNCONDITIONALLY — it does not branch on syncAuthDecision's accept
-		// bit, which is consulted only for the operator-facing reason string.
-		// That is deliberate: with the pending mechanism gone there is no
-		// "accept" outcome available here, so re-introducing a grace in the
-		// decision must not silently re-open this path.
-		//
-		// #5078: this arm used to hand that first frame back to the caller as a
-		// `pendingFrame`, which executed it BEFORE the connection was admitted
-		// — `syncMsgFence` on that path disabled every routing group for a peer
-		// that had proven nothing. With the dual-accept grace gone the arm can
-		// no longer accept, so the mechanism is deleted rather than reordered:
-		// unreachable code that mutates cluster state pre-admission is one edit
-		// away from being live again.
-		_, _, reason := syncAuthDecision(true, false, false, false)
-		return syncAuthUnauthenticated, nil, errors.New(reason)
-	}
-
-	if len(payload) < 2+syncAuthNonceSize {
-		return syncAuthUnauthenticated, nil, errors.New("cluster sync: short auth HELLO")
-	}
-	peerKeyed := payload[1] != 0
-	peerNonce := payload[2 : 2+syncAuthNonceSize]
-
-	if !peerKeyed {
-		// Peer is a new build that speaks the handshake but holds no key ⇒ it
-		// is not signing and can prove nothing. This node is keyed, so the
-		// connection is dropped.
-		//
-		// Like the legacy/no-HELLO arm above, this arm rejects
-		// UNCONDITIONALLY — it does not branch on syncAuthDecision's accept
-		// bit, which is consulted only for the operator-facing reason string.
-		// The two arms are the SAME admission decision reached by different
-		// evidence (no HELLO at all vs. a HELLO advertising keyed=0), so they
-		// get the same shape deliberately: this is the arm that literally IS
-		// the rolling-upgrade case, so it is the one an operator restoring
-		// rolling-upgrade compatibility would edit first. Leaving an "accept"
-		// outcome reachable here — even one that today's decision never
-		// returns — is a single deleted `if` away from admitting a PSK-less
-		// peer that then fences every routing group.
-		_, _, reason := syncAuthDecision(true, true, false, false)
-		return syncAuthUnauthenticated, nil, errors.New(reason)
-	}
-
-	// #5078: refuse a reflected or degenerate peer nonce BEFORE this node emits
-	// a proof over it. Ordered ahead of syncAuthProof deliberately — the proof
-	// this node writes IS the value the echo attack replays back, so a check
-	// that ran after it would already have handed the attacker the answer.
-	if err := syncCheckPeerNonce(localNonce, peerNonce); err != nil {
-		return syncAuthUnauthenticated, nil, err
-	}
-
-	// Both keyed ⇒ mutual challenge-response: prove we hold the key over the
-	// PEER's nonce; verify the peer's proof over OUR nonce.
-	proofOut := syncAuthProof(key, peerNonce)
-	go func() { writeErr <- writeMsg(conn, syncMsgAuthProof, proofOut) }()
-
-	ptyp, ppayload, err := readSyncFrameRaw(conn)
-	if err != nil {
-		<-writeErr
-		return syncAuthUnauthenticated, nil, err
-	}
-	if werr := <-writeErr; werr != nil {
-		return syncAuthUnauthenticated, nil, werr
-	}
-
-	proofOK := ptyp == syncMsgAuthProof && hmac.Equal(ppayload, syncAuthProof(key, localNonce))
-	mode, accept, reason := syncAuthDecision(true, true, true, proofOK)
-	if !accept {
-		return syncAuthUnauthenticated, nil, errors.New(reason)
-	}
-	frameKey := syncDeriveFrameKey(key, localNonce, peerNonce)
-	return mode, frameKey, nil
+	return syncAuthAuthenticated, keys, nil
 }
 
 // wrapSyncConn applies the negotiated handshake result to a connection: it
@@ -640,14 +561,19 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 // prose outlived the mechanism; see the `pendingFrame` note in
 // syncAuthDecision for why executing a peer frame before admission was the
 // bug rather than the feature.
-func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMode, frameKey []byte) *authConn {
+func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMode, keys syncNoiseKeys) *authConn {
 	ac := &authConn{Conn: conn}
 	if mode == syncAuthAuthenticated {
-		// Both directions at once: the handshake completed before any frame
-		// flowed, so there is no live stream to switch and no ordering to
+		// #7163: the two directions get INDEPENDENT keys, straight from the
+		// Noise Split(). Before this they were the same bytes, which is what
+		// made a node's own frame — `syncMsgFence` above all — verify when
+		// echoed back to it on the same connection.
+		//
+		// Both are set at once because the handshake completed before any
+		// frame flowed: there is no live stream to switch and no ordering to
 		// respect. Only the #6628 in-place upgrade sets them separately.
-		ac.readKey = frameKey
-		ac.writeKey = frameKey
+		ac.readKey = keys.readKey
+		ac.writeKey = keys.writeKey
 		// #6628: record the PSK this connection authenticated under, so the
 		// in-place-upgrade reconciler leaves it alone. Without this a
 		// connect-authenticated connection looks stale to the reconciler

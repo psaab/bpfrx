@@ -357,9 +357,13 @@ func TestConnectAuthenticatedConnectionIsNotDisturbedByACommit6628(t *testing.T)
 	// delete `ac.authPSK = ...` from wrapSyncConn and a hand-built fixture stays
 	// green while every real connect-authenticated connection is churned on
 	// every commit. Driving the production wrapper is the difference.
-	frameKey := syncDeriveFrameKey([]byte(psk),
-		[]byte("nonce-a-connect-time-32-bytes-xx"), []byte("nonce-b-connect-time-32-bytes-yy"))
-	wrapped := e.s.wrapSyncConn(0, e.ac.Conn, syncAuthAuthenticated, frameKey)
+	// #7163: directional keys. Deliberately DIFFERENT bytes per direction —
+	// the pre-#7163 shape used one key for both, which is the defect.
+	frameKeys := syncNoiseKeys{
+		readKey:  []byte("connect-time-read-key-32-bytes!!"),
+		writeKey: []byte("connect-time-write-key-32-byte!!"),
+	}
+	wrapped := e.s.wrapSyncConn(0, e.ac.Conn, syncAuthAuthenticated, frameKeys)
 	e.ac = wrapped
 	e.s.mu.Lock()
 	e.s.conn0 = wrapped

@@ -151,7 +151,7 @@ func TestPreAuthDefersBufferSizingUntilAuth(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		s.handleNewConnection(context.Background(), 0, srv)
+		s.handleNewConnection(context.Background(), 0, srv, true)
 		close(done)
 	}()
 

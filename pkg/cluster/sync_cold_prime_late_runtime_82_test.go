@@ -56,7 +56,7 @@ func TestColdPrimeOwedWhenRuntimeWiredAfterConnect(t *testing.T) {
 
 	// The peer connects inside the wiring window. Unkeyed, so the handshake is
 	// a no-op and handleNewConnection runs the real cold-prime path.
-	prim.handleNewConnection(ctx, 0, cap)
+	prim.handleNewConnection(ctx, 0, cap, true)
 
 	if got := prim.stats.BulkSyncs.Load(); got != 0 {
 		t.Fatalf("precondition: bulk must have failed with a nil session store, got %d completed bulks", got)
