@@ -768,6 +768,18 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		prometheus.CounterValue,
 		float64(status.InterfaceSNATPATCollisionsTotal),
 	)
+	// #7056: emitted unconditionally like the sibling above — a published 0 is
+	// the informative reading (no alias was ever refused), not an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNAT64FragCrossDomainMisses,
+		prometheus.CounterValue,
+		float64(status.NAT64FragCrossDomainMissesTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNAT64FragProtocolAliasMisses,
+		prometheus.CounterValue,
+		float64(status.NAT64FragProtocolAliasMissesTotal),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		c.userspaceInterfaceSNATIdentityExhaustion,
 		prometheus.CounterValue,

@@ -359,6 +359,23 @@ type ProcessStatus struct {
 	// xpf_userspace_interface_snat_pat_collisions_total. Omitempty for wire
 	// compat with older helpers.
 	InterfaceSNATPATCollisionsTotal uint64 `json:"interface_snat_pat_collisions_total,omitempty"`
+
+	// NAT64FragCrossDomainMissesTotal is #7056 (#5798 required-fix #5):
+	// fragment-association misses where a same-datagram entry existed under a
+	// DIFFERENT ingress security domain. The fail-closed refusal is #6835's;
+	// this is the observability half required-fix #5 asked for. Before it,
+	// such a miss was indistinguishable from a reorder, a TTL straddle, a
+	// shard eviction or a config-generation bump — all of which land on
+	// nat64_frag_dropped. This is the only one of that group that describes
+	// the TRAFFIC rather than cache pressure.
+	NAT64FragCrossDomainMissesTotal uint64 `json:"nat64_frag_cross_domain_misses_total,omitempty"`
+
+	// NAT64FragProtocolAliasMissesTotal is #7056's sibling leg: same ingress
+	// domain, different upper-layer protocol — a TCP and a UDP datagram that
+	// collided on (src, dst, ident) and were separated by the #5798 `protocol`
+	// key field. Kept DISTINCT from the cross-domain counter because the two
+	// are different operator stories; one total would answer neither.
+	NAT64FragProtocolAliasMissesTotal uint64 `json:"nat64_frag_protocol_alias_misses_total,omitempty"`
 	// InterfaceSNATIdentityExhaustionTotal is #6751 PR 2/3: interface-mode
 	// SNAT admissions that failed CLOSED because no free translated
 	// identity existed for their (egress address, remote endpoint) — every

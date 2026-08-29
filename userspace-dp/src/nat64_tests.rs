@@ -6887,3 +6887,179 @@ fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
          the forward entry owns it"
     );
 }
+
+// ---- #7056 (#5798 required-fix #5): the distinct refused-alias counters ----
+
+fn frag_alias_counts_7056() -> (u64, u64) {
+    (
+        NAT64_FRAG_CROSS_DOMAIN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+        NAT64_FRAG_PROTOCOL_ALIAS_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn frag_key_7056(protocol: u8, authority: FragAuthority) -> Nat64FragKey {
+    Nat64FragKey {
+        addr_family: libc::AF_INET6 as u8,
+        src: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        ident: 0xfeed,
+        protocol,
+        authority,
+    }
+}
+
+/// #7056: a fragment-association miss has several causes with very different
+/// meanings, and before this they all landed on the same drop counter. This is
+/// the table that separates them, and the MIDDLE ROW is what makes it a test
+/// rather than a demonstration: an ordinary miss — no entry at all — must count
+/// as NEITHER. A classifier that simply counted every miss would satisfy the two
+/// interesting rows and fail this one.
+#[test]
+fn refused_alias_misses_are_counted_distinctly_7056() {
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+
+    // (1) CROSS-DOMAIN: installed under one authority, consulted under another.
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1,
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_other_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(
+        hit.is_none(),
+        "precondition: a cross-domain consult must MISS (the #5798 fail-closed \
+         behaviour); if it hits, this test is measuring the wrong thing"
+    );
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (1, 0),
+        "a cross-domain refusal must advance the CROSS-DOMAIN counter and only \
+         that one — it is the one miss cause that describes the traffic rather \
+         than cache pressure (#7056)"
+    );
+
+    // (2) PROTOCOL ALIAS: same authority, TCP vs UDP on one (src, dst, ident).
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1,
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_TCP, frag_test_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: a protocol-aliased consult must MISS");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 1),
+        "a protocol-alias refusal must advance the PROTOCOL counter and only that \
+         one. Folding the two into a single \"alias refused\" total would answer \
+         neither operator question: cross-domain means another security domain's \
+         association was probed, protocol-alias means TCP and UDP collided on \
+         (src, dst, ident) (#7056)"
+    );
+
+    // (3) THE MIDDLE ROW — an ordinary miss, no entry at all. Neither counter.
+    let cache = Nat64FragAssoc::new();
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_test_authority()),
+        2_000,
+        1,
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: an empty cache must miss");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "an ORDINARY miss — reorder, TTL straddle, eviction, cold cache — must \
+         advance NEITHER counter. This is the row that distinguishes a real \
+         classifier from one that counts every miss, and counting every miss is \
+         exactly the lumping #7056 exists to undo"
+    );
+
+    // (4) A HIT must not count either, or the counters measure consult volume.
+    let cache = Nat64FragAssoc::new();
+    let key = frag_key_7056(PROTO_UDP, frag_test_authority());
+    cache.install(key, decision, None, 1_000, 1, 0);
+    let (x0, p0) = frag_alias_counts_7056();
+    let hit = cache.lookup(&key, 2_000, 1, |_| true);
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_some(), "precondition: the matching consult must HIT");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "a HIT must advance neither counter"
+    );
+}
+
+/// #7056: the classification must survive the entry it is classifying against
+/// being evicted for an unrelated reason. A config-generation bump evicts the
+/// entry and returns a miss BEFORE the alias scan would run, so that miss is a
+/// generation miss — not a refused alias — even though the stale entry differed
+/// in authority too.
+///
+/// Without this, the classifier could attribute every generation-fenced miss to
+/// cross-domain aliasing on a box that had simply committed a config change,
+/// which is the false-positive direction: it would make the one counter that is
+/// supposed to mean "something is probing another domain" fire on an ordinary
+/// commit.
+#[test]
+fn a_generation_fenced_miss_is_not_reported_as_an_alias_7056() {
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+    let cache = Nat64FragAssoc::new();
+    cache.install(
+        frag_key_7056(PROTO_UDP, frag_test_authority()),
+        decision,
+        None,
+        1_000,
+        1, // generation 1
+        0,
+    );
+    let (x0, p0) = frag_alias_counts_7056();
+    // SAME key, but the config generation moved on.
+    let hit = cache.lookup(
+        &frag_key_7056(PROTO_UDP, frag_test_authority()),
+        2_000,
+        2, // generation 2
+        |_| true,
+    );
+    let (x1, p1) = frag_alias_counts_7056();
+    assert!(hit.is_none(), "precondition: a stale-generation entry must miss");
+    assert_eq!(
+        (x1 - x0, p1 - p0),
+        (0, 0),
+        "a CONFIG-GENERATION miss must not be reported as a refused alias — it is \
+         an ordinary commit invalidating the cache, and attributing it to \
+         cross-domain probing would make that counter fire on every config \
+         change (#7056)"
+    );
+}

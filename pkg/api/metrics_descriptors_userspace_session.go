@@ -48,6 +48,33 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"against an already-unindexed session are not counted.",
 		nil, nil,
 	)
+	c.userspaceNAT64FragCrossDomainMisses = prometheus.NewDesc(
+		"xpf_userspace_nat64_frag_cross_domain_misses_total",
+		"#7056 (#5798 required-fix #5): fragment-association lookups that "+
+			"MISSED because a same-datagram association exists under a "+
+			"DIFFERENT ingress security domain, so the #5798 authority-scoped "+
+			"key refused it. The refusal itself is the fail-closed behaviour "+
+			"and is not a defect; this series exists because such a miss was "+
+			"previously indistinguishable from a reorder, a TTL straddle, a "+
+			"shard eviction or a config-generation bump, all of which land on "+
+			"the same drop counter. It is the only one of that group that "+
+			"describes the TRAFFIC rather than cache pressure: a nonzero and "+
+			"rising value means fragments are arriving in one security domain "+
+			"bearing the identity of a datagram admitted in another.",
+		nil, nil,
+	)
+	c.userspaceNAT64FragProtocolAliasMisses = prometheus.NewDesc(
+		"xpf_userspace_nat64_frag_protocol_alias_misses_total",
+		"#7056: the sibling of the cross-domain series — a same-datagram "+
+			"association exists under the SAME ingress domain but a different "+
+			"upper-layer protocol, i.e. a TCP and a UDP datagram collided on "+
+			"(src, dst, ident) and were separated by the #5798 `protocol` key "+
+			"field. Kept as a DISTINCT series rather than folded into the "+
+			"cross-domain total because the two are different operator "+
+			"stories: this one is ordinary identifier reuse between protocols, "+
+			"not a domain-crossing attempt.",
+		nil, nil,
+	)
 	c.userspaceInterfaceSNATPATCollisions = prometheus.NewDesc(
 		"xpf_userspace_interface_snat_pat_collisions_total",
 		"#6751: interface-mode source-NAT admissions whose PRESERVED "+

@@ -320,6 +320,26 @@ impl super::Coordinator {
         crate::nat::INTERFACE_SNAT_PAT_COLLISIONS.load(Ordering::Relaxed)
     }
 
+    /// #7056 (#5798 required-fix #5): fragment-association misses where a
+    /// same-datagram entry existed under a DIFFERENT ingress security domain.
+    /// The fail-closed refusal itself is #6835's; this is the observability
+    /// half, and it is the one miss cause that describes the TRAFFIC rather
+    /// than cache pressure. Surfaced as
+    /// `xpf_userspace_nat64_frag_cross_domain_misses_total`.
+    pub fn nat64_frag_cross_domain_misses_total(&self) -> u64 {
+        crate::nat64::NAT64_FRAG_CROSS_DOMAIN_MISSES.load(Ordering::Relaxed)
+    }
+
+    /// #7056: the sibling leg — same ingress domain, different upper-layer
+    /// protocol, i.e. a TCP and a UDP datagram that collided on
+    /// `(src, dst, ident)` and were separated by the #5798 `protocol` key
+    /// field. Kept DISTINCT from the cross-domain counter because the two are
+    /// different operator stories. Surfaced as
+    /// `xpf_userspace_nat64_frag_protocol_alias_misses_total`.
+    pub fn nat64_frag_protocol_alias_misses_total(&self) -> u64 {
+        crate::nat64::NAT64_FRAG_PROTOCOL_ALIAS_MISSES.load(Ordering::Relaxed)
+    }
+
     /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED with no
     /// free translated identity for their `(egress, remote)` pair, plus
     /// peer-synced imports refused for the same reason. Surfaced as
