@@ -679,6 +679,15 @@ pub(in crate::afxdp) struct BatchCounters {
     // let real fragments traverse end-to-end (#3291 stage 4) is deferred, so
     // this is the observable-drop half of #2562.
     nat64_frag_dropped: u64,
+    // #7054: first-fragment installs that evicted a still-LIVE association
+    // because their shard was at `NAT64_FRAG_CAP_PER_SHARD` with nothing
+    // expired to reclaim. The eviction itself is correct — a fixed ceiling has
+    // to sacrifice something — but it was SILENT: the victim's non-first
+    // fragments then miss and are dropped fail-closed, and the only trace was a
+    // `nat64_frag_dropped` bump indistinguishable from an ordinary orphan.
+    // Counting it separates "capacity pressure" from "reorder/orphan", which is
+    // what tells an operator whether the shard cap is the problem.
+    nat64_frag_assoc_evicted: u64,
     // #5623: fail-closed NAT64 SOURCE-ineligibility drops — an incoming IPv6
     // packet whose SOURCE lies within a configured Pref64 (a looping/synthesized
     // "already-translated" source, the RFC 6146 §5 hairpin construction — plus
@@ -891,6 +900,13 @@ impl BatchCounters {
         self.nat64_frag_dropped += 1;
     }
 
+    /// #7054: record one first-fragment install that evicted a still-LIVE
+    /// association. Flushed to `BindingLiveState.nat64_frag_assoc_evicted`.
+    pub(in crate::afxdp) fn record_nat64_frag_assoc_evicted(&mut self) {
+        self.touched = true;
+        self.nat64_frag_assoc_evicted += 1;
+    }
+
     /// #6122: record a fail-closed drop of an ordinary same-family NAT'd
     /// non-first fragment that missed the fragment-association cache. Bumped on
     /// the flowless miss path when `flowless_fragment_requires_nat_translation`
@@ -1030,6 +1046,11 @@ impl BatchCounters {
         }
         // #2562: fail-closed NAT64 fragment-drop tally, batched like the sibling
         // nat64 drop counters above.
+        if self.nat64_frag_assoc_evicted != 0 {
+            live.nat64_frag_assoc_evicted
+                .fetch_add(self.nat64_frag_assoc_evicted, Ordering::Relaxed);
+            self.nat64_frag_assoc_evicted = 0;
+        }
         if self.nat64_frag_dropped != 0 {
             live.nat64_frag_dropped
                 .fetch_add(self.nat64_frag_dropped, Ordering::Relaxed);

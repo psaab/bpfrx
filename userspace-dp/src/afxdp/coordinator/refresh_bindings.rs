@@ -137,6 +137,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.nat64_no_source_pool = snap.nat64_no_source_pool;
     binding.nat64_pool_exhausted = snap.nat64_pool_exhausted;
     binding.nat64_frag_dropped = snap.nat64_frag_dropped;
+    binding.nat64_frag_assoc_evicted = snap.nat64_frag_assoc_evicted;
     binding.nat64_ineligible_source = snap.nat64_ineligible_source;
     binding.nat64_ineligible_dest = snap.nat64_ineligible_dest;
     binding.nat64_exthdr_ineligible = snap.nat64_exthdr_ineligible;
@@ -360,6 +361,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.nat64_no_source_pool = 0;
     binding.nat64_pool_exhausted = 0;
     binding.nat64_frag_dropped = 0;
+    binding.nat64_frag_assoc_evicted = 0;
     binding.nat64_ineligible_source = 0;
     binding.nat64_ineligible_dest = 0;
     binding.nat64_exthdr_ineligible = 0;

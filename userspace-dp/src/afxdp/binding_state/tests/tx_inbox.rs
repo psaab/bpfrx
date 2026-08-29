@@ -139,6 +139,15 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 /// full scope, including why `repr(Rust)` plus an unpinned toolchain makes these
 /// literals a build tripwire rather than a portable invariant.
 #[test]
+// #7054 re-measured the two OFFSET literals here (2160 -> 2168, 2288 -> 2296)
+// in lockstep with the compile-time asserts in `binding_state/mod.rs`, when the
+// unconditional `nat64_frag_assoc_evicted` counter joined the cold-counter run.
+// Both must move together: this runtime cell and those `const _` asserts are
+// the pair that makes a `#[cfg(test)]` field detectable, because for such a
+// field production and test builds disagree and at most one can be green at any
+// one set of literals. An unconditional field shifts both by the same 8 bytes,
+// so re-measuring both is the guard being ANSWERED. `size_of` stays 2304 — the
+// bytes came out of tail padding, again.
 fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304() {
     assert_eq!(
         std::mem::size_of::<BindingLiveState>(),
@@ -155,14 +164,14 @@ fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304(
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, pending_tx_admitted),
-        2160,
+        2168,
         "#6304/#6114: ...nor the OFFSET of the admission counter whose \
          cacheline this is all about. A `cfg(test)` field ahead of it moves \
          this to 2160 while leaving the size assert above satisfied"
     );
     assert_eq!(
         std::mem::offset_of!(BindingLiveState, delta_loss_pending),
-        2288,
+        2296,
         "#6304: ...nor the offset of the last-declared field, which is the \
          sentinel for a `cfg(test)` member appended at the END of the struct — \
          that shape moves this to 2288 and trips nothing else"

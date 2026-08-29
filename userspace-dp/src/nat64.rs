@@ -703,8 +703,11 @@ impl Nat64FragAssoc {
         // #6857: owner RG of the resolution this fragment was admitted under;
         // 0 when no RG-bound interface owns it.
         owner_rg: i32,
-    ) {
+    ) -> bool {
         let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        // #7054: did this install sacrifice a LIVE association? Reported to the
+        // caller so the condition is observable; see the note above the eviction.
+        let mut evicted_live = false;
         let idx = nat64_frag_shard_index(&key);
         let mut shard = self.shards[idx]
             .lock()
@@ -726,7 +729,7 @@ impl Nat64FragAssoc {
             // would leave the entry stamped with the old value.
             e.owner_rg = owner_rg;
             shard.push(e);
-            return;
+            return false;
         }
         if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
             // Reclaim EXPIRED slots before touching a live one. Under a flood of
@@ -742,6 +745,7 @@ impl Nat64FragAssoc {
             shard.retain(|e| e.deadline_ns > now_ns);
             if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
                 shard.remove(0);
+                evicted_live = true;
             }
         }
         shard.push(Nat64FragEntry {
@@ -752,6 +756,7 @@ impl Nat64FragAssoc {
             generation,
             owner_rg,
         });
+        evicted_live
     }
 
     /// Consult the association for a NON-first fragment. Prunes expired entries
