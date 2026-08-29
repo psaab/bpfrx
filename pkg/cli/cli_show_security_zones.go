@@ -106,7 +106,8 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 				// because with no overflow they remain genuinely ambiguous and
 				// naming one would be a guess.
 				// #6895: one canonical spelling for all three surfaces.
-				fmt.Println(zonecounters.UnavailableLine(zoneCounterOverflowActive(c)))
+				fmt.Println(zonecounters.UnavailableLineFor(
+					zoneCounterLayoutVersion(c), zoneCounterOverflowActive(c)))
 			case errIn == nil && errOut == nil:
 				fmt.Println("  Traffic statistics:")
 				fmt.Printf("    Input:  %d packets, %d bytes\n",
@@ -242,6 +243,24 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 // The status read is per-invocation of `show security zones` and only on the
 // branch that has already decided the zone is unpopulated, so it costs nothing on
 // the healthy path.
+// zoneCounterLayoutVersion reports the helper's per-zone counter layout version,
+// or unknownToCaller when no status could be read.
+//
+// #7087: it returns the SENTINEL rather than 0 on a failed read, because 0 is a
+// meaningful value on this wire — absent field means a pre-#3651 helper. A read
+// failure and an old helper are different states and must not render the same
+// sentence; that conflation is the defect this accessor exists to avoid.
+func zoneCounterLayoutVersion(c *CLI) uint32 {
+	if c == nil {
+		return zonecounters.LayoutVersionUnknown
+	}
+	status, err := c.userspaceDataplaneStatus()
+	if err != nil {
+		return zonecounters.LayoutVersionUnknown
+	}
+	return status.ZoneCounterLayoutVersion
+}
+
 func zoneCounterOverflowActive(c *CLI) bool {
 	if c == nil {
 		return false

@@ -2065,33 +2065,20 @@ pub(crate) fn release_nat64_allocation_for_worker(
 
 /// #4381: roll back a NAT64 forward flow's translated pool port on an
 /// install-failure / admission-refusal / ICMP-error-bounce path, mirroring
-/// `rollback_source_nat_allocation`.
-/// Compile-time completeness guard for #6211 F2: this untracked entry point is
-/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
-/// BUILD FAILURE in the non-test profile rather than a silent single-holder
-/// release of a reservation every worker holds. Production uses the
-/// `_for_worker` twin.
-#[cfg(test)]
-pub(crate) fn rollback_nat64_allocation(
-    nat64: &Nat64State,
-    key: &crate::session::SessionKey,
-    nat: NatDecision,
-    is_reverse: bool,
-    now_ns: u64,
-) {
-    release_nat64_allocation_with_mode(
-        nat64,
-        key,
-        nat,
-        is_reverse,
-        now_ns,
-        true,
-        crate::nat::NatHolder::Untracked,
-    );
-}
-
-/// #6211 F2: roll back THIS worker's hold on a NAT64 reservation. The
-/// holder-aware twin of [`rollback_nat64_allocation`].
+/// `rollback_source_nat_allocation_for_worker`.
+///
+/// #7094: this used to have an `Untracked` twin, kept `#[cfg(test)]` as the
+/// #6211 F2 completeness guard — a production caller that forgot to thread its
+/// `worker_id` would fail the non-test build rather than silently release a
+/// reservation every worker holds. The twin had no caller left, in tests or
+/// anywhere else, and rustc warned. Deleting it does not weaken that guard: an
+/// undefined name is a build failure in every profile, which is strictly
+/// stronger than a name that exists under `cfg(test)`.
+///
+/// The holder argument is the whole point and is bound by
+/// `nat64_7094_rollback_for_worker_frees_only_that_holder`: a rollback releases
+/// only THIS worker's hold, so a reservation several workers share survives
+/// until the last one lets go.
 pub(crate) fn rollback_nat64_allocation_for_worker(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
