@@ -395,7 +395,7 @@ upgrade on any connection whose recorded PSK differs from the live one. It is a
 **mid-stream key switch**, so the frame key is held per direction
 (`authConn.readKey` / `writeKey`) and each side switches at the boundary the
 peer switched at — TCP's per-direction ordering makes a frame an unambiguous
-boundary:
+boundary.
 
 Since **#7163** the exchange is Noise_NNpsk0, the same construction as the
 connect handshake (`sync_auth_noise_7163.go`), separated from it by a phase byte
@@ -481,8 +481,9 @@ by staying silent, and a decliner is indistinguishable from a legitimate
 not-yet-keyed peer. Closing that needs a bounded drop window — the mechanism
 #5078 shipped and removed.
 
-(Types 16-29 are listed in `pkg/cluster/sync.go`; the two above are called out
-here because they change how type 8 travels.)
+(Types 16-29 are listed in `pkg/cluster/sync.go`. Types 30-31 are called out in
+the table above because they change how type 8 travels; 32/33/36/37 because they
+are how an established connection becomes authenticated at all.)
 
 ### Config-Payload Confidentiality (#6629)
 

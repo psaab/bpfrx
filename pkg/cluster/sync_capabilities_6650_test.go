@@ -18,6 +18,11 @@ import (
 	"encoding/binary"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -271,4 +276,89 @@ func liveSyncMessageTypesExcept(under int) []syncMessageType {
 		out = append(out, m)
 	}
 	return out
+}
+
+// TestLiveSyncMessageCensusIsComplete7163 makes every uniqueness guard in this
+// package mean something.
+//
+// liveSyncMessageTypesExcept is a HAND-MAINTAINED list, and the uniqueness
+// tests that consume it are only as good as it is. A constant added to sync.go
+// and forgotten here does not fail anything — the census simply does not know
+// about it, so a collision WITH it is invisible and the suite stays green. The
+// length floors those tests carry are a partial guard at best: they catch a
+// deletion from the census, not an omission from it.
+//
+// Collisions in this number space are not hypothetical. 27 is deliberately
+// reused (syncMsgAuthHello is PRE-install, syncMsgConfigApplyNack is POST-),
+// and #7147's issue proposed 30 for the fence ack when 30 was already
+// syncMsgConfigKeyExchange.
+//
+// So this scans the package's own non-test sources for `syncMsgX = N`
+// declarations and requires every one to appear in the census with a MATCHING
+// value. Comment lines are stripped first, and that is not hygiene: without it
+// the gate could be satisfied by a doc comment quoting the very declaration it
+// is looking for. The floor on the scan count is there because a regex that
+// matched nothing would sweep zero declarations and report a complete census —
+// a check that fails to a value indistinguishable from healthy.
+func TestLiveSyncMessageCensusIsComplete7163(t *testing.T) {
+	t.Parallel()
+
+	// -1 matches no live constant, so nothing is excluded.
+	census := map[string]int{}
+	for _, m := range liveSyncMessageTypesExcept(-1) {
+		census["syncMsg"+m.name] = m.v
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	decl := regexp.MustCompile(`^\s*(syncMsg[A-Za-z0-9_]+)\s*=\s*(\d+)\s*$`)
+	found := map[string]int{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		body, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			if k := strings.Index(line, "//"); k >= 0 {
+				line = line[:k]
+			}
+			m := decl.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			v, err := strconv.Atoi(m[2])
+			if err != nil {
+				t.Fatalf("%s: unparsable value in %q", f, line)
+			}
+			found[m[1]] = v
+		}
+	}
+
+	if len(found) < 30 {
+		t.Fatalf("the source scan found only %d syncMsg* declarations, which cannot be "+
+			"right — the scan is broken, and a broken scan reports a complete census",
+			len(found))
+	}
+
+	for name, v := range found {
+		got, ok := census[name]
+		if !ok {
+			t.Errorf("%s = %d is declared in the package but MISSING from "+
+				"liveSyncMessageTypesExcept. Every uniqueness test here is blind to a "+
+				"collision with it.", name, v)
+			continue
+		}
+		if got != v {
+			t.Errorf("%s = %d in source but %d in the census; the uniqueness tests are "+
+				"checking a value that is not on the wire", name, v, got)
+		}
+	}
 }

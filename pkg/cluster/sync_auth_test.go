@@ -479,6 +479,20 @@ func TestSyncAuthDecisionMatrix(t *testing.T) {
 //     longer exists. Binding is now structural (prologue + transcript), and
 //     TestNoiseHandshakeBindsIdentity7163 asserts the property that mattered:
 //     two ends that disagree about identity cannot derive a common key.
+//
+//     That test ALSO pinned `syncDeriveFrameKey(key, n1, n2)` ==
+//     `syncDeriveFrameKey(key, n2, n1)` — "frame-key derivation must be
+//     order-independent (both peers derive equal)". That assertion is not
+//     relocated, it is INVERTED, and saying so matters: order-independence is
+//     not a property this fix preserves elsewhere, it IS the vector-B defect.
+//     A key that does not depend on which end derived it is a key both
+//     directions share, which is what let a node's own syncMsgFence verify
+//     when echoed back at it. The replacement assertions are its negation —
+//     TestSyncAuthHandshakeBothKeyedAuthenticates and
+//     TestInPlaceUpgradeInstallsDirectionalKeys7163 both require the two
+//     directions to hold DIFFERENT keys. A reader who greps for the old
+//     assertion and finds nothing should not conclude the coverage was
+//     dropped.
 //   - TestSyncAuthHandshakeRejectsReflectedNonce_5078 and
 //     TestSyncAuthHandshakeRejectsZeroNonce_5078 guarded vector A by rejecting
 //     a reflected/degenerate NONCE. There are no nonces to reflect any more —
@@ -551,34 +565,74 @@ func TestNoiseHandshakeRejectsReflectedMessage7163(t *testing.T) {
 	}
 }
 
-// TestNoiseHandshakeBindsIdentity7163 asserts the property the deleted
-// proof-binding test cared about: identity is inside the transcript, so two
-// ends that disagree about it cannot derive a common key.
+// TestNoiseHandshakeBindsIdentity7163 binds the CONNECT path's prologue field
+// by field.
 //
-// The discriminator is a CLUSTER-ID mismatch with an identical PSK. If identity
-// were not bound, the shared PSK alone would complete the handshake and both
-// sides would key up — which is precisely the pre-#7163 behaviour.
+// The prologue is never PARSED — both ends construct it independently and the
+// handshake hash compares them — so a field that stopped being mixed in would
+// not surface as a decode error. It would surface as nothing at all: both ends
+// would drop it together and the handshake would still succeed, with the
+// binding silently absent.
+//
+// The FIRST row is the matching pair and must SUCCEED. Without it every
+// remaining row is satisfied by a handshake that never completes, which is the
+// failure this test would otherwise be blind to — an earlier revision varied
+// only the cluster id and had no positive control of its own.
 func TestNoiseHandshakeBindsIdentity7163(t *testing.T) {
 	key := []byte("shared-control-link-secret-key")
-	a := newAuthSyncNode(t, key, 0)
-	b := newAuthSyncNode(t, key, 1)
+	const cluster = 22
+	for _, tc := range []struct {
+		name        string
+		bNode       int
+		bCluster    int
+		bFabric     int
+		wantSuccess bool
+	}{
+		{"matching identity", 1, cluster, 0, true},
+		{"different cluster id", 1, cluster + 77, 0, false},
+		{"different node id", 0, cluster, 0, false},
+		{"different fabric index", 1, cluster, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newAuthSyncNode(t, key, 0)
+			b := NewSessionSync(":0", ":0", nil)
+			b.SetAuthProvider(&fakeSyncAuthProvider{key: key, node: tc.bNode, cluster: tc.bCluster})
 
-	// Same PSK, DIFFERENT cluster id on b.
-	b.SetAuthProvider(&fakeSyncAuthProvider{key: key, node: 1, cluster: 99})
+			ca, cb := net.Pipe()
+			defer ca.Close()
+			defer cb.Close()
 
-	ca, cb := net.Pipe()
-	defer ca.Close()
-	defer cb.Close()
+			ach := runHandshake(a, ca, true)
+			bch := runHandshakeFabric(b, cb, false, tc.bFabric)
+			ar, br := <-ach, <-bch
 
-	ach := runHandshake(a, ca, true)
-	bch := runHandshake(b, cb, false)
-	ar, br := <-ach, <-bch
-
-	if ar.err == nil && br.err == nil {
-		t.Fatal("two nodes with the SAME PSK but DIFFERENT cluster ids completed the " +
-			"handshake. Identity is not bound into the transcript, so the prologue is " +
-			"not doing its job and a node could be keyed into the wrong cluster.")
+			ok := ar.err == nil && br.err == nil
+			if ok != tc.wantSuccess {
+				if tc.wantSuccess {
+					t.Fatalf("the MATCHING pair failed the handshake (a=%v b=%v). Every "+
+						"refusal below is then satisfied by a handshake that never "+
+						"completes, and none of the bindings is actually pinned.",
+						ar.err, br.err)
+				}
+				t.Fatal("two ends that DISAGREE about this field completed the handshake, " +
+					"so the field is not mixed into the prologue. It would not surface as " +
+					"a decode error either: both ends would drop it together and the " +
+					"handshake would still succeed with the binding silently absent.")
+			}
+		})
 	}
+}
+
+// runHandshakeFabric is runHandshake with an explicit fabric index, so the
+// table above can make the two ends disagree about which fabric they are on —
+// the one prologue field runHandshake hard-codes to 0.
+func runHandshakeFabric(s *SessionSync, conn net.Conn, initiator bool, fabricIdx int) <-chan handshakeResult {
+	ch := make(chan handshakeResult, 1)
+	go func() {
+		mode, key, err := s.performSyncHandshake(conn, initiator, fabricIdx)
+		ch <- handshakeResult{mode: mode, key: key, err: err}
+	}()
+	return ch
 }
 
 // TestNoiseHandshakeRefusesWithoutIdentity7163 pins the FAIL-CLOSED path. A

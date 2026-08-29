@@ -1310,7 +1310,7 @@ func TestAuthUpgradeMessageTypesAreUnique6628(t *testing.T) {
 		{syncMsgAuthUpgradeRequest, "syncMsgAuthUpgradeRequest"},
 	} {
 		live := liveSyncMessageTypesExcept(under.v)
-		if len(live) < 35 {
+		if len(live) < 36 {
 			t.Fatalf("the live-type census holds only %d entries — it has fallen behind "+
 				"sync.go and can no longer certify uniqueness", len(live))
 		}
