@@ -8021,3 +8021,76 @@ fn retransmitted_synack_does_not_resurrect_the_forward_half_6752() {
          a handshake that never completed (#6752)",
     );
 }
+
+// ---- #7096: the fabric-redirected ingress identity ----
+
+/// #7096: a fabric-redirected session must record NO ingress identity, not the
+/// LOCAL fabric member's.
+///
+/// The two halves of the ingress record come from different sources for such a
+/// packet: the zone is overridden to the peer's ORIGINAL ingress zone (correct —
+/// the flow logically arrived on the peer's WAN), while `meta.ingress_ifindex`
+/// is still the local fabric member's netdev because nothing in production
+/// rewrites it. Recording that would make
+/// `show security flow session interface ge-0-0-0` select flows that arrived on
+/// the PEER's WAN, and `interface reth0.50` stop selecting them — and the same
+/// filter drives `clear`, so it is a wrong-session deletion.
+#[test]
+fn a_fabric_redirected_session_records_no_ingress_identity_7096() {
+    const LOCAL_FABRIC_MEMBER: u32 = 7;
+    const TAG: u16 = 50;
+
+    let (ifindex, vlan) = stamped_ingress_identity(LOCAL_FABRIC_MEMBER, TAG, true);
+    assert_eq!(
+        (ifindex, vlan),
+        (0, 0),
+        "a fabric-redirected session must record NO ingress identity. The peer's \
+         real ingress interface is not knowable here — the fabric stamp carries a \
+         u16 zone id and nothing else — so naming the local fabric member is a \
+         confidently WRONG answer, which is strictly worse than the zone \
+         approximation the Go side falls back to on zero (#7096)"
+    );
+}
+
+/// THE PAIRED CELL. The suppression must not widen: an ordinary (non-fabric)
+/// session must still record its true ingress identity, which is the whole point
+/// of #4983 and the thing this fix must not undo.
+///
+/// Identical inputs to the cell above; only `fabric_ingress` differs. That is
+/// what makes the pair discriminating rather than two separate demonstrations —
+/// a fix that returned (0, 0) unconditionally would satisfy the first cell and
+/// silently revert #4983.
+#[test]
+fn an_ordinary_session_still_records_its_true_ingress_identity_7096() {
+    const LOCAL_FABRIC_MEMBER: u32 = 7;
+    const TAG: u16 = 50;
+
+    let (ifindex, vlan) = stamped_ingress_identity(LOCAL_FABRIC_MEMBER, TAG, false);
+    assert_eq!(
+        (ifindex, vlan),
+        (LOCAL_FABRIC_MEMBER, TAG),
+        "a session whose first packet did NOT arrive over the fabric must keep its \
+         true {{ifindex, vlan}} identity — zeroing it unconditionally would revert \
+         #4983 and put every session back on the #4792 zone approximation"
+    );
+}
+
+/// #7096: the VLAN half must be cleared with the ifindex, not left behind.
+///
+/// The pair is the logical ingress unit and is meaningful only together — the Go
+/// consumer keys `{parent ifindex, unit VLAN}`. A residual VLAN beside a zeroed
+/// ifindex would key `{0, 50}`, which is not "no identity recorded" but a
+/// DIFFERENT identity, and one that could collide with a real interface whose
+/// ifindex resolution failed.
+#[test]
+fn the_fabric_stamp_clears_both_halves_of_the_pair_7096() {
+    for vlan in [0u16, 1, 50, 4094] {
+        let (ifindex, got_vlan) = stamped_ingress_identity(9, vlan, true);
+        assert_eq!(
+            (ifindex, got_vlan),
+            (0, 0),
+            "both halves must clear together for vlan {vlan}; a residual VLAN \
+             beside a zeroed ifindex is a different identity, not an absent one"
+        );
+    }
+}
