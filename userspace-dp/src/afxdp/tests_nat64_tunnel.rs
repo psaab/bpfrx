@@ -2808,3 +2808,98 @@ fn nat64_frag_assoc_install_site_derives_the_owner_rg_6857() {
          when the derivation was replaced by a literal"
     );
 }
+
+/// #7051: the claim that `FragAuthority.routing_table` is INERT IN PRODUCTION,
+/// made checkable instead of left in a comment.
+///
+/// The type's doc block now tells an auditor to count THREE live key dimensions
+/// rather than four, and the whole basis for that is a fact about production
+/// inputs: `meta.routing_table` is a literal `0` at every assignment, so no real
+/// packet carries a non-zero value into `frag_ingress_authority`. A comment
+/// asserting that rots the moment someone stamps the field, and the rot is
+/// silent — the key simply gets finer and nothing fails.
+///
+/// This is the guard for it. It checks BOTH assignment sites, in the two
+/// different ways they can be checked:
+///
+///   - the `Default` impl, by VALUE — the one site this crate owns and can call;
+///   - the shim writer, by SOURCE — `userspace-xdp` is a separate crate compiled
+///     into a BPF object, so there is no value to read here. Scanning its source
+///     is what a Go/Rust lockstep test in this repo already does for the same
+///     reason (`TestPoolUnusableReasonLockstepWithRust`).
+///
+/// WHAT A RED HERE MEANS. Not a defect: it means the field became LIVE, and the
+/// instruction is the one #6927 r2 wrote — relabel the fabricated case in
+/// `nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`, drive it from
+/// a real ingress, and correct the "three dimensions" wording in `FragAuthority`.
+/// Do not silence this by deleting it; the whole point is that the doc and the
+/// code stop agreeing and something says so.
+#[test]
+fn frag_authority_routing_table_is_inert_in_production_7051() {
+    // Site 1: the in-crate Default, by value.
+    let meta = UserspaceDpMeta::default();
+    assert_eq!(
+        meta.routing_table, 0,
+        "the UserspaceDpMeta Default now carries a non-zero routing_table, so \
+         FragAuthority's fourth dimension is no longer inert and its doc block's \
+         \"count THREE live dimensions\" is wrong (#7051)"
+    );
+
+    // Site 2: the shim writer, by source. Comments are stripped first — this
+    // file's own prose names the literal, and so would a doc comment there.
+    let shim = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("userspace-xdp")
+            .join("src")
+            .join("lib.rs"),
+    )
+    .expect("the shim source must be readable from the workspace");
+    let code: Vec<&str> = shim
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect();
+    // Split DECLARATION from ASSIGNMENT. The first draft of this guard did not,
+    // and matched the shim's own `routing_table: u32,` field declaration as if it
+    // were a stamp — reporting the field LIVE against a shim that only declares
+    // it. The RHS is the discriminator: a type on the left of the struct, a value
+    // at the construction site.
+    let mentions: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.contains("routing_table"))
+        .collect();
+    // `routing_table:` with the COLON is what separates a field-position use
+    // (declaration or struct-literal stamp) from a bare mention — the shim also
+    // has `mem::offset_of!(UserspaceDpMeta, routing_table)`, an ABI assert that
+    // is neither. The second draft of this guard counted that one as a stamp.
+    let assignments: Vec<&&&str> = mentions
+        .iter()
+        .filter(|l| l.contains("routing_table:") && !l.contains("routing_table: u32"))
+        .collect();
+    // Non-vacuity: a scan that finds NOTHING would pass the "all are zero"
+    // check below for free, and that is exactly how this guard would rot into
+    // decoration if the field were renamed in the shim.
+    assert!(
+        !mentions.is_empty(),
+        "no `routing_table` line found in the shim source at all. Either the \
+         field was renamed there — in which case this guard is now scanning for \
+         a name that does not exist and must be updated — or the path is wrong. \
+         Either way it is not evidence of inertness"
+    );
+    assert!(
+        !assignments.is_empty(),
+        "the shim DECLARES routing_table but never assigns it, so this guard has \
+         nothing to check. That is not inertness either — it means the meta the \
+         shim writes leaves the field uninitialised or the construction site \
+         moved. Mentions found: {mentions:?}"
+    );
+    for line in &assignments {
+        assert!(
+            line.contains("routing_table: 0"),
+            "the shim now stamps a non-literal routing_table ({}), so the field \
+             is LIVE. See this test's doc comment for what to update — this is \
+             not a defect, it is the trigger #6927 r2 wrote down (#7051)",
+            line.trim()
+        );
+    }
+}
