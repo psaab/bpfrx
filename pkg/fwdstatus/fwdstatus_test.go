@@ -583,3 +583,235 @@ func TestHeartbeatsHealthy(t *testing.T) {
 // (Cluster-mode rendering moved to the gRPC handler in #879;
 // fwdstatus.Build no longer takes a clusterMode flag. Cluster
 // composition tests live in pkg/grpcapi/.)
+
+// --- #7250: the helper crash/restart block ---------------------------
+//
+// #5838's last acceptance bullet asked operational status to expose exit
+// code/signal, restart count, timestamps, backoff deadline and a crash-loop
+// verdict. Before this, a crash-looping helper rendered as `State  Unknown`
+// and nothing else, because `resetAfterHelperGoneLocked` clears the cached
+// ProcessStatus and every surface degraded to a generic "unavailable".
+
+// fakeCrashDP is a userspace dataplane that also answers the #7250 crash
+// accessor. Separate from fakeUserspaceDP so the cells below can assert what
+// Build does when the accessor is ABSENT — which is what every pre-#7250
+// implementor looks like, and what the eBPF path looks like today.
+type fakeCrashDP struct {
+	fakeUserspaceDP
+	rec   userspace.HelperCrashRecord
+	known bool
+}
+
+func (f *fakeCrashDP) HelperCrashState() (userspace.HelperCrashRecord, bool) {
+	return f.rec, f.known
+}
+
+// crashBuild runs Build against a helper whose Status() errors, which is the
+// real post-crash shape: the supervisor clears the cached status, so a crash
+// and a "helper never started" look identical to every other surface.
+func crashBuild(t *testing.T, dp DataPlaneAccessor) *ForwardingStatus {
+	t.Helper()
+	fs, err := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return fs
+}
+
+func TestHelperCrashBlockIsRenderedWhenTheHelperCrashed7250(t *testing.T) {
+	now := time.Now()
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("userspace dataplane helper not running"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash: true,
+			RestartPending:   true,
+			Detail:           "exit status 101",
+			ExitCode:         101,
+			PID:              4242,
+			At:               now.Add(-30 * time.Second),
+			Restarts:         3,
+			NextRestart:      now.Add(4 * time.Second),
+		},
+	}
+	fs := crashBuild(t, dp)
+
+	// Build must carry the record across. Asserted separately from the render
+	// so a failure says which half broke.
+	if !fs.HelperCrashKnown {
+		t.Fatal("Build did not consult the crash accessor; the block cannot render")
+	}
+	if fs.HelperExitCode != 101 || fs.HelperRestarts != 3 || fs.HelperPID != 4242 {
+		t.Errorf("Build dropped crash fields: %+v", fs)
+	}
+
+	out := Format(fs)
+	for _, want := range []string{
+		"Helper",
+		"restart pending",
+		"Helper exit code",
+		"101",
+		"Helper last PID",
+		"4242",
+		"Helper restart attempts",
+		"Helper next restart",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("crash render is missing %q.\n--- got ---\n%s", want, out)
+		}
+	}
+	// The whole point: this is the surface whose ONLY output during a crash
+	// loop used to be `State  Unknown`.
+	if !strings.Contains(out, "State") {
+		t.Error("State row vanished")
+	}
+}
+
+// The zero-value trap. A never-crashed HelperCrashRecord is byte-identical to a
+// healthy one AND has ExitCode == 0, which satisfies the `ExitCode >= 0`
+// discriminator — so a renderer keyed on the record alone prints "exit code 0"
+// for a helper that never crashed. This is the same hazard BufferKnown exists
+// for, and it is why HelperCrashKnown is not redundant with LastExitWasCrash.
+func TestHealthyHelperRendersNoCrashBlockAndNoExitCodeZero7250(t *testing.T) {
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{fakeDP: fakeDP{loaded: true}},
+		known:           true,
+		rec:             userspace.HelperCrashRecord{}, // never crashed
+	}
+	out := Format(crashBuild(t, dp))
+
+	if strings.Contains(out, "Helper exit code") {
+		t.Errorf("a helper that never crashed rendered an exit code — ExitCode 0 "+
+			"satisfies the `ExitCode >= 0` discriminator, so the block must gate on "+
+			"the record being an actual crash.\n--- got ---\n%s", out)
+	}
+	if strings.Contains(out, "Helper restart attempts") {
+		t.Errorf("healthy helper rendered a restart row.\n--- got ---\n%s", out)
+	}
+	if strings.Contains(out, "CRASH LOOPING") {
+		t.Errorf("healthy helper rendered a crash-loop verdict.\n--- got ---\n%s", out)
+	}
+}
+
+// An unreachable manager must not render as a healthy helper. `known=false`
+// carries "could not ask", which is NOT a claim that the helper is well.
+func TestUnknownCrashStateRendersNothingRatherThanHealth7250(t *testing.T) {
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{fakeDP: fakeDP{loaded: true}},
+		known:           false,
+		// A populated record that must NOT leak through the known=false gate.
+		rec: userspace.HelperCrashRecord{LastExitWasCrash: true, Restarts: 9, PID: 77},
+	}
+	fs := crashBuild(t, dp)
+	if fs.HelperCrashKnown {
+		t.Error("known=false leaked through as HelperCrashKnown")
+	}
+	out := Format(fs)
+	if strings.Contains(out, "77") || strings.Contains(out, "Helper restart attempts") {
+		t.Errorf("a record the accessor refused to vouch for was rendered anyway.\n"+
+			"--- got ---\n%s", out)
+	}
+}
+
+// A dataplane with no crash accessor at all — every pre-#7250 implementor, and
+// the eBPF path. Build must not panic and must not invent a crash.
+func TestDataPlaneWithoutTheCrashAccessorIsTolerated7250(t *testing.T) {
+	dp := &fakeUserspaceDP{fakeDP: fakeDP{loaded: true}}
+	fs := crashBuild(t, dp)
+	if fs.HelperCrashKnown {
+		t.Error("a dataplane with no HelperCrashState method reported a known crash state")
+	}
+	if strings.Contains(Format(fs), "Helper restart attempts") {
+		t.Error("crash block rendered for a dataplane that cannot report one")
+	}
+}
+
+// The conflation the #7250 data half removed from the DATA must not be
+// reintroduced at the SURFACE. After an intentional stop LastExitWasCrash is
+// still true (the retry path reads it as debt) and Restarts survives with it,
+// so CrashLooping() keeps reporting "not coming back" while NO retry is armed.
+// The render must not promise a restart, and must not show a deadline that has
+// no timer behind it.
+func TestStoppedHelperIsNotRenderedAsRestartPending7250(t *testing.T) {
+	now := time.Now()
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("userspace dataplane helper not running"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash: true,
+			RestartPending:   false,                 // stop advanced procGen; timer orphaned
+			Restarts:         12,                    // deep enough that CrashLooping() is true
+			NextRestart:      now.Add(-time.Minute), // in the PAST, no timer behind it
+			ExitCode:         101,
+		},
+	}
+	fs := crashBuild(t, dp)
+
+	// Precondition: without this the assertions below could pass on a record
+	// that never reported crash-looping in the first place.
+	if !fs.HelperCrashLooping {
+		t.Fatalf("precondition: Restarts=%d must put CrashLooping() at the backoff cap; "+
+			"got HelperCrashLooping=false", fs.HelperRestarts)
+	}
+
+	out := Format(fs)
+	if strings.Contains(out, "restart pending") {
+		t.Errorf("a helper with no armed retry was rendered as restart-pending — this is "+
+			"the LastExitWasCrash/RestartPending conflation #7958 removed from the data, "+
+			"reintroduced at the surface.\n--- got ---\n%s", out)
+	}
+	if strings.Contains(out, "Helper next restart") {
+		t.Errorf("rendered a restart deadline with no timer behind it; after an "+
+			"intentional stop NextRestart is a time in the past.\n--- got ---\n%s", out)
+	}
+	if !strings.Contains(out, "no restart armed") {
+		t.Errorf("the render must SAY that no retry is armed rather than staying "+
+			"silent about it.\n--- got ---\n%s", out)
+	}
+}
+
+// Signal is the discriminator: exactly one of ExitCode >= 0 and Signal != "" is
+// meaningful, and ExitCode is -1 when the child was signalled. Rendering both
+// would print "exit code -1" beside a signal name.
+func TestSignalAndExitCodeAreRenderedExclusively7250(t *testing.T) {
+	base := func(rec userspace.HelperCrashRecord) string {
+		dp := &fakeCrashDP{
+			fakeUserspaceDP: fakeUserspaceDP{
+				fakeDP: fakeDP{loaded: true},
+				err:    errors.New("helper not running"),
+			},
+			known: true,
+			rec:   rec,
+		}
+		return Format(crashBuild(t, dp))
+	}
+
+	signalled := base(userspace.HelperCrashRecord{
+		LastExitWasCrash: true, RestartPending: true,
+		Signal: "killed", ExitCode: -1, Restarts: 1,
+	})
+	if !strings.Contains(signalled, "Helper exit signal") || !strings.Contains(signalled, "killed") {
+		t.Errorf("signalled exit did not render the signal.\n--- got ---\n%s", signalled)
+	}
+	if strings.Contains(signalled, "Helper exit code") {
+		t.Errorf("signalled exit ALSO rendered an exit code; ExitCode is -1 here, so the "+
+			"row would read \"exit code -1\".\n--- got ---\n%s", signalled)
+	}
+
+	exited := base(userspace.HelperCrashRecord{
+		LastExitWasCrash: true, RestartPending: true,
+		ExitCode: 101, Restarts: 1,
+	})
+	if !strings.Contains(exited, "Helper exit code") || !strings.Contains(exited, "101") {
+		t.Errorf("exited helper did not render the exit code.\n--- got ---\n%s", exited)
+	}
+	if strings.Contains(exited, "Helper exit signal") {
+		t.Errorf("exited helper rendered a signal row.\n--- got ---\n%s", exited)
+	}
+}

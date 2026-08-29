@@ -80,6 +80,18 @@ type cliUserspaceStatusProvider interface {
 	Status() (dpuserspace.ProcessStatus, error)
 }
 
+// cliUserspaceCrashProvider is the #7250 helper-crash accessor.
+//
+// SEPARATE from cliUserspaceStatusProvider rather than folded into it: the
+// crash record is Manager state that outlives the helper process, whereas
+// ProcessStatus is the helper's own published status and is CLEARED when the
+// helper dies. Widening the status interface would also have forced every
+// existing implementor — including test fakes — to grow a method they have no
+// use for.
+type cliUserspaceCrashProvider interface {
+	HelperCrashState() (dpuserspace.HelperCrashRecord, bool)
+}
+
 // cliUserspaceControlProvider extends the status provider with the
 // mutating control operations used by `request chassis cluster
 // data-plane userspace ...` (the sole CLI consumer, handled in

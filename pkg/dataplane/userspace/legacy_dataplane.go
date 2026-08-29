@@ -602,6 +602,25 @@ func (a *LegacyDataPlaneAdapter) Status() (ProcessStatus, error) {
 	return m.Status()
 }
 
+// HelperCrashState returns the manager's helper crash record (#7250).
+//
+// Returns ok=false when there is no manager to ask, deliberately rather than
+// returning a zero record: a zero HelperCrashRecord is EXACTLY what a healthy
+// helper looks like, so collapsing "no manager" into it would render an
+// unreachable dataplane as a clean one. Same comma-ok shape as CachedStatus
+// below, for the same reason.
+//
+// This delegate exists because `dataplane.Unwrap()` hands a status surface
+// THIS adapter, not the bare *Manager — so without it the accessor the #7250
+// data half exported is unreachable from pkg/cli and pkg/grpcapi.
+func (a *LegacyDataPlaneAdapter) HelperCrashState() (HelperCrashRecord, bool) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return HelperCrashRecord{}, false
+	}
+	return m.HelperCrashState(), true
+}
+
 // CachedStatus returns the last control-socket-captured ProcessStatus
 // without issuing a new request (#3970). Returns ok=false when the
 // manager is unavailable or no status has been captured yet.

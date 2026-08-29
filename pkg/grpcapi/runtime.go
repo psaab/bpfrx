@@ -60,6 +60,14 @@ type userspaceStatusProvider interface {
 	Status() (dpuserspace.ProcessStatus, error)
 }
 
+// userspaceCrashProvider is the #7250 helper-crash accessor. Separate from
+// userspaceStatusProvider for the reason given on its pkg/cli twin: the crash
+// record is Manager state that survives the helper, ProcessStatus is the
+// helper's own and is cleared when it dies.
+type userspaceCrashProvider interface {
+	HelperCrashState() (dpuserspace.HelperCrashRecord, bool)
+}
+
 // userspaceControlProvider: superset of statusProvider used by the
 // diag/control path (queue/binding admin, forwarding-armed, inject).
 type userspaceControlProvider interface {

@@ -101,6 +101,21 @@ func (a forwardingStatusCLIUserspaceDataPlane) Status() (dpuserspace.ProcessStat
 	return a.cli.userspaceDataplaneStatus()
 }
 
+// HelperCrashState feeds fwdstatus's #7250 crash block.
+//
+// It resolves the backend directly rather than going through
+// `userspaceDataplaneStatus()`, because that helper returns a ProcessStatus and
+// the crash record is Manager-owned state that is NOT part of it — a crash
+// clears the cached status, so routing this through the status path would make
+// the block blank in the one case it exists for.
+func (a forwardingStatusCLIUserspaceDataPlane) HelperCrashState() (dpuserspace.HelperCrashRecord, bool) {
+	provider, ok := a.cli.dpProbe().(cliUserspaceCrashProvider)
+	if !ok {
+		return dpuserspace.HelperCrashRecord{}, false
+	}
+	return provider.HelperCrashState()
+}
+
 func (c *CLI) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
 	if c == nil {
 		return nil
