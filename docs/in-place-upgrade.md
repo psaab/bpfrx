@@ -976,6 +976,87 @@ test) and falls back to the `xpfd`-liveness check alone — "no
 information" is not "unhealthy", and failing closed on it would revert
 every such caller's promotion.
 
+### Beacon target eligibility (#7157)
+
+Gate 4's ping only means something if it CAN fail. Three target classes make it
+succeed regardless of dataplane health, and before #7157 the gate could not tell
+them from a healthy probe. Each is now refused before the ping, with a named
+reason that reaches the operator through `KernelRollOutcome.Reason`:
+
+| refused class | why the ping is uninformative |
+|---|---|
+| egress `dev lo` (a LOCAL target) | the host stack answers without a packet leaving the box |
+| egress a MANAGEMENT interface | a candidate kernel can keep the OOB path working while the dataplane cannot forward transit traffic |
+| no route at all | nothing can leave, so nothing can be concluded |
+
+The `lo` case is the one that was reachable and unconditional. Measured on
+`loss:xpf-userspace-fw0`:
+
+```
+# ip route get 172.16.50.8          <- the box's OWN dataplane address
+local 172.16.50.8 dev lo table local src 172.16.50.8
+# ping -c 1 172.16.50.8
+1 packets transmitted, 1 received, 0% packet loss, rtt 0.055 ms
+```
+
+55 microseconds, over `lo`, with the dataplane in any state. So
+`XPF_KERNEL_BEACON_TARGET` set to the box's own dataplane address made Gate 4
+pass for **every** candidate kernel — and this document's own guidance ("set it
+to a dataplane-side target") is what leads an operator to type it. **Set it to an
+OFF-BOX address reachable over a dataplane interface** — the far end of a
+transit link, or the HA peer's dataplane address.
+
+The management classifier is `config.IsManagementIfName`, the #7515 SSOT already
+shared by the daemon's `vrf-mgmt` binder, the networkd `VRF=` emitter and the
+ip-monitoring next-hop validator. It is injected by the caller for the same
+reason `HelperStatus` is, and a `nil` classifier is "no information" rather than
+"ineligible" — but both production constructors wire it, and tests bind that
+rather than leaving it to a comment.
+
+Note that on an xpf-managed box the management default route is NOT what the
+fallback finds: `fxp*`/`fab*`/`em*` are enslaved to `vrf-mgmt` (table 999), so
+`ip -4 route show default` reads the main table and returns a dataplane route.
+The management refusal therefore guards an operator-set target and a posture
+where that VRF isolation is absent, not the default-gateway fallback.
+
+### Known limitation: the beacon cannot pass on an HA secondary (#7157)
+
+On a RETH-based HA secondary, FRR blackholes the static default while the peer
+holds the VIP. Measured on `loss:xpf-userspace-fw1`:
+
+```
+# ip -4 route show default
+blackhole default proto static metric 20
+# ip route get 1.1.1.1
+RTNETLINK answers: Invalid argument
+```
+
+`defaultGateway()` finds no `via`, so Gate 4 fails closed and the promotion
+reverts — on the node an HA operator upgrades FIRST. The direction is safe (a
+revert, never a brick), but a gate that cannot pass is a wall rather than a gate.
+The workaround today is to set `XPF_KERNEL_BEACON_TARGET` to an address the
+drained secondary can still reach over a dataplane interface. Whether a drained
+secondary should instead be allowed to promote on preconditions A+B alone is a
+deliberate weakening of a security gate and is tracked on #7157, not decided
+here.
+
+### Still open on #7157: this is eligibility, not a transit witness
+
+None of the above shows that a packet crossed ingress AF_XDP → filter/PBR → zone
+policy → session/NAT → egress. The ping is still host-originated, so it does not
+traverse the forwarding path a transit packet takes. What eligibility buys is
+that a PASS is now capable of being a FAIL. The external tagged transit witness
+— an isolated source, a configured ingress, an expected egress, an explicit
+policy/NAT expectation, bound to the candidate boot identity, IPv4 and IPv6 —
+remains open, and needs an observer outside the box that the unattended
+boot-time gate does not have.
+
+Related, and also still open: `KernelJournal.ArmNonce` is written on every arm
+and **never compared anywhere** (assignment sites only; the sole reads are in a
+test asserting two attempts differ). It is provenance, not an anti-stale
+mechanism, so #7157's "reject a stale result from an earlier candidate boot"
+case has no implementation behind it.
+
 ### Operator visibility (#6495)
 
 During a roll the channel is legible from the CLI the operator already has,

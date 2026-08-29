@@ -64,6 +64,24 @@ type realKernelSystem struct {
 	// StatusTimeout bounds a single control-socket status query (default 2s).
 	StatusTimeout time.Duration
 
+	// IsManagementIface classifies a KERNEL INTERFACE NAME as management
+	// (out-of-band) rather than dataplane, for ForwardBeacon's #7157 target
+	// eligibility check. Injected for the same reason HelperStatus is: the
+	// answer belongs to config.IsManagementIfName — the #7515 SSOT already
+	// shared by the daemon's vrf-mgmt binder, the networkd `VRF=` emitter and
+	// the ip-monitoring next-hop validator — and pkg/upgrade deliberately does
+	// not import pkg/config. Passing the SSOT rather than copying its three
+	// prefixes is the point: #7515 records that a divergence between the
+	// consumers of that rule is always a bug, and this is a fourth consumer.
+	//
+	// nil means this caller cannot classify interfaces, which is treated as "no
+	// information" and NOT as ineligible — the same contract the nil-HelperStatus
+	// branch documents below, and for the same reason (failing closed on a
+	// missing seam reverts every embedder's promotion). Both production
+	// constructors wire it, and that claim is bound by a test rather than left
+	// to this comment.
+	IsManagementIface func(iface string) bool
+
 	// Test seams (#5076). All nil/"" in production; a test injects them to
 	// drive the purge-failure path deterministically without shelling out to
 	// apt/dpkg or touching the real /boot + /lib/modules.
@@ -133,11 +151,13 @@ func NewKernelSystemWithHelperStatus(
 	unitActive func(ctx context.Context) (bool, error),
 	status HelperStatusFunc,
 	controlSocket string,
+	isManagementIface func(iface string) bool,
 ) *realKernelSystem {
 	s := NewKernelSystem()
 	s.UnitActive = unitActive
 	s.HelperStatus = status
 	s.ControlSocket = controlSocket
+	s.IsManagementIface = isManagementIface
 	return s
 }
 
@@ -822,6 +842,20 @@ func (s *realKernelSystem) ForwardBeacon(deadline time.Duration) (bool, error) {
 		// can set BeaconTarget to enable promotion on a box with no gateway).
 		return false, fmt.Errorf("no forward-beacon target (no default gateway; set BeaconTarget)")
 	}
+	// #7157: the target must be one a probe can actually FAIL against. A ping
+	// to the box's own address is answered by the local stack over `lo` in tens
+	// of microseconds with the dataplane in any state (measured: `ip route get
+	// 172.16.50.8` -> `local ... dev lo`, ping 0.055ms), so pointing
+	// XPF_KERNEL_BEACON_TARGET at a local dataplane address — which the
+	// guidance above actively invites — makes this gate pass UNCONDITIONALLY.
+	// A target egressing the out-of-band management interface is the same
+	// failure in the issue's original form. Refuse both, and refuse a target
+	// with no route at all, naming which: the error reaches the operator through
+	// KernelRunner.revert -> KernelRollOutcome.Reason, where "forward beacon
+	// FAILED" alone would not tell them what to change.
+	if err := beaconTargetEligible(target, s.IsManagementIface); err != nil {
+		return false, err
+	}
 	secs := int(deadline.Seconds())
 	if secs < 1 {
 		secs = 1
@@ -855,19 +889,18 @@ var beaconPing = func(target string, secs int) error {
 var beaconDefaultGateway = defaultGateway
 
 // defaultGateway returns the IPv4 default-route next hop, or "" if none.
+//
+// The parse itself lives in parseDefaultRoute (kernel_beacon_target_7157.go) so
+// the test can call the PRODUCTION function instead of a copy of it written
+// inside the test — which is what TestDefaultGatewayParseLogic used to do, and
+// which would have stayed green through any change made here.
 func defaultGateway() string {
 	out, err := captureCmd("ip", "-4", "route", "show", "default")
 	if err != nil {
 		return ""
 	}
-	// "default via 10.0.0.1 dev eth0 ..."
-	fields := strings.Fields(out)
-	for i := 0; i+1 < len(fields); i++ {
-		if fields[i] == "via" {
-			return fields[i+1]
-		}
-	}
-	return ""
+	gw, _ := parseDefaultRoute(out)
+	return gw
 }
 
 func (s *realKernelSystem) SetBootOrderFront(bootID string) error {

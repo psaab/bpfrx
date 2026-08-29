@@ -129,3 +129,46 @@ func stripGoComments7157(s string) string {
 		}
 	}
 }
+
+// TestDaemonKernelSystemWiresIsManagementIface_7157 binds the #7157 beacon
+// target classifier at the daemon's production construction site.
+//
+// beaconTargetEligible treats a NIL classifier as "no information" and does not
+// refuse a management egress — the right contract for an embedder that cannot
+// classify interfaces, and the reason the refusal is DEAD unless a caller
+// supplies the predicate. A test that only drove beaconTargetEligible would stay
+// green with this call site reverted to nil.
+//
+// It asserts BEHAVIOUR, not just non-nil: wiring some other predicate (or a
+// locally-written copy of the three prefixes) would satisfy a nil-check while
+// diverging from config.IsManagementIfName, which #7515 records as always a bug.
+func TestDaemonKernelSystemWiresIsManagementIface_7157(t *testing.T) {
+	v := reflect.Indirect(reflect.ValueOf(daemonKernelSystem()))
+	f := v.FieldByName("IsManagementIface")
+	if !f.IsValid() {
+		t.Fatal("no IsManagementIface field: the #7157 beacon target classifier cannot be observed")
+	}
+	if f.IsNil() {
+		t.Fatal("IsManagementIface is nil, so ForwardBeacon cannot refuse a beacon target that " +
+			"egresses the out-of-band management interface — a candidate kernel can keep " +
+			"management reachable while the dataplane cannot forward transit traffic (#7157)")
+	}
+	fn, ok := f.Interface().(func(string) bool)
+	if !ok {
+		t.Fatalf("IsManagementIface has type %s, want func(string) bool", f.Type())
+	}
+	for _, tc := range []struct {
+		iface string
+		want  bool
+	}{
+		{"fxp0", true}, {"em0", true}, {"fab0", true},
+		{"ge-0-0-1", false}, {"reth0.50", false}, {"lo", false},
+	} {
+		if got := fn(tc.iface); got != tc.want {
+			t.Errorf("wired classifier(%q) = %v, want %v — it must be "+
+				"config.IsManagementIfName, the #7515 SSOT shared with the vrf-mgmt binder, "+
+				"the networkd VRF= emitter and the ip-monitoring next-hop validator, not a "+
+				"local copy that can drift from it", tc.iface, got, tc.want)
+		}
+	}
+}
