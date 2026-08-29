@@ -15,7 +15,7 @@ import (
 var errExit = fmt.Errorf("exit")
 
 func (c *CLI) dispatch(line string) error {
-	if cmd, pipeType, pipeArg, ok := extractPipe(line); ok {
+	if cmd, pipeType, pipeArg, ok := cliterm.SplitPipe(line); ok {
 		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
 	}
 
@@ -28,28 +28,6 @@ func (c *CLI) dispatch(line string) error {
 	}
 
 	return c.dispatchOperational(line)
-}
-
-func extractPipe(line string) (string, string, string, bool) {
-	idx := strings.LastIndex(line, " | ")
-	if idx < 0 {
-		return line, "", "", false
-	}
-	cmd := strings.TrimSpace(line[:idx])
-	pipe := strings.TrimSpace(line[idx+3:])
-	parts := strings.SplitN(pipe, " ", 2)
-	pipeType := parts[0]
-	var pipeArg string
-	if len(parts) > 1 {
-		pipeArg = parts[1]
-	}
-
-	switch pipeType {
-	case "match", "grep", "except", "find", "count", "last", "no-more":
-		return cmd, pipeType, pipeArg, true
-	default:
-		return line, "", "", false
-	}
 }
 
 // dispatchWithPipe runs a command and applies a Junos-style output filter
