@@ -691,26 +691,34 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings,
 				"security flow sync-icmp-session configured but has no effect — xpf syncs ICMP sessions to the HA peer UNCONDITIONALLY (the session-sync path is protocol-agnostic), so this Junos opt-in knob is a no-op: ICMP session sync is already always on and cannot be turned off (config-only parity, #4231)")
 		}
-		// #5804: gre-performance-acceleration is the same accepted-only
-		// doctrine, and it gets its own line because its consequence is
-		// SPECIFIC rather than "no effect". The flag reaches
-		// ForwardingState.gre_acceleration and stops there; no packet path
-		// reads it. GRE (protocol 47) has no L4 ports, so the shim stamps
-		// flow_src_port = flow_dst_port = 0 and SessionKey — a 5-tuple with no
-		// tunnel discriminator — is identical for every keyed tunnel sharing
-		// the outer addresses. Two GRE/PPTP tunnels between the same pair of
-		// outer endpoints therefore ALIAS one firewall session, and the second
-		// one inherits the first's policy decision, NAT state, counters and
-		// timeout. An operator enabling this knob is asking for exactly the
-		// opposite, so saying "no effect" would understate it.
+		// #7188 cut 1 made this knob DO something, and this advisory had to
+		// change with it. Until then the text said the flag "reaches
+		// ForwardingState.gre_acceleration and stops there" — accurate when
+		// written for #5804, and FALSE from the moment transit GRE started
+		// resolving a discriminator-keyed session flow
+		// (poll_stages.rs, gre_keyed_session_flow).
+		//
+		// It is still not the whole feature, and the remaining gap is the
+		// reason this stays a warning rather than disappearing:
+		// build_synced_session_key (userspace-dp session_sync.rs) constructs a
+		// peer-synced SessionKey with `discriminator: Default::default()`, so a
+		// keyed GRE session that is independent on the active node ALIASES on
+		// the standby. #7188's acceptance requires such sessions be WITHHELD
+		// from sync on a peer without the capability, explicitly "not
+		// downgraded" — and a zeroed discriminator is exactly the downgrade.
+		//
+		// So the honest operator statement is neither "no effect" nor "in
+		// force": locally keyed, not yet keyed across a failover.
 		if flow.GREPerformanceAcceleration {
 			warnings = append(warnings,
-				"security flow gre-performance-acceleration configured but accepted-only — "+
-					"the userspace dataplane keys GRE sessions on the 5-tuple with no tunnel "+
-					"discriminator, so distinct RFC 2890 keys or PPTP call IDs between the SAME "+
-					"outer endpoints still share one session and its policy/NAT/counter/timeout "+
-					"state; independent per-tunnel sessions are not provided (config-only "+
-					"parity, #5804)")
+				"security flow gre-performance-acceleration configured and PARTIALLY in force — "+
+					"transit GRE sessions are keyed on the RFC 2890 tunnel discriminator on this "+
+					"node (#7188), so distinct keys between the same outer endpoints no longer "+
+					"share one session locally. HA session sync does NOT carry the discriminator: "+
+					"a synced session arrives at the peer with a zero discriminator, so per-tunnel "+
+					"identity does NOT survive a failover and the tunnels alias on the standby. "+
+					"Do not rely on per-tunnel policy/NAT/counter/timeout separation across an HA "+
+					"event (#7188)")
 		}
 	}
 
