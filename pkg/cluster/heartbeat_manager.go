@@ -230,6 +230,77 @@ func (m *Manager) StopHeartbeat() {
 	}
 }
 
+// ApplyCommittedHeartbeatTiming restarts the heartbeat when the COMMITTED
+// interval/threshold differ from what the RUNNING heartbeat is actually using,
+// and reports whether it restarted.
+//
+// #7164: StartHeartbeat snapshots m.hbInterval/m.hbThreshold into the sender and
+// receiver; UpdateConfig rewrites those manager fields on every commit; and
+// RestartHeartbeat had exactly ONE production caller, the VRF-rebind path. So
+// `set chassis cluster heartbeat-interval` (or `heartbeat-threshold`) updated
+// the manager and never reached the wire: the sender kept the old cadence and
+// the receiver kept declaring the peer dead at the old threshold*interval until
+// something unrelated — a VRF rebind, a transport-key change — happened to
+// rebuild it. Peers could declare death too early or too late relative to the
+// committed configuration, indefinitely.
+//
+// #5081 made that divergence CORRECT-BY-CONSTRUCTION wherever it is consumed
+// (every derived duration is sized from liveHeartbeatTimingLocked) and VISIBLE
+// to the operator (the `Heartbeat pending restart:` status line). It
+// deliberately did not make the commit take effect. This does, and it reuses
+// #5081's own predicate rather than adding a second notion of "diverged" that
+// could disagree with the line the operator is reading.
+//
+// The restart window is safe by an existing mechanism, not by luck:
+// RestartHeartbeat invokes m.hbRestartNotifyFn, which the daemon wires to
+// SessionSync.SendLivenessKeepalive so the peer's heartbeat-timeout suppression
+// guard keeps observing fresh sync traffic while this node's UDP heartbeats are
+// silent (#1792). That is the same protection the VRF-rebind path has always
+// relied on.
+//
+// "Not running" is checked EXPLICITLY rather than inferred from the comparison.
+// liveHeartbeatTimingLocked falls back to the desired values when no receiver
+// exists, so live == desired holds both when the timing is already correct and
+// when there is no heartbeat at all — two states a bare comparison cannot tell
+// apart. Depending on that coincidence would make this silently wrong if the
+// fallback ever changed.
+func (m *Manager) ApplyCommittedHeartbeatTiming() bool {
+	// The decision is heartbeatTimingDivergedLocked's, called rather than
+	// restated: a second copy of the condition here could disagree with the one
+	// the table in heartbeat_timing_apply_7164_test.go asserts, and then the
+	// tests would pass while production restarted on the wrong commits.
+	if !m.heartbeatTimingDivergedLocked() {
+		return false
+	}
+	m.mu.RLock()
+	liveInterval, liveThreshold := m.liveHeartbeatTimingLocked()
+	wantInterval, wantThreshold := m.hbInterval, m.hbThreshold
+	m.mu.RUnlock()
+	slog.Info("cluster: heartbeat timing changed by commit, restarting heartbeat",
+		"live_interval", liveInterval, "committed_interval", wantInterval,
+		"live_threshold", liveThreshold, "committed_threshold", wantThreshold)
+	return m.RestartHeartbeat()
+}
+
+// heartbeatTimingDivergedLocked is the DECISION half of
+// ApplyCommittedHeartbeatTiming, split out so it can be asserted without
+// standing up a real heartbeat.
+//
+// The split is deliberate: the restart MECHANISM is already covered by the
+// VRF-rebind path's tests, and binding a socket in a unit test to observe a
+// comparison would make the cell a bind-race rather than a statement about the
+// predicate. What #7164 changed is which commits decide to restart, so that is
+// what gets its own name and its own table.
+func (m *Manager) heartbeatTimingDivergedLocked() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.hbReceiver == nil {
+		return false
+	}
+	liveInterval, liveThreshold := m.liveHeartbeatTimingLocked()
+	return liveInterval != m.hbInterval || liveThreshold != m.hbThreshold
+}
+
 // RestartHeartbeat stops and restarts the heartbeat with the same parameters.
 // This is needed when the control interface's VRF binding changes (e.g. during
 // DHCP-triggered recompile) which invalidates the existing UDP sockets.

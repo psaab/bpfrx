@@ -306,6 +306,20 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// 19. Update chassis cluster state machine
 	if d.cluster != nil && cfg.Chassis.Cluster != nil {
 		d.cluster.UpdateConfig(cfg.Chassis.Cluster)
+		// #7164: UpdateConfig above rewrote the desired heartbeat
+		// interval/threshold, but a running heartbeat snapshotted the OLD ones
+		// at StartHeartbeat and nothing restarted it for a timing change —
+		// RestartHeartbeat's only production caller was the VRF-rebind path. So
+		// `set chassis cluster heartbeat-interval` never reached the wire.
+		//
+		// Placed HERE rather than in step 20 on purpose. Step 20 restarts comms
+		// on a transport-key change, which does rebuild the heartbeat as a side
+		// effect — but heartbeat timing is not part of clusterTransportKey, so a
+		// timing-only commit never reaches that branch. This is a direct
+		// consequence of the UpdateConfig on the line above, and belongs with
+		// it. The call is a no-op when the timing is unchanged or no heartbeat
+		// is running, so an ordinary commit costs one lock and two comparisons.
+		d.cluster.ApplyCommittedHeartbeatTiming()
 		// Feed interface monitor statuses into cluster weight calculation
 		if d.routing != nil {
 			monStatuses := d.routing.InterfaceMonitorStatuses()
