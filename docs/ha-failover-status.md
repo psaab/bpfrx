@@ -512,7 +512,7 @@ takeover:
 | Peer not connected | none — returns immediately | `Fence unconfirmed, took over anyway: peer not connected` |
 | Peer predates #7147 | none — capability not advertised | `Fence unconfirmed, took over anyway: peer does not support fence acknowledgement` |
 | Sync channel dropped mid-wait | none — waiter released at once | `Fence unconfirmed, took over anyway: session sync disconnected...` |
-| Socket alive, peer silent | up to `FenceConfirmTimeout` (250 ms) | `Fence unconfirmed, took over anyway: timed out after 250ms...` |
+| Socket alive, peer silent | up to `FenceConfirmTimeout` (1 s) | `Fence unconfirmed, took over anyway: timed out after 1s...` |
 | Peer partly fenced | none | `Fence NOT confirmed (peer disabled only 1/3 redundancy groups), took over anyway` |
 | Peer confirmed | one fabric round trip | `Fence confirmed by peer (peer disabled 4/4 redundancy groups)` |
 
@@ -520,26 +520,6 @@ The only row that spends the timeout is one where the TCP socket is still up
 but no ack comes back. The ordinary dead-peer takeover costs nothing extra,
 because `SendFenceAwait` returns immediately when there is no active
 connection — there is nothing to wait for.
-
-**That row does not establish that the peer is gone, and this is the residual
-this mode does not close.** A socket that is up but blackholed — a partition
-dropping packets with TCP not yet timed out — produces exactly the same
-observation as a peer that lost power before its socket noticed: silence for
-250 ms. In the first case the peer is ALIVE and may still be forwarding, and
-taking over is precisely the dual-active split-brain a fence exists to prevent.
-
-So `disable-rg-confirmed` **reduces** the split-brain window rather than
-eliminating it. It converts every case where the peer can answer into a
-confirmed fence, and leaves unconfirmed only the case where the peer cannot be
-reached within the bound — where it is usually, but not provably, already gone.
-An operator selecting this mode is buying a smaller window in exchange for a
-bounded delay, not a guarantee.
-
-The config leaf cannot express that difference, so the `EventFence` attempt
-line is the only place a confirmed fence is distinguishable from a fallback.
-`Fence confirmed by peer (...)` is the guarantee; every `took over anyway`
-variant is not. Read the attempt line, not the policy name, when establishing
-what actually happened during a takeover.
 
 A `Confirmations: received N, timed out N, sent to peer N` line accompanies
 `Action` whenever the policy is armed or any ack traffic has occurred. Read
