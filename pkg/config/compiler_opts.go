@@ -924,6 +924,28 @@ type compileOpts struct {
 	// is inert. Commit stays strict so the operator's next edit fails loudly.
 	// Same doctrine as lenientNATHostMask.
 	lenientNPTv6 bool
+	// lenientVRFOverlapPBR (#7924) downgrades the NARROW cross-tenant
+	// session-collision gate from a hard compile error to a cfg.Warnings entry.
+	//
+	// The strict commit path rejects ONLY the combination that is already
+	// silently wrong: overlapping L3 across distinct routing-instances AND a PBR
+	// `then routing-instance` term. That pairing is a live cross-tenant policy
+	// bypass — the established-session fast path short-circuits BEFORE
+	// ingress_route_table_override, so a second flow sharing a 5-tuple inherits
+	// the first flow's cached egress, NAT and POLICY decision across a tenant
+	// boundary.
+	//
+	// Plain VRF overlap with no PBR steering keeps its warning and still
+	// commits; overlapping address space is the primary reason VRFs exist and a
+	// broad reject would break designs that work correctly today.
+	//
+	// The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick) —
+	// rejecting here would brick a node on a config its peer already accepted,
+	// which is a worse outcome than the collision this gate exists to stop.
+	// Commit stays strict so the operator's next edit fails loudly. Same
+	// doctrine as lenientNPTv6.
+	lenientVRFOverlapPBR bool
 	// lenientNAT64Prefix (#3886) downgrades the NAT64 `prefix` /96 commit gate
 	// (validateNAT64PrefixStrict) from a hard compile error to a cfg.Warnings
 	// entry. The strict commit / commit-check path hard-rejects a NAT64
@@ -2434,6 +2456,7 @@ func lenientCompileOpts() compileOpts {
 		lenientFilterTerminalConflict:          true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
+		lenientVRFOverlapPBR:                   true,
 		lenientNAT64Prefix:                     true,
 		lenientNATPoolOverlap:                  true,
 		lenientFirewallRefs:                    true,

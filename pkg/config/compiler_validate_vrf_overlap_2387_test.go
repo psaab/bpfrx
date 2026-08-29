@@ -75,10 +75,28 @@ import (
 // diagnosis. It selects on the diagnosis phrase, NOT on "#2387" — see the
 // comment on the filter below for why the issue reference cannot be the
 // selector.
+// vrf2387WarningsLenient is vrf2387Warnings on the TOLERANT path.
+//
+// #7924 promoted the overlap+PBR combination to a strict commit REJECTION, so a
+// caller whose subject is the WARNING for that combination can no longer reach
+// it through CompileConfig. The lenient path still emits the identical warning
+// (the rejection is a downgrade of it, not a replacement), so a test about
+// warning CONTENT keeps testing content rather than being rewritten into a test
+// about disposition — which #7924 covers separately and on purpose.
+func vrf2387WarningsLenient(t *testing.T, cmds []string) []string {
+	t.Helper()
+	return vrf2387WarningsWith(t, cmds, CompileConfigLenient)
+}
+
 func vrf2387Warnings(t *testing.T, cmds []string) []string {
 	t.Helper()
+	return vrf2387WarningsWith(t, cmds, CompileConfig)
+}
+
+func vrf2387WarningsWith(t *testing.T, cmds []string, compile func(*ConfigTree) (*Config, error)) []string {
+	t.Helper()
 	tree := buildTree(t, cmds)
-	cfg, err := CompileConfig(tree)
+	cfg, err := compile(tree)
 	if err != nil {
 		t.Fatalf("CompileConfig: %v", err)
 	}
@@ -165,7 +183,14 @@ func TestVRFOverlapWarnsViaPBRTerms(t *testing.T) {
 	// The same destination prefix steered into two different routing-instances
 	// by two PBR `then routing-instance` terms is the exact reachable-via-PBR
 	// trigger — overlap detected from the filter-term source.
-	warns := vrf2387Warnings(t, []string{
+	//
+	// #7924: this exact shape is now a strict commit REJECTION, so the warning is
+	// reached through the tolerant path. The subject of this test is unchanged and
+	// deliberately so — it binds that PBR TERMS FEED the overlap detector, which
+	// is the input #7924's rejection depends on. Rewriting it into a
+	// disposition assertion would have deleted the only coverage of that feed and
+	// left #7924 resting on a source nothing pins.
+	warns := vrf2387WarningsLenient(t, []string{
 		"set routing-instances RI-A instance-type virtual-router",
 		"set routing-instances RI-B instance-type virtual-router",
 		"set firewall family inet filter fbf term to-a from destination-address 172.16.9.0/24",

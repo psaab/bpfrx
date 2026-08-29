@@ -85,10 +85,21 @@ const (
 // routing-instances for overlap (net/netip Prefix.Overlaps — contains-or-equal).
 // Deterministic ordering (sorted RI names, sorted filter names, sorted
 // prefixes) so the warning set is stable across commits.
-func validateVRFOverlap(cfg *Config) []string {
+func validateVRFOverlap(cfg *Config, lenientPBR bool) ([]string, error) {
 	if cfg == nil {
-		return nil
+		return nil, nil
 	}
+	// #7924: does ANY PBR term steer into a routing-instance? This is the second
+	// half of the narrow rejection condition, and it is deliberately a
+	// config-level fact rather than a property of the overlapping pair.
+	//
+	// The defect needs PBR to be steering at all: the established-session fast
+	// path short-circuits before `ingress_route_table_override`
+	// (poll_descriptor/mod.rs), and that override is what a `then
+	// routing-instance` term sets. With no such term nothing re-homes a flow's
+	// table mid-path, so two overlapping RIs cannot collide through it and the
+	// pre-#7924 warning is the correct disposition.
+	sawPBRRoutingInstance := false
 
 	// riPrefixes[riName] = de-duplicated, origin-tagged prefix set.
 	riPrefixes := map[string][]vrfOverlapPrefix{}
@@ -161,6 +172,12 @@ func validateVRFOverlap(cfg *Config) []string {
 			if term == nil || term.RoutingInstance == "" {
 				continue
 			}
+			// #7924: a `then routing-instance` term exists. Recorded even when the
+			// term carries no source/destination prefixes and so contributes
+			// nothing to the overlap sets — it still installs the table override
+			// the fast path skips, which is the mechanism, so gating on "the term
+			// contributed a prefix" would miss a match-all steering term.
+			sawPBRRoutingInstance = true
 			origin := fmt.Sprintf("filter %q term %q", filterName, term.Name)
 			for _, addr := range term.SourceAddresses {
 				addPrefix(term.RoutingInstance, addr, origin)
@@ -256,5 +273,26 @@ Scan:
 				"some overlaps may be unreported",
 			comparisons, len(warnings)))
 	}
-	return warnings
+	// #7924: promote to a REJECTION for the narrow combination that is already
+	// silently wrong — overlap AND PBR steering. See lenientVRFOverlapPBR for the
+	// #1960 no-brick reasoning behind the lenient downgrade.
+	//
+	// This is a WORKAROUND WITH A DEBT, not the fix. The real fix is #7160: widen
+	// the session key with a routing-domain discriminator
+	// (StableRoutingInstanceTableID) so the two flows stop colliding at all,
+	// staged behind #7925. This gate refuses a configuration the dataplane cannot
+	// currently forward correctly; it does not make that configuration work, and
+	// it must not become a substitute for #7160.
+	if len(warnings) > 0 && sawPBRRoutingInstance && !lenientPBR {
+		return warnings, fmt.Errorf(
+			"overlapping L3 across routing-instances combined with a PBR `then "+
+				"routing-instance` term is refused: the session identity carries no "+
+				"routing-instance discriminator, and the established-session fast path "+
+				"runs BEFORE the PBR table override, so a second flow sharing a 5-tuple "+
+				"inherits the first flow's cached egress, NAT and POLICY decision across "+
+				"the tenant boundary (#7924; tracked for a real fix by #7160). "+
+				"Overlapping VRF address space WITHOUT PBR steering still commits with a "+
+				"warning. First overlap: %s", warnings[0])
+	}
+	return warnings, nil
 }
