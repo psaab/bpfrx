@@ -460,11 +460,37 @@ const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
 /// that DETERMINES the gates a hit bypasses — the interface input filter is
 /// bound per logical interface, so two interfaces in the SAME zone can carry
 /// DIFFERENT filters and keying on zone alone would still alias them. `zone`
-/// and `routing_table` are functions of that interface, but they are carried
-/// explicitly because the enforcement arm reads them directly (a zone override
-/// or a fabric-origin packet can make the effective zone differ from the one
-/// the raw ifindex would imply), and a key must be derived from EXACTLY the
+/// is a function of that interface but is carried EXPLICITLY, because it can
+/// differ from the interface-implied value: a fabric/tunnel
+/// `ingress_zone_override` re-homes a packet's zone, the enforcement arm reads
+/// the overridden value directly, and a key must be derived from EXACTLY the
 /// ingress inputs enforcement uses for "same key <=> same domain" to hold.
+///
+/// `routing_table` does NOT earn its place the same way, and #7051 is the issue
+/// that asked. The asymmetry is measurable in `prerouting_ingress_scope`:
+/// `zone_name` consults `zone_override` FIRST, while `routing_instance` is read
+/// unconditionally from `ifindex_to_routing_instance[logical_ifindex]` — there
+/// is no routing-instance override anywhere on the path. That map is populated
+/// one entry per interface (`forwarding_build/interfaces.rs`), so the VRF is a
+/// PURE FUNCTION of the logical unit, and this key already carries that unit.
+/// Even populated correctly the field could not separate two authorities that
+/// `ingress_ifindex` + `ingress_vlan_id` do not already separate.
+///
+/// It is also INERT today: `meta.routing_table` is a literal 0 at both of its
+/// only assignments — the shim writer (`userspace-xdp/src/lib.rs`) and the
+/// `Default` impl (`afxdp/types/mod.rs`) — so no real packet carries a non-zero
+/// value into `frag_ingress_authority`. That is CHECKED rather than asserted in
+/// prose, by `frag_authority_routing_table_is_inert_in_production_7051`.
+///
+/// So count THREE live dimensions here, not four — which is what #7051 reported
+/// and what an auditor reading the previous wording got wrong. The field is
+/// nevertheless KEPT rather than dropped, a deliberate decision already recorded
+/// by #6927 r2 at
+/// `tests_nat64_tunnel::nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`:
+/// the key is ready if the shim ever stamps it, and the direction is safe — a
+/// stamped value can only make the key FINER, which is a MISS and therefore
+/// fail-closed, never a false inherit. If it is ever made live, relabel that
+/// test's fabricated case and drive it from a real ingress.
 ///
 /// NOT included: the config/FIB generation, which `Nat64FragEntry.generation`
 /// already fences (#5624), and direction, which is constant — the cache is
@@ -531,7 +557,17 @@ pub(crate) struct FragAuthority {
     /// already-admitted-flow property the flow-backed session table has across
     /// an RG transition; do not describe it as bounded by a shorter lifetime.
     pub(crate) ingress_zone: u16,
-    /// Routing instance / VRF the ingress resolves in.
+    /// Routing instance / VRF the ingress resolves in — **inert in production**
+    /// (#7051): every assignment of `meta.routing_table` is a literal 0, so on a
+    /// real packet this is always 0.
+    ///
+    /// Kept rather than dropped, and it costs nothing in discrimination either
+    /// way: the VRF is a pure function of the logical ingress unit
+    /// (`ifindex_to_routing_instance` is keyed by ifindex and, unlike
+    /// `ingress_zone`, has no override), so `ingress_ifindex` already separates
+    /// two ingresses in different routing instances. Full reasoning in the
+    /// type's doc block above; the guard that keeps this comment honest is
+    /// `frag_authority_routing_table_is_inert_in_production_7051`.
     pub(crate) routing_table: u32,
 }
 
@@ -700,8 +736,11 @@ impl Nat64FragAssoc {
         // #6857: owner RG of the resolution this fragment was admitted under;
         // 0 when no RG-bound interface owns it.
         owner_rg: i32,
-    ) {
+    ) -> bool {
         let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        // #7054: did this install sacrifice a LIVE association? Reported to the
+        // caller so the condition is observable; see the note above the eviction.
+        let mut evicted_live = false;
         let idx = nat64_frag_shard_index(&key);
         let mut shard = self.shards[idx]
             .lock()
@@ -723,7 +762,7 @@ impl Nat64FragAssoc {
             // would leave the entry stamped with the old value.
             e.owner_rg = owner_rg;
             shard.push(e);
-            return;
+            return false;
         }
         if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
             // Reclaim EXPIRED slots before touching a live one. Under a flood of
@@ -739,6 +778,7 @@ impl Nat64FragAssoc {
             shard.retain(|e| e.deadline_ns > now_ns);
             if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
                 shard.remove(0);
+                evicted_live = true;
             }
         }
         shard.push(Nat64FragEntry {
@@ -749,6 +789,7 @@ impl Nat64FragAssoc {
             generation,
             owner_rg,
         });
+        evicted_live
     }
 
     /// Consult the association for a NON-first fragment. Prunes expired entries

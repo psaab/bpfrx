@@ -99,25 +99,25 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     authority: crate::nat64::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
-) {
+) -> bool {
     // #5146: only a genuine NAT64 (cross-family) decision installs here. The
     // ordinary same-family NAT / NPTv6 association is installed by
     // `nat_install_forward_fragment_assoc` (which self-gates the other way), so
     // both can be called at one commit site and exactly one populates the table.
     if !decision.nat.nat64 {
-        return;
+        return false;
     }
     if decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
         || decision.resolution.neighbor_mac.is_none()
     {
-        return;
+        return false;
     }
     if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
         // #5624: stamp the association with the generation of the forwarding
         // state that admitted this first fragment. `build_generation` advances
         // on every config reload, so an association installed here is rejected
         // once a later commit changes deny/NAT64 rules.
-        forwarding.nat64.frag_assoc.install(
+        return forwarding.nat64.frag_assoc.install(
             key,
             *decision,
             None,
@@ -130,6 +130,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
             crate::afxdp::forwarding::owner_rg_for_resolution(forwarding, decision.resolution),
         );
     }
+    false
 }
 
 /// #2562: consult the fragment association for a NON-first NAT64 forward
@@ -205,21 +206,21 @@ pub(super) fn nat_install_forward_fragment_assoc(
     authority: crate::nat64::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
-) {
+) -> bool {
     // Cross-family NAT64 has its own install (which also stamps the reverse
     // info); here we cache only an ordinary same-family address rewrite.
     if decision.nat.nat64
         || (decision.nat.rewrite_src.is_none() && decision.nat.rewrite_dst.is_none())
     {
-        return;
+        return false;
     }
     if decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
         || decision.resolution.neighbor_mac.is_none()
     {
-        return;
+        return false;
     }
     if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
-        forwarding.nat64.frag_assoc.install(
+        return forwarding.nat64.frag_assoc.install(
             key,
             *decision,
             None,
@@ -232,6 +233,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
             crate::afxdp::forwarding::owner_rg_for_resolution(forwarding, decision.resolution),
         );
     }
+    false
 }
 
 /// #5689: consult the fragment association for a NON-first ORDINARY same-family

@@ -13,14 +13,14 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 	"classifiers": {desc: "Classifiers mapping incoming code points to forwarding classes", children: map[string]*schemaNode{
 		"dscp": {desc: "DSCP classifier", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
-				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority for packets matching this code point (ENFORCED: feeds dscp_lp_by_dscp, which selects the egress DSCP rewrite row)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-points": {desc: "DSCP code points to match (alias such as ef, af11, cs6, or numeric 0..63)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 				}},
 			}},
 		}},
 		"ieee-802.1": {desc: "IEEE 802.1p classifier", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
-				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority for packets matching this code point (ENFORCED: feeds ieee8021_lp_by_pcp, which selects the egress DSCP rewrite row)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-points": {desc: "IEEE 802.1p code points to match (0..7)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 				}},
 			}},
@@ -33,7 +33,7 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 		// `rewrite-rules inet-precedence` direction below is still inert.
 		"inet-precedence": {desc: "IP-precedence classifier (classify on the 3-bit IP precedence field)", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
-				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority for packets matching this precedence (ENFORCED: feeds inet_precedence_lp_by_prec, which selects the egress DSCP rewrite row)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-points": {desc: "IP-precedence code points to match (0..7)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 				}},
 			}},
@@ -42,7 +42,7 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 	"rewrite-rules": {desc: "Egress rewrite rules mapping forwarding classes to code points", children: map[string]*schemaNode{
 		"dscp": {desc: "DSCP rewrite rule", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
-				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority this rewrite entry applies to (ENFORCED: the egress DSCP is chosen by (queue, loss-priority))", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
 					"code-point":  {desc: "DSCP code point to write (alias such as ef, af11, cs6, or numeric 0..63)", args: 1, placeholder: "<code-point>", children: nil},
 					"code-points": {desc: "DSCP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 				}},

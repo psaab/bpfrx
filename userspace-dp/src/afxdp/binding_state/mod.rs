@@ -301,6 +301,8 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// fragments traverse end-to-end is deferred, so this is the observable-drop
     /// half of #2562.
     pub(super) nat64_frag_dropped: AtomicU64,
+    /// #7054: first-fragment installs that evicted a still-LIVE association.
+    pub(super) nat64_frag_assoc_evicted: AtomicU64,
     /// #5623: cumulative fail-closed NAT64 SOURCE-ineligibility drops — an
     /// incoming IPv6 packet whose SOURCE lies within a configured Pref64 (a
     /// looping/synthesized "already-translated" source, the RFC 6146 §5 hairpin
@@ -814,10 +816,25 @@ pub(in crate::afxdp) struct BindingLiveState {
 // guard reporting a real layout change and being answered, not defeated.
 // `size_of` is unchanged at 2304: the 8 bytes came out of existing tail
 // padding, so the next field added here will move it and should expect to.
+//
+// #7054 re-measured the two offsets again (2160 -> 2168, 2288 -> 2296) when
+// `nat64_frag_assoc_evicted` joined the cold-counter run. Same legitimate case
+// as #6664: the field is UNCONDITIONAL, so the production and test builds shift
+// by the same 8 bytes and re-measuring makes both green together — the guard
+// reporting a real layout change and being answered, not defeated. (Contrast
+// the `#[cfg(test)]` hazard above, where at most one of the two builds can be
+// green at any one pair of literals, which is what makes that case
+// un-satisfiable by re-measuring.)
+//
+// The #6664 note's prediction that "the next field added here will move
+// `size_of`" did NOT hold: it is still 2304, because the tail padding had room
+// for a second u64. Recorded so the next reader does not treat an unchanged
+// 2304 as evidence their field failed to land — check the OFFSETS, which did
+// move.
 const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
-const _: [(); 2160] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
-const _: [(); 2288] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+const _: [(); 2168] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2296] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
 
 impl BindingLiveState {
     pub(super) fn new() -> Self {
@@ -899,6 +916,7 @@ impl BindingLiveState {
             nat64_no_source_pool: AtomicU64::new(0),
             nat64_pool_exhausted: AtomicU64::new(0),
             nat64_frag_dropped: AtomicU64::new(0),
+            nat64_frag_assoc_evicted: AtomicU64::new(0),
             nat64_ineligible_source: AtomicU64::new(0),
             nat64_ineligible_dest: AtomicU64::new(0),
             nat64_exthdr_ineligible: AtomicU64::new(0),

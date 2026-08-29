@@ -5138,6 +5138,104 @@ fn nat64_frag_assoc_install_prunes_expired_before_evicting_live() {
 }
 
 #[test]
+fn nat64_frag_assoc_install_reports_only_live_evictions_7054() {
+    // #7054: the shard-cap eviction of a still-LIVE association was SILENT. The
+    // eviction itself is correct — a fixed ceiling has to sacrifice something —
+    // but the victim's non-first fragments then miss and are dropped
+    // fail-closed, and the only trace was a `nat64_frag_dropped` bump
+    // indistinguishable from an ordinary reorder/orphan. `install` now reports
+    // it so the caller can count it.
+    //
+    // REACHABILITY IS ALREADY PROVEN and is not re-proven here:
+    // `nat64_frag_assoc_install_all_live_still_evicts_oldest` below drives an
+    // all-live shard at cap and shows the front entry evicted. What this cell
+    // adds is the SIGNAL.
+    //
+    // THE FALSE CASES ARE THE POINT. `assert!(evicted)` alone passes against a
+    // function that returns `true` unconditionally — and a counter that fires on
+    // every install is worse than no counter, because it reads as constant
+    // capacity pressure. So the three ordinary paths are asserted false: a plain
+    // install into a shard with room, a REFRESH of an existing key, and an
+    // install that reclaimed an EXPIRED slot (the #5447 prune, which must not be
+    // reported as a live eviction).
+    let src = IpAddr::V6("2001:db8::7054".parse().unwrap());
+    let dst = IpAddr::V6("64:ff9b::0707:0707".parse().unwrap());
+    let family = libc::AF_INET6 as u8;
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 7),
+        Ipv4Addr::new(7, 7, 7, 7),
+        5007,
+    ));
+    let idents = frag_idents_in_one_shard(src, dst, family, NAT64_FRAG_CAP_PER_SHARD + 2);
+    let mk = |ident: u32| Nat64FragKey {
+        addr_family: family,
+        src,
+        dst,
+        ident,
+        protocol: PROTO_UDP,
+        authority: frag_test_authority(),
+    };
+
+    let cache = Nat64FragAssoc::new();
+
+    // FALSE 1 — a plain install with room in the shard.
+    assert!(
+        !cache.install(mk(idents[0]), decision, None, 1_000, 1, 0),
+        "an install into a shard with room evicted nothing and must report false"
+    );
+    // FALSE 2 — a REFRESH of the same key. It takes the early return and cannot
+    // evict; reporting true here would count every retransmitted first fragment.
+    assert!(
+        !cache.install(mk(idents[0]), decision, None, 2_000, 1, 0),
+        "a same-key refresh evicts nothing and must report false"
+    );
+
+    for &ident in &idents[1..NAT64_FRAG_CAP_PER_SHARD] {
+        assert!(
+            !cache.install(mk(ident), decision, None, 1_000, 1, 0),
+            "filling the shard must not report an eviction until it is full"
+        );
+    }
+    assert_eq!(
+        cache.len(),
+        NAT64_FRAG_CAP_PER_SHARD,
+        "fixture: the shard must be exactly at cap, or the cell below is not \
+         exercising the eviction branch at all"
+    );
+
+    // TRUE — every entry live, shard at cap: the oldest live entry is sacrificed.
+    assert!(
+        cache.install(mk(idents[NAT64_FRAG_CAP_PER_SHARD]), decision, None, 1_000, 1, 0),
+        "an install that evicted a still-LIVE association must report it — this \
+         is the condition #7054 exists to make observable"
+    );
+    assert!(
+        cache
+            .lookup(&mk(idents[0]), 1_000, 1, |_| true)
+            .is_none(),
+        "control: the reported eviction really did remove the front entry"
+    );
+
+    // FALSE 3 — the #5447 prune path. Advance past the TTL so every entry is
+    // expired; the install then reclaims a dead slot and must NOT be reported as
+    // a live eviction.
+    let past_ttl = 1_000 + NAT64_FRAG_TTL_NS + 1;
+    assert!(
+        !cache.install(
+            mk(idents[NAT64_FRAG_CAP_PER_SHARD + 1]),
+            decision,
+            None,
+            past_ttl,
+            1,
+            0
+        ),
+        "an install that reclaimed EXPIRED slots sacrificed no live association \
+         and must report false — otherwise the counter fires on ordinary TTL \
+         turnover and tells an operator nothing (#5447/#7054)"
+    );
+}
+
+#[test]
 fn nat64_frag_assoc_install_all_live_still_evicts_oldest() {
     // Control / capacity-bound preservation: when EVERY entry in a full shard is
     // LIVE, pruning reclaims nothing, so `install` still evicts the OLDEST

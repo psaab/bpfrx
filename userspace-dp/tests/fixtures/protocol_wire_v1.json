@@ -116,6 +116,7 @@
     "mirrored_bytes": 0,
     "mirrored_packets": 0,
     "nat64_exthdr_ineligible": 0,
+    "nat64_frag_assoc_evicted": 0,
     "nat64_frag_dropped": 0,
     "nat64_ineligible_dest": 0,
     "nat64_ineligible_source": 0,

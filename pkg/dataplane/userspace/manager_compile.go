@@ -4,9 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -229,20 +226,14 @@ func (m *Manager) SetPolicySchedulerActiveState(activeState map[string]bool) {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
-	// Delete XDP link pins BEFORE CompileUserspaceShim() so AttachXDP does
-	// a fresh attach. This is critical for zero-copy: fresh attach
-	// triggers mlx5 to initialize XSK buffer pool from fill ring.
-	// Pinned link reuse (l.Update) only swaps the program without
-	// reinitializing XSK RQs, leaving the fill ring unconsumed.
-	if linkPinDir := "/sys/fs/bpf/xpf/links"; true {
-		entries, _ := os.ReadDir(linkPinDir)
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "xdp_") {
-				path := filepath.Join(linkPinDir, e.Name())
-				_ = os.Remove(path)
-			}
-		}
-	}
+	// #7079: the XDP link-pin removal that used to be the first statement of
+	// this function now lives in dataplane.Manager.CompileUserspaceShim, after
+	// CompileConfig has accepted the config and immediately before the attach it
+	// exists for. Here it ran ahead of the #4960 validate-before-mutate
+	// pre-pass, so a config the pre-pass REJECTED still lost the host's pins for
+	// an apply that never happened. Its own comment named
+	// "BEFORE CompileUserspaceShim()" as the requirement, but the real
+	// constraint is "before AttachXDP", and that is satisfied at the new site.
 	caps := deriveUserspaceCapabilities(cfg)
 	// Userspace mode always attaches the retained XDP shim. The shim
 	// redirects to XSK when ctrl=1; when ctrl=0 it only passes proven

@@ -1517,6 +1517,8 @@ pub(crate) struct BindingLiveSnapshot {
     /// #2562: cumulative fail-closed NAT64 fragment drops snapshotted from
     /// BindingLiveState (a non-first fragment or a real ICMP/ICMPv6 fragment).
     pub(crate) nat64_frag_dropped: u64,
+    /// #7054: first-fragment installs that evicted a still-LIVE association.
+    pub(crate) nat64_frag_assoc_evicted: u64,
     /// #5623: cumulative fail-closed NAT64 source-ineligibility drops snapshotted
     /// from BindingLiveState (an incoming IPv6 packet whose source lies within a
     /// configured Pref64 — the RFC 6146 §3.5 mandatory hairpin/source drop).

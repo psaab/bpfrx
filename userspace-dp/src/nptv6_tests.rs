@@ -993,3 +993,59 @@ fn ones_complement_sum(words: &[u16; 8]) -> u16 {
     }
     sum as u16
 }
+
+/// #7077: `parse_prefix` must accept ONLY ASCII digits in the mask token.
+///
+/// This exists because the tightening it guards was unbound on **both** planes
+/// when it was written, which the mutation matrix found rather than review:
+///
+///   - the Go side's `rustParsePrefixTable` is a hand-maintained mirror, so it
+///     asserts what someone typed about this function, not what this function
+///     does — reverting the Rust leaves the whole Go suite green;
+///   - and nothing here covered the mask grammar at all.
+///
+/// So the Go mirror alone cannot bind it. `TestNPTv6HelperGrammarMatchesTheRustParser_7077`
+/// keeps the two spellings AGREEING, which is its job; this keeps the Rust one
+/// TRUE, which nothing else did.
+///
+/// The `+` row is the one that changed behaviour — `u8::from_str` accepts a
+/// leading sign, and Go's `net.ParseCIDR` (mask via `dtoi`) does not, so it was
+/// the last live divergence between the planes. The rest were already refused by
+/// `u8::from_str` and are now refused one step earlier by the same rule; they are
+/// here so a future "simplification" back to a bare `.parse()` cannot pass by
+/// covering only the sign.
+#[test]
+fn parse_prefix_mask_is_ascii_digits_only_7077() {
+    // The accepted control FIRST: without it every assertion below is satisfied
+    // by a parse_prefix that returns None for everything.
+    assert_eq!(
+        super::parse_prefix("2001:db8::/48").map(|(_, w)| w),
+        Some(3),
+        "the accepted control no longer parses, so the refusals below prove nothing"
+    );
+    assert_eq!(
+        super::parse_prefix("2001:db8::/048").map(|(_, w)| w),
+        Some(3),
+        "leading ZEROS are digits and must still parse — the rule is digits-only, \
+         not canonical-form-only, and Go's net.ParseCIDR accepts /048 too"
+    );
+
+    for bad in [
+        "2001:db8::/+48",  // the divergence #7077 closed
+        "2001:db8::/++48", // more than one sign
+        "2001:db8::/-48",  // the other sign
+        "2001:db8::/48+",  // trailing
+        "2001:db8::/ 48",  // whitespace
+        "2001:db8::/4_8",  // separator
+        "2001:db8::/0x30", // radix prefix
+        "2001:db8::/",     // empty mask
+    ] {
+        assert!(
+            super::parse_prefix(bad).is_none(),
+            "parse_prefix accepted {bad:?}. Go's net.ParseCIDR refuses it, so the two \
+             planes disagree about whether the rule installs — and the Go pre-pass \
+             infers the helper's verdict from its own parse (#6894 r9), which is how \
+             a config that applies today starts hard-failing"
+        );
+    }
+}
