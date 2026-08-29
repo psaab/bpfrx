@@ -2996,6 +2996,15 @@ func natTerminalActionCardinalityOffenders(cfg *Config) []LenientNATTerminalActi
 					out = append(out, LenientNATTerminalActionRule{
 						Kind: kind, RuleSet: rs.Name, Rule: rule.Name, Actions: n,
 					})
+				} else if modes := natThenPackedContradictionModes(rule); len(modes) > 0 {
+					// #7033: a PACKED contradiction resolves to one field, so the
+					// count above reads 1 and this rule would be missing from the
+					// gauge while a commit refuses it. Actions is the AUTHORED
+					// count, which is what the operator wrote and what the strict
+					// error reports.
+					out = append(out, LenientNATTerminalActionRule{
+						Kind: kind, RuleSet: rs.Name, Rule: rule.Name, Actions: len(modes),
+					})
 				}
 			}
 		}
@@ -3271,9 +3280,27 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 							"WHICH contradiction you get here. This gate counts the actions the "+
 							"rule RESOLVED to, so it catches a block that LOWERS two distinct "+
 							"actions; a contradiction whose tokens are PACKED onto one node, as "+
-							"in `pool <p> off`, lowers to a single action, is counted as one and "+
-							"is NOT caught here — tracked as #7033.)",
+							"in `pool <p> off`, lowers to a single action and is counted as one, "+
+							"so it is rejected by the packed-contradiction check that follows "+
+							"this one rather than here — #7033.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)
+				}
+				// #7033: the PACKED cross-mode contradiction, which the count
+				// above cannot see. Two modes written as tokens on one run lower
+				// to a single field, so n == 1 and the switch falls through. This
+				// runs after it so a block that LOWERS two actions keeps that
+				// message; the only configs reaching here are the ones the field
+				// count is blind to.
+				if modes := natThenPackedContradictionModes(rule); len(modes) > 0 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: one `then` block packs %d "+
+							"mutually-exclusive translation actions onto a single run (%s), "+
+							"but a rule carries exactly one (expected one of %s). Packed that "+
+							"way they lower to a SINGLE action, so the rule is counted as "+
+							"carrying one and nothing else reports it: %s. Author one action, "+
+							"or split them into separate rules",
+						kind, rs.Name, rule.Name, len(modes), strings.Join(modes, ", "),
+						actions, natPackedContradictionDetail(modes))
 				}
 			}
 		}
