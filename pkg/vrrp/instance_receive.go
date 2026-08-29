@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -40,36 +41,61 @@ func isTimeoutError(err error) bool {
 // combination that omits the control message — the VRID/TTL/self-IP gates still
 // apply. expectedIfindex <= 0 (an instance with no resolved interface index, as
 // in some unit-test constructions) also fails open.
-// unreportedArrivalIfindexWarn fires at most once per process when the
-// platform does not report an arrival interface for a VRRP advert (#7171).
+// arrivalIfindexDetector records the case where the platform does not report
+// an arrival interface for a VRRP advert (#7171), keeping the DECISION that it
+// happened separate from the once-guarded emission of the warning.
 //
-// The fail-open above is deliberate and stays. What was missing is any way to
-// know it is happening: on a kernel/socket combination that omits the
-// interface control message, EVERY advert takes the fail-open path, so the
-// #2886 cross-processing guard is silently inactive for the life of the
-// process. That is precisely the configuration #2886 exists for -- two VLAN
-// sub-interfaces on a shared parent running the same VRID -- and the symptom
-// without this line is state corruption and BACKUP flapping with nothing
-// pointing at the disabled guard.
+// The fail-open in acceptArrivalIfindex is deliberate and stays: it exists so a
+// kernel/socket combination that omits the interface control message does not
+// lose real advert delivery. What was missing is any way to know it is in
+// effect. On such a platform EVERY advert takes that branch, so the #2886
+// per-interface isolation is silently inactive for the life of the process --
+// exactly the configuration #2886 was filed for, two VLAN sub-interfaces of one
+// parent running instances with the same VRID, where the symptom is state
+// corruption and BACKUP flapping with nothing pointing at the disabled guard.
 //
-// sync.Once, not a per-packet log: RETH instances advertise every 30ms, so an
-// unguarded log here would flood journald (CLAUDE.md logging rules).
-var unreportedArrivalIfindexWarn sync.Once
+// The split matters twice over. A bare sync.Once cannot be tested -- whether it
+// fires depends on which test ran first in the package binary rather than on
+// the input -- so a guard against silence would itself have been unverifiable.
+// And the count is the operator-relevant signal: this condition is not a
+// one-off, it is every packet, and a Once reports one occurrence and a million
+// identically.
+type arrivalIfindexDetector struct {
+	occurrences atomic.Uint64
+	warn        sync.Once
+}
+
+// observe records one arrival-interface decision and reports whether the
+// platform failed to report an interface for a real instance. The log fires
+// once per process -- RETH instances advertise every 30ms and CLAUDE.md forbids
+// an unguarded log on a per-packet path -- while the count advances every time.
+func (d *arrivalIfindexDetector) observe(arrivalIfindex, expectedIfindex int) bool {
+	// Only the platform-side case is reportable. expectedIfindex <= 0 is an
+	// instance with no resolved index, which is a test construction rather
+	// than something an operator can act on.
+	if arrivalIfindex > 0 || expectedIfindex <= 0 {
+		return false
+	}
+	d.occurrences.Add(1)
+	d.warn.Do(func() {
+		slog.Warn("vrrp: kernel did not report an arrival interface for a "+
+			"VRRP advert; per-interface advert isolation (#2886) is inactive "+
+			"on this platform, so instances sharing a VRID across VLAN "+
+			"sub-interfaces of one parent may cross-process adverts",
+			"expected_ifindex", expectedIfindex)
+	})
+	return true
+}
+
+// count returns how many unreported-arrival adverts have been observed, across
+// all occurrences rather than only the first.
+func (d *arrivalIfindexDetector) count() uint64 { return d.occurrences.Load() }
+
+var unreportedArrivalIfindex arrivalIfindexDetector
 
 func acceptArrivalIfindex(arrivalIfindex, expectedIfindex int) bool {
 	if arrivalIfindex <= 0 || expectedIfindex <= 0 {
-		// Only the platform-side case is worth reporting. expectedIfindex <= 0
-		// is an instance with no resolved index, which is a test construction
-		// rather than something an operator can act on.
-		if arrivalIfindex <= 0 && expectedIfindex > 0 {
-			unreportedArrivalIfindexWarn.Do(func() {
-				slog.Warn("vrrp: kernel did not report an arrival interface for a "+
-					"VRRP advert; per-interface advert isolation (#2886) is inactive "+
-					"on this platform, so instances sharing a VRID across VLAN "+
-					"sub-interfaces of one parent may cross-process adverts",
-					"expected_ifindex", expectedIfindex)
-			})
-		}
+		unreportedArrivalIfindex.observe(arrivalIfindex, expectedIfindex)
 		return true
 	}
 	return arrivalIfindex == expectedIfindex
