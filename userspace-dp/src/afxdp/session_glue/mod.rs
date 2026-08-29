@@ -282,6 +282,36 @@ pub(super) struct WorkerCommandResults {
     /// no `BindingWorker` access — the outer poll loop in `worker.rs`
     /// dispatches based on this flag.
     pub vacate_all_shared_exact_slots: bool,
+    /// #7201: the shared queue still held commands after this call's
+    /// [`WORKER_COMMAND_DRAIN_BUDGET`] slice was taken.
+    ///
+    /// The worker loop MUST fold this into `did_work`. It is not a statistic:
+    /// `did_work` is set only by `poll_binding`, so without this the loop
+    /// classifies a budget-split drain as IDLE, and on a node with no traffic
+    /// yet — the standby that has just been promoted, which is exactly when the
+    /// RG-activation burst arrives — `idle_iters` passes `IDLE_SPIN_ITERS` and
+    /// every remaining slice waits behind a 1 ms `poll(2)` in Interrupt mode.
+    /// The budget would then have replaced a bounded 3.85 ms stall with ~16 ms
+    /// of drain.
+    pub commands_backlogged: bool,
+}
+
+impl WorkerCommandResults {
+    /// The no-work result: nothing dispatched, nothing left behind.
+    ///
+    /// `commands_backlogged: false` is load-bearing, not a filler default — it
+    /// is what keeps an empty or lock-contended pass out of `did_work`.
+    pub(super) fn empty() -> Self {
+        WorkerCommandResults {
+            cancelled_keys: Vec::new(),
+            deleted_synced_keys: Vec::new(),
+            exported_sequences: Vec::new(),
+            export_owner_rgs: Vec::new(),
+            shaped_tx_requests: Vec::new(),
+            vacate_all_shared_exact_slots: false,
+            commands_backlogged: false,
+        }
+    }
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -687,6 +717,12 @@ pub(super) fn apply_worker_commands(
     // in the worker loop. A peer-synced reservation is held by every worker, so
     // a release must drop THIS worker's bit rather than free the port outright.
     worker_id: u32,
+    // #7201: worker-owned, recycled across calls. The drain moves its bounded
+    // slice in here instead of `mem::take`-ing the shared deque, so the shared
+    // deque keeps its allocation (the producers hold the lock; they were paying
+    // to regrow it from zero capacity on every pass) and this buffer keeps its
+    // own. Entered empty and left empty — the dispatch loop below drains it.
+    scratch: &mut VecDeque<WorkerCommand>,
 ) -> WorkerCommandResults {
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
@@ -695,29 +731,26 @@ pub(super) fn apply_worker_commands(
     // policy, worker_queue.rs) and the recovered deque is processed as
     // normal — treating poison as absence-of-work made the worker
     // permanently deaf to coordinator commands.
-    let pending = match worker_queue::try_lock_recover(commands) {
+    //
+    // #7201: this takes a BOUNDED PREFIX, not the whole deque. Every command is
+    // a session-table mutation plus a BPF-map publish syscall, and the worker
+    // does not touch its AF_XDP rings until the loop below finishes — so an
+    // unbounded drain is unserviced ring time. See
+    // `worker_queue::WORKER_COMMAND_DRAIN_BUDGET` for the measurement and the
+    // ring arithmetic that fix the slice size.
+    let commands_backlogged = match worker_queue::try_lock_recover(commands) {
         Some(mut pending) => {
             if pending.is_empty() {
-                return WorkerCommandResults {
-                    cancelled_keys: Vec::new(),
-                    deleted_synced_keys: Vec::new(),
-                    exported_sequences: Vec::new(),
-                    export_owner_rgs: Vec::new(),
-                    shaped_tx_requests: Vec::new(),
-                    vacate_all_shared_exact_slots: false,
-                };
+                return WorkerCommandResults::empty();
             }
-            core::mem::take(&mut *pending)
+            worker_queue::drain_bounded_into(&mut pending, scratch)
         }
         None => {
-            return WorkerCommandResults {
-                cancelled_keys: Vec::new(),
-                deleted_synced_keys: Vec::new(),
-                exported_sequences: Vec::new(),
-                export_owner_rgs: Vec::new(),
-                shaped_tx_requests: Vec::new(),
-                vacate_all_shared_exact_slots: false,
-            };
+            // Could not take the lock this pass. The queue is not known to be
+            // empty — a producer holds it — but reporting a backlog here would
+            // pin the loop to `did_work` on nothing more than lock contention,
+            // so leave it to the next pass, which is one poll away.
+            return WorkerCommandResults::empty();
         }
     };
     // Sample monotonic time ONCE per tick so every handler sees the same
@@ -742,7 +775,7 @@ pub(super) fn apply_worker_commands(
     let mut export_owner_rgs: Vec<i32> = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
-    for cmd in pending {
+    for cmd in scratch.drain(..) {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
                 commands::handle_demote_owner_rgs(
@@ -881,6 +914,7 @@ pub(super) fn apply_worker_commands(
         export_owner_rgs,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
+        commands_backlogged,
     }
 }
 
