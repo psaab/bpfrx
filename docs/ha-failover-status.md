@@ -42,6 +42,46 @@ yet. Here is what is true today:
   starting in the slower `DrainSessionDeltas` polling fallback. The gate keys on
   the listener being UP, not on the local helper currently being connected;
   transient stream disconnects are covered by polling
+- The takeover readiness gate applies on COLD BOOT, not only when the peer is
+  alive (#7161). `electSingleNode` previously gated on `m.peerAlive`, so the
+  gate was fully enforced on the peer-alive path and fully bypassed on the
+  peer-dead path — which is the path both a cold boot and a peer loss take. The
+  condition is now `(m.peerAlive || !m.peerEverSeen)`:
+  - **peer LOSS** (`peerEverSeen && !peerAlive`) keeps the fail-open. An
+    established cluster had a working primary and it died; a survivor that
+    refuses takeover is a TOTAL OUTAGE and may be the only node that can
+    forward.
+  - **cold BOOT** (`!peerEverSeen`) applies the gate. There is no established
+    forwarding to preserve, and a not-ready node that promotes forwards nothing
+    anyway — it claims the VIPs and the RG while unable to serve them, and
+    denies the peer a clean takeover. This is #103 acceptance criterion 1.
+
+  **POLICY CHANGE, declared:** a userspace-configured data RG with no published
+  dataplane fail-closes in `checkUserspaceTakeoverReadinessFor`, so on a cold
+  boot it now stays SECONDARY where it previously promoted. It forwards nothing
+  either way; the difference is that it now says so instead of advertising
+  itself primary for traffic it cannot carry.
+
+  The prior in-code rationale ("sync readiness is impossible without a peer")
+  was stale and has been replaced rather than narrowed: sync readiness is not a
+  term in that conjunction at all. `IsReadyForTakeover` consults local
+  interfaces, local VRRP and the local userspace dataplane — all determinable
+  with no peer — and `fabricReady` is already forced true when the peer is down.
+
+  **Degraded-promotion fallback** (`DefaultDegradedPromoteTimeout`, 2 min): after
+  that much CONTINUOUS not-readiness a single node promotes anyway, with the
+  reason surfaced on the election event and `DegradedPromoted` set, so a
+  readiness bug can never cost the cluster both nodes. Two properties are
+  load-bearing and are pinned by tests:
+  - it is gated on NO peer condition — not `peerAlive`, not `peerEverSeen`, not
+    sync connectivity. #110 shows the failure mode: `armSyncReadyTimer`'s
+    callback bails on `!d.syncPeerConnected`, so its fallback never fires in
+    exactly the peer-absent case it was written for. A fallback whose firing
+    depends on the condition it compensates for is not a fallback.
+  - it is armed at the DECLINE SITE in `electSingleNode`, not in `SetRGReady`. A
+    cold-boot RG starts not-ready and may never see a readiness TRANSITION, so
+    arming from the transition branch would leave it unarmed in precisely the
+    case it exists for.
 - Blackhole routes skipped in userspace mode (#354)
 - Helper watchdog threshold aligned with sync cadence (#349)
 - Reverse companions pre-installed via sync path (#310)

@@ -73,6 +73,10 @@ func (m *Manager) SetRGReady(rgID int, ready bool, reasons []string) {
 		// Transition: not-ready → ready.
 		rg.ReadySince = time.Now()
 		rg.ReadinessReasons = nil
+		// #7161: the RG is ready, so cancel the degraded fallback and forget the
+		// not-ready window. A later decline must start a FRESH continuous window
+		// rather than inheriting one that has already been satisfied.
+		m.clearDegradedStateLocked(rg)
 		slog.Info("cluster: RG readiness: ready", "rg", rgID)
 
 		// Schedule a wakeup at ReadySince + takeoverHoldTime to

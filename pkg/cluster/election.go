@@ -1,8 +1,10 @@
 package cluster
 
 import (
+	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -425,13 +427,42 @@ func (m *Manager) electSingleNode() {
 			continue
 		}
 		// Readiness gate: block new promotions in cluster mode until
-		// interfaces + VRRP are confirmed ready for holdTime.
-		// Does not gate standalone mode (no controlInterface).
-		// Bypass when peer is dead: sync readiness is impossible without
-		// a peer, and the surviving node must take over immediately.
-		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" && m.peerAlive {
+		// interfaces + VRRP are confirmed ready for holdTime. Does not gate
+		// standalone mode (no controlInterface).
+		//
+		// #7161: the gate applies on a COLD BOOT (`!peerEverSeen`) but is
+		// bypassed on a genuine peer LOSS (`peerEverSeen && !peerAlive`). The
+		// two cases differ for a real reason:
+		//
+		//   - peer LOSS: an established cluster had a working primary and it
+		//     died. A survivor that refuses takeover is a TOTAL OUTAGE, and it
+		//     may be the only node that can forward. Fail open.
+		//   - cold BOOT: there is no established forwarding to preserve, and a
+		//     not-ready node that promotes FORWARDS NOTHING ANYWAY — it claims
+		//     the VIPs and the RG while unable to serve them, and denies the
+		//     peer a clean takeover. Promoting buys nothing.
+		//
+		// The prior rationale here read "sync readiness is impossible without a
+		// peer". That argued for bypassing a term that is not in this
+		// conjunction: `IsReadyForTakeover` consults local interfaces
+		// (Monitor.RGInterfaceReady), local VRRP (RGVRRPReady /
+		// checkNoRethTakeoverReadiness) and the local userspace dataplane
+		// (checkUserspaceTakeoverReadinessFor) — all determinable with no peer —
+		// and `fabricReady` is already forced true when the peer is down.
+		//
+		// `peerEverSeen` introduces no new state: the non-preempt guard two
+		// blocks above already draws the same cold-boot/loss distinction with
+		// it, so this makes the two consistent.
+		degradedReason := ""
+		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" &&
+			(m.peerAlive || !m.peerEverSeen) {
 			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
-				continue
+				if reason, ok := m.degradedPromoteDueLocked(rg); ok {
+					degradedReason = reason
+				} else {
+					m.armDegradedTimerLocked(rg)
+					continue
+				}
 			}
 		}
 		oldState := rg.State
@@ -441,7 +472,14 @@ func (m *Manager) electSingleNode() {
 			rg.State = StateSecondary
 		}
 		if oldState != rg.State {
-			m.sendEvent(rg.GroupID, oldState, rg.State, "Only node present")
+			reason := "Only node present"
+			if degradedReason != "" && rg.State == StatePrimary {
+				rg.DegradedPromoted = true
+				reason = degradedReason
+				slog.Warn("cluster: promoting NOT-READY RG after degraded timeout",
+					"rg", rg.GroupID, "reason", degradedReason)
+			}
+			m.sendEvent(rg.GroupID, oldState, rg.State, reason)
 		}
 	}
 }
@@ -736,5 +774,98 @@ func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
 			slog.Info("cluster: monitor debt reconciled on config change",
 				"rg", rgID, "old", oldWeight, "new", rg.Weight)
 		}
+	}
+}
+
+// degradedPromoteDueLocked reports whether the #7161 cold-boot readiness gate
+// has held this RG secondary for longer than degradedPromoteTimeout, and the
+// operator-facing reason if so.
+//
+// It reads only rg.NotReadySince and the clock. It consults NO peer condition —
+// that is the point. #110's armSyncReadyTimer bails its callback on
+// !d.syncPeerConnected, so its fallback never fires in exactly the peer-absent
+// case it exists for; a fallback gated on the condition it compensates for is
+// not a fallback.
+//
+// Caller must hold m.mu.
+func (m *Manager) degradedPromoteDueLocked(rg *RedundancyGroupState) (string, bool) {
+	if m.degradedPromoteTimeout <= 0 || rg.NotReadySince.IsZero() {
+		return "", false
+	}
+	held := time.Since(rg.NotReadySince)
+	if held < m.degradedPromoteTimeout {
+		return "", false
+	}
+	why := "readiness not reported"
+	if len(rg.ReadinessReasons) > 0 {
+		why = strings.Join(rg.ReadinessReasons, ", ")
+	}
+	return fmt.Sprintf(
+		"Promoted DEGRADED after %s not ready (%s); forwarding may be impaired",
+		held.Round(time.Second), why), true
+}
+
+// armDegradedTimerLocked stamps when the cold-boot gate first declined this RG
+// and schedules the wakeup that lets the degraded fallback actually fire.
+//
+// Both halves live HERE, at the decline site, rather than in SetRGReady. A
+// cold-boot RG starts not-ready and may never see a readiness TRANSITION, so
+// arming from SetRGReady's transition branch would leave the fallback unarmed in
+// precisely the case it exists for. The decline site, by construction, runs
+// exactly when the fallback is needed.
+//
+// Caller must hold m.mu.
+func (m *Manager) armDegradedTimerLocked(rg *RedundancyGroupState) {
+	if m.degradedPromoteTimeout <= 0 {
+		return
+	}
+	if rg.NotReadySince.IsZero() {
+		rg.NotReadySince = time.Now()
+	}
+	if rg.degradedTimer != nil {
+		return
+	}
+	remaining := m.degradedPromoteTimeout - time.Since(rg.NotReadySince)
+	if remaining < 0 {
+		remaining = 0
+	}
+	rgID := rg.GroupID
+	rg.degradedTimer = time.AfterFunc(remaining, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		// Quiesced manager (#4716) and stale-RG (#5245) guards, matching
+		// holdTimer: a timer that had already fired races config teardown.
+		if m.stopped {
+			return
+		}
+		cur, ok := m.groups[rgID]
+		if !ok || cur != rg {
+			return
+		}
+		rg.degradedTimer = nil
+		if rg.Ready {
+			return
+		}
+		slog.Warn("cluster: degraded-promotion timeout expired, re-evaluating election",
+			"rg", rgID, "not_ready_for", time.Since(rg.NotReadySince).Round(time.Second))
+		// Deliberately NOT branched on m.peerAlive. This fallback exists for the
+		// peer-absent case; routing it through runElection when a peer appeared
+		// meanwhile is still correct, because runElection has its own gate.
+		if m.peerAlive {
+			m.runElection()
+		} else {
+			m.electSingleNode()
+		}
+	})
+}
+
+// clearDegradedStateLocked cancels the fallback once the RG is ready again, so a
+// later decline starts a fresh continuous-not-ready window rather than inheriting
+// a stale one. Caller must hold m.mu.
+func (m *Manager) clearDegradedStateLocked(rg *RedundancyGroupState) {
+	rg.NotReadySince = time.Time{}
+	if rg.degradedTimer != nil {
+		rg.degradedTimer.Stop()
+		rg.degradedTimer = nil
 	}
 }

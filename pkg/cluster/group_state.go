@@ -54,6 +54,12 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 				rg.holdTimer.Stop()
 				rg.holdTimer = nil
 			}
+			// #7161: the degraded fallback is torn down with the hold timer —
+			// both pin the Manager until they fire.
+			if rg.degradedTimer != nil {
+				rg.degradedTimer.Stop()
+				rg.degradedTimer = nil
+			}
 			for k := range m.monitorWeights {
 				if k.rgID == id {
 					delete(m.monitorWeights, k)

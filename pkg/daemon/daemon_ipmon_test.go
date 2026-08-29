@@ -526,6 +526,15 @@ func ipmonCluster(rgs ...*config.RedundancyGroup) *cluster.Manager {
 		ControlInterface: "control0",
 		RedundancyGroups: rgs,
 	})
+	// #7161: this fixture is cluster-mode (ControlInterface set) and has never
+	// seen a peer, which is a COLD BOOT. Since #7161 the takeover readiness gate
+	// applies on cold boot, so an RG that never reports readiness stays
+	// SECONDARY — it would forward nothing anyway. Report readiness so the
+	// preempt RGs reach PRIMARY and this test can go on being about the ipmon
+	// publish gate rather than about election policy.
+	for _, rg := range rgs {
+		m.SetRGReady(rg.ID, true, nil)
+	}
 	return m
 }
 
