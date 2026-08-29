@@ -909,6 +909,22 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #7056: this literal enumerates every Desc
+		// emitUserspaceDynamicBufferMetrics touches, so a new emit without a
+		// matching entry here nil-derefs inside MustNewConstMetric rather than
+		// failing an assertion.
+		userspaceNAT64FragCrossDomainMisses: prometheus.NewDesc(
+			"xpf_userspace_nat64_frag_cross_domain_misses_total",
+			"nat64 frag cross-domain refused-alias misses",
+			nil,
+			nil,
+		),
+		userspaceNAT64FragProtocolAliasMisses: prometheus.NewDesc(
+			"xpf_userspace_nat64_frag_protocol_alias_misses_total",
+			"nat64 frag protocol refused-alias misses",
+			nil,
+			nil,
+		),
 		userspaceInterfaceSNATIdentityExhaustion: prometheus.NewDesc(
 			"xpf_userspace_interface_snat_identity_exhaustion_total",
 			"interface snat identity exhaustion",
@@ -1193,7 +1209,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #6751 PR 2/3: three DISTINCT non-zero values, so an emit wired to
 		// the wrong one of the trio cannot satisfy the assertions below --
 		// the two exhaustion counters exist precisely to be read apart.
-		InterfaceSNATPATCollisionsTotal:             17,
+		InterfaceSNATPATCollisionsTotal: 17,
+		// #7056: DISTINCT fixture values, so an emit wired to the wrong field
+		// swaps two numbers that differ rather than two that happen to match.
+		NAT64FragCrossDomainMissesTotal:             23,
+		NAT64FragProtocolAliasMissesTotal:           29,
 		InterfaceSNATIdentityExhaustionTotal:        19,
 		InterfaceSNATSyncIdentityConflictDropsTotal: 29,
 		InterfaceSNATRegistryCapExhaustionTotal:     23,
@@ -1275,9 +1295,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// (PAT collisions + identity exhaustion + sync-import identity-conflict
 	// drops + registry-cap exhaustion) = 44, plus the #6842
 	// gre_decap_unsupported_version_refusals_total counter = 45, plus the
-	// #6929 worker_command_queue_drops_total counter = 46.
-	if len(got) != 46 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 46 metrics, got %d", len(got))
+	// #6929 worker_command_queue_drops_total counter = 46, plus the #7056
+	// refused-alias PAIR (cross-domain + protocol) = 48. The pair is counted as
+	// TWO because they are deliberately distinct series; if a later change folds
+	// them into one total this census is the guard that notices.
+	if len(got) != 48 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 48 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1291,6 +1314,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #6751 PR 2/3: the interface-mode SNAT identity registry trio, each
 	// carrying its own value.
 	assertCounterClose(t, got, c.userspaceInterfaceSNATPATCollisions, nil, 17)
+	// #7056: assert the VALUES, not merely that two more series appeared — a
+	// census bump alone would pass against emits wired to the wrong field.
+	assertCounterClose(t, got, c.userspaceNAT64FragCrossDomainMisses, nil, 23)
+	assertCounterClose(t, got, c.userspaceNAT64FragProtocolAliasMisses, nil, 29)
 	assertCounterClose(t, got, c.userspaceInterfaceSNATIdentityExhaustion, nil, 19)
 	assertCounterClose(t, got, c.userspaceInterfaceSNATSyncConflictDrops, nil, 29)
 	assertCounterClose(t, got, c.userspaceInterfaceSNATRegistryCap, nil, 23)

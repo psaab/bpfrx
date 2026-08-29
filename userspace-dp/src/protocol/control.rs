@@ -280,6 +280,18 @@ pub(crate) struct ProcessStatus {
     /// reverse identity. Additive + `default`ed (#1961).
     #[serde(rename = "interface_snat_pat_collisions_total", default)]
     pub interface_snat_pat_collisions_total: u64,
+    /// #7056 (#5798 required-fix #5): fragment-association misses caused by the
+    /// key refusing a CROSS-DOMAIN alias — a same-datagram entry under a
+    /// different ingress security domain. Previously indistinguishable from a
+    /// reorder / TTL straddle / eviction on `nat64_frag_dropped`. Additive +
+    /// `default`ed (#1961), so an older helper that does not emit it decodes 0.
+    #[serde(rename = "nat64_frag_cross_domain_misses_total", default)]
+    pub nat64_frag_cross_domain_misses_total: u64,
+    /// #7056: the sibling leg — same domain, PROTOCOL alias (TCP vs UDP on one
+    /// `(src, dst, ident)`). Distinct from the cross-domain counter on purpose.
+    /// Additive + `default`ed (#1961).
+    #[serde(rename = "nat64_frag_protocol_alias_misses_total", default)]
+    pub nat64_frag_protocol_alias_misses_total: u64,
     /// #6751 PR 2/3: interface-mode SNAT admissions that failed CLOSED with no
     /// free translated identity — a completed full-cycle PAT probe, a port-less
     /// protocol whose single identity is owned, or a peer-synced import whose
