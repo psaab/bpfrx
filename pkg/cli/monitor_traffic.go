@@ -130,22 +130,6 @@ func parseMonitorTrafficArgs(args []string) (iface, filter, count string, err er
 	return iface, filter, count, nil
 }
 
-// stripSurroundingQuotes removes one layer of matching leading/trailing
-// single or double quotes. The CLI tokenizer does not honor shell quoting,
-// so an operator who wraps a multi-token pcap filter in quotes
-// (`matching "tcp port 80"`) leaves literal quote characters on the first
-// and last tokens; tcpdump/libpcap would reject those literal quotes, so
-// peel one balanced layer here.
-func stripSurroundingQuotes(s string) string {
-	if len(s) >= 2 {
-		q := s[0]
-		if (q == '"' || q == '\'') && s[len(s)-1] == q {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
-}
-
 // buildMonitorTrafficArgv assembles the tcpdump argv for a live capture.
 // The full filter expression is passed as trailing arguments exactly as
 // tcpdump/libpcap expects a filter (all tokens, verbatim), but only AFTER

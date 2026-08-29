@@ -396,13 +396,11 @@ func (c *CLI) dispatchConfig(line string) error {
 			return nil
 		}
 		line := strings.Join(parts[1:], " ")
-		quoteIdx := strings.Index(line, "\"")
-		if quoteIdx < 0 {
+		pathStr, comment, ok := annotateCommentFromLine(line)
+		if !ok {
 			fmt.Println("usage: annotate <path> \"comment\"")
 			return nil
 		}
-		pathStr := strings.TrimSpace(line[:quoteIdx])
-		comment := strings.Trim(line[quoteIdx:], "\"")
 		pathParts := append(c.store.GetEditPath(), strings.Fields(pathStr)...)
 		if err := c.store.Annotate(pathParts, comment); err != nil {
 			return err
