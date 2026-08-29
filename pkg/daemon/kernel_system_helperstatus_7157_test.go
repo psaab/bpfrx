@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/upgrade"
@@ -64,3 +66,66 @@ func TestDaemonHelperStatusNilIsNotReady_7157(t *testing.T) {
 // a signature drift in pkg/upgrade breaks the build here rather than silently
 // leaving the daemon on the bare constructor again.
 var _ upgrade.KernelSystem = daemonKernelSystem()
+
+// TestDaemonKernelCallSitesUseTheWiredConstructor_7157 binds the CALL SITES, not
+// the constructor.
+//
+// The sibling above calls daemonKernelSystem() directly, so it passes even if
+// every production site still uses the bare upgrade.NewKernelSystem() — which is
+// exactly what the mutation matrix showed: reverting all three sites left it
+// green. A constructor nothing calls is not a fix.
+//
+// Source-scanned because the choice of constructor is not observable at runtime:
+// both return an upgrade.KernelSystem, and the difference (HelperStatus nil or
+// not) is precisely what the bare one erases. Comments are stripped first — a
+// scan that reads its own prose is satisfied by the sentence describing what it
+// should find.
+func TestDaemonKernelCallSitesUseTheWiredConstructor_7157(t *testing.T) {
+	src, err := os.ReadFile("kernel_selfrecover.go")
+	if err != nil {
+		t.Fatalf("read kernel_selfrecover.go: %v", err)
+	}
+	code := stripGoComments7157(string(src))
+
+	if n := strings.Count(code, "upgrade.NewKernelSystem()"); n != 0 {
+		t.Errorf("%d call site(s) still use the BARE upgrade.NewKernelSystem(), which leaves "+
+			"HelperStatus nil and skips ForwardBeacon's Precondition B — the promotion gate "+
+			"then collapses to unit-liveness + a host ping on the self-recover path (#7157)", n)
+	}
+	// Non-vacuity: the scan must actually be looking at the call sites. If the
+	// file stops constructing a kernel system at all, the assertion above is
+	// trivially satisfied and this test has quietly stopped guarding anything.
+	if n := strings.Count(code, "daemonKernelSystem()"); n == 0 {
+		t.Error("kernel_selfrecover.go constructs no kernel system at all, so the check above " +
+			"passes vacuously — if the construction moved, move this guard with it")
+	}
+}
+
+// stripGoComments7157 removes // and /* */ comments so a source scan cannot be
+// satisfied by the comment describing what it looks for.
+func stripGoComments7157(s string) string {
+	var b strings.Builder
+	for {
+		i := strings.Index(s, "//")
+		j := strings.Index(s, "/*")
+		switch {
+		case i < 0 && j < 0:
+			b.WriteString(s)
+			return b.String()
+		case j < 0 || (i >= 0 && i < j):
+			b.WriteString(s[:i])
+			nl := strings.IndexByte(s[i:], '\n')
+			if nl < 0 {
+				return b.String()
+			}
+			s = s[i+nl:]
+		default:
+			b.WriteString(s[:j])
+			end := strings.Index(s[j:], "*/")
+			if end < 0 {
+				return b.String()
+			}
+			s = s[j+end+2:]
+		}
+	}
+}
