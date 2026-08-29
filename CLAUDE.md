@@ -130,6 +130,20 @@ make test-fbf-steering-lib # Self-test the #6936 FBF two-upstream steering
                      #   carries the probe-blind middle row. Hermetic + the
                      #   Go predicate that every config-committing smoke uses
                      #   the #6440 marker gate.
+make test-host-inbound-lib # Self-test the #6936 ON-WIRE host-inbound
+                     #   verdicts. A probe CANNOT observe a deny — it observes
+                     #   SILENCE, and "the firewall dropped it" and "my prober
+                     #   never reached the firewall" are the same reading. So
+                     #   every DENY cell is scored against a positive control
+                     #   at the SAME ADDRESS in the SAME run, and the selftest
+                     #   carries the middle row (same expectation, same
+                     #   observation, only the control differs). Hermetic.
+make test-host-inbound / test-host-inbound-failover # The smoke itself
+                     #   (loss cluster). Covers host-inbound on a TAGGED VLAN
+                     #   sub-unit and admission UNCHANGED across an RG
+                     #   failover. Commits NOTHING — it reads the committed
+                     #   config, derives its probe targets from it, and
+                     #   refuses to run if the zone posture went stale.
 make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
                      #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
                      #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)
