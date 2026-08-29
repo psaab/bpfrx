@@ -118,18 +118,31 @@ func TestForwardBeaconDataplaneCondition_6607(t *testing.T) {
 func TestForwardBeaconPassesWhenEverythingHealthy_6607(t *testing.T) {
 	origUnit := unitActiveProbeCtx
 	origPing := beaconPing
+	// #7157: the target-eligibility check runs a real `ip route get` unless the
+	// seam is stubbed, and this test then passes or fails on the routing table
+	// of whatever machine runs the suite. Measured on one dev box,
+	// `ip route get 192.0.2.1` answers `dev ix0` and the case passes by
+	// accident; on a host with no route it fails, and on a host whose default
+	// egresses a NIC named em*/fab*/fxp* it would fail for a reason this
+	// assertion cannot name. Same reasoning as the beaconPing stub below.
+	origGet := beaconRouteGet
 	t.Cleanup(func() {
 		unitActiveProbeCtx = origUnit
 		beaconPing = origPing
+		beaconRouteGet = origGet
 	})
 	unitActiveProbeCtx = func(context.Context, string) (bool, error) { return true, nil }
 	beaconPing = func(string, int) error { return nil }
+	beaconRouteGet = func(string) (string, error) {
+		return "192.0.2.1 via 172.16.50.1 dev ge-0-0-2.50 src 172.16.50.8 uid 0\n", nil
+	}
 
 	s := &realKernelSystem{
 		BeaconTarget: "192.0.2.1",
 		HelperStatus: func(string, time.Duration) (bool, bool, int, error) {
 			return true, true, 1234, nil
 		},
+		IsManagementIface: func(string) bool { return false },
 	}
 	if ok, err := s.ForwardBeacon(time.Second); !ok || err != nil {
 		t.Fatalf("ForwardBeacon = (%v, %v) with xpfd active, the dataplane armed and the "+

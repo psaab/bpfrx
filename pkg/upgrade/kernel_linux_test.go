@@ -1,7 +1,6 @@
 package upgrade
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -44,19 +43,15 @@ func TestSlotSelectorRegex(t *testing.T) {
 }
 
 // TestDefaultGatewayParse locks the `ip -4 route show default` parse used by
-// ForwardBeacon's fallback target discovery (r2 Codex Critical fix). The parse
-// is a pure helper over the command output; exercise the field extraction.
+// ForwardBeacon's fallback target discovery (r2 Codex Critical fix).
+//
+// #7157: this used to MIMIC defaultGateway()'s field scan with a copy of the
+// loop written inside the test — so it pinned the copy, and a change to the
+// production parse left it green. It now calls parseDefaultRoute, the function
+// defaultGateway() actually uses. The measured real-world shapes (the FRR
+// nexthop-group form and the HA-secondary blackhole, neither of which appeared
+// in the table below) are in TestParseDefaultRoute_7157.
 func TestDefaultGatewayParseLogic(t *testing.T) {
-	// mimic defaultGateway()'s field scan
-	parse := func(out string) string {
-		fields := splitFields(out)
-		for i := 0; i+1 < len(fields); i++ {
-			if fields[i] == "via" {
-				return fields[i+1]
-			}
-		}
-		return ""
-	}
 	cases := []struct{ out, want string }{
 		{"default via 10.0.0.1 dev eth0 proto dhcp", "10.0.0.1"},
 		{"default via 192.168.1.254 dev ens3", "192.168.1.254"},
@@ -64,10 +59,8 @@ func TestDefaultGatewayParseLogic(t *testing.T) {
 		{"default dev wg0 scope link", ""}, // no via (point-to-point)
 	}
 	for _, c := range cases {
-		if got := parse(c.out); got != c.want {
-			t.Errorf("parse(%q) = %q, want %q", c.out, got, c.want)
+		if got, _ := parseDefaultRoute(c.out); got != c.want {
+			t.Errorf("parseDefaultRoute(%q) = %q, want %q", c.out, got, c.want)
 		}
 	}
 }
-
-func splitFields(s string) []string { return strings.Fields(s) }
