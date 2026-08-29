@@ -254,13 +254,6 @@ var shimPrePublishLoad = func(m *Manager) error {
 // attaches only the retained userspace XDP shim. This keeps normal AF_XDP
 // startup independent from xdp_main and TC program objects.
 func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, error) {
-	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
-		return nil, err
-	}
-	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
-		return nil, err
-	}
-
 	m.SelectUserspaceXDPShimEntryProgram()
 	compilerDP := userspaceShimCompileDataplane{Manager: m}
 	result, err := CompileConfig(compilerDP, cfg, m.lastCompile != nil)
@@ -288,6 +281,28 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	// a method value is a SelectorExpr and would silently give that canary
 	// nothing to anchor to. Keeping the call shape keeps the existing guard
 	// intact instead of loosening it to fit this refactor.
+	// #7079: the three bpffs cleanups run HERE — after CompileConfig has accepted
+	// the config, and immediately before the attach they exist for. They used to
+	// run ahead of CompileConfig, so a config the #4960 pre-pass REJECTED still
+	// lost the host's XDP link pins, legacy TC link pins and legacy-only map pins
+	// for an apply that never happened.
+	//
+	// The ordering they must respect is narrower than where they used to sit: the
+	// XDP removal's constraint is "before AttachXDP", not "before
+	// CompileUserspaceShim" as its old comment said. Nothing between CompileConfig
+	// and here touches pins — CompileConfig runs against
+	// userspaceShimCompileDataplane, whose dataplane methods are no-ops.
+	//
+	// Blast radius, and why this MOVES rather than becoming recoverable:
+	// docs/log/7079.md. Bound by TestPinCleanupsRunAfterCompileConfig_7079.
+	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
+		return nil, err
+	}
+	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
+		return nil, err
+	}
+	removeUserspaceShimXDPLinkPins()
+
 	if err := runPostMutationSteps(result,
 		func(r *CompileResult) error {
 			return m.preflightCheckIfindexCaps(ifindexSet(r.pendingXDP))
@@ -355,6 +370,23 @@ func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
 		}
 	}
 	return nil
+}
+
+// removeUserspaceShimXDPLinkPins deletes every `xdp_*` link pin so the attach is
+// a FRESH attach rather than a pinned-link reuse — reuse (`existing.Update`)
+// swaps the program without reinitializing the mlx5 XSK RQs, leaving the fill
+// ring unconsumed, which breaks zero-copy.
+//
+// Relocated here from userspace.Manager.Compile by #7079: it must precede
+// AttachXDP and must NOT precede CompileConfig. Best-effort — a pin already gone
+// is the desired end state, as at the original site.
+func removeUserspaceShimXDPLinkPins() {
+	entries, _ := os.ReadDir(linkPinPath)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "xdp_") {
+			_ = os.Remove(filepath.Join(linkPinPath, e.Name()))
+		}
+	}
 }
 
 type pinnedTCLink interface {
