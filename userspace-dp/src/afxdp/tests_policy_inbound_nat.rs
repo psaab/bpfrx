@@ -356,6 +356,7 @@ fn inbound_dnat_reverse_session_key_uses_public_facing_tuple() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
         src_port: 54321,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let dnat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),

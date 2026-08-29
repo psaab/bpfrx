@@ -894,6 +894,7 @@ mod tests {
                     dst_ip,
                     src_port: 500,
                     dst_port,
+                                    discriminator: Default::default(),
                 },
             }
         }

@@ -26,6 +26,7 @@ fn key_v4() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -37,6 +38,7 @@ fn key_v6() -> SessionKey {
         dst_ip: IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().expect("v6 dst")),
         src_port: 5555,
         dst_port: 53,
+            discriminator: Default::default(),
     }
 }
 
@@ -173,6 +175,7 @@ fn tcp_key_v6() -> SessionKey {
         dst_ip: IpAddr::V6("2606:4700:4700::1111".parse::<Ipv6Addr>().expect("v6 dst")),
         src_port: 51000,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -1011,6 +1014,7 @@ fn make_v4_key(src_octet: u8, port: u16) -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: port,
         dst_port: 53,
+            discriminator: Default::default(),
     }
 }
 
@@ -1303,6 +1307,7 @@ fn wheel_alias_lookup_refreshes_canonical_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let alias_key = SessionKey {
         addr_family: 2,
@@ -1311,6 +1316,7 @@ fn wheel_alias_lookup_refreshes_canonical_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let mut reverse_metadata = metadata();
     reverse_metadata.is_reverse = true;
@@ -2737,6 +2743,7 @@ fn reply_match_finds_tcp_snat_reverse_tuple() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 42424,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2745,6 +2752,7 @@ fn reply_match_finds_tcp_snat_reverse_tuple() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -2766,6 +2774,7 @@ fn reply_match_finds_icmp_snat_reverse_tuple() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2774,6 +2783,7 @@ fn reply_match_finds_icmp_snat_reverse_tuple() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -2796,6 +2806,7 @@ fn find_forward_nat_match_uses_reverse_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 42424,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2804,6 +2815,7 @@ fn find_forward_nat_match_uses_reverse_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2843,6 +2855,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 42424,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let canonical_reply = SessionKey {
         addr_family: 2,
@@ -2851,6 +2864,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2888,6 +2902,7 @@ fn reverse_canonical_key_keeps_icmp_identifier_position() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let reply = reverse_canonical_key(&forward, NatDecision::default());
     assert_eq!(reply.src_ip, IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)));
@@ -2906,6 +2921,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index_for_icmp() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let canonical_reply = SessionKey {
         addr_family: 2,
@@ -2914,6 +2930,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index_for_icmp() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
@@ -2952,6 +2969,7 @@ fn find_forward_wire_match_uses_translated_forward_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 42528,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let translated = SessionKey {
         addr_family: 2,
@@ -2960,6 +2978,7 @@ fn find_forward_wire_match_uses_translated_forward_index() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 42528,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2999,6 +3018,7 @@ fn lookup_uses_translated_reverse_alias() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let reverse_canonical = SessionKey {
         addr_family: 2,
@@ -3007,6 +3027,7 @@ fn lookup_uses_translated_reverse_alias() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
         src_port: 5201,
         dst_port: 42424,
+            discriminator: Default::default(),
     };
     let mut reverse_metadata = metadata();
     reverse_metadata.is_reverse = true;
@@ -3050,6 +3071,7 @@ fn dnat_port_in_reverse_wire_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 54321,
         dst_port: 80,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -3064,6 +3086,7 @@ fn dnat_port_in_reverse_wire_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
         src_port: 8080,
         dst_port: 54321,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3083,6 +3106,7 @@ fn dnat_plus_snat_ports_in_reverse_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 54321,
         dst_port: 80,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
@@ -3100,6 +3124,7 @@ fn dnat_plus_snat_ports_in_reverse_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         src_port: 8080,
         dst_port: 54321,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3118,6 +3143,7 @@ fn icmp_port_handling_unchanged_with_dnat_ports() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -3132,6 +3158,7 @@ fn icmp_port_handling_unchanged_with_dnat_ports() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3165,6 +3192,7 @@ fn icmp_query_id_translation_demuxes_reverse_wire_key() {
         dst_ip: target,
         src_port: query_id,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     // Distinct translated ids allocated by pool SNAT for the two hosts.
     let mk_nat = |translated_id: u16| NatDecision {
@@ -3203,6 +3231,7 @@ fn icmp_query_id_translation_demuxes_reverse_wire_key() {
         dst_ip: pool,
         src_port: 40001,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
     assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
@@ -3250,6 +3279,7 @@ fn icmp_query_id_zero_translation_demuxes_reverse_wire_key() {
         dst_ip: target,
         src_port: query_id,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let mk_nat = |translated_id: u16| NatDecision {
         rewrite_src: Some(pool),
@@ -3281,6 +3311,7 @@ fn icmp_query_id_zero_translation_demuxes_reverse_wire_key() {
         dst_ip: pool,
         src_port: 40001,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
     assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
@@ -3304,6 +3335,7 @@ fn find_forward_nat_match_with_dnat_port_rewrite() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 54321,
         dst_port: 80,
+            discriminator: Default::default(),
     };
     // Reply from internal:8080 -> client:54321
     let reply = SessionKey {
@@ -3313,6 +3345,7 @@ fn find_forward_nat_match_with_dnat_port_rewrite() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
         src_port: 8080,
         dst_port: 54321,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -5049,6 +5082,7 @@ fn reverse_translated_1n_collision_preserves_displaced_alias() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
         src_port: 40001,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let mut r2 = r1.clone();
     r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
@@ -5126,6 +5160,7 @@ fn reverse_translated_1n_delete_removes_specific_handle_not_the_key() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
         src_port: 50002,
         dst_port: 8443,
+            discriminator: Default::default(),
     };
     let mut r2 = r1.clone();
     r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
@@ -5942,6 +5977,7 @@ fn limit_key(src_octet: u8, dst_octet: u8, src_port: u16) -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, dst_octet)),
         src_port,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -7534,6 +7570,7 @@ fn account_packet_reverse_folds_onto_forward_translated_icmp() {
             dst_ip: target,
             src_port: orig_id,
             dst_port: 0,
+                    discriminator: Default::default(),
         };
         let fwd_nat = NatDecision {
             rewrite_src: Some(pool),

@@ -1047,6 +1047,7 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let forward_decision = SessionDecision {
         resolution: lookup_forwarding_resolution(

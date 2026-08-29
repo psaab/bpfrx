@@ -403,6 +403,7 @@ fn build_live_forward_request_prefers_session_flow_ports_over_frame() {
             dst_ip: IpAddr::V6(dst_ip),
             src_port: session_src_port,
             dst_port: frame_dst_port,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -840,6 +841,7 @@ fn build_live_forward_request_emits_output_filter_log_event() {
             dst_ip: IpAddr::V4(dst_ip),
             src_port: 49152,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -1002,6 +1004,7 @@ fn live_forward_filter_log_zones_6722(egress_ifindex: i32) -> (ForwardingState, 
             dst_ip: IpAddr::V4(dst_ip),
             src_port: 49152,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -1201,6 +1204,7 @@ fn build_live_forward_request_uses_flow_or_metadata_ports_when_frame_ports_unava
             dst_ip: IpAddr::V6(dst_ip),
             src_port: 54688,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -1294,6 +1298,7 @@ fn build_live_forward_request_marks_session_fabric_redirect_for_nat_and_zone() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
             src_port: 5201,
             dst_port: 44278,
+                    discriminator: Default::default(),
         },
     };
 

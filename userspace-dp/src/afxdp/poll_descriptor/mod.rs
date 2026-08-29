@@ -2917,6 +2917,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 dst_ip: IpAddr::V4(snat_v4),
                                                 src_port,
                                                 dst_port,
+                                                                                            discriminator: Default::default(),
                                             },
                                             rev_proto,
                                         )

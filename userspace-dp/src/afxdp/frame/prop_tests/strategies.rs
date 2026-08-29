@@ -73,6 +73,7 @@ impl ValidPacket {
                 dst_ip: self.dst_ip,
                 src_port: self.src_port,
                 dst_port: self.dst_port,
+                            discriminator: Default::default(),
             },
         }
     }

@@ -738,6 +738,7 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let local_decision = SessionDecision {
         resolution: ForwardingResolution {

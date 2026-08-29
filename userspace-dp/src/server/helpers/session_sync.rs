@@ -59,6 +59,7 @@ pub(crate) fn build_synced_session_key(
             .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?,
         src_port: req.src_port,
         dst_port: req.dst_port,
+            discriminator: Default::default(),
     })
 }
 

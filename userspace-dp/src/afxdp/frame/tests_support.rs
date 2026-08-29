@@ -150,6 +150,7 @@ pub(super) fn pbr_v4_flow() -> SessionFlow {
             dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     }
 }
@@ -178,6 +179,7 @@ pub(super) fn pbr_v6_flow() -> SessionFlow {
             dst_ip: IpAddr::V6(dst),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     }
 }

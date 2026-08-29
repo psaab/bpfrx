@@ -2817,6 +2817,7 @@ fn ipsec_flow_to(family: i32, protocol: u8, dst_port: u16, dst_ip: IpAddr) -> Se
             dst_ip,
             src_port: 40000,
             dst_port,
+                    discriminator: Default::default(),
         },
     }
 }

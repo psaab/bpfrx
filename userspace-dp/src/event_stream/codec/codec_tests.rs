@@ -31,6 +31,7 @@ fn test_key_v4() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 200)),
         src_port: 12345,
         dst_port: 80,
+            discriminator: Default::default(),
     }
 }
 
@@ -42,6 +43,7 @@ fn test_key_v6() -> SessionKey {
         dst_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0xbf02, 0, 0, 0, 0x200)),
         src_port: 54321,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -785,6 +787,7 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
         dst_ip: IpAddr::V6("64:ff9b::c0a8:101".parse::<Ipv6Addr>().unwrap()),
         src_port: 5001,
         dst_port: 80,
+            discriminator: Default::default(),
     };
     let frame = EventFrame::encode_session_open(1, &key, &decision, &md, &zones, false, 0);
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];

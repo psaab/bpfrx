@@ -47,7 +47,9 @@ type SeededReverseTranslatedIndex = HashMap<SessionKey, NatIndexBucket, FxSeeded
 // translated_session_key, reverse_canonical_key, reverse_wire_key,
 // reply_matches_forward_session) live in session/key.rs. Re-exporting
 // at pub(crate) keeps the existing crate::session::* surface intact.
+mod discriminator;
 mod key;
+pub(crate) use discriminator::TunnelDiscriminator;
 pub(crate) use key::*;
 mod entry;
 pub(crate) use entry::*;

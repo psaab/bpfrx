@@ -31,6 +31,7 @@ fn delta_with_session_id(session_id: u64) -> SessionDelta {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {
@@ -193,6 +194,7 @@ fn delta_with_attribution() -> SessionDelta {
         dst_ip: IpAddr::V6("64:ff9b::c0a8:101".parse::<Ipv6Addr>().unwrap()),
         src_port: 5001,
         dst_port: 80,
+            discriminator: Default::default(),
     };
     delta.metadata.policy_id = 4242;
     delta.metadata.policy_counter_idx = 9;

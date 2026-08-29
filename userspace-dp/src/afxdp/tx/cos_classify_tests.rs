@@ -208,6 +208,7 @@ fn clone_prepared_request_for_cos_returns_local_copy_with_metadata() {
             dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
             src_port: 1111,
             dst_port: 2222,
+                    discriminator: Default::default(),
         }),
         egress_ifindex: 80,
         cos_queue_id: Some(4),
@@ -301,6 +302,7 @@ fn prepare_local_request_for_cos_materializes_prepared_frame() {
             dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
             src_port: 1111,
             dst_port: 2222,
+                    discriminator: Default::default(),
         }),
         egress_ifindex: 80,
         cos_queue_id: Some(5),
@@ -842,6 +844,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1078,6 +1081,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
             src_port: 5201,
             dst_port: 49152,
+                    discriminator: Default::default(),
         }),
     );
     let forward_shape_on_reverse_egress = resolve_cos_queue_id(
@@ -1097,6 +1101,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
             src_port: 49152,
             dst_port: 5201,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1235,6 +1240,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1358,6 +1364,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1480,6 +1487,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1619,6 +1627,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     // POST-NAT egress wire tuple — DNAT rewrote the destination port to 8443, so
     // it no longer matches the ingress term's destination-port 443.
@@ -1762,6 +1771,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -1848,6 +1858,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -1909,6 +1920,7 @@ fn resolve_cos_tx_selection_drops_terminal_output_filter_without_log() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -1965,6 +1977,7 @@ fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -2650,6 +2663,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -2747,6 +2761,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -2814,6 +2829,7 @@ fn resolve_cos_tx_selection_returns_none_when_no_cos_or_tx_selection_filters_exi
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -2992,6 +3008,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -3096,6 +3113,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -3199,6 +3217,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -3343,6 +3362,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
 
@@ -3430,6 +3450,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
         TermMatchExtra::default(),
     );
@@ -3613,6 +3634,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         };
         let selection =
             resolve_cos_tx_selection(&forwarding, 202, meta, Some(&key), TermMatchExtra::default());
@@ -4085,6 +4107,7 @@ fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
         src_port: 49152,
         dst_port: 53,
+            discriminator: Default::default(),
     };
     let pre_fix = resolve_cos_tx_selection_at(
         &forwarding,
@@ -4138,6 +4161,7 @@ fn output_filter_family_selected_by_egress_key_for_nat64_3642() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
         src_port: 33000,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     // Ingress metadata is IPv6 (the pre-NAT64 family).
     let ingress_v6_meta = UserspaceDpMeta {
@@ -4382,6 +4406,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let meta = || UserspaceDpMeta {
         ingress_ifindex: 5,
@@ -4584,6 +4609,7 @@ fn pbr_classify_flow_key() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -4901,6 +4927,7 @@ fn count4085_v4_key() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -4912,6 +4939,7 @@ fn count4085_v6_key() -> SessionKey {
         dst_ip: IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -5342,6 +5370,7 @@ fn resolve_cos_queue_id_preserves_input_fc_under_counter_only_output_filter() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
     assert_eq!(
@@ -5372,6 +5401,7 @@ fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
     assert_eq!(
@@ -5543,6 +5573,7 @@ fn inet_precedence_test_key() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 
@@ -5856,6 +5887,7 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         }),
     );
     assert!(

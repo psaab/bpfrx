@@ -309,6 +309,7 @@ fn fabric_ingress_syn_ack_seeds_no_reverse_session_6478() {
         dst_ip: IpAddr::V4(dst),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let origin = sessions
         .lookup_with_origin(&key, 123_000_000_000, TCP_FLAG_SYN | TCP_FLAG_ACK)
@@ -390,6 +391,7 @@ fn fabric_ingress_icmp_echo_reply_seeds_no_reverse_session_6478() {
         // (identifier, 0); the builder stamps identifier 0x1234.
         src_port: 0x1234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let origin = sessions
         .lookup_with_origin(&key, 123_000_000_000, 0)

@@ -2529,6 +2529,7 @@ fn shim_probe_key(meta: UserspaceDpMeta) -> SessionKey {
         dst_ip: IpAddr::V6(Ipv6Addr::from(meta.flow_dst_addr)),
         src_port: meta.flow_src_port,
         dst_port: meta.flow_dst_port,
+            discriminator: Default::default(),
     }
 }
 
@@ -2838,6 +2839,7 @@ fn shim_non_terminal_protocols_are_never_installable_by_userspace_6886() {
                 // TCP/UDP/ICMPv6 — exactly the key shape under test.
                 src_port: 0,
                 dst_port: 0,
+                            discriminator: Default::default(),
             },
         };
         let meta = UserspaceDpMeta {

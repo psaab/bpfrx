@@ -27,6 +27,7 @@ fn test_flow() -> SessionFlow {
             dst_ip,
             src_port: 49152,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     }
 }
@@ -48,6 +49,7 @@ fn dnat_test_flow() -> SessionFlow {
             dst_ip,
             src_port: 51000,
             dst_port: 2222,
+                    discriminator: Default::default(),
         },
     }
 }

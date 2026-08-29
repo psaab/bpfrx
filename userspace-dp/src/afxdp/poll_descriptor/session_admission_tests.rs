@@ -29,6 +29,7 @@ mod new_flow_session_limit_tests {
             dst_ip: dst,
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         }
     }
 
@@ -195,6 +196,7 @@ mod strict_syn_check_tests {
             dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         }
     }
 

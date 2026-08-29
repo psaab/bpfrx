@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use super::gre::{GRE_FLAG_CHECKSUM, GRE_FLAG_KEY};
+use crate::session::TunnelDiscriminator;
 
 /// RFC 1701 Routing Present. RFC 2890 declares the bit reserved-zero; a frame
 /// that sets it carries a variable-length Source Route Entry list with no fixed
@@ -36,45 +37,6 @@ const GRE_FLAG_ROUTING: u16 = 0x4000;
 /// Version lives in the low 3 bits. RFC 2784/2890 GRE is version 0; RFC 2637
 /// PPTP enhanced GRE is version 1 and re-purposes the same 32 bits.
 const GRE_VERSION_MASK: u16 = 0x0007;
-
-/// The session-identity discriminator for a tunnelled protocol.
-///
-/// The four classes are DISJOINT ON PURPOSE (#7188 decision 6), and the two
-/// pairs that look mergeable are the two that must not merge:
-///
-/// * `Unkeyed` is not `Keyed(0)`. A tunnel that carries no Key and a tunnel
-///   whose Key is literally zero are different tunnels, and RFC 2890 permits
-///   both. Collapsing them would let an unkeyed tunnel join a keyed-zero
-///   session.
-/// * `Unparseable` is not `Unkeyed`. A truncated, version-1 or source-routed
-///   header is one we could not read — not one we read and found no key in.
-///   Falling back to `Unkeyed` would let a malformed header merge into a
-///   legitimate unkeyed session, which is the failure a fail-closed class
-///   exists to prevent.
-///
-/// `None` is the everything-else case: a protocol with no discriminator concept
-/// at all. It is what every non-GRE session carries, so adding this field to a
-/// session key leaves every existing protocol's identity unchanged.
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
-pub(in crate::afxdp) enum TunnelDiscriminator {
-    /// No discriminator concept for this protocol (everything but GRE today).
-    #[default]
-    None,
-    /// GRE with the K bit clear — a real, distinct identity.
-    Unkeyed,
-    /// RFC 2890 Key, including the legal value 0.
-    Keyed(u32),
-    /// The header could not be read. Fails closed: never merges with anything.
-    Unparseable,
-}
-
-impl TunnelDiscriminator {
-    /// True when this discriminator would split sessions that the 5-tuple alone
-    /// would merge. Used to keep the acceleration-off path bit-identical.
-    pub(in crate::afxdp) fn is_none(self) -> bool {
-        matches!(self, TunnelDiscriminator::None)
-    }
-}
 
 /// Classify a transit GRE packet's RFC 2890 discriminator.
 ///

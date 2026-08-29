@@ -173,6 +173,7 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let reverse_key = crate::session::reverse_session_key(&forward_key, nat);
     let tunnel_resolution = ForwardingResolution {
@@ -287,6 +288,7 @@ fn replay_filter_preserves_order_and_survivors_across_many_drops() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 10000,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let key_at = |src_port: u16| SessionKey {
         src_port,
@@ -514,6 +516,7 @@ fn dnat_v6_key_bytes_matches_entry_bytes_key_half() {
         dst_ip: IpAddr::V6("2001:559:8585:80::200".parse().unwrap()),
         src_port: 12345,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V6(snat_v6)),

@@ -67,6 +67,7 @@ fn test_key() -> crate::session::SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 50, 200)),
         src_port: 45678,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 

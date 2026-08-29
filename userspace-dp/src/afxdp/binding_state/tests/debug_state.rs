@@ -247,6 +247,7 @@ fn active_flow_debug_test_key() -> crate::session::SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 5205,
         dst_port: 443,
+            discriminator: Default::default(),
     }
 }
 

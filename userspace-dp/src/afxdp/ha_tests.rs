@@ -143,6 +143,7 @@ fn test_key() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 55068,
         dst_port: 5201,
+            discriminator: Default::default(),
     }
 }
 
