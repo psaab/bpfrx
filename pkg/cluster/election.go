@@ -325,8 +325,14 @@ func (m *Manager) runElection() {
 		// hasn't been ready for takeoverHoldTime. This does NOT demote
 		// an already-primary node. Only applies in cluster mode
 		// (controlInterface configured) — standalone nodes skip the gate.
+		degradedReason := ""
 		if result == electLocalPrimary && rg.State != StatePrimary && m.controlInterface != "" {
-			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+			// #7939: through the SHARED verdict, so this path gets the degraded
+			// fallback electSingleNode already had. Before this, a stuck
+			// readiness term here left the RG secondary on both nodes with no
+			// way out — see readinessGateVerdictLocked.
+			promote, degReason := m.readinessGateVerdictLocked(rg)
+			if !promote {
 				slog.Info("cluster: election blocked by readiness gate",
 					"rg", rg.GroupID, "ready", rg.Ready,
 					"readySince", rg.ReadySince,
@@ -334,6 +340,7 @@ func (m *Manager) runElection() {
 					"reasons", rg.ReadinessReasons)
 				continue
 			}
+			degradedReason = degReason
 		}
 
 		oldState := rg.State
@@ -393,6 +400,18 @@ func (m *Manager) runElection() {
 			// Track failover count for primary→non-primary transitions.
 			if oldState == StatePrimary {
 				rg.FailoverCount++
+			}
+			// #7939: a promotion that only happened because the degraded
+			// timeout expired must be MARKED and said loudly, exactly as
+			// electSingleNode does. The RG is forwarding while not ready, which
+			// is the right trade against both nodes staying secondary — but it
+			// is not a normal promotion and must not read as one in the event
+			// stream or in `show chassis cluster status`.
+			if degradedReason != "" && rg.State == StatePrimary {
+				rg.DegradedPromoted = true
+				reason = degradedReason
+				slog.Warn("cluster: promoting NOT-READY RG after degraded timeout",
+					"rg", rg.GroupID, "reason", degradedReason)
 			}
 			m.sendEvent(rg.GroupID, oldState, rg.State, reason)
 		}
@@ -456,14 +475,13 @@ func (m *Manager) electSingleNode() {
 		degradedReason := ""
 		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" &&
 			(m.peerAlive || !m.peerEverSeen) {
-			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
-				if reason, ok := m.degradedPromoteDueLocked(rg); ok {
-					degradedReason = reason
-				} else {
-					m.armDegradedTimerLocked(rg)
-					continue
-				}
+			// #7939: the same shared verdict runElection uses. Written out
+			// separately here before, which is how the two drifted apart.
+			promote, reason := m.readinessGateVerdictLocked(rg)
+			if !promote {
+				continue
 			}
+			degradedReason = reason
 		}
 		oldState := rg.State
 		if rg.Weight > 0 {
@@ -775,6 +793,46 @@ func (m *Manager) reconcileMonitorDebtsLocked(cfg *config.ClusterConfig) {
 				"rg", rgID, "old", oldWeight, "new", rg.Weight)
 		}
 	}
+}
+
+// readinessGateVerdictLocked is the ONE readiness-gate decision, shared by both
+// election paths.
+//
+// #7939: it exists because the two paths had separate copies and they diverged.
+// #7161 put the degraded-promotion fallback in electSingleNode only. runElection
+// — the path taken whenever `peerAlive` is true, which is where a cluster spends
+// its life — kept a bare gate with no fallback, so #7161's guarantee that "a
+// readiness bug can never cost the cluster both nodes" held on the path a
+// cluster is almost never on and not on the path it is almost always on.
+//
+// That was observed live, not derived: after a routine cluster-deploy, RG1 sat
+// SECONDARY ON BOTH NODES indefinitely with `userspace XSK liveness not proven`,
+// logging twice a second for minutes. It could not self-heal, because proving
+// XSK liveness requires traffic and traffic requires a primary — the gate was
+// holding shut the only thing that could open it. It recovered only when traffic
+// was driven through the cluster by hand.
+//
+// Note what the divergence did to the fallback's own contract. #7161 required a
+// fallback NOT gated on any peer condition, precisely so it would fire when the
+// peer situation is what is wrong. Living only in electSingleNode gated it on a
+// peer condition anyway — just at the placement level rather than inside the
+// timer — which is the #110 shape one layer up: a fallback that cannot fire in
+// the case it exists for.
+//
+// Returns (promote, degradedReason). promote=false means hold this RG secondary
+// and the caller must not advance it. A non-empty degradedReason means promote
+// ANYWAY and say so loudly — the RG is not ready, and staying secondary is worse.
+//
+// Caller must hold m.mu.
+func (m *Manager) readinessGateVerdictLocked(rg *RedundancyGroupState) (bool, string) {
+	if rg.IsReadyForTakeover(m.takeoverHoldTime) {
+		return true, ""
+	}
+	if reason, ok := m.degradedPromoteDueLocked(rg); ok {
+		return true, reason
+	}
+	m.armDegradedTimerLocked(rg)
+	return false, ""
 }
 
 // degradedPromoteDueLocked reports whether the #7161 cold-boot readiness gate
