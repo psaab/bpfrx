@@ -181,6 +181,19 @@ const maxHeartbeatSoftwareVersionSize = 255
 // unguarded per-send log would flood journald (#4434).
 var oversizeHeartbeatGroupsWarn sync.Once
 
+// truncatedHeartbeatMonitorsWarn is the monitor-section counterpart, guarded
+// the same way and for the same reason (#7171). The monitor loop below fits as
+// many entries as the frame allows and BREAKS on the first one that does not,
+// which was entirely silent -- the only asymmetry in this function, since the
+// group section above has warned since #4434.
+//
+// Silence is the wrong default here because the truncation is not local: the
+// peer consumes NumMonitors to compute weight-based failover, so a node whose
+// monitor list did not fit advertises a SMALLER monitored set than it actually
+// has, and the peer's failover arithmetic is then computed from an incomplete
+// picture with nothing on either side saying so.
+var truncatedHeartbeatMonitorsWarn sync.Once
+
 func normalizeHAProtocolVersion(version uint16) uint16 {
 	if version == 0 {
 		return LegacyHAProtocolVersion
@@ -279,6 +292,14 @@ func marshalHeartbeatBody(pkt *HeartbeatPacket, tailReserve int) []byte {
 		copy(buf[off:off+len(nameBytes)], nameBytes)
 		off += len(nameBytes)
 		numMon++
+	}
+	if numMon < len(pkt.Monitors) {
+		truncatedHeartbeatMonitorsWarn.Do(func() {
+			slog.Warn("cluster: monitored-interface list exceeds heartbeat wire "+
+				"limit; advertising only the entries that fit",
+				"monitors", len(pkt.Monitors), "advertised", numMon,
+				"wire_limit", maxHeartbeatSize)
+		})
 	}
 	buf[monCountOff] = uint8(numMon)
 	if off+versionReserve+tailReserve <= maxHeartbeatSize {
