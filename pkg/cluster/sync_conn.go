@@ -1012,6 +1012,15 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// for), so a retained capability would authorise a push the new
 		// incarnation cannot represent.
 		s.peerSnapshotProtocol.Store(0)
+		// #7147: the capability flags are scoped to the same peer incarnation
+		// for the same reason, and a retained fence-ack bit is worse than a
+		// retained version: it would make every confirmed-fence takeover wait
+		// out its full timeout against a downgraded peer that cannot answer.
+		s.peerCapabilityFlags.Store(0)
+		// #7147: release fence-ack waiters so a fence sent moments before the
+		// fabric dropped fails open NOW instead of holding the takeover for
+		// the whole timeout waiting for an answer that can no longer arrive.
+		s.abortFenceAckWaiters()
 		// #5718 C01a: peerHeartbeatAckEver is a capability probe of the peer
 		// PROCESS, not of this node, so it must be scoped to the peer
 		// incarnation exactly like clockSynced above. Full disconnect ends

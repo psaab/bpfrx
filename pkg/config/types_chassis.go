@@ -149,7 +149,7 @@ type ClusterConfig struct {
 	DHCPLeaseSync         bool   // enable DHCP-server lease synchronization (#2239 PATH C: lease state held on standby, seeded into Kea on takeover)
 	RethAdvertiseInterval int    // RETH VRRP advertisement interval in milliseconds, 0=default(30)
 	HitlessRestart        bool   // preserve BPF state on shutdown (default false in HA — fail-closed)
-	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"
+	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg", "disable-rg-confirmed" (#7147)
 	TakeoverHoldTime      int    // milliseconds, 0=immediate takeover once ready
 	NoRethVRRP            bool   // cluster directly manages VIPs (no VRRP for RETH interfaces)
 	PrivateRGElection     bool   // election over control link only, suppress RETH VRRP

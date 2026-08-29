@@ -122,7 +122,7 @@ func TestPeerCapabilitiesMessageTypeIsUnique6650(t *testing.T) {
 				syncMsgPeerCapabilities, m.name)
 		}
 	}
-	if len(live) < 34 {
+	if len(live) < 35 {
 		t.Fatalf("the live-type list holds only %d entries — it has fallen behind "+
 			"sync.go and can no longer certify uniqueness", len(live))
 	}
@@ -150,17 +150,55 @@ func TestPeerCapabilitiesPayloadIsLengthGated6650(t *testing.T) {
 	}
 }
 
-// TestSendCapabilitiesStaysSilentWhenUnset6650 pins the "silence beats a
-// literal 0" encoding. Advertising 0 would be indistinguishable from a
-// pre-#6650 peer to the receiver while ALSO looking like a deliberate claim of
-// zero capability, so an un-wired node must send nothing at all.
-func TestSendCapabilitiesStaysSilentWhenUnset6650(t *testing.T) {
+// TestSendCapabilitiesAdvertisesUnconditionally6650_7147 SUPERSEDES the former
+// TestSendCapabilitiesStaysSilentWhenUnset6650, which pinned the opposite
+// source shape ("if v == 0 { return }") and is deliberately gone rather than
+// deleted silently.
+//
+// WHY THE CONTRACT CHANGED. #6650's frame carried only the snapshot version,
+// and for that payload silence was the more honest encoding of "not wired".
+// #7147 added capability FLAGS to the same frame. Flags are a property of the
+// BINARY, always true for this build, so suppressing the whole frame because an
+// unrelated field was 0 would have made the fence-ack capability depend on
+// userspace.ProtocolVersion staying nonzero — and had it ever been 0, the
+// confirmed-fence gate would have stopped arming while looking exactly like a
+// healthy pre-#7147 peer.
+//
+// WHAT SURVIVES. The invariant the old test actually protected is unchanged and
+// is re-asserted below: a receiver cannot distinguish "frame absent" from
+// "frame carrying version 0", because both leave peerSnapshotProtocol at 0 and
+// #6650's contract already reads 0 as INCAPABLE rather than unknown. So the
+// version SEMANTICS are identical; only the encoding moved.
+func TestSendCapabilitiesAdvertisesUnconditionally6650_7147(t *testing.T) {
 	t.Parallel()
 	src := readClusterSource(t, "sync_conn_write.go")
-	if !sourceContainsFlat(src, "v := s.localSnapshotProtocol.Load()") ||
-		!sourceContainsFlat(src, "if v == 0 { return }") {
-		t.Error("sendCapabilities does not suppress the advertisement when the local " +
-			"version is unset; an un-wired node would advertise a literal 0")
+	if !sourceContainsFlat(src, "v := s.localSnapshotProtocol.Load()") {
+		t.Error("sendCapabilities no longer reads localSnapshotProtocol")
+	}
+	if sourceContainsFlat(src, "if v == 0 { return }") {
+		t.Error("sendCapabilities still suppresses the advertisement when the local " +
+			"version is unset. #7147 requires the frame unconditionally: the capability " +
+			"FLAGS it now carries are a property of this binary and must not be gated on " +
+			"an unrelated version field being nonzero, or the confirmed-fence gate " +
+			"silently stops arming and looks identical to a healthy old peer.")
+	}
+	if !sourceContainsFlat(src, "buf[2] = localCapabilityFlags") {
+		t.Error("sendCapabilities does not append the #7147 capability flags byte, so " +
+			"no peer can ever learn this node acks fences and every confirmed-fence " +
+			"takeover fails open without waiting")
+	}
+
+	// The surviving #6650 invariant, asserted behaviourally rather than by
+	// source shape: version 0 on the wire and no frame at all must be
+	// indistinguishable to the receiver.
+	var ss SessionSync
+	if got := ss.PeerSnapshotProtocolVersion(); got != 0 {
+		t.Fatalf("a peer that never advertised reads %d, want 0", got)
+	}
+	ss.peerSnapshotProtocol.Store(uint32(uint16(0)))
+	if got := ss.PeerSnapshotProtocolVersion(); got != 0 {
+		t.Fatalf("a peer that advertised a literal 0 reads %d, want 0 — the two must "+
+			"stay indistinguishable, which is what makes the encoding change safe", got)
 	}
 }
 
@@ -222,6 +260,7 @@ func liveSyncMessageTypesExcept(under int) []syncMessageType {
 		{syncMsgAuthUpgradeHello, "AuthUpgradeHello"},
 		{syncMsgAuthUpgradeProof, "AuthUpgradeProof"},
 		{syncMsgAuthUpgradeAck, "AuthUpgradeAck"},
+		{syncMsgFenceAck, "FenceAck"},
 	}
 	out := make([]syncMessageType, 0, len(all))
 	for _, m := range all {

@@ -323,6 +323,13 @@ type SyncStats struct {
 	DHCPLeasesSeeded       atomic.Uint64
 	FencesSent             atomic.Uint64
 	FencesReceived         atomic.Uint64
+	// FenceAcksSent / FenceAcksReceived / FenceAcksTimedOut instrument the
+	// #7147 confirmed fence. FenceAcksTimedOut is the one that matters
+	// operationally: it counts takeovers that proceeded WITHOUT the
+	// confirmation the operator asked for, which is invisible in FencesSent.
+	FenceAcksSent     atomic.Uint64
+	FenceAcksReceived atomic.Uint64
+	FenceAcksTimedOut atomic.Uint64
 	Errors                 atomic.Uint64
 	DeletesDropped         atomic.Uint64
 	// DeletesStaleIgnored counts deletes refused by the #2170 install-
@@ -414,6 +421,9 @@ type SyncStatsSnapshot struct {
 	DHCPLeasesSeeded           uint64
 	FencesSent                 uint64
 	FencesReceived             uint64
+	FenceAcksSent              uint64
+	FenceAcksReceived          uint64
+	FenceAcksTimedOut          uint64
 	Errors                     uint64
 	DeletesDropped             uint64
 	DeletesStaleIgnored        uint64
@@ -693,8 +703,15 @@ type SessionSync struct {
 	// fenced before the batch failoverAckApplied reply is sent (#5640). reqID
 	// identifies the batch request whose barriers are being waited on (#6177).
 	WaitFailoverAppliedBatch func(rgIDs []int, reqID uint64) error
-	// OnFenceReceived requests this node to disable all RGs.
-	OnFenceReceived func()
+	// OnFenceReceived requests this node to disable all RGs, and reports what
+	// that achieved so a sequenced fence can be acknowledged truthfully
+	// (#7147). The returned FenceResult is encoded into syncMsgFenceAck; it is
+	// ignored for an unsequenced (pre-#7147) fence.
+	//
+	// It is invoked SYNCHRONOUSLY on the receive loop and the ack is written
+	// after it returns. That ordering is the whole guarantee: an ack sent
+	// before the fence had been applied would confirm nothing.
+	OnFenceReceived func() FenceResult
 	// OnPrepareActivation asks the peer to pre-warm neighbors for the given RG.
 	OnPrepareActivation func(rgID int)
 	// OnForwardSessionInstalled fires when a forward synced session is installed locally.
@@ -806,6 +823,27 @@ type SessionSync struct {
 	// peer INCARNATION that proved it, and the peer that reconnects may be a
 	// different, older process.
 	peerSnapshotProtocol atomic.Uint32
+
+	// peerCapabilityFlags holds the peer's advertised capability bits (#7147),
+	// carried in the trailing byte of syncMsgPeerCapabilities on top of #6650's
+	// version field. 0 means "advertises nothing", which for every bit means
+	// INCAPABLE — a pre-#7147 peer sends a 2-byte frame with no flags at all.
+	//
+	// Cleared on full disconnect alongside peerSnapshotProtocol and for the
+	// identical reason: the capability belongs to the peer INCARNATION that
+	// proved it, and the process that reconnects may be an older build. A
+	// retained fence-ack bit would make a confirmed-fence gate wait out its
+	// whole timeout against a downgraded peer that can never answer.
+	peerCapabilityFlags atomic.Uint32
+
+	// fenceSeq numbers sequenced peer fences (#7147). Starts at 0 and is only
+	// ever read via Add(1), so the first fence is seq 1 — seq 0 is reserved on
+	// the wire to mean "no ack requested", which is how a pre-#7147 fence's
+	// empty payload decodes.
+	fenceSeq        atomic.Uint64
+	fenceAckMu      sync.Mutex
+	fenceAckWaiters map[uint64]chan FenceAck
+
 	zoneRGMu             sync.RWMutex
 	zoneRGMap            map[uint16]int
 
@@ -1414,7 +1452,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), ImportsRefusedByHelper: s.stats.ImportsRefusedByHelper.Load(), ConfigsQueueFullDropped: s.stats.ConfigsQueueFullDropped.Load(), ConfigApplyNacksReceived: s.stats.ConfigApplyNacksReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), ConfigsStaleIgnored: s.stats.ConfigsStaleIgnored.Load(), BulkPrimesWithoutIncarnation: s.stats.BulkPrimesWithoutIncarnation.Load(), PeerBootIncarnation: s.PeerBootIncarnation().String(), ConfigsDeadIncarnationDropped: s.stats.ConfigsDeadIncarnationDropped.Load(), ConfigsApplyFailed: s.stats.ConfigsApplyFailed.Load(), ImportsRefusedByHelper: s.stats.ImportsRefusedByHelper.Load(), ConfigsQueueFullDropped: s.stats.ConfigsQueueFullDropped.Load(), ConfigApplyNacksReceived: s.stats.ConfigApplyNacksReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), IPsecSAStaleIgnored: s.stats.IPsecSAStaleIgnored.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesStaleIgnored: s.stats.DHCPLeasesStaleIgnored.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), FenceAcksSent: s.stats.FenceAcksSent.Load(), FenceAcksReceived: s.stats.FenceAcksReceived.Load(), FenceAcksTimedOut: s.stats.FenceAcksTimedOut.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), SessionsStaleConfigIgnored: s.stats.SessionsStaleConfigIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), PreAuthRejected: s.stats.PreAuthRejected.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

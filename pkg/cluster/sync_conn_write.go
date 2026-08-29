@@ -269,10 +269,22 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 // sendCapabilities advertises this node's config-snapshot protocol version to
 // the peer (#6650). Called once per installed connection.
 //
-// A node whose version was never wired (0) sends NOTHING rather than
-// advertising 0: the receiver reads a missing advertisement as "pre-#6650
-// peer", and a literal 0 would be indistinguishable from that while ALSO
-// looking like a deliberate claim. Silence is the honest encoding.
+// #7147 CHANGED THE SEND CONDITION. This used to return early when the
+// snapshot version was 0, on the reasoning that silence is a more honest
+// encoding of "not wired" than a literal 0. That reasoning was sound for a
+// frame carrying only the version, but the frame now also carries capability
+// FLAGS, which are a property of the BINARY and are always true for this
+// build. Suppressing the whole frame on an unrelated field being 0 would have
+// made #7147's fence-ack capability silently depend on
+// `userspace.ProtocolVersion` staying nonzero — and if it ever were 0 the
+// confirmed-fence gate would quietly stop arming, which is indistinguishable
+// from a healthy pre-#7147 peer. Wrong failure to have.
+//
+// Sending an explicit 0 version is behaviourally identical to sending nothing:
+// the receiver has no way to distinguish "frame absent" from "frame with
+// version 0" — both leave peerSnapshotProtocol at 0 — and #6650's own contract
+// already states that 0 means INCAPABLE rather than unknown. So the version
+// semantics are preserved exactly; only the encoding changed.
 //
 // A send failure is logged and NOT escalated to handleDisconnect: unlike the
 // clock sync this is advisory metadata, and dropping a live fabric because an
@@ -280,16 +292,14 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 // The receiver's 0-means-incapable default already fails closed.
 func (s *SessionSync) sendCapabilities(conn net.Conn) {
 	v := s.localSnapshotProtocol.Load()
-	if v == 0 {
-		return
-	}
-	var buf [2]byte
-	binary.LittleEndian.PutUint16(buf[:], uint16(v))
+	var buf [3]byte
+	binary.LittleEndian.PutUint16(buf[:2], uint16(v))
+	buf[2] = localCapabilityFlags
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgPeerCapabilities, buf[:])
 	s.writeMu.Unlock()
 	if err != nil {
-		slog.Warn("cluster sync: failed to advertise snapshot protocol version", "err", err)
+		slog.Warn("cluster sync: failed to advertise capabilities", "err", err)
 	}
 }
 

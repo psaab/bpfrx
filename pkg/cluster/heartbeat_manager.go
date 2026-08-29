@@ -618,23 +618,36 @@ func (m *Manager) handlePeerTimeout() {
 		m.clearPeerTransferOutOverrideLocked(rgID)
 	}
 
+	// #7147: under `disable-rg-confirmed` the fence runs BEFORE the election
+	// and this node waits, bounded, for the peer to confirm it relinquished
+	// its redundancy groups. That ordering is the entire point of the policy —
+	// see awaitPeerFenceLocked for why it cannot stall a takeover.
+	if m.peerFencing == PeerFencingDisableRGConfirmed {
+		m.awaitPeerFenceLocked()
+	}
+
 	// Peer lost: re-run single-node election.
 	m.electSingleNode()
 
 	// Attempt peer fencing if configured.
 	//
-	// Ordering note (#72): the election above runs BEFORE the fence, and the
-	// fence is never a precondition for ownership. That is deliberate and not
-	// currently changeable by reordering alone — SendFence
-	// (sync_failover.go) writes syncMsgFence and returns; there is no
-	// fence-ack message on the wire, so "fence acknowledged" is not an
-	// observable this code could gate on. Gating takeover on the send
+	// Ordering note (#72): under `disable-rg` the election above runs BEFORE
+	// the fence, and the fence is never a precondition for ownership. That is
+	// deliberate: SendFence (sync_failover.go) writes syncMsgFence and returns
+	// without waiting, so a `sent to peer` result means the write reached the
+	// socket, not that the peer disabled anything. Gating takeover on the send
 	// SUCCEEDING would be worse than useless: the send fails precisely when
 	// the peer is unreachable, which is the split-brain case fencing exists
 	// to cover, so it would convert a dead peer into a total outage.
+	//
+	// #7147 added the acknowledged alternative rather than changing this one.
+	// An operator who wants ownership gated on a confirmed fence selects
+	// `disable-rg-confirmed` above; `disable-rg` behaves exactly as it always
+	// has, so no existing config changes behaviour.
+	//
 	// Every attempt and its result is recorded to the EventFence history and
 	// rendered by FormatInformation's "Peer fencing:" block.
-	if m.peerFencing == "disable-rg" {
+	if m.peerFencing == PeerFencingDisableRG {
 		fn := m.peerFenceFn
 		if fn != nil {
 			// Release lock for the network call.
