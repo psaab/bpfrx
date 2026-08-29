@@ -86,6 +86,41 @@ type LLDPConfig struct {
 	Disable        bool            // globally disable LLDP
 }
 
+// neighborKey identifies a learned LLDP neighbor.
+//
+// It is a STRUCT rather than a separator-joined string, and that is the whole
+// point (#7176 C179-026). Two of its three components — ChassisID and PortID —
+// are peer-controlled TLV strings taken straight off the wire by ParseTLVs, and
+// port IDs legitimately contain "/" (a Junos-style `ge-0/0/1`). A
+// "%s/%s/%s"-formatted key therefore cannot represent them unambiguously:
+// chassis="a/b" port="c" and chassis="a" port="b/c" format to the same string.
+//
+// That ambiguity was not cosmetic. A TTL=0 LLDPDU is an explicit withdrawal
+// (IEEE 802.1AB) and withdrawNeighbor deletes by key, so a peer able to choose
+// its own ChassisID/PortID could forge the key of a DIFFERENT neighbor and
+// evict an entry it does not own — remote-input-driven deletion of another
+// peer's state.
+//
+// A comparable struct makes the collision UNREPRESENTABLE rather than escaped:
+// there is no separator to smuggle, so no escaping rule to get wrong later and
+// no encoder/decoder pair that can drift apart.
+type neighborKey struct {
+	Iface     string
+	ChassisID string
+	PortID    string
+}
+
+// neighborKeyFor builds the table key for a neighbor learned on ifaceName.
+//
+// Split out of the receive loop so the REAL construction is drivable by a test.
+// The collision this key type exists to prevent is created exactly here — where
+// peer-controlled TLV strings become a key — and a test that assembles keys by
+// hand cannot observe a regression at this site: it would keep passing while the
+// production path went back to joining the components into one string.
+func neighborKeyFor(ifaceName string, n *Neighbor) neighborKey {
+	return neighborKey{Iface: ifaceName, ChassisID: n.ChassisID, PortID: n.PortID}
+}
+
 // Manager runs LLDP transmit/receive goroutines and maintains the neighbor table.
 type Manager struct {
 	// lifecycleMu serializes the Apply/Stop generation transition. Apply (a
@@ -109,7 +144,7 @@ type Manager struct {
 	lifecycleMu sync.Mutex
 
 	mu        sync.RWMutex
-	neighbors map[string]*Neighbor // key: "ifname/chassisID/portID"
+	neighbors map[neighborKey]*Neighbor
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	// sessions are the per-interface RX/TX sockets for the current Apply
@@ -247,7 +282,7 @@ func (s *ifSession) close() {
 // New creates a new LLDP manager.
 func New() *Manager {
 	return &Manager{
-		neighbors:       make(map[string]*Neighbor),
+		neighbors:       make(map[neighborKey]*Neighbor),
 		capDropLastWarn: make(map[string]time.Time),
 	}
 }
@@ -418,7 +453,7 @@ func (m *Manager) stopLocked() {
 	}
 
 	m.mu.Lock()
-	m.neighbors = make(map[string]*Neighbor)
+	m.neighbors = make(map[neighborKey]*Neighbor)
 	m.capDropLastWarn = make(map[string]time.Time)
 	m.mu.Unlock()
 }
@@ -451,11 +486,23 @@ func (m *Manager) Neighbors() []*Neighbor {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	keys := make([]string, 0, len(m.neighbors))
+	keys := make([]neighborKey, 0, len(m.neighbors))
 	for k := range m.neighbors {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	// Deterministic order, field by field. The previous sort.Strings over the
+	// joined key ordered by the same components in the same precedence; sorting
+	// the fields directly keeps that without reintroducing a separator.
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.Iface != b.Iface {
+			return a.Iface < b.Iface
+		}
+		if a.ChassisID != b.ChassisID {
+			return a.ChassisID < b.ChassisID
+		}
+		return a.PortID < b.PortID
+	})
 
 	out := make([]*Neighbor, 0, len(keys))
 	for _, k := range keys {
@@ -588,7 +635,7 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 			continue
 		}
 
-		key := fmt.Sprintf("%s/%s/%s", iface.Name, neighbor.ChassisID, neighbor.PortID)
+		key := neighborKeyFor(iface.Name, neighbor)
 
 		// IEEE 802.1AB shutdown semantics: a TTL=0 LLDPDU is an explicit
 		// withdrawal, not a neighbor advertisement. Remove any existing entry
@@ -638,7 +685,7 @@ const capDropWarnInterval = 60 * time.Second
 // reaps aged-out entries, so once a transient flood stops advertising the table
 // shrinks back below the cap and new legitimate neighbors are admitted again.
 // Returns true if the neighbor was stored, false if it was dropped by the cap.
-func (m *Manager) learnNeighbor(key string, n *Neighbor) bool {
+func (m *Manager) learnNeighbor(key neighborKey, n *Neighbor) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -674,7 +721,7 @@ func (m *Manager) learnNeighbor(key string, n *Neighbor) bool {
 // learn and expiry paths use, so the delete is serialized against concurrent
 // refreshes and reaps. A shutdown is a rare per-neighbor event (not per-packet),
 // so the state-transition log mirrors expiryLoop's "expired" line.
-func (m *Manager) withdrawNeighbor(key string) {
+func (m *Manager) withdrawNeighbor(key neighborKey) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n, ok := m.neighbors[key]

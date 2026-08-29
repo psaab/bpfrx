@@ -521,7 +521,7 @@ func TestNeighborTable(t *testing.T) {
 
 	// Manually add neighbors and verify.
 	m.mu.Lock()
-	m.neighbors["eth0/aa:bb:cc:dd:ee:ff/port1"] = &Neighbor{
+	m.neighbors[mkNeighborKey("eth0", "aa:bb:cc:dd:ee:ff", "port1")] = &Neighbor{
 		ChassisID: "aa:bb:cc:dd:ee:ff",
 		PortID:    "port1",
 		TTL:       120,
@@ -529,7 +529,7 @@ func TestNeighborTable(t *testing.T) {
 		LastSeen:  time.Now(),
 		ExpiresAt: time.Now().Add(120 * time.Second),
 	}
-	m.neighbors["eth1/11:22:33:44:55:66/port2"] = &Neighbor{
+	m.neighbors[mkNeighborKey("eth1", "11:22:33:44:55:66", "port2")] = &Neighbor{
 		ChassisID: "11:22:33:44:55:66",
 		PortID:    "port2",
 		TTL:       60,
@@ -557,7 +557,7 @@ func TestNeighborExpiry(t *testing.T) {
 
 	// Add an already-expired neighbor.
 	m.mu.Lock()
-	m.neighbors["eth0/aa:bb:cc:dd:ee:ff/port1"] = &Neighbor{
+	m.neighbors[mkNeighborKey("eth0", "aa:bb:cc:dd:ee:ff", "port1")] = &Neighbor{
 		ChassisID: "aa:bb:cc:dd:ee:ff",
 		PortID:    "port1",
 		TTL:       1,
@@ -566,7 +566,7 @@ func TestNeighborExpiry(t *testing.T) {
 		ExpiresAt: time.Now().Add(-5 * time.Second),
 	}
 	// Add a still-valid neighbor.
-	m.neighbors["eth1/11:22:33:44:55:66/port2"] = &Neighbor{
+	m.neighbors[mkNeighborKey("eth1", "11:22:33:44:55:66", "port2")] = &Neighbor{
 		ChassisID: "11:22:33:44:55:66",
 		PortID:    "port2",
 		TTL:       300,
@@ -642,8 +642,12 @@ func mkNeighbor(iface, chassis, port string) *Neighbor {
 	}
 }
 
-func neighborKey(iface, chassis, port string) string {
-	return fmt.Sprintf("%s/%s/%s", iface, chassis, port)
+// #7176 (C179-026): this helper used to re-implement the production key as
+// fmt.Sprintf("%s/%s/%s", ...) — a copy of the very construction under test, so
+// it would have stayed green through any change to it. It now builds the
+// production type, which is what makes the collision unrepresentable.
+func mkNeighborKey(iface, chassis, port string) neighborKey {
+	return neighborKey{Iface: iface, ChassisID: chassis, PortID: port}
 }
 
 // TestLearnNeighborCapPerInterface is the fail-on-revert unit test for the
@@ -666,7 +670,7 @@ func TestLearnNeighborCapPerInterface(t *testing.T) {
 	// Fill eth0 exactly to the cap. Every add is a distinct new key.
 	for i := 0; i < maxNeighborsPerInterface; i++ {
 		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
-		if !m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+		if !m.learnNeighbor(mkNeighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
 			t.Fatalf("add %d within cap should be admitted", i)
 		}
 	}
@@ -676,7 +680,7 @@ func TestLearnNeighborCapPerInterface(t *testing.T) {
 
 	// One more DISTINCT neighbor on eth0 must be dropped, not stored.
 	overChassis := "02:00:00:00:ff:ff"
-	if m.learnNeighbor(neighborKey("eth0", overChassis, "p"), mkNeighbor("eth0", overChassis, "p")) {
+	if m.learnNeighbor(mkNeighborKey("eth0", overChassis, "p"), mkNeighbor("eth0", overChassis, "p")) {
 		t.Fatal("a new neighbor past the per-interface cap must be dropped (returned true)")
 	}
 	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
@@ -688,21 +692,21 @@ func TestLearnNeighborCapPerInterface(t *testing.T) {
 	refreshChassis := "02:00:00:00:00:00"
 	refreshed := mkNeighbor("eth0", refreshChassis, "p")
 	refreshed.TTL = 999
-	if !m.learnNeighbor(neighborKey("eth0", refreshChassis, "p"), refreshed) {
+	if !m.learnNeighbor(mkNeighborKey("eth0", refreshChassis, "p"), refreshed) {
 		t.Fatal("a refresh of an existing neighbor must be accepted even at the cap")
 	}
 	if got := len(m.Neighbors()); got != maxNeighborsPerInterface {
 		t.Fatalf("refresh must not grow the table: got %d, want %d", got, maxNeighborsPerInterface)
 	}
 	m.mu.RLock()
-	gotTTL := m.neighbors[neighborKey("eth0", refreshChassis, "p")].TTL
+	gotTTL := m.neighbors[mkNeighborKey("eth0", refreshChassis, "p")].TTL
 	m.mu.RUnlock()
 	if gotTTL != 999 {
 		t.Fatalf("refresh did not update in place: TTL got %d, want 999", gotTTL)
 	}
 
 	// The cap is per interface: a neighbor on eth1 has its own budget.
-	if !m.learnNeighbor(neighborKey("eth1", "02:00:00:00:01:00", "p"), mkNeighbor("eth1", "02:00:00:00:01:00", "p")) {
+	if !m.learnNeighbor(mkNeighborKey("eth1", "02:00:00:00:01:00", "p"), mkNeighbor("eth1", "02:00:00:00:01:00", "p")) {
 		t.Fatal("a neighbor on a different interface must be admitted (cap is per-interface)")
 	}
 	if got := len(m.Neighbors()); got != maxNeighborsPerInterface+1 {
@@ -739,12 +743,12 @@ func TestLearnNeighborCapWarnsRateLimited(t *testing.T) {
 	// Fill to the cap (no drops, no warns yet).
 	for i := 0; i < maxNeighborsPerInterface; i++ {
 		chassis := fmt.Sprintf("02:00:00:00:00:%02x", i)
-		m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p"))
+		m.learnNeighbor(mkNeighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p"))
 	}
 	// Now drop 10 distinct new neighbors past the cap.
 	for i := 0; i < 10; i++ {
 		chassis := fmt.Sprintf("02:00:00:00:aa:%02x", i)
-		if m.learnNeighbor(neighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
+		if m.learnNeighbor(mkNeighborKey("eth0", chassis, "p"), mkNeighbor("eth0", chassis, "p")) {
 			t.Fatalf("over-cap add %d should have been dropped", i)
 		}
 	}
