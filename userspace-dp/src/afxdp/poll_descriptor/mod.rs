@@ -2468,6 +2468,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         .policy
                                         .hit_counter_by_idx(policy_result.policy_counter_idx)
                                         .cloned();
+                                    let (stamped_ifindex, stamped_vlan) =
+                                        crate::session::stamped_ingress_identity(
+                                            meta.ingress_ifindex,
+                                            meta.ingress_vlan_id,
+                                            fabric_ingress,
+                                        );
                                     let forward_metadata = SessionMetadata {
                                         ingress_zone: from_zone_id,
                                         egress_zone: to_zone_id,
@@ -2476,8 +2482,15 @@ pub(super) fn poll_binding_process_descriptor(
                                         // tag. Recorded ONCE here and never re-derived from the zone, which is
                                         // the approximation `show/clear security flow session interface <name>`
                                         // is being freed from.
-                                        ingress_ifindex: meta.ingress_ifindex,
-                                        ingress_vlan_id: meta.ingress_vlan_id,
+                                        // #7096: NOT meta.ingress_ifindex directly.
+                                        // A fabric-redirected packet carries the
+                                        // LOCAL fabric member's ifindex while its
+                                        // zone names the PEER's real ingress, and
+                                        // the peer's interface is not knowable here
+                                        // (the fabric stamp carries a zone id and
+                                        // nothing else). See stamped_ingress_identity.
+                                        ingress_ifindex: stamped_ifindex,
+                                        ingress_vlan_id: stamped_vlan,
                                         owner_rg_id,
                                         fabric_ingress,
                                         is_reverse: false,
