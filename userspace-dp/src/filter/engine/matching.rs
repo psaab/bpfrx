@@ -342,8 +342,7 @@ fn port_terms_match(
     dst_port: u16,
 ) -> bool {
     if (term.source_port_constrained || term.dest_port_constrained)
-        && extra.is_fragment
-        && !extra.l4_present
+        && ((extra.is_fragment && !extra.l4_present) || extra.ports_unknown)
     {
         return false;
     }

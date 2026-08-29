@@ -774,6 +774,8 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         } else {
             declared_end.and_then(|end| frame.get(l4..end))
         },
+        // #7992: these callers DO have real ports.
+        ports_unknown: false,
     }
 }
 
@@ -829,6 +831,8 @@ pub(in crate::afxdp) fn term_match_extra_from_meta(
         // #3232: likewise no L4 bytes on the meta-only path — a layer-4 flex
         // term fails closed.
         flex_l4: None,
+        // #7992: these callers DO have real ports.
+        ports_unknown: false,
     }
 }
 

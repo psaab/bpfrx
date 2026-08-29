@@ -39,10 +39,10 @@ pub(crate) fn evaluate_filter_ref_tx_selection_cached(
 ) -> CachedTxSelectionFilterResult {
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => evaluate_filter_ref_tx_selection_cached_v4(
-            filter, src, dst, protocol, src_port, dst_port, dscp,
+            filter, src, dst, protocol, src_port, dst_port, dscp, false,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_tx_selection_cached_v6(
-            filter, src, dst, protocol, src_port, dst_port, dscp,
+            filter, src, dst, protocol, src_port, dst_port, dscp, false,
         ),
         _ => CachedTxSelectionFilterResult::default(),
     }
@@ -56,6 +56,7 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    ports_unknown: bool,
 ) -> CachedTxSelectionFilterResult {
     // #2544: accumulate modifiers across fall-through terms; return on the first
     // terminating matched term. See merge_matched_cached_modifiers.
@@ -69,7 +70,10 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
             src_port,
             dst_port,
             dscp,
-            TermMatchExtra::default(),
+            TermMatchExtra {
+                ports_unknown,
+                ..Default::default()
+            },
         ) {
             continue;
         }
@@ -126,6 +130,7 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    ports_unknown: bool,
 ) -> CachedTxSelectionFilterResult {
     // #2544: see evaluate_filter_ref_tx_selection_cached_v4.
     let mut acc = CachedTxSelectionFilterResult::default();
@@ -138,7 +143,10 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
             src_port,
             dst_port,
             dscp,
-            TermMatchExtra::default(),
+            TermMatchExtra {
+                ports_unknown,
+                ..Default::default()
+            },
         ) {
             continue;
         }
@@ -249,6 +257,42 @@ fn capture_input_filter_counters_v4(
     }
     counters
 }
+/// #7992: the cache-replay evaluator for a caller that has NO PORTS AT ALL.
+///
+/// It takes no port arguments, which is the point: the FLOWLESS arm of
+/// `resolve_cached_cos_tx_selection_impl` used to call the ported entry point
+/// with literal `0, 0`, and literal zero is not "no port" — it is a port value
+/// that a term can match on. `destination-port-except 22` matches everything
+/// that is not 22, and 0 is not 22, so the exception matched and an egress
+/// `then discard` fired on a packet whose real port was excepted (#7174 C19,
+/// second reachability path).
+///
+/// The arm's own comment argued this was safe because "a port-BEARING term never
+/// matches (no spurious drop)". That is true of `from destination-port 22` and
+/// FALSE of the except form — a claim correct for the case its author had in
+/// mind that silently generalised to the case where it inverts.
+///
+/// Removing the parameters rather than passing a flag is deliberate: it makes
+/// the defect unrepresentable at this call site instead of relying on the next
+/// caller to pass the right bool.
+pub(crate) fn evaluate_filter_ref_tx_selection_cached_portless(
+    filter: &Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    dscp: u8,
+) -> CachedTxSelectionFilterResult {
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            evaluate_filter_ref_tx_selection_cached_v4(filter, src, dst, protocol, 0, 0, dscp, true)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            evaluate_filter_ref_tx_selection_cached_v6(filter, src, dst, protocol, 0, 0, dscp, true)
+        }
+        _ => CachedTxSelectionFilterResult::default(),
+    }
+}
+
 
 #[inline]
 fn capture_input_filter_counters_v6(
