@@ -7092,6 +7092,26 @@ fn retire_worker_frees_only_when_it_was_the_last_holder_7092() {
          assertion below passes against an allocator that never held it"
     );
 
+    // FIXTURE ADEQUACY — does this really create TWO holders? The mask has no
+    // test accessor, so it is established two ways rather than assumed.
+    //
+    // 1. `reserve_synced_source_nat_allocation_for_worker` is the path where
+    //    workers 2..N actually land: it reaches `reserve_flow`'s idempotent
+    //    early return, which ORs the caller's bit into the existing record.
+    //    Two `allocate_source_for_worker` calls would NOT do this — the live-hit
+    //    path returns the existing translation without taking a second bit — so
+    //    an allocate-twice fixture cannot create the state this cell is about
+    //    and would fail in the flattering direction (#7094 hit exactly that).
+    // 2. The first assertion below is SELF-VERIFYING in the direction that
+    //    matters: with only ONE holder, `retire_worker(0)` would empty the mask
+    //    and free, returning 1, and `assert_eq!(.., 0)` would fail. It passing
+    //    REQUIRES worker 1's bit to be present.
+    //
+    // Confirmed a third way by measurement: mutation cell M1 ("free on ANY
+    // holder") reds this test. With a single holder, M1 and the real code
+    // behave identically — retiring the sole holder frees either way — so M1
+    // reddening is only possible if the fixture holds at least two bits.
+
     // ONE OF TWO — must free nothing. This is the cell that would have caught
     // this operation being written against the pre-#6522 mask.
     assert_eq!(
