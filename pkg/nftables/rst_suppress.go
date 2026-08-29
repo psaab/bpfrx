@@ -117,79 +117,111 @@ func queueRSTSuppression(c *nftables.Conn, plan rstSuppressionPlan) bool {
 	})
 
 	for _, addr := range plan.v4Addrs {
-		addRSTDropRuleV4(c, table, chain, addr.As4())
+		addRSTDropRule(c, table, chain, addr)
 	}
 	for _, addr := range plan.v6Addrs {
-		addRSTDropRuleV6(c, table, chain, addr.As16())
+		addRSTDropRule(c, table, chain, addr)
 	}
 	return true
 }
 
-func addRSTDropRuleV4(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, addr [4]byte) {
-	addRSTDropRule(c, table, chain, net.IP(addr[:]), uint32(4), 12, unix.NFPROTO_IPV4)
-}
-
-func addRSTDropRuleV6(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, addr [16]byte) {
-	addRSTDropRule(c, table, chain, net.IP(addr[:]), uint32(16), 8, unix.NFPROTO_IPV6)
-}
-
 // addRSTDropRule adds: meta nfproto <family> ip/ip6 saddr <addr> tcp flags & rst != 0 counter drop
-func addRSTDropRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, addrBytes net.IP, addrLen uint32, saddrOffset uint32, family byte) {
+func addRSTDropRule(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, addr netip.Addr) {
 	c.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
-		Exprs: []expr.Any{
-			// meta nfproto ipv4/ipv6
-			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{family},
-			},
-			// ip/ip6 saddr == addr
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       saddrOffset,
-				Len:          addrLen,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     addrBytes,
-			},
-			// meta l4proto tcp
-			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     []byte{unix.IPPROTO_TCP},
-			},
-			// tcp flags & RST != 0
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseTransportHeader,
-				Offset:       13, // TCP flags byte
-				Len:          1,
-			},
-			&expr.Bitwise{
-				SourceRegister: 1,
-				DestRegister:   1,
-				Len:            1,
-				Mask:           []byte{0x04}, // RST flag
-				Xor:            []byte{0x00},
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpNeq,
-				Register: 1,
-				Data:     []byte{0x00},
-			},
-			// counter
-			&expr.Counter{},
-			// drop
-			&expr.Verdict{Kind: expr.VerdictDrop},
-		},
+		Exprs: rstDropExprs(addr),
 	})
+}
+
+// rstDropExprs builds the expression list for one RST-drop rule, deriving the
+// nfproto byte, the source-address payload offset and the address length from
+// the address itself.
+//
+// Taking a netip.Addr rather than (bytes, len, offset, family) is what makes
+// the rule shape testable AND removes a defect class (#7171). Previously the
+// three per-family constants were passed in by addRSTDropRuleV4/V6, so the
+// binding between a family and ITS offset lived at the call site. A test could
+// then only assert that this function copies the arguments it was handed --
+// true however the constants are paired -- so transposing v4's saddr offset to
+// v6's was invisible to it. That is not a hypothetical: it is the first
+// mutation run against the earlier version of this split, and it escaped.
+// Deriving the constants here puts the binding in the one place a test calls.
+//
+// It also retires the As4() conversion the callers used to make, which panics
+// on a v6 address. That panic was unreachable -- the only production caller
+// builds its v4 slice with netip.AddrFrom4 -- but the guarantee now comes from
+// the type rather than from an invariant each future caller has to know.
+//
+// The fields below are all silently wrong rather than loudly wrong: nftables
+// accepts a rule with the wrong offset, mask or family, the install reports
+// success, and the only symptom is that the RST this exists to suppress is not
+// suppressed.
+func rstDropExprs(addr netip.Addr) []expr.Any {
+	var (
+		addrBytes   net.IP
+		addrLen     uint32
+		saddrOffset uint32
+		family      byte
+	)
+	if addr.Is4() {
+		v4 := addr.As4()
+		addrBytes, addrLen, saddrOffset, family = net.IP(v4[:]), 4, 12, unix.NFPROTO_IPV4
+	} else {
+		v6 := addr.As16()
+		addrBytes, addrLen, saddrOffset, family = net.IP(v6[:]), 16, 8, unix.NFPROTO_IPV6
+	}
+	return []expr.Any{
+		// meta nfproto ipv4/ipv6
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{family},
+		},
+		// ip/ip6 saddr == addr
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseNetworkHeader,
+			Offset:       saddrOffset,
+			Len:          addrLen,
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     addrBytes,
+		},
+		// meta l4proto tcp
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{unix.IPPROTO_TCP},
+		},
+		// tcp flags & RST != 0
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       13, // TCP flags byte
+			Len:          1,
+		},
+		&expr.Bitwise{
+			SourceRegister: 1,
+			DestRegister:   1,
+			Len:            1,
+			Mask:           []byte{0x04}, // RST flag
+			Xor:            []byte{0x00},
+		},
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0x00},
+		},
+		// counter
+		&expr.Counter{},
+		// drop
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	}
 }
 
 func ptrPolicy(p nftables.ChainPolicy) *nftables.ChainPolicy {
