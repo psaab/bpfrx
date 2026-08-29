@@ -151,6 +151,19 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// command (#5031 withholds it from /health because that endpoint is
 		// unauthenticated, which is a different question from privilege).
 		BootstrapImportFn: d.bootstrapShowSnapshot,
+		// #7181: the APPLIED state of the host-inbound nft surface, so `show
+		// security zones` reports what the kernel enforces rather than only what
+		// the config asks for.
+		HostInboundAppliedFn: func() grpcapi.HostInboundApplied {
+			st := d.HostInboundApplied()
+			return grpcapi.HostInboundApplied{
+				Known:           true,
+				Established:     st.Established,
+				Generation:      st.Generation,
+				LastApplyFailed: st.LastApplyFailed,
+				GapFenceActive:  st.GapFenceActive,
+			}
+		},
 		RPMResultsFn: func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
@@ -311,6 +324,21 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		},
 		// #4184: surface the day-0 / bootstrap config-import outcome so a
 		// failed import is visible on /health, not just a boot-time WARN.
+		// #7181: same applied state on the REST surface.
+		HostInboundAppliedFn: func() api.HostInboundAppliedSnapshot {
+			st := d.HostInboundApplied()
+			snap := api.HostInboundAppliedSnapshot{
+				Known:           true,
+				Established:     st.Established,
+				Generation:      st.Generation,
+				LastApplyFailed: st.LastApplyFailed,
+				GapFenceActive:  st.GapFenceActive,
+			}
+			if !st.LastFailureAt.IsZero() {
+				snap.LastFailureUnixSec = st.LastFailureAt.Unix()
+			}
+			return snap
+		},
 		BootstrapImportFn: func() api.BootstrapImportSnapshot {
 			b := d.BootstrapImportSnapshot()
 			return api.BootstrapImportSnapshot{

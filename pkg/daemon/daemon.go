@@ -776,6 +776,17 @@ type Daemon struct {
 	// ordered operations in separate state domains, not one atomic publication.
 	hostInboundEnforced atomic.Bool
 
+	// #7181 applied-state latch. hostInboundEnforced above is STICKY-TRUE and so
+	// cannot distinguish "established and current" from "established but a later
+	// render failed" -- the day-2 state daemon_nft.go's gap-fence branch exists to
+	// handle. These four carry that distinction out to the operator-facing
+	// projections via HostInboundApplied(); see host_inbound_applied_7181.go.
+	// Written on the same applySem-serialized paths as hostInboundEnforced.
+	hostInboundApplyGen            atomic.Uint64
+	hostInboundLastApplyFailed     atomic.Bool
+	hostInboundLastFailureUnixNano atomic.Int64
+	hostInboundGapFenceActive      atomic.Bool
+
 	// hostInboundConntrackDebt is the #6802 retry debt: a conntrack revocation
 	// that FAILED, so stale kernel entries for now-denied host services may
 	// still be riding the chain's leading `ct state established,related accept`.

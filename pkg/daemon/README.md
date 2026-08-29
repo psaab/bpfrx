@@ -2060,7 +2060,38 @@ never lock an operator out of a remote box it manages.
   netlink install failure still returns its error into the `errors.Join`
   fail-closed tail (invariant H7), a failed teardown still keeps
   `hostInboundEnforced` (#5790), and the cold-boot / coverage-gap fences still
-  install fail-closed (#5644/#5789). When the netlink install fails because the
+  install fail-closed (#5644/#5789).
+
+  **#7181 — the APPLIED state is now exported.** Until #7181 the observed-state
+  machine never left this package: `hostInboundEnforced` had no exported
+  accessor and no reader outside `daemon_nft.go`, so every operator-facing zone
+  projection rendered DESIRED config with no way to say whether a kernel table
+  was enforcing it. `codex-review-182:4394` put it as "on a cold-boot #5644
+  failure, diagnostics can report default-deny while no table exists".
+
+  `Daemon.HostInboundApplied()` (`host_inbound_applied_7181.go`) exports it, and
+  it is deliberately NOT a bool. `hostInboundEnforced` is STICKY-TRUE — a failed
+  render does not clear it, because the retained generation may still be
+  protecting; only a successful teardown clears it — so it cannot separate the
+  two states an operator most needs separated:
+
+  | state | meaning |
+  |---|---|
+  | `not-established` | nothing has ever published a host-inbound DROP; a configured default-deny is NOT in force |
+  | `current` | the most recent real render succeeded |
+  | `stale` | a later render FAILED; the retained generation covers only what it covered when it loaded, and an address that appeared since may be covered only by the #5789 additive gap fence, or not at all |
+
+  The `stale` row is not hypothetical — the day-2 branch above exists to handle
+  exactly it. Rendering it as `current` is the confidently-wrong answer #5719
+  refused to ship on the counter side.
+
+  Carried by a generation counter (successful real installs only), a
+  last-apply-failed flag with its timestamp, and a gap-fence-active marker, all
+  written on the same `applySem`-serialized paths as the latch. Rendered by REST
+  (`ZoneInfo.host_inbound_applied`, omitted entirely when the daemon was not
+  asked) and by gRPC `ShowText`. **An unwired callback renders NOTHING rather
+  than "not enforced"** — absence claims nothing, the same contract
+  `PerZoneCountersAvailable` uses. When the netlink install fails because the
   kernel `nf_tables` subsystem is UNAVAILABLE, the returned error is tagged
   `xnft.ErrNFTablesUnavailable` (a one-time distinct operator log +
   Config-Sync `CF` monitor-failure reason, §12.5) without ever downgrading

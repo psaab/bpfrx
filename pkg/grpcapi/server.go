@@ -162,6 +162,11 @@ type Config struct {
 	// config applied. nil in a unit-test / no-daemon build, where the topic
 	// reports that the daemon has not recorded an outcome.
 	BootstrapImportFn func() bootstrapshow.Snapshot
+
+	// HostInboundAppliedFn returns the #7181 APPLIED state of the host-inbound
+	// nftables surface. nil in a no-daemon unit-test build; an unset callback
+	// renders desired-only rather than claiming "not enforced".
+	HostInboundAppliedFn func() HostInboundApplied
 	// PeerLookupFn overrides how the primary listener's #5278 authorization
 	// gate learns which local account owns a connection. Production leaves it
 	// nil and the gate calls authz.LookupPeer, which reads the kernel's socket
@@ -217,7 +222,8 @@ type Server struct {
 	// bootstrapImportFn returns the recorded day-0 import outcome for the
 	// `bootstrap-import` ShowText topic (#6496). Wired from
 	// Config.BootstrapImportFn; nil in a no-daemon unit-test build.
-	bootstrapImportFn func() bootstrapshow.Snapshot
+	bootstrapImportFn    func() bootstrapshow.Snapshot
+	hostInboundAppliedFn func() HostInboundApplied
 	// requestedAddr is the primary gRPC bind requested at construction
 	// (--grpc-addr). Immutable, so it is read without effMu; it is the fallback
 	// address reported while pre-bind and on a bind failure (#6385/#6401).
@@ -360,6 +366,7 @@ func NewServer(addr string, cfg Config) *Server {
 		listenersFn:           cfg.ListenersFn,
 		kernelUpgradeStatusFn: cfg.KernelUpgradeStatusFn,
 		bootstrapImportFn:     cfg.BootstrapImportFn,
+		hostInboundAppliedFn:  cfg.HostInboundAppliedFn,
 		peerLookupFn:          cfg.PeerLookupFn,
 	}
 }
