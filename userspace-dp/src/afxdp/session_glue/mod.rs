@@ -1413,8 +1413,31 @@ pub(super) fn resolve_flow_session_decision(
         });
     }
 
-    let forward_match =
-        lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
+    // #7169: the main packet path — the one that INSTALLS a reverse session
+    // from the match, making the adjudication durable. Revalidate the arrival
+    // zone against the session being synthesized.
+    //
+    // A fabric-ingress packet is exempt and must be: it arrives on the fabric
+    // link from the peer node, so its arrival zone is the fabric rather than
+    // the flow's logical ingress. Constraining it would break cross-chassis
+    // forwarding, which is a correctness break, not a hardening.
+    let reverse_ingress = if fabric_ingress {
+        crate::afxdp::shared_ops::ReverseIngress::Unconstrained
+    } else {
+        match forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied() {
+            Some(z) => crate::afxdp::shared_ops::ReverseIngress::Zone(z),
+            // Fail CLOSED. An unmapped arrival interface gives nothing to
+            // revalidate against, and treating that as "no constraint" would
+            // reopen the hole for exactly the traffic least accounted for.
+            None => crate::afxdp::shared_ops::ReverseIngress::Unzoned,
+        }
+    };
+    let forward_match = lookup_forward_nat_across_scopes(
+        sessions,
+        shared_nat_sessions,
+        &flow.forward_key,
+        reverse_ingress,
+    )?;
     let (resolved, reverse_installed) = install_reverse_session_from_forward_match(
         sessions,
         session_map_fd,
