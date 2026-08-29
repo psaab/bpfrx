@@ -81,12 +81,16 @@ func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.Se
 		revVal.ReverseKey = key
 		revVal.IngressZone = val.EgressZone
 		revVal.EgressZone = val.IngressZone
-		// Clear FIB cache — reverse egress must be re-resolved locally.
-		revVal.FibIfindex = 0
-		revVal.FibVlanID = 0
-		revVal.FibDmac = [6]byte{}
-		revVal.FibSmac = [6]byte{}
-		revVal.FibGen = 0
+		// #7917: clear everything the REPLY direction has not observed — the
+		// forward egress (re-resolved locally) AND the #4983 ingress identity.
+		// The ingress half was missing: the companion inherited the FORWARD
+		// direction's ingress binding, which `pkg/dataplane/types.go` names as a
+		// legitimate-`0` population precisely because a prediction of where the
+		// reply will arrive is not an observation of where it did. Since #7095
+		// that also means clearing `IngressIfaceFold` — the wire request derives
+		// its ingress identity from the fold, so leaving it set stamps the
+		// forward binding onto the companion the helper receives.
+		revVal.ResetUnobservedForReverseCompanion()
 		reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", val.ReverseKey, &revVal))
 	}
 	// Snapshot reads are complete; transmit both requests under ONE sessionMu
@@ -239,12 +243,16 @@ func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.
 		revVal.ReverseKey = key
 		revVal.IngressZone = val.EgressZone
 		revVal.EgressZone = val.IngressZone
-		// Clear FIB cache — reverse egress must be re-resolved locally.
-		revVal.FibIfindex = 0
-		revVal.FibVlanID = 0
-		revVal.FibDmac = [6]byte{}
-		revVal.FibSmac = [6]byte{}
-		revVal.FibGen = 0
+		// #7917: clear everything the REPLY direction has not observed — the
+		// forward egress (re-resolved locally) AND the #4983 ingress identity.
+		// The ingress half was missing: the companion inherited the FORWARD
+		// direction's ingress binding, which `pkg/dataplane/types.go` names as a
+		// legitimate-`0` population precisely because a prediction of where the
+		// reply will arrive is not an observation of where it did. Since #7095
+		// that also means clearing `IngressIfaceFold` — the wire request derives
+		// its ingress identity from the fold, so leaving it set stamps the
+		// forward binding onto the companion the helper receives.
+		revVal.ResetUnobservedForReverseCompanion()
 		reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", val.ReverseKey, &revVal))
 	}
 	// Snapshot reads are complete; transmit both requests under ONE sessionMu

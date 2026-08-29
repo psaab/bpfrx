@@ -131,11 +131,36 @@ census, both directions, plus a struct field-count pin) and
 peer-install site delegates and none has re-grown a private list) are what keep
 the one list complete.
 
-The reverse COMPANION that `mirrorSessionPairV4` / `...V6` synthesize is a
-different case and deliberately does not use this helper: it resets fields
-because the reverse direction has not been OBSERVED yet, not because they belong
-to another node. Folding the two would make a future node-local field
-automatically a reverse-companion reset, which does not follow.
+The reverse COMPANION that `mirrorSessionPairV4` / `...V6` synthesize has its
+own reset, `SessionValue.ResetUnobservedForReverseCompanion()`
+(`pkg/dataplane/session_reverse_companion.go`, #7917). It clears fields because
+the reverse direction has not OBSERVED them yet, not because they belong to
+another node — a different question with a different answer.
+
+Before #7917 the companion cleared only the cached FIB result, so it inherited
+the FORWARD direction's #4983 ingress identity. `pkg/dataplane/types.go` already
+named the companion as the first legitimate-`0` population and gave the reason —
+the forward flow's egress is a PREDICTION of where the reply will arrive, not an
+OBSERVATION of where it did, and routing may be asymmetric — so the code
+contradicted the contract the design note states.
+
+The two resets are NOT interchangeable, and since #7095 they no longer even
+cover the same fields:
+
+| field | `ScrubNodeLocal` | companion reset |
+|---|---|---|
+| `Fib*` (5) | yes | yes |
+| `IngressIfindex` / `IngressVlanID` | yes | yes |
+| `IngressIfaceFold` | **no** | **yes** |
+
+`IngressIfaceFold` is the #7095 CLUSTER-STABLE fold whose entire purpose is to
+cross the wire so the #4983 identity survives a failover, so the node-local scrub
+must leave it alone. The companion must clear it, because
+`buildSessionSyncRequestV4` resolves the request's ingress identity FROM the fold
+(`resolveIngressFoldLocked`) — a companion that keeps it stamps the forward
+direction's binding onto the row the helper installs, which is the wire half of
+the same defect. `TestCompanionResetAndNodeLocalScrubAreDifferentRules7917` pins
+the divergence so the two cannot be folded together.
 
 **#7581 — a synced import with no pool to reserve from is not a collision.**
 Before publishing a peer-synced session the helper reserves its translated NAT
