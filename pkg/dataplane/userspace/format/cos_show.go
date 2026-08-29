@@ -514,7 +514,13 @@ func cosUnitMaterializedClasses(cfg *config.Config, cosUnit *config.CoSInterface
 	out := map[string]bool{}
 	if sm := cfg.ClassOfService.SchedulerMaps[cosUnit.SchedulerMap]; sm != nil {
 		for className := range sm.Entries {
-			if cfg.ClassOfService.ForwardingClasses[className] != nil {
+			// The SHARED #6534 predicate, not a hand-rolled map lookup. The
+			// builder skips a scheduler-map entry naming an undefined class at
+			// the same call, so a copy here could drift and this command would
+			// claim enforcement against a queue the builder never materializes
+			// — the exact class of defect #7063 is about. cos_exclusion_reason.go
+			// states the one-predicate rule; pkg/showaudit's census enforces it.
+			if !config.CoSForwardingClassUndefined(cfg.ClassOfService, className) {
 				out[className] = true
 			}
 		}
