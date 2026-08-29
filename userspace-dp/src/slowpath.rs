@@ -818,6 +818,15 @@ const NONBLOCK_WOULDBLOCK_RETRY_BUDGET: u32 = 1024;
 /// errno and is non-fatal in the WG/GRE write predicates.
 const WOULDBLOCK_EXHAUSTED_ERRNO: i32 = libc::ENOBUFS;
 
+/// #7174 M05: how long one WouldBlock wait blocks on POLLOUT, in milliseconds.
+///
+/// Short on purpose. `NONBLOCK_WOULDBLOCK_RETRY_BUDGET` bounds how MANY waits a
+/// single packet may make, so this bounds how long each one costs — and the
+/// product is the worst case a genuinely wedged device can hold the delivery
+/// thread. A longer slice would swap the CPU-burn this fixes for
+/// head-of-line blocking, which is the same defect wearing different clothes.
+const NONBLOCK_WOULDBLOCK_POLL_SLICE_MS: i32 = 1;
+
 /// Write one whole packet to a NON-BLOCKING packet-oriented fd (the WG/GRE
 /// local-delivery TUN devices, opened `O_NONBLOCK`).
 ///
@@ -852,9 +861,14 @@ const WOULDBLOCK_EXHAUSTED_ERRNO: i32 = libc::ENOBUFS;
 /// (mirroring `libc::write`: a byte count on success, `-1` with `errno` set on
 /// error). It is a seam so the short-count / EINTR / EAGAIN behaviour is
 /// unit-testable without a real non-blocking fd.
-fn write_packet_atomic_nonblocking<F>(len: usize, mut writer: F) -> io::Result<()>
+fn write_packet_atomic_nonblocking<F, W>(
+    len: usize,
+    mut writer: F,
+    mut wait_writable: W,
+) -> io::Result<()>
 where
     F: FnMut(usize) -> isize,
+    W: FnMut(),
 {
     let mut wouldblock_retries: u32 = 0;
     loop {
@@ -876,6 +890,22 @@ where
                     if wouldblock_retries > NONBLOCK_WOULDBLOCK_RETRY_BUDGET {
                         return Err(io::Error::from_raw_os_error(WOULDBLOCK_EXHAUSTED_ERRNO));
                     }
+                    // #7174 M05: WAIT for the device instead of asking it again
+                    // immediately. This arm used to be a bare `continue`, so a
+                    // full TUN queue produced up to
+                    // NONBLOCK_WOULDBLOCK_RETRY_BUDGET back-to-back EAGAIN
+                    // syscalls before the packet was dropped — a tight spin
+                    // burning a core under sustained backpressure, and doing it
+                    // once per dropped packet.
+                    //
+                    // The wait is INJECTED rather than done here because this
+                    // function is deliberately fd-free so it can be unit-tested
+                    // without a real non-blocking device (#2438). Keeping that
+                    // property is why it is a second closure and not a poll()
+                    // call: a test supplies a counting no-op and can assert the
+                    // wait actually happened, which a poll buried in here could
+                    // not be asked about.
+                    wait_writable();
                     continue;
                 }
                 _ => return Err(err),
@@ -903,12 +933,40 @@ where
 /// Replaces std `Write::write_all`, whose stream-resume loop corrupts a packet
 /// device on a short count.
 pub(crate) fn write_packet_nonblocking(fd: i32, bytes: &[u8]) -> io::Result<()> {
-    write_packet_atomic_nonblocking(bytes.len(), |buf_len| {
-        // SAFETY: `bytes` is a valid slice for `buf_len` bytes; `fd` is the TUN
-        // fd owned by the caller's thread. Always writes from offset 0 — a TUN
-        // write is one packet, never a partial-offset resubmit.
-        unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), buf_len) }
-    })
+    write_packet_atomic_nonblocking(
+        bytes.len(),
+        |buf_len| {
+            // SAFETY: `bytes` is a valid slice for `buf_len` bytes; `fd` is the
+            // TUN fd owned by the caller's thread. Always writes from offset 0
+            // — a TUN write is one packet, never a partial-offset resubmit.
+            unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), buf_len) }
+        },
+        || {
+            // #7174 M05: block briefly until the device can accept a write,
+            // instead of re-asking immediately. POLLOUT is the primitive that
+            // answers exactly the question EAGAIN raised.
+            //
+            // The slice is deliberately SHORT (1 ms). The retry budget bounds
+            // the number of waits, so the slice bounds the worst case a wedged
+            // device can cost this delivery thread — 1 ms x budget — and a
+            // longer slice would trade a CPU-burn problem for a
+            // head-of-line-blocking one. Under real backpressure the kernel
+            // routing stack drains the TUN in far less than a slice, so the
+            // common case returns immediately and adds no latency.
+            //
+            // A poll error is deliberately ignored: it degrades to the previous
+            // immediate-retry behaviour, which is bounded by the same budget, so
+            // there is nothing safer to do here than try the write again.
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is a valid, initialised pollfd for the caller-owned
+            // fd; poll does not retain the pointer.
+            unsafe { libc::poll(&mut pfd, 1, NONBLOCK_WOULDBLOCK_POLL_SLICE_MS) };
+        },
+    )
 }
 
 pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {

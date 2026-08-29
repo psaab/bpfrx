@@ -129,6 +129,17 @@ pub(in crate::afxdp) fn push_bounded(
 /// syscalls the measurement could not pay.
 pub(in crate::afxdp) const WORKER_COMMAND_DRAIN_BUDGET: usize = 256;
 
+/// The budget must be a strict fraction of the queue capacity.
+///
+/// Compile-time, and deliberately HERE rather than in the test module: the
+/// failure it prevents is silent. At
+/// `WORKER_COMMAND_DRAIN_BUDGET >= MAX_PENDING_WORKER_COMMANDS` the drain can
+/// never leave a remainder, so every behavioural cell for #7201 still passes
+/// while the budget has quietly become the take-everything drain it replaced.
+/// An invariant over two production constants has to hold in a production
+/// build, not only under `cfg(test)`.
+const _: () = assert!(WORKER_COMMAND_DRAIN_BUDGET < MAX_PENDING_WORKER_COMMANDS);
+
 /// Move at most [`WORKER_COMMAND_DRAIN_BUDGET`] commands from the front of
 /// `pending` into `scratch`, returning whether `pending` still holds a backlog.
 ///
