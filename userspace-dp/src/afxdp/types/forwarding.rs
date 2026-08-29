@@ -345,9 +345,9 @@ pub(in crate::afxdp) struct ForwardingState {
     /// userspace dataplane keys GRE flows on the 5-tuple only, so this flag is
     /// threaded into ForwardingState for config truth/parity but is NOT yet read
     /// by any packet/forwarding path — hence `#[allow(dead_code)]`. The consumer
-    /// (GRE key/call-id extraction) is a deferred feature; this is the seam it
-    /// would read.
-    #[allow(dead_code)]
+    /// #7188: READ by stage_parse_flow_and_learn, which gives transit GRE an
+    /// identity keyed on the RFC 2890 discriminator when this is set. Off, the
+    /// packet stays flowless exactly as #6837 left it.
     pub(in crate::afxdp) gre_acceleration: bool,
     /// `security flow power-mode-disable` (#2008 H14). vSRX power-mode is an
     /// express datapath; this flag forces the regular flow path when set. The
