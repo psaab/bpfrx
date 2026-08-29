@@ -238,3 +238,58 @@ func TestBindErrorWinsWhenBothFail_7041(t *testing.T) {
 			"whole point of #7041; got %v", err)
 	}
 }
+
+// TestAChangedBindErrorStillSpeaks_7041 answers the standard failure mode of
+// this class of fix directly, even though this fix cannot exhibit it.
+//
+// The usual way a "stop the repeated noise" change goes wrong is a dedup keyed
+// on "still not serving": the second and later attempts are swallowed wholesale,
+// so a bind failure that has BECOME A DIFFERENT FAILURE — EADDRNOTAVAIL because
+// the interface address went away, then EADDRINUSE because something else took
+// the port — is silently absorbed. That transition is precisely the diagnostic
+// an operator needs, and it is invisible to a latch that only knows "still down".
+//
+// This fix carries no dedup at all: it reorders bind and build, so the bind error
+// is produced and returned by the same path on every attempt. The cell is here to
+// pin that, so a later "optimisation" that adds a latch has to red this test
+// rather than discover the consequence in the field. It passes both before and
+// after the reordering, which is the right shape for a property the change must
+// preserve rather than establish.
+func TestAChangedBindErrorStillSpeaks_7041(t *testing.T) {
+	dir := seedStaleFor(t, addr7041)
+	errs := []error{
+		errors.New("cannot assign requested address"),
+		errors.New("cannot assign requested address"),
+		errors.New("address already in use"), // the failure CHANGED
+	}
+	i := 0
+	s := &Server{listen: func(string, string) (net.Listener, error) {
+		e := errs[i]
+		i++
+		return nil, e
+	}}
+	s.SetTLSCertDirForTest(dir)
+
+	var got []string
+	for range errs {
+		err := s.ReconcileHTTPS(true, addr7041)
+		if err == nil {
+			t.Fatal("every failing attempt must return an error")
+		}
+		got = append(got, err.Error())
+	}
+	if !strings.Contains(got[2], "address already in use") {
+		t.Fatalf("the THIRD attempt's bind failed for a DIFFERENT reason and that "+
+			"change must reach the caller — a dedup keyed on \"still not serving\" "+
+			"would swallow it, hiding the transition an operator most needs to see "+
+			"(#7041); got %q", got[2])
+	}
+	if got[0] == got[2] {
+		t.Fatalf("the first and third errors must differ; the fixture is not varying "+
+			"the failure, so this cell would pass without testing anything: %q", got[0])
+	}
+	if i != len(errs) {
+		t.Fatalf("the listener factory was consulted %d time(s), want %d — a suppressed "+
+			"attempt would not have reached it at all", i, len(errs))
+	}
+}
