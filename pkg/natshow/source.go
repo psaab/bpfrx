@@ -120,14 +120,26 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 					if len(pool.Addresses) > 0 {
 						fmt.Fprintf(w, "    Pool addresses:          %s\n", strings.Join(pool.Addresses, ", "))
 					}
-					portLow, portHigh := pool.PortLow, pool.PortHigh
-					if portLow == 0 {
-						portLow = 1024
+					// #7173: a `port no-translation` pool does not translate the
+					// source port at all — the dataplane takes the address-only
+					// path and ignores the range entirely (see the #3906 note in
+					// pkg/dataplane/userspace/nat_source.go). Printing
+					// "Port range: 1024-65535" for one told the operator the pool
+					// uses a port range it does not use, and the number shown was
+					// a default this display invented locally rather than
+					// anything configured.
+					if pool.PortNoTranslation {
+						fmt.Fprintf(w, "    Port translation:        disabled (source port preserved)\n")
+					} else {
+						portLow, portHigh := pool.PortLow, pool.PortHigh
+						if portLow == 0 {
+							portLow = 1024
+						}
+						if portHigh == 0 {
+							portHigh = 65535
+						}
+						fmt.Fprintf(w, "    Port range:              %d-%d\n", portLow, portHigh)
 					}
-					if portHigh == 0 {
-						portHigh = 65535
-					}
-					fmt.Fprintf(w, "    Port range:              %d-%d\n", portLow, portHigh)
 				}
 			}
 

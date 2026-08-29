@@ -745,11 +745,26 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 				}
 			}
 		}
-		if pool.PortLow == 0 {
-			pool.PortLow = 1024
-		}
-		if pool.PortHigh == 0 {
-			pool.PortHigh = 65535
+		// #7173: do NOT invent a port range for a pool that does not translate
+		// ports. `port no-translation` takes the address-only path, so 1024-65535
+		// here was a value the compiler made up for a field nothing in that mode
+		// consumes — and a future reader would reasonably assume it meant
+		// something.
+		//
+		// Safe to skip because this defaulting is not load-bearing: BOTH readers
+		// apply the same default independently. config.SourceNATPoolPortRange
+		// substitutes 1024/65535 for a zero low/high, and that accessor is what
+		// builds the dataplane snapshot (which the pool-utilization alarm then
+		// reads, so its capacity computation is unaffected). This was the third
+		// copy of one default, and the one that mutated the stored config so it
+		// no longer said what the operator wrote.
+		if !pool.PortNoTranslation {
+			if pool.PortLow == 0 {
+				pool.PortLow = 1024
+			}
+			if pool.PortHigh == 0 {
+				pool.PortHigh = 65535
+			}
 		}
 		sec.NAT.SourcePools[pool.Name] = pool
 	}
