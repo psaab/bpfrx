@@ -58,6 +58,22 @@ type RedundancyGroupState struct {
 	ReadinessReasons []string    // reasons why not ready (empty when ready)
 	holdTimer        *time.Timer // fires at ReadySince+holdTime to re-trigger election
 
+	// #7161 degraded-promotion fallback. NotReadySince is when the COLD-BOOT
+	// readiness gate first declined to promote this RG; degradedTimer fires at
+	// NotReadySince+degradedPromoteTimeout to re-run the election so the
+	// fallback has something to wake it. DegradedPromoted records that the RG
+	// was promoted through the fallback rather than by becoming ready, so the
+	// status render and the election event can say so.
+	//
+	// Both are stamped at the DECLINE SITE in electSingleNode, not in
+	// SetRGReady. A cold-boot RG starts not-ready and may never see a readiness
+	// TRANSITION, so arming from SetRGReady's transition branch would leave the
+	// fallback unarmed in exactly the case it exists for — the #110 shape this
+	// fallback is written to avoid repeating.
+	NotReadySince    time.Time
+	degradedTimer    *time.Timer
+	DegradedPromoted bool
+
 	// Transfer readiness is the stricter explicit-manual-failover readiness.
 	// It intentionally stays separate from takeover readiness so operators can
 	// distinguish election readiness from transfer protocol readiness.
@@ -481,6 +497,18 @@ type Manager struct {
 	// once readiness is established.
 	takeoverHoldTime time.Duration
 
+	// degradedPromoteTimeout bounds how long the #7161 cold-boot readiness gate
+	// may hold an RG secondary. After this much CONTINUOUS not-readiness the RG
+	// promotes anyway, with the reason surfaced, so a readiness bug can never
+	// cost the cluster both nodes.
+	//
+	// It is deliberately NOT gated on any peer condition — not peerAlive, not
+	// peerEverSeen, not sync connectivity. A fallback whose firing depends on
+	// the condition it compensates for is not a fallback (#110:
+	// armSyncReadyTimer's callback bails on !d.syncPeerConnected, so its
+	// fallback never fires in exactly the peer-absent case it was written for).
+	degradedPromoteTimeout time.Duration
+
 	// syncReady is true once bulk session sync has been received (or the
 	// readiness timeout released the hold). It gates NOTHING: no consumer
 	// reads it to decide RG promotion, in private-rg-election / no-reth-vrrp
@@ -548,6 +576,19 @@ type peerGroupSnapshot struct {
 // ready before election promotes it to primary. Zero means promote as soon as
 // readiness is established.
 const DefaultTakeoverHoldTime = 0
+
+// DefaultDegradedPromoteTimeout bounds the #7161 cold-boot readiness gate: after
+// this much continuous not-readiness a single node promotes anyway rather than
+// leaving the cluster with no primary.
+//
+// 2 minutes is chosen against the two failures it sits between. Too SHORT and it
+// defeats the gate on a node that is legitimately still coming up — interface
+// enumeration, VRRP settling and the userspace dataplane load are all on the
+// cold-boot path. Too LONG and a readiness bug strands a single-node cluster for
+// the length of an outage. A node that is not ready two minutes after boot is
+// not "still starting"; something is wrong, and forwarding degraded beats
+// forwarding nothing once there is no peer to take over instead.
+const DefaultDegradedPromoteTimeout = 2 * time.Minute
 const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 const minTransferCommitGracePeriod = 10 * time.Second
@@ -590,6 +631,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
 		takeoverHoldTime:               DefaultTakeoverHoldTime,
+		degradedPromoteTimeout:         DefaultDegradedPromoteTimeout,
 		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
@@ -820,6 +862,12 @@ func (m *Manager) Stop() {
 		if rg.holdTimer != nil {
 			rg.holdTimer.Stop()
 			rg.holdTimer = nil
+		}
+		// #7161: the degraded fallback is torn down with the hold timer —
+		// both pin the Manager until they fire.
+		if rg.degradedTimer != nil {
+			rg.degradedTimer.Stop()
+			rg.degradedTimer = nil
 		}
 	}
 	m.mu.Unlock()
