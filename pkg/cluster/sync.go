@@ -849,6 +849,27 @@ type SessionSync struct {
 	// whole timeout against a downgraded peer that can never answer.
 	peerCapabilityFlags atomic.Uint32
 
+	// peerSessionSyncWire holds the peer's advertised SessionSyncWireVersion
+	// (#7990), carried as a trailing u16 on syncMsgPeerCapabilities on top of
+	// #6650's version field and #7147's flags byte. 0 means UNKNOWN — a peer
+	// predating #7990 advertises nothing, and that is genuinely different from
+	// "advertises 0": there is no valid sync wire version 0, so the two cannot
+	// be confused the way #6650's 0-means-incapable had to be.
+	//
+	// Why this is not derivable from anything already exchanged: the heartbeat
+	// carries HAProtocolVersion, and since #7925 the sync wire version is its
+	// OWN counter — so a peer's HA version says nothing about whether its
+	// session frames will decode. That was the gap: the image-replace gate
+	// compares both versions from the image manifest, and the LANE-1 in-place
+	// path had no channel to learn the peer's at all.
+	//
+	// Cleared on full disconnect alongside peerSnapshotProtocol and
+	// peerCapabilityFlags, for the identical reason: the version belongs to the
+	// peer INCARNATION that advertised it, and the process that reconnects may
+	// be an older build — which is precisely the rolling-upgrade case this
+	// exists for.
+	peerSessionSyncWire atomic.Uint32
+
 	// fenceSeq numbers sequenced peer fences (#7147). Starts at 0 and is only
 	// ever read via Add(1), so the first fence is seq 1 — seq 0 is reserved on
 	// the wire to mean "no ack requested", which is how a pre-#7147 fence's

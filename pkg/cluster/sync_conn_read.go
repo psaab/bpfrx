@@ -663,7 +663,17 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			peerFlags = payload[2]
 		}
 		s.peerCapabilityFlags.Store(uint32(peerFlags))
-		slog.Info("cluster sync: peer advertised capabilities", "version", peerProto, "flags", peerFlags)
+		// #7990: the peer's session-sync WIRE version rides as a trailing u16
+		// under the same discipline — a payload shorter than 5 bytes is a
+		// pre-#7990 peer and leaves 0 = UNKNOWN, which callers must handle
+		// explicitly rather than reading as a version.
+		var peerWire uint16
+		if len(payload) >= 5 {
+			peerWire = binary.LittleEndian.Uint16(payload[3:5])
+		}
+		s.peerSessionSyncWire.Store(uint32(peerWire))
+		slog.Info("cluster sync: peer advertised capabilities",
+			"version", peerProto, "flags", peerFlags, "session_sync_wire", peerWire)
 	case syncMsgClockSync:
 		if len(payload) < 8 {
 			slog.Warn("cluster sync: clock sync message too short")

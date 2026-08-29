@@ -3,12 +3,14 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
@@ -153,6 +155,57 @@ func (g *grpcCluster) HAProtocolCompatible() (bool, error) {
 	return parseHAProtocolCompatible(s), nil
 }
 
+// SessionSyncWireCompatible reads the peer's advertised session-sync wire
+// version from the STATUS topic and asks pkg/cluster for the verdict (#7990).
+//
+// The verdict lives in pkg/cluster rather than here so there is ONE definition
+// of "compatible" shared with the runtime side, rather than a second copy in
+// the upgrade driver that could drift from the wire it is judging.
+func (g *grpcCluster) SessionSyncWireCompatible() (bool, string, error) {
+	s, err := g.statusText()
+	if err != nil {
+		return false, "", err
+	}
+	return sessionSyncWireVerdictFromStatus(s)
+}
+
+// sessionSyncWireVerdictFromStatus is the DECISION half of
+// SessionSyncWireCompatible, split from the gRPC fetch so it is drivable (#7990).
+//
+// The split is not cosmetic. The first version of this code inlined the decision
+// next to the fetch, and the only test of the absent-line behaviour drove
+// parsePeerSessionSyncWire and cluster.SessionSyncWireCompatible directly —
+// both of which are UNCHANGED by the defect. Reverting the absent-line handling
+// left the whole suite green. The collapse lives HERE, between the parser and
+// the verdict, so this is the layer a test has to reach.
+func sessionSyncWireVerdictFromStatus(status string) (bool, string, error) {
+	peer, present := parsePeerSessionSyncWire(status)
+	if !present {
+		// The line is ABSENT, which is a statement about the INSTRUMENT, not
+		// about the peer — and collapsing it into "peer advertises nothing"
+		// (which permits) would be a gate that cannot fire, silently, exactly
+		// the failure shape this change exists to remove.
+		//
+		// It is safe to refuse. FormatStatus renders the peer line
+		// unconditionally when the peer is alive, this node is by definition
+		// running THIS build (it is the node being upgraded), and
+		// DrainAndConfirm's PeerAlive precheck runs FIRST and refuses a dead
+		// peer. So by the time this runs the line must be present; its absence
+		// means the status could not be rendered or parsed — a renamed line, a
+		// truncated response, a peer that died between the two RPCs. Draining
+		// on any of those is not something to do quietly.
+		//
+		// Reported as an ERROR rather than an incompatibility so the operator's
+		// message says "the check could not run", not "the peer is
+		// incompatible". Those are different facts and only one is about the peer.
+		return false, "", fmt.Errorf("peer session-sync wire version not present in " +
+			"`show chassis cluster status` — the check cannot run, and an unreadable " +
+			"instrument is not evidence of compatibility")
+	}
+	okv, reason := cluster.SessionSyncWireCompatible(peer)
+	return okv, reason, nil
+}
+
 // statusText fetches the rendered `show chassis cluster status` text.
 func (g *grpcCluster) statusText() (string, error) {
 	cli, closeFn, err := g.dial()
@@ -250,6 +303,42 @@ func parseSyncEstablished(s string) bool {
 // the peer line is ABSENT (peer not alive / version unknown) we return
 // false so the driver does not proceed blind — PeerAlive already gates
 // the happy path, and a missing peer-version here fails closed.
+// parsePeerSessionSyncWire extracts the peer session-sync wire version from
+// `show chassis cluster status` (FormatStatus):
+//
+//	Peer session-sync wire version: N        -> (N, true)
+//	Peer session-sync wire version: unknown  -> (0, true)
+//	line absent                              -> (0, false)
+//
+// "unknown" and a missing line are reported DIFFERENTLY even though both yield
+// 0, because they are different facts about the instrument: "unknown" means this
+// node rendered the line and the peer advertised nothing, while a missing line
+// means this node never rendered it at all. The caller collapses them, but a
+// future caller that must not may need to tell them apart, and a parser that
+// erases the distinction cannot be asked later.
+func parsePeerSessionSyncWire(s string) (uint16, bool) {
+	const prefix = "peer session-sync wire version:"
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(l), prefix) {
+			continue
+		}
+		val := strings.TrimSpace(l[len(prefix):])
+		if strings.EqualFold(val, "unknown") {
+			return 0, true
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 0 || n > 65535 {
+			// A line we cannot parse is not a version. Report it as PRESENT
+			// but 0 so the caller's permit-on-unknown path takes it, rather
+			// than reporting absent and inviting a different branch.
+			return 0, true
+		}
+		return uint16(n), true
+	}
+	return 0, false
+}
+
 func parseHAProtocolCompatible(s string) bool {
 	var local, peer int
 	haveLocal, havePeer := false, false

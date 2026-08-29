@@ -47,9 +47,35 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration, allowMixedHA boo
 			return fmt.Errorf("HA-protocol check: %w", err)
 		}
 		if !compat {
-			return fmt.Errorf("HA/session-sync protocol incompatible with peer — " +
+			// #7990: this message used to say "HA/session-sync protocol
+			// incompatible" while the check looked only at the HA protocol
+			// version — a claim the code did not support, and since #7925 the
+			// two are separate counters. Name only what was checked.
+			return fmt.Errorf("HA protocol incompatible with peer — " +
 				"this kernel roll is not safe; use image-replace (LANE 2)")
 		}
+	}
+	// #7990: the session-sync WIRE version is a SEPARATE gate from the HA
+	// protocol one, and until now the in-place path had neither the channel nor
+	// the check. A drain hands the RGs to the peer; if the peer cannot decode
+	// this node's session frames, that handover drops every established flow
+	// while heartbeat, election and failover all keep working — so the cluster
+	// looks healthy and the loss is only discovered at the failover.
+	//
+	// NOT gated behind allowMixedHA. That flag exists because the LANE-2
+	// mixed-base gate already validated the HA WINDOW and exact-equality would
+	// wrongly abort the second node; it says nothing about the session wire,
+	// which GateMixedBaseSwap checks for EXACT equality in both cases. Reusing
+	// it here would silently disable this gate on exactly the path that most
+	// needs it.
+	syncOK, syncWhy, err := cl.SessionSyncWireCompatible()
+	if err != nil {
+		return fmt.Errorf("session-sync wire check: %w", err)
+	}
+	if !syncOK {
+		return fmt.Errorf("session-sync wire incompatible with peer (%s) — draining would "+
+			"hand over to a node that cannot receive this node's sessions; use "+
+			"image-replace (LANE 2), which gates on this version explicitly", syncWhy)
 	}
 	ready, err := cl.PeerTakeoverReady()
 	if err != nil {
