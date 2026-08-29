@@ -127,6 +127,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // fail-closed exhaustion modes it can hit.
     state.status.interface_snat_pat_collisions_total =
         state.afxdp.interface_snat_pat_collisions_total();
+    // #7056: the two refused-alias legs, kept apart so an operator can tell a
+    // cross-domain probe from a TCP/UDP ident collision.
+    state.status.nat64_frag_cross_domain_misses_total =
+        state.afxdp.nat64_frag_cross_domain_misses_total();
+    state.status.nat64_frag_protocol_alias_misses_total =
+        state.afxdp.nat64_frag_protocol_alias_misses_total();
     state.status.interface_snat_identity_exhaustion_total =
         state.afxdp.interface_snat_identity_exhaustion_total();
     state
