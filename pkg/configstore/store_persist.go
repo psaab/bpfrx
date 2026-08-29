@@ -543,6 +543,20 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 // pruned as stale. The seed retry the commit path performs (#6404 edge 1,
 // ensureArchiveSeededLocked) rests on the same invariant: archiveSeedDir names
 // a dir this process has actually scanned, never a stale disabled one.
+// ArchiveDir returns the archive directory currently configured on this store,
+// or "" when archival is disabled.
+//
+// #7173: zeroize needs the CONFIGURED directory, not the compiled-in default.
+// It previously erased DefaultArchiveDir unconditionally, so on a box with a
+// custom `system archival archive-dir` it wiped a path that held nothing and
+// left the real archive — with its cleartext PSKs — untouched, reporting a
+// clean reset.
+func (s *Store) ArchiveDir() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.archiveDir
+}
+
 func (s *Store) SetArchiveConfig(dir string, max int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

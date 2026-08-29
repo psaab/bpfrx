@@ -35,7 +35,7 @@ func TestZeroizeRefusesSharedConfigRoot(t *testing.T) {
 	})
 
 	var wiped bool
-	performZeroizeWipe = func(_, _ string) error { wiped = true; return nil }
+	performZeroizeWipe = func(_, _, _ string) error { wiped = true; return nil }
 	scheduleStopDaemon = func() {}
 
 	// A config file placed directly in a shared directory: filepath.Dir resolves

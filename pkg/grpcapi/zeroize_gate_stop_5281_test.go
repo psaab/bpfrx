@@ -36,7 +36,7 @@ func TestZeroizeGoesThroughGateAndStopsDaemon(t *testing.T) {
 	// sequence is gate → wipe → stop (never stop-before-wipe, never a bypassed
 	// gate).
 	var seq []string
-	performZeroizeWipe = func(_, _ string) error { seq = append(seq, "wipe"); return nil }
+	performZeroizeWipe = func(_, _, _ string) error { seq = append(seq, "wipe"); return nil }
 	scheduleStopDaemon = func() { seq = append(seq, "stop") }
 
 	var gateWipeArg func() error
@@ -91,7 +91,7 @@ func TestZeroizeFailClosedDoesNotStopDaemon(t *testing.T) {
 	})
 
 	wantErr := errors.New("configdb not fully erased")
-	performZeroizeWipe = func(_, _ string) error { return wantErr }
+	performZeroizeWipe = func(_, _, _ string) error { return wantErr }
 	var stopped bool
 	scheduleStopDaemon = func() { stopped = true }
 
@@ -131,7 +131,7 @@ func TestZeroizeFallsBackToDirectWipeWithoutGate(t *testing.T) {
 	})
 
 	var wiped, stopped bool
-	performZeroizeWipe = func(_, _ string) error { wiped = true; return nil }
+	performZeroizeWipe = func(_, _, _ string) error { wiped = true; return nil }
 	scheduleStopDaemon = func() { stopped = true }
 
 	dir := t.TempDir()

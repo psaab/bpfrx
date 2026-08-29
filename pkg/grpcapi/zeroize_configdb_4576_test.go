@@ -144,7 +144,7 @@ func TestIsTextRollbackFile(t *testing.T) {
 func TestZeroizeSurfacesWipeError(t *testing.T) {
 	orig := performZeroizeWipe
 	t.Cleanup(func() { performZeroizeWipe = orig })
-	performZeroizeWipe = func(_, _ string) error { return errors.New("simulated .configdb wipe failure") }
+	performZeroizeWipe = func(_, _, _ string) error { return errors.New("simulated .configdb wipe failure") }
 
 	dir := t.TempDir()
 	store := newConfigStore(t, filepath.Join(dir, "xpf.conf"))

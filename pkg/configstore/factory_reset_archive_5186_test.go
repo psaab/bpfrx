@@ -85,8 +85,20 @@ func TestFactoryResetArchiveDirSkipsCustomPath(t *testing.T) {
 	secretFile := seedArchiveFile(t, customDir)
 
 	buf := captureWarnLogs(t)
-	if err := FactoryResetArchiveDir(customDir); err != nil {
-		t.Fatalf("FactoryResetArchiveDir(custom) returned error: %v", err)
+	// #7173 CHANGED THIS CONTRACT DELIBERATELY. The skip used to return nil,
+	// which let the caller report a clean zeroize while the prior tenant's
+	// archived PSKs were still on disk. It now returns a typed
+	// *ArchiveDirSkippedError so the incompleteness is a first-class result.
+	//
+	// What this test is ABOUT is unchanged and still asserted below: a custom
+	// path is skipped rather than erased, and its contents survive. Only the
+	// return value moved, so the assertion moved with it rather than the test
+	// being deleted.
+	err := FactoryResetArchiveDir(customDir)
+	var skipped *ArchiveDirSkippedError
+	if !errors.As(err, &skipped) {
+		t.Fatalf("FactoryResetArchiveDir(custom) returned %v, want an "+
+			"*ArchiveDirSkippedError naming the unerased directory (#7173)", err)
 	}
 
 	// The custom archive and its secret survive.

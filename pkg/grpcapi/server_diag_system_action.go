@@ -140,7 +140,16 @@ func (s *Server) runZeroize(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	wipe := func() error { return performZeroizeWipe(configDir, configBase) }
+	// #7173: the CONFIGURED archive dir, from the store this server owns.
+	// Hardcoding the default here meant a box with a custom
+	// `system archival archive-dir` had that archive — and the cleartext PSKs
+	// in it — survive a zeroize that reported success. "" means archival is
+	// disabled and there is nothing to erase.
+	archiveDir := ""
+	if s.store != nil {
+		archiveDir = s.store.ArchiveDir()
+	}
+	wipe := func() error { return performZeroizeWipe(configDir, configBase, archiveDir) }
 	if s.zeroizeFn != nil {
 		return s.zeroizeFn(ctx, wipe)
 	}

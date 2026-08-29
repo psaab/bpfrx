@@ -52,6 +52,26 @@ const RescueConfigBase = "rescue.conf"
 // carried 0600 full-config-text copies with the prior tenant's cleartext PSKs,
 // keys, and communities.
 //
+// ArchiveDirSkippedError reports that the config archive was NOT erased because
+// its directory could not be proven to be xpf-owned (#7173).
+//
+// It is deliberately a distinct type rather than a plain error: the caller must
+// be able to tell "the archive still holds the prior tenant's secrets" apart
+// from "the erasure failed", because they need different operator-facing words.
+// It is also NOT a reason to abort the rest of the wipe — everything else must
+// still be erased — so a caller that treats every non-nil error as fatal would
+// make this change a regression. Use errors.As.
+type ArchiveDirSkippedError struct {
+	Dir string
+}
+
+func (e *ArchiveDirSkippedError) Error() string {
+	return "config archive directory " + e.Dir + " was NOT erased: its ownership " +
+		"could not be proven (not the xpf-owned default " + DefaultArchiveDir + "). " +
+		"Archived configuration text and any secrets it contains remain on disk; " +
+		"erase this directory manually to complete the zeroize"
+}
+
 // OWNERSHIP GUARD (#5186): erase the archive ONLY when archiveDir is the
 // xpf-owned default (DefaultArchiveDir). An operator-configured CUSTOM archive
 // directory may be a remote mount, an NFS export, or a compliance/audit
@@ -80,7 +100,19 @@ func FactoryResetArchiveDir(archiveDir string) error {
 			"compliance archive destination is the operator's to erase, not "+
 			"the factory reset's",
 			"dir", archiveDir, "default", DefaultArchiveDir)
-		return nil
+		// #7173: the skip is a FIRST-CLASS RESULT, not a log line. This
+		// function's own contract two paragraphs above says a merely
+		// non-durable erasure "must not be reported as a clean zeroize"; a
+		// skipped one did not happen AT ALL, which is strictly worse, and it
+		// returned nil. An operator who ran zeroize on a box with a custom
+		// archive-dir was told the reset completed while every archived config
+		// snapshot — carrying cleartext IKE PSKs, WireGuard keys and SNMP
+		// communities — was still on disk.
+		//
+		// The skip itself stays: erasing a directory whose ownership cannot be
+		// proven could destroy compliance records that are not xpf's to delete.
+		// What changes is that the caller can no longer mistake it for success.
+		return &ArchiveDirSkippedError{Dir: archiveDir}
 	}
 
 	var firstErr error

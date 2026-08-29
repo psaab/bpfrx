@@ -144,10 +144,10 @@ func TestConfirmRecoveryInWindowRollbackDoesNotPersistNeverCommitted(t *testing.
 
 	for _, w := range markerWrites {
 		if !w.committed {
-			t.Fatalf("the auto-rollback persisted the NEVER-COMMITTED marker "+
-				"(committed=0) over a real previously-committed config: it derived "+
-				"\"first commit on a fresh store\" from confirmPrevCfg==nil, which "+
-				"here means \"the rollback target failed to compile\". The next "+
+			t.Fatalf("the auto-rollback persisted the NEVER-COMMITTED marker " +
+				"(committed=0) over a real previously-committed config: it derived " +
+				"\"first commit on a fresh store\" from confirmPrevCfg==nil, which " +
+				"here means \"the rollback target failed to compile\". The next " +
 				"restart re-classifies this box into bootstrap (#6538 part 2)")
 		}
 	}
