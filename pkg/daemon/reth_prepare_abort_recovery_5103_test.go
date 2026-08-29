@@ -55,6 +55,11 @@ import (
 // renewal that fires on some members and not others is the same intermittent
 // defect with extra steps.
 type abortRecoveryLinkController struct {
+	// #7074: onPrepare runs INSIDE PrepareLinkCycle, i.e. inside the
+	// beforeCycle hook, which is the only window in which the dataplane cell
+	// can be republished between the join and the rollback. Nil for every
+	// pre-existing test, so this is additive.
+	onPrepare    func()
 	prepareErr   error
 	notifyErr    error
 	prepareCalls int
@@ -68,6 +73,9 @@ func (c *abortRecoveryLinkController) SetDeferWorkers(bool) {}
 
 func (c *abortRecoveryLinkController) PrepareLinkCycle() error {
 	c.prepareCalls++
+	if c.onPrepare != nil {
+		c.onPrepare()
+	}
 	return c.prepareErr
 }
 
