@@ -129,11 +129,27 @@ const _: () = assert!(
 /// rather than a read past the buffer.
 ///
 /// # Safety
-/// `data..data_end` must describe a single readable region, which is what the
-/// XDP context guarantees for `ctx->data`/`ctx->data_end`. The host-side parity
-/// test upholds it by passing a live slice's own bounds.
+/// `data..data_end` must describe a single readable region that outlives `'a`,
+/// which is what the XDP context guarantees for `ctx->data`/`ctx->data_end`.
+/// The host-side parity test upholds it by passing a live slice's own bounds.
+///
+/// #7174 C03: this is `unsafe` because it cannot be anything else. It
+/// dereferences two caller-supplied `usize` values and hands back a slice whose
+/// lifetime `'a` is UNCONSTRAINED — chosen by the caller, tied to no input — so
+/// as a safe `fn` any safe code could pass arbitrary integers, or pick
+/// `'static`, and obtain a dangling slice with no `unsafe` block anywhere. Every
+/// call site in this crate passes real `ctx->data`/`ctx->data_end` bounds and is
+/// sound, so this is defence in depth rather than a live defect; the point is
+/// that the `# Safety` contract above was unenforceable while the signature said
+/// `pub fn`, and a contract only prose carries is one a future caller can breach
+/// without ever writing `unsafe`.
 #[inline(always)]
-pub fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -> Option<&'a [u8]> {
+pub unsafe fn read_bytes<'a>(
+    data: usize,
+    data_end: usize,
+    offset: usize,
+    len: usize,
+) -> Option<&'a [u8]> {
     if data.checked_add(offset)?.checked_add(len)? > data_end {
         return None;
     }
@@ -224,29 +240,29 @@ pub fn walk_ipv6_ext_headers(
     for _ in 0..MAX_EXT_HDRS {
         match eh_class(protocol) {
             EH_CLASS_GENERIC => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                let opt = unsafe { read_bytes(data, data_end, offset as usize, 2) }?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
-                read_bytes(
+                unsafe { read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;
+                ) }?;
             }
             EH_CLASS_AUTH => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                let opt = unsafe { read_bytes(data, data_end, offset as usize, 2) }?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
-                read_bytes(
+                unsafe { read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;
+                ) }?;
             }
             EH_CLASS_FRAGMENT => {
-                let frag = read_bytes(data, data_end, offset as usize, 8)?;
+                let frag = unsafe { read_bytes(data, data_end, offset as usize, 8) }?;
                 // #6704: all 8 bytes were already read for the advance, so the
                 // offset test is two of them and a mask. RFC 8200 §4.5 puts the
                 // 13-bit fragment offset in the upper bits of bytes 2..4; a
