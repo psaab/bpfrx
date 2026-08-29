@@ -2224,3 +2224,149 @@ fn post_dnat_source_nat_matches_translated_destination() {
     assert_eq!(merged.rewrite_dst_port, Some(8443));
 }
 
+
+// ---------------------------------------------------------------------------
+// #7174 C19 MEASUREMENT: can a FLOWLESS packet (a non-first fragment) reach the
+// CACHED filter evaluator, and with what ports?
+// ---------------------------------------------------------------------------
+
+/// #7174 C19 reachability measurement. Not a fix; an observation.
+///
+/// The question is whether a non-first fragment can reach
+/// `evaluate_filter_ref_tx_selection_cached`. The `cache_sensitive` doc asserts
+/// it cannot ("cache-declined ... input filters never reach a cached flow"), but
+/// that assertion is the thing under test, so it is quoted here only to be
+/// checked rather than relied on.
+///
+/// This drives the real `resolve_cached_cos_tx_selection` with `flow_key: None`
+/// -- which is exactly what a fragment presents, per the flowless arm's own
+/// branch -- against an interface OUTPUT filter whose sole match condition is
+/// `destination-port-except 22`.
+///
+/// The two arms differ on ONE axis, the flow key, so the difference is
+/// attributable to it and nothing else.
+#[test]
+fn measure_c19_flowless_reaches_cached_filter_7174() {
+    use crate::filter::FilterAction;
+    let state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "c19-probe".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-except-web".into(),
+                source_except: false,
+                destination_except: false,
+                source_constrained: false,
+                destination_constrained: false,
+                destination_addresses: vec![],
+                source_addresses: vec![],
+                protocols: vec!["udp".into()],
+                source_ports: vec![],
+                destination_ports: vec![],
+                dscp_values: vec![],
+                action: "discard".into(),
+                next_term: false,
+                count: String::new(),
+                log: false,
+                syslog: false,
+                reject_message_type: String::new(),
+                policer: String::new(),
+                routing_instance: String::new(),
+                forwarding_class: String::new(),
+                dscp_rewrite: None,
+                tcp_flags: None,
+                tcp_flags_forbidden: None,
+                tcp_flags_unparseable: false,
+                icmp_type_unrepresentable: false,
+                icmp_code_unrepresentable: false,
+                dscp_match_unrepresentable: false,
+                ports_unrepresentable: false,
+                address_unrepresentable: false,
+                is_fragment: false,
+                icmp_types: vec![],
+                icmp_codes: vec![],
+                flex_match: None,
+                source_ports_except: vec![],
+                destination_ports_except: vec!["22".into()],
+            }],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    let compiled = state
+        .filters
+        .get("inet:c19-probe")
+        .expect("compiled filter present")
+        .clone();
+    assert!(
+        compiled.needs_tx_eval(),
+        "PREMISE: the filter must be TX-eligible, or the cached evaluator is \
+         never consulted and both arms below would be vacuous"
+    );
+
+    let mut forwarding = ForwardingState::default();
+    forwarding.filter_state = state;
+    // Bind as the v4 interface OUTPUT filter on the egress ifindex.
+    forwarding
+        .filter_state
+        .iface_filter_out_v4_fast
+        .insert(12, compiled);
+
+    let src_ip = Ipv4Addr::new(10, 0, 61, 100);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 10,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: 60,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        flow_src_addr: {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&src_ip.octets());
+            a
+        },
+        flow_dst_addr: {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&dst_ip.octets());
+            a
+        },
+        ..UserspaceDpMeta::default()
+    };
+
+    // ARM A -- CONTROL, ports known: a real 5-tuple whose dst port IS 22.
+    // 22 is in the except list, so the discard term must NOT match.
+    let flow_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        src_ip: IpAddr::V4(src_ip),
+        dst_ip: IpAddr::V4(dst_ip),
+        src_port: 40000,
+        dst_port: 22,
+    };
+    let with_flow =
+        crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, Some(&flow_key));
+    println!(
+        "\n#7174 ARM A (flow_key = Some, dst_port 22): drop={} reject={}",
+        with_flow.drop, with_flow.reject
+    );
+
+    // ARM B -- the SUBJECT, flowless: exactly what a non-first fragment presents.
+    let flowless = crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, None);
+    println!(
+        "#7174 ARM B (flow_key = None, the fragment case): drop={} reject={}",
+        flowless.drop, flowless.reject
+    );
+    println!(
+        "#7174 => flowless packets {} the cached evaluator",
+        if flowless.drop != with_flow.drop { "REACH (and get a different verdict from)" } else { "produce the same verdict as" }
+    );
+    let _ = FilterAction::Accept;
+}
