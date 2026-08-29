@@ -93,6 +93,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
             dst_ip: IpAddr::V4(server_ip),
             src_port: client_port,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {
@@ -241,6 +242,7 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
             dst_ip: IpAddr::V4(server_ip),
             src_port: client_port,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -521,6 +523,7 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
             dst_ip: IpAddr::V4(server_ip),
             src_port: client_port,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -700,6 +703,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             dst_ip: IpAddr::V6(n6472_pref64_server()),
             src_port: N6472_CLIENT_PORT,
             dst_port: N6472_SERVER_PORT,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -745,6 +749,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             dst_ip: IpAddr::V4(n6472_pool_v4()),
             src_port: N6472_SERVER_PORT,
             dst_port: N6472_XLATED_PORT,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1138,6 +1143,7 @@ fn poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472() {
             dst_ip: IpAddr::V4(server_ip),
             src_port: client_port,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1264,6 +1270,7 @@ fn n6474_install_snat_session(
             dst_ip: server_ip,
             src_port: 12345,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1564,6 +1571,7 @@ fn embedded_icmp_outbound_snat_marker_scoping_6474() {
             dst_ip: IpAddr::V4(server_ip),
             src_port: 12345,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -2410,6 +2418,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let decision = SessionDecision {
         resolution: ForwardingResolution {
@@ -2830,6 +2839,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let local_decision = SessionDecision {
         resolution: ForwardingResolution {

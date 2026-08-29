@@ -14,6 +14,15 @@ pub(crate) struct SessionKey {
     pub dst_ip: IpAddr,
     pub src_port: u16,
     pub dst_port: u16,
+    /// #7188: the tunnel discriminator that participates in session identity
+    /// for protocols with no L4 ports. `None` for every protocol that has no
+    /// discriminator concept, which is everything but GRE — so this field
+    /// leaves every existing protocol's identity byte-for-byte unchanged, and
+    /// the `Hash`/`Eq` derives above keep doing the right thing for free.
+    ///
+    /// It is NOT a port: it is never matchable, never rendered in a port field,
+    /// and never encoded onto a wire that carries ports (#7188 decision 5).
+    pub discriminator: TunnelDiscriminator,
 }
 
 pub(crate) fn reply_matches_forward_session(
@@ -67,6 +76,7 @@ pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 
@@ -88,6 +98,7 @@ pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> Sess
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 
@@ -137,6 +148,7 @@ pub(super) fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 
@@ -153,6 +165,7 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
         dst_ip: forward_key.src_ip,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 
@@ -228,5 +241,6 @@ pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> Session
         dst_ip: wire_dst,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }

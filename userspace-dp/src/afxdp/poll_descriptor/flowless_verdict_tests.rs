@@ -147,6 +147,7 @@ mod flowless_local_delivery_tests {
                 dst_ip: dst,
                 src_port: 0,
                 dst_port: 0,
+                            discriminator: Default::default(),
             },
         }
     }

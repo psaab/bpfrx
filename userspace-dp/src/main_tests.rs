@@ -2054,6 +2054,7 @@ fn apply_path_persistent_snat_key(
         dst_ip,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 

@@ -5950,6 +5950,7 @@ fn stale_session_never_adopts_reowned_tunnel_id() {
             dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
             src_port: 55068,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let stale_decision = crate::session::SessionDecision {

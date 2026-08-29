@@ -1373,6 +1373,7 @@ fn session_hit_keeps_interface_snat_ipv4_local_delivery() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
             src_port: 5201,
             dst_port: 43600,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -1406,6 +1407,7 @@ fn inactive_interface_snat_session_hit_redirects_to_fabric() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
             src_port: 5201,
             dst_port: 43600,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -1441,6 +1443,7 @@ fn session_hit_keeps_interface_snat_ipv6_local_delivery() {
             dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
             src_port: 5201,
             dst_port: 43600,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -1719,6 +1722,7 @@ fn source_nat_selection_uses_interface_addresses() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
@@ -1745,6 +1749,7 @@ fn source_nat_selection_uses_interface_addresses_v6() {
             dst_ip: "2001:559:8585:80::200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
@@ -1783,6 +1788,7 @@ fn source_nat_pool_unavailable_reports_rule_and_pool_identity() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
@@ -1821,6 +1827,7 @@ fn source_nat_allocator_exhausted_reports_rule_and_pool_identity() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_zone, to_zone) = zone_pair_for_flow(&state, 24, 12);
@@ -2328,6 +2335,7 @@ fn helper_local_session_on_miss_stays_out_of_shared_alias_maps() {
         dst_ip: "172.16.80.200".parse().expect("dst"),
         src_port: 40278,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let decision = SessionDecision {
         resolution: ingress_interface_local_resolution_on_session_miss(
@@ -2400,6 +2408,7 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
         dst_ip: "172.16.80.200".parse().expect("dst"),
         src_port: 40278,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let decision = SessionDecision {
         resolution: ingress_interface_local_resolution_on_session_miss(
@@ -2499,6 +2508,7 @@ fn unsolicited_dns_reply_respects_flow_knob() {
             dst_ip: "10.0.61.102".parse().expect("dst"),
             src_port: 53,
             dst_port: 5353,
+                    discriminator: Default::default(),
         },
     };
     state.allow_dns_reply = true;
@@ -2520,6 +2530,7 @@ fn policy_selection_permits_matching_zone_pair() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
@@ -2551,6 +2562,7 @@ fn policy_selection_denies_on_default_policy() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
@@ -2600,6 +2612,7 @@ fn policy_selection_deny_emits_rt_flow_event() {
             dst_ip: "172.16.80.200".parse().expect("dst"),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let (from_id, to_id) = zone_pair_ids_for_flow(&state, 24, 12);
@@ -4521,6 +4534,7 @@ fn ecmp_static_route_spreads_per_flow_not_per_destination() {
             dst_ip: dst,
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     // A non-LocalDelivery, non-tunnel, non-cacheable decision resolution so
@@ -4605,6 +4619,7 @@ fn ecmp_flow_hash_is_stable_and_spreads() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
         src_port: 1024,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let mut key_b = key_a.clone();
     key_b.src_port = 1025;

@@ -61,6 +61,7 @@ fn key(src_port: u16) -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port,
         dst_port: 5201,
+            discriminator: Default::default(),
     }
 }
 

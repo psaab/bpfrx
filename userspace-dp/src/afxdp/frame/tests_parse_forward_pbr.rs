@@ -483,6 +483,7 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let meta = UserspaceDpMeta {
@@ -647,6 +648,7 @@ fn pbr_routing_instance_reject_synthesizes_reply_on_session_miss() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
             src_port: 49152,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let mut pipeline = pbr_reject_tx_pipeline(0);
@@ -733,6 +735,7 @@ fn pbr_override_survives_nat64_translation_no_vrf_leak() {
             dst_ip: IpAddr::V6(dst_v6),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let meta = UserspaceDpMeta {
@@ -810,6 +813,7 @@ fn pbr_override_survives_nat64_translation_no_vrf_leak() {
             dst_ip: IpAddr::V6(plain_dst_v6),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let RouteOverride::Table(plain_table) =
@@ -857,6 +861,7 @@ fn pbr_egress_output_filter_applied_not_base_egress_no_bypass() {
             dst_ip: IpAddr::V4(dst),
             src_port: 40000,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
     };
     let meta = UserspaceDpMeta {

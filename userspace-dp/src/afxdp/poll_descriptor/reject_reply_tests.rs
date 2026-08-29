@@ -70,6 +70,7 @@ fn tcp_v4_syn() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
         dst_ip: std::net::IpAddr::V4(dst_ip),
         src_port,
         dst_port,
+            discriminator: Default::default(),
     };
     let flow = SessionFlow {
         src_ip: std::net::IpAddr::V4(src_ip),
@@ -200,6 +201,7 @@ fn reject_reply_dropped_by_egress_output_filter() {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -358,6 +360,7 @@ fn filter_reject_non_tcp_enqueues_icmp_unreachable() {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     // build_reject_icmp_unreachable needs an egress with a v4 primary on
@@ -487,6 +490,7 @@ fn filter_reject_output_filter_drop_uses_filter_counter() {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -887,6 +891,7 @@ fn unreplyable_non_first_fragment_reject_untouched_3656() {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     // Zero max-pending => TX budget exhausted (drives the H12 leg too).
@@ -958,6 +963,7 @@ fn icmp_v4_echo() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     (frame, meta, flow)
@@ -1297,6 +1303,7 @@ fn reject_reply_non_tcp_sources_from_logical_vlan_ifindex_3976() {
             dst_ip: std::net::IpAddr::V4(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
 
@@ -1415,6 +1422,7 @@ fn filter_reject_non_tcp_v6_sources_from_logical_vlan_ifindex_3976() {
             dst_ip: std::net::IpAddr::V6(server),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let mut pipeline = tx_pipeline(

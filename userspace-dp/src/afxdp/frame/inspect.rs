@@ -1384,6 +1384,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
                     dst_ip,
                     src_port,
                     dst_port,
+                                    discriminator: Default::default(),
                 },
             })
         }
@@ -1414,6 +1415,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
                     dst_ip,
                     src_port,
                     dst_port,
+                                    discriminator: Default::default(),
                 },
             })
         }
@@ -1567,6 +1569,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_frame(
                     dst_ip,
                     src_port,
                     dst_port,
+                                    discriminator: Default::default(),
                 },
             })
         }
@@ -1603,6 +1606,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
             dst_ip,
             src_port: meta.flow_src_port,
             dst_port: meta.flow_dst_port,
+                    discriminator: Default::default(),
         },
     })
 }
@@ -1699,6 +1703,7 @@ pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Opti
             // #3291: NO L4 ports — a flowless packet's L4 header is absent.
             src_port: 0,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     })
 }
@@ -1773,6 +1778,7 @@ pub(in crate::afxdp) fn parse_ipv4_session_flow_from_frame(
             dst_ip,
             src_port,
             dst_port,
+                    discriminator: Default::default(),
         },
     })
 }

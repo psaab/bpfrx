@@ -139,6 +139,7 @@ fn session_key_has_lo0_filter_matches_packet_family() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let v6_key = SessionKey {
         addr_family: libc::AF_INET6 as u8,
@@ -147,6 +148,7 @@ fn session_key_has_lo0_filter_matches_packet_family() {
         dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
 
     assert!(!session_key_has_lo0_filter(&forwarding, &v4_key));
@@ -169,6 +171,7 @@ fn republish_local_delivery_sessions_for_lo0_filter_selects_existing_hits() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     let mut sessions = SessionTable::new();
     assert!(sessions.install_with_protocol_with_origin(
@@ -205,6 +208,7 @@ fn purge_sessions_for_input_dscp_filter_revalidation_removes_family() {
         dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
         src_port: 12345,
         dst_port: 5201,
+            discriminator: Default::default(),
     };
     assert!(sessions.install_with_protocol_with_origin(
         v4_key.clone(),
@@ -330,6 +334,7 @@ fn test_key() -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
         src_port: 55068,
         dst_port: 5201,
+            discriminator: Default::default(),
     }
 }
 
@@ -777,6 +782,7 @@ fn lookup_forward_nat_across_scopes_returns_shared_nat_entry() {
         dst_ip: IpAddr::V6("2607:f8b0:4005:814::200e".parse::<Ipv6Addr>().unwrap()),
         src_port: 0x8234,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let decision = SessionDecision {
         resolution: test_resolution(),
@@ -3442,6 +3448,7 @@ fn synthesized_synced_reverse_entry_inherits_nat64_reverse_4565() {
             dst_ip: IpAddr::V6(orig_dst_v6),
             src_port: 5001,
             dst_port: 80,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: test_resolution(),
@@ -3799,6 +3806,7 @@ fn reverse_session_from_tunnel_forward_bypasses_unseeded_ha_during_startup_grace
                 dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
                 src_port: 42424,
                 dst_port: 5201,
+                            discriminator: Default::default(),
             },
             decision: SessionDecision {
                 resolution: ForwardingResolution {
@@ -4124,6 +4132,7 @@ fn reverse_session_from_split_owner_fabric_redirect_uses_fabric_return_when_clie
                 dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
                 src_port: 42424,
                 dst_port: 5201,
+                            discriminator: Default::default(),
             },
             decision: SessionDecision {
                 resolution: ForwardingResolution {
@@ -4381,6 +4390,7 @@ fn reverse_materialized_shared_hit_adopts_replica_session_id_6313() {
         dst_ip: forward.src_ip,
         src_port: forward.dst_port,
         dst_port: forward.src_port,
+            discriminator: Default::default(),
     };
     // A second reverse companion (different client port) for the negative
     // control below.
@@ -4959,6 +4969,7 @@ fn w3_forward_entry(src_host: u8, src_port: u16, snat_ip: Ipv4Addr) -> SyncedSes
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: test_resolution(),
@@ -5140,6 +5151,7 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 91)), // VIP
             src_port: 40_003,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: test_resolution(),
@@ -5681,6 +5693,7 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 51000,
         dst_port: 2222,
+            discriminator: Default::default(),
     };
     let mut decision = test_decision();
     decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
@@ -6846,6 +6859,7 @@ fn purge_translated_synced_hit_releases_nat64_reservation_5295() {
         dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
         src_port: 5000,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let nat = crate::nat64::Nat64State::forward_decision(snat, dst_v4, 1024);
     let wire_key = forward_wire_key(&orig_key, nat); // post-NAT v4 wire tuple
@@ -7287,6 +7301,7 @@ fn handle_upsert_synced_resolves_active_zone_pair_for_snat_reserve_6211() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40000,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let mut decision = test_decision();
     decision.nat = NatDecision {
@@ -7402,6 +7417,7 @@ fn delete_synced_frees_both_allocators_end_to_end_6211() {
         dst_ip: "8.8.8.8".parse().unwrap(),
         src_port: 40000,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let mut decision = test_decision();
     decision.nat = NatDecision {
@@ -7506,6 +7522,7 @@ fn nat_reverse_fixture_7169() -> (
         dst_ip: IpAddr::V4("203.0.113.9".parse().unwrap()),
         src_port: 40000,
         dst_port: 443,
+            discriminator: Default::default(),
     };
     let decision = SessionDecision {
         resolution: test_resolution(),

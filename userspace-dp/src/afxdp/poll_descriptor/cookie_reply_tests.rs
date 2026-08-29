@@ -103,6 +103,7 @@ fn tcp_v4_syn_frame() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
         dst_ip: std::net::IpAddr::V4(dst_ip),
         src_port,
         dst_port,
+            discriminator: Default::default(),
     };
     let flow = SessionFlow {
         src_ip: std::net::IpAddr::V4(src_ip),

@@ -1901,6 +1901,7 @@ fn session_key_from_src(
         dst_ip: dst_ip.parse().unwrap(),
         src_port,
         dst_port,
+            discriminator: Default::default(),
     }
 }
 

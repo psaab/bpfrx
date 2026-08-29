@@ -77,6 +77,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {

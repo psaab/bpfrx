@@ -1353,6 +1353,7 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
             dst_ip: IpAddr::V6(server_ip),
             src_port: echo_id,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
         decision,
         metadata,
@@ -1544,6 +1545,7 @@ fn icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_physical_paren
             dst_ip: IpAddr::V6(server_ip),
             src_port: echo_id,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
         decision,
         metadata,
@@ -1619,6 +1621,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         dst_ip: IpAddr::V6(server_ip),
         src_port: echo_id,
         dst_port: 0,
+            discriminator: Default::default(),
     };
     let forward_decision = SessionDecision {
         resolution: ForwardingResolution {

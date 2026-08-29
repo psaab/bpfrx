@@ -200,6 +200,7 @@ fn finish_generated_key(
         dst_ip,
         src_port,
         dst_port,
+            discriminator: Default::default(),
     };
     let meta = ForwardPacketMeta {
         addr_family,

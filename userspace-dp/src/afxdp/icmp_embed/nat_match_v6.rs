@@ -84,6 +84,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         dst_ip: hdr.dst,
         src_port: hdr.src_port,
         dst_port: hdr.dst_port,
+            discriminator: Default::default(),
     };
     // reverse_key for the forward-NAT lookup uses the WIRE source.
     // Mirrors icmp_embed.rs:369-376.

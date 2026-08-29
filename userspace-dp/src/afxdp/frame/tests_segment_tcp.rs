@@ -503,6 +503,7 @@ fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
             dst_ip: IpAddr::V6(dst_ip),
             src_port: expected_src_port,
             dst_port,
+                    discriminator: Default::default(),
         },
     };
 

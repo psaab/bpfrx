@@ -13,6 +13,7 @@ fn dummy_session_key(id: u16) -> SessionKey {
         dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
         src_port: id,
         dst_port: 5201,
+            discriminator: Default::default(),
     }
 }
 

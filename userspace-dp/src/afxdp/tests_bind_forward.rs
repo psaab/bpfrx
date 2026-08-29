@@ -454,6 +454,7 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -626,6 +627,7 @@ fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
             dst_ip: IpAddr::V4(dst_ip),
             src_port,
             dst_port,
+                    discriminator: Default::default(),
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -812,6 +814,7 @@ fn output_filter_reject_carries_the_configured_icmp_code_6854() {
             dst_ip: IpAddr::V4(dst_ip),
             src_port,
             dst_port,
+                    discriminator: Default::default(),
         },
     };
     let mut forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1063,6 +1066,7 @@ fn output_filter_matches_post_snat_source_forward_leg_3642() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1193,6 +1197,7 @@ fn output_filter_matches_post_snat_dest_reverse_leg_3642() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
             src_port: 443,
             dst_port: 12345,
+                    discriminator: Default::default(),
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1317,6 +1322,7 @@ fn output_filter_matches_post_dnat_dest_3642() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
             src_port: 40000,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1407,6 +1413,7 @@ fn icmp_reverse_key_keeps_identifier_position() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let reverse = flow.reverse_key_with_nat(NatDecision {
@@ -1430,6 +1437,7 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1482,6 +1490,7 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1536,6 +1545,7 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1601,6 +1611,7 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1669,6 +1680,7 @@ fn resolution_target_uses_rewritten_destination_for_reverse_dnat() {
             dst_ip: IpAddr::V6("2001:559:8585:80::8".parse().expect("dst")),
             src_port: 0x1234,
             dst_port: 0,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -1712,6 +1724,7 @@ fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
             src_port: 12345,
             dst_port: 5201,
+                    discriminator: Default::default(),
         },
     };
     let decision = SessionDecision {
@@ -2192,6 +2205,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
             dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
             src_port: 54321,
             dst_port: 443,
+                    discriminator: Default::default(),
         },
     };
     let dnat = state

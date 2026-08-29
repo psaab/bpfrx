@@ -237,6 +237,7 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
         dst_ip: src_ip,
         src_port: reply_src_port,
         dst_port: reply_dst_port,
+            discriminator: Default::default(),
     }
 }
 

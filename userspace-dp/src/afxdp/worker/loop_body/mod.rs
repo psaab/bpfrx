@@ -1781,6 +1781,7 @@ mod flow_cache_invalidation_tests {
             dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         }
     }
 
@@ -2482,6 +2483,7 @@ mod gc_reap_source_nat_release_tests_6901 {
             dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         }
     }
 
@@ -2689,6 +2691,7 @@ mod gc_reap_nat64_release_tests_7740 {
             dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
             src_port,
             dst_port: 443,
+                    discriminator: Default::default(),
         }
     }
 
