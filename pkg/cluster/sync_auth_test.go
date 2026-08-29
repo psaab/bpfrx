@@ -16,8 +16,8 @@ import (
 // and with it the only caller that ever passed authSeen=true — the deleted
 // TestSyncAuthHandshakeDowngradeGuardRejects.
 type fakeSyncAuthProvider struct {
-	key    []byte
-	node   int
+	key     []byte
+	node    int
 	cluster int
 }
 
@@ -237,6 +237,17 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	}
 }
 
+// legacySyncAuthVersion / legacySyncAuthNonceSize describe the RETIRED
+// pre-#7163 HELLO. They are literals rather than references to live constants
+// on purpose: this shape is frozen history, and pinning it to a constant the
+// current handshake still owns would let a future edit to that constant move
+// the "legacy peer" fixture along with it — at which point the flag-day tests
+// below would be asserting that a peer speaking the CURRENT wire is refused.
+const (
+	legacySyncAuthVersion   = 1
+	legacySyncAuthNonceSize = 32
+)
+
 // writeSyncAuthHello writes a well-formed HELLO from the PEER side of a pipe,
 // with the keyed byte under the caller's control. performSyncHandshake only
 // ever emits keyed=1 (it returns early when it holds no key), so a keyed=0
@@ -246,11 +257,11 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 // below is the keyed advertisement.
 func writeSyncAuthHello(t *testing.T, conn net.Conn, keyed byte, nonce []byte) {
 	t.Helper()
-	if len(nonce) != syncAuthNonceSize {
-		t.Fatalf("test bug: nonce must be %d bytes, got %d", syncAuthNonceSize, len(nonce))
+	if len(nonce) != legacySyncAuthNonceSize {
+		t.Fatalf("test bug: nonce must be %d bytes, got %d", legacySyncAuthNonceSize, len(nonce))
 	}
-	hello := make([]byte, 0, 2+syncAuthNonceSize)
-	hello = append(hello, syncAuthVersion, keyed)
+	hello := make([]byte, 0, 2+legacySyncAuthNonceSize)
+	hello = append(hello, legacySyncAuthVersion, keyed)
 	hello = append(hello, nonce...)
 	if err := writeMsg(conn, syncMsgAuthHello, hello); err != nil {
 		t.Fatalf("peer failed to send HELLO(keyed=%d): %v", keyed, err)
@@ -298,7 +309,7 @@ func TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer(t *testing.T) {
 	} else if typ != syncMsgAuthHello {
 		t.Fatalf("expected server HELLO type %d, got %d", syncMsgAuthHello, typ)
 	}
-	writeSyncAuthHello(t, cb, 0, bytes.Repeat([]byte{0xA5}, syncAuthNonceSize))
+	writeSyncAuthHello(t, cb, 0, bytes.Repeat([]byte{0xA5}, legacySyncAuthNonceSize))
 
 	ar := <-ach
 	if ar.err == nil {
@@ -455,7 +466,6 @@ func TestSyncAuthDecisionMatrix(t *testing.T) {
 	}
 }
 
-
 // #7163 SUPERSESSION NOTE. Four tests were removed from this file by the Noise
 // conversion, and they are recorded here rather than deleted quietly, because
 // three of them were the #5078/#7152 attack guards and a reader must be able to
@@ -496,7 +506,7 @@ func TestNoiseHandshakeRejectsLegacyPeer7163(t *testing.T) {
 	// Consume our msg1 and answer with a legacy-shaped HELLO.
 	go func() {
 		_, _, _ = readSyncFrameRaw(cb)
-		legacy := make([]byte, 2+syncAuthNonceSize)
+		legacy := make([]byte, 2+legacySyncAuthNonceSize)
 		legacy[0], legacy[1] = 1, 1
 		_ = writeMsg(cb, syncMsgAuthHello, legacy)
 	}()

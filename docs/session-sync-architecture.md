@@ -375,9 +375,11 @@ switch ("standby retains newer set").
 | 15 | BulkAck | Secondary -> Primary | Bulk acknowledgement |
 | 30 | ConfigKeyExchange | Bidirectional | Ephemeral X25519 public key for config-payload encryption (#6629) |
 | 31 | ConfigEncrypted | Primary -> Secondary | Type 8's payload, sealed (#6629) |
-| 32 | AuthUpgradeHello | Bidirectional | In-place authentication upgrade: challenge (#6628) |
-| 33 | AuthUpgradeProof | Bidirectional | In-place authentication upgrade: proof (#6628) |
-| 34 | AuthUpgradeAck | Bidirectional | In-place authentication upgrade: responder switch marker (#6628) |
+| 32 | AuthUpgradeHello | Initiator -> Responder | In-place authentication upgrade: Noise msg1 (#6628, #7163) |
+| 33 | AuthUpgradeProof | Responder -> Initiator | In-place authentication upgrade: Noise msg2 (#6628, #7163) |
+| 34 | *(retired)* | — | Was AuthUpgradeAck, the fourth frame of the pre-#7163 exchange. Left unused rather than recycled. |
+| 36 | AuthUpgradeConfirm | Initiator -> Responder | In-place authentication upgrade: handshake-binding MAC, and the responder's read boundary (#7163) |
+| 37 | AuthUpgradeRequest | Responder -> Initiator | In-place authentication upgrade: the responder-role node asking the initiator-role node to start (#7163) |
 
 ### In-Place Authentication Upgrade (#6628)
 
@@ -395,30 +397,57 @@ upgrade on any connection whose recorded PSK differs from the live one. It is a
 peer switched at — TCP's per-direction ordering makes a frame an unambiguous
 boundary:
 
+Since **#7163** the exchange is Noise_NNpsk0, the same construction as the
+connect handshake (`sync_auth_noise_7163.go`), separated from it by a phase byte
+in the prologue. It had to move: the pre-#7163 exchange called `syncAuthProof`
+and `syncDeriveFrameKey`, so converting only the connect handshake would have
+left this as a SECOND admission path carrying the identical two-connection
+oracle — and the one an attacker picks, because it is the one that still
+accepts.
+
 ```
-I (initiator)                          R (responder)
--- Hello{nI} ------------------->
-                                       <-- Proof{proof_R(nI), nR} --   (no switch)
-verifies proof over nI  ⇒ key equality proven
--- Proof{proof_I(nR), nI} ------>      then I sets writeKey
-                                       verifies, sets readKey (this frame
-                                       IS the boundary)
-                                       <-- Ack --                     then R sets writeKey
-receives Ack, sets readKey
+I (node 0)                             R (node 1)
+-- Hello{noise msg1} ----------->
+                                       reads msg1 ⇒ key equality PROVEN
+                                       (psk0 tags the first message)
+                                       <-- Proof{noise msg2} --        then R sets writeKey
+reads msg2 ⇒ sets readKey
+(that frame IS the boundary)
+-- Confirm{MAC(i2r, binding)} -->      then I sets writeKey
+                                       verifies MAC, sets readKey
+                                       (that frame IS the boundary)
 ```
 
-The fourth frame is not ceremony. In the obvious three-frame version R switches
-its write direction right after sending its Proof, having proven nothing; if the
-two nodes hold **different** keys — a botched rotation — I's verification fails,
-I never switches, and R's next sealed frame reaches a reader not expecting a
-trailer. Frame desync, connection dropped, by the mechanism whose premise is
-that it never drops. Deferring R's switch until it has verified I's proof means
-neither side switches until key equality is mutually proven.
+**Three frames, where #6628 needed four.** The Ack existed because the responder
+"has proven nothing" when it switches. Under Noise_NNpsk0 that premise is false:
+psk0 mixes the PSK into the chaining key before the first message is encrypted,
+so msg1 is 48 bytes — a 32-byte ephemeral plus a 16-byte Poly1305 tag over an
+empty payload — and reading it proves key equality *before* R answers. This is
+measured, not assumed (`TestUpgradeMsg1IsAuthenticated7163`); if it stopped
+holding, the three-frame shape would be unsafe.
 
-Simultaneous initiation needs no tie-break message: both ends know both nonces,
-and the smaller nonce initiates. `syncCheckPeerNonce` (the #5078 reflection
-guard) applies unchanged. `writeKey` is installed under `writeMu` inside the
-same critical section as the frame that precedes it.
+**The Confirm still carries a MAC** even though R has already authenticated I.
+It is not a proof of possession — msg1 was that — it is an unforgeable BOUNDARY
+MARKER: without it, anyone able to inject a frame into a not-yet-sealed stream
+could make R start requiring a trailer while the real I is still writing
+unsealed frames, and the connection would drop.
+
+**Role comes from node id**, the lower id initiating. #6628 decided it by
+comparing the two nonces, which made role a function of a peer-supplied value
+feeding this node's own key derivation — the same mistake vector B exploited.
+The higher-id node therefore cannot open the exchange; when it is the one that
+becomes keyed first it sends an `AuthUpgradeRequest`, which carries no key
+material and moves no boundary.
+
+**Two install points per direction, not one.** `Split()` returns two independent
+keys where `syncDeriveFrameKey` returned one shared value, so read and write are
+installed separately in each direction. They cannot land out of order: each is
+anchored to one frame, the writer installs immediately after writing it inside
+the `writeMu` section, and the reader installs while processing it. The two
+frames that complete a direction — the Proof and the Confirm — are therefore
+deliberately NOT gated on the live control-link key: a key rotated or cleared
+between the Hello and one of them would otherwise leave the peer sealing into a
+reader that never moved.
 
 **Not closed:** a hostile stream admitted before the commit declines the upgrade
 by staying silent, and a decliner is indistinguishable from a legitimate

@@ -73,6 +73,26 @@ const (
 	// syncNoiseKeyLen is the directional frame-key length. Noise CipherStates
 	// hold 32-byte keys.
 	syncNoiseKeyLen = 32
+
+	// syncNoisePhaseConnect and syncNoisePhaseUpgrade separate the two places
+	// a Noise_NNpsk0 exchange runs: the connection-setup handshake
+	// (performSyncHandshake) and the #6628 in-place upgrade of an ALREADY
+	// ESTABLISHED connection (sync_auth_upgrade.go).
+	//
+	// They must not share a transcript, and the reason is concrete rather than
+	// hygienic. Both run under the same PSK, and a connect msg1 travels in
+	// cleartext on a fresh TCP connection where anyone on the fabric can read
+	// it. Without this byte the two prologues are identical, so that captured
+	// msg1 is ALSO a well-formed upgrade Hello: replay it into an established
+	// unauthenticated stream and the responder answers with a msg2 and switches
+	// its write direction to a key derived from an ephemeral nobody holds — not
+	// the attacker (no PSK) and not the legitimate initiator (it never sent that
+	// msg1). The peer can then no longer read a single frame and the connection
+	// DROPS, which is the one property the in-place upgrade promises it will
+	// never do. One byte in the prologue makes the replayed message fail its
+	// AEAD tag instead.
+	syncNoisePhaseConnect = 1
+	syncNoisePhaseUpgrade = 2
 )
 
 // syncNoiseCipherSuite is the negotiated suite. Fixed, not negotiated: this is
@@ -126,14 +146,17 @@ func (s *SessionSync) syncNoiseIdentity() (clusterID, nodeID int, err error) {
 // disagreement about role changes the prologue, changes the handshake hash and
 // fails the handshake, rather than quietly producing a shared key.
 //
+// The PHASE byte separates the connect handshake from the #6628 in-place
+// upgrade; see syncNoisePhaseConnect for the replay it stops.
+//
 // Fixed width and fixed order: every field is a fixed-size big-endian integer,
 // so the encoding is unambiguous and no length-prefix parsing is involved. The
 // prologue is never parsed by anyone — both sides construct it independently
 // and the hash compares them — so an ambiguous encoding would surface as an
 // unexplained handshake failure rather than as a confusion attack.
-func syncNoisePrologue(clusterID, initiatorNode, responderNode, fabricIdx int) []byte {
-	buf := make([]byte, 0, 1+4*4)
-	buf = append(buf, syncNoiseVersion)
+func syncNoisePrologue(phase byte, clusterID, initiatorNode, responderNode, fabricIdx int) []byte {
+	buf := make([]byte, 0, 2+4*4)
+	buf = append(buf, syncNoiseVersion, phase)
 	var scratch [4]byte
 	for _, v := range []int{clusterID, initiatorNode, responderNode, fabricIdx} {
 		binary.BigEndian.PutUint32(scratch[:], uint32(v))
@@ -187,29 +210,9 @@ type syncNoiseKeys struct {
 // Sending it would make it an attacker-chosen input to our own identity
 // binding, which is precisely the mistake the old proof made with its nonce.
 func (s *SessionSync) performNoiseHandshake(conn net.Conn, key []byte, initiator bool, fabricIdx int) (syncNoiseKeys, error) {
-	clusterID, localNode, err := s.syncNoiseIdentity()
+	hs, err := s.newSyncNoiseState(key, initiator, syncNoisePhaseConnect, fabricIdx)
 	if err != nil {
 		return syncNoiseKeys{}, err
-	}
-	peerNode := 1 - localNode
-
-	initiatorNode, responderNode := localNode, peerNode
-	if !initiator {
-		initiatorNode, responderNode = peerNode, localNode
-	}
-	prologue := syncNoisePrologue(clusterID, initiatorNode, responderNode, fabricIdx)
-
-	hs, err := noise.NewHandshakeState(noise.Config{
-		CipherSuite:           syncNoiseCipherSuite,
-		Pattern:               noise.HandshakeNN,
-		Initiator:             initiator,
-		Prologue:              prologue,
-		PresharedKey:          syncNoisePSK(key),
-		PresharedKeyPlacement: 0, // psk0: the PSK is mixed in before anything else.
-		Random:                rand.Reader,
-	})
-	if err != nil {
-		return syncNoiseKeys{}, fmt.Errorf("cluster sync: noise handshake init: %w", err)
 	}
 
 	var csInitiatorToResponder, csResponderToInitiator *noise.CipherState
@@ -263,7 +266,55 @@ func (s *SessionSync) performNoiseHandshake(conn net.Conn, key []byte, initiator
 	if csInitiatorToResponder == nil || csResponderToInitiator == nil {
 		return syncNoiseKeys{}, errors.New("cluster sync: noise handshake produced no cipher states")
 	}
+	return syncNoiseSplitKeys(initiator, csInitiatorToResponder, csResponderToInitiator), nil
+}
 
+// newSyncNoiseState builds the Noise_NNpsk0 handshake state both exchanges run
+// on: the connection-setup handshake and the #6628 in-place upgrade.
+//
+// It is ONE function on purpose. The prologue is where every identity binding
+// lives, so two copies of this construction would be two places for a binding
+// to be dropped from — and a dropped binding is invisible, because both ends
+// drop it together and the handshake still succeeds. The phase byte is what
+// keeps the two exchanges' transcripts apart while the code stays single.
+func (s *SessionSync) newSyncNoiseState(key []byte, initiator bool, phase byte, fabricIdx int) (*noise.HandshakeState, error) {
+	clusterID, localNode, err := s.syncNoiseIdentity()
+	if err != nil {
+		return nil, err
+	}
+	peerNode := 1 - localNode
+
+	initiatorNode, responderNode := localNode, peerNode
+	if !initiator {
+		initiatorNode, responderNode = peerNode, localNode
+	}
+	prologue := syncNoisePrologue(phase, clusterID, initiatorNode, responderNode, fabricIdx)
+
+	hs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:           syncNoiseCipherSuite,
+		Pattern:               noise.HandshakeNN,
+		Initiator:             initiator,
+		Prologue:              prologue,
+		PresharedKey:          syncNoisePSK(key),
+		PresharedKeyPlacement: 0, // psk0: the PSK is mixed in before anything else.
+		Random:                rand.Reader,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cluster sync: noise handshake init: %w", err)
+	}
+	return hs, nil
+}
+
+// syncNoiseSplitKeys maps the two CipherStates Split() returns onto THIS side's
+// read and write directions.
+//
+// flynn/noise returns them in a fixed order — (initiator→responder,
+// responder→initiator) — for both peers, so the two sides read the same pair
+// and disagree only about which one they write with. That asymmetry is the
+// whole point: it is the specific replacement for the pre-#7163 canonical nonce
+// sort, which handed both directions the same bytes and let a node's own frame
+// verify when echoed back at it.
+func syncNoiseSplitKeys(initiator bool, csInitiatorToResponder, csResponderToInitiator *noise.CipherState) syncNoiseKeys {
 	// UnsafeKey() is the library's own name for "give me the raw key", and the
 	// warning it encodes is real, so here is why it is the right call here.
 	//
@@ -285,5 +336,5 @@ func (s *SessionSync) performNoiseHandshake(conn net.Conn, key []byte, initiator
 		keys.writeKey = append([]byte(nil), r2i[:]...)
 		keys.readKey = append([]byte(nil), i2r[:]...)
 	}
-	return keys, nil
+	return keys
 }

@@ -85,7 +85,7 @@ func TestAcceptLoopHandshakeDoesNotBlockOthers(t *testing.T) {
 		CipherSuite:           syncNoiseCipherSuite,
 		Pattern:               noise.HandshakeNN,
 		Initiator:             true,
-		Prologue:              syncNoisePrologue(22, 1, 0, 0),
+		Prologue:              syncNoisePrologue(syncNoisePhaseConnect, 22, 1, 0, 0),
 		PresharedKey:          syncNoisePSK(key),
 		PresharedKeyPlacement: 0,
 		Random:                rand.Reader,
