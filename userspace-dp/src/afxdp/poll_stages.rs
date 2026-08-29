@@ -650,6 +650,14 @@ pub(super) fn stage_screen_check(
                         event_now_ns_from_secs(now_secs),
                     );
                     screen.record_alarm_without_drop();
+                    // #7086: the check TRIPPED; only the drop was suppressed. Tally
+                    // it per zone on the ALARM triple so the surface can tell
+                    // "alarming and permitting" from "nothing recorded".
+                    crate::afxdp::flood_counters::record_zone_flood_alarm(
+                        &worker_ctx.forwarding.flood_counter_slot_map,
+                        zone_id,
+                        reason,
+                    );
                     StageOutcome::Continue(ScreenCheckOutcome::Pass)
                 } else {
                     emit_screen_drop_event(
@@ -757,6 +765,14 @@ pub(super) fn stage_screen_check(
                     event_now_ns_from_secs(now_secs),
                 );
                 screen.record_alarm_without_drop();
+                // #7086: the check TRIPPED; only the drop was suppressed. Tally
+                // it per zone on the ALARM triple so the surface can tell
+                // "alarming and permitting" from "nothing recorded".
+                crate::afxdp::flood_counters::record_zone_flood_alarm(
+                    &worker_ctx.forwarding.flood_counter_slot_map,
+                    zone_id,
+                    reason,
+                );
                 StageOutcome::Continue(ScreenCheckOutcome::Pass)
             } else {
                 emit_screen_drop_event(
@@ -792,6 +808,19 @@ pub(super) fn stage_screen_check(
                     event_now_ns_from_secs(now_secs),
                 );
                 screen.record_alarm_without_drop();
+                // #7086: mirror the drop arm below, which passes this same
+                // "syn-cookie" literal to record_screen_drop. That reason is
+                // NOT one of flood_reason_index's three, so both arms
+                // contribute nothing to the per-zone flood tally today. The
+                // call is here anyway so the two arms cannot DRIFT: if
+                // "syn-cookie" ever becomes a counted family, it starts
+                // counting on the alarm arm and the drop arm together, rather
+                // than re-creating #7086 for a new reason.
+                crate::afxdp::flood_counters::record_zone_flood_alarm(
+                    &worker_ctx.forwarding.flood_counter_slot_map,
+                    zone_id,
+                    "syn-cookie",
+                );
                 StageOutcome::Continue(ScreenCheckOutcome::Pass)
             } else {
                 emit_screen_drop_event(

@@ -811,6 +811,45 @@ zone with no traffic / no flood events alike.
   helper store (the Go `ClearAllCounters` override sends it) so an operator clear
   does not snap back on the next 1 s poll.
 
+  **Alarm arm (#7086).** The drop-path funnel above is what makes the tally
+  drift-proof for DROPS, and is exactly why it missed alarms: a zone configured
+  `alarm-without-drop` suppresses the drop and forwards the packet, so
+  `stage_screen_check`'s three alarm arms never reach `record_screen_drop`. A
+  zone under a sustained flood alarm therefore published NOTHING — `snapshot`
+  omits all-zero rows, the Go side replaces its offset map from that sparse
+  snapshot, and all four render sites printed "the zone has recorded no flood
+  events" during a live flood. Junos `alarm-without-drop` suppresses the drop,
+  not the statistic.
+
+  The fix is a SEPARATE per-zone alarm triple, never folded into the drop
+  counts: a counter whose name, module doc and call-site contract all say DROP
+  must not report packets that were permitted and forwarded, which would turn an
+  honest "not available" into a confident wrong answer. `record_zone_flood_alarm`
+  is called at each of the three alarm arms and shares the drop half's LUT,
+  per-zone atomic block and single per-RX-batch fold (`FloodPending` gains a
+  parallel `alarms` array under the same `touched_slots` bitmask). Batching is
+  MORE load-bearing here, not less: `alarm_without_drop` is a per-ZONE profile
+  flag, so an alarming zone suppresses every flood drop it would take and a
+  volumetric flood runs this path per packet on every worker with no drop
+  thinning it.
+
+  Unlike the drop side there is no funnel to make drift impossible — the
+  suppression is decided inline in three arms and `record_alarm_without_drop`
+  lives in the `screen` module, which cannot see the afxdp slot map — so a test
+  derives the expected tally-call count from the arms themselves and fails if a
+  fourth arm is added without one.
+
+  **The wire is still drops-only, deliberately.** `snapshot`'s row predicate and
+  the Go render are unchanged. Emitting a row for an alarm-only zone without
+  teaching the render about alarms would make the surface WORSE:
+  `Manager.ReadFloodCounters` returns `ErrCounterNotPopulated` only when the
+  offset map has no row, so a row of zeroed drop counts renders "SYN flood
+  events: 0" on a zone that is actively alarming. Because `alarm_without_drop`
+  is per-zone, an alarming zone has zero drops BY CONSTRUCTION and is precisely
+  the row the predicate omits, so predicate and render cannot be separated. They
+  change together with the flood surface's cause-naming work (the #7907
+  treatment of the zone half).
+
   **Rejected-build safety, flood half.** The flood store is the exact sibling
   of the traffic store above — `Arc`-backed, carried forward by the same
   `previous` handle — so the #5716/#6832 split applies to it verbatim, and it
