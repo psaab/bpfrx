@@ -43,6 +43,11 @@ const (
 	// equal today (this build speaks 1 and is compatible back to 1); a future
 	// incompatible bump raises Current AND sets this floor to the oldest peer the
 	// new build can still sync with (which may equal Current if no back-compat).
+	//
+	// #7925: a SESSION-WIRE-only change does not touch this. SessionSyncWireVersion
+	// is its own counter now, so widening the session key bumps that alone and
+	// leaves this window intact for the heartbeat/failover semantics that did not
+	// change. Re-evaluate this floor only on a CurrentHAProtocolVersion bump.
 	MinCompatHAProtocolVersion = CurrentHAProtocolVersion
 
 	// maxHeartbeatSize is the max packet size we'll read/write.
