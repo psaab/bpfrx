@@ -1035,14 +1035,20 @@ directly:
   recovery keeps the committed queue and loses nothing, a capacity drop
   discards a command, and the two have opposite remediations.
   - The expected steady-state value is **0**, and not because the queue
-    is roomy: the consumer drains the WHOLE deque in one
-    `core::mem::take` per poll, so a sustained producer cannot outrun
-    it. A rising counter therefore does not mean "busy" — it means a
-    worker has STOPPED draining. `spawn_supervised_worker` catches a
+    is roomy: what a producer has to outrun is the consumer's
+    ~1 µs/command PROCESSING rate, which no control-plane producer
+    sustains. A rising counter therefore does not mean "busy" — it means
+    a worker has STOPPED draining. `spawn_supervised_worker` catches a
     `worker_loop` panic, sets `runtime_atomics.dead = true` and lets the
     thread exit, but the worker RECORD is never removed and producers
     fan out over `records.values()` with no `dead` check, so they keep
     enqueueing into a queue nothing will drain.
+    - #6929 originally justified this as "the consumer drains the WHOLE
+      deque in one `core::mem::take` per poll". **That is no longer how
+      the drain works** — see the bounded prefix drain below — but the
+      conclusion is unchanged, because it never rested on the drain
+      granularity. The bounded drain absorbs the same commands/second
+      and simply revisits the queue ~16x more often.
   - It refuses the NEWEST rather than evicting the oldest. The queue
     carries ordered state transitions (`UpsertSynced` then
     `DeleteSynced` for one key), so dropping from the front would apply
@@ -1054,6 +1060,40 @@ directly:
     (`session_glue/tests.rs`, `newflow_contention_tests.rs`) are
     excluded on purpose; they drive the consumer and routing them
     through the cap would change what they exercise.
+- `drain_bounded_into` is how a worker consumes that queue (#7201).
+  `apply_worker_commands` takes a **bounded prefix** of at most
+  `WORKER_COMMAND_DRAIN_BUDGET` (256) commands into a worker-owned
+  recycled scratch deque, dispatches those, and leaves the remainder in
+  the shared queue for the next poll.
+  - **It is a ring-service budget, not a fairness knob.** The worker
+    does not touch its AF_XDP RX/TX rings while it dispatches commands,
+    so batch size is wall-clock time the rings go unserviced. Draining
+    a full 4096-command queue measured **3.85 ms** — a LOWER bound, at
+    `session_map_fd = -1` where the `bpf_map_update_elem` calls fail at
+    the fd check without paying the kernel-side insert. A 4096-slot RX
+    ring (`ring_entries`, `server/lifecycle.rs`) fills in ~1.97 ms at
+    25 Gbps with 1500 B frames. The burst arrives at RG activation, the
+    moment the node has just become forwarding-authoritative — hence
+    "availability defect", not "allocation nit". 256 is the slice
+    `sessions.drain_deltas(256)` already uses in the same loop, and
+    bounds the unserviced window to ~256 µs.
+  - The slice is a contiguous FRONT prefix, so FIFO and every ordering
+    group survive a split by construction. The `UpsertSynced` →
+    `DeleteSynced` transitions the queue carries are the reason a
+    quota-filling or back-taking budget would be wrong.
+  - **The backlog signal feeds `did_work`.** `WorkerCommandResults`
+    carries `commands_backlogged`, and `worker/loop_body` seeds
+    `did_work` from it. This is load-bearing, not bookkeeping:
+    `did_work` is otherwise set only by `poll_binding` (packet work), so
+    a budget WITHOUT this wiring is a regression rather than a partial
+    fix — on a promoted standby with no traffic yet, `idle_iters` passes
+    `IDLE_SPIN_ITERS` and each remaining slice waits behind a 1 ms
+    `poll(2)`, turning a bounded 3.85 ms stall into ~16 ms of drain. A
+    source-level guard pins that seed line.
+  - Replacing `core::mem::take(&mut *pending)` also ends the zero-cap
+    regrow: the take moved the producers' buffer out and left the shared
+    deque at capacity 0, so the producers reallocated it under the lock
+    on every pass.
 - `try_lock_recover` keeps WouldBlock as a skip (`None`) — only the
   Poisoned arm changes behavior.
 

@@ -299,6 +299,15 @@ pub(crate) fn worker_loop(
     // prevent.
     let mut idle_poll_degraded = false;
     let mut poll_start = 0usize;
+    // #7201: the recycled landing buffer for `apply_worker_commands`'s bounded
+    // prefix drain. Owned here, outside the loop, because the point is that it
+    // is REUSED: the drain it replaces did `core::mem::take(&mut *pending)`,
+    // which handed the worker the producers' allocation and left the SHARED
+    // deque at zero capacity for the producers to regrow under the lock on every
+    // pass. Sized to the budget once; entered and left empty each call, so it
+    // settles at that capacity and never reallocates.
+    let mut command_scratch: VecDeque<WorkerCommand> =
+        VecDeque::with_capacity(crate::afxdp::worker_queue::WORKER_COMMAND_DRAIN_BUDGET);
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
     // #5468: per-drain-cycle aggregate lossless-wedge latch. `flush_session_deltas`
     // bounds each individual lossless send to `WORKER_LOSSLESS_QUEUE_BUDGET`, but
@@ -849,16 +858,10 @@ pub(crate) fn worker_loop(
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
                 worker_id,
+                &mut command_scratch,
             )
         } else {
-            WorkerCommandResults {
-                cancelled_keys: Vec::new(),
-                deleted_synced_keys: Vec::new(),
-                exported_sequences: Vec::new(),
-                export_owner_rgs: Vec::new(),
-                shaped_tx_requests: Vec::new(),
-                vacate_all_shared_exact_slots: false,
-            }
+            WorkerCommandResults::empty()
         };
         let WorkerCommandResults {
             cancelled_keys,
@@ -867,6 +870,7 @@ pub(crate) fn worker_loop(
             export_owner_rgs,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
+            commands_backlogged,
         } = command_results;
         // #941 Work item C: HA-demotion vacate. The
         // VacateAllSharedExactSlots WorkerCommand cannot be processed
@@ -1051,7 +1055,16 @@ pub(crate) fn worker_loop(
                 forwarding = Arc::new(updated);
             }
         }
-        let mut did_work = false;
+        // #7201: a command backlog IS work. `apply_worker_commands` drains at
+        // most `WORKER_COMMAND_DRAIN_BUDGET` per pass so the AF_XDP rings get
+        // serviced between slices; the remainder is only reachable if this loop
+        // comes straight back. Left out of `did_work` — which `poll_binding`
+        // alone would set — a promoted standby with no traffic yet runs
+        // `idle_iters` past `IDLE_SPIN_ITERS` and puts every remaining slice
+        // behind a 1 ms `poll(2)`, so the budget would trade a bounded 3.85 ms
+        // stall for ~16 ms of drain. Seeded here rather than OR-ed after the
+        // sweep so there is one assignment to reason about.
+        let mut did_work = commands_backlogged;
         let mut dbg_poll = DebugPollCounters::default();
         // #1620: read the cold-path sample mask from forwarding state once
         // per poll cycle (rather than per-binding) — it's a daemon-wide

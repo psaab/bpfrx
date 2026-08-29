@@ -6,6 +6,21 @@
 // session_glue/mod.rs.
 
 use super::*;
+use crate::afxdp::worker_queue::WORKER_COMMAND_DRAIN_BUDGET;
+
+// #7201: `apply_worker_commands` now drains a BOUNDED PREFIX
+// (`WORKER_COMMAND_DRAIN_BUDGET` = 256) into a caller-owned scratch deque
+// instead of `core::mem::take`-ing the whole queue, so the worker returns to its
+// AF_XDP rings between slices.
+//
+// Every call below passes a FRESH `&mut VecDeque::new()`, i.e. exactly one
+// bounded pass. That is deliberate and it is not a weakening: no fixture in this
+// file queues anywhere near 256 commands (all 20 command pushes are flat — none
+// sits inside a loop), so one pass drains each batch completely and every cell
+// asserts precisely what it asserted before the budget existed. The budget's own
+// behaviour — the split, the FIFO/order preservation across a split, the
+// backlog signal, the scratch recycling — is covered by the dedicated cells at
+// the end of this file, which queue PAST the budget on purpose.
 use crate::filter::Filter;
 use crate::test_zone_ids::*;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1843,6 +1858,7 @@ fn apply_worker_commands_replaces_stale_local_session_for_inactive_owner_rg() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("synced hit");
@@ -1910,6 +1926,7 @@ fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("live hit");
@@ -1968,6 +1985,7 @@ fn apply_worker_commands_demotes_local_owner_rg_sessions_to_sync_import() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     let Some((_decision, _metadata, origin)) = sessions.entry_with_origin(&key) else {
@@ -2009,6 +2027,7 @@ fn demoted_local_session_promotes_as_synced_on_failback_lookup() {
         &inactive_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -2297,6 +2316,7 @@ fn export_owner_rg_command_does_not_overflow_ring_unbounded() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     // (a) the command recorded the owner RG and sequence.
@@ -2398,6 +2418,7 @@ fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -2471,6 +2492,7 @@ fn apply_worker_commands_does_not_export_missing_neighbor_seed_sessions() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -2521,6 +2543,7 @@ fn apply_worker_commands_demote_owner_rg_returns_cancelled_keys() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     assert_eq!(results.exported_sequences, Vec::<u64>::new());
@@ -2762,6 +2785,7 @@ fn apply_worker_commands_demotes_local_owner_rg_sessions_and_cancels_keys() {
         &BTreeMap::new(),
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -2803,6 +2827,7 @@ fn apply_worker_commands_demote_owner_rg_rewrites_resolution_to_fabric_redirect(
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert_eq!(results.cancelled_keys, vec![key.clone()]);
@@ -2881,6 +2906,7 @@ fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redire
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert_eq!(results.cancelled_keys, vec![reverse_key.clone()]);
@@ -2961,6 +2987,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_cand
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3049,6 +3076,7 @@ fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_se
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3137,6 +3165,7 @@ fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3225,6 +3254,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_remote_reverse_session_on_pee
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3308,6 +3338,7 @@ fn apply_worker_commands_refresh_owner_rg_rewrites_shared_promote_reverse_on_pee
         &ha_state,
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert!(results.cancelled_keys.is_empty());
@@ -3360,6 +3391,7 @@ fn export_owner_rg_sessions_skips_locally_demoted_entries() {
         &BTreeMap::new(),
         &Arc::new(ShardedNeighborMap::new()),
         0,
+        &mut VecDeque::new(),
     );
 
     assert_eq!(results.exported_sequences, vec![11]);
@@ -4621,6 +4653,7 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     // ── (a) Exports preserved ───────────────────────────────────────────────
@@ -4779,6 +4812,7 @@ fn apply_worker_commands_demote_dedup_is_linear_not_quadratic() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
     let elapsed = start.elapsed();
 
@@ -4865,6 +4899,7 @@ fn apply_worker_commands_recovers_poisoned_queue_and_processes_commands() {
         &ha_state,
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     );
 
     // The queued command was processed (NOT the empty "deaf" result the
@@ -5356,6 +5391,7 @@ fn apply_upsert_local_pair(
         &BTreeMap::new(),
         &dynamic_neighbors,
         0,
+        &mut VecDeque::new(),
     )
 }
 
@@ -7729,4 +7765,204 @@ fn the_main_path_passes_a_resolved_arrival_zone_7169() {
         "the only exemption on the installing path is fabric ingress, and it \
          must be gated on it — an unconditional Unconstrained reopens #7169"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #7201: `apply_worker_commands` consults the drain budget.
+// ---------------------------------------------------------------------------
+//
+// The cells in `worker_queue_tests.rs` exercise `drain_bounded_into` DIRECTLY,
+// so all of them stay green if this function is reverted to
+// `core::mem::take(&mut *pending)` — they assert a property of the helper, not
+// of the ingest path. These cells drive the ingest path and are the ones that
+// red on that revert.
+
+/// Queue `n` distinct `ExportOwnerRGSessions` commands, sequences `0..n`.
+///
+/// `ExportOwnerRGSessions` is the probe because `exported_sequences` records one
+/// entry per command IN DISPATCH ORDER, so a batch of them makes the loop's
+/// traversal order directly observable — which is what acceptance criterion 2
+/// needs, and what a `cancelled_keys` set (deduped) or a bool flag could not
+/// show.
+fn queue_exports(commands: &Arc<Mutex<VecDeque<WorkerCommand>>>, n: usize) {
+    let mut pending = commands.lock().expect("commands lock");
+    for sequence in 0..n as u64 {
+        pending.push_back(WorkerCommand::ExportOwnerRGSessions {
+            sequence,
+            owner_rgs: vec![1],
+        });
+    }
+}
+
+fn apply_once(
+    commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
+    sessions: &mut SessionTable,
+    scratch: &mut VecDeque<WorkerCommand>,
+) -> WorkerCommandResults {
+    apply_worker_commands(
+        commands,
+        sessions,
+        -1,
+        -1,
+        -1,
+        &ForwardingState::default(),
+        &BTreeMap::new(),
+        &Arc::new(ShardedNeighborMap::default()),
+        0,
+        scratch,
+    )
+}
+
+#[test]
+fn apply_worker_commands_7201_stops_at_the_budget_and_leaves_the_rest_queued() {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+    let mut scratch = VecDeque::new();
+    let over = WORKER_COMMAND_DRAIN_BUDGET + 44;
+    queue_exports(&commands, over);
+
+    let results = apply_once(&commands, &mut sessions, &mut scratch);
+
+    assert_eq!(
+        results.exported_sequences.len(),
+        WORKER_COMMAND_DRAIN_BUDGET,
+        "one call dispatched {} commands, not the {WORKER_COMMAND_DRAIN_BUDGET}-command \
+         budget. Each command is a session-table mutation plus a BPF-map publish and \
+         the worker does not touch its AF_XDP rings until the loop ends, so an \
+         unbounded drain is unserviced ring time at RG activation (#7201).",
+        results.exported_sequences.len()
+    );
+    assert_eq!(
+        commands.lock().expect("lock").len(),
+        44,
+        "the undispatched remainder must stay in the shared queue"
+    );
+    assert!(
+        results.commands_backlogged,
+        "a split batch reported no backlog, so the worker loop may go idle with \
+         an RG-activation burst still queued"
+    );
+    assert!(
+        scratch.is_empty(),
+        "the scratch buffer must be returned EMPTY — the caller reuses it across \
+         every pass, so a leftover command would be re-dispatched next call"
+    );
+}
+
+#[test]
+fn apply_worker_commands_7201_preserves_dispatch_order_across_a_budget_split() {
+    // Acceptance criterion 2. A budget that capped the count but took from the
+    // back, or filled its quota by skipping, would satisfy the cell above and
+    // still invert the UpsertSynced-then-DeleteSynced transitions the queue
+    // carries for one key.
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+    let mut scratch = VecDeque::new();
+    // Three passes, and a final partial one, so the assertion covers a boundary
+    // that is not merely the first split.
+    let total = WORKER_COMMAND_DRAIN_BUDGET * 3 + 7;
+    queue_exports(&commands, total);
+
+    let mut observed: Vec<u64> = Vec::with_capacity(total);
+    let mut per_pass_max: Vec<u64> = Vec::new();
+    let mut passes = 0;
+    loop {
+        let results = apply_once(&commands, &mut sessions, &mut scratch);
+        passes += 1;
+        if let Some(max) = results.exported_sequences.iter().copied().max() {
+            per_pass_max.push(max);
+        }
+        observed.extend(results.exported_sequences.iter().copied());
+        if !results.commands_backlogged {
+            break;
+        }
+        assert!(passes < 16, "drain did not terminate");
+    }
+
+    assert_eq!(
+        passes, 4,
+        "expected the batch to split across 4 passes at a {WORKER_COMMAND_DRAIN_BUDGET} \
+         budget; a different count means the budget is not the thing bounding the drain"
+    );
+    assert_eq!(
+        observed,
+        (0..total as u64).collect::<Vec<_>>(),
+        "dispatch order was not preserved across the budget split. FIFO and the \
+         ordering groups must survive a split; the pin in \
+         `apply_worker_commands_dispatch_order_pin_with_demote_dedup` covers one \
+         batch, this covers the seam between batches."
+    );
+
+    // Export-ack semantics. `worker/loop_body` stores
+    // `exported_sequences.iter().max()` into `session_export_ack` once per pass,
+    // so a split is only safe if each pass's max is strictly greater than the
+    // last — otherwise the ack the HA peer reads goes BACKWARDS mid-burst.
+    assert_eq!(per_pass_max.len(), passes);
+    assert!(
+        per_pass_max.windows(2).all(|w| w[0] < w[1]),
+        "per-pass export-ack maxima are not strictly increasing ({per_pass_max:?}); \
+         `session_export_ack` is a plain store, so a non-monotonic split would \
+         retract an ack the peer already observed"
+    );
+}
+
+#[test]
+fn apply_worker_commands_7201_does_not_zero_the_shared_queue_capacity() {
+    // Acceptance criterion 3, driven through the ingest path rather than the
+    // helper: the old `core::mem::take(&mut *pending)` moved the producers'
+    // buffer out and left the shared deque at capacity zero, so the producers
+    // regrew it from nothing while holding the lock.
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+    let mut scratch = VecDeque::new();
+    // Under the budget: the queue ends EMPTY either way, so capacity is the only
+    // thing that distinguishes a prefix drain from `mem::take`.
+    queue_exports(&commands, 8);
+    let grown = commands.lock().expect("lock").capacity();
+    assert!(grown >= 8, "precondition: the queue actually allocated");
+
+    let results = apply_once(&commands, &mut sessions, &mut scratch);
+    assert_eq!(results.exported_sequences.len(), 8);
+    assert!(!results.commands_backlogged);
+
+    let queue = commands.lock().expect("lock");
+    assert!(queue.is_empty());
+    assert!(
+        queue.capacity() >= grown,
+        "the shared queue came back at capacity {} (was {grown}) — `mem::take` \
+         leaves it at zero and the producers pay to regrow it under the lock on \
+         every pass",
+        queue.capacity()
+    );
+}
+
+#[test]
+fn apply_worker_commands_7201_empty_and_contended_passes_report_no_backlog() {
+    // The backlog flag drives `did_work`, so a spurious `true` pins a worker to
+    // a hot loop on a core it should have yielded.
+    let commands: Arc<Mutex<VecDeque<WorkerCommand>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let mut sessions = SessionTable::new();
+    let mut scratch = VecDeque::new();
+
+    let results = apply_once(&commands, &mut sessions, &mut scratch);
+    assert!(
+        !results.commands_backlogged,
+        "an empty queue reported a backlog"
+    );
+
+    // Lock held elsewhere: the drain cannot run, and must NOT claim work.
+    queue_exports(&commands, WORKER_COMMAND_DRAIN_BUDGET + 1);
+    let held = commands.lock().expect("hold the lock");
+    let results = apply_once(&commands, &mut sessions, &mut scratch);
+    assert!(
+        results.exported_sequences.is_empty(),
+        "a contended pass dispatched commands"
+    );
+    assert!(
+        !results.commands_backlogged,
+        "a pass that could not take the lock claimed a backlog — the queue is \
+         genuinely non-empty here, but reporting it would pin `did_work` on lock \
+         contention alone, and the next poll is one iteration away"
+    );
+    drop(held);
 }

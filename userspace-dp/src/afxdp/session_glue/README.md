@@ -29,6 +29,50 @@ sees the same sessions the userspace path is processing.
   so the eBPF data-display surface mirrors the live userspace
   session table.
 
+## Command ingest is budgeted (`apply_worker_commands`, #7201)
+
+`apply_worker_commands` is the worker's consumer for its
+`Arc<Mutex<VecDeque<WorkerCommand>>>` queue. It does **not** drain the
+whole queue.
+
+Each pass takes a contiguous FRONT prefix of at most
+`worker_queue::WORKER_COMMAND_DRAIN_BUDGET` (256) commands into a
+caller-owned scratch deque (`drain_bounded_into`), dispatches exactly
+those, and returns `WorkerCommandResults.commands_backlogged` if the
+shared queue still holds more.
+
+Why, and what a change here must not break:
+
+- **Every command is a session-table mutation plus a BPF-map publish
+  syscall, and the worker does not touch its AF_XDP rings until the
+  dispatch loop ends.** Batch size is therefore unserviced ring time.
+  Draining the full #6929 queue cap of 4096 measured 3.85 ms against an
+  RX ring that fills in ~1.97 ms at 25 Gbps — and the burst arrives at
+  RG activation. Before #7201 this was `core::mem::take` of the whole
+  deque and one uninterrupted `for` loop.
+- **The prefix is contiguous and taken from the front,** so FIFO and the
+  ordering groups survive a split by construction. The queue carries
+  ordered state transitions (`UpsertSynced` then `DeleteSynced` for one
+  key); a budget that filled its quota by skipping, or took from the
+  back, would invert a key's state.
+  `apply_worker_commands_dispatch_order_pin_with_demote_dedup` pins the
+  order within one batch;
+  `apply_worker_commands_7201_preserves_dispatch_order_across_a_budget_split`
+  pins it across the seam.
+- **`commands_backlogged` must reach `did_work` in
+  `worker/loop_body`.** It is not a statistic. `did_work` is otherwise
+  set only by `poll_binding`, so dropping this makes the budget worse
+  than the defect: a promoted standby with no traffic yet runs
+  `idle_iters` past `IDLE_SPIN_ITERS` and puts every remaining slice
+  behind a 1 ms `poll(2)` in Interrupt mode.
+- **The scratch deque is worker-owned and recycled** — entered empty,
+  left empty. It is what removed the zero-capacity regrow: `mem::take`
+  handed the worker the producers' allocation and left the shared deque
+  at capacity 0 for the producers to rebuild under the lock every pass.
+- Export acks stay monotonic across a split: `worker/loop_body` stores
+  `exported_sequences.iter().max()` per pass, and FIFO makes each pass's
+  max strictly greater than the last.
+
 ## Terminal-filtered session teardown (`delete_terminal_filtered_session`, #5622)
 
 When an *established* LocalDelivery session re-evaluates a terminal gate

@@ -535,3 +535,168 @@ fn worker_queue_6929_the_wiring_scan_can_actually_see_a_bare_push_back() {
         hits[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7201: the bounded prefix drain.
+// ---------------------------------------------------------------------------
+//
+// The defect: `apply_worker_commands` took the WHOLE deque in one
+// `core::mem::take` and dispatched every command in one uninterrupted loop,
+// never touching its AF_XDP rings until the batch was done. Measured at the
+// #6929 cap of 4096 commands that is 3.85 ms of unserviced rings — a LOWER
+// bound (the measurement ran at `session_map_fd = -1`, so the map syscalls
+// failed at the fd check without paying the kernel-side insert) — against a
+// 4096-slot RX ring that fills in ~1.97 ms at 25 Gbps with 1500 B frames. The
+// burst arrives at RG activation, when the node has just become
+// forwarding-authoritative.
+//
+// A survives-assertion is a FLOOR here just as it was for #6929: draining N
+// commands and checking they all arrive passes identically with NO budget. Every
+// cell below therefore queues PAST the budget and asserts what is left behind.
+
+/// The budget must be a strict fraction of the queue capacity.
+///
+/// Compile-time, because the failure it prevents is silent: at
+/// `WORKER_COMMAND_DRAIN_BUDGET >= MAX_PENDING_WORKER_COMMANDS` the drain can
+/// never leave a remainder, so every behavioural cell below still passes while
+/// the budget has quietly become the take-everything drain it replaced.
+const _: () = assert!(WORKER_COMMAND_DRAIN_BUDGET < MAX_PENDING_WORKER_COMMANDS);
+
+#[test]
+fn worker_queue_7201_drain_takes_the_budget_and_reports_the_remainder() {
+    let mut q: VecDeque<WorkerCommand> = VecDeque::new();
+    let mut scratch: VecDeque<WorkerCommand> = VecDeque::new();
+    let over = WORKER_COMMAND_DRAIN_BUDGET + 44;
+    for i in 0..over {
+        assert!(push_bounded(&mut q, export_command(i as u64)));
+    }
+
+    let backlogged = drain_bounded_into(&mut q, &mut scratch);
+    assert_eq!(
+        scratch.len(),
+        WORKER_COMMAND_DRAIN_BUDGET,
+        "the drain took {} commands instead of the {WORKER_COMMAND_DRAIN_BUDGET}-command \
+         budget — an unbounded drain holds the AF_XDP rings for the whole batch",
+        scratch.len()
+    );
+    assert_eq!(
+        q.len(),
+        44,
+        "the remainder must stay in the SHARED queue for the next pass"
+    );
+    assert!(
+        backlogged,
+        "a drain that left 44 commands behind reported no backlog — the worker \
+         loop reads this to decide whether it may go idle, so a false here parks \
+         the rest of an RG-activation burst behind a 1 ms poll(2) each"
+    );
+
+    // FIFO, and a contiguous PREFIX: not merely 256 of the 300.
+    let taken: Vec<u64> = scratch.iter().map(export_sequence).collect();
+    assert_eq!(
+        taken,
+        (0..WORKER_COMMAND_DRAIN_BUDGET as u64).collect::<Vec<_>>(),
+        "the budget must take the FRONT slice in order; reordering or skipping \
+         breaks the UpsertSynced-then-DeleteSynced transitions the queue carries"
+    );
+    let left: Vec<u64> = q.iter().map(export_sequence).collect();
+    assert_eq!(
+        left,
+        (WORKER_COMMAND_DRAIN_BUDGET as u64..over as u64).collect::<Vec<_>>(),
+        "the remainder must be the untouched suffix, still in order"
+    );
+
+    // Second pass finishes it and clears the backlog signal.
+    scratch.clear();
+    let backlogged = drain_bounded_into(&mut q, &mut scratch);
+    assert_eq!(scratch.len(), 44);
+    assert!(
+        !backlogged,
+        "an emptied queue still reported a backlog — the worker would never go \
+         idle, spinning a pinned core forever"
+    );
+}
+
+#[test]
+fn worker_queue_7201_drain_leaves_the_shared_queue_its_allocation() {
+    // The allocation half of the finding. `core::mem::take(&mut *pending)`
+    // handed the worker the producers' buffer and left the SHARED deque at
+    // capacity zero, so the producers — which hold the lock — reallocated it
+    // from nothing on every single pass.
+    let mut q: VecDeque<WorkerCommand> = VecDeque::new();
+    let mut scratch: VecDeque<WorkerCommand> = VecDeque::new();
+    for i in 0..WORKER_COMMAND_DRAIN_BUDGET {
+        push_bounded(&mut q, export_command(i as u64));
+    }
+    let grown = q.capacity();
+    assert!(grown >= WORKER_COMMAND_DRAIN_BUDGET);
+
+    drain_bounded_into(&mut q, &mut scratch);
+    assert!(
+        q.is_empty(),
+        "precondition: this cell drains the queue completely, so the capacity \
+         it then checks is a RETAINED allocation and not merely an unread tail"
+    );
+    assert!(
+        q.capacity() >= grown,
+        "the drain shrank the shared queue from {grown} to {} — `mem::take` \
+         zeroes it, which is exactly the regrow this replaces",
+        q.capacity()
+    );
+}
+
+#[test]
+fn worker_queue_7201_did_work_consumes_the_backlog_signal() {
+    // `commands_backlogged` is only worth returning if the worker loop acts on
+    // it, and the consumer is a local `did_work` inside a 1500-line function —
+    // no unit fixture can reach it, so the wiring is bound as a source-level
+    // agreement (the #6929 pattern).
+    //
+    // WHY THIS MATTERS MORE THAN IT LOOKS. `did_work` is set ONLY by
+    // `poll_binding`, i.e. by packet work. Command work does not set it. So a
+    // budget WITHOUT this wiring is a REGRESSION, not a partial fix: on a node
+    // with no traffic yet — the standby that has just been promoted, which is
+    // precisely when the RG-activation burst arrives — `idle_iters` runs past
+    // `IDLE_SPIN_ITERS` and every remaining slice waits behind a 1 ms `poll(2)`
+    // in Interrupt mode, turning a bounded 3.85 ms stall into ~16 ms of drain.
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/afxdp/worker/loop_body/mod.rs");
+    let src = std::fs::read_to_string(&path).expect("read worker loop_body");
+    // Comments blanked so this cannot be satisfied by the prose above the line
+    // it is looking for — that comment names `did_work` and `commands_backlogged`
+    // in exactly the shape being matched.
+    let code = blank_comments_and_strings(&src);
+    assert!(
+        code.contains("commands_backlogged"),
+        "precondition: the guard read a tree with no `commands_backlogged` in \
+         it at all, so its agreement check below would pass vacuously"
+    );
+
+    let seeds: Vec<&str> = code
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("let mut did_work"))
+        .collect();
+    assert_eq!(
+        seeds.len(),
+        1,
+        "expected exactly one `did_work` seed to reason about; found {seeds:?}"
+    );
+    assert_eq!(
+        seeds[0], "let mut did_work = commands_backlogged;",
+        "the worker loop no longer seeds `did_work` from the command backlog. A \
+         `let mut did_work = false;` here reverts #7201 to a pure regression: the \
+         budget still splits the batch, but the loop classifies the split passes \
+         as IDLE and parks each remaining slice behind a 1 ms poll(2)."
+    );
+
+    // The destructure must actually bind the field — a `..` rest pattern would
+    // compile, leave `commands_backlogged` unbound, and take the seed line with
+    // it, so pinning the seed alone is not enough.
+    assert!(
+        code.contains("commands_backlogged,\n        } = command_results;")
+            || code.contains("commands_backlogged,\n    } = command_results;"),
+        "`commands_backlogged` must be destructured out of WorkerCommandResults \
+         at the call site, not dropped by a `..` rest pattern"
+    );
+}

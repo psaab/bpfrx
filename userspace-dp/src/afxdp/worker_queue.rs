@@ -35,10 +35,24 @@ pub(in crate::afxdp) static WORKER_COMMAND_QUEUE_POISON_RECOVERIES: AtomicU64 = 
 
 /// #6929: the per-worker command-queue capacity.
 ///
-/// WHY A CAP IS NEEDED AT ALL, since the consumer cannot be outrun. The worker
-/// drain takes the WHOLE deque in one `core::mem::take` (`session_glue::mod.rs`),
-/// so no sustained producer can outpace it — every poll empties the queue. The
-/// unbounded case is not a rate mismatch, it is a consumer that has STOPPED:
+/// WHY A CAP IS NEEDED AT ALL. #6929 justified this cap by observing that the
+/// consumer could not be outrun: the drain took the WHOLE deque in one
+/// `core::mem::take`, so every poll emptied the queue however fast the producer
+/// ran. **That is no longer how the drain works** — #7201 replaced the
+/// take-everything drain with a bounded prefix drain
+/// ([`drain_bounded_into`]), so a poll now removes at most
+/// [`WORKER_COMMAND_DRAIN_BUDGET`] commands and a backlog can persist across
+/// polls.
+///
+/// The cap's justification survives that change, because it never rested on the
+/// drain granularity. What governs whether the cap is reached is the consumer's
+/// PROCESSING rate (~1 µs/command, measured in #7201), not how many commands one
+/// `mem::take` moved: a producer faster than ~1 command/µs reaches the cap under
+/// either drain, and a slower one reaches it under neither. The bounded drain
+/// revisits the queue ~16x more often for the same absorbed throughput.
+///
+/// The unbounded case was never a rate mismatch anyway — it is a consumer that
+/// has STOPPED:
 ///
 ///   - `spawn_supervised_worker` catches a `worker_loop` panic, sets
 ///     `runtime_atomics.dead = true` and lets the thread exit;
@@ -91,6 +105,60 @@ pub(in crate::afxdp) fn push_bounded(
     }
     pending.push_back(cmd);
     true
+}
+
+/// #7201: the most commands one `apply_worker_commands` call may process before
+/// returning to the worker loop.
+///
+/// THIS IS A RING-SERVICE BUDGET, NOT A FAIRNESS KNOB. The worker does not touch
+/// its AF_XDP RX/TX rings while it is applying commands, so the batch size is
+/// wall-clock time the rings go unserviced. `ring_entries` defaults to 4096
+/// (`server/lifecycle.rs`), and at 25 Gbps with 1500 B frames (~2.08 Mpps) a
+/// 4096-slot RX ring fills in ~1.97 ms. A drain of the full
+/// [`MAX_PENDING_WORKER_COMMANDS`] measured 3.85 ms — already past that, and a
+/// LOWER bound, since the measurement ran with `session_map_fd = -1` so the
+/// `bpf_map_update_elem` calls failed at the fd check without paying the
+/// kernel-side hash insert (a forward `publish_live_session_entry` issues up to
+/// four real map updates). That burst arrives at RG activation, the moment the
+/// node has just become forwarding-authoritative.
+///
+/// 256 is the same slice `sessions.drain_deltas(256)` already takes in this
+/// loop, so the worker keeps one batch granularity rather than two. At the
+/// measured ~1 µs/command it bounds the unserviced window to ~256 µs — an order
+/// of magnitude under the ring's fill time, with margin for the real map
+/// syscalls the measurement could not pay.
+pub(in crate::afxdp) const WORKER_COMMAND_DRAIN_BUDGET: usize = 256;
+
+/// Move at most [`WORKER_COMMAND_DRAIN_BUDGET`] commands from the front of
+/// `pending` into `scratch`, returning whether `pending` still holds a backlog.
+///
+/// PREFIX, NOT FILTER. The slice is contiguous and taken from the FRONT, so FIFO
+/// and every ordering group inside the batch survive by construction — there is
+/// no ordering rule for a split to violate that a whole-batch drain would have
+/// honoured. A budget that skipped or reordered commands to fill a quota is what
+/// would break `apply_worker_commands_dispatch_order_pin_with_demote_dedup`.
+///
+/// `scratch` is worker-owned and recycled across calls; it is drained by the
+/// caller, so it keeps its allocation. This is what replaces the
+/// `core::mem::take(&mut *pending)` the drain used to do — that left the SHARED
+/// deque at zero capacity on every pass, forcing the producers (which hold the
+/// lock) to reallocate it from scratch each time.
+///
+/// The caller MUST treat a `true` return as work for the worker loop's idle
+/// regulation. `did_work` in `worker/loop_body` is set only by `poll_binding`,
+/// so a backlog left behind by this budget is invisible to it; on a node with no
+/// traffic yet — the standby that has just been told to take over — `idle_iters`
+/// passes `IDLE_SPIN_ITERS` and each remaining slice lands behind a 1 ms
+/// `poll(2)` in Interrupt mode. That would convert a bounded 3.85 ms stall into
+/// ~16 ms of drain, which is worse than the defect this budget exists to fix.
+#[inline]
+pub(in crate::afxdp) fn drain_bounded_into(
+    pending: &mut VecDeque<WorkerCommand>,
+    scratch: &mut VecDeque<WorkerCommand>,
+) -> bool {
+    let take = pending.len().min(WORKER_COMMAND_DRAIN_BUDGET);
+    scratch.extend(pending.drain(..take));
+    !pending.is_empty()
 }
 
 /// Lock a worker-command queue, recovering and CLEARING poison.
