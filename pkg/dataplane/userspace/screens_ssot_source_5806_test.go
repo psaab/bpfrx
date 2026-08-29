@@ -56,10 +56,31 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 	// constant is a multi-line `+` concatenation, so any fragment spanning a
 	// chunk boundary matches nothing in the source and the guard would pass
 	// vacuously — the self-check below is what catches that.
+	//
+	// #7168 MOVED this guard's subject, and that is the change to understand
+	// before editing it. The tail used to be shared by BOTH no-enforcement
+	// dispositions, because both states had the identical consequence and
+	// differed only in why. An unresolved reference is now enforced against a
+	// substituted conservative default, so "no screen checks are applied" is
+	// false for that state and still true for the inert one. The tail therefore
+	// belongs to ScreenInertDisposition alone, and the self-check anchors there.
+	//
+	// The COUNT property is unchanged and is the point of the guard: the tail
+	// literal must appear exactly once across pkg/ and cmd/, however split
+	// across `+` seams. What changed is which constant is allowed to contain it,
+	// not how many may.
 	const fragment = "checks are applied to this zone; policy evaluation is unaffected"
-	if !strings.Contains(ScreenUnresolvedDisposition, fragment) {
+	if !strings.Contains(ScreenInertDisposition, fragment) {
 		t.Fatalf("guard fragment is stale: %q is not inside the constant %q",
-			fragment, ScreenUnresolvedDisposition)
+			fragment, ScreenInertDisposition)
+	}
+	// And it must NOT have crept back into the unresolved disposition: sharing
+	// the tail again would make that surface assert a consequence the dataplane
+	// contradicts, which is the drift this guard exists to prevent.
+	if strings.Contains(ScreenUnresolvedDisposition, fragment) {
+		t.Errorf("ScreenUnresolvedDisposition contains the no-enforcement tail %q, but "+
+			"#7168 made that claim FALSE for an unresolved reference — the dataplane "+
+			"enforces the substituted conservative default for that zone", fragment)
 	}
 
 	// Count OCCURRENCES, not files: a second copy in the SAME file is exactly as

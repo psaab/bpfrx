@@ -116,6 +116,56 @@ pub(crate) struct ScreenProfile {
     pub alarm_without_drop: bool,
 }
 
+impl ScreenProfile {
+    /// #7168: the profile substituted for a zone whose configured screen
+    /// reference does NOT resolve (a tolerant load of an older/externally
+    /// modified `active.json`, an HA config-sync from a schema-skewed peer, a
+    /// rolling-upgrade interval).
+    ///
+    /// Before this, such a zone got `ScreenVerdict::Pass` — the active config
+    /// said a screen was attached and ZERO checks ran for it, a configured
+    /// security control silently disappearing. Failing CLOSED instead is not
+    /// the answer either: it turns a config-reference typo into a per-zone
+    /// outage on the very path whose reason to exist is #1960 no-brick,
+    /// converting a security gap into an availability incident at exactly the
+    /// moment the tolerant path is load-bearing.
+    ///
+    /// So: enforce the THRESHOLD-FREE malformed-packet subset and synthesise
+    /// none of the rate checks. The line is drawn by whether a value has to be
+    /// GUESSED. The checks enabled here take no operator-supplied threshold and
+    /// drop only packets that are invalid on their face, so they cannot
+    /// black-hole legitimate traffic. The rate checks (`syn_flood`,
+    /// `icmp_flood`, `udp_flood`, `ip_sweep`, `port_scan`, `limit_session`) are
+    /// precisely the ones whose safe value is site-specific — a guessed
+    /// threshold there IS an outage risk — so every threshold stays 0
+    /// (disabled) via `Default`.
+    ///
+    /// `icmp_fragment` is deliberately NOT enabled, even though it is a
+    /// threshold-free bool and would otherwise fit the rule. A fragmented ICMP
+    /// packet is unusual but not malformed — a large ping legitimately
+    /// fragments — so enabling it could black-hole traffic that is merely
+    /// atypical, which is the property that disqualifies the rate checks.
+    ///
+    /// Expressed as a DELTA from `Default` rather than a full literal so the
+    /// fields it does not name stay visibly disabled: a field added to
+    /// `ScreenProfile` later is off here unless someone deliberately turns it
+    /// on, which is the safe direction for a substituted profile.
+    pub(crate) fn conservative_default() -> Self {
+        Self {
+            land: true,
+            syn_fin: true,
+            no_flag: true,
+            fin_no_ack: true,
+            winnuke: true,
+            ping_death: true,
+            teardrop: true,
+            syn_frag: true,
+            source_route: true,
+            ..Self::default()
+        }
+    }
+}
+
 /// Result of a screen check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScreenVerdict {

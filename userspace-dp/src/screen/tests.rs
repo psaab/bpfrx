@@ -4999,12 +4999,19 @@ fn scan_table_pressure_event_fires_rarely_under_flood() {
 
 // A zone that REFERENCES a screen profile undefined at snapshot-build time
 // (no entry in `profiles`, but present in the references-missing set) must take
-// the WARN path on the None branch — yet still return Pass (no verdict change).
+// the WARN path on the None branch, rate-limited to one per zone per second.
 // FAIL-ON-REVERT: revert the references-missing threading (the None branch no
 // longer calls `maybe_warn_missing_profile`, or the set is never populated) and
 // `missing_profile_warn_count()` stays 0 → this test goes RED.
+//
+// #7168 narrowed what the Pass assertions here mean, so read them accordingly.
+// The verdict for an unresolved reference is no longer unconditionally Pass —
+// it is the substituted conservative default. These packets are plain SYNs,
+// which that default does not drop, so the assertions are unchanged and still
+// correct. What they no longer establish is "an unresolved reference always
+// passes"; that claim is now false, and the #7168 cells own the drop side.
 #[test]
-fn missing_profile_reference_warns_but_passes_and_is_rate_limited() {
+fn missing_profile_reference_warns_and_is_rate_limited() {
     let mut state = ScreenState::new();
     let mut missing = FxHashMap::default();
     missing.insert("trust".to_string(), "ghost".to_string());
@@ -5937,4 +5944,176 @@ fn screen_ext_header_depth_agrees_with_the_forwarding_walker_6885() {
         "#6885: both walkers must resolve 0..=7 extension headers and refuse 8 or more — the \
          depth the shim's MAX_EXT_HDRS = MAX_IPV6_EXT_HEADERS - 1 parity note names"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #7168: a zone whose screen reference does not resolve is enforced against the
+// SUBSTITUTED conservative default, not passed outright.
+//
+// Before #7168 the None branch returned `ScreenVerdict::Pass`: the active
+// config said a screen was attached to the zone and ZERO checks ran for it, on
+// the three paths #5806 enumerates (tolerant load of an older/externally
+// modified active.json, HA config-sync from a schema-skewed peer, rolling
+// upgrade intervals). Failing CLOSED was rejected as the fix because it turns a
+// config-reference typo into a per-zone outage on the one path whose reason to
+// exist is #1960 no-brick.
+//
+// The two halves below must BOTH hold, and they pull in opposite directions —
+// which is the point. Enforcing too little is the security hole; enforcing too
+// much is the availability incident the fail-closed option was rejected for. A
+// test suite that only asserted the drops would be satisfied by a substitution
+// that turned everything on.
+// ---------------------------------------------------------------------------
+
+fn missing_ref_state(zone: &str, profile: &str) -> ScreenState {
+    let mut state = ScreenState::new();
+    let mut missing = FxHashMap::default();
+    missing.insert(zone.to_string(), profile.to_string());
+    state.update_missing_profiles(missing);
+    state
+}
+
+// Acceptance: a LAND packet (src == dst) to a dangling-reference zone is
+// DROPPED. Reverting `missing_profile_verdict` to `ScreenVerdict::Pass` reds
+// this.
+#[test]
+fn substituted_default_drops_land_on_the_flow_path_7168() {
+    let mut state = missing_ref_state("trust", "ghost");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert!(
+        matches!(state.check_packet("trust", &land, 1), ScreenVerdict::Drop(_)),
+        "a LAND packet to a zone whose screen reference did not resolve must be dropped by \
+         the #7168 substituted conservative default, not passed"
+    );
+    assert_eq!(
+        state.substituted_default_drops(),
+        1,
+        "a drop by the substituted default must be counted separately — it means a broken \
+         screen reference is being masked, which the operator still has to fix"
+    );
+}
+
+// The flowless path (non-first fragment / non-query ICMP) must substitute too.
+// It is a SEPARATE None branch, so fixing one and not the other is live.
+#[test]
+fn substituted_default_drops_on_the_flowless_path_7168() {
+    let mut state = missing_ref_state("trust", "ghost");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = flowless_icmp_pkt(same, same);
+    assert!(
+        matches!(
+            state.check_flowless_screens("trust", &land, true, 1),
+            ScreenVerdict::Drop(_)
+        ),
+        "the flowless None branch must substitute the conservative default too — it is a \
+         separate branch from the flow-present one, so fixing only one leaves a live hole"
+    );
+}
+
+// LAND compares source against destination, so it is only meaningful when the
+// caller supplied real L3 addresses. With addrs_known=false the substitution
+// must NOT invent a verdict from addresses it does not have.
+#[test]
+fn substituted_default_skips_land_when_addresses_are_unknown_7168() {
+    let mut state = missing_ref_state("trust", "ghost");
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = flowless_icmp_pkt(same, same);
+    assert_eq!(
+        state.check_flowless_screens("trust", &land, false, 1),
+        ScreenVerdict::Pass,
+        "with addrs_known=false the addresses are not the packet's real ones, so LAND must \
+         not be evaluated against them"
+    );
+}
+
+// Acceptance, and the half that stops this fix becoming the outage the
+// fail-closed option was rejected for: the RATE checks must NOT be synthesised.
+// A SYN burst far beyond any plausible syn-flood threshold still passes.
+//
+// WHAT THIS CELL CAN AND CANNOT SEE — measured, not assumed. Setting
+// `syn_flood_threshold: 100` in conservative_default does NOT red this test.
+// That is not a gap in the fixture, it is the structural guarantee showing
+// through: the substituted path runs only STATELESS checks, because the rate
+// checks need per-zone tracker and sketch state that does not exist for an
+// unresolved zone, so a threshold set there is inert and unreachable. The cell
+// that actually catches a synthesised threshold today is the field-level
+// assertion in substituted_default_excludes_icmp_fragment_7168, which reds on
+// exactly that mutation.
+//
+// This test is kept anyway, and the reason is worth stating: it guards the
+// FUTURE change, not the current code. The day someone wires zone state into
+// this path — giving the rate checks something to run against — the structural
+// guarantee evaporates and this becomes the cell that notices. Presenting it as
+// load-bearing against today's code would be overclaiming; deleting it would
+// remove the only behavioural guard on the property that matters.
+#[test]
+fn substituted_default_does_not_synthesise_rate_checks_7168() {
+    let mut state = missing_ref_state("trust", "ghost");
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
+    let syn = tcp_pkt(src, dst, 5000, 80, TCP_SYN);
+    for i in 0..5_000 {
+        assert_eq!(
+            state.check_packet("trust", &syn, 1),
+            ScreenVerdict::Pass,
+            "packet {i} of a 5000-SYN burst was dropped: the substitution synthesised a \
+             rate threshold. It must not — a guessed flood threshold is site-specific and \
+             would make this fix an availability incident, which is exactly why failing \
+             CLOSED was rejected"
+        );
+    }
+    assert_eq!(
+        state.substituted_default_drops(),
+        0,
+        "no drops expected from a burst of well-formed SYNs"
+    );
+}
+
+// Control: a zone with NO screen configured at all is a legitimate
+// configuration, not a fault, and must still pass silently. Without this, a
+// substitution that fired for every unresolved lookup — including zones that
+// never referenced a screen — would pass every cell above while screening
+// traffic the operator never asked to screen.
+#[test]
+fn zone_with_no_screen_configured_is_not_substituted_7168() {
+    let mut state = ScreenState::new(); // no missing-refs entry at all
+    let same = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let land = tcp_pkt(same, same, 5000, 5000, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &land, 1),
+        ScreenVerdict::Pass,
+        "a zone with no screen configured must pass silently — substituting a default there \
+         would enforce screens the operator never configured"
+    );
+    assert_eq!(state.substituted_default_drops(), 0);
+    assert_eq!(
+        state.missing_profile_warn_count(),
+        0,
+        "and it must not WARN either — there is no fault to report"
+    );
+}
+
+// icmp-fragment is deliberately NOT in the substituted subset, even though it is
+// a threshold-free bool that otherwise fits the rule. A fragmented ICMP packet
+// is unusual but not malformed — a large ping legitimately fragments — so
+// enabling it could black-hole traffic that is merely atypical. Pinned so the
+// exclusion is a decision rather than an oversight someone "fixes" later.
+#[test]
+fn substituted_default_excludes_icmp_fragment_7168() {
+    let p = ScreenProfile::conservative_default();
+    assert!(!p.icmp_fragment, "icmp-fragment must stay disabled in the substituted default");
+    assert!(p.land && p.teardrop && p.winnuke && p.syn_fin && p.no_flag);
+    assert!(p.fin_no_ack && p.syn_frag && p.ping_death && p.source_route);
+    // Every threshold disabled — the property the burst test exercises
+    // behaviourally, stated here directly so a new threshold field added to the
+    // struct is visibly off unless someone deliberately turns it on.
+    assert_eq!(p.syn_flood_threshold, 0);
+    assert_eq!(p.icmp_flood_threshold, 0);
+    assert_eq!(p.udp_flood_threshold, 0);
+    assert_eq!(p.port_scan_threshold, 0);
+    assert_eq!(p.ip_sweep_threshold, 0);
+    assert_eq!(p.session_limit_src, 0);
+    assert_eq!(p.session_limit_dst, 0);
+    assert!(!p.alarm_without_drop, "the substitute must DROP, not merely alarm");
 }

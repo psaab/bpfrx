@@ -189,6 +189,13 @@ func TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad(t *testing.T) {
 		t.Errorf("HELP disposition must carry the #5806 anchor so a posture change "+
 			"greps to this claim; got %q", help)
 	}
+	// The posture change #5806 anticipated arrived in #7168, so its anchor is
+	// load-bearing too. Both are required: #5806 is the lineage a reader may
+	// grep from, #7168 is what the runtime does today.
+	if !strings.Contains(help, "7168") {
+		t.Errorf("HELP disposition must carry the #7168 anchor (the settled posture); "+
+			"got %q", help)
+	}
 
 	for k := range got {
 		if k.zone == "wan" {

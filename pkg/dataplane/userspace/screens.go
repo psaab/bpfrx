@@ -209,16 +209,33 @@ func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 // posture is an OPEN design decision owned by #5806; when it is settled, a grep
 // for 5806 must land on every place that asserts today's behaviour, including
 // this one.
-const ScreenUnresolvedDisposition = "the profile reference does not resolve, " +
-	screenNoEnforcementTail
-
-// screenNoEnforcementTail is the half of the disposition sentence that is TRUE
-// OF BOTH no-enforcement states and must therefore exist exactly once (#7059).
+// #7168 SPLIT this from screenNoEnforcementTail, which it used to share.
 //
-// The two dispositions differ only in WHY nothing is enforced; what happens next
-// — no screen checks, policy evaluation unaffected, pending the #5806 posture
-// decision — is identical, and if the copies ever diverged one surface would be
-// describing a consequence the other denies.
+// The tail exists because both no-enforcement states had an IDENTICAL
+// consequence and only differed in WHY. That is no longer true. An unresolved
+// reference is now enforced against the substituted conservative default, so
+// "no screen checks are applied to this zone" — the tail's central claim — is
+// FALSE for this state and remains true for the inert one. Continuing to share
+// the tail would make this surface assert a consequence the code contradicts,
+// which is the exact failure the single-sourcing was built to prevent, arriving
+// from the other direction: the risk was never two copies as such, it was two
+// statements of one fact drifting apart. Here the FACT diverged, so the
+// sentences must.
+//
+// TestScreenUnresolvedDispositionHasOneSource still counts the tail literal and
+// still requires exactly one occurrence; its self-check now anchors on
+// ScreenInertDisposition, the constant that still owns the tail.
+const ScreenUnresolvedDisposition = "the profile reference does not resolve, so " +
+	"the dataplane enforces a substituted conservative default for this zone — the " +
+	"threshold-free malformed-packet checks only (land, teardrop, winnuke, syn-fin, " +
+	"no-flag, fin-no-ack, syn-frag, ping-death, source-route-option), with NO " +
+	"flood, scan or session-limit thresholds synthesised; policy evaluation is " +
+	"unaffected. The zone is protected but its configured profile is NOT in " +
+	"effect, so the reference still needs fixing (#5806 posture, resolved in #7168)"
+
+// screenNoEnforcementTail is the half of the disposition sentence that must
+// exist exactly once (#7059). It is now used by ScreenInertDisposition alone —
+// see the #7168 note above for why the unresolved state no longer shares it.
 // TestScreenUnresolvedDispositionHasOneSource enforces exactly this: it counts
 // the sentence as a source literal across pkg/ and cmd/ and requires exactly
 // one. Writing the second disposition as its own full sentence reddened that
