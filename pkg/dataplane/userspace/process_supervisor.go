@@ -90,25 +90,99 @@ func (g *helperGeneration) describeExit() string {
 	return fmt.Sprintf("exit status %d", g.state.ExitCode())
 }
 
-// helperCrashState is the operator-visible record of the last unexpected exit
+// exitCodeAndSignal returns the child's disposition as two separable values:
+// the exit status (or -1) and the signal name (or ""). #7250 — describeExit
+// folds both into one prose string that a renderer cannot take apart again.
+func (g *helperGeneration) exitCodeAndSignal() (int, string) {
+	if g.state == nil {
+		return -1, ""
+	}
+	if ws, ok := g.state.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return -1, ws.Signal().String()
+	}
+	return g.state.ExitCode(), ""
+}
+
+// HelperCrashRecord is the operator-visible record of the last unexpected exit
 // and the backoff it drives.
-type helperCrashState struct {
-	// Crashed is set while the manager is between an unexpected exit and a
-	// successful restart. It is what makes the staleness observable instead of
-	// having to be inferred from a nil pointer.
-	Crashed bool
+//
+// #7250: EXPORTED, because the previous unexported `HelperCrashRecord` could be
+// returned but not NAMED by an out-of-package caller — and a status surface is
+// exactly such a caller. It could hold the value and not declare a variable, a
+// struct field or a parameter for it, which made the accessor unusable for the
+// thing it exists to feed. The type is named ...Record rather than ...State so
+// it does not collide with the Manager.HelperCrashState() accessor.
+type HelperCrashRecord struct {
+	// LastExitWasCrash is set while the manager is between an unexpected exit
+	// and a successful restart. It is what makes the staleness observable
+	// instead of having to be inferred from a nil pointer.
+	//
+	// #7250: renamed from `Crashed`, which was read as BOTH "the last exit was
+	// unexpected" and "a restart is coming" — two facts that diverge. This is
+	// the first one, and it is deliberately NOT cleared by an intentional stop:
+	// `ensureProcessLocked` calls the same `stopLocked` when a spawn misses its
+	// readiness wait, and the retry path depends on this flag as its debt
+	// (clearing it turned TestRestartUsesTheCurrentConfigNotTheDeadGeneration5838
+	// red). Use RestartPending for the other fact.
+	LastExitWasCrash bool
 	// Detail is the reaped disposition ("exit status 101", "killed by signal
-	// killed"). Never carries a secret.
+	// killed"). Never carries a secret. Kept for display; prefer ExitCode /
+	// Signal when deciding anything.
 	Detail string
+	// ExitCode is the child's exit status, or -1 when it was signalled or the
+	// status could not be read (#7250). Exactly one of ExitCode >= 0 and
+	// Signal != "" is meaningful, and Signal is the discriminator.
+	//
+	// Split out because Detail folded the two into one string, and a renderer
+	// cannot reliably take them apart again — "killed by signal killed" and
+	// "exit status 101" have no common grammar to parse.
+	ExitCode int
+	// Signal is the signal name when the child was killed by one, otherwise "".
+	Signal string
 	// PID is the dead child, kept so an operator can correlate with journald.
 	PID int
 	// At is when the exit was observed.
 	At time.Time
 	// Restarts counts consecutive restart ATTEMPTS since the last helper that
-	// reached readiness. It drives the backoff and is reset on success.
+	// reached readiness.
 	Restarts int
-	// NextRestart is the deadline the pending restart is scheduled for.
+	// NextRestart is when the armed retry is due. Only meaningful when
+	// RestartPending is true — after an intentional stop this is a time in the
+	// PAST with no timer behind it (#7250).
 	NextRestart time.Time
+	// RestartPending reports whether a retry is actually armed and will fire.
+	//
+	// #7250: DERIVED in HelperCrashState() from the live generation rather than
+	// stored, because a stored flag is exactly what went stale. An intentional
+	// stop advances procGen, which orphans the armed timer without clearing the
+	// crash record — so before this, a renderer would have reported a restart
+	// that was never going to happen.
+	RestartPending bool
+	// restartGen is the process generation the pending retry was armed for.
+	// Unexported: it is an internal fence, not something a renderer should see
+	// or construct.
+	restartGen uint64
+}
+
+// CrashLooping reports whether the helper should be treated as not coming back.
+//
+// #7250 asked for "a predicate an operator or a health surface can read", and
+// noted it needs deciding rather than plumbing. The decision: crash-looping is
+// BACKOFF AT THE CAP, not a raw restart count.
+//
+// A count threshold is time-blind — twenty restarts over a week and twenty in a
+// minute are different situations and a bare counter cannot tell them apart.
+// The backoff already encodes the time dimension: it doubles from
+// helperRestartBackoffBase and saturates at helperRestartBackoffMax, so reaching
+// the cap means the supervisor has exhausted its escalation and is now retrying
+// at its slowest rate. With the shipped 1s base and 60s cap that is roughly two
+// minutes of uninterrupted failure, and it does not fire for a helper that
+// crashed once an hour ago.
+//
+// Derived, never stored, for the same reason RestartPending is: a stored
+// judgement about the present is the thing that goes stale.
+func (r HelperCrashRecord) CrashLooping() bool {
+	return r.LastExitWasCrash && helperRestartDelay(r.Restarts) >= helperRestartBackoffMax
 }
 
 // Helper restart backoff. Bounded exponential from base to max, so a helper
@@ -224,12 +298,18 @@ func (m *Manager) handleUnexpectedHelperExitLocked(g *helperGeneration) {
 	m.proc = nil
 	m.resetAfterHelperGoneLocked()
 
-	m.helperCrash = helperCrashState{
-		Crashed:  true,
-		Detail:   detail,
-		PID:      pid,
-		At:       time.Now(),
-		Restarts: m.helperCrash.Restarts,
+	exitCode, signal := g.exitCodeAndSignal()
+	m.helperCrash = HelperCrashRecord{
+		LastExitWasCrash: true,
+		Detail:           detail,
+		ExitCode:         exitCode,
+		Signal:           signal,
+		PID:              pid,
+		At:               time.Now(),
+		Restarts:         m.helperCrash.Restarts,
+		// #7250: the generation this retry is fenced on, so
+		// HelperCrashState() can tell an armed restart from an orphaned one.
+		restartGen: g.gen,
 	}
 	m.scheduleHelperRestartLocked(g.gen)
 }
@@ -260,7 +340,7 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	defer m.mu.Unlock()
 	// Fences: a newer generation exists (someone already restarted or Stop ran
 	// and respawned), or a helper is running again, or the crash was cleared.
-	if m.procGen != gen || m.proc != nil || !m.helperCrash.Crashed {
+	if m.procGen != gen || m.proc != nil || !m.helperCrash.LastExitWasCrash {
 		return
 	}
 	if err := m.ensureProcessLocked(m.cfg); err != nil {
@@ -274,7 +354,7 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	}
 	slog.Info("userspace dataplane helper restarted after unexpected exit",
 		"attempts", m.helperCrash.Restarts)
-	m.helperCrash = helperCrashState{}
+	m.helperCrash = HelperCrashRecord{}
 	// The crash tore the 1 Hz reconcile loop down with the generation it was
 	// polling; the replacement needs its own.
 	m.ensureStatusLoopLocked()
@@ -282,8 +362,18 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 
 // HelperCrashState returns the last unexpected-exit record, for status
 // rendering and tests. The zero value means no crash is on record.
-func (m *Manager) HelperCrashState() helperCrashState {
+func (m *Manager) HelperCrashState() HelperCrashRecord {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.helperCrash
+	rec := m.helperCrash
+	// #7250: DERIVE RestartPending here rather than storing it. An armed retry
+	// is fenced on the generation that died; an intentional stop advances
+	// procGen and orphans the timer WITHOUT clearing the crash record, so a
+	// stored flag would report a restart that will never fire. The fence is the
+	// same one restartHelperAfterCrash applies, read at the moment the caller
+	// asks.
+	rec.RestartPending = rec.LastExitWasCrash &&
+		m.proc == nil &&
+		m.procGen == rec.restartGen
+	return rec
 }
