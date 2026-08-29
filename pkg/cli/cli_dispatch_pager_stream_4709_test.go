@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/cliterm"
 )
 
 func bufioReader(s string) *bufio.Reader {
@@ -205,10 +207,14 @@ func TestLineSourceSemantics(t *testing.T) {
 		{"a\r\nb\r\n", []string{"a\r", "b\r"}}, // only "\n" is the delimiter
 	}
 	for _, tc := range cases {
-		ls := &lineSource{r: bufioReader(tc.in)}
+		// #7210: LineSource moved to pkg/cliterm and is now shared with the
+		// remote CLI. This test moved with it rather than being left pointing
+		// at a name that no longer exists — the splitting contract it pins is
+		// unchanged and now covers BOTH surfaces.
+		ls := cliterm.NewLineSource(strings.NewReader(tc.in))
 		var got []string
-		for ls.hasMore() {
-			l, ok := ls.next()
+		for ls.HasMore() {
+			l, ok := ls.Next()
 			if !ok {
 				t.Fatalf("hasMore/next disagreed for %q", tc.in)
 			}

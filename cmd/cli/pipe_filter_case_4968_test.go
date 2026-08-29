@@ -3,12 +3,28 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/cliterm"
 )
 
-// TestApplyPipeFilterCaseSensitive pins the remote CLI pipe filter to the same
-// case-SENSITIVE semantics as the local CLI's pkg/cli.filterStream. Junos
-// `| match` never case-folds; the earlier remote implementation lowercased both
-// operands, so `| match Foo` matched `foo` on remote but not local (#4968).
+// TestApplyPipeFilterCaseSensitive pins the remote CLI pipe filter to
+// case-SENSITIVE semantics. Junos `| match` never case-folds; the earlier remote
+// implementation lowercased both operands, so `| match Foo` matched `foo` on
+// remote but not local (#4968).
+//
+// #7210 changed what this test can fail on, so read the change before trusting
+// it. The remote surface no longer has its own filter: it calls
+// cliterm.FilterStream, the same implementation pkg/cli uses. The specific
+// divergence #4968 found is therefore structurally impossible now rather than
+// merely tested against.
+//
+// The test is KEPT and pointed at the shared function rather than deleted,
+// because the property it pins — these semantics are case-sensitive — is still
+// worth a guard, and the assertions are unchanged. What it no longer proves on
+// its own is that the two surfaces AGREE; that is now carried by
+// TestRemotePipeUsesTheSharedFilter7210, which pins the delegation itself. A
+// test that outlives the structure it was written for should say which half of
+// its original claim it still carries.
 func TestApplyPipeFilterCaseSensitive(t *testing.T) {
 	lines := []string{
 		"Foo matches exactly",
@@ -52,10 +68,11 @@ func TestApplyPipeFilterCaseSensitive(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf strings.Builder
-			applyPipeFilter(lines, &buf, tc.pipeType, tc.pipeArg)
+			cliterm.FilterStream(strings.NewReader(strings.Join(lines, "\n")+"\n"),
+				&buf, tc.pipeType, tc.pipeArg)
 			got := splitNonEmptyLines(buf.String())
 			if !equalStringSlices(got, tc.want) {
-				t.Fatalf("applyPipeFilter(%q, %q) = %#v, want %#v",
+				t.Fatalf("FilterStream(%q, %q) = %#v, want %#v",
 					tc.pipeType, tc.pipeArg, got, tc.want)
 			}
 		})
