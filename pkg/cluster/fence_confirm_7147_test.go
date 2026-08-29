@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // #7147 — the `peer-fencing disable-rg-confirmed` policy at the Manager level.
@@ -297,17 +299,121 @@ func TestConfirmationCountersAreRendered7147(t *testing.T) {
 	}
 }
 
-// The policy string the runtime branches on must be the one the config
-// compiler can actually produce. A constant that disagreed with the schema
-// enum would compile, pass every test above (they all use the constant), and
-// silently no-op in production.
-func TestPolicyConstantsMatchTheConfigEnum7147(t *testing.T) {
+// The policy strings the runtime branches on must be values an operator can
+// actually COMMIT. A constant that disagreed with the config schema's enum
+// would compile, pass every test above (they all use the constant, so they
+// agree with themselves by construction), and silently no-op in production —
+// handlePeerTimeout would match neither arm and fence nothing.
+//
+// So this asserts the AGREEMENT by driving the real schema validator, rather
+// than pinning the constants to literals. Pinning would only prove the
+// constants equal whatever this test also hard-codes; it could not see the
+// schema rejecting them. The near-miss rows are what stop the check passing on
+// a validator loosened to a prefix match.
+func TestPolicyConstantsAreCommittable7147(t *testing.T) {
 	t.Parallel()
-	if PeerFencingDisableRG != "disable-rg" {
-		t.Errorf("PeerFencingDisableRG = %q, want the committed leaf value", PeerFencingDisableRG)
+
+	commit := func(t *testing.T, value string) error {
+		t.Helper()
+		tree := &config.ConfigTree{}
+		path, err := config.ParseSetCommand("set chassis cluster peer-fencing " + value)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", value, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", value, err)
+		}
+		return config.SchemaValidate(tree, nil)
 	}
-	if PeerFencingDisableRGConfirmed != "disable-rg-confirmed" {
-		t.Errorf("PeerFencingDisableRGConfirmed = %q, want the committed leaf value",
-			PeerFencingDisableRGConfirmed)
+
+	for _, v := range []string{PeerFencingDisableRG, PeerFencingDisableRGConfirmed} {
+		if err := commit(t, v); err != nil {
+			t.Errorf("the runtime branches on peer-fencing %q but the config schema "+
+				"REJECTS it (%v). handlePeerTimeout would match neither arm and fence "+
+				"nothing, while every other test here still passed because they all use "+
+				"this same constant.", v, err)
+		}
+	}
+
+	// Guard the guard: if the schema accepted anything, the loop above would
+	// pass no matter what the constants said.
+	for _, v := range []string{"disable-rg-confirm", "shoot-the-other-node"} {
+		if err := commit(t, v); err == nil {
+			t.Errorf("the schema accepted peer-fencing %q; the acceptance check above "+
+				"then proves nothing about the real constants", v)
+		}
+	}
+}
+
+// THE HAZARD THE FIRST DRAFT OF THIS SUITE COULD NOT SEE.
+//
+// `awaitPeerFenceLocked` releases m.mu across the wait. handlePeerTimeout sets
+// peerAlive=false precisely to BYPASS electSingleNode's #7161 readiness gate
+// (armed only when `controlInterface != "" && (peerAlive || !peerEverSeen)`),
+// so a heartbeat landing inside that window re-arms the gate and the election
+// declines to promote — after the peer has already been fenced dark. Peer dark
+// plus local node passive is a total outage, produced by the very policy that
+// exists to prevent split-brain.
+//
+// Every other test in this file is STRUCTURALLY BLIND to it: confirmFenceManager
+// builds its config with makeConfig, which never sets ControlInterface, so
+// `m.controlInterface == ""` makes the gate arm unreachable and the window
+// cannot change any outcome. This fixture arms the gate (ControlInterface set,
+// a takeover hold running so the RG is not takeover-ready) and simulates the
+// racing heartbeat from inside the confirm callback — the one place that is
+// genuinely inside the window.
+func TestConfirmedFencePromotesEvenIfAHeartbeatLandsInTheWindow7147(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100}))
+	cfg.PeerFencing = PeerFencingDisableRGConfirmed
+	// Arm the election gates: without this the branch under test is dead code
+	// and the test would pass against the unfixed implementation.
+	cfg.ControlInterface = "em0"
+	cfg.TakeoverHoldTime = int((30 * time.Second) / time.Millisecond)
+	m.UpdateConfig(cfg)
+
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	for _, rg := range m.groups {
+		rg.State = StateSecondary
+		// Ready, but only just — so IsReadyForTakeover is false for the whole
+		// takeover-hold window and readinessGateVerdictLocked would decline if
+		// the gate were armed.
+		rg.Ready = true
+		rg.ReadySince = time.Now()
+	}
+	if m.controlInterface == "" {
+		m.mu.Unlock()
+		t.Fatal("fixture did not arm the readiness gate (controlInterface empty); " +
+			"this test cannot observe the hazard it exists for")
+	}
+	if m.groups[0].IsReadyForTakeover(m.takeoverHoldTime) {
+		m.mu.Unlock()
+		t.Fatal("fixture RG is already takeover-ready, so the readiness gate would " +
+			"permit promotion regardless and the test would pass either way")
+	}
+	m.mu.Unlock()
+
+	m.SetPeerFenceConfirmFunc(func(time.Duration) (FenceAck, error) {
+		// Inside the window: m.mu is released here, exactly as a blocked
+		// handlePeerHeartbeat goroutine would find it. Take it and set
+		// peerAlive, which is all handlePeerHeartbeat needs to do to re-arm
+		// the gate.
+		m.mu.Lock()
+		m.peerAlive = true
+		m.mu.Unlock()
+		// The peer HAS been fenced: it reports every RG disabled.
+		return FenceAck{Status: FenceAckOK, RGsFenced: 1, RGsTotal: 1}, nil
+	})
+
+	m.handlePeerTimeout()
+
+	if got := rgState(t, m, 0); got != StatePrimary {
+		t.Fatalf("node is %v after a CONFIRMED fence, want primary. A heartbeat that "+
+			"landed while awaitPeerFenceLocked held m.mu open re-armed the #7161 "+
+			"readiness gate, so electSingleNode declined to promote — while the peer "+
+			"had already driven every RG to rg_active=false in response to our fence. "+
+			"Peer dark, this node passive: no primary anywhere.", got)
 	}
 }

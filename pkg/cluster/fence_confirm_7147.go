@@ -28,23 +28,40 @@ const (
 //
 // The wait can only be entered when the session-sync socket is live
 // (SendFenceAwait returns immediately with "peer not connected" otherwise), so
-// the EXPECTED cost is one TCP round trip on the fabric link plus the peer's
-// fenceAllRedundancyGroups — sub-millisecond plus a handful of dataplane
-// writes. 250ms is roughly three orders of magnitude of headroom over that.
+// the ordinary dead-peer takeover never spends any of it.
 //
-// The bound matters for the one case that does spend it: a peer that has lost
-// power while its TCP socket has not yet noticed. There the socket looks alive,
-// no ack ever comes, and this timeout is what releases the takeover. It is
-// therefore sized against the heartbeat detection window that precedes it —
-// 200ms interval x threshold 5 = ~1s — so the worst case adds ~25% to a
-// detection that has already taken a second, rather than to the ~60ms VRRP
-// number, which this path is not on.
+// WHAT THE PEER ACTUALLY DOES BEFORE IT CAN ANSWER. This was mis-sized at
+// first, on the assumption that the receiver's fence is a fabric round trip
+// plus "a handful of dataplane writes". It is not. Each RG's
+// SetRGActive(false) reaches userspace Manager.UpdateRGActive, which takes the
+// helper manager's OWN mutex — shared with the 1/s status poll, session
+// installs and snapshot apply — and issues an `update_ha_state` request on the
+// shared control socket, whose base deadline is controlBaseDeadline = 3s
+// (pkg/dataplane/userspace/process_control.go). That happens once per RG,
+// sequentially, and the reply then queues behind s.writeMu, which a stalled
+// send loop can hold for syncWriteDeadline = 2s. A peer loss frequently
+// follows a fabric reconnect, i.e. exactly when that socket is most contended.
+//
+// So no bound short enough to sit in a takeover path can GUARANTEE the ack
+// arrives. This value is therefore a POLICY bound, not a derivation of the
+// peer's worst case: wait long enough that an uncontended cluster — where the
+// round trip is milliseconds — actually gets its confirmation, and fail open
+// rather than let a contended control socket hold the takeover.
+//
+// 1s is that compromise. It comfortably covers several control round trips on
+// an idle helper, it is bounded well below a single 3s control deadline so a
+// genuinely wedged socket fails open instead of stalling, and it is on the
+// order of the ~1s heartbeat detection (200ms interval x threshold 5) that
+// already elapsed before this code runs — not the ~60ms VRRP number, which
+// this path is not on. FenceAcksTimedOut is what tells an operator the bound
+// is being exceeded in practice.
 //
 // It is not configurable because there is no operator input that would improve
-// it: shorter defeats the purpose on a loaded fabric, longer extends an outage
-// window in the only case that reaches it, and the policy leaf already
-// expresses the one decision an operator actually has (gate, or do not).
-const FenceConfirmTimeout = 250 * time.Millisecond
+// it: shorter stops the gate ever engaging on a loaded fabric, longer extends
+// an outage window in the only case that reaches it, and the policy leaf
+// already expresses the one decision an operator actually has (gate, or do
+// not).
+const FenceConfirmTimeout = 1 * time.Second
 
 // awaitPeerFenceLocked runs the confirmed peer fence.
 //
@@ -88,11 +105,18 @@ const FenceConfirmTimeout = 250 * time.Millisecond
 // runs BEFORE anything has been fenced, which is what makes aborting safe
 // there and unsafe here.)
 //
-// Second, handlePeerTimeout runs on the heartbeat receive path, so the wait
-// also delays heartbeat processing by up to FenceConfirmTimeout. That is
-// bounded, opt-in, and confined to the peer-loss event itself, which is why it
-// is accepted rather than moved to a goroutine — a fence that completed
-// asynchronously could not gate the election it exists to precede.
+// Second, on WHICH goroutine this blocks — the answer matters, because
+// believing it was the receive path is what made the hazard above look
+// impossible. handlePeerTimeout runs on heartbeatReceiver.timeoutLoop, a
+// dedicated ticker goroutine (heartbeat.go), NOT on the frame-receive path
+// that runs handlePeerHeartbeat. Those are different goroutines, so the
+// receive path keeps running for the whole wait — which is precisely how a
+// late heartbeat gets in to flip peerAlive.
+//
+// The cost of the wait itself is therefore only a delayed next timeout tick,
+// which is harmless: the re-entry hits handlePeerTimeout's `!m.peerAlive`
+// early return. The wait is not moved to a goroutine because a fence that
+// completed asynchronously could not gate the election it exists to precede.
 func (m *Manager) awaitPeerFenceLocked() {
 	fn := m.peerFenceConfirmFn
 	if fn == nil {
@@ -105,6 +129,38 @@ func (m *Manager) awaitPeerFenceLocked() {
 	m.mu.Unlock()
 	ack, err := fn(FenceConfirmTimeout)
 	m.mu.Lock()
+	// RE-ESTABLISH THE PEER-LOST DECISION. This is not defensive tidying; it
+	// repairs an atomicity that releasing m.mu above breaks, and getting it
+	// wrong strands the cluster with NO primary.
+	//
+	// handlePeerTimeout sets m.peerAlive = false specifically so that
+	// electSingleNode's #7161 readiness gate — armed only when
+	// `m.controlInterface != "" && (m.peerAlive || !m.peerEverSeen)`
+	// (election.go) — is BYPASSED on a genuine peer loss. Pre-#7147 that write
+	// and the election ran under one unbroken hold, so nothing could flip it in
+	// between. The wait above opens exactly that window, and
+	// handlePeerHeartbeat runs on a DIFFERENT goroutine that is blocked on
+	// m.mu: the moment we release it, a late heartbeat frame can set
+	// peerAlive = true.
+	//
+	// The consequence is not a stale field. It re-arms the readiness gate, so
+	// electSingleNode reaches `if !promote { continue }` and declines to
+	// promote — AFTER the fence has already driven every RG on the peer to
+	// rg_active=false. Peer dark, this node passive: the total outage this
+	// policy exists to avoid, produced by the policy itself.
+	//
+	// So the peer-loss decision, which was made and acted on before the fence
+	// went out, is re-asserted here. It is honest as well as necessary: we have
+	// just told the peer to relinquish everything, so "the peer does not own
+	// its groups" is exactly the state we created. A genuinely-recovered peer
+	// re-establishes peerAlive on its next heartbeat (<= one interval) and the
+	// normal election reconverges — the same recovery path as before #7147.
+	//
+	// Only peerAlive is restored: it is the sole field in the peer-loss block
+	// that electSingleNode's promotion decision reads. peerGroups/peerMonitors
+	// are rebuilt by whichever heartbeat won the window and do not gate
+	// promotion.
+	m.peerAlive = false
 
 	if err != nil {
 		slog.Warn("cluster: fence: taking over WITHOUT peer confirmation", "err", err)
