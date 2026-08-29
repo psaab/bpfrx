@@ -79,6 +79,15 @@ func TestScreenUnresolvedProfileLinesNamesZoneProfileAndDisposition(t *testing.T
 	if !strings.Contains(joined, "5806") {
 		t.Errorf("rendered disposition must carry the #5806 anchor; got:\n%s", joined)
 	}
+	// #7168 SETTLED the posture #5806 deferred, so the anchor for what the
+	// dataplane does NOW must also be greppable. #5806 is kept alongside it
+	// rather than replaced: it is the lineage, and someone working from the old
+	// issue must still land here.
+	if !strings.Contains(joined, "7168") {
+		t.Errorf("rendered disposition must carry the #7168 anchor — that is the issue "+
+			"that decided what the dataplane actually does with an unresolved "+
+			"reference; got:\n%s", joined)
+	}
 	for _, want := range []string{"trust", "missing", ScreenUnresolvedDisposition} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("status block must mention %q; got:\n%s", want, joined)
