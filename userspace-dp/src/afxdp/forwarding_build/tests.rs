@@ -3037,6 +3037,101 @@ fn ifindex_to_zone_id_populated_from_snapshot_at_build_time() {
     assert_eq!(state.ifindex_to_zone_id.get(&42).copied(), Some(7));
 }
 
+/// #7025: `EgressInterface::zone_id` is a MIRROR of
+/// `ifindex_unambiguous_zone_id`, and must stay one.
+///
+/// The field has no production reader in a default build — deleting it yields
+/// seven `E0609` reads, all in test files; `--features debug-log` adds exactly
+/// one, the `FWD_STATE: egress[..]` dump. It is retained so that debug line is
+/// self-describing, and this cell is what stops it from becoming the "stale
+/// copy that looks like a second opinion" #7025 was filed about: a future edit
+/// that sources it from anywhere but the ledger reds here.
+///
+/// THE TABLE NEEDS BOTH ROWS. A fixture whose interfaces all resolve to zone 0
+/// cannot distinguish a correct mirror from a field hardcoded to 0 — every
+/// comparison passes. So the snapshot carries a ZONED interface (non-zero) and
+/// an UNZONED one (zero), and the cell asserts both cases occur before
+/// comparing.
+///
+/// WHAT IT CATCHES, MEASURED — and what it does NOT, which matters more.
+///
+/// Severing the mirror (`zone_id` hardcoded to 0) reds this cell. It also reds
+/// FOUR pre-existing tests, so on that mutation this cell is not the only guard.
+///
+/// Re-pointing `populate_egress` at the row-derived `ifindex_to_zone_id` — the
+/// map #6722 replaced, and the realistic regression — reds two pre-existing
+/// tests (`unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722`
+/// and `unzoned_interface_with_egress_row_stays_zone_zero_6713`) and does NOT
+/// red this one. That is a property of the FIXTURE: the two maps agree for both
+/// interfaces here, so the mutation is a no-op on this input. An earlier
+/// revision of this comment claimed the opposite; it was measured and was
+/// wrong, and it is recorded rather than quietly corrected because a guard's
+/// stated scope is a claim like any other.
+///
+/// So what this cell adds is not extra coverage of those two mutations — it is
+/// the STRUCTURAL invariant, asserted over every egress row rather than over a
+/// fixture's expected zone values. The pre-existing tests pin what specific
+/// interfaces should resolve to; this pins that the field and
+/// `egress_zone_id()` can never disagree, which is the property the doc on the
+/// field promises a reader.
+#[test]
+fn egress_zone_id_mirrors_the_unambiguous_ledger_7025() {
+    use crate::ZoneSnapshot;
+    let snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "wan".into(),
+            id: 11,
+            ..Default::default()
+        }],
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/1".into(),
+                zone: "wan".into(),
+                egress_zone: "wan".into(),
+                ifindex: 99,
+                hardware_addr: "02:00:00:00:00:99".into(),
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0/0/2".into(),
+                ifindex: 77,
+                hardware_addr: "02:00:00:00:00:77".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+
+    // Precondition: BOTH cases are present, or the comparison below is
+    // satisfied by everything being zero.
+    let zoned = state.egress.get(&99).expect("zoned egress row");
+    let unzoned = state.egress.get(&77).expect("unzoned egress row");
+    assert_ne!(
+        zoned.zone_id, 0,
+        "fixture invalid: the zoned interface resolved to zone 0, so this cell \
+         would compare 0 against 0 for every row and pass against a field \
+         hardcoded to 0 (#7025)"
+    );
+    assert_eq!(
+        unzoned.zone_id, 0,
+        "fixture invalid: the unzoned interface must resolve to 0, so the table \
+         covers both sides of the mirror"
+    );
+
+    for (ifidx, eg) in &state.egress {
+        assert_eq!(
+            eg.zone_id,
+            state.egress_zone_id(*ifidx),
+            "EgressInterface::zone_id for ifindex {ifidx} disagrees with \
+             ForwardingState::egress_zone_id. The field is a DEBUG-ONLY MIRROR of \
+             ifindex_unambiguous_zone_id (#7025) and the debug dump renders a \
+             zone name from it — a divergence prints a zone the dataplane is not \
+             using, which is worse than printing nothing"
+        );
+    }
+}
+
 /// #921: EgressInterface.zone_id is set from the snapshot at
 /// config build time.
 #[test]

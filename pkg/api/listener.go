@@ -553,6 +553,10 @@ func (s *Server) ReconcileHTTP(addr string) error {
 // and serving BEFORE any old one is retired. A cert or bind failure retains the
 // previous HTTPS state (fail-closed) and returns the error for retry debt.
 //
+// The default arm BINDS BEFORE IT BUILDS (#7041) — see the comment on that arm
+// for why, and for the two consequences it carries (the listener is closed if
+// the build then fails; the bind error wins when both fail).
+//
 // The same-addr no-op tests listenerLeg.serving(), NOT a non-nil pointer
 // (#6827 round 6). An unexpected serve exit marks the leg `dead` and leaves it
 // INSTALLED in s.httpsLeg, so a pointer test called that address converged and
@@ -576,13 +580,36 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	case s.httpsLeg.serving() && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
-		plan, err := s.planHTTPSLeg(addr)
-		if err != nil {
-			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
-		}
+		// BIND FIRST, BUILD SECOND (#7041). Building loads the durable
+		// certificate — certGen has no cache, so LoadX509KeyPair re-reads the
+		// on-disk pair and warnStaleLoadedCert re-runs on every call. The #6827
+		// liveness disjunct in the daemon's reconciler re-enters this arm on
+		// EVERY commit while HTTPS is wanted and not serving (that is the point
+		// of it), so with the old order a box whose bind fails persistently and
+		// whose cert is stale re-emitted the whole stale-cert diagnostic per
+		// commit, forever. A leg that cannot bind serves no client, so there is
+		// nothing a certificate can be stale FOR until the bind succeeds — the
+		// same reachability argument as #7039's loopback gate. The suppression
+		// is bounded in time, not permanent: the first commit that binds emits
+		// the diagnostic.
+		//
+		// The bind failure itself is unaffected — it is still returned on every
+		// attempt, so the caller's retry debt and the daemon's own reconcile
+		// warnings are untouched. Only the CERT diagnostic, which describes a
+		// client that cannot exist yet, stops repeating.
 		ln, err := s.listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("api: bind HTTPS listener %q: %w", addr, err)
+		}
+		plan, err := s.planHTTPSLeg(addr)
+		if err != nil {
+			// The socket is already held. Closing it is not tidiness: a retained
+			// listener keeps the port, so every later retry would fail
+			// EADDRINUSE and a transient cert fault would become a permanent
+			// bind failure — manufacturing exactly the never-converging state
+			// this reordering exists to stop.
+			ln.Close()
+			return fmt.Errorf("api: generate HTTPS certificate for %q: %w", addr, err)
 		}
 		old := s.httpsLeg
 		s.httpsLeg = s.serveLegLocked(plan, ln, true)

@@ -1452,7 +1452,25 @@ the drop fails loudly instead of going quietly vacuous.
     HTTPS bind unchanged. Each leg binds the new socket and serves it BEFORE
     retiring the old (no unreachable window on that plane, no double-bind of an
     unchanged socket); a bind (or HTTPS cert) failure fail-closes to the retained
-    previous leg. `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
+    previous leg.
+    **`ReconcileHTTPS` BINDS BEFORE IT BUILDS (#7041).** Building resolves the
+    durable certificate, and `certGen` has no cache — `LoadX509KeyPair` re-reads
+    the on-disk pair and `warnStaleLoadedCert` re-runs on every call. Because the
+    #6827 liveness disjunct re-enters `ReconcileHTTPS` on EVERY commit while HTTPS
+    is wanted and not serving, building first meant a box whose bind fails
+    persistently and whose cert is stale re-emitted the whole stale-cert
+    diagnostic once per commit, forever. A leg that cannot bind serves no client,
+    so nothing can be verifying against that certificate yet — the same
+    reachability argument as the #7039 loopback gate, and like it the suppression
+    is bounded in TIME: the first commit that binds successfully emits the
+    diagnostic. The bind failure itself is unchanged and still returned on every
+    attempt, so retry debt and the daemon's reconcile warnings are untouched.
+    Two consequences are asserted rather than left implicit: a cert failure now
+    happens with the socket already held, so the listener is CLOSED on that path
+    (retaining it would hold the port and turn a transient cert fault into a
+    permanent `EADDRINUSE` on every retry); and when BOTH the bind and the cert
+    fail, the reported error is now the BIND error rather than the cert error.
+    `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
     and HTTPS best-effort (a boot HTTPS failure leaves HTTP up). BOTH boot
     failures are retried on the next commit — but only since #5561 round 14,
     which made the retry debt real: the reconciler now keeps the `Server` after a
@@ -1656,7 +1674,12 @@ the drop fails loudly instead of going quietly vacuous.
         silence the diagnostic on the most remotely-reachable listener there is.
         `TestLoopbackOnlyIsNotTheComplementOfBindHostWarnable_7039` pins the
         divergence, and the wildcard binds appear as MUST-STILL-WARN cells beside
-        the loopback silence cells so the suppression cannot widen unnoticed. **Accepted residual:** a rename that CROSSES the
+        the loopback silence cells so the suppression cannot widen unnoticed.
+        An **empty** bind host is likewise not loopback: `":8443"` splits to an
+        empty host, so `""` usually means WILDCARD (the same reading the bind-host
+        bullet above already uses), and suppressing there would silence the
+        diagnostic on a listener reachable from every interface.
+        **Accepted residual:** a rename that CROSSES the
         qualified/unqualified boundary is diagnosed at the commit but not on any
         later boot, so it is never diagnosed at all in the two states that had
         no commit-time diagnosis behind them — a box already drifted before this
