@@ -167,12 +167,24 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		close(done)
 	}()
 
-	cmdErr := c.dispatch(cmd)
-	w.Close()
-	os.Stdout = origStdout
-	<-done
+	// Restore stdout and reap the filter in ONE deferred block (#7171) so no
+	// exit path can leave the process's stdout pointing at the pipe. The
+	// failure this was filed for -- a panic between the swap and the restore
+	// -- is NOT reachable today: nothing on this path recovers, so a panic
+	// takes the process down and a leaked swap cannot be observed. The class
+	// that IS reachable is an early return: both of these functions are short
+	// enough that adding an error check between the swap and the restore is a
+	// natural edit, and such a return would have left every later write going
+	// into a pipe nobody drains AND leaked the filter goroutine blocked on
+	// read. Closing w must precede <-done or the filter never sees EOF and
+	// this deadlocks.
+	defer func() {
+		w.Close()
+		os.Stdout = origStdout
+		<-done
+	}()
 
-	return cmdErr
+	return c.dispatch(cmd)
 }
 
 func (c *ctl) dispatchOperational(line string) error {
