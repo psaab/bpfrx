@@ -1317,3 +1317,139 @@ fn declining_to_poison_a_leading_zero_member_does_not_restore_it_6812() {
     assert_eq!(ok[0].pool_addresses_v4.len(), 8);
     assert_eq!(port_allocator_build_count(), 1);
 }
+
+/// #7032: the ADDRESSES axis of the exact-fit boundary.
+///
+/// `SourceNatAggregateUse::admitted_with` admits on `<=` across all three axes,
+/// and that `<=` is a CONTRACT, not an accident: it must agree with the Go gate
+/// (`SourceNATAggregateOverBudgetPools` refuses on `cand > Max`, i.e. admits on
+/// `cand <= Max`), so a config whose aggregate lands EXACTLY on a budget has to
+/// install rather than fail closed.
+///
+/// Before this test only the POOL-COUNT axis had a witness. Narrowing
+/// `addresses <= max` to `<` left the entire binary green — measured, 4817 tests
+/// collected, rc=0 — so the addresses boundary was free to drift one config off
+/// the Go gate with nothing to notice.
+///
+/// EXACTLY ON THE BOUNDARY IS THE WHOLE POINT. A fixture at `max - 1` passes
+/// under both `<` and `<=` and witnesses nothing; one at `max + 1` is refused by
+/// both. Only `addresses == max_addresses` discriminates, which is why the first
+/// pool is sized to hit it dead on.
+///
+/// SINGLE-AXIS BY CONSTRUCTION, asserted rather than assumed. The other two axes
+/// are given headroom of several orders of magnitude and the test CHECKS that
+/// headroom, so this cannot quietly become a compound witness if someone edits
+/// the budget later — and flipping either other axis' operator leaves it green,
+/// which is what proves it is the addresses witness specifically.
+#[test]
+fn exact_fit_on_the_addresses_budget_installs_7032() {
+    // /29 = 8 addresses x 10 ports = 80 port slots, 1 pool.
+    const ADDRESSES_IN_SMALL_POOL: u64 = 8;
+    let budget = SourceNatAggregateBudget {
+        max_pools: 1024,
+        max_addresses: ADDRESSES_IN_SMALL_POOL,
+        max_port_capacity: 1 << 33,
+    };
+
+    // FIXTURE SELF-CHECK: the two axes NOT under test must have room to spare,
+    // or a red here would not say which boundary moved.
+    assert!(
+        budget.max_pools > 2 && budget.max_port_capacity > 1_000,
+        "the pool-count and port-capacity axes must be far from their ceilings, \
+         or this stops being a single-axis witness"
+    );
+
+    let snaps = vec![
+        // Charges exactly max_addresses. Admitted under `<=`, REFUSED under `<`.
+        pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        // One address past it: refused under both, which is the other half of
+        // the boundary and what stops "admit everything" passing this test.
+        pool_snap("r1", "p1", &["198.51.100.7/32"], SMALL_LOW, SMALL_HIGH),
+    ];
+    let rules =
+        parse_source_nat_rules_with_budget(&snaps, None, &NatCounterStore::default(), &budget);
+
+    assert_eq!(
+        rules[0].pool_failure, None,
+        "a pool landing EXACTLY on max_addresses ({}) must install. The comparison \
+         is `<=` on purpose — the Go gate refuses only on `cand > Max`, so a `<` \
+         here fails closed on a config Go accepts and the two planes disagree \
+         about the same config",
+        ADDRESSES_IN_SMALL_POOL
+    );
+    assert!(
+        rules[0].pool_allocator.debug_occupancy_words() > 0,
+        "the admitted exact-fit pool must have actually built its allocator; \
+         without this the assertion above would pass on a pool that installed \
+         in name only"
+    );
+    assert_eq!(
+        rules[1].pool_failure,
+        Some(SourceNatFailureReason::OverBudget),
+        "one address PAST the budget must be refused. Exact-fit admits; exact-fit \
+         plus one does not"
+    );
+    assert_eq!(rules[1].pool_allocator.debug_occupancy_words(), 0);
+}
+
+/// #7032: the PORT-CAPACITY axis of the exact-fit boundary.
+///
+/// The sibling of the addresses witness above, and it needs its own cell for the
+/// reason the issue's compound mutation could not supply: a single mutation that
+/// moves BOTH boundaries proves only that NEITHER is witnessed. It cannot show
+/// they are independently unwitnessed, and once a fix lands it cannot localise
+/// which witness is doing the work — a bound half reds the cell and masks the
+/// unbound one.
+///
+/// Measured before this test existed: narrowing `port_capacity <= max` to `<`
+/// left the whole binary green on its own (4817 collected, rc=0), so the two
+/// axes really were independently unwitnessed rather than one covering both.
+///
+/// Port capacity is `addresses x ports`, so the exact fit here is a DIFFERENT
+/// arithmetic from the addresses one — 8 addresses x 10 ports = 80 slots — which
+/// is why the same fixture cannot serve both and why each budget puts its own
+/// axis on the boundary while leaving the others far away.
+#[test]
+fn exact_fit_on_the_port_capacity_budget_installs_7032() {
+    // 8 addresses (/29) x 10 ports (10000..=10009) = 80 slots.
+    const SLOTS_IN_SMALL_POOL: u64 = 80;
+    let budget = SourceNatAggregateBudget {
+        max_pools: 1024,
+        max_addresses: 1_048_576,
+        max_port_capacity: SLOTS_IN_SMALL_POOL,
+    };
+
+    // FIXTURE SELF-CHECK, as above: pools and addresses must have headroom.
+    assert!(
+        budget.max_pools > 2 && budget.max_addresses > 1_000,
+        "the pool-count and addresses axes must be far from their ceilings, or \
+         this stops being a single-axis witness"
+    );
+
+    let snaps = vec![
+        // Charges exactly max_port_capacity. Admitted under `<=`, REFUSED under `<`.
+        pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        // A single extra slot (1 address x 1 port) past the ceiling.
+        pool_snap("r1", "p1", &["198.51.100.7/32"], 20000, 20000),
+    ];
+    let rules =
+        parse_source_nat_rules_with_budget(&snaps, None, &NatCounterStore::default(), &budget);
+
+    assert_eq!(
+        rules[0].pool_failure, None,
+        "a pool landing EXACTLY on max_port_capacity ({}) must install — same \
+         exact-fit contract as the addresses axis, same disagreement with the Go \
+         gate if it narrows to `<`",
+        SLOTS_IN_SMALL_POOL
+    );
+    assert!(
+        rules[0].pool_allocator.debug_occupancy_words() > 0,
+        "the admitted exact-fit pool must have actually built its allocator"
+    );
+    assert_eq!(
+        rules[1].pool_failure,
+        Some(SourceNatFailureReason::OverBudget),
+        "ONE port slot past the budget must be refused"
+    );
+    assert_eq!(rules[1].pool_allocator.debug_occupancy_words(), 0);
+}
