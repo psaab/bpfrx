@@ -998,6 +998,21 @@ fn tunnel_next_hop_live(
     )
 }
 
+/// #7204 (A1-b7-F6): the largest ECMP fanout this build can be asked to select
+/// from, and therefore the width the liveness mask must cover.
+///
+/// Not a tuning knob. It is the ceiling the control plane renders:
+/// `pkg/frr/config_render.go`'s `resolveECMP` sets `ecmpMaxPaths = 64` for any
+/// load-balancing export policy, and `pkg/frr/protocols_render.go` emits that
+/// verbatim as FRR's `maximum-paths`. Junos `routing-options maximum-ecmp` is
+/// listed Missing in docs/feature-gaps.md, so no operator knob raises it.
+///
+/// Lowering this does not change which member is selected -- the fallback below
+/// is equivalent -- it silently reintroduces the per-lookup allocation this item
+/// removed, for fanouts between the new value and 64. That is why it is pinned
+/// by a test against the rendered ceiling rather than left as a bare literal.
+pub(in crate::afxdp) const MAX_SUPPORTED_ECMP_FANOUT: usize = 64;
+
 pub(in crate::afxdp) fn select_route_next_hop<'a, T: Copy>(
     candidates: &'a [T],
     ip_hash: u64,
@@ -1006,13 +1021,68 @@ pub(in crate::afxdp) fn select_route_next_hop<'a, T: Copy>(
     if candidates.is_empty() {
         return None;
     }
-    // Single liveness evaluation: collect live candidate references once.
-    // `is_live` is called exactly `candidates.len()` times total.
+    // #7204 (A1-b7-F6): record liveness in a BITMASK, not a list of references.
+    //
+    // The collection never needed the references. It is used for exactly two
+    // things — how many candidates are live, and which one is the Nth live in
+    // candidate order — and a `u64` answers both in 8 bytes with `count_ones`
+    // and a bit walk. `SmallVec<[&T; 8]>` was 64 bytes of inline stack that
+    // spilled to the heap from fanout 9 up, on the packet-driven session-miss
+    // path.
+    //
+    // WHY NOT A BIGGER INLINE ARRAY. The supported ECMP ceiling is 64
+    // (`pkg/frr/config_render.go` resolveECMP -> `maximum-paths 64`, and Junos
+    // `routing-options maximum-ecmp` is Missing per docs/feature-gaps.md, so no
+    // operator knob raises it). `[&T; 64]` would never spill, but it costs 512
+    // bytes of stack on EVERY call including the 1-4 fanout that real multi-WAN
+    // configs actually run — paying the worst case always, to avoid an
+    // allocation almost nobody reaches. The mask costs 8 bytes at every fanout
+    // and allocates at none of them, so the trade does not have to be made.
+    //
+    // WHY NOT TWO PASSES over the candidates instead. `is_live` is not a field
+    // read: both call sites reach `tunnel_next_hop_live`, which resolves a
+    // tunnel endpoint and consults the neighbour map. The original comment's
+    // "single liveness evaluation" is load-bearing, and this preserves it —
+    // `is_live` is still called exactly `candidates.len()` times.
+    //
+    // SELECTION IS UNCHANGED. The bit walk yields the pick-th SET bit in
+    // ascending index order, which is the same element `live[pick]` named.
+    // ECMP picks must stay flow-consistent, so this had to be an equivalence,
+    // not merely a valid choice.
+    const MASK_BITS: usize = MAX_SUPPORTED_ECMP_FANOUT;
+    if candidates.len() <= MASK_BITS {
+        let mut live_mask: u64 = 0;
+        for (i, c) in candidates.iter().enumerate() {
+            if is_live(c) {
+                live_mask |= 1u64 << i;
+            }
+        }
+        let live_count = live_mask.count_ones() as u64;
+        if live_count > 0 {
+            let mut pick = ip_hash % live_count;
+            let mut remaining = live_mask;
+            loop {
+                let idx = remaining.trailing_zeros() as usize;
+                if pick == 0 {
+                    return candidates.get(idx);
+                }
+                pick -= 1;
+                remaining &= remaining - 1;
+            }
+        }
+        let pick = (ip_hash % candidates.len() as u64) as usize;
+        return candidates.get(pick);
+    }
+
+    // Above the supported ceiling the mask cannot represent every candidate, so
+    // fall back to the original collect. Unreachable through configuration —
+    // nothing renders more than 64 paths — but a route arriving with more must
+    // still be selected from correctly rather than silently truncated to the
+    // first 64.
     let live: smallvec::SmallVec<[&'a T; 8]> =
         candidates.iter().filter(|c| is_live(c)).collect();
     if !live.is_empty() {
         let pick = (ip_hash % live.len() as u64) as usize;
-        // `pick < live.len()` by construction, so this never yields None.
         live.get(pick).copied()
     } else {
         let pick = (ip_hash % candidates.len() as u64) as usize;
