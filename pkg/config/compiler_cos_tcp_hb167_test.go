@@ -25,6 +25,29 @@ func compileHB167(t *testing.T, lines []string) *Config {
 	return cfg
 }
 
+// compileHB167Lenient is the tolerant-path twin for fixtures that deliberately
+// carry a dangling class-of-service interface reference, which #7337 made a
+// hard commit error. See cosINetTree7080Lenient for why the shared strict
+// helper is not loosened instead.
+func compileHB167Lenient(t *testing.T, lines []string) *Config {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("compile error (lenient): %v", err)
+	}
+	return cfg
+}
+
 // TestCompileCoSTrafficControlProfileShapesUnit is the fable-167 F-2
 // make-or-break: a traffic-control-profile bound to a unit via
 // output-traffic-control-profile must ACTUALLY shape — its shaping-rate and
@@ -150,7 +173,9 @@ func TestValidateCoSTrafficControlProfileAdvisories(t *testing.T) {
 	}
 
 	// Dangling reference advisory.
-	cfg2 := compileHB167(t, []string{
+	// #7337: dangling on purpose, so compile on the tolerant path where the
+	// advisory under test is still what happens.
+	cfg2 := compileHB167Lenient(t, []string{
 		"set class-of-service interfaces ge-0/0/2 unit 80 output-traffic-control-profile missing-tcp",
 		"set system dataplane-type userspace",
 	})

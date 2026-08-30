@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 )
 
@@ -199,6 +200,133 @@ var cosLossPriorityValues = map[string]struct{}{
 //
 // Units are visited in sorted (interface, unit) order so commit-check surfaces
 // a STABLE first-error message.
+// validateClassOfServiceInterfaceRefsStrict hard-rejects a
+// `class-of-service interfaces` binding whose named scheduler-map,
+// traffic-control-profile, classifier or rewrite-rule does not resolve to a
+// defined `class-of-service` entry — a commit-time typo (#7337).
+//
+// These are the INTERFACE-side references, distinct from
+// validateClassOfServiceSchedulerMapRefsStrict above, which validates the
+// scheduler-map -> scheduler link one level down. Both links could dangle
+// independently and only the inner one was gated.
+//
+// Before this gate all seven were warn-only (compiler_validate_warn.go) and
+// then FAILED OPEN in the dataplane: forwarding_build/cos.rs resolves each
+// name with a bare `.get(...)` yielding None, with no Missing*Ref and no
+// error. So the interface materializes no scheduler queues, or a classifier
+// arm contributes nothing, and QoS silently degrades to best-effort while the
+// committed config still says the interface is shaped and classified. The
+// operator's only evidence is a warning they saw once at commit time.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientCoSInterfaceRefs) so a config persisted by an older
+// binary — which only warned — or synced from a peer still boots (#1960
+// no-brick). The dataplane's own None-resolution is the safety net on that
+// boot: it is the fail-open being fixed, but it is not a crash, so a
+// leniently-loaded config degrades exactly as it does today rather than
+// failing to load.
+//
+// Iteration is sorted by interface name then unit so commit-check surfaces a
+// STABLE first-error message; Go map iteration order is randomized and an
+// unstable message makes a fixture flaky in a way that looks intermittent.
+func validateClassOfServiceInterfaceRefsStrict(cos *ClassOfServiceConfig) error {
+	if cos == nil {
+		return nil
+	}
+	ifNames := make([]string, 0, len(cos.Interfaces))
+	for name := range cos.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		iface := cos.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		// Level is checked as well as Units. applyCoSInterfaceLevelBindings
+		// (compiler.go, before the gates) folds an interface-level binding
+		// into each CONFIGURED unit, so for an interface that has units this
+		// is redundant — but an interface-level binding on a stanza with NO
+		// configured units is folded nowhere, and its dangling name would
+		// otherwise be invisible to this gate.
+		if iface.Level != nil {
+			if err := cosUnitRefsResolve(cos, ifName, -1, iface.Level); err != nil {
+				return err
+			}
+		}
+		units := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			units = append(units, u)
+		}
+		sort.Ints(units)
+		for _, u := range units {
+			if err := cosUnitRefsResolve(cos, ifName, u, iface.Units[u]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// cosUnitRefsResolve checks one CoS unit binding's seven outbound references.
+// `unit` is -1 for an interface-level binding, which renders as the Junos
+// interface-level form rather than a fake unit number.
+func cosUnitRefsResolve(cos *ClassOfServiceConfig, ifName string, unit int, u *CoSInterfaceUnit) error {
+	if u == nil {
+		return nil
+	}
+	where := fmt.Sprintf("class-of-service interfaces %s unit %d", ifName, unit)
+	if unit < 0 {
+		where = fmt.Sprintf("class-of-service interfaces %s", ifName)
+	}
+	if u.SchedulerMap != "" {
+		if _, ok := cos.SchedulerMaps[u.SchedulerMap]; !ok {
+			return fmt.Errorf("%s references undefined scheduler-map %q", where, u.SchedulerMap)
+		}
+	}
+	if u.OutputTrafficControlProfile != "" {
+		if _, ok := cos.TrafficControlProfiles[u.OutputTrafficControlProfile]; !ok {
+			return fmt.Errorf("%s references undefined output-traffic-control-profile %q",
+				where, u.OutputTrafficControlProfile)
+		}
+	}
+	if u.DSCPClassifier != "" {
+		if _, ok := cos.DSCPClassifiers[u.DSCPClassifier]; !ok {
+			return fmt.Errorf("%s references undefined dscp classifier %q", where, u.DSCPClassifier)
+		}
+	}
+	if u.IEEE8021Classifier != "" {
+		if _, ok := cos.IEEE8021Classifiers[u.IEEE8021Classifier]; !ok {
+			return fmt.Errorf("%s references undefined ieee-802.1 classifier %q", where, u.IEEE8021Classifier)
+		}
+	}
+	// INetPrecedenceClassifiers records NAMES only (#6847), so membership is a
+	// slice scan rather than a map lookup — the same asymmetry the warn path has.
+	if u.INetPrecedenceClassifier != "" {
+		if !slices.Contains(cos.INetPrecedenceClassifiers, u.INetPrecedenceClassifier) {
+			return fmt.Errorf("%s references undefined inet-precedence classifier %q",
+				where, u.INetPrecedenceClassifier)
+		}
+	}
+	if u.DSCPRewriteRule != "" {
+		if _, ok := cos.DSCPRewriteRules[u.DSCPRewriteRule]; !ok {
+			return fmt.Errorf("%s references undefined dscp rewrite-rule %q", where, u.DSCPRewriteRule)
+		}
+	}
+	// IEEE8021RewriteRules is modeled but documented inert on this dataplane.
+	// A dangling name is still an operator typo and still rejected: the gate is
+	// about whether the NAME resolves, not whether the resolved rule has a
+	// runtime effect. Gating only the enforced references would make commit
+	// behaviour depend on an implementation detail invisible from the config.
+	if u.IEEE8021RewriteRule != "" {
+		if _, ok := cos.IEEE8021RewriteRules[u.IEEE8021RewriteRule]; !ok {
+			return fmt.Errorf("%s references undefined ieee-802.1 rewrite-rule %q",
+				where, u.IEEE8021RewriteRule)
+		}
+	}
+	return nil
+}
+
 func validateCoSUnitClassifierConflict(cos *ClassOfServiceConfig) error {
 	if cos == nil {
 		return nil
