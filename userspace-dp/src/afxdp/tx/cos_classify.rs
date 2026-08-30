@@ -202,8 +202,28 @@ fn resolve_cached_cos_tx_selection_impl(
         // filter carrying such a term (`interface_output_filter_has_per_packet_l4_match`,
         // flow_cache.rs), so no per-packet-L4 output term reaches this arm; only
         // an L3-only (`from source-address`/`destination-address`/`protocol`/bare
-        // `then`) term takes effect, matching the #5467 flowless contract. Ports
-        // are 0, so a port-BEARING term never matches (no spurious drop). The
+        // `then`) term takes effect, matching the #5467 flowless contract.
+        //
+        // #7174 C19 CORRECTION. This comment used to claim "Ports are 0, so a
+        // port-BEARING term never matches (no spurious drop)". That is TRUE for
+        // a POSITIVE port list (`from destination-port 22` cannot match port 0)
+        // and FALSE for an EXCEPT list: `from destination-port-except 22`
+        // matches everything that is NOT 22, and 0 is not 22, so the term DOES
+        // match and a `then discard` DOES fire on a flowless packet.
+        //
+        // The second line of defence quoted below does not cover it either:
+        // `Filter::has_per_packet_l4_match` (filter/mod.rs) tests tcp-flags,
+        // is-fragment, icmp-type, icmp-code and flex — PORTS ARE NOT IN THAT
+        // LIST — so the flow-cache does not decline a port-bearing filter and it
+        // reaches this arm.
+        //
+        // The resulting behaviour is FAIL-CLOSED (the fragment is dropped),
+        // which is the posture this gate exists to produce, so the behaviour is
+        // left as it is. What was wrong was the claimed invariant: a reader
+        // relying on "a port-bearing term never matches here" would conclude a
+        // permitted flow's fragments are safe, and they are not.
+        // measure_c19_flowless_reaches_cached_filter_7174 pins the real
+        // behaviour. The
         // `drop` bit is the OUTPUT filter's terminal action only (a three-color
         // policer runs at replay via `apply_cached_three_color_policers`),
         // identical to the flow-keyed arm's #3608 convention.
@@ -636,11 +656,12 @@ fn resolve_cos_tx_selection_internal(
         // header is absent) and honor the verdict exactly as the flow-keyed
         // path below does, so an L3-matching deny FAILS CLOSED.
         //
-        // Ports are 0, so a port-BEARING output term never matches a fragment
-        // (preserving the #2357/#3290 guarantee that a port-matching terminal
-        // term does not spuriously drop / misclassify a flowless packet); only
-        // an L3-only (`from source-address`/`destination-address`/`protocol`/
-        // bare `then`) term takes effect. With no matching output term the
+        // #7174 C19: ports are 0, so a POSITIVE port term never matches a
+        // fragment — but an EXCEPT term (`from destination-port-except 22`)
+        // matches everything that is not 22, and 0 is not 22, so it DOES match
+        // and its terminal action DOES fire. The #2357/#3290 guarantee holds
+        // only for positive port lists. Behaviour is fail-closed and is left as
+        // is; the claim that it could not happen was the defect. With no matching output term the
         // result is `drop:false` — the pass-through case is unchanged. Queue
         // and DSCP-rewrite selection stay exactly as computed above; this gate
         // ADDS enforcement only, it does not re-classify the fragment's queue.

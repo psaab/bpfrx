@@ -2368,5 +2368,34 @@ fn measure_c19_flowless_reaches_cached_filter_7174() {
         "#7174 => flowless packets {} the cached evaluator",
         if flowless.drop != with_flow.drop { "REACH (and get a different verdict from)" } else { "produce the same verdict as" }
     );
+
+    // PIN THE ANSWER. The measurement above printed it; these assertions make
+    // it a contract, because a print-only test cannot fail and therefore
+    // measures nothing once it is in the suite.
+    assert!(
+        !with_flow.drop,
+        "CONTROL: with a real 5-tuple whose dst port IS 22, the \
+         `destination-port-except 22` term must NOT match and the packet must \
+         not be dropped. If this fires, the arms no longer differ on the flow \
+         key alone and the subject assertion below proves nothing."
+    );
+    assert!(
+        flowless.drop,
+        "#7174 C19: a FLOWLESS packet (a non-first fragment) reaches the cached \
+         output-filter evaluator with ports forced to 0, and a \
+         `destination-port-except 22` term matches at port 0 because 0 is not \
+         22 — so a fragment of a PERMITTED flow is dropped.\n\n\
+         This assertion pins the CURRENT behaviour, which is fail-closed and \
+         deliberate. It exists because cos_classify.rs twice claimed the \
+         opposite: \"a port-BEARING term never matches (no spurious drop)\". \
+         That is true of a POSITIVE port list and false of an EXCEPT list. The \
+         flow-cache decline gate does not save it either — \
+         Filter::has_per_packet_l4_match tests tcp-flags / is-fragment / \
+         icmp-type / icmp-code / flex, and PORTS ARE NOT IN THAT LIST.\n\n\
+         If this now fails because the behaviour was deliberately changed to \
+         fail OPEN for unknown ports, update this test AND both comments in \
+         cos_classify.rs together — they are the pair that went out of step \
+         once already."
+    );
     let _ = FilterAction::Accept;
 }
