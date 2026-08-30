@@ -107,6 +107,8 @@ fn txn_non_decap_missing_neighbor_buffers_and_retries_correctly() {
         // SAFETY: same single-threaded umem-area contract as above.
         unsafe { &*area },
         &mut shared_recycles,
+        None,
+        &mut BatchCounters::default(),
     );
     assert!(
         bindings[0].pending_neigh.is_empty(),
