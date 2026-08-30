@@ -228,6 +228,31 @@ type ownedRecord struct {
 	// reopen the #2053 plaintext-secret-on-disk disclosure class — nothing
 	// sensitive is ever hashed in or written out.
 	//
+	// #7405 sharpened "carries NO credentials" to the claim that is actually
+	// true, because the original sentence enumerates only Secret-TYPED fields
+	// and a reader can take it as a guarantee about the hashed VALUES. The
+	// enforced property is: no config.Secret-typed field participates, bound by
+	// TestBackendFingerprintStableAndSecretFree. It does NOT guarantee the
+	// inputs are credential-free in every operator's config — Server is
+	// documented as accepting a full base URL, so an operator may embed userinfo
+	// (`https://user:pw@host/`), and that string IS hashed.
+	//
+	// That was measured and ACCEPTED rather than fixed. FNV-64a is unsalted,
+	// non-cryptographic and 64-bit, so a short credential inside a persisted
+	// digest is brute-forceable offline — but the digest is never logged, is
+	// never exported off-box, and a Server carrying userinfo is a plain string
+	// (not Secret) that is ALREADY held in cleartext by the config store in this
+	// same root-only directory. Recovering the credential by attacking the hash
+	// is therefore strictly harder than reading the neighbouring file, so the
+	// digest adds no exposure. The supported way to supply a credential is
+	// Username/Password, which are Secret-redacted and excluded here.
+	//
+	// If the ownership store ever becomes something shipped off-box (a support
+	// bundle, a telemetry export, a peer sync), that reasoning lapses and the
+	// fix is to fingerprint RedactURL(Server) instead — see #7405 for the
+	// upgrade hazard that change carries, since it moves every existing
+	// fingerprint and a moved fingerprint reads as an endpoint change.
+	//
 	// Its sole purpose is to make a provider IDENTITY change DETECTABLE so the
 	// old record is not silently mishandled: a provider RENAME to a different
 	// endpoint (H01), an in-place server/zone edit under the same provider name
