@@ -81,13 +81,21 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 			case rule.Then.Interface:
 				action = "interface"
 			}
-			srcMatch := "0.0.0.0/0"
-			if rule.Match.SourceAddress != "" {
-				srcMatch = rule.Match.SourceAddress
+			// #7363: the FULL match on BOTH sides. The source renderer had the
+			// same singular-field shape as the destination one, so a fix to
+			// only one would leave `show security nat source rule` still
+			// rendering a name-scoped rule as 0.0.0.0/0.
+			srcMatch := natMatchAddresses(
+				rule.Match.SourceAddress, rule.Match.SourceAddresses,
+				rule.Match.SourceAddressName, rule.Match.SourceAddressNames)
+			if srcMatch == "" {
+				srcMatch = "0.0.0.0/0"
 			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
+			dstMatch := natMatchAddresses(
+				rule.Match.DestinationAddress, rule.Match.DestinationAddresses,
+				rule.Match.DestinationAddressName, rule.Match.DestinationAddressNames)
+			if dstMatch == "" {
+				dstMatch = "0.0.0.0/0"
 			}
 			fmt.Fprintf(w, "source NAT rule: %s\n", rule.Name)
 			fmt.Fprintf(w, "  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
