@@ -43,6 +43,33 @@ func (d *wiringExporterDP) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpu
 
 func (d *wiringExporterDP) Mode() dpuserspace.DataplaneMode { return dpuserspace.ModeUserspaceStrict }
 
+// HA returns a no-op controller (#7350).
+//
+// The embedded dataplane.RuntimeDataPlane is NIL, so before this the promoted
+// HA() dispatched into a nil interface. startClusterComms launches the HA
+// watchdog heartbeat, whose goroutine calls rt.HA().SetHAWatchdog on a ticker,
+// so this fixture carried a latent SIGSEGV that fired roughly half a second in.
+//
+// Nothing noticed because the test used to reach its assertion within
+// milliseconds and tear the daemon down before the first tick. The moment the
+// test WAITED for anything — which is exactly what #7350's fix requires — the
+// panic became reachable, and a panic takes the whole package binary down
+// rather than failing one test.
+//
+// A no-op is the honest double here: this test is about wiring, not about what
+// the watchdog writes, and returning a controller that records nothing keeps
+// the goroutine harmless without pretending to model it.
+func (d *wiringExporterDP) HA() dataplane.HAController { return noopHAController7350{} }
+
+type noopHAController7350 struct{}
+
+func (noopHAController7350) SetRGActive(context.Context, int, bool) error { return nil }
+func (noopHAController7350) SetHAWatchdog(context.Context, int, uint64) error { return nil }
+func (noopHAController7350) SetFabricForwarding(context.Context, dataplane.FabricID, dataplane.FabricFwdInfo) error {
+	return nil
+}
+func (noopHAController7350) SyncFabricState(context.Context) error { return nil }
+
 // Sessions/Telemetry are reached by SessionSync.SetRuntime. nil is the
 // "no store wired" case the sync layer already guards for — this test is about
 // the SOURCE, not about the store walk it exists to replace.
@@ -126,18 +153,49 @@ func TestStartClusterCommsWiresBulkSnapshotSource7259(t *testing.T) {
 	d.startClusterComms(ctx)
 	t.Cleanup(d.stopClusterComms)
 
+	// #7350: WAIT FOR THE ASSERTED PROPERTY, NOT A PROXY FOR IT.
+	//
+	// startClusterComms publishes the SessionSync BEFORE it wires it —
+	// deliberately, because publishSessionSyncIfCurrent is the generation check
+	// that drops a superseded constructor's object before it touches cluster
+	// state (the Order contract at daemon_ha_comms_wiring.go:128). So
+	// getSessionSync() goes non-nil several wiring calls before
+	// BulkSnapshotSource is assigned in wireSessionSyncPeerCallbacks.
+	//
+	// This loop used to exit on the OBJECT and then immediately assert the
+	// FIELD, with nothing ordering the two. It lost 1 run in 5 under
+	// full-suite scheduling pressure and passed 3/3 under a -run filter — the
+	// signature of a window, not of a defect in what it was testing. Any
+	// future change that adds wiring between the publish and this field widens
+	// it again, which is why the wait condition itself has to be the property.
+	//
+	// NOT fixable by wiring before publishing: that inverts the deliberate
+	// order above.
+	//
+	// The two waited-for states are tracked separately so a failure says WHICH
+	// one was reached. "Never published" and "published but never wired" are
+	// different defects, and collapsing them would send the next reader to the
+	// wrong half of startClusterComms.
 	var ss *cluster.SessionSync
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if ss = d.getSessionSync(); ss != nil {
-			break
+	published := false
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+		if cand := d.getSessionSync(); cand != nil {
+			published = true
+			if cand.BulkSnapshotSource != nil {
+				ss = cand
+				break
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if ss == nil {
+	if ss == nil && !published {
 		t.Fatal("setup: startClusterComms never published a SessionSync")
 	}
-
-	if ss.BulkSnapshotSource == nil {
+	// The deadline path MUST fail with the #7259 message rather than fall
+	// through. A wait-for-the-field rewrite that let a never-wired field time
+	// out into a PASS would silently convert this regression guard into a
+	// no-op — the #7259 property must stay bound, not become a timeout.
+	if ss == nil {
 		t.Fatal("#7259: startClusterComms published a SessionSync with NO BulkSnapshotSource — " +
 			"doBulkSync takes its src==nil branch and frames the cold-prime window from the " +
 			"BPF display mirror, which is blind to transit sessions, so the standby's live " +
