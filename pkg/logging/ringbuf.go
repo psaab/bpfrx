@@ -135,20 +135,6 @@ const (
 	closeReasonHostInbound = 6
 )
 
-const (
-	actionDeny   = 0
-	actionPermit = 1
-	actionReject = 2
-	// actionNotApplicable flags the binary-log action byte on a SESSION_CLOSE,
-	// which carries no forwarding decision. Its wire action byte is
-	// intentionally 0, which the raw encoding would stamp as "deny" (actionDeny)
-	// and mislead binary forensic consumers into reading a normal close as a
-	// drop (#4914). The standard and structured text formatters OMIT the action
-	// field on a close (#2513); the fixed-shape binary record cannot omit a
-	// field, so it carries this explicit "not applicable" sentinel instead of a
-	// bogus 0.
-	actionNotApplicable = 0xFF
-)
 
 const (
 	eventTypeSessionOpen  = 1
@@ -572,7 +558,8 @@ func (er *EventReader) logEvent(data []byte) {
 	}
 
 	eventName := eventTypeName(evt.EventType)
-	actionStr := actionName(evt.Action)
+	// #7531: empty for a lifecycle event, whose action byte is intentionally 0.
+	actionStr := recordActionName(evt.EventType, evt.Action)
 	protoStr := protoName(evt.Protocol)
 
 	// Build EventRecord. #2511: honor the on-wire decision-time stamp via the
@@ -971,7 +958,8 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		DstAddr:         dstStr,
 		Protocol:        protoName(evt.Protocol),
 		ProtocolNum:     evt.Protocol,
-		Action:          actionName(evt.Action),
+		// #7531: empty for a lifecycle event (see recordActionName).
+		Action:          recordActionName(evt.EventType, evt.Action),
 		PolicyID:        evt.PolicyID,
 		InZone:          evt.IngressZone,
 		OutZone:         evt.EgressZone,
@@ -1403,12 +1391,18 @@ func formatBinaryRecord(evt *rawEvent, rec *EventRecord, severity int, closeReas
 	// Event fields
 	buf[5] = evt.EventType
 	buf[6] = evt.Protocol
-	// #4914: a SESSION_CLOSE carries no forwarding decision — its wire action
-	// byte is intentionally 0, which as a raw actionDeny would tell a binary
-	// forensic consumer that a normal termination was a drop. Flag it "not
-	// applicable" so tooling does not attribute closes to a deny. Every other
-	// event type keeps its real action byte.
-	if evt.EventType == eventTypeSessionClose {
+	// #4914 / #7531: a lifecycle event carries no forwarding decision — its
+	// wire action byte is intentionally 0, which as a raw actionDeny would tell
+	// a binary forensic consumer that a normal session open or termination was
+	// a drop. Flag it "not applicable" so tooling does not attribute either to
+	// a deny. Every other event type keeps its real action byte.
+	//
+	// #4914 covered only SESSION_CLOSE. SESSION_OPEN's byte is 0 for the same
+	// stated reason (the producer says so at the write site), so a binary
+	// consumer read every session CREATE as a deny too — the more misleading
+	// half, because a "deny" on a create looks like a blocked connection
+	// attempt rather than an established one.
+	if !eventCarriesForwardingAction(evt.EventType) {
 		buf[7] = actionNotApplicable
 	} else {
 		buf[7] = evt.Action

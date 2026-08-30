@@ -67,8 +67,22 @@ func TestFormatBinaryRecord_Basic(t *testing.T) {
 	if buf[6] != 6 {
 		t.Errorf("protocol = %d, want 6", buf[6])
 	}
-	if buf[7] != actionPermit {
-		t.Errorf("action = %d, want %d", buf[7], actionPermit)
+	// #7531: this fixture is a SESSION_OPEN, and a lifecycle event's binary
+	// action byte is the "not applicable" sentinel, not a forwarding decision.
+	//
+	// The assertion used to be `want actionPermit`, pinning a value NO PRODUCER
+	// EMITS. Every write to the wire action byte was enumerated: the two
+	// lifecycle encoders (`encode_session_close_rt_flow` /
+	// `encode_session_create_rt_flow`) both write a literal 0 and say at the
+	// write site that it is intentional, and the generic
+	// `encode_dataplane_event` — the only site that writes `event.action`
+	// verbatim — carries a `debug_assert!(false)` for SessionClose/SessionCreate
+	// stating that no payload is ever constructed for them. So the old
+	// expectation described a record that cannot occur, while the record that
+	// DOES occur (action byte 0) rendered as `deny` to every binary consumer.
+	if buf[7] != actionNotApplicable {
+		t.Errorf("action = %d, want %d (actionNotApplicable — a SESSION_OPEN "+
+			"carries no forwarding decision)", buf[7], actionNotApplicable)
 	}
 	if buf[8] != addrFamilyInet {
 		t.Errorf("addr family = %d, want %d", buf[8], addrFamilyInet)

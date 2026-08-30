@@ -478,17 +478,32 @@ func extractAddr(addrPort string) netip.Addr {
 
 func (tw *TraceWriter) formatTrace(rec EventRecord) string {
 	ts := rec.Time.Format("2006-01-02 15:04:05.000")
+	// #7531: OMIT `action=` when the event carries no forwarding decision,
+	// rather than printing an empty one. EventRecord.Action is empty for a
+	// lifecycle event (recordActionName), and this is the same treatment the
+	// standard and structured syslog lines already give it under #2513 /
+	// #2593 — the trace was the surface that never got its own issue and went
+	// on printing `action=deny` for every normal session open and close.
+	//
+	// An empty `action=` would be an improvement over a false `deny` and still
+	// wrong: a field with no value reads as a producer that failed to populate
+	// it, which is a different (and alarming) claim from "this event type has
+	// no action".
+	act := ""
+	if rec.Action != "" {
+		act = " action=" + rec.Action
+	}
 	if rec.Type == "SESSION_CLOSE" {
-		return fmt.Sprintf("%s %-14s %s -> %s proto=%s action=%s policy=%d zone=%d->%d pkts=%d bytes=%d\n",
-			ts, rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
+		return fmt.Sprintf("%s %-14s %s -> %s proto=%s%s policy=%d zone=%d->%d pkts=%d bytes=%d\n",
+			ts, rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, act,
 			rec.PolicyID, rec.InZone, rec.OutZone, rec.SessionPkts, rec.SessionBytes)
 	}
 	if rec.Type == "SCREEN_DROP" {
 		return fmt.Sprintf("%s %-14s %s -> %s proto=%s screen=%s zone=%d\n",
 			ts, rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.ScreenCheck, rec.InZone)
 	}
-	return fmt.Sprintf("%s %-14s %s -> %s proto=%s action=%s policy=%d zone=%d->%d\n",
-		ts, rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
+	return fmt.Sprintf("%s %-14s %s -> %s proto=%s%s policy=%d zone=%d->%d\n",
+		ts, rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, act,
 		rec.PolicyID, rec.InZone, rec.OutZone)
 }
 
