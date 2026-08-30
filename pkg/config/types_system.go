@@ -554,9 +554,20 @@ type SystemSyslogConfig struct {
 
 // SyslogUserConfig defines a syslog user destination.
 type SyslogUserConfig struct {
-	User     string // "*" = all users
-	Facility string
-	Severity string
+	User string // "*" = all users
+	// Selectors holds EVERY facility/severity pair authored under this user
+	// destination, in config order.
+	//
+	// #7187: these were a scalar Facility/Severity pair, and the compiler
+	// ASSIGNED rather than appended, so `user * { daemon info; auth warning; }`
+	// kept only `auth warning` — the last pair parsed. Every earlier selector
+	// was discarded at compile time, before any render or validation could see
+	// it, so the operator got no warning and no record under the facility they
+	// authored first. The host sink already carried a slice
+	// (SyslogHostConfig.Facilities); this brings the user sink to the same
+	// shape. A destination with no authored pair has an empty slice and
+	// renders `*.*`, which is what an empty scalar pair rendered before.
+	Selectors []SyslogFacility
 }
 
 // SyslogHostConfig defines a syslog host destination.
@@ -581,9 +592,12 @@ type SyslogFacility struct {
 
 // SyslogFileConfig defines a syslog file destination.
 type SyslogFileConfig struct {
-	Name     string
-	Facility string
-	Severity string
+	Name string
+	// Selectors holds EVERY facility/severity pair authored under this file
+	// destination, in config order. See SyslogUserConfig.Selectors — the same
+	// #7187 assign-instead-of-append defect applied here, so
+	// `file messages { daemon info; auth warning; }` logged only auth records.
+	Selectors []SyslogFacility
 	// ArchiveConfigured records that an `archive` container was present
 	// under this syslog file (#7146). In Junos a bare `archive;` enables
 	// archiving with defaults, so PRESENCE alone — not just a populated

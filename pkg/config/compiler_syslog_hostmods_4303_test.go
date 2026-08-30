@@ -82,8 +82,9 @@ func TestSyslogFileArchiveNotMisparsed(t *testing.T) {
 		t.Fatalf("expected one syslog file, got %+v", c.System.Syslog)
 	}
 	f := c.System.Syslog.Files[0]
-	if f.Facility != "any" || f.Severity != "info" {
-		t.Fatalf("file facility/severity = %q/%q, want any/info (archive/match/structured-data leaked in)",
-			f.Facility, f.Severity)
+	if len(f.Selectors) != 1 || f.Selectors[0].Facility != "any" ||
+		f.Selectors[0].Severity != "info" {
+		t.Fatalf("file selectors = %+v, want exactly one any/info "+
+			"(archive/match/structured-data leaked in)", f.Selectors)
 	}
 }

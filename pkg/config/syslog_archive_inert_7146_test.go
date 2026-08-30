@@ -126,8 +126,9 @@ func TestSyslogFileArchiveInertWarning(t *testing.T) {
 		t.Errorf("ArchiveKnobs = %q, want %q (sorted + deduplicated)", got, wantKnobs)
 	}
 	// Facility/severity parsing must survive the new `archive` case.
-	if files[0].Facility != "any" || files[0].Severity != "any" {
-		t.Errorf("facility/severity = %q/%q, want any/any", files[0].Facility, files[0].Severity)
+	if len(files[0].Selectors) != 1 || files[0].Selectors[0].Facility != "any" ||
+		files[0].Selectors[0].Severity != "any" {
+		t.Errorf("selectors = %+v, want one any/any", files[0].Selectors)
 	}
 }
 

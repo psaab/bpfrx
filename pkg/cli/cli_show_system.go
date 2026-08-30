@@ -517,17 +517,26 @@ func (c *CLI) showSystemSyslog() error {
 		}
 	}
 
+	// #7187: one line per authored selector, matching the host sink above and
+	// the gRPC renderer. Showing only the first would reproduce the discard
+	// this change fixed, in the operator's own `show` output.
 	if len(sys.Files) > 0 {
 		fmt.Println("Syslog files:")
 		for _, f := range sys.Files {
-			fmt.Printf("  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
+			fmt.Printf("  %-20s\n", f.Name)
+			for _, sel := range f.Selectors {
+				fmt.Printf("    %-20s %s\n", sel.Facility, sel.Severity)
+			}
 		}
 	}
 
 	if len(sys.Users) > 0 {
 		fmt.Println("Syslog users:")
 		for _, u := range sys.Users {
-			fmt.Printf("  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+			fmt.Printf("  %-20s\n", u.User)
+			for _, sel := range u.Selectors {
+				fmt.Printf("    %-20s %s\n", sel.Facility, sel.Severity)
+			}
 		}
 	}
 

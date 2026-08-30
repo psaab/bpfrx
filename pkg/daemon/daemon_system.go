@@ -1381,26 +1381,10 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// `=`/`!`/`!=` modifiers, and neither position's native syntax is
 			// the other's. One allowlist applied to both would have to be the
 			// intersection, which drops working destinations.
-			if !syslogSelectorFacilitySafe(f.Facility) || !syslogSelectorSeveritySafe(f.Severity) {
-				slog.Warn("skipping syslog file destination with unsafe selector token (#5797)",
-					"name", f.Name, "facility", f.Facility, "severity", f.Severity)
+			selector, ok := renderSyslogSelectorList(f.Selectors, "file", f.Name)
+			if !ok {
 				continue
 			}
-			// Map Junos facility/severity to rsyslog selector
-			facility := f.Facility
-			if facility == "" || facility == "any" {
-				facility = "*"
-			}
-			// Junos "change-log" maps to local6; rsyslog doesn't know the name
-			if facility == "change-log" {
-				facility = "local6"
-			}
-			severity := f.Severity
-			if severity == "" || severity == "any" {
-				severity = "*"
-			}
-			// Junos severity names map directly to rsyslog (info, warning, error, etc.)
-			selector := fmt.Sprintf("%s.%s", facility, severity)
 			logPath := fmt.Sprintf("/var/log/%s", f.Name)
 
 			content := fmt.Sprintf("# Managed by xpf — do not edit\n%s\t%s\n", selector, logPath)
@@ -1428,23 +1412,10 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// position-aware pair of predicates, deliberately kept identical to
 			// the file site: a destination that renders as a file must render as
 			// a user, and vice versa.
-			if !syslogSelectorFacilitySafe(u.Facility) || !syslogSelectorSeveritySafe(u.Severity) {
-				slog.Warn("skipping syslog user destination with unsafe selector token (#5797)",
-					"user", u.User, "facility", u.Facility, "severity", u.Severity)
+			selector, ok := renderSyslogSelectorList(u.Selectors, "user", u.User)
+			if !ok {
 				continue
 			}
-			facility := u.Facility
-			if facility == "" || facility == "any" {
-				facility = "*"
-			}
-			if facility == "change-log" {
-				facility = "local6"
-			}
-			severity := u.Severity
-			if severity == "" || severity == "any" {
-				severity = "*"
-			}
-			selector := fmt.Sprintf("%s.%s", facility, severity)
 			target := u.User // "*" means all logged-in users
 			content := fmt.Sprintf("# Managed by xpf — do not edit\n%s\t:omusrmsg:%s\n", selector, target)
 			confFile := prefix + "user-" + target + ".conf"
@@ -1668,4 +1639,63 @@ func syslogSelectorSeveritySafe(tok string) bool {
 		return true
 	}
 	return syslogSelectorAtomSafe(rest)
+}
+
+// renderSyslogSelectorList turns a file/user destination's authored
+// facility/severity pairs into ONE rsyslog selector field (#7187).
+//
+// WHY ONE FIELD AND NOT N DROP-INS. A destination is one target — a log path,
+// or an omusrmsg account — and gets one xpf-managed drop-in named after it.
+// rsyslog's selector field already expresses a set: semicolon-separated
+// `facility.priority` pairs are OR'd, which is exactly Junos' meaning for two
+// statements under one `file`/`user` stanza. So `daemon info; auth warning`
+// renders `daemon.info;auth.warning<TAB>/var/log/messages`, not two files
+// racing for the same path.
+//
+// EMPTY IS `*.*`, deliberately. Before #7187 these sinks held a scalar pair and
+// an unset one rendered `*.*` (both the empty facility and the empty severity
+// mapped to `*`). A destination authored with no selector at all keeps that
+// behaviour rather than silently disappearing.
+//
+// AN UNSAFE SELECTOR IS DROPPED, NOT THE WHOLE DESTINATION — unless it was the
+// only one. The #5797 render belt skipped a destination whose single pair
+// failed the position-aware safety predicates; with a list, skipping everything
+// because one pair is unsafe would discard the operator's safe selectors too.
+// Dropping just the offending pair is strictly closer to what was authored, and
+// for a one-selector destination it is bit-identical to the old behaviour: the
+// list ends up empty and the destination is skipped. `ok=false` means exactly
+// that — nothing safe survived a non-empty list.
+func renderSyslogSelectorList(sels []config.SyslogFacility, kind, name string) (string, bool) {
+	if len(sels) == 0 {
+		return "*.*", true
+	}
+	parts := make([]string, 0, len(sels))
+	for _, sel := range sels {
+		if !syslogSelectorFacilitySafe(sel.Facility) || !syslogSelectorSeveritySafe(sel.Severity) {
+			slog.Warn("skipping syslog selector with unsafe selector token (#5797)",
+				"kind", kind, "name", name,
+				"facility", sel.Facility, "severity", sel.Severity)
+			continue
+		}
+		facility := sel.Facility
+		if facility == "" || facility == "any" {
+			facility = "*"
+		}
+		// Junos "change-log" maps to local6; rsyslog doesn't know the name.
+		if facility == "change-log" {
+			facility = "local6"
+		}
+		severity := sel.Severity
+		if severity == "" || severity == "any" {
+			severity = "*"
+		}
+		// Junos severity names map directly to rsyslog (info, warning, error, ...).
+		parts = append(parts, fmt.Sprintf("%s.%s", facility, severity))
+	}
+	if len(parts) == 0 {
+		slog.Warn("skipping syslog destination: every authored selector was unsafe (#5797)",
+			"kind", kind, "name", name)
+		return "", false
+	}
+	return strings.Join(parts, ";"), true
 }

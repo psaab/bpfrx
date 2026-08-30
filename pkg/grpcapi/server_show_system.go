@@ -332,16 +332,26 @@ func (s *Server) showSystemSyslog(buf *strings.Builder) {
 			}
 		}
 	}
+	// #7187: file and user destinations carry EVERY authored selector now, so
+	// they render one line per selector — the same shape the host sink above
+	// has always used. Showing only the first would reproduce, in the operator's
+	// own `show` output, the discard this change fixed.
 	if len(sys.Files) > 0 {
 		fmt.Fprintln(buf, "Syslog files:")
 		for _, f := range sys.Files {
-			fmt.Fprintf(buf, "  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
+			fmt.Fprintf(buf, "  %-20s\n", f.Name)
+			for _, sel := range f.Selectors {
+				fmt.Fprintf(buf, "    %-20s %s\n", sel.Facility, sel.Severity)
+			}
 		}
 	}
 	if len(sys.Users) > 0 {
 		fmt.Fprintln(buf, "Syslog users:")
 		for _, u := range sys.Users {
-			fmt.Fprintf(buf, "  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+			fmt.Fprintf(buf, "  %-20s\n", u.User)
+			for _, sel := range u.Selectors {
+				fmt.Fprintf(buf, "    %-20s %s\n", sel.Facility, sel.Severity)
+			}
 		}
 	}
 }

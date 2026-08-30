@@ -96,7 +96,7 @@ func syslogFileCfg6800(name string) *config.Config {
 	cfg := &config.Config{}
 	cfg.System.Syslog = &config.SystemSyslogConfig{
 		Files: []*config.SyslogFileConfig{
-			{Name: name, Facility: "any", Severity: "info"},
+			{Name: name, Selectors: []config.SyslogFacility{{Facility: "any", Severity: "info"}}},
 		},
 	}
 	return cfg
