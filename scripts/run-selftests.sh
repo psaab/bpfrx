@@ -220,6 +220,51 @@ run_bash test/incus/fbf-steering-selftest.sh
 # layers later by the analyzer as if the dataplane were at fault. Needs bash.
 run_bash test/incus/newflow-ceiling-selftest.sh
 
+# #7296: the remaining hermetic test/incus self-tests. Every one was on disk and
+# green, and NONE was reached by this runner -- so `make selftest` reported a
+# clean pass while 192 cases across seven files never executed. The issue named
+# ONE of them; there were seven, which is why the census below exists rather
+# than a longer list alone.
+run_bash test/incus/deploy-lib-selftest.sh
+run_bash test/incus/cluster-cell-selftest.sh
+run_bash test/incus/cluster-env-selftest.sh
+run_bash test/incus/cos-apply-lib-selftest.sh
+run_bash test/incus/host-inbound-selftest.sh
+run_bash test/incus/iperf-throughput-selftest.sh
+run_bash test/incus/with-cluster-selftest.sh
+
+# -- self-test census (#7296) --
+#
+# The defect was not "one script was forgotten" -- it was that NOTHING NOTICED.
+# Seven hermetic self-tests accumulated unreached because this runner carries a
+# hand-maintained list with no check that the list covers what is on disk.
+# Adding the seven without this census would leave the eighth to repeat it.
+#
+# Matches the `run_bash <path>` CALL form with comments stripped: a bare
+# filename mention would otherwise be satisfied by the comment block above that
+# names these very scripts -- the shape where a source-scanning gate passes on
+# its own documentation.
+census_missing=""
+census_seen=0
+runner_code=$(sed 's/#.*//' scripts/run-selftests.sh)
+for st in test/incus/*-selftest.sh; do
+	[ -f "$st" ] || continue
+	census_seen=$((census_seen + 1))
+	case "$runner_code" in
+	*"run_bash $st"*) ;;
+	*) census_missing="$census_missing $st" ;;
+	esac
+done
+if [ "$census_seen" -eq 0 ]; then
+	# A glob matching nothing would otherwise report a complete census over an
+	# empty set -- a clean pass that swept nothing.
+	faill "self-test census (matched NO test/incus/*-selftest.sh -- the glob is wrong)"
+elif [ -n "$census_missing" ]; then
+	faill "self-test census (not invoked by this runner:$census_missing)"
+else
+	passl "self-test census ($census_seen hermetic test/incus self-tests, all invoked)"
+fi
+
 # ── summary ──
 printf '\n\033[1m== selftest summary ==\033[0m\n'
 echo "  passed=$PASS  skipped=$SKIP  failed=$FAIL"
