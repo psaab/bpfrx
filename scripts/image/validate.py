@@ -26,7 +26,8 @@ never the shared loss cluster) and proves the first-boot contract:
      daemon assigns the node-1 vSRX names em0 + ge-7/0/N (FPC 7).
   q  libvirt/plain-QEMU bootability (#4209 H-9) -> the SAME qcow2 the docs
      sell for "libvirt/KVM, plain QEMU" is a valid, non-corrupt qcow2 of at
-     least the bake floor (always), and — gated on qemu-system-x86_64 +
+     least the bake floor (ALWAYS — a missing qemu-img FAILS the gate rather
+     than skipping it, #7347), and — gated on qemu-system-x86_64 +
      /dev/kvm + OVMF — actually boots under direct QEMU with the day-0 config
      on a cdrom (the cdrom day-0 attach path incus never exercises). Prefers
      an SB-ENFORCING firmware pair; an SB-off fallback is reported AS one
@@ -780,6 +781,15 @@ class Harness:
         self.verify_sig = verify_sig
         self.created_net = False
         self.instances = []
+        # #7347: the skip LEDGER. Before this, a scenario that skipped and one
+        # that asserted were indistinguishable to main() -- scenarios were run
+        # for effect and main() returned 0 unconditionally, so a skipped leg
+        # reached bake.py as a pass and was signed as `validated: true`.
+        #
+        # Every skip now has to be RECORDED, and every recorded skip is named
+        # in the closing summary. A skip that is not survivable on the bake
+        # path is `fatal=True` and makes main() exit non-zero.
+        self.skipped = []
         self.work = tempfile.mkdtemp(prefix="xpf-validate-")
         # Per-run ownership token (#4905-D). The alias + every instance name is
         # namespaced with it, and every destructive op refuses to touch an
@@ -1541,17 +1551,60 @@ class Harness:
         info("Scenario E PASS (node-id=1 persisted, cluster em0 + ge-7-0-N naming)")
         self.drop(e)
 
+    def skip(self, what, reason, fatal):
+        """Record a skipped leg, and say so in a form main() can act on.
+
+        `fatal` is a CLASSIFICATION, not a severity guess, and it is decided by
+        one question: does bake.py guarantee the tool on a real bake host?
+
+          - qemu-img is require()d in bake.py's preflight (bake.py:805), so its
+            absence cannot happen on a legitimate bake. It is not routed here
+            at all -- it is a hard fail() at the call site.
+          - /dev/kvm is only a WARNING in that same preflight ("no /dev/kvm
+            access — libguestfs will use TCG (slow)"), and qemu-system-x86_64
+            is not required at all. A TCG bake host is therefore a SUPPORTED
+            configuration, and the boot leg genuinely cannot run there. Making
+            it fatal would break bakes that work today, so it is fatal=False --
+            recorded and reported, never silent.
+
+        This is the one place the #7347 fix deliberately departs from that
+        issue's proposal ("exit non-zero if ANY scenario SKIPped"). Applied
+        literally, that would fail every bake on a TCG host. The issue's own
+        analysis agrees the boot leg is "a genuine partial skip" and that "the
+        severity is concentrated in" the qemu-img return.
+        """
+        self.skipped.append((what, reason, fatal))
+        info(f"SKIP {what}{' (FATAL)' if fatal else ''}: {reason}")
+
     def scenario_qemu(self):
         info("── Scenario Q: libvirt/plain-QEMU bootability (#4209 H-9) ──")
-        # ── Config-level probe (always runs when qemu-img is present): the
-        # qcow2 the docs sell for libvirt/KVM + plain QEMU must be a valid,
-        # non-corrupt qcow2 of at least the bake floor. Catches a truncated /
-        # wrong-format / corrupt export that incus import might still accept
-        # but a raw qcow2 consumer (libvirt) would refuse. ──
+        # ── Config-level probe (ALWAYS — a missing qemu-img is a FAILURE, not
+        # a skip): the qcow2 the docs sell for libvirt/KVM + plain QEMU must be
+        # a valid, non-corrupt qcow2 of at least the bake floor. Catches a
+        # truncated / wrong-format / corrupt export that incus import might
+        # still accept but a raw qcow2 consumer (libvirt) would refuse.
+        #
+        # #7347: this used to `return` when qemu-img was absent, which skipped
+        # the ENTIRE scenario. main() ran the scenarios for effect and returned
+        # 0 regardless, bake.py read exit 0 as a pass, and finalize_artifacts
+        # went on to stamp `validated: true` into the MINISIGNED manifest with
+        # no structural evidence behind it. A scenario that returns is
+        # indistinguishable from one that asserted, and here the difference was
+        # laundered through a signature -- downstream `publish.py` and
+        # `xpf-deploy.py fetch` verify the signature and read a signed image as
+        # a validated one.
+        #
+        # Failing is safe by construction: bake.py's own preflight require()s
+        # qemu-img (bake.py:805), so on a real bake host it is present. The
+        # skip could only ever fire where this gate should not have been
+        # trusted in the first place. Same posture as assert_image_sealed's
+        # libguestfs check (#6547/#7317): a security gate that skips itself
+        # when its tool is absent is the vacuous-gate shape these checks exist
+        # to remove. ──
         if not shutil.which("qemu-img"):
-            info("SKIP: qemu-img not installed (qemu-utils) — cannot probe the "
-                 "qcow2's libvirt bootability")
-            return
+            fail("qemu-img not found — install qemu-utils. The qcow2's "
+                 "structural validity cannot be probed without it, and an "
+                 "unprobed image must not be signed as validated (#7347)")
         raw = subprocess.run(["qemu-img", "info", "--output=json", self.qcow2],
                              capture_output=True, text=True)
         if raw.returncode != 0:
@@ -1586,9 +1639,12 @@ class Harness:
         # was being counted as something it is not.
         ovmf, ovmf_vars, sb_on, fw_reason = _qemu_firmware_choice()
         if not qsys or not os.path.exists("/dev/kvm") or not ovmf or not ovmf_vars:
-            info("SKIP boot leg: need qemu-system-x86_64 + /dev/kvm + OVMF "
-                 f"(qemu={bool(qsys)} kvm={os.path.exists('/dev/kvm')} "
-                 f"firmware: {fw_reason}) — the structural probe above stands")
+            self.skip(
+                "Q/boot-leg",
+                "need qemu-system-x86_64 + /dev/kvm + OVMF "
+                f"(qemu={bool(qsys)} kvm={os.path.exists('/dev/kvm')} "
+                f"firmware: {fw_reason}) — the structural probe above stands",
+                fatal=False)
             return
         if sb_on:
             info(f"QEMU firmware: {fw_reason}")
@@ -1677,6 +1733,45 @@ def maybe_reexec_incus_admin():
         os.execvp("sg", ["sg", "incus-admin", "-c", cmd])
 
 
+def _stderr(m):
+    print(m, file=sys.stderr)
+
+
+def _skip_verdict(skipped, allow_skip):
+    """Pure verdict over the skip ledger: (exit_code, lines_to_report).
+
+    Split out of main() so the DECISION is testable without incus, a network,
+    an image import or six VM boots. The bug this replaces was precisely that
+    the decision did not exist: scenarios were run for effect and main()
+    returned 0 unconditionally, so a leg that skipped reached bake.py as a pass
+    and was signed `validated: true` (#7347).
+
+    Reporting every skip by name is not cosmetic. The failure mode being fixed
+    is that a skip was INVISIBLE downstream, so a run that skipped must say
+    which leg and why, whether or not it also fails.
+    """
+    fatal = [x for x in skipped if x[2]]
+    lines = []
+    if skipped:
+        lines.append(f"Validation complete, with {len(skipped)} skipped leg(s):")
+        for what, reason, is_fatal in skipped:
+            lines.append(f"  {'FATAL ' if is_fatal else ''}{what}: {reason}")
+    else:
+        lines.append("Validation complete (no legs skipped).")
+    if fatal and not allow_skip:
+        lines.append(
+            f"FAIL: REFUSING to report success: {len(fatal)} leg(s) were "
+            "skipped, not asserted. An artifact whose gate skipped must not be "
+            "signed as validated (#7347). Pass --allow-skip for a dev run that "
+            "knowingly accepts this.")
+        return 1, lines
+    if fatal:
+        lines.append(
+            "NOTE: --allow-skip was given, so the skipped leg(s) above do NOT "
+            "fail this run. Do not sign an artifact validated this way.")
+    return 0, lines
+
+
 def main():
     maybe_reexec_incus_admin()
     p = argparse.ArgumentParser(description=__doc__,
@@ -1690,6 +1785,12 @@ def main():
     g.add_argument("--no-verify-sig", dest="verify_sig", action="store_const",
                    const=False, help="skip image signature verification (dev)")
     p.set_defaults(verify_sig=True)  # default: verify if a .minisig is present
+    # #7347: the dev escape hatch, shaped like --no-verify-sig above. It is
+    # deliberately NOT passed by bake.py, so the bake path cannot skip a leg
+    # and still report success.
+    p.add_argument("--allow-skip", action="store_true",
+                   help="do not fail when a leg is skipped rather than asserted "
+                        "(dev only — never on a path that signs the artifact)")
     p.add_argument("scenario", nargs="?", default="all",
                    choices=SCENARIO_ORDER + ["all"])
     a = p.parse_args()
@@ -1711,8 +1812,15 @@ def main():
         keys = SCENARIO_ORDER if a.scenario == "all" else [a.scenario]
         for k in keys:
             getattr(h, SCENARIO_METHODS[k])()
-        info("Validation complete.")
-        return 0
+        # #7347: the scenarios used to be run purely for effect and main()
+        # returned 0 unconditionally, so a leg that SKIPPED was indistinguish-
+        # able from one that ASSERTED -- and bake.py reads exit 0 as a pass and
+        # signs `validated: true`. Report every skip by name, and refuse to
+        # return 0 when a skip was classified as not survivable.
+        code, lines = _skip_verdict(h.skipped, a.allow_skip)
+        for line in lines:
+            (info if code == 0 else _stderr)(line)
+        return code
     finally:
         h.cleanup()
 
