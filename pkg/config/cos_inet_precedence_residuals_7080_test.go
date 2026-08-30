@@ -30,6 +30,33 @@ func cosINetTree7080(t *testing.T, lines ...string) *Config {
 	return cfg
 }
 
+// cosINetTree7080Lenient is the tolerant-path twin, for fixtures that
+// DELIBERATELY carry a dangling class-of-service interface reference.
+//
+// #7337 made those references a hard commit error, so a fixture built to
+// exercise the WARNING must compile on the path where a warning is still what
+// happens. Loosening the shared strict helper instead would silently remove
+// the strict check from every other test in this file — those tests would keep
+// passing while no longer proving anything about commit behaviour.
+func cosINetTree7080Lenient(t *testing.T, lines ...string) *Config {
+	t.Helper()
+	tree := &ConfigTree{}
+	for _, ln := range lines {
+		path, err := ParseSetCommand(ln)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", ln, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", ln, err)
+		}
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	return cfg
+}
+
 // #7084: the collector accepted DECIMAL 0..7 only, so the two spellings Junos
 // actually uses were rejected at commit.
 //
@@ -103,7 +130,10 @@ func TestINetPrecedenceRejectsNonsense_7084(t *testing.T) {
 // #7081: every OTHER CoS binding a unit can carry drew an undefined-reference
 // warning; the one #6847 added did not.
 func TestUndefinedINetPrecedenceClassifierWarns_7081(t *testing.T) {
-	cfg := cosINetTree7080(t,
+	// #7337 made a dangling class-of-service interface reference a hard commit
+	// error, so this fixture compiles on the TOLERANT path — the one where the
+	// warning under test is still the outcome. The warning itself is unchanged.
+	cfg := cosINetTree7080Lenient(t,
 		"set class-of-service forwarding-classes queue 0 BE",
 		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 		"set class-of-service interfaces ge-0/0/0 unit 0 classifiers inet-precedence NOPE",

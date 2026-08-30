@@ -228,6 +228,21 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientSchedulerMapRef bool
 
+	// lenientCoSInterfaceRefs (#7337) downgrades the class-of-service
+	// INTERFACE-side reference check
+	// (validateClassOfServiceInterfaceRefsStrict) from a hard error to a
+	// warning on the tolerant load / peer-sync paths. All seven of those
+	// references — scheduler-map, output-traffic-control-profile, the three
+	// classifiers and the two rewrite-rules — were warn-only at commit before
+	// this gate, so a config persisted by an older binary or synced from a peer
+	// may carry a dangling name; an upgrading or receiving node must still boot
+	// through it (#1960 no-brick). Commit / commit-check stay strict, because a
+	// new operator edit naming a scheduler-map that does not exist silently
+	// degrades the interface to best-effort while the committed config still
+	// says it is shaped. Distinct from lenientSchedulerMapRef, which governs the
+	// scheduler-map -> scheduler link one level down.
+	lenientCoSInterfaceRefs bool
+
 	// lenientCoSLossPriority (#3995) downgrades the class-of-service
 	// classifier / rewrite-rule loss-priority value check
 	// (validateClassOfServiceLossPriorityStrict) from a hard error to a
@@ -2442,6 +2457,7 @@ func lenientCompileOpts() compileOpts {
 		lenientEventAttributesMatch:            true,
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
+		lenientCoSInterfaceRefs:                true,
 		lenientCoSLossPriority:                 true,
 		lenientCoSUnitClassifierConflict:       true,
 		lenientCoSForwardingClassQueue:         true,
