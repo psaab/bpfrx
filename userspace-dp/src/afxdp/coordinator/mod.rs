@@ -695,6 +695,11 @@ impl Coordinator {
             }
         }
         self.wg_control_threads.clear();
+        // #7092: reclaim the outgoing generation's NAT holder bits BEFORE
+        // `stop_and_clear` drops the records — after it the ids are gone and
+        // nothing can name them again. Why all ids, and why this is not the
+        // `dead`-keyed sweep, is on `retire_all_worker_holders`.
+        self.retire_all_worker_holders();
         self.workers.stop_and_clear(
             self.bpf_maps.map_fd.as_ref(),
             self.bpf_maps.heartbeat_map_fd.as_ref(),

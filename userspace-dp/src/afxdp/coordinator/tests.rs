@@ -7490,3 +7490,118 @@ fn refresh_status_reclaims_dead_worker_holders_6979() {
         "the status path must latch the worker as retired"
     );
 }
+
+/// #7092 REPLAN route: a generation teardown must reclaim holder bits across
+/// ALL THREE allocator families, for a worker that is perfectly healthy.
+///
+/// `dead` is written only by the panic supervisor, so a replan — which stops and
+/// joins a healthy generation — never sets it. #8069's sweep is keyed on `dead`
+/// and therefore cannot see this case at all; that gap is exactly what kept
+/// #7092 open after the panic route closed.
+///
+/// The fixture covers interface-mode, pool-mode and NAT64 deliberately. #8069's
+/// test exercised interface-mode only, and its disclosed consequence was that
+/// dropping either of the other two sweeps red nothing. Binding one family and
+/// claiming three is the shape that lets a sweep silently stop covering a
+/// family, so all three hold a live reservation here and each is asserted
+/// separately.
+#[test]
+fn stop_inner_retires_holders_for_all_allocator_families_7092() {
+    use crate::nat::{NatHolder, PortAllocator, SourceNatFlowKey, TranslatedTuple};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let atomics = rec.handle.runtime_atomics.clone();
+    coordinator.workers.records.insert(2, rec);
+    assert!(
+        !atomics.dead.load(Ordering::Relaxed),
+        "the worker must be HEALTHY: a replan retires a live generation, and a \
+         dead-keyed sweep cannot see that"
+    );
+
+    let flow = |src_port: u16| SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.11".parse().unwrap(),
+        dst_ip: "198.51.100.11".parse().unwrap(),
+        src_port,
+        dst_port: 443,
+    };
+
+    // (1) interface-mode
+    let egress: IpAddr = "192.0.2.20".parse().unwrap();
+    let iface_alloc = coordinator
+        .forwarding
+        .iface_nat_allocators
+        .allocator_for(egress)
+        .expect("iface allocator");
+    assert!(iface_alloc.reserve_flow(
+        flow(6001),
+        TranslatedTuple { ip: egress, port: 40001 },
+        0,
+        false,
+        1_000,
+        NatHolder::Worker(2),
+    ));
+
+    // (2) pool-mode rule. The allocator is Clone-shared, so the clone kept here
+    // observes the same state as the one inside `source_nat_rules`.
+    let mut rule = crate::nat::SourceNatRule::default();
+    rule.pool_allocator = PortAllocator::new(1, 40000, 40100);
+    let pool_alloc = rule.pool_allocator.clone();
+    let pool_addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+    assert!(pool_alloc.reserve_flow(
+        flow(6002),
+        TranslatedTuple { ip: pool_addr, port: 40002 },
+        0,
+        false,
+        1_000,
+        NatHolder::Worker(2),
+    ));
+    coordinator.forwarding.source_nat_rules.push(rule);
+
+    // (3) NAT64 prefix
+    let nat64_alloc = PortAllocator::new(1, 40000, 40100);
+    let nat64_addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+    assert!(nat64_alloc.reserve_flow(
+        flow(6003),
+        TranslatedTuple { ip: nat64_addr, port: 40003 },
+        0,
+        false,
+        1_000,
+        NatHolder::Worker(2),
+    ));
+    coordinator
+        .forwarding
+        .nat64
+        .prefixes
+        .push(crate::nat64::Nat64Prefix::for_test(
+            [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0],
+            vec![Ipv4Addr::new(198, 51, 100, 77)],
+            nat64_alloc.clone(),
+        ));
+
+    // Preconditions: without these the assertions after teardown could pass
+    // against reservations that were never taken.
+    assert!(iface_alloc.debug_is_port_occupied(0, 40001), "iface fixture");
+    assert!(pool_alloc.debug_is_port_occupied(0, 40002), "pool fixture");
+    assert!(nat64_alloc.debug_is_port_occupied(0, 40003), "nat64 fixture");
+
+    coordinator.stop_inner(false);
+
+    assert!(
+        !iface_alloc.debug_is_port_occupied(0, 40001),
+        "interface-mode reservation survived the generation teardown"
+    );
+    assert!(
+        !pool_alloc.debug_is_port_occupied(0, 40002),
+        "pool-mode reservation survived the generation teardown — this is the \
+         family #8069's fixture did not cover"
+    );
+    assert!(
+        !nat64_alloc.debug_is_port_occupied(0, 40003),
+        "NAT64 reservation survived the generation teardown — the other family \
+         #8069's fixture did not cover"
+    );
+}

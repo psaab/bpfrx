@@ -241,6 +241,28 @@ pub(crate) struct Nat64Prefix {
     pub(crate) over_budget: bool,
 }
 
+impl Nat64Prefix {
+    /// #7092: minimal constructor for tests that need a prefix holding a live
+    /// allocator. `pool_index` is private, so a struct literal cannot be built
+    /// outside this module; this keeps that field private rather than widening
+    /// it for one fixture.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        prefix_bytes: [u8; 12],
+        pool_v4: Vec<Ipv4Addr>,
+        port_allocator: PortAllocator,
+    ) -> Self {
+        Self {
+            prefix_bytes,
+            pool_v4,
+            pool_index: AtomicUsize::new(0),
+            port_allocator,
+            deterministic_v6: None,
+            over_budget: false,
+        }
+    }
+}
+
 impl Clone for Nat64Prefix {
     fn clone(&self) -> Self {
         Self {
