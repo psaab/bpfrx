@@ -1,5 +1,69 @@
 # #2387 — VRF/routing-instance awareness in session/flow identity
 
+> **v7 — DECIDED AND LANDED (2026-08-30).** Track B-P0 (phase 1, #7160 /
+> PR #8098) put `routing_domain: u32` on `SessionKey`; **phase 2 populates
+> it**, which is what closes the collision in production. Both phases are on
+> master. Read this note before §0 or v6 — it corrects one claim each made.
+>
+> **What phase 2 does.** `StableRoutingInstanceTableID(name)` is computed in
+> Go (`routingInstanceDomain`, `pkg/dataplane/userspace/routes.go`), shipped
+> per interface on the config snapshot (`InterfaceSnapshot.routing_domain`),
+> and stamped onto the flow at ONE site — the poll path's stage 9b, just
+> after fabric-ingress classification — from the LOGICAL ingress interface
+> (`forwarding::ingress_routing_domain`). Two routing instances that share a
+> 5-tuple are now two conntrack entries, so the established-session fast path
+> can no longer hand tenant B tenant A's cached egress, NAT and policy
+> verdict.
+>
+> **§0e's "ISOLATE" table row is right; its symmetry premise was NOT.** Both
+> v5 §0a and the v6 note assert a flow's routing domain is the same in both
+> directions. Measured at implementation time, that is FALSE for this
+> dataplane and the reason is already written in §3: the transit route lookup
+> is **not** VRF-isolated — it uses the default table unless a PBR term
+> overrides it — so a flow that ingresses on a routing-instance member
+> interface and egresses out of the default instance is a real, WORKING
+> configuration whose reply resolves a different domain. Keying the reverse
+> index on the forward domain would have blackholed every such flow's
+> replies: a forwarding outage, not a hardening. The maintainer flagged
+> exactly this on the issue ("config-derived guarantees the two NODES agree;
+> it does not guarantee the two DIRECTIONS do") and it is now answered.
+>
+> **How phase 2 answers it.** The five transforms split. The three
+> SAME-DIRECTION ones (`forward_wire_key`, `translated_session_key`,
+> `reverse_session_key`) preserve the domain. The two REVERSE-MATCH ones
+> (`reverse_wire_key`, `reverse_canonical_key`) build a domain-AGNOSTIC
+> index, and `find_forward_nat_match` spends the reply's own domain on a
+> two-pass PREFERENCE over the (1:N) bucket instead — a candidate carrying
+> the reply's domain wins, and a domain-agnostic match is the fallback. Two
+> contained tenants demux exactly on the reply; a non-contained flow keeps
+> forwarding as it did before the field existed.
+>
+> **No HA protocol bump, and no new wire field either.** §0a's finding
+> stands and is now stronger than it needed to be: the domain does not ride
+> the wire at all. It is a pure function of the flow's ingress interface and
+> the config, both nodes run identical config, and #7095 already resolves the
+> peer's cluster-stable ingress NAME into the importing node's own
+> ifindex/vlan — so the importing node DERIVES it
+> (`Coordinator::synced_routing_domain`). A second spelling of one fact is
+> the thing that can disagree; there isn't one. `CurrentHAProtocolVersion`
+> and `SessionSyncWireVersion` both stay put.
+>
+> **What is still out of scope.** Per-VRF default FIB (Track B-ext) — the
+> change that would make the reply direction symmetric BY CONSTRUCTION rather
+> than by preference — remains deferred and is still not a prerequisite. A
+> PBR `then routing-instance` on an `instance-type forwarding` instance with
+> no member interfaces still resolves domain 0 in both directions; #7924's
+> strict-path rejection of overlap + PBR is what covers that shape, exactly
+> the "coherent division" the maintainer named on the issue. The Go-side
+> session store is still keyed on the bare 5-tuple
+> (`dataplane.SessionKeyV4`), which bounds HA sync fidelity for two tenants
+> sharing a 5-tuple.
+>
+> Guarded by `userspace-dp/tests/vrf_session_identity_doc_guard.rs`, which
+> now pins the 3/2 transform split, the two-pass preference, the single stamp
+> site, and that the stamp runs after fabric classification.
+
+
 > **v6 — DECIDED AND PARTLY LANDED (2026-08-30).** The open maintainer
 > question in §0 is answered: **Option B, widen the key.** Track B-P0 has
 > landed as #7160 phase 1.

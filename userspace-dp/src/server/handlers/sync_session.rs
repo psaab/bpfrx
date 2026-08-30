@@ -17,8 +17,19 @@ pub(super) fn handle(
         response.error = "missing session sync request".to_string();
         return;
     };
+    // #7160 (#2387): resolve the imported session's routing DOMAIN from the
+    // #7095 cluster-stable ingress identity, which the sender resolved into
+    // THIS node's own ifindex/vlan before the request got here. Derived, never
+    // wire-carried — see `Coordinator::synced_routing_domain`.
+    let routing_domain = guard
+        .afxdp
+        .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id);
     match sync_req.operation.as_str() {
-        "upsert" => match build_synced_session_entry(&sync_req, guard.afxdp.zone_name_to_id_ref()) {
+        "upsert" => match build_synced_session_entry(
+            &sync_req,
+            guard.afxdp.zone_name_to_id_ref(),
+            routing_domain,
+        ) {
             Ok(entry) => {
                 // #6785: a SEMANTIC refusal (stale generation / import cap /
                 // translated-tuple reserve) used to return `()` and leave
@@ -46,9 +57,24 @@ pub(super) fn handle(
                 response.error = err;
             }
         },
-        "delete" => match build_synced_session_key(&sync_req) {
+        "delete" => match build_synced_session_key(&sync_req, routing_domain) {
             Ok(key) => {
-                guard.afxdp.delete_synced_session(key);
+                guard.afxdp.delete_synced_session(key.clone());
+                // #7160 (#2387): a bare-5-tuple delete (the `clear security
+                // flow session` / batch-revoke path) carries no ingress
+                // identity, so the key above resolved domain 0 and the exact
+                // delete cannot reach a session that lives in a routing
+                // instance. Retry once per configured domain so a clear the
+                // operator was told succeeded actually revoked the session.
+                // Empty — and therefore a no-op — in every deployment with no
+                // routing-instance interface membership.
+                if key.routing_domain == 0 {
+                    for domain in guard.afxdp.routing_domains() {
+                        let mut scoped = key.clone();
+                        scoped.routing_domain = domain;
+                        guard.afxdp.delete_synced_session(scoped);
+                    }
+                }
             }
             Err(err) => {
                 response.ok = false;

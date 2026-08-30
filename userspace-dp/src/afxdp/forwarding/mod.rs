@@ -138,6 +138,61 @@ pub(super) fn resolve_ingress_logical_ifindex(
         .copied()
 }
 
+/// #7160 (#2387): the ROUTING DOMAIN a received frame's flow belongs to — the
+/// value stamped onto `SessionKey.routing_domain` so two routing instances
+/// that share a 5-tuple are two conntrack entries rather than one.
+///
+/// Resolved from the LOGICAL (VLAN unit) ingress ifindex, exactly like the
+/// zone / filter / pre-routing-NAT ingress identity (#3021/#5802): a trunk
+/// whose units sit in different routing instances must not collapse onto its
+/// parent's first unit. An interface in no routing instance — every interface
+/// in a single-instance deployment — is domain 0.
+///
+/// **Why the INGRESS interface and nothing else.** The reverse key is built by
+/// swapping the forward key's fields and never observes the reply packet, so
+/// the domain has to be a quantity BOTH directions of a flow compute the same
+/// way from their own arriving frame. The ingress interface's routing-instance
+/// membership is that quantity for a flow contained in one instance. A PBR
+/// `then routing-instance` assignment is NOT: the reply ingresses on an
+/// interface the PBR term never touches, so an assigned-domain key could never
+/// be recomputed on the reply. See `forwarding/README.md`.
+///
+/// **Fabric ingress.** A frame arriving over the fabric link did not arrive on
+/// the flow's real ingress interface, so the fabric link's own membership (no
+/// instance, domain 0) would be a wrong answer, not a missing one. When the
+/// peer zone-encoded the ORIGINAL ingress zone into the frame, the domain is
+/// resolved from that zone instead (`zone_routing_domain`), which is the same
+/// identity the rest of the fabric-ingress path already adjudicates on. An
+/// unencoded fabric frame has nothing to resolve and stays domain 0.
+#[inline]
+pub(in crate::afxdp) fn ingress_routing_domain(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+    fabric_ingress_zone: Option<u16>,
+) -> u32 {
+    // Single-bool gate: a deployment with no routing-instance interface
+    // membership never probes either map, so its session identity is
+    // bit-identical to pre-#7160.
+    if !forwarding.has_routing_domains {
+        return 0;
+    }
+    if let Some(zone) = fabric_ingress_zone {
+        return forwarding
+            .zone_routing_domain
+            .get(&zone)
+            .copied()
+            .unwrap_or(0);
+    }
+    let logical = resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, ingress_vlan_id)
+        .unwrap_or(ingress_ifindex);
+    forwarding
+        .ifindex_to_routing_domain
+        .get(&logical)
+        .copied()
+        .unwrap_or(0)
+}
+
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
 #[cfg(test)]
