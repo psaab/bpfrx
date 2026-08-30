@@ -111,7 +111,10 @@ const (
 	// EnvelopeFormatVersion is the envelope grammar version (the `v=`
 	// field). Bump only on an incompatible header-grammar change; a
 	// reader rejects an envelope whose v= it does not understand.
-	EnvelopeFormatVersion = 1
+	// #7176 (C179-053) raised this 1 -> 2. v2 binds the header line into the
+	// AES-GCM AAD, so the plaintext header — including the #1922
+	// committed= marker — is authenticated instead of freely editable.
+	EnvelopeFormatVersion = 2
 
 	// EnvelopeASTVersion is the current config AST/schema version the
 	// writer stamps. Informational today (carried for future migrations);
@@ -124,6 +127,20 @@ const (
 	// It equals EnvelopeFormatVersion today (this build both writes and
 	// requires v1); a future incompatible writer raises it.
 	EnvelopeMinReaderVersion = 1
+
+	// envelopeAADFormatVersion is the first envelope version whose encrypted
+	// body is sealed with the header line as AES-GCM additional authenticated
+	// data (#7176 C179-053).
+	//
+	// It is a READ-SIDE gate, and that is what makes the migration safe against
+	// a forced downgrade. A reader uses nil AAD only when the stored v= is
+	// BELOW this. An attacker who rewrites a v2 envelope's header to v=1 to get
+	// the weaker path makes the reader attempt nil-AAD decryption against a
+	// ciphertext sealed WITH AAD — which fails. The downgrade attempt fails
+	// CLOSED rather than succeeding weakly, and the upgrade direction cannot be
+	// forged because it requires re-sealing. Old envelopes stay readable and
+	// migrate to v2 on their next write, so there is no flag day.
+	envelopeAADFormatVersion = 2
 
 	// EnvelopeRollbackFormatVersion is the rollback-slot DB format version
 	// (carried so a future rollback-format change is detectable). The
@@ -171,7 +188,7 @@ func hasEnvelope(data []byte) bool {
 // trailing newline) for the given writer version. committed stamps the
 // #1922 step-0 marker (committed=1 for a real commit/sync, committed=0 for
 // the never-committed first-commit-rollback marker).
-func buildEnvelopeHeaderLine(writer string, committed bool) []byte {
+func buildEnvelopeHeaderLine(writer string, committed bool, minReader int) []byte {
 	if writer == "" {
 		writer = "unknown"
 	}
@@ -184,7 +201,7 @@ func buildEnvelopeHeaderLine(writer string, committed bool) []byte {
 	}
 	line := fmt.Sprintf("%s v=%d writer=%s ast=%d min-reader=%d rollback-fmt=%d %s=%d\n",
 		envelopeMagic, EnvelopeFormatVersion, writer,
-		EnvelopeASTVersion, EnvelopeMinReaderVersion, EnvelopeRollbackFormatVersion,
+		EnvelopeASTVersion, minReader, EnvelopeRollbackFormatVersion,
 		committedFieldKey, c)
 	return []byte(line)
 }
@@ -206,8 +223,8 @@ func sanitizeEnvelopeToken(s string) string {
 // wrapEnvelope prepends the magic header line to body. body is the
 // already-(maybe-)encrypted JSON bytes. committed stamps the #1922 step-0
 // marker (see buildEnvelopeHeaderLine).
-func wrapEnvelope(body []byte, writer string, committed bool) []byte {
-	header := buildEnvelopeHeaderLine(writer, committed)
+func wrapEnvelope(body []byte, writer string, committed bool, minReader int) []byte {
+	header := buildEnvelopeHeaderLine(writer, committed, minReader)
 	out := make([]byte, 0, len(header)+len(body))
 	out = append(out, header...)
 	out = append(out, body...)
@@ -301,11 +318,29 @@ func parseEnvelopeHeader(line string) (*envelopeHeader, error) {
 			}
 			hdr.RollbackFormat = n
 		case committedFieldKey:
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, fmt.Errorf("config envelope: bad %s=%q: %w", committedFieldKey, v, err)
+			// #7176 (C179-053): CANONICAL parse. This was strconv.Atoi followed
+			// by `n != 0`, which accepted "2", "-1", "+1", "007" and " 1" as
+			// committed — a permissive reading of a field that gates the #1922
+			// bootstrap decision. Only the two values this build ever writes are
+			// accepted; anything else is a malformed envelope, not a truthy one.
+			//
+			// Absence is a SEPARATE question and is deliberately NOT changed
+			// here: a header with no committed= field still defaults to true
+			// (migration rule C3 above), because an older-build envelope must
+			// read as committed or an upgrade misclassifies into bootstrap.
+			// That default stops being a fail-open once v2 binds the header into
+			// the AAD, since an attacker can no longer DELETE the field without
+			// breaking decryption.
+			switch v {
+			case "0":
+				hdr.Committed = false
+			case "1":
+				hdr.Committed = true
+			default:
+				return nil, fmt.Errorf(
+					"config envelope: bad %s=%q (want exactly \"0\" or \"1\")",
+					committedFieldKey, v)
 			}
-			hdr.Committed = n != 0
 		default:
 			// Unknown fields are tolerated (additive forward-compat); the
 			// v=/min-reader gate is what governs readability.
@@ -315,4 +350,22 @@ func parseEnvelopeHeader(line string) (*envelopeHeader, error) {
 		return nil, fmt.Errorf("config envelope: header missing required v= field: %q", line)
 	}
 	return hdr, nil
+}
+
+// envelopeHeaderLineBytes returns the header line of an enveloped file EXACTLY
+// as stored, including its trailing newline — the byte sequence the writer used
+// as AES-GCM AAD (#7176 C179-053).
+//
+// It deliberately returns the stored bytes rather than re-rendering the header
+// from the parsed fields. A re-render would normalise field order, spacing and
+// unknown forward-compat fields, so any writer difference would silently break
+// decryption; and it would also re-authenticate a header the reader had just
+// rewritten, which is the opposite of the point. The caller must have confirmed
+// hasEnvelope(data).
+func envelopeHeaderLineBytes(data []byte) []byte {
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		return nil
+	}
+	return data[:nl+1]
 }

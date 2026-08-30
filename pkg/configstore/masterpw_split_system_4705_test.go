@@ -141,7 +141,7 @@ func TestMasterPasswordSplitStanzaDowngradeWarn_4705(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal tree: %v", err)
 	}
-	framed := wrapEnvelope(body, "", true)
+	framed := wrapEnvelope(body, "", true, EnvelopeMinReaderVersion)
 	if err := fsatomic.WriteFileDurable(s.db.activePath(), framed, 0600); err != nil {
 		t.Fatalf("write plaintext active.json: %v", err)
 	}

@@ -72,7 +72,7 @@ func TestReadConfirmRejectsDegenerateRecord_5637(t *testing.T) {
 		}
 		raw := []byte(body)
 		if encrypted {
-			raw, err = db.maybeEncryptTreeJSON(raw, mpTree)
+			raw, err = db.maybeEncryptTreeJSON(raw, mpTree, nil)
 			if err != nil {
 				t.Fatalf("maybeEncryptTreeJSON: %v", err)
 			}

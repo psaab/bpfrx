@@ -52,7 +52,7 @@ func TestReadTreeMetaRejectsNonObjectBody_5474(t *testing.T) {
 		}
 		raw := []byte(body)
 		if enveloped {
-			raw = wrapEnvelope(raw, "9.9.9", true)
+			raw = wrapEnvelope(raw, "9.9.9", true, EnvelopeMinReaderVersion)
 		}
 		if err := os.WriteFile(db.activePath(), raw, 0600); err != nil {
 			t.Fatalf("write active.json: %v", err)

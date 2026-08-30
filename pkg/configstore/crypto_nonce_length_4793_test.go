@@ -45,7 +45,7 @@ func TestMaybeDecryptTreeJSON_WrongNonceLength_ReturnsErrorNotPanic(t *testing.T
 		}
 	}()
 
-	_, decrypted, err := db.maybeDecryptTreeJSON(data)
+	_, decrypted, err := db.maybeDecryptTreeJSON(data, nil)
 	if err == nil {
 		t.Fatalf("expected error for wrong-length nonce, got nil (decrypted=%v)", decrypted)
 	}

@@ -259,7 +259,13 @@ func nodeValue(n *config.Node) string {
 	return ""
 }
 
-func (db *DB) maybeEncryptTreeJSON(data []byte, tree *config.ConfigTree) ([]byte, error) {
+// aad is the AES-GCM additional authenticated data. The envelope write path
+// passes the header line so the plaintext header — including the #1922
+// committed= marker — is bound to the ciphertext and cannot be edited in place
+// (#7176 C179-053). Callers with no header to bind (WriteConfirm) pass nil,
+// which is the pre-#7176 behaviour and is correct for them: there is no
+// plaintext preamble to authenticate.
+func (db *DB) maybeEncryptTreeJSON(data []byte, tree *config.ConfigTree, aad []byte) ([]byte, error) {
 	prf := masterPasswordPRF(tree)
 	if prf == "" {
 		return data, nil
@@ -293,7 +299,7 @@ func (db *DB) maybeEncryptTreeJSON(data []byte, tree *config.ConfigTree) ([]byte
 		PRF:    prf,
 		Salt:   base64.StdEncoding.EncodeToString(salt),
 		Nonce:  base64.StdEncoding.EncodeToString(nonce),
-		Data:   base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, data, nil)),
+		Data:   base64.StdEncoding.EncodeToString(gcm.Seal(nil, nonce, data, aad)),
 	}
 	return marshalEnvelope(env)
 }
@@ -304,7 +310,13 @@ func (db *DB) maybeEncryptTreeJSON(data []byte, tree *config.ConfigTree) ([]byte
 // plaintext because it carried no envelope (false). Callers that know
 // the config declares a master-password use the flag to detect an
 // unexpected plaintext downgrade (#4579 A4-06).
-func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, bool, error) {
+// aad must be byte-identical to what the writer sealed with, or the tag check
+// fails. The envelope read path supplies the stored header line ONLY when the
+// stored v= is at or above envelopeAADFormatVersion; below that it passes nil,
+// which is how pre-v2 envelopes stay readable. A tampered v2 header — including
+// one rewritten to claim v=1 — therefore fails to decrypt rather than being
+// read under the weaker rule (#7176 C179-053).
+func (db *DB) maybeDecryptTreeJSON(data []byte, aad []byte) ([]byte, bool, error) {
 	env, ok, err := unmarshalEnvelope(data)
 	if err != nil {
 		return nil, false, err
@@ -351,7 +363,7 @@ func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, bool, error) {
 	if len(nonce) != gcm.NonceSize() {
 		return nil, false, fmt.Errorf("invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
 	}
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, false, fmt.Errorf("decrypt config tree: %w", err)
 	}

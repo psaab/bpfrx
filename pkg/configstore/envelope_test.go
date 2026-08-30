@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,7 +57,16 @@ func TestEnvelopeOnDiskHasMagicHeader(t *testing.T) {
 		t.Fatalf("on-disk active.json does not start with envelope magic: %q", raw[:min(40, len(raw))])
 	}
 	firstLine := string(raw[:bytes.IndexByte(raw, '\n')])
-	for _, want := range []string{"v=1", "writer=9.9.9", "min-reader=1"} {
+	// #7176: assert against the CONSTANTS, not literals. Pinning "v=1" encoded
+	// which side of the agreement was trusted, and it broke the moment the
+	// writer legitimately moved to v2 — reporting a version bump as a header
+	// defect. The property worth holding is that the header states what this
+	// build actually writes.
+	for _, want := range []string{
+		fmt.Sprintf("v=%d", EnvelopeFormatVersion),
+		"writer=9.9.9",
+		fmt.Sprintf("min-reader=%d", EnvelopeMinReaderVersion),
+	} {
 		if !strings.Contains(firstLine, want) {
 			t.Errorf("header line %q missing %q", firstLine, want)
 		}
@@ -69,7 +79,7 @@ func TestEnvelopeOnDiskHasMagicHeader(t *testing.T) {
 // silent-wipe defect the floor closes: an old reader must reject, not
 // empty-load.
 func TestOldReaderRejectsEnvelope(t *testing.T) {
-	body := wrapEnvelope([]byte(`{"Children":null}`), "1.0", true)
+	body := wrapEnvelope([]byte(`{"Children":null}`), "1.0", true, EnvelopeMinReaderVersion)
 	var tree config.ConfigTree
 	if err := json.Unmarshal(body, &tree); err == nil {
 		t.Fatal("old reader (bare json.Unmarshal) accepted the envelope; floor is broken — it must reject")
