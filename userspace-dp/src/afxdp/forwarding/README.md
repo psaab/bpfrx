@@ -349,7 +349,11 @@ forward-direction collision.
   request named no ingress identity to resolve one from*
   (#7096 fabric-redirected, or no cluster-stable name). The upsert verb
   refuses `None` — `SyncedImportOutcome::RejectedUnknownRoutingDomain`,
-  counted by `synced_import_unknown_routing_domain_total`.
+  counted by `synced_import_unknown_routing_domain_total` and exported as
+  `xpf_userspace_synced_import_unknown_routing_domain_total`. Alert on
+  sustained growth: it is the only signal that a VRF cluster is silently not
+  taking over a subset of its peer's sessions, and it is always 0 on a
+  single-instance node.
 
   This bullet previously said such a session "imports at domain 0 — the
   pre-#7160 identity … a correctness-preserving degradation, not a bypass".

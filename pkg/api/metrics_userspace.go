@@ -845,6 +845,14 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		prometheus.CounterValue,
 		float64(status.SyncedImportReserveRefused),
 	)
+	// #7160: emitted unconditionally like its neighbours — a 0 is the real
+	// "every synced import resolved its routing domain" signal, and an absent
+	// series is indistinguishable from a helper that never reports.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSyncedImportUnknownRoutingDomain,
+		prometheus.CounterValue,
+		float64(status.SyncedImportUnknownRoutingDomain),
+	)
 
 	// #7209: peer-synced imports that skipped #6211's zone narrowing.
 	// Emitted unconditionally, for the same reason as its neighbours: a 0

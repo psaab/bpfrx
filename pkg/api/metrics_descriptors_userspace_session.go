@@ -351,6 +351,18 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"pre-failover warning, not a post-mortem.",
 		nil, nil,
 	)
+	c.userspaceSyncedImportUnknownRoutingDomain = prometheus.NewDesc(
+		"xpf_userspace_synced_import_unknown_routing_domain_total",
+		"Peer-synced imports refused because this node runs routing "+
+			"instances and the request named no ingress identity to resolve "+
+			"the session's routing domain from (#7160). Importing under "+
+			"domain 0 would file the session in the DEFAULT instance's "+
+			"identity space, where a reply that resolved its own domain "+
+			"reaches it. Sustained growth on a VRF cluster means those flows "+
+			"will NOT be taken over on failover; always 0 on a "+
+			"single-instance node.",
+		nil, nil,
+	)
 	c.userspaceSharedSessionPoisonRecoveries = prometheus.NewDesc(
 		"xpf_userspace_shared_session_poison_recoveries_total",
 		"Shared-session mutex poison recoveries across every "+

@@ -593,6 +593,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "synced_import_reserve_refused", default)]
     pub synced_import_reserve_refused: u64,
+    /// #7160 (#2387): peer-synced imports refused because this node runs
+    /// routing instances and the request named no ingress identity to resolve
+    /// the session's routing DOMAIN from. Importing under domain 0 would file
+    /// the session in the DEFAULT instance's identity space, where a reply
+    /// that resolved its own domain reaches it — so it is refused instead.
+    /// Sustained growth on a VRF cluster means those flows will NOT be taken
+    /// over on failover; always 0 on a single-instance node. Surfaced as
+    /// `xpf_userspace_synced_import_unknown_routing_domain_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "synced_import_unknown_routing_domain", default)]
+    pub synced_import_unknown_routing_domain: u64,
     /// #7209: peer-synced imports whose zone pair did not resolve, so the
     /// source-NAT reservation skipped #6211's zone narrowing. Surfaced as
     /// `xpf_userspace_synced_import_zone_unresolved_total`.

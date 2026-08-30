@@ -169,6 +169,13 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.afxdp.session_delete_stale_ignored_total();
     state.status.synced_import_reserve_refused =
         state.afxdp.synced_import_reserve_refused_total();
+    // #7160 (#2387): imports refused for an unresolvable routing domain. Wired
+    // here rather than parked in UNSURFACED because that allowlist is
+    // deliberately EMPTY (#7398 emptied it), and because this counter is the
+    // only signal that a VRF cluster is silently not taking over a subset of
+    // its peer's sessions.
+    state.status.synced_import_unknown_routing_domain =
+        state.afxdp.synced_import_unknown_routing_domain_total();
     // #7209: peer-synced imports whose zone pair did not resolve, so the
     // source-NAT reservation skipped #6211's narrowing. Expected nonzero while
     // a config apply is in flight (sync_session reads the PUBLISHED forwarding

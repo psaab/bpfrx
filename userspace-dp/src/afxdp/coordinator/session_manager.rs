@@ -100,11 +100,14 @@ pub(in crate::afxdp) struct SessionManager {
     /// sessions are not taken over; their flows re-adjudicate through policy
     /// after a failover.
     ///
-    /// Surfaced via `Coordinator::synced_import_unknown_routing_domain_total()`.
-    /// It is deliberately NOT yet on the Prometheus surface: giving the
-    /// tolerant-path admissions a runtime surface is #7991's subject, and one
-    /// counter exported through a different route than its siblings is how the
-    /// two descriptions drift.
+    /// Surfaced via `Coordinator::synced_import_unknown_routing_domain_total()`
+    /// and the Prometheus counter
+    /// `xpf_userspace_synced_import_unknown_routing_domain_total`, on the same
+    /// route as every sibling refusal counter. It was briefly written as
+    /// "deliberately not surfaced"; the #6641 status-wiring audit rejected
+    /// that, correctly — its `UNSURFACED` allowlist is deliberately EMPTY
+    /// since #7398, and this counter is the only signal that a VRF cluster is
+    /// silently not taking over a subset of its peer's sessions.
     pub(in crate::afxdp) import_unknown_routing_domain: AtomicU64,
     /// #6600: peer-synced imports REFUSED because this node could not reserve
     /// the translated NAT port the session names.
