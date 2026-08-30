@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -103,7 +104,43 @@ func applyStartupNamingPolicy(cfg *config.Config, nodeID int, clusterMode bool,
 	if deviceMapNamingActive(cfg) {
 		return enumerateAndRenameMappedFn(cfg.Chassis.DeviceMap, cfg, protected)
 	}
+	// #7205: positional naming has no strand refusal, and that is CORRECT --
+	// it claims every present NIC by design, so "the lifeline moved" is the
+	// normal case rather than an error. Device-map mode refuses a boot rename
+	// that would strand management (deviceMapStrandsManagement) precisely
+	// because it does NOT claim every NIC, so a stranded lifeline there means
+	// an unmapped NIC nobody will name.
+	//
+	// What was wrong was accepting the parameter and dropping it in silence: a
+	// reader of this function could not tell a deliberate non-use from an
+	// oversight, and an operator who had configured a lifeline expectation had
+	// no way to learn it does not apply on this branch. Say so, once, and only
+	// when the combination is actually surprising (a non-empty protected set
+	// reaching the branch that will not honour it).
+	notePositionalIgnoresProtected(protected)
 	return enumerateAndRenameInterfacesFn(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed)
+}
+
+// notePositionalIgnoresProtected records that a management/lifeline protected
+// set reached the positional branch, which does not refuse renames (#7205).
+//
+// Deliberately an INFO and not a WARN: this is the designed behaviour of
+// positional mode, not a fault. It is emitted only for a NON-EMPTY set, so a
+// normal boot stays silent and the line appears exactly when an operator might
+// otherwise assume the protection applied.
+func notePositionalIgnoresProtected(protected map[string]bool) {
+	if len(protected) == 0 {
+		return
+	}
+	names := make([]string, 0, len(protected))
+	for n := range protected {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	slog.Info("linksetup: positional naming claims every present NIC, so the "+
+		"management/lifeline protected set is NOT a rename refusal on this branch "+
+		"(it is one only in device-map mode, where unmapped NICs exist)",
+		"protected", strings.Join(names, ","))
 }
 
 // deviceMapOriginalNameFor computes the OriginalName= to record in a mapped
@@ -289,7 +326,7 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		nicByName[nics[i].Name] = nics[i]
 		currentNames[i] = nics[i].Name
 	}
-	strandedTmp, changed := breakNameCollisions("device-map", currentNames, desiredNames,
+	strandedTmp, unfreed, changed := breakNameCollisions("device-map", currentNames, desiredNames,
 		desiredByCurrent, originalByCurrent, renameInterfaceFn)
 	// A temp-stranded UNMAPPED NIC (not a desired source) is carried into phase
 	// 3 keyed by its temp name; the presentNIC keeps its ORIGINAL (pre-temp)
@@ -301,6 +338,15 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 
 	// Phase 2: rename each mapped NIC to its final logical name.
 	for current, final := range desiredByCurrent {
+		// #7205: phase 1 could not free this final name, so every rename onto
+		// it below would EEXIST. Report the real cause once, here, rather than
+		// letting each attempt surface a misleading EEXIST.
+		if current != final && unfreed[final] {
+			slog.Warn("device-map: skipping rename onto a name the collision "+
+				"break could not free", "from", current, "to", final)
+			renameErrs = append(renameErrs, unfreedNameErr("device-map", current, final))
+			continue
+		}
 		// The OriginalName= is the TRUE pre-rename kernel name captured
 		// before any temp rename; fall back to recovering it if absent.
 		original := originalByCurrent[current]
