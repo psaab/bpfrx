@@ -1401,6 +1401,15 @@ type compileOpts struct {
 	// before this gate existed and still contributes none), just with an
 	// operator-visible warning. Same doctrine as lenientZoneInterfaceDefined.
 	lenientZoneInterfacesNonEmpty bool
+
+	// lenientNestedZonePair (#7523) downgrades the nested
+	// `from-zone X { to-zone Y { ... } }` rejection to a warning on the
+	// tolerant Load / SyncApply ingress. The shape compiled to nothing before
+	// this gate existed and still compiles to nothing, so a leniently-loaded
+	// config enforces exactly what it enforced before -- the #1960 no-brick
+	// contract. Strict on the operator commit path, where the point is to stop
+	// the operator BELIEVING the policy is in force.
+	lenientNestedZonePair bool
 	// lenientZoneInterfacePackedTail (#6735) downgrades the zone-interfaces
 	// PACKED-TAIL gate (validateZoneInterfacePackedTailStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -2487,6 +2496,7 @@ func lenientCompileOpts() compileOpts {
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
 		lenientZoneInterfacesNonEmpty:          true,
+		lenientNestedZonePair:                  true,
 		lenientZoneInterfacePackedTail:         true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,

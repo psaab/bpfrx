@@ -252,6 +252,20 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 	// the stanza "names no interface" sends them looking for the wrong problem.
 	// Every other non-empty case (a keyword with NOTHING after it, a body-only
 	// block) leaves this gate silent and still reaches that one.
+	// #7523 NESTED ZONE-PAIR gate. Strict on commit / commit-check, lenient on
+	// the tolerant Load / SyncApply ingress. Runs on the tree, not the compiled
+	// *Config, because the nested shape compiles to NOTHING -- a compiled
+	// SecurityConfig cannot distinguish "no policies were written" from "the
+	// policies that were written were dropped", which is the whole defect.
+	if err := validateNestedZonePairStrict(tree); err != nil {
+		if opts.lenientNestedZonePair {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nested zone pair (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	if err := validateZoneInterfacePackedTailStrict(tree); err != nil {
 		if opts.lenientZoneInterfacePackedTail {
 			cfg.Warnings = append(cfg.Warnings,
