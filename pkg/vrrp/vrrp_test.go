@@ -655,12 +655,34 @@ func TestSyncHold_RearmStopsPreviousTimer(t *testing.T) {
 	}
 	m.mu.Unlock()
 
-	m.SetSyncHold(30 * time.Millisecond)
-	time.Sleep(15 * time.Millisecond)
-	m.SetSyncHold(120 * time.Millisecond)
+	// #8018: every duration here is a wall-clock sample, so the RATIOS are the
+	// test rather than the values. The originals were 30/15/120/60/90 — roughly
+	// 2x margin on each window and 1.25x on the last — which reds under
+	// concurrent-suite load, in pkg/vrrp, on changes that cannot reach it.
+	//
+	//   firstHold  the timer that must be STOPPED by the re-arm
+	//   rearmHold  the timer that replaces it; must be long enough that
+	//              waitPastFirst cannot reach it
+	//   preRearm   must land INSIDE firstHold, or the first timer fires before
+	//              the re-arm and there is nothing to stop (10x margin)
+	//   waitPastFirst  must exceed firstHold — otherwise "still held" passes
+	//              vacuously because nothing had time to fire — while staying
+	//              well under rearmHold (4x past, 3.75x short)
+	const (
+		firstHold     = 100 * time.Millisecond
+		rearmHold     = 1500 * time.Millisecond
+		preRearm      = 10 * time.Millisecond
+		waitPastFirst = 400 * time.Millisecond
+	)
+
+	m.SetSyncHold(firstHold)
+	time.Sleep(preRearm)
+	m.SetSyncHold(rearmHold)
 	defer m.ReleaseSyncHold()
 
-	time.Sleep(60 * time.Millisecond)
+	// A NEGATIVE assertion — the first timer must not have fired — so this one
+	// cannot poll. Absence is only observable by waiting the window out.
+	time.Sleep(waitPastFirst)
 
 	m.mu.RLock()
 	held := m.syncHold
@@ -672,13 +694,27 @@ func TestSyncHold_RearmStopsPreviousTimer(t *testing.T) {
 		t.Fatalf("expected empty sync hold reason while hold active, got %q", reason)
 	}
 
-	time.Sleep(90 * time.Millisecond)
-
-	m.mu.RLock()
-	held = m.syncHold
-	m.mu.RUnlock()
-	if held {
-		t.Fatal("expected sync hold to release after re-armed timeout")
+	// A POSITIVE assertion — the re-armed timer DOES fire — so this one polls
+	// against a generous deadline instead of sampling at a fixed instant. The
+	// original waited a fixed 90ms for a 120ms timer whose deadline was 150ms
+	// away, a 1.25x margin; polling removes the sample entirely.
+	//
+	// This half is also the CONTROL for the half above: it proves the timer
+	// mechanism fires at all, so "still held" earlier means the first timer was
+	// stopped rather than that nothing was ever armed.
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		m.mu.RLock()
+		held = m.syncHold
+		m.mu.RUnlock()
+		if !held {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expected sync hold to release after re-armed timeout, but it was " +
+				"still held 6s later — the re-armed timer never fired")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if reason := m.SyncHoldReason(); reason != "timeout-degraded" {
 		t.Fatalf("expected timeout-degraded reason after timeout, got %q", reason)
