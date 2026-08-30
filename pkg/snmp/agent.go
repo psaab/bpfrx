@@ -1148,10 +1148,64 @@ func (a *Agent) handleV1GetNext(community []byte, pduBody []byte) []byte {
 // any Counter64-typed node so a v1 GETNEXT/GET-walk steps over the 64-bit
 // high-capacity counters instead of stalling or emitting a type v1 cannot carry.
 // Returns (nil, nil, 0) at the end of the MIB view.
+// #7433: the loop below is the ONE unbounded walk over the successor lookup,
+// and it used to terminate only because `findNextOIDSnap` returns a successor
+// that STRICTLY advances past the cursor. Nothing asserted that, and the
+// property lives in a DIFFERENT function — so someone optimising the successor
+// lookup could not see what depended on it.
+//
+// Worse, the failure mode was a HANG, not a wrong answer. It was found by
+// mutation: changing the successor's search predicate from `> 0` to `>= 0`
+// makes an OID its own successor and this loop spins forever. The cell did not
+// fail, it hung — which produces no `--- FAIL` line, so a harness gating on
+// named failures scores it as a void or an escape rather than a defect.
+//
+// It is not reachable from the wire today: GETNEXT performs one lookup per
+// request OID with no loop, and GETBULK is bounded by max-repetitions plus the
+// #6551 byte budget. But both of those bounds are INCIDENTAL — they are
+// properties of the callers, not of this loop — so this now carries its own.
+//
+// The bound is the view length, which is the most steps a strictly-advancing
+// walk can possibly take: every iteration must consume at least one OID from an
+// ordered view, so exceeding it proves the invariant is broken. Exceeding it
+// returns end-of-view, which is fail-CLOSED (a v1 walk ends early rather than
+// spinning a CPU serving no one), and logs loudly enough to attribute.
 func (a *Agent) findNextV1OIDSnap(oid []int, snap *ifSnapshot) ([]int, []byte, byte) {
+	return a.findNextV1OIDSnapWith(oid, snap, a.findNextOIDSnap)
+}
+
+// findNextV1OIDSnapWith is findNextV1OIDSnap with the successor lookup passed
+// in (#7433).
+//
+// PARAMETERIZED SO THE BOUND CAN BE EXERCISED, not for production flexibility —
+// there is one production caller and it passes `a.findNextOIDSnap`. The step
+// bound below can only fire when the successor fails to advance, and the
+// successor is correct, so with the real lookup the guard is unreachable and a
+// mutation deleting it escapes every test. A guard whose failure mode is a HANG
+// is the one most worth binding, so the loop takes the successor as an argument
+// and a test supplies a non-advancing one.
+//
+// This is the same shape as extracting a body from its snapshot handoff: the
+// production path is unchanged and the thing that was untestable becomes
+// reachable, without a behaviour hook on the production struct.
+func (a *Agent) findNextV1OIDSnapWith(
+	oid []int,
+	snap *ifSnapshot,
+	nextOID func([]int, *ifSnapshot) []int,
+) ([]int, []byte, byte) {
 	cur := oid
-	for {
-		next := a.findNextOIDSnap(cur, snap)
+	// +1 so the bound can never be tighter than a legitimate walk: the first
+	// call may start below the view, and a walk that skips every OID in it is
+	// still correct.
+	maxSteps := len(snap.mibOIDs()) + 1
+	for steps := 0; ; steps++ {
+		if steps > maxSteps {
+			slog.Warn("SNMP: v1 successor walk exceeded the MIB view length; the "+
+				"successor lookup is not strictly advancing (#7433)",
+				"start_oid", oid, "cursor", cur, "steps", steps, "view_len", maxSteps-1)
+			return nil, nil, 0
+		}
+		next := nextOID(cur, snap)
 		if next == nil {
 			return nil, nil, 0
 		}

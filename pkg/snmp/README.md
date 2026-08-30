@@ -34,6 +34,44 @@ differ, per the SNMPv1 error model:
   `noSuchName`; a **GETNEXT walk steps OVER** every Counter64 node
   (`findNextV1OIDSnap`) so the walk advances to the next representable object.
   No Counter64 octet ever reaches the wire on a v1 response.
+
+  **That skip is the ONE unbounded loop in the agent, and it is now
+  self-bounding (#7433).** `findNextV1OIDSnap` advances by `cur = next` and
+  repeats until the successor lookup returns nil, so it terminated only because
+  `findNextOIDSnap` returns a successor that STRICTLY ADVANCES past the cursor.
+  Nothing asserted that, and the property lives in a DIFFERENT function — so
+  anyone optimising the successor lookup could not see what depended on it.
+
+  The failure mode was the bad one: a HANG, not a wrong answer. It was found by
+  mutation — changing the successor's search predicate from `> 0` to `>= 0`
+  makes an OID its own successor and the walk spins forever. The cell did not
+  fail, it hung, which produces no `--- FAIL` line and scores as a void or an
+  escape rather than a defect.
+
+  Two callers bounded it incidentally (GETNEXT does one lookup per request OID
+  with no loop; GETBULK is bounded by max-repetitions plus the #6551 byte
+  budget), so a spin was never wire-reachable. But those are properties of the
+  CALLERS. The loop now carries its own bound — the MIB view length, which is
+  the most steps a strictly-advancing walk can take — and exceeding it returns
+  end-of-view with a warning. Fail-closed: a v1 walk ends early rather than
+  spinning a CPU serving no one.
+
+  Three things about the tests are worth knowing before editing them:
+
+  - The load-bearing assertion is the PROPERTY (`TestSuccessorStrictlyAdvances`),
+    not the consequence. Asserting "the walk terminates" requires running the
+    walk, which is the thing that hangs.
+  - Every cell that CALLS the loop goes through `withDeadline7433`. The first
+    draft did not, and the matrix caught it: one cell reproduced the hang it was
+    written to convert into a red.
+  - `findNextV1OIDSnapWith` takes the successor as a parameter **so the bound
+    can be exercised**, not for production flexibility — there is one production
+    caller. With the real lookup the bound is unreachable (the successor is
+    correct), so a mutation deleting it escaped every other cell until a test
+    supplied a non-advancing successor. That fixture must return a **Counter64**
+    OID: an ordinary value makes the loop return on its first iteration, and the
+    non-advancing cursor never matters. The first version of it did exactly
+    that and proved nothing.
 - **SET** — the agent exposes no writable object, and v1 lacks the `noAccess`
   / `notWritable` statuses the v2c handler returns; per the RFC 2089 §2.1
   SNMPv2→SNMPv1 error mapping BOTH map to `noSuchName`. So a v1 SET (whether
