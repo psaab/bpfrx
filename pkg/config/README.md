@@ -1033,6 +1033,46 @@ context config plus a path-SCOPED display command triggers it (an unscoped
 `pkg/config/show_config_dup_context_4562_test.go` (multi-key + single-key
 duplicate-context descent, single-context no-regression control).
 
+**Empty security IDENTITIES are rejected at commit (#7525):** a zone name, a
+zone-pair's `from-zone`/`to-zone`, and a policy name are all NAMES, and an empty
+one is not a name. Four spellings committed cleanly and then diverged from what
+the operator wrote — `security-zone ""`, `from-zone ""`, `to-zone ""`, and
+`policy ""` (measured at master, with the fixture built up past the #3044 and
+zone-reference gates that fire first and otherwise mask the question).
+
+The consequence is a **widening, not an error**. `sortDedupZones`
+(`types_security.go`) STRIPS the empty string from a zone set, and
+`ZoneScopeSetLabel` renders an empty set as the idiomatic Junos `any` — so the
+identity silently applies to every zone, which for a `then permit` is a
+fail-open. The userspace preflight, meanwhile, rejects the same concrete empty
+reference outright. The two halves therefore disagree about the same config,
+and the operator learns about it at runtime rather than at the commit where
+they can act.
+
+`validateNonEmptySecurityIdentities` runs in the prewalk, on the
+group-expanded, inactive-pruned AST, **ahead of normalization** — because
+normalization is exactly the step that makes the mistake unobservable. Once
+`sortDedupZones` has run there is no empty string left to complain about, only
+a wildcard indistinguishable from an intended one. Strict on commit /
+commit-check; lenient (warn) under `lenientEmptySecurityIdentity` on the load
+and peer-sync ingress so an already-persisted config still boots (#1960).
+
+Two shape notes, both learned by the tests rather than by inspection. The
+zone-pair AST has **two** forms — a single node with a four-element key
+(`["from-zone","trust","to-zone","untrust"]`) and a nested
+`from-zone -> name -> to-zone -> name` chain — and `compileSecurityPolicies`
+reads both, so a gate reading one covers only the spelling its author tested
+(the #2419 class); the first version of this validator missed every empty
+`to-zone` and every empty policy name. And the walk uses `forEachChild` at each
+level rather than first-match, for the #3562 duplicate-block reason: a benign
+first `security {}` followed by a second carrying the empty identity would
+otherwise slip past.
+
+The scoped-global case (`security policies global policy p match from-zone ""`)
+is **not** handled here — #6526 already rejects it, with a message that names
+this exact widening. Duplicating it would give one config two errors for one
+mistake.
+
 **Security policies missing a required `match` criterion are rejected at commit
 (#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
 policy `match` clause to specify all three core dimensions — `source-address`,

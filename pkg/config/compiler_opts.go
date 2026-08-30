@@ -2071,6 +2071,17 @@ type compileOpts struct {
 	// two findings stay independently attributable. Same doctrine as
 	// lenientPolicyMissingMatch.
 	lenientPolicyValuelessMatch bool
+	// lenientEmptySecurityIdentity (#7525) downgrades the empty-security-
+	// identity gate — an empty zone name, an empty zone-pair from-zone or
+	// to-zone, or an empty policy name — from a hard compile error to a
+	// cfg.Warnings entry. Those commit cleanly today and then diverge: the Go
+	// side STRIPS the empty string in sortDedupZones and renders an empty zone
+	// set as the all-zones wildcard `any`, so the identity silently WIDENS
+	// rather than failing, while the userspace preflight rejects the same
+	// empty reference outright. Lenient on the load / peer-sync ingress so an
+	// already-persisted config carrying one still boots (#1960), with the
+	// widening flagged rather than silent.
+	lenientEmptySecurityIdentity bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -2551,6 +2562,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyThenDeny:                  true,
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyValuelessMatch:            true,
+		lenientEmptySecurityIdentity:           true,
 		lenientPolicyCommunityRef:              true,
 		lenientSNMPv3KeyMaterial:               true,
 		lenientPolicyASPathRef:                 true,
