@@ -4459,3 +4459,134 @@ fn session_sync_import_keeps_zero_ingress_when_unknown_7095() {
     );
     assert_eq!(entry.metadata.ingress_vlan_id, 0);
 }
+
+// #7160 (#2387) — the domain-aware delete sweep.
+//
+// A Go "delete" built from a bare 5-tuple (`deleteHelperSessionsV4`, the
+// `clear security flow session` / batch-revoke path) carries NO ingress
+// identity, so the imported key resolves domain 0 and an exact-key delete
+// cannot reach a session that lives in a routing instance. The operator is
+// told the clear succeeded while the helper keeps forwarding the flow.
+//
+// This drives the REAL control-socket dispatcher, so it binds the retry loop in
+// the handler and not just the `routing_domains()` reader that loop calls.
+mod routing_domain_delete_7160 {
+    use super::*;
+
+    const DOMAIN: u32 = 100_007;
+
+    fn upsert_request() -> SessionSyncRequest {
+        SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 1234,
+            dst_port: 80,
+            egress_ifindex: 7,
+            neighbor_mac: "02:bf:72:01:02:03".to_string(),
+            src_mac: "02:bf:72:0a:0b:0c".to_string(),
+            ..SessionSyncRequest::default()
+        }
+    }
+
+    /// The bare-5-tuple delete `deleteHelperSessionsV4` actually sends: "a
+    /// delete request built with a nil value carries only the 5-tuple", so
+    /// there is no ingress identity to resolve a domain from.
+    fn bare_five_tuple_delete() -> ControlRequest {
+        let mut request = req("sync_session");
+        request.session_sync = Some(SessionSyncRequest {
+            operation: "delete".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: "10.0.0.1".to_string(),
+            dst_ip: "10.0.0.2".to_string(),
+            src_port: 1234,
+            dst_port: 80,
+            ..SessionSyncRequest::default()
+        });
+        request
+    }
+
+    fn state_holding_a_session_in(routing_domain: u32) -> Arc<Mutex<ServerState>> {
+        let mut afxdp = afxdp::Coordinator::new();
+        if routing_domain != 0 {
+            afxdp.seed_routing_domain_for_test(24, routing_domain);
+        }
+        let entry = crate::server::helpers::build_synced_session_entry(
+            &upsert_request(),
+            afxdp.zone_name_to_id_ref(),
+            routing_domain,
+        )
+        .expect("build the synced entry the delete must reach");
+        let key = entry.key.clone();
+        afxdp.upsert_synced_session(entry);
+        assert!(
+            afxdp.synced_session_entry_count_for_test() > 0,
+            "setup: the session must exist before the delete, or the assertion \
+             below passes for the wrong reason"
+        );
+        assert_eq!(key.routing_domain, routing_domain);
+        Arc::new(Mutex::new(ServerState {
+            status: ProcessStatus::default(),
+            snapshot: None,
+            afxdp,
+            state_writer: Arc::new(StateWriter::new()),
+        }))
+    }
+
+    fn synced_key_count(state: &Arc<Mutex<ServerState>>) -> usize {
+        state
+            .lock()
+            .expect("server state")
+            .afxdp
+            .synced_session_entry_count_for_test()
+    }
+
+    /// FAIL-ON-REVERT: drop the per-domain retry in
+    /// `server/handlers/sync_session.rs` and the domain-scoped session survives
+    /// a delete whose caller was told it succeeded.
+    #[test]
+    fn a_bare_five_tuple_delete_reaches_a_domain_scoped_session() {
+        let state = state_holding_a_session_in(DOMAIN);
+        let before = synced_key_count(&state);
+        assert!(before > 0, "setup: the shared map must hold the session");
+
+        let response = run_request(state.clone(), bare_five_tuple_delete());
+        assert!(response.ok, "unexpected error: {}", response.error);
+
+        assert_eq!(
+            synced_key_count(&state),
+            0,
+            "a session in routing domain {DOMAIN} survived a bare-5-tuple \
+             delete. The request carries no ingress identity, so the key the \
+             handler builds is in domain 0 and the exact-key delete misses — \
+             without the per-domain retry the helper keeps forwarding a flow \
+             the operator was told had been cleared."
+        );
+    }
+
+    /// The gate: with no routing-instance interface membership the retry loop
+    /// has nothing to iterate, and the ordinary domain-0 delete still works.
+    #[test]
+    fn a_bare_five_tuple_delete_still_works_with_no_membership() {
+        let state = state_holding_a_session_in(0);
+        assert!(
+            state
+                .lock()
+                .expect("server state")
+                .afxdp
+                .routing_domains()
+                .is_empty(),
+            "with no membership the retry loop must have nothing to iterate"
+        );
+        let response = run_request(state.clone(), bare_five_tuple_delete());
+        assert!(response.ok, "unexpected error: {}", response.error);
+        assert_eq!(
+            synced_key_count(&state),
+            0,
+            "the default-instance delete path regressed"
+        );
+    }
+}

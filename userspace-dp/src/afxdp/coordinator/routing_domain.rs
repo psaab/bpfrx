@@ -23,6 +23,30 @@ impl Coordinator {
     /// a handful, and the delete path is a slow path. `has_routing_domains`
     /// false (every single-instance deployment) makes this an empty vec and the
     /// retry loop disappears.
+    /// Test seam: how many entries the shared synced-session map holds. The
+    /// map is `pub(in crate::afxdp)`, so a `server::tests` cell that drives the
+    /// real control-socket delete cannot read the outcome directly.
+    #[cfg(test)]
+    pub(crate) fn synced_session_entry_count_for_test(&self) -> usize {
+        self.sessions
+            .synced
+            .lock()
+            .map(|m| m.len())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().len())
+    }
+
+    /// Test seam: declare an interface a routing-instance member without
+    /// building a whole `ConfigSnapshot`. The two fields are
+    /// `pub(in crate::afxdp)`, so a `server::tests` cell that needs a
+    /// domain-carrying coordinator cannot set them directly.
+    #[cfg(test)]
+    pub(crate) fn seed_routing_domain_for_test(&mut self, ifindex: i32, domain: u32) {
+        self.forwarding.has_routing_domains = true;
+        self.forwarding
+            .ifindex_to_routing_domain
+            .insert(ifindex, domain);
+    }
+
     pub fn routing_domains(&self) -> Vec<u32> {
         if !self.forwarding.has_routing_domains {
             return Vec::new();

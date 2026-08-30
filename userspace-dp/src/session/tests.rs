@@ -8427,6 +8427,64 @@ fn a_reply_from_outside_the_flows_domain_still_resolves_its_session_7160() {
     assert_eq!(matched.key, forward);
 }
 
+/// The NAT'd twin of the cell above, and it is not redundant with it.
+///
+/// With no NAT, `reverse_wire_key` and `reverse_canonical_key` produce the SAME
+/// tuple, so the index carries one bucket that either transform's zeroing is
+/// enough to place at domain 0 — and a revert of just ONE of them leaves that
+/// cell green. Measured: reverting `reverse_wire_key` alone did exactly that.
+/// Under NAT the two transforms produce DIFFERENT tuples, the reply arrives on
+/// the WIRE tuple, and only `reverse_wire_key`'s zeroing puts that bucket where
+/// the reply can find it.
+///
+/// FAIL-ON-REVERT: make `reverse_wire_key` preserve the domain and this goes
+/// red on its own, without needing `reverse_canonical_key` reverted too.
+#[test]
+fn a_natted_reply_from_outside_the_flows_domain_still_resolves_its_session_7160() {
+    const DOMAIN: u32 = 0x0001_86A5;
+    let mut table = SessionTable::new();
+
+    // Source NAT: the reply comes back addressed to the POOL tuple, which is
+    // what `reverse_wire_key` names and `reverse_canonical_key` does not.
+    let mut decision = decision();
+    decision.nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 41))),
+        rewrite_src_port: Some(40001),
+        ..NatDecision::default()
+    };
+    let nat = decision.nat;
+
+    let mut forward = key_v4();
+    forward.routing_domain = DOMAIN;
+    assert_ne!(
+        super::key::reverse_wire_key(&forward, nat),
+        super::key::reverse_canonical_key(&forward, nat),
+        "the fixture must NAT — with the two reverse transforms producing one \
+         tuple this cell cannot distinguish which of them zeroes the domain"
+    );
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        decision,
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+
+    // The reply the SERVER sends: addressed to the pool tuple, arriving on a
+    // default-instance interface.
+    let mut reply = super::key::reverse_wire_key(&forward, nat);
+    reply.routing_domain = 0;
+
+    let matched = table.find_forward_nat_match(&reply).expect(
+        "a NAT'd reply arriving in the default instance found no session for a \
+         flow that ingressed in a routing instance — the reverse WIRE bucket is \
+         keyed on the forward domain, so the pool tuple the server actually \
+         replies to is unreachable and the flow breaks",
+    );
+    assert_eq!(matched.key, forward);
+}
+
 /// A single-instance deployment must be bit-identical to pre-#7160: every key
 /// is domain 0, so the preference pass accepts exactly what the fallback would
 /// and the reverse bucket walk is unchanged.
