@@ -45,6 +45,8 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"sort"
+	"time"
 )
 
 // applyStep0Tunables is the single wire point for #801 Step-0 host
@@ -285,31 +287,150 @@ func (d *Daemon) restoreStep0TunablesOnShutdown() {
 		slog.Debug("shutdown: host tunables restore skip (no captures)")
 		return
 	}
+	restoreStep0Captures(prior, active, realHostTunableFS{}, realRSSExecutor{})
+}
+
+// restoreStep0Captures puts every captured tunable back. Split from
+// restoreStep0TunablesOnShutdown, which owns the snapshot handoff (apply-lock,
+// priorTunablesMu, one-shot clear), so the restore ITSELF is reachable from a
+// test with injected backends. Without that split a test can only call the leaf
+// restores directly, which leaves the calls FROM here — the wiring, the thing
+// that was actually missing in #7619 — unbound.
+func restoreStep0Captures(prior *priorHostTunables, active bool,
+	fs hostTunableFS, execer rssExecutor) {
+	if prior == nil {
+		return
+	}
 	// Scope the log message to what we actually restore so operators
 	// can tell a coalescence-only revert from a full host-scope revert.
-	hasHostScope := active && (len(prior.governors) > 0 || prior.budget != "")
-	hasCoalesce := len(prior.mlx5Adaptive) > 0
-	hasNeighRetrans := len(prior.neighRetrans) > 0
-	if !hasHostScope && !hasCoalesce && !hasNeighRetrans {
+	hasHostScope := step0HasHostScope(prior, active)
+	if !step0RestoreHasCaptures(prior, active) {
 		slog.Debug("shutdown: host tunables restore skip (empty captures)")
 		return
 	}
 	slog.Info("shutdown: restoring tunables to pre-xpfd values",
 		"host_scope", hasHostScope, "coalesce_ifaces", len(prior.mlx5Adaptive),
-		"neigh_retrans", hasNeighRetrans)
+		"neigh_retrans", len(prior.neighRetrans) > 0, "rss_ifaces", len(prior.rssOwned))
 	// Host-scope restore is gated on `active`: if the opt-in was
 	// already flipped off during runtime, we already restored those
 	// fields in applyStep0TunablesWith; running the write again would
 	// be a no-op but the map may also have been cleared on that path.
 	if active {
-		restoreHostScopeTunables(prior, realHostTunableFS{})
+		restoreHostScopeTunables(prior, fs)
 	}
 	// Coalescence restore always runs when captures exist.
 	for iface, s := range prior.mlx5Adaptive {
-		restoreMlx5Coalesce(iface, s, realRSSExecutor{})
+		restoreMlx5Coalesce(iface, s, execer)
 	}
 	// #1636: neigh retrans_time_ms restore runs unconditionally (the
 	// apply was never gated on claim-host-tunables) so a co-tenant's
 	// tuned value is put back when xpfd exits.
-	restoreNeighRetransTime(prior, realHostTunableFS{})
+	restoreNeighRetransTime(prior, fs)
+	// #7619: and the RSS indirection table, which this path did not restore.
+	restoreOwnedRSSOnShutdown(prior, execer, rssShutdownRestoreBudget)
+}
+
+// step0HasHostScope reports whether the host-SCOPE captures (governors, the
+// NAPI budget) are ours to put back. Gated on `active` because an opt-in
+// flipped off at runtime already restored those fields in
+// applyStep0TunablesWith, which may also have cleared the map.
+func step0HasHostScope(prior *priorHostTunables, active bool) bool {
+	if prior == nil {
+		return false
+	}
+	return active && (len(prior.governors) > 0 || prior.budget != "")
+}
+
+// step0RestoreHasCaptures reports whether the shutdown restore has any owned
+// state to put back. Extracted from restoreStep0TunablesOnShutdown so the
+// empty-captures early return is testable without a live Daemon.
+//
+// #7619: a NIC whose RSS indirection table xpf concentrated onto the
+// userspace-dp queue set is owned state too, so `rssOwned` belongs in this
+// predicate. The subtlest way to get that fix wrong is to append the RSS
+// restore at the bottom of the caller while leaving this guard unaware of the
+// map — a NIC with ONLY rss ownership (no host-scope opt-in, no coalescence
+// capture, no neigh retrans) then takes the early return and the defect
+// survives its own fix. Adding a capture kind below without adding it here is
+// the same bug again.
+func step0RestoreHasCaptures(prior *priorHostTunables, active bool) bool {
+	if prior == nil {
+		return false
+	}
+	return step0HasHostScope(prior, active) ||
+		len(prior.mlx5Adaptive) > 0 ||
+		len(prior.neighRetrans) > 0 ||
+		len(prior.rssOwned) > 0
+}
+
+// rssShutdownRestoreBudget bounds the TOTAL wall-clock time the #7619
+// restore-on-stop may spend, mirroring hostAuthCloseoutBudget (#5874).
+//
+// This runs on the shutdown path, which the unit caps at TimeoutStopSec=20, and
+// it adds an `ethtool` round-trip per owned NIC. A hung ethtool must cost a
+// logged timeout, not a SIGKILLed daemon — so the budget is well under the
+// unit's, leaving room for the restores that already run above it. A var so a
+// test can shrink it and observe its own timeout rather than waiting.
+var rssShutdownRestoreBudget = 5 * time.Second
+
+// restoreOwnedRSSOnShutdown reverts every NIC whose RSS indirection table xpf
+// concentrated onto the userspace-dp queue set (#7619).
+//
+// WHY ON EVERY STOP, INCLUDING A RESTART'S. The issue asks whether a stop that
+// is part of a `systemctl restart` should be exempt, and notes it may not be
+// distinguishable. It is not: systemd delivers an ordinary SIGTERM either way
+// and exposes nothing at stop time that separates them. So "restore only on a
+// real stop" is not implementable, and the choice is restore-always or
+// restore-never.
+//
+// Restore-always is right, and the churn it adds to a restart — default the
+// table, then re-concentrate on the next start — is bounded at two ethtool
+// calls per owned NIC across a window in which the daemon is not forwarding
+// anyway. Restore-never is today's defect: the kernel stack runs on a table
+// shaped for a dataplane that is not there until the next boot or a manual
+// `ethtool -X <if> default`.
+//
+// THE RETRY DEBT IS DIFFERENT FROM #6801's, DELIBERATELY. That path drops
+// ownership only after a successful restore, so a later tick can retry. A stop
+// has no later tick, so a failure here is logged and left: the process is
+// exiting and the in-memory ownership map goes with it. The reconciliation is
+// the next boot's claim, which re-captures and re-applies. A NIC left
+// concentrated by a failed restore-on-stop is therefore only stranded if xpfd
+// never starts again — a case no shutdown path can fix.
+func restoreOwnedRSSOnShutdown(prior *priorHostTunables, execer rssExecutor, budget time.Duration) {
+	if prior == nil || len(prior.rssOwned) == 0 {
+		return
+	}
+	// Sorted so a timeout truncates a deterministic prefix rather than a random
+	// one — an operator comparing two shutdowns can otherwise not tell a
+	// different failure from a different map order.
+	ifaces := make([]string, 0, len(prior.rssOwned))
+	for iface := range prior.rssOwned {
+		ifaces = append(ifaces, iface)
+	}
+	sort.Strings(ifaces)
+
+	deadline := time.Now().Add(budget)
+	restored, failed, skipped := 0, 0, 0
+	for _, iface := range ifaces {
+		if !time.Now().Before(deadline) {
+			skipped = len(ifaces) - restored - failed
+			slog.Warn("shutdown: rss indirection restore budget exhausted, "+
+				"remaining interfaces keep the xpf-concentrated table until the next "+
+				"boot re-applies or `ethtool -X <if> default` is run by hand (#7619)",
+				"budget", budget, "restored", restored, "failed", failed,
+				"not_attempted", skipped)
+			break
+		}
+		if err := restoreDefaultRSSIndirectionOne(iface, execer); err != nil {
+			failed++
+			slog.Warn("shutdown: rss indirection restore failed; this NIC keeps the "+
+				"xpf-concentrated table until the next boot's claim reconciles it (#7619)",
+				"iface", iface, "err", err)
+			continue
+		}
+		restored++
+	}
+	slog.Info("shutdown: rss indirection restore complete",
+		"restored", restored, "failed", failed, "not_attempted", skipped)
 }
