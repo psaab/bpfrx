@@ -236,7 +236,7 @@ fn vrf_session_identity_doc_claims_still_match_the_code() {
     // identity rather than reading a wire field. That is what keeps
     // CurrentHAProtocolVersion still, and what makes the two nodes unable to
     // disagree — there is only one spelling.
-    let coordinator_rs = read(&root.join("userspace-dp/src/afxdp/coordinator/mod.rs"));
+    let coordinator_rs = read(&root.join("userspace-dp/src/afxdp/coordinator/routing_domain.rs"));
     assert!(
         coordinator_rs.contains("pub fn synced_routing_domain("),
         "the #7160 synced-session routing-domain derivation is gone. If it was \
