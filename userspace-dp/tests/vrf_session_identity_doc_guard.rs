@@ -101,15 +101,69 @@ fn vrf_session_identity_decision_record_exists_and_matches_runtime() {
 fn vrf_session_identity_doc_claims_still_match_the_code() {
     let root = repo_root();
 
-    // Claim 1: the identity is still the bare 5-tuple. When Track B widens it,
-    // this fires so the decision record is updated in the same change.
+    // Claim 1 (#7160, Track B-P0 landed): the key now CARRIES a routing
+    // domain. This assertion used to read `!key_rs.contains("routing_domain")`
+    // and fired when the field was added, which is what forced the doc update
+    // in the same change. Rather than delete it, it is INVERTED: the same
+    // guard now pins the invariants the field depends on, so it keeps working
+    // for the change after this one instead of silently retiring.
     let key_rs = read(&root.join("userspace-dp/src/session/key.rs"));
     assert!(
-        !key_rs.contains("routing_domain"),
-        "SessionKey grew a routing-domain discriminator — update the #2387 \
-         decision record (docs/research/2387-vrf-flow-identity/plan.md) and the \
-         \"Session identity is NOT VRF-aware\" section of \
-         userspace-dp/src/afxdp/forwarding/README.md in this change"
+        key_rs.contains("pub routing_domain: u32,"),
+        "SessionKey LOST its routing-domain discriminator. Reverting it \
+         re-opens the #2387 cross-tenant collision: two routing instances \
+         sharing a 5-tuple collapse to one conntrack entry, and the \
+         established-session fast path hands tenant B tenant A's cached \
+         egress, NAT and POLICY decision."
+    );
+
+    // Every key transform must PRESERVE the domain. A transform that defaults
+    // it re-creates the collision on that path alone, and no single-VRF test
+    // can see it because the field is 0 everywhere in a single-VRF config.
+    // Counted rather than merely searched: a partial revert that fixes four
+    // transforms and misses one is exactly the plausible mistake here.
+    let preserved = key_rs.matches("routing_domain: forward_key.routing_domain,").count()
+        + key_rs.matches("routing_domain: key.routing_domain,").count();
+    assert_eq!(
+        preserved, 5,
+        "expected all 5 key transforms (forward_wire_key, translated_session_key, \
+         reverse_wire_key, reverse_canonical_key, reverse_session_key) to carry \
+         the source key's routing_domain, found {preserved}. A transform that \
+         zeroes it silently re-opens #2387 on that path."
+    );
+
+    // Claim 1b: the field is NOT YET POPULATED. Phase 1 is structural only —
+    // it makes the key ABLE to represent a routing domain, and every value in
+    // the tree is still 0, which is why this change needs no HA protocol bump.
+    // When phase 2 threads StableRoutingInstanceTableID through the control
+    // plane and onto the sync wire, this fires — which is the point.
+    //
+    // Phase 2 does NOT need an HA protocol bump, despite what #7160's issue
+    // text says: that quotes plan §4d, which plan v5 §0a corrected. The domain
+    // rides as a length-gated trailing VALUE field (the #2170 / #5212 shape)
+    // and domain 0 interns to the default instance, so an old peer's omitted
+    // field decodes correctly and a non-VRF cluster is bit-identical across
+    // the mixed-version window. Bumping it anyway would break rolling upgrade
+    // for nothing. See the wire bullet in forwarding/README.md.
+    let proto_dir = root.join("userspace-dp/src/protocol");
+    let mut on_the_wire = false;
+    for e in std::fs::read_dir(&proto_dir).expect("read protocol dir") {
+        let path = e.expect("dir entry").path();
+        if path.extension().and_then(|x| x.to_str()) == Some("rs")
+            && read(&path).contains("routing_domain")
+        {
+            on_the_wire = true;
+        }
+    }
+    assert!(
+        !on_the_wire,
+        "routing_domain reached userspace-dp/src/protocol/ — phase 2 has begun. \
+         Carry it as a length-gated trailing VALUE field with domain 0 \
+         interning to the default instance (plan v5 \u{a7}0a), which is what \
+         lets CurrentHAProtocolVersion stay put; do NOT bump it on the \
+         strength of #7160's issue text, which quotes the superseded \
+         \u{a7}4d. Then rewrite the session-identity section of \
+         forwarding/README.md and the #2387 plan status in that change."
     );
 
     // Claim 2: session install unconditionally evicts a same-key incumbent,

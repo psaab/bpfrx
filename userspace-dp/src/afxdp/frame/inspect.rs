@@ -1389,6 +1389,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
                     src_port,
                     dst_port,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             })
         }
@@ -1420,6 +1421,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
                     src_port,
                     dst_port,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             })
         }
@@ -1574,6 +1576,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_frame(
                     src_port,
                     dst_port,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             })
         }
@@ -1611,6 +1614,7 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
             src_port: meta.flow_src_port,
             dst_port: meta.flow_dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     })
 }
@@ -1708,6 +1712,7 @@ pub(in crate::afxdp) fn l3_session_flow_from_meta(meta: UserspaceDpMeta) -> Opti
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     })
 }
@@ -1783,6 +1788,7 @@ pub(in crate::afxdp) fn parse_ipv4_session_flow_from_frame(
             src_port,
             dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     })
 }

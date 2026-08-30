@@ -1354,6 +1354,7 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
             src_port: echo_id,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision,
         metadata,
@@ -1546,6 +1547,7 @@ fn icmpv6_te_nptv6_reverse_lookup_uses_logical_vlan_unit_zone_not_physical_paren
             src_port: echo_id,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision,
         metadata,
@@ -1622,6 +1624,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         src_port: echo_id,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let forward_decision = SessionDecision {
         resolution: ForwardingResolution {

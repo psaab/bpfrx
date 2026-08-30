@@ -20,6 +20,7 @@ fn make_key() -> crate::session::SessionKey {
         src_port: 45678,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -1257,6 +1258,7 @@ fn make_v6_round_trip_inputs() -> (
         protocol: PROTO_TCP,
         addr_family: libc::AF_INET6 as u8,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let flow = SessionFlow {
         src_ip,
@@ -1693,6 +1695,7 @@ fn key_in_set(target_set: usize, salt: u16) -> crate::session::SessionKey {
             src_port: port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         };
         if FlowCache::set_index(&key, 7) == target_set {
             return key;
@@ -2620,6 +2623,7 @@ fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
                 src_port: 40000u16.wrapping_add(i),
                 dst_port: 443,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             })
             .collect()
     }

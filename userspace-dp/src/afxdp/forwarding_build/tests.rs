@@ -5951,6 +5951,7 @@ fn stale_session_never_adopts_reowned_tunnel_id() {
             src_port: 55068,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let stale_decision = crate::session::SessionDecision {

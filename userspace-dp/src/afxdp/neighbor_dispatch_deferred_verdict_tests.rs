@@ -141,6 +141,7 @@ fn flush_one(
             src_port,
             dst_port,
             discriminator: TunnelDiscriminator::default(),
+            routing_domain: 0,
         })
     } else {
         None

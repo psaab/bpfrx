@@ -3931,6 +3931,7 @@ fn nat64_4381_release_untracks_flow() {
         src_port: 5000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     release_nat64_allocation(
         &state,
@@ -3969,6 +3970,7 @@ fn nat64_4381_reverse_entry_release_is_noop() {
         src_port: 5000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     // is_reverse == true: no-op, so the mapping stays live and idempotent.
     release_nat64_allocation(
@@ -4001,6 +4003,7 @@ fn nat64_synced_key(client: &str) -> crate::session::SessionKey {
         src_port: 5000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -6246,6 +6249,7 @@ fn synced_key_for_dst_6892(client: &str, dst_v6: &str) -> crate::session::Sessio
         src_port: 5000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -6873,6 +6877,7 @@ fn nat64_7094_rollback_is_a_noop_on_the_reverse_entry() {
         src_port: 6000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     rollback_nat64_allocation_for_worker(
         &state,

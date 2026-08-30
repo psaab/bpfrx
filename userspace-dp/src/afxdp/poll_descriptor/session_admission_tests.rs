@@ -30,6 +30,7 @@ mod new_flow_session_limit_tests {
             src_port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }
     }
 
@@ -197,6 +198,7 @@ mod strict_syn_check_tests {
             src_port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }
     }
 

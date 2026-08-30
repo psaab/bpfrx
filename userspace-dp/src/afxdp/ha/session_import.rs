@@ -577,6 +577,7 @@ impl crate::afxdp::Coordinator {
             src_port: 40000 + idx,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         };
         let resolution = ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,

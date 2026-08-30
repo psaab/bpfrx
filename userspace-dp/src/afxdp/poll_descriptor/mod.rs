@@ -2918,6 +2918,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 src_port,
                                                 dst_port,
                                                                                             discriminator: Default::default(),
+                                                                                            routing_domain: 0,
                                             },
                                             rev_proto,
                                         )

@@ -26,6 +26,7 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         src_port: hdr.src_port,
         dst_port: hdr.dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reverse_key = embedded_reply_key(
         libc::AF_INET as u8,

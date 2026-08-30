@@ -32,6 +32,7 @@ fn delta_with_session_id(session_id: u64) -> SessionDelta {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {
@@ -195,6 +196,7 @@ fn delta_with_attribution() -> SessionDelta {
         src_port: 5001,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     delta.metadata.policy_id = 4242;
     delta.metadata.policy_counter_idx = 9;

@@ -144,6 +144,7 @@ fn test_key() -> SessionKey {
         src_port: 55068,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

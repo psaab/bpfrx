@@ -601,6 +601,7 @@ fn metadata_tuple_complete_matches_the_shim_resolved_set_6837() {
                 src_port,
                 dst_port,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         let meta = UserspaceDpMeta {
@@ -668,6 +669,7 @@ fn resolved_set_and_ipv6_traversable_set_are_disjoint_6837() {
                 src_port: 1234,
                 dst_port: 5678,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         let meta = UserspaceDpMeta {
@@ -800,6 +802,7 @@ fn metadata_tuple_complete_refuses_unresolved_ipv6_ext_protocols_even_with_ports
                 src_port,
                 dst_port,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         let meta = UserspaceDpMeta {

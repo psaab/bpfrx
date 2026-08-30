@@ -284,18 +284,42 @@ next-hops, preference 0). The wire specimen lives in
       stored into BOTH the full `ha.runtime` view's forwarding Arc AND the worker fast-path
       `ha.fabrics` Arc so no reader retains the stale peer.
 
-## Session identity is NOT VRF-aware — single forwarding domain (#2387)
+## Session identity is VRF-CAPABLE but not yet VRF-POPULATED (#2387 / #7160)
 
 The FIB route model above is table-scoped for route + local-delivery
-*selection*, but the session/flow *identity* is not. This is a known
-limitation, tracked by #2387.
+*selection*. Session/flow *identity* is being made table-scoped to match,
+in two phases. **Phase 1 has landed; the limitation below is still live in
+production** because nothing sets the field yet.
 
-- **`SessionKey` is the bare 5-tuple** (`session/key.rs`) — no
-  routing-instance / VRF / zone / ingress-ifindex discriminator. The
-  conntrack table and the shared synced / NAT / forward-wire session maps
-  (`afxdp/coordinator/session_manager.rs`) are all keyed by it alone, so
-  two flows with identical 5-tuples on any two interfaces share one
-  conntrack entry.
+- **`SessionKey` carries a `routing_domain: u32`** (`session/key.rs`,
+  #7160). `0` is the default routing instance. All five key transforms
+  (`forward_wire_key`, `translated_session_key`, `reverse_wire_key`,
+  `reverse_canonical_key`, `reverse_session_key`) PRESERVE it, because a
+  flow's routing domain is the same in both directions — that symmetry is
+  what allows it on the key at all, and is the axis on which it differs
+  from #6928's `ingress_ifindex`/`ingress_vlan_id` (session VALUE,
+  asymmetric, node-local).
+- **Phase 2 is not done: nothing populates the field.** Every value in the
+  tree is `0`, so today two flows with identical 5-tuples in different
+  routing instances still share one conntrack entry, and the
+  established-session fast path still short-circuits before
+  `ingress_route_table_override` — tenant B inherits tenant A's cached
+  egress, NAT and **policy** decision. The commit-time overlap warning
+  (`pkg/config/compiler_validate_vrf_overlap.go`) remains the operator's
+  only signal. Phase 2 threads `StableRoutingInstanceTableID(name)` — a
+  pure, collision-gated function of the instance NAME, therefore identical
+  on both HA nodes by construction — through the control plane and onto the
+  session-sync wire.
+- **Phase 2 still does NOT need a version bump** — see the wire bullet
+  below, which is plan v5 §0a's correction of §4d and remains in force. The
+  domain rides as a length-gated trailing VALUE field and domain 0 decodes
+  an old peer's omitted field to the default instance, so a non-VRF cluster
+  stays bit-identical across the mixed-version window. #7160's issue text
+  says Option B "bumps the HA wire"; that quotes the superseded §4d, and
+  taking it at face value would break rolling upgrade for no reason. Phase 1
+  does not touch `userspace-dp/src/protocol/` at all;
+  `userspace-dp/tests/vrf_session_identity_doc_guard.rs` enforces that split
+  and fires when phase 2 begins.
 - **PBR `then routing-instance` is the ONLY per-VRF forwarding path.** An
   interface's native `routing_instance` selects only the connected-route
   table NAME (#2388 above) — it does NOT scope a transit packet's

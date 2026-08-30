@@ -78,6 +78,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {

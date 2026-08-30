@@ -1795,6 +1795,7 @@ mod flow_cache_invalidation_tests {
             src_port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }
     }
 
@@ -2497,6 +2498,7 @@ mod gc_reap_source_nat_release_tests_6901 {
             src_port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }
     }
 
@@ -2705,6 +2707,7 @@ mod gc_reap_nat64_release_tests_7740 {
             src_port,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }
     }
 

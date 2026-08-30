@@ -2055,6 +2055,7 @@ fn apply_path_persistent_snat_key(
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
