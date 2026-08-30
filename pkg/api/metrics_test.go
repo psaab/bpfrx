@@ -1077,6 +1077,17 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #7160: this collector is built by struct literal, so a descriptor
+		// the emit path uses and this fixture omits is a nil *Desc and
+		// `MustNewConstMetric` SEGVs rather than failing an assertion — a
+		// panic, not a red, which the package-level FAIL reports with no
+		// `--- FAIL` line at all.
+		userspaceSyncedImportUnknownRoutingDomain: prometheus.NewDesc(
+			"xpf_userspace_synced_import_unknown_routing_domain_total",
+			"synced imports refused for an unresolvable routing domain",
+			nil,
+			nil,
+		),
 		userspaceSyncedImportZoneUnresolved: prometheus.NewDesc(
 			"xpf_userspace_synced_import_zone_unresolved_total",
 			"synced imports that skipped the #6211 zone narrowing",
@@ -1338,9 +1349,16 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// session_install_stale_ignored_total, session_delete_stale_ignored_total
 	// and synced_import_reserve_refused_total = 52. Counted as three because
 	// they are distinct series; folding any two together is a change this
-	// census is here to notice.
-	if len(got) != 52 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 52 metrics, got %d", len(got))
+	// census is here to notice. Plus the #7160 (#2387)
+	// synced_import_unknown_routing_domain_total counter = 53 — a peer-synced
+	// import refused because this node runs routing instances and the request
+	// named no ingress identity to resolve the session's routing domain from.
+	// Its own series rather than folded into the reserve-refusal above,
+	// because the two say different things to an operator: one means the
+	// standby cannot hold a translation, the other means it will not adopt a
+	// session under a domain nothing verified.
+	if len(got) != 53 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 53 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
