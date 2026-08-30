@@ -61,11 +61,12 @@ func TestSessionWireRoundTripRTFlowSessionID5212V4(t *testing.T) {
 			dVal.ConfigEpoch, dVal.Generation, dVal.PolicyCounterIdx)
 	}
 
-	// Mixed-version: truncate the trailing 8-byte #5212 id AND the 4-byte
-	// #7095 IngressIfaceFold behind it (an old peer stops
-	// after ConfigEpoch). Decode must still succeed with id 0 and the epoch +
-	// prior fields preserved.
-	legacy := payload[:len(payload)-12]
+	// Mixed-version: truncate the trailing 8-byte #5212 id AND everything
+	// appended behind it — the 4-byte #7095 IngressIfaceFold and the 8-byte
+	// #7188 TunnelDiscriminator — so the frame ends after ConfigEpoch, which is
+	// where an old peer stops. Decode must still succeed with id 0 and the
+	// epoch + prior fields preserved.
+	legacy := payload[:len(payload)-20]
 	_, lVal, ok := decodeSessionV4Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
@@ -107,10 +108,11 @@ func TestSessionWireRoundTripRTFlowSessionID5212V6(t *testing.T) {
 			dVal.ConfigEpoch, dVal.Nat64SnatV4)
 	}
 
-	// Mixed-version: truncate the trailing 8-byte id AND the 4-byte #7095
-	// IngressIfaceFold behind it (an old peer stops after
-	// ConfigEpoch). Decode still succeeds with id 0 and the epoch preserved.
-	legacy := payload[:len(payload)-12]
+	// Mixed-version: truncate the trailing 8-byte id AND everything appended
+	// behind it — the 4-byte #7095 IngressIfaceFold and the 8-byte #7188
+	// TunnelDiscriminator — so the frame ends after ConfigEpoch, which is where
+	// an old peer stops. Decode still succeeds with id 0 and the epoch preserved.
+	legacy := payload[:len(payload)-20]
 	_, lVal, ok := decodeSessionV6Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) v6 decode failed")

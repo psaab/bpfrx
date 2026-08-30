@@ -246,6 +246,14 @@ pub(in crate::afxdp) fn session_delta_info(
         // cannot derive it from the synced forward v6 key.
         nat64,
         nat64_snat_v4: nat64_snat_v4_string(nat64_snat_v4),
+        // #7188: carry the session key's tunnel discriminator on the JSON leg.
+        // Read from `delta.key`, the SAME key the binary open frame encodes, so
+        // the two legs cannot describe one session's identity differently. A
+        // non-GRE session encodes `None`, which is an EXPLICIT statement and not
+        // the reserved absent tag 0 — that distinction is what lets the receiver
+        // withhold a protocol-47 session from a peer that cannot express it
+        // instead of importing it aliased onto another tunnel's key.
+        tunnel_discriminator: delta.key.discriminator.to_wire(),
     }
 }
 

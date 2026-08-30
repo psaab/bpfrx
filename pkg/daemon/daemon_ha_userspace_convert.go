@@ -441,6 +441,13 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	val.PolicyID = delta.PolicyID
 	val.PolicyCounterIdx = delta.PolicyCounterIdx
 	val.AppTimeout = delta.AppTimeout
+	// #7188: carry the helper's tunnel session-identity discriminator so the
+	// peer helper folds it back into the key it reconstructs. Opaque here.
+	// Protocol 47 has no L4 ports, so two RFC 2890 GRE tunnels between one pair
+	// of outer endpoints are ONE Go session key; this value is what keeps them
+	// two sessions on the standby. 0 = not carried by this helper, on which the
+	// peer withholds a protocol-47 session rather than aliasing it.
+	val.TunnelDiscriminator = delta.TunnelDiscriminator
 	return key, val, true
 }
 
@@ -552,6 +559,13 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	if ip := net.ParseIP(delta.Nat64SnatV4).To4(); ip != nil {
 		copy(val.Nat64SnatV4[:], ip)
 	}
+	// #7188: carry the helper's tunnel session-identity discriminator so the
+	// peer helper folds it back into the key it reconstructs. Opaque here.
+	// Protocol 47 has no L4 ports, so two RFC 2890 GRE tunnels between one pair
+	// of outer endpoints are ONE Go session key; this value is what keeps them
+	// two sessions on the standby. 0 = not carried by this helper, on which the
+	// peer withholds a protocol-47 session rather than aliasing it.
+	val.TunnelDiscriminator = delta.TunnelDiscriminator
 	return key, val, true
 }
 

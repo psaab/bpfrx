@@ -529,6 +529,9 @@ pub(crate) use coordinator::neigh_monitor_test_serial;
 #[path = "tests_support.rs"]
 mod tests_support;
 #[cfg(test)]
+#[path = "tests_gre_session_sync_7188.rs"]
+mod tests_gre_session_sync_7188;
+#[cfg(test)]
 #[path = "tests_bind_forward.rs"]
 mod tests_bind_forward;
 #[cfg(test)]

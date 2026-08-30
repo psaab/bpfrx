@@ -1077,6 +1077,7 @@
     "src_mac": "",
     "src_port": 0,
     "timestamp": "1970-01-01T00:00:00Z",
+    "tunnel_discriminator": 0,
     "tunnel_endpoint_id": 0,
     "tx_ifindex": 0,
     "tx_vlan_id": 0,
@@ -1119,6 +1120,7 @@
     "src_ip": "",
     "src_mac": "",
     "src_port": 0,
+    "tunnel_discriminator": 0,
     "tunnel_endpoint_id": 0,
     "tx_ifindex": 0,
     "tx_vlan_id": 0

@@ -2,7 +2,7 @@
 // handlers.rs lines 309-342 (preserves the nested match on
 // sync_req.operation).
 
-use super::super::helpers::{build_synced_session_entry, build_synced_session_key};
+use super::super::helpers::{build_synced_session_entry, build_synced_session_key, SyncedKeyIntent};
 use super::super::ServerState;
 use crate::afxdp::SYNCED_IMPORT_REFUSED_PREFIX;
 use crate::{ControlResponse, SessionSyncRequest};
@@ -46,7 +46,12 @@ pub(super) fn handle(
                 response.error = err;
             }
         },
-        "delete" => match build_synced_session_key(&sync_req) {
+        // #7188: a delete reconstructs the key with `Delete` intent, so a peer
+        // that could not state the tunnel discriminator retracts the `None`
+        // class rather than being refused. A delete can only under-match; it
+        // never publishes an identity, which is the reason the install arm
+        // above fails closed and this one does not.
+        "delete" => match build_synced_session_key(&sync_req, SyncedKeyIntent::Delete) {
             Ok(key) => {
                 guard.afxdp.delete_synced_session(key);
             }

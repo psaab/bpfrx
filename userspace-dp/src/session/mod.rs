@@ -49,7 +49,11 @@ type SeededReverseTranslatedIndex = HashMap<SessionKey, NatIndexBucket, FxSeeded
 // at pub(crate) keeps the existing crate::session::* surface intact.
 mod discriminator;
 mod key;
-pub(crate) use discriminator::TunnelDiscriminator;
+// #7188: `WireDiscriminator` is exported alongside the class enum because the
+// HA session-sync receiver has to distinguish "the peer stated a class" from
+// "the peer could not state one" — two answers a plain `TunnelDiscriminator`
+// cannot carry.
+pub(crate) use discriminator::{TunnelDiscriminator, WireDiscriminator};
 pub(crate) use key::*;
 mod entry;
 pub(crate) use entry::*;

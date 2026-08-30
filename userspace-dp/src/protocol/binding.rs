@@ -1308,5 +1308,29 @@ pub(crate) struct SessionDeltaInfo {
     pub nat64: bool,
     #[serde(rename = "nat64_snat_v4", default)]
     pub nat64_snat_v4: String,
+    /// #7188: the session key's `TunnelDiscriminator`, encoded by
+    /// `TunnelDiscriminator::to_wire` (`session/discriminator.rs`).
+    ///
+    /// GRE is protocol 47 and has no L4 ports, so two RFC 2890 tunnels between
+    /// one pair of outer endpoints are one 5-tuple. The local session key
+    /// separates them on this typed discriminator; without it on the wire the
+    /// standby rebuilds BOTH sync records as the SAME key and the second
+    /// install evicts the first (`session/install.rs` opens with an
+    /// unconditional `remove_entry`) — one session for two tunnels, so after a
+    /// failover they share one policy decision, one NAT state, one counter set
+    /// and one timeout.
+    ///
+    /// `0` is RESERVED for "not carried" and is NOT the encoding of
+    /// `TunnelDiscriminator::None`; see `WireDiscriminator`. That is what lets
+    /// the receiver tell a peer that predates this field (withhold a protocol-47
+    /// session rather than import it aliased, #7188 decision 2) from a new peer
+    /// deliberately saying "this protocol has no discriminator". Additive and
+    /// rolling-upgrade safe in both directions: an old helper omits the key and
+    /// `default` decodes 0, an old daemon ignores a key it does not know.
+    ///
+    /// The rename MUST match the Go struct tag
+    /// (`pkg/dataplane/userspace/protocol_ha.go`, `SessionDeltaInfo`).
+    #[serde(rename = "tunnel_discriminator", default)]
+    pub tunnel_discriminator: u64,
 }
 

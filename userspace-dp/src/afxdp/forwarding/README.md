@@ -407,6 +407,23 @@ production** because nothing sets the field yet.
   = the default routing-instance** makes an old peer's omitted field decode
   to the default VRF, so a non-VRF cluster is bit-identical across the
   mixed-version window and `CurrentHAProtocolVersion` never moves.
+- **The trailing-value shape has since been USED, by #7188.** The GRE tunnel
+  discriminator rides exactly this way — `SessionValue{,V6}.TunnelDiscriminator`
+  on the cluster wire (after the #7095 `IngressIfaceFold`),
+  `SessionSyncRequest.tunnel_discriminator` to the peer helper, and a trailing
+  u64 on both binary HA delta frames — and the receiver folds it into the key it
+  reconstructs. No `CurrentHAProtocolVersion` bump, as this bullet predicted.
+  One correction the routing-domain plan does NOT anticipate: **`0` must be
+  RESERVED for "the peer did not carry this field", separate from the field's
+  own zero-value class.** `serde(default)` and a short record both yield `0`, so
+  `0` is the one value a peer emits without meaning to; if it also spells a real
+  class, a peer that cannot express the identity is indistinguishable from one
+  that deliberately said "default". #7188 needs that distinction to WITHHOLD a
+  protocol-47 session from a peer that predates the field rather than importing
+  it aliased. Interning "domain 0 = the default routing-instance" gives up
+  exactly that distinction, which is safe for #7160 only because every legacy
+  session genuinely IS in the default instance. Full write-up:
+  `docs/session-sync-architecture.md`, "Tunnel Session-Identity Discriminator".
 - **Do NOT "decline the hit and fall through"** as a cheap mitigation.
   `install_with_protocol_with_origin` opens with an unconditional
   `remove_entry(&key)` (`session/install.rs`), so the session-miss path

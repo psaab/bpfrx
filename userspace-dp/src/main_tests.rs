@@ -4208,6 +4208,14 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
         dst_port: 0,
         ingress_zone: "lan".to_string(),
         egress_zone: "wan".to_string(),
+        // #7188: state the discriminator explicitly. This fixture sweeps
+        // protocol 47 in over-reach guard (a), and #7188's install gate refuses
+        // a protocol-47 record whose peer did NOT carry a discriminator — so
+        // leaving the field at its "not carried" default would make that guard
+        // pass for the wrong reason (refused by the new gate, never reaching
+        // the #6923 one it was written to test). An explicit `None` is what a
+        // modern peer sends for every protocol in this sweep.
+        tunnel_discriminator: crate::session::TunnelDiscriminator::None.to_wire(),
         ..SessionSyncRequest::default()
     };
     let v6 = libc::AF_INET6 as u8;
@@ -4218,7 +4226,10 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
         .collect();
     assert_eq!(traversable.len(), 10, "#6923: the traversable set changed size");
     for protocol in &traversable {
-        let err = build_synced_session_key(&sync_req(v6, *protocol, "2001:db8::11", "2001:db8::22"))
+        let err = build_synced_session_key(
+            &sync_req(v6, *protocol, "2001:db8::11", "2001:db8::22"),
+            SyncedKeyIntent::Install,
+        )
             .expect_err(&format!(
                 "#6923: a synced IPv6 session keyed on extension-header protocol {protocol} must \
                  be REFUSED — importing it hands the shim a hit for the exact over-limit chain it \
@@ -4238,22 +4249,22 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
     //     verdict on both sides). Refusing on "ports are 0/0" would take these
     //     with it.
     for protocol in [6u8, 17, 50, 58, 59, 47] {
-        let key =
-            build_synced_session_key(&sync_req(v6, protocol, "2001:db8::11", "2001:db8::22"))
-                .unwrap_or_else(|e| {
-                    panic!("#6923: a resolved IPv6 protocol {protocol} must still import: {e}")
-                });
+        let key = build_synced_session_key(
+            &sync_req(v6, protocol, "2001:db8::11", "2001:db8::22"),
+            SyncedKeyIntent::Install,
+        )
+        .unwrap_or_else(|e| {
+            panic!("#6923: a resolved IPv6 protocol {protocol} must still import: {e}")
+        });
         assert_eq!(key.protocol, protocol);
     }
 
     // (b) IPv4 is untouched — the same numbers are ordinary IPv4 protocols.
     for protocol in &traversable {
-        let key = build_synced_session_key(&sync_req(
-            libc::AF_INET as u8,
-            *protocol,
-            "192.0.2.1",
-            "192.0.2.2",
-        ))
+        let key = build_synced_session_key(
+            &sync_req(libc::AF_INET as u8, *protocol, "192.0.2.1", "192.0.2.2"),
+            SyncedKeyIntent::Install,
+        )
         .unwrap_or_else(|e| panic!("#6923: IPv4 protocol {protocol} must still import: {e}"));
         assert_eq!(key.protocol, *protocol);
     }
