@@ -653,16 +653,48 @@ fn classify_protocol(token: &str, hi: &mut ZoneHostInbound) {
 /// Keep this set in lock-step with the kernel chain in
 /// `pkg/daemon/daemon_nft.go` and its
 /// `TestHostInboundFilterExemptsIPsecAndV6Errors` accept assertions.
-fn is_icmp_host_inbound_global_accept(protocol: u8, icmp_type: u8) -> bool {
-    match protocol {
-        // ICMPv4: destination-unreachable (3, also carries PMTUD
+/// #7520: expose the predicate to the family-pairing test. A `for_test`
+/// accessor rather than widening the function itself — the test needs to CALL
+/// it, not to make it part of the module's surface.
+#[cfg(test)]
+pub(super) fn is_icmp_host_inbound_global_accept_for_test(
+    protocol: u8,
+    is_v6: bool,
+    icmp_type: u8,
+) -> bool {
+    is_icmp_host_inbound_global_accept(protocol, is_v6, icmp_type)
+}
+
+fn is_icmp_host_inbound_global_accept(protocol: u8, is_v6: bool, icmp_type: u8) -> bool {
+    // #7520: the protocol number is paired with the IP FAMILY, not read alone.
+    //
+    // Switching on `protocol` by itself is family-blind, and the two arms mean
+    // different things on different families. An IPv4 packet whose protocol
+    // byte is 58 took the ICMPv6 arm and was globally admitted for type 1/2/3/4
+    // or 133..137 — bypassing zone admission entirely — even though 58 is not
+    // ICMPv6 on IPv4. Symmetrically an IPv6 packet with next-header 1 took the
+    // ICMPv4 arm. Both are fail-OPEN: this predicate returns early, BEFORE the
+    // zone lookup, so a match here admits a packet the zone's
+    // `host-inbound-traffic` set never permitted.
+    //
+    // The type numbers do not disambiguate it either — they overlap. ICMPv6
+    // destination-unreachable is 1, and 1 is a legal (if unassigned-to-error)
+    // ICMPv4 type; ICMPv4 time-exceeded is 11, which is nothing in ICMPv6's
+    // error range. A `(protocol, type)` pair alone cannot tell the two apart,
+    // which is why the family has to be part of the key.
+    //
+    // An unknown / neither-family packet admits nothing: the fall-through is
+    // false, so a packet whose address family the parser could not determine
+    // stays gated on the zone set rather than exempted.
+    match (protocol, is_v6) {
+        // ICMPv4 on IPv4: destination-unreachable (3, also carries PMTUD
         // "fragmentation needed" as code 4), time-exceeded (11),
         // parameter-problem (12).
-        1 => matches!(icmp_type, 3 | 11 | 12),
-        // ICMPv6 errors: destination-unreachable (1), packet-too-big (2,
-        // PMTUD), time-exceeded (3), parameter-problem (4); PLUS the ND set:
-        // RS (133), RA (134), NS (135), NA (136), Redirect (137).
-        58 => matches!(icmp_type, 1 | 2 | 3 | 4 | 133 | 134 | 135 | 136 | 137),
+        (1, false) => matches!(icmp_type, 3 | 11 | 12),
+        // ICMPv6 on IPv6 errors: destination-unreachable (1), packet-too-big
+        // (2, PMTUD), time-exceeded (3), parameter-problem (4); PLUS the ND
+        // set: RS (133), RA (134), NS (135), NA (136), Redirect (137).
+        (58, true) => matches!(icmp_type, 1 | 2 | 3 | 4 | 133 | 134 | 135 | 136 | 137),
         _ => false,
     }
 }
@@ -691,7 +723,7 @@ pub(in crate::afxdp) fn host_inbound_admits(
     // router-discovery, matching the kernel host-inbound chain's global accepts.
     // Echo-request and IPv4 router-advert/solicit are NOT in this set, so they
     // stay gated on the `ping` / `router-discovery` tokens below.
-    if is_icmp_host_inbound_global_accept(protocol, icmp_type) {
+    if is_icmp_host_inbound_global_accept(protocol, is_v6, icmp_type) {
         return true;
     }
     match state.zone_host_inbound.get(&ingress_zone_id) {
@@ -792,7 +824,7 @@ pub(in crate::afxdp) fn host_inbound_admits_iface(
     icmp_type: u8,
 ) -> bool {
     if let Some(hi) = state.ifindex_host_inbound.get(&ingress_ifindex) {
-        if is_icmp_host_inbound_global_accept(protocol, icmp_type) {
+        if is_icmp_host_inbound_global_accept(protocol, is_v6, icmp_type) {
             return true;
         }
         return hi.admits(protocol, dst_port, is_v6, icmp_type);

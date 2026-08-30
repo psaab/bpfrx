@@ -533,8 +533,41 @@ operation or session return traffic. nft: `buildHostInboundFilterPayload`; Rust:
 |---|---|---|---|
 | Established/related | `ct state established,related accept` | conntrack fast path | Return / ongoing host traffic. **On a tightening the kernel entry is reconciled — see "Stale kernel authorization on a tightening (#5566)" below.** |
 | Raw IPsec ESP/AH | `meta l4proto { 50, 51 } accept` | `stage_ipsec_passthrough_check` (before `host_inbound_admits`) | Kernel XFRM decrypts host-terminated IPsec; makes `ike`/`ipsec` a working superset. |
-| ICMPv4 errors/PMTUD | `icmp type { destination-unreachable, time-exceeded, parameter-problem }` | proto 1 types 3, 11, 12 | PMTUD / unreachable / traceroute-to-self signalling. Echo-request is NOT here (gated on `ping`). |
-| ICMPv6 errors + ND | `icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 }` | proto 58 types 1-4, 133-137 | v6 error/PMTUD (1-4) + Neighbor Discovery (133-137). Echo-request (128) is NOT here (gated on `ping`). |
+| ICMPv4 errors/PMTUD | `icmp type { destination-unreachable, time-exceeded, parameter-problem }` | proto 1 **on IPv4** types 3, 11, 12 | PMTUD / unreachable / traceroute-to-self signalling. Echo-request is NOT here (gated on `ping`). |
+| ICMPv6 errors + ND | `icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 }` | proto 58 **on IPv6** types 1-4, 133-137 | v6 error/PMTUD (1-4) + Neighbor Discovery (133-137). Echo-request (128) is NOT here (gated on `ping`). |
+
+### The protocol number is paired with the IP FAMILY (#7520)
+
+`is_icmp_host_inbound_global_accept` used to switch on the protocol number
+**alone**, and the two arms mean different things on different families. So:
+
+| packet | old verdict |
+|---|---|
+| **IPv4**, protocol byte 58, type 1/2/3/4/133..137 | took the ICMPv6 arm → **globally ADMITTED** |
+| **IPv6**, next-header 1, type 3/11/12 | took the ICMPv4 arm → **globally ADMITTED** |
+
+This predicate returns **before** the zone lookup, so a match admits a packet
+the zone's `host-inbound-traffic` set never permitted — a **fail-open**, not a
+fail-closed narrowing.
+
+The type numbers cannot disambiguate it, which is why the family has to be part
+of the key: ICMPv6 destination-unreachable is type **1**, and 1 is a perfectly
+legal ICMPv4 type number; ICMPv4 time-exceeded is **11**, which is nothing in
+ICMPv6's error range. A `(protocol, type)` pair alone genuinely cannot tell the
+two apart.
+
+An unknown or neither-family packet now admits nothing — the fall-through is
+`false`, so a packet whose address family the parser could not determine stays
+gated on the zone set rather than exempted.
+
+**Why it survived #3171 and #3292:** those implemented the two halves of this
+admission and neither tested their **composition**. Each half is correct in
+isolation; the defect is only visible when you ask what happens to a packet
+whose protocol byte belongs to the other family.
+
+The nft side was never affected: `icmp type` and `icmpv6 type` are
+family-scoped matchers by construction, so the two surfaces had silently
+diverged.
 
 ## Stale kernel authorization on a tightening (#5566)
 
