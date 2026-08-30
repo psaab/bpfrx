@@ -142,8 +142,22 @@ func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Dura
 			// running"; the stack can, immediately. Anyone who hits this should
 			// read the dump rather than re-run, because the two have completely
 			// different fixes and only one of them is about the machine.
+			// ALL goroutines (the `true`), and GROWN until the dump fits.
+			// runtime.Stack truncates silently when the buffer is short — it
+			// just returns fewer bytes — so a fixed size would produce a dump
+			// that looks complete and has lost exactly the goroutine the
+			// blocked one is waiting on. Under a full `./...` run there are
+			// many. Growing until n < len(buf) is the standard idiom and the
+			// only way to know the dump is whole.
 			buf := make([]byte, 1<<20)
-			n := runtime.Stack(buf, true)
+			var n int
+			for {
+				n = runtime.Stack(buf, true)
+				if n < len(buf) {
+					break
+				}
+				buf = make([]byte, 2*len(buf))
+			}
 			t.Fatalf("the teardown goroutine completed no stops in %s. This is a "+
 				"HANG, not a slow machine, and the goroutine dump below says which "+
 				"kind: look for the goroutine in StopHeartbeat. If it is blocked in "+
