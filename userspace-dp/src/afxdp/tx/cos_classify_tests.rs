@@ -209,6 +209,7 @@ fn clone_prepared_request_for_cos_returns_local_copy_with_metadata() {
             src_port: 1111,
             dst_port: 2222,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         egress_ifindex: 80,
         cos_queue_id: Some(4),
@@ -303,6 +304,7 @@ fn prepare_local_request_for_cos_materializes_prepared_frame() {
             src_port: 1111,
             dst_port: 2222,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         egress_ifindex: 80,
         cos_queue_id: Some(5),
@@ -845,6 +847,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1082,6 +1085,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             src_port: 5201,
             dst_port: 49152,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
     let forward_shape_on_reverse_egress = resolve_cos_queue_id(
@@ -1102,6 +1106,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             src_port: 49152,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1241,6 +1246,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1365,6 +1371,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1488,6 +1495,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1628,6 +1636,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     // POST-NAT egress wire tuple — DNAT rewrote the destination port to 8443, so
     // it no longer matches the ingress term's destination-port 443.
@@ -1772,6 +1781,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -1859,6 +1869,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -1921,6 +1932,7 @@ fn resolve_cos_tx_selection_drops_terminal_output_filter_without_log() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -1978,6 +1990,7 @@ fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -2664,6 +2677,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -2762,6 +2776,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -2830,6 +2845,7 @@ fn resolve_cos_tx_selection_returns_none_when_no_cos_or_tx_selection_filters_exi
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -3009,6 +3025,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -3114,6 +3131,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -3218,6 +3236,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -3363,6 +3382,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
 
@@ -3451,6 +3471,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
         TermMatchExtra::default(),
     );
@@ -3635,6 +3656,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         };
         let selection =
             resolve_cos_tx_selection(&forwarding, 202, meta, Some(&key), TermMatchExtra::default());
@@ -4108,6 +4130,7 @@ fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
         src_port: 49152,
         dst_port: 53,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let pre_fix = resolve_cos_tx_selection_at(
         &forwarding,
@@ -4162,6 +4185,7 @@ fn output_filter_family_selected_by_egress_key_for_nat64_3642() {
         src_port: 33000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     // Ingress metadata is IPv6 (the pre-NAT64 family).
     let ingress_v6_meta = UserspaceDpMeta {
@@ -4407,6 +4431,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let meta = || UserspaceDpMeta {
         ingress_ifindex: 5,
@@ -4610,6 +4635,7 @@ fn pbr_classify_flow_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -4928,6 +4954,7 @@ fn count4085_v4_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -4940,6 +4967,7 @@ fn count4085_v6_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -5371,6 +5399,7 @@ fn resolve_cos_queue_id_preserves_input_fc_under_counter_only_output_filter() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
     assert_eq!(
@@ -5402,6 +5431,7 @@ fn resolve_cached_cos_tx_selection_preserves_input_fc_under_counter_only_output_
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
     assert_eq!(
@@ -5574,6 +5604,7 @@ fn inet_precedence_test_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -5888,6 +5919,7 @@ fn cached_cos_tx_selection_carries_the_reject_message_type_6854() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         }),
     );
     assert!(

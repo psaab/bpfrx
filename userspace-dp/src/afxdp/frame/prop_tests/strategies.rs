@@ -74,6 +74,7 @@ impl ValidPacket {
                 src_port: self.src_port,
                 dst_port: self.dst_port,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         }
     }

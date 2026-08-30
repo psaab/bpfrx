@@ -201,6 +201,7 @@ fn finish_generated_key(
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let meta = ForwardPacketMeta {
         addr_family,

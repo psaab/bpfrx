@@ -1,5 +1,38 @@
 # #2387 — VRF/routing-instance awareness in session/flow identity
 
+> **v6 — DECIDED AND PARTLY LANDED (2026-08-30).** The open maintainer
+> question in §0 is answered: **Option B, widen the key.** Track B-P0 has
+> landed as #7160 phase 1.
+>
+> **What is in the tree now.** `SessionKey` carries `routing_domain: u32`
+> (`userspace-dp/src/session/key.rs`); `0` is the default routing instance,
+> so single-VRF identity is byte-identical. All five key transforms preserve
+> it, which is the symmetry property that lets it sit on the key at all.
+> `PendingNeighPacket` grew 272 -> 280 as a result (embedded key), accepted
+> on the same reasoning as the #7188 growth it sits beside.
+>
+> **What is NOT done.** Nothing populates the field — every value in the tree
+> is 0 — so the collision described in §3/§4b is still live in production and
+> the commit-time overlap warning is still the operator's only signal. Phase
+> 2 threads `StableRoutingInstanceTableID(name)` through the control plane
+> and onto the sync wire.
+>
+> **§0a stands and §4d remains superseded.** Phase 2 needs **no** HA protocol
+> bump: the domain rides as a length-gated trailing VALUE field and domain 0
+> interns to the default instance. #7160's issue text says otherwise because
+> it quotes §4d; that was corrected on the issue. `CurrentHAProtocolVersion`
+> does not move.
+>
+> **Deviation from B-P0 as drafted.** The draft proposed reusing "the dead
+> `routing_table` slot"; phase 1 adds a new `u32` field instead, which is why
+> the size assertion moved. Reusing a dead slot remains available as a later
+> size optimisation and is not a correctness difference.
+>
+> Guarded by `userspace-dp/tests/vrf_session_identity_doc_guard.rs`, which
+> pins the field, counts the five preserving transforms, and fires when
+> phase 2 reaches `src/protocol/`.
+
+
 > **v5 (this revision) — engineering-time addendum. Read §0 FIRST: it
 > CORRECTS §4d, retires two cost objections, and narrows the open maintainer
 > question to a single binary choice. The rest of the document is the

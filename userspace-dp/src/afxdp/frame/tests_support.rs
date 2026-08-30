@@ -151,6 +151,7 @@ pub(super) fn pbr_v4_flow() -> SessionFlow {
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     }
 }
@@ -180,6 +181,7 @@ pub(super) fn pbr_v6_flow() -> SessionFlow {
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     }
 }

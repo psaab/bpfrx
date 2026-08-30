@@ -27,6 +27,7 @@ fn key_v4() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -39,6 +40,7 @@ fn key_v6() -> SessionKey {
         src_port: 5555,
         dst_port: 53,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -176,6 +178,7 @@ fn tcp_key_v6() -> SessionKey {
         src_port: 51000,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -1015,6 +1018,7 @@ fn make_v4_key(src_octet: u8, port: u16) -> SessionKey {
         src_port: port,
         dst_port: 53,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -1308,6 +1312,7 @@ fn wheel_alias_lookup_refreshes_canonical_key() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let alias_key = SessionKey {
         addr_family: 2,
@@ -1317,6 +1322,7 @@ fn wheel_alias_lookup_refreshes_canonical_key() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let mut reverse_metadata = metadata();
     reverse_metadata.is_reverse = true;
@@ -2744,6 +2750,7 @@ fn reply_match_finds_tcp_snat_reverse_tuple() {
         src_port: 42424,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2753,6 +2760,7 @@ fn reply_match_finds_tcp_snat_reverse_tuple() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -2775,6 +2783,7 @@ fn reply_match_finds_icmp_snat_reverse_tuple() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2784,6 +2793,7 @@ fn reply_match_finds_icmp_snat_reverse_tuple() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -2807,6 +2817,7 @@ fn find_forward_nat_match_uses_reverse_index() {
         src_port: 42424,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reply = SessionKey {
         addr_family: 2,
@@ -2816,6 +2827,7 @@ fn find_forward_nat_match_uses_reverse_index() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2856,6 +2868,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index() {
         src_port: 42424,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let canonical_reply = SessionKey {
         addr_family: 2,
@@ -2865,6 +2878,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2903,6 +2917,7 @@ fn reverse_canonical_key_keeps_icmp_identifier_position() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reply = reverse_canonical_key(&forward, NatDecision::default());
     assert_eq!(reply.src_ip, IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)));
@@ -2922,6 +2937,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index_for_icmp() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let canonical_reply = SessionKey {
         addr_family: 2,
@@ -2931,6 +2947,7 @@ fn find_forward_nat_match_uses_canonical_reverse_index_for_icmp() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
@@ -2970,6 +2987,7 @@ fn find_forward_wire_match_uses_translated_forward_index() {
         src_port: 42528,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let translated = SessionKey {
         addr_family: 2,
@@ -2979,6 +2997,7 @@ fn find_forward_wire_match_uses_translated_forward_index() {
         src_port: 42528,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -3019,6 +3038,7 @@ fn lookup_uses_translated_reverse_alias() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let reverse_canonical = SessionKey {
         addr_family: 2,
@@ -3028,6 +3048,7 @@ fn lookup_uses_translated_reverse_alias() {
         src_port: 5201,
         dst_port: 42424,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let mut reverse_metadata = metadata();
     reverse_metadata.is_reverse = true;
@@ -3072,6 +3093,7 @@ fn dnat_port_in_reverse_wire_key() {
         src_port: 54321,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -3087,6 +3109,7 @@ fn dnat_port_in_reverse_wire_key() {
         src_port: 8080,
         dst_port: 54321,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3107,6 +3130,7 @@ fn dnat_plus_snat_ports_in_reverse_key() {
         src_port: 54321,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
@@ -3125,6 +3149,7 @@ fn dnat_plus_snat_ports_in_reverse_key() {
         src_port: 8080,
         dst_port: 54321,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3144,6 +3169,7 @@ fn icmp_port_handling_unchanged_with_dnat_ports() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -3159,6 +3185,7 @@ fn icmp_port_handling_unchanged_with_dnat_ports() {
         src_port: 0x1234,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(
         &forward,
@@ -3193,6 +3220,7 @@ fn icmp_query_id_translation_demuxes_reverse_wire_key() {
         src_port: query_id,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     // Distinct translated ids allocated by pool SNAT for the two hosts.
     let mk_nat = |translated_id: u16| NatDecision {
@@ -3232,6 +3260,7 @@ fn icmp_query_id_translation_demuxes_reverse_wire_key() {
         src_port: 40001,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
     assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
@@ -3280,6 +3309,7 @@ fn icmp_query_id_zero_translation_demuxes_reverse_wire_key() {
         src_port: query_id,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let mk_nat = |translated_id: u16| NatDecision {
         rewrite_src: Some(pool),
@@ -3312,6 +3342,7 @@ fn icmp_query_id_zero_translation_demuxes_reverse_wire_key() {
         src_port: 40001,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     assert!(reply_matches_forward_session(&fwd_a, nat_a, &reply_a));
     assert!(!reply_matches_forward_session(&fwd_b, nat_b, &reply_a));
@@ -3336,6 +3367,7 @@ fn find_forward_nat_match_with_dnat_port_rewrite() {
         src_port: 54321,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     // Reply from internal:8080 -> client:54321
     let reply = SessionKey {
@@ -3346,6 +3378,7 @@ fn find_forward_nat_match_with_dnat_port_rewrite() {
         src_port: 8080,
         dst_port: 54321,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let nat = NatDecision {
         rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10))),
@@ -5083,6 +5116,7 @@ fn reverse_translated_1n_collision_preserves_displaced_alias() {
         src_port: 40001,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let mut r2 = r1.clone();
     r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
@@ -5161,6 +5195,7 @@ fn reverse_translated_1n_delete_removes_specific_handle_not_the_key() {
         src_port: 50002,
         dst_port: 8443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let mut r2 = r1.clone();
     r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
@@ -5978,6 +6013,7 @@ fn limit_key(src_octet: u8, dst_octet: u8, src_port: u16) -> SessionKey {
         src_port,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -7571,6 +7607,7 @@ fn account_packet_reverse_folds_onto_forward_translated_icmp() {
             src_port: orig_id,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         };
         let fwd_nat = NatDecision {
             rewrite_src: Some(pool),
@@ -8130,4 +8167,140 @@ fn the_fabric_stamp_clears_both_halves_of_the_pair_7096() {
              beside a zeroed ifindex is a different identity, not an absent one"
         );
     }
+}
+// ===========================================================================
+// #7160 (#2387) — routing_domain on SessionKey.
+//
+// The defect: two flows in different routing-instances that share a 5-tuple
+// collided in the conntrack map, and because the established-session fast path
+// short-circuits before `ingress_route_table_override`, tenant B's flow
+// inherited tenant A's cached egress, NAT and POLICY decision. A cross-tenant
+// policy bypass, not merely wrong forwarding.
+//
+// These cells guard the two properties the field's doc comment claims, both of
+// which are invisible to every pre-existing test because every one of them
+// runs in the default routing instance where the field is 0.
+// ===========================================================================
+
+/// Two tenants, one 5-tuple, two sessions. This is the whole point of the
+/// field: before it, the second install found the first's entry.
+#[test]
+fn two_routing_domains_sharing_a_5tuple_are_distinct_sessions_7160() {
+    let mut table = SessionTable::new();
+
+    let mut tenant_a = key_v4();
+    tenant_a.routing_domain = 0x1111_1111;
+    let mut tenant_b = key_v4();
+    tenant_b.routing_domain = 0x2222_2222;
+
+    // Identical in every field a pre-#7160 SessionKey had.
+    assert_eq!(tenant_a.src_ip, tenant_b.src_ip);
+    assert_eq!(tenant_a.dst_ip, tenant_b.dst_ip);
+    assert_eq!(tenant_a.src_port, tenant_b.src_port);
+    assert_eq!(tenant_a.dst_port, tenant_b.dst_port);
+    assert_eq!(tenant_a.protocol, tenant_b.protocol);
+    assert_ne!(
+        tenant_a, tenant_b,
+        "keys differing only in routing_domain must not be equal; if they are, \
+         the field is not participating in Eq and every guarantee below is void"
+    );
+
+    assert!(table.install_with_protocol(
+        tenant_a.clone(),
+        decision(),
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    assert!(
+        table.install_with_protocol(
+            tenant_b.clone(),
+            decision(),
+            metadata(),
+            1_000,
+            PROTO_TCP,
+            TCP_SYN,
+        ),
+        "tenant B's install was refused — its 5-tuple collided with tenant A's, \
+         which is exactly the #2387 cross-tenant collision"
+    );
+
+    assert!(
+        table.entry_by_key(&tenant_a).is_some(),
+        "tenant A's session vanished when tenant B installed"
+    );
+    assert!(
+        table.entry_by_key(&tenant_b).is_some(),
+        "tenant B's session is missing; its install landed on tenant A's entry"
+    );
+}
+
+/// Every key transform must CARRY the routing domain. A flow's routing domain
+/// is the same in both directions, and a transform that zeroes it re-creates
+/// the collision on the reverse path only — where no single-VRF test can see
+/// it. Each transform is asserted by name so a failure says which one dropped
+/// it, rather than reporting "a transform" and leaving the reader to bisect.
+#[test]
+fn every_key_transform_preserves_the_routing_domain_7160() {
+    const DOMAIN: u32 = 0xABCD_1234;
+    let mut key = key_v4();
+    key.routing_domain = DOMAIN;
+    let nat = decision().nat;
+
+    let cases: [(&str, SessionKey); 5] = [
+        ("forward_wire_key", super::key::forward_wire_key(&key, nat)),
+        (
+            "translated_session_key",
+            super::key::translated_session_key(&key, nat),
+        ),
+        ("reverse_wire_key", super::key::reverse_wire_key(&key, nat)),
+        (
+            "reverse_canonical_key",
+            super::key::reverse_canonical_key(&key, nat),
+        ),
+        (
+            "reverse_session_key",
+            super::key::reverse_session_key(&key, nat),
+        ),
+    ];
+
+    for (name, derived) in cases {
+        assert_eq!(
+            derived.routing_domain, DOMAIN,
+            "{name} dropped the routing domain ({:#x} -> {:#x}). A derived key \
+             in domain 0 collides with the default instance, so tenant traffic \
+             would match a default-instance session on this path. Preserve the \
+             source key's routing_domain; do NOT use Default::default().",
+            DOMAIN, derived.routing_domain
+        );
+    }
+}
+
+/// The behavioural consequence: a reply that arrives in a DIFFERENT routing
+/// domain must not be matched to this session. Without the field both keys
+/// were identical and the reply matched, which is how tenant B inherited
+/// tenant A's policy decision.
+#[test]
+fn a_reply_in_another_routing_domain_does_not_match_the_session_7160() {
+    let mut forward = key_v4();
+    forward.routing_domain = 0x1111_1111;
+    let nat = decision().nat;
+
+    let same_domain_reply = super::key::reverse_wire_key(&forward, nat);
+    assert!(
+        super::key::reply_matches_forward_session(&forward, nat, &same_domain_reply),
+        "the reply in the SAME routing domain must still match — if this fails \
+         the field has broken ordinary conntrack reverse matching, which is a \
+         far worse regression than the bug it fixes"
+    );
+
+    let mut other_domain_reply = same_domain_reply.clone();
+    other_domain_reply.routing_domain = 0x2222_2222;
+    assert!(
+        !super::key::reply_matches_forward_session(&forward, nat, &other_domain_reply),
+        "a reply in a DIFFERENT routing domain matched this session — this is \
+         the #2387 cross-tenant collision: tenant B's traffic inherits tenant \
+         A's cached egress, NAT and policy decision"
+    );
 }

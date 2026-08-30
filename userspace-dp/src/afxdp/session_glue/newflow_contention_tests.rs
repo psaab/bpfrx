@@ -62,6 +62,7 @@ fn key(src_port: u16) -> SessionKey {
         src_port,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

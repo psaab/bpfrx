@@ -748,6 +748,7 @@ mod lo0_gate_tests {
                 src_port: 40000,
                 dst_port: 443,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         (flow, meta)
@@ -966,6 +967,7 @@ mod lo0_gate_tests {
                     src_port: 40000,
                     dst_port: 5000,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             };
             (flow, meta)
@@ -1103,6 +1105,7 @@ mod filter_terminal_tests {
                 src_port: 40000,
                 dst_port: 443,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         }
     }
@@ -1227,6 +1230,7 @@ mod filter_terminal_tests {
                 src_port: 0x1234,
                 dst_port: 0,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         let filter_state = crate::filter::parse_filter_state(
@@ -1499,6 +1503,7 @@ mod filter_log_egress_zone_tests {
                     src_port: 40000,
                     dst_port: 443,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             };
             let meta = UserspaceDpMeta {

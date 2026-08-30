@@ -223,6 +223,7 @@ pub(in crate::afxdp) fn test_session_key(src_port: u16, dst_port: u16) -> Sessio
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

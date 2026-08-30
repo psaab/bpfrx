@@ -504,6 +504,7 @@ fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
             src_port: expected_src_port,
             dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
 

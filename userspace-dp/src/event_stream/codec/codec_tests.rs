@@ -32,6 +32,7 @@ fn test_key_v4() -> SessionKey {
         src_port: 12345,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -44,6 +45,7 @@ fn test_key_v6() -> SessionKey {
         src_port: 54321,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -788,6 +790,7 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
         src_port: 5001,
         dst_port: 80,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let frame = EventFrame::encode_session_open(1, &key, &decision, &md, &zones, false, 0);
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];

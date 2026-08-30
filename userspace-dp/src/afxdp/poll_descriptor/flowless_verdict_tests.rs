@@ -148,6 +148,7 @@ mod flowless_local_delivery_tests {
                 src_port: 0,
                 dst_port: 0,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         }
     }

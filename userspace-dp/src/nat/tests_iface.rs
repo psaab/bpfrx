@@ -103,6 +103,7 @@ fn key(src: &str, src_port: u16, dst: &str, dst_port: u16) -> crate::session::Se
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

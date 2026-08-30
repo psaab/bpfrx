@@ -484,6 +484,7 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let meta = UserspaceDpMeta {
@@ -649,6 +650,7 @@ fn pbr_routing_instance_reject_synthesizes_reply_on_session_miss() {
             src_port: 49152,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let mut pipeline = pbr_reject_tx_pipeline(0);
@@ -736,6 +738,7 @@ fn pbr_override_survives_nat64_translation_no_vrf_leak() {
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let meta = UserspaceDpMeta {
@@ -814,6 +817,7 @@ fn pbr_override_survives_nat64_translation_no_vrf_leak() {
             src_port: 0,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let RouteOverride::Table(plain_table) =
@@ -862,6 +866,7 @@ fn pbr_egress_output_filter_applied_not_base_egress_no_bypass() {
             src_port: 40000,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let meta = UserspaceDpMeta {

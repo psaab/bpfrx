@@ -94,6 +94,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
             src_port: client_port,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: ForwardingResolution {
@@ -243,6 +244,7 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
             src_port: client_port,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -524,6 +526,7 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
             src_port: client_port,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -704,6 +707,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             src_port: N6472_CLIENT_PORT,
             dst_port: N6472_SERVER_PORT,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -750,6 +754,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
             src_port: N6472_SERVER_PORT,
             dst_port: N6472_XLATED_PORT,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1144,6 +1149,7 @@ fn poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472() {
             src_port: client_port,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1271,6 +1277,7 @@ fn n6474_install_snat_session(
             src_port: 12345,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -1572,6 +1579,7 @@ fn embedded_icmp_outbound_snat_marker_scoping_6474() {
             src_port: 12345,
             dst_port: 80,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         SessionDecision {
             resolution: ForwardingResolution {
@@ -2419,6 +2427,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         src_port: 12345,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = SessionDecision {
         resolution: ForwardingResolution {
@@ -2840,6 +2849,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         src_port: 12345,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let local_decision = SessionDecision {
         resolution: ForwardingResolution {

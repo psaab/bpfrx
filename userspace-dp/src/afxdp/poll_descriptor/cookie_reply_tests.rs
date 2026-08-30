@@ -105,6 +105,7 @@ fn tcp_v4_syn_frame() -> (Vec<u8>, UserspaceDpMeta, SessionFlow) {
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let flow = SessionFlow {
         src_ip: std::net::IpAddr::V4(src_ip),
