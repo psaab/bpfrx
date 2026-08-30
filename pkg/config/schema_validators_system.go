@@ -487,12 +487,62 @@ func ValidateSyslogFacility(raw string, _ *Config) error {
 			"comma-separated list of names each starting with a letter or digit and "+
 			"containing only letters, digits and internal hyphens. No whitespace, "+
 			"control characters, or rsyslog selector punctuation such as ';' '.' ':' "+
-			"'_'. Junos facility names are `any`, `authorization`, `change-log`, "+
-			"`conflict-log`, `daemon`, `dfc`, `firewall`, `ftp`, "+
-			"`interactive-commands`, `kernel`, `ntp`, `pfe`, `security`, `user`, or a "+
-			"BSD name / local0-local7", raw)
+			"'_'. Junos facility names are %s, or a BSD name / local0-local7",
+			raw, junosSyslogFacilityList())
 	}
 	return nil
+}
+
+// junosSyslogFacilityNames is the `[edit system syslog]` facility vocabulary
+// this box advertises to an operator in a commit error.
+//
+// IT IS A CLAIM, NOT A DECORATION. An operator reads this list, writes one of
+// the names, and expects records under it. A name that appears here but is not
+// mapped commits, files silently to local0, and emits nothing under the name
+// the operator asked for -- which is exactly the failure the list exists to
+// prevent.
+//
+// Two names were removed in #7187 because they were never `[edit system
+// syslog]` facilities, and the repository had ALREADY established that in
+// pkg/logging (parse_facility_checked_5797_test.go, verified against the
+// documentation) while this message went on advertising them:
+//
+//   - `security` names a DIFFERENT hierarchy, `[edit security log]`.
+//   - `ntp` is excluded by the empty-second-column rule: Table 2 carries the
+//     NTP code with no Junos facility name against it, and such a code "cannot
+//     be included in a statement at the [edit system syslog] hierarchy level".
+//     junosRemoteFacility documents this at length and deliberately omits it.
+//
+// The two are kept honest by TestConfigFacilityAdviceMatchesTheWireMapping7187
+// in pkg/logging, which asserts this list and the wire mapping agree in BOTH
+// directions. The agreement is asserted rather than one side pinned to a
+// literal, because a literal encodes which side you trust -- and here the side
+// everyone trusted (this message) was the wrong one.
+//
+// `any` is deliberately present and is deliberately the ONE exception to the
+// mapping agreement: it is a selector wildcard valid on the rsyslog-backed
+// file/user destinations, not a numeric facility a host client can stamp.
+var junosSyslogFacilityNames = []string{
+	"any",
+	"authorization", "change-log", "conflict-log", "daemon", "dfc",
+	"firewall", "ftp", "interactive-commands", "kernel", "pfe", "user",
+}
+
+// JunosSyslogFacilityNames returns the advertised `[edit system syslog]`
+// facility vocabulary. Exported so pkg/logging can assert it against the wire
+// mapping; pkg/logging imports pkg/config, so the dependency cannot run the
+// other way and the two lists cannot be single-sourced.
+func JunosSyslogFacilityNames() []string {
+	return append([]string(nil), junosSyslogFacilityNames...)
+}
+
+// junosSyslogFacilityList renders the vocabulary for an operator-facing error.
+func junosSyslogFacilityList() string {
+	quoted := make([]string, 0, len(junosSyslogFacilityNames))
+	for _, n := range junosSyslogFacilityNames {
+		quoted = append(quoted, "`"+n+"`")
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // zoneNameSegmentRE is the safe shape for one `/`-separated segment of a
