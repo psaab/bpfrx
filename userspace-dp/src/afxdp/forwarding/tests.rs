@@ -2761,6 +2761,7 @@ fn canonical_route_table_borrows_default_and_owns_vrf() {
     // pre-#4674 `String` return type cannot match the `Cow::Borrowed` /
     // `Cow::Owned` patterns, so this test fails to compile against the
     // reverted signature.
+    use crate::afxdp::forwarding::fib::{DEFAULT_V4_TABLE, DEFAULT_V6_TABLE};
     use std::borrow::Cow;
 
     // v4 -> v6 default remap: borrowed (zero alloc), equals inet6.0.
@@ -2782,9 +2783,19 @@ fn canonical_route_table_borrows_default_and_owns_vrf() {
     assert!(matches!(vrf_v4, Cow::Owned(_)));
     assert_eq!(vrf_v4, "myvrf.inet.0");
 
-    // Non-canonical passthrough: owned, unchanged.
+    // Non-canonical passthrough: BORROWED since #7204 (A1-b7-F5), unchanged.
+    //
+    // This assertion used to require `Cow::Owned`, pinning the copy rather than
+    // the behaviour: the function returned its own argument and allocated only
+    // to satisfy a `'static` return type. That is the allocation A1-b7-F5 is
+    // about, and it was on the common same-family path, so the assertion has
+    // been flipped rather than deleted — the VALUE assertion below is what this
+    // case was really guarding and it is unchanged.
     let passthrough = canonical_route_table("custom.table", true);
-    assert!(matches!(passthrough, Cow::Owned(_)));
+    assert!(
+        matches!(passthrough, Cow::Borrowed(_)),
+        "a name with nothing to rewrite must be borrowed, not copied (#7204)"
+    );
     assert_eq!(passthrough, "custom.table");
 }
 
@@ -6590,4 +6601,49 @@ fn ecmp_liveness_mask_covers_the_rendered_maximum_paths_7204() {
         crate::afxdp::forwarding::fib::MAX_SUPPORTED_ECMP_FANOUT,
         RENDERED_MAXIMUM_PATHS,
     );
+}
+
+/// #7204 (A1-b7-F5): `canonical_route_table` must BORROW when it has nothing to
+/// rewrite, and the value it returns must be unchanged either way.
+///
+/// The observable is `Cow::Borrowed` vs `Cow::Owned` — the direct form of "did
+/// this allocate", the same role capacity played for the TX deques. Asserting
+/// only the string value would pass identically before and after, because the
+/// defect was never a wrong name: it was copying the argument to satisfy a
+/// `'static` return on the common same-family path.
+///
+/// The Owned cases are asserted too, and not as an afterthought: a "fix" that
+/// borrowed unconditionally would return the WRONG TABLE for a genuine family
+/// rewrite, which no allocation-counting assertion would catch.
+#[test]
+fn canonical_route_table_borrows_when_no_rewrite_is_needed_7204() {
+    use std::borrow::Cow;
+
+    // Same family: nothing to rewrite, so nothing to allocate. This is the arm
+    // that used to `to_string()` its own argument.
+    for (table, is_ipv6) in [("vrf-a.inet.0", false), ("vrf-a.inet6.0", true)] {
+        let got = canonical_route_table(table, is_ipv6);
+        assert!(
+            matches!(got, Cow::Borrowed(_)),
+            "{table} (v6={is_ipv6}) needs no rewrite and must be borrowed, not copied"
+        );
+        assert_eq!(got, table, "...and must come back unchanged");
+    }
+
+    // Default-table cross-family: a different &'static str, still borrowed.
+    assert!(matches!(
+        canonical_route_table(DEFAULT_V4_TABLE, true),
+        Cow::Borrowed(_)
+    ));
+    assert_eq!(canonical_route_table(DEFAULT_V4_TABLE, true), DEFAULT_V6_TABLE);
+    assert_eq!(canonical_route_table(DEFAULT_V6_TABLE, false), DEFAULT_V4_TABLE);
+
+    // Genuine rewrites: a NEW string, so Owned is correct here and borrowing
+    // would be a wrong-table bug rather than an optimisation.
+    let v6 = canonical_route_table("vrf-a.inet.0", true);
+    assert!(matches!(v6, Cow::Owned(_)), "a family rewrite must produce a new string");
+    assert_eq!(v6, "vrf-a.inet6.0");
+    let v4 = canonical_route_table("vrf-a.inet6.0", false);
+    assert!(matches!(v4, Cow::Owned(_)));
+    assert_eq!(v4, "vrf-a.inet.0");
 }
