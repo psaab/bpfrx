@@ -12,7 +12,13 @@ controlled-topology VMs, but it is hazardous on real bare metal:
   rename is at least collision-safe — an enumeration shift no longer
   corrupts the `.link` `OriginalName=` chain via `breakNameCollisions`,
   the same phase-1 discipline device-map mode uses — but the index→name
-  binding still MOVES on a hardware change. Only the device-map pins it.)
+  binding still MOVES on a hardware change. Only the device-map pins it.
+  Since #7205 the positional pass also reads the LIVE names back after the
+  reload and reports any NIC not wearing its intended name; that catches a
+  rename which reported success and did not take effect, but it cannot
+  catch the wrong NIC wearing the right name, because in positional mode
+  the index IS the identity. The device-map's permanent-MAC check is the
+  only thing that closes that.)
 - **Claims everything** — a real host has NICs xpf must not touch: a
   BMC/IPMI shared NIC, a storage/cluster fabric, the admin's own management
   path. Positional mode renames them all and, if unconfigured, forces them
@@ -249,6 +255,35 @@ back — never triggers a spurious commit failure or a `networkctl reload`. Only
 GENUINE rename-back / reload failure retains-and-errors. This mirrors the #4956
 startup rename/reload aggregation and the #4901 retain-on-failed-delete
 discipline.
+
+### A collision phase 1 could not break (#7205)
+
+`breakNameCollisions` is phase 1 of the shared two-pass rename, used by BOTH
+device-map and positional naming. It moves any NIC that currently wears a
+desired final name — but is not that name's intended occupant — to a temporary
+`xpf-tmp-N` name, so phase 2 always finds its target free.
+
+If one of those temp renames **fails**, that NIC keeps occupying a desired final
+name and phase 2's premise ("collisions are already broken, so no EEXIST here")
+no longer holds for that one name. Since #7205 phase 2 **declines** the rename
+onto that name and reports:
+
+```
+device-map: cannot rename enp9s0 -> ge-0-0-3: the collision break could not free
+"ge-0-0-3" (its current occupant failed to temp-rename), so this rename would
+EEXIST and phase 2's no-collision premise does not hold for this name (#7205)
+```
+
+Before this the rename was attempted and the resulting `EEXIST` was reported —
+loud, but pointing at the wrong thing. An operator reading it went looking at
+udev or the `.link` file rather than at the collision break that did not happen.
+
+**It is not a rollback.** Un-renaming the NICs that phase 1 moved successfully
+would leave the box in a third state neither phase understands. The pass
+finishes and reports per name, the same discipline phase 2 itself uses.
+
+Other names are unaffected — only the specific name that could not be freed is
+declined.
 
 ## Safety: commit pre-flight & rollback
 

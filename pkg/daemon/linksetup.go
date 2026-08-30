@@ -113,6 +113,14 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers
 		slog.Info("linksetup: interface naming unchanged")
 	}
 
+	// #7205: READ THE LIVE NAMES BACK. Everything above reports what was
+	// ATTEMPTED; only this reports what took effect. It runs AFTER the reload
+	// so a reload that partially applied is visible, and its findings join the
+	// same #5842 error channel as a failed rename -- the next-boot and
+	// this-boot consequences are identical, so they must not be reported on
+	// different channels.
+	nameErrs = append(nameErrs, verifyPositionalNames(fpc, clusterMode)...)
+
 	// D3 (#785): constrain mlx5 RSS indirection to queues 0..workers-1
 	// on every mlx5_core interface that userspace-dp will bind on.
 	// Must run strictly before any AF_XDP bind — that ordering is
@@ -276,7 +284,7 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 	// After this every desired final name is free. The positional path names
 	// every present NIC, so there are no unmapped stranded NICs — the stranded
 	// set is empty and ignored.
-	_, changed := breakNameCollisions("linksetup", currentNames, desiredNames,
+	_, unfreed, changed := breakNameCollisions("linksetup", currentNames, desiredNames,
 		desiredByCurrent, originalByCurrent, renameFn)
 
 	// Phase 2: write each .link with its pre-captured OriginalName and rename
@@ -300,6 +308,14 @@ func renamePositional(nics []pciNIC, fpc int, clusterMode bool, renameFn func(fr
 			changed = true
 		}
 		if current != final {
+			// #7205: phase 1 could not free this name, so the rename below
+			// would EEXIST. Report the real cause instead.
+			if unfreed[final] {
+				slog.Warn("linksetup: skipping rename onto a name the collision "+
+					"break could not free", "from", current, "to", final)
+				errs = append(errs, unfreedNameErr("linksetup", current, final))
+				continue
+			}
 			if err := renameFn(current, final); err != nil {
 				slog.Warn("linksetup: rename failed",
 					"from", current, "to", final, "err", err)
@@ -348,7 +364,7 @@ func breakNameCollisions(
 	desiredByCurrent map[string]string,
 	originalByCurrent map[string]string,
 	renameFn func(from, to string) error,
-) (stranded map[string]string, changed bool) {
+) (stranded map[string]string, unfreed map[string]bool, changed bool) {
 	inUse := make(map[string]bool, len(currentNames))
 	for _, name := range currentNames {
 		inUse[name] = true
@@ -363,6 +379,7 @@ func breakNameCollisions(
 		}
 	}
 	stranded = make(map[string]string)
+	unfreed = make(map[string]bool)
 	for _, name := range currentNames {
 		if !desiredNames[name] {
 			continue // this NIC's current name is not wanted by anyone
@@ -372,8 +389,16 @@ func breakNameCollisions(
 		}
 		tmp := freeTempName()
 		if err := renameFn(name, tmp); err != nil {
-			slog.Warn(logPrefix+": temp-rename to break collision failed",
-				"from", name, "to", tmp, "err", err)
+			// #7205: this NIC still occupies a DESIRED final name, so phase 2's
+			// stated premise -- "collisions are already broken, so no EEXIST
+			// here" -- is false for THIS name. Report it rather than letting
+			// phase 2 attempt a rename that is guaranteed to EEXIST: the
+			// resulting error names the wrong cause and sends the reader at the
+			// rename rather than at the collision break that did not happen.
+			slog.Warn(logPrefix+": temp-rename to break collision failed; the "+
+				"desired name it occupies cannot be claimed this pass",
+				"from", name, "to", tmp, "occupies", name, "err", err)
+			unfreed[name] = true
 			continue
 		}
 		slog.Info(logPrefix+": temp-renamed conflicting interface", "from", name, "to", tmp)
@@ -391,7 +416,78 @@ func breakNameCollisions(
 			stranded[tmp] = name
 		}
 	}
-	return stranded, changed
+	return stranded, unfreed, changed
+}
+
+// unfreedNameErr is the error both rename paths report when phase 1 could not
+// free a desired final name (#7205).
+//
+// Phase 2's premise is "collisions are already broken, so no EEXIST here". A
+// failed temp rename in breakNameCollisions falsifies that premise for exactly
+// one name, and before this the paths went ahead and attempted the rename
+// anyway. The resulting EEXIST is reported -- #7203 gave both paths an error
+// channel -- but it names the WRONG cause: it points at the rename, and the
+// reader goes looking at udev or the .link file instead of at the collision
+// break that did not happen. Refusing the doomed rename and saying why is the
+// difference between an error that is loud and one that is useful.
+//
+// This is deliberately NOT a rollback. Rolling the collision break back would
+// mean un-renaming NICs that were successfully moved, which leaves the box in a
+// third state that neither phase understands; finishing the pass and reporting
+// per-name is the same discipline #5842 chose for phase 2 itself.
+func unfreedNameErr(logPrefix, current, final string) error {
+	return fmt.Errorf("%s: cannot rename %s -> %s: the collision break could not free "+
+		"%q (its current occupant failed to temp-rename), so this rename would EEXIST "+
+		"and phase 2's no-collision premise does not hold for this name (#7205)",
+		logPrefix, current, final, final)
+}
+
+// verifyPositionalNames reads the LIVE interface list back and reports any NIC
+// not wearing the name positional naming intended for it (#7205).
+//
+// renamePositional reports what it ATTEMPTED. It cannot report what took
+// effect: a networkctl reload that partially applied, a udev race, or a NIC
+// that vanished mid-pass all leave the box running under names the config does
+// not reference, with a clean return value. #7203 gave this path an error
+// channel; this is what fills it with the thing that actually matters.
+//
+// Device-map mode has the identity half of this -- enumerateAndRenameMapped
+// refuses a binding whose PCI address matches but whose permanent MAC differs,
+// so a swapped card is never silently hijacked. Positional mode has no stable
+// identity to verify against, because the positional INDEX is the identity. A
+// live-name readback is the available substitute: it cannot tell you the right
+// NIC got the name, but it can tell you the name is worn at all.
+//
+// Re-enumeration is sound here because enumeratePCINICs sorts by (sortKey,
+// busAddr) -- both PCI-derived and independent of the interface NAME -- so
+// index i addresses the same NIC before and after a rename pass. If that sort
+// ever became name-dependent this check would silently compare a NIC against
+// another NIC's intended name, which is why the ordering is stated here rather
+// than assumed.
+func verifyPositionalNames(fpc int, clusterMode bool) []error {
+	nics, err := enumeratePCINICsFn()
+	if err != nil {
+		// The readback itself failed, so convergence is UNKNOWN rather than
+		// confirmed. Reporting it is the point: silently treating an
+		// unreadable interface list as "names are fine" is the fail-open this
+		// function exists to remove.
+		return []error{fmt.Errorf("verify interface names: re-enumerate NICs: %w", err)}
+	}
+	var errs []error
+	for idx, nic := range nics {
+		want := assignName(idx, fpc, clusterMode)
+		if nic.name != want {
+			slog.Error("linksetup: interface is not wearing its intended name after "+
+				"the naming pass", "index", idx, "bus", nic.busAddr,
+				"live_name", nic.name, "intended", want)
+			errs = append(errs, fmt.Errorf(
+				"interface at PCI %s (positional index %d) is named %q but positional "+
+					"naming intended %q: the rename did not take effect, so the box is "+
+					"running under names the configuration does not reference (#7205)",
+				nic.busAddr, idx, nic.name, want))
+		}
+	}
+	return errs
 }
 
 // recoverOriginalName returns the OriginalName from an existing .link file
