@@ -382,7 +382,15 @@ func (m *Manager) ProveArmCoverage(result *CompileResult) ArmCoverageReport {
 	if m == nil {
 		return ArmCoverageReport{}
 	}
-	return classifyArmCoverage(result, m.attachedInstance)
+	rep := classifyArmCoverage(result, m.attachedInstance)
+	// #7191: publish the verdict so the daemon can GATE on it. Publishing from
+	// INSIDE the proof (rather than from the call site) is deliberate: it makes
+	// it impossible to publish a stashed or hand-built report, which is the same
+	// property TestArmProofIsInvokedFromCompileUserspaceShim enforces for the
+	// LOGGED report. The classification itself is unchanged and still writes no
+	// state of its own.
+	m.publishArmCoverage(rep)
+	return rep
 }
 
 // instanceLookup reports the program instance bound at an ifindex.

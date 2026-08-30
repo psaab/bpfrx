@@ -35,6 +35,8 @@ func (noopNftInstaller) InstallHostInbound(xnft.HostInboundSpec) error { return 
 func (noopNftInstaller) InstallColdBootFence(xnft.FenceSpec) error     { return nil }
 func (noopNftInstaller) InstallLo0ColdBootFence(xnft.FenceSpec) error  { return nil }
 func (noopNftInstaller) InstallGapFence(xnft.GapFenceSpec) error       { return nil }
+func (noopNftInstaller) InstallTransitBarrier() error                  { return nil }
+func (noopNftInstaller) RemoveTransitBarrier() error                   { return nil }
 func (noopNftInstaller) InstallLo0(s xnft.Lo0FilterSpec) (int, error)  { return fakeLo0Rules(s), nil }
 func (noopNftInstaller) DeleteTable(string) error                      { return nil }
 
@@ -52,6 +54,13 @@ type fakeNftInstaller struct {
 	// nil means "derive it from the spec" (fakeLo0Rules).
 	lo0Rules *int
 	del      func(string) error
+	// #7191: barrier call recorder. barrierCalls appends "install"/"remove" in
+	// order so a test can assert the SEQUENCE, not just that a call happened —
+	// install-then-remove and remove-then-install have opposite meanings for a
+	// fail-closed gate.
+	barrierCalls   []string
+	barrierInstall func() error
+	barrierRemove  func() error
 }
 
 func (f *fakeNftInstaller) InstallHostInbound(s xnft.HostInboundSpec) error {
@@ -203,3 +212,23 @@ func hostInboundProgramHasSrc(spec xnft.HostInboundSpec, ifname, src string) boo
 	}
 	return false
 }
+
+func (f *fakeNftInstaller) InstallTransitBarrier() error {
+	f.barrierCalls = append(f.barrierCalls, "install")
+	if f.barrierInstall != nil {
+		return f.barrierInstall()
+	}
+	return nil
+}
+
+func (f *fakeNftInstaller) RemoveTransitBarrier() error {
+	f.barrierCalls = append(f.barrierCalls, "remove")
+	if f.barrierRemove != nil {
+		return f.barrierRemove()
+	}
+	return nil
+}
+
+// #7191: barrier no-ops; this fake counts host-inbound installs only.
+func (c *countingNftInstaller) InstallTransitBarrier() error { return nil }
+func (c *countingNftInstaller) RemoveTransitBarrier() error  { return nil }

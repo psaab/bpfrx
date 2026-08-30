@@ -1793,7 +1793,48 @@ never lock an operator out of a remote box it manages.
   - **What still works.** `ip_forward` governs FORWARDED packets only, so
     management is unaffected by design (#1960 no-brick): SSH, gRPC/REST/CLI,
     the cluster heartbeat, and DHCP are locally terminated, and the `hook
-    input` host-inbound chains are untouched. The daemon does NOT exit.
+    input` host-inbound chains are untouched. The daemon does NOT exit. The
+    #7191 nftables barrier is likewise forward-hook only and carries no
+    management exemption *because it needs none* — management is INPUT.
+  - **How deep the barrier goes (#7191).** The gate is no longer the sysctl
+    alone. While unarmed the daemon also installs `xpf_transit_barrier`, an
+    unconditional forward-hook DROP, in **both** the `inet` and `bridge`
+    families (`pkg/nftables/transit_barrier.go`). The bridge leg exists
+    because `ip_forward` does not govern bridged frames at all, and this repo
+    creates bridge domains. Before #7191 the repo had **zero** `hook forward`
+    chains, so a single sysctl — raisable by a `sysctl.d` drop-in, a systemd
+    unit, an operator, or any future code path — was the only thing between an
+    unarmed box and kernel routing.
+
+    The barrier is installed and removed from the same `mark*` helpers that
+    drive the sysctls, and re-asserted on every apply tail, so a stale barrier
+    self-heals rather than silently black-holing armed transit. It is scoped
+    strictly to the unarmed window, which is the window `ip_forward=0` already
+    covers — so it closes nothing that was open. That scoping is not a detail:
+    several ARMED paths deliberately rely on an open kernel forward hook
+    (route-based IPsec plaintext off an xfrm interface, SNAT'd frames passed up
+    for kernel routing, the #7409 slow-path reinject), and a barrier live while
+    armed would drop all three.
+
+    Plan §6's third leg, a flowtable disable, is a deliberate no-op: xpf creates
+    no flowtable, so there is nothing to flush.
+    `TestNoFlowtableIsEverCreated7191` pins that assumption.
+  - **The per-interface attach is now part of the arm state (#7191).**
+    `dataplaneArmed` used to track only the `rt.Start()` boundary, so a box
+    where Start succeeded but an individual interface failed to attach reported
+    itself armed and kept `ip_forward=1` with nothing adjudicating that
+    interface. The post-attach arm-coverage proof
+    (`pkg/dataplane/armproof.go`), previously observe-only, is now consulted on
+    the apply tail and disarms through the SAME `markDataplaneArmFailed` path a
+    Start failure uses — one arm state, one set of side effects.
+
+    The gate is one-way (it can only disarm) and three-state: a report that has
+    never been published, or one that could not classify, does **not** disarm,
+    because gating on a reading that never happened is a brick rather than a
+    fence. Note the proof currently conflates "no tracked link" with "the
+    link's identity could not be read", so a readback fault disarms like a real
+    attach failure — the conservative direction, recorded in
+    `daemon_arm_coverage_7191.go`.
   - **What is NOT covered.** FRR adjacencies and VRRP/RG ownership are *not*
     relinquished by this gate — an unarmed node can still hold a VIP and
     advertise routes, so peers may keep steering transit at it (a blackhole

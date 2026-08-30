@@ -34,6 +34,9 @@ const (
 
 // Manager manages the eBPF dataplane: programs, maps, and attachments.
 type Manager struct {
+	// armCoverage holds the most recent #7191 arm-coverage proof so the daemon
+	// can gate on per-interface attach coverage instead of only logging it.
+	armCoverage armCoverageCell
 	// loaded is the #2114 A3 armed-admission bit: atomic so the
 	// pre-registry loaded checks (AttachXDP/AttachTC/CompileConfig) and
 	// the externally visible IsLoaded() surface never race the shim
@@ -319,6 +322,11 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	// `result` directly and publishes nothing: hoisting the m.lastCompile
 	// assignment to feed it would expose a half-observed CompileResult through
 	// the exported LastCompileResult() for a diagnostic's benefit.
+	//
+	// #7191: the report is no longer only logged — ProveArmCoverage now also
+	// PUBLISHES it so the daemon can gate on it (ArmCoverageSummary). The call
+	// shape here is unchanged, which keeps the #5275 canary's guarantee that the
+	// logged report is a LIVE proof rather than a stashed one.
 	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
 	m.markVLANSubInterfaces(result)
