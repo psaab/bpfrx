@@ -211,11 +211,6 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
 			m.StopHeartbeat()
 			stops.Add(1)
 			// #7663/#7970: yield a gap on the order of a START's own duration.
@@ -238,6 +233,34 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 			// detector still sees unsynchronised accesses. That is the property;
 			// pacing changes only how often the probe reaches it.
 			time.Sleep(time.Duration(rand.Intn(2*startCostMicros)) * time.Microsecond)
+			// #7970: the `done` check is at the END, so this goroutine always
+			// completes AT LEAST ONE stop before it can exit.
+			//
+			// It used to be at the TOP, and that is the whole of #7970. `done`
+			// is closed by the start goroutine's `defer` once its 60 starts are
+			// finished — about 3.7ms of work. If this goroutine lost the
+			// first-schedule race by that much (routine under `go test ./...`
+			// oversubscription) it observed `done` already closed on its very
+			// first iteration and returned having done NOTHING. waitForTeardown-
+			// Progress then waited the full 30s for a stop that could never
+			// arrive, because the only thing that produces stops had exited.
+			//
+			// So the red was never starvation and never a slow machine: it was a
+			// wait on an IMPOSSIBLE event, and the bound only set how long the
+			// suite paid to discover that. Raising it could not have helped —
+			// which is why raising it 5s -> 30s (#7679) did not.
+			//
+			// Verified by construction: with a 50ms sleep inserted before the old
+			// top-of-loop check, the failure reproduced deterministically at
+			// exactly 30.00s with zero stops. Confirmed against the captured
+			// goroutine dump from a real `./...` red, in which NEITHER probe
+			// goroutine appears — both had already exited, so nothing was blocked
+			// and nothing was runnable-but-starved.
+			select {
+			case <-done:
+				return
+			default:
+			}
 		}
 	}()
 	// #7650: wait until the teardown side is provably RUNNING before the
