@@ -7,8 +7,10 @@
 // control-response reconstruction — no packet path, no allocation on the
 // worker loop. Bodies byte-for-byte identical to the pre-split source.
 
-use crate::afxdp::{self, SyncedSessionEntry};
+use crate::afxdp::{self, SyncedSessionEntry, SYNCED_IMPORT_REFUSED_PREFIX};
+use crate::ip_proto::PROTO_GRE;
 use crate::protocol::SessionSyncRequest;
+use crate::session::{TunnelDiscriminator, WireDiscriminator};
 
 /// #4555/#6923: the second producer of a session key, and the one the packet
 /// path cannot vouch for.
@@ -42,15 +44,84 @@ fn reject_unresolved_ipv6_ext_protocol(req: &SessionSyncRequest) -> Result<(), S
     Ok(())
 }
 
+/// What the reconstructed key is FOR (#7188).
+///
+/// The two uses want opposite answers when the peer could not state the
+/// discriminator, and collapsing them is what made the aliasing silent:
+///
+/// * `Install` publishes an identity. Importing a protocol-47 record whose
+///   discriminator the peer could not express means guessing which of two
+///   tunnels it names — and `install.rs` opens with an unconditional
+///   `remove_entry`, so the guess EVICTS the other tunnel. #7188 decision 2
+///   says withhold: the peer misses the session and re-learns it.
+/// * `Delete` retracts an identity. A key reconstructed without a
+///   discriminator names the `None` class only, so at worst it matches
+///   nothing — a delete can under-match but can never create or merge an
+///   identity. Refusing it instead would turn every legacy peer's ordinary
+///   GRE close into an error response for no gain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncedKeyIntent {
+    Install,
+    Delete,
+}
+
+/// Resolve the wire discriminator for a reconstructed key, or refuse.
+///
+/// The refusal carries [`SYNCED_IMPORT_REFUSED_PREFIX`] because it is the
+/// CORRECT answer from a HEALTHY helper, not a transport failure: Go
+/// discriminates on that token (`process_control.go`) and a transport failure
+/// gates takeover-readiness (#5247), which a peer running an older build must
+/// not do.
+fn resolve_synced_discriminator(
+    req: &SessionSyncRequest,
+    intent: SyncedKeyIntent,
+) -> Result<TunnelDiscriminator, String> {
+    match TunnelDiscriminator::from_wire(req.tunnel_discriminator) {
+        WireDiscriminator::Present(discriminator) => Ok(discriminator),
+        // A delete never publishes an identity, so an unstatable one costs
+        // nothing here: the key names the `None` class and under-matches.
+        WireDiscriminator::Absent | WireDiscriminator::Unrecognized
+            if intent == SyncedKeyIntent::Delete =>
+        {
+            Ok(TunnelDiscriminator::None)
+        }
+        // A peer that predates the field. Correct for every protocol that has
+        // no discriminator concept — that is what `None` means and it is
+        // bit-identical to the pre-#7188 import — but for GRE it means the peer
+        // cannot tell two same-endpoint RFC 2890 tunnels apart, so importing
+        // its record would alias them here.
+        WireDiscriminator::Absent => {
+            if req.protocol == PROTO_GRE {
+                Err(format!(
+                    "{SYNCED_IMPORT_REFUSED_PREFIX}gre-discriminator-not-carried"
+                ))
+            } else {
+                Ok(TunnelDiscriminator::None)
+            }
+        }
+        // A class this build does not define. Coercing it into a known class
+        // would publish an identity we cannot reproduce, for ANY protocol.
+        WireDiscriminator::Unrecognized => Err(format!(
+            "{SYNCED_IMPORT_REFUSED_PREFIX}tunnel-discriminator-unrecognized"
+        )),
+    }
+}
+
 /// #7160 (#2387): `routing_domain` is resolved by the CALLER
 /// (`Coordinator::synced_routing_domain`) from the #7095 cluster-stable
 /// ingress identity this request already carries, not read off a wire field.
 /// See that function for why the number is derived rather than sent.
+///
+/// #7188: `intent` is the OTHER identity axis, and it is NOT derived — it says
+/// what the key is FOR, because install and delete want opposite answers when
+/// the peer could not state the discriminator. See `SyncedKeyIntent`.
 pub(crate) fn build_synced_session_key(
     req: &SessionSyncRequest,
     routing_domain: u32,
+    intent: SyncedKeyIntent,
 ) -> Result<crate::session::SessionKey, String> {
     reject_unresolved_ipv6_ext_protocol(req)?;
+    let discriminator = resolve_synced_discriminator(req, intent)?;
     Ok(crate::session::SessionKey {
         addr_family: req.addr_family,
         protocol: req.protocol,
@@ -64,7 +135,12 @@ pub(crate) fn build_synced_session_key(
             .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?,
         src_port: req.src_port,
         dst_port: req.dst_port,
-        discriminator: Default::default(),
+        // #7188: NOT `Default::default()`. Default is `None` — the "no
+        // discriminator concept for this protocol" class — so every synced GRE
+        // session, keyed or not, arrived in the class reserved for non-tunnel
+        // protocols and two keyed tunnels between one endpoint pair rebuilt to
+        // ONE key here.
+        discriminator,
         routing_domain,
     })
 }
@@ -126,7 +202,7 @@ pub(crate) fn build_synced_session_entry(
     zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
     routing_domain: u32,
 ) -> Result<SyncedSessionEntry, String> {
-    let key = build_synced_session_key(req, routing_domain)?;
+    let key = build_synced_session_key(req, routing_domain, SyncedKeyIntent::Install)?;
     let next_hop = if req.next_hop.is_empty() {
         None
     } else {

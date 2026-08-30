@@ -213,14 +213,20 @@ fn delta_with_attribution() -> SessionDelta {
 /// Parsed from the frame bytes, not from the encoder's inputs: this is the leg
 /// the JSON leg has to agree WITH, so it must be read the way the Go decoder
 /// reads it (`pkg/dataplane/userspace/eventstream.go`). The #3301 block is the
-/// last thing on the frame apart from the #4565 snat_v4 and the #5212 session
-/// id, so it is addressed from the END.
+/// last thing on the frame apart from the #4565 snat_v4, the #5212 session id
+/// and the #7188 tunnel discriminator, so it is addressed from the END.
 struct BinaryAttribution {
     policy_id: u32,
     policy_counter_idx: u32,
     app_timeout: u32,
     nat64: bool,
     nat64_snat_v4: String,
+    /// #7188: the tunnel session-identity discriminator, the frame's last
+    /// field. It joins this struct because it is the newest thing BOTH legs
+    /// carry, and because it is the one field here that is part of session
+    /// IDENTITY rather than attribution — a divergence between the legs would
+    /// not mis-label a session, it would merge two.
+    tunnel_discriminator: u64,
 }
 
 fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
@@ -239,19 +245,23 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
     let u32_at = |off: usize| -> u32 {
         u32::from_le_bytes(payload[off..off + 4].try_into().expect("4 bytes"))
     };
-    // [n-24..n-20] policy_id, [n-20..n-16] policy_counter_idx,
-    // [n-16..n-12] inactivity secs, [n-12..n-8] snat_v4, [n-8..n] session id.
-    let snat = &payload[n - 12..n - 8];
+    // [n-32..n-28] policy_id, [n-28..n-24] policy_counter_idx,
+    // [n-24..n-20] inactivity secs, [n-20..n-16] snat_v4,
+    // [n-16..n-8] session id, [n-8..n] #7188 tunnel discriminator.
+    let snat = &payload[n - 20..n - 16];
     BinaryAttribution {
-        policy_id: u32_at(n - 24),
-        policy_counter_idx: u32_at(n - 20),
-        app_timeout: u32_at(n - 16),
+        policy_id: u32_at(n - 32),
+        policy_counter_idx: u32_at(n - 28),
+        app_timeout: u32_at(n - 24),
         nat64: payload[26] & FLAG_NAT64 != 0,
         nat64_snat_v4: if snat == [0, 0, 0, 0] {
             String::new()
         } else {
             format!("{}.{}.{}.{}", snat[0], snat[1], snat[2], snat[3])
         },
+        tunnel_discriminator: u64::from_le_bytes(
+            payload[n - 8..n].try_into().expect("8 bytes"),
+        ),
     }
 }
 
@@ -333,9 +343,24 @@ fn session_delta_json_and_binary_agree_on_policy_attribution_6949() {
          its reverse v4->v6 BIB at all (#4565): {v}"
     );
 
+    assert_eq!(
+        v.get("tunnel_discriminator").and_then(|x| x.as_u64()),
+        Some(want.tunnel_discriminator),
+        "the two legs disagree on the #7188 tunnel session-identity discriminator. \
+         This one does not mis-label a session, it MERGES two: a keyed-GRE session \
+         recovered through the JSON leg would carry a different identity from the \
+         same session recovered through the binary leg, and for protocol 47 the \
+         5-tuples are equal so the peer cannot tell them apart afterwards: {v}"
+    );
+
     // Positive controls: the binary side really did carry the fixture, so an
     // equality above cannot be two legs agreeing on nothing.
     assert_eq!(want.policy_id, 4242, "binary leg carried the fixture policy");
+    assert_ne!(
+        want.tunnel_discriminator, 0,
+        "binary leg must STATE a discriminator class; 0 is the reserved \
+         `not carried` tag and would make this agreement vacuous (#7188)"
+    );
     assert_eq!(want.app_timeout, 1800, "binary leg converted ns -> s");
     assert_eq!(want.nat64_snat_v4, "203.0.113.5", "binary leg carried snat");
     // ...and this really is the delta -> JSON conversion of THAT session.
@@ -360,6 +385,10 @@ fn session_delta_info_zero_attribution_is_present_not_absent_6949() {
         &zone_names(),
     );
     let v: serde_json::Value = serde_json::to_value(&info).expect("serialize SessionDeltaInfo");
+    // #7188 is deliberately NOT in this list: its `0` is the RESERVED
+    // "not carried" tag, not a legitimate value, so it is asserted NON-zero by
+    // `session_delta_info_states_none_explicitly_for_non_tunnel_protocols_7188`
+    // instead. Same three-state discipline, opposite sentinel.
     for key in ["policy_id", "policy_counter_idx", "app_timeout"] {
         assert_eq!(
             v.get(key).and_then(|x| x.as_u64()),
@@ -465,4 +494,98 @@ fn sync_attribution_exhaustive_destructure_6949() {
             "{producer} binds {got:?} of SessionSyncAttribution's {want:?}"
         );
     }
+}
+
+// --- #7188: the JSON leg carries the tunnel session-identity discriminator ---
+
+/// A keyed-GRE delta: protocol 47, no L4 ports, and a discriminator that is the
+/// only thing distinguishing it from another tunnel between the same endpoints.
+fn keyed_gre_delta(key: u32) -> SessionDelta {
+    let mut delta = delta_with_session_id(0);
+    delta.key.protocol = crate::ip_proto::PROTO_GRE;
+    delta.key.src_port = 0;
+    delta.key.dst_port = 0;
+    delta.key.discriminator = crate::session::TunnelDiscriminator::Keyed(key);
+    delta
+}
+
+/// Fail-on-revert: drop `tunnel_discriminator: delta.key.discriminator.to_wire()`
+/// from `session_delta_info` and the JSON leg emits the reserved 0 tag, so the
+/// peer reads a fully capable node as one that cannot express the identity and
+/// WITHHOLDS every keyed-GRE session it sends.
+///
+/// The pair is the point: two tunnels between one pair of outer endpoints have
+/// identical tuples on this leg, so a single-tunnel assertion would pass with
+/// the field hardcoded to any constant.
+#[test]
+fn session_delta_info_carries_distinct_tunnel_discriminators_7188() {
+    let first = session_delta_info(
+        &test_binding_identity(),
+        &keyed_gre_delta(100),
+        &zone_names(),
+    );
+    let second = session_delta_info(
+        &test_binding_identity(),
+        &keyed_gre_delta(200),
+        &zone_names(),
+    );
+    assert_eq!(
+        first.tunnel_discriminator,
+        crate::session::TunnelDiscriminator::Keyed(100).to_wire()
+    );
+    assert_ne!(
+        first.tunnel_discriminator, second.tunnel_discriminator,
+        "two RFC 2890 tunnels between the same outer endpoints are one 5-tuple on \
+         this leg — protocol 47 has no ports — so a shared discriminator makes the \
+         two deltas indistinguishable and the standby holds one session for both"
+    );
+    // Positive control: this really is the delta -> JSON conversion.
+    assert_eq!(first.protocol, crate::ip_proto::PROTO_GRE);
+    assert_eq!(first.src_port, 0, "protocol 47 carries no ports");
+}
+
+/// The wire KEY is the cross-language contract: the Go consumer decodes this as
+/// `SessionDeltaInfo.TunnelDiscriminator` with `json:"tunnel_discriminator"`
+/// (pkg/dataplane/userspace/protocol_ha.go). A rename here ships a key Go
+/// ignores — present on the wire and still silently lost, which the struct-level
+/// assertion above cannot see.
+#[test]
+fn session_delta_info_tunnel_discriminator_wire_key_7188() {
+    let info = session_delta_info(
+        &test_binding_identity(),
+        &keyed_gre_delta(0x0BAD_F00D),
+        &zone_names(),
+    );
+    let v: serde_json::Value = serde_json::to_value(&info).expect("serialize SessionDeltaInfo");
+    let on_wire = v
+        .get("tunnel_discriminator")
+        .unwrap_or_else(|| panic!("no `tunnel_discriminator` key on the wire: {v}"));
+    assert_eq!(
+        on_wire.as_u64(),
+        Some(crate::session::TunnelDiscriminator::Keyed(0x0BAD_F00D).to_wire()),
+        "`tunnel_discriminator` must carry the encoded class verbatim: {v}"
+    );
+}
+
+/// A non-GRE session emits an EXPLICIT `None`, never the reserved absent tag.
+/// That is what tells the receiver this producer can express the identity, and
+/// it is the whole reason a peer that omits the field can be told apart from one
+/// that says "this protocol has no discriminator".
+#[test]
+fn session_delta_info_states_none_explicitly_for_non_tunnel_protocols_7188() {
+    let info = session_delta_info(
+        &test_binding_identity(),
+        &delta_with_session_id(0),
+        &zone_names(),
+    );
+    assert_ne!(
+        info.tunnel_discriminator, 0,
+        "0 is RESERVED for `the peer did not carry this field`; a TCP session must \
+         still STATE its `None` class, otherwise every record this helper sends is \
+         indistinguishable from one sent by a build that predates the field"
+    );
+    assert_eq!(
+        info.tunnel_discriminator,
+        crate::session::TunnelDiscriminator::None.to_wire()
+    );
 }

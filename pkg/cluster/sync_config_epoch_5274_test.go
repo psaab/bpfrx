@@ -191,12 +191,12 @@ func TestSessionWireRoundTripConfigEpoch5274V4(t *testing.T) {
 			dVal.Generation, dVal.AppTimeout, dVal.PolicyCounterIdx)
 	}
 
-	// Mixed-version: truncate the trailing #5274 config epoch (8 bytes) AND the
-	// #5212 RTFlowSessionID (8 bytes) AND the #7095 IngressIfaceFold (4
-	// bytes) so the frame ends after PolicyCounterIdx
-	// (an old peer that stops there). Decode must still succeed with epoch 0 and
-	// the #3301 fields + Generation preserved.
-	legacy := payload[:len(payload)-20]
+	// Mixed-version: truncate the trailing #5274 config epoch (8 bytes), the
+	// #5212 RTFlowSessionID (8 bytes), the #7095 IngressIfaceFold (4 bytes) AND
+	// the #7188 TunnelDiscriminator (8 bytes) so the frame ends after
+	// PolicyCounterIdx (an old peer that stops there). Decode must still succeed
+	// with epoch 0 and the #3301 fields + Generation preserved.
+	legacy := payload[:len(payload)-28]
 	_, lVal, ok := decodeSessionV4Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
@@ -239,12 +239,12 @@ func TestSessionWireRoundTripConfigEpoch5274V6(t *testing.T) {
 		t.Fatalf("adjacent trailing fields corrupted: gen=%#x idx=%d", dVal.Generation, dVal.PolicyCounterIdx)
 	}
 
-	// Mixed-version: truncate the trailing epoch (8 bytes) AND the #5212
-	// RTFlowSessionID (8 bytes) AND the #7095 IngressIfaceFold (4 bytes) so
-	// the frame ends after Nat64SnatV4 (an old peer
-	// stops there). Decode still succeeds with epoch 0 and NAT64 source
-	// preserved.
-	legacy := payload[:len(payload)-20]
+	// Mixed-version: truncate the trailing epoch (8 bytes), the #5212
+	// RTFlowSessionID (8 bytes), the #7095 IngressIfaceFold (4 bytes) AND the
+	// #7188 TunnelDiscriminator (8 bytes) so the frame ends after Nat64SnatV4
+	// (an old peer stops there). Decode still succeeds with epoch 0 and the
+	// NAT64 source preserved.
+	legacy := payload[:len(payload)-28]
 	_, lVal, ok := decodeSessionV6Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) v6 decode failed")
