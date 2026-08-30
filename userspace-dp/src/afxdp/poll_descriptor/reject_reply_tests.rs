@@ -11,6 +11,7 @@ fn tx_pipeline(max_pending_tx: usize, free_frames: usize) -> WorkerTxPipeline {
         free_tx_frames: (0..free_frames as u64).collect(),
         pending_tx_prepared: VecDeque::new(),
         pending_tx_local: VecDeque::new(),
+        backup_retry_scratch: std::collections::VecDeque::new(),
         max_pending_tx,
         outstanding_tx: 0,
         pending_fill_frames: VecDeque::new(),
