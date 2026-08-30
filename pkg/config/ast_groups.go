@@ -405,6 +405,24 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string, budget *grou
 				key = s.Keys[0]
 			}
 			if peer := leafListPeer(*dst, key); peer != nil {
+				// #7648: a COMPACT group leaf whose key names a schema
+				// CONTAINER, matched against a container peer, is the block
+				// spelling wearing a leaf's shape. Expand it and merge, so the
+				// two spellings of one group produce one outcome. The override
+				// decision then happens one level down against the expanded
+				// child, so an inline value still wins.
+				if !peer.IsLeaf {
+					if body := groupPackedLeafBody(ancestorPath, s); body != nil {
+						if err := budget.charge(countNodes(body)); err != nil {
+							return err
+						}
+						if err := mergeNodes(&peer.Children, body,
+							appendPath(ancestorPath, peer.Keys), budget); err != nil {
+							return err
+						}
+						continue
+					}
+				}
 				// A same-key node already exists inline. UNION when the
 				// statement is a pure value-list leaf-list; otherwise OVERRIDE
 				// (skip the group value — inline wins). Scalars, args>=2
@@ -504,6 +522,75 @@ func appendPath(base [][]string, keys []string) [][]string {
 	copy(out, base)
 	out[len(base)] = keys
 	return out
+}
+
+// schemaAtAncestorPath resolves the schema node addressed by an ancestor path,
+// or nil when the path is not modelled. Extracted from isLeafListSchema so the
+// #7648 packed-leaf expansion can reach the same context without duplicating
+// the compoundKey descent.
+func schemaAtAncestorPath(ancestorPath [][]string) *schemaNode {
+	schema := setSchema
+	for _, pk := range ancestorPath {
+		if schema == nil || len(pk) == 0 {
+			return nil
+		}
+		child := resolveSchemaChild(schema, pk[0])
+		if child == nil {
+			return nil
+		}
+		// consumeNodeKeys descends a compoundKey sub-token (family inet6) so
+		// the leaf lookup lands at the correct level; args/midKeyword tokens
+		// are identity values that do not change the schema level.
+		_, child = consumeNodeKeys(pk, child)
+		schema = child
+	}
+	return schema
+}
+
+// groupPackedLeafBody expands a group's COMPACT leaf into the children its
+// BLOCK spelling would have produced, or nil when it carries no expandable
+// tail (#7648).
+//
+// A group node carrying its body on `Keys` --
+// `authentication-sha256 authentication-password "groupsecret"` -- is
+// classified IsLeaf, so it took the leaf path and was OVERRIDDEN whenever a
+// same-name node already existed inline. The BLOCK spelling of the same group
+// is a container and merged correctly. Two spellings of one intent, opposite
+// outcomes.
+//
+// Expanding lets the SAME override logic run one level down, which is what
+// makes this correct rather than merely different:
+//
+//   - local `authentication-sha256 { }` (empty) -- no peer for the expanded
+//     child, so the group's value is adopted. That is the case that was
+//     silently dropped.
+//   - local `authentication-sha256 { authentication-password "local"; }` --
+//     the expanded child finds a peer and the ordinary apply-groups OVERRIDE
+//     applies, so INLINE STILL WINS. The fix does not weaken that.
+//
+// Returns nil unless the tail actually expands under the schema, so an
+// unmodelled or genuinely scalar leaf keeps its existing override behaviour.
+func groupPackedLeafBody(ancestorPath [][]string, s *Node) []*Node {
+	if s == nil || len(s.Keys) < 2 {
+		return nil
+	}
+	parent := schemaAtAncestorPath(ancestorPath)
+	if parent == nil {
+		return nil
+	}
+	leafSchema := resolveSchemaChild(parent, s.Keys[0])
+	if leafSchema == nil || leafSchema.children == nil {
+		// Not a container in the schema: a real scalar leaf, whose override
+		// semantics are correct as they stand.
+		return nil
+	}
+	expanded := packedBodyChildren(s, leafSchema)
+	// packedBodyChildren returns s.Children unchanged when there is no tail to
+	// expand; that is the not-applicable case.
+	if len(expanded) == 0 || (len(expanded) == 1 && expanded[0] == s) {
+		return nil
+	}
+	return expanded
 }
 
 // leafListPeer returns the first dst node that expresses the leaf-list keyed
