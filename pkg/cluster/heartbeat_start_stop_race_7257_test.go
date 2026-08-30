@@ -173,7 +173,7 @@ func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Dura
 func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	m := NewManager(0, 1)
 
-	const startAttempts = 60
+	const startAttempts = 240
 	var stops, starts, published, superseded atomic.Int64
 	done := make(chan struct{})
 	var wg sync.WaitGroup
