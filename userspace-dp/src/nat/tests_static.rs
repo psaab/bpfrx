@@ -699,7 +699,7 @@ fn static_nat_external_ips_iterator() {
         ],
         &crate::nat::NatCounterStore::default(),
     );
-    let mut ips: Vec<IpAddr> = table.external_ips().copied().collect();
+    let mut ips: Vec<IpAddr> = table.external_ips().collect();
     ips.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     assert_eq!(ips.len(), 2);
     assert!(ips.contains(&"203.0.113.10".parse::<IpAddr>().unwrap()));
@@ -750,7 +750,7 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
     );
     // The external IP must be registered (bare, no mask) for local delivery
     // recognition (forwarding_build iterates external_ips()).
-    let ips: Vec<IpAddr> = table.external_ips().copied().collect();
+    let ips: Vec<IpAddr> = table.external_ips().collect();
     assert_eq!(ips, vec!["203.0.113.5".parse::<IpAddr>().unwrap()]);
 }
 
@@ -877,7 +877,7 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
             ..NatDecision::default()
         })
     );
-    let ips: Vec<IpAddr> = table.external_ips().copied().collect();
+    let ips: Vec<IpAddr> = table.external_ips().collect();
     assert_eq!(ips, vec!["2001:db8::1".parse::<IpAddr>().unwrap()]);
 }
 
@@ -1320,4 +1320,183 @@ fn static_nat_unparseable_source_constraint_surfaces_and_still_fails_closed_5190
         "#5190: an unparseable static-NAT match source-address must be \
          recorded as a NAT reconcile parse error, not silently dropped"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #7219: a static-NAT BLOCK rule must register every usable host for
+// proxy-ARP/ND, not only the block's network base.
+//
+// external_ips()/external_ips_scoped() pushed `block.external.base` alone. The
+// existing comment defended that as "sufficient parity for the network address
+// without an unbounded blow-up", which is a true and sound argument about the
+// DNAT MATCH path — that lookup is prefix-keyed and independent of `local_v*`.
+// But `local_v*` has a SECOND role: it is the proxy-ARP/ND and local-delivery
+// address set.
+//
+// So on a directly-connected external segment the firewall answered ARP/ND only
+// for 203.0.113.0. Peers got no reply for .1-.254, inbound traffic to those
+// addresses never reached the firewall, and the translation that would have
+// handled it correctly was never reached. Silent, and indistinguishable from a
+// routing problem.
+//
+// The DNAT sibling already solved this (DnatTable::destination_ips, #3164), and
+// this is that port. Static-NAT has NO exemption concept, so DNAT's #6025
+// exact_off shadowing has no analogue to port: `off` does not appear in this
+// file's grammar, and an exact-host static entry is always a TRANSLATE, which
+// can only duplicate an address the expansion also yields.
+
+fn block_rule_7219(name: &str, external: &str, internal: &str) -> StaticNATRuleSnapshot {
+    StaticNATRuleSnapshot {
+        source_addresses: Vec::new(),
+        counter_id: 0,
+        name: name.to_string(),
+        from_zone: String::new(),
+        from_interface: String::new(),
+        from_routing_instance: String::new(),
+        external_ip: external.to_string(),
+        internal_ip: internal.to_string(),
+        match_destination_port: 0,
+        mapped_port: 0,
+    }
+}
+
+#[test]
+fn static_nat_block_registers_usable_hosts_for_proxy_arp_7219() {
+    let table = StaticNatTable::from_snapshots(
+        &[block_rule_7219("b1", "203.0.113.0/24", "192.168.1.0/24")],
+        &NatCounterStore::default(),
+    );
+    let ips: Vec<IpAddr> = table.external_ips().collect();
+
+    // The defect: only the base was present.
+    for host in ["203.0.113.1", "203.0.113.42", "203.0.113.254"] {
+        let want: IpAddr = host.parse().unwrap();
+        assert!(
+            ips.contains(&want),
+            "{host} is absent from external_ips(). On a directly-connected external \
+             segment the firewall answers no ARP/ND for it, so inbound traffic never \
+             arrives to be translated — even though the static-NAT match itself would \
+             translate it correctly (#7219). got {} entries",
+            ips.len()
+        );
+    }
+    // The scoped view must agree — the two were independent implementations
+    // before this, which is exactly how one could be fixed and the other not.
+    let scoped: Vec<IpAddr> = table.external_ips_scoped().into_iter().map(|(ip, _)| ip).collect();
+    for host in ["203.0.113.1", "203.0.113.254"] {
+        let want: IpAddr = host.parse().unwrap();
+        assert!(
+            scoped.contains(&want),
+            "{host} is in external_ips() but NOT in external_ips_scoped(); the deduped \
+             and scoped views have drifted (#7219)"
+        );
+    }
+}
+
+#[test]
+fn static_nat_block_over_the_bound_registers_base_only_7219() {
+    // A /8 is 16M hosts. Expanding it would put 16M entries in a hot lookup
+    // set; the bound is what makes the fix shippable, so it needs its own cell
+    // or "register every host" is satisfied by an unbounded implementation.
+    let table = StaticNatTable::from_snapshots(
+        &[block_rule_7219("big", "10.0.0.0/8", "192.168.0.0/8")],
+        &NatCounterStore::default(),
+    );
+    let ips: Vec<IpAddr> = table.external_ips().collect();
+    assert_eq!(
+        ips.len(),
+        1,
+        "a /8 block expanded to {} entries; MAX_LOCAL_PREFIX_HOSTS must bound it \
+         (an oversized block relies on being ROUTED to the firewall, not proxy-ARP'd)",
+        ips.len()
+    );
+    assert!(ips.contains(&"10.0.0.0".parse::<IpAddr>().unwrap()));
+}
+
+#[test]
+fn static_nat_v6_block_expands_when_host_scale_7219() {
+    let table = StaticNatTable::from_snapshots(
+        &[block_rule_7219("v6", "2001:db8::/125", "fd00::/125")],
+        &NatCounterStore::default(),
+    );
+    let ips: Vec<IpAddr> = table.external_ips().collect();
+    let want: IpAddr = "2001:db8::3".parse().unwrap();
+    assert!(
+        ips.contains(&want),
+        "a host-scale v6 block did not expand; ND for the block's hosts is the same \
+         gap as ARP for v4 (#7219). got {ips:?}"
+    );
+}
+
+#[test]
+fn static_nat_v6_block_over_the_bound_registers_base_only_7219() {
+    // A /64 is astronomically large; the v6 arm needs its own bound cell
+    // because its host_count returns Option and a wrong `is_some_and` polarity
+    // would expand it while the v4 cell above stayed green.
+    let table = StaticNatTable::from_snapshots(
+        &[block_rule_7219("v6big", "2001:db8::/64", "fd00::/64")],
+        &NatCounterStore::default(),
+    );
+    let ips: Vec<IpAddr> = table.external_ips().collect();
+    assert_eq!(ips.len(), 1, "a /64 v6 block expanded to {} entries", ips.len());
+}
+
+#[test]
+fn static_nat_host_rules_are_unchanged_7219() {
+    // The control. Exact-host static-NAT rules must register exactly what they
+    // did before — a change that registered extra addresses for a /32 would
+    // proxy-ARP for hosts the firewall does not own.
+    let table = StaticNatTable::from_snapshots(
+        &[block_rule_7219("h1", "203.0.113.10", "192.168.1.10")],
+        &NatCounterStore::default(),
+    );
+    let ips: Vec<IpAddr> = table.external_ips().collect();
+    assert_eq!(
+        ips,
+        vec!["203.0.113.10".parse::<IpAddr>().unwrap()],
+        "an exact-host rule registered something other than its own address; \
+         proxy-ARP'ing an address the firewall does not own hijacks that host's \
+         traffic on a directly-connected segment"
+    );
+}
+
+#[test]
+fn static_nat_zero_length_block_is_rejected_before_expansion_7219() {
+    // WHY THIS CELL EXISTS, and it is not the reason I first wrote it.
+    //
+    // Mutation found that flipping the v6 bound's `is_some_and` to `is_none_or`
+    // reds NOTHING. A /64 does not distinguish them — host_count_v6(64) is
+    // Some(2^64) and both spellings answer "too big". Only a prefix whose count
+    // OVERFLOWS u128 (anything shorter than /1) separates them, and there
+    // `is_none_or` would attempt to enumerate 2^128 addresses: a hang in the
+    // forwarding-state build, not a wrong answer.
+    //
+    // My first cell here used `::/0` and asserted `ips.len() <= 1`. It passed —
+    // and it was VACUOUS, because the count is 0, not 1. A /0 static-NAT rule
+    // produces NO BLOCK AT ALL: #5658 rejects a zero-length block prefix
+    // fail-closed before block insertion, since an equal-length /0 pair is an
+    // identity translation that would shadow every narrower rule.
+    //
+    // So the escaped mutation is INERT rather than uncovered — the branch it
+    // breaks is unreachable through this constructor, and #5658's rejection is
+    // a STRONGER guarantee than the bound check it defeats. That is worth
+    // pinning: this cell asserts the invariant the bound is relying on, so if
+    // #5658's rejection is ever relaxed, this reds and points at the unbounded
+    // expansion it would newly expose.
+    for (name, ext, int) in [
+        ("v6zero", "::/0", "fd00::/0"),
+        ("v4zero", "0.0.0.0/0", "10.0.0.0/0"),
+    ] {
+        let table = StaticNatTable::from_snapshots(
+            &[block_rule_7219(name, ext, int)],
+            &NatCounterStore::default(),
+        );
+        let ips: Vec<IpAddr> = table.external_ips().collect();
+        assert!(
+            ips.is_empty(),
+            "a /0 block prefix produced {ips:?}. #5658 rejects it fail-closed \
+             before insertion, and the #7219 expansion bound relies on that: a \
+             reachable /0 would enumerate the entire address family (#7219)"
+        );
+    }
 }

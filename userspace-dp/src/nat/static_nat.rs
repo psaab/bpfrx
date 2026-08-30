@@ -1,6 +1,7 @@
 // Static 1:1 NAT table — bidirectional internal↔external mapping.
 
 use super::{NatCounterStore, NatDecision, NatRuleCounter};
+use super::destination::DnatTable;
 use crate::StaticNATRuleSnapshot;
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -824,12 +825,41 @@ impl StaticNatTable {
     /// (the cold-path `match_dnat_with_counter` runs on transit regardless),
     /// so emitting only the base — rather than expanding a whole (possibly
     /// /16 or v6-huge) prefix into the local set — is sufficient parity for
-    /// the network address without an unbounded blow-up.
-    pub(crate) fn external_ips(&self) -> impl Iterator<Item = &IpAddr> {
-        self.dnat
-            .keys()
-            .map(|(ip, _)| ip)
-            .chain(self.blocks.iter().map(|b| &b.external.base))
+    /// Returns the external (firewall-owned) IPs this table's rules match on.
+    ///
+    /// #7219: a BLOCK rule contributes its usable hosts when the block is small
+    /// enough (`DnatTable::MAX_LOCAL_PREFIX_HOSTS`), not just its network base.
+    ///
+    /// The base-only version was defensible about the DNAT MATCH — that lookup
+    /// is prefix-keyed and independent of `local_v*` — but `local_v*` has a
+    /// SECOND role as the proxy-ARP/ND and local-delivery address set. On a
+    /// directly-connected external segment the firewall answered ARP/ND only for
+    /// `203.0.113.0`, so every other address the block translates was
+    /// unreachable: peers got no reply for `.1`-`.254`, inbound traffic never
+    /// arrived, and the translation that would have handled it correctly was
+    /// never reached. Silent, and indistinguishable from a routing problem.
+    ///
+    /// The bound is `DnatTable`'s constant rather than a second copy: the two
+    /// tables register into the SAME `local_v*` set, so a divergent bound would
+    /// mean one NAT family proxy-ARPs a block size the other refuses, for no
+    /// reason a reader could reconstruct.
+    ///
+    /// Static-NAT has NO exemption concept — the issue asks whether an analogue
+    /// of DNAT's #6025 `exact_off` shadowing is needed, and there is none to
+    /// port: `off` does not appear in this file's grammar at all. An exact-host
+    /// entry here is always a TRANSLATE, so it can only duplicate an address the
+    /// block expansion also yields, which the dedup below absorbs.
+    ///
+    /// Implemented ON TOP of `external_ips_scoped` so the deduped view and the
+    /// scoped view cannot drift on the expansion bound — the same reason
+    /// `DnatTable::destination_ips` is. They were independent before this, which
+    /// is precisely how one of them could have been fixed and the other not.
+    pub(crate) fn external_ips(&self) -> impl Iterator<Item = IpAddr> {
+        let mut seen: FxHashMap<IpAddr, ()> = FxHashMap::default();
+        for (ip, _instance) in self.external_ips_scoped() {
+            seen.entry(ip).or_insert(());
+        }
+        seen.into_keys()
     }
 
     /// #3769: like [`external_ips`], but pairs each external IP with the
@@ -840,7 +870,14 @@ impl StaticNatTable {
     /// resolving VRF instead of the global `local_v*` membership. A single
     /// external IP may appear more than once (per port mapping AND per
     /// split-horizon scope, #3605); every (IP, instance) pair is yielded and
-    /// the builder de-duplicates by inserting into a set.
+    /// the builder inserts into a per-IP set of tables.
+    ///
+    /// #7219: block rules contribute their usable hosts under the shared
+    /// `MAX_LOCAL_PREFIX_HOSTS` bound. A larger block still contributes only its
+    /// network base and relies on being ROUTED to the firewall rather than
+    /// proxy-ARP'd — the same trade `DnatTable` makes, and the reason the bound
+    /// exists at all is that an unbounded expansion of a /8 would be 16M entries
+    /// in a hot lookup set.
     pub(crate) fn external_ips_scoped(&self) -> Vec<(IpAddr, &str)> {
         let mut out = Vec::new();
         for ((ip, _port), entries) in &self.dnat {
@@ -849,8 +886,69 @@ impl StaticNatTable {
             }
         }
         for block in &self.blocks {
-            out.push((block.external.base, block.from_routing_instance.as_str()));
+            let instance = block.from_routing_instance.as_str();
+            let base = block.external.base;
+            // Never register the UNSPECIFIED address as a proxy-ARP/ND target:
+            // it is not an owned unicast VIP, and registering it perturbs
+            // local-delivery classification (#5658, same guard as DNAT's).
+            if !base.is_unspecified() {
+                out.push((base, instance));
+            }
+            match base {
+                IpAddr::V4(addr) => {
+                    if static_block_host_count_v4(block.external.len)
+                        <= DnatTable::MAX_LOCAL_PREFIX_HOSTS
+                        && let Ok(net) = Ipv4Net::new(addr, block.external.len)
+                    {
+                        for host in net.hosts() {
+                            out.push((IpAddr::V4(host), instance));
+                        }
+                    }
+                }
+                IpAddr::V6(addr) => {
+                    // Only expand a v6 block that is itself host-scale; anything
+                    // shorter is astronomically large.
+                    //
+                    // The `is_some_and` (rather than `is_none_or`) polarity is
+                    // DEFENSE IN DEPTH, not the primary guard, and a mutation
+                    // flipping it is INERT: `host_count_v6` returns None only
+                    // for a prefix shorter than /1, and #5658 already rejects a
+                    // zero-length block prefix fail-closed before insertion (an
+                    // equal-length /0 pair is an identity translation that would
+                    // shadow every narrower rule). So no /0 block reaches here.
+                    // Kept anyway — the cost is one comparison, and the failure
+                    // it would prevent is a hang enumerating 2^128 addresses,
+                    // not a wrong answer. `static_nat_zero_length_block_is_
+                    // rejected_before_expansion_7219` pins the invariant this
+                    // relies on.
+                    if static_block_host_count_v6(block.external.len)
+                        .is_some_and(|h| h <= u128::from(DnatTable::MAX_LOCAL_PREFIX_HOSTS))
+                        && let Ok(net) = Ipv6Net::new(addr, block.external.len)
+                    {
+                        for host in net.hosts() {
+                            out.push((IpAddr::V6(host), instance));
+                        }
+                    }
+                }
+            }
         }
         out
+    }
+}
+
+/// #7219: usable host count of an IPv4 prefix (saturating; /0 -> u32::MAX).
+/// Mirrors `destination.rs`'s `host_count_v4`, which is private to that module.
+fn static_block_host_count_v4(prefix_len: u8) -> u32 {
+    match 32u32.checked_sub(u32::from(prefix_len)) {
+        Some(host_bits) if host_bits < 32 => 1u32 << host_bits,
+        _ => u32::MAX,
+    }
+}
+
+/// #7219: usable host count of an IPv6 prefix; `None` if it overflows u128.
+fn static_block_host_count_v6(prefix_len: u8) -> Option<u128> {
+    match 128u32.checked_sub(u32::from(prefix_len)) {
+        Some(host_bits) if host_bits < 128 => Some(1u128 << host_bits),
+        _ => None,
     }
 }
