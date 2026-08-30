@@ -218,20 +218,52 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	}
 }
 
+// compileAddressBook folds one `security address-book` block into the global
+// address book, MERGING with whatever earlier blocks contributed (#7524).
+//
+// It used to read the FIRST `global` child and then ASSIGN
+// `sec.AddressBook = ab`, which lost entries in three different ways —
+// measured, each losing a different one:
+//
+//	security { address-book { global { A } global { B } } }   -> [A]  (first wins)
+//	security { address-book { global { A } }
+//	           address-book { global { B } } }                -> [B]  (last wins)
+//	security { address-book { global { A } } }
+//	security { address-book { global { B } } }                -> [B]  (last wins)
+//
+// parseStatements APPENDS a repeated block rather than merging it, and
+// compileSecurity iterates every `address-book` sibling and every `security`
+// root — so all three shapes reach the compiler and all three silently dropped
+// an address. "Replace or ignore earlier entries" is literal: the first case
+// ignores, the other two replace.
+//
+// It matters because an address that vanishes is not a parse error anywhere
+// downstream. A policy naming the dropped address compiles against a book that
+// does not contain it, and the resulting rule matches a different set of
+// traffic than the operator wrote — the same silent-narrowing class #4706 and
+// #4818 fixed for the INNER and SIBLING merges. Those two did not reach the
+// CONTAINERS, which is what this closes.
+//
+// LAZY ALLOCATION IS PRESERVED: the book is materialized only when a `global`
+// block actually exists, so a config with no address-book still compiles to a
+// nil AddressBook and every `!= nil` check downstream keeps its meaning.
+// Within a block, later entries with the same NAME still win, which is the
+// existing #4706 semantics and unchanged.
 func compileAddressBook(node *Node, sec *SecurityConfig) error {
-	globalNode := node.FindChild("global")
-	if globalNode == nil {
+	globals := node.FindChildren("global")
+	if len(globals) == 0 {
 		return nil
 	}
 
-	ab := &AddressBook{
-		Addresses:   make(map[string]*Address),
-		AddressSets: make(map[string]*AddressSet),
+	if sec.AddressBook == nil {
+		sec.AddressBook = &AddressBook{
+			Addresses:   make(map[string]*Address),
+			AddressSets: make(map[string]*AddressSet),
+		}
 	}
-
-	parseAddressBookEntries(globalNode, ab)
-
-	sec.AddressBook = ab
+	for _, g := range globals {
+		parseAddressBookEntries(g, sec.AddressBook)
+	}
 	return nil
 }
 
