@@ -1,0 +1,79 @@
+# #7481: the SHARED corpus for the NAT match-prefix grammar.
+#
+# One file, read by BOTH the Go gate's test (pkg/config) and the Rust parsers'
+# test (userspace-dp/src/nat). Two hand-maintained lists is the disease this
+# issue is about, one layer up — the Go predicate claimed by COMMENT to mirror
+# the Rust parsers, and it did not.
+#
+# Format: <verdict> <TAB> <literal>
+#   accept  every implementation must accept it
+#   reject  every implementation must reject it
+#
+# A literal is quoted with Go/Rust string syntax so leading and trailing
+# whitespace survives the file. Blank lines and #-comments are ignored.
+#
+# THE GRAMMAR, decided in #7481 rather than inherited:
+#   - a CIDR whose prefix length is a decimal within the family's range, with a
+#     leading `+` or leading zeros TOLERATED and normalized away
+#   - or a bare host address (implicitly /32 or /128)
+#   - nothing else: no negative length, no surrounding whitespace, no zone
+#     suffix, no second slash
+#
+# WHY TOLERATE RATHER THAN REJECT. Rejecting the odd spellings is the
+# reject-only direction and would normally win. #7145's test says why it does
+# not here: a box committed with `match source-address 1.2.3.4/024` is
+# forwarding today (static NAT installs it), and a validator widened to refuse a
+# working value bricks that operator's next commit (#1960). Both spellings are
+# UNAMBIGUOUS — `/+24`, `/024`, `/0024` can only mean 24 — so normalizing loses
+# no information and there is no wrong interpretation to pick.
+#
+# The danger was never the spelling; it was the DISAGREEMENT. Measured, all
+# three implementations over this corpus:
+#
+#   literal            Go ParseCIDR   ipnet::IpNet   u8::from_str
+#   10.0.0.0/024       accept         REJECT         accept
+#   2001:db8::/064     accept         ACCEPT         accept
+#   2001:db8::/0064    accept         reject         accept
+#   10.0.0.0/+24       reject         reject         ACCEPT
+#
+# ipnet disagrees with ITSELF across families on zero padding, so single-
+# sourcing the Rust side onto IpNet would still not have produced one grammar.
+# `/024` was the worse case: it passed an ordinary strict commit and was then
+# DROPPED by parse_match_prefix, leaving a NAT rule that matched nothing.
+
+accept	"10.0.0.0/24"
+accept	"10.0.0.5"
+accept	"10.0.0.5/24"
+accept	"0.0.0.0/0"
+accept	"2001:db8::/64"
+accept	"2001:db8::1"
+accept	"::/0"
+
+# Tolerated spellings — normalized to a plain decimal by every end.
+accept	"10.0.0.0/+24"
+accept	"10.0.0.0/+0"
+accept	"2001:db8::/+64"
+accept	"10.0.0.0/024"
+accept	"10.0.0.0/0024"
+accept	"2001:db8::/064"
+accept	"2001:db8::/0064"
+
+# A normalized length is still range-checked.
+reject	"10.0.0.0/+33"
+reject	"10.0.0.0/033"
+
+# Out of range for the family.
+reject	"10.0.0.0/33"
+reject	"2001:db8::/129"
+reject	"10.0.0.0/-1"
+
+# Not an address, or carrying decoration no implementation accepts.
+reject	"fe80::1%eth0"
+reject	""
+reject	" 10.0.0.0/24"
+reject	"10.0.0.0/24 "
+reject	"10.0.0.0/ 24"
+reject	"10.0.0.0/"
+reject	"/24"
+reject	"not-an-address"
+reject	"10.0.0.0/24/24"

@@ -47,6 +47,48 @@ mod static_nat;
 mod status;
 
 // Tests split out of nat/tests.rs into per-subject sibling files
+/// #7481: rewrite a tolerated prefix-length spelling to its canonical decimal
+/// form — `/+24`, `/024` and `/0024` all become `/24`.
+///
+/// THE GRAMMAR IS STATED HERE RATHER THAN INHERITED, because no parser we build
+/// on is self-consistent about it. Measured over one corpus:
+///
+/// | literal            | Go net.ParseCIDR | ipnet::IpNet | u8::from_str |
+/// |--------------------|------------------|--------------|--------------|
+/// | `10.0.0.0/024`     | accept           | **reject**   | accept       |
+/// | `2001:db8::/064`   | accept           | **ACCEPT**   | accept       |
+/// | `2001:db8::/0064`  | accept           | reject       | accept       |
+/// | `10.0.0.0/+24`     | reject           | reject       | **accept**   |
+///
+/// `ipnet` disagrees with ITSELF across address families on zero padding — v6
+/// takes a three-digit `064`, v4 refuses `024`. Nobody would choose that; it is
+/// an artifact of two parse paths inside a dependency, and it means single-
+/// sourcing the Rust side onto `IpNet` still would not have produced one
+/// grammar.
+///
+/// NORMALIZE RATHER THAN REJECT. Refusing the odd spellings is the reject-only
+/// direction and would normally win, but #7145's test says why it does not
+/// here: a box committed with `match source-address 1.2.3.4/024` is forwarding
+/// today, and a validator widened to refuse a working value bricks that
+/// operator's next commit (#1960). Both spellings are UNAMBIGUOUS, so
+/// normalizing loses no information and there is no wrong interpretation to
+/// pick. The danger was never the spelling — it was the DISAGREEMENT.
+///
+/// `pkg/config`'s `normalizeNATPrefixLen` is the twin;
+/// `testdata/nat_match_prefix_corpus.txt` is the shared corpus binding them.
+pub(crate) fn normalize_nat_prefix_len(s: &str) -> String {
+    let Some(i) = s.find('/') else {
+        return s.to_string(); // bare host address; nothing to normalize
+    };
+    let (addr, rest) = s.split_at(i + 1);
+    let mut mask = rest.strip_prefix('+').unwrap_or(rest);
+    // Strip leading zeros but keep the last digit, so "/0" survives.
+    while mask.len() > 1 && mask.starts_with('0') {
+        mask = &mask[1..];
+    }
+    format!("{addr}{mask}")
+}
+
 // (#4409, pure code motion); each is a `#[path]` child module of `nat`.
 #[cfg(test)]
 #[path = "tests_source.rs"]
@@ -60,6 +102,10 @@ mod tests_destination;
 #[cfg(test)]
 #[path = "tests_pool.rs"]
 mod tests_pool;
+// #7481: the Rust half of the shared NAT match-prefix corpus differential.
+#[cfg(test)]
+#[path = "tests_prefix_corpus_7481.rs"]
+mod tests_prefix_corpus_7481;
 #[cfg(test)]
 #[path = "tests_iface.rs"]
 mod tests_iface;

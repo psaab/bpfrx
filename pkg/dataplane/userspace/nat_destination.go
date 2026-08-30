@@ -30,6 +30,18 @@ func dnatDestinationParts(raw string) (base, prefix string, ok bool) {
 	if raw == "" {
 		return "", "", false
 	}
+	// #7481: normalize the prefix-length spelling, exactly as the commit gate
+	// (config.NATMatchPrefixParses) and both Rust parsers now do. A leading `+`
+	// or leading zeros are tolerated everywhere or nowhere; the failure this
+	// closes is a value the gate accepts and a builder silently discards.
+	//
+	// #7215's differential is what caught this: widening the gate without
+	// widening this function reproduced, immediately, the exact drift that test
+	// was written for — "validateDestinationNATAddressesStrict carried a comment
+	// promising its acceptance MUST match the builder's exactly and then drifted
+	// for six years' worth of mask spellings". A comment cannot fail; that
+	// differential did, in the same run.
+	raw = config.NormalizeNATPrefixLen(raw)
 	if strings.IndexByte(raw, '/') == -1 {
 		// Bare address — always a host.
 		if net.ParseIP(raw) == nil {

@@ -458,11 +458,74 @@ func applyDeterministicHost(det *DeterministicNATConfig, hostNode *Node) {
 // leaves the match list NON-empty, and the Rust `*_constrained` flag is keyed
 // on list length — so an empty entry narrows the rule (or, alone, makes it
 // match nothing) exactly like any other unparseable one.
+//
+// #7481: the "mirrors the Rust parser EXACTLY" claim this comment used to make
+// was FALSE, and it was asserted by prose rather than by a test. One Go
+// predicate was said to mirror two structurally different Rust
+// implementations — source/mod.rs's IpNet/IpAddr path and static_nat.rs's
+// hand-rolled splitn + u8::from_str. They disagreed on `/+24` and on `/024`,
+// and so did the Go gate.
+//
+// The agreement is now asserted by a shared-corpus differential
+// (testdata/nat_match_prefix_corpus.txt, read by BOTH languages' tests) rather
+// than by this comment. A comment cannot fail.
 func natMatchPrefixParses(raw string) bool {
+	// #7481: NORMALIZE the prefix-length spelling before parsing, so every end
+	// of the stack answers the same way.
+	//
+	// Three parsers, three different tolerances, measured over one corpus:
+	//
+	//	literal            Go ParseCIDR   ipnet::IpNet   u8::from_str
+	//	10.0.0.0/024       accept         REJECT         accept
+	//	2001:db8::/064     accept         ACCEPT         accept
+	//	2001:db8::/0064    accept         reject         accept
+	//	10.0.0.0/+24       reject         reject         ACCEPT
+	//
+	// `ipnet` disagrees with ITSELF across address families on zero padding —
+	// v6 takes a three-digit `064`, v4 refuses `024`. Nobody would choose that;
+	// it is an artifact of two parse paths inside a dependency.
+	//
+	// NORMALIZE RATHER THAN REJECT, and that is a deliberate reversal. Rejecting
+	// the odd spellings is the reject-only direction and would normally win —
+	// but #7145's test says plainly why it does not here: a box committed with
+	// `match source-address 1.2.3.4/024` is forwarding today (static NAT
+	// installs it), and a widened validator that refuses a working value bricks
+	// that operator's next commit (#1960). Both spellings are UNAMBIGUOUS —
+	// `/+24`, `/024` and `/0024` can only mean 24 — so normalizing loses no
+	// information and there is no wrong interpretation to pick.
+	//
+	// The danger was never the spelling. It was the DISAGREEMENT: `/024`
+	// committed clean here and was then dropped by parse_match_prefix, leaving a
+	// NAT rule that matched nothing. Agreement removes that whether the shared
+	// answer is accept or reject; accept is the one that bricks nobody.
+	raw = normalizeNATPrefixLen(raw)
 	if _, _, err := net.ParseCIDR(raw); err == nil {
 		return true
 	}
 	return net.ParseIP(raw) != nil
+}
+
+// normalizeNATPrefixLen rewrites a tolerated prefix-length spelling to its
+// canonical decimal form (#7481): a leading `+` is dropped and leading zeros
+// are stripped, so `/+24`, `/024` and `/0024` all become `/24`.
+//
+// Its Rust twin is nat::normalize_nat_prefix_len, and
+// testdata/nat_match_prefix_corpus.txt is the shared corpus that binds the two.
+// A leading `-` is left alone: a negative prefix length is not a tolerated
+// spelling of anything, and every parser refuses it.
+func normalizeNATPrefixLen(raw string) string {
+	i := strings.IndexByte(raw, '/')
+	if i < 0 {
+		return raw // bare host address; no prefix length to normalize
+	}
+	addr, mask := raw[:i+1], raw[i+1:]
+	mask = strings.TrimPrefix(mask, "+")
+	// Strip leading zeros but keep the last digit, so "/0" survives as "0"
+	// rather than becoming empty.
+	for len(mask) > 1 && mask[0] == '0' {
+		mask = mask[1:]
+	}
+	return addr + mask
 }
 
 // NATMatchPrefixParses exposes natMatchPrefixParses so the userspace snapshot
@@ -477,3 +540,13 @@ func natMatchPrefixParses(raw string) bool {
 // a differential over both predicates can. See natMatchPrefixParses and
 // pkg/dataplane/userspace/nat_destination.go.
 func NATMatchPrefixParses(raw string) bool { return natMatchPrefixParses(raw) }
+
+// NormalizeNATPrefixLen exposes normalizeNATPrefixLen so every consumer of the
+// NAT match-prefix grammar applies the SAME normalization (#7481) — the commit
+// gate, the Go snapshot builders, and (via nat::normalize_nat_prefix_len) both
+// Rust parsers.
+//
+// It is exported for the same reason NATMatchPrefixParses is: the alternative
+// is each consumer re-deriving the tolerance and the set of accepted spellings
+// drifting, which is exactly what #7481 found across three implementations.
+func NormalizeNATPrefixLen(raw string) string { return normalizeNATPrefixLen(raw) }
