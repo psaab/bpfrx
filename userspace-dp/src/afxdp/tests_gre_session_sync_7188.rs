@@ -1,0 +1,235 @@
+// #7188: two RFC 2890 GRE tunnels between ONE pair of outer endpoints must
+// survive HA session sync as TWO sessions.
+//
+// THE FIXTURE IS THE WHOLE TEST. A test that syncs ONE keyed tunnel passes
+// whether or not the discriminator crosses the wire, because a single session
+// has nothing to alias with. The defect only exists when two records share a
+// 5-tuple — GRE is protocol 47 and has no L4 ports, so two tunnels between the
+// same outer endpoints ARE one 5-tuple — and `install.rs` opens with an
+// unconditional `remove_entry`, so the second install lands on the first.
+//
+// Before this change `build_synced_session_key` hardcoded
+// `discriminator: Default::default()`, and `Default` for `TunnelDiscriminator`
+// is `None` — the "no discriminator concept for this protocol" class, not even
+// `Unkeyed`. Both records therefore rebuilt to the SAME key: one session for
+// two tunnels, so after a failover they shared one policy decision, one NAT
+// state, one counter set and one timeout.
+
+use super::*;
+use crate::ip_proto::{PROTO_GRE, PROTO_TCP};
+use crate::server::helpers::{build_synced_session_entry, build_synced_session_key, SyncedKeyIntent};
+use crate::session::TunnelDiscriminator;
+use crate::test_zone_ids::*;
+use crate::SessionSyncRequest;
+
+/// One peer sync record for a transit session between a fixed pair of outer
+/// endpoints. Everything except `protocol` and the discriminator is held
+/// constant on purpose: the whole point is that two calls differing ONLY in the
+/// discriminator must not collapse.
+fn gre_sync_req(protocol: u8, discriminator: u64) -> SessionSyncRequest {
+    SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol,
+        src_ip: "198.51.100.7".to_string(),
+        dst_ip: "203.0.113.9".to_string(),
+        // Protocol 47 has no L4 ports. These zeros are exactly what the shim's
+        // `parse_l4` catch-all stamps, and they are why the 5-tuple cannot tell
+        // two tunnels apart on its own.
+        src_port: 0,
+        dst_port: 0,
+        ingress_zone_id: TEST_TRUST_ZONE_ID,
+        egress_zone_id: TEST_UNTRUST_ZONE_ID,
+        tunnel_discriminator: discriminator,
+        ..SessionSyncRequest::default()
+    }
+}
+
+/// THE fixture. Two keyed tunnels, keys 100 and 200, identical outer endpoints.
+///
+/// FAIL-ON-REVERT: restore `discriminator: Default::default()` in
+/// `build_synced_session_key` and both records rebuild to one key, so the
+/// synced map holds ONE entry and this asserts 2.
+#[test]
+fn two_keyed_gre_tunnels_sharing_a_5_tuple_sync_as_two_sessions_7188() {
+    let coordinator = Coordinator::new();
+    let zones = rustc_hash::FxHashMap::default();
+
+    for key in [100u32, 200u32] {
+        let req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::Keyed(key).to_wire());
+        let entry = build_synced_session_entry(&req, &zones, 0)
+            .unwrap_or_else(|e| panic!("keyed-GRE tunnel {key} must import: {e}"));
+        assert_eq!(
+            entry.key.discriminator,
+            TunnelDiscriminator::Keyed(key),
+            "the rebuilt key must carry the RFC 2890 key the peer sent, not the \
+             `Default::default()` (`None`) class every synced session used to land in"
+        );
+        assert!(matches!(
+            coordinator.upsert_synced_session(entry),
+            SyncedImportOutcome::Applied
+        ));
+    }
+
+    let synced = coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("shared synced sessions");
+    let forward: Vec<_> = synced
+        .iter()
+        .filter(|(key, _)| key.protocol == PROTO_GRE && !synced[key].metadata.is_reverse)
+        .map(|(key, _)| key.discriminator)
+        .collect();
+    assert_eq!(
+        forward.len(),
+        2,
+        "two RFC 2890 tunnels between the same outer endpoints must be TWO synced \
+         sessions. One means the standby aliased them onto a single key, so after a \
+         failover both tunnels share one policy decision, one NAT state, one counter \
+         set and one timeout — the exact collapse #7188 exists to prevent, restored \
+         silently by the failover. Discriminators present: {forward:?}"
+    );
+    assert!(forward.contains(&TunnelDiscriminator::Keyed(100)));
+    assert!(forward.contains(&TunnelDiscriminator::Keyed(200)));
+
+    // WHAT THIS CELL DOES NOT CLAIM, stated because the filter above is easy to
+    // read past. It counts FORWARD entries. The REVERSE companions of these two
+    // tunnels are still one entry, because all five `SessionKey` transforms in
+    // `session/key.rs` build their output with `discriminator:
+    // Default::default()` — they preserve the sibling `routing_domain` and drop
+    // this field. MEASURED here: the map holds three rows, not four —
+    //
+    //     198.51.100.7->203.0.113.9 disc=Keyed(100) reverse=false
+    //     198.51.100.7->203.0.113.9 disc=Keyed(200) reverse=false
+    //     203.0.113.9->198.51.100.7 disc=None       reverse=true
+    //
+    // That is a defect in what the ACTIVE node's own identity model produces
+    // (it reproduces on a standalone box with no cluster configured), not in
+    // the sync path this change fixes — the sync path's job is to make the
+    // standby's identity match the active's, which it now does exactly.
+    // Tracked as #8103; see also `docs/session-sync-architecture.md`, "Known
+    // residuals".
+}
+
+/// #7188 decision 2, the fail-closed half: a peer that does NOT carry the
+/// discriminator has its keyed-GRE sessions WITHHELD, not downgraded to a
+/// 5-tuple record. Withholding is the conservative direction — the peer misses
+/// the session and re-learns it, rather than installing a record that aliases
+/// two tunnels.
+///
+/// The refusal is reported with the machine-readable refusal prefix, not as a
+/// bare error, because it is the CORRECT answer from a HEALTHY helper: Go
+/// discriminates on that token and a transport-class failure would gate
+/// takeover-readiness (#5247) on a node that is working.
+#[test]
+fn a_peer_that_cannot_express_the_discriminator_has_its_gre_session_withheld_7188() {
+    let zones = rustc_hash::FxHashMap::default();
+    // Tag 0 is what `#[serde(default)]` and a short length-gated record both
+    // produce, i.e. exactly what an older daemon sends.
+    let req = gre_sync_req(PROTO_GRE, 0);
+    let err = build_synced_session_entry(&req, &zones, 0).expect_err(
+        "a protocol-47 record whose peer could not state the discriminator must be \
+         WITHHELD; importing it guesses which of two tunnels it names, and the \
+         install's unconditional remove_entry makes that guess EVICT the other",
+    );
+    assert!(
+        err.starts_with(SYNCED_IMPORT_REFUSED_PREFIX),
+        "the withhold is a semantic refusal from a healthy helper, so it must carry \
+         the refusal prefix Go matches on rather than reading as a transport \
+         failure that gates takeover-readiness (#5247): {err}"
+    );
+}
+
+/// The CONTROL for the test above, and the reason the gate keys on ABSENCE
+/// rather than on "protocol 47".
+///
+/// With `gre-performance-acceleration` off a GRE session's identity would be
+/// `None`, and a NEW peer states that explicitly. (Today #6837 leaves such a
+/// session flowless so none is created — the gate deliberately does not depend
+/// on that staying true.) An explicit `None` is a statement; tag 0 is the
+/// absence of one, and only the absence may be refused.
+#[test]
+fn an_explicitly_stated_none_on_protocol_47_still_imports_7188() {
+    let zones = rustc_hash::FxHashMap::default();
+    let req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::None.to_wire());
+    let entry = build_synced_session_entry(&req, &zones, 0).expect(
+        "an explicit `None` from a peer that CAN express the discriminator is a \
+         statement about the session, not an inability to make one",
+    );
+    assert_eq!(entry.key.discriminator, TunnelDiscriminator::None);
+}
+
+/// Every non-tunnel protocol is untouched by the fail-closed gate, including
+/// from a peer that carries nothing. `None` is what those sessions have always
+/// been keyed on, so this arm is bit-identical to the pre-#7188 import.
+#[test]
+fn a_legacy_peers_non_gre_session_still_imports_as_none_7188() {
+    let zones = rustc_hash::FxHashMap::default();
+    let mut req = gre_sync_req(PROTO_TCP, 0);
+    req.src_port = 5001;
+    req.dst_port = 443;
+    let entry = build_synced_session_entry(&req, &zones, 0)
+        .expect("a legacy peer's TCP session must still import unchanged");
+    assert_eq!(entry.key.discriminator, TunnelDiscriminator::None);
+}
+
+/// A DELETE reconstructs the same key but wants the opposite answer when the
+/// peer could not state the discriminator.
+///
+/// The cluster delete message carries the key and the #2170 delete generation
+/// only — there is no value to hang a discriminator on — so every delete
+/// arrives with tag 0. Refusing them would turn a legacy peer's ordinary GRE
+/// close into an error response for no gain: a key rebuilt without a
+/// discriminator names the `None` class alone, so a delete can only
+/// UNDER-match. Under-matching never merges two identities, which is exactly
+/// why the install arm fails closed and this one does not.
+#[test]
+fn a_delete_without_a_discriminator_is_not_refused_7188() {
+    let key = build_synced_session_key(
+        &gre_sync_req(PROTO_GRE, 0),
+        0,
+        SyncedKeyIntent::Delete,
+    )
+    .expect("a delete for a protocol-47 key must not be refused");
+    assert_eq!(
+        key.discriminator,
+        TunnelDiscriminator::None,
+        "a delete with no stated discriminator must name the `None` class only, so \
+         it under-matches instead of retracting a keyed tunnel it cannot name"
+    );
+}
+
+/// The four classes are disjoint locally (decision 6); they must stay disjoint
+/// after a round trip through the sync path. Asserted over the whole set at the
+/// KEY level — where the aliasing actually happens — rather than only over the
+/// wire codec, so a key builder that dropped or coerced a class would be caught
+/// here even if the codec round-tripped.
+#[test]
+fn every_discriminator_class_survives_the_sync_path_distinctly_7188() {
+    let classes = [
+        TunnelDiscriminator::None,
+        TunnelDiscriminator::Unkeyed,
+        TunnelDiscriminator::Unparseable,
+        TunnelDiscriminator::Keyed(0),
+        TunnelDiscriminator::Keyed(1),
+        TunnelDiscriminator::Keyed(u32::MAX),
+    ];
+    let mut keys = std::collections::HashSet::new();
+    for class in classes {
+        let key = build_synced_session_key(
+            &gre_sync_req(PROTO_GRE, class.to_wire()),
+            0,
+            SyncedKeyIntent::Install,
+        )
+        .unwrap_or_else(|e| panic!("{class:?} must rebuild: {e}"));
+        assert_eq!(key.discriminator, class);
+        assert!(
+            keys.insert(key),
+            "{class:?} rebuilt to a key equal to another class's. `Unkeyed` is not \
+             `Keyed(0)` and `Unparseable` is not `Unkeyed` (#7188 decision 6): a \
+             malformed header must not merge into a legitimate session, and an \
+             unkeyed tunnel must not join a keyed-zero one"
+        );
+    }
+}

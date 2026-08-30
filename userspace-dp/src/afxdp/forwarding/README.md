@@ -453,6 +453,36 @@ forward-direction collision.
   safe: an absent or unresolvable ingress identity decodes to the default
   VRF, a non-VRF cluster is bit-identical either way, and
   `CurrentHAProtocolVersion` never moves.
+- **The trailing-value shape has since been USED, by #7188** — by the GRE
+  tunnel discriminator, which took the route the domain considered and
+  declined. It rides as `SessionValue{,V6}.TunnelDiscriminator` on the cluster
+  wire (after the #7095 `IngressIfaceFold`),
+  `SessionSyncRequest.tunnel_discriminator` to the peer helper, and a trailing
+  u64 on both binary HA delta frames; the receiver folds it into the key it
+  reconstructs. No `CurrentHAProtocolVersion` bump, as the bullet above says
+  there need not be.
+
+  The two identity axes are carried by OPPOSITE mechanisms, and the reason is
+  worth stating because it is not a preference. The routing domain is
+  DERIVABLE on the importing node — #7095 already carries a cluster-stable
+  ingress identity and already resolves it locally — so #7160 derives it and
+  ships no field. An RFC 2890 Key is not derivable from anything the peer
+  sends: it lives in the GRE header of a packet only the ORIGINATING node saw.
+  It has to ride, or it is lost.
+
+  That forces a distinction the derived axis never needs: **`0` must be
+  RESERVED for "the peer did not carry this field", separate from the field's
+  own zero-value class.** `serde(default)` and a short record both yield `0`,
+  so `0` is the one value a peer emits without meaning to; if it also spells a
+  real class, a peer that cannot express the identity is indistinguishable from
+  one that deliberately said "default", and #7188 must tell those apart to
+  WITHHOLD a protocol-47 session from a peer that predates the field rather
+  than importing it aliased. Interning "domain 0 = the default
+  routing-instance" spends exactly that distinction — which costs #7160
+  nothing, because an unresolvable ingress identity and a legacy session are
+  both genuinely in the default instance, whereas for a tunnel key they are
+  not the same statement at all. Full write-up:
+  `docs/session-sync-architecture.md`, "Tunnel Session-Identity Discriminator".
 - **Do NOT "decline the hit and fall through"** as a cheap mitigation.
   `install_with_protocol_with_origin` opens with an unconditional
   `remove_entry(&key)` (`session/install.rs`), so the session-miss path

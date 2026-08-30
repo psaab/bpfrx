@@ -1459,6 +1459,21 @@ pub(crate) struct SessionSyncRequest {
     /// fresh-local-id import (rolling-upgrade safe).
     #[serde(rename = "session_id", default)]
     pub session_id: u64,
+    /// #7188: the forward session key's `TunnelDiscriminator`, encoded by
+    /// `TunnelDiscriminator::to_wire` (`session/discriminator.rs`). GRE is
+    /// protocol 47 and carries no L4 ports, so two RFC 2890 tunnels between one
+    /// pair of outer endpoints share a 5-tuple; without this field both records
+    /// rebuilt to the same key and the second install evicted the first.
+    ///
+    /// `0` is RESERVED for "the peer did not carry this field" and is NOT the
+    /// encoding of `None` (see `WireDiscriminator`), so a `serde(default)` 0
+    /// from an older daemon has its protocol-47 sessions WITHHELD rather than
+    /// imported aliased; every other protocol decodes to `None`, bit-identical
+    /// to pre-#7188. Plain `u64` with NO `skip_serializing_if`, matching the
+    /// `generation` discipline above: 0 must serialize explicitly.
+    /// Full contract: `docs/session-sync-architecture.md`.
+    #[serde(rename = "tunnel_discriminator", default)]
+    pub tunnel_discriminator: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

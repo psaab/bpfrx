@@ -1504,6 +1504,17 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		d.RTFlowSessionID = binary.LittleEndian.Uint64(payload[off : off+8])
 		off += 8
 	}
+	// #7188: trailing tunnel discriminator (u64 LE), length-gated. The one field
+	// on the record that tells two RFC 2890 GRE tunnels between the same outer
+	// endpoints apart — protocol 47 has no ports, so their 5-tuples are equal.
+	// Opaque to Go: the tag is defined by the helper's
+	// TunnelDiscriminator::to_wire. An old helper omits it (=> 0, the RESERVED
+	// "not carried" tag, on which the peer helper withholds a protocol-47
+	// session rather than importing it aliased).
+	if off+8 <= len(payload) {
+		d.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off : off+8])
+		off += 8
+	}
 
 	return d, true
 }
@@ -1576,6 +1587,14 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	if len(payload) >= off+4 {
 		d.IngressZoneID = binary.LittleEndian.Uint16(payload[off : off+2])
 		d.EgressZoneID = binary.LittleEndian.Uint16(payload[off+2 : off+4])
+		off += 4
+	}
+	// #7188: trailing tunnel discriminator (u64 LE), length-gated. A close names
+	// the session to RETRACT, and for protocol 47 the 5-tuple names two tunnels
+	// at once, so the retraction needs the same discriminator the open carried.
+	if len(payload) >= off+8 {
+		d.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off : off+8])
+		off += 8
 	}
 
 	return d, true

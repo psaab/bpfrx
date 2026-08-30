@@ -484,11 +484,17 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, wired *dpuserspace
 // DELETES every eligible session it omits — so a divergence between the two
 // filters is always a bug, never a legitimate difference. Single-sourcing the
 // walk makes that divergence unrepresentable instead of merely tested.
+//
+// #7188: the delete arms take the converted VALUE as well as the key. A
+// dataplane.SessionKey is a 5-tuple, and protocol 47 carries no L4 ports, so
+// two RFC 2890 GRE tunnels between one pair of outer endpoints have EQUAL keys
+// and differ only in val.TunnelDiscriminator. A sink that dedupes or retracts
+// on the key alone therefore merges them; the value is what tells them apart.
 type userspaceDeltaSink interface {
 	openV4(key dataplane.SessionKey, val dataplane.SessionValue)
 	openV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6)
-	deleteV4(key dataplane.SessionKey)
-	deleteV6(key dataplane.SessionKeyV6)
+	deleteV4(key dataplane.SessionKey, val dataplane.SessionValue)
+	deleteV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6)
 }
 
 // queueDeltaSink forwards each resolved session onto the incremental
@@ -504,9 +510,20 @@ func (q queueDeltaSink) openV6(key dataplane.SessionKeyV6, val dataplane.Session
 	q.ss.QueueSessionV6(key, val)
 }
 
-func (q queueDeltaSink) deleteV4(key dataplane.SessionKey) { q.ss.QueueDeleteV4(key) }
+// The cluster delete message carries the key and the #2170 delete generation
+// only, so the #7188 discriminator on `val` has nowhere to ride here. The peer
+// helper reconstructs a delete key with `Delete` intent and resolves an absent
+// discriminator to the None class, so such a delete can only UNDER-match: a
+// keyed-GRE synced session is retracted by its idle timeout rather than by an
+// explicit delete. Under-matching is the safe direction — it never merges two
+// identities — which is why the install arm fails closed and this one does not.
+func (q queueDeltaSink) deleteV4(key dataplane.SessionKey, _ dataplane.SessionValue) {
+	q.ss.QueueDeleteV4(key)
+}
 
-func (q queueDeltaSink) deleteV6(key dataplane.SessionKeyV6) { q.ss.QueueDeleteV6(key) }
+func (q queueDeltaSink) deleteV6(key dataplane.SessionKeyV6, _ dataplane.SessionValueV6) {
+	q.ss.QueueDeleteV6(key)
+}
 
 // snapshotDeltaSink accumulates a point-in-time set of LIVE sessions for one
 // authoritative bulk window (#6031). A close delta drained alongside the export
@@ -514,40 +531,68 @@ func (q queueDeltaSink) deleteV6(key dataplane.SessionKeyV6) { q.ss.QueueDeleteV
 // batch, and framing an already-closed session would resurrect it on the peer.
 // Keys are accumulated in maps, so a repeated open is idempotent and window
 // order is irrelevant (the receiver keys the window by session key).
+//
+// #7188: the map key is the session key PLUS the tunnel discriminator, not the
+// session key alone. A dataplane.SessionKey is a 5-tuple and protocol 47 has no
+// L4 ports, so two RFC 2890 GRE tunnels between one pair of outer endpoints
+// produce EQUAL keys; deduping on the key alone silently dropped one of them
+// from every cold-prime window, and the standby then held one session for two
+// tunnels — the same collapse #7188 removes from the helper's own key. The
+// emitted BulkSnapshot is a SLICE, so two entries with equal keys and different
+// discriminators both ride the window and the peer helper folds each
+// discriminator into the key it reconstructs.
 type snapshotDeltaSink struct {
-	v4 map[dataplane.SessionKey]dataplane.SessionValue
-	v6 map[dataplane.SessionKeyV6]dataplane.SessionValueV6
+	v4 map[snapshotDedupKeyV4]dataplane.SessionValue
+	v6 map[snapshotDedupKeyV6]dataplane.SessionValueV6
+}
+
+// snapshotDedupKeyV4 is the IDENTITY the cold-prime window dedupes on: the
+// 5-tuple the peer's wire key carries plus the #7188 discriminator the peer
+// folds into it. Comparable by construction (both members are comparable), so
+// it is a valid map key.
+type snapshotDedupKeyV4 struct {
+	key           dataplane.SessionKey
+	discriminator uint64
+}
+
+type snapshotDedupKeyV6 struct {
+	key           dataplane.SessionKeyV6
+	discriminator uint64
 }
 
 func newSnapshotDeltaSink() *snapshotDeltaSink {
 	return &snapshotDeltaSink{
-		v4: make(map[dataplane.SessionKey]dataplane.SessionValue),
-		v6: make(map[dataplane.SessionKeyV6]dataplane.SessionValueV6),
+		v4: make(map[snapshotDedupKeyV4]dataplane.SessionValue),
+		v6: make(map[snapshotDedupKeyV6]dataplane.SessionValueV6),
 	}
 }
 
 func (c *snapshotDeltaSink) openV4(key dataplane.SessionKey, val dataplane.SessionValue) {
-	c.v4[key] = val
+	c.v4[snapshotDedupKeyV4{key: key, discriminator: val.TunnelDiscriminator}] = val
 }
 
 func (c *snapshotDeltaSink) openV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
-	c.v6[key] = val
+	c.v6[snapshotDedupKeyV6{key: key, discriminator: val.TunnelDiscriminator}] = val
 }
 
-func (c *snapshotDeltaSink) deleteV4(key dataplane.SessionKey) { delete(c.v4, key) }
+func (c *snapshotDeltaSink) deleteV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	delete(c.v4, snapshotDedupKeyV4{key: key, discriminator: val.TunnelDiscriminator})
+}
 
-func (c *snapshotDeltaSink) deleteV6(key dataplane.SessionKeyV6) { delete(c.v6, key) }
+func (c *snapshotDeltaSink) deleteV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+	delete(c.v6, snapshotDedupKeyV6{key: key, discriminator: val.TunnelDiscriminator})
+}
 
 func (c *snapshotDeltaSink) snapshot() cluster.BulkSnapshot {
 	snap := cluster.BulkSnapshot{
 		V4: make([]dataplane.SessionEntryV4, 0, len(c.v4)),
 		V6: make([]dataplane.SessionEntryV6, 0, len(c.v6)),
 	}
-	for key, val := range c.v4 {
-		snap.V4 = append(snap.V4, dataplane.SessionEntryV4{Key: key, Value: val})
+	for dedup, val := range c.v4 {
+		snap.V4 = append(snap.V4, dataplane.SessionEntryV4{Key: dedup.key, Value: val})
 	}
-	for key, val := range c.v6 {
-		snap.V6 = append(snap.V6, dataplane.SessionEntryV6{Key: key, Value: val})
+	for dedup, val := range c.v6 {
+		snap.V6 = append(snap.V6, dataplane.SessionEntryV6{Key: dedup.key, Value: val})
 	}
 	return snap
 }
@@ -603,12 +648,12 @@ func (d *Daemon) walkUserspaceSessionDeltas(
 			case dataplane.AFInet:
 				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
 				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					sink.deleteV4(key)
+					sink.deleteV4(key, val)
 					n++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV4(key, delta)
 						if wireKey != key {
-							sink.deleteV4(wireKey)
+							sink.deleteV4(wireKey, val)
 							n++
 						}
 					}
@@ -616,12 +661,12 @@ func (d *Daemon) walkUserspaceSessionDeltas(
 			case dataplane.AFInet6:
 				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
 				if ok && d.shouldSyncUserspaceDelta(ss, delta, val.IngressZone) {
-					sink.deleteV6(key)
+					sink.deleteV6(key, val)
 					n++
 					if delta.FabricRedirect && !delta.FabricIngress {
 						wireKey := userspaceForwardWireKeyV6(key, delta)
 						if wireKey != key {
-							sink.deleteV6(wireKey)
+							sink.deleteV6(wireKey, val)
 							n++
 						}
 					}

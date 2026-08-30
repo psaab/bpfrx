@@ -19,12 +19,19 @@
 //! The refusal discipline is shared, and deliberately: version and routing are
 //! both hard refusals in `gre.rs` for reasons that apply identically here.
 //!
-//! NOTHING IN PRODUCTION CALLS THIS YET, hence the `#![allow(dead_code)]` below.
-//! This cut lands the extractor and its classification rules ALONE, so the
-//! packet path is observably unchanged — transit GRE stays flowless, exactly as
-//! #6837 left it. The next cut threads `TunnelDiscriminator` onto `SessionKey`
-//! and reads it here. That is the same seam convention
-//! `ForwardingState.gre_acceleration` already documents for this feature.
+//! THE SEAM IS CLOSED. This module's landing cut said "nothing in production
+//! calls this yet"; that has not been true since `stage_parse_flow_and_learn`
+//! grew `None if worker_ctx.forwarding.gre_acceleration =>
+//! gre_keyed_session_flow(..)` (`afxdp/poll_stages.rs`), which is the read this
+//! module was staged for. The `#![allow(dead_code)]` stays because the module
+//! still carries classification helpers the single call site does not reach.
+//!
+//! What this classification now feeds, beyond the local key: the discriminator
+//! rides the HA session-sync wire (#7188, `session/discriminator.rs`
+//! `to_wire`/`from_wire`), so a misclassification here is not merely a local
+//! identity error — it is the identity a peer imports after a failover. See
+//! `docs/session-sync-architecture.md`, "Tunnel Session-Identity
+//! Discriminator".
 #![allow(dead_code)]
 
 use super::gre::{GRE_FLAG_CHECKSUM, GRE_FLAG_KEY};

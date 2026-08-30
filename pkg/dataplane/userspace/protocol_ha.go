@@ -124,6 +124,25 @@ type SessionSyncRequest struct {
 	// id carried" sentinel that falls back to a fresh local id (rolling-upgrade
 	// safe). The Rust side declares `#[serde(rename = "session_id", default)]`.
 	RTFlowSessionID uint64 `json:"session_id,omitempty"`
+	// #7188: the forward session key's tunnel discriminator, as encoded by the
+	// helper's TunnelDiscriminator::to_wire (userspace-dp
+	// session/discriminator.rs). Opaque to Go — this side never interprets the
+	// tag, it only carries it — so the encoding lives in exactly one place.
+	//
+	// GRE is protocol 47 and has no L4 ports, so two RFC 2890 tunnels between
+	// one pair of outer endpoints share a 5-tuple. Without this field the peer
+	// helper rebuilt BOTH sync records as the same key (build_synced_session_key
+	// hardcoded `discriminator: Default::default()`) and the second install
+	// evicted the first — one session for two tunnels, sharing one policy
+	// decision, NAT state, counter set and timeout after failover.
+	//
+	// NO omitempty, matching Generation above (#1961 wire-type discipline on a
+	// numeric field whose 0 is meaningful): 0 is RESERVED for "not carried" and
+	// is NOT the encoding of the None class, so it must serialize explicitly.
+	// A helper that predates the field decodes it via serde(default) to 0 and
+	// WITHHOLDS a protocol-47 session rather than importing it aliased (#7188
+	// decision 2); every other protocol imports unchanged.
+	TunnelDiscriminator uint64 `json:"tunnel_discriminator"`
 }
 
 // SessionDeltaInfo is the HA session-open/close delta as it reaches this
@@ -256,4 +275,20 @@ type SessionDeltaInfo struct {
 	// Absent on an old helper => 0, the standby allocs a fresh local id
 	// (pre-#5212 behavior, rolling-upgrade safe).
 	RTFlowSessionID uint64 `json:"rt_flow_session_id,omitempty"`
+	// #7188: the session key's tunnel discriminator, decoded from the trailing
+	// u64 of the binary open/close frames (after the #5212 session id / the
+	// #3075 zone ids) AND from the JSON RPC-fallback delta, whose Rust producer
+	// declares `#[serde(rename = "tunnel_discriminator")]`. Opaque here: Go
+	// carries the tag, the helper defines it.
+	//
+	// Stamped onto the synced SessionValue{,V6}.TunnelDiscriminator by
+	// daemon_ha_userspace_convert.go so the cluster sync wire and the peer
+	// helper carry it. Without it two RFC 2890 GRE tunnels between one pair of
+	// outer endpoints — one 5-tuple, protocol 47 has no ports — rebuilt to ONE
+	// key on the standby and the second install evicted the first.
+	//
+	// Absent on an old helper => 0, the RESERVED "not carried" tag (NOT the
+	// None class), which makes the peer helper withhold a protocol-47 session
+	// instead of aliasing it (#7188 decision 2, rolling-upgrade safe).
+	TunnelDiscriminator uint64 `json:"tunnel_discriminator,omitempty"`
 }
