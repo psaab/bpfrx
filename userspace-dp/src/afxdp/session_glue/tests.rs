@@ -8000,3 +8000,188 @@ fn apply_worker_commands_7201_empty_and_contended_passes_report_no_backlog() {
     );
     drop(held);
 }
+
+// #6979 F3: an accepted same-key synced replacement must not strand the
+// REPLACED session's source-NAT reservation.
+//
+// Most replacements are already safe and these tests must not claim credit for
+// that: `reserve_flow` is keyed on the ORIGINAL 5-tuple (`SourceNatFlowKey`),
+// so a NAT -> different-NAT re-decision finds the incumbent under the same flow
+// and retires it with release semantics (#6528). The hole is the replacement
+// that never REACHES `reserve_flow` — the reserve is gated on
+// `is_peer_synced() && !is_reverse` at the call site and on
+// `nat.rewrite_src.is_some()` inside the helper, so a NAT -> NO-NAT
+// re-decision installed the new session and left the old port reserved with
+// nothing left to free it (delete-sync releases the CURRENT decision, which no
+// longer names that port).
+//
+// All three drive the REAL `handle_upsert_synced` entry point, so deleting the
+// wiring reds them — testing the release helper directly would not.
+
+fn f3_forwarding_6979() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+        crate::SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+    ]);
+    forwarding.zone_id_to_name.insert(1, "lan".to_string());
+    forwarding.zone_id_to_name.insert(2, "wan".to_string());
+    forwarding
+}
+
+fn f3_key_6979() -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.50".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40000,
+        dst_port: 443,
+        discriminator: Default::default(),
+        // #7160 phase 1 widened SessionKey after this PR was authored; 0 is
+        // the default routing instance, so F3's fixture is unchanged.
+        routing_domain: 0,
+    }
+}
+
+fn f3_entry_6979(nat: NatDecision) -> SyncedSessionEntry {
+    let mut decision = test_decision();
+    decision.nat = nat;
+    SyncedSessionEntry {
+        key: f3_key_6979(),
+        decision,
+        metadata: SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            is_reverse: false,
+            ..test_metadata()
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    }
+}
+
+fn f3_nat_on_port_6979(port: u16) -> NatDecision {
+    NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(port),
+        ..NatDecision::default()
+    }
+}
+
+/// Import a synced session on port 20000, then replace it at the SAME key with
+/// `second`. Returns `(used_ports_after_replace, installed_rewrite_port)`.
+///
+/// The second element is the anti-vacuity discriminator: `used_ports` alone
+/// cannot tell "the replacement landed and freed the port" from "the
+/// replacement was REJECTED so nothing changed". Every assertion below pins it.
+fn f3_replace_6979(second: NatDecision) -> (u64, Option<Option<u16>>) {
+    let forwarding = f3_forwarding_6979();
+    let mut sessions = SessionTable::new();
+    let ha_state: BTreeMap<i32, HAGroupRuntime> = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+
+    crate::afxdp::session_glue::commands::handle_upsert_synced(
+        &mut sessions,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        f3_entry_6979(f3_nat_on_port_6979(20000)),
+        1_000,
+        1,
+        0,
+    );
+    assert_eq!(
+        crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports,
+        1,
+        "precondition: the first synced import must reserve its pool port — \
+         without this the whole cell measures nothing"
+    );
+
+    crate::afxdp::session_glue::commands::handle_upsert_synced(
+        &mut sessions,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        f3_entry_6979(second),
+        2_000,
+        2,
+        0,
+    );
+
+    let used = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules)[0].used_ports;
+    let installed = sessions
+        .entry_with_origin(&f3_key_6979())
+        .map(|(d, _, _)| d.nat.rewrite_src_port);
+    (used, installed)
+}
+
+/// FAIL-ON-REVERT. The replaced session's port is freed when the new decision
+/// carries no source rewrite.
+#[test]
+fn synced_replace_dropping_nat_releases_the_old_reservation_6979_f3() {
+    let (used, installed) = f3_replace_6979(NatDecision::default());
+    assert_eq!(
+        installed,
+        Some(None),
+        "the replacement must have LANDED with no source rewrite — if it was \
+         rejected, the used_ports assertion below proves nothing"
+    );
+    assert_eq!(
+        used, 0,
+        "#6979 F3: a synced replacement that drops NAT never reaches \
+         `reserve_flow`, so its stale-tuple eviction cannot retire the \
+         incumbent. Without the explicit release the old pool port stays \
+         reserved forever — delete-sync frees the CURRENT decision, which no \
+         longer names it"
+    );
+}
+
+/// OVER-REACH CONTROL for the #6528 path: a NAT -> different-NAT re-decision is
+/// retired by `reserve_flow` itself. The F3 release must SKIP it — releasing as
+/// well would free a port the new decision legitimately holds.
+#[test]
+fn synced_replace_changing_nat_port_keeps_exactly_one_reservation_6979_f3() {
+    let (used, installed) = f3_replace_6979(f3_nat_on_port_6979(20001));
+    assert_eq!(
+        installed,
+        Some(Some(20001)),
+        "the replacement must have landed on the new port"
+    );
+    assert_eq!(
+        used, 1,
+        "the new tuple is reserved and the old retired by `reserve_flow` \
+         (#6528) — exactly one port held. 0 means the F3 release double-freed \
+         the port the new decision owns; 2 means neither path retired"
+    );
+}
+
+/// OVER-REACH CONTROL for the unconditional fix. Releasing the previous
+/// reservation on EVERY replace would drop this worker's holder bit and re-take
+/// it on a same-tuple refresh (HA sync reconnect / periodic re-upsert), opening
+/// a window for another worker's local allocation to steal the port. The
+/// refresh must be a no-op that keeps the reservation.
+#[test]
+fn synced_refresh_with_identical_nat_keeps_its_reservation_6979_f3() {
+    let (used, installed) = f3_replace_6979(f3_nat_on_port_6979(20000));
+    assert_eq!(installed, Some(Some(20000)), "the refresh keeps the same tuple");
+    assert_eq!(
+        used, 1,
+        "a same-tuple refresh must keep its reservation — `reserve_flow` takes \
+         its idempotent holder-OR early return and the F3 release must not run"
+    );
+}
