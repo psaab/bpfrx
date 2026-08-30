@@ -1405,6 +1405,13 @@ fn parse_match_prefix(
     rule_name: &str,
     axis: &str,
 ) {
+    // #7481: normalize the prefix-length spelling before any parser sees it.
+    // `ipnet` accepts `2001:db8::/064` but refuses `10.0.0.0/024` — it
+    // disagrees with itself across families — and the Go gate accepts both,
+    // so `/024` committed clean and was then DROPPED here, leaving a rule that
+    // matched nothing. Normalizing makes every end answer the same way.
+    let normalized = crate::nat::normalize_nat_prefix_len(prefix);
+    let prefix: &str = &normalized;
     match prefix.parse::<IpNet>() {
         Ok(IpNet::V4(net)) => v4.push(PrefixV4::from_net(net)),
         Ok(IpNet::V6(net)) => v6.push(PrefixV6::from_net(net)),

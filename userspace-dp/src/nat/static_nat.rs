@@ -332,28 +332,59 @@ fn remap_addr(addr: IpAddr, src: &NatPrefix, dst: &NatPrefix) -> Option<IpAddr> 
 /// block is INSTALLED is decided in `from_snapshots` (equal-length 1:1
 /// pairs only).
 fn parse_nat_prefix(s: &str) -> Option<NatPrefix> {
-    let mut parts = s.splitn(2, '/');
-    let addr: IpAddr = parts.next()?.parse().ok()?;
+    // #7481: parse through `IpNet` / `IpAddr`, the SAME path
+    // `source/mod.rs::parse_match_prefix` uses, rather than a hand-rolled
+    // `splitn` + `u8::from_str`.
+    //
+    // The hand-rolled version's integer parser accepted a leading `+`, so
+    // `10.0.0.0/+24` installed here as `(10.0.0.0, /24)` while the Go strict
+    // gate and `ipnet` both rejected it. Measured across all three
+    // implementations: two already agreed and this one did not, so aligning it
+    // needed no grammar decision — it was one parser against a consensus.
+    //
+    // `IpNet::from_str` rejects a bare host address, which this grammar must
+    // accept as an implicit /32 or /128, so the `IpAddr` fallback is kept —
+    // again matching parse_match_prefix rather than inventing a third shape.
+    // #7481: normalize the prefix-length spelling before any parser sees it.
+    let s = &super::normalize_nat_prefix_len(s);
+    let (addr, len) = match s.parse::<IpNet>() {
+        Ok(net) => (net.addr(), net.prefix_len()),
+        Err(_) => {
+            let addr: IpAddr = s.parse().ok()?;
+            let max = match addr {
+                IpAddr::V4(_) => 32u8,
+                IpAddr::V6(_) => 128u8,
+            };
+            (addr, max)
+        }
+    };
     let max = match addr {
         IpAddr::V4(_) => 32u8,
         IpAddr::V6(_) => 128u8,
     };
-    let len = match parts.next() {
-        // Bare address — a host route.
-        None => max,
-        Some(mask) => {
-            let len: u8 = mask.parse().ok()?;
-            if len > max {
-                return None;
-            }
-            len
-        }
-    };
+    if len > max {
+        return None;
+    }
     let base = match addr {
         IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) & !host_mask_v4(len))),
         IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) & !host_mask_v6(len))),
     };
     Some(NatPrefix { base, len })
+}
+
+/// #7481: expose `parse_nat_prefix` to the corpus differential.
+///
+/// A `for_test` accessor rather than widening the function's visibility: the
+/// differential needs to CALL it, not to have it become part of the module's
+/// surface. Same trade as `Nat64Prefix::for_test` — loosening production
+/// visibility to make a test possible is how an invariant stops being one.
+#[cfg(test)]
+/// Returns whether the parser ACCEPTS the literal, not the parsed value: the
+/// differential compares verdicts, and `NatPrefix` is private to this module.
+/// Widening it to make a test compile is the trade this accessor exists to
+/// avoid.
+pub(super) fn parse_nat_prefix_accepts_for_test(s: &str) -> bool {
+    parse_nat_prefix(s).is_some()
 }
 
 impl StaticNatTable {
