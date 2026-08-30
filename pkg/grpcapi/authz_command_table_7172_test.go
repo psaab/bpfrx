@@ -32,6 +32,30 @@ func TestEveryMappedCommandIsCanonical7172(t *testing.T) {
 			t.Errorf("%s maps to an empty command", method)
 			continue
 		}
+		// EVERY WORD MUST BE A KEYWORD, checked before canonicalization.
+		//
+		// This is the half the original #8057 check was missing, and its absence
+		// made that PR's claim ("a real, already-canonical operational command")
+		// too strong. Canonicalize returns OK for `show interfaces zzbogus`,
+		// because `interfaces` carries a dynamic child and value slots absorb
+		// arbitrary words BY DESIGN — they are operator data, and cut 1 is right
+		// to leave them alone.
+		//
+		// That is correct for canonicalizing a command an operator typed, and
+		// wrong as a validity check for THIS table, whose entries are pure
+		// command paths with no arguments. Without this arm, an entry could name
+		// a command nobody can run and still pass, so long as the garbage landed
+		// in a value slot rather than at a keyword position.
+		//
+		// The mutation that motivated it: `show zzbogus nonexistent` reds
+		// (nothing under `show` matches), but `show interfaces zzbogus` did not.
+		if !everyWordIsAKeyword(words) {
+			t.Errorf("%s maps to %q, in which some word is not a command KEYWORD — it is "+
+				"being absorbed by a value slot (a dynamic, typed or placeholder child). "+
+				"Table entries are pure command paths with no arguments, so every word "+
+				"must be a real node.", method, cmd)
+			continue
+		}
 		canon, res := cmdtree.Canonicalize(cmdtree.OperationalTree, words)
 		if res != cmdtree.CanonicalOK {
 			t.Errorf("%s maps to %q, which does not resolve against the operational tree "+
@@ -107,4 +131,29 @@ func TestCommandTableIsNotYetConsumed7172(t *testing.T) {
 	if len(methodCanonicalCommand) == 0 || len(methodsWithoutCanonicalCommand) == 0 {
 		t.Fatal("precondition: both tables must be populated for this to mean anything")
 	}
+}
+
+// everyWordIsAKeyword reports whether each word names a real node in the
+// operational tree, rather than being consumed by a value slot.
+//
+// Deliberately NOT a change to cmdtree.Canonicalize: absorbing operator data
+// into value slots is exactly what canonicalization must do for a command an
+// operator typed. The distinction is that THIS table holds argument-free
+// command paths, so the stricter rule belongs to the table's validity check and
+// not to the shared canonicalizer.
+func everyWordIsAKeyword(words []string) bool {
+	current := cmdtree.OperationalTree
+	for _, w := range words {
+		node, ok := current[w]
+		if !ok {
+			return false
+		}
+		if node.Children == nil {
+			// A leaf: any further word would be an argument, which this table
+			// must not contain.
+			return true
+		}
+		current = node.Children
+	}
+	return true
 }
