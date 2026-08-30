@@ -8,6 +8,15 @@ The default run targets the isolated loss userspace cluster, applies the
 symmetric CoS fixture, and runs IPv4 forward traffic from
 `loss:cluster-userspace-host` to `172.16.80.200`.
 
+## Prerequisite: target services
+
+This harness sends to `172.16.80.200` on ports 5200/5202/5210/5211 and needs
+live `iperf3 -s` listeners there. It calls
+`./test/incus/target-services.sh check 5200 5202 5210 5211` before applying
+the CoS fixture, so a missing listener aborts with the full 24-port grid
+rather than a partway-through run. See the target-service prerequisite section
+in `docs/fairness-regimes.md` (#8040). `SKIP_TARGET_PRECHECK=1` bypasses it.
+
 ## Cells
 
 The smoke matrix is intentionally small:

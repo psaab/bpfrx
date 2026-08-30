@@ -417,7 +417,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -446,6 +446,19 @@ test-deploy-lib:
 test-cluster-lock-lib:
 	bash ./test/incus/with-cluster-selftest.sh
 	bash ./test/incus/cluster-cell-selftest.sh
+
+# Self-test the #8040 target-service preflight. Every per-class harness
+# (mouse-latency, fairness, CoS best-effort contention) needs live listeners
+# on 5200-5211 and 6200-6211 at the VLAN-80 target; none could create one, and
+# each checked only the single port it was about to use. So a run spent a
+# build, a deploy and the shared cluster lock before discovering the target was
+# unprovisioned, and named one missing port out of twenty-four.
+# target-services.sh is now the one place that knows that contract; this gates
+# its predicate (scoped, so an unrelated class does not block a two-port smoke)
+# and its diagnosis (the whole grid, every missing port named). Hermetic —
+# `incus` is stubbed, no cluster.
+test-target-services-lib:
+	bash ./test/incus/target-services-selftest.sh
 
 # Self-test the #6440 CoS-apply CLI-transcript gate. `apply-cos-config.sh`
 # drives the Junos CLI by piping a heredoc into it; that form is a REPL that

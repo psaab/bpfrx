@@ -83,6 +83,14 @@ else
     DEFAULT_PORT=5210
 fi
 PORT=${2:-$DEFAULT_PORT}
+# #8040: the target-service contract, checked before any traffic is generated.
+# This harness sends to ONE port, so the predicate is that one port; the
+# diagnosis on failure is still the whole grid.
+if [[ "${SKIP_TARGET_PRECHECK:-0}" != "1" ]]; then
+    TARGET_V4="$TARGET" \
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target-services.sh" \
+        check "$PORT" || exit 1
+fi
 N=${3:-12}
 T=${4:-120}
 # Default to the historical reverse fixture only when the argument is

@@ -19,6 +19,15 @@ APPLY_COS_CONFIG="${APPLY_COS_CONFIG:-$ROOT_DIR/test/incus/apply-cos-config.sh}"
 VALIDATOR="${VALIDATOR:-$ROOT_DIR/test/incus/cos_be_contention_validate.py}"
 
 TARGET_IP="${TARGET_IP:-172.16.80.200}"
+# #8040: fail on the target-service contract BEFORE the CoS fixture is applied
+# and the lock is spent. Scoped to the four ports this smoke actually uses, so
+# an unrelated class being down does not block it — but the report on failure
+# is the whole 24-port grid, because a runner wants every hole at once.
+SKIP_TARGET_PRECHECK="${SKIP_TARGET_PRECHECK:-0}"
+if [[ "$SKIP_TARGET_PRECHECK" != "1" ]]; then
+    TARGET_V4="$TARGET_IP" "$ROOT_DIR/test/incus/target-services.sh" \
+        check 5200 5202 5210 5211 || exit 1
+fi
 DURATION="${DURATION:-8}"
 EXACT_PARALLEL="${EXACT_PARALLEL:-4}"
 CONTENDER_PARALLEL="${CONTENDER_PARALLEL:-4}"
