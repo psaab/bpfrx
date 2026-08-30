@@ -28,11 +28,13 @@ impl Coordinator {
     /// real control-socket delete cannot read the outcome directly.
     #[cfg(test)]
     pub(crate) fn synced_session_entry_count_for_test(&self) -> usize {
-        self.sessions
-            .synced
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().len())
+        // #6653: a shared-session surface is locked through the recover helper,
+        // never bare, so a worker that panicked under this mutex cannot make
+        // the read silently report "empty" instead of recovering. The audit in
+        // `ha_tests.rs` enforces that on every non-test file under `afxdp/`,
+        // and this file is not one — the seam is `#[cfg(test)]`, the FILE is
+        // production.
+        crate::afxdp::shared_ops::lock_shared_recover(&self.sessions.synced).len()
     }
 
     /// Test seam: declare an interface a routing-instance member without
