@@ -133,10 +133,18 @@ func secretIndices(fp []string) []int {
 				out = append(out, j)
 			}
 		case "password":
-			// Generic keyword — secret only under REST api-auth or a DDNS
-			// provider; other `password` uses do not exist today but the
-			// context gate keeps a future non-secret `password` unmasked.
-			if containsAnyOf(fp[:i], "api-auth", "dynamic-dns") {
+			// Generic keyword — secret only under REST api-auth, a DDNS
+			// provider, or an archive-site transfer credential (#7511); other
+			// `password` uses do not exist today but the context gate keeps a
+			// future non-secret `password` unmasked.
+			//
+			// #7511: `system archival configuration archive-sites <url>
+			// password <secret>` rendered the secret IN FULL. `archive-sites`
+			// is named for what it is, and a `password` nested under it matched
+			// neither of the two scopes this pass knew about — the name-keyed
+			// design's limitation, seen on the raw-AST surface after #7510
+			// fixed the typed one.
+			if containsAnyOf(fp[:i], "api-auth", "dynamic-dns", "archive-sites") {
 				for j := i + 1; j < len(fp); j++ {
 					out = append(out, j)
 				}
@@ -195,6 +203,32 @@ func urlLeafIndices(fp []string) []int {
 				for j := i + 1; j < len(fp); j++ {
 					out = append(out, j)
 				}
+			}
+		case "archive-sites":
+			// #7511: an archive TRANSFER url — `scp://user:pw@host/dir` — which
+			// lives only in the raw AST and is never promoted to a typed field,
+			// so no MarshalJSON sees it and #7510's typed pass could not reach
+			// it. Both spellings are covered: `system syslog file <n> archive
+			// archive-sites <url>` and `system archival configuration
+			// archive-sites <url>`.
+			//
+			// STOPS AT `password`, which follows the url as a sibling token in
+			// the flat path (`archive-sites <url> password <secret>`). Marking
+			// every trailing token would hand the SECRET to RedactURL, and
+			// RedactURL is a no-op on input that is not a URL — so the password
+			// would render verbatim while looking like it had been processed.
+			// The secret is masked outright by secretIndices' `password` case,
+			// which #7511 extends to this scope; these two must not overlap.
+			//
+			// If another sub-keyword is ever added under archive-sites, it
+			// needs adding here too, or its value is fed to RedactURL. That is
+			// a no-op rather than a corruption, but it would also mean the new
+			// leaf is unredacted — so the stop list is the thing to extend.
+			for j := i + 1; j < len(fp); j++ {
+				if fp[j] == "password" {
+					break
+				}
+				out = append(out, j)
 			}
 		}
 	}
