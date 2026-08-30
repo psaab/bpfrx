@@ -322,17 +322,64 @@ func TestDebounceCoalescing(t *testing.T) {
 		e.HandleTransition(transition("WAN", "wan-a", "fail", results))
 		e.HandleTransition(transition("WAN", "wan-a", "pass", results))
 	}
-	time.Sleep(40 * time.Millisecond)
-	first := actuations.Load()
-	if first < 1 {
-		t.Fatal("no actuation after debounce window")
+	// The debounce fires on its own goroutine, so WHEN the first actuation
+	// lands is a scheduling outcome, not a property of the code. The old
+	// `time.Sleep(40ms)` sampled at a fixed instant with only a 20ms margin
+	// over the 20ms debounce, and under CPU contention that goroutine had not
+	// run yet: measured 2 failures in 40 runs at GOMAXPROCS=1 pinned to a busy
+	// core, both on the lower bound (#7969).
+	//
+	// The deadline stays INSIDE the throttle window deliberately. The upper
+	// bound below is scoped to ONE window, so waiting longer would admit a
+	// second legitimate actuation and break the assertion rather than
+	// stabilise it. This is the case where "poll with a generous deadline" is
+	// wrong: the generosity has a ceiling, and it is the throttle.
+	//
+	// Polling the whole window also makes the real assertion STRONGER than the
+	// single sample it replaces. Coalescing is violated the moment a third
+	// actuation appears, and one late read could miss a third that came and
+	// went; this checks the bound continuously across the window.
+	const (
+		observeWindow = 50 * time.Millisecond // < throttle (60ms), > debounce (20ms)
+		pollEvery     = time.Millisecond
+	)
+	var first int32
+	sawActuation := false
+	for deadline := time.Now().Add(observeWindow); ; {
+		first = actuations.Load()
+		if first > 2 {
+			t.Fatalf("actuations = %d within one window, want coalesced (<= 2: config-apply + storm)", first)
+		}
+		if first >= 1 {
+			sawActuation = true
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollEvery)
 	}
-	if first > 2 {
-		t.Fatalf("actuations = %d within one window, want coalesced (<= 2: config-apply + storm)", first)
+	// SETUP GUARD, not the assertion. The property under test is coalescing —
+	// the `> 2` bound above. This branch only establishes that anything
+	// happened at all, i.e. that the observation window was long enough. Its
+	// old message ("no actuation after debounce window") read as a coalescing
+	// failure and sent whoever hit it looking for a defect in the engine.
+	if !sawActuation {
+		t.Fatalf("SETUP GUARD (not a coalescing failure): no actuation observed within %v "+
+			"(debounce %v, throttle %v). The debounce goroutine did not get scheduled inside "+
+			"the observation window, so the coalescing bound above was never exercised. "+
+			"This means the machine was too loaded to sample, not that the engine failed to "+
+			"coalesce.", observeWindow, e.debounce, e.throttle)
 	}
 
 	// Sustained flapping stays bounded: ≤ 1 actuation per throttle
 	// window (plus one carry-over).
+	//
+	// This half is deliberately left on fixed sleeps (#7969). Its assertion is
+	// an UPPER bound, and every way the machine can misbehave — slow
+	// scheduling, fewer loop iterations, a late timer — produces FEWER
+	// actuations, not more. A slow machine cannot make `total > 6` fire, so
+	// there is no sample to stabilise here; the throttle itself bounds the
+	// count regardless of timing.
 	start := actuations.Load()
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {
