@@ -22,7 +22,9 @@
 mod persistence;
 mod planning;
 mod session_sync;
-mod status;
+// #6979: see server/mod.rs — the retirement call site lives here and is bound
+// by a test that enters through refresh_status.
+pub(crate) mod status;
 
 pub(crate) use persistence::*;
 pub(crate) use planning::*;

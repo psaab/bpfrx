@@ -7306,3 +7306,187 @@ fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
         "no live worker may outlive the forwarding state it was reading"
     );
 }
+
+/// #6979: the retirement sweep must be WIRED, one-shot, and must not touch a
+/// live worker's reservations.
+///
+/// `PortAllocator::retire_worker` (#7092) is already covered by
+/// `nat::tests_pool` — that it clears one bit, spares a second holder, and frees
+/// only when the mask empties. None of that binds this change, which is the
+/// CALL SITE: #7092 landed the primitive deliberately unwired, and a test of the
+/// primitive passes identically whether or not anything ever calls it. So this
+/// drives the coordinator entry point instead.
+#[test]
+fn retire_dead_worker_holders_reclaims_only_dead_workers_6979() {
+    use crate::nat::NatHolder;
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let atomics = rec.handle.runtime_atomics.clone();
+    coordinator.workers.records.insert(3, rec);
+
+    // A live interface-mode allocation held by worker 3.
+    let egress: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+    let alloc = coordinator
+        .forwarding
+        .iface_nat_allocators
+        .allocator_for(egress)
+        .expect("allocator");
+    let flow = crate::nat::SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.5".parse().unwrap(),
+        dst_ip: "198.51.100.9".parse().unwrap(),
+        src_port: 4000,
+        dst_port: 80,
+    };
+    let translated = crate::nat::TranslatedTuple {
+        ip: egress,
+        port: 20000,
+    };
+    assert!(
+        alloc.reserve_flow(flow, translated, 0, false, 1_000, NatHolder::Worker(3)),
+        "fixture must actually take the reservation, or the sweep below has \
+         nothing to reclaim and would pass vacuously"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 20000),
+        "fixture precondition: the port is occupied before any retirement"
+    );
+
+    // NEGATIVE CONTROL: worker 3 is ALIVE. The sweep must leave it alone — a
+    // sweep that retired every worker would satisfy the positive case below
+    // while freeing tuples out from under workers that are still forwarding,
+    // which is the over-release the holder mask exists to prevent.
+    assert_eq!(
+        coordinator.retire_dead_worker_holders(),
+        0,
+        "a LIVE worker's reservations must not be reclaimed"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 20000),
+        "...and its port must still be occupied"
+    );
+    assert!(
+        !atomics.holders_retired.load(Ordering::Relaxed),
+        "a live worker must not be latched as retired"
+    );
+
+    // The worker panics: supervisor sets `dead` and the thread exits.
+    atomics.dead.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        coordinator.retire_dead_worker_holders(),
+        1,
+        "a dead worker's last-holder reservation must be reclaimed — without \
+         this wiring the bit survives for the life of the allocator and the \
+         pool port is never returned (#7092's leak, unwired until #6979)"
+    );
+    assert!(
+        !alloc.debug_is_port_occupied(0, 20000),
+        "the reclaimed port must be free for a new flow"
+    );
+    assert!(
+        atomics.holders_retired.load(Ordering::Relaxed),
+        "the one-shot latch must be set after the sweep"
+    );
+
+    // ONE-SHOT, and the fixture has to be built so that this can actually FAIL.
+    //
+    // Asserting "the second call returns 0" against the state left above is
+    // VACUOUS: the first sweep already freed the only record, so a second sweep
+    // finds nothing to free whether or not the latch works. Measured — mutating
+    // the latch away left that assertion green.
+    //
+    // So take a NEW reservation for the same dead worker first. With the latch,
+    // the second sweep skips the worker entirely and the new reservation
+    // survives. Without it, the sweep runs again and frees it. That is the
+    // hazard #7092's doc named as the reason it would not choose this call
+    // site: without "already retired" state every 1 Hz tick re-walks
+    // `live_by_flow` under each allocator's mutex forever.
+    let flow2 = crate::nat::SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.6".parse().unwrap(),
+        dst_ip: "198.51.100.9".parse().unwrap(),
+        src_port: 4001,
+        dst_port: 80,
+    };
+    assert!(
+        alloc.reserve_flow(flow2, translated, 0, false, 3_000, NatHolder::Worker(3)),
+        "fixture: a second reservation must take, or the one-shot check below is          vacuous again"
+    );
+    assert_eq!(
+        coordinator.retire_dead_worker_holders(),
+        0,
+        "the sweep must be one-shot per dead worker, not once per status tick"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 20000),
+        "the one-shot latch must stop the second sweep from touching a          reservation taken after the retirement"
+    );
+}
+
+/// #6979: the retirement must be REACHED from the production status path, not
+/// merely reachable.
+///
+/// The sibling test above drives `retire_dead_worker_holders` directly, which
+/// binds what the sweep DOES and nothing about whether anything calls it —
+/// measured: deleting the call from `server/helpers/status.rs` left that test
+/// green. #7092 landed this primitive deliberately unwired, so "the function is
+/// correct" is exactly the state this change is supposed to move past, and a
+/// test that cannot tell the two apart is the wrong instrument.
+///
+/// So this enters through `refresh_status`, the real 1 Hz status entry point
+/// that the call lives in.
+#[test]
+fn refresh_status_reclaims_dead_worker_holders_6979() {
+    use crate::nat::NatHolder;
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    let atomics = rec.handle.runtime_atomics.clone();
+    coordinator.workers.records.insert(5, rec);
+
+    let egress: std::net::IpAddr = "192.0.2.8".parse().unwrap();
+    let alloc = coordinator
+        .forwarding
+        .iface_nat_allocators
+        .allocator_for(egress)
+        .expect("allocator");
+    let flow = crate::nat::SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.9".parse().unwrap(),
+        dst_ip: "198.51.100.4".parse().unwrap(),
+        src_port: 5000,
+        dst_port: 443,
+    };
+    let translated = crate::nat::TranslatedTuple {
+        ip: egress,
+        port: 30000,
+    };
+    assert!(
+        alloc.reserve_flow(flow, translated, 0, false, 1_000, NatHolder::Worker(5)),
+        "fixture must take the reservation"
+    );
+    atomics.dead.store(true, Ordering::Relaxed);
+
+    let mut state = crate::server::state::ServerState {
+        status: Default::default(),
+        snapshot: None,
+        afxdp: coordinator,
+        state_writer: std::sync::Arc::new(crate::state_writer::StateWriter::new()),
+    };
+    crate::server::helpers::status::refresh_status(&mut state);
+
+    assert!(
+        !alloc.debug_is_port_occupied(0, 30000),
+        "a status refresh must reclaim a dead worker's stranded NAT reservation \
+         — if this passes only when retire_dead_worker_holders is called by hand, \
+         the primitive is still unwired and #7092's leak is still open"
+    );
+    assert!(
+        atomics.holders_retired.load(Ordering::Relaxed),
+        "the status path must latch the worker as retired"
+    );
+}

@@ -63,6 +63,37 @@ pub(crate) fn release_source_nat_allocation(
 /// reservation, which every worker took against the single shared allocator,
 /// only `worker_id`'s bit is cleared and the port survives until the last worker
 /// releases it.
+/// #6979: clear `worker_id`'s holder bit across every POOL-mode rule allocator,
+/// freeing any record the clear empties. Returns records freed.
+///
+/// The counterpart to [`release_source_nat_allocation_for_worker`] for a worker
+/// that will never call it. That function clears one bit for one flow when the
+/// worker runs its own release; this clears the same worker's bit across every
+/// flow it still holds, for a worker that has stopped.
+///
+/// Sound only because #6522 made the allocating worker a holder of its own
+/// allocation: before that the mask named every worker EXCEPT the one
+/// forwarding, so emptying it would have freed a tuple still in use. The
+/// direction-of-error rule is stated at `PortAllocator::drop_holder_locked` --
+/// an under-release leaks a bounded port, an over-release hands a live worker's
+/// `(pool_addr, port)` to a new flow -- and clearing a STOPPED worker's bit
+/// cannot over-release, because that worker will never forward again.
+pub(crate) fn retire_worker_from_pool_rules(
+    rules: &[SourceNatRule],
+    worker_id: u32,
+    now_ns: u64,
+) -> usize {
+    // Every rule is swept, not just pool-mode ones: a non-pool rule's allocator
+    // holds no bits, so its retire is a no-op returning 0. Filtering on
+    // `pool_mode` here would re-derive a predicate the allocator already answers
+    // correctly, and would go wrong for a rule whose mode changed while it still
+    // held live allocations.
+    rules
+        .iter()
+        .map(|rule| rule.pool_allocator.retire_worker(worker_id, now_ns))
+        .sum()
+}
+
 pub(crate) fn release_source_nat_allocation_for_worker(
     // #6751: see `release_source_nat_allocation`.
     iface_allocs: &InterfaceNatAllocators,

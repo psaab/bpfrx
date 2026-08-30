@@ -316,11 +316,26 @@ fn every_runtime_atomic_is_bound_or_knowingly_off_wire_6961() {
         );
     }
 
-    // `dead` is the one non-u64 atomic and IS on the wire; it is bound by
-    // worker_runtime_status_binds_dead_and_panic_message_6961.
+    // Two non-u64 atomics, and the decision for each is recorded here rather
+    // than left to the reader:
+    //
+    //   `dead`            — ON THE WIRE, bound by
+    //                       worker_runtime_status_binds_dead_and_panic_message_6961.
+    //   `holders_retired` — DELIBERATELY OFF THE WIRE (#6979). It is not worker
+    //                       telemetry; it is a one-shot latch saying the NAT
+    //                       holder-bit reclaim for this dead worker has already
+    //                       run, so the 1 Hz sweep does not re-walk every
+    //                       allocator's live_by_flow on every tick. An operator
+    //                       reading status wants `dead` and the panic message;
+    //                       whether the internal reclaim has fired is a
+    //                       coordinator implementation detail, and putting it on
+    //                       the wire would invite it to be read as a second
+    //                       liveness signal. The reclaim's OUTCOME is already
+    //                       observable — the freed ports reappear in the pool
+    //                       allocator's occupancy.
     assert_eq!(
         other_fields,
-        vec!["dead".to_string()],
+        vec!["dead".to_string(), "holders_retired".to_string()],
         "a non-u64 atomic appeared on WorkerRuntimeAtomics. Decide whether it rides the wire \
          and bind it; this assertion exists so a new one cannot slip past the u64 sweep above"
     );

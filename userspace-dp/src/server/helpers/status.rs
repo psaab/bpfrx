@@ -270,6 +270,13 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         .map(|s| s.fabrics.clone())
         .unwrap_or_default();
     state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
+    // #6979: reclaim any NAT holder bits stranded by a worker that panicked and
+    // exited. Driven from this 1 Hz status path because it is the only place
+    // that already observes `dead`, and it is one-shot per worker
+    // (`holders_retired`), so a healthy node pays one relaxed atomic load per
+    // worker per second and nothing else. Called BEFORE the snapshot below so a
+    // reclaim and the status it is reported alongside cannot disagree by a tick.
+    state.afxdp.retire_dead_worker_holders();
     // #869: per-worker busy/idle runtime telemetry.
     state.status.worker_runtime = state.afxdp.worker_runtime_snapshots();
     state.status.session_table_entries = state
