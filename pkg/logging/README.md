@@ -741,6 +741,41 @@ client never reconnects once the receiver returns.
   Junos. The omission is scoped to the close event type only — POLICY_DENY,
   SCREEN_DROP, and FILTER_LOG (the genuine deny/reject paths) still render
   `action`. Golden coverage: `session_close_format_test.go`.
+- **Lifecycle action applicability is ONE predicate, not a per-surface
+  exception (#7531).** The producer writes the wire action byte as 0 for BOTH
+  lifecycle events and says so at each write site — *"a session close has no
+  permit/deny/reject action semantics, so this byte is intentionally 0 … Do NOT
+  rely on the 0 rendering as a value"*, and the same for the open path. The Go
+  side then taught that exception to the formatters one at a time: #2513 for the
+  close text lines, #2593 for the open text lines, #4914 for the binary close
+  record. **Every surface added afterwards inherited the raw `actionName(0)` ==
+  `"deny"` until someone noticed it too** — a four-issue tail for one fact.
+
+  The surfaces that never got their own issue were `EventRecord.Action` itself,
+  which the trace, REST and SSE surfaces all read, and the binary SESSION_OPEN
+  record (#4914 covered only the close). A `deny` on a session CREATE is the
+  more misleading of the two: it reads as a blocked connection attempt rather
+  than an established one.
+
+  `eventCarriesForwardingAction(eventType)` now states the fact once and the
+  surfaces read it. `recordActionName` returns the empty string for a lifecycle
+  event, `formatBinaryRecord` stamps `actionNotApplicable` (0xFF) for both, and
+  the trace OMITS `action=` rather than printing an empty one — an empty field
+  reads as a producer that failed to populate it, a different and more alarming
+  claim than "this event type has no action".
+
+  **Empty rather than a placeholder, deliberately.** `EventRecord.Action` feeds
+  the event-buffer filter (`EventFilter.matches`), so before this an operator
+  filtering `action deny` matched every normal session open and close — the
+  concrete harm, since it makes a deny filter useless on a busy box. A
+  placeholder string would just be a new value to match by accident.
+
+  Applicability is a property of the EVENT TYPE, not of the byte, so a future
+  producer writing a stray non-zero cannot resurrect the claim. Pins:
+  `lifecycle_action_7531_test.go` (both lifecycle types, the non-lifecycle
+  control that must KEEP its decision, the binary sentinel with a POLICY_DENY
+  control, trace omission with a POLICY_DENY control, and the deny-filter
+  behaviour in both directions).
 - **SESSION_OPEN log lines carry no `action` (#2593).** Sibling of #2513
   on the adjacent event: a session open (`RT_FLOW_SESSION_CREATE`) is a
   permit-and-create event, not a forwarding decision, so it has no
