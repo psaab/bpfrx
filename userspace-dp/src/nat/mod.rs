@@ -134,6 +134,10 @@ pub(crate) use source::{
 // #6211 F2: test-only untracked entry points (see their doc comments).
 #[cfg(test)]
 pub(crate) use source::{reserve_synced_source_nat_allocation, rollback_source_nat_allocation};
+pub(crate) use source::retire_worker_from_pool_rules;
+// #6979: reachable from the afxdp coordinator test that binds the retirement
+// wiring; the primitive itself stays covered by nat::tests_pool.
+pub(crate) use allocator::TranslatedTuple;
 pub(crate) use static_nat::{StaticNatEntry, StaticNatTable};
 pub(crate) use status::source_nat_pool_statuses;
 

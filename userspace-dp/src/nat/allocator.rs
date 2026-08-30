@@ -119,9 +119,9 @@ pub(super) struct PersistentSourceKey {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(super) struct TranslatedTuple {
-    pub(super) ip: IpAddr,
-    pub(super) port: u16,
+pub(crate) struct TranslatedTuple {
+    pub(crate) ip: IpAddr,
+    pub(crate) port: u16,
 }
 
 /// #6751: how many PAT candidates one `live`-mutex acquisition may probe
@@ -1156,7 +1156,7 @@ impl PortAllocator {
 
     /// Test-only: is `port` currently occupied on pool address `addr_index`?
     #[cfg(test)]
-    pub(super) fn debug_is_port_occupied(&self, addr_index: usize, port: u16) -> bool {
+    pub(crate) fn debug_is_port_occupied(&self, addr_index: usize, port: u16) -> bool {
         match self.shared.occupancy.get(addr_index) {
             Some(occ) => match occ.offset_of(port) {
                 Some(offset) => occ.is_occupied(offset),
@@ -1906,19 +1906,24 @@ impl PortAllocator {
     /// ever claimed; `bit & 0 == 0`, so the filter below skips it and no
     /// `Untracked` allocation can be freed by a retirement it never joined.
     ///
-    /// NOT WIRED YET, and that is stated rather than implied: this PR lands the
-    /// reclaim operation and the invariant that makes it sound; nothing calls it
-    /// on a production path, so **#7092's leak is not closed by this change
-    /// alone**. Choosing the call site is its own decision with its own hazard —
-    /// `coordinator/status.rs` has both `forwarding.iface_nat_allocators` and the
-    /// `.dead` flag in scope, but retiring from the 1 Hz status tick would walk
-    /// `live_by_flow` under the alloc mutex on every tick unless it also carries
-    /// "already retired" state, and the replan path that retires ids
-    /// deterministically does not hold the allocator. Landing the primitive
-    /// first mirrors how #6765 split its re-seed primitive from wiring it into
-    /// both rebuild sites.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn retire_worker(&self, worker_id: u32, now_ns: u64) -> usize {
+    /// WIRED SINCE #6979, for the PANIC route only. The call site is the 1 Hz
+    /// status tick, which this doc previously named as the candidate with a
+    /// hazard: it "would walk `live_by_flow` under the alloc mutex on every tick
+    /// unless it also carries 'already retired' state". It now carries exactly
+    /// that -- `WorkerRuntimeAtomics::holders_retired`, a one-shot
+    /// compare-and-swap -- so the sweep runs ONCE per dead worker and every
+    /// later tick pays one relaxed atomic load per record and stops.
+    ///
+    /// THE REPLAN ROUTE IS STILL NOT COVERED, and that is stated rather than
+    /// implied. `worker_id` is minted as `queue_id % workers`
+    /// (`server/helpers/planning.rs`), so a plan that SHRINKS the worker set
+    /// retires ids that still hold bits, and the allocator is carried across the
+    /// reload by `parse_source_nat_rules_with_previous` so the bits survive with
+    /// it. That route sets NO flag -- not `dead`, not anything -- so there is no
+    /// signal for this sweep to react to, and the plan-application path that
+    /// knows the retired ids does not hold the allocator. Closing it needs a
+    /// signal that does not exist yet, which is why it is not in #6979.
+    pub(crate) fn retire_worker(&self, worker_id: u32, now_ns: u64) -> usize {
         // An id too wide for the mask never SET a bit, so it holds nothing to
         // clear. Checked HERE rather than through `NatHolder::bit()`, whose
         // `debug_assert!` would fire on the very id this arm exists to tolerate.
@@ -2372,7 +2377,7 @@ impl PortAllocator {
         matches!((port as u32).checked_sub(occ.port_low as u32), Some(o) if o < occ.range)
     }
 
-    pub(super) fn reserve_flow(
+    pub(crate) fn reserve_flow(
         &self,
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,

@@ -1642,6 +1642,20 @@ impl Nat64State {
 
     /// Check if an IPv6 destination matches any NAT64 prefix.
     /// Returns (prefix_index, extracted_ipv4_dest) on match.
+    /// #6979: clear `worker_id`'s holder bit across every NAT64 prefix
+    /// allocator, freeing any record the clear empties. Returns records freed.
+    ///
+    /// The NAT64 half of the retirement sweep. Each `Nat64Prefix` owns its OWN
+    /// `port_allocator`, so a stopped worker's bits are stranded per prefix and
+    /// every prefix has to be swept -- the same reason the standby reserve had
+    /// to stop guessing which prefix a synced flow belonged to (#6892).
+    pub(crate) fn retire_worker(&self, worker_id: u32, now_ns: u64) -> usize {
+        self.prefixes
+            .iter()
+            .map(|prefix| prefix.port_allocator.retire_worker(worker_id, now_ns))
+            .sum()
+    }
+
     pub(crate) fn match_ipv6_dest(&self, dst: Ipv6Addr) -> Option<(usize, Ipv4Addr)> {
         let octets = dst.octets();
         for (idx, prefix) in self.prefixes.iter().enumerate() {

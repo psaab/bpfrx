@@ -117,6 +117,27 @@ pub(crate) struct InterfaceNatAllocators {
 }
 
 impl InterfaceNatAllocators {
+    /// #6979: clear `worker_id`'s holder bit across every interface-mode
+    /// allocator, freeing any record the clear empties. Returns records freed.
+    ///
+    /// The per-allocator primitive (`PortAllocator::retire_worker`, #7092)
+    /// landed sound but UNWIRED — its own doc says so — because choosing the
+    /// call site was left as a separate decision. This is the interface-mode
+    /// half of that wiring; the pool-mode and NAT64 halves are the sibling
+    /// sweeps in `nat::retire_worker_from_pool_rules` and
+    /// `Nat64State::retire_worker`.
+    ///
+    /// Read lock, not write: retirement mutates each allocator's OWN state
+    /// through its interior mutex and never touches this map's shape, so it
+    /// must not serialise against the new-flow admission path that
+    /// `allocator_for`'s read fast path exists to keep clear.
+    pub(crate) fn retire_worker(&self, worker_id: u32, now_ns: u64) -> usize {
+        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .map(|alloc| alloc.retire_worker(worker_id, now_ns))
+            .sum()
+    }
+
     /// Resolve (creating on first use) the allocator that owns `egress`'s
     /// identity space.
     ///

@@ -919,6 +919,69 @@ impl super::Coordinator {
     /// the worker's runtime record (`rec.panic`) alongside its handle — the
     /// former cross-map join (`handles.iter()` + `worker_panics.get(id)`)
     /// collapses into a single record read.
+    /// #6979: reclaim the NAT holder bits of every worker that has died and not
+    /// yet been retired. Returns the number of allocator records freed.
+    ///
+    /// THE LEAK. A holder bit is set on reserve and cleared only when that same
+    /// worker runs its own release. `spawn_supervised_worker` catches a
+    /// `worker_loop` panic, sets `dead`, and lets the thread exit; nothing
+    /// respawns it, so its `SessionTable` dies with it and its reservations are
+    /// stranded for the life of the allocator. There is no TTL and no reconcile
+    /// that clears them, so those pool ports never come back and SNAT for new
+    /// flows eventually fails `AllocatorExhausted`.
+    ///
+    /// `PortAllocator::retire_worker` (#7092) landed sound but unwired,
+    /// explicitly deferring the call-site choice because retiring from this 1 Hz
+    /// tick "would walk `live_by_flow` under the alloc mutex on every tick
+    /// unless it also carries 'already retired' state". `holders_retired` is
+    /// that state: a one-shot compare_exchange, so a dead worker is swept once
+    /// and every later tick pays one relaxed load per record.
+    ///
+    /// SCOPE, stated rather than implied: this covers the PANIC route only. The
+    /// REPLAN route -- a plan that shrinks the worker set retires ids that still
+    /// hold bits, while `parse_source_nat_rules_with_previous` carries the
+    /// allocator across the reload -- sets no flag at all, so there is nothing
+    /// here to react to. It is not fixed by this change.
+    pub(crate) fn retire_dead_worker_holders(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        // Sourced here rather than passed in: the only caller is the status
+        // path, which has no clock of its own, and threading one through would
+        // make the timestamp a caller's choice for a reclaim whose correctness
+        // does not depend on it (retire_worker uses it only to stamp freed
+        // records, never to decide what to free).
+        let now_ns = crate::afxdp::wg::counters::monotonic_now_ns();
+        let mut freed = 0;
+        for (worker_id, rec) in self.workers.records.iter() {
+            let atomics = &rec.handle.runtime_atomics;
+            if !atomics.dead.load(Ordering::Relaxed) {
+                continue;
+            }
+            // One-shot: the loser of a race does not sweep, so the walk happens
+            // exactly once no matter how many tickers observe the death.
+            if atomics
+                .holders_retired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            let id = *worker_id;
+            freed += self.forwarding.iface_nat_allocators.retire_worker(id, now_ns);
+            freed += crate::nat::retire_worker_from_pool_rules(
+                &self.forwarding.source_nat_rules,
+                id,
+                now_ns,
+            );
+            freed += self.forwarding.nat64.retire_worker(id, now_ns);
+            if freed > 0 {
+                eprintln!(
+                    "xpf-dp: reclaimed {freed} NAT reservation(s) stranded by dead worker {id}"
+                );
+            }
+        }
+        freed
+    }
+
     pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
         self.workers
             .records

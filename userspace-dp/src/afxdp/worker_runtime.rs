@@ -262,6 +262,19 @@ pub(crate) struct WorkerRuntimeAtomics {
     /// `#[repr(align(64))]` rounding; cost is negligible (a few hundred
     /// bytes total across all workers).
     pub dead: AtomicBool,
+    /// #6979: has this worker's NAT holder bits already been reclaimed?
+    ///
+    /// A one-shot latch, not a second liveness flag. `dead` says the worker will
+    /// never run another release; this says the sweep that acts on that has
+    /// already run. Without it the retirement would repeat on every 1 Hz status
+    /// tick, walking `live_by_flow` under each allocator's mutex forever — the
+    /// exact hazard `PortAllocator::retire_worker`'s doc named as the reason its
+    /// call site was left unchosen.
+    ///
+    /// Set with `compare_exchange`, so concurrent tickers cannot both sweep.
+    /// Never cleared: a respawn would replace the whole `WorkerRuntimeAtomics`,
+    /// which is how `dead` is already specified to reset.
+    pub holders_retired: AtomicBool,
     /// Cacheline padding after the atomics so that adjacent workers in
     /// a `Vec<WorkerRuntimeAtomics>` don't false-share.
     _pad: [u8; 0],
@@ -306,6 +319,7 @@ impl WorkerRuntimeAtomics {
             window_gen: AtomicU64::new(0),
             tid: AtomicU64::new(0),
             dead: AtomicBool::new(false),
+            holders_retired: AtomicBool::new(false),
             _pad: [],
         }
     }

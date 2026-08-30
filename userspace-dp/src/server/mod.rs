@@ -10,7 +10,9 @@
 mod handlers;
 pub(crate) mod helpers;
 pub(crate) mod lifecycle;
-mod state;
+// #6979: pub(crate) so the coordinator test can build a ServerState and drive
+// refresh_status, binding the retirement CALL SITE rather than the function.
+pub(crate) mod state;
 
 #[cfg(test)]
 mod tests;
