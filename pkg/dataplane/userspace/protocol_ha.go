@@ -126,6 +126,38 @@ type SessionSyncRequest struct {
 	RTFlowSessionID uint64 `json:"session_id,omitempty"`
 }
 
+// SessionDeltaInfo is the HA session-open/close delta as it reaches this
+// daemon. ONE Go struct serves BOTH transports (#7194):
+//
+//   - the BINARY open frame (userspace-dp event_stream/codec/session_sync.rs),
+//     decoded by decodeSessionEvent in eventstream.go. Positional little-endian
+//     bytes behind a length prefix and NO version field; trailing fields are
+//     tolerated by per-field length gates, so a decoder can only survive fields
+//     appended at the TAIL.
+//   - the JSON RPC-fallback delta (userspace-dp protocol/binding.rs
+//     SessionDeltaInfo), drained every 100ms while the binary stream is down and
+//     every 5s as reconciliation while it is up, plus every helper-requested
+//     FullResync export.
+//
+// Both legs come from the SAME helper process, so they share its schema.
+//
+// The transports are kept equivalent by two artefacts, and it is worth being
+// precise about which does what, because one is build-time and one is runtime:
+//
+//   - session_delta_transport_parity_7194_test.go (#8043) compares the Rust
+//     JSON producer's wire names against this struct's json tags. It is a
+//     BUILD-TIME check between two source trees. It cannot see what a RUNNING
+//     helper actually carries.
+//   - the DERIVED schema fingerprint (session_delta_schema.go, #7194) is the
+//     RUNTIME half: the helper advertises a hash of its own wire-name set on
+//     ProcessStatus, and a mismatch withholds the sync instead of installing a
+//     record whose zeros mean "field not carried" rather than "no value".
+//
+// The second exists because a zero is ambiguous at the consumer: policy_id 0
+// means BOTH "no policy attribution" and "this producer does not carry the
+// field". #5865 shipped five such fields on the binary leg and not the JSON
+// leg, and #5212 -> #6312 shipped rt_flow_session_id one issue apart, each
+// without a version bump — because there was no version to bump.
 type SessionDeltaInfo struct {
 	Timestamp   time.Time `json:"timestamp"`
 	Slot        uint32    `json:"slot"`

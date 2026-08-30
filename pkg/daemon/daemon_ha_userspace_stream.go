@@ -644,6 +644,12 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 	if ss == nil {
 		return 0
 	}
+	// #7194 fail-closed gate. This is the ONE chokepoint all three producers
+	// funnel through -- the binary event stream, the JSON drain fallback, and
+	// the FullResync export -- so gating here covers every leg with one check.
+	if !d.userspaceDeltaSchemaAdmits(len(deltas)) {
+		return 0
+	}
 	return d.walkUserspaceSessionDeltas(ss, zoneIDs, deltas, queueDeltaSink{ss: ss})
 }
 
@@ -658,10 +664,15 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 	zoneIDs := buildZoneIDs(cfg)
 	total := 0
 	for batch := 0; batch < maxBatches; batch++ {
-		deltas, _, err := drainer.DrainSessionDeltas(256)
+		deltas, status, err := drainer.DrainSessionDeltas(256)
 		if err != nil {
 			return total, err
 		}
+		// #7194: the drain already carries the helper's ProcessStatus; record
+		// the advertised delta-schema fingerprint so the consumption gate can
+		// see it. Also reached while the binary stream is UP, because the
+		// fallback loop still reconciles over JSON every 5s.
+		d.recordUserspaceDeltaSchema(status.SessionDeltaSchemaFingerprint)
 		if len(deltas) == 0 {
 			break
 		}

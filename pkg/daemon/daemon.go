@@ -114,6 +114,25 @@ type Daemon struct {
 	// not proof of an armed forwarding path.
 	dataplaneArmed atomic.Bool
 
+	// #7194: last session-delta schema fingerprint advertised by the RUNNING
+	// helper, recorded from the ProcessStatus that DrainSessionDeltas returns.
+	// 0 == never observed / helper predates the field, which
+	// CompareSessionDeltaSchema treats as unknown-and-deferred.
+	//
+	// It is read on the delta consumption chokepoint, so a helper whose delta
+	// schema is not this binary's cannot install records whose zeros mean
+	// "field not carried" rather than "no value".
+	userspaceDeltaSchemaFP atomic.Uint64
+	// userspaceDeltaSchemaLogged dampens the mismatch warning to once per
+	// episode. Fail-closed must be LOUD, but a per-batch log at 100ms drain
+	// cadence would flood the ring buffer and bury the one line that matters
+	// (the #4958 hot path runs this per batch).
+	userspaceDeltaSchemaLogged atomic.Bool
+	// userspaceDeltaSchemaWithheld counts delta batches refused by the #7194
+	// gate. Withholding silently would replace a silent zero-fill with a
+	// silently dead HA sync, which is worse; this is the observable.
+	userspaceDeltaSchemaWithheld atomic.Uint64
+
 	networkd *networkd.Manager
 	routing  *routing.Manager
 	frr      *frr.Manager

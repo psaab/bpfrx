@@ -2038,6 +2038,58 @@ These deltas are **not** blindly mirrored. Filtering in
 - if the delta carries `OwnerRGID`, ownership is checked with `IsPrimaryForRGFn`
 - otherwise the fallback is `ShouldSyncZone(ingressZone)`
 
+## Session-delta schema identity (#7194)
+
+The two session-open transports — the binary open frame and the JSON
+RPC-fallback delta — are kept equivalent by two artefacts with different reach.
+
+**Build time.** `session_delta_transport_parity_7194_test.go` (#8043) compares
+the Rust JSON producer's wire names against the Go consumer's json tags, in both
+directions, with the Rust struct located by brace counting and both extractions
+carrying an anti-vacuity floor. It compares WIRE names, not field names, because
+a `serde(rename)` drift breaks the wire while leaving both field names alone.
+
+That test is a tripwire between two source trees. It cannot see what a RUNNING
+helper carries.
+
+**Run time.** The helper advertises a DERIVED fingerprint of its own
+session-delta wire schema on `ProcessStatus.session_delta_schema_fingerprint`
+(`userspace-dp/src/protocol/session_delta_schema.rs`), and the daemon compares
+it against its own (`pkg/dataplane/userspace/session_delta_schema.go`).
+
+It is derived, not a hand-maintained integer, because a constant someone must
+remember to bump inherits exactly the discipline that already failed three
+times: the five #5865 fields and #6312's `rt_flow_session_id` all shipped
+divergent with no version bump, since the session-delta schema had no version at
+all. The fingerprint is computed FROM the serialized shape — serializing a
+default record on the Rust side, reflecting json tags on the Go side — so adding,
+removing or renaming a wire field changes it whether or not anyone remembers.
+
+Canonical form on both sides: wire names, sorted ascending as byte strings,
+joined with `\n`, no trailing newline, FNV-1a/64. Neither implementation is
+pinned to the other's output; both are pinned to the published FNV-1a vectors,
+so agreement is a consequence of both being correct rather than of one having
+been copied.
+
+**The gate is three-state**, and the middle state is the point:
+
+| advertised | verdict | action |
+|---|---|---|
+| `0` (or never observed) | unknown | PERMIT — helper predates the field; the snapshot-protocol gates already fence a genuinely old helper. Refusing here would be a brick, not a fence (#1960). |
+| equal to the daemon's | match | proceed |
+| anything else | mismatch | WITHHOLD the delta batch |
+
+Enforcement sits on `queueUserspaceSessionDeltas`, the single chokepoint all
+three producers funnel through (binary stream, JSON drain, FullResync export),
+so one check covers every leg.
+
+**The refusal is loud on purpose.** Withholding quietly would trade a silent
+zero-fill for a silently dead HA sync — the standby would stop receiving
+sessions and a failover would find nothing there, which is worse than the bug
+being fixed. A mismatch warns once per episode (the drain runs at 100ms while
+the stream is down) and increments a withheld-batch counter; the warning re-arms
+when the schema recovers, so a second episode is not swallowed by the first.
+
 The filtering fields on `SessionDeltaInfo` are `FabricRedirect` and
 `FabricIngress` (boolean flags), not a single combined field.
 

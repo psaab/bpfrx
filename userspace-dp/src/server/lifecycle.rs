@@ -186,6 +186,8 @@ pub(crate) fn run() -> Result<(), String> {
             pid: std::process::id() as i32,
             config_snapshot_protocol_version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
             inject_packet_tuple_protocol_version: INJECT_PACKET_TUPLE_PROTOCOL_VERSION,
+            session_delta_schema_fingerprint:
+                crate::protocol::session_delta_schema::session_delta_schema_fingerprint(),
             started_at: Utc::now(),
             control_socket: args.control_socket.clone(),
             state_file: args.state_file.clone(),

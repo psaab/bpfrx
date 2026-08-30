@@ -34,6 +34,7 @@ mod cos;
 mod nat;
 mod resolution;
 mod security;
+pub(crate) mod session_delta_schema;
 pub(crate) mod snapshot;
 
 #[cfg(test)]
