@@ -376,9 +376,41 @@ func marshalEnvelope(env encryptedTreeEnvelope) ([]byte, error) {
 }
 
 func unmarshalEnvelope(data []byte) (encryptedTreeEnvelope, bool, error) {
+	// #7454: decide envelope-ness by KEY PRESENCE, before the typed decode.
+	//
+	// The guard below fails closed on an envelope-shaped body whose
+	// discriminator we do not support (#4888) — but it sits AFTER this
+	// unmarshal, and this unmarshal used to swallow every error as "not the
+	// envelope shape at all". That comment is true for a SYNTAX error. It is
+	// not true for a *json.UnmarshalTypeError: a perfectly good JSON object,
+	// with the right keys, one of them carrying the wrong JSON TYPE
+	// (`"salt": 5`, `"data": null`, `"format": []`) landed in the same branch
+	// and passed through as PLAINTEXT — never reaching the fail-closed test.
+	//
+	// Downstream, json.Unmarshal then drops the unknown fields and decodes an
+	// EMPTY ConfigTree, Store.Load compiles it, and the daemon boots with NO
+	// POLICY reporting success. The #4579 plaintext-downgrade warning does not
+	// fire either: it keys on masterPasswordPRF(tree) != "" and the tree is
+	// empty. Completely silent — and the exact outcome #4888's comment names as
+	// the thing it exists to prevent, reached by the branch in front of it.
+	//
+	// KEY PRESENCE is used rather than discriminating the error type, because it
+	// is strictly stronger and carries no over-rejection risk here: the
+	// plaintext body written by writeTreeMarked is `json.MarshalIndent(tree)` of
+	// a config.ConfigTree, whose ONLY top-level key is "Children". None of the
+	// five envelope keys can appear in a genuine plaintext body. So any body
+	// carrying one was MEANT to be an envelope, and a decode failure on it is
+	// corruption, whatever its shape — a wrong type, a null, an array.
+	envKeys := envelopeKeysPresent(data)
+
 	type alias encryptedTreeEnvelope
 	var env alias
 	if err := json.Unmarshal(data, &env); err != nil {
+		if len(envKeys) > 0 {
+			return encryptedTreeEnvelope{}, false, fmt.Errorf(
+				"corrupted encrypted config envelope: %w (envelope fields present: %s)",
+				err, strings.Join(envKeys, ", "))
+		}
 		// Not JSON, or not the envelope object shape at all — a genuine
 		// plaintext (pre-encryption / legacy) config body. Pass through.
 		return encryptedTreeEnvelope{}, false, nil
@@ -404,6 +436,30 @@ func unmarshalEnvelope(data []byte) (encryptedTreeEnvelope, bool, error) {
 		return encryptedTreeEnvelope{}, false, fmt.Errorf("invalid encrypted config envelope")
 	}
 	return encryptedTreeEnvelope(env), true, nil
+}
+
+// envelopeKeysPresent returns the encrypted-envelope field names present at the
+// top level of a JSON object body, sorted; nil when the body is not a JSON
+// object at all (#7454).
+//
+// It answers "was this MEANT to be an envelope", which is a different question
+// from "does it decode as one" — and it is the question that matters, because a
+// body that was meant to be an envelope and does not decode is corrupt, not
+// plaintext. Deliberately tolerant of a body that is not an object: `null`, an
+// array, a scalar or garbage keeps the existing plaintext-passthrough
+// behaviour, which the acceptance criteria require unchanged.
+func envelopeKeysPresent(data []byte) []string {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil
+	}
+	var present []string
+	for _, k := range []string{"data", "format", "nonce", "prf", "salt"} {
+		if _, ok := probe[k]; ok {
+			present = append(present, k)
+		}
+	}
+	return present
 }
 
 func deriveEncryptionKey(keyMaterial []byte, prf string) ([]byte, []byte, error) {
