@@ -167,7 +167,9 @@ func (vi *vrrpInstance) receiver() {
 		}
 
 		// Filter self-sent packets (RFC 5798 §6.4.2/6.4.3).
-		if lip := vi.getLocalIP(); lip != nil && hdr.Src.Equal(lip) {
+		// #7334: the SET, not the one selected send source. A self-advert sent
+		// from address A bypassed this once the selection moved to B.
+		if vi.isLocalAddr(hdr.Src) {
 			continue
 		}
 
@@ -283,7 +285,8 @@ func (vi *vrrpInstance) receiverIPv6() {
 		}
 
 		// Filter self-sent packets.
-		if lip6 := vi.getLocalIPv6(); lip6 != nil && srcIP != nil && srcIP.Equal(lip6) {
+		// #7334: the SET, not the one selected link-local.
+		if srcIP != nil && vi.isLocalAddr(srcIP) {
 			continue
 		}
 
@@ -384,7 +387,8 @@ func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
 	copy(srcIP, ip[12:16])
 
 	// Filter self-sent packets.
-	if lip := vi.getLocalIP(); lip != nil && srcIP.Equal(lip) {
+	// #7334: see isLocalAddr — the address SET, failing open when unresolved.
+	if vi.isLocalAddr(srcIP) {
 		return
 	}
 
@@ -430,7 +434,8 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 	copy(srcIP, ip6[8:24])
 
 	// Filter self-sent packets.
-	if lip6 := vi.getLocalIPv6(); lip6 != nil && srcIP.Equal(lip6) {
+	// #7334: see isLocalAddr.
+	if vi.isLocalAddr(srcIP) {
 		return
 	}
 

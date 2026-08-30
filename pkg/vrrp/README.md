@@ -876,12 +876,37 @@ An unclassifiable sockaddr **fails open** (treated as not-outgoing).
 Dropping a frame we cannot classify would be a self-inflicted
 master-down, which is strictly worse than the bug being fixed.
 
-**Not addressed here.** `resolveLocalIPv4` selects ONE address (the
-lowest non-VIP), not the interface's address SET, so a self-advert sent
-from address A also bypasses the comparison once the selected source has
-become B. That residual is narrower than it looks now that the two
-delivery paths above are suppressed, and it is tracked separately rather
-than folded in.
+**The residual #6560 named is closed by #7334.** `resolveLocalIPv4` selects ONE
+address (the lowest non-VIP), so a self-advert sent from address A bypassed the
+comparison once the selected source had become B — a NON-nil snapshot that still
+fails. `resolveEqualPriorityMaster` then compared `peerCmp` (our own OLD source
+A) against `localCmp` (our own NEW source B) and stepped down whenever `A > B`:
+a coin flip, and a self-inflicted master-down.
+
+The four receive-path self-checks now consult `isLocalAddr`, which tests
+membership in the interface's full non-VIP **address set** for the frame's
+family. **The selection and the set are different things, deliberately:**
+
+- the SEND source stays one deterministic address (the lowest), so it does not
+  flip on unrelated secondary-address churn — that is #2528's whole point;
+- the self-CHECK must recognise every address we might have sent from,
+  including one the selection has since moved off.
+
+Both are recomputed from a single `reresolveLocalAddrs` read, so the set can
+never lag the selection.
+
+**It fails OPEN on an unresolved set**, matching the posture #6560 established.
+An empty set is exactly the #2528 RETH-MAC flush window — `programRethMAC` does
+link DOWN, set MAC, UP, and DOWN flushes every kernel address. A frame we cannot
+classify must still be able to be a peer's advert; dropping it would be the
+self-inflicted master-down the change exists to prevent, so the fix's failure
+direction is bounded by the same rule as the bug's.
+
+The alternative #7334 lists — comparing the frame's source MAC against
+`vi.iface.HardwareAddr` on the AF_PACKET path — was not taken. It covers only
+that one path, whereas the address set covers all four call sites including the
+raw-socket receivers, and it would introduce an L2 identity the package
+currently does not use at all.
 
 The manager now runs a singleton ADDRESS-watcher (`addrwatch.go`,
 `runAddrWatcher`) subscribed via `netlink.AddrSubscribe`. On any address

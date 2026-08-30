@@ -146,6 +146,11 @@ func (vi *vrrpInstance) reresolveLocalAddrs() {
 	vipSet := vi.vipAddrSet()
 	vi.setLocalIP(vi.resolveLocalIPv4(vipSet))
 	vi.setLocalIPv6(vi.resolveIPv6LinkLocal(vipSet))
+	// #7334: the self-check's address SET, taken from the same re-resolve so
+	// it can never lag the send-source selection.
+	v4Set, v6Set := vi.resolveLocalAddrSets(vipSet)
+	vi.setLocalAddrSet(false, v4Set)
+	vi.setLocalAddrSet(true, v6Set)
 }
 
 // resolveIPv6LinkLocal deterministically selects the lowest non-VIP
@@ -182,4 +187,125 @@ func (vi *vrrpInstance) resolveIPv6LinkLocal(vipSet map[string]bool) net.IP {
 		return bytes.Compare(candidates[i], candidates[j]) < 0
 	})
 	return candidates[0]
+}
+
+// THE SELECTION AND THE SET ARE DIFFERENT THINGS (#7334).
+//
+// localIP/localIPv6 are the SEND source and must stay a single deterministic
+// choice (the lowest non-VIP), so the advert source is stable across unrelated
+// secondary-address churn — that is #2528's whole point.
+//
+// But the receive-path self-CHECK compared an incoming frame's source against
+// that one selected value, so a self-advert sent from address A bypassed the
+// check once the selection had moved to B. resolveEqualPriorityMaster then
+// compared our own OLD source A against our own NEW source B and stepped down
+// whenever A > B: a coin flip, and a self-inflicted master-down. The check needs
+// every address we might have sent from, including one the selection has since
+// moved off.
+//
+// Both are recomputed from a single reresolveLocalAddrs read, so the set can
+// never lag the selection.
+
+// getLocalAddrSet returns the snapshot of every non-VIP address of `family`
+// currently on the interface, as canonical strings (#7334). Nil/empty means
+// UNRESOLVED, and every caller must fail OPEN on it.
+func (vi *vrrpInstance) getLocalAddrSet(v6 bool) []string {
+	p := vi.localAddrSet.Load()
+	if v6 {
+		p = vi.localAddrSetV6.Load()
+	}
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// setLocalAddrSet atomically stores the address-set snapshot for a family.
+func (vi *vrrpInstance) setLocalAddrSet(v6 bool, set []string) {
+	target := &vi.localAddrSet
+	if v6 {
+		target = &vi.localAddrSetV6
+	}
+	if len(set) == 0 {
+		target.Store(nil)
+		return
+	}
+	target.Store(&set)
+}
+
+// isLocalAddr reports whether ip is one of OUR addresses on this interface
+// (#7334).
+//
+// FAILS OPEN on an unresolved set, matching the posture #6560 established: a
+// frame we cannot classify must still be able to be a peer's advert, and
+// dropping it would be a self-inflicted master-down — strictly worse than the
+// bug being fixed. An unresolved set is exactly the #2528 RETH-MAC flush
+// window, when programRethMAC's link DOWN has removed every kernel address.
+//
+// This is the SET, not the selected send source. The selection is deliberately
+// one deterministic address so the advert source stays stable; the self-check
+// must recognise every address we might have sent from, including one the
+// selection has since moved off.
+func (vi *vrrpInstance) isLocalAddr(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	v6 := ip.To4() == nil
+	set := vi.getLocalAddrSet(v6)
+	if len(set) == 0 {
+		return false // unresolved -> fail open (not ours -> do not drop)
+	}
+	want := canonicalVRRPAddr(ip)
+	i := sort.SearchStrings(set, want)
+	return i < len(set) && set[i] == want
+}
+
+// canonicalVRRPAddr renders an address for set membership: a v4-in-v6 form must
+// match a snapshot taken as 4 bytes, since the receive path can hand either
+// representation.
+//
+// The explicit To4() is BELT-AND-BRACES over net.IP.String(), which already
+// performs the same check internally — so a mutation removing it is INERT
+// rather than uncovered, and that is worth saying here so the next reader does
+// not delete it, see nothing red, and conclude the canonicalisation is
+// untested. It is kept because the intent ("normalise the family
+// representation") should be visible at this call site rather than inferred
+// from the standard library's implementation.
+func canonicalVRRPAddr(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
+}
+
+// resolveLocalAddrSets recomputes both family address sets from the
+// interface's CURRENT kernel addresses (#7334). Called from
+// reresolveLocalAddrs alongside the send-source selection, so the set and the
+// selection are always taken from the same read.
+func (vi *vrrpInstance) resolveLocalAddrSets(vipSet map[string]bool) (v4, v6 []string) {
+	addrs, err := vi.interfaceAddrs()
+	if err != nil {
+		return nil, nil
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		if ip4 := ipNet.IP.To4(); ip4 != nil {
+			if vipSet[ip4.String()] {
+				continue
+			}
+			v4 = append(v4, ip4.String())
+			continue
+		}
+		ip := ipNet.IP
+		if ip == nil || vipSet[ip.String()] {
+			continue
+		}
+		v6 = append(v6, ip.String())
+	}
+	sort.Strings(v4)
+	sort.Strings(v6)
+	return v4, v6
 }
