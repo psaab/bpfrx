@@ -366,10 +366,10 @@ func TestSessionPairOversizedGroupFallsBack_5698(t *testing.T) {
 		reqs[i] = SessionSyncRequest{Operation: "upsert", AddrFamily: dataplane.AFInet}
 	}
 	m.mu.Lock()
-	err := m.syncSessionPairLocked(reqs...)
+	res := m.syncSessionPairLocked(reqs...)
 	m.mu.Unlock()
-	if err != nil {
-		t.Fatalf("oversized group returned %v; the fallback must still transmit", err)
+	if res.firstErr != nil {
+		t.Fatalf("oversized group returned %v; the fallback must still transmit", res.firstErr)
 	}
 
 	r.mu.Lock()
