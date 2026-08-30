@@ -27,11 +27,18 @@ fn key(src_port: u16) -> SessionKey {
     }
 }
 
+/// #7212: `ingress_ifindex` is `IF_A` for a FORWARD entry and `0` for a reverse
+/// companion, matching production (#4983: the reverse half's ingress is
+/// unobserved at install). Those are the two values a hypothetical
+/// stamp-at-install would use, so the cells below assert staleness against
+/// exactly them — a fixture that stamped one value and probed another would
+/// report "stale" for the wrong reason and stay green against an install that
+/// DOES stamp.
 fn metadata(is_reverse: bool) -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
-        ingress_ifindex: 0,
+        ingress_ifindex: if is_reverse { 0 } else { IF_A as u32 },
         ingress_vlan_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
@@ -98,12 +105,31 @@ fn install_leaves_the_entry_unvalidated_7212() {
     let k = key(49152);
     install(&mut table, &k, false);
 
+    // `IF_A` is the metadata's own `ingress_ifindex`, so this is the exact
+    // (generation, ingress) pair an install that stamped LIVE would write. A
+    // probe on any OTHER interface would be stale either way and would let such
+    // an install through.
     assert!(
         table.filter_revalidation_stale(&k, IF_A),
-        "a fresh install carries no verdict, so its next packet must derive one"
+        "a fresh FORWARD install carries no verdict, so its next packet must \
+         derive one"
     );
     table.mark_filter_revalidated(&k, IF_A);
     assert!(!table.filter_revalidation_stale(&k, IF_A));
+
+    // The REVERSE companion is the half that matters most: its ingress is
+    // unobserved at install (`ingress_ifindex == 0`), so a live stamp there
+    // would claim a filter judged a direction no filter has seen. Probe on `0`,
+    // the value such a stamp would carry.
+    let mut rev = key(49153);
+    std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
+    std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
+    install(&mut table, &rev, true);
+    assert!(
+        table.filter_revalidation_stale(&rev, 0),
+        "a fresh REVERSE install carries no verdict either — its ingress was \
+         not observed, so nothing has judged it"
+    );
 }
 
 /// A generation bump makes a revalidated session stale again. Without this the

@@ -170,11 +170,15 @@ fn meta(ingress_ifindex: u32, vlan: u16, v6: bool) -> UserspaceDpMeta {
     }
 }
 
+/// #7212: `ingress_ifindex` is `LAN_IFINDEX`, the interface the cells then probe
+/// against, so it is the exact `(generation, ingress)` pair an install that
+/// stamped LIVE would write. Probing a DIFFERENT interface would report stale
+/// for the wrong reason and stay green against such an install.
 fn metadata() -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
-        ingress_ifindex: 0,
+        ingress_ifindex: LAN_IFINDEX as u32,
         ingress_vlan_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
