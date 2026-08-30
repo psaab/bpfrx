@@ -185,6 +185,19 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	// peer-synced config still boots — #1960). Runs on the fully-compiled
 	// *Config so the community map is populated regardless of authoring order.
 	// Mirrors validateRoutingExportReferencesStrict.
+	// #7471 as-path REFERENCE gate. Strict on commit / commit-check, lenient on
+	// the tolerant ingress. Separate from the community gate above because the
+	// CONSEQUENCE is opposite: a dangling community makes frr-reload fail
+	// loudly, a dangling as-path is accepted by FRR and silently never matches.
+	if err := validatePolicyASPathReferencesStrict(cfg); err != nil {
+		if opts.lenientPolicyASPathRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy as-path reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	if err := validatePolicyCommunityReferencesStrict(cfg); err != nil {
 		if opts.lenientPolicyCommunityRef {
 			cfg.Warnings = append(cfg.Warnings,

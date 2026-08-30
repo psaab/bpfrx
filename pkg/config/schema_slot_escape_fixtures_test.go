@@ -108,6 +108,13 @@ var slotEscPolicyOptions = []string{
 	"set policy-options community C1 members 65000:1",
 }
 
+// slotEscPolicyOptionsASPath adds the as-path definition the #7471 reference
+// gate requires, so the `good` value commits clean and the row measures the
+// SLOT ESCAPE rather than the reference gate.
+var slotEscPolicyOptionsASPath = append(append([]string{}, slotEscPolicyOptions...),
+	`set policy-options as-path AP1 "^65000 "`,
+)
+
 var slotEscBGP = append(append([]string{}, slotEscPolicyOptions...),
 	"set routing-options autonomous-system 65000",
 	"set protocols bgp group G type external",
@@ -328,6 +335,14 @@ func slotEscapeRows() []slotEscapeRow {
 		{"policy-statement from community", "policy-options policy-statement <*> term <*> from community",
 			slotEscPolicyOptions,
 			"set policy-options policy-statement PS term t1 from community", "C1", "zznotdefined"},
+		// #7471: `from as-path` became definedness-gated
+		// (validatePolicyASPathReferencesStrict), so it now has a
+		// reject-a-dangling-name verdict to record, exactly like `from
+		// community` above. Before that gate it committed anything and this
+		// census had nothing to classify.
+		{"policy-statement from as-path", "policy-options policy-statement <*> term <*> from as-path",
+			slotEscPolicyOptionsASPath,
+			"set policy-options policy-statement PS term t1 from as-path", "AP1", "zznotdefined"},
 		{"bgp import", "protocols bgp import", slotEscBGP,
 			"set protocols bgp import", "PS", "zznotdefined"},
 		{"bgp group neighbor import", "protocols bgp group <*> neighbor <*> import", slotEscBGP,

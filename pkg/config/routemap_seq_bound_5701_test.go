@@ -126,15 +126,23 @@ func TestPolicyRouteMapSequenceBound_GateDirect_5701(t *testing.T) {
 // oversized policy, so the reject assertion fires RED.
 func TestPolicyRouteMapSequenceBound_CompileReject_5701(t *testing.T) {
 	// 82 prefix-lists x 82 as-paths in ONE term = 6724 sequences > the 6552
-	// ceiling. `from prefix-list` / `from as-path` policy refs are not
-	// definedness-gated, so the compiler populates the term's OR-sets without
-	// any earlier gate firing.
+	// ceiling.
+	//
+	// #7471: each as-path is now DEFINED. `from as-path` became
+	// definedness-gated (validatePolicyASPathReferencesStrict), and that gate
+	// runs before this one — so leaving them dangling would make this test pass
+	// for the wrong reason: the as-path gate would reject first and the
+	// sequence-bound gate under test would never run. Defining them keeps the
+	// SEQUENCE BOUND the subject.
+	//
+	// `from prefix-list` remains ungated, so those refs stay dangling.
 	const n = 82
 	var sets []string
 	for i := 0; i < n; i++ {
 		sets = append(sets, fmt.Sprintf("set policy-options policy-statement BIG term t1 from prefix-list pl%d", i))
 	}
 	for i := 0; i < n; i++ {
+		sets = append(sets, fmt.Sprintf(`set policy-options as-path asp%d "^%d "`, i, 65000+i))
 		sets = append(sets, fmt.Sprintf("set policy-options policy-statement BIG term t1 from as-path asp%d", i))
 	}
 	tree := flatTreeFromSets(t, sets...)
