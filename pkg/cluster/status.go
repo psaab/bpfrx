@@ -823,23 +823,74 @@ func (m *Manager) FormatIPMonitoringStatus() string {
 
 	hasIP := false
 	for _, rg := range states {
-		// Check for IP monitor failures (prefixed with "ip:").
+		// #7338: split ip-monitoring debts by CLASS, using the shared
+		// discriminator, not a raw "ip:" prefix.
+		//
+		// Global-threshold mode installs a SINGLE aggregate debt under
+		// ipAggregateMonitorName, which deliberately does not carry the "ip:"
+		// prefix (monitor.go) -- and installs NO per-target debts by design.
+		// The old prefix filter therefore matched nothing for an RG that
+		// ip-monitoring had actively DEMOTED, and this renderer printed "No IP
+		// monitoring failures" on the primary failover diagnostic.
+		//
+		// That is a false negative on a diagnostic, which is worse than a wrong
+		// number: an operator reads it as EVIDENCE and rules ip-monitoring out,
+		// during the post-mortem of the very failover its global-weight
+		// demotion may have caused. Global-threshold mode is the vSRX-parity
+		// mode, i.e. the one an operator following Junos documentation
+		// configures.
+		//
+		// isIPMonitorName's own doc says any code reconciling ONE class must
+		// use it to avoid clobbering the other. This renderer is such code and
+		// never got it.
 		var ipFails []string
+		aggregateFailed := false
 		for _, f := range rg.MonitorFails {
-			if strings.HasPrefix(f, "ip:") {
-				ipFails = append(ipFails, f)
+			if !isIPMonitorName(f) {
+				continue
 			}
+			if f == ipAggregateMonitorName {
+				aggregateFailed = true
+				continue
+			}
+			ipFails = append(ipFails, f)
 		}
 		// Show IP monitor section regardless (config-driven).
 		if len(ipFails) > 0 || true {
 			// We always show the section for each RG if any monitors are configured.
 			fmt.Fprintf(&b, "Redundancy group %d:\n", rg.GroupID)
-			if len(ipFails) > 0 {
+			switch {
+			case aggregateFailed:
+				// Render the CROSSING, not an address. In this mode there is no
+				// per-address debt, so naming one would invent a target.
+				if mon != nil {
+					if threshold, weight, ok := mon.IPGlobalThreshold(rg.GroupID); ok {
+						fmt.Fprintf(&b, "  %-20s Status: global threshold crossed "+
+							"(threshold %d, weight %d applied)\n",
+							"ip-monitoring", threshold, weight)
+					} else {
+						fmt.Fprintf(&b, "  %-20s Status: global threshold crossed\n",
+							"ip-monitoring")
+					}
+				} else {
+					fmt.Fprintf(&b, "  %-20s Status: global threshold crossed\n",
+						"ip-monitoring")
+				}
+				fmt.Fprintln(&b, "  (global-threshold mode installs one aggregate debt and no")
+				fmt.Fprintln(&b, "   per-target debts, so individual targets are not listed here)")
+				// A per-target debt cannot normally coexist with the aggregate,
+				// but print any that do rather than hiding them behind the
+				// mode -- the two classes share one structure (#5080).
 				for _, f := range ipFails {
 					addr := strings.TrimPrefix(f, "ip:")
 					fmt.Fprintf(&b, "  %-20s Status: unreachable\n", addr)
 				}
-			} else {
+			case len(ipFails) > 0:
+				for _, f := range ipFails {
+					addr := strings.TrimPrefix(f, "ip:")
+					fmt.Fprintf(&b, "  %-20s Status: unreachable\n", addr)
+				}
+			default:
 				fmt.Fprintln(&b, "  No IP monitoring failures")
 			}
 			fmt.Fprintln(&b)
