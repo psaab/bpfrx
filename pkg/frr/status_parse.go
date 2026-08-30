@@ -97,6 +97,29 @@ type ISISAdjacency struct {
 	Level     string
 	State     string
 	HoldTime  string
+
+	// Malformed marks a row the parser could not read: no header was seen
+	// (so the trailing-column width is unknown), or the row is shorter than
+	// that width. The derived fields are left EMPTY and Raw carries the line
+	// (#7430).
+	//
+	// WHY REPORTED RATHER THAN DROPPED. `continue` made an unparseable row
+	// simply not appear, which to an operator debugging a missing neighbour is
+	// indistinguishable from "the adjacency does not exist" — it points at the
+	// wrong problem. A row saying THIS LINE COULD NOT BE PARSED points at the
+	// real one (an FRR version change, a truncated vtysh response).
+	//
+	// WHY NOT RENDERED PARTIALLY. The rejected alternative was to emit the row
+	// with empty derived fields, which reports a neighbour in state "" —
+	// quieter than column-forgery but still false. So the shape is "report as
+	// unparseable", never "render partially", and a consumer MUST branch on
+	// Malformed rather than read the empty fields.
+	Malformed bool
+	// Raw is the unparsed line, verbatim. It is PEER-INFLUENCED text — the
+	// first column is the peer's advertised dynamic hostname — so every
+	// display site must route it through termsafe, exactly as the parsed
+	// cells are (#6468).
+	Raw string
 }
 
 // GetISISAdjacency queries FRR for IS-IS adjacencies.
@@ -138,13 +161,19 @@ func (m *Manager) GetISISAdjacency() ([]ISISAdjacency, error) {
 			continue
 		}
 		if trailing <= 0 {
+			// #7430: no header seen, so the trailing width is unknown and
+			// guessing is the #6590 failure. Report the row rather than drop it.
+			adjs = append(adjs, ISISAdjacency{Malformed: true, Raw: line})
 			continue
 		}
 		// A row must carry every trailing column plus at least one token of
-		// hostname. Anything shorter is malformed; skipping it is the
-		// "reported rather than rendered" half — a partial row would put
-		// peer-chosen text under the wrong heading, which is the defect.
+		// hostname. Anything shorter is malformed. #7430: report it rather than
+		// skip it — a partial row would put peer-chosen text under the wrong
+		// heading, which is the #6590 defect, but dropping it silently is the
+		// display defect. Neither: mark it, carry the raw line, render neither
+		// set of columns.
 		if len(fields) < trailing+1 {
+			adjs = append(adjs, ISISAdjacency{Malformed: true, Raw: line})
 			continue
 		}
 		split := len(fields) - trailing
