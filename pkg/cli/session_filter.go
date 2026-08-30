@@ -566,11 +566,33 @@ func (f *sessionFilter) ingressIfaceDisplay(ingressIfindex uint32, ingressVlanID
 // session carries one, else the egress zone's single bound interface, else "".
 //
 // The FIB hit is NOT corroborated against the recorded egress zone the way the
-// ingress hit is. A recycled FibIfindex is the same hazard on this side and is
-// tracked as #7239's sibling, #7240 — the egress zone's own value has to be
-// enumerated across the fabric/tunnel override paths before the symmetric check
-// is safe. The change here is the zone fallback, which must not claim one
-// interface for all of its siblings on either column of a row.
+// ingress hit is, and — measured under #7240 — it CANNOT BE. The blocker is
+// structural, not an enumeration that someone still owes:
+//
+// The ingress zone and the ingress {ifindex, VLAN} are stamped at the SAME
+// instant from the SAME observation. The packet arrived on that interface, and
+// that interface's zone is the one policy used, so they must agree; a
+// disagreement is therefore positive evidence the ifindex was recycled, which
+// is what #6987 exploits.
+//
+// The FIB result and the egress zone are two DIFFERENT derivations. The FIB
+// answers "which netdev does this route leave by"; the zone answers "what
+// security zone did policy assign". Those legitimately differ — a `lo.x`
+// egress, and by construction the tunnel and fabric paths — so a disagreement
+// here is the normal case for any egress interface that is not a zone member,
+// not evidence of a recycle.
+//
+// Applying the symmetric check was tried and reverted: it made a session
+// unreachable by a filter naming the interface it actually left on
+// (TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928, whose
+// `lo.50` -> `lo.80` row selects through the egress arm by design), and on the
+// display side it suppressed a TRUE name. A real fix needs a datum recorded at
+// the same instant as the FIB ifindex — an interface generation compared at
+// query, or the resolved egress NAME carried on the session — and is larger
+// than #7240 as filed.
+//
+// The change here is the zone fallback, which must not claim one interface for
+// all of its siblings on either column of a row.
 func (f *sessionFilter) egressIfaceDisplay(fibIfindex uint32, fibVlanID uint16, egressZone uint16) string {
 	if fibIfindex != 0 {
 		if ifName, ok := f.ifaceNamesByKey[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
