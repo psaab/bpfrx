@@ -791,7 +791,22 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"default-profile": {desc: "Designate this profile as the default", children: nil},
 			"category": {desc: "Per-category field configuration", children: map[string]*schemaNode{
 				"session": {desc: "Session category field configuration", children: map[string]*schemaNode{
-					"field-extra-name": {desc: "Extra field to include in session records", args: 1, placeholder: "<field>", children: nil},
+					// #7502: say so. The compiler's `case "category":` arm is an
+					// explicit no-op ("field-extra-name emission is out of scope
+					// for this increment"), and LogProfile carries no field for
+					// the value — so this leaf commits clean and is never
+					// applied. Session log records are an audit surface, and an
+					// operator adding an extra field is usually satisfying a
+					// logging or compliance requirement; a silent under-record
+					// is the worst way for that to fail.
+					//
+					// Of the 22 leaves the #7484/#7492 spelling-gate analysis
+					// found unread by the compiler, 21 declare it in their own
+					// `desc` — which is what `?` help shows. This was the
+					// exception, and it read exactly like a working feature.
+					// Declaring it does not implement it; it removes the false
+					// advertisement now, at no risk to anything that works.
+					"field-extra-name": {desc: "Extra field to include in session records (parsed, not implemented)", args: 1, placeholder: "<field>", children: nil},
 				}},
 			}},
 		}},
