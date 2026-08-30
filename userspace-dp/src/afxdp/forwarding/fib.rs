@@ -8,9 +8,9 @@
 use super::*;
 use std::borrow::Cow;
 
-const DEFAULT_V4_TABLE: &str = "inet.0";
+pub(in crate::afxdp) const DEFAULT_V4_TABLE: &str = "inet.0";
 
-const DEFAULT_V6_TABLE: &str = "inet6.0";
+pub(in crate::afxdp) const DEFAULT_V6_TABLE: &str = "inet6.0";
 
 const MAX_NEXT_TABLE_DEPTH: usize = 8;
 
@@ -41,7 +41,28 @@ pub(in crate::afxdp) fn classify_metadata(
 /// removes the per-new-flow FIB-resolution alloc that `.to_string()` forced at
 /// every lookup-path caller (see `lookup_forwarding_resolution_inner_ecmp`,
 /// which now defaults to `Cow::Borrowed(DEFAULT_V*_TABLE)`).
-pub(in crate::afxdp) fn canonical_route_table(table: &str, is_ipv6: bool) -> Cow<'static, str> {
+/// #7204 (A1-b7-F5): borrows the caller's name when no rewrite is needed.
+///
+/// The return type used to be `Cow<'static, str>`, and that `'static` — not the
+/// rewriting — is what made this allocate on the hot path. Four of the six arms
+/// allocated, but two of them are IDENTITY arms: they hand back exactly the name
+/// they were given, and copied it only because a borrow could not outlive the
+/// call under `'static`. Tying the output lifetime to the input turns those two
+/// into `Cow::Borrowed` and leaves an allocation only where a family rewrite
+/// genuinely produces a NEW string.
+///
+/// That identity arm is the common case, not the rare one: a lookup for family F
+/// against a table already in family F (`vrf-a.inet.0` asked for v4) matches
+/// neither the default-table arm nor the opposite-family suffix, so every
+/// same-family resolution was paying a `to_string` to get its own argument back.
+///
+/// Interning into a `TableId` — the fix #7204 proposes — would also remove the
+/// allocation, at the cost of a new id type threaded through PBR and next-table
+/// recursion plus a snapshot-build interning pass. It is not needed to make the
+/// identity arm free, and the callers do not need an owned value at all: every
+/// hot-path use is a comparison, a `visited` membership test, or a map lookup,
+/// all of which take `&str`.
+pub(in crate::afxdp) fn canonical_route_table(table: &str, is_ipv6: bool) -> Cow<'_, str> {
     if is_ipv6 {
         if table == DEFAULT_V4_TABLE {
             return Cow::Borrowed(DEFAULT_V6_TABLE);
@@ -49,7 +70,7 @@ pub(in crate::afxdp) fn canonical_route_table(table: &str, is_ipv6: bool) -> Cow
         if let Some(prefix) = table.strip_suffix(".inet.0") {
             return Cow::Owned(format!("{prefix}.inet6.0"));
         }
-        return Cow::Owned(table.to_string());
+        return Cow::Borrowed(table);
     }
     if table == DEFAULT_V6_TABLE {
         return Cow::Borrowed(DEFAULT_V4_TABLE);
@@ -57,7 +78,7 @@ pub(in crate::afxdp) fn canonical_route_table(table: &str, is_ipv6: bool) -> Cow
     if let Some(prefix) = table.strip_suffix(".inet6.0") {
         return Cow::Owned(format!("{prefix}.inet.0"));
     }
-    Cow::Owned(table.to_string())
+    Cow::Borrowed(table)
 }
 
 pub(in crate::afxdp) fn parse_packet_destination(
@@ -350,6 +371,24 @@ pub(in crate::afxdp) fn lookup_forwarding_resolution_v4(
     // chain for A->B->A next-table cycle detection. The tunnel-underlay
     // sub-resolution (resolve_tunnel_outer) also enters through this public
     // wrapper, so it correctly starts its own independent chain.
+    // #7204 (A1-b7-F5), the visited half: MEASURED AND DELIBERATELY LEFT.
+    //
+    // #7204 proposes a fixed `[TableId; MAX_NEXT_TABLE_DEPTH]` stack here. It is
+    // not worth it, for the reason that decided the ECMP fanout in #8083: do not
+    // pay the worst case on every call to remove a cost the common path never
+    // incurs.
+    //
+    //   * `Vec::new()` does not allocate. A resolution that never traverses a
+    //     next-table -- the overwhelming majority -- pays nothing here.
+    //   * The clones happen only on an actual next-table hop, and
+    //     MAX_NEXT_TABLE_DEPTH bounds them at 8: bounded work on a configured,
+    //     non-default feature path.
+    //   * An inline `[_; 8]` stack would cost ~192 bytes on EVERY resolution,
+    //     including all the ones that never push.
+    //
+    // The allocation this item is really about was in `canonical_route_table`,
+    // which copied its own argument on every same-family lookup to satisfy a
+    // `'static` return. That one is fixed, and it was on the common path.
     let mut visited: Vec<String> = Vec::new();
     lookup_forwarding_resolution_v4_inner(
         state,
