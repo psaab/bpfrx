@@ -336,9 +336,35 @@ func (s *Store) LoadOverrideAs(sessionID, content string) error {
 		return fmt.Errorf("not in configuration mode")
 	}
 
-	tree, errs := config.NewParser(content).Parse()
-	if len(errs) > 0 {
-		return fmt.Errorf("parse error: %v", errs[0])
+	// #7527: classify the input before parsing it. LoadOverride used to call
+	// the hierarchical parser unconditionally and then ATOMICALLY REPLACE the
+	// candidate with whatever came back. The parser treats newlines as
+	// whitespace, so a flat set-command file did not fail — it collapsed into
+	// ONE junk top-level node and the call returned nil:
+	//
+	//   in:  "set system host-name a\nset system domain-name example.net"
+	//   out: set set system host-name a set system domain-name example.net
+	//
+	// The operator's entire configuration was replaced by that, and both the
+	// CLI and the RPC reported success. `show configuration | display set >
+	// backup.txt` followed by `load override backup.txt` is an ordinary
+	// workflow, and `load set` accepts only `terminal` — so there was no
+	// file-based path for flat input at all, and the one an operator would
+	// reach for silently destroyed the candidate.
+	//
+	// LoadMerge already classifies and replays line-by-line; this mirrors it.
+	// The difference is the starting tree: MERGE replays onto a clone of the
+	// candidate, OVERRIDE replays onto an EMPTY one, which is what "override"
+	// means.
+	//
+	// MISCLASSIFICATION FAILS LOUD, which is what makes accepting flat input
+	// the bounded choice rather than the risky one. If a hierarchical file were
+	// mistaken for flat, the #3442 M3 rule below rejects the first line without
+	// a recognized verb — an error, never a silently wrong candidate. The
+	// reverse (flat mistaken for hierarchical) is the defect being fixed here.
+	tree, err := parseOverrideContent(content)
+	if err != nil {
+		return err
 	}
 
 	s.candidate = tree
@@ -346,6 +372,54 @@ func (s *Store) LoadOverrideAs(sessionID, content string) error {
 	s.bumpCandidateGenLocked() // #5848: candidate changed — advance the generation
 	s.dirty = true
 	return nil
+}
+
+// parseOverrideContent turns `load override` input into the replacement tree,
+// accepting BOTH the hierarchical form and a flat set/delete/deactivate/
+// activate script (#7527).
+//
+// It builds the tree standalone and returns an error without touching any
+// store state, so a caller swaps in a complete result or nothing — the same
+// atomicity LoadMerge gained in #5187, for the same reason: a partially
+// applied override is a config nobody authored, and a partial DELETE of deny
+// terms fails open.
+func parseOverrideContent(content string) (*config.ConfigTree, error) {
+	lines := strings.Split(content, "\n")
+	isSetFormat := false
+	for _, line := range lines {
+		if hasFlatVerb(strings.TrimSpace(line)) {
+			isSetFormat = true
+			break
+		}
+	}
+	if !isSetFormat {
+		tree, errs := config.NewParser(content).Parse()
+		if len(errs) > 0 {
+			return nil, fmt.Errorf("parse error: %v", errs[0])
+		}
+		return tree, nil
+	}
+
+	// Flat: replay onto an EMPTY tree. Starting from the candidate would make
+	// this a merge, which is the other verb.
+	tree := &config.ConfigTree{}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// #3442 M3, same rule as the merge path: once flat format is
+		// selected, every non-comment line MUST carry a recognized verb.
+		// Otherwise ParseSetVerb treats free text as a bare `set` path and
+		// materializes a junk node — which is the #7527 defect one layer down.
+		if !hasFlatVerb(trimmed) {
+			return nil, fmt.Errorf("line %d: %q is not a set/delete/deactivate/activate command", i+1, trimmed)
+		}
+		if err := applyEditLine(tree, trimmed); err != nil {
+			return nil, fmt.Errorf("line %d: %q: %w", i+1, trimmed, err)
+		}
+	}
+	return tree, nil
 }
 
 // LoadMerge merges the parsed input into the existing candidate config.

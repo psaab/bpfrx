@@ -183,6 +183,40 @@ inline archive-site passwords).
   `ActiveApplied` compares against (`configTextDigest(s.active.Format())`). The
   marker is keyed on config text, so a stale value can only cause an idempotent
   re-apply, never a false convergence.
+- **`LoadOverride` accepts flat set input as well as hierarchical (#7527).**
+  It used to call the hierarchical parser unconditionally and then atomically
+  replace the candidate with the result. The parser treats newlines as
+  whitespace, so a flat set-command file did not fail to parse — it collapsed
+  into ONE junk top-level node, and the call returned `nil`:
+
+  ```
+  in:  "set system host-name a\nset system domain-name example.net"
+  out: set set system host-name a set system domain-name example.net
+  err: <nil>
+  ```
+
+  The operator's whole candidate became that, and both the CLI and the RPC
+  printed success. It is reachable through an ordinary workflow, not a
+  contrived one — `show configuration | display set > backup.txt` then
+  `load override backup.txt` — and `load set` accepts only `terminal`, so
+  there was no file-based path for flat input at all. The one an operator
+  would reach for was the one that destroyed the candidate.
+
+  `parseOverrideContent` now classifies with the same `hasFlatVerb` scan
+  `LoadMerge` uses. **The difference between the two verbs is the starting
+  tree**: merge replays onto a clone of the candidate, override replays onto
+  an EMPTY one. Reusing the merge body directly would silently make
+  `load override` a second spelling of `load merge`, which every other
+  assertion about this path would still pass.
+
+  Accepting flat input is the bounded choice rather than the risky one
+  because **misclassification fails loud**. If a hierarchical file were
+  mistaken for flat, the #3442 M3 rule rejects the first line carrying no
+  recognized verb — an error naming the line, never a silently wrong
+  candidate. The reverse direction is the defect that was fixed. The tree is
+  built standalone and swapped in only on complete success, so a rejected
+  override leaves the candidate byte-identical (#5187's atomicity, for the
+  same reason: a partial delete of deny terms fails open).
 - `MaxConfigSize` (16 MiB) + `checkConfigSize` — `store.go`. The
   transport-independent input-size ceiling checked at the head of every
   parse entry point: `LoadOverride`, `LoadMerge`, `LoadSet`, the HA
