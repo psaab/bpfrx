@@ -887,12 +887,37 @@ adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
 
 - Config is regenerated fully on every `Apply()` (no diff). The Kea config
   schema is JSON-based, so this is cheap.
-- **`dhcp-socket-type` is never emitted, so Dhcp4 runs Kea's default
-  `raw` (#6460).** `interfaces-config` carries only the `interfaces`
-  list. AF_PACKET delivery happens BEFORE the netfilter input hook, so
-  the `xpf_hostinbound` chain cannot gate DHCPv4 at all — a zone whose
-  `host-inbound-traffic system-services` omits `dhcp` does **not** stop
-  this server answering on an interface its group binds. Dhcp6 has no
+- **`dhcp-socket-type` defaults to unset, so Dhcp4 runs Kea's default
+  `raw` (#6460, opt-in knob added in #7318).** Unless the operator sets
+  `system services dhcp-local-server dhcp-socket-type`,
+  `interfaces-config` carries only the `interfaces` list and the key is
+  not emitted at all. AF_PACKET delivery happens BEFORE the netfilter
+  input hook, so on the default the `xpf_hostinbound` chain cannot gate
+  DHCPv4 at all — a zone whose `host-inbound-traffic system-services`
+  omits `dhcp` does **not** stop this server answering on an interface
+  its group binds.
+
+  Precisely, and this is easy to state wrongly: the input hook is not
+  *skipped*. Measured on a live node (#7318), an INPUT drop at priority
+  -100 for `udp dport 67` COUNTED the packet — on both the
+  `255.255.255.255` and the interface-unicast destination — and Kea
+  answered anyway. netfilter sees the packet and drops it; it just drops
+  a copy Kea never reads, because AF_PACKET took its own copy at
+  `ptype_all`, before `ip_rcv`. That is why no nft rule can ever fix
+  this, and it is a different claim from "the packet never reaches the
+  chain".
+
+  Note the raw socket's LPF admits **broadcast OR unicast to the
+  interface's own address**, so the relayed/renewing unicast leg is
+  ungateable too — not just the broadcast DISCOVER.
+
+  Setting `dhcp-socket-type udp` moves Dhcp4 onto an ordinary UDP socket
+  that does traverse the input hook, at which point the zone's `dhcp`
+  token governs the server path. It is opt-in and **not** a default flip
+  because, per Kea's documentation, UDP sockets "can be used for relayed
+  traffic only" — directly-attached clients with no address yet stop
+  being served. `validateDHCPSocketTypeWarnings` states that trade at
+  commit time. Dhcp6 has no
   raw mode but is addressed at the `ff02::1:2` multicast group, which
   matches no per-zone unicast `daddr` rule and falls through the input
   chain's accept policy — same outcome, different mechanism. A

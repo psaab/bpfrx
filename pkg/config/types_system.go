@@ -1834,6 +1834,13 @@ type DHCPLocalServerConfig struct {
 	// for v4, dhcpv6-local-server for v6), not on DHCPPool. v4 and v6 are
 	// tuned independently because Kea renders the block per Dhcp4 / Dhcp6.
 	ExpiredLeases *DHCPExpiredLeasesConfig
+
+	// SocketType maps to Kea's `interfaces-config.dhcp-socket-type` and is
+	// IPv4-ONLY (#7318). "" == today's behaviour byte-for-byte: the key is not
+	// rendered, so Kea applies its documented default `raw`. The measurement
+	// that motivates the leaf, and the trade that makes it opt-in rather than a
+	// default flip, are on DHCPSocketTypeRaw/UDP in types_dhcp_socket_type.go.
+	SocketType string
 }
 
 // DHCPExpiredLeasesConfig maps to Kea's per-family

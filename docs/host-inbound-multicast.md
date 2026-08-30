@@ -141,17 +141,53 @@ RENEWING-state ACK as a unicast to that address; whether that specific frame
 loses its lease when the token is absent was **not** measured and is not claimed
 here.
 
+### The userspace gate is DENY-ONLY for an AF_PACKET consumer (#7318)
+
+A ceiling worth stating before someone designs into it. The AF_XDP gate looks
+like a general enforcement point for host-bound traffic, and for a service that
+reads from a kernel **socket** it is. For a service that taps the **physical
+device** with `AF_PACKET` — Kea's Dhcp4 on the default `raw` is exactly this —
+it can only ever DENY.
+
+The asymmetry is in the delivery mechanism, not the gate. A DENIED packet is
+dropped in the worker and reaches the kernel on no device, so an AF_PACKET tap
+cannot see it (the measurement above: +22 denies, zero on `tcpdump -ni any`).
+But an ADMITTED packet is not passed through on its ingress NIC — local delivery
+is a `write()` into the TUN device `xpf-usp0`, opened `IFF_TUN | IFF_NO_PI`,
+carrying a **bare L3 packet with the Ethernet header stripped**
+(`userspace-dp/src/afxdp/tx/dispatch/slow_path.rs`, `userspace-dp/src/slowpath.rs`).
+A raw-socket consumer bound to `ge-0-0-1` therefore never sees it: wrong device
+for `packet_rcv`'s filter, and no L2 header for a filter that reads the
+ethertype at offset 12 — which Kea's LPF does, as its first test.
+
+The practical consequence: routing DHCPv4 into the dataplane so the gate can
+*admit* it would not gate DHCP, it would take the server off the air. Any
+proposal to enforce host-inbound for a raw-socket service has to be a
+deny-side-only change, leaving the admit path exactly as it is.
+
 Zone attribution and effective-admission resolution reuse the same two SSOTs
 Component B uses (`zoneIfaceLogicalKeys`, `ZoneConfig.InterfaceHostInboundEffective`),
 so the three advisories cannot drift in which interfaces they can see.
 WARN-only, zero dataplane surface, no error return and no `lenient` flag — the
 #1960 no-brick property is structural, matching the #5619 doctrine.
 
-**Enforcement is not planned.** The v6 leg needs the same per-zone `iifname`
-class gate Component A was PLAN-KILLed for. The v4 leg cannot be closed by
-netfilter at all — it would need Kea moved to `dhcp-socket-type: udp`, which
-breaks address-less clients that require raw broadcast reach, so it is a
-behaviour choice rather than a bug fix and is tracked separately.
+**Enforcement is not planned by default.** The v6 leg needs the same per-zone
+`iifname` class gate Component A was PLAN-KILLed for. The v4 leg cannot be
+closed by netfilter *on the default `raw` socket* at all — not because the
+input hook is bypassed unreached, but because it acts on a copy Kea never
+reads (#7318 measured an INPUT drop at priority -100 counting the packet on
+both the broadcast and the interface-unicast destination while Kea answered
+regardless).
+
+#7318 shipped the opt-in half: `system services dhcp-local-server
+dhcp-socket-type udp` moves Dhcp4 onto a UDP socket that does traverse the
+input hook, at which point the per-zone `dhcp` token governs the server path
+with no Component A required — because on UDP Kea does not receive broadcast
+at all, so the fall-through that Component A would have to close no longer has
+anything listening behind it. The DEFAULT is unchanged (`raw`), because udp
+serves relayed and renewing clients only and stops serving directly-attached
+address-less clients; that is a deployment choice, not a bug fix. Whether the
+default should ever flip is still open and deliberately unprejudiced.
 
 ## Protocol → multicast-group catalog
 

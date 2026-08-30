@@ -1737,6 +1737,7 @@ func ValidateConfig(cfg *Config) []string {
 	// FRR), so this shape produced no advisory at all before #6460. WARN-only;
 	// the per-zone enforcement is PLAN-KILLed with #4455 Component A.
 	warnings = append(warnings, validateDHCPServerHostInboundBypassWarnings(cfg)...)
+	warnings = append(warnings, validateDHCPSocketTypeWarnings(cfg)...)
 
 	// #5837 (Track-1 mitigation): a destination-NAT / static-NAT rule whose
 	// public (matched / external) destination address equals a configured
