@@ -88,7 +88,8 @@ use reject_reply::{deny_reply_and_emit, enqueue_filter_reject_reply};
 use resolver_enqueue::try_enqueue_resolver;
 
 use filter::{
-    emit_input_filter_log_match, evaluate_input_filter_on_session_hit,
+    collect_revoked_flow_cache_keys, emit_input_filter_log_match,
+    evaluate_input_filter_on_session_hit,
     evaluate_non_pbr_input_filter, evaluate_non_pbr_input_filter_counters_cached,
     evaluate_non_pbr_input_filter_log_only, filter_terminal, host_inbound_gated_lo0_action,
 };
@@ -736,23 +737,32 @@ pub(super) fn poll_binding_process_descriptor(
                                     // the #6457 failure mode — and the revoked
                                     // 5-tuple keeps forwarding off a cached
                                     // `RewriteDescriptor` with no session row.
-                                    // Sibling WORKERS are covered by the
+                                    //
+                                    // TWO windows remain, and both are stated
+                                    // rather than claimed closed. The keys are
+                                    // drained in `worker/lifecycle.rs` after
+                                    // this RX BATCH, so a LATER descriptor in
+                                    // the SAME batch, arriving on a sibling
+                                    // binding of this worker that holds a
+                                    // current-generation slot for the tuple, can
+                                    // still hit it — bounded by the remainder of
+                                    // one batch. Sibling WORKERS evict on their
+                                    // next tick via the
                                     // `replicate_session_delete` -> DeleteSynced
-                                    // -> #6457 eviction the teardown already
-                                    // queues, which lands on their next tick;
-                                    // that is the same promptness every other
+                                    // -> #6457 path the teardown already queues.
+                                    // Both are the promptness every other
                                     // revocation primitive here has, including
                                     // the operator's own `clear security flow
-                                    // session`.
+                                    // session`; closing the first would mean
+                                    // breaking the RX batch on every revocation,
+                                    // which is a packet-path cost paid by every
+                                    // configuration to bound a window measured
+                                    // in microseconds. #8114.
                                     // #7212: `revoked_key` is the CANONICAL key
                                     // the revalidation resolved — NOT
                                     // `resolved.key`, which is the WIRE tuple
                                     // and, on the NAT reverse-translated alias
                                     // path, names no entry in the primary index.
-                                    let revoked_companion_key = crate::session::reverse_session_key(
-                                        &revoked_key,
-                                        resolved.decision.nat,
-                                    );
                                     delete_terminal_filtered_session(
                                         sessions,
                                         binding.bpf_maps.session_map_fd,
@@ -771,16 +781,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         now_ns,
                                         worker_id,
                                     );
-                                    binding
-                                        .scratch
-                                        .scratch_filter_revoked_keys
-                                        .push(revoked_key.clone());
-                                    if revoked_companion_key != revoked_key {
-                                        binding
-                                            .scratch
-                                            .scratch_filter_revoked_keys
-                                            .push(revoked_companion_key);
-                                    }
+                                    collect_revoked_flow_cache_keys(
+                                        &resolved.key,
+                                        &revoked_key,
+                                        resolved.decision.nat,
+                                        &mut binding.scratch.scratch_filter_revoked_keys,
+                                    );
                                     telemetry.dbg.filter_revoked_sessions += 1;
                                 }
                                 binding.scratch.scratch_recycle.push(desc.addr);

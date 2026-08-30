@@ -351,12 +351,57 @@ pub(super) struct SessionHitInputFilterEval {
     /// about the flow.
     ///
     /// It carries the KEY rather than a bool because the caller's `resolved.key`
-    /// is a WIRE tuple (`ResolvedSessionKey::QueryKey` on a local hit), and on
-    /// the NAT reverse-translated alias path — the reply to a source-NAT'd flow
-    /// — that is the TRANSLATED tuple, which names no entry in the primary
-    /// index. Handing the caller the canonical key this revalidation actually
-    /// resolved is what makes the teardown act on the session that was judged.
+    /// is a WIRE tuple (`ResolvedSessionKey::QueryKey` on a local hit), and an
+    /// entry reached through the NAT reverse-translated ALIAS index is stored
+    /// under a DIFFERENT key than the one that found it — that tuple names no
+    /// entry in the primary index. Handing the caller the canonical key this
+    /// revalidation actually resolved is what makes the teardown act on the
+    /// session that was judged.
+    ///
+    /// An ordinary source-NAT reply is NOT that case, and an earlier revision of
+    /// this comment said it was: the pair install stores the reverse companion
+    /// under `reverse_session_key(forward, nat)`, which is ALREADY the wire reply
+    /// tuple, so that reply resolves through the primary index. The alias index
+    /// holds the post-de-NAT tuple. The fix is a correct superset either way —
+    /// the resolution is right for both — but the severity was overstated.
     pub(super) revoked_key: Option<crate::session::SessionKey>,
+}
+
+/// #7212: collect the keys whose flow-cache slots a revocation must evict.
+///
+/// Three, and each is a different identity the same revoked flow is known by:
+///
+///   * `canonical_key` — what the SESSION TABLE holds, and what
+///     `delete_terminal_filtered_session` deletes;
+///   * its COMPANION, derived with the same `reverse_session_key` transform the
+///     teardown uses internally, so the eviction set is exactly the deletion
+///     set;
+///   * `wire_key` — what the packet carried, which is what the FLOW CACHE is
+///     keyed by (`FlowCacheEntry::from_forward_decision` stamps
+///     `flow.forward_key`). On the NAT reverse-translated alias path that is the
+///     TRANSLATED tuple and differs from the canonical key — the same divergence
+///     `canonical_session_key` exists for — so evicting only the table's two
+///     identities leaves an aliased reply's descriptor live.
+///
+/// `invalidate_slot` requires exact key equality, so a duplicate would cost one
+/// no-op set walk per binding; duplicates are elided here anyway. A named helper
+/// rather than three inline pushes because the aliased case is exactly the one
+/// an inline version gets wrong, and the poll loop it would live in is not
+/// callable from a test.
+pub(super) fn collect_revoked_flow_cache_keys(
+    wire_key: &crate::session::SessionKey,
+    canonical_key: &crate::session::SessionKey,
+    nat: crate::nat::NatDecision,
+    out: &mut Vec<crate::session::SessionKey>,
+) {
+    let companion = crate::session::reverse_session_key(canonical_key, nat);
+    out.push(canonical_key.clone());
+    if companion != *canonical_key {
+        out.push(companion);
+    }
+    if wire_key != canonical_key {
+        out.push(wire_key.clone());
+    }
 }
 
 /// Re-evaluate the ingress interface's INPUT filter for an established-session
@@ -438,29 +483,50 @@ pub(super) fn evaluate_input_filter_on_session_hit(
             revoked_key: None,
         });
     }
-    // #7212: a purely STATIC filter. `session_key` is the WIRE tuple the packet
-    // carried; resolve it to the entry's CANONICAL key before touching the
-    // stamp, because on the NAT reverse-translated alias path (the reply to a
-    // source-NAT'd flow) the two differ and a primary-index probe on the wire
-    // tuple silently misses the entry.
+    // #7212: a purely STATIC filter.
     //
-    // `None` here means this worker's table holds no entry for the packet's
-    // tuple, which is not a miss to work around: the established hit was served
-    // from the SHARED map without a local install (the #2120 transient
-    // synced-hit path, `should_keep_synced_hit_transient`). There is no local
-    // session to stamp or to tear down. It is bounded rather than open-ended —
-    // `maybe_promote_synced_session` installs the entry on a later packet, and
-    // an installed peer-synced entry carries generation `0`, so the promoted
-    // session revalidates before this node forwards on it as its own.
-    let canonical_key = sessions.canonical_session_key(session_key)?;
-    // Nothing to do until the snapshot moves.
-    if !sessions.filter_revalidation_stale(&canonical_key) {
+    // ...unless it is ROUTE-LOOKUP-AFFECTING, in which case this path declines.
+    // The non-routing walk the static verdict runs DEFERS on a matched
+    // `routing-instance` term — it returns the default Accept before the term's
+    // own action is examined — and #4392 established that a
+    // `then { routing-instance X; discard; }` term is a DROP, adjudicated by
+    // `ingress_route_table_override` on the session-MISS path. Reading that
+    // deferral as an Accept would let the revalidation PRESERVE (and stamp) a
+    // session the routing-aware evaluation drops: a fail-open, and a stamped one
+    // that would not re-derive until the next generation. The walk cannot tell
+    // "Accept because nothing matched" from "Accept because it deferred", so
+    // declining is the only honest answer available here. It leaves such filters
+    // exactly where they were before #7212 — no revocation — rather than
+    // inventing a wrong one; a routing-aware static evaluator is #8114.
+    if filter.affects_route_lookup {
         return None;
     }
+    // ONE probe answers both questions: which entry does this WIRE tuple name,
+    // and does that entry still lack a verdict derived under the live generation
+    // on THIS ingress interface. `None` — the answer for every packet but one
+    // per session per (generation, ingress) — costs a single hash and a compare,
+    // which matters because this runs on every established hit on an interface
+    // that has an input filter, i.e. the entire population the feature serves.
+    //
+    // The resolution is needed because `session_key` is the tuple the packet
+    // carried, and a reverse entry reached through the NAT reverse-translated
+    // ALIAS index is stored under a DIFFERENT key than the one that found it. A
+    // primary-index-only probe reports such an entry fresh forever, and a
+    // teardown handed the wire tuple deletes nothing. (An ordinary source-NAT
+    // reply is not that case — its companion's primary key IS the wire reply
+    // tuple.)
+    //
+    // `None` also covers "this worker holds no entry for the tuple" — the #2120
+    // transient synced-hit path, where the packet was served from the shared map
+    // without a local install. There is nothing local to stamp or tear down; the
+    // window is bounded by `maybe_promote_synced_session` installing the entry
+    // UNVALIDATED, and it is one of the cases #8114 tracks.
+    let canonical_key = sessions.stale_filter_revalidation_key(session_key, ingress_ifindex)?;
     revalidate_static_input_filter_on_session_hit(
         forwarding,
         sessions,
         canonical_key,
+        ingress_ifindex,
         filter,
         flow,
         meta,
@@ -501,6 +567,10 @@ fn revalidate_static_input_filter_on_session_hit(
     sessions: &mut SessionTable,
     // The CANONICAL key, already resolved by the caller.
     canonical_key: crate::session::SessionKey,
+    // The LOGICAL ingress this verdict is being derived against — half of the
+    // stamp, because the verdict is a function of the interface as well as the
+    // snapshot.
+    logical_ingress_ifindex: i32,
     filter: &crate::filter::Filter,
     // No `frame`: this evaluation is deliberately frame-INDEPENDENT (see the
     // `TermMatchExtra::default()` note in the body). Taking the frame and not
@@ -555,7 +625,7 @@ fn revalidate_static_input_filter_on_session_hit(
         // logged, and the session — including its NAT translation, which is the
         // reason #5858's family purge was rejected — is untouched. Re-stamp so
         // no later packet of this generation re-derives the same verdict.
-        sessions.mark_filter_revalidated(&canonical_key);
+        sessions.mark_filter_revalidated(&canonical_key, logical_ingress_ifindex);
         return None;
     }
     // DENY: deliberately NOT re-stamped — see the header. The caller revokes the

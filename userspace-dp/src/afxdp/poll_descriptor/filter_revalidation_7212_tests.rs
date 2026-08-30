@@ -80,6 +80,37 @@ fn forwarding_with_input_filter(
     build_forwarding_state(&snapshot)
 }
 
+/// The shared topology with a DIFFERENT inet INPUT filter on each of two
+/// interfaces: `permit` on `a`, `deny` on `b`.
+fn forwarding_with_two_input_filters(
+    a: i32,
+    permit: Vec<FirewallTermSnapshot>,
+    b: i32,
+    deny: Vec<FirewallTermSnapshot>,
+) -> ForwardingState {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.filters = vec![
+        FirewallFilterSnapshot {
+            name: "on-a".into(),
+            family: "inet".into(),
+            terms: permit,
+        },
+        FirewallFilterSnapshot {
+            name: "on-b".into(),
+            family: "inet".into(),
+            terms: deny,
+        },
+    ];
+    for iface in snapshot.interfaces.iter_mut() {
+        if iface.ifindex == a {
+            iface.filter_input_v4 = "on-a".into();
+        } else if iface.ifindex == b {
+            iface.filter_input_v4 = "on-b".into();
+        }
+    }
+    build_forwarding_state(&snapshot)
+}
+
 fn v4_flow(dst_port: u16) -> SessionFlow {
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102));
     let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
@@ -177,9 +208,22 @@ fn decision() -> SessionDecision {
 
 /// Install `flow` as an established session stamped under generation
 /// `stamped_gen`, with the table now publishing `live_gen`.
-fn table_with_session(flow: &SessionFlow, stamped_gen: u64, live_gen: u64) -> SessionTable {
+/// Install `flow` as an established session, with the table publishing
+/// `live_gen`.
+///
+/// The install itself stamps `FilterRevalidationStamp::UNVALIDATED` (#7212: no
+/// static verdict has been derived for the ENTRY yet, whichever direction it
+/// is), so the session is stale on its next packet by construction. The
+/// `revalidated_on` argument, when `Some`, then marks it revalidated on that
+/// logical ingress under `live_gen` — which is how a cell asks for a
+/// NOT-stale session.
+fn table_with_session(
+    flow: &SessionFlow,
+    live_gen: u64,
+    revalidated_on: Option<i32>,
+) -> SessionTable {
     let mut sessions = SessionTable::new();
-    sessions.set_filter_revalidation_gen(stamped_gen);
+    sessions.set_filter_revalidation_gen(live_gen);
     assert!(sessions.install_with_protocol_with_origin(
         flow.forward_key.clone(),
         decision(),
@@ -189,7 +233,9 @@ fn table_with_session(flow: &SessionFlow, stamped_gen: u64, live_gen: u64) -> Se
         PROTO_TCP,
         0,
     ));
-    sessions.set_filter_revalidation_gen(live_gen);
+    if let Some(ifindex) = revalidated_on {
+        sessions.mark_filter_revalidated(&flow.forward_key, ifindex);
+    }
     sessions
 }
 
@@ -215,7 +261,7 @@ fn frame() -> Vec<u8> {
 fn static_discard_revokes_a_stale_stamped_session_7212() {
     let forwarding = forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
@@ -254,7 +300,7 @@ fn a_still_permitted_session_keeps_its_snat_translation_7212() {
     let flow = v4_flow(5201);
 
     let mut sessions = SessionTable::new();
-    sessions.set_filter_revalidation_gen(6);
+    sessions.set_filter_revalidation_gen(7);
     let mut snat = decision();
     snat.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
     snat.nat.rewrite_src_port = Some(40001);
@@ -267,7 +313,6 @@ fn a_still_permitted_session_keeps_its_snat_translation_7212() {
         PROTO_TCP,
         0,
     ));
-    sessions.set_filter_revalidation_gen(7);
 
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
@@ -296,7 +341,7 @@ fn a_still_permitted_session_keeps_its_snat_translation_7212() {
         Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)))
     );
     assert!(
-        !sessions.filter_revalidation_stale(&flow.forward_key),
+        !sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
         "an Accept verdict must re-stamp, or every later packet re-derives it"
     );
 }
@@ -314,7 +359,7 @@ fn a_still_permitted_session_keeps_its_snat_translation_7212() {
 fn a_fresh_stamp_skips_the_revalidation_entirely_7212() {
     let forwarding = forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 7, 7);
+    let mut sessions = table_with_session(&flow, 7, Some(LAN_IFINDEX));
 
     assert!(
         evaluate_input_filter_on_session_hit(
@@ -338,7 +383,7 @@ fn a_fresh_stamp_skips_the_revalidation_entirely_7212() {
 fn static_discard_revokes_an_ipv6_session_7212() {
     let forwarding = forwarding_with_input_filter(LAN_IFINDEX, true, vec![deny_term("no-5201", "5201")]);
     let flow = v6_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
@@ -363,7 +408,7 @@ fn static_discard_resolves_through_the_vlan_logical_unit_7212() {
     let forwarding =
         forwarding_with_input_filter(VLAN_UNIT_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
@@ -392,7 +437,7 @@ fn term_order_decides_the_static_verdict_7212() {
         };
         let forwarding = forwarding_with_input_filter(LAN_IFINDEX, false, terms);
         let flow = v4_flow(5201);
-        let mut sessions = table_with_session(&flow, 6, 7);
+        let mut sessions = table_with_session(&flow, 7, None);
         let hit = evaluate_input_filter_on_session_hit(
             &forwarding,
             &mut sessions,
@@ -420,7 +465,7 @@ fn source_address_except_inverts_the_static_verdict_7212() {
         term.source_except = except;
         let forwarding = forwarding_with_input_filter(LAN_IFINDEX, false, vec![term]);
         let flow = v4_flow(5201);
-        let mut sessions = table_with_session(&flow, 6, 7);
+        let mut sessions = table_with_session(&flow, 7, None);
         let hit = evaluate_input_filter_on_session_hit(
             &forwarding,
             &mut sessions,
@@ -446,7 +491,7 @@ fn detaching_the_filter_revokes_nothing_7212() {
     snapshot.filters = Vec::new();
     let forwarding = build_forwarding_state(&snapshot);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     assert!(
         evaluate_input_filter_on_session_hit(
@@ -473,7 +518,7 @@ fn a_per_packet_filter_drops_the_packet_without_revoking_the_session_7212() {
     term.tcp_flags = Some(crate::tcp_flags::TCP_SYN);
     let forwarding = forwarding_with_input_filter(LAN_IFINDEX, false, vec![term]);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     let mut m = meta(LAN_IFINDEX as u32, 0, false);
     m.tcp_flags = crate::tcp_flags::TCP_SYN;
@@ -493,7 +538,7 @@ fn a_per_packet_filter_drops_the_packet_without_revoking_the_session_7212() {
         "a per-packet verdict must drop the packet, never revoke the session"
     );
     assert!(
-        sessions.filter_revalidation_stale(&flow.forward_key),
+        sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
         "the per-packet arm must not consume the static revalidation stamp"
     );
 }
@@ -502,16 +547,21 @@ fn a_per_packet_filter_drops_the_packet_without_revoking_the_session_7212() {
 /// reverse-translated ALIAS index, must revalidate too — and the verdict must
 /// name the entry's CANONICAL key, not the translated tuple the packet carried.
 ///
-/// This is the dominant reverse-direction shape, not an edge case: every reply
-/// to a SNAT'd flow arrives addressed to the pool tuple, so
-/// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` = the
-/// TRANSLATED key, which names no entry in the primary index. A
-/// primary-index-only stamp probe answers "not stale" for every one of them: the
-/// reply half is never revalidated, never revoked, and never re-stamped, so a
-/// `then discard` on the reply-side ingress interface does nothing to it. The
-/// teardown has the same dependency — handed the translated key it would delete
-/// nothing — which is why the verdict carries the resolved key rather than a
-/// bool.
+/// The subject is a reverse entry whose WIRE and CANONICAL keys diverge — the
+/// shape the reverse-translated ALIAS index exists for. `lookup_with_origin`
+/// finds such an entry through that index, so
+/// `ResolvedFlowSessionDecision::key` is the wire tuple and names no entry in
+/// the PRIMARY index. A primary-index-only stamp probe answers "not stale" for
+/// it forever: never revalidated, never revoked, never re-stamped, so a
+/// `then discard` on its ingress interface does nothing to it. The teardown has
+/// the same dependency — handed the wire tuple it would delete nothing — which
+/// is why the verdict carries the resolved key rather than a bool.
+///
+/// An ORDINARY source-NAT reply is not this shape and the fixture does not claim
+/// to be one: the pair install stores the reverse companion under
+/// `reverse_session_key(forward, nat)`, which is already the wire reply tuple,
+/// so that reply resolves primary. The fixture builds the divergence directly,
+/// which is what the alias index is reached by.
 ///
 /// The fixture is built so the two keys genuinely DIFFER (an address rewrite
 /// plus a port rewrite on the reverse entry); with `NatDecision::default()` the
@@ -543,7 +593,7 @@ fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
     reverse_metadata.is_reverse = true;
 
     let mut sessions = SessionTable::new();
-    sessions.set_filter_revalidation_gen(6);
+    sessions.set_filter_revalidation_gen(7);
     assert!(sessions.install_with_protocol_with_origin(
         reverse_key.clone(),
         reverse_decision,
@@ -553,7 +603,6 @@ fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
         PROTO_TCP,
         0,
     ));
-    sessions.set_filter_revalidation_gen(7);
 
     // What the poll path holds for this packet: the WIRE (translated) tuple.
     let wire_key = crate::session::translated_session_key(&reverse_key, reverse_decision.nat);
@@ -563,12 +612,15 @@ fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
          this cell exercises the primary-index path and proves nothing"
     );
     assert!(
-        !sessions.filter_revalidation_stale(&wire_key),
-        "precondition, and the defect this cell pins: a primary-index probe on \
-         the wire tuple finds nothing and reports the session fresh"
+        sessions.filter_revalidation_stale(&wire_key, LAN_IFINDEX),
+        "the wire tuple must resolve THROUGH the alias index; a \
+         primary-index-only probe finds nothing and reports the session fresh, \
+         which is the defect this cell pins"
     );
     assert_eq!(
-        sessions.canonical_session_key(&wire_key).as_ref(),
+        sessions
+            .stale_filter_revalidation_key(&wire_key, LAN_IFINDEX)
+            .as_ref(),
         Some(&reverse_key),
         "the wire tuple must resolve to the entry's canonical key through the \
          reverse-translated alias index"
@@ -598,7 +650,7 @@ fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
          translated tuple deletes nothing"
     );
     assert!(
-        sessions.filter_revalidation_stale(&reverse_key),
+        sessions.filter_revalidation_stale(&reverse_key, LAN_IFINDEX),
         "a DENY leaves the stamp stale by design (see \
          `a_deny_verdict_does_not_re_stamp_the_session_7212`); the re-stamp \
          landing on the CANONICAL key is pinned by the permitted sibling below"
@@ -633,7 +685,7 @@ fn a_permitted_snat_reply_through_the_nat_alias_is_untouched_7212() {
     reverse_metadata.is_reverse = true;
 
     let mut sessions = SessionTable::new();
-    sessions.set_filter_revalidation_gen(6);
+    sessions.set_filter_revalidation_gen(7);
     assert!(sessions.install_with_protocol_with_origin(
         reverse_key.clone(),
         reverse_decision,
@@ -643,7 +695,6 @@ fn a_permitted_snat_reply_through_the_nat_alias_is_untouched_7212() {
         PROTO_TCP,
         0,
     ));
-    sessions.set_filter_revalidation_gen(7);
     let wire_key = crate::session::translated_session_key(&reverse_key, reverse_decision.nat);
     let flow = SessionFlow {
         src_ip: wire_key.src_ip,
@@ -669,7 +720,7 @@ fn a_permitted_snat_reply_through_the_nat_alias_is_untouched_7212() {
         .expect("the permitted reply half must survive");
     assert_eq!(lookup.decision.nat.rewrite_dst_port, Some(40001));
     assert!(
-        !sessions.filter_revalidation_stale(&reverse_key),
+        !sessions.filter_revalidation_stale(&reverse_key, LAN_IFINDEX),
         "an Accept verdict must re-stamp the aliased entry too"
     );
 }
@@ -704,7 +755,7 @@ fn a_non_first_fragment_of_a_permitted_flow_does_not_revoke_it_7212() {
         ],
     );
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
     let fragment = non_first_fragment_frame();
     // Fixture liveness: the frame really is a non-first fragment, so the
     // frame-derived extra really would suppress the port-constrained permit.
@@ -732,7 +783,7 @@ fn a_non_first_fragment_of_a_permitted_flow_does_not_revoke_it_7212() {
         "a fragment must not revoke a flow the filter permits on its 5-tuple"
     );
     assert!(
-        !sessions.filter_revalidation_stale(&flow.forward_key),
+        !sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
         "the permitted flow is still re-stamped"
     );
 }
@@ -758,7 +809,7 @@ fn a_non_first_fragment_still_revokes_a_denied_flow_7212() {
     );
     // Same filter, a flow on a port the permit does not cover.
     let flow = v4_flow(9999);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
         &mut sessions,
@@ -802,7 +853,7 @@ fn a_deny_verdict_does_not_re_stamp_the_session_7212() {
     let forwarding =
         forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
     let flow = v4_flow(5201);
-    let mut sessions = table_with_session(&flow, 6, 7);
+    let mut sessions = table_with_session(&flow, 7, None);
 
     let hit = evaluate_input_filter_on_session_hit(
         &forwarding,
@@ -816,7 +867,7 @@ fn a_deny_verdict_does_not_re_stamp_the_session_7212() {
     .expect("first packet: the session is newly denied");
     assert!(hit.revoked_key.is_some());
     assert!(
-        sessions.filter_revalidation_stale(&flow.forward_key),
+        sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
         "a DENY must leave the stamp stale, so a teardown that did not take \
          cannot turn into a forwarded flow"
     );
@@ -835,4 +886,214 @@ fn a_deny_verdict_does_not_re_stamp_the_session_7212() {
     .expect("second packet: still denied, not forwarded under a stale-clean stamp");
     assert_eq!(again.eval.action, crate::filter::FilterAction::Discard);
     assert!(again.revoked_key.is_some());
+}
+
+/// A ROUTE-LOOKUP-AFFECTING filter is deliberately NOT revalidated, even for a
+/// flow one of its plain static terms denies.
+///
+/// The static verdict runs the NON-ROUTING walk, which returns the default
+/// Accept the moment it matches a `routing-instance` term — before that term's
+/// own action is examined. #4392 established that
+/// `then { routing-instance blue; discard; }` is a DROP, reached on the
+/// session-MISS path through `ingress_route_table_override`. Reading the
+/// deferral as an Accept would PRESERVE and STAMP a session the routing-aware
+/// evaluation drops, and the stamp would keep it from re-deriving until the next
+/// generation. The walk cannot tell "Accept because nothing matched" from
+/// "Accept because it deferred", so this path declines.
+///
+/// The fixture is the case that COSTS something, not the case that is safe: the
+/// flow does NOT match the PBR term, so the walk would reach `deny-5201` and
+/// revoke. Declining loses that revocation — a stated limitation (#8114), not an
+/// accident — and pinning it here is what makes a later fix visible as a
+/// deliberate change rather than an incidental one.
+#[test]
+fn a_route_lookup_affecting_filter_is_not_revalidated_7212() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![
+            FirewallTermSnapshot {
+                name: "pbr".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["9999".into()],
+                routing_instance: "blue".into(),
+                action: "accept".into(),
+                syslog: false,
+                reject_message_type: String::new(),
+                ..Default::default()
+            },
+            deny_term("deny-5201", "5201"),
+        ],
+    );
+    // Fixture liveness: the filter really is route-lookup-affecting, and the
+    // deny term really does match this flow — so the decline is what produces
+    // the `None`, not a non-matching filter.
+    let filter = crate::filter::interface_input_filter(
+        &forwarding.filter_state,
+        LAN_IFINDEX,
+        false,
+    )
+    .expect("the filter is attached");
+    assert!(
+        filter.affects_route_lookup,
+        "fixture liveness: without a routing-instance term the decline is never \
+         reached and this cell proves nothing"
+    );
+    let flow = v4_flow(5201);
+    assert_eq!(
+        crate::filter::filter_ref_static_verdict(
+            filter,
+            flow.src_ip,
+            flow.dst_ip,
+            PROTO_TCP,
+            flow.forward_key.src_port,
+            flow.forward_key.dst_port,
+            0,
+            crate::filter::TermMatchExtra::default(),
+        ),
+        crate::filter::FilterAction::Discard,
+        "fixture liveness: the deny term matches this flow, so the decline is \
+         costing a revocation rather than being free"
+    );
+
+    let mut sessions = table_with_session(&flow, 7, None);
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a route-lookup-affecting filter must decline rather than read its own \
+         deferral as an Accept"
+    );
+    assert!(
+        sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX),
+        "and it must not STAMP the session — a stamp would suppress the \
+         re-derivation a later routing-aware evaluator needs"
+    );
+}
+
+/// The eviction key set covers all THREE identities the revoked flow is known
+/// by. The aliased row is the one that matters: the flow cache is keyed by the
+/// WIRE tuple, so a set built only from the table's canonical key and its
+/// companion leaves an aliased SNAT reply's descriptor live.
+#[test]
+fn revoked_flow_cache_keys_cover_the_wire_alias_7212() {
+    let canonical = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        src_port: 5201,
+        dst_port: 12345,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let mut nat = crate::nat::NatDecision::default();
+    nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+    nat.rewrite_dst_port = Some(40001);
+    let wire = crate::session::translated_session_key(&canonical, nat);
+    assert_ne!(
+        wire, canonical,
+        "fixture liveness: the wire tuple must differ, or the alias row is not \
+         being exercised"
+    );
+
+    let mut out = Vec::new();
+    collect_revoked_flow_cache_keys(&wire, &canonical, nat, &mut out);
+    assert!(out.contains(&canonical), "the table's key");
+    assert!(
+        out.contains(&crate::session::reverse_session_key(&canonical, nat)),
+        "the companion the teardown also deletes"
+    );
+    assert!(
+        out.contains(&wire),
+        "the WIRE tuple the flow cache is keyed by — without it an aliased \
+         reply keeps forwarding off a cached descriptor with no session"
+    );
+}
+
+/// The non-aliased case emits no duplicate: when the packet's tuple IS the
+/// canonical key, the wire entry is elided. Without this row the helper could
+/// push unconditionally and the alias row above would still pass.
+#[test]
+fn revoked_flow_cache_keys_elide_the_duplicate_wire_key_7212() {
+    let flow = v4_flow(5201);
+    let mut out = Vec::new();
+    collect_revoked_flow_cache_keys(
+        &flow.forward_key,
+        &flow.forward_key,
+        crate::nat::NatDecision::default(),
+        &mut out,
+    );
+    assert_eq!(
+        out.iter().filter(|k| **k == flow.forward_key).count(),
+        1,
+        "an untranslated flow's key must appear exactly once"
+    );
+}
+
+/// A session judged on interface A is NOT considered judged on interface B, at
+/// the SAME generation.
+///
+/// The verdict is a function of the interface as well as the snapshot, and the
+/// session key carries no ingress identity. A generation-only stamp reports the
+/// session already judged when a same-direction packet arrives on B —
+/// asymmetric routing, a zone spanning several members, a redundancy-group
+/// change, two VLAN units on one trunk — and B's `then discard` is never
+/// evaluated for the rest of that generation.
+///
+/// The generation is held FIXED across both packets, so the interface is the
+/// only thing that can move the answer. Every other cell in this file uses ONE
+/// ingress interface, which is exactly the fixture shape in which deleting the
+/// ifindex from the stamp changes no outcome.
+#[test]
+fn a_verdict_on_one_interface_does_not_judge_another_7212() {
+    // WAN unit `reth0.80` (ifindex 12) is the second interface; it exists in the
+    // shared topology and is in a different zone, which is what makes two
+    // different filters on it realistic.
+    const IF_B: i32 = 12;
+    let forwarding = forwarding_with_two_input_filters(
+        LAN_IFINDEX,
+        vec![accept_term("permit-web", "5201")],
+        IF_B,
+        vec![deny_term("deny-web", "5201")],
+    );
+    let flow = v4_flow(5201);
+    let mut sessions = table_with_session(&flow, 7, None);
+
+    // Packet 1 on A: permitted, and the session is stamped as judged on A.
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "A's filter permits this flow"
+    );
+    assert!(!sessions.filter_revalidation_stale(&flow.forward_key, LAN_IFINDEX));
+
+    // Packet 2, SAME generation, same session, arriving on B. B denies it.
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(IF_B as u32, 0, false),
+        Some(TEST_WAN_ZONE_ID),
+    )
+    .expect("B's filter must be evaluated — A's verdict says nothing about B");
+    assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
+    assert_eq!(hit.revoked_key.as_ref(), Some(&flow.forward_key));
 }

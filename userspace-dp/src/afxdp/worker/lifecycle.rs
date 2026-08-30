@@ -273,9 +273,7 @@ pub(super) fn poll_binding(
         // `RewriteDescriptor` on this worker even once. Sibling WORKERS evict on
         // their next tick via the `replicate_session_delete` -> `DeleteSynced`
         // -> #6457 path the teardown already queued.
-        let mut revoked_keys = core::mem::take(&mut binding.scratch.scratch_filter_revoked_keys);
-        invalidate_flow_cache_slots_for_revoked_sessions(left, binding, right, &mut revoked_keys);
-        binding.scratch.scratch_filter_revoked_keys = revoked_keys;
+        drain_revoked_flow_cache_keys(left, binding, right);
         if !pending_forwards.is_empty() {
             // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
             // Safety: the Arc<BindingLiveState> outlives this function call;
@@ -382,6 +380,28 @@ pub(super) fn poll_binding(
 ///
 /// `keys` is DRAINED so the caller can hand its scratch vector straight back to
 /// the binding with its capacity intact.
+/// #7212: take the revoked keys `current` accumulated during its RX batch,
+/// evict them from every binding of this worker, and hand the emptied vector
+/// back so its capacity is reused.
+///
+/// The take/evict/restore is ONE named function rather than three statements at
+/// the call site because the call site is inside a poll function no test can
+/// invoke: with it inline, deleting it left every #7212 cell green while the
+/// revoked flow kept forwarding off a cached descriptor AND the scratch vector
+/// grew without bound, since nothing else clears it. This is the repo's
+/// "bind the WIRING, not the function it calls" rule — the cell that drives this
+/// starts from a binding whose scratch is populated, which is the state the poll
+/// pass actually leaves behind.
+pub(super) fn drain_revoked_flow_cache_keys(
+    left: &mut [BindingWorker],
+    current: &mut BindingWorker,
+    right: &mut [BindingWorker],
+) {
+    let mut keys = core::mem::take(&mut current.scratch.scratch_filter_revoked_keys);
+    invalidate_flow_cache_slots_for_revoked_sessions(left, current, right, &mut keys);
+    current.scratch.scratch_filter_revoked_keys = keys;
+}
+
 pub(super) fn invalidate_flow_cache_slots_for_revoked_sessions(
     left: &mut [BindingWorker],
     current: &mut BindingWorker,

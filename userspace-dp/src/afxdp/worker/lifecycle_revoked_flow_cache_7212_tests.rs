@@ -213,10 +213,13 @@ fn revocation_eviction_leaves_other_flows_cached_7212() {
     assert!(hits(&mut b, &bystander, &epochs));
 }
 
-/// An empty revocation list touches nothing — the common case is every tick, so
-/// it must not walk the bindings at all.
+/// An empty revocation list evicts nothing. The common case is every tick, and
+/// the claim here is about the OUTCOME, not about the early return: an empty
+/// `drain` over an empty vector is already a no-op, so no assertion can
+/// distinguish the `is_empty()` guard from its absence. The guard is a
+/// readability choice, and this cell pins only what is observable.
 #[test]
-fn no_revocations_is_a_no_op_7212() {
+fn no_revocations_evicts_nothing_7212() {
     let epochs = epochs();
     let mut a = BindingWorker::new_for_mirror_test(0, 0, IF_A, 0);
     let live = key(12345, 5201);
@@ -224,4 +227,43 @@ fn no_revocations_is_a_no_op_7212() {
     let mut keys: Vec<SessionKey> = Vec::new();
     invalidate_flow_cache_slots_for_revoked_sessions(&mut [], &mut a, &mut [], &mut keys);
     assert!(hits(&mut a, &live, &epochs));
+}
+
+/// The WIRING: `drain_revoked_flow_cache_keys` reads the keys the poll pass left
+/// on the binding's scratch, evicts across every binding, and hands the emptied
+/// vector back with its capacity.
+///
+/// The three cells above drive the eviction helper with a caller-supplied
+/// vector, so they stay green if the take/restore around it is deleted — and
+/// deleting it is exactly the mutation that matters: the revoked flow keeps
+/// forwarding off a cached descriptor, and the scratch grows without bound
+/// because nothing else clears it.
+#[test]
+fn revoked_keys_are_drained_from_the_bindings_own_scratch_7212() {
+    let epochs = epochs();
+    let mut a = BindingWorker::new_for_mirror_test(0, 0, IF_A, 0);
+    let mut b = BindingWorker::new_for_mirror_test(1, 0, IF_B, 0);
+    let revoked = key(12345, 5201);
+    seed(&mut a, &revoked);
+    seed(&mut b, &revoked);
+    // The state a poll pass leaves behind.
+    b.scratch.scratch_filter_revoked_keys.push(revoked.clone());
+    let capacity_before = b.scratch.scratch_filter_revoked_keys.capacity();
+
+    drain_revoked_flow_cache_keys(std::slice::from_mut(&mut a), &mut b, &mut []);
+
+    assert!(
+        !hits(&mut a, &revoked, &epochs),
+        "the sibling binding's slot must be evicted from the SCRATCH contents"
+    );
+    assert!(!hits(&mut b, &revoked, &epochs));
+    assert!(
+        b.scratch.scratch_filter_revoked_keys.is_empty(),
+        "the scratch must be emptied, or it grows without bound"
+    );
+    assert_eq!(
+        b.scratch.scratch_filter_revoked_keys.capacity(),
+        capacity_before,
+        "and handed back with its capacity, not replaced by a fresh Vec"
+    );
 }

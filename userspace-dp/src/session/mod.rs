@@ -347,6 +347,40 @@ mod expire;
 mod install;
 mod lookup;
 
+/// #7212: the `(config generation, logical ingress interface)` pair a session's
+/// static input-filter verdict was derived under.
+///
+/// Both halves are needed because the verdict is a function of BOTH: the
+/// generation says WHICH filter snapshot judged it, the interface says WHOSE
+/// filter did. A stamp carrying only the generation silently claims an
+/// interface change was already adjudicated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FilterRevalidationStamp {
+    generation: u64,
+    logical_ingress_ifindex: i32,
+}
+
+impl FilterRevalidationStamp {
+    /// "No static input-filter verdict has been derived for this entry."
+    ///
+    /// It can never collide with a live stamp: generation `0` is the value
+    /// `SessionTable` holds before the first poll pass publishes one, and the Go
+    /// control plane's snapshot generation is a monotone counter that starts at
+    /// 1 — so no live packet is ever classified at generation 0
+    /// (`classify_metadata` also requires `snapshot_installed`).
+    pub(crate) const UNVALIDATED: Self = Self {
+        generation: 0,
+        logical_ingress_ifindex: 0,
+    };
+
+    fn live(generation: u64, logical_ingress_ifindex: i32) -> Self {
+        Self {
+            generation,
+            logical_ingress_ifindex,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionEntry {
     decision: SessionDecision,
@@ -432,30 +466,51 @@ struct SessionEntry {
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
     /// stale duplicate (lazy-delete discriminator).
     wheel_tick: u64,
-    /// #7212: the config generation this direction's interface INPUT-filter
-    /// verdict was last computed under.
+    /// #7212: the `(config generation, logical ingress interface)` this
+    /// direction's static input-filter verdict was last derived under, or
+    /// [`FilterRevalidationStamp::UNVALIDATED`].
     ///
     /// A purely STATIC (address / protocol / port) input filter's verdict is a
-    /// pure function of `(ingress interface, family, 5-tuple)` — every input is
-    /// constant for the life of one direction of a session — so it does not need
-    /// re-deriving per packet, only when the filter snapshot can have changed.
+    /// pure function of `(ingress interface, family, 5-tuple)`. The 5-tuple and
+    /// the family are the session key; the other two are what this records, so
+    /// the stamp names EVERY input the verdict depended on. An earlier revision
+    /// recorded only the generation, which made the stamp claim more than it
+    /// knew: at a fixed generation, a same-direction packet arriving on a
+    /// DIFFERENT interface (asymmetric routing, a redundancy-group member
+    /// change) is adjudicated by that interface's filter, and a
+    /// generation-only stamp reported the session already judged.
+    ///
+    /// It is written ONLY by `mark_filter_revalidated`, from the established-hit
+    /// path that actually ran the interface's filter. Every INSTALL — forward,
+    /// reverse companion, peer-synced import alike — stamps `UNVALIDATED`, and
+    /// that uniformity is deliberate rather than lazy:
+    ///
+    ///   * the REVERSE companion is pre-installed alongside the forward session
+    ///     and its ingress is explicitly UNOBSERVED at that point (the same
+    ///     reason `SessionMetadata::ingress_ifindex` is `0` for it, #4983), so
+    ///     no filter has adjudicated it and a live stamp would be a false claim
+    ///     that one had;
+    ///   * a PEER-SYNCED import carries the peer's adjudication, made against
+    ///     the peer's interfaces, which is the failover fence;
+    ///   * the FORWARD install's verdict WAS just computed by the session-MISS
+    ///     path, so a live stamp would be truthful there — but it would be the
+    ///     only truthful case, and buying it costs a per-install branch to keep
+    ///     one static term walk off each new session's second packet. That walk
+    ///     is side-effect free and is paid only on an interface with an input
+    ///     filter attached, which is the gate every arm passes through first.
+    ///
     /// The established-session HIT path compares this against
-    /// `SessionTable::filter_revalidation_gen` (the live
-    /// `ValidationState::config_generation`); on a mismatch it re-derives the
-    /// static verdict ONCE, side-effect free, re-stamps here, and revokes the
-    /// session only if the verdict is now DENY. A session the filter still
-    /// PERMITS is never touched — the whole reason #5858's family purge was
-    /// rejected.
+    /// `(SessionTable::filter_revalidation_gen, the packet's logical ingress)`;
+    /// on a mismatch it re-derives the static verdict ONCE, re-stamps here on
+    /// ACCEPT, and revokes the session on DENY. A DENY deliberately does NOT
+    /// re-stamp — see `afxdp/poll_descriptor/filter.rs`.
     ///
-    /// Forward and reverse are separate entries with separate stamps, so each
-    /// direction revalidates against the interface ITS packets actually arrive
-    /// on. There is no stored ingress ifindex: the ingress is read off the
-    /// packet in hand, an OBSERVATION rather than the prediction
-    /// `SessionMetadata::ingress_ifindex` documents as the wrong datum for the
-    /// reverse half (#4983).
-    ///
-    /// `config_generation` is a SUPERSET trigger: it advances on every commit
-    /// and on every `BumpFIBGeneration`, not only on filter edits. That is
+    /// `config_generation` is a SUPERSET trigger: it advances on every commit,
+    /// not only on filter edits. It does NOT advance on a `BumpFIBGeneration` —
+    /// `Coordinator::bump_fib_generation` assigns `validation.fib_generation`
+    /// alone and republishes, reusing the published forwarding `Arc` so the
+    /// #1188 worker short-circuit still hits — which an earlier revision of this
+    /// comment claimed, over-stating the cost. That is
     /// deliberate and safe — the re-derivation can only DROP a session the
     /// current filter denies, so an extra revalidation of a permitted flow is a
     /// no-op, and its cost is gated behind a single `iface_filter_v{4,6}_fast`
@@ -464,15 +519,10 @@ struct SessionEntry {
     /// (`FlowCacheStamp::config_generation`), so the packet that pays for the
     /// revalidation is one already taking the session path.
     ///
-    /// `0` is never a live generation. It is the stamp a peer-SYNCED import
-    /// carries (`upsert_synced_with_origin`), which is what makes a promoted
-    /// session revalidate against THIS node's filter state on its first local
-    /// packet after a failover.
-    ///
     /// Node-local derived state, like `established` and `handshake_pending`:
     /// `SessionEntry` carries no serde, so this is on no wire and is not part of
     /// session identity.
-    filter_revalidated_gen: u64,
+    filter_revalidated: FilterRevalidationStamp,
     /// #2120: the RG epoch (`rg_epochs[owner_rg_id]`, or the node-level
     /// `rg_epochs[0]` for `owner_rg_id <= 0`) recorded the last time this
     /// entry was self-healed (the expire pass observed this node START
@@ -688,14 +738,14 @@ pub(crate) struct SessionTable {
     /// timeout, byte-identical to pre-#3527.
     opening_overrides: FxHashMap<u16, u64>,
     /// #7212: the live `ValidationState::config_generation` this worker is
-    /// forwarding under. Installed sessions are stamped with it, and the
-    /// established-hit static input-filter revalidation compares against it.
-    /// Refreshed from the same `validation` the poll pass classifies packets
-    /// against (`poll_binding_process_descriptor`), so the stamp a session
-    /// carries and the generation it is compared to can never come from
-    /// different publishes. `0` until the first poll pass — and `0` is never a
-    /// live generation, so a session installed before then simply revalidates
-    /// once.
+    /// forwarding under. The established-hit static input-filter revalidation
+    /// compares a session's stamp against it, and `mark_filter_revalidated`
+    /// writes it. Refreshed from the same `validation` the poll pass classifies
+    /// packets against (`poll_binding_process_descriptor`), so the generation a
+    /// session is stamped with and the generation it is compared to can never
+    /// come from different publishes. `0` until the first poll pass, which is
+    /// also `FilterRevalidationStamp::UNVALIDATED`'s generation and is never
+    /// live.
     filter_revalidation_gen: u64,
     epoch_counter: u64,
     expired: u64,
@@ -1008,9 +1058,9 @@ impl SessionTable {
 
     /// #7212: publish the config generation this worker is forwarding under.
     /// Called once per poll pass from `poll_binding_process_descriptor` with the
-    /// SAME `ValidationState` the pass classifies packets against, so a session
-    /// installed during the pass is stamped with the generation its verdict was
-    /// actually computed under.
+    /// SAME `ValidationState` the pass classifies packets against, so a verdict
+    /// derived during the pass is stamped with the generation it was actually
+    /// derived under.
     pub(crate) fn set_filter_revalidation_gen(&mut self, generation: u64) {
         self.filter_revalidation_gen = generation;
     }
@@ -1021,71 +1071,102 @@ impl SessionTable {
         self.filter_revalidation_gen
     }
 
-    /// #7212: resolve a WIRE tuple to the CANONICAL key of the entry it names.
+    /// #7212: resolve a WIRE tuple to the entry it names, and answer in ONE
+    /// probe whether that entry still lacks a static input-filter verdict
+    /// derived under the live generation on `logical_ingress_ifindex`.
     ///
-    /// The established-hit path does NOT reliably hold a canonical key.
-    /// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` on
-    /// the local session-table hit — i.e. the tuple the packet carried — and on
-    /// the NAT reverse-translated ALIAS path that tuple is the TRANSLATED one,
-    /// not the entry's key. A reply to a source-NAT'd flow is exactly that path,
-    /// so a primary-index-only probe silently misses the dominant reverse
-    /// direction: it would never report the session stale, never revalidate it,
-    /// and never re-stamp it — and a teardown handed the translated key would
-    /// delete nothing.
+    /// `Some(canonical key)` means "stale — re-derive, then stamp THIS key".
+    /// `None` means either "already judged under this (generation, ingress)" or
+    /// "this worker holds no entry for the tuple".
     ///
-    /// Resolution mirrors `lookup_with_origin` and `bound_policy_counter_for`
-    /// — the direct primary key, then the reverse-translated index with the
-    /// SAME validation (`is_reverse` plus a translation round-trip back to the
-    /// probed key, both inside `resolve_reverse_translated_handle`), so a stale
-    /// or colliding index entry can never hand back a different session's key.
-    pub(crate) fn canonical_session_key(&self, key: &SessionKey) -> Option<SessionKey> {
-        if let Some(handle) = self.key_to_handle.get(key).copied()
-            && let Some(record) = self.entries.get(handle as usize)
-            && record.key == *key
-        {
-            return Some(record.key.clone());
-        }
-        let handle = self.resolve_reverse_translated_handle(key)?;
-        self.entries
-            .get(handle as usize)
-            .map(|record| record.key.clone())
-    }
-
-    /// #7212: does the session `key` names still carry an input-filter verdict
-    /// computed under an OLDER generation?
+    /// **Why the two questions are one call.** The caller is on the
+    /// established-hit path, which has already resolved this key once inside
+    /// `lookup_with_origin`. Asking separately cost a second `key_to_handle`
+    /// hash plus a third for the staleness probe, and a `SessionKey` clone,
+    /// on EVERY packet of every session on an interface with an input filter —
+    /// the entire population the feature serves — to answer a question that is
+    /// "no" for all but one packet per session per generation. Folded, the
+    /// common answer costs one hash and one comparison, and the clone happens
+    /// only on the rare stale exit.
     ///
-    /// `key` must be the entry's CANONICAL key — this is a primary-index probe.
-    /// A caller holding a wire tuple resolves it through
-    /// [`SessionTable::canonical_session_key`] first. A key with no entry
-    /// answers `false`: there is no session to revoke, and answering `true`
-    /// would send the caller into a re-derivation whose re-stamp has nowhere to
-    /// land, so it would re-derive on every packet forever.
-    pub(crate) fn filter_revalidation_stale(&self, key: &SessionKey) -> bool {
-        self.entry_ref(key)
-            .is_some_and(|entry| entry.filter_revalidated_gen != self.filter_revalidation_gen)
+    /// **Why a wire tuple has to be resolved at all.**
+    /// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` on a
+    /// local session-table hit — the tuple the packet carried — and a reverse
+    /// entry reached through the NAT reverse-translated ALIAS index is stored
+    /// under a DIFFERENT key than the one that found it. A primary-index-only
+    /// probe reports such an entry fresh forever: never revalidated, never
+    /// revoked, never re-stamped, and a teardown handed the wire tuple deletes
+    /// nothing.
+    ///
+    /// Resolution mirrors `lookup_with_origin` exactly, including its
+    /// stale-handle guard: a `key_to_handle` hit whose stored key does NOT match
+    /// is a freed-and-reused slab slot and yields `None` rather than falling
+    /// through to the alias index — where a live alias entry for the same tuple
+    /// would resolve a DIFFERENT session, which the caller would then revoke.
+    pub(crate) fn stale_filter_revalidation_key(
+        &self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) -> Option<SessionKey> {
+        let record = match self.key_to_handle.get(key).copied() {
+            Some(handle) => {
+                let record = self.entries.get(handle as usize)?;
+                if record.key != *key {
+                    // Stale primary handle: same guard `lookup_with_origin`
+                    // applies. Falling through to the alias index here could
+                    // resolve a different live session under this tuple.
+                    return None;
+                }
+                record
+            }
+            None => {
+                let handle = self.resolve_reverse_translated_handle(key)?;
+                self.entries.get(handle as usize)?
+            }
+        };
+        let live = FilterRevalidationStamp::live(
+            self.filter_revalidation_gen,
+            logical_ingress_ifindex,
+        );
+        (record.entry.filter_revalidated != live).then(|| record.key.clone())
     }
 
     /// #7212: record that this direction's static input-filter verdict has been
-    /// re-derived under the live generation. Idempotent; a miss is a no-op (the
-    /// session was torn down between the probe and here). Takes the CANONICAL
-    /// key, like its `filter_revalidation_stale` sibling.
-    pub(crate) fn mark_filter_revalidated(&mut self, key: &SessionKey) {
-        let generation = self.filter_revalidation_gen;
+    /// re-derived under the live generation on `logical_ingress_ifindex`.
+    ///
+    /// Takes the CANONICAL key — the one
+    /// [`SessionTable::stale_filter_revalidation_key`] just handed back — so it
+    /// is a primary-index write. Idempotent; a miss is a no-op (the session was
+    /// torn down between the probe and here).
+    pub(crate) fn mark_filter_revalidated(
+        &mut self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) {
+        let stamp =
+            FilterRevalidationStamp::live(self.filter_revalidation_gen, logical_ingress_ifindex);
         if let Some(handle) = self.key_to_handle.get(key).copied()
             && let Some(record) = self.entries.get_mut(handle as usize)
             && record.key == *key
         {
-            record.entry.filter_revalidated_gen = generation;
+            record.entry.filter_revalidated = stamp;
         }
     }
 
-    /// #7212: borrow the entry `key` names by its PRIMARY index, validating the
-    /// stored key against a stale handle exactly as `lookup_with_origin` does.
-    fn entry_ref(&self, key: &SessionKey) -> Option<&SessionEntry> {
-        let handle = self.key_to_handle.get(key).copied()?;
-        let record = self.entries.get(handle as usize)?;
-        (record.key == *key).then_some(&record.entry)
+    /// #7212 test view: the boolean half of
+    /// [`SessionTable::stale_filter_revalidation_key`]. A `.is_some()` over the
+    /// SAME call, not a second implementation, so it cannot answer differently
+    /// from what production asks.
+    #[cfg(test)]
+    pub(crate) fn filter_revalidation_stale(
+        &self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) -> bool {
+        self.stale_filter_revalidation_key(key, logical_ingress_ifindex)
+            .is_some()
     }
+
 
     /// #3527: install the per-screened-zone half-open (`tcp_opening_ns`)
     /// timeout overrides (zone id → ns), driven from each zone's `syn-flood

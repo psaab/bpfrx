@@ -75,26 +75,76 @@ fn install(table: &mut SessionTable, k: &SessionKey, is_reverse: bool) {
     ));
 }
 
-/// A session installed under generation N is NOT stale at N, and IS stale once
-/// the worker publishes N+1. Without both halves the accessor could be a
-/// constant: an always-false stale predicate would make the revocation dead
-/// code, and an always-true one would re-derive every session's verdict on
-/// every packet.
+/// The ingress interfaces the cells below stamp against. Two of them, because
+/// the stamp names the interface as well as the generation and a single-value
+/// fixture cannot show that.
+const IF_A: i32 = 24;
+const IF_B: i32 = 25;
+
+/// An INSTALL leaves the entry unvalidated, so its next packet derives a
+/// verdict; `mark_filter_revalidated` is the only thing that clears that.
+///
+/// The install used to stamp the live generation, on the reasoning that the
+/// forward session's first packet had just been adjudicated by the session-MISS
+/// path. That is true of the forward entry and FALSE of the reverse companion
+/// this same constructor builds, whose ingress is explicitly unobserved at
+/// install (#4983) — a live stamp there claims a filter judged a direction no
+/// filter has seen. Uniformly unvalidated costs one side-effect-free term walk
+/// per direction, on an interface that has an input filter at all.
 #[test]
-fn install_stamps_the_live_generation_and_goes_stale_on_the_next_7212() {
+fn install_leaves_the_entry_unvalidated_7212() {
     let mut table = SessionTable::new();
     table.set_filter_revalidation_gen(41);
     let k = key(49152);
     install(&mut table, &k, false);
 
     assert!(
-        !table.filter_revalidation_stale(&k),
-        "a session installed under the live generation carries its verdict"
+        table.filter_revalidation_stale(&k, IF_A),
+        "a fresh install carries no verdict, so its next packet must derive one"
     );
+    table.mark_filter_revalidated(&k, IF_A);
+    assert!(!table.filter_revalidation_stale(&k, IF_A));
+}
+
+/// A generation bump makes a revalidated session stale again. Without this the
+/// stamp could be a one-shot "seen" bit and nothing would notice.
+#[test]
+fn a_generation_bump_makes_a_revalidated_session_stale_7212() {
+    let mut table = SessionTable::new();
+    table.set_filter_revalidation_gen(41);
+    let k = key(49152);
+    install(&mut table, &k, false);
+    table.mark_filter_revalidated(&k, IF_A);
+    assert!(!table.filter_revalidation_stale(&k, IF_A));
+
     table.set_filter_revalidation_gen(42);
     assert!(
-        table.filter_revalidation_stale(&k),
+        table.filter_revalidation_stale(&k, IF_A),
         "a config generation bump must make the stamped verdict stale"
+    );
+}
+
+/// An INGRESS change makes it stale too, at a FIXED generation.
+///
+/// The verdict is a function of the interface as well as the snapshot: the
+/// filter that judged the session on A says nothing about B's filter. A
+/// generation-only stamp reports the session already judged when a
+/// same-direction packet arrives on B — asymmetric routing, a redundancy-group
+/// member change — and B's deny is skipped. The generation is deliberately held
+/// FIXED here so the only thing that can move the answer is the interface.
+#[test]
+fn an_ingress_change_makes_a_revalidated_session_stale_7212() {
+    let mut table = SessionTable::new();
+    table.set_filter_revalidation_gen(41);
+    let k = key(49152);
+    install(&mut table, &k, false);
+    table.mark_filter_revalidated(&k, IF_A);
+
+    assert!(!table.filter_revalidation_stale(&k, IF_A));
+    assert!(
+        table.filter_revalidation_stale(&k, IF_B),
+        "the same generation on a DIFFERENT ingress must be stale — that \
+         interface's filter has not judged this session"
     );
 }
 
@@ -105,17 +155,16 @@ fn install_stamps_the_live_generation_and_goes_stale_on_the_next_7212() {
 #[test]
 fn mark_filter_revalidated_clears_only_its_own_entry_7212() {
     let mut table = SessionTable::new();
-    table.set_filter_revalidation_gen(1);
+    table.set_filter_revalidation_gen(2);
     let a = key(49152);
     let b = key(49153);
     install(&mut table, &a, false);
     install(&mut table, &b, false);
-    table.set_filter_revalidation_gen(2);
 
-    table.mark_filter_revalidated(&a);
-    assert!(!table.filter_revalidation_stale(&a));
+    table.mark_filter_revalidated(&a, IF_A);
+    assert!(!table.filter_revalidation_stale(&a, IF_A));
     assert!(
-        table.filter_revalidation_stale(&b),
+        table.filter_revalidation_stale(&b, IF_A),
         "re-stamping one session must not re-stamp its neighbours"
     );
 }
@@ -128,19 +177,18 @@ fn mark_filter_revalidated_clears_only_its_own_entry_7212() {
 #[test]
 fn forward_and_reverse_carry_independent_stamps_7212() {
     let mut table = SessionTable::new();
-    table.set_filter_revalidation_gen(5);
+    table.set_filter_revalidation_gen(6);
     let fwd = key(49152);
     let mut rev = key(49152);
     std::mem::swap(&mut rev.src_ip, &mut rev.dst_ip);
     std::mem::swap(&mut rev.src_port, &mut rev.dst_port);
     install(&mut table, &fwd, false);
     install(&mut table, &rev, true);
-    table.set_filter_revalidation_gen(6);
 
-    table.mark_filter_revalidated(&fwd);
-    assert!(!table.filter_revalidation_stale(&fwd));
+    table.mark_filter_revalidated(&fwd, IF_A);
+    assert!(!table.filter_revalidation_stale(&fwd, IF_A));
     assert!(
-        table.filter_revalidation_stale(&rev),
+        table.filter_revalidation_stale(&rev, IF_B),
         "the reverse direction must revalidate on its own ingress interface"
     );
 }
@@ -165,33 +213,14 @@ fn peer_synced_import_is_always_stale_7212() {
         true,
     ));
     assert!(
-        table.filter_revalidation_stale(&k),
+        table.filter_revalidation_stale(&k, IF_A),
         "an imported session carries no locally-derived verdict, so it must \
          revalidate before this node forwards on it"
     );
-}
-
-/// A locally-installed session is NOT stale under the same generation the
-/// import above is stale under. Without this row the import cell above would
-/// pass for a table that reports everything stale.
-#[test]
-fn local_install_is_not_stale_under_the_generation_that_makes_an_import_stale_7212() {
-    let mut table = SessionTable::new();
-    table.set_filter_revalidation_gen(9);
-    let local = key(49152);
-    let imported = key(49153);
-    install(&mut table, &local, false);
-    assert!(table.upsert_synced(
-        imported.clone(),
-        decision(),
-        metadata(false),
-        1_000,
-        PROTO_TCP,
-        0,
-        true,
-    ));
-    assert!(!table.filter_revalidation_stale(&local));
-    assert!(table.filter_revalidation_stale(&imported));
+    // Not vacuous against "everything is stale": marking it clears it, so the
+    // predicate is reading the stamp rather than returning a constant.
+    table.mark_filter_revalidated(&k, IF_A);
+    assert!(!table.filter_revalidation_stale(&k, IF_A));
 }
 
 /// A key with no entry answers "not stale". The caller would otherwise be sent
@@ -201,28 +230,30 @@ fn local_install_is_not_stale_under_the_generation_that_makes_an_import_stale_72
 fn an_absent_key_is_not_stale_7212() {
     let mut table = SessionTable::new();
     table.set_filter_revalidation_gen(3);
-    assert!(!table.filter_revalidation_stale(&key(49152)));
+    assert!(!table.filter_revalidation_stale(&key(49152), IF_A));
     // ...and re-stamping it is a no-op rather than a panic.
-    table.mark_filter_revalidated(&key(49152));
+    table.mark_filter_revalidated(&key(49152), IF_A);
 }
 
-/// The generation the table hands installs is the one the worker published, not
-/// a value the table invents. `set_filter_revalidation_gen` is called once per
-/// poll pass with the SAME `ValidationState` the pass classifies packets
-/// against; if the table drifted from it, a session could be stamped with a
-/// generation its verdict was never computed under.
+/// The generation `mark_filter_revalidated` writes is the one the worker
+/// published, not a value the table invents. `set_filter_revalidation_gen` is
+/// called once per poll pass with the SAME `ValidationState` the pass
+/// classifies packets against; if the table drifted from it, a session could be
+/// stamped with a generation its verdict was never derived under.
 #[test]
-fn published_generation_is_what_installs_stamp_7212() {
+fn the_published_generation_is_what_gets_stamped_7212() {
     let mut table = SessionTable::new();
     assert_eq!(table.filter_revalidation_gen(), 0);
     table.set_filter_revalidation_gen(77);
     assert_eq!(table.filter_revalidation_gen(), 77);
     let k = key(49152);
     install(&mut table, &k, false);
-    // Rewinding to the value the entry should carry proves the entry was
-    // stamped with 77 specifically, not merely "some non-stale value".
+    table.mark_filter_revalidated(&k, IF_A);
+
+    // Rewinding to the value the entry should carry proves it was stamped with
+    // 77 specifically, not merely "some non-stale value".
     table.set_filter_revalidation_gen(78);
-    assert!(table.filter_revalidation_stale(&k));
+    assert!(table.filter_revalidation_stale(&k, IF_A));
     table.set_filter_revalidation_gen(77);
-    assert!(!table.filter_revalidation_stale(&k));
+    assert!(!table.filter_revalidation_stale(&k, IF_A));
 }

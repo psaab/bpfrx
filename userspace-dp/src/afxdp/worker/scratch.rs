@@ -79,10 +79,13 @@ pub(crate) struct WorkerScratch {
     /// `left`/`current`/`right` split borrow, in the SAME tick, before any
     /// further packet is processed.
     ///
-    /// Bounded by the revocation rate — one push per direction per revoked
-    /// session, and a session is revoked at most once because the teardown
-    /// removes it — so this is not a per-packet allocation site. Drained and
-    /// returned to the binding each pass, keeping its capacity.
+    /// Sized for the worst case an RX batch can produce so a push inside the
+    /// packet loop cannot reallocate: up to `RX_BATCH_SIZE` descriptors, each
+    /// able to revoke one session, and each revocation pushing the canonical
+    /// key, its companion, and the wire tuple the packet carried (which differs
+    /// from the canonical key on the NAT reverse-translated alias path and keys
+    /// its own flow-cache slot). Drained and returned to the binding each pass,
+    /// keeping that capacity.
     pub(crate) scratch_filter_revoked_keys: Vec<SessionKey>,
 }
 
@@ -93,6 +96,11 @@ impl WorkerScratch {
     /// `ring_entries` sizes `scratch_completed_offsets` alone — it is drained
     /// against the completion ring, so its bound is the ring's, not a batch's.
     /// Every other capacity is a compile-time batch bound.
+    /// #7212: the revoked-key buffer's bound — see
+    /// `scratch_filter_revoked_keys`. Three keys per revoked session, one
+    /// revocation per descriptor at worst.
+    pub(crate) const REVOKED_KEYS_PER_DESCRIPTOR: usize = 3;
+
     pub(crate) fn pre_sized(ring_entries: u32) -> Self {
         Self {
             scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -107,9 +115,12 @@ impl WorkerScratch {
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
-            // #7212: pre-sized like its sibling scratch vectors so a revocation
-            // burst does not reallocate on the poll path.
-            scratch_filter_revoked_keys: Vec::with_capacity(16),
+            // #7212: pre-sized for the worst case ONE RX batch can produce, so
+            // a push inside the packet loop never reallocates. The old
+            // hand-written 16 was under the bound by 12x.
+            scratch_filter_revoked_keys: Vec::with_capacity(
+                RX_BATCH_SIZE as usize * Self::REVOKED_KEYS_PER_DESCRIPTOR,
+            ),
         }
     }
 }

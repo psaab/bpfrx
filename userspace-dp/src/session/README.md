@@ -515,25 +515,38 @@ last computed under:
 The key the stamp is read and written through is the entry's CANONICAL key, and
 the poll path does not hold one: `ResolvedFlowSessionDecision::key` is
 `ResolvedSessionKey::QueryKey` on a local session-table hit — the tuple the
-packet carried — and on the NAT reverse-translated ALIAS path that is the
-TRANSLATED tuple, which names no entry in the primary index. That path is the
-reply to every source-NAT'd flow, so a primary-index-only probe would report the
-whole reverse direction fresh, never revalidate it, and never re-stamp it — and a
-teardown handed the translated key would delete nothing. `canonical_session_key`
-resolves it the same two ways `lookup_with_origin` does — the primary key, then
-the reverse-translated index with its own `is_reverse` + round-trip validation —
-and the verdict carries the resolved key rather than a bool so the teardown acts
-on the session that was judged. Those are the only two indexes an established
-HIT resolves through; `forward_wire_index` and `nat_reverse_index` back the
-reverse-session SYNTHESIS finders on the session-MISS path, which produce a
-`ResolvedSessionKey::Canonical` key directly.
+packet carried. For most established hits that IS the entry's key, including an
+ordinary source-NAT reply: the pair install stores the reverse companion under
+`reverse_session_key(forward, nat)`, which is already the wire reply tuple, so
+the reply resolves through the PRIMARY index. But `lookup_with_origin` also
+resolves through the reverse-translated ALIAS index, and an entry reached that
+way is stored under a DIFFERENT key than the one that found it — a
+primary-index-only probe reports it fresh forever, never revalidates it, never
+re-stamps it, and a teardown handed the wire tuple deletes nothing.
 
-A `None` from that resolution is not a gap to work around: it means this
-worker's table holds no entry for the tuple, because the hit was served from the
-SHARED map without a local install (the #2120 transient synced-hit path). There
-is nothing local to stamp or tear down, and the window is bounded —
-`maybe_promote_synced_session` installs the entry on a later packet, with
-generation `0`, so it revalidates before this node forwards on it as its own.
+`stale_filter_revalidation_key` resolves the wire tuple the same two ways
+`lookup_with_origin` does — the primary key WITH its stale-handle guard (a
+`key_to_handle` hit whose stored key does not match is a reused slab slot and
+must not fall through to the alias index, where a live alias entry for the same
+tuple would resolve a DIFFERENT session), then the reverse-translated index with
+its own `is_reverse` + round-trip validation — and answers the staleness
+question in the SAME probe, so the established-hit path pays one hash rather
+than three. The verdict then carries the resolved key rather than a bool, so the
+teardown acts on the session that was judged.
+
+Those are the only two indexes an established HIT resolves through.
+`forward_wire_index` and `nat_reverse_index` are also reachable from
+`lookup_session_across_scopes`, but both surface as
+`ResolvedSessionKey::Canonical`, so they primary-probe cleanly.
+
+A `None` from that probe covers two answers. Either the entry is already judged
+under this `(generation, ingress)` — the common one — or this worker's table
+holds no entry for the tuple, because the hit was served from the SHARED map
+without a local install (the #2120 transient synced-hit path) or because a
+reverse-NAT repair's install was refused at `max_sessions`. In those there is
+nothing local to stamp or tear down; the transient window is bounded by
+`maybe_promote_synced_session` installing the entry `UNVALIDATED`, and both are
+tracked in #8114.
 
 On an established-session HIT, `evaluate_input_filter_on_session_hit`
 (`afxdp/poll_descriptor/filter.rs`) does ONE `iface_filter_v{4,6}_fast` lookup
@@ -577,8 +590,12 @@ next tick through the `replicate_session_delete` -> `DeleteSynced` -> #6457 path
 the teardown already queues; that is the same promptness the operator's own
 `clear security flow session` has.
 
-`config_generation` is a SUPERSET trigger — it advances on every commit and on
-every `BumpFIBGeneration`, not only on filter edits. That is deliberate: the
+`config_generation` is a SUPERSET trigger — it advances on every commit, not
+only on filter edits. (It does NOT advance on a `BumpFIBGeneration`: that path
+assigns `validation.fib_generation` alone and republishes, reusing the same
+forwarding `Arc` so the #1188 worker short-circuit still hits. An earlier
+revision of this paragraph claimed it did, which over-stated the cost.) The
+superset is deliberate: the
 re-derivation can only DROP a session the current filter denies, so an extra
 revalidation of a permitted flow is a no-op, and it is gated behind the single
 fast-map lookup that only an interface with an input filter attached ever passes.

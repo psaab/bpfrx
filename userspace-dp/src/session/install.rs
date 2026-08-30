@@ -163,12 +163,17 @@ impl SessionTable {
                 established: !(matches!(protocol, PROTO_TCP) && is_initial_syn(tcp_flags)),
                 // #6752: a fresh install has seen no SYN-ACK, so nothing is pending.
                 handshake_pending: false,
-                // #7212: this session's first packet was just adjudicated by the
-                // session-MISS path, which ran the interface input filter in
-                // full. Stamp the generation that verdict was computed under so
-                // the established-hit path re-derives it only once the snapshot
-                // moves — not on the very next packet.
-                filter_revalidated_gen: self.filter_revalidation_gen,
+                // #7212: no static input-filter verdict has been derived for
+                // this ENTRY yet. The forward install's own first packet was
+                // adjudicated by the session-MISS path, but this constructor
+                // also builds the REVERSE companion, whose ingress is
+                // explicitly unobserved at install (the same reason
+                // `SessionMetadata::ingress_ifindex` is `0` for it, #4983) —
+                // stamping a live generation there would claim a filter had
+                // judged a direction no filter has seen. Uniformly
+                // `UNVALIDATED`, so the first packet of each direction derives
+                // its own verdict against the interface it actually arrived on.
+                filter_revalidated: FilterRevalidationStamp::UNVALIDATED,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
@@ -403,13 +408,13 @@ impl SessionTable {
                 handshake_pending: false,
                 // #7212: a peer-synced import carries NO locally-derived
                 // input-filter verdict — the peer adjudicated it against the
-                // peer's own interfaces. Stamp `0`, which is never a live
-                // generation, so the first packet this node forwards on the
-                // session re-derives the verdict against THIS node's filter
-                // state. That is the failover fence: a standby still holding a
-                // pre-commit view cannot cold-serve a flow the primary revoked,
-                // because the promoted copy revalidates before it forwards.
-                filter_revalidated_gen: 0,
+                // peer's own interfaces. `UNVALIDATED` makes the first packet
+                // this node forwards on the session re-derive the verdict
+                // against THIS node's filter state. That is the failover fence:
+                // a standby still holding a pre-commit view cannot cold-serve a
+                // flow the primary revoked, because the promoted copy
+                // revalidates before it forwards.
+                filter_revalidated: FilterRevalidationStamp::UNVALIDATED,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
