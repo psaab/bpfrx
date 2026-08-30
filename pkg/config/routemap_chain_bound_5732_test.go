@@ -32,7 +32,7 @@ func TestComposedChainSequenceCount_5732(t *testing.T) {
 		{"empty", nil, 0},
 	}
 	for _, c := range cases {
-		if got := ComposedChainSequenceCount(pss, c.chain); got != c.want {
+		if got := ComposedChainSequenceCount(nil, pss, c.chain); got != c.want {
 			t.Errorf("%s: ComposedChainSequenceCount = %d, want %d", c.name, got, c.want)
 		}
 	}
@@ -75,11 +75,11 @@ func TestComposedChainSequenceBound_CompileReject_5732(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lenient compile must not hard-fail: %v", err)
 	}
-	if got := RouteMapSequenceCount(lenient.PolicyOptions.PolicyStatements["A"]); got > MaxRouteMapSequences {
+	if got := RouteMapSequenceCount(&lenient.PolicyOptions, lenient.PolicyOptions.PolicyStatements["A"]); got > MaxRouteMapSequences {
 		t.Fatalf("test setup: member A (%d) must be UNDER the per-policy ceiling %d", got, MaxRouteMapSequences)
 	}
 	// The composed chain exceeds the ceiling.
-	if got := ComposedChainSequenceCount(lenient.PolicyOptions.PolicyStatements, []string{"A", "B"}); got <= MaxRouteMapSequences {
+	if got := ComposedChainSequenceCount(&lenient.PolicyOptions, lenient.PolicyOptions.PolicyStatements, []string{"A", "B"}); got <= MaxRouteMapSequences {
 		t.Fatalf("test setup: composed A+B (%d) must EXCEED the ceiling %d", got, MaxRouteMapSequences)
 	}
 

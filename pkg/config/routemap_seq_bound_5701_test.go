@@ -62,7 +62,7 @@ func TestRouteMapSequenceCount_5701(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		if got := RouteMapSequenceCount(c.ps); got != c.want {
+		if got := RouteMapSequenceCount(nil, c.ps); got != c.want {
 			t.Errorf("%s: RouteMapSequenceCount = %d, want %d", c.name, got, c.want)
 		}
 	}
@@ -81,10 +81,10 @@ func TestRouteMapSequenceCount_OverCeilingNoWrap_5701(t *testing.T) {
 		PrefixList:    makeNames("pl", 83),
 		FromCommunity: makeNames("c", 83),
 	}}}
-	if got := RouteMapSequenceCount(ps); got != 83*83 {
+	if got := RouteMapSequenceCount(nil, ps); got != 83*83 {
 		t.Fatalf("count = %d, want %d", got, 83*83)
 	}
-	if RouteMapSequenceCount(ps) <= MaxRouteMapSequences {
+	if RouteMapSequenceCount(nil, ps) <= MaxRouteMapSequences {
 		t.Fatalf("83x83 must exceed the ceiling %d", MaxRouteMapSequences)
 	}
 }
@@ -153,7 +153,7 @@ func TestPolicyRouteMapSequenceBound_CompileReject_5701(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lenient compile must not hard-fail: %v", err)
 	}
-	if got := RouteMapSequenceCount(lenient.PolicyOptions.PolicyStatements["BIG"]); got <= MaxRouteMapSequences {
+	if got := RouteMapSequenceCount(&lenient.PolicyOptions, lenient.PolicyOptions.PolicyStatements["BIG"]); got <= MaxRouteMapSequences {
 		t.Fatalf("test setup: BIG must exceed the ceiling, got %d (max %d)", got, MaxRouteMapSequences)
 	}
 

@@ -40,7 +40,17 @@ const (
 // sum are overflow-checked (checkedMulU64 / saturating add): a pathological
 // crafted policy saturates to math.MaxUint64 rather than wrapping back down
 // into the in-bound range, so it never under-reports an over-ceiling policy.
-func RouteMapSequenceCount(ps *PolicyStatement) uint64 {
+// #7526: po carries the prefix-list table, because the count depends on WHAT
+// the referenced lists hold, not just how many are named. The renderer expands
+// one prefix-list NAME into one match line per family it holds
+// (fromPrefixListRefs), so a mixed v4+v6 list is TWO sequences. Counting names
+// under-counted every such reference by exactly a factor of two, and a policy
+// admitted just under MaxRouteMapSequences then rendered past FRR's ceiling.
+//
+// The parameter is REQUIRED rather than optional so the compiler enumerates
+// every call site: an optional table would be nil at the sites that most need
+// it, and the count would silently fall back to the old family-blind answer.
+func RouteMapSequenceCount(po *PolicyOptionsConfig, ps *PolicyStatement) uint64 {
 	if ps == nil {
 		return 0
 	}
@@ -53,7 +63,7 @@ func RouteMapSequenceCount(ps *PolicyStatement) uint64 {
 		if termRouteFiltersMixFamily(term) {
 			fam = 2
 		}
-		v := checkedMulU64(fam, orOneU64(len(term.PrefixList)))
+		v := checkedMulU64(fam, TermPrefixListRefCount(po, term.PrefixList))
 		v = checkedMulU64(v, orOneU64(len(term.FromCommunity)))
 		v = checkedMulU64(v, orOneU64(len(term.FromASPath)))
 		if total > math.MaxUint64-v {
@@ -82,14 +92,16 @@ func RouteMapSequenceCount(ps *PolicyStatement) uint64 {
 // the in-bound range. This is the SSOT the #5732 commit gate
 // (validateBGPComposedChainSequenceBoundStrict) and the renderComposedRouteMap
 // render-side belt BOTH consult, so they can never disagree on what overflows.
-func ComposedChainSequenceCount(pss map[string]*PolicyStatement, chain []string) uint64 {
+// #7526: po is required for the same reason as on RouteMapSequenceCount — the
+// per-member count depends on what the referenced prefix-lists hold.
+func ComposedChainSequenceCount(po *PolicyOptionsConfig, pss map[string]*PolicyStatement, chain []string) uint64 {
 	var total uint64
 	for _, name := range chain {
 		ps := pss[name]
 		if ps == nil {
 			continue
 		}
-		n := RouteMapSequenceCount(ps)
+		n := RouteMapSequenceCount(po, ps)
 		if total > math.MaxUint64-n {
 			total = math.MaxUint64
 		} else {
@@ -170,7 +182,7 @@ func validatePolicyRouteMapSequenceBoundStrict(cfg *Config) error {
 		if ps == nil {
 			continue
 		}
-		if n := RouteMapSequenceCount(ps); n > MaxRouteMapSequences {
+		if n := RouteMapSequenceCount(&cfg.PolicyOptions, ps); n > MaxRouteMapSequences {
 			return fmt.Errorf(
 				"policy-statement %q expands to %d route-map sequences, over the "+
 					"FRR ceiling of %d (route-map sequence numbers are 1..%d in steps "+

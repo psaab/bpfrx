@@ -365,7 +365,7 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 		// route-map`, and independent of FRR's undefined-map behaviour. See
 		// renderQuarantineDenyRouteMap for why deny and not "drop the
 		// attachment".
-		if n := config.RouteMapSequenceCount(ps); n > config.MaxRouteMapSequences {
+		if n := config.RouteMapSequenceCount(po, ps); n > config.MaxRouteMapSequences {
 			slog.Warn("oversized route-map policy: expansion would overflow FRR sequence numbers "+
 				"and poison the reload; rendering an explicit DENY under this name instead — "+
 				"routes matched by its attachments are withdrawn until the policy is reduced",
@@ -947,7 +947,7 @@ func (m *Manager) renderComposedRouteMap(po *config.PolicyOptionsConfig, compose
 	// (RMAP_DENY on a failed route_map_lookup_by_name, stable/10.6), not
 	// permits as the previous comment claimed. Same tradeoff as the
 	// single-policy site (#5701); see renderQuarantineDenyRouteMap.
-	if n := config.ComposedChainSequenceCount(po.PolicyStatements, chain); n > config.MaxRouteMapSequences {
+	if n := config.ComposedChainSequenceCount(po, po.PolicyStatements, chain); n > config.MaxRouteMapSequences {
 		slog.Warn("oversized composed BGP policy-chain route-map: expansion would overflow FRR "+
 			"sequence numbers and poison the reload; rendering an explicit DENY under this name "+
 			"instead — routes on neighbors carrying this chain are withdrawn until it is reduced",

@@ -133,7 +133,7 @@ func validateBGPComposedChainSequenceBoundStrict(cfg *Config) error {
 	sort.Strings(names)
 	for _, name := range names {
 		chain := chains[name]
-		if n := ComposedChainSequenceCount(pss, chain); n > MaxRouteMapSequences {
+		if n := ComposedChainSequenceCount(&cfg.PolicyOptions, pss, chain); n > MaxRouteMapSequences {
 			return fmt.Errorf(
 				"BGP composed policy chain [ %s ] expands to %d route-map sequences, "+
 					"over the FRR ceiling of %d — renderComposedRouteMap concatenates "+
