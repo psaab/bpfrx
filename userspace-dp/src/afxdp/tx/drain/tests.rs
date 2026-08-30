@@ -199,3 +199,67 @@ fn shaped_drain_entry_guard_requires_interface_order() {
         "bindings without an interface order cannot make shaped-drain progress"
     );
 }
+
+/// #7204 (A1-b6-F4): the backup drain must not drop either deque's allocation.
+///
+/// This binds the PROPERTY, not the path, and that is deliberate. The item is a
+/// discipline violation, not a wrong result: the drain transmits the same
+/// packets before and after the fix, so a test that merely exercises it passes
+/// either way and would tell the next reader the discipline is enforced when it
+/// is not. Capacity is the observable that separates them — a re-allocated
+/// `VecDeque::new()` has capacity 0, and the whole point of the fix is that the
+/// deques come back with theirs.
+#[test]
+fn park_drained_deques_keeps_both_allocations_7204() {
+    use std::collections::VecDeque;
+
+    let mut pipeline = crate::afxdp::worker::WorkerTxPipeline::empty_for_test();
+
+    // FULL SUCCESS: retry drained empty. `pending` is empty but carries the
+    // allocation the drain took out of `pending_tx_local`.
+    let mut pending: VecDeque<TxRequest> = VecDeque::with_capacity(64);
+    let retry: VecDeque<TxRequest> = VecDeque::with_capacity(32);
+    assert!(pending.capacity() >= 64 && retry.capacity() >= 32, "fixture");
+    pending.clear();
+
+    let restored = pipeline.park_drained_deques(pending, retry);
+    assert!(
+        restored.capacity() >= 64,
+        "full success must hand the PENDING allocation back to pending_tx_local; \
+         a fresh VecDeque would have capacity 0 and the producer would regrow it \
+         on the warmed TX path"
+    );
+    assert!(
+        pipeline.backup_retry_scratch.capacity() >= 32,
+        "...and must park the retry deque so the next batch does not allocate one"
+    );
+
+    // RETRY PATH: the deque holding items is the one that goes back, or
+    // untransmitted requests end up BEHIND newly-arrived ones.
+    let mut pipeline2 = crate::afxdp::worker::WorkerTxPipeline::empty_for_test();
+    let pending2: VecDeque<TxRequest> = VecDeque::with_capacity(64);
+    let mut retry2: VecDeque<TxRequest> = VecDeque::with_capacity(32);
+    retry2.push_back(TxRequest {
+        bytes: Vec::new(),
+        expected_ports: None,
+        expected_addr_family: 0,
+        expected_protocol: 0,
+        flow_key: None,
+        egress_ifindex: 0,
+        cos_queue_id: None,
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: 0,
+    });
+    let restored2 = pipeline2.park_drained_deques(pending2, retry2);
+    assert_eq!(
+        restored2.len(),
+        1,
+        "the deque still holding items must be the one restored — FIFO order \
+         depends on it, not just its allocation"
+    );
+    assert!(
+        pipeline2.backup_retry_scratch.capacity() >= 64,
+        "...and the emptied pending deque becomes the next batch's scratch"
+    );
+}

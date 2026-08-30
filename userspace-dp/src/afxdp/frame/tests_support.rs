@@ -204,6 +204,7 @@ pub(super) fn pbr_reject_tx_pipeline(max_pending_tx: usize) -> crate::afxdp::wor
         free_tx_frames: std::collections::VecDeque::new(),
         pending_tx_prepared: std::collections::VecDeque::new(),
         pending_tx_local: std::collections::VecDeque::new(),
+        backup_retry_scratch: std::collections::VecDeque::new(),
         max_pending_tx,
         outstanding_tx: 0,
         pending_fill_frames: std::collections::VecDeque::new(),

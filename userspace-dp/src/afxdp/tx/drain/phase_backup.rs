@@ -144,6 +144,12 @@ fn backup_drain_local(
     }
     let mut pending = take_pending_tx_requests(binding);
     if pending.is_empty() {
+        // #7204 (A1-b6-F4): give the allocation back before returning.
+        // `take_pending_tx_requests` mem::takes `pending_tx_local`, so bailing
+        // out here used to leave the shared deque at capacity 0 and make the
+        // producer regrow it — the idle-binding path, which is the one this
+        // early return exists to make cheap.
+        binding.tx_pipeline.pending_tx_local = pending;
         return BackupOutcome::EarlyReturnNoDebugUpdate;
     }
     // #760: drop any CoS-bound items. Fast-exit if no CoS is
@@ -159,7 +165,10 @@ fn backup_drain_local(
             shared_recycles,
         );
     }
-    let mut retry = VecDeque::new();
+    // #7204 (A1-b6-F4): recycle the worker-owned retry deque instead of
+    // allocating one per batch. Parked empty in `backup_retry_scratch` between
+    // batches, so its capacity survives.
+    let mut retry = core::mem::take(&mut binding.tx_pipeline.backup_retry_scratch);
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
         if retry.len() >= TX_BATCH_SIZE
@@ -206,8 +215,17 @@ fn backup_drain_local(
             }
         }
     }
-    if !retry.is_empty() {
-        restore_pending_tx_requests(binding, retry);
-    }
+    // #7204 (A1-b6-F4): BOTH deques go back, on BOTH paths. The old tail
+    // restored only when `retry` was non-empty, so the full-success path — the
+    // common one — dropped the fresh retry deque AND the `pending_tx_local`
+    // allocation this drain had taken, and the next batch re-allocated two
+    // deques on the warmed TX path.
+    //
+    // `restore_pending_tx_requests` prepends its argument to `pending_tx_local`,
+    // so it must be given the deque that still HOLDS items; whichever is empty
+    // becomes next batch's scratch. Handing the wrong one over would reorder
+    // untransmitted requests behind newly-arrived ones.
+    let to_restore = binding.tx_pipeline.park_drained_deques(pending, retry);
+    restore_pending_tx_requests(binding, to_restore);
     BackupOutcome::Continue
 }
