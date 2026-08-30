@@ -60,7 +60,11 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   forwarding. Input/output filters with DSCP match terms force the
   flow-cache insertion path to decline caching because DSCP is not part
   of the session key. Established session hits still re-evaluate
-  DSCP-sensitive input filters per packet. Forwarding rotations compare
+  DSCP-sensitive input filters per packet, and — since #7212 — re-derive a
+  purely STATIC input filter's verdict once per config generation, revoking
+  the session only when the verdict has become a DENY (see "Static
+  input-filter revalidation stamp (#7212)" in `session/README.md`).
+  Forwarding rotations compare
   DSCP-sensitive input filter content by stable names, terms, and
   three-color policer runtime shape, not by compiler-positional filter
   IDs, before deciding whether existing sessions need a conservative
@@ -272,7 +276,8 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   The precheck takes a `count_policy: NonRoutingCountPolicy`:
   `OnlyTerminalNonAccept` (count only on the terminal discard/reject exit —
   the routing evaluator owns the Accept exit count) vs `Always` (precheck
-  is the sole counter, counts on every exit).
+  is the sole counter, counts on every exit) vs `Never` (#7212 — count
+  nothing at all).
   `evaluate_non_pbr_input_filter` derives it as `OnlyTerminalNonAccept`
   when `routing_eval_follows && interface_filter_affects_route_lookup(...)`
   else `Always`. The miss-path call site passes `routing_eval_follows =
@@ -283,6 +288,28 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   exits. (The earlier coarse fix gated the precheck solely on
   `affects_route_lookup`; that under-counted to zero on the discard/reject
   and session-hit exits, where the routing evaluator is never the counter.)
+
+- **`Never` is the side-effect-free STATIC verdict (#7212).**
+  `filter_ref_static_verdict` runs the SAME
+  `evaluate_filter_ref_non_routing_counted` walk with counting suppressed on
+  BOTH of its arms and returns only `.action`, so its verdict is the counted
+  walk's verdict by construction — there is no second walk to drift. Its caller
+  is the established-session-hit STATIC revalidation
+  (`afxdp/poll_descriptor/filter.rs`), which re-derives an already-admitted
+  session's verdict once per config generation to find out whether a newly
+  attached or tightened purely-static filter now DENIES the flow. That packet is
+  not a new arrival at the filter — it was adjudicated under the previous
+  generation — so counting it would inflate every matched `then count` term by
+  one packet per permitted session per commit, and `then log` would re-fire for a
+  flow whose record was already emitted. Nothing else in the walk is a side
+  effect: `then log` is DATA on the returned `FilterResult` (the caller emits the
+  record) and the three-color policer is not metered by this evaluator at all
+  (`now_ns = None`, #5857). On the DENY exit the caller re-runs the ordinary
+  `Always` walk, so the one newly-denied packet is counted and logged exactly
+  once. `NonRoutingCountPolicy::counting()` is an exhaustive `match` returning
+  `(count during the walk, replay on a terminal non-Accept)` rather than two `==`
+  comparisons, so a policy added later must classify itself on both axes instead
+  of inheriting whichever answer a negated comparison happened to give it.
 
 - **A routing-instance term that ALSO carries `reject`/`discard` is a DENY
   (#4392).** The non-PBR precheck DEFERS any matched routing-instance term
@@ -818,6 +845,17 @@ per-flag accessor can never drift:
   `Filter::varies_per_packet_within_flow()`. The flow-cache decline gate
   (`afxdp/flow_cache.rs`) still consults the two per-flag accessors individually
   (input **and** output directions), so they stay live.
+
+  #7212 widened this site rather than adding a second lookup beside it. The
+  session-hit gate now has to answer two questions in sequence — does the filter
+  vary per packet, and if not what is its static verdict — so it takes the
+  `&Filter` BORROW (`interface_input_filter`) and reads
+  `varies_per_packet_within_flow()` off it. Same single `.get()`, same cost for
+  the overwhelmingly common no-input-filter case;
+  `interface_input_filter_varies_per_packet` stays as the flow-cache path's own
+  single-lookup accessor and as the independent reference the equivalence tests
+  compare the folded borrow against (delegating would make that comparison
+  tautological).
 - **CoS TX-selection output arms** (`afxdp/tx/cos_classify.rs`, all four
   cached/runtime × flow-keyed/flowless): the `needs_tx_eval` bool precheck + the
   separate output-filter `.get()` + a redundant `.filter(needs_tx_eval)` fold to

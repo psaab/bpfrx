@@ -254,6 +254,28 @@ pub(super) fn poll_binding(
             );
         }
         binding.scratch.scratch_rst_teardowns = rst_teardowns;
+        // #7212: evict the flow-cache slots backing every session this pass
+        // REVOKED against a changed static interface INPUT filter.
+        //
+        // This runs on EVERY binding of this worker — `left`, the current
+        // binding, and `right` — because the session key does not carry the
+        // ingress ifindex the cache is keyed on, and the forward and reverse
+        // directions of one flow are routinely cached on different bindings.
+        // `invalidate_slot` drops only a slot whose key AND ingress_ifindex both
+        // match, and the session table is keyed by the 5-tuple alone, so at most
+        // one VALID descriptor exists per key: on a non-owning binding the call
+        // either no-ops or drops a stale prior-flow slot with the same tuple,
+        // never another live flow's entry. Same ownership argument as the #3776
+        // GC-reap and #6457 delete-sync evictions.
+        //
+        // It runs in the SAME tick as the teardown, before another packet is
+        // processed, so the revoked flow cannot be served off a cached
+        // `RewriteDescriptor` on this worker even once. Sibling WORKERS evict on
+        // their next tick via the `replicate_session_delete` -> `DeleteSynced`
+        // -> #6457 path the teardown already queued.
+        let mut revoked_keys = core::mem::take(&mut binding.scratch.scratch_filter_revoked_keys);
+        invalidate_flow_cache_slots_for_revoked_sessions(left, binding, right, &mut revoked_keys);
+        binding.scratch.scratch_filter_revoked_keys = revoked_keys;
         if !pending_forwards.is_empty() {
             // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
             // Safety: the Arc<BindingLiveState> outlives this function call;
@@ -339,3 +361,49 @@ pub(super) fn poll_binding(
     update_binding_debug_state(binding);
     did_work
 }
+
+/// #7212: evict the flow-cache slots backing every session the poll pass
+/// REVOKED against a changed static interface INPUT filter, on EVERY binding of
+/// this worker.
+///
+/// A named helper rather than an inline loop so the all-binding property is
+/// bindable by a test: the enclosing poll function is not callable on its own,
+/// and an inline `for` over `left`/`current`/`right` can be narrowed to the
+/// current binding alone with no test going red.
+///
+/// Every binding is walked because a session key does not carry the ingress
+/// ifindex the cache is keyed on, and the forward and reverse directions of one
+/// flow are routinely cached on different bindings. `invalidate_slot` drops only
+/// a slot whose key AND ingress_ifindex both match, and the session table is
+/// keyed by the 5-tuple alone, so at most one VALID descriptor exists per key:
+/// on a non-owning binding the call either no-ops or drops a stale prior-flow
+/// slot with the same tuple, never another live flow's entry. Same ownership
+/// argument as the #3776 GC-reap and #6457 delete-sync evictions.
+///
+/// `keys` is DRAINED so the caller can hand its scratch vector straight back to
+/// the binding with its capacity intact.
+pub(super) fn invalidate_flow_cache_slots_for_revoked_sessions(
+    left: &mut [BindingWorker],
+    current: &mut BindingWorker,
+    right: &mut [BindingWorker],
+    keys: &mut Vec<SessionKey>,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    for key in keys.drain(..) {
+        for binding in left
+            .iter_mut()
+            .chain(core::iter::once(&mut *current))
+            .chain(right.iter_mut())
+        {
+            binding.flow.flow_cache.invalidate_slot(&key, binding.ifindex);
+        }
+    }
+}
+
+// #7212: the all-binding, same-tick eviction of a revoked session's flow-cache
+// slots.
+#[cfg(test)]
+#[path = "lifecycle_revoked_flow_cache_7212_tests.rs"]
+mod lifecycle_revoked_flow_cache_7212_tests;

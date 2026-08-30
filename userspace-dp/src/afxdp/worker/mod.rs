@@ -587,6 +587,9 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                // #7212: pre-sized like its sibling scratch vectors so a
+                // revocation burst does not reallocate on the poll path.
+                scratch_filter_revoked_keys: Vec::with_capacity(16),
             },
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
@@ -742,6 +745,9 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                // #7212: pre-sized like its sibling scratch vectors so a
+                // revocation burst does not reallocate on the poll path.
+                scratch_filter_revoked_keys: Vec::with_capacity(16),
             },
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),
@@ -870,6 +876,9 @@ impl BindingWorker {
                 scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
+                // #7212: pre-sized like its sibling scratch vectors so a
+                // revocation burst does not reallocate on the poll path.
+                scratch_filter_revoked_keys: Vec::with_capacity(16),
             },
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),

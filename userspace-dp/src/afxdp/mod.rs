@@ -540,6 +540,10 @@ mod tests_icmp_reject_reversal;
 #[cfg(test)]
 #[path = "tests_embedded_poll_filter.rs"]
 mod tests_embedded_poll_filter;
+// #7212: end-to-end static input-filter revocation through the real poll path.
+#[cfg(test)]
+#[path = "tests_filter_revocation_7212.rs"]
+mod tests_filter_revocation_7212;
 #[cfg(test)]
 #[path = "tests_fabric_zone_stamp.rs"]
 mod tests_fabric_zone_stamp;

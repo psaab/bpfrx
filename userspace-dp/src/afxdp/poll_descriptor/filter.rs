@@ -18,14 +18,15 @@
 //     callee (emit_cached_output_filter_log_tail); the input emitter's
 //     non-None tail is already just a call to the cold
 //     emit_input_filter_log_match.
-//   - evaluate_dscp_sensitive_input_filter_on_session_hit runs per
-//     packet on the session-hit path for DSCP-sensitive-filter configs
-//     (flow_cache.rs:285 does not cache those). It stays #[inline] so
-//     the cheap interface_input_filter_varies_per_packet guard folds in
-//     (a single fast-map lookup evaluating the #1430 DSCP OR #2362
-//     per-packet-L4 OR, #6236 PR-2C) and returns None with no call when
-//     no such filter is configured. The post-guard body calls the cold
-//     evaluate_non_pbr_input_filter.
+//   - evaluate_input_filter_on_session_hit (#7212, formerly
+//     evaluate_dscp_sensitive_input_filter_on_session_hit) runs on the
+//     session-hit path. It stays #[inline] so the cheap guard folds in —
+//     ONE `iface_filter_v{4,6}_fast` lookup now serving both the #1430
+//     DSCP / #2362 per-packet-L4 re-eval gate and the #7212 static
+//     revalidation gate — and returns None with no call when the ingress
+//     interface has no input filter in this family. The post-guard bodies
+//     call the cold evaluate_non_pbr_input_filter and the cold
+//     revalidate_static_input_filter_on_session_hit.
 //   - evaluate_non_pbr_input_filter / _log_only,
 //     emit_input_filter_log_match, apply_lo0_filter_action are the
 //     rare/exception bodies: #[cold] #[inline(never)] for .text.unlikely
@@ -334,14 +335,69 @@ pub(super) fn evaluate_non_pbr_input_filter_counters_cached(
     )
 }
 
+/// #7212: what an established-session HIT owes the ingress interface's INPUT
+/// filter, after the ONE `iface_filter_v{4,6}_fast` lookup that decides it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SessionHitInputFilterEval {
+    /// The verdict + any `then log` record, produced by the ordinary counted
+    /// evaluator so a packet the filter drops is counted and logged exactly as a
+    /// session-MISS packet would be.
+    pub(super) eval: NonPbrInputFilterEval,
+    /// #7212: this verdict came from a STATIC-filter REVALIDATION rather than a
+    /// per-packet re-evaluation, so a non-`Accept` action REVOKES the session —
+    /// both directions, plus its flow-cache slots — instead of only dropping
+    /// this packet. `false` on the #1430/#2362 per-packet path, whose verdict is
+    /// about THIS packet and says nothing about the flow.
+    pub(super) revoked: bool,
+}
+
+/// Re-evaluate the ingress interface's INPUT filter for an established-session
+/// hit, when it owes one.
+///
+/// ONE `iface_filter_v{4,6}_fast` lookup decides between the two re-evaluations
+/// this path can owe, and `None` — no input filter on this ingress interface in
+/// this family — costs exactly that one lookup and nothing else. That is the
+/// same cost the pre-#7212 gate (`interface_input_filter_varies_per_packet`)
+/// paid, which is why this stays `#[inline]`: the common case folds into the
+/// caller as a load and a branch, with the heavy bodies behind `#[cold]` callees.
+///
+/// **Per-packet (#1430 / #2362).** A filter carrying a DSCP match or a
+/// per-packet L4 match (tcp-flags / is-fragment / icmp-type / icmp-code /
+/// flexible-match-range) has a verdict that is NOT a function of the 5-tuple, so
+/// the first-packet decision must not be replayed: it is re-evaluated on EVERY
+/// hit, with its counters and `then log` record. Unchanged from pre-#7212.
+///
+/// **Static revalidation (#7212).** Every other filter's verdict IS a pure
+/// function of `(ingress interface, family, 5-tuple)`, all constant for the life
+/// of one direction of a session. So it is re-derived only when the session's
+/// stamp predates the live config generation — once per session per generation,
+/// not per packet — and the session is re-stamped. The re-derivation is
+/// SIDE-EFFECT FREE (`NonRoutingCountPolicy::Never`): a session the filter still
+/// permits, which is nearly all of them on nearly every commit, leaves every
+/// `then count` term and every `then log` record untouched. Only when the
+/// verdict has become a DENY does the ordinary counted evaluator run, so the one
+/// packet that is newly denied is counted, logged and rejected exactly once.
+///
+/// Why the ingress interface is read off the packet and not off the session: it
+/// is an OBSERVATION of where this direction's traffic actually arrives.
+/// `SessionMetadata::ingress_ifindex` deliberately carries `0` for the reverse
+/// companion (#4983) precisely because the forward half's `egress_ifindex` is a
+/// PREDICTION of where the reply will land, which asymmetric routing can
+/// falsify. Forward and reverse are separate entries with separate stamps, so
+/// each direction revalidates against its own interface's filter with no stored
+/// ingress identity at all.
 #[inline]
-pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
+pub(super) fn evaluate_input_filter_on_session_hit(
     forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    // The matched entry's CANONICAL key (`ResolvedFlowSessionDecision::key`) —
+    // the primary index the stamp is read and written through.
+    session_key: &crate::session::SessionKey,
     frame: &[u8],
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
-) -> Option<NonPbrInputFilterEval> {
+) -> Option<SessionHitInputFilterEval> {
     let flow = flow?;
     let ingress_ifindex = resolve_ingress_logical_ifindex(
         forwarding,
@@ -350,37 +406,112 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
-    // #2362: re-evaluate on a session hit whenever the interface input filter
-    // carries EITHER a DSCP match term OR a per-packet L4 match term
-    // (tcp-flags / is-fragment / icmp-type / icmp-code). Both classes vary per
-    // packet within a flow, so the first-packet decision must not be replayed.
-    // #6236 PR-2C: fold the two per-flag prechecks (which each looked the same
-    // ingress ifindex up on the same-family input fast map) into ONE lookup that
-    // evaluates the `has_dscp_match_terms || has_per_packet_l4_match_terms` OR
-    // (`Filter::varies_per_packet_within_flow`) off a single borrow. The
-    // extra-build stays AFTER this gate so the common no-such-filter case pays
-    // ONE FxHashMap lookup (this function is #[inline] on the hot session-hit
-    // path).
-    if !crate::filter::interface_input_filter_varies_per_packet(
-        &forwarding.filter_state,
-        ingress_ifindex,
-        is_v6,
-    ) {
+    // THE single lookup. Both arms below read off this one borrow.
+    let filter =
+        crate::filter::interface_input_filter(&forwarding.filter_state, ingress_ifindex, is_v6)?;
+    if filter.varies_per_packet_within_flow() {
+        // #1430/#2362 — unchanged. The extra-build stays after the gate so the
+        // no-such-filter case never pays it.
+        let extra = term_match_extra_from_frame(frame, meta);
+        // #2620: the session-HIT re-eval is the SOLE counter for this packet —
+        // it never calls `ingress_route_table_override`/the routing evaluator.
+        // Pass `routing_eval_follows = false` so it counts on every exit
+        // (per-packet, pre-#2620 behavior), even when the filter is
+        // route-lookup-affecting.
+        return Some(SessionHitInputFilterEval {
+            eval: evaluate_non_pbr_input_filter(
+                forwarding,
+                extra,
+                Some(flow),
+                meta,
+                ingress_zone_override,
+                false,
+            ),
+            revoked: false,
+        });
+    }
+    // #7212: a purely STATIC filter. Nothing to do until the snapshot moves.
+    if !sessions.filter_revalidation_stale(session_key) {
         return None;
     }
-    let extra = term_match_extra_from_frame(frame, meta);
-    // #2620: the session-HIT re-eval is the SOLE counter for this packet — it
-    // never calls `ingress_route_table_override`/the routing evaluator. Pass
-    // `routing_eval_follows = false` so it counts on every exit (per-packet,
-    // pre-#2620 behavior), even when the filter is route-lookup-affecting.
-    Some(evaluate_non_pbr_input_filter(
+    revalidate_static_input_filter_on_session_hit(
         forwarding,
-        extra,
-        Some(flow),
+        sessions,
+        session_key,
+        filter,
+        frame,
+        flow,
         meta,
         ingress_zone_override,
-        false,
-    ))
+    )
+}
+
+/// #7212: the cold tail of [`evaluate_input_filter_on_session_hit`] — the
+/// session's static input-filter verdict is stale, so re-derive it.
+///
+/// Split out and `#[cold] #[inline(never)]` because it runs at most once per
+/// session per config generation: keeping it out of line leaves the caller's
+/// common path (no filter, or a fresh stamp) a lookup and two branches.
+///
+/// The re-stamp happens on BOTH exits, before the verdict is acted on. On the
+/// ACCEPT exit that is the whole point. On the DENY exit it is not merely
+/// harmless but load-bearing for the failure mode where the teardown does not
+/// take: the session must not re-derive the same DENY on every subsequent
+/// packet, re-running the counted evaluator (and its `then count` /
+/// `then log` / reject-reply side effects) each time.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn revalidate_static_input_filter_on_session_hit(
+    forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    session_key: &crate::session::SessionKey,
+    filter: &crate::filter::Filter,
+    frame: &[u8],
+    flow: &SessionFlow,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
+) -> Option<SessionHitInputFilterEval> {
+    // The filter is static, so `extra` is inert for every one of its terms
+    // (each per-packet condition is gated on the term flag that would have made
+    // `varies_per_packet_within_flow()` true). It is built from the frame anyway
+    // so this derivation and the counted evaluator below run on IDENTICAL
+    // inputs — the two must agree on the action, and building a different
+    // `TermMatchExtra` for each would make that agreement an argument rather
+    // than a fact.
+    let extra = term_match_extra_from_frame(frame, meta);
+    let verdict = crate::filter::filter_ref_static_verdict(
+        filter,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+        extra,
+    );
+    sessions.mark_filter_revalidated(session_key);
+    if verdict == crate::filter::FilterAction::Accept {
+        // The filter still permits this flow. Nothing is counted, nothing is
+        // logged, and the session — including its NAT translation, which is the
+        // reason #5858's family purge was rejected — is untouched.
+        return None;
+    }
+    // Newly DENIED. Re-run the ordinary counted evaluator so this packet is
+    // charged to the matching `then count` terms and produces its `then log`
+    // record exactly once, then let the caller run the reject reply, drop the
+    // packet, and revoke the session pair.
+    Some(SessionHitInputFilterEval {
+        eval: evaluate_non_pbr_input_filter(
+            forwarding,
+            extra,
+            Some(flow),
+            meta,
+            ingress_zone_override,
+            false,
+        ),
+        revoked: true,
+    })
 }
 
 #[cold]
@@ -1622,3 +1753,11 @@ mod filter_log_egress_zone_tests {
         );
     }
 }
+
+// #7212: the established-session-hit input-filter re-evaluation gate — family,
+// VLAN unit, term order, `except`, attach/detach, stamp freshness, and the
+// permitted-SNAT pin. Its own file rather than another block in this one, per
+// the modularity rule on test files.
+#[cfg(test)]
+#[path = "filter_revalidation_7212_tests.rs"]
+mod filter_revalidation_7212_tests;

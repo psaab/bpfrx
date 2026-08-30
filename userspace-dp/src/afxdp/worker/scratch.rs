@@ -59,4 +59,21 @@ pub(crate) struct WorkerScratch {
     #[allow(dead_code)]
     pub(crate) scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
     pub(crate) scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
+    /// #7212: forward + reverse keys of every session this poll pass REVOKED
+    /// because a static interface INPUT filter now denies it.
+    ///
+    /// Deferred rather than evicted inline for the same borrow-checker reason as
+    /// `scratch_cross_binding_tx`: the eviction has to run on EVERY binding of
+    /// this worker (a session does not carry the ingress ifindex the flow cache
+    /// is keyed on, and the two directions of one flow can be cached on
+    /// different bindings), and the RX loop holds `&mut BindingWorker` for one
+    /// binding only. `worker/lifecycle.rs` drains it under the
+    /// `left`/`current`/`right` split borrow, in the SAME tick, before any
+    /// further packet is processed.
+    ///
+    /// Bounded by the revocation rate — one push per direction per revoked
+    /// session, and a session is revoked at most once because the teardown
+    /// removes it — so this is not a per-packet allocation site. Drained and
+    /// returned to the binding each pass, keeping its capacity.
+    pub(crate) scratch_filter_revoked_keys: Vec<SessionKey>,
 }

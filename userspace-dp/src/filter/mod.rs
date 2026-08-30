@@ -1129,3 +1129,10 @@ impl Default for CachedTxSelectionFilterResult {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #7212: the side-effect-free static verdict (`NonRoutingCountPolicy::Never`).
+// Its own file rather than another block in the 9k-line `tests.rs`, per the
+// modularity rule on test files.
+#[cfg(test)]
+#[path = "static_verdict_7212_tests.rs"]
+mod static_verdict_7212_tests;

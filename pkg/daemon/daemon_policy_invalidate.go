@@ -297,6 +297,46 @@ func defaultPolicyChangeRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]str
 	return map[uint32]struct{}{dataplane.DefaultPolicySentinelID: {}}
 }
 
+// reportSessionAuthorizationChanges is the ONE commit-time entry point for
+// "authorization the operator just changed, versus sessions already
+// established". It exists as a single named seam rather than a bare call at
+// each of the three commit sites (commit, commit-confirmed, confirmed-rollback)
+// because a fourth site would otherwise be easy to add with the invalidation
+// left out.
+//
+// #7212: it used to have a SECOND half — the #5858 advisory, a commit-time
+// warning that an attached or tightened interface INPUT filter did NOT revoke
+// established sessions and that the operator had to run `clear security flow
+// session interface <name>` themselves. That warning existed only because the
+// revocation did not, and its central claim ("ESTABLISHED sessions are NOT
+// revoked and keep forwarding under the previous filter until they idle out")
+// is now FALSE: the dataplane revalidates each established session against the
+// changed static filter on its next packet and revokes the ones the filter now
+// denies (userspace-dp `evaluate_input_filter_on_session_hit`). A commit-time
+// warning that misstates current behaviour, and names a remedy the operator no
+// longer needs, is worse than none — an operator who learns one warning is
+// stale discounts the ones that matter. The advisory, its `filterCanDeny` gate,
+// and their tests were deleted with the revocation, in the same change.
+//
+// Note the asymmetry that remains and is correct: a POLICY change is revoked
+// HERE, at commit, because the policy that admitted a session is stamped on it
+// and the set of affected sessions is knowable from the config diff alone. A
+// FILTER change is revoked in the dataplane, lazily, because which sessions a
+// filter newly denies is a per-5-tuple question the control plane cannot answer
+// without re-deriving every session's verdict — and answering it by interface
+// instead, the obvious symmetry, is what #5858 rejected: it drops PERMITTED
+// flows, and a purged permitted SNAT flow reinstalls on a different translated
+// port.
+//
+// Returns the policy invalidation's error contract unchanged (#5578): non-nil
+// means a PARTIAL clear, so some traffic may keep forwarding under stale
+// authorization.
+//
+// Caller must hold d.applySem.
+func (d *Daemon) reportSessionAuthorizationChanges(oldCfg, newCfg *config.Config) error {
+	return d.clearSessionsForPolicyChanges(oldCfg, newCfg)
+}
+
 // clearSessionsForPolicyChanges runs the three commit-time session
 // invalidations — the deletion-clear (#4234), the modified-policy re-eval
 // (policy-rematch), and the default-policy change clear (#4342) — in order and

@@ -163,6 +163,12 @@ impl SessionTable {
                 established: !(matches!(protocol, PROTO_TCP) && is_initial_syn(tcp_flags)),
                 // #6752: a fresh install has seen no SYN-ACK, so nothing is pending.
                 handshake_pending: false,
+                // #7212: this session's first packet was just adjudicated by the
+                // session-MISS path, which ran the interface input filter in
+                // full. Stamp the generation that verdict was computed under so
+                // the established-hit path re-derives it only once the snapshot
+                // moves — not on the very next packet.
+                filter_revalidated_gen: self.filter_revalidation_gen,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,
@@ -395,6 +401,15 @@ impl SessionTable {
                 // to wait for — pending must stay false or it would be held on the
                 // opening window forever.
                 handshake_pending: false,
+                // #7212: a peer-synced import carries NO locally-derived
+                // input-filter verdict — the peer adjudicated it against the
+                // peer's own interfaces. Stamp `0`, which is never a live
+                // generation, so the first packet this node forwards on the
+                // session re-derives the verdict against THIS node's filter
+                // state. That is the failover fence: a standby still holding a
+                // pre-commit view cannot cold-serve a flow the primary revoked,
+                // because the promoted copy revalidates before it forwards.
+                filter_revalidated_gen: 0,
                 expires_after_ns: session_timeout_ns(
                     protocol,
                     tcp_flags,

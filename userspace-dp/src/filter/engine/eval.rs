@@ -316,7 +316,7 @@ fn evaluate_filter_ref_counted_v6(
 /// * `Always` — this precheck is the SOLE counter for the packet. Used when no
 ///   routing-instance term exists in the filter (the routing evaluator returns
 ///   early at the `affects_route_lookup` guard and counts nothing) AND on the
-///   DSCP/L4-sensitive SESSION-HIT re-eval path (`evaluate_dscp_sensitive_input_filter_on_session_hit`),
+///   DSCP/L4-sensitive SESSION-HIT re-eval arm of `evaluate_input_filter_on_session_hit`,
 ///   which never invokes the routing evaluator. Counts every matched `then
 ///   count` term on every exit — bit-identical to pre-#2620 behavior.
 /// * `OnlyTerminalNonAccept` — used on the session-MISS path when the filter IS
@@ -329,10 +329,42 @@ fn evaluate_filter_ref_counted_v6(
 ///   count every matched `then count` term up to and including the terminal one
 ///   (else those terms under-count to zero, the regression the coarse boolean
 ///   gate introduced).
+/// * `Never` (#7212) — the walk is a pure VERDICT derivation and charges
+///   nothing. Used by the established-session-hit STATIC input-filter
+///   revalidation, which re-derives an already-admitted session's verdict once
+///   per config generation to find out whether the filter now DENIES it. That
+///   packet is not a new arrival at the filter — it was already adjudicated
+///   under the previous generation — so counting it here would inflate every
+///   `then count` term by one packet per permitted session per commit, and
+///   `then log` would re-fire for a flow whose log record was already emitted.
+///   The revoking DENY path re-runs the ordinary `Always` walk afterwards, so
+///   the one packet that IS newly denied is counted and logged exactly once
+///   (`afxdp/poll_descriptor/filter.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NonRoutingCountPolicy {
     Always,
     OnlyTerminalNonAccept,
+    Never,
+}
+
+impl NonRoutingCountPolicy {
+    /// `(count every matched term during the walk, replay the matched terms
+    /// when the walk lands on a terminal non-Accept)`.
+    ///
+    /// An exhaustive `match` rather than two `==` comparisons: a policy added
+    /// later must classify itself on BOTH axes instead of silently inheriting
+    /// whichever answer a negated comparison happened to give it. That is how
+    /// `Never` would otherwise have arrived — `!always_count` was the replay
+    /// guard, so a third variant would have replayed the counters it exists to
+    /// suppress, on exactly the terminal-DENY exit the #7212 revalidation takes.
+    #[inline]
+    pub(crate) fn counting(self) -> (bool, bool) {
+        match self {
+            Self::Always => (true, false),
+            Self::OnlyTerminalNonAccept => (false, true),
+            Self::Never => (false, false),
+        }
+    }
 }
 
 #[inline]
@@ -403,7 +435,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     // `discard`/`reject` (the exit on which the poll path `continue`s and the
     // routing evaluator never runs), so those fall-through counters are recorded
     // exactly once and never drop to zero.
-    let always_count = count_policy == NonRoutingCountPolicy::Always;
+    let (always_count, replay_on_terminal_deny) = count_policy.counting();
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
@@ -425,7 +457,7 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         acc.routing_instance = None;
         if !term.continue_term {
             acc.action = term.action;
-            if !always_count && term.action != FilterAction::Accept {
+            if replay_on_terminal_deny && term.action != FilterAction::Accept {
                 count_matched_non_routing_terms_v4(
                     filter,
                     src_ip,
@@ -498,7 +530,7 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     count_policy: NonRoutingCountPolicy,
 ) -> FilterResult {
     // #2544/#2620: see evaluate_filter_ref_non_routing_counted_v4.
-    let always_count = count_policy == NonRoutingCountPolicy::Always;
+    let (always_count, replay_on_terminal_deny) = count_policy.counting();
     let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
@@ -518,7 +550,7 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         acc.routing_instance = None;
         if !term.continue_term {
             acc.action = term.action;
-            if !always_count && term.action != FilterAction::Accept {
+            if replay_on_terminal_deny && term.action != FilterAction::Accept {
                 count_matched_non_routing_terms_v6(
                     filter,
                     src_ip,
@@ -878,6 +910,54 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
     )
 }
 
+/// #7212: the SIDE-EFFECT-FREE verdict a purely STATIC interface INPUT filter
+/// gives one 5-tuple.
+///
+/// "Static" means `!Filter::varies_per_packet_within_flow()` — no DSCP match
+/// (#1430) and no per-packet L4 match (#2362: tcp-flags / is-fragment /
+/// icmp-type / icmp-code / flexible-match-range). For such a filter the verdict
+/// is a pure function of `(ingress interface, family, 5-tuple)`, all constant
+/// for the life of one direction of a session, so the established-session HIT
+/// path can re-derive it once per config generation instead of per packet. The
+/// caller owns that gate; this function does not re-check it, because it is also
+/// the reference the equivalence tests compare the counted walk against.
+///
+/// It is the SAME walk `evaluate_interface_filter_non_routing_counted` runs —
+/// `NonRoutingCountPolicy::Never` only suppresses `record_filter_counter` on
+/// both of that walk's arms — so the action it returns is that walk's action by
+/// construction and the two cannot drift. Nothing else in the walk is a side
+/// effect: `then log` is DATA on the returned `FilterResult` (the CALLER emits
+/// the record), and the three-color policer is not metered by this evaluator at
+/// all (`now_ns = None`, #5857). Only `.action` is returned so a caller cannot
+/// accidentally act on the discarded log/policer/modifier fields.
+pub(crate) fn filter_ref_static_verdict(
+    filter: &Filter,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    extra: TermMatchExtra<'_>,
+) -> FilterAction {
+    evaluate_filter_ref_non_routing_counted(
+        filter,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        extra,
+        // No packet is charged, so there are no bytes to charge. `packet_bytes`
+        // reaches only `record_filter_counter` (suppressed by `Never`) and the
+        // unmetered `apply_term_three_color_policer(term, None, ..)`.
+        0,
+        NonRoutingCountPolicy::Never,
+    )
+    .action
+}
+
 pub(crate) fn evaluate_interface_filter_log_match(
     state: &FilterState,
     ifindex: i32,
@@ -1205,6 +1285,35 @@ pub(crate) fn interface_filter_affects_route_lookup(
 /// is the same `Arc<Filter>` the evaluator's own lookup would return; for a
 /// duplicate ifindex the fast map is the last-wins SSOT, so the precheck agrees
 /// with the filter the evaluator walks.
+/// #7212: borrow the per-interface INPUT filter for this family, ungated.
+///
+/// The established-session HIT path needs the filter ITSELF, not one of its
+/// derived booleans, because ONE lookup now has to answer two questions in
+/// sequence: does this filter vary per packet (#1430/#2362 — re-evaluate every
+/// packet), and if not, what is its static verdict (#7212 — re-derive once per
+/// config generation). Reading `Filter::varies_per_packet_within_flow()` off
+/// this borrow is exactly what `interface_input_filter_varies_per_packet`
+/// computes from its own lookup, so the two agree by construction; that accessor
+/// stays as the independent reference the equivalence tests compare against, and
+/// as the flow-cache decline gate's own single-lookup path.
+///
+/// Cost for an interface with NO input filter — the overwhelmingly common case,
+/// and the one the session-hit gate is tuned for — is the SAME single
+/// `FxHashMap::get` the pre-#7212 gate paid: `None` comes straight back and the
+/// caller pays no further work.
+pub(crate) fn interface_input_filter(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> Option<&Filter> {
+    let filter = if is_v6 {
+        state.iface_filter_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_v4_fast.get(&ifindex)
+    };
+    filter.map(Arc::as_ref)
+}
+
 pub(crate) fn interface_filter_route_lookup_affecting(
     state: &FilterState,
     ifindex: i32,

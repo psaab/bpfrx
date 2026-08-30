@@ -23,9 +23,9 @@ pub(crate) use eval::{
     evaluate_interface_filter, evaluate_interface_filter_counted,
     evaluate_interface_filter_log_match, evaluate_interface_filter_non_routing_counted,
     evaluate_interface_output_filter, evaluate_interface_output_filter_counted, evaluate_lo0_filter,
-    evaluate_lo0_filter_counted, evaluate_lo0_filter_log_match,
+    evaluate_lo0_filter_counted, evaluate_lo0_filter_log_match, filter_ref_static_verdict,
     interface_filter_affects_route_lookup, interface_filter_route_lookup_affecting,
-    NonRoutingCountPolicy,
+    interface_input_filter, NonRoutingCountPolicy,
 };
 // #6236 PR-2C: the `(state, ifindex, ..)` routing-instance map-lookup wrappers
 // are test-only now — production shares the `interface_filter_route_lookup_affecting`
