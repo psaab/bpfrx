@@ -1442,13 +1442,55 @@ Invariants worth keeping:
   Under-claiming is the defect: a NIC xpf tunes but never records can
   never be handed back.
 
-Not covered: restoring the default RSS table on **daemon stop**.
-`restoreStep0TunablesOnShutdown` reverts coalescence, host-scope knobs
-and neigh `retrans_time_ms`, but not `rssOwned` — that is a separate
-lifecycle question (a second bounded `ethtool` round-trip per owned NIC
-on a shutdown path already capped by `TimeoutStopSec=20`, plus a changed
-restart profile). #6801 scopes itself to interfaces that leave xpf's
-ownership while the daemon keeps running.
+#6801 scopes itself to interfaces that leave xpf's ownership **while the
+daemon keeps running**. The stop case is #7619, below.
+
+### Restoring the RSS table on daemon stop (#7619)
+
+`restoreStep0TunablesOnShutdown` reverted coalescence, host-scope knobs
+and neigh `retrans_time_ms` but NOT `rssOwned`, so a clean `systemctl
+stop xpfd` left every bound mlx5 NIC with its hash outputs concentrated
+onto queues `0..workers-1`. The kernel stack then ran on a table shaped
+for a dataplane that was not there, until the next boot re-claimed the
+NIC or an operator ran `ethtool -X <if> default` by hand. It is the same
+end state #6801 fixed for a released interface, reached by the other
+door.
+
+`restoreOwnedRSSOnShutdown` closes it, and three decisions are worth
+recording because the issue left them open:
+
+- **It runs on EVERY stop, including a restart's.** systemd delivers an
+  ordinary SIGTERM either way and exposes nothing at stop time that
+  separates them, so "exempt a restart" is not implementable — the
+  choice is restore-always or restore-never. Restore-always costs a
+  restart two `ethtool` calls per owned NIC (default the table, then
+  re-concentrate on the next start) across a window in which the daemon
+  is not forwarding anyway. Restore-never is the defect.
+- **Bounded by `rssShutdownRestoreBudget` (5s)**, mirroring
+  `hostAuthCloseoutBudget` (#5874). One `ethtool` round-trip per owned
+  NIC on a path the unit caps at `TimeoutStopSec=20`: a hung `ethtool`
+  must cost a logged timeout, not a SIGKILLed daemon. The walk is
+  name-sorted so a truncation is deterministic, and it truncates rather
+  than aborting — a failure on one NIC does not abandon the rest.
+- **The retry debt is logged and left**, unlike #6801's. That path drops
+  ownership only after a successful restore so a later reconcile tick can
+  retry; a stop has no later tick, and the in-memory ownership map exits
+  with the process. Reconciliation is the next boot's claim, which
+  re-captures and re-applies. A NIC left concentrated by a failed
+  restore-on-stop is stranded only if xpfd never starts again — a case no
+  shutdown path can fix.
+
+**The empty-captures guard is part of the contract.**
+`step0RestoreHasCaptures` decides whether the shutdown restore has any
+work; a NIC with ONLY rss ownership (no host-scope opt-in, no coalescence
+capture, no neigh retrans) must admit, or the restore call added below it
+never runs and the defect survives its own fix. Adding a fifth capture
+kind without adding it to that predicate is the same bug again. The
+restore body lives in `restoreStep0Captures`, split from the snapshot
+handoff (apply-lock, `priorTunablesMu`, one-shot clear) so the wiring
+itself is reachable from a test with injected backends — #7619 was a
+missing CALL, not a broken function, and a test that only exercises the
+leaf cannot see it.
 
 ## Bootstrap mode + management lifeline (#1922)
 
