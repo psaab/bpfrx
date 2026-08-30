@@ -211,7 +211,17 @@ class SealWiringTests(unittest.TestCase):
 
         class RecordingHarness:
             def __init__(self, *a, **kw):
-                pass
+                # #7347: main() now reads the skip LEDGER after running the
+                # scenarios. __getattr__ below answers EVERY attribute with a
+                # recording callable, so without a real list here `h.skipped`
+                # comes back as a function and _skip_verdict raises
+                # TypeError: 'function' object is not iterable.
+                #
+                # Modelling it is the right fix rather than making the verdict
+                # tolerant of a non-list: a double is a stand-in for Harness,
+                # and Harness genuinely has this attribute now. A verdict that
+                # shrugged at the wrong type would also shrug on the real gate.
+                self.skipped = []
 
             def __getattr__(self, name):
                 def record(*a, **kw):
