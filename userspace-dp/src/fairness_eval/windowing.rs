@@ -109,12 +109,38 @@ pub(crate) fn extract_window(
     }
 
     // Per-stream window-mean throughput for the per-flow CoV input.
+    //
+    // #7206 A1-b5-F3: the divisor is the WINDOW's accepted-interval count, not
+    // the count of intervals THIS stream happened to appear in.
+    //
+    // Dividing by `v.len()` scored a stream present in 1 of 60 accepted
+    // intervals at its FULL instantaneous rate, because its single sample was
+    // its own mean. A near-total outage therefore produced per-flow
+    // throughputs that all looked equal, a CoV near 0, and a PASS on the CoS
+    // fairness gate -- a false PASS that can carry a merge decision, which is
+    // the reason this row is worth more than its LOW severity label.
+    //
+    // Dividing by the window count makes an absent interval contribute 0 to
+    // that stream's mean, which is the same "absent == 0, don't drop"
+    // principle `per_flow_throughputs_all` below applies to fully-absent
+    // streams. The two are now consistent about what absence means; they
+    // differ only in WHICH absence they cover, which is the documented V-9
+    // split.
+    //
+    // The `!v.is_empty()` filter is deliberately KEPT. A stream absent from
+    // EVERY accepted interval is `per_flow_throughputs_all`'s case by the V-9
+    // contract, and folding it in here would change the per-flow CoV
+    // population as well as the divisor -- two changes wearing one commit.
+    //
+    // observed_buckets is >= 1 here: the coverage gate above returns Err when
+    // it is below MIN_STEADY_STATE_SECS - STEADY_STATE_SAMPLE_SLACK_SECS, so
+    // this cannot divide by zero.
     let per_flow_throughputs: Vec<u64> = per_stream_buckets
         .values()
         .filter(|v| !v.is_empty())
         .map(|v| {
             let sum: u64 = v.iter().sum();
-            sum / v.len() as u64
+            sum / observed_buckets
         })
         .collect();
 
@@ -211,6 +237,105 @@ mod tests {
         assert!(
             err.contains("buckets"),
             "error must cite the observed bucket count: {err}"
+        );
+    }
+
+    /// One interval carrying MULTIPLE streams, so a per-stream density gap can
+    /// be modelled. The single-socket `interval` helper above cannot express
+    /// "socket A present, socket B absent" in the same interval, which is the
+    /// only shape that reproduces #7206 A1-b5-F3.
+    fn multi_interval(entries: &[(u64, f64)], start: f64, omitted: bool) -> Iperf3Interval {
+        Iperf3Interval {
+            streams: entries
+                .iter()
+                .map(|(socket, bps)| Iperf3StreamInterval {
+                    socket: *socket,
+                    start,
+                    end: start + 1.0,
+                    bits_per_second: *bps,
+                })
+                .collect(),
+            sum: Iperf3IntervalSum { omitted },
+        }
+    }
+
+    /// #7206 A1-b5-F3 fail-on-revert: a stream present in ONE of sixty accepted
+    /// intervals must not be scored at its full instantaneous rate.
+    ///
+    /// Dividing by the stream's own sample count made its single sample its own
+    /// mean, so a near-total outage produced per-flow throughputs that all
+    /// looked equal, a CoV near zero, and a PASS on the CoS fairness gate. That
+    /// is a FALSE PASS that can carry a merge decision, which is why this row
+    /// is worth more than its LOW severity label.
+    ///
+    /// The assertion is on the RATIO, not on an absolute number: what the fix
+    /// establishes is that a 1-of-60 stream scores about 1/60 of a
+    /// continuously-present stream at the same instantaneous rate. Pinning a
+    /// byte count instead would break on any unrelated change to the window
+    /// bounds and would not say what went wrong.
+    ///
+    /// Revert `sum / observed_buckets` to `sum / v.len() as u64` and the two
+    /// means become EQUAL, which is exactly the defect.
+    #[test]
+    fn extract_window_scores_a_one_of_sixty_stream_by_the_window_7206() {
+        const RATE: f64 = 1.0e9;
+        let mut intervals = Vec::new();
+        for i in 0..60u64 {
+            if i == 0 {
+                // Socket 7 appears ONCE, at the same instantaneous rate as the
+                // always-present socket 5.
+                intervals.push(multi_interval(&[(5, RATE), (7, RATE)], i as f64, false));
+            } else {
+                intervals.push(multi_interval(&[(5, RATE)], i as f64, false));
+            }
+        }
+        let iperf = output(60, intervals);
+        let w = extract_window(&iperf, 0, 0).expect("window");
+
+        assert_eq!(
+            w.aggregate_buckets_bps.len(),
+            60,
+            "precondition: the window must hold 60 accepted intervals, or the \
+             1-of-60 ratio below is not the ratio being asserted"
+        );
+        assert_eq!(
+            w.per_flow_throughputs.len(),
+            2,
+            "precondition: both streams must reach the per-flow CoV input; if the \
+             sparse stream were dropped the assertion below would compare one \
+             stream against itself"
+        );
+
+        let mut means = w.per_flow_throughputs.clone();
+        means.sort_unstable();
+        let (sparse, dense) = (means[0], means[1]);
+        assert!(
+            sparse * 10 < dense,
+            "a stream present in 1 of 60 accepted intervals scored {sparse} against \
+             the always-present stream's {dense} at the SAME instantaneous rate. \
+             Its single sample was taken as its own mean, so a near-total outage \
+             yields a CoV near zero and the CoS fairness gate PASSES on it \
+             (#7206 A1-b5-F3)"
+        );
+    }
+
+    /// CONTROL. Two streams that are BOTH continuously present at the same rate
+    /// must still score equal. Without this, a "fix" that scored every stream
+    /// at 1/60 would satisfy the cell above and destroy every real comparison.
+    #[test]
+    fn extract_window_scores_equally_present_streams_equally_7206() {
+        const RATE: f64 = 1.0e9;
+        let mut intervals = Vec::new();
+        for i in 0..60u64 {
+            intervals.push(multi_interval(&[(5, RATE), (7, RATE)], i as f64, false));
+        }
+        let iperf = output(60, intervals);
+        let w = extract_window(&iperf, 0, 0).expect("window");
+        assert_eq!(w.per_flow_throughputs.len(), 2);
+        assert_eq!(
+            w.per_flow_throughputs[0], w.per_flow_throughputs[1],
+            "two continuously-present streams at the same rate must score equally; \
+             a divisor change must not perturb the ordinary case"
         );
     }
 }
