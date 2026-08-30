@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -127,9 +128,29 @@ func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Dura
 	deadline := time.Now().Add(within)
 	for stops.Load() == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("the teardown goroutine completed no stops in %s — it was "+
-				"never scheduled, so every start below would run uncontended and "+
-				"the probe would be degenerate (#7650)", within)
+			// #7970: DUMP, do not diagnose. The message this replaced asserted
+			// "it was never scheduled" as fact — a conclusion this wait cannot
+			// support and, measured, one of at least two possibilities:
+			//
+			//   - the goroutine is RUNNABLE but has not been given a P (genuine
+			//     starvation under `./...` oversubscription), or
+			//   - it is BLOCKED inside StopHeartbeat — which now tears down real
+			//     senders/receivers, since #7663's pacing means starts actually
+			//     publish, and both stop() paths join goroutines via wg.Wait().
+			//
+			// The deadline cannot tell those apart and neither can "still
+			// running"; the stack can, immediately. Anyone who hits this should
+			// read the dump rather than re-run, because the two have completely
+			// different fixes and only one of them is about the machine.
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			t.Fatalf("the teardown goroutine completed no stops in %s. This is a "+
+				"HANG, not a slow machine, and the goroutine dump below says which "+
+				"kind: look for the goroutine in StopHeartbeat. If it is blocked in "+
+				"wg.Wait() the defect is a stop that cannot complete; if it is "+
+				"absent or runnable the defect is scheduling starvation under "+
+				"`go test ./...` (#7970/#7650).\n\n=== goroutine dump ===\n%s",
+				within, buf[:n])
 		}
 		time.Sleep(time.Millisecond)
 	}
