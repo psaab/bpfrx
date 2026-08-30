@@ -574,23 +574,7 @@ impl BindingWorker {
                 cos_local_batch_scratch: VecDeque::new(),
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
-            scratch: WorkerScratch {
-                scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
-                scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_committed_orig_idx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
-                scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_rst_teardowns: Vec::with_capacity(16),
-                // #7212: pre-sized like its sibling scratch vectors so a
-                // revocation burst does not reallocate on the poll path.
-                scratch_filter_revoked_keys: Vec::with_capacity(16),
-            },
+            scratch: WorkerScratch::pre_sized(ring_entries),
             // GEMINI-NEXT.md Section 3 cold start: lazy allocation. The
             // 4096-cap is enforced at admission (poll_descriptor.rs check
             // against MAX_PENDING_NEIGH), so pre-allocating that capacity
@@ -732,23 +716,7 @@ impl BindingWorker {
                 cos_local_batch_scratch: VecDeque::new(),
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
-            scratch: WorkerScratch {
-                scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
-                scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_committed_orig_idx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
-                scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_rst_teardowns: Vec::with_capacity(16),
-                // #7212: pre-sized like its sibling scratch vectors so a
-                // revocation burst does not reallocate on the poll path.
-                scratch_filter_revoked_keys: Vec::with_capacity(16),
-            },
+            scratch: WorkerScratch::pre_sized(ring_entries),
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),
             last_neigh_generation: (0, 0),
@@ -863,23 +831,7 @@ impl BindingWorker {
                 cos_local_batch_scratch: VecDeque::new(),
                 cos_prepared_batch_scratch: VecDeque::new(),
             },
-            scratch: WorkerScratch {
-                scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
-                scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_committed_orig_idx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
-                scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
-                scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
-                scratch_rst_teardowns: Vec::with_capacity(16),
-                // #7212: pre-sized like its sibling scratch vectors so a
-                // revocation burst does not reallocate on the poll path.
-                scratch_filter_revoked_keys: Vec::with_capacity(16),
-            },
+            scratch: WorkerScratch::pre_sized(ring_entries),
             pending_neigh: super::types::FastMap::default(),
             pending_neigh_schedule: Default::default(),
             last_neigh_generation: (0, 0),

@@ -27,9 +27,17 @@ use super::*;
 /// PR #1168 flagged that a `#[derive(Default)]` would silently
 /// produce zero-capacity Vecs on accidental
 /// `WorkerScratch::default()` calls, regressing the no-allocation-
-/// on-hot-path contract. The only legal construction path is the
-/// explicit literal in `BindingWorker::create` which carries the
-/// per-Vec `with_capacity` hints.
+/// on-hot-path contract. The only legal construction path is
+/// [`WorkerScratch::pre_sized`], which carries the per-Vec
+/// `with_capacity` hints.
+///
+/// #7212: that constructor replaces the three IDENTICAL struct literals
+/// `BindingWorker::create` and its two siblings in `worker/mod.rs` used to
+/// carry. Three copies of a thirteen-field pre-sizing table is a place where a
+/// new buffer has to be added three times and can be pre-sized differently in
+/// each — and adding the thirteenth was what pushed `worker/mod.rs` past the
+/// 2000-LOC [REFACTOR] floor. One constructor removes both problems: the
+/// capacity policy lives once, next to the fields it sizes.
 pub(crate) struct WorkerScratch {
     pub(crate) scratch_recycle: Vec<u64>,
     pub(crate) scratch_forwards: Vec<PendingForwardRequest>,
@@ -76,4 +84,32 @@ pub(crate) struct WorkerScratch {
     /// removes it — so this is not a per-packet allocation site. Drained and
     /// returned to the binding each pass, keeping its capacity.
     pub(crate) scratch_filter_revoked_keys: Vec<SessionKey>,
+}
+
+impl WorkerScratch {
+    /// The ONE construction path: every buffer pre-allocated at the capacity
+    /// its stage actually needs, so the poll cycle never reallocates.
+    ///
+    /// `ring_entries` sizes `scratch_completed_offsets` alone — it is drained
+    /// against the completion ring, so its bound is the ring's, not a batch's.
+    /// Every other capacity is a compile-time batch bound.
+    pub(crate) fn pre_sized(ring_entries: u32) -> Self {
+        Self {
+            scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
+            scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_committed_orig_idx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
+            scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_rst_teardowns: Vec::with_capacity(16),
+            // #7212: pre-sized like its sibling scratch vectors so a revocation
+            // burst does not reallocate on the poll path.
+            scratch_filter_revoked_keys: Vec::with_capacity(16),
+        }
+    }
 }
