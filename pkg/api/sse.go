@@ -12,11 +12,36 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 )
 
-// setSSEHeaders configures the response for Server-Sent Events streaming.
+// setSSEHeaders configures the response for Server-Sent Events streaming AND
+// flushes the header block to the client.
+//
+// #7655: the flush is not an optimisation. net/http sends no response headers
+// until the first Write or Flush, so setting values alone left a client
+// connecting to a QUIET feed blocked waiting for headers that were never sent.
+// A browser EventSource on an idle firewall hung rather than establishing the
+// stream.
+//
+// The consequence is not cosmetic: until the first event arrives -- which on a
+// quiet box could be hours -- an SSE consumer cannot distinguish "connected and
+// quiet" from "not connected", and every reconnect/backoff decision it makes
+// rests on exactly that distinction. It also inverts the debugging order: the
+// operator sees a hung client and goes looking for a network or auth problem
+// while the stream is established and simply silent.
+//
+// THE FLUSH LIVES HERE, NOT AT THE CALL SITES. Both SSE handlers had the same
+// shape, and a per-site flush is a line the next handler forgets. Binding it to
+// the function that sets the headers makes "headers set" and "headers sent" one
+// step, which is the property callers actually need.
+//
+// A ResponseWriter that does not implement http.Flusher cannot stream at all,
+// so there is nothing to do for it and nothing is lost by skipping.
 func setSSEHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // --- #7632: bounding a SLOW SSE READER -------------------------------------

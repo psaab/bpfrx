@@ -21,6 +21,7 @@ package api
 // this is a sibling and not a copy of #6809.
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"net/http"
@@ -379,34 +380,21 @@ func openSSEStream7632(t *testing.T, deadline time.Duration) (*logging.EventBuff
 		srv.eventStreamHandler(w, r)
 	}))
 
-	// #7654 review, finding 3: publish on a TICKER until the GET returns, not
-	// once after a fixed sleep. Subscriptions have no replay, so a single
-	// publish that lands before the handler subscribes is lost — and because no
-	// headers are then written, the GET waits for the package timeout rather
-	// than failing. That is the #7650 shape (a fixed wall-clock point standing
-	// in for "the other side is ready") in my own harness, which is not a
-	// defensible place to have it.
-	established := make(chan struct{})
-	go func() {
-		tick := time.NewTicker(25 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-established:
-				return
-			case <-tick.C:
-				floodEvents7632(buf, 1)
-			}
-		}
-	}()
-
+	// #7655: the GET now returns at CONNECT, so the establishing event no longer
+	// has to be manufactured to make it return. This used to publish on a ticker
+	// because setSSEHeaders wrote no headers and net/http therefore sent none
+	// until the first event — the very defect #7655 fixed, worked around here.
+	//
+	// Publishing AFTER the GET is safe, and the ordering is not incidental:
+	// eventStreamHandler subscribes BEFORE it calls setSSEHeaders, so "the GET
+	// returned" implies "the subscription exists". Subscriptions still have no
+	// replay, which is exactly why the publish must FOLLOW the GET.
 	resp, err := httpGetWithTimeout7632(ts.URL+"/api/v1/events/stream", 20*time.Second)
-	close(established)
 	if err != nil {
 		ts.Close()
-		t.Fatalf("GET: %v — the stream never established, so no headers were "+
-			"written (see #7655)", err)
+		t.Fatalf("GET: %v — the stream never established", err)
 	}
+	floodEvents7632(buf, 1)
 	stop := func() {
 		resp.Body.Close()
 		// The handler is parked in its select; force the connection shut so its
@@ -489,23 +477,12 @@ func openSSEStreamH2_7632(t *testing.T, deadline time.Duration) (*logging.EventB
 	ts.EnableHTTP2 = true
 	ts.StartTLS()
 
-	established := make(chan struct{})
-	go func() {
-		tick := time.NewTicker(25 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-established:
-				return
-			case <-tick.C:
-				floodEvents7632(buf, 1)
-			}
-		}
-	}()
+	// #7655: same as the HTTP/1.1 helper — the GET returns at connect, and the
+	// handler subscribes before flushing headers, so one publish afterwards
+	// cannot be lost.
 	c := ts.Client()
 	c.Timeout = 20 * time.Second
 	resp, err := c.Get(ts.URL + "/api/v1/events/stream")
-	close(established)
 	if err != nil {
 		ts.Close()
 		t.Fatalf("GET over HTTP/2: %v", err)
@@ -515,6 +492,8 @@ func openSSEStreamH2_7632(t *testing.T, deadline time.Duration) (*logging.EventB
 		ts.Close()
 		t.Fatalf("negotiated %s, not HTTP/2 — the cell would test the wrong protocol", resp.Proto)
 	}
+	// One establishing event, which the caller drains as its precondition.
+	floodEvents7632(buf, 1)
 	return buf, resp, func() {
 		resp.Body.Close()
 		ts.CloseClientConnections()
@@ -633,40 +612,42 @@ func TestLargeEventSurvivesASlowButProgressingReader7632(t *testing.T) {
 
 	// A payload many chunks long: one window under the mutation, many with it.
 	big := strings.Repeat("A", 8*sseWriteChunk)
-	// Publish until the stream establishes — no fixed wall-clock point (finding 4).
-	established := make(chan struct{})
-	go func() {
-		tick := time.NewTicker(20 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-established:
-				return
-			case <-tick.C:
-				buf.Add(logging.EventRecord{
-					Time: time.Now(), Type: "SESSION_OPEN",
-					SrcAddr: "10.0.1.9:1", DstAddr: "10.0.2.1:80",
-					Protocol: "TCP", Action: "permit", Reason: big,
-				})
-			}
+
+	// #7655: read the HEADER BLOCK first, then publish ONCE.
+	//
+	// This used to publish on a ticker and treat "any payload byte seen" as the
+	// establishment signal, because no headers were written until an event
+	// arrived. Two things changed: headers now arrive at CONNECT, so the ticker
+	// is unnecessary; and the old signal became actively WRONG, because the
+	// header block itself contains a capital A (`Date: ... Aug ...`). That
+	// closed `established` on the HEADER, stopped the ticker before any event
+	// was published, and the read then blocked to its deadline reporting
+	// "failed after 1 payload bytes" — a real failure that looked exactly like
+	// the severed-reader defect this test exists to catch.
+	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	br := bufio.NewReader(c)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading the response header block: %v", err)
 		}
-	}()
+		if line == "\r\n" {
+			break
+		}
+	}
+	buf.Add(logging.EventRecord{
+		Time: time.Now(), Type: "SESSION_OPEN",
+		SrcAddr: "10.0.1.9:1", DstAddr: "10.0.2.1:80",
+		Protocol: "TCP", Action: "permit", Reason: big,
+	})
 
 	// Drain CONTINUOUSLY — the reader is slow, never stopped, so any failure
 	// here is the budget measuring elapsed time rather than lack of progress.
-	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
 	var seen int
 	b := make([]byte, 32*1024)
 	for seen < len(big) {
-		n, err := c.Read(b)
+		n, err := br.Read(b)
 		seen += strings.Count(string(b[:n]), "A")
-		if seen > 0 {
-			select {
-			case <-established:
-			default:
-				close(established)
-			}
-		}
 		if err != nil {
 			t.Fatalf("a %d-byte event to a CONTINUOUSLY reading client failed after "+
 				"%d payload bytes: %v — the write budget is measuring elapsed time "+
