@@ -177,7 +177,7 @@ fn vrf_session_identity_doc_claims_still_match_the_code() {
          tenants sharing a 5-tuple on the reply direction."
     );
     assert!(
-        lookup_rs.contains("let probe = reverse_match_key(reply_key);"),
+        lookup_rs.contains("zeroed = reverse_match_key(reply_key);"),
         "find_forward_nat_match no longer zeroes the reply key before probing \
          the reverse bucket — the two halves of the #7160 domain-agnostic \
          reverse-match convention have drifted apart, and a reply that resolved \

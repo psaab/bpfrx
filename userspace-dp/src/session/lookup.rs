@@ -280,8 +280,19 @@ impl SessionTable {
         // In a deployment with no routing-instance interface membership every
         // key is domain 0, so pass 1 accepts exactly what pass 2 would and the
         // walk is bit-identical to pre-#7160.
-        let probe = reverse_match_key(reply_key);
-        let bucket = self.nat_reverse_index.get(&probe)?;
+        // Borrow, do not clone, in the domain-0 case — which is EVERY packet in
+        // a deployment with no routing-instance interface membership, on the
+        // established-session reverse path. `reverse_match_key` returns the key
+        // unchanged there, so materialising it would be a per-packet copy of a
+        // key this function used to take by reference.
+        let zeroed;
+        let probe: &SessionKey = if reply_key.routing_domain == 0 {
+            reply_key
+        } else {
+            zeroed = reverse_match_key(reply_key);
+            &zeroed
+        };
+        let bucket = self.nat_reverse_index.get(probe)?;
         let mut fallback: Option<ForwardSessionMatch> = None;
         for &handle in bucket.iter() {
             let Some(record) = self.entries.get(handle as usize) else {
@@ -289,7 +300,7 @@ impl SessionTable {
             };
             let entry = &record.entry;
             if entry.metadata.is_reverse
-                || !reply_matches_forward_session(&record.key, entry.decision.nat, &probe)
+                || !reply_matches_forward_session(&record.key, entry.decision.nat, probe)
             {
                 continue;
             }
