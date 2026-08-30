@@ -31,6 +31,27 @@ func runUniformGatesCoSPlatform(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #7337 class-of-service INTERFACE reference gate. Strict on commit /
+	// commit-check (hard-reject a binding naming a scheduler-map,
+	// traffic-control-profile, classifier or rewrite-rule that does not
+	// exist). Runs immediately after the scheduler-map -> scheduler gate
+	// above because the two are the outer and inner halves of one reference
+	// chain, and the outer failing first gives the operator the message
+	// closest to what they typed. Lenient on load / peer-sync (#1960
+	// no-brick): all seven were warn-only before this gate, so an
+	// already-persisted or peer-synced config may carry a dangling name and
+	// must still boot. The dataplane resolves such a name to None, which is
+	// the fail-open this gate stops on NEW edits — not a crash, so a
+	// leniently-loaded config degrades exactly as it does today.
+	if err := validateClassOfServiceInterfaceRefsStrict(cfg.ClassOfService); err != nil {
+		if opts.lenientCoSInterfaceRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("class-of-service interface reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3995 class-of-service loss-priority value gate. Strict on commit /
 	// commit-check (hard-reject an unrecognized loss-priority such as an
 	// operator typo `medum-low`, which the dataplane would otherwise apply

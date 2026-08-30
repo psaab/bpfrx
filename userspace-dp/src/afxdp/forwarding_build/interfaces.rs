@@ -121,6 +121,19 @@ pub(super) fn populate_interfaces(
         state
             .ifindex_to_routing_instance
             .insert(iface.ifindex, iface.routing_instance.clone());
+        // #7160 (#2387): record the numeric routing DOMAIN alongside the name.
+        // Go decides the number (`routingInstanceDomain`); 0 is the default
+        // instance and is what an old Go binary's snapshot yields for every
+        // interface. Only a non-zero domain is stored, so the map holds exactly
+        // the routing-instance MEMBER interfaces and an absent ifindex reads as
+        // domain 0 — the same "absent = default" convention the name map above
+        // uses, and what keeps `has_routing_domains` a truthful gate.
+        if iface.routing_domain != 0 {
+            state
+                .ifindex_to_routing_domain
+                .insert(iface.ifindex, iface.routing_domain);
+            state.has_routing_domains = true;
+        }
         name_to_ifindex.insert(iface.name.clone(), iface.ifindex);
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
@@ -435,6 +448,44 @@ pub(super) fn populate_interfaces(
         }
     }
 
+    // #7160 (#2387): zone -> routing DOMAIN, for the fabric-ingress path where
+    // the arriving interface is the fabric link and the peer's zone encoding is
+    // the only ingress identity available. Derived AFTER the walk from the two
+    // per-ifindex maps it is a join of, so it cannot disagree with either.
+    //
+    // A zone is only recorded when EVERY member interface with a zone agrees on
+    // one domain; a zone spanning two routing instances is left ABSENT and
+    // reads as domain 0, the pre-#7160 answer. That is the #6722
+    // `ifindex_unambiguous_zone_id` discipline: identify exactly one, or
+    // nothing. Assigning the first-seen domain to a straddling zone would hand
+    // a fabric-redirected packet a confidently wrong domain, which is strictly
+    // worse than the undifferentiated one.
+    if state.has_routing_domains {
+        let mut ambiguous: FastSet<u16> = FastSet::default();
+        for (ifindex, zone_id) in state.ifindex_to_zone_id.iter() {
+            if *zone_id == 0 {
+                continue;
+            }
+            let domain = state
+                .ifindex_to_routing_domain
+                .get(ifindex)
+                .copied()
+                .unwrap_or(0);
+            match state.zone_routing_domain.get(zone_id).copied() {
+                Some(seen) if seen == domain => {}
+                Some(_) => {
+                    ambiguous.insert(*zone_id);
+                }
+                None => {
+                    state.zone_routing_domain.insert(*zone_id, domain);
+                }
+            }
+        }
+        for zone_id in ambiguous {
+            state.zone_routing_domain.remove(&zone_id);
+        }
+    }
+
     Ok(IfaceIndex {
         name_to_ifindex,
         linux_to_ifindex,
@@ -660,4 +711,197 @@ pub(in crate::afxdp) fn pick_interface_v6(iface: &InterfaceSnapshot) -> Option<I
         }
     }
     fallback
+}
+
+// #7160 (#2387) — the routing-domain half of the interface build.
+//
+// These cells guard the two maps `forwarding::ingress_routing_domain` reads
+// and the single-bool gate that keeps a deployment with no routing-instance
+// interface membership from probing either. All three are invisible to every
+// pre-existing forwarding_build test because they all run in the default
+// instance, where the domain is 0.
+#[cfg(test)]
+mod routing_domain_7160_tests {
+    use super::*;
+    use crate::afxdp::forwarding::ingress_routing_domain;
+    use crate::protocol::{ConfigSnapshot, InterfaceSnapshot, ZoneSnapshot};
+
+    const DOMAIN_A: u32 = 100_001;
+    const DOMAIN_B: u32 = 100_002;
+
+    fn build(snapshot: &ConfigSnapshot) -> ForwardingState {
+        let mut state = ForwardingState::default();
+        // Zones must be registered first — `populate_interfaces` resolves each
+        // row's zone NAME through `zone_name_to_id` and fails the snapshot
+        // closed on an unknown one. This mirrors the real builder's order
+        // (`forwarding_build/mod.rs`).
+        crate::afxdp::forwarding_build::zones::populate_zones(snapshot, &mut state);
+        populate_interfaces(
+            snapshot,
+            &mut state,
+            &FastSet::default(),
+            &FastSet::default(),
+        )
+        .expect("populate_interfaces");
+        state
+    }
+
+    fn iface(name: &str, ifindex: i32, zone: &str, ri: &str, domain: u32) -> InterfaceSnapshot {
+        InterfaceSnapshot {
+            name: name.into(),
+            linux_name: name.into(),
+            ifindex,
+            zone: zone.into(),
+            routing_instance: ri.into(),
+            routing_domain: domain,
+            ..Default::default()
+        }
+    }
+
+    fn zone(name: &str, id: u16) -> ZoneSnapshot {
+        ZoneSnapshot {
+            name: name.into(),
+            id,
+            ..Default::default()
+        }
+    }
+
+    /// A config with no routing-instance interface membership must leave BOTH
+    /// maps empty and the gate false, so `ingress_routing_domain` returns 0
+    /// without a single map probe. This is what makes #7160 bit-identical to
+    /// pre-#7160 for the overwhelming majority of deployments.
+    #[test]
+    fn no_membership_leaves_the_gate_false_and_the_maps_empty() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                iface("ge-0-0-0", 10, "trust", "", 0),
+                iface("ge-0-0-1", 11, "untrust", "", 0),
+            ],
+            zones: vec![zone("trust", 1), zone("untrust", 2)],
+            ..Default::default()
+        };
+        let state = build(&snapshot);
+        assert!(
+            !state.has_routing_domains,
+            "has_routing_domains must stay false with no routing-instance member \
+             interfaces — it is the gate that keeps the packet path from probing \
+             the map at all"
+        );
+        assert!(state.ifindex_to_routing_domain.is_empty());
+        assert!(state.zone_routing_domain.is_empty());
+        assert_eq!(ingress_routing_domain(&state, 10, 0, None), 0);
+    }
+
+    /// The map is keyed on the ifindex the snapshot row carries, and only a
+    /// NON-ZERO domain is stored — so an absent ifindex reads as domain 0, the
+    /// same "absent = default" convention `ifindex_to_routing_instance` uses.
+    #[test]
+    fn member_interfaces_resolve_their_domain_and_others_resolve_zero() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                iface("ge-0-0-0", 10, "tenant-a-lan", "tenant-a", DOMAIN_A),
+                iface("ge-0-0-1", 11, "tenant-b-lan", "tenant-b", DOMAIN_B),
+                iface("ge-0-0-2", 12, "untrust", "", 0),
+            ],
+            zones: vec![
+                zone("tenant-a-lan", 1),
+                zone("tenant-b-lan", 2),
+                zone("untrust", 3),
+            ],
+            ..Default::default()
+        };
+        let state = build(&snapshot);
+        assert!(state.has_routing_domains);
+        assert_eq!(ingress_routing_domain(&state, 10, 0, None), DOMAIN_A);
+        assert_eq!(ingress_routing_domain(&state, 11, 0, None), DOMAIN_B);
+        assert_eq!(
+            ingress_routing_domain(&state, 12, 0, None),
+            0,
+            "an interface in no routing instance must be the default domain"
+        );
+        assert_eq!(
+            ingress_routing_domain(&state, 999, 0, None),
+            0,
+            "an unknown ifindex must be the default domain, not a panic or a \
+             borrowed neighbour's domain"
+        );
+    }
+
+    /// A zone whose member interfaces all agree gets a domain; a zone that
+    /// STRADDLES two routing instances is left ABSENT and reads as 0.
+    ///
+    /// This map is read only on the fabric-ingress path, where the arriving
+    /// interface is the fabric link and the peer's zone encoding is the only
+    /// ingress identity available. Assigning a straddling zone the first-seen
+    /// domain would hand a fabric-redirected packet a CONFIDENTLY WRONG domain,
+    /// which is strictly worse than the undifferentiated one — the #6722
+    /// `ifindex_unambiguous_zone_id` discipline.
+    ///
+    /// FAIL-ON-REVERT: drop the ambiguity sweep and the straddling zone starts
+    /// resolving whichever member the iteration happened to see first.
+    #[test]
+    fn a_zone_straddling_two_routing_instances_resolves_no_domain() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                // `clean` is wholly inside tenant-a.
+                iface("ge-0-0-0", 10, "clean", "tenant-a", DOMAIN_A),
+                iface("ge-0-0-1", 11, "clean", "tenant-a", DOMAIN_A),
+                // `straddle` has one interface in tenant-b and one in the
+                // default instance.
+                iface("ge-0-0-2", 12, "straddle", "tenant-b", DOMAIN_B),
+                iface("ge-0-0-3", 13, "straddle", "", 0),
+            ],
+            zones: vec![zone("clean", 1), zone("straddle", 2)],
+            ..Default::default()
+        };
+        let state = build(&snapshot);
+        assert_eq!(
+            state.zone_routing_domain.get(&1).copied(),
+            Some(DOMAIN_A),
+            "a zone whose members all sit in one routing instance must resolve it"
+        );
+        assert_eq!(
+            state.zone_routing_domain.get(&2).copied(),
+            None,
+            "a zone straddling two routing instances must resolve NOTHING; a \
+             first-seen answer is a confidently wrong domain for every \
+             fabric-redirected packet stamped with that zone"
+        );
+        // And that is what the fabric-ingress read produces.
+        assert_eq!(ingress_routing_domain(&state, 10, 0, Some(1)), DOMAIN_A);
+        assert_eq!(ingress_routing_domain(&state, 10, 0, Some(2)), 0);
+    }
+
+    /// A fabric-ingress frame must NOT take the arriving interface's domain.
+    /// It arrived on the fabric link, not on the flow's real ingress, so the
+    /// fabric link's own membership is a wrong answer rather than a missing
+    /// one — the peer's zone encoding is the identity to resolve from.
+    ///
+    /// FAIL-ON-REVERT: make the fabric zone advisory (fall through to the
+    /// ifindex map) and this goes red.
+    #[test]
+    fn a_fabric_ingress_frame_resolves_from_the_encoded_zone_not_the_link() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                // The fabric link itself happens to be a tenant-b member.
+                iface("ge-0-0-0", 10, "fabric", "tenant-b", DOMAIN_B),
+                iface("ge-0-0-1", 11, "tenant-a-lan", "tenant-a", DOMAIN_A),
+            ],
+            zones: vec![zone("fabric", 1), zone("tenant-a-lan", 2)],
+            ..Default::default()
+        };
+        let state = build(&snapshot);
+        assert_eq!(
+            ingress_routing_domain(&state, 10, 0, Some(2)),
+            DOMAIN_A,
+            "the peer-encoded ORIGINAL ingress zone decides the domain, not the \
+             fabric link the frame physically arrived on"
+        );
+        assert_eq!(
+            ingress_routing_domain(&state, 10, 0, None),
+            DOMAIN_B,
+            "without a zone encoding the same interface is an ordinary ingress \
+             and keeps its own domain"
+        );
+    }
 }

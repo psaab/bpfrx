@@ -205,7 +205,7 @@ pub(super) fn poll_binding_process_descriptor(
                 // learning uses the live UMEM Ethernet frame so
                 // the source MAC is the outer host's, not the
                 // GRE tunnel egress).
-                let flow = stage_parse_flow_and_learn(
+                let mut flow = stage_parse_flow_and_learn(
                     // SAFETY: per the `area` contract in this
                     // function's header comment.
                     unsafe { &*area },
@@ -243,6 +243,42 @@ pub(super) fn poll_binding_process_descriptor(
                     ingress_zone_override,
                     packet_fabric_ingress,
                 } = stage_classify_fabric_ingress(packet_frame, &mut meta, now_secs, worker_ctx);
+                // #7160 (#2387) stage 9b: stamp the flow's ROUTING DOMAIN.
+                //
+                // THE single site that populates `SessionKey.routing_domain`
+                // for a received frame, so every key this descriptor derives —
+                // the lookup key, the installed forward key, the reverse
+                // companion, the reverse/translated index entries, the flow
+                // cache's session handle — carries one consistent domain. Two
+                // routing instances that share a 5-tuple therefore occupy two
+                // conntrack entries, and the established-session fast path can
+                // no longer hand tenant B tenant A's cached egress, NAT and
+                // policy decision.
+                //
+                // It runs HERE, after stage 9, and not inside
+                // `stage_parse_flow_and_learn`, because the fabric-ingress
+                // classification is an INPUT: a frame that arrived over the
+                // fabric link did not arrive on the flow's real ingress
+                // interface, and the zone the peer encoded into it is the only
+                // ingress identity this node can resolve a domain from.
+                //
+                // `has_routing_domains` is false for every deployment with no
+                // routing-instance interface membership, which makes this a
+                // predictable-branch no-op there and leaves session identity
+                // bit-identical to pre-#7160.
+                if let Some(flow) = flow.as_mut() {
+                    flow.forward_key.routing_domain =
+                        crate::afxdp::forwarding::ingress_routing_domain(
+                            worker_ctx.forwarding,
+                            meta.ingress_ifindex as i32,
+                            meta.ingress_vlan_id,
+                            if packet_fabric_ingress {
+                                ingress_zone_override
+                            } else {
+                                None
+                            },
+                        );
+                }
                 // #946 Phase 1 stage 10: screen / IDS slow-path.
                 // Caller still owns the recycle push (matches
                 // original code's pattern).

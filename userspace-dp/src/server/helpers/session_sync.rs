@@ -42,8 +42,13 @@ fn reject_unresolved_ipv6_ext_protocol(req: &SessionSyncRequest) -> Result<(), S
     Ok(())
 }
 
+/// #7160 (#2387): `routing_domain` is resolved by the CALLER
+/// (`Coordinator::synced_routing_domain`) from the #7095 cluster-stable
+/// ingress identity this request already carries, not read off a wire field.
+/// See that function for why the number is derived rather than sent.
 pub(crate) fn build_synced_session_key(
     req: &SessionSyncRequest,
+    routing_domain: u32,
 ) -> Result<crate::session::SessionKey, String> {
     reject_unresolved_ipv6_ext_protocol(req)?;
     Ok(crate::session::SessionKey {
@@ -59,8 +64,8 @@ pub(crate) fn build_synced_session_key(
             .map_err(|e| format!("parse dst_ip {}: {e}", req.dst_ip))?,
         src_port: req.src_port,
         dst_port: req.dst_port,
-            discriminator: Default::default(),
-            routing_domain: 0,
+        discriminator: Default::default(),
+        routing_domain,
     })
 }
 
@@ -119,8 +124,9 @@ fn build_nat64_reverse_rebuild(
 pub(crate) fn build_synced_session_entry(
     req: &SessionSyncRequest,
     zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
+    routing_domain: u32,
 ) -> Result<SyncedSessionEntry, String> {
-    let key = build_synced_session_key(req)?;
+    let key = build_synced_session_key(req, routing_domain)?;
     let next_hop = if req.next_hop.is_empty() {
         None
     } else {

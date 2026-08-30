@@ -43,18 +43,56 @@ pub(crate) struct SessionKey {
     /// number names a different NIC on the peer, so carrying it across the
     /// cluster would produce a confidently wrong answer.
     ///
-    /// **It is SYMMETRIC.** A flow's routing domain is the same in both
-    /// directions, so every key transform in this file PRESERVES it rather
-    /// than defaulting it. That is the property that lets it live on the KEY
-    /// at all. Contrast `discriminator` above and #6928's
-    /// `ingress_ifindex`/`ingress_vlan_id`, which sit on the session VALUE
-    /// because the reply ingresses on the forward flow's EGRESS interface —
-    /// asymmetric, and therefore impossible to lift into a key without
-    /// breaking conntrack reverse matching.
+    /// **It is SAME-DIRECTION SYMMETRIC.** Every packet of a flow that
+    /// arrives at the firewall the way the FORWARD packets did resolves the
+    /// same domain, because it is a property of the ingress interface and
+    /// nothing else (`forwarding::ingress_routing_domain`). Contrast
+    /// `discriminator` above and #6928's `ingress_ifindex`/`ingress_vlan_id`,
+    /// which sit on the session VALUE.
     ///
-    /// Do not "optimise" any transform here to `Default::default()`. Zeroing
-    /// it on a reverse key silently re-creates the cross-tenant collision this
-    /// field exists to prevent, and every single-VRF test would still pass.
+    /// **It is NOT reply-direction symmetric, and phase 2 (#7160) does not
+    /// pretend otherwise.** A reply ingresses on the forward flow's EGRESS
+    /// interface, and this dataplane's transit route lookup is not VRF-isolated
+    /// — it uses the DEFAULT table unless a PBR term overrides it
+    /// (`poll_descriptor/mod.rs`, and plan §3; per-VRF default FIB is Track
+    /// B-ext, explicitly NOT a prerequisite). So a flow that ingresses on a
+    /// routing-instance member interface and egresses out of the default
+    /// instance is a real, working configuration whose two directions resolve
+    /// DIFFERENT domains.
+    ///
+    /// That is why the transforms in this file split into two groups, and the
+    /// split is load-bearing in both directions:
+    ///
+    ///   * `forward_wire_key`, `translated_session_key` and
+    ///     `reverse_session_key` PRESERVE it. They name another key of the
+    ///     SAME direction (the post-NAT forward tuple, a reverse entry's
+    ///     translated alias) or navigate between the two halves of one flow,
+    ///     so they must not lose the discriminator.
+    ///   * `reverse_wire_key` and `reverse_canonical_key` deliberately ZERO
+    ///     it. Those two build the REVERSE-MATCH index — the keys a REPLY is
+    ///     looked up under — and a reply whose domain the forward direction
+    ///     cannot predict must still find its session. Preserving the domain
+    ///     there would blackhole every non-contained VRF flow's replies, which
+    ///     is a forwarding outage, not a hardening.
+    ///
+    /// Zeroing the reverse-match keys does NOT give the cross-tenant collision
+    /// back, and this is the part to check before touching either group.
+    /// The collision #7160 exists to close is a FORWARD-direction one: tenant
+    /// B's packets matching tenant A's conntrack entry and inheriting its
+    /// cached egress, NAT and policy verdict. Forward lookups go through
+    /// `key_to_handle` on this full key, domain included, so two tenants now
+    /// hold two entries and neither can reach the other's. The reverse side
+    /// keeps its isolation a different way: `find_forward_nat_match` walks the
+    /// (1:N) reverse bucket in TWO passes and prefers a candidate whose
+    /// forward session carries the reply's own domain, falling back to a
+    /// domain-agnostic match only when no candidate shares it. Two contained
+    /// tenants therefore demux exactly; a flow whose reply genuinely arrives
+    /// in another domain still resolves, as it did before this field existed.
+    ///
+    /// Do not "optimise" the PRESERVING three to `Default::default()`, and do
+    /// not "restore symmetry" on the zeroing two without also removing the
+    /// two-pass preference in `session/lookup.rs` — each half is what makes
+    /// the other correct, and every single-instance test passes either way.
     pub routing_domain: u32,
 }
 
@@ -202,7 +240,30 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
         src_port,
         dst_port,
         discriminator: Default::default(),
-        routing_domain: forward_key.routing_domain,
+        // #7160 (#2387): REVERSE-MATCH key — deliberately domain-agnostic, for
+        // the same reason as `reverse_wire_key` above.
+        routing_domain: 0,
+    }
+}
+
+/// #7160 (#2387): the domain-agnostic form of a key, for looking one up in a
+/// REVERSE-MATCH index.
+///
+/// `reverse_wire_key` / `reverse_canonical_key` build those index keys with
+/// `routing_domain: 0`, so the arriving reply must be zeroed the same way
+/// before it is used as a probe — otherwise a reply that DID resolve a domain
+/// would look for a bucket that was never inserted. One named function so the
+/// two halves of the convention cannot drift apart.
+///
+/// The reply's own domain is not discarded: the caller keeps it to run the
+/// two-pass preference that restores per-domain demux (`find_forward_nat_match`).
+pub(crate) fn reverse_match_key(key: &SessionKey) -> SessionKey {
+    if key.routing_domain == 0 {
+        return key.clone();
+    }
+    SessionKey {
+        routing_domain: 0,
+        ..key.clone()
     }
 }
 

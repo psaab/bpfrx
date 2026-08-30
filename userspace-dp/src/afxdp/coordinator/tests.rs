@@ -7605,3 +7605,82 @@ fn stop_inner_retires_holders_for_all_allocator_families_7092() {
          #8069's fixture did not cover"
     );
 }
+
+// #7160 (#2387) — the two routing-domain accessors the session-sync handler
+// calls. Both answer questions a peer-synced session cannot answer for itself:
+// which domain to import it under, and which domains a bare-5-tuple delete has
+// to sweep.
+mod routing_domain_7160 {
+    use super::*;
+
+    const DOMAIN_A: u32 = 100_001;
+    const DOMAIN_B: u32 = 100_002;
+
+    fn coordinator_with_domains() -> Coordinator {
+        let mut c = Coordinator::new();
+        // Two member interfaces in tenant-a, one in tenant-b, one in the
+        // default instance. The duplicate is deliberate: `routing_domains`
+        // must DEDUPE, or the delete sweep repeats work per interface rather
+        // than per instance.
+        c.forwarding.has_routing_domains = true;
+        c.forwarding.ifindex_to_routing_domain.insert(10, DOMAIN_A);
+        c.forwarding.ifindex_to_routing_domain.insert(11, DOMAIN_A);
+        c.forwarding.ifindex_to_routing_domain.insert(12, DOMAIN_B);
+        // A trunk unit: the logical ifindex is what the map is keyed on, so the
+        // (parent, vlan) -> logical mapping has to be consulted.
+        c.forwarding.ingress_logical_ifindex.insert((20, 50), 12);
+        c
+    }
+
+    #[test]
+    fn synced_routing_domain_resolves_through_the_logical_unit() {
+        let c = coordinator_with_domains();
+        assert_eq!(c.synced_routing_domain(10, 0), DOMAIN_A);
+        assert_eq!(
+            c.synced_routing_domain(20, 50),
+            DOMAIN_B,
+            "a trunk unit must resolve its LOGICAL ifindex's domain, not its \
+             parent's — the parent maps only to its first unit"
+        );
+    }
+
+    /// A session whose ingress identity the peer could not name arrives with
+    /// ifindex 0. It must import at domain 0 — the pre-#7160 identity — and
+    /// NOT borrow whatever domain ifindex 0 happens to hash into.
+    #[test]
+    fn an_unnamed_peer_ingress_imports_at_the_default_domain() {
+        let c = coordinator_with_domains();
+        assert_eq!(c.synced_routing_domain(0, 0), 0);
+        assert_eq!(c.synced_routing_domain(-1, 0), 0);
+        assert_eq!(
+            c.synced_routing_domain(999, 0),
+            0,
+            "an ifindex this node knows nothing about must be the default \
+             domain, not a neighbour's"
+        );
+    }
+
+    /// The delete sweep's domain set: one entry per INSTANCE, not per member
+    /// interface, and never 0 (the bare key already covers the default
+    /// instance).
+    #[test]
+    fn routing_domains_is_the_deduped_nonzero_set() {
+        let c = coordinator_with_domains();
+        assert_eq!(c.routing_domains(), vec![DOMAIN_A, DOMAIN_B]);
+    }
+
+    /// The gate: with no routing-instance interface membership both accessors
+    /// are inert, so the delete retry loop does not exist and the import path
+    /// resolves 0 without a map probe.
+    #[test]
+    fn no_membership_makes_both_accessors_inert() {
+        let c = Coordinator::new();
+        assert!(!c.forwarding.has_routing_domains);
+        assert!(
+            c.routing_domains().is_empty(),
+            "the per-domain delete retry must be a no-op in a deployment with \
+             no routing-instance interface membership"
+        );
+        assert_eq!(c.synced_routing_domain(10, 0), 0);
+    }
+}

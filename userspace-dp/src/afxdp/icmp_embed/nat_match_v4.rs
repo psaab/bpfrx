@@ -18,6 +18,21 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
     let hdr = parse_embedded_v4(frame, embedded_ip_start)?;
     let emb_src = IpAddr::V4(hdr.src);
     let emb_dst = IpAddr::V4(hdr.dst);
+    // #7160 (#2387): the embedded tuple names the ORIGINAL flow, so its key
+    // needs that flow's routing domain or the plain (exact-key) lookups below
+    // miss a session in a non-default routing instance. An ICMP error for a
+    // forward flow comes back on the flow's EGRESS side, so the arriving
+    // interface's domain is the right answer for a flow contained in one
+    // routing instance. A flow that is not contained resolves a different
+    // domain here and falls through to the forward-NAT lookup, whose index is
+    // domain-agnostic by construction (session/key.rs) — degraded to the
+    // pre-#7160 path, never mismatched to another tenant.
+    let embedded_routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        None,
+    );
     let embedded_key = SessionKey {
         addr_family: libc::AF_INET as u8,
         protocol: hdr.proto,
@@ -25,8 +40,8 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v4(
         dst_ip: emb_dst,
         src_port: hdr.src_port,
         dst_port: hdr.dst_port,
-            discriminator: Default::default(),
-            routing_domain: 0,
+        discriminator: Default::default(),
+        routing_domain: embedded_routing_domain,
     };
     let reverse_key = embedded_reply_key(
         libc::AF_INET as u8,

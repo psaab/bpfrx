@@ -617,6 +617,29 @@ func buildInterfaceRoutingInstances(cfg *config.Config) map[string]string {
 	return out
 }
 
+// routingInstanceDomain maps a bare routing-instance name to the #7160 (#2387)
+// ROUTING DOMAIN id carried on `InterfaceSnapshot.RoutingDomain` and, from
+// there, into `SessionKey.routing_domain` in the Rust dataplane.
+//
+// The default instance ("") is domain 0. Every named instance folds through
+// `config.StableRoutingInstanceTableID`, which is a pure FNV-1a of the NAME
+// into [RoutingInstanceTableIDBase, +Span) = [100000, 999999] — so a named
+// instance can never produce the 0 that means "default", and a rename is a
+// genuine reconfiguration rather than a renumbering of its siblings.
+//
+// Reusing the kernel-table id rather than minting a second numbering is
+// deliberate: the id already has a commit-time collision gate
+// (validateRoutingInstanceTableIDCollisionAST, pkg/config/routinginstanceid.go),
+// and a second parallel numbering would need its own gate to say the same
+// thing. It is a routing-domain LABEL here, not a kernel table handle — the
+// dataplane never indexes a kernel table with it.
+func routingInstanceDomain(name string) uint32 {
+	if name == "" {
+		return 0
+	}
+	return uint32(config.StableRoutingInstanceTableID(name))
+}
+
 func connectedPrefixesForInterface(iface InterfaceSnapshot) ([]string, []string) {
 	var v4 []string
 	var v6 []string
