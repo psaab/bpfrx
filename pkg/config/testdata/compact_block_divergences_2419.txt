@@ -142,18 +142,9 @@ protocols isis net
 protocols lldp hold-multiplier
 protocols lldp transmit-interval
 protocols ospf area xpfarg interface xpfarg authentication md5 xpfarg key
-protocols ospf area xpfarg interface xpfarg dead-interval
-protocols ospf area xpfarg interface xpfarg hello-interval
-protocols ospf area xpfarg interface xpfarg interface-type
-protocols ospf area xpfarg interface xpfarg priority
-protocols ospf area xpfarg interface xpfarg retransmit-interval
 protocols ospf area xpfarg virtual-link xpfarg transit-area
 protocols ospf export
 protocols ospf router-id
-protocols ospf3 area xpfarg interface xpfarg dead-interval
-protocols ospf3 area xpfarg interface xpfarg hello-interval
-protocols ospf3 area xpfarg interface xpfarg priority
-protocols ospf3 area xpfarg interface xpfarg retransmit-interval
 protocols ospf3 export
 protocols ospf3 router-id
 protocols rip authentication-key
@@ -176,16 +167,7 @@ routing-instances xpfname protocols isis interface xpfarg level
 routing-instances xpfname protocols isis is-type
 routing-instances xpfname protocols isis level
 routing-instances xpfname protocols isis net
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg dead-interval
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg hello-interval
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg interface-type
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg priority
-routing-instances xpfname protocols ospf area xpfarg interface xpfarg retransmit-interval
 routing-instances xpfname protocols ospf area xpfarg virtual-link xpfarg transit-area
-routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg dead-interval
-routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg hello-interval
-routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg priority
-routing-instances xpfname protocols ospf3 area xpfarg interface xpfarg retransmit-interval
 routing-instances xpfname protocols ospf3 export
 routing-instances xpfname protocols ospf3 router-id
 routing-options autonomous-system

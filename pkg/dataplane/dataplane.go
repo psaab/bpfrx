@@ -325,41 +325,20 @@ type DataPlane interface {
 	// DNAT
 	SetDNATEntry(key DNATKey, val DNATValue) error
 	DeleteDNATEntry(key DNATKey) error
-	ClearDNATStatic() error
 	SetDNATEntryV6(key DNATKeyV6, val DNATValueV6) error
 	DeleteDNATEntryV6(key DNATKeyV6) error
-	ClearDNATStaticV6() error
 
 	// SNAT
-	SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) error
-	ClearSNATRules() error
-	SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV6) error
-	ClearSNATRulesV6() error
 
 	// NAT pools
-	SetNATPoolConfig(poolID uint32, cfg NATPoolConfig) error
-	SetNATPoolIPV4(poolID, index uint32, ip uint32) error
-	SetNATPoolIPV6(poolID, index uint32, ip [16]byte) error
-	ClearNATPoolConfigs() error
-	ClearNATPoolIPs() error
 
 	// SNAT egress IPs (interface-mode SNAT)
-	SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error
-	ClearSNATEgressIPs() error
 
 	// Static NAT
-	SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error
-	SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [16]byte) error
-	ClearStaticNATEntries() error
 
 	// NPTv6 (RFC 6296)
-	SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error
-	DeleteStaleNPTv6(written map[NPTv6Key]bool)
 
 	// NAT64
-	SetNAT64Config(index uint32, cfg NAT64Config) error
-	SetNAT64Count(count uint32) error
-	ClearNAT64Configs() error
 
 	// Screen
 	SetScreenConfig(profileID uint32, cfg ScreenConfig) error
@@ -454,8 +433,6 @@ type DataPlane interface {
 	DeleteStaleVlanIface(written map[uint32]bool)
 	DeleteStaleZonePairPolicies(written map[ZonePairKey]bool)
 	DeleteStaleApplications(written map[AppKey]bool)
-	DeleteStaleSNATRules(written map[SNATKey]bool)
-	DeleteStaleSNATRulesV6(written map[SNATKey]bool)
 	DeleteStaleDNATStatic(written map[DNATKey]bool)
 	DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool)
 	DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool)

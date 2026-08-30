@@ -161,27 +161,8 @@ func armedGateInvoke() map[string]func(m *Manager) error {
 		"ClearMirrorConfigs":     func(m *Manager) error { return m.ClearMirrorConfigs() },
 		"SetDNATEntry":           func(m *Manager) error { return m.SetDNATEntry(DNATKey{}, DNATValue{}) },
 		"DeleteDNATEntry":        func(m *Manager) error { return m.DeleteDNATEntry(DNATKey{}) },
-		"ClearDNATStatic":        func(m *Manager) error { return m.ClearDNATStatic() },
-		"SetSNATRule":            func(m *Manager) error { return m.SetSNATRule(1, 1, 0, SNATValue{}) },
-		"ClearSNATRules":         func(m *Manager) error { return m.ClearSNATRules() },
 		"SetDNATEntryV6":         func(m *Manager) error { return m.SetDNATEntryV6(DNATKeyV6{}, DNATValueV6{}) },
 		"DeleteDNATEntryV6":      func(m *Manager) error { return m.DeleteDNATEntryV6(DNATKeyV6{}) },
-		"ClearDNATStaticV6":      func(m *Manager) error { return m.ClearDNATStaticV6() },
-		"SetSNATRuleV6":          func(m *Manager) error { return m.SetSNATRuleV6(1, 1, 0, SNATValueV6{}) },
-		"ClearSNATRulesV6":       func(m *Manager) error { return m.ClearSNATRulesV6() },
-		"SetNATPoolConfig":       func(m *Manager) error { return m.SetNATPoolConfig(0, NATPoolConfig{}) },
-		"SetNATPoolIPV4":         func(m *Manager) error { return m.SetNATPoolIPV4(0, 0, 0) },
-		"SetNATPoolIPV6":         func(m *Manager) error { return m.SetNATPoolIPV6(0, 0, [16]byte{}) },
-		"ClearNATPoolConfigs":    func(m *Manager) error { return m.ClearNATPoolConfigs() },
-		"ClearNATPoolIPs":        func(m *Manager) error { return m.ClearNATPoolIPs() },
-		"SetSNATEgressIP":        func(m *Manager) error { return m.SetSNATEgressIP(SNATEgressKey{}, SNATEgressValue{}) },
-		"ClearSNATEgressIPs":     func(m *Manager) error { return m.ClearSNATEgressIPs() },
-		"SetStaticNATEntryV4":    func(m *Manager) error { return m.SetStaticNATEntryV4(0, 0, 0) },
-		"SetStaticNATEntryV6":    func(m *Manager) error { return m.SetStaticNATEntryV6([16]byte{}, 0, [16]byte{}) },
-		"SetNAT64Config":         func(m *Manager) error { return m.SetNAT64Config(0, NAT64Config{}) },
-		"SetNAT64Count":          func(m *Manager) error { return m.SetNAT64Count(0) },
-		"ClearNAT64Configs":      func(m *Manager) error { return m.ClearNAT64Configs() },
-		"SetNPTv6Rule":           func(m *Manager) error { return m.SetNPTv6Rule(NPTv6Key{}, NPTv6Value{}) },
 		"ReadNATPortCounter":     func(m *Manager) error { _, err := m.ReadNATPortCounter(0); return err },
 		"SetZoneConfig":          func(m *Manager) error { return m.SetZoneConfig(1, ZoneConfig{}) },
 		"SetZonePairPolicy":      func(m *Manager) error { return m.SetZonePairPolicy(1, 1, PolicySet{}) },
@@ -234,10 +215,9 @@ func armedGateInvoke() map[string]func(m *Manager) error {
 		},
 
 		// class 2 (neutral; error-returning members return nil on fresh)
-		"SessionCount":          func(m *Manager) error { m.SessionCount(); return nil },
-		"GetMapStats":           func(m *Manager) error { m.GetMapStats(); return nil },
-		"ClearSessionCounts":    func(m *Manager) error { return m.ClearSessionCounts() },
-		"ClearStaticNATEntries": func(m *Manager) error { return m.ClearStaticNATEntries() },
+		"SessionCount":       func(m *Manager) error { m.SessionCount(); return nil },
+		"GetMapStats":        func(m *Manager) error { m.GetMapStats(); return nil },
+		"ClearSessionCounts": func(m *Manager) error { return m.ClearSessionCounts() },
 		"UpdatePolicyScheduleState": func(m *Manager) error {
 			return m.UpdatePolicyScheduleState(nil, map[string]bool{})
 		},
@@ -250,12 +230,9 @@ func armedGateInvoke() map[string]func(m *Manager) error {
 			return nil
 		},
 		"DeleteStaleApplications": func(m *Manager) error { m.DeleteStaleApplications(nil); return nil },
-		"DeleteStaleSNATRules":    func(m *Manager) error { m.DeleteStaleSNATRules(nil); return nil },
-		"DeleteStaleSNATRulesV6":  func(m *Manager) error { m.DeleteStaleSNATRulesV6(nil); return nil },
 		"DeleteStaleDNATStatic":   func(m *Manager) error { m.DeleteStaleDNATStatic(nil); return nil },
 		"DeleteStaleDNATStaticV6": func(m *Manager) error { m.DeleteStaleDNATStaticV6(nil); return nil },
 		"DeleteStaleStaticNAT":    func(m *Manager) error { m.DeleteStaleStaticNAT(nil, nil); return nil },
-		"DeleteStaleNPTv6":        func(m *Manager) error { m.DeleteStaleNPTv6(nil); return nil },
 		"DeleteStaleNAT64":        func(m *Manager) error { m.DeleteStaleNAT64(0, nil); return nil },
 		"ZeroStaleScreenConfigs":  func(m *Manager) error { m.ZeroStaleScreenConfigs(0); return nil },
 		"ZeroStaleNATPoolConfigs": func(m *Manager) error { m.ZeroStaleNATPoolConfigs(0); return nil },
@@ -1140,72 +1117,6 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 		if armed {
 			name = "armed"
 		}
-		t.Run(name+"_ClearNAT64Configs_partial_registry", func(t *testing.T) {
-			// The DISCRIMINATING partial-registry leg: required nat64_configs
-			// PRESENT with a nonzero nat64_count, OPTIONAL nat64_prefix_map
-			// ABSENT — the call must SUCCEED AND the trailing required count
-			// write must land. A premature optional-miss return leaves the
-			// count non-zero and FAILS this leg.
-			m := New()
-			m.maps["nat64_configs"] = newArray(t, "nat64_configs", uint32(sizeOf[NAT64Config]()), 4)
-			m.maps["nat64_count"] = newArray(t, "nat64_count", 4, 1)
-			m.loaded.Store(armed)
-
-			if err := m.SetNAT64Count(2); err != nil {
-				t.Fatalf("seed nat64_count: %v", err)
-			}
-			if err := m.ClearNAT64Configs(); err != nil {
-				t.Fatalf("ClearNAT64Configs with optional nat64_prefix_map absent = %v, want success (continuation)", err)
-			}
-			var got uint32
-			if err := m.maps["nat64_count"].Lookup(uint32(0), &got); err != nil {
-				t.Fatalf("read back nat64_count: %v", err)
-			}
-			if got != 0 {
-				t.Fatalf("nat64_count after ClearNAT64Configs = %d, want 0 (the trailing required write did not land — premature optional-miss return)", got)
-			}
-		})
-
-		t.Run(name+"_SetNAT64Config_required_write_lands", func(t *testing.T) {
-			// Leg (i): REQUIRED nat64_configs present, OPTIONAL
-			// nat64_prefix_map absent — the call succeeds AND the required
-			// write is readable back.
-			m := New()
-			m.maps["nat64_configs"] = newArray(t, "nat64_configs", uint32(sizeOf[NAT64Config]()), 4)
-			m.loaded.Store(armed)
-
-			cfg := NAT64Config{Prefix: [3]uint32{0x64ff9b00, 0, 0}}
-			if err := m.SetNAT64Config(0, cfg); err != nil {
-				t.Fatalf("SetNAT64Config with optional nat64_prefix_map absent = %v, want success", err)
-			}
-			var back NAT64Config
-			if err := m.maps["nat64_configs"].Lookup(uint32(0), &back); err != nil {
-				t.Fatalf("read back nat64_configs[0]: %v", err)
-			}
-			if back != cfg {
-				t.Fatalf("nat64_configs[0] = %+v, want the written config (the required write did not land)", back)
-			}
-		})
-
-		t.Run(name+"_ClearStaticNATEntries_continues_to_v6", func(t *testing.T) {
-			// Absent static_nat_v4 must CONTINUE to the v6 clear.
-			m := New()
-			v6 := newHash(t, "static_nat_v6", uint32(sizeOf[StaticNATKeyV6]()), uint32(sizeOf[StaticNATValueV6]()), 8)
-			m.maps["static_nat_v6"] = v6
-			m.loaded.Store(armed)
-
-			k := StaticNATKeyV6{Direction: 1}
-			if err := v6.Update(k, StaticNATValueV6{}, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed static_nat_v6: %v", err)
-			}
-			if err := m.ClearStaticNATEntries(); err != nil {
-				t.Fatalf("ClearStaticNATEntries = %v", err)
-			}
-			var out StaticNATValueV6
-			if err := v6.Lookup(k, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
-				t.Fatalf("static_nat_v6 entry survives (err=%v) — the v4-absent path did not continue to v6", err)
-			}
-		})
 
 		t.Run(name+"_SessionCount_absent_first_family_continues", func(t *testing.T) {
 			// Discriminating continuation (Codex PR #6743 M5): sessions is
