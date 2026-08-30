@@ -540,7 +540,15 @@ On an established-session HIT, `evaluate_input_filter_on_session_hit`
 and branches: a per-packet-varying filter keeps its existing per-packet
 re-evaluation; a static filter is re-derived only when the stamp is stale. The
 re-derivation is side-effect free (`NonRoutingCountPolicy::Never` — no
-`then count`, no `then log`, no policer meter), so a session the filter still
+`then count`, no `then log`, no policer meter), and only the ACCEPT exit
+re-stamps. A DENY deliberately leaves the stamp stale: the caller revokes the
+session, so normally there is no entry left to stamp, and if the teardown ever
+failed to take, a stamped entry would say "already judged under the live
+generation" and be FORWARDED for the rest of the generation under a filter that
+denies it. Unstamped, the next packet re-derives the same DENY and drops — the
+same failure, fail-closed instead of fail-open.
+
+A session the filter still
 PERMITS costs one term walk per config generation and is otherwise untouched —
 critically including its NAT translation, since a purged-and-recreated permitted
 SNAT flow reinstalls on a DIFFERENT translated port and breaks. Only on a DENY
@@ -580,7 +588,8 @@ revalidation is one already taking the session path.
 
 Regression coverage: `session/filter_revalidation_7212_tests.rs` (stamp
 lifecycle) and `afxdp/poll_descriptor/filter_revalidation_7212_tests.rs`
-(verdict, side-effect freedom, the pinned permitted-SNAT case).
+(verdict, side-effect freedom, the NAT-alias reverse half, the fragment purity
+case, the DENY-exit fail-closed stamp, and the pinned permitted-SNAT case).
 
 ## Per-session byte/packet accounting (#2501)
 

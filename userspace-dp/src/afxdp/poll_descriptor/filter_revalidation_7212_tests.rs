@@ -598,9 +598,10 @@ fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
          translated tuple deletes nothing"
     );
     assert!(
-        !sessions.filter_revalidation_stale(&reverse_key),
-        "the re-stamp must land on the entry, not on the wire tuple, or the \
-         verdict is re-derived on every packet"
+        sessions.filter_revalidation_stale(&reverse_key),
+        "a DENY leaves the stamp stale by design (see \
+         `a_deny_verdict_does_not_re_stamp_the_session_7212`); the re-stamp \
+         landing on the CANONICAL key is pinned by the permitted sibling below"
     );
 }
 
@@ -782,4 +783,56 @@ fn non_first_fragment_frame() -> Vec<u8> {
     frame[20] = 0x00;
     frame[21] = 0x01; // offset = 1 (8 bytes in), MF clear -> the LAST fragment
     frame
+}
+
+/// A DENY verdict does NOT re-stamp the session.
+///
+/// The caller revokes it, so in the normal case there is no entry left to
+/// stamp. The case this pins is the abnormal one: if the teardown ever fails to
+/// take, a stamped entry would say "already judged under the live generation"
+/// and be FORWARDED for the rest of the generation under a filter that denies
+/// it. Unstamped, the next packet re-derives the same DENY and drops — the same
+/// failure, fail-closed instead of fail-open.
+///
+/// The helper is called directly here precisely because it does NOT perform the
+/// teardown; that is what makes "the entry survived a DENY" reachable in a test
+/// at all.
+#[test]
+fn a_deny_verdict_does_not_re_stamp_the_session_7212() {
+    let forwarding =
+        forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-5201", "5201")]);
+    let flow = v4_flow(5201);
+    let mut sessions = table_with_session(&flow, 6, 7);
+
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("first packet: the session is newly denied");
+    assert!(hit.revoked_key.is_some());
+    assert!(
+        sessions.filter_revalidation_stale(&flow.forward_key),
+        "a DENY must leave the stamp stale, so a teardown that did not take \
+         cannot turn into a forwarded flow"
+    );
+
+    // Second packet on the surviving entry: the verdict is re-derived and it is
+    // still a DENY, so the packet is dropped again rather than forwarded.
+    let again = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("second packet: still denied, not forwarded under a stale-clean stamp");
+    assert_eq!(again.eval.action, crate::filter::FilterAction::Discard);
+    assert!(again.revoked_key.is_some());
 }

@@ -475,12 +475,24 @@ pub(super) fn evaluate_input_filter_on_session_hit(
 /// session per config generation: keeping it out of line leaves the caller's
 /// common path (no filter, or a fresh stamp) a lookup and two branches.
 ///
-/// The re-stamp happens on BOTH exits, before the verdict is acted on. On the
-/// ACCEPT exit that is the whole point. On the DENY exit it is not merely
-/// harmless but load-bearing for the failure mode where the teardown does not
-/// take: the session must not re-derive the same DENY on every subsequent
-/// packet, re-running the counted evaluator (and its `then count` /
-/// `then log` / reject-reply side effects) each time.
+/// The re-stamp happens on the ACCEPT exit ONLY, and that asymmetry is
+/// deliberate.
+///
+/// On ACCEPT it is the whole point: the session keeps its entry and must not
+/// re-derive the same verdict on every later packet of this generation.
+///
+/// On DENY the caller REVOKES the session, so in the normal case there is no
+/// entry left to carry a stamp and the next packet of that 5-tuple takes the
+/// session-MISS path — where the filter denies it again, with its counters, its
+/// log record and its reject reply. Re-stamping there would only ever matter if
+/// the teardown did NOT take, and in exactly that case the stamp is a fail-OPEN:
+/// the session would say "already judged under the live generation" and be
+/// FORWARDED for the rest of the generation, under a filter that denies it. Not
+/// stamping makes the same failure fail CLOSED — the next packet re-derives the
+/// same DENY and is dropped again — at the cost of re-running the walk for a
+/// flow every packet of which is being dropped anyway. That is also the closer
+/// Junos behaviour: a stateless `then count; then discard` term counts every
+/// packet it drops.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -538,13 +550,17 @@ fn revalidate_static_input_filter_on_session_hit(
         meta.dscp,
         extra,
     );
-    sessions.mark_filter_revalidated(&canonical_key);
     if verdict == crate::filter::FilterAction::Accept {
         // The filter still permits this flow. Nothing is counted, nothing is
         // logged, and the session — including its NAT translation, which is the
-        // reason #5858's family purge was rejected — is untouched.
+        // reason #5858's family purge was rejected — is untouched. Re-stamp so
+        // no later packet of this generation re-derives the same verdict.
+        sessions.mark_filter_revalidated(&canonical_key);
         return None;
     }
+    // DENY: deliberately NOT re-stamped — see the header. The caller revokes the
+    // session; if that ever fails to take, the next packet must re-derive this
+    // same DENY and drop, not be forwarded under a "judged" stamp.
     // Newly DENIED. Re-run the ordinary counted evaluator so this packet is
     // charged to the matching `then count` terms and produces its `then log`
     // record exactly once, then let the caller run the reject reply, drop the
