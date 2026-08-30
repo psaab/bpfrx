@@ -46,6 +46,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -329,9 +330,47 @@ func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, 
 	// arg only applies when O_CREATE actually creates the file; on an
 	// EXISTING inode O_APPEND ignores it, so migratePermsLocked() above
 	// is what tightens an upgraded 0644 journal (#5188).
-	f, err = os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
+	// #7176 (C179-061): O_NOFOLLOW plus a post-open regular-file check.
+	//
+	// This package already refuses to CHMOD through a symlinked segment
+	// (chmodOwnerOnly above: Lstat, reject ModeSymlink, require IsRegular) — it
+	// just did not refuse to APPEND through one. The audit journal is the record
+	// an operator reads to reconstruct what happened, so writing it into
+	// someone else's file is worse than the permission gap that convention was
+	// written for.
+	//
+	// Both checks are needed and neither subsumes the other:
+	//
+	//   - O_NOFOLLOW refuses when the FINAL path component is a symlink, and the
+	//     kernel decides it at open time, so there is no TOCTOU window the way
+	//     an Lstat-then-open would have.
+	//   - O_NOFOLLOW happily opens a FIFO, device or socket planted directly at
+	//     the path — those are not symlinks. A FIFO is the worst of them: with
+	//     O_RDWR the open succeeds, writes land in the pipe buffer, and the
+	//     daemon BLOCKS once it fills. So fstat the descriptor and require a
+	//     regular file.
+	//
+	// The check is f.Stat() on the open descriptor, not os.Stat(j.path): a
+	// path-based stat would be checking a different object from the one just
+	// opened.
+	//
+	// Cost to a legitimate deployment: an operator who symlinks the journal FILE
+	// itself now gets a clear error instead of silent indirection. Symlinking
+	// the journal DIRECTORY still works — O_NOFOLLOW only constrains the final
+	// component.
+	f, err = os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return nil, false, false, fmt.Errorf("open journal: %w", err)
+	}
+	if fi, statErr := f.Stat(); statErr != nil {
+		f.Close()
+		return nil, false, false, fmt.Errorf("stat journal after open: %w", statErr)
+	} else if !fi.Mode().IsRegular() {
+		mode := fi.Mode()
+		f.Close()
+		return nil, false, false, fmt.Errorf(
+			"journal path %s is not a regular file (mode %s) — refusing to append the "+
+				"audit journal into it", j.path, mode)
 	}
 
 	// Torn-tail self-heal: a crash between a previous write and its
