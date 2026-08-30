@@ -74,6 +74,14 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		<-done
 	}()
 
+	// #7172: the command the operator ran includes its pipe, and SplitPipe has
+	// already removed it. Hand it to the gate for the duration of this single
+	// dispatch and clear it after, so a later un-piped command on the same CLI
+	// cannot inherit a stale suffix.
+	prevSuffix := c.pendingPipeSuffix
+	c.pendingPipeSuffix = strings.TrimSpace(pipeType + " " + pipeArg)
+	defer func() { c.pendingPipeSuffix = prevSuffix }()
+
 	return c.dispatch(cmd)
 }
 
@@ -254,6 +262,15 @@ func (c *CLI) dispatchOperational(line string) error {
 	parts[0] = resolved
 
 	if err := c.checkPermission(parts); err != nil {
+		return err
+	}
+
+	// #7172: fine-grained allow/deny command regexes, AFTER the coarse
+	// permission bits authorized the family. Here rather than in dispatch()
+	// because `case "run"` below re-enters this function directly from config
+	// mode, so a gate at dispatch() would leave `run request system reboot`
+	// ungated for anyone who can reach config mode.
+	if err := c.checkCommandRegex(line); err != nil {
 		return err
 	}
 
