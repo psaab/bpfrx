@@ -75,9 +75,13 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 			case rule.Then.Off:
 				action = "off"
 			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
+			// #7363: the FULL match — bracket list and address-book names —
+			// not just the singular back-compat field.
+			dstMatch := natMatchAddresses(
+				rule.Match.DestinationAddress, rule.Match.DestinationAddresses,
+				rule.Match.DestinationAddressName, rule.Match.DestinationAddressNames)
+			if dstMatch == "" {
+				dstMatch = "0.0.0.0/0"
 			}
 			fmt.Fprintf(w, "destination NAT rule: %s\n", rule.Name)
 			fmt.Fprintf(w, "  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
