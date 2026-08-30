@@ -205,6 +205,18 @@ impl EventFrame {
         buf[pos..pos + 8].copy_from_slice(&session_id.to_le_bytes());
         pos += 8;
 
+        // #7188: [+24:+32] the session key's tunnel discriminator (u64 LE),
+        // trailing/length-gated after the #5212 session id. GRE is protocol 47
+        // and has no L4 ports, so two RFC 2890 tunnels between one pair of
+        // outer endpoints share a 5-tuple; this is the only field on the record
+        // that tells them apart. Without it the standby rebuilt both records as
+        // ONE key and the second install evicted the first. The encoding
+        // reserves 0 for "not carried" and never emits it for a real class, so
+        // an old Go decoder length-skips these 8 bytes and the receiver reads
+        // the peer as unable to express the identity (withhold, not alias).
+        buf[pos..pos + 8].copy_from_slice(&key.discriminator.to_wire().to_le_bytes());
+        pos += 8;
+
         // Write header
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_OPEN, seq);
@@ -267,6 +279,15 @@ impl EventFrame {
         pos += 2;
         buf[pos..pos + 2].copy_from_slice(&egress_zone_id.to_le_bytes());
         pos += 2;
+
+        // #7188: the tunnel discriminator (u64 LE), trailing/length-gated after
+        // the #3075 zone ids. A close names the session to RETRACT, and for
+        // protocol 47 the 5-tuple names two tunnels at once — so a close that
+        // could not carry the discriminator would retract the wrong one, or
+        // (once the receiver refuses an inexpressible protocol-47 key) neither.
+        // An old Go decoder length-skips these 8 bytes.
+        buf[pos..pos + 8].copy_from_slice(&key.discriminator.to_wire().to_le_bytes());
+        pos += 8;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_CLOSE, seq);

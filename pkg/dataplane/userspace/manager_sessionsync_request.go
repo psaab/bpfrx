@@ -87,6 +87,19 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		// #5212: carry the originating node's stable RT_FLOW session id so the
 		// peer helper adopts it on import instead of minting a fresh local id.
 		req.RTFlowSessionID = val.RTFlowSessionID
+		// #7188: carry the tunnel session-identity discriminator to the peer
+		// helper, which folds it into the key it reconstructs. Two RFC 2890 GRE
+		// tunnels between one pair of outer endpoints are ONE Go session key
+		// (protocol 47 has no L4 ports), so without this the helper rebuilt both
+		// records as the same key and the second install evicted the first.
+		//
+		// A "delete" request is built with val == nil and therefore carries 0 —
+		// the RESERVED "not carried" tag. That is deliberate and safe: a delete
+		// reconstructs the key with Delete intent on the helper, which resolves
+		// an absent discriminator to the None class, so it can only under-match.
+		// A keyed-GRE synced session is retracted by its idle timeout rather
+		// than by an explicit delete.
+		req.TunnelDiscriminator = val.TunnelDiscriminator
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0
@@ -174,6 +187,8 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		}
 		// #5212: carry the originating node's stable RT_FLOW session id (see V4).
 		req.RTFlowSessionID = val.RTFlowSessionID
+		// #7188: carry the tunnel session-identity discriminator (see V4).
+		req.TunnelDiscriminator = val.TunnelDiscriminator
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0

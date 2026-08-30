@@ -799,13 +799,15 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
         FLAG_NAT64,
         "nat64 decision must set flags bit 1<<5"
     );
-    // snat_v4 sits at [n-12 .. n-8]: #5212 appended an 8-byte session_id after
-    // the 4-byte snat_v4, so snat_v4 is no longer the last field.
+    // snat_v4 sits at [n-20 .. n-16]: #5212 appended an 8-byte session_id after
+    // the 4-byte snat_v4, and #7188 appended an 8-byte tunnel discriminator
+    // after that, so snat_v4 is two fields from the tail.
     let n = payload.len();
     assert_eq!(
-        &payload[n - 12..n - 8],
+        &payload[n - 20..n - 16],
         &[203, 0, 113, 5],
-        "snat_v4 must be the translated pool source (before the trailing id)"
+        "snat_v4 must be the translated pool source (before the trailing id and \
+         the #7188 discriminator)"
     );
 
     // A non-NAT64 v4 session: flag clear, snat_v4 all-zero.
@@ -814,7 +816,7 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
     let pp = &frame_plain.data[FRAME_HEADER_SIZE..frame_plain.len as usize];
     assert_eq!(pp[26] & FLAG_NAT64, 0, "non-nat64 must leave the flag clear");
     let m = pp.len();
-    assert_eq!(&pp[m - 12..m - 8], &[0, 0, 0, 0], "non-nat64 snat is zero");
+    assert_eq!(&pp[m - 20..m - 16], &[0, 0, 0, 0], "non-nat64 snat is zero");
 }
 
 // #5212 RED-on-revert: the originating node's stable RT_FLOW session id rides the
@@ -841,16 +843,17 @@ fn test_encode_session_open_carries_session_id_5212() {
     );
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     let n = payload.len();
-    // The LAST 8 bytes are the session id (LE); the 4 bytes before it are the
-    // #4565 snat_v4 (all-zero for this non-NAT64 v4 session), which must be
-    // undisturbed by the appended id.
+    // The session id is the second-from-last field: #7188 appended an 8-byte
+    // tunnel discriminator BEHIND it, so it sits at [n-16 .. n-8]. The 4 bytes
+    // before it are the #4565 snat_v4 (all-zero for this non-NAT64 v4 session),
+    // which must be undisturbed by either append.
     assert_eq!(
-        u64::from_le_bytes(payload[n - 8..n].try_into().unwrap()),
+        u64::from_le_bytes(payload[n - 16..n - 8].try_into().unwrap()),
         session_id,
-        "the trailing u64 must carry the stable session id"
+        "the session-id u64 must carry the stable session id"
     );
     assert_eq!(
-        &payload[n - 12..n - 8],
+        &payload[n - 20..n - 16],
         &[0, 0, 0, 0],
         "the snat_v4 field must still precede the session id, unchanged"
     );
@@ -869,7 +872,7 @@ fn test_encode_session_open_carries_session_id_5212() {
     let p0 = &frame0.data[FRAME_HEADER_SIZE..frame0.len as usize];
     let n0 = p0.len();
     assert_eq!(
-        u64::from_le_bytes(p0[n0 - 8..n0].try_into().unwrap()),
+        u64::from_le_bytes(p0[n0 - 16..n0 - 8].try_into().unwrap()),
         0,
         "a zero session id writes zero on the wire"
     );
@@ -891,13 +894,14 @@ fn test_encode_session_open_carries_policy_fields_3301() {
         EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     // #3301 trailing block: policy_id, policy_counter_idx, inactivity_timeout
-    // (seconds), each u32 LE. #4565 appended a 4-byte snat_v4 AFTER this block
-    // and #5212 appended a further 8-byte session_id AFTER that, so the policy
-    // fields are now at [n-24 .. n-12] (snat_v4 = [n-12 .. n-8], id = last 8).
+    // (seconds), each u32 LE. #4565 appended a 4-byte snat_v4 AFTER this block,
+    // #5212 a further 8-byte session_id AFTER that, and #7188 an 8-byte tunnel
+    // discriminator last, so the policy fields are now at [n-32 .. n-20]
+    // (snat_v4 = [n-20 .. n-16], id = [n-16 .. n-8], discriminator = last 8).
     let n = p.len();
-    let policy_id = u32::from_le_bytes(p[n - 24..n - 20].try_into().unwrap());
-    let counter_idx = u32::from_le_bytes(p[n - 20..n - 16].try_into().unwrap());
-    let inact_secs = u32::from_le_bytes(p[n - 16..n - 12].try_into().unwrap());
+    let policy_id = u32::from_le_bytes(p[n - 32..n - 28].try_into().unwrap());
+    let counter_idx = u32::from_le_bytes(p[n - 28..n - 24].try_into().unwrap());
+    let inact_secs = u32::from_le_bytes(p[n - 24..n - 20].try_into().unwrap());
     assert_eq!(policy_id, 42, "policy_id must ride the open frame");
     assert_eq!(counter_idx, 7, "policy_counter_idx must ride the open frame");
     assert_eq!(inact_secs, 30, "inactivity_timeout (ns->s) must ride the open frame");
@@ -914,10 +918,11 @@ fn test_encode_session_open_carries_policy_fields_3301() {
     );
     let pn = &frame_none.data[FRAME_HEADER_SIZE..frame_none.len as usize];
     let m = pn.len();
-    // Shifted by the #4565 snat_v4 (4) + #5212 session_id (8) trailing fields.
+    // Shifted by the #4565 snat_v4 (4) + #5212 session_id (8) + #7188 tunnel
+    // discriminator (8) trailing fields.
+    assert_eq!(u32::from_le_bytes(pn[m - 32..m - 28].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(pn[m - 28..m - 24].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(pn[m - 24..m - 20].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(pn[m - 20..m - 16].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(pn[m - 16..m - 12].try_into().unwrap()), 0);
 }
 
 #[test]
@@ -1095,5 +1100,143 @@ fn test_disposition_encoding() {
     assert_eq!(
         encode_disposition(ForwardingDisposition::NextTableUnsupported),
         8
+    );
+}
+
+// --- #7188: the tunnel discriminator on the binary HA delta frames -----------
+
+/// A keyed-GRE forward key. Protocol 47 carries no L4 ports, so the ports are
+/// zero and the discriminator is the ONLY field distinguishing this from
+/// another tunnel between the same outer endpoints.
+fn keyed_gre_key_7188(key: u32) -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_GRE,
+        src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+        src_port: 0,
+        dst_port: 0,
+        discriminator: crate::session::TunnelDiscriminator::Keyed(key),
+        routing_domain: 0,
+    }
+}
+
+/// The open frame's trailing u64 (#7188), after the #5212 session id.
+///
+/// FAIL-ON-REVERT: drop the `key.discriminator.to_wire()` write and the trailing
+/// slot reads 0 — the reserved "not carried" tag — so a fully capable helper is
+/// indistinguishable from one that predates the field and the peer withholds
+/// every keyed-GRE session it sends.
+///
+/// The pair is the point: two tunnels between one pair of outer endpoints
+/// produce byte-identical frames up to this field, so a single-tunnel assertion
+/// would pass with the value hardcoded to any constant.
+#[test]
+fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
+    let zones = test_zone_map();
+    let encode = |key: u32| {
+        EventFrame::encode_session_open(
+            1,
+            &keyed_gre_key_7188(key),
+            &test_decision(),
+            &test_metadata(),
+            &zones,
+            false,
+            0,
+        )
+    };
+    let first = encode(100);
+    let second = encode(200);
+
+    let tail = |frame: &EventFrame| {
+        let end = frame.len as usize;
+        u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap())
+    };
+    assert_eq!(
+        tail(&first),
+        crate::session::TunnelDiscriminator::Keyed(100).to_wire(),
+        "the open frame's LAST field must be the encoded discriminator"
+    );
+    assert_ne!(
+        tail(&first),
+        tail(&second),
+        "two RFC 2890 tunnels between the same outer endpoints must not encode to \
+         the same identity — their 5-tuples are equal, so the standby would rebuild \
+         one key for both and the second install would evict the first (#7188)"
+    );
+    // The field is APPENDED: everything before it is unchanged, so the two
+    // frames differ ONLY in these 8 bytes.
+    let body = |frame: &EventFrame| frame.data[FRAME_HEADER_SIZE..frame.len as usize - 8].to_vec();
+    assert_eq!(
+        body(&first),
+        body(&second),
+        "fixture check: the two frames must be identical apart from the \
+         discriminator, otherwise this test is not measuring the aliasing shape"
+    );
+}
+
+/// The CLOSE frame is a separate encoder. A close names the session to RETRACT,
+/// and for protocol 47 the 5-tuple names two tunnels at once, so a close that
+/// dropped the discriminator would retract the wrong tunnel.
+#[test]
+fn session_close_frames_carry_the_tunnel_discriminator_7188() {
+    let frame = EventFrame::encode_session_close(7, &keyed_gre_key_7188(200), 1, 0, 300, 1000);
+    let end = frame.len as usize;
+    assert_eq!(
+        u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap()),
+        crate::session::TunnelDiscriminator::Keyed(200).to_wire()
+    );
+    // The #3075 zone ids must still sit where they did — the discriminator is
+    // appended BEHIND them, not spliced in.
+    let p = &frame.data[FRAME_HEADER_SIZE..];
+    assert_eq!(u16::from_le_bytes([p[19], p[20]]), 300);
+    assert_eq!(u16::from_le_bytes([p[21], p[22]]), 1000);
+}
+
+/// A non-tunnel session states `None` EXPLICITLY rather than emitting the
+/// reserved absent tag. That statement is what lets the receiver tell this
+/// helper from one that predates the field.
+#[test]
+fn session_open_frames_state_none_explicitly_for_non_tunnel_protocols_7188() {
+    let zones = test_zone_map();
+    let frame = EventFrame::encode_session_open(
+        1,
+        &test_key_v4(),
+        &test_decision(),
+        &test_metadata(),
+        &zones,
+        false,
+        0,
+    );
+    let end = frame.len as usize;
+    let tail = u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap());
+    assert_ne!(
+        tail, 0,
+        "0 is RESERVED for `not carried`; a TCP session must still STATE its `None` \
+         class or every frame this helper emits looks like a legacy peer's"
+    );
+    assert_eq!(tail, crate::session::TunnelDiscriminator::None.to_wire());
+}
+
+/// The v6 open frame is the widest record this fixed 256-byte buffer carries.
+/// Appending 8 bytes must not run it out of headroom — an overflow here is a
+/// panic in the HA delta producer, not a wrong value.
+#[test]
+fn v6_session_open_frame_still_fits_the_buffer_7188() {
+    let zones = test_zone_map();
+    let frame = EventFrame::encode_session_open(
+        1,
+        &test_key_v6(),
+        &test_decision(),
+        &test_metadata(),
+        &zones,
+        false,
+        0,
+    );
+    assert!(
+        (frame.len as usize) <= frame.data.len(),
+        "v6 open frame is {} bytes, buffer is {}",
+        frame.len,
+        frame.data.len()
     );
 }

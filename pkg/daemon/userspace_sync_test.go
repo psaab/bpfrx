@@ -1170,11 +1170,15 @@ func (c *captureDeltaSink) openV6(key dataplane.SessionKeyV6, _ dataplane.Sessio
 	c.opensV6 = append(c.opensV6, key)
 }
 
-func (c *captureDeltaSink) deleteV4(key dataplane.SessionKey) {
+// #7188: the delete arms take the converted VALUE too, because two RFC 2890 GRE
+// tunnels between one pair of outer endpoints share a dataplane.SessionKey and
+// differ only in val.TunnelDiscriminator. This capture sink records keys only —
+// its subject is the eligibility filter, not identity — so it discards the value.
+func (c *captureDeltaSink) deleteV4(key dataplane.SessionKey, _ dataplane.SessionValue) {
 	c.deletesV4 = append(c.deletesV4, key)
 }
 
-func (c *captureDeltaSink) deleteV6(key dataplane.SessionKeyV6) {
+func (c *captureDeltaSink) deleteV6(key dataplane.SessionKeyV6, _ dataplane.SessionValueV6) {
 	c.deletesV6 = append(c.deletesV6, key)
 }
 

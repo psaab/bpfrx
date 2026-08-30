@@ -1073,6 +1073,116 @@ worker-namespaced, adopting the peer's id verbatim keeps it unique across the
 importing node's shared-nothing worker tables. The standby's SESSION_CLOSE
 RT_FLOW then correlates with the primary's SESSION_CREATE.
 
+### Tunnel Session-Identity Discriminator (#7188)
+
+GRE is IP protocol 47 and carries no L4 ports, so two RFC 2890 tunnels between
+one pair of outer endpoints are ONE 5-tuple. The helper's own `SessionKey`
+separates them on a typed `TunnelDiscriminator`
+(`userspace-dp/src/session/discriminator.rs`) with four DISJOINT classes:
+`None` (no discriminator concept for this protocol — everything but GRE),
+`Unkeyed`, `Keyed(u32)` (including the legal key `0`), and `Unparseable`.
+`Unkeyed` is not `Keyed(0)` and `Unparseable` is not `Unkeyed`.
+
+**The bug this section exists to record.** The sync path did not carry the
+discriminator: `build_synced_session_key` hardcoded
+`discriminator: Default::default()`, and `Default` is `None` — the class
+reserved for non-tunnel protocols. So two keyed tunnels' sync records both
+rebuilt to the SAME key on the standby, and `install.rs`'s unconditional
+`remove_entry` made the second install evict the first. The standby held ONE
+session for two tunnels, so after a failover they shared one policy decision,
+one NAT state, one counter set and one timeout — the exact collapse #7188
+exists to prevent, restored silently by the failover.
+
+**Carriage.** Like `RTFlowSessionID` above, this is a length-gated trailing
+VALUE field and needs no `CurrentHAProtocolVersion` bump. The path is:
+
+1. the helper encodes `key.discriminator.to_wire()` as the trailing u64 of the
+   `MSG_SESSION_OPEN` **and** `MSG_SESSION_CLOSE` frames, and as
+   `SessionDeltaInfo.tunnel_discriminator` on the JSON RPC-fallback leg;
+2. the daemon decodes it into `SessionDeltaInfo.TunnelDiscriminator` and stamps
+   `SessionValue{,V6}.TunnelDiscriminator`;
+3. `SessionSync` encodes it as the trailing wire field (after the #7095
+   `IngressIfaceFold`), v4 and v6;
+4. the peer daemon forwards it on `SessionSyncRequest.tunnel_discriminator`;
+5. the peer helper folds it into the key it reconstructs.
+
+Go never interprets the tag — it carries it — so the encoding is defined in
+exactly one place.
+
+**`0` is RESERVED for "not carried", and is NOT the encoding of `None`.** This
+is the load-bearing detail. `serde(default)` and a short length-gated record
+both yield `0`, so `0` is the one value a peer produces WITHOUT meaning to; a
+build that has the field always states a class, `None` included. That is what
+lets the receiver tell "the peer cannot express this identity" from "the peer
+says this protocol has no discriminator" — a real answer, which every non-GRE
+session sends. It is also the answer a GRE session would carry with
+`gre-performance-acceleration` off; today #6837 leaves such a session flowless
+so none is created, and the receiver deliberately does not depend on that
+staying true.
+
+**Fail-closed import (#7188 decision 2).** On an INSTALL, an absent
+discriminator on protocol 47 means the peer cannot tell two same-endpoint
+tunnels apart, so the session is WITHHELD — `build_synced_session_key` returns a
+`synced-import-refused:` error and the peer re-learns the session — rather than
+imported onto a key that may evict another tunnel. An unrecognised tag (a class
+from a future build) is refused for every protocol, same reasoning. Every other
+protocol with an absent tag imports as `None`, bit-identical to pre-#7188.
+
+The refusal carries the machine-readable `SYNCED_IMPORT_REFUSED_PREFIX` because
+it is the CORRECT answer from a HEALTHY helper: Go discriminates on that token
+(`process_control.go`) and a transport-class failure gates takeover-readiness
+(#5247), which an older peer must not be able to trigger.
+
+**A DELETE takes the opposite branch, deliberately.** The cluster delete message
+carries the key and the #2170 delete generation only, and the local clear path
+builds its request with `val == nil`, so a delete always arrives with tag `0`.
+Refusing it would turn every ordinary GRE close into an error response for no
+gain: a key rebuilt without a discriminator names the `None` class alone, so a
+delete can only UNDER-match. Under-matching never merges two identities, which
+is why install fails closed and delete does not.
+
+**Bulk window.** `snapshotDeltaSink` dedupes on the session key PLUS the
+discriminator (`snapshotDedupKeyV4`/`V6`, `daemon_ha_userspace_stream.go`). Keyed
+on the 5-tuple alone it silently dropped one of two same-endpoint tunnels from
+every cold-prime window. `BulkSnapshot` is a SLICE, so two entries with equal
+keys and different discriminators both ride the window.
+
+**Known residuals**, all recorded rather than fixed here:
+
+- A keyed-GRE synced session is retracted by its idle timeout, not by an
+  explicit delete, because the delete wire has no value slot to carry the
+  discriminator (see above).
+- The REVERSE COMPANION of a keyed-GRE session is still shared. All five
+  `SessionKey` transforms (`forward_wire_key`, `translated_session_key`,
+  `reverse_wire_key`, `reverse_canonical_key`, `reverse_session_key`,
+  `session/key.rs`) build their output with `discriminator:
+  Default::default()` — they preserve the sibling `routing_domain` and drop
+  this field. Measured after this change: two synced keyed tunnels produce
+  THREE rows in `sessions.synced`, not four — two forward keys carrying
+  `Keyed(100)` / `Keyed(200)` and ONE reverse companion carrying `None`. This
+  is a defect in what the ACTIVE node's identity model produces (it reproduces
+  on a standalone box with no cluster configured), not in the sync path: the
+  sync path's job is to make the standby's identity match the active's, which
+  it now does exactly. Fixing it is a packet-path change — it alters which
+  session a live reply resolves to — so it wants its own PR, cells built from
+  two tunnels, and a smoke that generates real keyed GRE in both directions.
+  Tracked as **#8103**.
+- `dataplane.SessionKey` — the Go BPF-mirror key — still aliases two
+  same-endpoint tunnels onto one row, so the mirror-backed `show`/clear surfaces
+  and the #5085 `bulkRecvV4` reconcile see one entry for both. This is
+  pre-existing from #7188's local half (the mirror key has no discriminator at
+  all) and is display/bookkeeping, not forwarding: the peer HELPER's session
+  table, which is what forwards after a failover, holds both.
+- Rolling upgrade is asymmetric by construction. NEW active -> OLD standby: the
+  old helper still hardcodes `Default::default()` and aliases, which cannot be
+  fixed from the new side without a hello handshake. OLD active -> NEW standby:
+  the new standby withholds the old peer's protocol-47 sessions, which is
+  decision 2's intended conservative direction. The exposure is narrow:
+  `metadata_tuple_complete` (`afxdp/frame/inspect.rs`) refuses protocol 47 on
+  both arms since #6837, so a peer on a recent build creates a TRANSIT GRE
+  session only with `gre-performance-acceleration` on — i.e. only in the
+  configuration this field exists to serve.
+
 ### Node-Local BPF-ABI Session Id (#6198)
 
 `SessionValue{,V6}.SessionID` is the *other*, node-local id: the on-map BPF

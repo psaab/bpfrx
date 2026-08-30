@@ -332,6 +332,35 @@ type SessionValue struct {
 	// It is HA-wire metadata only and is not part of the on-map C conntrack
 	// ABI.
 	IngressIfaceFold uint32
+
+	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
+	// as encoded by the Rust helper's TunnelDiscriminator::to_wire
+	// (userspace-dp session/discriminator.rs). It is OPAQUE on this side: Go
+	// carries the tag across the cluster wire and hands it back to the peer
+	// helper, which is the only place the encoding is defined.
+	//
+	// It exists because GRE is protocol 47 and has no L4 ports, so two RFC 2890
+	// tunnels between one pair of outer endpoints are ONE 5-tuple. The helper's
+	// own session key separates them on this typed discriminator; the sync path
+	// did not carry it, so the standby rebuilt both records as the same key and
+	// the second install evicted the first — one session for two tunnels, and
+	// after a failover one policy decision, one NAT state, one counter set and
+	// one timeout for both.
+	//
+	// It rides as a VALUE field, not a key field: the fixed-width wire key block
+	// and the BPF/C conntrack ABI both stay untouched, and the receiver folds it
+	// into the key it reconstructs (the plan v5 §0a shape — see
+	// userspace-dp/src/afxdp/forwarding/README.md). Like Generation/ConfigEpoch
+	// it is userspace-sync-only HA metadata carried as a length-gated trailing
+	// field in the encode*Payload functions, and MUST NOT be added to the
+	// BPF/C conntrack ABI.
+	//
+	// 0 = "not carried" (a legacy peer, or a delete request built from a key
+	// with no value). It is RESERVED and is NOT the encoding of the helper's
+	// None class, which is what lets the peer helper withhold a protocol-47
+	// session it cannot express rather than importing it aliased (#7188
+	// decision 2). Every other protocol imports unchanged.
+	TunnelDiscriminator uint64
 	// PLACEMENT: this sits after RTFlowSessionID, not before Generation.
 	// Generation must be the FIRST field past the on-map conntrack layout —
 	// TestSessionValueCarriesSyncOnlyGeneration asserts that offset exactly —
@@ -637,6 +666,35 @@ type SessionValueV6 struct {
 	// through their own encoder and decoder; wiring only the v4 pair leaves
 	// every IPv6 session degraded after a failover.
 	IngressIfaceFold uint32
+
+	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
+	// as encoded by the Rust helper's TunnelDiscriminator::to_wire
+	// (userspace-dp session/discriminator.rs). It is OPAQUE on this side: Go
+	// carries the tag across the cluster wire and hands it back to the peer
+	// helper, which is the only place the encoding is defined.
+	//
+	// It exists because GRE is protocol 47 and has no L4 ports, so two RFC 2890
+	// tunnels between one pair of outer endpoints are ONE 5-tuple. The helper's
+	// own session key separates them on this typed discriminator; the sync path
+	// did not carry it, so the standby rebuilt both records as the same key and
+	// the second install evicted the first — one session for two tunnels, and
+	// after a failover one policy decision, one NAT state, one counter set and
+	// one timeout for both.
+	//
+	// It rides as a VALUE field, not a key field: the fixed-width wire key block
+	// and the BPF/C conntrack ABI both stay untouched, and the receiver folds it
+	// into the key it reconstructs (the plan v5 §0a shape — see
+	// userspace-dp/src/afxdp/forwarding/README.md). Like Generation/ConfigEpoch
+	// it is userspace-sync-only HA metadata carried as a length-gated trailing
+	// field in the encode*Payload functions, and MUST NOT be added to the
+	// BPF/C conntrack ABI.
+	//
+	// 0 = "not carried" (a legacy peer, or a delete request built from a key
+	// with no value). It is RESERVED and is NOT the encoding of the helper's
+	// None class, which is what lets the peer helper withhold a protocol-47
+	// session it cannot express rather than importing it aliased (#7188
+	// decision 2). Every other protocol imports unchanged.
+	TunnelDiscriminator uint64
 	// PLACEMENT: this sits after RTFlowSessionID, not before Generation.
 	// Generation must be the FIRST field past the on-map conntrack layout —
 	// TestSessionValueCarriesSyncOnlyGeneration asserts that offset exactly —

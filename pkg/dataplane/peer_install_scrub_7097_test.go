@@ -47,6 +47,15 @@ import (
 // node resolves it back to its own {ifindex, vlan}. Scrubbing it would delete
 // the peer's answer and put every synced session back on the #4792 zone
 // approximation, which is exactly what #7095 removed.
+//
+// TunnelDiscriminator (#7188) is NOT here either, and for a stronger reason
+// than #7095's. It is not merely cluster-agreeable, it is SYMMETRIC BY
+// CONSTRUCTION: an RFC 2890 GRE Key is carried identically in both directions
+// of a tunnel and is identical on both chassis — being symmetric is precisely
+// why that field was chosen as the discriminator over the PPTP call ID and the
+// ESP SPI, which are allocated per-direction. Scrubbing it would put both of a
+// peer's same-endpoint keyed tunnels back on one key, which is the aliasing
+// #7188 exists to remove.
 var nodeLocalSessionFields = map[string]bool{
 	"FibIfindex":     true,
 	"FibVlanID":      true,
@@ -201,11 +210,12 @@ func TestSessionValueFieldCountIsPinned7097(t *testing.T) {
 		typ  reflect.Type
 		want int
 	}{
-		// 36/37 since #7095 added IngressIfaceFold. Classified as NOT node-local
-		// and therefore absent from ScrubNodeLocal / nodeLocalSessionFields — see
+		// 37/38 since #7188 added TunnelDiscriminator (36/37 after #7095's
+		// IngressIfaceFold). Both are classified as NOT node-local and are
+		// therefore absent from ScrubNodeLocal / nodeLocalSessionFields — see
 		// the note on nodeLocalSessionFields.
-		{"SessionValue", reflect.TypeOf(SessionValue{}), 36},
-		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 37},
+		{"SessionValue", reflect.TypeOf(SessionValue{}), 37},
+		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 38},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.typ.NumField(); got != tc.want {
