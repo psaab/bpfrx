@@ -1954,3 +1954,67 @@ func TestWorkerRuntimeStatusInstallRefusalTrioRoundTrip(t *testing.T) {
 		t.Fatalf("legacy WorkerRuntimeStatus trio nonzero")
 	}
 }
+
+// TestProcessStatusUnsurfacedCounterTrioRoundTrip7398 covers the three
+// counters #7398 wired out of the status-wiring allowlist. Each is asserted
+// with a DISTINCT value, so a field wired to the wrong wire key cannot pass by
+// reading its neighbour — the three sit adjacent in the struct and carry
+// near-identical names, which is exactly the shape that makes a copy-paste
+// error survive a "the key is present" check.
+func TestProcessStatusUnsurfacedCounterTrioRoundTrip7398(t *testing.T) {
+	in := ProcessStatus{
+		SessionInstallStaleIgnored: 31,
+		SessionDeleteStaleIgnored:  32,
+		SyncedImportReserveRefused: 33,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"session_install_stale_ignored",
+		"session_delete_stale_ignored",
+		"synced_import_reserve_refused",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.SessionInstallStaleIgnored != 31 {
+		t.Errorf("SessionInstallStaleIgnored: got %d, want 31 — a value of 32 or 33 means "+
+			"this field decodes another counter's wire key", back.SessionInstallStaleIgnored)
+	}
+	if back.SessionDeleteStaleIgnored != 32 {
+		t.Errorf("SessionDeleteStaleIgnored: got %d, want 32 — a value of 31 or 33 means "+
+			"this field decodes another counter's wire key", back.SessionDeleteStaleIgnored)
+	}
+	if back.SyncedImportReserveRefused != 33 {
+		t.Errorf("SyncedImportReserveRefused: got %d, want 33 — a value of 31 or 32 means "+
+			"this field decodes another counter's wire key", back.SyncedImportReserveRefused)
+	}
+
+	// A helper that predates #7398 omits all three keys; they must decode to 0
+	// rather than failing the parse, which is what makes the wiring additive
+	// and keeps a mixed-version cluster readable.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if legacy.SessionInstallStaleIgnored != 0 ||
+		legacy.SessionDeleteStaleIgnored != 0 ||
+		legacy.SyncedImportReserveRefused != 0 {
+		t.Fatalf("pre-#7398 payload must decode the trio to 0, got %d/%d/%d",
+			legacy.SessionInstallStaleIgnored,
+			legacy.SessionDeleteStaleIgnored,
+			legacy.SyncedImportReserveRefused)
+	}
+}

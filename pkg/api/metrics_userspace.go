@@ -826,6 +826,26 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SharedSessionPoisonRecoveries),
 	)
 
+	// #7398: emitted unconditionally like their neighbours. A 0 here is a real
+	// "no stale install/delete was refused, no import lost its reservation"
+	// signal; an absent series would be indistinguishable from a helper that
+	// never reports, which is the state these three were in before #7398.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionInstallStaleIgnored,
+		prometheus.CounterValue,
+		float64(status.SessionInstallStaleIgnored),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionDeleteStaleIgnored,
+		prometheus.CounterValue,
+		float64(status.SessionDeleteStaleIgnored),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSyncedImportReserveRefused,
+		prometheus.CounterValue,
+		float64(status.SyncedImportReserveRefused),
+	)
+
 	// #7209: peer-synced imports that skipped #6211's zone narrowing.
 	// Emitted unconditionally, for the same reason as its neighbours: a 0
 	// is a real "every synced import resolved its zones" signal, and an
