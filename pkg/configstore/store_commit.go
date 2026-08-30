@@ -472,6 +472,12 @@ func (s *Store) commitConfirmedLocked(minutes int) (*config.Config, error) {
 			minutes, MaxCommitConfirmedMinutes)
 	}
 
+	// #7291: capture the DURABLE never-committed state before anything below
+	// sets it. Both the post-rename-converge branch and the success branch set
+	// s.everCommitted = true ahead of the arm site, so by the time the rollback
+	// target is recorded the flag no longer says what it said on entry.
+	everCommittedOnEntry := s.everCommitted
+
 	// #1799 Option A: persist BEFORE promoting and BEFORE touching
 	// any confirm state (see contract above).
 	//
@@ -524,14 +530,33 @@ func (s *Store) commitConfirmedLocked(minutes int) (*config.Config, error) {
 		// Save current active state for potential rollback.
 		s.confirmPrevTree = s.active.Clone()
 		s.confirmPrevCfg = s.compiled
-		// #6538: record first-commit-ness HERE, where it is known, instead of
-		// re-deriving it later from confirmPrevCfg==nil. s.compiled is still
-		// the PRE-promotion compiled active config at this point, so a nil
-		// here means this store had no compiled active config before this
-		// commit — the #1922 Item 1b fresh-store case. A nil that shows up
-		// later for a different reason (a recovered rollback target that would
-		// not compile) must not be read as this.
-		s.confirmPrevFirst = s.compiled == nil
+		// #6538 records first-commit-ness HERE, where it is known, instead of
+		// re-deriving it later from confirmPrevCfg==nil. #7291 corrects WHAT is
+		// recorded: the durable never-committed marker, not the compiled
+		// pointer.
+		//
+		// `s.compiled == nil` was an incidental proxy for "first commit" and it
+		// is wrong in BOTH directions, because the two states are independent:
+		//
+		//   everCommitted=false, compiled != nil — after a #1922 Item 1b
+		//   first-commit rollback the DB holds committed=0 with the EMPTY tree.
+		//   The empty tree COMPILES, so the next Load leaves a never-committed
+		//   store with a non-nil compiled config. The proxy said "not first",
+		//   the rollback took the non-first branch, and it persisted
+		//   committed=1 over a never-committed DB — the operator-committed-empty
+		//   state, which computeBootClass resolves to NORMAL. The restart after
+		//   that runs the positional claim-all interface rename on an empty
+		//   config: precisely the #1922 Item 2 case-5 hazard the Item 1b marker
+		//   exists to prevent.
+		//
+		//   everCommitted=true, compiled == nil — the #1960 broken-config load.
+		//   The operator repairs the config and commits confirmed; the proxy
+		//   said "first", so the rollback would write committed=0 over a box
+		//   that HAS a committed config.
+		//
+		// everCommittedOnEntry is the durable marker as it stood before this
+		// commit touched it, which is the authority the rollback branch needs.
+		s.confirmPrevFirst = !everCommittedOnEntry
 	}
 
 	// Push current active to history
