@@ -30,6 +30,57 @@ func rustSnapshotSerdeRename(t *testing.T, rustField string) string {
 // module, so a sibling key-agreement guard over another protocol struct
 // (session_delta_rt_flow_session_id_key_6312_test.go) parses the declaration
 // with the SAME regex instead of writing a second one that could drift.
+// rustProcessStatusRename resolves a ProcessStatus field's `#[serde(rename)]`
+// WITHOUT pinning which file under `userspace-dp/src/protocol/` declares it.
+//
+// #7160: `ProcessStatus` moved from `control.rs` to `status.rs` when
+// `control.rs` crossed the modularity floor, and two lockstep guards that
+// hardcoded the path went red on a pure code motion — reporting "no
+// serde(rename) found", which reads like a DELETED rename rather than a moved
+// file. The guards are worth keeping and the path is not the thing they are
+// guarding, so they search the directory instead.
+//
+// It fails if the field is found in NO file (a genuinely lost rename) and if
+// it is found in more than one (two declarations of one wire key is itself a
+// drift hazard, and silently taking the first would hide it).
+func rustProcessStatusRename(t *testing.T, rustField string) string {
+	t.Helper()
+	dir := filepath.Join("..", "..", "..", "userspace-dp", "src", "protocol")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v (the Go/Rust wire-key lockstep guard cannot run)", dir, err)
+	}
+	var found []string
+	var key string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".rs") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !regexp.MustCompile(`(?m)^\s*pub ` + regexp.QuoteMeta(rustField) + `:`).Match(src) {
+			continue
+		}
+		found = append(found, e.Name())
+		key = rustSerdeRenameIn(t, path, rustField)
+	}
+	switch len(found) {
+	case 0:
+		t.Fatalf("no `pub %s` field found under %s. If it was renamed or removed, UPDATE "+
+			"this lockstep guard rather than deleting it — without it nothing pins the Go "+
+			"emitter's JSON key to the key the Rust decoder reads, and a key mismatch is "+
+			"silent on both planes", rustField, dir)
+	case 1:
+	default:
+		t.Fatalf("`pub %s` is declared in %d files under %s (%v). Two declarations of one "+
+			"wire key is the drift this guard exists to catch", rustField, len(found), dir, found)
+	}
+	return key
+}
+
 func rustSerdeRenameIn(t *testing.T, path, rustField string) string {
 	t.Helper()
 	src, err := os.ReadFile(path)

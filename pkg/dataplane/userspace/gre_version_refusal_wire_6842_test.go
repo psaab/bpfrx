@@ -32,8 +32,9 @@ func TestGreDecapUnsupportedVersionRefusalsWireKeyLockstepWithRust(t *testing.T)
 	const rustField = "gre_decap_unsupported_version_refusals_total"
 	const goField = "GreDecapUnsupportedVersionRefusalsTotal"
 
-	control := filepath.Join("..", "..", "..", "userspace-dp", "src", "protocol", "control.rs")
-	rustKey := rustSerdeRenameIn(t, control, rustField)
+	// #7160: resolved by FIELD, not by file path — `ProcessStatus` moved out
+	// of `control.rs` when that file crossed the modularity floor.
+	rustKey := rustProcessStatusRename(t, rustField)
 
 	field, ok := reflect.TypeOf(ProcessStatus{}).FieldByName(goField)
 	if !ok {
