@@ -57,17 +57,8 @@ var managerMethodClasses = map[string]string{
 	"ClearFilterConfigs": "class1", "ReadFilterCounters": "class1", "ClearFilterCounters": "class1",
 	"SetFlowTimeout": "class1", "SetFlowConfig": "class1",
 	"SetMirrorConfig": "class1", "ClearMirrorConfigs": "class1",
-	"SetDNATEntry": "class1", "DeleteDNATEntry": "class1", "ClearDNATStatic": "class1",
-	"SetSNATRule": "class1", "ClearSNATRules": "class1",
-	"SetDNATEntryV6": "class1", "DeleteDNATEntryV6": "class1", "ClearDNATStaticV6": "class1",
-	"SetSNATRuleV6": "class1", "ClearSNATRulesV6": "class1",
-	"SetNATPoolConfig": "class1", "SetNATPoolIPV4": "class1", "SetNATPoolIPV6": "class1",
-	"ClearNATPoolConfigs": "class1", "ClearNATPoolIPs": "class1",
-	"SetSNATEgressIP": "class1", "ClearSNATEgressIPs": "class1",
-	"SetStaticNATEntryV4": "class1", "SetStaticNATEntryV6": "class1",
-	"SetNAT64Config": "class1", "SetNAT64Count": "class1", "ClearNAT64Configs": "class1",
-	"SetNPTv6Rule": "class1", "ReadNATPortCounter": "class1",
-	"SetZoneConfig": "class1", "SetZonePairPolicy": "class1", "SetPolicyRule": "class1",
+	"SetDNATEntry": "class1", "DeleteDNATEntry": "class1",
+	"ReadNATPortCounter": "class1", "SetDNATEntryV6": "class1", "DeleteDNATEntryV6": "class1", "SetZoneConfig": "class1", "SetZonePairPolicy": "class1", "SetPolicyRule": "class1",
 	"SetAddressBookEntry": "class1", "SetAddressMembership": "class1",
 	"ClearAddressBookV4": "class1", "ClearAddressBookV6": "class1", "ClearAddressMembership": "class1",
 	"SetApplication": "class1", "SetAppRange": "class1", "ClearAppRanges": "class1",
@@ -92,7 +83,6 @@ var managerMethodClasses = map[string]string{
 	"SessionCount":                "class2",
 	"GetMapStats":                 "class2",
 	"ClearSessionCounts":          "class2",
-	"ClearStaticNATEntries":       "class2",
 	"UpdatePolicyScheduleState":   "class2", // the #3780 deliberate nil
 	"SeedNATPortCounters":         "class2",
 	"SeedSessionIDCounter":        "class2",
@@ -100,12 +90,9 @@ var managerMethodClasses = map[string]string{
 	"DeleteStaleVlanIface":        "class2",
 	"DeleteStaleZonePairPolicies": "class2",
 	"DeleteStaleApplications":     "class2",
-	"DeleteStaleSNATRules":        "class2",
-	"DeleteStaleSNATRulesV6":      "class2",
 	"DeleteStaleDNATStatic":       "class2",
 	"DeleteStaleDNATStaticV6":     "class2",
 	"DeleteStaleStaticNAT":        "class2",
-	"DeleteStaleNPTv6":            "class2",
 	"DeleteStaleNAT64":            "class2",
 	"ZeroStaleScreenConfigs":      "class2",
 	"ZeroStaleNATPoolConfigs":     "class2",
@@ -247,8 +234,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 164 {
-		t.Fatalf("exported *Manager method inventory = %d, want 164 (the plan census 157 + the two #6743 r4 additions + ReplaceFloodCounterOffsets (#3651) + the three #6740 additions: XDPEntryPrograms, IsVLANSubInterface, SetLinkForTest) + the #6741 observability accessor ObsoleteRegistryAccesses); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 141 {
+		t.Fatalf("exported *Manager method inventory = %d, want 141 (the 164 census minus the 23 NAT write methods retired in #7268 — the writers for snat_rules, static_nat_*, nptv6_rules, nat_pool_*, snat_egress_ips and nat64_* maps, none of which the AF_XDP shim declares); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {
@@ -1165,37 +1152,13 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_flow.go", "SetFlowTimeout", "map", `"flow_timeouts"`, "required"},
 	{"maps_mirror.go", "ClearMirrorConfigs", "map", `"mirror_config"`, "required"},
 	{"maps_mirror.go", "SetMirrorConfig", "map", `"mirror_config"`, "required"},
-	{"maps_nat.go", "ClearDNATStatic", "map", `"dnat_table"`, "required"},
-	{"maps_nat.go", "ClearDNATStaticV6", "map", `"dnat_table_v6"`, "required"},
-	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_configs"`, "required"},    // leg: partial-registry continuation — present + nonzero count, prefix_map ABSENT: succeeds AND the count is zeroed
-	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_prefix_map"`, "optional"}, //   (same leg: the optional miss must NOT abort before the trailing required SetNAT64Count write)
-	{"maps_nat.go", "ClearNATPoolConfigs", "map", `"nat_pool_configs"`, "required"},
-	{"maps_nat.go", "ClearNATPoolIPs", "map", `"nat_pool_ips_v4"`, "required"},
-	{"maps_nat.go", "ClearNATPoolIPs", "map", `"nat_pool_ips_v6"`, "required"},
 	{"maps_nat.go", "ClearNATRuleCounters", "map", `"nat_rule_counters"`, "optional"}, // class 3
-	{"maps_nat.go", "ClearSNATEgressIPs", "map", `"snat_egress_ips"`, "required"},
-	{"maps_nat.go", "ClearSNATRules", "map", `"snat_rules"`, "required"},
-	{"maps_nat.go", "ClearSNATRulesV6", "map", `"snat_rules_v6"`, "required"},
-	{"maps_nat.go", "ClearStaticNATEntries", "map", `"static_nat_v4"`, "optional"}, // leg: absent v4 CONTINUES to the v6 clear
-	{"maps_nat.go", "ClearStaticNATEntries", "map", `"static_nat_v6"`, "optional"},
 	{"maps_nat.go", "DeleteDNATEntry", "map", `"dnat_table"`, "required"},
 	{"maps_nat.go", "DeleteDNATEntryV6", "map", `"dnat_table_v6"`, "required"},
 	{"maps_nat.go", "ReadNATPortCounter", "map", `"nat_port_counters"`, "required"},
 	{"maps_nat.go", "SeedNATPortCounters", "map", `"nat_port_counters"`, "optional"},
 	{"maps_nat.go", "SetDNATEntry", "map", `"dnat_table"`, "required"},
 	{"maps_nat.go", "SetDNATEntryV6", "map", `"dnat_table_v6"`, "required"},
-	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_configs"`, "required"},    // leg (i): required present + optional absent -> succeeds AND the required write landed
-	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_prefix_map"`, "optional"}, //   (same leg)
-	{"maps_nat.go", "SetNAT64Count", "map", `"nat64_count"`, "required"},
-	{"maps_nat.go", "SetNATPoolConfig", "map", `"nat_pool_configs"`, "required"},
-	{"maps_nat.go", "SetNATPoolIPV4", "map", `"nat_pool_ips_v4"`, "required"},
-	{"maps_nat.go", "SetNATPoolIPV6", "map", `"nat_pool_ips_v6"`, "required"},
-	{"maps_nat.go", "SetNPTv6Rule", "map", `"nptv6_rules"`, "required"},
-	{"maps_nat.go", "SetSNATEgressIP", "map", `"snat_egress_ips"`, "required"},
-	{"maps_nat.go", "SetSNATRule", "map", `"snat_rules"`, "required"},
-	{"maps_nat.go", "SetSNATRuleV6", "map", `"snat_rules_v6"`, "required"},
-	{"maps_nat.go", "SetStaticNATEntryV4", "map", `"static_nat_v4"`, "required"},
-	{"maps_nat.go", "SetStaticNATEntryV6", "map", `"static_nat_v6"`, "required"},
 	{"maps_policy.go", "ClearAddressBookV4", "map", `"address_book_v4"`, "required"},
 	{"maps_policy.go", "ClearAddressBookV6", "map", `"address_book_v6"`, "required"},
 	{"maps_policy.go", "ClearAddressMembership", "map", `"address_membership"`, "required"},
@@ -1244,9 +1207,6 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_stale.go", "DeleteStaleIfaceZone", "map", `"iface_zone_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_configs"`, "optional"}, // leg: multi-map stale cleanups process ALL maps (continuation)
 	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_prefix_map"`, "optional"},
-	{"maps_stale.go", "DeleteStaleNPTv6", "map", `"nptv6_rules"`, "optional"},
-	{"maps_stale.go", "DeleteStaleSNATRules", "map", `"snat_rules"`, "optional"},
-	{"maps_stale.go", "DeleteStaleSNATRulesV6", "map", `"snat_rules_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v4"`, "optional"}, // (same continuation pattern)
 	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleVlanIface", "map", `"vlan_iface_map"`, "optional"},
