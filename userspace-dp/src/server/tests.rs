@@ -4544,6 +4544,124 @@ mod routing_domain_delete_7160 {
             .synced_session_entry_count_for_test()
     }
 
+    /// The defect this branch closes, measured rather than argued.
+    ///
+    /// A peer-synced session whose ingress identity the sender could not name
+    /// (#7096 fabric-redirected, or no cluster-stable name) used to import at
+    /// domain 0. On a node that runs routing instances that is not a neutral
+    /// placeholder — 0 is the DEFAULT routing instance — so the session was
+    /// filed in the default instance's identity space and became reachable
+    /// from it: `lookup_shared_forward_nat_match` probes the exact key and
+    /// then falls back to the domain-agnostic one, which is exactly the key
+    /// such a mis-filed session sits at.
+    ///
+    /// FAIL-ON-REVERT: return `Some(0)` from `synced_routing_domain` instead
+    /// of `None`, or drop the refusal arm in the handler, and the import
+    /// succeeds — leaving an entry in the shared map under a domain nothing
+    /// verified.
+    #[test]
+    fn an_unnamed_peer_ingress_is_refused_on_a_node_with_routing_instances() {
+        let mut afxdp = afxdp::Coordinator::new();
+        afxdp.seed_routing_domain_for_test(24, DOMAIN);
+        let state = Arc::new(Mutex::new(ServerState {
+            status: ProcessStatus::default(),
+            snapshot: None,
+            afxdp,
+            state_writer: Arc::new(StateWriter::new()),
+        }));
+
+        let mut request = req("sync_session");
+        // No ingress_ifindex / ingress_vlan_id: this is what a #7096
+        // fabric-redirected session, and any session with no cluster-stable
+        // ingress name, actually sends.
+        request.session_sync = Some(upsert_request());
+
+        let response = run_request(state.clone(), request);
+        assert!(
+            !response.ok,
+            "a synced session with no resolvable routing domain was ACCEPTED on \
+             a node that runs routing instances. It is now filed under the \
+             default instance, where a reply that resolved its own domain \
+             reaches it through the domain-agnostic fallback probe."
+        );
+        assert!(
+            response.error.contains("unknown-routing-domain"),
+            "the refusal must carry its own stable reason token so Go can tell \
+             it from a transport failure and from the other semantic \
+             refusals; got {:?}",
+            response.error
+        );
+
+        let guard = state.lock().expect("server state");
+        assert_eq!(
+            guard.afxdp.synced_session_entry_count_for_test(),
+            0,
+            "the refusal must leave NOTHING in the shared map — a refusal that \
+             still published is the defect wearing an error message"
+        );
+        assert_eq!(
+            guard.afxdp.synced_import_unknown_routing_domain_total(),
+            1,
+            "the refusal must be counted; an uncounted fail-closed path is \
+             indistinguishable from one that never fires"
+        );
+    }
+
+    /// The same request on a node with NO routing instances must still import.
+    /// This is the half that keeps the fix from being a fail-closed regression
+    /// for every single-instance cluster — which is all of them today.
+    ///
+    /// FAIL-ON-REVERT: gate the refusal on `ingress_ifindex <= 0` alone,
+    /// without the `has_routing_domains` precondition, and this goes red.
+    #[test]
+    fn an_unnamed_peer_ingress_still_imports_with_no_routing_instances() {
+        let state = Arc::new(Mutex::new(ServerState {
+            status: ProcessStatus::default(),
+            snapshot: None,
+            afxdp: afxdp::Coordinator::new(),
+            state_writer: Arc::new(StateWriter::new()),
+        }));
+        let mut request = req("sync_session");
+        request.session_sync = Some(upsert_request());
+
+        let response = run_request(state.clone(), request);
+        assert!(
+            response.ok,
+            "a single-instance node must keep importing sessions with no \
+             ingress identity exactly as it did pre-#7160; got {:?}",
+            response.error
+        );
+        let guard = state.lock().expect("server state");
+        assert!(
+            guard.afxdp.synced_session_entry_count_for_test() > 0,
+            "the session must actually be in the shared map"
+        );
+        assert_eq!(
+            guard.afxdp.synced_import_unknown_routing_domain_total(),
+            0,
+            "nothing may be counted as refused on a node with no routing \
+             instances — 0 is the only domain there, and it is correct"
+        );
+    }
+
+    /// A NAMED ingress on a VRF node imports at its own domain, so the
+    /// refusal above is scoped to the unresolvable case and does not simply
+    /// turn off HA session sync for VRF deployments.
+    #[test]
+    fn a_named_peer_ingress_imports_at_its_own_domain() {
+        let state = state_holding_a_session_in(DOMAIN);
+        let guard = state.lock().expect("server state");
+        assert!(
+            guard.afxdp.synced_session_entry_count_for_test() > 0,
+            "a session whose ingress THIS node resolved must import"
+        );
+        assert_eq!(
+            guard.afxdp.synced_import_unknown_routing_domain_total(),
+            0,
+            "a resolvable ingress must not be counted as unknown"
+        );
+    }
+
     /// FAIL-ON-REVERT: drop the per-domain retry in
     /// `server/handlers/sync_session.rs` and the domain-scoped session survives
     /// a delete whose caller was told it succeeded.
