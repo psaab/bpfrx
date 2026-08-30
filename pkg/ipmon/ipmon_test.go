@@ -305,9 +305,31 @@ func TestWinnerResolution(t *testing.T) {
 	}
 }
 
-// TestDebounceCoalescing: N rapid transitions collapse to one actuation
-// per throttle window (§4.3 coalescing).
-func TestDebounceCoalescing(t *testing.T) {
+// TestActuationCountStaysBoundedUnderFlapStorm: N rapid transitions collapse
+// to one actuation per throttle window (§4.3 coalescing).
+//
+// RENAMED FROM TestDebounceCoalescing (#8027), because that name claimed a
+// property this test cannot observe. Disabling the debounce entirely —
+// `now.Sub(e.dirtySince) >= e.debounce` becomes `>= 0` — leaves every
+// assertion here GREEN.
+//
+// The reason is structural. Actuation is driven by a DIRTY FLAG: one
+// actuation covers every pending transition regardless of how many arrived,
+// so a storm coalesces by design. The `<= 2` bound is therefore satisfied by
+// the shape of the code whatever the debounce window does, and cannot
+// distinguish "coalescing works" from "multiple actuations are unreachable in
+// this fixture" — which is true regardless. Both bounds here are really about
+// the throttle and the dirty flag, and the second half's bound reds under a
+// throttle break, which is what the name now says.
+//
+// The DEBOUNCE's own property is a latency lower bound, not a count, and it
+// lives in TestDebounceActuallyDelaysActuation8027 — which reds, alone, when
+// the debounce is disabled.
+//
+// This test keeps real time deliberately (#7969 stabilised it there): it is
+// the end-to-end exercise of the real timer path, which the fake-clock cells
+// do not cover.
+func TestActuationCountStaysBoundedUnderFlapStorm(t *testing.T) {
 	var actuations atomic.Int32
 	e := New(func(context.Context) bool { actuations.Add(1); return true })
 	e.debounce = 20 * time.Millisecond

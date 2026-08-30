@@ -38,6 +38,48 @@ route caches). A sustained per-cycle flapper with hold-down 0
 produces at most one frr-reload + one snapshot push per throttle window
 — bounded and observable via `xpf_ipmon_policy_transitions_total`.
 
+### Three separate properties, and what can observe each (#8027)
+
+"Coalesced" above bundles three mechanisms that fail independently, and a
+test that observes one is easy to mistake for a test that observes all
+three. The distinction cost a green test that covered nothing:
+
+| mechanism | what it does | falsified by |
+|---|---|---|
+| **dirty bit** | one actuation covers every pending change | a count of actuations under a storm |
+| **debounce** | DELAYS actuation until the window elapses | a latency LOWER bound after a change |
+| **throttle** | paces consecutive actuations | a latency lower bound after an actuation |
+
+**A count cannot see the debounce.** Because the dirty bit makes one
+actuation cover every pending transition, a flap storm coalesces *by
+design* — the count stays low whatever the window does. `TestDebounceCoalescing`
+asserted `<= 2` actuations under a ten-flap storm, and stayed GREEN with the
+debounce disabled outright (`now.Sub(e.dirtySince) >= e.debounce` changed to
+`>= 0`). Its bound was satisfied by the shape of the code, not by the
+behaviour it was named for, so it could not distinguish *coalescing works*
+from *multiple actuations are unreachable in this fixture* — which is true
+regardless. It is now `TestActuationCountStaysBoundedUnderFlapStorm`, which
+is what it does cover.
+
+The debounce's and throttle's own properties are latency lower bounds, in
+`debounce_falsifiable_8027_test.go`. Two things make those assertions stable
+rather than a new timing flake:
+
+- they run on the package's **fake clock**, so the window is crossed by
+  `clock.Advance` and not by elapsed wall time;
+- the load-bearing assertion is an **absence** — nothing actuated before the
+  window — and contention can only make an actuation LATER, never earlier. A
+  loaded machine cannot produce a false RED. It could produce a false GREEN
+  (a wedged loop that never actuates at all), which is why each cell is
+  bracketed by liveness waits proving the engine actuates both before and
+  after the quiet period.
+
+**Each is set small while the other is under test, deliberately.** With the
+production proportions the throttle is the binding constraint, and an
+actuation held back by the throttle is indistinguishable from one held back
+by the debounce — a test written that way passes with the debounce disabled,
+which is the defect being fixed.
+
 ### Probe verdicts survive a probe restart (#6561)
 
 `evaluateLocked` computes `anyFailed` from `e.failedTests`, which
