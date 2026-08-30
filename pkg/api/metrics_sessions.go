@@ -160,6 +160,28 @@ func (c *xpfCollector) sessionGaugeSnapshotCached(dp apiRuntimeDataPlane) (sessi
 //	state). Half-open / opening sessions are counted in active but
 //	not established.
 func walkSessionGauges(dp apiRuntimeDataPlane) (sessionGaugeSnapshot, error) {
+	// #8001: take a sessionWalkLimiter slot like every other full-table walk in
+	// this package. Six siblings do (sessions.go x5, nat.go x1); this one did
+	// not, so the limiter's guarantee was not the guarantee anyone reading it
+	// would assume -- correct about every call site but this one.
+	//
+	// It matters more here than at a request-driven site, not less: this walk is
+	// driven by a Prometheus scraper on a fixed interval rather than by an
+	// operator, so it is the call site least likely to be noticed under load and
+	// most likely to overlap with something else.
+	//
+	// Acquire() is NON-BLOCKING -- it returns ErrBusy immediately at the cap --
+	// so a scrape can never hang behind an operator's session walk. Returning
+	// the error takes the caller's EXISTING failure path: the cached snapshot
+	// and its TTL are left untouched so the next scrape retries, and scrape_ok
+	// goes to 0. That is the #3345 convention (skip the sample rather than
+	// report a misleading one) reached without new error handling.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return sessionGaugeSnapshot{}, err
+	}
+	defer release()
+
 	var s sessionGaugeSnapshot
 	countForward := func(state uint8, flags uint16, ipCounter *int) {
 		s.active++
