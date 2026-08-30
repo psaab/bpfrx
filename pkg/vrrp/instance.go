@@ -143,6 +143,12 @@ type vrrpInstance struct {
 	localIP   atomic.Pointer[net.IP] // our IPv4 address on this interface
 	localIPv6 atomic.Pointer[net.IP] // our link-local IPv6 address
 
+	// #7334: the receive-path self-frame check's address SETS. See
+	// isLocalAddr (instance_addr.go) for why these differ from the send
+	// sources above and why an unresolved set fails OPEN.
+	localAddrSet   atomic.Pointer[[]string]
+	localAddrSetV6 atomic.Pointer[[]string]
+
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
 	rawConn *ipv4.RawConn
