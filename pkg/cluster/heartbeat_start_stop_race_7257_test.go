@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"errors"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,15 +88,38 @@ import (
 // so the machine is heavily oversubscribed and a cheap goroutine can wait a
 // long time for a P.
 //
-// Raising it costs nothing when healthy — the loop exits on the first observed
-// stop, typically within a millisecond — and it does not weaken what the bound
-// detects, because a goroutine that is genuinely never scheduled stays
-// unscheduled for 30s just as surely as for 5s. Sampling an asynchronous
-// observable at a fixed wall-clock point is exactly the #7650 defect this file
-// was changed to fix; a 5s deadline is still such a point, just a later one.
+// #7970 CORRECTION. The sentence that stood here — "raising it costs nothing…
+// a goroutine that is genuinely never scheduled stays unscheduled for 30s just
+// as surely as for 5s" — is FALSE, and it was the sentence that would have sent
+// the next person to raise the bound a third time. The test then red at exactly
+// 30.00s under `go test ./...`, so the goroutine was not "genuinely never
+// scheduled": the bound was a wall-clock sample after all, just a later one.
 //
-// See #7663: this probe reaches nothing it claims to probe, so a green here is
-// not evidence the #7257 regression is guarded either way.
+// The cause was not the machine. It was THIS TEST. The teardown loop used to
+// spin with no pacing, burning ~73k stop iterations per run; under `./...` the
+// runner already oversubscribes every core, so the probe was both the
+// contributor to and the victim of the contention it then waited 30s on. It
+// starved itself. #7663's vacuity and #7970's flake were one knob seen from two
+// ends, and pacing the loop (see the teardown goroutine) removed both.
+//
+// The bound is kept at 30s and is NOT a timing assertion: its only job is to
+// turn a hang into a named failure. It is deliberately left generous rather than
+// lowered to match the now-much-lower contention, because lowering it would be a
+// fresh unmeasured claim about scheduling latency — the exact kind of claim this
+// comment previously got wrong.
+// startCostMicros is the measured cost of one `StartHeartbeat` on this path,
+// in microseconds, and it is what the teardown pacing is scaled against.
+//
+// Measured rather than guessed (#7663): 60 uncontended starts averaged 60.95us
+// each (two socket binds dominate) against 226ns for a stop — a ratio of ~270.
+// That ratio IS the vacuity: an unpaced teardown loop lands ~270 stops inside
+// every start's entry-to-epoch-recheck window, so every start is superseded.
+//
+// It does not need to be exact. It sets the ORDER OF MAGNITUDE of the gap the
+// teardown leaves, and the randomisation spans it; being wrong by 2x changes
+// how often starts publish, not whether they can.
+const startCostMicros = 61
+
 const teardownProgressBudget = 30 * time.Second
 
 func waitForTeardownProgress(t *testing.T, stops *atomic.Int64, within time.Duration) {
@@ -115,7 +139,7 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	m := NewManager(0, 1)
 
 	const startAttempts = 60
-	var stops, starts atomic.Int64
+	var stops, starts, published, superseded atomic.Int64
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -126,10 +150,23 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 		defer close(done)
 		for i := 0; i < startAttempts; i++ {
 			// Loopback both ways: the bind succeeds without a cluster peer.
-			// A superseded start is a valid outcome here, not a failure — it
-			// is the outcome this whole change exists to produce.
-			if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err == nil ||
-				errors.Is(err, ErrHeartbeatStartSuperseded) {
+			//
+			// #7663: the two outcomes are counted SEPARATELY, because they are
+			// not equivalent for this probe. `StartHeartbeat` returns nil only
+			// after it has published `m.hbSender`/`m.hbReceiver` — the single
+			// `return nil` sits below the publish — so `published` is an exact,
+			// production-instrumentation-free measure of how many starts
+			// reached the window the race lives in. A superseded start returned
+			// before the publish and carries no race to detect. Lumping them
+			// into one counter is what let this probe report 60 healthy starts
+			// while reaching the publish ZERO times.
+			err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", "")
+			switch {
+			case err == nil:
+				published.Add(1)
+				starts.Add(1)
+			case errors.Is(err, ErrHeartbeatStartSuperseded):
+				superseded.Add(1)
 				starts.Add(1)
 			}
 		}
@@ -146,6 +183,26 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 			}
 			m.StopHeartbeat()
 			stops.Add(1)
+			// #7663/#7970: yield a gap on the order of a START's own duration.
+			//
+			// A tight spin here is what made this probe vacuous AND flaky. A
+			// stop costs ~226ns and a start ~61us (measured), so an unpaced
+			// loop lands ~270 stops inside every start's entry-to-epoch-recheck
+			// window and supersedes all of them: 0 of 60 starts ever reached the
+			// publish. The same spin burned ~73k iterations per run, which under
+			// `go test ./...` oversubscription is what left this test's own
+			// teardown goroutine waiting on a P for 30s (#7970).
+			//
+			// Randomised, and NOT a fixed interval: a fixed gap phase-locks
+			// against the start loop and samples one alignment. Randomising
+			// samples the whole window, including gaps short enough to land
+			// inside a post-publish deref.
+			//
+			// This is still UNORDERED with respect to any particular start —
+			// no channel, no handshake, no happens-before edge — so the race
+			// detector still sees unsynchronised accesses. That is the property;
+			// pacing changes only how often the probe reaches it.
+			time.Sleep(time.Duration(rand.Intn(2*startCostMicros)) * time.Microsecond)
 		}
 	}()
 	// #7650: wait until the teardown side is provably RUNNING before the
@@ -171,18 +228,29 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 	if got := starts.Load(); got < startAttempts {
 		t.Fatalf("only %d of %d starts completed — the probe under-exercised its window", got, startAttempts)
 	}
-	if stops.Load() < starts.Load() {
-		t.Fatalf("#7257 probe is degenerate: %d stops against %d starts — the teardown side "+
-			"must out-run the start side or the window is barely contended. NOTE "+
-			"(#7650): this is an anti-degeneracy PRECONDITION, not the property. "+
-			"The property is the race detector, and it did not fire. A very low "+
-			"stop count means the teardown goroutine was starved, which is a "+
-			"statement about the machine; re-run on an idle box before suspecting "+
-			"the heartbeat code",
-			stops.Load(), starts.Load())
+	// #7663: the precondition is REACH, not stop volume.
+	//
+	// This replaces a `stops >= starts` floor that was not merely unhelpful, it
+	// enforced the vacuity: satisfying it required the teardown side to out-run
+	// the start side, which is precisely the condition under which every start
+	// is superseded before publishing. Measured both ways on this file —
+	//
+	//	spin teardown  : published 0/60,  1223 stops/start, floor PASSES
+	//	paced teardown : published 59/60, 0.08 stops/start, floor FAILS
+	//
+	// — so the old floor and the property were in strict opposition, and the
+	// floor won every time. A probe that cannot reach the window it probes is
+	// degenerate no matter how contended it is.
+	if published.Load() == 0 {
+		t.Fatalf("#7257 probe is degenerate: %d of %d starts were SUPERSEDED before "+
+			"publishing and none reached the window (%d stops). `StartHeartbeat` "+
+			"returns nil only after it publishes m.hbSender/m.hbReceiver, so zero "+
+			"published starts means the race this probe exists to detect was never "+
+			"executed — a green here would be vacuous, not evidence (#7663)",
+			superseded.Load(), startAttempts, stops.Load())
 	}
-	t.Logf("#7257 race probe: %d starts against %d stops (%.1f stops/start)",
-		starts.Load(), stops.Load(), float64(stops.Load())/float64(starts.Load()))
+	t.Logf("#7257 race probe: %d published / %d superseded of %d starts, %d stops",
+		published.Load(), superseded.Load(), starts.Load(), stops.Load())
 }
 
 // TestStartHeartbeatSupersededByStopDoesNotPublish7257 is the deterministic
