@@ -503,6 +503,17 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 			if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
 				warnings = append(warnings, msg(fmt.Sprintf(
 					"%q (from-zone %q)", p.Name, zpp.FromZone), reason))
+			} else if p.Action == PolicyPermit {
+				// #7374: the APPLICATION dimension. Checked separately because
+				// it needs the zone's effective admit set, which the
+				// action+match predicate above cannot see -- and because it is
+				// a COMPARISON, not a token test: an application-narrowed
+				// permit is only stricter when the gate admits something the
+				// permit does not cover.
+				if gap, reason := junosHostPermitApplicationGap(cfg, zoneByName(cfg, zpp.FromZone), p.Match); gap {
+					warnings = append(warnings, msg(fmt.Sprintf(
+						"%q (from-zone %q)", p.Name, zpp.FromZone), reason))
+				}
 			}
 		}
 	}
@@ -520,6 +531,17 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 		}
 		if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
 			warnings = append(warnings, msg(fmt.Sprintf("global %q", p.Name), reason))
+		} else if p.Action == PolicyPermit {
+			// #7374: a global `to-zone junos-host` permit applies from EVERY
+			// zone, so it has a gap if ANY zone's gate admits something it does
+			// not cover. Zones are walked in sorted order so the first-reported
+			// gap is deterministic.
+			for _, zn := range sortedZoneNames(cfg) {
+				if gap, reason := junosHostPermitApplicationGap(cfg, zoneByName(cfg, zn), p.Match); gap {
+					warnings = append(warnings, msg(fmt.Sprintf("global %q", p.Name), reason))
+					break
+				}
+			}
 		}
 	}
 	return warnings
