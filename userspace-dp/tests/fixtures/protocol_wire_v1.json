@@ -937,6 +937,7 @@
     "ring_entries": 0,
     "route_entries": 0,
     "session_create_drops": 0,
+    "session_delta_schema_fingerprint": 0,
     "session_install_admission_refused": 0,
     "session_install_partial": 0,
     "session_publish_errors_total": 0,

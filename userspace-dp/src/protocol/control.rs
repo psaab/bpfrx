@@ -218,6 +218,17 @@ pub(crate) struct ProcessStatus {
     pub config_snapshot_protocol_version: i32,
     #[serde(rename = "inject_packet_tuple_protocol_version", default)]
     pub inject_packet_tuple_protocol_version: i32,
+    /// #7194: DERIVED fingerprint of the session-open delta wire schema
+    /// (protocol::session_delta_schema). Unlike the two version integers above
+    /// it is not hand-maintained -- it is computed from the serialized shape of
+    /// SessionDeltaInfo, so a field added to one transport and not the other
+    /// changes it without anyone remembering to bump anything.
+    ///
+    /// 0 means "not advertised" (a helper predating this field). The Go gate
+    /// treats 0 as unknown-and-deferred, never as a mismatch, so an older
+    /// helper is fenced rather than bricked (#1960 no-brick doctrine).
+    #[serde(rename = "session_delta_schema_fingerprint", default)]
+    pub session_delta_schema_fingerprint: u64,
     #[serde(rename = "started_at")]
     pub started_at: DateTime<Utc>,
     #[serde(rename = "control_socket")]
