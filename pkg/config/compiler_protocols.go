@@ -81,7 +81,18 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 
 			for _, ifInst := range namedInstances(areaInst.node.FindChildren("interface")) {
 				iface := &OSPFInterface{Name: ifInst.name}
-				for _, prop := range ifInst.node.Children {
+				// #7653: the body may be PACKED onto the instance line
+				//   interface ge-0/0/0.0 authentication simple-password "s";
+				// in which case Children is empty and every property below --
+				// including the authentication that keeps the adjacency from
+				// coming up unauthenticated -- is silently dropped. The
+				// instance is still created, so the half-built object reaches
+				// the FRR renderer, which emits interface activation
+				// UNCONDITIONALLY while authentication is conditional on the
+				// dropped AuthType. Expand the tail schema-driven, exactly as
+				// the #6818/#6821 siblings do.
+				for _, prop := range packedBodyChildren(ifInst.node,
+					schemaForPath("protocols", "ospf", "area", "interface")) {
 					switch prop.Name() {
 					case "passive":
 						iface.Passive = true
@@ -674,7 +685,9 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 
 			for _, ifInst := range namedInstances(areaInst.node.FindChildren("interface")) {
 				iface := &OSPFv3Interface{Name: ifInst.name}
-				for _, prop := range ifInst.node.Children {
+				// #7653: same packed-instance shape as the OSPFv2 loop above.
+				for _, prop := range packedBodyChildren(ifInst.node,
+					schemaForPath("protocols", "ospf3", "area", "interface")) {
 					switch prop.Name() {
 					case "passive":
 						iface.Passive = true

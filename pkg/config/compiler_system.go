@@ -1859,7 +1859,23 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 	if usmNode == nil {
 		return
 	}
+	// #7653: `usm local-engine { user ... }` packs the intermediate container
+	// onto the usm line, so local-engine sits in usmNode.Keys and this
+	// FindChild returns nil -- and EVERY v3 user disappears. That is not a
+	// credential downgrade but an SNMPv3 management outage from a config whose
+	// text is correct. packedBodyChildren expands the tail schema-driven AND
+	// (per #6818) attaches the nested block UNDER the packed node rather than
+	// beside it, which is exactly the shape needed here: the users are
+	// usmNode.Children and they belong under the synthesized local-engine.
 	engineNode := usmNode.FindChild("local-engine")
+	if engineNode == nil {
+		for _, c := range packedBodyChildren(usmNode, schemaForPath("snmp", "v3", "usm")) {
+			if c.Name() == "local-engine" {
+				engineNode = c
+				break
+			}
+		}
+	}
 	if engineNode == nil {
 		return
 	}
@@ -1878,6 +1894,17 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 		userChildren := child.Children
 		if len(child.Keys) < 2 && len(child.Children) > 0 {
 			userChildren = child.Children[0].Children
+		}
+		// #7653: the body may be PACKED onto the user's own instance line
+		//   user ops authentication-sha256 authentication-password "s3cret";
+		// leaving Children empty. The user was still REGISTERED -- with no
+		// derived key -- and minimum-security enforcement keys on key
+		// presence, so a noAuthNoPriv request naming this user bypasses the
+		// authentication the operator authored. Route the trailing key run
+		// through the same parseSNMPv3UserKeys the flat-set form uses above,
+		// rather than a second copy of its table.
+		if len(child.Keys) > 2 {
+			parseSNMPv3UserKeys(child.Keys[2:], user)
 		}
 		for _, prop := range userChildren {
 			// #6822: the compact spelling
