@@ -1055,6 +1055,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceSyncedImportZoneUnresolved: prometheus.NewDesc(
+			"xpf_userspace_synced_import_zone_unresolved_total",
+			"synced imports that skipped the #6211 zone narrowing",
+			nil,
+			nil,
+		),
 		userspaceGreDecapEcnIllegalDrops: prometheus.NewDesc(
 			"xpf_userspace_gre_decap_ecn_illegal_drops_total",
 			"gre decap rfc6040 illegal-combo drops",
@@ -1182,6 +1188,7 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2402/#6641: shared-session poison-recovery counter emitted
 		// unconditionally.
 		SharedSessionPoisonRecoveries: 5,
+		SyncedImportZoneUnresolved:    7,
 		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
 		// emitted unconditionally.
 		GreDecapEcnIllegalDropsTotal: 3,
@@ -1298,9 +1305,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #6929 worker_command_queue_drops_total counter = 46, plus the #7056
 	// refused-alias PAIR (cross-domain + protocol) = 48. The pair is counted as
 	// TWO because they are deliberately distinct series; if a later change folds
-	// them into one total this census is the guard that notices.
-	if len(got) != 48 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 48 metrics, got %d", len(got))
+	// them into one total this census is the guard that notices. Plus the
+	// #7209 synced_import_zone_unresolved_total counter = 49.
+	if len(got) != 49 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 49 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1360,6 +1368,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// unconditionally, so a 0 is a real "no worker panic touched HA session
 	// state" signal rather than an absent series.
 	assertCounterClose(t, got, c.userspaceSharedSessionPoisonRecoveries, nil, 5)
+	// #7209: synced imports that skipped the #6211 zone narrowing. Emitted
+	// unconditionally like its neighbours, so a 0 is a real "every synced
+	// import resolved its zones" signal rather than an absent series. The
+	// fixture value is deliberately NOT 0 — a 0 here would pass against a
+	// collector that never emitted the series at all.
+	assertCounterClose(t, got, c.userspaceSyncedImportZoneUnresolved, nil, 7)
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapEcnIllegalDrops, nil, 3)

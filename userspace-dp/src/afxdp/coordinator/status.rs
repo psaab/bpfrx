@@ -261,6 +261,15 @@ impl super::Coordinator {
         self.sessions.install_stale_ignored.load(Ordering::Relaxed)
     }
 
+    /// #7209: peer-synced imports whose zone pair did not resolve, so the
+    /// source-NAT reservation skipped #6211's narrowing. See the field's doc on
+    /// `session_manager.rs` for what an operator actually loses.
+    pub fn synced_import_zone_unresolved_total(&self) -> u64 {
+        self.sessions
+            .synced_import_zone_unresolved
+            .load(Ordering::Relaxed)
+    }
+
     /// #2170: total stale-generation deletes refused by the helper's
     /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
     /// helper-side generation-aware delete).

@@ -826,6 +826,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SharedSessionPoisonRecoveries),
 	)
 
+	// #7209: peer-synced imports that skipped #6211's zone narrowing.
+	// Emitted unconditionally, for the same reason as its neighbours: a 0
+	// is a real "every synced import resolved its zones" signal, and an
+	// absent series is indistinguishable from a helper that never reports.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSyncedImportZoneUnresolved,
+		prometheus.CounterValue,
+		float64(status.SyncedImportZoneUnresolved),
+	)
+
 	// #2315: GRE-decap RFC 6040 4.2 illegal-combination drops (outer CE
 	// over a Not-ECT inner). Emitted unconditionally so a 0 is a real
 	// "no illegal combinations seen" signal rather than an absent series.

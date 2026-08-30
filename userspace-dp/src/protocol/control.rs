@@ -555,6 +555,11 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "shared_session_poison_recoveries", default)]
     pub shared_session_poison_recoveries: u64,
+    /// #7209: peer-synced imports whose zone pair did not resolve, so the
+    /// source-NAT reservation skipped #6211's zone narrowing. Surfaced as
+    /// `xpf_userspace_synced_import_zone_unresolved_total`.
+    #[serde(default)]
+    pub synced_import_zone_unresolved: u64,
     /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
     /// ECN combine because the outer header carried a CE mark over an
     /// inner packet that was Not-ECT (the illegal combination — a

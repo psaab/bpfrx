@@ -2528,6 +2528,95 @@ fn sync_session_is_served_during_a_forwarding_settle_wait() {
     );
 }
 
+// --- #7209: sync_session must not queue behind a ServerState lock holder ----
+
+/// #7209: a `sync_session` request must be SERVED while another thread holds
+/// the global `ServerState` mutex.
+///
+/// THE INSTRUMENT IS DELIBERATELY NOT `apply_snapshot`. The issue frames the
+/// case as "sync_session served while apply_snapshot reconciles", but in this
+/// suite the Coordinator is `Coordinator::new()` with no NICs, so a reconcile
+/// does NOT reach the 10 s worker-readiness barrier and returns almost
+/// immediately. A timing test built on it would pass whether or not
+/// `sync_session` takes the global lock — it would be measuring nothing, which
+/// is the failure mode where a green is indistinguishable from an absent test.
+///
+/// So this holds the lock DIRECTLY. That is the property the issue is actually
+/// about — "`sync_session` does not queue behind a `ServerState` lock holder" —
+/// rather than one instance of a slow holder, and it is deterministic: the hold
+/// duration is the test's, not the reconcile path's. Every long holder the
+/// issue enumerates (the 10 s barrier at `reconcile/bringup.rs`, the mlx5
+/// teardown quiesce, the unbounded worker `join()`, the map-pin syscalls)
+/// reaches `sync_session` through exactly this mutex, so binding the mutex
+/// binds all four.
+///
+/// EXPECTED RED until #7209 is fixed. `handlers/mod.rs` dispatches every verb,
+/// `sync_session` included, under one `state.lock()`, so today this request
+/// blocks for the full hold. That is the point: the test is written before the
+/// fix so the fix has a red to work against, rather than resting on a reading
+/// of the lock graph — which is what failed on #7095.
+///
+/// The request is REJECTED (no payload) and that is irrelevant: what is
+/// asserted is that it was DISPATCHED promptly rather than queued. Asserting on
+/// the response would bind the wrong property.
+#[test]
+#[ignore = "#7209: reds until sync_session is taken off the snapshot-wide ServerState mutex"]
+fn sync_session_is_served_while_the_state_lock_is_held_7209() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // How long the stand-in holder keeps the lock, and the bar the measured
+    // request must beat. The gap between them is the test's whole signal, so
+    // they are named together rather than buried as literals.
+    const HOLD_MS: u64 = 1_200;
+    const SERVED_WITHIN_MS: u64 = 500;
+
+    let state = never_settling_state();
+
+    // A holder standing in for any of the four long operations apply_snapshot
+    // performs under the lock. `holding` reports that the lock is actually
+    // taken, so the measurement below cannot start before contention exists —
+    // a sleep here would race and could time an UNCONTENDED request, which
+    // passes for the wrong reason.
+    let (holding_tx, holding_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder_state = state.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = holder_state.lock().expect("state lock");
+        holding_tx.send(()).expect("signal holding");
+        // Released on the measurement's signal, or after HOLD_MS, whichever
+        // comes first. The bound is not just a hang guard: waiting only on the
+        // signal is CIRCULAR today, because the signal is sent after the
+        // measured request returns and that request cannot return until this
+        // lock drops. The bound is what makes the red cost HOLD_MS instead of
+        // the full timeout, and it does not weaken the assertion — HOLD_MS is
+        // comfortably above the threshold, so a queued request still reds.
+        let _ = release_rx.recv_timeout(Duration::from_millis(HOLD_MS));
+    });
+    holding_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder never acquired the state lock");
+
+    let t0 = Instant::now();
+    let resp = run_request(state.clone(), req("sync_session"));
+    let elapsed = t0.elapsed();
+    let _ = release_tx.send(());
+    holder.join().expect("holder thread");
+
+    assert!(
+        elapsed < Duration::from_millis(SERVED_WITHIN_MS),
+        "a sync_session request waited {elapsed:?} behind a thread holding the \
+         global ServerState mutex. apply_snapshot holds that same mutex across a \
+         10 s worker-readiness barrier, an unbounded worker join() and the mlx5 \
+         teardown quiesce, while the Go side budgets 3 s per session round-trip \
+         and #5380 ABORTS the rest of a bulk batch on the first transport \
+         failure — so this contention drops session mirrors (up to 255 in one \
+         batch) during exactly the failover the path exists to serve (#7209). \
+         error={}",
+        resp.error
+    );
+}
+
 #[test]
 fn stop_workers_clears_socket_fields_on_all_bindings() {
     // stop_workers must tear down per-binding socket state so the

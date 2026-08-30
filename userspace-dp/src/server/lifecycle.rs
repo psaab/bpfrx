@@ -251,6 +251,7 @@ pub(crate) fn run() -> Result<(), String> {
             worker_command_queue_poison_recoveries: 0,
             worker_command_queue_drops: 0,
             shared_session_poison_recoveries: 0,
+            synced_import_zone_unresolved: 0,
             gre_decap_ecn_illegal_drops_total: 0,
             wg_decap_ecn_illegal_drops_total: 0,
             gre_encap_df_oversize_drops_total: 0,
