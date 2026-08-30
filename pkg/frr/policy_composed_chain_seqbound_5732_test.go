@@ -46,10 +46,10 @@ func TestRenderComposedRouteMap_SkipsOversizedChain_5732(t *testing.T) {
 		},
 	}
 	// Sanity: each member is in-bounds, the composed chain is not.
-	if config.RouteMapSequenceCount(po.PolicyStatements["A"]) > config.MaxRouteMapSequences {
+	if config.RouteMapSequenceCount(po, po.PolicyStatements["A"]) > config.MaxRouteMapSequences {
 		t.Fatalf("member A must be within the per-policy ceiling")
 	}
-	if config.ComposedChainSequenceCount(po.PolicyStatements, []string{"A", "B"}) <= config.MaxRouteMapSequences {
+	if config.ComposedChainSequenceCount(po, po.PolicyStatements, []string{"A", "B"}) <= config.MaxRouteMapSequences {
 		t.Fatalf("composed A+B must exceed the ceiling")
 	}
 

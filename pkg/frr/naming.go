@@ -80,16 +80,16 @@ const (
 // list still yields exactly one keyword, so its render is byte-identical to the
 // pre-#2607 behavior.
 func prefixListFamilies(pl *config.PrefixList) []string {
-	hasV4, hasV6 := false, false
-	if pl != nil {
-		for _, p := range pl.Prefixes {
-			if strings.Contains(p, ":") {
-				hasV6 = true
-			} else {
-				hasV4 = true
-			}
-		}
-	}
+	// #7526: WHICH families a list holds is decided by config.PrefixListFamilies,
+	// the single source the admission bound also reads. This function keeps only
+	// the mapping to FRR's "ip"/"ipv6" match keywords, which are FRR spellings.
+	//
+	// The two used to derive it separately, and they disagreed: the renderer
+	// emitted one match line per family while the bound counted one per NAME, so
+	// a policy referencing mixed v4+v6 lists rendered up to twice the sequences
+	// admission had approved. Sharing the predicate makes the counts equal by
+	// construction rather than by two implementations agreeing.
+	hasV4, hasV6 := config.PrefixListFamilies(pl)
 	var fams []string
 	if hasV4 {
 		fams = append(fams, "ip")
@@ -97,11 +97,11 @@ func prefixListFamilies(pl *config.PrefixList) []string {
 	if hasV6 {
 		fams = append(fams, "ipv6")
 	}
-	if len(fams) == 0 {
-		// nil / empty list → default to IPv4; the referenced list is undefined
-		// or has no entries, so its match NOMATCHes every route (fail-closed).
-		fams = []string{"ip"}
-	}
+	// #7526: the nil / empty-list fallback to IPv4 lives in
+	// config.PrefixListFamilies, not here. It used to be duplicated, and the
+	// duplicate made the config-side normalization DEAD — a mutation removing
+	// it changed no behaviour, because this fallback silently covered for it.
+	// Two places deciding the same thing is exactly what this issue is about.
 	return fams
 }
 

@@ -184,10 +184,10 @@ func TestOversizedComposedChainLeavesNoDanglingAttachment6807(t *testing.T) {
 	}
 	// Sanity: each member is in-bounds, the chain is not — otherwise this cell
 	// exercises the single-policy belt instead of the composed one.
-	if config.RouteMapSequenceCount(po.PolicyStatements["A"]) > config.MaxRouteMapSequences {
+	if config.RouteMapSequenceCount(po, po.PolicyStatements["A"]) > config.MaxRouteMapSequences {
 		t.Fatal("member A must be within the per-policy ceiling")
 	}
-	if config.ComposedChainSequenceCount(po.PolicyStatements, []string{"A", "B"}) <= config.MaxRouteMapSequences {
+	if config.ComposedChainSequenceCount(po, po.PolicyStatements, []string{"A", "B"}) <= config.MaxRouteMapSequences {
 		t.Fatal("composed A+B must exceed the ceiling")
 	}
 

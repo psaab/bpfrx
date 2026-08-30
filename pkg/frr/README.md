@@ -202,6 +202,54 @@ also carries operator content:
   two begin markers and a corrupt block that FRR reload rejects. Anchoring
   keeps `end >= start`, so the slice can never duplicate.
 
+## The sequence bound and the renderer share ONE expansion (#7526)
+
+`config.MaxRouteMapSequences` is admission's ceiling on how many route-map
+sequences a policy may expand to; rendering past FRR's maximum sequence number
+"poisons the ENTIRE frr-reload", which is why the bound exists at all.
+
+**The bound and the renderer disagreed on the cardinality.** `fromPrefixListRefs`
+expands one referenced prefix-list NAME into one match line **per family it
+holds** — a mixed v4+v6 list yields an `ip` ref and an `ipv6` ref so both
+families bind a family-correct match (#2607). `RouteMapSequenceCount` counted
+`len(term.PrefixList)` — names, family-blind. So a policy referencing
+mixed-family lists rendered up to **twice** the sequences admission approved,
+and a config sitting just under the ceiling rendered past it.
+
+The fix is not to teach the bound the renderer's rule; it is to have one rule.
+`config.PrefixListFamilies` decides WHICH families a list holds and is read by
+both. `prefixListFamilies` here keeps only the mapping to FRR's `ip`/`ipv6`
+match keywords, which are FRR spellings; the counts are now equal **by
+construction** rather than by two implementations agreeing.
+
+`RouteMapSequenceCount` and `ComposedChainSequenceCount` therefore take the
+`*PolicyOptionsConfig`. It is **required, not optional**, so the compiler
+enumerates every call site — an optional table would be nil exactly where it
+matters and the count would silently fall back to the family-blind answer.
+
+Three things the mutation matrix established that inspection did not:
+
+- The nil/empty-list fallback to IPv4 was **duplicated** here, and the duplicate
+  made the config-side normalization dead — removing it changed no behaviour
+  because this fallback silently covered for it. Two places deciding the same
+  thing is the disease, so the duplicate is gone.
+- A term with **no** `from-prefix-list` must count 1, not 0. Zero multiplies the
+  whole term's cross-product to zero, so the bound would report that a large
+  policy expands to nothing and admit anything. That is the most common term
+  shape and it was uncovered.
+- An **undefined or empty** referenced list counts as ONE family: the renderer
+  still emits one fail-closed NOMATCH match line for it.
+
+The saturation contract is unchanged and was verified rather than adjusted:
+`checkedMulU64` and the running-sum guard clamp to `math.MaxUint64`, and
+admission rejects strictly `> MaxRouteMapSequences` — saturating at the ceiling
+instead would make an over-limit count equal the accepted maximum.
+
+The regression test asserts the **agreement**, not a literal: it renders the
+policy, counts the emitted sequence lines, and compares that to what the bound
+predicts. Pinning a number I computed would encode which of the two I decided to
+trust, and this issue is precisely a case where one of them was wrong.
+
 ## An undefined route-map name DENIES (#6807) — the repo said the opposite
 
 **FRR does not permit-all on a dangling route-map reference. It denies.**
