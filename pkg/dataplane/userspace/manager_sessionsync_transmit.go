@@ -69,8 +69,8 @@ func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
 // fast-fails: it stops after the first transport failure and returns it. The
 // mirror is best-effort — the periodic sweep retries once the helper is healthy
 // again.
-func sendSessionSyncBatch(reqs []SessionSyncRequest, send func(ControlRequest) error) error {
-	var firstErr error
+func sendSessionSyncBatch(reqs []SessionSyncRequest, send func(ControlRequest) error) sessionPairResult {
+	res := sessionPairResult{total: len(reqs)}
 	for i := range reqs {
 		ctrlReq := ControlRequest{
 			Type:           "sync_session",
@@ -79,17 +79,85 @@ func sendSessionSyncBatch(reqs []SessionSyncRequest, send func(ControlRequest) e
 		}
 		if err := send(ctrlReq); err != nil {
 			slog.Debug("userspace session sync mirror failed", "operation", reqs[i].Operation, "err", err)
-			if firstErr == nil {
-				firstErr = err
+			res.failed = append(res.failed, i)
+			if res.firstErr == nil {
+				res.firstErr = err
 			}
 			// Helper unreachable/hung: abort the batch instead of paying the
-			// per-request deadline once per remaining request (#5380).
+			// per-request deadline once per remaining request (#5380). Record
+			// how far the batch got: the requests never attempted are not
+			// failures the helper saw, and telling them apart is what lets the
+			// caller distinguish a wholly-undelivered pair from a partially
+			// APPLIED one.
 			if errors.Is(err, errSessionHelperUnreachable) {
+				res.aborted = true
 				break
 			}
+			continue
+		}
+		res.applied = append(res.applied, i)
+	}
+	return res
+}
+
+// sessionPairResult is the per-half outcome of a pair transmit.
+//
+// A bare first-error could not answer the question that matters (#7179): it
+// says something went wrong, not whether the helper is now holding state the
+// control plane did not intend. The two outcomes need opposite handling. A
+// wholly-undelivered pair is benign — the helper applied nothing and the
+// periodic session sync reconciles it — while a partially APPLIED pair leaves
+// residue that no later transmit necessarily corrects.
+type sessionPairResult struct {
+	total    int
+	applied  []int
+	failed   []int
+	aborted  bool
+	firstErr error
+}
+
+// orphanedReverse reports the one partial outcome measured to strand state in
+// the helper: the FORWARD was refused while the explicit REVERSE was applied,
+// leaving a reverse-only entry with no forward.
+//
+// The direction is deliberate and is the opposite of what #7179 was filed
+// describing. A forward that SUCCEEDS never leaves a half pair, because the
+// helper synthesizes and publishes the reverse companion itself on every
+// non-reverse import (userspace-dp session_import.rs) — measured as
+// `entries=2` from a single forward upsert. And a forward that fails at the
+// TRANSPORT layer aborts the batch above, so the reverse is never sent. The
+// only way to publish a lone reverse is a forward the helper actively REFUSED
+// — an application error such as a capacity rejection — after which the batch
+// continues and the explicit reverse lands alone. That case is already
+// documented helper-side as a bounded, self-inflicted "+1 orphan"; what was
+// missing is any signal on this side that it happened.
+func (r sessionPairResult) orphanedReverse() bool {
+	if r.total < 2 {
+		return false
+	}
+	// No explicit `aborted` guard, deliberately. A transport abort breaks the
+	// batch at the forward, so the reverse is never SENT and cannot appear in
+	// `applied` — the loop below already returns false for that shape. A guard
+	// here would be unreachable by construction, and an unreachable branch is
+	// one a mutation cannot bind: removing it changed no test result, which is
+	// how it was found. `aborted` stays recorded because it distinguishes a
+	// batch that stopped early from one that ran to completion, which the
+	// per-request Debug logs alone do not say.
+	forwardFailed := false
+	for _, i := range r.failed {
+		if i == 0 {
+			forwardFailed = true
+			break
 		}
 	}
-	return firstErr
+	if !forwardFailed {
+		return false
+	}
+	// Any applied request at this point IS the reverse: index 0 is in `failed`,
+	// so it cannot also be in `applied`. An `i > 0` filter here reads as
+	// careful and is another distinction that cannot differ -- mutating it to
+	// `i >= 0` changed no test result, which is how it was found.
+	return len(r.applied) > 0
 }
 
 // syncSessionRequestsLocked transmits one or more PRE-BUILT session-sync
@@ -124,9 +192,9 @@ func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) error {
 		return nil
 	}
 	m.mu.Unlock()
-	firstErr := sendSessionSyncBatch(reqs, m.requestSessionSync)
+	res := sendSessionSyncBatch(reqs, m.requestSessionSync)
 	m.mu.Lock()
-	return firstErr
+	return res.firstErr
 }
 
 // sessionPairMaxRequests is the hard cap on how many requests
@@ -164,24 +232,32 @@ const sessionPairMaxRequests = 2
 // sendSessionSyncBatch): first error wins, application-level rejections do not
 // stop the group, a transport failure aborts it.
 //
-// RESIDUAL (deliberately out of scope): this makes the pair's transmit
-// contiguous, not atomic. If the SECOND request fails at the transport layer
-// the helper is left with a half-installed pair; nothing rolls the first half
-// back. Closing that needs a helper-side pair transaction over the wire.
-func (m *Manager) syncSessionPairLocked(reqs ...SessionSyncRequest) error {
+// RESIDUAL, corrected (#7179): this makes the pair's transmit contiguous, not
+// atomic — but the half-pair long attributed to that gap does not occur in the
+// direction it was described. A FORWARD that succeeds never leaves a half pair,
+// because the helper synthesizes and publishes the reverse companion itself on
+// every non-reverse import (measured: one forward upsert yields two entries).
+// A forward that fails at the TRANSPORT layer aborts the batch, so the reverse
+// is never sent. The one partial that does strand state is the opposite one — a
+// forward the helper actively REFUSES, after which the explicit reverse lands
+// alone — and sessionPairResult.orphanedReverse is what makes it visible.
+func (m *Manager) syncSessionPairLocked(reqs ...SessionSyncRequest) sessionPairResult {
 	if len(reqs) == 0 {
-		return nil
+		return sessionPairResult{}
 	}
 	if len(reqs) > sessionPairMaxRequests {
 		slog.Error("userspace session pair transmit oversized; falling back to "+
 			"per-request locking (no contiguity guarantee)",
 			"requests", len(reqs), "max", sessionPairMaxRequests)
-		return m.syncSessionRequestsLocked(reqs...)
+		return sessionPairResult{
+			total:    len(reqs),
+			firstErr: m.syncSessionRequestsLocked(reqs...),
+		}
 	}
 	m.mu.Unlock()
 	m.sessionMu.Lock()
-	firstErr := sendSessionSyncBatch(reqs, m.requestSessionSyncLocked)
+	res := sendSessionSyncBatch(reqs, m.requestSessionSyncLocked)
 	m.sessionMu.Unlock()
 	m.mu.Lock()
-	return firstErr
+	return res
 }

@@ -10,6 +10,7 @@ package userspace
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -95,9 +96,12 @@ func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.Se
 	}
 	// Snapshot reads are complete; transmit both requests under ONE sessionMu
 	// hold so nothing interleaves between the halves (#5698). The mirror upsert
-	// is best-effort (the periodic session sync reconciles a transient miss),
-	// so the helper IPC error is intentionally discarded.
-	_ = m.syncSessionPairLocked(reqs...)
+	// stays best-effort — the periodic session sync reconciles a transient miss
+	// — so the IPC error is still not propagated. What is no longer discarded
+	// is a PARTIAL application (#7179): a pair the helper never applied
+	// self-heals, a lone reverse it did apply does not, and dropping the result
+	// on the floor made those two indistinguishable.
+	m.recordSessionPairResult("v4", m.syncSessionPairLocked(reqs...))
 }
 
 func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
@@ -257,9 +261,12 @@ func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.
 	}
 	// Snapshot reads are complete; transmit both requests under ONE sessionMu
 	// hold so nothing interleaves between the halves (#5698). The mirror upsert
-	// is best-effort (the periodic session sync reconciles a transient miss),
-	// so the helper IPC error is intentionally discarded.
-	_ = m.syncSessionPairLocked(reqs...)
+	// stays best-effort — the periodic session sync reconciles a transient miss
+	// — so the IPC error is still not propagated. What is no longer discarded
+	// is a PARTIAL application (#7179): a pair the helper never applied
+	// self-heals, a lone reverse it did apply does not, and dropping the result
+	// on the floor made those two indistinguishable.
+	m.recordSessionPairResult("v6", m.syncSessionPairLocked(reqs...))
 }
 
 func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
@@ -579,4 +586,31 @@ func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) error {
 		}
 	}
 	return firstErr
+}
+
+// recordSessionPairResult surfaces a pair transmit that left the helper
+// holding state the control plane did not intend (#7179).
+//
+// Only the orphaned-reverse outcome is reported. A pair the helper never
+// applied is benign and already logged at Debug per request; warning on it
+// would fire on every transient helper hiccup and bury the case that matters.
+// The counter advances on EVERY occurrence while the log stays per-event,
+// because a condition that recurs is different information from one that
+// happened once.
+func (m *Manager) recordSessionPairResult(family string, res sessionPairResult) {
+	if !res.orphanedReverse() {
+		return
+	}
+	m.sessionPairOrphanedReverse.Add(1)
+	slog.Warn("userspace session pair left a reverse-only entry in the helper: "+
+		"the forward was refused while its explicit reverse was applied",
+		"family", family, "err", res.firstErr,
+		"orphaned_total", m.sessionPairOrphanedReverse.Load())
+}
+
+// SessionPairOrphanedReverseTotal reports how many pair transmits left a
+// reverse-only entry in the helper. Exported for the status/metrics surface so
+// the condition is observable without reading the log.
+func (m *Manager) SessionPairOrphanedReverseTotal() uint64 {
+	return m.sessionPairOrphanedReverse.Load()
 }
