@@ -126,21 +126,49 @@ func TestISISOrdinaryRowStillParses6590(t *testing.T) {
 //
 // A row too short to carry every trailing column cannot be split safely — any
 // assignment would put peer-chosen text under a heading it does not belong to,
-// which is the defect itself. Such a row is dropped, not guessed at.
+// which is the defect itself. Such a row is never guessed at.
 //
 // A table with NO header is likewise not parsed: the trailing width is unknown
 // without it, and guessing the width is the same failure in a different place.
+//
+// #7430 CHANGED THE CONTRACT AND THIS TEST FOLLOWED IT. The subject is
+// unchanged — NO GUESSWORK — but the mechanism is no longer "return nothing".
+// Dropping the row silently made it indistinguishable from "the adjacency does
+// not exist", which sends an operator debugging a missing neighbour at the
+// wrong problem. The row is now RETURNED with Malformed set and every derived
+// field EMPTY.
+//
+// Empty-derived-fields is what carries #6590's property forward, and it is what
+// this test asserts. A row with a fabricated State would be the forgery this
+// issue exists to prevent, arriving by a different route — so the assertion
+// moved from "no rows" to "no derived content", which is the property that
+// actually mattered.
 func TestISISMalformedRowsAreNotRendered6590(t *testing.T) {
+	assertNoDerivedContent := func(t *testing.T, what string, adjs []ISISAdjacency) {
+		t.Helper()
+		if len(adjs) != 1 {
+			t.Fatalf("#6590/#7430: %s must yield exactly one REPORTED row; got %+v", what, adjs)
+		}
+		a := adjs[0]
+		if !a.Malformed {
+			t.Errorf("#6590: %s was parsed as a well-formed adjacency — that is the "+
+				"positional guess this issue exists to prevent; got %+v", what, a)
+		}
+		if a.SystemID != "" || a.Interface != "" || a.Level != "" || a.State != "" || a.HoldTime != "" {
+			t.Errorf("#6590: %s carries derived fields %+v. Any assignment puts "+
+				"peer-chosen text under a heading it does not belong to — the forgery "+
+				"arriving by a different route now that the row is reported rather than "+
+				"dropped", what, a)
+		}
+	}
+
 	// Short row: fewer fields than the header's trailing width + 1.
 	short := isisMgr6590(isisTable6590("rtr1 ge-0-0-1 2"))
 	adjs, err := short.GetISISAdjacency()
 	if err != nil {
 		t.Fatalf("GetISISAdjacency(short): %v", err)
 	}
-	if len(adjs) != 0 {
-		t.Errorf("#6590: a row too short to carry every trailing column must be dropped, "+
-			"not split by guesswork; got %+v", adjs)
-	}
+	assertNoDerivedContent(t, "a row too short to carry every trailing column", adjs)
 
 	// Headerless table: width unknown.
 	headerless := isisMgr6590("Area 1:\n rtr1 ge-0-0-1 2 Up 27 2020.2020.2020\n")
@@ -148,10 +176,7 @@ func TestISISMalformedRowsAreNotRendered6590(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetISISAdjacency(headerless): %v", err)
 	}
-	if len(adjs) != 0 {
-		t.Errorf("#6590: without the header the trailing width is unknown — parsing anyway "+
-			"reintroduces the positional guess; got %+v", adjs)
-	}
+	assertNoDerivedContent(t, "a table with no header", adjs)
 }
 
 // TestISISTrailingWidthFollowsTheHeader6590 pins that the width is DERIVED.

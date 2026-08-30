@@ -473,6 +473,20 @@ func (c *CLI) showISIS(args []string) error {
 		fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
 			"System ID", "Interface", "Level", "State", "Hold Time")
 		for _, a := range adjs {
+			// #7430: an unparseable row is REPORTED, not dropped. A dropped row is
+			// indistinguishable from "no such adjacency" to an operator debugging a
+			// missing neighbour, and points at the wrong problem. Rendering it with
+			// empty derived fields would report a neighbour in state "" — quieter
+			// than column-forgery but still false — so the raw line is shown under a
+			// single heading instead of split across the parsed columns.
+			//
+			// Raw is peer-influenced text and goes through termsafe exactly as the
+			// parsed cells do (#6468).
+			if a.Malformed {
+				fmt.Printf("  %s\n",
+					termsafe.SanitizeForDisplay("<unparseable IS-IS neighbor row: "+a.Raw+">"))
+				continue
+			}
 			fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
 				termsafe.SanitizeRowForDisplay(
 					a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)...)
