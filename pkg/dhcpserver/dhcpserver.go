@@ -1191,10 +1191,19 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		ifaces = append(ifaces, group.Interfaces...)
 	}
 
+	// #7318: `dhcp-socket-type` is emitted ONLY when the operator selected one.
+	// Omitting it is not the same as writing "raw" in the config file, but it
+	// IS the same to Kea (raw is its documented default), and omitting keeps
+	// every pre-#7318 config rendering byte-for-byte identically.
+	ifacesCfg := map[string]any{
+		"interfaces": ifaces,
+	}
+	if st := cfg.DHCPLocalServer.SocketType; st != "" {
+		ifacesCfg["dhcp-socket-type"] = st
+	}
+
 	dhcp4 := map[string]any{
-		"interfaces-config": map[string]any{
-			"interfaces": ifaces,
-		},
+		"interfaces-config": ifacesCfg,
 		"lease-database": map[string]any{
 			"type": "memfile",
 			"name": keaLeaseFile4,

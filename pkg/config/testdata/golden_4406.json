@@ -1145,7 +1145,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -2414,7 +2415,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -3682,7 +3684,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -4950,7 +4953,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -6219,7 +6223,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -7487,7 +7492,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": null,
           "DynamicDNS": null,
@@ -8438,7 +8444,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -8464,7 +8471,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null
@@ -9415,7 +9423,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -9441,7 +9450,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null
@@ -10391,7 +10401,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -10417,7 +10428,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null
@@ -11367,7 +11379,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -11393,7 +11406,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null
@@ -12344,7 +12358,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -12370,7 +12385,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null
@@ -13320,7 +13336,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DHCPv6LocalServer": {
             "Groups": {
@@ -13346,7 +13363,8 @@
                 ]
               }
             },
-            "ExpiredLeases": null
+            "ExpiredLeases": null,
+            "SocketType": ""
           },
           "DynamicDNS": null,
           "DynamicDNSv6": null

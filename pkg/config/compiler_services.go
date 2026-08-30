@@ -400,6 +400,33 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 	// family's DHCPLocalServerConfig (lsc), NOT to a pool. v4 and v6 are
 	// tuned independently. A truly empty/garbage block compiles to nil so
 	// it neither forces reclamation on nor renders anything.
+	// #7318: `dhcp-socket-type` is IPv4-ONLY — Kea's Dhcp6 has no raw mode and
+	// already receives on UDP, so there is nothing for the leaf to select on
+	// the v6 path. It is not modeled under dhcpv6-local-server, and the isV6
+	// guard here means a hand-written v6 stanza cannot smuggle one in and have
+	// it silently take effect on the v4 render.
+	if !isV6 {
+		// #2419/#6821 dual-shape. THREE spellings have to land on the same
+		// value, and FindChild alone sees only the first two:
+		//
+		//	dhcp-local-server { dhcp-socket-type udp; }   -> child, Keys[1]
+		//	dhcp-local-server { dhcp-socket-type { udp; } } -> child, Children[0]
+		//	dhcp-local-server dhcp-socket-type udp;       -> packed onto THIS
+		//	                                                node's own Keys
+		//
+		// In the third the leaf never becomes a child at all, so FindChild
+		// returns nil and the operator's value is silently dropped.
+		// packedBodyChildren expands the packed tail into the same synthetic
+		// children the schema walker validates (which is why the schema node
+		// sets packedTail: true — the gate and the compiler must move
+		// together), and nodeVal then covers the first two.
+		for _, prop := range packedBodyChildren(node, dhcpLocalServerSchemaNode()) {
+			if len(prop.Keys) > 0 && prop.Keys[0] == "dhcp-socket-type" {
+				lsc.SocketType = nodeVal(prop)
+			}
+		}
+	}
+
 	if elpNode := node.FindChild("expired-leases-processing"); elpNode != nil {
 		lsc.ExpiredLeases = compileDHCPExpiredLeases(elpNode)
 	}
@@ -2334,4 +2361,19 @@ func dhcpGroupInterfaceValues(prop *Node) []string {
 		}
 	}
 	return vals
+}
+
+// dhcpLocalServerSchemaNode returns the live `system services
+// dhcp-local-server` schema node so the compiler expands a packed tail with
+// exactly the grammar the walker validates (#6821). It reads setSchema rather
+// than restating the shape, so the two cannot drift.
+func dhcpLocalServerSchemaNode() *schemaNode {
+	n := setSchema
+	for _, k := range []string{"system", "services", "dhcp-local-server"} {
+		if n == nil {
+			return nil
+		}
+		n = n.children[k]
+	}
+	return n
 }

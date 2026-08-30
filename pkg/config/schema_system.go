@@ -570,10 +570,28 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			}},
 		}},
 		"dns": {desc: "DNS service", children: nil},
-		"dhcp-local-server": {desc: "DHCP local server", children: map[string]*schemaNode{
+		// packedTail (#6821): compileDHCPLocalServer reads this container's
+		// packed tail (`dhcp-local-server dhcp-socket-type udp;`), so the
+		// walker must validate the same expansion. Without the pairing the
+		// compact spelling would compile UNVALIDATED while the block spelling
+		// is enum-checked.
+		"dhcp-local-server": {desc: "DHCP local server", packedTail: true, children: map[string]*schemaNode{
 			"group":                     dhcpLocalServerGroupSchema("DHCP"),
 			"dynamic-dns":               dhcpDynamicDNSSchema(),
 			"expired-leases-processing": dhcpExpiredLeasesSchema(),
+			// #7318: IPv4-only. Kea's Dhcp6 has no raw mode, so there is
+			// deliberately no sibling under dhcpv6-local-server. Absent ==
+			// Kea's default `raw` == today's behaviour; `udp` is the opt-in
+			// that makes DHCPv4 traverse the netfilter input hook, at the
+			// cost of no longer serving directly-attached address-less
+			// clients (validateDHCPSocketTypeWarnings states the trade).
+			"dhcp-socket-type": {desc: "Kea DHCPv4 receive socket type", args: 1, scalar: true,
+				placeholder:   "<socket-type>",
+				valueType:     ValueEnumOf,
+				valueDesc:     "raw (default; AF_PACKET, ungateable by netfilter) | udp (relayed traffic only)",
+				valueExamples: []string{"raw", "udp"},
+				validator:     ValidateEnum(dhcpSocketTypes),
+				children:      nil},
 		}},
 		"dhcpv6-local-server": {desc: "DHCPv6 local server", children: map[string]*schemaNode{
 			"group":                     dhcpLocalServerGroupSchema("DHCPv6"),
