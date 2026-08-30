@@ -322,6 +322,19 @@ func (c *CLI) dispatchConfig(line string) error {
 		return nil
 	}
 
+	// #7172: deny-configuration. THE FIRST per-command authorization on this
+	// path — until now `configure` was all-or-nothing and every mutation inside
+	// config mode ran unchecked.
+	//
+	// Before the switch, so one gate covers every mutating verb rather than
+	// nine copies drifting apart. The gate resolves the current edit path
+	// itself: each case below prefixes `store.GetEditPath()`, so matching the
+	// typed fragment would let `edit system` walk a deny on
+	// `system root-authentication`.
+	if err := c.checkConfigRegex(line); err != nil {
+		return err
+	}
+
 	switch parts[0] {
 	case "edit":
 		if len(parts) < 2 {
