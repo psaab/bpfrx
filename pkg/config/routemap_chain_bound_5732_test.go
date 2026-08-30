@@ -57,6 +57,10 @@ func TestComposedChainSequenceBound_CompileReject_5732(t *testing.T) {
 			sets = append(sets, fmt.Sprintf("set policy-options policy-statement %s term t1 from prefix-list %s_pl%d", pol, pol, i))
 		}
 		for i := 0; i < per; i++ {
+			// #7471: define each as-path. `from as-path` is definedness-gated
+			// now and that gate runs first, so a dangling ref would reject
+			// before the CHAIN BOUND under test could fire.
+			sets = append(sets, fmt.Sprintf(`set policy-options as-path %s_asp%d "^%d "`, pol, i, 65000+i))
 			sets = append(sets, fmt.Sprintf("set policy-options policy-statement %s term t1 from as-path %s_asp%d", pol, pol, i))
 		}
 	}

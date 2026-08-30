@@ -18,6 +18,8 @@ func TestPolicyTermMultiMatch_Hierarchical_2642(t *testing.T) {
 	// Communities must be defined (#2881 cross-reference gate).
 	cfg := `policy-options {
     community c1 members 65000:1;
+    as-path a1 "^65000 ";
+    as-path a2 "^65001 ";
     community c2 members 65000:2;
     policy-statement P {
         term t1 {
@@ -67,6 +69,7 @@ func TestPolicyTermSingleMatch_Hierarchical_2642(t *testing.T) {
 	// Community must be defined (#2881 cross-reference gate).
 	cfg := `policy-options {
     community c1 members 65000:1;
+    as-path a1 "^65000 ";
     policy-statement P {
         term t1 {
             from {
@@ -112,6 +115,12 @@ func TestPolicyTermMultiMatch_FlatSet_2630(t *testing.T) {
 		// Communities must be defined (#2881 cross-reference gate).
 		"set policy-options community c1 members 65000:1",
 		"set policy-options community c2 members 65000:2",
+		// #7471: `from as-path` is definedness-gated now, exactly as
+		// `from community` has been since #2881. Define the as-paths so this
+		// test keeps MULTI-VALUE RETENTION as its subject rather than passing
+		// or failing on a reference gate.
+		`set policy-options as-path a1 "^65000 "`,
+		`set policy-options as-path a2 "^65001 "`,
 		"set policy-options policy-statement P term t1 from community c1",
 		"set policy-options policy-statement P term t1 from community c2",
 		"set policy-options policy-statement P term t1 from prefix-list pl1",

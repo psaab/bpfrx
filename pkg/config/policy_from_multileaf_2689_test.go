@@ -147,6 +147,10 @@ func TestPolicyFromPrefixListBracketPlusSibling_2689(t *testing.T) {
 
 func TestPolicyFromASPathBracketFlatSet_2689(t *testing.T) {
 	cfg, err := compileSet(t, []string{
+		// #7471: `from as-path` is definedness-gated now. Define the members so
+		// this test keeps BRACKET-LIST RETENTION as its subject.
+		`set policy-options as-path a1 "^65000 "`,
+		`set policy-options as-path a2 "^65001 "`,
 		"set policy-options policy-statement P term T from as-path [ a1 a2 ]",
 		"set policy-options policy-statement P term T then accept",
 	})
@@ -161,7 +165,11 @@ func TestPolicyFromASPathBracketFlatSet_2689(t *testing.T) {
 }
 
 func TestPolicyFromASPathBracketHierarchical_2689(t *testing.T) {
+	// #7471: `from as-path` is definedness-gated now; define the members so
+	// this test keeps bracket-list retention as its subject.
 	src := `policy-options {
+    as-path a1 "^65000 ";
+    as-path a2 "^65001 ";
     policy-statement P {
         term T {
             from {
@@ -181,6 +189,10 @@ func TestPolicyFromASPathBracketHierarchical_2689(t *testing.T) {
 
 func TestPolicyFromASPathBracketPlusSibling_2689(t *testing.T) {
 	cfg, err := compileSet(t, []string{
+		// #7471: definedness-gated; define all three members.
+		`set policy-options as-path a1 "^65000 "`,
+		`set policy-options as-path a2 "^65001 "`,
+		`set policy-options as-path a3 "^65002 "`,
 		"set policy-options policy-statement P term T from as-path [ a1 a2 ]",
 		"set policy-options policy-statement P term T from as-path a3",
 		"set policy-options policy-statement P term T then accept",

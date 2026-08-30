@@ -2093,6 +2093,13 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+
+	// lenientPolicyASPathRef (#7471) downgrades the dangling `from as-path`
+	// rejection to a warning on the tolerant Load / SyncApply ingress, so an
+	// already-persisted or peer-synced config carrying the typo still boots
+	// (#1960 no-brick). Its own flag rather than sharing the community one, so
+	// the two findings stay independently attributable.
+	lenientPolicyASPathRef bool
 	// lenientPolicyASPathRegex (#6686) downgrades the as-path regex gate
 	// (validatePolicyASPathRegexStrict) from a hard compile error to a
 	// cfg.Warnings entry. xpf renders one `bgp as-path access-list <name>
@@ -2538,6 +2545,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyValuelessMatch:            true,
 		lenientPolicyCommunityRef:              true,
+		lenientPolicyASPathRef:              true,
 		lenientPolicyASPathRegex:               true,
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
