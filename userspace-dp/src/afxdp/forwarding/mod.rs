@@ -142,3 +142,7 @@ pub(super) fn resolve_ingress_logical_ifindex(
 
 #[cfg(test)]
 mod tests;
+// #7520: the ICMP global-accept family-pairing cells.
+#[cfg(test)]
+#[path = "tests_icmp_family_7520.rs"]
+mod tests_icmp_family_7520;
