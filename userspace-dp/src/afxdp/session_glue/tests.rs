@@ -8047,6 +8047,9 @@ fn f3_key_6979() -> crate::session::SessionKey {
         src_port: 40000,
         dst_port: 443,
         discriminator: Default::default(),
+        // #7160 phase 1 widened SessionKey after this PR was authored; 0 is
+        // the default routing instance, so F3's fixture is unchanged.
+        routing_domain: 0,
     }
 }
 
