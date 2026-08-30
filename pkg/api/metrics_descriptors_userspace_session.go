@@ -296,6 +296,30 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"are still enqueueing to it (#6929).",
 		nil, nil,
 	)
+	c.userspaceSyncedImportZoneUnresolved = prometheus.NewDesc(
+		"xpf_userspace_synced_import_zone_unresolved_total",
+		"Peer-synced session imports whose (from-zone, to-zone) pair "+
+			"could not be resolved locally, so the source-NAT "+
+			"reservation was booked WITHOUT the #6211 zone narrowing. "+
+			"The session itself is installed correctly: the translated "+
+			"address and port come off the HA wire and are never "+
+			"recomputed, so nothing is mistranslated. What is lost is "+
+			"the narrowing that decides WHICH rule's allocator holds "+
+			"the reservation — with one pool-mode rule owning that "+
+			"address the result is identical and this is purely "+
+			"informational, but where two rules' pools both contain it "+
+			"in separate allocators the booking may sit in a different "+
+			"allocator than the active node's, and a later re-upsert "+
+			"that does resolve books a SECOND reservation, both live "+
+			"until teardown and both counting against max_tracked_flows. "+
+			"Nonzero is not itself a fault: it is expected while a "+
+			"config apply is in flight (sync_session reads the "+
+			"published forwarding view by design, #7209) and on a "+
+			"standby's first sync before any snapshot is applied. "+
+			"Sustained growth on a settled config means the two nodes' "+
+			"zone configuration has drifted.",
+		nil, nil,
+	)
 	c.userspaceSharedSessionPoisonRecoveries = prometheus.NewDesc(
 		"xpf_userspace_shared_session_poison_recoveries_total",
 		"Shared-session mutex poison recoveries across every "+

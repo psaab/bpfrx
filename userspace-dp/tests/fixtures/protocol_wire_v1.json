@@ -971,6 +971,7 @@
     "started_at": "1970-01-01T00:00:00Z",
     "state_file": "",
     "synced_import_cap_drops_total": 0,
+    "synced_import_zone_unresolved": 0,
     "three_color_policer_counters": [],
     "time_exceeded_rate_limited_total": 0,
     "wg_decap_ecn_illegal_drops_total": 0,

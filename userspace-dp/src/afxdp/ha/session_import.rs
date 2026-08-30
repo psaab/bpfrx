@@ -116,6 +116,30 @@ impl crate::afxdp::Coordinator {
             &self.forwarding,
             &entry.metadata,
         );
+        // #7209: count the degraded path. Bumped HERE, on the coordinator's
+        // once-per-import pre-publish reservation, and deliberately NOT at the
+        // worker-side twin in `commands/upsert_synced.rs`: that one runs on
+        // EVERY worker for the same entry (the command is fanned out to each
+        // queue), so counting there would multiply one degraded import by the
+        // worker count and make the metric a function of `--workers` rather
+        // than of what happened.
+        //
+        // Counted only when the unresolved pair actually COST something. The
+        // reservation early-returns for a reverse session and for one with no
+        // source-NAT rewrite (`reserve_synced_source_nat_allocation_with_holder`
+        // returns on `is_reverse` and on `rewrite_src == None`), so for those
+        // the zone pair is never consulted and nothing is degraded. Counting
+        // them would make the metric a function of how much non-NAT traffic the
+        // peer syncs rather than of what was lost — an operator watching it
+        // would see it climb on a healthy cluster and learn to ignore it.
+        if zones.is_none()
+            && !entry.metadata.is_reverse
+            && entry.decision.nat.rewrite_src.is_some()
+        {
+            self.sessions
+                .synced_import_zone_unresolved
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if !crate::nat::reserve_synced_source_nat_allocation_untracked(
             &self.forwarding.iface_nat_allocators,
             &self.forwarding.source_nat_rules,

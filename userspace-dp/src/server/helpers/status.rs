@@ -159,6 +159,13 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.worker_command_queue_drops = state.afxdp.worker_command_queue_drops_total();
     state.status.shared_session_poison_recoveries =
         state.afxdp.shared_session_poison_recoveries_total();
+    // #7209: peer-synced imports whose zone pair did not resolve, so the
+    // source-NAT reservation skipped #6211's narrowing. Expected nonzero while
+    // a config apply is in flight (sync_session reads the PUBLISHED forwarding
+    // view by design) and on a standby's first sync; sustained growth on a
+    // settled config means the nodes' zone config has drifted.
+    state.status.synced_import_zone_unresolved = state.afxdp.synced_import_zone_unresolved_total();
+
     // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
     // over a Not-ECT inner). Nonzero = a misbehaving tunnel ingress
     // ECT-marked the outer for un-ECN inner traffic on a congested path.

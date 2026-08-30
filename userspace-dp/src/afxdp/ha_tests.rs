@@ -2150,6 +2150,126 @@ fn reserve6600_forwarding() -> ForwardingState {
 
 /// A peer-synced forward entry whose NAT decision names `pool_port` on the
 /// single-address pool above.
+/// #7209: register one worker so `reserve_synced_translation` actually runs.
+///
+/// Not boilerplate. `upsert_synced_session` gates the whole coordinator-side
+/// reservation on `!self.workers.records.is_empty()` — with no worker nothing
+/// polls, so there is no racing local allocation to guard against and the
+/// reserve is deliberately skipped. A fixture without a worker therefore never
+/// reaches the code under test, and every leg below would pass by never
+/// executing anything. That is how the first draft of this test failed, and it
+/// failed in the right direction: leg A red because the counter stayed 0.
+fn register_test_worker_7209(coordinator: &mut Coordinator) {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands)),
+    );
+}
+
+/// #7209: the degraded-import counter must move EXACTLY when an unresolved
+/// zone pair actually costs something, and not otherwise.
+///
+/// The counter exists because the degradation is otherwise silent: the zone
+/// pair fails to resolve, #6211's narrowing is skipped, the pre-#6211 fallback
+/// books the reservation, and nothing anywhere says so.
+///
+/// Three legs, because a counter has two ways to be useless and only one of
+/// them is "never fires":
+///
+///   A. unresolved AND source-NAT present -> counts. The empty
+///      `zone_id_to_name` here is not contrived: it is exactly an HA standby's
+///      first sync, before any snapshot has been applied.
+///   B. resolvable -> does NOT count. Without this leg a counter bumped on
+///      every import passes leg A, and the metric would climb on a healthy
+///      cluster until an operator learned to ignore it.
+///   C. unresolved but NO source-NAT rewrite -> does NOT count. The reservation
+///      early-returns on `rewrite_src == None`, so the zone pair is never
+///      consulted and nothing is lost. This is the leg that makes the metric
+///      mean "something was degraded" rather than "some zone lookup missed".
+///
+/// Each leg asserts the zone pair's actual resolution state first, so a fixture
+/// that stopped exercising the intended case fails loudly instead of passing
+/// vacuously.
+#[test]
+fn synced_import_zone_unresolved_counts_only_real_degradation_7209() {
+    // --- Leg A: unresolved, with a source-NAT rewrite to lose. -------------
+    let mut unresolved = Coordinator::new();
+    register_test_worker_7209(&mut unresolved);
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &unresolved.forwarding,
+            &test_metadata(),
+        )
+        .is_none(),
+        "fixture no longer exercises the UNRESOLVED case — a fresh Coordinator's \
+         zone_id_to_name must be empty, or leg A proves nothing"
+    );
+    let before = unresolved.synced_import_zone_unresolved_total();
+    unresolved.upsert_synced_session(reserve6600_entry(41000, 21000));
+    assert_eq!(
+        unresolved.synced_import_zone_unresolved_total(),
+        before + 1,
+        "an import whose zone pair did not resolve, on a session that DOES carry \
+         a source-NAT rewrite, must be counted — otherwise the #6211 narrowing \
+         is skipped and nothing tells an operator it happened (#7209)"
+    );
+
+    // --- Leg B: resolvable -> must NOT count. ------------------------------
+    let mut resolved = Coordinator::new();
+    register_test_worker_7209(&mut resolved);
+    let mut forwarding = ForwardingState::default();
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_LAN_ZONE_ID, "lan".to_string());
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_WAN_ZONE_ID, "wan".to_string());
+    resolved.forwarding = forwarding;
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &resolved.forwarding,
+            &test_metadata(),
+        )
+        .is_some(),
+        "fixture no longer exercises the RESOLVED case — leg B would then be a \
+         second copy of leg A and could not detect an unconditional bump"
+    );
+    let before_b = resolved.synced_import_zone_unresolved_total();
+    resolved.upsert_synced_session(reserve6600_entry(41001, 21001));
+    assert_eq!(
+        resolved.synced_import_zone_unresolved_total(),
+        before_b,
+        "an import whose zone pair RESOLVED was counted as degraded; the metric \
+         then climbs on a healthy cluster and stops meaning anything (#7209)"
+    );
+
+    // --- Leg C: unresolved but nothing to lose -> must NOT count. ----------
+    let mut no_nat = Coordinator::new();
+    register_test_worker_7209(&mut no_nat);
+    let mut entry = reserve6600_entry(41002, 0);
+    entry.decision.nat = NatDecision::default(); // no rewrite_src
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &no_nat.forwarding,
+            &entry.metadata,
+        )
+        .is_none(),
+        "leg C must still be an UNRESOLVED case, or it cannot distinguish the \
+         source-NAT condition from the zone condition"
+    );
+    let before_c = no_nat.synced_import_zone_unresolved_total();
+    no_nat.upsert_synced_session(entry);
+    assert_eq!(
+        no_nat.synced_import_zone_unresolved_total(),
+        before_c,
+        "an import with NO source-NAT rewrite was counted as degraded. The \
+         reservation early-returns on rewrite_src == None, so the zone pair is \
+         never consulted and nothing was lost — counting it makes the metric a \
+         function of how much non-NAT traffic the peer syncs (#7209)"
+    );
+}
+
 fn reserve6600_entry(src_port: u16, pool_port: u16) -> SyncedSessionEntry {
     SyncedSessionEntry {
         key: SessionKey {

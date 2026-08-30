@@ -41,6 +41,30 @@ pub(in crate::afxdp) struct SessionManager {
     /// `session_delete_stale_ignored_total()`.
     pub(in crate::afxdp) install_stale_ignored: AtomicU64,
     pub(in crate::afxdp) delete_stale_ignored: AtomicU64,
+    /// #7209: peer-synced imports whose `(from_zone, to_zone)` pair could not
+    /// be resolved locally, so the source-NAT reservation was booked WITHOUT
+    /// #6211's zone narrowing.
+    ///
+    /// What the operator loses, which is what makes this worth a counter: the
+    /// session is installed with the ACTIVE node's exact translated address and
+    /// port — those come off the HA wire and are never recomputed, so nothing
+    /// is mistranslated. What is lost is the narrowing that picks WHICH rule's
+    /// allocator holds the reservation. With a single pool-mode rule owning the
+    /// translated address the two paths agree and this is purely informational.
+    /// It only diverges where two pool-mode rules' pools BOTH contain that
+    /// address in separate allocators, and there the booking may sit in a
+    /// different allocator than the active's — with a second booking taken if a
+    /// later re-upsert does resolve, both live until teardown frees them and
+    /// both counting against `max_tracked_flows`.
+    ///
+    /// Nonzero is not by itself a fault: it is expected while a config apply is
+    /// in flight (`sync_session` reads the PUBLISHED forwarding view, which lags
+    /// the pending one by design — #7209) and on an HA standby's first sync
+    /// before any snapshot has been applied. Sustained growth on a settled
+    /// config means the nodes' zone configuration has drifted.
+    ///
+    /// Surfaced via `Coordinator::synced_import_zone_unresolved_total()`.
+    pub(in crate::afxdp) synced_import_zone_unresolved: AtomicU64,
     /// #5674: peer-synced session imports REJECTED by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`
@@ -97,6 +121,7 @@ impl SessionManager {
             owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
             export_seq: AtomicU64::new(0),
             install_stale_ignored: AtomicU64::new(0),
+            synced_import_zone_unresolved: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),
             import_reserve_refused: AtomicU64::new(0),

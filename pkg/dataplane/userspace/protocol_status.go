@@ -441,6 +441,12 @@ type ProcessStatus struct {
 	// xpf_userspace_shared_session_poison_recoveries_total. Decodes to 0
 	// for an older helper that does not send the key.
 	SharedSessionPoisonRecoveries uint64 `json:"shared_session_poison_recoveries,omitempty"`
+
+	// SyncedImportZoneUnresolved is xpf_userspace_synced_import_zone_unresolved_total.
+	// Decodes to 0 against a helper that predates #7209, which reads the same as
+	// "never happened" — acceptable here because the metric is diagnostic rather
+	// than a gate, and an old helper genuinely has no degraded imports to report.
+	SyncedImportZoneUnresolved uint64 `json:"synced_import_zone_unresolved,omitempty"`
 	// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side ECN
 	// combine because the outer header carried a CE mark over an inner
 	// packet that was Not-ECT (the illegal combination — a congested
