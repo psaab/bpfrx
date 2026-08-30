@@ -1110,9 +1110,15 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// #7337: this fixture deliberately carries a dangling class-of-service
+	// INTERFACE reference (`dscp missing-classifier`), now hard-rejected at
+	// strict commit by validateClassOfServiceInterfaceRefsStrict — the same
+	// treatment the scheduler-map reference already gets, per the note below.
+	// Compile on the TOLERANT path so the warnings under test are still
+	// produced; the strict rejection has its own coverage.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("compile error: %v", err)
+		t.Fatalf("compile error (lenient): %v", err)
 	}
 	warnings := strings.Join(cfg.Warnings, "\n")
 	// A dangling scheduler reference in a scheduler-map is no longer
