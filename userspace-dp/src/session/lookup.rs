@@ -258,24 +258,57 @@ impl SessionTable {
         // reply was mis-delivered or dropped. The common (bijective /
         // non-colliding) case is a len-1 bucket — one validate, zero heap
         // (SmallVec inline) — so the pool-mode-SNAT fast path is unchanged.
-        let bucket = self.nat_reverse_index.get(reply_key)?;
+        //
+        // #7160 (#2387): the bucket is keyed domain-AGNOSTICALLY — the two
+        // reverse-match transforms zero `routing_domain` because a reply may
+        // legitimately arrive in a different routing domain than the forward
+        // direction resolved (this dataplane's transit route lookup is not
+        // VRF-isolated; see the `routing_domain` doc in session/key.rs). So the
+        // probe is zeroed to match, and the domain is instead spent on a
+        // PREFERENCE over the candidates:
+        //
+        //   pass 1 — a candidate whose forward session carries the reply's OWN
+        //            domain. Two tenants whose flows are contained in their
+        //            routing instances land in one bucket and demux exactly
+        //            here, which is what keeps the reverse direction isolated
+        //            once the forward direction is.
+        //   pass 2 — any validating candidate. This is the pre-#7160 answer
+        //            verbatim, and it is what keeps a flow whose reply arrives
+        //            in another domain (the common non-contained VRF shape)
+        //            forwarding instead of blackholing.
+        //
+        // In a deployment with no routing-instance interface membership every
+        // key is domain 0, so pass 1 accepts exactly what pass 2 would and the
+        // walk is bit-identical to pre-#7160.
+        let probe = reverse_match_key(reply_key);
+        let bucket = self.nat_reverse_index.get(&probe)?;
+        let mut fallback: Option<ForwardSessionMatch> = None;
         for &handle in bucket.iter() {
             let Some(record) = self.entries.get(handle as usize) else {
                 continue;
             };
             let entry = &record.entry;
             if entry.metadata.is_reverse
-                || !reply_matches_forward_session(&record.key, entry.decision.nat, reply_key)
+                || !reply_matches_forward_session(&record.key, entry.decision.nat, &probe)
             {
                 continue;
             }
-            return Some(ForwardSessionMatch {
+            let matched = ForwardSessionMatch {
                 key: record.key.clone(),
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
-            });
+            };
+            if record.key.routing_domain == reply_key.routing_domain {
+                return Some(matched);
+            }
+            // First validating candidate from another domain — remembered, not
+            // returned, so a same-domain candidate later in the bucket still
+            // wins. Bucket order is install order and carries no meaning.
+            if fallback.is_none() {
+                fallback = Some(matched);
+            }
         }
-        None
+        fallback
     }
 
     pub fn find_forward_wire_match(&self, wire_key: &SessionKey) -> Option<ForwardSessionMatch> {

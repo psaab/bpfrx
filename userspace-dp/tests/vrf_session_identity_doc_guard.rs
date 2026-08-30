@@ -117,53 +117,133 @@ fn vrf_session_identity_doc_claims_still_match_the_code() {
          egress, NAT and POLICY decision."
     );
 
-    // Every key transform must PRESERVE the domain. A transform that defaults
-    // it re-creates the collision on that path alone, and no single-VRF test
-    // can see it because the field is 0 everywhere in a single-VRF config.
-    // Counted rather than merely searched: a partial revert that fixes four
-    // transforms and misses one is exactly the plausible mistake here.
+    // The five key transforms split into two groups, and BOTH halves are
+    // load-bearing. Phase 1 had all five preserving the domain, on the belief
+    // that a flow's routing domain is the same in both directions. Phase 2
+    // measured that and it is FALSE in this dataplane: the transit route
+    // lookup is not VRF-isolated (it uses the default table unless a PBR term
+    // overrides it), so a flow that ingresses on a routing-instance member
+    // interface and egresses out of the default instance is a real, working
+    // configuration whose reply resolves a different domain.
+    //
+    //   * SAME-DIRECTION transforms PRESERVE it (forward_wire_key,
+    //     translated_session_key, reverse_session_key) — they name another key
+    //     of the same direction, or navigate between the two halves of one
+    //     flow.
+    //   * REVERSE-MATCH transforms ZERO it (reverse_wire_key,
+    //     reverse_canonical_key) — they build the index a REPLY is looked up
+    //     under, and preserving the domain there blackholes every
+    //     non-contained VRF flow's replies. That is a forwarding outage, not a
+    //     hardening.
+    //
+    // Counted, not merely searched, both ways: a partial revert that "restores
+    // symmetry" on one reverse transform and not the other, or that zeroes a
+    // same-direction transform, is exactly the plausible mistake — and no
+    // single-instance test can see either, because the field is 0 everywhere
+    // in a single-instance config.
     let preserved = key_rs.matches("routing_domain: forward_key.routing_domain,").count()
         + key_rs.matches("routing_domain: key.routing_domain,").count();
     assert_eq!(
-        preserved, 5,
-        "expected all 5 key transforms (forward_wire_key, translated_session_key, \
-         reverse_wire_key, reverse_canonical_key, reverse_session_key) to carry \
-         the source key's routing_domain, found {preserved}. A transform that \
-         zeroes it silently re-opens #2387 on that path."
+        preserved, 3,
+        "expected the 3 SAME-DIRECTION key transforms (forward_wire_key, \
+         translated_session_key, reverse_session_key) to carry the source \
+         key's routing_domain, found {preserved}. A transform that zeroes one \
+         of those loses the discriminator on a path that shares the forward \
+         direction's identity."
+    );
+    let zeroed = key_rs
+        .matches("// #7160 (#2387): REVERSE-MATCH key")
+        .count();
+    assert_eq!(
+        zeroed, 2,
+        "expected the 2 REVERSE-MATCH transforms (reverse_wire_key, \
+         reverse_canonical_key) to build a domain-agnostic key, found \
+         {zeroed} carrying the #7160 marker comment. Preserving the domain \
+         there blackholes the replies of every flow whose reply arrives in \
+         another routing domain."
     );
 
-    // Claim 1b: the field is NOT YET POPULATED. Phase 1 is structural only —
-    // it makes the key ABLE to represent a routing domain, and every value in
-    // the tree is still 0, which is why this change needs no HA protocol bump.
-    // When phase 2 threads StableRoutingInstanceTableID through the control
-    // plane and onto the sync wire, this fires — which is the point.
-    //
-    // Phase 2 does NOT need an HA protocol bump, despite what #7160's issue
-    // text says: that quotes plan §4d, which plan v5 §0a corrected. The domain
-    // rides as a length-gated trailing VALUE field (the #2170 / #5212 shape)
-    // and domain 0 interns to the default instance, so an old peer's omitted
-    // field decodes correctly and a non-VRF cluster is bit-identical across
-    // the mixed-version window. Bumping it anyway would break rolling upgrade
-    // for nothing. See the wire bullet in forwarding/README.md.
-    let proto_dir = root.join("userspace-dp/src/protocol");
-    let mut on_the_wire = false;
-    for e in std::fs::read_dir(&proto_dir).expect("read protocol dir") {
-        let path = e.expect("dir entry").path();
-        if path.extension().and_then(|x| x.to_str()) == Some("rs")
-            && read(&path).contains("routing_domain")
-        {
-            on_the_wire = true;
-        }
-    }
+    // The zeroing above is only SAFE because the reverse bucket walk spends
+    // the reply's own domain on a PREFERENCE instead. Delete the preference
+    // and the reverse direction silently becomes first-installed-wins across
+    // tenants while every test still passes, because a single-instance bucket
+    // has one candidate either way.
+    let lookup_rs = read(&root.join("userspace-dp/src/session/lookup.rs"));
     assert!(
-        !on_the_wire,
-        "routing_domain reached userspace-dp/src/protocol/ — phase 2 has begun. \
-         Carry it as a length-gated trailing VALUE field with domain 0 \
-         interning to the default instance (plan v5 \u{a7}0a), which is what \
-         lets CurrentHAProtocolVersion stay put; do NOT bump it on the \
-         strength of #7160's issue text, which quotes the superseded \
-         \u{a7}4d. Then rewrite the session-identity section of \
-         forwarding/README.md and the #2387 plan status in that change."
+        lookup_rs.contains("if record.key.routing_domain == reply_key.routing_domain {"),
+        "find_forward_nat_match lost the #7160 two-pass domain preference over \
+         the reverse bucket. The reverse-match index is keyed domain-agnostically \
+         on purpose; the preference is the only thing that demuxes two contained \
+         tenants sharing a 5-tuple on the reply direction."
+    );
+    assert!(
+        lookup_rs.contains("let probe = reverse_match_key(reply_key);"),
+        "find_forward_nat_match no longer zeroes the reply key before probing \
+         the reverse bucket — the two halves of the #7160 domain-agnostic \
+         reverse-match convention have drifted apart, and a reply that resolved \
+         a domain now looks for a bucket that was never inserted."
+    );
+
+    // Claim 1b (#7160 phase 2): the field is POPULATED, from ONE site.
+    //
+    // This assertion used to read `!on_the_wire` and fire when `routing_domain`
+    // reached `src/protocol/`, which is what forced this doc update. Rather
+    // than delete it, it is INVERTED: the config snapshot must still be where
+    // the number arrives, and the stamp must still be a single site, so a
+    // future change that starts deriving the domain somewhere else has to come
+    // back through here.
+    let snapshot_rs = read(&root.join("userspace-dp/src/protocol/snapshot.rs"));
+    assert!(
+        snapshot_rs.contains("pub routing_domain: u32,"),
+        "InterfaceSnapshot LOST its routing_domain. The number is decided in Go \
+         (routingInstanceDomain, pkg/dataplane/userspace/routes.go) and shipped \
+         per interface; re-deriving it in Rust would be a second spelling of one \
+         fact that has to mean the same thing on the HA peer."
+    );
+    let poll_rs = read(&root.join("userspace-dp/src/afxdp/poll_descriptor/mod.rs"));
+    let stamps = poll_rs
+        .matches("flow.forward_key.routing_domain =")
+        .count();
+    assert_eq!(
+        stamps, 1,
+        "expected EXACTLY ONE site stamping the flow's routing domain in the \
+         poll path, found {stamps}. Every key the descriptor derives — lookup \
+         key, installed forward key, reverse companion, index entries — has to \
+         carry ONE domain; a second stamp is how they come to disagree."
+    );
+
+    // The stamp must run AFTER fabric-ingress classification. A frame that
+    // arrived over the fabric link did not arrive on the flow's real ingress
+    // interface, so the fabric link's own membership is a WRONG answer rather
+    // than a missing one, and the peer's zone encoding is the only ingress
+    // identity this node can resolve a domain from. Move the stamp above
+    // stage 9 and that input is simply not available yet.
+    let fabric_stage = poll_rs
+        .find("stage_classify_fabric_ingress(packet_frame, &mut meta, now_secs, worker_ctx)")
+        .expect("poll path should still call stage_classify_fabric_ingress");
+    let stamp_at = poll_rs
+        .find("flow.forward_key.routing_domain =")
+        .expect("poll path should still stamp the routing domain");
+    assert!(
+        stamp_at > fabric_stage,
+        "the #7160 routing-domain stamp moved ABOVE fabric-ingress \
+         classification, so a fabric-redirected frame is now stamped with the \
+         FABRIC LINK's routing domain instead of the peer-encoded ingress \
+         zone's."
+    );
+
+    // The HA peer DERIVES the domain from the #7095 cluster-stable ingress
+    // identity rather than reading a wire field. That is what keeps
+    // CurrentHAProtocolVersion still, and what makes the two nodes unable to
+    // disagree — there is only one spelling.
+    let coordinator_rs = read(&root.join("userspace-dp/src/afxdp/coordinator/mod.rs"));
+    assert!(
+        coordinator_rs.contains("pub fn synced_routing_domain("),
+        "the #7160 synced-session routing-domain derivation is gone. If it was \
+         replaced by a wire field, CurrentHAProtocolVersion still must not move \
+         (plan v5 \u{a7}0a) and the field must be length-gated and trailing — and \
+         this guard, the README wire bullet and the plan status all have to say \
+         so."
     );
 
     // Claim 2: session install unconditionally evicts a same-key incumbent,

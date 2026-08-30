@@ -77,6 +77,16 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         .translate_inbound(&mut emb_src_lookup_v6, ingress_zone);
     let emb_src_lookup = IpAddr::V6(emb_src_lookup_v6);
 
+    // #7160 (#2387): the embedded tuple names the ORIGINAL flow, so its key
+    // needs that flow's routing domain or the plain (exact-key) lookups below
+    // miss a session in a non-default routing instance. See the twin comment
+    // in `nat_match_v4.rs` for why the arriving interface is the right source.
+    let embedded_routing_domain = crate::afxdp::forwarding::ingress_routing_domain(
+        ctx.forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+        None,
+    );
     let embedded_key = SessionKey {
         addr_family: libc::AF_INET6 as u8,
         protocol: hdr.proto,
@@ -84,8 +94,8 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
         dst_ip: hdr.dst,
         src_port: hdr.src_port,
         dst_port: hdr.dst_port,
-            discriminator: Default::default(),
-            routing_domain: 0,
+        discriminator: Default::default(),
+        routing_domain: embedded_routing_domain,
     };
     // reverse_key for the forward-NAT lookup uses the WIRE source.
     // Mirrors icmp_embed.rs:369-376.

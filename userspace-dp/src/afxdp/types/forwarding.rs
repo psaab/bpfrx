@@ -127,6 +127,35 @@ pub(in crate::afxdp) struct ForwardingState {
     /// `from`/`to routing-instance` scope against the flow's ingress/egress
     /// interface VRF. An ifindex absent here resolves to "" (default).
     pub(in crate::afxdp) ifindex_to_routing_instance: FastMap<i32, String>,
+    /// #7160 (#2387): LOGICAL ifindex -> routing DOMAIN id, the numeric twin of
+    /// `ifindex_to_routing_instance` above. Built at config-commit from
+    /// `InterfaceSnapshot::routing_domain`, which Go derives from the instance
+    /// NAME (`StableRoutingInstanceTableID`). Absent / default instance = 0.
+    ///
+    /// It is a SEPARATE map rather than a lookup through the name map because
+    /// this one is read on the packet path: the name map answers a
+    /// config-matching question on the NAT slow path and hashes a `String`,
+    /// while this answers "which routing domain does this flow belong to" for
+    /// every session key built from a received frame.
+    pub(in crate::afxdp) ifindex_to_routing_domain: FastMap<i32, u32>,
+    /// #7160 (#2387): zone id -> routing DOMAIN, defined ONLY for a zone whose
+    /// member interfaces all agree on one domain. Read on the fabric-ingress
+    /// path, where the arriving interface is the fabric link rather than the
+    /// flow's real ingress and the peer's zone encoding is the only ingress
+    /// identity available (`ingress_routing_domain`).
+    ///
+    /// A zone whose interfaces span two routing instances is ABSENT rather than
+    /// arbitrarily assigned — the same "identifies exactly one, or nothing"
+    /// discipline as #6722's `ifindex_unambiguous_zone_id`. Absent reads as
+    /// domain 0, which is the pre-#7160 answer.
+    pub(in crate::afxdp) zone_routing_domain: FastMap<u16, u32>,
+    /// #7160: true iff ANY interface resolves to a non-zero routing domain,
+    /// i.e. iff at least one interface is a member of a named routing
+    /// instance. Single-bool gate so a deployment with no routing-instance
+    /// interface membership — every deployment before this change, and the
+    /// overwhelming majority after it — never probes the map at all and its
+    /// session identity stays bit-identical to pre-#7160.
+    pub(in crate::afxdp) has_routing_domains: bool,
     /// #921: ifindex → zone ID (was `FastMap<i32, String>`). Built
     /// at config-commit time from the snapshot's per-interface
     /// zone NAME via the `zone_name_to_id` lookup. Hot-path callers

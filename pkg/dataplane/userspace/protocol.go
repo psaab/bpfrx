@@ -393,6 +393,26 @@ type InterfaceSnapshot struct {
 	// not know the field treats every interface as the default instance
 	// (the pre-#2388 global behavior); an old Go binary omits it.
 	RoutingInstance string `json:"routing_instance,omitempty"`
+	// RoutingDomain is the #7160 (#2387) ROUTING DOMAIN id for
+	// RoutingInstance: `config.StableRoutingInstanceTableID(RoutingInstance)`
+	// for a named instance, and 0 for the default instance. It is the
+	// discriminator the Rust dataplane folds into `SessionKey.routing_domain`
+	// so two routing instances that share a 5-tuple do not collapse to one
+	// conntrack entry.
+	//
+	// It is computed HERE, in Go, rather than hashed independently on the
+	// Rust side, because the number also has to survive a trip across the
+	// HA session-sync wire: a value both nodes derive from the same config by
+	// the same code cannot drift, whereas two implementations of one hash in
+	// two languages is exactly the "when two spellings must agree" trap. The
+	// band is [100000, 999999] (RoutingInstanceTableIDBase/Span), so a named
+	// instance can never collide with the 0 that means "default instance",
+	// and pkg/config's commit-time gate already refuses a name collision
+	// inside the band.
+	//
+	// Additive: an old Rust helper that does not know the field treats every
+	// interface as domain 0, which is the pre-#7160 behaviour exactly.
+	RoutingDomain   uint32 `json:"routing_domain,omitempty"`
 	LinuxName       string `json:"linux_name,omitempty"`
 	ParentLinuxName string `json:"parent_linux_name,omitempty"`
 	Ifindex         int    `json:"ifindex,omitempty"`

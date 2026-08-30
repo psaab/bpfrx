@@ -3289,7 +3289,7 @@ fn nat64_synced_entry_rebuilds_reverse_bib_4565() {
         nat64_snat_v4: "203.0.113.5".to_string(),
         ..SessionSyncRequest::default()
     };
-    let entry = build_synced_session_entry(&req, &zones).expect("build nat64 entry");
+    let entry = build_synced_session_entry(&req, &zones, 0).expect("build nat64 entry");
 
     // (a) NAT64 cross-family bit set -> tx dispatch reverse-translates + #4564
     // reserve arms.
@@ -3346,7 +3346,7 @@ fn nat64_synced_entry_rebuilds_reverse_bib_4565() {
         nat_src_port: 50000,
         ..SessionSyncRequest::default()
     };
-    let plain_entry = build_synced_session_entry(&plain, &zones).expect("build plain entry");
+    let plain_entry = build_synced_session_entry(&plain, &zones, 0).expect("build plain entry");
     assert!(!plain_entry.decision.nat.nat64, "non-nat64 stays non-nat64");
     assert_eq!(plain_entry.metadata.nat64_reverse, None);
     assert_eq!(
@@ -4413,7 +4413,7 @@ fn session_sync_import_stores_locally_resolved_ingress_7095() {
         ingress_vlan_id: 50,
         ..SessionSyncRequest::default()
     };
-    let entry = build_synced_session_entry(&req, &zones).expect("build entry");
+    let entry = build_synced_session_entry(&req, &zones, 0).expect("build entry");
     assert_eq!(
         entry.metadata.ingress_ifindex, 42,
         "a peer-imported session must carry the ingress ifindex the Go side \
@@ -4451,7 +4451,7 @@ fn session_sync_import_keeps_zero_ingress_when_unknown_7095() {
         // sends, since serde defaults them.
         ..SessionSyncRequest::default()
     };
-    let entry = build_synced_session_entry(&req, &zones).expect("build entry");
+    let entry = build_synced_session_entry(&req, &zones, 0).expect("build entry");
     assert_eq!(
         entry.metadata.ingress_ifindex, 0,
         "an absent ingress identity must stay 0 — the consumer falls back to the \

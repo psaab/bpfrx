@@ -48,6 +48,24 @@ pub(crate) struct InterfaceSnapshot {
     /// pre-#2388 global behavior).
     #[serde(rename = "routing_instance", default)]
     pub routing_instance: String,
+    /// #7160 (#2387): the ROUTING DOMAIN id for `routing_instance` —
+    /// `config.StableRoutingInstanceTableID(name)` for a named instance, 0 for
+    /// the default instance. Folded into `SessionKey.routing_domain` for every
+    /// flow that ingresses on this interface, so two routing instances sharing
+    /// a 5-tuple are two conntrack entries instead of one colliding entry.
+    ///
+    /// The NUMBER is decided in Go (`routingInstanceDomain`,
+    /// pkg/dataplane/userspace/routes.go) and never re-derived here. Hashing
+    /// the name independently in Rust would be a second spelling of one fact
+    /// that can drift; the value also has to mean the same thing on the HA
+    /// peer, and "both nodes ran the same Go function over the same config"
+    /// is the property that makes that true by construction.
+    ///
+    /// Additive via serde default: absent on snapshots from an old Go binary,
+    /// in which case every interface is domain 0 — the pre-#7160 behaviour
+    /// exactly, and correct for every single-instance deployment.
+    #[serde(rename = "routing_domain", default)]
+    pub routing_domain: u32,
     #[serde(rename = "linux_name", default)]
     pub linux_name: String,
     #[serde(rename = "parent_linux_name", default)]

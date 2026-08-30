@@ -237,8 +237,13 @@ pub(in crate::afxdp::icmp_embed) fn embedded_reply_key(
         dst_ip: src_ip,
         src_port: reply_src_port,
         dst_port: reply_dst_port,
-            discriminator: Default::default(),
-            routing_domain: 0,
+        discriminator: Default::default(),
+        // #7160 (#2387): a REVERSE-direction key, so domain 0 is the correct
+        // value and not an omission — the reverse-match transforms and index
+        // are domain-agnostic by construction (session/key.rs). The forward
+        // `embedded_key` its callers build alongside this one DOES carry the
+        // arriving interface's domain.
+        routing_domain: 0,
     }
 }
 
