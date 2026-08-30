@@ -911,14 +911,7 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 		// updater for THIS withdraw cycle so the backend that published also
 		// withdraws (else the nop silently drops ownership, orphaning the live
 		// RR — the same hazard the single-family path guards, plan §4.2).
-		if isNopUpdater(env.updater[0]) && !isNopUpdater(m.updater) && m.familyOwnsRecords(4) {
-			env.updater[0] = m.updater
-			slog.Debug("ddns: keeping live v4 updater this cycle to withdraw owned records")
-		}
-		if isNopUpdater(env.updater[1]) && !isNopUpdater(m.updater) && m.familyOwnsRecords(6) {
-			env.updater[1] = m.updater
-			slog.Debug("ddns: keeping live v6 updater this cycle to withdraw owned records")
-		}
+		env.updater = m.applyWithdrawAnchors(env.updater)
 		// Track a single representative live updater for the next-cycle
 		// withdraw guard (m.updater is the "last live backend seen" anchor).
 		if !isNopUpdater(env.updater[0]) {
