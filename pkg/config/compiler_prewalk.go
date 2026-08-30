@@ -448,6 +448,24 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #7525: reject an EMPTY security identity — a zone name, a zone-pair's
+	// from-zone/to-zone, or a policy name. Those committed cleanly and then
+	// diverged: sortDedupZones STRIPS the empty string and an empty zone set
+	// renders and matches as the all-zones wildcard `any`, so the identity
+	// silently WIDENS instead of failing (a fail-open for `then permit`),
+	// while the userspace preflight rejects the same empty reference outright.
+	// Runs HERE, on the group-expanded, inactive-pruned AST, because
+	// normalization is exactly the step that makes the mistake unobservable —
+	// afterwards there is no empty string left, only a wildcard
+	// indistinguishable from an intended one. Strict (commit / commit-check):
+	// hard-reject naming the identity. Lenient (load / peer-sync): warn so an
+	// already-persisted config still boots (#1960).
+	emptyIdentityWarnings, err := validateNonEmptySecurityIdentities(
+		tree.Children, opts.lenientEmptySecurityIdentity)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3444: reject a `security nat destination rule-set <name> to ...`
 	// scope. A Junos destination-NAT rule-set has only a `from` clause —
 	// DNAT translates the destination on inbound, so there is no egress
@@ -599,6 +617,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, policyThenRejectWarnings...)
 	warnings = append(warnings, policyThenDenyWarnings...)
 	warnings = append(warnings, policyMissingMatchWarnings...)
+	warnings = append(warnings, emptyIdentityWarnings...)
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
 	warnings = append(warnings, chassisIdentityWarnings...)
