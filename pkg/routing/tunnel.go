@@ -1236,7 +1236,21 @@ func (t *tunnelManager) clearLocked() error {
 	for name := range names {
 		link, err := t.ops.LinkByName(name)
 		if err != nil {
-			continue // already gone
+			if isLinkNotFound(err) {
+				continue // genuinely gone
+			}
+			// #7529: a transient lookup failure is not absence. Falling through
+			// here dropped the name from ownedNames (it is rebuilt from
+			// `failed` below), so a tunnel still present in the kernel became
+			// untracked and no later Apply retried its delete — leaving a live
+			// link with stale addresses and XFRM if_id state that xpf no longer
+			// believes it owns. Same treatment as a failed LinkDel: retain
+			// ownership and surface the error.
+			slog.Warn("tunnel clear: link lookup failed, retaining ownership for retry",
+				"name", name, "err", err)
+			errs = append(errs, fmt.Errorf("lookup tunnel %s: %w", name, err))
+			failed[name] = true
+			continue
 		}
 		if err := t.ops.LinkDel(link); err != nil {
 			// #4901: a failed LinkDel leaves the tunnel in the kernel. Retain
