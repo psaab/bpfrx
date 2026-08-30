@@ -84,6 +84,12 @@ func sortedPoolNames(pools map[string]*NATPool) []string {
 func ValidateConfig(cfg *Config) []string {
 	var warnings []string
 
+	// #7361: a `pool-utilization-alarm` on an address-only pool can never fire.
+	// Accept-with-advisory (#4316): the combination is valid and the alarm
+	// applies correctly to every other pool, so this must warn rather than
+	// reject.
+	warnings = append(warnings, natPoolAlarmInapplicableWarnings(cfg)...)
+
 	// Note (#1476): the previous "ebpf is deprecated" warning was
 	// removed because `validateDataplaneTypeStrict` now hard-rejects
 	// `dataplane-type ebpf` at commit time with

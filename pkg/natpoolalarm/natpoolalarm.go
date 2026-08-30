@@ -112,7 +112,14 @@ type Monitor struct {
 
 	mu      sync.Mutex
 	active  map[string]*alarmState
-	started bool // run() launched (guards Stop against an unstarted monitor)
+	// #7361: pools whose alarm is STRUCTURALLY INAPPLICABLE, with the reason.
+	// Separate from `active` because this is not a raised alarm — it never
+	// clears on utilization and must never emit a raise/clear syslog. It is a
+	// display fact: `show` renders the alarm config for these pools, and a 0%
+	// utilization is indistinguishable from a healthy pool, so an operator who
+	// configured a raise-threshold needs to learn it cannot arrive.
+	inapplicable map[string]string
+	started      bool // run() launched (guards Stop against an unstarted monitor)
 
 	stopOnce sync.Once // guards close(stop) against concurrent Stop callers
 	stop     chan struct{}
@@ -264,6 +271,42 @@ func (m *Monitor) evaluate() {
 		if p.Deterministic != nil {
 			continue // deterministic pools are skipped in r1
 		}
+		// #7361: an ADDRESS-ONLY pool (`port no-translation`) has no
+		// port-utilization to measure, and its alarm can never fire.
+		//
+		// The allocator's `used_ports` is a popcount over the occupancy
+		// bitmaps; `reserve_address_only` never touches occupancy — it records
+		// ownership in `live.address_only_owners`. So UsedPorts is permanently
+		// 0, pct is permanently 0, and the raise-threshold cannot be crossed.
+		//
+		// THE HARM IS NOT THE MISSING PERCENTAGE, it is that 0% is
+		// indistinguishable from a healthy pool: `show` renders the alarm
+		// config, and the operator reads a working alarm. Marking it
+		// INAPPLICABLE says the thing that is actually true.
+		//
+		// WHY NOT REDEFINE THE DENOMINATOR. #7361 proposes capacity =
+		// AddressCount, used = distinct addresses allocated. That models an
+		// exhaustion mode this pool class does not have: addresses are handed
+		// out round-robin and freely REUSED across flows with different
+		// destination tuples, so an address-only pool exhausts on
+		// reverse-identity collision, not on running out of addresses. A
+		// one-address pool would report 100% after its first flow and stay
+		// there while serving thousands more — an alarm that fires on the first
+		// packet and never clears, which is worse than the current silence
+		// because it trains operators to ignore the alarm that DOES work on
+		// port-bearing pools.
+		//
+		// If a genuine early warning is wanted for this class, the signal is
+		// the denial rate (the AllocatorExhausted / collision path), not a
+		// utilization ratio. That is a different mechanism with its own
+		// threshold semantics and is deliberately not folded in here.
+		if p.PortNoTranslation {
+			eligible[poolName] = true
+			m.markInapplicable(poolName, "address-only pool (port no-translation) "+
+				"has no port utilization to measure")
+			continue
+		}
+		m.clearInapplicable(poolName)
 		eligible[poolName] = true
 
 		s, present := view.Pools[poolName]
@@ -406,4 +449,42 @@ func (m *Monitor) ActiveAlarms() []ActiveAlarm {
 	m.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].PoolName < out[j].PoolName })
 	return out
+}
+
+// markInapplicable records that a pool's utilization alarm cannot fire, with
+// the reason (#7361).
+//
+// It emits NO syslog. This is not an alarm transition — it is a statement about
+// the alarm's applicability, and raising it would be a permanent alarm on a
+// healthy pool, which is exactly the failure mode #7361's proposed denominator
+// would have produced.
+func (m *Monitor) markInapplicable(poolName, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.inapplicable == nil {
+		m.inapplicable = map[string]string{}
+	}
+	m.inapplicable[poolName] = reason
+	// A pool that was raised under a previous config (port-bearing) and is now
+	// address-only must not stay latched: the alarm it was raised on no longer
+	// exists. Drop the state without a clear syslog — the CLEAR would claim
+	// utilization fell below the threshold, which is not what happened.
+	delete(m.active, poolName)
+}
+
+// clearInapplicable drops any inapplicability record for a pool that is now
+// measurable again (#7361), e.g. `port no-translation` removed on a commit.
+func (m *Monitor) clearInapplicable(poolName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.inapplicable, poolName)
+}
+
+// InapplicableReason returns why a pool's utilization alarm cannot fire, or ""
+// when it can (#7361). Rendering surfaces use it to show NOT APPLICABLE instead
+// of a healthy-looking 0%.
+func (m *Monitor) InapplicableReason(poolName string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inapplicable[poolName]
 }
