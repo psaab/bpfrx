@@ -672,3 +672,114 @@ fn a_permitted_snat_reply_through_the_nat_alias_is_untouched_7212() {
         "an Accept verdict must re-stamp the aliased entry too"
     );
 }
+
+/// A NON-FIRST FRAGMENT of a PERMITTED flow must not revoke it.
+///
+/// `Filter::varies_per_packet_within_flow()` is not a complete purity gate:
+/// `port_terms_match` reads `TermMatchExtra` too, and any term with a PORT
+/// constraint fails to match when `(is_fragment && !l4_present)`. Evaluated
+/// against the frame, the shape below skips its `web` permit on a fragment and
+/// falls through to the catch-all `deny-rest` — revoking a session the operator
+/// permits, off ONE fragment. Evaluated on the 5-tuple alone, `web` matches and
+/// the session is kept.
+///
+/// The `deny-rest` term is what makes this distinguishing. Without a catch-all
+/// behind the permit, a fragment would simply match no term and reach the
+/// implicit Accept, and the cell would be green against both implementations.
+#[test]
+fn a_non_first_fragment_of_a_permitted_flow_does_not_revoke_it_7212() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![
+            accept_term("web", "5201"),
+            FirewallTermSnapshot {
+                name: "deny-rest".into(),
+                action: "discard".into(),
+                syslog: false,
+                reject_message_type: String::new(),
+                ..Default::default()
+            },
+        ],
+    );
+    let flow = v4_flow(5201);
+    let mut sessions = table_with_session(&flow, 6, 7);
+    let fragment = non_first_fragment_frame();
+    // Fixture liveness: the frame really is a non-first fragment, so the
+    // frame-derived extra really would suppress the port-constrained permit.
+    let extra = crate::afxdp::frame::term_match_extra_from_frame(
+        &fragment,
+        meta(LAN_IFINDEX as u32, 0, false),
+    );
+    assert!(
+        extra.is_fragment && !extra.l4_present,
+        "fixture liveness: the frame must derive is_fragment && !l4_present, or \
+         the port gate is never reached and this cell proves nothing"
+    );
+
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &flow.forward_key,
+            &fragment,
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a fragment must not revoke a flow the filter permits on its 5-tuple"
+    );
+    assert!(
+        !sessions.filter_revalidation_stale(&flow.forward_key),
+        "the permitted flow is still re-stamped"
+    );
+}
+
+/// The control for the cell above: with the SAME fragment, a flow the filter
+/// does NOT permit is still revoked. Evaluating on the 5-tuple must not turn
+/// into "a fragment disables revalidation".
+#[test]
+fn a_non_first_fragment_still_revokes_a_denied_flow_7212() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![
+            accept_term("web", "5201"),
+            FirewallTermSnapshot {
+                name: "deny-rest".into(),
+                action: "discard".into(),
+                syslog: false,
+                reject_message_type: String::new(),
+                ..Default::default()
+            },
+        ],
+    );
+    // Same filter, a flow on a port the permit does not cover.
+    let flow = v4_flow(9999);
+    let mut sessions = table_with_session(&flow, 6, 7);
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &flow.forward_key,
+        &non_first_fragment_frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("a denied flow must still be revoked when a fragment triggers it");
+    assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
+    assert_eq!(hit.revoked_key.as_ref(), Some(&flow.forward_key));
+}
+
+/// The shared TCP SYN frame with the IPv4 fragment-offset field set to a
+/// NON-ZERO offset, which is what makes it a non-first fragment: no L4 header
+/// lives at `l4_offset`, its bytes are payload.
+fn non_first_fragment_frame() -> Vec<u8> {
+    let mut frame = frame();
+    // IPv4 flags+fragment-offset is bytes 6..8 of the IP header, and the IP
+    // header starts at 14 (Ethernet II, untagged).
+    frame[20] = 0x00;
+    frame[21] = 0x01; // offset = 1 (8 bytes in), MF clear -> the LAST fragment
+    frame
+}

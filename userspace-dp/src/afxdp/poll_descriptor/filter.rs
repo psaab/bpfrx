@@ -453,7 +453,6 @@ pub(super) fn evaluate_input_filter_on_session_hit(
         sessions,
         canonical_key,
         filter,
-        frame,
         flow,
         meta,
         ingress_zone_override,
@@ -482,19 +481,44 @@ fn revalidate_static_input_filter_on_session_hit(
     // The CANONICAL key, already resolved by the caller.
     canonical_key: crate::session::SessionKey,
     filter: &crate::filter::Filter,
-    frame: &[u8],
+    // No `frame`: this evaluation is deliberately frame-INDEPENDENT (see the
+    // `TermMatchExtra::default()` note in the body). Taking the frame and not
+    // reading it would invite the next author to "use it".
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
 ) -> Option<SessionHitInputFilterEval> {
-    // The filter is static, so `extra` is inert for every one of its terms
-    // (each per-packet condition is gated on the term flag that would have made
-    // `varies_per_packet_within_flow()` true). It is built from the frame anyway
-    // so this derivation and the counted evaluator below run on IDENTICAL
-    // inputs — the two must agree on the action, and building a different
-    // `TermMatchExtra` for each would make that agreement an argument rather
-    // than a fact.
-    let extra = term_match_extra_from_frame(frame, meta);
+    // #7212: the revalidation asks a question about the FLOW, so it evaluates on
+    // the flow's 5-tuple ALONE — `TermMatchExtra::default()`, not the frame.
+    //
+    // `varies_per_packet_within_flow()` is NOT a complete purity gate, and using
+    // the frame-derived extra here was a real defect. That predicate covers the
+    // #1430 DSCP and #2362 per-packet-L4 conditions, but `port_terms_match` also
+    // reads the extra: any term with a PORT constraint fails to match when
+    // `(is_fragment && !l4_present)` or `ports_unknown`. So an ordinary static
+    // shape —
+    //
+    //     term web       { from destination-port 5201; then accept; }
+    //     term deny-rest { then discard; }
+    //
+    // — evaluated against a NON-FIRST FRAGMENT of a permitted flow would skip
+    // `web` (its port constraint fails closed on a fragment), fall through to
+    // `deny-rest`, and REVOKE a session the operator permits. One fragment,
+    // whole flow gone. `TermMatchExtra::default()` leaves the fragment gate
+    // untriggered (`is_fragment = false`, `ports_unknown = false`) and every
+    // per-packet-L4 condition inert (a static filter carries none by
+    // construction), so what remains is exactly the 5-tuple verdict.
+    //
+    // That is the RIGHT answer in both directions, not merely the safe one: a
+    // deny on the flow's port still revokes when a fragment is the packet that
+    // triggers the revalidation, and a permit on the flow's port still protects
+    // it. Whether the FRAGMENT itself is forwarded is a separate question the
+    // ordinary per-packet path answers with the frame-derived extra.
+    //
+    // The counted evaluator below is handed the SAME extra, so the two walks
+    // cannot disagree on the action — which matters, because the caller drops on
+    // the counted walk's action while tearing down on this one's.
+    let extra = crate::filter::TermMatchExtra::default();
     let verdict = crate::filter::filter_ref_static_verdict(
         filter,
         flow.src_ip,
