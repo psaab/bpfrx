@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1220,13 +1221,27 @@ func (s *Store) saveRollbackFiles() {
 	for i, entry := range entries {
 		if entry.Config == nil {
 			// #4810: a tombstoned slot (unreadable/corrupt at load, see
-			// loadRollbackHistory) has no config text to persist. Leave
-			// its on-disk file untouched — writing would dereference a
-			// nil Config, and removing it would let a NEXT boot's
-			// os.IsNotExist break() truncate every slot after it. The
-			// slot stays visibly broken (same tombstone next boot) until
-			// an operator fixes it out-of-band, instead of silently
-			// losing later, otherwise-fine slots.
+			// loadRollbackHistory) has no config text to persist, and removing
+			// the file would let a NEXT boot's os.IsNotExist break() truncate
+			// every slot after it. So the file must keep existing.
+			//
+			// #7176 (C179-056): it must NOT keep its OLD CONTENT. Leaving the
+			// file untouched was the defect: history is most-recent-first and
+			// shifts by one on every commit, so the bytes still sitting in slot
+			// i+1 came from the PREVIOUS generation's slot i+1 — a different
+			// entry. Next boot they parse cleanly and the slot presents as
+			// healthy, so `rollback i+1` hands the operator a config from
+			// another generation with nothing in the load path able to detect
+			// it. A wrong answer to a recovery command is worse than a refused
+			// one.
+			//
+			// Writing the marker preserves #4810's file-must-exist requirement
+			// while guaranteeing the slot cannot masquerade as healthy config.
+			path := s.rollbackPath(i + 1)
+			if err := rbWriteFileAtomic(path, []byte(rollbackTombstoneMarker), 0600); err != nil {
+				slog.Warn("failed to write rollback tombstone marker", "path", path, "err", err)
+				degraded = true
+			}
 			continue
 		}
 		path := s.rollbackPath(i + 1)
@@ -1338,6 +1353,29 @@ func (s *Store) loadRollbackHistory() {
 			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
 			continue
 		}
+		// #7176 (C179-056): an explicit tombstone written by saveRollbackFiles.
+		//
+		// THIS CHECK IS DIAGNOSTIC, NOT A CORRECTNESS GUARD, and the mutation
+		// matrix is how I know: deleting it changes no outcome. The marker ends
+		// in a stray "}", so a loader that falls through to the parser gets a
+		// parse error and tombstones the slot via the corrupt-file branch below
+		// — the same result. What this buys is the LOG: an operator seeing
+		// "corrupt rollback file" on every boot cannot tell a recorded tombstone
+		// from a slot that needs investigating.
+		//
+		// The safety property lives entirely in the marker's CONTENT, and it is
+		// load-bearing there. A bare "# xpf-rollback-tombstone" comment parses
+		// with ZERO errors into an EMPTY config (measured), so without the
+		// trailing brace a reader predating this check would present the slot as
+		// a healthy empty configuration and `rollback N` would WIPE the config
+		// rather than return the wrong generation — the fix making the bug
+		// worse. TestTombstoneMarkerFailsToParse_7176 binds that, and it is the
+		// cell to keep if this check is ever removed.
+		if bytes.HasPrefix(data, []byte(rollbackTombstoneMarkerPrefix)) {
+			slog.Info("rollback slot is a recorded tombstone", "path", path)
+			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
+			continue
+		}
 		parser := config.NewParser(string(data))
 		tree, errs := parser.Parse()
 		if len(errs) > 0 {
@@ -1377,3 +1415,22 @@ func (s *Store) loadRollbackHistory() {
 		slog.Info("loaded rollback history", "entries", len(entries))
 	}
 }
+
+// Rollback-slot tombstone marker (#7176 C179-056).
+//
+// Written into a slot whose history entry is a tombstone, so the file keeps
+// existing (the #4810 sequence-contiguity requirement) without keeping the
+// PREVIOUS generation's config text, which would re-load as a healthy slot at a
+// shifted index.
+//
+// The two lines do different jobs. The first is a human-readable comment naming
+// the file, and is what loadRollbackHistory prefix-matches. The second is a
+// stray closing brace that guarantees a PARSE ERROR — which is what makes the
+// marker safe on a reader predating the prefix check, since that reader
+// tombstones it through the corrupt-file branch. Without the brace the file is a
+// comment-only config that parses cleanly into an EMPTY tree, and an old reader
+// would offer it as a valid rollback target that wipes the configuration.
+const (
+	rollbackTombstoneMarkerPrefix = "# xpf-rollback-tombstone"
+	rollbackTombstoneMarker       = rollbackTombstoneMarkerPrefix + "\n}\n"
+)

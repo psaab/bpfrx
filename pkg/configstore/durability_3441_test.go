@@ -445,16 +445,27 @@ func TestSaveRollbackFilesSkipsTombstoneWithoutPanic(t *testing.T) {
 		t.Fatalf("commit hostE (with a tombstoned history entry present): %v", err)
 	}
 
-	// Slot 3 must be BYTE-IDENTICAL to before the commit: saveRollbackFiles
-	// must skip writing the position the tombstone now occupies rather than
-	// dereferencing its nil Config (which would panic) or overwriting a
-	// perfectly good slot with garbage.
+	// The subject of this test is that saveRollbackFiles does not dereference a
+	// tombstone's nil Config (which would panic). The commit above completing is
+	// that property, and it is unchanged.
+	//
+	// #7176 (C179-056) changed what the slot must CONTAIN. This used to assert
+	// slot 3 was BYTE-IDENTICAL, reasoning that saveRollbackFiles "must not
+	// overwrite a perfectly good slot with garbage". That rationale does not
+	// survive measurement: the slot is only perfectly good for a position it NO
+	// LONGER OCCUPIES. History is most-recent-first and shifted on this commit,
+	// so those bytes belong to the previous generation's slot 3 — and persisting
+	// them is exactly what resurrects the tombstone as a HEALTHY entry on the
+	// next boot (see TestRollbackTombstoneSurvivesReload_7176, which is the
+	// across-restart cell this suite did not have).
 	after, err := os.ReadFile(slot3)
 	if err != nil {
 		t.Fatalf("read slot 3 after commit: %v", err)
 	}
-	if string(before) != string(after) {
-		t.Errorf("slot 3 changed after a commit with a tombstone at that history position:\nbefore=%q\nafter=%q", before, after)
+	if string(after) != rollbackTombstoneMarker {
+		t.Errorf("slot 3 must hold the tombstone marker after the commit, not another "+
+			"generation's config:\nbefore=%q\nafter=%q\nwant=%q",
+			before, after, rollbackTombstoneMarker)
 	}
 }
 
