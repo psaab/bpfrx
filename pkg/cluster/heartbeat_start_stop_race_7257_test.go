@@ -263,6 +263,23 @@ func TestStartHeartbeatDoesNotRaceStopHeartbeat7257(t *testing.T) {
 			// detector still sees unsynchronised accesses. That is the property;
 			// pacing changes only how often the probe reaches it.
 			time.Sleep(time.Duration(rand.Intn(2*startCostMicros)) * time.Microsecond)
+			// #7970 RETRO-EXPLANATION. This mechanism accounts for every
+			// symptom the flake showed, which is how you tell it is THE cause
+			// rather than a cause:
+			//
+			//   - it red at exactly 30.00s, never a jittery value, because the
+			//     awaited event was IMPOSSIBLE rather than late — the full
+			//     budget was paid every time;
+			//   - #7679 raising the bound 5s -> 30s did not help and could not
+			//     have: a larger bound only buys a longer wait for an event
+			//     that will never arrive;
+			//   - it passed in 0.010s in isolation, because on an idle box this
+			//     goroutine wins the first-schedule race trivially;
+			//   - it SURVIVED the #7663 pacing fix, because pacing changes how
+			//     often starts reach the publish window and touches the
+			//     first-schedule race not at all. (That is also why linking the
+			//     two issues as one defect was wrong.)
+			//
 			// #7970: the `done` check is at the END, so this goroutine always
 			// completes AT LEAST ONE stop before it can exit.
 			//
