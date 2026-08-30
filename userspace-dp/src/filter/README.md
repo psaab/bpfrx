@@ -311,6 +311,24 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   comparisons, so a policy added later must classify itself on both axes instead
   of inheriting whichever answer a negated comparison happened to give it.
 
+  **The revalidation passes `TermMatchExtra::default()`, not the frame — and
+  `varies_per_packet_within_flow()` is NOT a complete purity gate.** That
+  predicate covers the #1430 DSCP condition and the #2362 per-packet-L4
+  conditions, and it is tempting to conclude that a filter failing it reads
+  nothing from `TermMatchExtra`. It is not true: `port_terms_match` reads
+  `is_fragment`, `l4_present` and `ports_unknown`, gated on a PORT constraint
+  rather than on either flag. Against a NON-FIRST FRAGMENT, that gate suppresses
+  every port-constrained term — so `term web { from destination-port 5201; then
+  accept; } term deny-rest { then discard; }` skips its permit, falls through to
+  the deny, and would REVOKE a session the operator permits, off one fragment.
+  The revalidation asks a question about the FLOW, so it evaluates on the flow's
+  5-tuple alone: `default()` leaves the fragment gate untriggered and every
+  per-packet-L4 condition inert, which is exactly the 5-tuple verdict, and the
+  DENY-path counted walk is handed the same value so the two cannot disagree. A
+  future read of `TermMatchExtra` from OUTSIDE `per_packet_l4_matches` — the one
+  place `varies_per_packet_within_flow()` actually summarises — has to be
+  re-checked against this argument.
+
 - **A routing-instance term that ALSO carries `reject`/`discard` is a DENY
   (#4392).** The non-PBR precheck DEFERS any matched routing-instance term
   (`eval.rs`: a matched term with a non-empty `routing_instance` returns the

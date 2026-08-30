@@ -443,6 +443,15 @@ pub(super) fn evaluate_input_filter_on_session_hit(
     // stamp, because on the NAT reverse-translated alias path (the reply to a
     // source-NAT'd flow) the two differ and a primary-index probe on the wire
     // tuple silently misses the entry.
+    //
+    // `None` here means this worker's table holds no entry for the packet's
+    // tuple, which is not a miss to work around: the established hit was served
+    // from the SHARED map without a local install (the #2120 transient
+    // synced-hit path, `should_keep_synced_hit_transient`). There is no local
+    // session to stamp or to tear down. It is bounded rather than open-ended —
+    // `maybe_promote_synced_session` installs the entry on a later packet, and
+    // an installed peer-synced entry carries generation `0`, so the promoted
+    // session revalidates before this node forwards on it as its own.
     let canonical_key = sessions.canonical_session_key(session_key)?;
     // Nothing to do until the snapshot moves.
     if !sessions.filter_revalidation_stale(&canonical_key) {

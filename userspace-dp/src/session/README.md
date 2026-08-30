@@ -520,9 +520,20 @@ TRANSLATED tuple, which names no entry in the primary index. That path is the
 reply to every source-NAT'd flow, so a primary-index-only probe would report the
 whole reverse direction fresh, never revalidate it, and never re-stamp it — and a
 teardown handed the translated key would delete nothing. `canonical_session_key`
-resolves it the same two ways `lookup_with_origin` does, and the verdict carries
-the resolved key rather than a bool so the teardown acts on the session that was
-judged.
+resolves it the same two ways `lookup_with_origin` does — the primary key, then
+the reverse-translated index with its own `is_reverse` + round-trip validation —
+and the verdict carries the resolved key rather than a bool so the teardown acts
+on the session that was judged. Those are the only two indexes an established
+HIT resolves through; `forward_wire_index` and `nat_reverse_index` back the
+reverse-session SYNTHESIS finders on the session-MISS path, which produce a
+`ResolvedSessionKey::Canonical` key directly.
+
+A `None` from that resolution is not a gap to work around: it means this
+worker's table holds no entry for the tuple, because the hit was served from the
+SHARED map without a local install (the #2120 transient synced-hit path). There
+is nothing local to stamp or tear down, and the window is bounded —
+`maybe_promote_synced_session` installs the entry on a later packet, with
+generation `0`, so it revalidates before this node forwards on it as its own.
 
 On an established-session HIT, `evaluate_input_filter_on_session_hit`
 (`afxdp/poll_descriptor/filter.rs`) does ONE `iface_filter_v{4,6}_fast` lookup
