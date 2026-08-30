@@ -185,8 +185,22 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 	// peer-synced config still boots — #1960). Runs on the fully-compiled
 	// *Config so the community map is populated regardless of authoring order.
 	// Mirrors validateRoutingExportReferencesStrict.
+	// #7530 SNMPv3 partial-credential gate. Strict on commit / commit-check,
+	// lenient on the tolerant ingress. The agent's per-user security floor is
+	// derived from the KEY, so a protocol with no material behind it has no
+	// floor and serves below the configured level. Enforce the configured
+	// INTENT here rather than degrading at serve time.
+	if err := validateSNMPv3UserKeyMaterialStrict(cfg); err != nil {
+		if opts.lenientSNMPv3KeyMaterial {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("snmpv3 key material (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #7471 as-path REFERENCE gate. Strict on commit / commit-check, lenient on
-	// the tolerant ingress. Separate from the community gate above because the
+	// the tolerant ingress. Separate from the community gate below because the
 	// CONSEQUENCE is opposite: a dangling community makes frr-reload fail
 	// loudly, a dangling as-path is accepted by FRR and silently never matches.
 	if err := validatePolicyASPathReferencesStrict(cfg); err != nil {

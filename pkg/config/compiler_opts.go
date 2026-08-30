@@ -2094,6 +2094,13 @@ type compileOpts struct {
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
 
+	// lenientSNMPv3KeyMaterial (#7530) downgrades the partial-credential
+	// rejection to a warning on the tolerant Load / SyncApply ingress. An
+	// already-persisted or peer-synced config carrying a protocol without its
+	// key served at the lower level before this gate and still does, so
+	// refusing to boot would cost availability with no gain in security --
+	// while a warning gets the operator to the fix (#1960 no-brick).
+	lenientSNMPv3KeyMaterial bool
 	// lenientPolicyASPathRef (#7471) downgrades the dangling `from as-path`
 	// rejection to a warning on the tolerant Load / SyncApply ingress, so an
 	// already-persisted or peer-synced config carrying the typo still boots
@@ -2545,7 +2552,8 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyValuelessMatch:            true,
 		lenientPolicyCommunityRef:              true,
-		lenientPolicyASPathRef:              true,
+		lenientSNMPv3KeyMaterial:               true,
+		lenientPolicyASPathRef:                 true,
 		lenientPolicyASPathRegex:               true,
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
