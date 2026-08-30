@@ -184,3 +184,85 @@ failed to ask:
    carried instead?
 2. Is the applier reachable from a periodic converger, or only from a
    transition edge? An edge-only applier loses every failure.
+
+## Measurement 3 — the typed marker is PLAN-KILLED; the registry is built (#7343)
+
+The triage above proposed two mechanisms. Classifying all **42** population
+sites (the count in Measurement 1 was 43; one has since moved) settles which is
+worth building, and the answer was not the one the cost estimate predicted.
+
+**19 sites are structurally not markers.** Measurement 1 anticipated most of
+this; reading the rest added two categories it did not list — **read-outs into a
+display view or a returned snapshot** (`cli_show_security_filters.go`,
+`sync_bulk.go`, `surface_a.go`) and one **log-dedup memo**
+(`tunnels.go`'s `lastPublishedWgEndpoints`, which remembers what was last
+*logged*, not what was applied).
+
+**23 sites are real markers, and every one of them is already correct** — by
+four different mechanisms:
+
+| how it is correct | n |
+|---|---|
+| early return: the error path returned above the stamp | 11 |
+| caller contract or explicit guard | 7 |
+| status readback or dedup-skip — no error exists at all | 4 |
+| advances on failure, deliberately (`pkg/dhcpserver`, #6535) | 1 |
+
+**Exactly one site has a live, unreturned error in scope at the stamp**, and it
+is the declared escape. This was checked rather than sampled: a scan for
+enclosing functions that accumulate errors (`errors.Join` / `errs = append`)
+flagged 5 of 42, deliberately over-reporting; two are zero-resets, two are
+`manager_worker_arm` where the `errors.Join` sits inside an early `return` above
+the stamp, and one is `dhcpserver`.
+
+### Why `Advance(gen, err)` does not work here
+
+The honest test proposed on #7343 was *"if a third of the real markers need the
+escape hatch, the guard is not buying much."* The escape rate is **1 in 23**,
+comfortably under that bar. **The mechanism still fails, for a different
+reason.**
+
+`Advance(gen, err)` makes the unsafe form unwritable by forcing the caller to
+hold the outcome — but at 22 of 23 real markers **there is no error in scope to
+pass**. Every one of those sites would migrate to a literal `Advance(gen, nil)`.
+
+> A parameter that is `nil` at every call site encodes no contract. It is a
+> no-op wearing the shape of a guarantee — and it is worse than nothing,
+> because a reviewer seeing `Advance(gen, err)` would reasonably conclude the
+> invariant is now type-enforced.
+
+That is the same "looks checked, checks nothing" failure #6533 was killed for,
+relocated from a lint into an API. A single `Advance` signature also flattens
+four genuinely different correctness mechanisms: `rg_state.MarkApplied` contains
+no error *by design*, `process_status`'s readback mirrors bookkeeping the helper
+has *already confirmed*, and its dedup-skip advances when nothing was published
+*and that is correct*.
+
+### What was built instead: the driver registry (I2)
+
+`pkg/refactoraudit/applied_marker_registry_7343_test.go` is item 2, and it is
+the half #7343 identified as load-bearing — *"storage without a driver is the
+bug."* It holds two tables: real markers, each naming the periodic symbol that
+re-drives it and why its stamp is correct; and non-markers, each with its
+reason.
+
+Three properties are asserted, and all five mutations of them red:
+
+1. **Every population assignment is classified.** A new marker added anywhere in
+   the tree arrives as an unclassified statement and fails. This is the
+   recurrence guard: a marker added without a driver cannot land silently.
+2. **Every registered marker names a driver symbol that exists.** Renaming or
+   deleting a converger fails, which is the twelve-times-recurring defect.
+3. **`pkg/dhcpserver`'s advance-on-failure is a first-class declaration** naming
+   `ClaimApplyRetry` as its driver — not a `//nolint`, which is precisely the
+   suppression #6533 was killed for.
+
+The inventory is keyed on **(file, statement, count)**, not `file:line`: a
+line-keyed registry goes stale on any edit above a site and would fail for
+reasons unrelated to convergence, while counting identical statements per file
+is stable under line drift and still fails when a new assignment appears.
+
+**The two reviewer questions below still stand.** The registry checks that a
+driver exists and is named; it does not check that the driver's predicate is
+`desired != applied`, and it cannot tell you whether a *new* marker's stamp is
+on a failure path. That judgement remains review-enforced.
