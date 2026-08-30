@@ -303,8 +303,8 @@ func lo0FilterDefined(cfg *config.Config, name string, v6 bool) bool {
 // a lifeline has that address fenced like any other for the fence window; the
 // mandatory ct established,related admit keeps an already-open session up, and
 // the drop is destination-address-only with no iifname (#3718), so the ingress
-// path cannot exempt it. See docs/host-inbound-service-matrix.md, "Lifeline
-// exclusion is by INTERFACE, not by address value". It carries no named counters
+// path cannot exempt it. See docs/host-inbound-service-matrix.md,
+// "Lifeline exclusion is by address VALUE, in the fence and the real table". It carries no named counters
 // (a fence is transient).
 //
 // A fence deliberately does NOT set lo0Enforced — that flag is set true ONLY by a
@@ -477,11 +477,12 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// host-inbound admission (fail-open; Junos passes no traffic on an unzoned
 	// interface). These get their own catch-all DROP below. The builder excludes
 	// lifeline INTERFACES and subtracts zoned addresses, so this never conflicts with
-	// a zone rule — but it does NOT subtract lifeline address VALUES: a management
-	// address also configured on an UNZONED interface lands here with an EMPTY admit
-	// set, so the real table drops new management connections to it and the #5566
-	// reconcile flushes the established ones. See docs/host-inbound-service-matrix.md,
-	// "Lifeline exclusion is by INTERFACE, not by address value".
+	// a zone rule — and since #7284 it also subtracts lifeline address VALUES. A
+	// management address additionally configured on an UNZONED interface used to
+	// land here with an EMPTY admit set, so the real table dropped new management
+	// connections to it and the #5566 reconcile — fed from this same set — flushed
+	// the established ones. See docs/host-inbound-service-matrix.md,
+	// "Lifeline exclusion is by address VALUE, in the fence and the real table".
 	unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
 	// #3698: surface the transient fail-open admit window. A configured
 	// host-inbound-enforcing zone whose non-lifeline interfaces have no
@@ -777,8 +778,8 @@ func (d *Daemon) installHostInboundGapFence(uncoveredV4, uncoveredV6 []string, w
 // — or shared with — a lifeline interface is ever dropped here. A non-lifeline
 // address the operator happens to manage the box on IS fenced for the fence
 // window, with only the mandatory ct established,related admit keeping an open
-// session up. See docs/host-inbound-service-matrix.md, "Lifeline exclusion is by
-// INTERFACE, not by address value". It carries no named counters (a fence is
+// session up. See docs/host-inbound-service-matrix.md,
+// "Lifeline exclusion is by address VALUE, in the fence and the real table". It carries no named counters (a fence is
 // transient) so
 // it has fewer moving parts than the real payload and is more likely to load when
 // the real one hit a payload-specific nft error. After successful nft completion,
