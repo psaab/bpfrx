@@ -337,6 +337,43 @@ inline archive-site passwords).
   fields dropped — an EMPTY tree — booting a committed-empty config (loss of
   policy) instead of failing closed. This restores at the inner layer the same
   no-empty-load-on-unknown property the outer envelope provides.
+- **A wrong JSON TYPE on an envelope field fails closed too (#7454).** #4888's
+  guard sits AFTER the initial unmarshal, and that unmarshal swallowed every
+  error as *"not the envelope object shape at all — a genuine plaintext body.
+  Pass through."* That comment is true for a **syntax** error. It is not true
+  for a `*json.UnmarshalTypeError`: a perfectly good JSON object, with the right
+  keys, one carrying the wrong JSON type (`"salt": 5`, `"format": []`,
+  `"prf": {}`, `"nonce": true`) took the same branch and passed through as
+  plaintext — reaching the empty-tree, committed-empty boot that the guard
+  immediately below it exists to prevent.
+
+  **The failure was completely silent.** The #4579 plaintext-downgrade warning
+  does not fire either: it keys on `masterPasswordPRF(tree) != ""` and the tree
+  is empty. Contrast the string-valued path, which is correctly fatal all the
+  way to `daemon_run_bringup.go` refusing to start.
+
+  The fix decides envelope-ness by **key presence**, before the typed decode,
+  rather than by discriminating the error type. It is strictly stronger and
+  carries **no over-rejection risk here**: the plaintext body written by
+  `writeTreeMarked` is `json.MarshalIndent` of a `config.ConfigTree`, whose only
+  top-level key is `Children`. None of the five envelope keys can appear in a
+  genuine plaintext body, so any body carrying one was MEANT to be an envelope
+  and a decode failure on it is corruption — whatever its shape.
+
+  **Measured, and it corrects the issue's framing:** JSON `null` is *not* a type
+  error in Go. It decodes into any type as a no-op, leaving the zero value, so a
+  null-valued field reaches the envelope's own required-field check (or #4888's
+  discriminator check, for a null `format`) and was **already** fail-closed by a
+  different guard. Only a genuine wrong type took the passthrough branch. The
+  table keeps both kinds of row with their distinct expected diagnoses, because
+  an operator tells a corrupt envelope from an unsupported one by that wording
+  and the two have different remedies.
+
+  Reachability is a corrupted or tampered `active.json`, so this is
+  "fails OPEN to no-policy where the neighbouring branch fails closed", not
+  attacker-reachable — but a partial disk write or a truncated value is a
+  plausible way in, and it is exactly the state the fail-closed design exists to
+  prevent.
 - **Non-object top-level body fails closed (#5474).** After the envelope is
   stripped and any AES-GCM ciphertext decrypted, `readTreeMeta` requires the
   final plaintext ConfigTree body to be a JSON OBJECT (`requireJSONObject`)
