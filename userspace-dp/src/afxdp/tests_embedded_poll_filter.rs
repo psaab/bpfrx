@@ -2966,3 +2966,328 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
     assert_eq!(event_handle.dataplane_event_stats().filter_log.sent, 1);
 }
 
+
+
+/// #7359: the flowless embedded-ICMP NAT reversal used to forward to the
+/// client BEFORE the interface input filter ran, so a `filter input` attached
+/// to the ingress interface never saw a reverse-translated ICMP error.
+///
+/// This is the SAME fixture as the #5690 reachability test above — same NAT
+/// session, same frame, same ingress — with one difference: a `discard` input
+/// filter on the ingress unit. That is deliberate. The sibling test asserts
+/// the reversal DOES queue a forward with this fixture, so the pair shows the
+/// filter is what changed the outcome and not something about the setup.
+///
+/// Fail-on-revert: move the input-filter evaluation back below the
+/// `is_embedded_icmp_error` branch in poll_descriptor/mod.rs and the reversal
+/// queues its forward before the filter runs, so `scratch_forwards` is
+/// non-empty and this test goes RED.
+#[test]
+fn input_filter_discard_drops_the_embedded_icmp_reversal_7359() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    // Outer: router -> snat_ip; embedded quoted: snat_ip:snat_port -> server:80.
+    let frame = build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+
+    // allow_embedded_icmp gates the poll-path reversal — enable it.
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    // #7359: attach `filter input` with a bare `discard` term to the WAN unit
+    // the error ingresses on. Nothing about the filter is ICMP-specific — a
+    // term with no match criteria matches every packet arriving there, which
+    // is exactly the operator expectation this path violated.
+    snapshot.filters.push(crate::protocol::FirewallFilterSnapshot {
+        name: "block-all-in".to_string(),
+        family: "inet".to_string(),
+        terms: vec![crate::protocol::FirewallTermSnapshot {
+            name: "t-discard".to_string(),
+            action: "discard".to_string(),
+            ..Default::default()
+        }],
+    });
+    for iface in snapshot.interfaces.iter_mut() {
+        if iface.ifindex == 12 {
+            iface.filter_input_v4 = "block-all-in".to_string();
+        }
+    }
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // The error ingresses on the WAN (reth0.80, ifindex 12) since it is
+    // addressed to the SNAT address; the reversal resolves egress toward the
+    // client on the LAN (reth1.0, ifindex 24), so learn the client neighbor.
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: meta_len as u16,
+        ingress_ifindex: 12,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 42,
+        pkt_len: frame.len() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        tcp_flags: 0,
+        dscp: 0,
+        config_generation: 7,
+        fib_generation: 9,
+        // #7359: the shim stamps the L3 identity into the meta, and
+        // `l3_session_flow_from_meta` returns None for an UNSPECIFIED address
+        // (the #7055 reachable leg). Leaving these zero makes l3_ctx None, the
+        // input-filter block is skipped on EVERY path, and the test then
+        // "passes" against a broken implementation for the wrong reason.
+        flow_src_addr: {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&router_ip.octets());
+            a
+        },
+        flow_dst_addr: {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&snat_ip.octets());
+            a
+        },
+        ..UserspaceDpMeta::default()
+    };
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(&frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(&binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let ha_state = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    // Neighbor toward the client on the LAN unit so the reversed error resolves
+    // a tx interface + MAC (egress ifindex 24).
+    learn_dynamic_neighbor(
+        &forwarding,
+        &dynamic_neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(ExceptionEventRing::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+        8,
+        crate::event_stream::DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding: &forwarding,
+        ha_state: &ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        ike_exchanges: &ike_exchanges,
+        slow_path: None,
+        event_stream: Some(&event_handle),
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+
+    // Install the forward NAT session (client:client_port -> server:80 SNAT'd
+    // to snat_ip:snat_port) so the embedded reversal can recover the client.
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: client_port,
+            dst_port: 80,
+                    discriminator: Default::default(),
+                    routing_domain: 0,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
+                neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: Some(snat_port),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        123_000_000_000,
+        PROTO_TCP,
+        0x18,
+    ));
+    let sessions_before = sessions.len();
+
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+
+    poll_binding_process_descriptor(
+        &mut binding,
+        0,
+        area_ptr,
+        1,
+        &mut sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+
+    // The filter runs BEFORE the reversal now, so the error is dropped and no
+    // prebuilt reversed forward is ever queued.
+    assert!(
+        binding.scratch.scratch_forwards.is_empty(),
+        "an interface input filter with a `discard` term must drop a \
+         reverse-translated embedded-ICMP error, but {} prebuilt forward(s) \
+         were queued toward the client. Before #7359 the reversal ran first \
+         and `continue`d past the filter entirely, so a configured discard \
+         term never saw the packet, its counters never advanced, and a \
+         policer never metered it.",
+        binding.scratch.scratch_forwards.len()
+    );
+    // A flowless deny is a SILENT drop — no reject — and the descriptor is
+    // recycled rather than owned by a queued forward.
+    assert_eq!(
+        binding.scratch.scratch_recycle.len(),
+        1,
+        "the dropped error must recycle its descriptor"
+    );
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "a filtered ICMP error must not seed a session"
+    );
+}
+
+/// Fixture guard for the #7359 ordering test: does the discard filter actually
+/// ATTACH to ifindex 12 in the BUILT forwarding state?
+///
+/// Kept as a permanent cell rather than deleted after use, because the sibling
+/// test asserts an ABSENCE — no queued forward — and an absence assertion is
+/// satisfied just as well by a fixture that configures nothing. If the filter
+/// silently stopped attaching (a renamed snapshot field, a changed family
+/// string, an ifindex that moved), the ordering test would keep passing while
+/// measuring nothing at all. This cell is what makes that impossible.
+#[test]
+fn the_7359_fixture_actually_attaches_its_input_filter() {
+    let mut snapshot = nat_snapshot();
+    snapshot.flow.allow_embedded_icmp = true;
+    snapshot.filters.push(crate::protocol::FirewallFilterSnapshot {
+        name: "block-all-in".to_string(),
+        family: "inet".to_string(),
+        terms: vec![crate::protocol::FirewallTermSnapshot {
+            name: "t-discard".to_string(),
+            action: "discard".to_string(),
+            ..Default::default()
+        }],
+    });
+    let mut attached = 0;
+    for iface in snapshot.interfaces.iter_mut() {
+        if iface.ifindex == 12 {
+            iface.filter_input_v4 = "block-all-in".to_string();
+            attached += 1;
+        }
+    }
+    assert_eq!(attached, 1, "expected exactly one ifindex-12 interface in nat_snapshot");
+    let forwarding = build_forwarding_state(&snapshot);
+    let has = forwarding.filter_state.iface_filter_v4_fast.contains_key(&12);
+    assert!(
+        has,
+        "the discard filter did not attach to ifindex 12 in the built forwarding state; \
+         keys present: {:?}",
+        forwarding.filter_state.iface_filter_v4_fast.keys().collect::<Vec<_>>()
+    );
+}
