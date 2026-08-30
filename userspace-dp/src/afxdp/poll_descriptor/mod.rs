@@ -3485,6 +3485,67 @@ pub(super) fn poll_binding_process_descriptor(
                             EmbeddedIcmpReversal::NotHandled => {}
                         }
                     }
+                    // #7359: build the L3 identity and run the INTERFACE INPUT
+                    // FILTER here, BEFORE the embedded-ICMP NAT reversal below,
+                    // because that reversal `continue`s with the descriptor
+                    // consumed and used to skip this entirely. An operator who
+                    // attaches `filter input` to an interface expects it to see
+                    // every packet arriving there; a reverse-translated ICMP
+                    // error was a hole in that — a discard term did not drop it,
+                    // a count term did not advance, and a policer did not meter.
+                    //
+                    // HOISTED rather than duplicated into the reversal arm. Two
+                    // call sites would double-count every counter and re-fire
+                    // every log term on the flowless path, which is a worse bug
+                    // than the one being fixed and one that no single-path test
+                    // would notice.
+                    //
+                    // A deny here is SILENT for both consumers, and for the same
+                    // reason in each: the flowless path has no L4 header to
+                    // synthesize a reject from, and an ICMP error must never be
+                    // answered with an ICMP error.
+                    let l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
+
+                    // (1) Interface input filter (pre-routing), mirroring the
+                    //     session-miss site above. The frame-derived `extra`
+                    //     carries `is_fragment` + `l4_present = false`, so a
+                    //     `from is-fragment then discard` term matches while
+                    //     tcp-flags / icmp-type / flex predicates fail closed. No
+                    //     filter configured => Accept (no behavior change).
+                    if let Some(l3_flow) = l3_ctx.as_ref() {
+                        let input_eval = evaluate_non_pbr_input_filter(
+                            worker_ctx.forwarding,
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
+                            Some(l3_flow),
+                            meta,
+                            ingress_zone_override,
+                            true,
+                        );
+                        if let Some(cached_log) = input_eval.cached_log {
+                            emit_input_filter_log_match(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                l3_flow,
+                                meta,
+                                cached_log,
+                                // #3615: a flowless (non-first fragment / no-L4)
+                                // deny is ALWAYS a silent drop — no reply can be
+                                // synthesized — so a `then reject` term logs the
+                                // truthful DENY (reject_reply_enqueued = false).
+                                false,
+                                now_ns,
+                            );
+                        }
+                        if input_eval.action != crate::filter::FilterAction::Accept {
+                            // A flowless deny is SILENT: a non-first fragment has
+                            // no L4 header to synthesize a TCP RST / reject from,
+                            // so both `discard` and `reject` drop quietly.
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                    }
+
+
                     // #5690: an inbound non-query ICMP error referencing a NAT'd
                     // flow is FLOWLESS (#3290 discards its metadata pseudo-port so
                     // it never seeds a session). Attempt the generic embedded-ICMP
@@ -3560,47 +3621,6 @@ pub(super) fn poll_binding_process_descriptor(
                     // flows are the deferred fragment-association-cache stage of
                     // the #3291 plan; until then their non-first fragments fall to
                     // the default policy, the documented fail-closed limitation.)
-                    let l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
-
-                    // (1) Interface input filter (pre-routing), mirroring the
-                    //     session-miss site above. The frame-derived `extra`
-                    //     carries `is_fragment` + `l4_present = false`, so a
-                    //     `from is-fragment then discard` term matches while
-                    //     tcp-flags / icmp-type / flex predicates fail closed. No
-                    //     filter configured => Accept (no behavior change).
-                    if let Some(l3_flow) = l3_ctx.as_ref() {
-                        let input_eval = evaluate_non_pbr_input_filter(
-                            worker_ctx.forwarding,
-                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
-                            Some(l3_flow),
-                            meta,
-                            ingress_zone_override,
-                            true,
-                        );
-                        if let Some(cached_log) = input_eval.cached_log {
-                            emit_input_filter_log_match(
-                                worker_ctx.forwarding,
-                                worker_ctx.event_stream,
-                                l3_flow,
-                                meta,
-                                cached_log,
-                                // #3615: a flowless (non-first fragment / no-L4)
-                                // deny is ALWAYS a silent drop — no reply can be
-                                // synthesized — so a `then reject` term logs the
-                                // truthful DENY (reject_reply_enqueued = false).
-                                false,
-                                now_ns,
-                            );
-                        }
-                        if input_eval.action != crate::filter::FilterAction::Accept {
-                            // A flowless deny is SILENT: a non-first fragment has
-                            // no L4 header to synthesize a TCP RST / reject from,
-                            // so both `discard` and `reject` drop quietly.
-                            binding.scratch.scratch_recycle.push(desc.addr);
-                            continue;
-                        }
-                    }
-
                     // (2) PBR `then routing-instance` override + base resolution.
                     //     When a PBR term matches a flowless predicate
                     //     (is-fragment / address / protocol) the route lookup is
