@@ -23,6 +23,39 @@ pub(crate) struct SessionKey {
     /// It is NOT a port: it is never matchable, never rendered in a port field,
     /// and never encoded onto a wire that carries ports (#7188 decision 5).
     pub discriminator: TunnelDiscriminator,
+    /// #7160 (#2387): the ROUTING DOMAIN this flow belongs to — the
+    /// discriminator that makes two tenants' identical 5-tuples two distinct
+    /// sessions instead of one colliding entry.
+    ///
+    /// `0` is the default routing instance, so every single-VRF deployment
+    /// keeps byte-identical session identity and the `Hash`/`Eq` derives above
+    /// continue to do the right thing unchanged.
+    ///
+    /// Two properties make this field safe, and both are load-bearing:
+    ///
+    /// **It is CONFIG-DERIVED, never a kernel ifindex.** The value is
+    /// `StableRoutingInstanceTableID(name)` — a pure FNV-1a function of the
+    /// routing-instance NAME, gated at commit against collisions. Because it
+    /// depends only on config, both HA nodes compute the SAME number for the
+    /// same instance by construction, which is what makes it legal to put on
+    /// the session-sync wire. #6928 settled the precedent in the other
+    /// direction when it declined to sync `ingress_ifindex`: a node-local
+    /// number names a different NIC on the peer, so carrying it across the
+    /// cluster would produce a confidently wrong answer.
+    ///
+    /// **It is SYMMETRIC.** A flow's routing domain is the same in both
+    /// directions, so every key transform in this file PRESERVES it rather
+    /// than defaulting it. That is the property that lets it live on the KEY
+    /// at all. Contrast `discriminator` above and #6928's
+    /// `ingress_ifindex`/`ingress_vlan_id`, which sit on the session VALUE
+    /// because the reply ingresses on the forward flow's EGRESS interface —
+    /// asymmetric, and therefore impossible to lift into a key without
+    /// breaking conntrack reverse matching.
+    ///
+    /// Do not "optimise" any transform here to `Default::default()`. Zeroing
+    /// it on a reverse key silently re-creates the cross-tenant collision this
+    /// field exists to prevent, and every single-VRF test would still pass.
+    pub routing_domain: u32,
 }
 
 pub(crate) fn reply_matches_forward_session(
@@ -76,7 +109,8 @@ pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
-            discriminator: Default::default(),
+        discriminator: Default::default(),
+        routing_domain: forward_key.routing_domain,
     }
 }
 
@@ -98,7 +132,8 @@ pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> Sess
         dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
         src_port,
         dst_port,
-            discriminator: Default::default(),
+        discriminator: Default::default(),
+        routing_domain: key.routing_domain,
     }
 }
 
@@ -148,7 +183,8 @@ pub(super) fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
         dst_ip: wire_dst,
         src_port,
         dst_port,
-            discriminator: Default::default(),
+        discriminator: Default::default(),
+        routing_domain: forward_key.routing_domain,
     }
 }
 
@@ -165,7 +201,8 @@ pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision)
         dst_ip: forward_key.src_ip,
         src_port,
         dst_port,
-            discriminator: Default::default(),
+        discriminator: Default::default(),
+        routing_domain: forward_key.routing_domain,
     }
 }
 
@@ -241,6 +278,7 @@ pub(crate) fn reverse_session_key(key: &SessionKey, nat: NatDecision) -> Session
         dst_ip: wire_dst,
         src_port,
         dst_port,
-            discriminator: Default::default(),
+        discriminator: Default::default(),
+        routing_domain: key.routing_domain,
     }
 }

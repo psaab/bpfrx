@@ -2530,6 +2530,7 @@ fn shim_probe_key(meta: UserspaceDpMeta) -> SessionKey {
         src_port: meta.flow_src_port,
         dst_port: meta.flow_dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -2840,6 +2841,7 @@ fn shim_non_terminal_protocols_are_never_installable_by_userspace_6886() {
                 src_port: 0,
                 dst_port: 0,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             },
         };
         let meta = UserspaceDpMeta {

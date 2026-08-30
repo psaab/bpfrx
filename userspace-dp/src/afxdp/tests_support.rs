@@ -146,6 +146,7 @@ pub(super) fn icmp_suppress_flow_v4(src: Ipv4Addr, dst: Ipv4Addr) -> SessionFlow
             src_port: 0xc000,
             dst_port: 53,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     }
 }
@@ -198,6 +199,7 @@ pub(super) fn te_request_built(frame: &[u8], meta: UserspaceDpMeta) -> bool {
             src_port: 0xc000,
             dst_port: 53,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let desc = XdpDesc {
@@ -2084,6 +2086,7 @@ pub(super) fn dnat_v4_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 
@@ -2097,6 +2100,7 @@ pub(super) fn dnat_v6_key() -> SessionKey {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

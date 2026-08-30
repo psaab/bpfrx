@@ -895,6 +895,7 @@ mod tests {
                     src_port: 500,
                     dst_port,
                                     discriminator: Default::default(),
+                                    routing_domain: 0,
                 },
             }
         }

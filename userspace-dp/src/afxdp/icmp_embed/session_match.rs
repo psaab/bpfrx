@@ -33,6 +33,7 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
                 src_port: hdr.src_port,
                 dst_port: hdr.dst_port,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             };
             let reverse_key = embedded_reply_key(
                 libc::AF_INET as u8,
@@ -55,6 +56,7 @@ pub(in crate::afxdp::icmp_embed) fn try_embedded_icmp_session_match_from_frame(
                 src_port: hdr.src_port,
                 dst_port: hdr.dst_port,
                             discriminator: Default::default(),
+                            routing_domain: 0,
             };
             let reverse_key = embedded_reply_key(
                 libc::AF_INET6 as u8,

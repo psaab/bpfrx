@@ -1048,6 +1048,7 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
         src_port: 12345,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let forward_decision = SessionDecision {
         resolution: lookup_forwarding_resolution(

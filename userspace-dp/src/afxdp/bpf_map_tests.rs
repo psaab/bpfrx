@@ -256,6 +256,7 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = SessionDecision {
         resolution: ForwardingResolution {
@@ -314,6 +315,7 @@ fn session_map_redirect_keys_for_kernel_local_synced_session_delete_superset() {
         src_port: 0,
         dst_port: 0,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = SessionDecision {
         resolution: ForwardingResolution {
@@ -385,6 +387,7 @@ fn build_conntrack_value_stamps_stable_session_id_v4() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = local_delivery_decision(0);
     let metadata = synced_forward_metadata();
@@ -413,6 +416,7 @@ fn build_conntrack_value_stamps_stable_session_id_v6() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = local_delivery_decision(0);
     let metadata = synced_forward_metadata();
@@ -459,6 +463,7 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
             src_port: 10_000 + i as u16, // distinct 5-tuples -> distinct forward entries
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         };
         let decision = SessionDecision {
             resolution: ForwardingResolution {
@@ -551,6 +556,7 @@ fn build_conntrack_value_stamps_ingress_identity_v4_4983() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = local_delivery_decision(0);
     let mut metadata = synced_forward_metadata();
@@ -588,6 +594,7 @@ fn build_conntrack_value_stamps_ingress_identity_v6_4983() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = local_delivery_decision(0);
     let mut metadata = synced_forward_metadata();
@@ -627,6 +634,7 @@ fn ingress_identity_does_not_occupy_the_fib_egress_slots_4983() {
         src_port: 41086,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let decision = local_delivery_decision(0);
     let mut metadata = synced_forward_metadata();

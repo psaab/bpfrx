@@ -739,6 +739,7 @@ fn poll_descriptor_junos_host_deny_drops_local_delivery_session_hit() {
         src_port: 12345,
         dst_port: 5201,
             discriminator: Default::default(),
+            routing_domain: 0,
     };
     let local_decision = SessionDecision {
         resolution: ForwardingResolution {

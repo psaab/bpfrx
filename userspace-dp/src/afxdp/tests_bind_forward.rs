@@ -455,6 +455,7 @@ fn build_live_forward_request_from_frame_drops_logged_output_filter_discard() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -628,6 +629,7 @@ fn build_live_forward_request_from_frame_output_filter_reject_sends_rst_3608() {
             src_port,
             dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -816,6 +818,7 @@ fn output_filter_reject_carries_the_configured_icmp_code_6854() {
             src_port,
             dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let mut forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1070,6 +1073,7 @@ fn output_filter_matches_post_snat_source_forward_leg_3642() {
             src_port: 12345,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1201,6 +1205,7 @@ fn output_filter_matches_post_snat_dest_reverse_leg_3642() {
             src_port: 443,
             dst_port: 12345,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1326,6 +1331,7 @@ fn output_filter_matches_post_dnat_dest_3642() {
             src_port: 40000,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let forwarding = build_forwarding_state(&ConfigSnapshot {
@@ -1417,6 +1423,7 @@ fn icmp_reverse_key_keeps_identifier_position() {
             src_port: 0x1234,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let reverse = flow.reverse_key_with_nat(NatDecision {
@@ -1441,6 +1448,7 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1494,6 +1502,7 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1549,6 +1558,7 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1615,6 +1625,7 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
         decision: SessionDecision {
             resolution: lookup_forwarding_resolution(
@@ -1684,6 +1695,7 @@ fn resolution_target_uses_rewritten_destination_for_reverse_dnat() {
             src_port: 0x1234,
             dst_port: 0,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let decision = SessionDecision {
@@ -1728,6 +1740,7 @@ fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
             src_port: 12345,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let decision = SessionDecision {
@@ -2209,6 +2222,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
             src_port: 54321,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let dnat = state
@@ -2400,6 +2414,7 @@ fn measure_c19_flowless_reaches_cached_filter_7174() {
         src_port: 40000,
         dst_port: 22,
         discriminator: Default::default(),
+        routing_domain: 0,
     };
     let with_flow =
         crate::afxdp::tx::resolve_cached_cos_tx_selection(&forwarding, 12, meta, Some(&flow_key));

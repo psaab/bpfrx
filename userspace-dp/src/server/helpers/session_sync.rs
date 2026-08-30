@@ -60,6 +60,7 @@ pub(crate) fn build_synced_session_key(
         src_port: req.src_port,
         dst_port: req.dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     })
 }
 

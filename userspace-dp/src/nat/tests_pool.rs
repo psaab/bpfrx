@@ -1902,6 +1902,7 @@ fn session_key_from_src(
         src_port,
         dst_port,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

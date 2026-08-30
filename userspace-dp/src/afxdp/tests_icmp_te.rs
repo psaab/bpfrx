@@ -155,6 +155,7 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
             src_port: 0x1234,
             dst_port: 1,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let mut forwarding = ForwardingState::default();
@@ -613,6 +614,7 @@ fn build_local_time_exceeded_request_skips_fabric_ingress_packets() {
             src_port: 0x1234,
             dst_port: 1,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let mut forwarding = ForwardingState::default();

@@ -248,6 +248,7 @@ fn active_flow_debug_test_key() -> crate::session::SessionKey {
         src_port: 5205,
         dst_port: 443,
             discriminator: Default::default(),
+            routing_domain: 0,
     }
 }
 

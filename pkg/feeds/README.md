@@ -243,6 +243,43 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 `FeedInfo` carries additive status fields (`LastSuccess`, `LastError`,
 `StaleSince`, `Hash`) alongside the legacy `URL`/`Prefixes`/`LastFetch`.
 
+## Where a credential may be placed in a feed URL (#7406)
+
+A `feed-server` has **no credential leaf**. The entire leaf set is `url`,
+`hostname`, `update-interval`, `hold-interval` and `feed-name <name> path`
+(`pkg/config/schema_security.go`), so a provider's subscription key has nowhere
+to go but the URL itself. This is what makes a feed different from a DDNS
+provider, which always has a dedicated `config.Secret` leaf (`password`,
+`api-token`, `aws-secret-key`) to hold the credential — `pkg/ddns/README.md`
+tells operators to put it there, and **that advice does not transfer here**.
+
+`FeedServer.MarshalJSON` and `FeedEntry.MarshalJSON` (#6703) run `url` and each
+`path` through `config.RedactURL` on the JSON route, and `urlLeafIndices`
+(#7406) does the same on the AST route behind `show configuration`, the gRPC
+config RPCs and the REST config reads. Between them, every placement
+`RedactURL` understands is covered on every config-read surface:
+
+    https://feeds.example.com/list.txt?token=SECRET  ->  ...?<redacted>
+    https://user:SECRET@feeds.example.com/list.txt   ->  https://<redacted>@...
+    https://feeds.example.com/list.txt#SECRET        ->  ...#<redacted>
+
+A key that **is** a host label or a path segment is rendered **verbatim**:
+
+    https://SECRET.feeds.example.com/list.txt        <-- rendered verbatim
+    https://feeds.example.com/SECRET/list.txt        <-- rendered verbatim
+
+(the `hostname` leaf is the first case). This is not a redactor bug.
+`https://SECRET.feeds.example/l.txt` and `https://cdn.feeds.example/l.txt` are
+indistinguishable strings, so any rule that hides the first hides the host and
+path of every feed — the diagnostic payload that makes a redacted URL worth
+printing at all.
+
+**Operator consequence:** if a feed provider keys on a hostname label or a path
+segment, that key is visible to anyone who can read the configuration (`show
+configuration`, `GET /api/v1/config`, `show security dynamic-address`) and no
+placement avoids it. Treat such a configuration as sensitive. Where the
+provider offers a query-string or userinfo form, prefer it — those are redacted.
+
 ## Callers
 
 `pkg/daemon` (compile-cycle integration), `pkg/grpcapi` (status queries).

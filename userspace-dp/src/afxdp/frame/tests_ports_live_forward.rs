@@ -404,6 +404,7 @@ fn build_live_forward_request_prefers_session_flow_ports_over_frame() {
             src_port: session_src_port,
             dst_port: frame_dst_port,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let decision = SessionDecision {
@@ -842,6 +843,7 @@ fn build_live_forward_request_emits_output_filter_log_event() {
             src_port: 49152,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -1005,6 +1007,7 @@ fn live_forward_filter_log_zones_6722(egress_ifindex: i32) -> (ForwardingState, 
             src_port: 49152,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let filter_state = crate::filter::parse_filter_state(
@@ -1205,6 +1208,7 @@ fn build_live_forward_request_uses_flow_or_metadata_ports_when_frame_ports_unava
             src_port: 54688,
             dst_port: 5201,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
     let decision = SessionDecision {
@@ -1299,6 +1303,7 @@ fn build_live_forward_request_marks_session_fabric_redirect_for_nat_and_zone() {
             src_port: 5201,
             dst_port: 44278,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     };
 

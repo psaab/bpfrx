@@ -28,6 +28,7 @@ fn test_flow() -> SessionFlow {
             src_port: 49152,
             dst_port: 443,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     }
 }
@@ -50,6 +51,7 @@ fn dnat_test_flow() -> SessionFlow {
             src_port: 51000,
             dst_port: 2222,
                     discriminator: Default::default(),
+                    routing_domain: 0,
         },
     }
 }
