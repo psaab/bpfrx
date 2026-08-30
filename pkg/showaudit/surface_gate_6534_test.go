@@ -115,14 +115,17 @@ var families = []family{
 		Collections:       []string{"NAT.Source"},
 		BuilderPredicates: []string{"SourceNATPoolUnusableReason"},
 		SurfacePredicates: []string{"SourceNATPoolUnusableReason", "SourceNATPoolDisarmedReason", "SourceNATDisarmReasonText"},
+		// #7473 closed the CLI text renderers (showNATSourceRuleAll,
+		// showNATSourceRuleSet, showNATSourceSummary). What remains is the
+		// STRUCTURED half: a JSON or protobuf rule object cannot be fixed by
+		// appending a line, it needs a not_installed field, which is a wire
+		// surface change; and collectNATPoolMetrics is a third shape again, a
+		// Prometheus gauge computed over rules including the disarmed ones.
 		Unannotated: []string{
 			"pkg/api/metrics_nat.go:collectNATPoolMetrics",
 			"pkg/api/nat.go:natPoolStatsHandler",
 			"pkg/api/nat.go:natRuleStatsHandler",
 			"pkg/api/nat.go:natSourceHandler",
-			"pkg/cli/cli_show_nat.go:showNATSourceRuleAll",
-			"pkg/cli/cli_show_nat.go:showNATSourceRuleSet",
-			"pkg/cli/cli_show_nat.go:showNATSourceSummary",
 			"pkg/grpcapi/server_nat.go:GetNATPoolStats",
 			"pkg/grpcapi/server_nat.go:GetNATRuleStats",
 			"pkg/grpcapi/server_nat.go:GetNATSource",
@@ -134,13 +137,10 @@ var families = []family{
 		Collections:       []string{"NAT.Destination"},
 		BuilderPredicates: []string{"DestinationNATRuleExcludedReason"},
 		SurfacePredicates: []string{"DestinationNATRuleExcludedReason"},
+		// #7473 closed the five CLI text renderers; the structured half
+		// remains (see the source family's note).
 		Unannotated: []string{
 			"pkg/api/nat.go:natDestHandler",
-			"pkg/cli/cli_show_nat.go:showNATDestination",
-			"pkg/cli/cli_show_nat.go:showNATDestinationPool",
-			"pkg/cli/cli_show_nat.go:showNATDestinationRuleAll",
-			"pkg/cli/cli_show_nat.go:showNATDestinationRuleSet",
-			"pkg/cli/cli_show_nat.go:showNATDestinationSummary",
 			"pkg/grpcapi/server_nat.go:GetNATDestination",
 			"pkg/grpcapi/server_nat.go:GetNATRuleStats",
 		},

@@ -294,6 +294,13 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 	fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
 		"Pool", "Address", "Ports", "Used", "Available", "Utilization")
 	for _, p := range pools {
+		// #7473: the Ports/Available columns below describe a pool the builder
+		// may have refused, where the numbers are configuration rather than
+		// live capacity.
+		poolDisarm := ""
+		if pl, ok := cfg.Security.NAT.SourcePools[p.name]; ok {
+			poolDisarm = sourceNATPoolNotInstalled(pl)
+		}
 		ports := "N/A"
 		avail := "N/A"
 		util := "N/A"
@@ -308,6 +315,9 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		}
 		fmt.Printf("%-20s %-20s %-8s %-8d %-12s %-12s\n",
 			p.name, p.address, ports, p.used, avail, util)
+		if poolDisarm != "" {
+			fmt.Println(natNotInstalledLine(poolDisarm, true))
+		}
 	}
 
 	// Per-rule-set session counts
@@ -428,6 +438,10 @@ func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
 				dstMatch = rule.Match.DestinationAddress
 			}
 			fmt.Printf("    Match: source %s destination %s\n", srcMatch, dstMatch)
+			// #7473
+			if line := natNotInstalledLine(sourceNATRuleNotInstalled(cfg, rule), true); line != "" {
+				fmt.Println("  " + line)
+			}
 			fmt.Printf("    Action: %s\n", action)
 
 			// Show hit counters if dataplane is loaded
@@ -478,6 +492,11 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 			fmt.Printf("Rule-set: %-20s Rule: %-12s %s -> %s  Action: %s\n",
 				rs.Name, rule.Name, rs.FromZone, rs.ToZone, action)
 			fmt.Printf("  Match: source %s destination %s\n", srcMatch, dstMatch)
+			// #7473: without this the translation-hit 0 printed below reads as
+			// "no traffic matched" for a rule the builder never installed.
+			if line := natNotInstalledLine(sourceNATRuleNotInstalled(cfg, rule), true); line != "" {
+				fmt.Println(line)
+			}
 
 			if c.dp != nil && cr != nil {
 				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
@@ -555,6 +574,11 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 		fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
 		for _, rule := range rs.Rules {
 			fmt.Printf("  Rule: %s\n", rule.Name)
+			// #7473: annotate before the match/pool lines, so the operator sees
+			// the rule is not armed before reading what it claims to translate.
+			if line := natNotInstalledLine(destNATRuleNotInstalled(cfg, rule), false); line != "" {
+				fmt.Println("  " + line)
+			}
 			if rule.Match.DestinationAddress != "" {
 				fmt.Printf("    Match destination-address: %s\n", rule.Match.DestinationAddress)
 			}
@@ -678,6 +702,12 @@ func (c *CLI) showNATDestinationSummary(cfg *config.Config) error {
 		hits := poolHits[name]
 		fmt.Printf("%-20s %-20s %-8s %-12d\n",
 			name, pool.Address, portStr, hits)
+		// #7473: a pool whose every referencing rule is excluded is not
+		// translating, and the Hits column above would otherwise read as
+		// "no traffic" rather than "not installed".
+		if reason := destNATPoolNotInstalled(cfg, name); reason != "" {
+			fmt.Println(natNotInstalledLine(reason, false))
+		}
 	}
 
 	// Per-rule-set session counts
@@ -723,6 +753,12 @@ func (c *CLI) showNATDestinationPool(cfg *config.Config, poolName string) error 
 				if rule.Then.PoolName == name {
 					fmt.Printf("  Referenced by: %s/%s (from %s)\n",
 						rs.Name, rule.Name, rs.FromZone)
+					// #7473: a referencing rule the builder excluded does not
+					// actually reach this pool; without the annotation the
+					// reference reads as a live translation path.
+					if line := natNotInstalledLine(destNATRuleNotInstalled(cfg, rule), false); line != "" {
+						fmt.Println("  " + line)
+					}
 				}
 			}
 		}
@@ -781,6 +817,10 @@ func (c *CLI) showNATDestinationRuleSet(cfg *config.Config, rsName string) error
 				dstMatch = rule.Match.DestinationAddress
 			}
 			fmt.Printf("    Match destination-address: %s\n", dstMatch)
+			// #7473
+			if line := natNotInstalledLine(destNATRuleNotInstalled(cfg, rule), false); line != "" {
+				fmt.Println("  " + line)
+			}
 			if rule.Match.DestinationPort != 0 {
 				fmt.Printf("    Match destination-port: %d\n", rule.Match.DestinationPort)
 			}
@@ -838,6 +878,10 @@ func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
 			fmt.Printf("Rule-set: %-20s Rule: %-12s from %s  Action: %s\n",
 				rs.Name, rule.Name, rs.FromZone, action)
 			fmt.Printf("  Match: destination %s\n", dstMatch)
+			// #7473: same archetype on the destination family.
+			if line := natNotInstalledLine(destNATRuleNotInstalled(cfg, rule), false); line != "" {
+				fmt.Println(line)
+			}
 
 			if c.dp != nil && cr != nil {
 				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
