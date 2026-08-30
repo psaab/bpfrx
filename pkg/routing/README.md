@@ -110,6 +110,30 @@ path already draws (see the WireGuard/tunnel removal notes below and
   retained entry rather than nil-ing the map). The #4901 hardening only
   covered a failed `LinkDel` **after** a successful lookup; this closes the
   predating `LinkByName`-error branch.
+- **#7529 (the same conflation in two SIBLING managers).** The xfrm manager
+  was fixed above and the bond and tunnel managers were not, so the identical
+  branch survived in two other places:
+  - `bondManager.deleteLocked` dropped the name from `b.bonds` **and returned
+    `nil`** on any lookup error. So xpf reported a successful delete for a bond
+    still in the kernel, still enslaving its members, and no longer tracked —
+    and nothing retries, because the reconcile diff keys off `b.bonds`.
+  - `tunnelManager.Clear` took a bare `continue`, which leaves the name out of
+    the `failed` set that `ownedNames` is rebuilt from. A live tunnel with
+    stale addresses and XFRM `if_id` state became untracked, so no later
+    `Apply` had a removed-desired entry to retry the delete.
+
+  Both now release ownership **only** on `isLinkNotFound`; a transient error
+  retains it and surfaces the real cause. Ownership is released **per name, on
+  that name's own answer** — a `Clear` walking several owned names must release
+  the genuinely-absent ones while retaining the transiently-failing one, so
+  "retain everything if anything failed" is not the fix (it passes every
+  single-name test and is wrong on the shape a real reconcile sees).
+
+  Worth noting for the next sibling: the shape here is not a bug that recurred,
+  it is one fix that was applied to one of three managers holding the same
+  branch. When a predicate like `isLinkNotFound` is introduced, the question to
+  ask is which OTHER call sites make the same conflation — grep for
+  `LinkByName` with an error branch that assumes absence.
 
 **Identity re-assertion on every post-create readback (#5523 C179-104 +
 #6396).** `LinkAdd` and the `LinkByName` readback that follows it are two
