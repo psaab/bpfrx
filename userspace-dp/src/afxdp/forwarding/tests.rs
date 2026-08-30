@@ -6475,3 +6475,119 @@ fn egress_row_zone_is_order_invariant_not_last_write_6722() {
         );
     }
 }
+
+/// #7204 (A1-b7-F6): the liveness bitmask must pick the SAME member the
+/// collect-based implementation did, at every fanout on both sides of the
+/// 64-candidate mask boundary.
+///
+/// This is an EQUIVALENCE, not a validity check, and that distinction is the
+/// whole point. ECMP selection is flow-consistent — a given 5-tuple must keep
+/// landing on the same member — so an implementation that picked a *different*
+/// live member would still look correct to a test that only asserted "the
+/// result is live", while silently repinning every existing flow on upgrade.
+///
+/// The reference below is the pre-#7204 body verbatim. Spanning 1..=70 covers
+/// the boundary in both directions: at or below 64 the mask path runs, above it
+/// the collect fallback does, and a spill above the supported ceiling is
+/// CORRECT behaviour rather than a defect — so the fallback is asserted to
+/// still select properly instead of being pinned as unreachable.
+#[test]
+fn select_route_next_hop_bitmask_matches_collect_reference_7204() {
+    fn reference<'a, T: Copy>(
+        candidates: &'a [T],
+        ip_hash: u64,
+        is_live: impl Fn(&T) -> bool,
+    ) -> Option<&'a T> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let live: Vec<&'a T> = candidates.iter().filter(|c| is_live(c)).collect();
+        if !live.is_empty() {
+            let pick = (ip_hash % live.len() as u64) as usize;
+            live.get(pick).copied()
+        } else {
+            let pick = (ip_hash % candidates.len() as u64) as usize;
+            candidates.get(pick)
+        }
+    }
+
+    for fanout in 1usize..=70 {
+        let candidates: Vec<u32> = (0..fanout as u32).collect();
+        // Several liveness shapes: all live, none live, alternating, only the
+        // last live, only the first. "None live" exercises the fallback branch,
+        // which a uniformly-live fixture would never reach.
+        let shapes: Vec<Box<dyn Fn(&u32) -> bool>> = vec![
+            Box::new(|_c: &u32| true),
+            Box::new(|_c: &u32| false),
+            Box::new(|c: &u32| c % 2 == 0),
+            Box::new(move |c: &u32| *c as usize == fanout - 1),
+            Box::new(|c: &u32| *c == 0),
+        ];
+        for (shape_idx, is_live) in shapes.iter().enumerate() {
+            for ip_hash in [0u64, 1, 2, 7, 63, 64, 65, 1_000_003, u64::MAX] {
+                let got = select_route_next_hop(&candidates, ip_hash, |c| is_live(c));
+                let want = reference(&candidates, ip_hash, |c| is_live(c));
+                assert_eq!(
+                    got, want,
+                    "fanout={fanout} shape={shape_idx} hash={ip_hash}: the bitmask \
+                     picked a different member than the collect reference — ECMP is \
+                     flow-consistent, so a different-but-live pick silently repins \
+                     every existing flow"
+                );
+            }
+        }
+    }
+}
+
+/// #7204 (A1-b7-F6): the bitmask must not cost a second liveness evaluation.
+///
+/// The collect existed to call `is_live` exactly once per candidate — both call
+/// sites reach `tunnel_next_hop_live`, which resolves a tunnel endpoint and
+/// consults the neighbour map, so a two-pass rewrite would have traded an
+/// allocation for double that work. This pins the property the collect was
+/// bought for, at a fanout the old inline capacity could not hold.
+#[test]
+fn select_route_next_hop_bitmask_evaluates_liveness_once_7204() {
+    use std::cell::Cell;
+
+    for fanout in [1usize, 8, 9, 64, 65] {
+        let candidates: Vec<u32> = (0..fanout as u32).collect();
+        let calls = Cell::new(0usize);
+        let _ = select_route_next_hop(&candidates, 12345, |c| {
+            calls.set(calls.get() + 1);
+            c % 3 != 0
+        });
+        assert_eq!(
+            calls.get(),
+            fanout,
+            "fanout={fanout}: liveness must be evaluated exactly once per candidate"
+        );
+    }
+}
+
+/// #7204 (A1-b7-F6): the liveness mask must cover the whole supported ECMP
+/// range, or the allocation this item removed comes back for the fanouts it no
+/// longer reaches.
+///
+/// This pins a PROPERTY, not the constant's value: lowering the mask width does
+/// not change which member is picked (the fallback is equivalence-tested above),
+/// so no behavioural test can see it. What it changes is whether a supported
+/// configuration allocates on every new-flow lookup — and the bound that makes
+/// 64 the right number is the control plane's rendered `maximum-paths`, not a
+/// preference.
+#[test]
+fn ecmp_liveness_mask_covers_the_rendered_maximum_paths_7204() {
+    // pkg/frr/config_render.go resolveECMP -> ecmpMaxPaths = 64, rendered by
+    // pkg/frr/protocols_render.go as `maximum-paths %d`. Junos
+    // routing-options maximum-ecmp is Missing (docs/feature-gaps.md), so 64 is
+    // a ceiling rather than a default an operator can raise.
+    const RENDERED_MAXIMUM_PATHS: usize = 64;
+    assert!(
+        crate::afxdp::forwarding::fib::MAX_SUPPORTED_ECMP_FANOUT >= RENDERED_MAXIMUM_PATHS,
+        "the ECMP liveness mask covers {} candidates but the control plane renders \
+         maximum-paths {}; fanouts in between fall back to the heap-collecting path \
+         and allocate on every new-flow FIB resolution",
+        crate::afxdp::forwarding::fib::MAX_SUPPORTED_ECMP_FANOUT,
+        RENDERED_MAXIMUM_PATHS,
+    );
+}
