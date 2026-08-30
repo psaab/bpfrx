@@ -138,6 +138,38 @@ Packets that pass all checks get a `UserspaceDpMeta` header prepended via
 `bpf_xdp_adjust_meta` and are redirected to the AF_XDP socket with
 `bpf_redirect_map(&USERSPACE_XSK_MAP, slot)`.
 
+#### Metadata alignment (#7176 / C179-019)
+
+The shim writes `UserspaceDpMeta` with a plain aligned store; the userspace
+consumer reads it back with `ptr::read_unaligned`. That asymmetry is
+deliberate and measured, not an oversight:
+
+* `meta_ptr == xdp->data - size_of::<UserspaceDpMeta>()`, and
+  `size_of == 96` with `align_of == 8`, so `96 % 8 == 0` and therefore
+  `meta_ptr % 8 == xdp->data % 8`. Whether the store is aligned depends
+  **only** on the driver's `xdp->data`, which is a kernel property.
+* Measured on the shipped target (mlx5_core VF, AF_XDP native, kernel
+  7.0.0-rc7+) via a kprobe on `bpf_xdp_adjust_meta`: **5,989,142 samples,
+  all `% 8 == 0`**, none misaligned. The histogram was not broken down by
+  ingress path and no fabric traffic was deliberately driven, so the
+  generic-XDP fabric path is unrepresented or under-represented rather than
+  proven clean — it is the one surface where the answer could differ.
+  The probe's own total is recorded alongside the histogram deliberately: a
+  kprobe that never fired and a pointer that never misaligned produce the
+  same empty histogram, so the total is what makes the zero a measurement.
+* This records that the invariant **currently holds on this target**, not
+  that a plain store is sound in general — `ptr::write` to a misaligned
+  pointer is UB whether or not the hardware faults.
+* Making it explicit costs real budget: `core::ptr::write_unaligned` lowers
+  to a byte-wise copy on the BPF backend, measured at +145 instructions and
+  +1,152 bytes of `.xdp`, moving #1864 verifier headroom 19.86% -> 18.73%
+  against the 15.0% floor. That delta is attributable because a no-change
+  rebuild of the object is byte-identical (`f576dfef…`) — the control was
+  established before the comparison. Take that cost if the invariant breaks.
+* A runtime alignment check is **not implementable**: the verifier rejects
+  it with `R1 bitwise operator &= on pointer prohibited`, so a BPF program
+  cannot observe a packet pointer's alignment at all.
+
 ### Per-binding UMEM and rings
 
 Each AF_XDP binding gets its own `WorkerUmem` with independent fill,
