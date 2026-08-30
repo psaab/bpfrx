@@ -470,6 +470,17 @@ type ProcessStatus struct {
 	// BEFORE the failover rather than after.
 	SyncedImportReserveRefused uint64 `json:"synced_import_reserve_refused,omitempty"`
 
+	// SyncedImportUnknownRoutingDomain is
+	// xpf_userspace_synced_import_unknown_routing_domain_total (#7160/#2387):
+	// peer-synced imports refused because the helper runs routing instances and
+	// the request named no ingress identity to resolve the session's routing
+	// domain from. Importing under domain 0 would file the session in the
+	// DEFAULT instance's identity space, where a reply that resolved its own
+	// domain reaches it, so the helper refuses instead. Sustained growth on a
+	// VRF cluster means those flows will NOT be taken over on failover; always
+	// 0 on a single-instance node.
+	SyncedImportUnknownRoutingDomain uint64 `json:"synced_import_unknown_routing_domain,omitempty"`
+
 	// SyncedImportZoneUnresolved is xpf_userspace_synced_import_zone_unresolved_total.
 	// Decodes to 0 against a helper that predates #7209, which reads the same as
 	// "never happened" — acceptable here because the metric is diagnostic rather

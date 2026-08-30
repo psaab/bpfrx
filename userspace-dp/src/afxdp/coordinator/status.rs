@@ -298,6 +298,17 @@ impl super::Coordinator {
         self.sessions.import_cap_drops.load(Ordering::Relaxed)
     }
 
+    /// #7160 (#2387): peer-synced imports refused because this node runs
+    /// routing instances and the request named no ingress identity to resolve
+    /// the session's routing domain from. See
+    /// `SessionManager::import_unknown_routing_domain` for what a nonzero
+    /// value means and why it cannot fire on a single-instance node.
+    pub fn synced_import_unknown_routing_domain_total(&self) -> u64 {
+        self.sessions
+            .import_unknown_routing_domain
+            .load(Ordering::Relaxed)
+    }
+
     /// #6600: peer-synced imports refused because this node could not reserve
     /// the translated NAT port the session names. See
     /// `SessionManager::import_reserve_refused` for what a nonzero value means.

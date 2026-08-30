@@ -35,6 +35,9 @@ mod nat;
 mod resolution;
 mod security;
 pub(crate) mod session_delta_schema;
+// #7160: `ProcessStatus`, split out of `control.rs` to keep it under the
+// modularity floor. Re-exported below, so every existing path is unchanged.
+mod status;
 pub(crate) mod snapshot;
 
 #[cfg(test)]
@@ -46,6 +49,7 @@ pub(crate) use cos::*;
 pub(crate) use nat::*;
 pub(crate) use resolution::*;
 pub(crate) use security::*;
+pub(crate) use status::*;
 pub(crate) use snapshot::*;
 
 /// Deserialize a `Vec<T>` that tolerates an explicit JSON `null` as an empty

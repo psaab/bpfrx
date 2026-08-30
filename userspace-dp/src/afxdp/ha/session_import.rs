@@ -32,6 +32,23 @@ pub enum SyncedImportOutcome {
     RejectedCapacity,
     /// #6600: the translated NAT tuple could not be reserved for this import.
     RejectedReserve,
+    /// #7160 (#2387): this node runs routing instances, and the request named
+    /// no ingress identity to resolve the session's routing DOMAIN from.
+    ///
+    /// Refused rather than imported at domain 0, which is NOT a neutral
+    /// default here: domain 0 is the DEFAULT ROUTING INSTANCE, so importing a
+    /// tenant's session under it files that session in another tenant's
+    /// identity space. The reverse-match path then reaches it — a reply that
+    /// resolved its own domain falls back to the domain-agnostic probe
+    /// (`lookup_shared_forward_nat_match`) and can match a session that was
+    /// only keyed at 0 because its domain was unknown. That is the HA half of
+    /// the very collision #7160 closes, and no single-instance test can see
+    /// it, because there every key is legitimately 0.
+    ///
+    /// The cost of refusing is bounded and visible: the session is not taken
+    /// over, so after a failover its flow re-adjudicates through policy
+    /// instead of being adopted under a domain nothing verified.
+    RejectedUnknownRoutingDomain,
 }
 
 /// The machine-readable prefix every semantic refusal carries in the control
@@ -48,6 +65,7 @@ impl SyncedImportOutcome {
             SyncedImportOutcome::RejectedStaleGeneration => Some("stale-generation"),
             SyncedImportOutcome::RejectedCapacity => Some("capacity"),
             SyncedImportOutcome::RejectedReserve => Some("reserve"),
+            SyncedImportOutcome::RejectedUnknownRoutingDomain => Some("unknown-routing-domain"),
         }
     }
 }

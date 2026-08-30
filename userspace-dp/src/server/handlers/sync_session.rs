@@ -21,14 +21,37 @@ pub(super) fn handle(
     // #7095 cluster-stable ingress identity, which the sender resolved into
     // THIS node's own ifindex/vlan before the request got here. Derived, never
     // wire-carried — see `Coordinator::synced_routing_domain`.
-    let routing_domain = guard
+    //
+    // THREE states, and the third is the one that matters. `Some(0)` is the
+    // default routing instance and is correct; `Some(n)` is a tenant's; `None`
+    // is "this node runs routing instances and the request named nothing to
+    // resolve one from". The two verbs answer `None` differently, because the
+    // cost of guessing runs opposite ways:
+    //   * UPSERT refuses. Importing under domain 0 would file the session in
+    //     the DEFAULT instance's identity space, where a reply that resolved
+    //     its own domain can reach it through the domain-agnostic fallback
+    //     probe — the HA half of the collision #7160 closes.
+    //   * DELETE proceeds at domain 0 and lets the per-domain sweep below do
+    //     the work. A refused delete LEAKS a session; a delete that sweeps one
+    //     domain too many removes nothing that was not named by the 5-tuple.
+    let resolved_domain = guard
         .afxdp
         .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id);
     match sync_req.operation.as_str() {
+        "upsert" if resolved_domain.is_none() => {
+            guard.afxdp.note_unknown_routing_domain_import();
+            response.ok = false;
+            response.error = format!(
+                "{SYNCED_IMPORT_REFUSED_PREFIX}{}",
+                crate::afxdp::SyncedImportOutcome::RejectedUnknownRoutingDomain
+                    .refusal_reason()
+                    .expect("a rejection always carries a reason token")
+            );
+        }
         "upsert" => match build_synced_session_entry(
             &sync_req,
             guard.afxdp.zone_name_to_id_ref(),
-            routing_domain,
+            resolved_domain.expect("the None arm above already returned"),
         ) {
             Ok(entry) => {
                 // #6785: a SEMANTIC refusal (stale generation / import cap /
@@ -62,7 +85,19 @@ pub(super) fn handle(
         // class rather than being refused. A delete can only under-match; it
         // never publishes an identity, which is the reason the install arm
         // above fails closed and this one does not.
-        "delete" => match build_synced_session_key(&sync_req, routing_domain, SyncedKeyIntent::Delete) {
+        //
+        // #7160 (#2387) makes the identical argument on the ROUTING DOMAIN
+        // axis, which is why the two land on the same line: an unresolvable
+        // domain refuses on upsert and resolves to 0 here, because a refused
+        // delete LEAKS a session while an under-matching one removes nothing
+        // the 5-tuple did not already name. Two different fields, one rule —
+        // fail closed where an identity is PUBLISHED, fail open where one is
+        // only RETRACTED.
+        "delete" => match build_synced_session_key(
+            &sync_req,
+            resolved_domain.unwrap_or(0),
+            SyncedKeyIntent::Delete,
+        ) {
             Ok(key) => {
                 guard.afxdp.delete_synced_session(key.clone());
                 // #7160 (#2387): a bare-5-tuple delete (the `clear security

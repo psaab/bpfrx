@@ -88,6 +88,27 @@ pub(in crate::afxdp) struct SessionManager {
     /// peer's full logical set (N logical → 2N entries) EXACTLY fits the 2N cap
     /// — never trips it, at any peer load.
     pub(in crate::afxdp) import_cap_drops: AtomicU64,
+    /// #7160 (#2387): peer-synced imports REFUSED because this node runs
+    /// routing instances and the request named no ingress identity to resolve
+    /// the session's routing DOMAIN from.
+    ///
+    /// Always 0 on a node with no routing-instance interface membership — the
+    /// resolver returns the default domain there and nothing is refused — so a
+    /// nonzero value means specifically: a VRF deployment received a synced
+    /// session whose cluster-stable ingress name the sender could not supply
+    /// (#7096 fabric-redirected, or a session with no such name). Those
+    /// sessions are not taken over; their flows re-adjudicate through policy
+    /// after a failover.
+    ///
+    /// Surfaced via `Coordinator::synced_import_unknown_routing_domain_total()`
+    /// and the Prometheus counter
+    /// `xpf_userspace_synced_import_unknown_routing_domain_total`, on the same
+    /// route as every sibling refusal counter. It was briefly written as
+    /// "deliberately not surfaced"; the #6641 status-wiring audit rejected
+    /// that, correctly — its `UNSURFACED` allowlist is deliberately EMPTY
+    /// since #7398, and this counter is the only signal that a VRF cluster is
+    /// silently not taking over a subset of its peer's sessions.
+    pub(in crate::afxdp) import_unknown_routing_domain: AtomicU64,
     /// #6600: peer-synced imports REFUSED because this node could not reserve
     /// the translated NAT port the session names.
     ///
@@ -124,6 +145,7 @@ impl SessionManager {
             synced_import_zone_unresolved: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),
+            import_unknown_routing_domain: AtomicU64::new(0),
             import_reserve_refused: AtomicU64::new(0),
         }
     }

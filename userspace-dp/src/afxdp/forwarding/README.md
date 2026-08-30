@@ -340,12 +340,37 @@ forward-direction collision.
   peer's cluster-stable ingress NAME into this node's own ifindex/vlan
   before the request reaches the helper
   (`Coordinator::synced_routing_domain`). Sending the number as well would
-  be a second spelling of one fact that could disagree with the first. A
-  session whose ingress identity the peer could not name (fabric-redirected,
-  #7096; no cluster-stable name) imports at domain 0 — the pre-#7160
-  identity — so it re-adjudicates through policy after a failover instead of
-  being taken over. That is a correctness-preserving degradation, not a
-  bypass, and it is the price of not maintaining two spellings.
+  be a second spelling of one fact that could disagree with the first.
+- **An import whose domain cannot be resolved is REFUSED, not defaulted.**
+  `synced_routing_domain` returns THREE states, and the third is the point:
+  `Some(0)` = the default routing instance (and the only domain on a node
+  with no routing-instance membership, so nothing is ever refused there);
+  `Some(n)` = a tenant's; `None` = *this node runs routing instances and the
+  request named no ingress identity to resolve one from*
+  (#7096 fabric-redirected, or no cluster-stable name). The upsert verb
+  refuses `None` — `SyncedImportOutcome::RejectedUnknownRoutingDomain`,
+  counted by `synced_import_unknown_routing_domain_total` and exported as
+  `xpf_userspace_synced_import_unknown_routing_domain_total`. Alert on
+  sustained growth: it is the only signal that a VRF cluster is silently not
+  taking over a subset of its peer's sessions, and it is always 0 on a
+  single-instance node.
+
+  This bullet previously said such a session "imports at domain 0 — the
+  pre-#7160 identity … a correctness-preserving degradation, not a bypass".
+  **That was wrong, and the error is worth keeping visible.** 0 is not a
+  neutral placeholder on a VRF node; it is the DEFAULT ROUTING INSTANCE. An
+  import filed there sits at exactly the key the domain-agnostic fallback
+  probe in `lookup_shared_forward_nat_match` reaches, so a reply that DID
+  resolve its own domain could match a session that was only keyed at 0
+  because nothing knew its domain — the HA half of the collision #7160
+  closes. The fallback probe is not the defect (it is what keeps a
+  non-contained flow's reply resolving); manufacturing wrong domain-0 keys
+  on the sync path was.
+
+  The DELETE verb answers `None` the other way, on purpose: it proceeds at
+  domain 0 and lets the per-domain sweep run, because a refused delete LEAKS
+  a session while an over-broad sweep removes nothing the 5-tuple did not
+  already name.
 - **Residuals, named.** (a) The Go-side session store is still keyed on the
   bare 5-tuple (`dataplane.SessionKeyV4`), so two tenants' identical
   5-tuples still collide THERE; that bounds HA sync fidelity for such a

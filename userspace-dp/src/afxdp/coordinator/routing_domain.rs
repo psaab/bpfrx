@@ -83,15 +83,37 @@ impl Coordinator {
     /// imports exactly as it did before; the cost is that its flow
     /// re-adjudicates through policy after a failover instead of being taken
     /// over, which is a correctness-preserving degradation, not a bypass.
-    pub fn synced_routing_domain(&self, ingress_ifindex: i32, ingress_vlan_id: u16) -> u32 {
-        if ingress_ifindex <= 0 {
-            return 0;
+    pub fn synced_routing_domain(&self, ingress_ifindex: i32, ingress_vlan_id: u16) -> Option<u32> {
+        // No routing instances configured: 0 is not a fallback here, it is the
+        // ONLY domain that exists, and it is the right answer for every
+        // session. Returned as `Some` so a single-instance node never refuses
+        // an import — its behaviour must stay bit-identical to pre-#7160.
+        if !self.forwarding.has_routing_domains {
+            return Some(0);
         }
-        crate::afxdp::forwarding::ingress_routing_domain(
+        // Routing instances DO exist and the request named no ingress identity
+        // to resolve one from. This is the third state, and collapsing it into
+        // `Some(0)` is the bug: 0 means THE DEFAULT ROUTING INSTANCE, so a
+        // tenant's session would be filed in another tenant's identity space
+        // and reachable from it. The caller must refuse, not default.
+        if ingress_ifindex <= 0 {
+            return None;
+        }
+        Some(crate::afxdp::forwarding::ingress_routing_domain(
             &self.forwarding,
             ingress_ifindex,
             ingress_vlan_id,
             None,
-        )
+        ))
+    }
+
+    /// #7160 (#2387): count one import refused for an unresolvable routing
+    /// domain. Separate from the refusal itself because the refusal is decided
+    /// in the control-socket handler, where the request's ingress identity is,
+    /// while the counter lives with its siblings on the session manager.
+    pub fn note_unknown_routing_domain_import(&self) {
+        self.sessions
+            .import_unknown_routing_domain
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

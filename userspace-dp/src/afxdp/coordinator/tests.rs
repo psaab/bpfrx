@@ -7635,29 +7635,63 @@ mod routing_domain_7160 {
     #[test]
     fn synced_routing_domain_resolves_through_the_logical_unit() {
         let c = coordinator_with_domains();
-        assert_eq!(c.synced_routing_domain(10, 0), DOMAIN_A);
+        assert_eq!(c.synced_routing_domain(10, 0), Some(DOMAIN_A));
         assert_eq!(
             c.synced_routing_domain(20, 50),
-            DOMAIN_B,
+            Some(DOMAIN_B),
             "a trunk unit must resolve its LOGICAL ifindex's domain, not its \
              parent's — the parent maps only to its first unit"
         );
     }
 
-    /// A session whose ingress identity the peer could not name arrives with
-    /// ifindex 0. It must import at domain 0 — the pre-#7160 identity — and
-    /// NOT borrow whatever domain ifindex 0 happens to hash into.
+    /// The THIRD state. A session whose ingress identity the peer could not
+    /// name arrives with ifindex 0, and on a node that runs routing instances
+    /// that is UNKNOWN, not "the default instance".
+    ///
+    /// This cell asserted the opposite until the sync path was re-examined:
+    /// it claimed such a session "must import at domain 0 — the pre-#7160
+    /// identity". That reading is wrong because 0 is not a neutral placeholder
+    /// on a VRF node, it is the DEFAULT ROUTING INSTANCE — so importing there
+    /// files a tenant's session in another tenant's identity space, where the
+    /// domain-agnostic fallback probe can reach it.
+    ///
+    /// FAIL-ON-REVERT: collapse `None` back into `Some(0)` and this goes red.
     #[test]
-    fn an_unnamed_peer_ingress_imports_at_the_default_domain() {
+    fn an_unnamed_peer_ingress_is_unknown_not_the_default_domain() {
         let c = coordinator_with_domains();
-        assert_eq!(c.synced_routing_domain(0, 0), 0);
-        assert_eq!(c.synced_routing_domain(-1, 0), 0);
+        for (ifindex, why) in [
+            (0i32, "the sender had no cluster-stable ingress name to fold"),
+            (-1, "a negative ifindex is not an interface"),
+        ] {
+            assert_eq!(
+                c.synced_routing_domain(ifindex, 0),
+                None,
+                "ifindex {ifindex} ({why}) must resolve UNKNOWN on a node with \
+                 routing instances, so the caller refuses rather than filing \
+                 the session under the default instance"
+            );
+        }
+        // An ifindex this node knows nothing about is a different case: the
+        // request DID name an interface, this node resolved it, and it is in
+        // no routing instance. That is genuinely the default domain.
         assert_eq!(
             c.synced_routing_domain(999, 0),
-            0,
-            "an ifindex this node knows nothing about must be the default \
-             domain, not a neighbour's"
+            Some(0),
+            "a NAMED ingress that resolves to no routing instance is the \
+             default domain, not unknown — refusing it would drop every \
+             default-instance session on a VRF node"
         );
+    }
+
+    /// The same input on a node with NO routing instances is not unknown at
+    /// all: 0 is the only domain there, so nothing is ever refused and a
+    /// single-instance cluster keeps importing exactly as it did pre-#7160.
+    #[test]
+    fn an_unnamed_peer_ingress_is_the_default_domain_with_no_membership() {
+        let c = Coordinator::new();
+        assert_eq!(c.synced_routing_domain(0, 0), Some(0));
+        assert_eq!(c.synced_routing_domain(-1, 0), Some(0));
+        assert_eq!(c.synced_routing_domain(24, 0), Some(0));
     }
 
     /// The delete sweep's domain set: one entry per INSTANCE, not per member
@@ -7681,6 +7715,6 @@ mod routing_domain_7160 {
             "the per-domain delete retry must be a no-op in a deployment with \
              no routing-instance interface membership"
         );
-        assert_eq!(c.synced_routing_domain(10, 0), 0);
+        assert_eq!(c.synced_routing_domain(10, 0), Some(0));
     }
 }
