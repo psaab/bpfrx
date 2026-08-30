@@ -749,7 +749,7 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
     }
 }
 
-fn packet_tcp_flags(packet: &[u8], _addr_family: u8, protocol: u8, rel_l4: u16) -> u8 {
+pub(in crate::afxdp) fn packet_tcp_flags(packet: &[u8], _addr_family: u8, protocol: u8, rel_l4: u16) -> u8 {
     if protocol != PROTO_TCP {
         return 0;
     }
@@ -865,94 +865,36 @@ pub(super) fn try_native_gre_decap_from_frame(
     let (protocol, rel_l4_offset, payload_offset) =
         parse_inner_protocol_and_offsets(inner_packet, inner_family)?;
 
-    let mut synthetic = vec![0u8; 14 + inner_packet.len()];
-    synthetic[12..14].copy_from_slice(&inner_eth_proto.to_be_bytes());
-    synthetic[14..].copy_from_slice(inner_packet);
-
-    // #2315: RFC 6040 §4.2 decap-side ECN combine. The outer ECN (read
-    // from the still-present outer IP header in `frame` at
-    // `meta.l3_offset`) is combined into the inner ECN: an outer CE
-    // upgrades an ECN-capable inner to CE so a congestion mark applied
-    // on the OUTER path is reflected to the inner endpoints; the illegal
-    // outer-CE / inner-Not-ECT combination is dropped. Mutates the
-    // synthetic inner in place (octet `14 + 1` for the inner TOS) and
-    // recomputes the inner IPv4 header checksum when CE is set. Skipped
-    // when the outer header is truncated (`outer_ecn_bits` → None).
-    if let Some(outer_ecn) = outer_ecn_bits(frame, meta)
-        && !apply_decap_ecn_combine(
-            &mut synthetic[14..],
+    // #7167: the synthesize / ECN-combine / reparse / logical-rebind tail now
+    // lives in `logical_ingress::build_logical_ingress_packet` so WireGuard and
+    // IPsec plaintext can be adjudicated by the SAME code rather than a second
+    // copy of it. Everything above stays GRE-specific (outer parse, GRE key,
+    // `match_tunnel_endpoint` filtered to TunnelKind::Gre).
+    let (synthetic, inner_meta) = crate::afxdp::logical_ingress::build_logical_ingress_packet(
+        forwarding,
+        &crate::afxdp::logical_ingress::LogicalIngressParams {
+            inner_packet,
             inner_family,
-            outer_ecn,
-            &GRE_DECAP_ECN_ILLEGAL_DROPS,
-        )
-    {
-        // Illegal RFC 6040 §4.2 combination — drop (counter bumped in
-        // apply_decap_ecn_combine).
-        return None;
-    }
-
-    let flow = parse_session_flow_from_frame(
-        &synthetic,
-        UserspaceDpMeta {
-            addr_family: inner_family,
+            inner_eth_proto,
             protocol,
-            ..UserspaceDpMeta::default()
+            rel_l4_offset,
+            payload_offset,
+            logical_ifindex: endpoint.logical_ifindex,
+            // GRE still has its outer IP header in `frame`, so it reads the
+            // outer ECN bits here and hands them in.
+            outer_ecn: outer_ecn_bits(frame, meta),
+            ecn_illegal_drops: &GRE_DECAP_ECN_ILLEGAL_DROPS,
+            // #2486: mark the inner packet GRE-decapped so the forward builder
+            // selects the `tcp-mss gre-in` clamp value.
+            meta_flags: GRE_DECAP_INGRESS_FLAG,
+            rx_queue_index: meta.rx_queue_index,
+            // GRE runs inside a worker on a received packet, so the attachment
+            // generations are inherited from the triggering RX meta (#7167
+            // invariant 5). A caller with no ingress meta has no such value.
+            config_generation: meta.config_generation,
+            fib_generation: meta.fib_generation,
         },
-    );
-    let mut flow_src_addr = [0u8; 16];
-    let mut flow_dst_addr = [0u8; 16];
-    let (src_port, dst_port) = flow
-        .as_ref()
-        .map(|flow| (flow.forward_key.src_port, flow.forward_key.dst_port))
-        .unwrap_or_default();
-    if let Some(flow) = flow.as_ref() {
-        match flow.src_ip {
-            IpAddr::V4(ip) => flow_src_addr[..4].copy_from_slice(&ip.octets()),
-            IpAddr::V6(ip) => flow_src_addr.copy_from_slice(&ip.octets()),
-        }
-        match flow.dst_ip {
-            IpAddr::V4(ip) => flow_dst_addr[..4].copy_from_slice(&ip.octets()),
-            IpAddr::V6(ip) => flow_dst_addr.copy_from_slice(&ip.octets()),
-        }
-    }
-
-    // #921: GRE decap fires from afxdp.rs (pre-flow-cache), so this
-    // is the per-packet path on GRE-tunnel workloads. Direct ID
-    // lookup — was a two-hop name round-trip.
-    let ingress_zone = forwarding
-        .ifindex_to_zone_id
-        .get(&endpoint.logical_ifindex)
-        .copied()
-        .unwrap_or_default();
-    let pkt_len = u16::try_from(inner_packet.len()).ok()?;
-    let inner_meta = UserspaceDpMeta {
-        magic: USERSPACE_META_MAGIC,
-        version: USERSPACE_META_VERSION,
-        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-        ingress_ifindex: endpoint.logical_ifindex as u32,
-        rx_queue_index: meta.rx_queue_index,
-        ingress_vlan_id: 0,
-        ingress_zone,
-        l3_offset: 14,
-        l4_offset: 14 + rel_l4_offset,
-        payload_offset: 14 + payload_offset,
-        pkt_len,
-        addr_family: inner_family,
-        protocol,
-        tcp_flags: packet_tcp_flags(inner_packet, inner_family, protocol, rel_l4_offset),
-        // #2486: mark this inner packet as GRE-decapped so the forward
-        // builder selects the `tcp-mss gre-in` clamp value. The inbound
-        // GRE-decapped SYN is the exact direction where an inner LAN peer
-        // would otherwise learn an MSS too large for the GRE return path.
-        meta_flags: GRE_DECAP_INGRESS_FLAG,
-        flow_src_port: src_port,
-        flow_dst_port: dst_port,
-        flow_src_addr,
-        flow_dst_addr,
-        config_generation: meta.config_generation,
-        fib_generation: meta.fib_generation,
-        ..UserspaceDpMeta::default()
-    };
+    )?;
 
     Some(NativeGrePacket {
         frame: synthetic,
