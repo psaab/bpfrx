@@ -204,6 +204,28 @@ func urlLeafIndices(fp []string) []int {
 					out = append(out, j)
 				}
 			}
+		case "path":
+			// #7406: the per-feed path under `security dynamic-address
+			// feed-server <s> feed-name <f> path <p>`. resolveBaseURL joins
+			// this onto the feed-server's url/hostname, so the leaf accepts a
+			// full URL tail and a `?token=SECRET` query is the common feed
+			// provider shape. FeedEntry.MarshalJSON (types_security.go) has
+			// run it through RedactURL on the JSON config-read route since
+			// #6703; without this case `show configuration` rendered the SAME
+			// token verbatim. The two surfaces have to agree, and the
+			// AST one was the leak.
+			//
+			// Gated like `server`: `path` is a generic keyword, so it is a URL
+			// only under a feed-server. Note this closes the QUERY/userinfo
+			// class only — a key that IS a path segment or a host label
+			// (`.../SECRET/list.txt`, `https://SECRET.feed.example/`) is
+			// unredactable by any string rule and is documented as such in
+			// pkg/feeds/README.md rather than papered over here.
+			if containsAnyOf(fp[:i], "feed-server") {
+				for j := i + 1; j < len(fp); j++ {
+					out = append(out, j)
+				}
+			}
 		case "archive-sites":
 			// #7511: an archive TRANSFER url — `scp://user:pw@host/dir` — which
 			// lives only in the raw AST and is never promoted to a typed field,
