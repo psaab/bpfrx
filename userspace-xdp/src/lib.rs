@@ -722,6 +722,57 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
     }
 
+    // #7176 (C179-019) ALIGNMENT: this is a plain aligned store through a
+    // *mut UserspaceDpMeta (align_of == 8, from `config_generation: u64`),
+    // while the consumer reads the same bytes back with `read_unaligned` and
+    // documents that it makes no alignment assumption
+    // (userspace-dp/src/afxdp/frame/inspect.rs). The two sides disagree on
+    // paper. They do not disagree in practice HERE, and this records why.
+    //
+    // The invariant this store depends on:
+    //     meta_ptr == xdp->data - size_of::<UserspaceDpMeta>()
+    //     size_of::<UserspaceDpMeta>() == 96, align_of == 8, 96 % 8 == 0
+    //   =>  meta_ptr % 8 == xdp->data % 8
+    // So the ONLY variable is whether the driver hands us an 8-aligned
+    // `xdp->data`. That is a kernel/driver property, not an xpf one.
+    //
+    // Measured on the shipped target (mlx5_core VF, AF_XDP native, kernel
+    // 7.0.0-rc7+) with a kprobe on bpf_xdp_adjust_meta reading xdp_buff->data:
+    // 5,989,142 samples, ALL of them `% 8 == 0`, zero in buckets 1-7, over
+    // LAN->WAN v4 and v6 (ping + iperf3). The histogram was NOT broken down
+    // by ingress path and no fabric traffic was deliberately driven, so the
+    // generic-XDP fabric path is unrepresented or under-represented rather
+    // than proven clean; its buffers come from an skb rather than a
+    // page-aligned frame, so it is the one surface where the answer could
+    // differ.
+    //
+    // The probe recorded its own total alongside the histogram, deliberately:
+    // a kprobe that never fired and a pointer that never misaligned produce
+    // the SAME empty histogram. The total (5,989,142, equal to the aligned
+    // bucket) is what makes the zero in buckets 1-7 a measurement rather than
+    // an absence of evidence.
+    //
+    // This says the invariant is CURRENTLY SATISFIED on this target. It does
+    // NOT say the construct is sound: `ptr::write` to a misaligned pointer is
+    // UB regardless of whether the hardware faults, and LLVM is entitled to
+    // exploit that, so "x86 tolerates it" is a weaker guarantee than it reads
+    // as. A driver whose `xdp->data` is not 8-aligned, or a target that faults
+    // on misaligned stores, makes this a live bug rather than a latent one.
+    //
+    // The fix if that happens is `core::ptr::write_unaligned` here. It was
+    // implemented and measured rather than estimated: the BPF backend lowers
+    // it to a byte-wise copy costing +145 instructions and +1,152 bytes of
+    // .xdp, which moves #1864 verifier headroom 19.86% -> 18.73% against a
+    // 15.0% floor — roughly a quarter of the remaining margin. Cheap if the
+    // counter ever fires; not worth prepaying while it does not. That delta
+    // is attributable because a no-change rebuild of this object is
+    // byte-identical (md5 f576dfef5644337fc6f614c35c4555e2): the control was
+    // established before the comparison rather than assumed.
+    //
+    // Note for anyone tempted by a runtime alignment check: the verifier
+    // rejects it. `R1 bitwise operator &= on pointer prohibited` — a BPF
+    // program cannot observe a packet pointer's alignment at all, so neither
+    // an in-band probe nor a check-and-refuse variant is implementable.
     unsafe {
         *meta_ptr = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,

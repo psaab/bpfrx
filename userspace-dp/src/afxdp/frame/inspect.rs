@@ -1902,6 +1902,15 @@ pub(in crate::afxdp) fn try_parse_metadata(
     // dereferencing as *const UserspaceDpMeta directly would be UB on
     // architectures that fault on misaligned loads (the x86 host happens
     // to tolerate it but it's still UB and a portability footgun).
+    //
+    // #7176 (C179-019): this read stays unaligned and is correct as written.
+    // The PRODUCER side (userspace-xdp/src/lib.rs) does a plain aligned store
+    // to the same bytes, which reads as a contradiction with this comment. It
+    // is not one: that store's alignment was measured on the shipped target
+    // (5,989,142 samples, zero misaligned) and the producer carries the
+    // invariant, the measurement, and the cost of making it explicit. Do not
+    // "reconcile" the two by weakening this side to a plain deref — this side
+    // is the one with no alignment guarantee to lose.
     let meta = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const UserspaceDpMeta) };
     if meta.magic != USERSPACE_META_MAGIC || meta.version != USERSPACE_META_VERSION {
         return None;
