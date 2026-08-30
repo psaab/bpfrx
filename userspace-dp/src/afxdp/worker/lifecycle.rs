@@ -162,6 +162,8 @@ pub(super) fn poll_binding(
                 // call and is never aliased mutably on the poll path.
                 unsafe { &*(binding.umem.area() as *const MmapArea) },
                 shared_recycles,
+                event_stream,
+                &mut counters,
             );
             counters.flush(&binding.live);
             update_binding_idle_debug_state(binding, now_ns);
@@ -330,6 +332,8 @@ pub(super) fn poll_binding(
         // the poll path.
         unsafe { &*area },
         shared_recycles,
+        event_stream,
+        &mut counters,
     );
     counters.flush(&binding.live);
     update_binding_debug_state(binding);

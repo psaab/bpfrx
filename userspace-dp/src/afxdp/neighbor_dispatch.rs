@@ -193,6 +193,14 @@ pub(super) fn retry_pending_neigh(
     now_ns: u64,
     area: &MmapArea,
     shared_recycles: &mut Vec<(u32, u64)>,
+    // #7176 (C179-001): a buffered packet's output filter is evaluated HERE and
+    // nowhere else, so this path owes the same `then reject` reply and `then
+    // log` event the immediate forward path emits. Both need context the flush
+    // did not previously carry: the event stream to publish the filter-log
+    // event on, and the batch counters `enqueue_filter_reject_reply` meters the
+    // synthesized reply against.
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    counters: &mut BatchCounters,
 ) {
     if binding.pending_neigh.is_empty() {
         return;
@@ -487,6 +495,46 @@ pub(super) fn retry_pending_neigh(
             now_ns,
         );
         if cos.drop {
+            // #7176 (C179-001): apply the SAME reject-reply / filter-log side
+            // effects the immediate forward path applies. Before this, a
+            // dropping verdict here recycled the frame silently, so an output
+            // filter `then reject` degraded to `then discard` and a `then log`
+            // term emitted nothing — for every packet unlucky enough to arrive
+            // before its neighbor resolved. `cos` is resolved from the same
+            // `resolve_cos_tx_selection_at_prenat` the immediate path uses, so
+            // the verdict is identical; only the handling of it diverged.
+            //
+            // The flow is rebuilt from the buffered pre-NAT session key, which
+            // is the deferred equivalent of the immediate path's
+            // `tx_selection_flow`. A packet buffered without a key (a non-first
+            // fragment, #2357) yields `None` and keeps the silent drop, which
+            // matches the immediate path's flowless behaviour (#3615 -- no L4
+            // header to synthesize a reply from).
+            let deferred_flow = pkt.flow_key.as_ref().map(|key| SessionFlow {
+                src_ip: key.src_ip,
+                dst_ip: key.dst_ip,
+                forward_key: key.clone(),
+            });
+            crate::afxdp::forward_request::apply_cos_drop_side_effects(
+                &cos,
+                crate::afxdp::forward_request::CoSDropSideEffects {
+                    forwarding,
+                    meta: pkt.meta,
+                    ingress_ifindex: pkt.meta.ingress_ifindex as i32,
+                    egress_ifindex: decision.resolution.egress_ifindex,
+                    // A deferred packet is never a fabric ingress: the fabric
+                    // redirect path forwards immediately and never buffers.
+                    fabric_ingress_zone: None,
+                    now_ns,
+                },
+                source_frame,
+                deferred_flow.as_ref(),
+                Some(crate::afxdp::forward_request::ForwardRejectReply {
+                    tx_pipeline: &mut binding.tx_pipeline,
+                    counters,
+                }),
+                event_stream,
+            );
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         }
@@ -812,6 +860,10 @@ pub(super) fn build_missing_neighbor_session_metadata(
 #[cfg(test)]
 #[path = "neighbor_dispatch_mirror_tests.rs"]
 mod mirror_tests;
+
+#[cfg(test)]
+#[path = "neighbor_dispatch_deferred_verdict_tests.rs"]
+mod deferred_verdict_tests;
 
 #[cfg(test)]
 mod cold_start_probe_schedule_tests {
