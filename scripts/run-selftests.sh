@@ -231,6 +231,7 @@ run_bash test/incus/cluster-env-selftest.sh
 run_bash test/incus/cos-apply-lib-selftest.sh
 run_bash test/incus/host-inbound-selftest.sh
 run_bash test/incus/iperf-throughput-selftest.sh
+run_bash test/incus/target-services-selftest.sh
 run_bash test/incus/with-cluster-selftest.sh
 
 # -- self-test census (#7296) --

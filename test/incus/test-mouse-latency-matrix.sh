@@ -75,6 +75,28 @@ mapfile -t CELLS < <(printf '%s\n' "$CELLS_RAW" | sed '/^[[:space:]]*$/d')
 
 start_t=$(date +%s)
 
+# ---- target-service preflight (#8040)
+#
+# BEFORE the 60s probe rep below, and before any CoS mutation: check that the
+# per-class listeners this matrix will actually use are up, and report the
+# WHOLE grid if they are not.
+#
+# The old preflight reached the target only through test-mouse-latency.sh's
+# single-port /dev/tcp check, so a matrix aborted on the first class it
+# happened to reach and said nothing about the other twenty-three. A sweep
+# that fixed that one port then failed on the next. Worse, the abort arrived
+# after a build, a deploy and the shared /tmp/xpf-cluster.lock had all been
+# spent — this check is cheap and answers first.
+#
+# Scoped to the ports this run needs, not all 24: an unrelated class being
+# down must not block a matrix that never sends to it.
+MOUSE_PORT="${MOUSE_PORT:-6200}"
+ELEPHANT_PORT="${ELEPHANT_PORT:-5202}"
+if ! "${SCRIPT_DIR}/target-services.sh" check "$MOUSE_PORT" "$ELEPHANT_PORT"; then
+    echo "aborting matrix: the target services this run needs are not up (#8040)" >&2
+    exit 1
+fi
+
 # ---- echo-server preflight (plan §4.6)
 PREFLIGHT_DIR="${OUT_ROOT}/preflight"
 mkdir -p "$PREFLIGHT_DIR"

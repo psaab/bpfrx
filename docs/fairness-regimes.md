@@ -262,6 +262,43 @@ is a re-steer.
   "Small-class per-class rate-metering floor (#1630 cause-1)"
   section below for the CoS-shaping floors.
 
+## Target-service prerequisite (#8040)
+
+**Every per-class harness in this document needs live listeners on the
+VLAN-80 target that none of them can create.** Traffic runs from the LAN-side
+source container, through the firewall, to `172.16.80.200`
+(`IPERF_TARGET4` in `test/incus/loss-userspace-cluster.env`), which must be
+running:
+
+| ports | service | mapped by |
+|---|---|---|
+| 5200-5211 | per-class `iperf3 -s` | `test/incus/cos-iperf-config.set` |
+| 6200-6211 | per-class TCP echo | same port -> forwarding-class grid |
+
+Check before spending a deploy and the shared cluster lock:
+
+```bash
+./test/incus/target-services.sh status   # the whole 24-port grid, one table
+./test/incus/target-services.sh check    # exit 1 if anything is down
+./test/incus/target-services.sh check 5202 6200   # only the ports you need
+```
+
+`test-mouse-latency-matrix.sh`, `fairness-harness.sh` and
+`cos-be-contention-harness.sh` call `check` themselves now, scoped to the
+ports they use — an unrelated class being down does not block a smoke that
+never sends to it, but the report on failure is always the full grid.
+
+**Why this went unnoticed for so long.** `make test-failover` uses the DEFAULT
+iperf3 port, not the per-class grid, so the standing smoke stays green at
+18+ Gb/s while every harness here is unrunnable. The green everyone watches
+does not cover the dependency everything else needs. On the standing loss
+cluster the target is external lab hardware: it answers ICMP on
+`ge-0-0-2.80` but is not an incus instance in any project and accepts no ssh,
+so `target-services.sh up` can only provision a target it has a handle for and
+otherwise prints exactly what must be started and where. That boundary is the
+honest one — the tooling cannot invent a management path that does not exist,
+but no harness should ever rediscover the fact again.
+
 ## Acceptance gates
 
 A measurement run **PASSES** iff ALL of:
