@@ -942,18 +942,52 @@ impl super::Coordinator {
     /// hold bits, while `parse_source_nat_rules_with_previous` carries the
     /// allocator across the reload -- sets no flag at all, so there is nothing
     /// here to react to. It is not fixed by this change.
+    /// #7092: reclaim the NAT holder bits of EVERY currently-registered worker,
+    /// for the generation teardown that a replan performs. Returns records freed.
+    ///
+    /// The sibling of `retire_dead_worker_holders`, for the route that sets no
+    /// flag. `dead` is written only by the panic supervisor, so a clean
+    /// generation teardown — which is what a worker-count change does — never
+    /// sets it, and a sweep keyed on `dead` cannot see this case at all. That
+    /// gap is why #7092 stayed open after #8069 closed the panic route.
+    ///
+    /// The latch is shared with the dead-worker sweep on purpose: a worker that
+    /// panicked and was already retired by the 1 Hz tick must not be swept a
+    /// second time here, and one that is retired here must not be swept again if
+    /// a status tick observes it before the records are dropped. One
+    /// compare_exchange answers both.
+    ///
+    /// WHY ALL IDS, not just the ones a shrinking plan drops. An id reused by
+    /// the next generation self-heals — the new worker takes the same bit and
+    /// eventually releases it — so only the dropped ids leak, which is why
+    /// #7092 frames this as shrinking. But "which ids does the NEXT plan mint"
+    /// is not known at teardown, and deferring until it is means sweeping after
+    /// the records naming the outgoing ids are already gone. Retiring all of
+    /// them is correct for the same reason retiring one dead worker is: the bit
+    /// records a claim by a worker that no longer exists. The next generation
+    /// re-imports the synced sessions and re-reserves, and no forwarding happens
+    /// in between, so the interval where a port is free while its session still
+    /// exists has no packet path through it.
+    pub(crate) fn retire_all_worker_holders(&self) -> usize {
+        self.retire_worker_holders_where(|_| true)
+    }
+
     pub(crate) fn retire_dead_worker_holders(&self) -> usize {
+        self.retire_worker_holders_where(|atomics| atomics.dead.load(Ordering::Relaxed))
+    }
+
+    /// Shared body: retire every registered worker whose `select` says so,
+    /// exactly once each.
+    fn retire_worker_holders_where(
+        &self,
+        select: impl Fn(&crate::afxdp::worker_runtime::WorkerRuntimeAtomics) -> bool,
+    ) -> usize {
         use std::sync::atomic::Ordering;
-        // Sourced here rather than passed in: the only caller is the status
-        // path, which has no clock of its own, and threading one through would
-        // make the timestamp a caller's choice for a reclaim whose correctness
-        // does not depend on it (retire_worker uses it only to stamp freed
-        // records, never to decide what to free).
         let now_ns = crate::afxdp::wg::counters::monotonic_now_ns();
         let mut freed = 0;
         for (worker_id, rec) in self.workers.records.iter() {
             let atomics = &rec.handle.runtime_atomics;
-            if !atomics.dead.load(Ordering::Relaxed) {
+            if !select(atomics) {
                 continue;
             }
             // One-shot: the loser of a race does not sweep, so the walk happens
