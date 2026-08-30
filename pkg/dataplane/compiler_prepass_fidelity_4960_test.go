@@ -107,7 +107,7 @@ func TestPrePassFakeIsNoMorePermissiveThanProduction_4960(t *testing.T) {
 	fakeDecl, _ := declaredMethodsInPackage(t, "discardingDataPlane")
 
 	// FLOOR: a rename or file move would empty either scan and pass vacuously.
-	if len(shimDecl) < 40 || len(fakeDecl) < 30 {
+	if len(shimDecl) < 32 || len(fakeDecl) < 20 {
 		t.Fatalf("scan found %d shim and %d fake methods — it is not reaching the "+
 			"real types, so a divergence could be introduced without this test "+
 			"noticing", len(shimDecl), len(fakeDecl))

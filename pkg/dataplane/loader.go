@@ -522,37 +522,10 @@ func (d userspaceShimCompileDataplane) SetPolicyRule(uint32, uint32, PolicyRule)
 	return nil
 }
 func (d userspaceShimCompileDataplane) SetDefaultPolicy(uint8) error { return nil }
-func (d userspaceShimCompileDataplane) SetSNATRule(uint16, uint16, uint16, SNATValue) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetSNATRuleV6(uint16, uint16, uint16, SNATValueV6) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetSNATEgressIP(SNATEgressKey, SNATEgressValue) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetNATPoolConfig(uint32, NATPoolConfig) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetNATPoolIPV4(uint32, uint32, uint32) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetNATPoolIPV6(uint32, uint32, [16]byte) error {
-	return nil
-}
+
 func (d userspaceShimCompileDataplane) SetDNATEntry(DNATKey, DNATValue) error       { return nil }
 func (d userspaceShimCompileDataplane) SetDNATEntryV6(DNATKeyV6, DNATValueV6) error { return nil }
-func (d userspaceShimCompileDataplane) SetStaticNATEntryV4(uint32, uint8, uint32) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetStaticNATEntryV6([16]byte, uint8, [16]byte) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetNPTv6Rule(NPTv6Key, NPTv6Value) error {
-	return nil
-}
-func (d userspaceShimCompileDataplane) SetNAT64Config(uint32, NAT64Config) error { return nil }
-func (d userspaceShimCompileDataplane) SetNAT64Count(uint32) error               { return nil }
+
 func (d userspaceShimCompileDataplane) SetScreenConfig(uint32, ScreenConfig) error {
 	return nil
 }
@@ -566,20 +539,19 @@ func (d userspaceShimCompileDataplane) SetPolicerConfig(uint32, PolicerConfig) e
 func (d userspaceShimCompileDataplane) SetIfaceFilter(IfaceFilterKey, uint32) error { return nil }
 func (d userspaceShimCompileDataplane) SetFilterConfig(uint32, FilterConfig) error  { return nil }
 func (d userspaceShimCompileDataplane) SetFilterRule(uint32, FilterRule) error      { return nil }
-func (d userspaceShimCompileDataplane) ClearSNATEgressIPs() error                   { return nil }
-func (d userspaceShimCompileDataplane) DeleteStaleIfaceZone(map[IfaceZoneKey]bool)  {}
-func (d userspaceShimCompileDataplane) DeleteStaleVlanIface(map[uint32]bool)        {}
+
+func (d userspaceShimCompileDataplane) DeleteStaleIfaceZone(map[IfaceZoneKey]bool) {}
+func (d userspaceShimCompileDataplane) DeleteStaleVlanIface(map[uint32]bool)       {}
 func (d userspaceShimCompileDataplane) DeleteStaleZonePairPolicies(map[ZonePairKey]bool) {
 }
 func (d userspaceShimCompileDataplane) DeleteStaleApplications(map[AppKey]bool) {}
-func (d userspaceShimCompileDataplane) DeleteStaleSNATRules(map[SNATKey]bool)   {}
-func (d userspaceShimCompileDataplane) DeleteStaleSNATRulesV6(map[SNATKey]bool) {}
-func (d userspaceShimCompileDataplane) DeleteStaleDNATStatic(map[DNATKey]bool)  {}
+
+func (d userspaceShimCompileDataplane) DeleteStaleDNATStatic(map[DNATKey]bool) {}
 func (d userspaceShimCompileDataplane) DeleteStaleDNATStaticV6(map[DNATKeyV6]bool) {
 }
 func (d userspaceShimCompileDataplane) DeleteStaleStaticNAT(map[StaticNATKeyV4]bool, map[StaticNATKeyV6]bool) {
 }
-func (d userspaceShimCompileDataplane) DeleteStaleNPTv6(map[NPTv6Key]bool) {}
+
 func (d userspaceShimCompileDataplane) DeleteStaleNAT64(uint32, map[NAT64PrefixKey]bool) {
 }
 func (d userspaceShimCompileDataplane) ZeroStaleScreenConfigs(uint32) {}

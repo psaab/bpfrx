@@ -207,36 +207,15 @@ func (discardingDataPlane) SetApplication(protocol uint8, dstPort uint16, appID 
 func (discardingDataPlane) SetAppRange(index uint32, entry AppRangeEntry) error { return nil }
 func (discardingDataPlane) SetDNATEntry(key DNATKey, val DNATValue) error       { return nil }
 func (discardingDataPlane) SetDNATEntryV6(key DNATKeyV6, val DNATValueV6) error { return nil }
-func (discardingDataPlane) SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) error {
-	return nil
-}
-func (discardingDataPlane) SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV6) error {
-	return nil
-}
-func (discardingDataPlane) SetNATPoolConfig(poolID uint32, cfg NATPoolConfig) error      { return nil }
-func (discardingDataPlane) SetNATPoolIPV4(poolID, index uint32, ip uint32) error         { return nil }
-func (discardingDataPlane) SetNATPoolIPV6(poolID, index uint32, ip [16]byte) error       { return nil }
-func (discardingDataPlane) SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error { return nil }
-func (discardingDataPlane) ClearSNATEgressIPs() error                                    { return nil }
-func (discardingDataPlane) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
-	return nil
-}
-func (discardingDataPlane) SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [16]byte) error {
-	return nil
-}
-func (discardingDataPlane) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error          { return nil }
-func (discardingDataPlane) DeleteStaleNPTv6(written map[NPTv6Key]bool)               {}
-func (discardingDataPlane) SetNAT64Config(index uint32, cfg NAT64Config) error       { return nil }
-func (discardingDataPlane) SetNAT64Count(count uint32) error                         { return nil }
+
 func (discardingDataPlane) SetScreenConfig(profileID uint32, cfg ScreenConfig) error { return nil }
 func (discardingDataPlane) SetFlowTimeout(idx, seconds uint32) error                 { return nil }
 func (discardingDataPlane) SetFlowConfig(cfg FlowConfigValue) error                  { return nil }
 func (discardingDataPlane) DeleteStaleZonePairPolicies(written map[ZonePairKey]bool) {}
 func (discardingDataPlane) DeleteStaleApplications(written map[AppKey]bool)          {}
-func (discardingDataPlane) DeleteStaleSNATRules(written map[SNATKey]bool)            {}
-func (discardingDataPlane) DeleteStaleSNATRulesV6(written map[SNATKey]bool)          {}
-func (discardingDataPlane) DeleteStaleDNATStatic(written map[DNATKey]bool)           {}
-func (discardingDataPlane) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool)       {}
+
+func (discardingDataPlane) DeleteStaleDNATStatic(written map[DNATKey]bool)     {}
+func (discardingDataPlane) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool) {}
 func (discardingDataPlane) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool) {
 }
 func (discardingDataPlane) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {}

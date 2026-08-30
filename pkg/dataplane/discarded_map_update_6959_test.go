@@ -58,16 +58,18 @@ var discardedUpdateAllowlist = map[string]string{
 // the bound its inline loop used at origin/master, so the conversion cannot
 // have narrowed a sweep or pointed one at the wrong map's max_entries.
 // Whitespace is normalised before comparison.
+// #7268 removed the snat_rules, snat_rules_v6, nat_pool_configs and
+// nat64_configs rows with the clear loops themselves: those maps are not
+// declared by the AF_XDP shim, so nothing on the deployed dataplane can hold
+// entries for them to sweep. The rows are deleted rather than the guard
+// weakened -- every clear loop that still EXISTS is still bound here, and the
+// len(sc.boundsSeen) == 0 floor above still refuses a vacuous pass.
 var clearArrayEntriesBounds = map[string]string{
 	"app_ranges":        "MaxAppRanges",
 	"zone_counters":     "128",
 	"policer_configs":   "MaxPolicers",
 	"filter_configs":    "MaxFilterConfigs",
 	"screen_configs":    "64",
-	"snat_rules":        "MaxZones*MaxZones*MaxSNATRulesPerPair",
-	"snat_rules_v6":     "MaxZones*MaxZones*MaxSNATRulesPerPair",
-	"nat_pool_configs":  "32",
-	"nat64_configs":     "4",
 	"nat_rule_counters": "MaxNATRuleCounters",
 }
 

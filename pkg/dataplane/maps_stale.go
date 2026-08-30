@@ -111,68 +111,6 @@ func (m *Manager) DeleteStaleApplications(written map[AppKey]bool) {
 	}
 }
 
-// DeleteStaleSNATRules zeroes snat_rules ARRAY entries not in the written set.
-// The map is an ARRAY so entries cannot be deleted — zero means "no rule".
-func (m *Manager) DeleteStaleSNATRules(written map[SNATKey]bool) {
-	zm, present, _ := m.lookupMapLocked("snat_rules")
-	if !present {
-		return
-	}
-	empty := SNATValue{}
-	var key uint32
-	var val SNATValue
-	iter := zm.Iterate()
-	count := 0
-	for iter.Next(&key, &val) {
-		if val.Mode == 0 && val.SrcAddrID == 0 && val.DstAddrID == 0 {
-			continue // already empty
-		}
-		fromZone := uint16(key / (MaxZones * MaxSNATRulesPerPair))
-		rem := key % (MaxZones * MaxSNATRulesPerPair)
-		toZone := uint16(rem / MaxSNATRulesPerPair)
-		ruleIdx := uint16(rem % MaxSNATRulesPerPair)
-		sk := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
-		if !written[sk] {
-			zm.Update(key, empty, ebpf.UpdateAny)
-			count++
-		}
-	}
-	if count > 0 {
-		slog.Info("zeroed stale snat_rules entries", "count", count)
-	}
-}
-
-// DeleteStaleSNATRulesV6 zeroes snat_rules_v6 ARRAY entries not in the written set.
-// The map is an ARRAY so entries cannot be deleted — zero means "no rule".
-func (m *Manager) DeleteStaleSNATRulesV6(written map[SNATKey]bool) {
-	zm, present, _ := m.lookupMapLocked("snat_rules_v6")
-	if !present {
-		return
-	}
-	empty := SNATValueV6{}
-	var key uint32
-	var val SNATValueV6
-	iter := zm.Iterate()
-	count := 0
-	for iter.Next(&key, &val) {
-		if val.Mode == 0 && val.SrcAddrID == 0 && val.DstAddrID == 0 {
-			continue // already empty
-		}
-		fromZone := uint16(key / (MaxZones * MaxSNATRulesPerPair))
-		rem := key % (MaxZones * MaxSNATRulesPerPair)
-		toZone := uint16(rem / MaxSNATRulesPerPair)
-		ruleIdx := uint16(rem % MaxSNATRulesPerPair)
-		sk := SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ruleIdx}
-		if !written[sk] {
-			zm.Update(key, empty, ebpf.UpdateAny)
-			count++
-		}
-	}
-	if count > 0 {
-		slog.Info("zeroed stale snat_rules_v6 entries", "count", count)
-	}
-}
-
 // DeleteStaleDNATStatic removes static dnat_table entries not in the written set.
 func (m *Manager) DeleteStaleDNATStatic(written map[DNATKey]bool) {
 	zm, present, _ := m.lookupMapLocked("dnat_table")
@@ -254,29 +192,6 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writte
 		if len(stale) > 0 {
 			slog.Info("deleted stale static_nat_v6 entries", "count", len(stale))
 		}
-	}
-}
-
-// DeleteStaleNPTv6 removes nptv6_rules entries not in the written set.
-func (m *Manager) DeleteStaleNPTv6(written map[NPTv6Key]bool) {
-	zm, present, _ := m.lookupMapLocked("nptv6_rules")
-	if !present {
-		return
-	}
-	var key NPTv6Key
-	var val []byte
-	iter := zm.Iterate()
-	var stale []NPTv6Key
-	for iter.Next(&key, &val) {
-		if !written[key] {
-			stale = append(stale, key)
-		}
-	}
-	for _, k := range stale {
-		zm.Delete(k)
-	}
-	if len(stale) > 0 {
-		slog.Info("deleted stale nptv6_rules entries", "count", len(stale))
 	}
 }
 
