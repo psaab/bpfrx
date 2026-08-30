@@ -703,6 +703,35 @@ type ClampedIPWeight struct {
 // surface including the log. That is worse than the interface-monitor case
 // #6589 was filed about, and it is the same failure shape: a monitor clamped to
 // 0 owes no election debt, so its RG never demotes when the probe fails.
+// IPGlobalThreshold reports the configured global-threshold parameters for an
+// RG, and whether that RG is in global-threshold mode at all (#7338).
+//
+// The status renderer needs these to describe the aggregate debt as what it is
+// -- a THRESHOLD CROSSING -- rather than as an unreachable address. In
+// global-threshold mode there is no per-address debt to name (desiredRGIPDebts
+// installs a SINGLE debt and returns), so rendering the aggregate as an address
+// would invent a target that does not exist.
+//
+// ok is false when the RG has no ip-monitoring or is in independent (per-target)
+// mode, so a caller cannot mistake a zero threshold for a configured one.
+func (mon *Monitor) IPGlobalThreshold(rgID int) (threshold, weight int, ok bool) {
+	mon.mu.Lock()
+	groups := mon.groups
+	mon.mu.Unlock()
+
+	for _, rg := range groups {
+		if rg == nil || rg.ID != rgID || rg.IPMonitoring == nil {
+			continue
+		}
+		if rg.IPMonitoring.GlobalThreshold <= 0 {
+			return 0, 0, false
+		}
+		w, _ := config.ClampInterfaceMonitorWeight(rg.IPMonitoring.GlobalWeight)
+		return rg.IPMonitoring.GlobalThreshold, w, true
+	}
+	return 0, 0, false
+}
+
 func (mon *Monitor) ClampedIPMonitorWeights() []ClampedIPWeight {
 	mon.mu.Lock()
 	groups := mon.groups
