@@ -149,9 +149,13 @@ var managerMethodClasses = map[string]string{
 	// m.attachedInstance.
 	"ReplaceZoneCounterOffsets": "catG",
 	"ProveArmCoverage":          "catG",
-	"ClearZoneCounterOffsets":   "catG",
-	"ReadFloodCounters":         "catG",
-	"SetFloodCounterOffset":     "catG",
+	// #7191: ArmCoverageSummary reads only the armCoverage cell (its own RWMutex),
+	// touches no map registry, and cannot arm or disarm anything on its own — the
+	// daemon-side gate decides. Same class as the proof it reports.
+	"ArmCoverageSummary":      "catG",
+	"ClearZoneCounterOffsets": "catG",
+	"ReadFloodCounters":       "catG",
+	"SetFloodCounterOffset":   "catG",
 	// #3651 flood half: the plural sibling of SetFloodCounterOffset, and the
 	// only production writer of the flood offset map. Same shape as
 	// ReplaceZoneCounterOffsets above — it takes m.mu, rebuilds the
@@ -234,8 +238,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 141 {
-		t.Fatalf("exported *Manager method inventory = %d, want 141 (the 164 census minus the 23 NAT write methods retired in #7268 — the writers for snat_rules, static_nat_*, nptv6_rules, nat_pool_*, snat_egress_ips and nat64_* maps, none of which the AF_XDP shim declares); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 142 {
+		t.Fatalf("exported *Manager method inventory = %d, want 142 (the 164 census minus the 23 NAT write methods retired in #7268, plus ArmCoverageSummary added in #7191 — the writers for snat_rules, static_nat_*, nptv6_rules, nat_pool_*, snat_egress_ips and nat64_* maps, none of which the AF_XDP shim declares); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {

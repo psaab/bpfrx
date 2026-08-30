@@ -619,3 +619,13 @@ func (m *Manager) SetDeferWorkers(v bool) {
 	m.deferWorkers = v
 	m.mu.Unlock()
 }
+
+// ArmCoverageSummary forwards the #7191 arm-coverage proof from the bpf shim so
+// the daemon can gate on per-interface attach coverage. The userspace manager
+// holds no coverage state of its own — one source, per #7191.
+func (m *Manager) ArmCoverageSummary() (uncovered, total int, ran, seen bool) {
+	if m == nil || m.bpfShim == nil {
+		return 0, 0, false, false
+	}
+	return m.bpfShim.ArmCoverageSummary()
+}

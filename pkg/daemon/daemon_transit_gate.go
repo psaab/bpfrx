@@ -40,8 +40,31 @@ import (
 // relinquish routing adjacencies and RG mastership) is HA-coupled, owes a
 // `test-failover` smoke, and is deliberately NOT in this gate; likewise the
 // full transit barrier in docs/research/5275-arm-failclosed/plan.md §6
-// (inet FORWARD drop + bridge-family barrier + flowtable disable), of which
-// this is the `ip_forward=0` half.
+// (inet FORWARD drop + bridge-family barrier + flowtable disable).
+//
+// #7191 added the nftables legs. The barrier is now BOTH the `ip_forward=0`
+// sysctl and an unconditional forward-hook DROP in the inet AND bridge
+// families (pkg/nftables/transit_barrier.go), installed and removed from the
+// same mark* helpers below so there is one arm state driving both. The bridge
+// leg matters because `ip_forward` does not govern bridged frames at all, and
+// this repo creates bridge domains.
+//
+// The plan's third leg, a flowtable disable, is a NO-OP today and is
+// deliberately unwritten: xpf creates no flowtable, so there is nothing to
+// flush. TestNoFlowtableIsEverCreated7191 pins that assumption so this
+// sentence cannot rot into a false claim.
+//
+// CRITICALLY, the nftables legs are scoped to the UNARMED window only — the
+// same window in which `ip_forward` is already 0 — so they close nothing that
+// was open. See "WHY THE ARMED CASE IS UNAFFECTED" below: several armed paths
+// depend on the kernel forward hook being open and unfiltered, and a barrier
+// live while armed would drop them.
+//
+// #7191 also made the per-interface attach part of the arm state: the
+// post-attach arm-coverage proof now GATES (daemon_arm_coverage_7191.go)
+// instead of only logging, so a box where Start() succeeded but an interface
+// never got a shim no longer reports itself armed while forwarding that
+// interface unadjudicated.
 //
 // WHY THE ARMED CASE IS UNAFFECTED. The armed AF_XDP fast path does not
 // need `ip_forward` at all — measured in docs/image-validation.md
@@ -139,6 +162,9 @@ func (d *Daemon) DataplaneArmed() bool { return d.dataplaneArmed.Load() }
 func (d *Daemon) markDataplaneArmed(stage string) {
 	d.dataplaneArmed.Store(true)
 	writeTransitForwardSysctls(true)
+	// #7191: remove the nft barrier LAST on the opening path, so transit is
+	// open only once both legs agree. Either leg alone still closes it.
+	d.applyTransitBarrier(true)
 	d.applyDataplaneArmTrack(true)
 	slog.Info("dataplane armed; kernel transit forwarding enabled", "stage", stage)
 }
@@ -186,6 +212,9 @@ func (d *Daemon) applyDataplaneArmTrack(armed bool) {
 // reachable so the operator can correct the config in-band (#1960 no-brick).
 func (d *Daemon) markDataplaneArmFailed(stage, remediation string, err error) {
 	d.dataplaneArmed.Store(false)
+	// #7191: install the nft barrier FIRST on the closing path. Both legs
+	// close, so the order only affects how early closure is complete.
+	d.applyTransitBarrier(false)
 	writeTransitForwardSysctls(false)
 	d.applyDataplaneArmTrack(false)
 	slog.Error("dataplane arm FAILED; kernel transit forwarding DISABLED (fail-closed, degraded): "+
@@ -213,6 +242,7 @@ func (d *Daemon) markDataplaneArmFailed(stage, remediation string, err error) {
 // agree with bring-up instead of contradicting it.
 func (d *Daemon) markDataplaneNotArmed(stage, reason string) {
 	d.dataplaneArmed.Store(false)
+	d.applyTransitBarrier(false) // #7191
 	writeTransitForwardSysctls(false)
 	// #7178: DELIBERATE and FAILED are the same fact to a peer — this node
 	// forwards no transit either way, so it must not outbid one that does. The
@@ -223,4 +253,45 @@ func (d *Daemon) markDataplaneNotArmed(stage, reason string) {
 	d.applyDataplaneArmTrack(false)
 	slog.Info("dataplane not armed; kernel transit forwarding disabled (fail-closed)",
 		"stage", stage, "reason", reason)
+}
+
+// applyTransitBarrier drives the #7191 nftables half of the barrier from the
+// SAME arm state that drives the sysctls. armed==true REMOVES it; armed==false
+// INSTALLS it.
+//
+// One source, deliberately: the barrier is never derived independently of
+// dataplaneArmed. A second notion of "should the barrier be up" is precisely
+// how a stale barrier survives arming and black-holes a healthy box.
+//
+// FAILURE DIRECTION IS ASYMMETRIC, and that asymmetry is the safety argument:
+//
+//   - failing to INSTALL (closing) is logged and swallowed, exactly as
+//     writeTransitForwardSysctls does. The sysctl leg has already closed
+//     transit; the barrier is belt to those braces, so a barrier that did not
+//     install leaves the box no worse than pre-#7191, and propagating it would
+//     brick management on a boot path.
+//   - failing to REMOVE (opening) is logged at ERROR, because that is the
+//     black-hole direction: a barrier that outlives arming drops the armed
+//     paths that deliberately rely on kernel forwarding — route-based IPsec
+//     plaintext off an xfrm interface, SNAT'd frames passed up for kernel
+//     routing, and the #7409 slow-path reinject. The apply tail re-asserts on
+//     every commit, so a transient failure self-heals; a persistent one is loud.
+func (d *Daemon) applyTransitBarrier(armed bool) {
+	if nftInstaller == nil {
+		return
+	}
+	if armed {
+		if err := nftInstaller.RemoveTransitBarrier(); err != nil {
+			slog.Error("failed to REMOVE the unarmed transit barrier while armed; "+
+				"kernel-forwarded paths that rely on an open FORWARD hook (route-based "+
+				"IPsec plaintext, SNAT'd frames, slow-path reinject) may be dropped until "+
+				"the next apply re-asserts", "err", err)
+		}
+		return
+	}
+	if err := nftInstaller.InstallTransitBarrier(); err != nil {
+		slog.Warn("failed to install the unarmed transit barrier; ip_forward=0 still "+
+			"closes transit, so this is a loss of defence-in-depth rather than an "+
+			"open forwarding path", "err", err)
+	}
 }

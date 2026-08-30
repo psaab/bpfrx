@@ -833,7 +833,19 @@ func (d *Daemon) applyKernelTuning(cfg *config.Config) {
 	// router. Writing the armed state (rather than skipping the write when
 	// unarmed) is deliberate: it also RE-ASSERTS the closure against
 	// anything else that raised the knob since the last apply.
+	// #7191: consult the post-attach arm-coverage proof BEFORE asserting the
+	// knobs. It runs first because a disarm verdict changes DataplaneArmed(),
+	// and the two writes below must assert the corrected state rather than the
+	// stale one. ApplyConfig has already run the per-interface attach by this
+	// point, so the proof describes the attachment that just happened.
+	d.evaluateArmCoverage("apply")
+
 	writeTransitForwardSysctls(d.DataplaneArmed())
+	// #7191: re-assert the nftables barrier on the same cadence and from the
+	// same predicate. This is what makes a stale barrier self-healing — a
+	// failed remove at arm time is corrected on the next commit rather than
+	// silently black-holing armed transit until a restart.
+	d.applyTransitBarrier(d.DataplaneArmed())
 }
 
 // sshKnownHostsPath is the OpenSSH global known-hosts file xpfd owns and fully
