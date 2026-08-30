@@ -38,8 +38,8 @@ import (
 // does not fix that — it only stops the degeneracy floor firing spuriously
 // under load (#7650). Measured at de6b8c85d on an idle machine, with the #7257
 // production fix reverted, `-race` reports ZERO data races, both with and
-// without the #7650 change. The fail-on-revert contract stated further down is
-// false as written.
+// without the #7650 change. That contract was false as written; it is now
+// stated below as the measured RATE it actually is, with its run counts.
 //
 // The cause is structural, not timing: StartHeartbeat re-checks its entry epoch
 // before publishing, StopHeartbeat bumps that epoch, and this probe runs an
@@ -66,9 +66,39 @@ import (
 // a quiet pass.
 //
 // The assertion is the race detector, so this is only meaningful under -race.
-// RED on revert: restore the unlocked `m.hbReceiver.start()` / `m.hbSender.start()`
-// pair after the Unlock and `go test -race -run TestStartHeartbeatDoesNotRaceStopHeartbeat7257
-// ./pkg/cluster/` reports WARNING: DATA RACE naming StartHeartbeat and StopHeartbeat.
+//
+// RED ON REVERT (#7663) — a measured RATE, deliberately not stated as a
+// contract. The exact revert, in StartHeartbeat — written as before/after
+// rather than as a unified diff, because gofmt reformats a leading `-`/`+`
+// inside an indented comment into a godoc list and rewrites `+` to `-`, which
+// would silently turn the additions below into deletions and make this
+// instruction wrong:
+//
+//	BEFORE (fixed, as shipped):     AFTER (reverted, reproduces the race):
+//	    receiver.start()                m.mu.Unlock()
+//	    sender.start()                  m.hbReceiver.start()
+//	    m.mu.Unlock()                   m.hbSender.start()
+//
+// Both halves matter: the start() calls move AFTER the Unlock, AND they read
+// the FIELDS rather than the locals. That unlocked read of fields StopHeartbeat
+// nils under the lock is #7257's actual defect. Disarming the `m.hbEpoch !=
+// startEpoch` supersede guard instead does NOT reproduce it — that leaves the
+// publish and both start() calls inside the critical section, so there is no
+// unsynchronised access for the detector to find. (Recorded because a reviewer
+// read "restore the unlocked pair" that way, reasonably, and measured 0 races.)
+//
+// With that revert applied, `go test -race -run
+// TestStartHeartbeatDoesNotRaceStopHeartbeat7257 ./pkg/cluster/` reported
+// WARNING: DATA RACE naming StartHeartbeat and StopHeartbeat in:
+//
+//	12 of 12 runs at startAttempts = 240   (this file)
+//	10 of 12 runs at startAttempts = 60    (the previous value)
+//
+// It is a rate and not a guarantee, and 12/12 does not upgrade it to one — the
+// misses are governed by REACH, and a run whose contention happens to collapse
+// reach (one miss logged `4 published / 56 superseded`) has fewer chances to
+// catch it. Before #7663 the rate was 0 of N: the probe could not distinguish a
+// fixed tree from a reverted one at all.
 // waitForTeardownProgress blocks until the teardown goroutine has completed at
 // least one stop, so the start loop is issued into a window that is provably
 // being contended (#7650).
