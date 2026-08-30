@@ -332,7 +332,7 @@ impl SessionTable {
     /// stale-index guard. The common non-colliding case is a len-1 bucket (one
     /// validate, zero heap), so the fast path is unchanged. Returns the matching
     /// handle, or `None` when no live reverse entry aliases to `key`.
-    fn resolve_reverse_translated_handle(&self, key: &SessionKey) -> Option<u32> {
+    pub(super) fn resolve_reverse_translated_handle(&self, key: &SessionKey) -> Option<u32> {
         let bucket = self.reverse_translated_index.get(key)?;
         for &handle in bucket.iter() {
             let Some(record) = self.entries.get(handle as usize) else {

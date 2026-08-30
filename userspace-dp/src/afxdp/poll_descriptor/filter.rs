@@ -337,18 +337,26 @@ pub(super) fn evaluate_non_pbr_input_filter_counters_cached(
 
 /// #7212: what an established-session HIT owes the ingress interface's INPUT
 /// filter, after the ONE `iface_filter_v{4,6}_fast` lookup that decides it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct SessionHitInputFilterEval {
     /// The verdict + any `then log` record, produced by the ordinary counted
     /// evaluator so a packet the filter drops is counted and logged exactly as a
     /// session-MISS packet would be.
     pub(super) eval: NonPbrInputFilterEval,
-    /// #7212: this verdict came from a STATIC-filter REVALIDATION rather than a
-    /// per-packet re-evaluation, so a non-`Accept` action REVOKES the session —
-    /// both directions, plus its flow-cache slots — instead of only dropping
-    /// this packet. `false` on the #1430/#2362 per-packet path, whose verdict is
-    /// about THIS packet and says nothing about the flow.
-    pub(super) revoked: bool,
+    /// #7212: `Some(canonical key)` when this verdict came from a STATIC-filter
+    /// REVALIDATION rather than a per-packet re-evaluation, so a non-`Accept`
+    /// action REVOKES the session — both directions, plus its flow-cache slots
+    /// — instead of only dropping this packet. `None` on the #1430/#2362
+    /// per-packet path, whose verdict is about THIS packet and says nothing
+    /// about the flow.
+    ///
+    /// It carries the KEY rather than a bool because the caller's `resolved.key`
+    /// is a WIRE tuple (`ResolvedSessionKey::QueryKey` on a local hit), and on
+    /// the NAT reverse-translated alias path — the reply to a source-NAT'd flow
+    /// — that is the TRANSLATED tuple, which names no entry in the primary
+    /// index. Handing the caller the canonical key this revalidation actually
+    /// resolved is what makes the teardown act on the session that was judged.
+    pub(super) revoked_key: Option<crate::session::SessionKey>,
 }
 
 /// Re-evaluate the ingress interface's INPUT filter for an established-session
@@ -427,17 +435,23 @@ pub(super) fn evaluate_input_filter_on_session_hit(
                 ingress_zone_override,
                 false,
             ),
-            revoked: false,
+            revoked_key: None,
         });
     }
-    // #7212: a purely STATIC filter. Nothing to do until the snapshot moves.
-    if !sessions.filter_revalidation_stale(session_key) {
+    // #7212: a purely STATIC filter. `session_key` is the WIRE tuple the packet
+    // carried; resolve it to the entry's CANONICAL key before touching the
+    // stamp, because on the NAT reverse-translated alias path (the reply to a
+    // source-NAT'd flow) the two differ and a primary-index probe on the wire
+    // tuple silently misses the entry.
+    let canonical_key = sessions.canonical_session_key(session_key)?;
+    // Nothing to do until the snapshot moves.
+    if !sessions.filter_revalidation_stale(&canonical_key) {
         return None;
     }
     revalidate_static_input_filter_on_session_hit(
         forwarding,
         sessions,
-        session_key,
+        canonical_key,
         filter,
         frame,
         flow,
@@ -465,7 +479,8 @@ pub(super) fn evaluate_input_filter_on_session_hit(
 fn revalidate_static_input_filter_on_session_hit(
     forwarding: &ForwardingState,
     sessions: &mut SessionTable,
-    session_key: &crate::session::SessionKey,
+    // The CANONICAL key, already resolved by the caller.
+    canonical_key: crate::session::SessionKey,
     filter: &crate::filter::Filter,
     frame: &[u8],
     flow: &SessionFlow,
@@ -490,7 +505,7 @@ fn revalidate_static_input_filter_on_session_hit(
         meta.dscp,
         extra,
     );
-    sessions.mark_filter_revalidated(session_key);
+    sessions.mark_filter_revalidated(&canonical_key);
     if verdict == crate::filter::FilterAction::Accept {
         // The filter still permits this flow. Nothing is counted, nothing is
         // logged, and the session — including its NAT translation, which is the
@@ -510,7 +525,7 @@ fn revalidate_static_input_filter_on_session_hit(
             ingress_zone_override,
             false,
         ),
-        revoked: true,
+        revoked_key: Some(canonical_key),
     })
 }
 

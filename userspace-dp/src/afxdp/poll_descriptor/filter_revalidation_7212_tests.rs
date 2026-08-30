@@ -229,8 +229,9 @@ fn static_discard_revokes_a_stale_stamped_session_7212() {
     .expect("a newly-denied stale session must produce a verdict");
     assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
     assert!(
-        hit.revoked,
-        "a static-filter verdict must revoke the SESSION, not just drop the packet"
+        hit.revoked_key.as_ref() == Some(&flow.forward_key),
+        "a static-filter verdict must revoke the SESSION, not just drop the \
+         packet, and must name the entry it judged"
     );
 }
 
@@ -350,7 +351,7 @@ fn static_discard_revokes_an_ipv6_session_7212() {
     )
     .expect("v6 verdict");
     assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
-    assert!(hit.revoked);
+    assert!(hit.revoked_key.is_some());
 }
 
 /// The filter is resolved through the LOGICAL VLAN unit, not the physical
@@ -375,7 +376,7 @@ fn static_discard_resolves_through_the_vlan_logical_unit_7212() {
     )
     .expect("the VLAN unit's own filter must be found");
     assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
-    assert!(hit.revoked);
+    assert!(hit.revoked_key.is_some());
 }
 
 /// Term ORDER decides. The same two terms with the accept first must permit;
@@ -402,7 +403,7 @@ fn term_order_decides_the_static_verdict_7212() {
             Some(TEST_LAN_ZONE_ID),
         );
         assert_eq!(
-            hit.is_some_and(|h| h.revoked),
+            hit.is_some_and(|h| h.revoked_key.is_some()),
             want_revoked,
             "accept_first={accept_first}: first match wins"
         );
@@ -430,7 +431,7 @@ fn source_address_except_inverts_the_static_verdict_7212() {
             Some(TEST_LAN_ZONE_ID),
         );
         assert_eq!(
-            hit.is_some_and(|h| h.revoked),
+            hit.is_some_and(|h| h.revoked_key.is_some()),
             want_revoked,
             "except={except}: the deny applies only when the address matches"
         );
@@ -488,11 +489,186 @@ fn a_per_packet_filter_drops_the_packet_without_revoking_the_session_7212() {
     .expect("a per-packet filter is re-evaluated on every hit");
     assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
     assert!(
-        !hit.revoked,
+        hit.revoked_key.is_none(),
         "a per-packet verdict must drop the packet, never revoke the session"
     );
     assert!(
         sessions.filter_revalidation_stale(&flow.forward_key),
         "the per-packet arm must not consume the static revalidation stamp"
+    );
+}
+
+/// The REPLY direction of a source-NAT'd flow, reached through the NAT
+/// reverse-translated ALIAS index, must revalidate too — and the verdict must
+/// name the entry's CANONICAL key, not the translated tuple the packet carried.
+///
+/// This is the dominant reverse-direction shape, not an edge case: every reply
+/// to a SNAT'd flow arrives addressed to the pool tuple, so
+/// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` = the
+/// TRANSLATED key, which names no entry in the primary index. A
+/// primary-index-only stamp probe answers "not stale" for every one of them: the
+/// reply half is never revalidated, never revoked, and never re-stamped, so a
+/// `then discard` on the reply-side ingress interface does nothing to it. The
+/// teardown has the same dependency — handed the translated key it would delete
+/// nothing — which is why the verdict carries the resolved key rather than a
+/// bool.
+///
+/// The fixture is built so the two keys genuinely DIFFER (an address rewrite
+/// plus a port rewrite on the reverse entry); with `NatDecision::default()` the
+/// translation is the identity, the alias path is never taken, and the cell
+/// would pass against the primary-index-only version it exists to catch. The
+/// deny term matches the reply's ON-WIRE destination port, because that is the
+/// tuple an input filter on the ingress interface sees — the packet has not been
+/// un-translated yet.
+#[test]
+fn a_snat_reply_reached_through_the_nat_alias_is_revalidated_7212() {
+    let forwarding =
+        forwarding_with_input_filter(LAN_IFINDEX, false, vec![deny_term("no-pool", "40001")]);
+    // The reverse entry is keyed on the UNTRANSLATED reply tuple; the wire
+    // reply carries the translated one.
+    let reverse_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        src_port: 5201,
+        dst_port: 12345,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let mut reverse_decision = decision();
+    reverse_decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+    reverse_decision.nat.rewrite_dst_port = Some(40001);
+    let mut reverse_metadata = metadata();
+    reverse_metadata.is_reverse = true;
+
+    let mut sessions = SessionTable::new();
+    sessions.set_filter_revalidation_gen(6);
+    assert!(sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        reverse_decision,
+        reverse_metadata,
+        SessionOrigin::ReverseFlow,
+        1_000,
+        PROTO_TCP,
+        0,
+    ));
+    sessions.set_filter_revalidation_gen(7);
+
+    // What the poll path holds for this packet: the WIRE (translated) tuple.
+    let wire_key = crate::session::translated_session_key(&reverse_key, reverse_decision.nat);
+    assert_ne!(
+        wire_key, reverse_key,
+        "fixture liveness: the wire tuple must DIFFER from the entry key, or \
+         this cell exercises the primary-index path and proves nothing"
+    );
+    assert!(
+        !sessions.filter_revalidation_stale(&wire_key),
+        "precondition, and the defect this cell pins: a primary-index probe on \
+         the wire tuple finds nothing and reports the session fresh"
+    );
+    assert_eq!(
+        sessions.canonical_session_key(&wire_key).as_ref(),
+        Some(&reverse_key),
+        "the wire tuple must resolve to the entry's canonical key through the \
+         reverse-translated alias index"
+    );
+
+    // The reply's own flow, as the poll path parses it off the wire.
+    let flow = SessionFlow {
+        src_ip: wire_key.src_ip,
+        dst_ip: wire_key.dst_ip,
+        forward_key: wire_key.clone(),
+    };
+    let hit = evaluate_input_filter_on_session_hit(
+        &forwarding,
+        &mut sessions,
+        &wire_key,
+        &frame(),
+        Some(&flow),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+    )
+    .expect("the reply half must be revalidated through the alias index");
+    assert_eq!(hit.eval.action, crate::filter::FilterAction::Discard);
+    assert_eq!(
+        hit.revoked_key.as_ref(),
+        Some(&reverse_key),
+        "the revocation must name the CANONICAL key — a teardown handed the \
+         translated tuple deletes nothing"
+    );
+    assert!(
+        !sessions.filter_revalidation_stale(&reverse_key),
+        "the re-stamp must land on the entry, not on the wire tuple, or the \
+         verdict is re-derived on every packet"
+    );
+}
+
+/// The permitted sibling of the cell above: a SNAT'd reply the filter still
+/// allows is re-stamped through the alias and left alone, translation intact.
+/// Without this row the alias cell would be satisfied by an implementation that
+/// revoked every aliased reply.
+#[test]
+fn a_permitted_snat_reply_through_the_nat_alias_is_untouched_7212() {
+    let forwarding = forwarding_with_input_filter(
+        LAN_IFINDEX,
+        false,
+        vec![deny_term("no-ssh", "22"), accept_term("pool", "40001")],
+    );
+    let reverse_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        src_port: 5201,
+        dst_port: 12345,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    };
+    let mut reverse_decision = decision();
+    reverse_decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+    reverse_decision.nat.rewrite_dst_port = Some(40001);
+    let mut reverse_metadata = metadata();
+    reverse_metadata.is_reverse = true;
+
+    let mut sessions = SessionTable::new();
+    sessions.set_filter_revalidation_gen(6);
+    assert!(sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        reverse_decision,
+        reverse_metadata,
+        SessionOrigin::ReverseFlow,
+        1_000,
+        PROTO_TCP,
+        0,
+    ));
+    sessions.set_filter_revalidation_gen(7);
+    let wire_key = crate::session::translated_session_key(&reverse_key, reverse_decision.nat);
+    let flow = SessionFlow {
+        src_ip: wire_key.src_ip,
+        dst_ip: wire_key.dst_ip,
+        forward_key: wire_key.clone(),
+    };
+
+    assert!(
+        evaluate_input_filter_on_session_hit(
+            &forwarding,
+            &mut sessions,
+            &wire_key,
+            &frame(),
+            Some(&flow),
+            meta(LAN_IFINDEX as u32, 0, false),
+            Some(TEST_LAN_ZONE_ID),
+        )
+        .is_none(),
+        "a permitted reply must produce no verdict"
+    );
+    let lookup = sessions
+        .lookup(&reverse_key, 2_000, 0)
+        .expect("the permitted reply half must survive");
+    assert_eq!(lookup.decision.nat.rewrite_dst_port, Some(40001));
+    assert!(
+        !sessions.filter_revalidation_stale(&reverse_key),
+        "an Accept verdict must re-stamp the aliased entry too"
     );
 }

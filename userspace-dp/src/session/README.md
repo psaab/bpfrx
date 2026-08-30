@@ -512,6 +512,18 @@ last computed under:
   packet it forwards after a promotion — the failover fence, obtained from the
   import default rather than from cross-node plumbing.
 
+The key the stamp is read and written through is the entry's CANONICAL key, and
+the poll path does not hold one: `ResolvedFlowSessionDecision::key` is
+`ResolvedSessionKey::QueryKey` on a local session-table hit — the tuple the
+packet carried — and on the NAT reverse-translated ALIAS path that is the
+TRANSLATED tuple, which names no entry in the primary index. That path is the
+reply to every source-NAT'd flow, so a primary-index-only probe would report the
+whole reverse direction fresh, never revalidate it, and never re-stamp it — and a
+teardown handed the translated key would delete nothing. `canonical_session_key`
+resolves it the same two ways `lookup_with_origin` does, and the verdict carries
+the resolved key rather than a bool so the teardown acts on the session that was
+judged.
+
 On an established-session HIT, `evaluate_input_filter_on_session_hit`
 (`afxdp/poll_descriptor/filter.rs`) does ONE `iface_filter_v{4,6}_fast` lookup
 and branches: a per-packet-varying filter keeps its existing per-packet

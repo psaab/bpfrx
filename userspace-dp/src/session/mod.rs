@@ -1021,13 +1021,45 @@ impl SessionTable {
         self.filter_revalidation_gen
     }
 
-    /// #7212: does the session `key` resolves to still carry an input-filter
-    /// verdict computed under an OLDER generation?
+    /// #7212: resolve a WIRE tuple to the CANONICAL key of the entry it names.
     ///
-    /// `key` is the matched entry's CANONICAL key (`ResolvedFlowSessionDecision
-    /// ::key`), so this is a primary-index probe. A key with no entry answers
-    /// `false`: there is no session to revoke, and answering `true` would send
-    /// the caller into a re-derivation whose re-stamp has nowhere to land.
+    /// The established-hit path does NOT reliably hold a canonical key.
+    /// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` on
+    /// the local session-table hit — i.e. the tuple the packet carried — and on
+    /// the NAT reverse-translated ALIAS path that tuple is the TRANSLATED one,
+    /// not the entry's key. A reply to a source-NAT'd flow is exactly that path,
+    /// so a primary-index-only probe silently misses the dominant reverse
+    /// direction: it would never report the session stale, never revalidate it,
+    /// and never re-stamp it — and a teardown handed the translated key would
+    /// delete nothing.
+    ///
+    /// Resolution mirrors `lookup_with_origin` and `bound_policy_counter_for`
+    /// — the direct primary key, then the reverse-translated index with the
+    /// SAME validation (`is_reverse` plus a translation round-trip back to the
+    /// probed key, both inside `resolve_reverse_translated_handle`), so a stale
+    /// or colliding index entry can never hand back a different session's key.
+    pub(crate) fn canonical_session_key(&self, key: &SessionKey) -> Option<SessionKey> {
+        if let Some(handle) = self.key_to_handle.get(key).copied()
+            && let Some(record) = self.entries.get(handle as usize)
+            && record.key == *key
+        {
+            return Some(record.key.clone());
+        }
+        let handle = self.resolve_reverse_translated_handle(key)?;
+        self.entries
+            .get(handle as usize)
+            .map(|record| record.key.clone())
+    }
+
+    /// #7212: does the session `key` names still carry an input-filter verdict
+    /// computed under an OLDER generation?
+    ///
+    /// `key` must be the entry's CANONICAL key — this is a primary-index probe.
+    /// A caller holding a wire tuple resolves it through
+    /// [`SessionTable::canonical_session_key`] first. A key with no entry
+    /// answers `false`: there is no session to revoke, and answering `true`
+    /// would send the caller into a re-derivation whose re-stamp has nowhere to
+    /// land, so it would re-derive on every packet forever.
     pub(crate) fn filter_revalidation_stale(&self, key: &SessionKey) -> bool {
         self.entry_ref(key)
             .is_some_and(|entry| entry.filter_revalidated_gen != self.filter_revalidation_gen)
@@ -1035,7 +1067,8 @@ impl SessionTable {
 
     /// #7212: record that this direction's static input-filter verdict has been
     /// re-derived under the live generation. Idempotent; a miss is a no-op (the
-    /// session was torn down between the probe and here).
+    /// session was torn down between the probe and here). Takes the CANONICAL
+    /// key, like its `filter_revalidation_stale` sibling.
     pub(crate) fn mark_filter_revalidated(&mut self, key: &SessionKey) {
         let generation = self.filter_revalidation_gen;
         if let Some(handle) = self.key_to_handle.get(key).copied()

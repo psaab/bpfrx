@@ -643,6 +643,7 @@ pub(super) fn poll_binding_process_descriptor(
                             Some(resolved.metadata.ingress_zone),
                         ) {
                             let input_filter_eval = input_filter_hit.eval;
+                            let input_filter_revoked_key = input_filter_hit.revoked_key;
                             // #2521/#3615: a filter `then reject` synthesizes a
                             // TCP RST / ICMP unreachable back toward the source
                             // (same machinery as policy reject); `discard` stays
@@ -680,7 +681,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 );
                             }
                             if input_filter_eval.action != crate::filter::FilterAction::Accept {
-                                if input_filter_hit.revoked {
+                                if let Some(revoked_key) = input_filter_revoked_key {
                                     // #7212: the verdict came from a STATIC
                                     // input-filter revalidation, so the filter
                                     // now denies this FLOW, not merely this
@@ -707,8 +708,13 @@ pub(super) fn poll_binding_process_descriptor(
                                     // revocation primitive here has, including
                                     // the operator's own `clear security flow
                                     // session`.
+                                    // #7212: `revoked_key` is the CANONICAL key
+                                    // the revalidation resolved — NOT
+                                    // `resolved.key`, which is the WIRE tuple
+                                    // and, on the NAT reverse-translated alias
+                                    // path, names no entry in the primary index.
                                     let revoked_companion_key = crate::session::reverse_session_key(
-                                        &resolved.key,
+                                        &revoked_key,
                                         resolved.decision.nat,
                                     );
                                     delete_terminal_filtered_session(
@@ -722,7 +728,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         &worker_ctx.shared_owner_rg_indexes,
                                         worker_ctx.peer_worker_commands,
                                         worker_ctx.forwarding,
-                                        &resolved.key,
+                                        &revoked_key,
                                         resolved.decision,
                                         &resolved.metadata,
                                         resolved.origin,
@@ -732,8 +738,8 @@ pub(super) fn poll_binding_process_descriptor(
                                     binding
                                         .scratch
                                         .scratch_filter_revoked_keys
-                                        .push(resolved.key.clone());
-                                    if revoked_companion_key != resolved.key {
+                                        .push(revoked_key.clone());
+                                    if revoked_companion_key != revoked_key {
                                         binding
                                             .scratch
                                             .scratch_filter_revoked_keys
