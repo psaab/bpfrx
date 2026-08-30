@@ -137,7 +137,7 @@ impl crate::afxdp::Coordinator {
             && entry.decision.nat.rewrite_src.is_some()
         {
             self.sessions
-                .synced_import_zone_unresolved
+                .counters.synced_import_zone_unresolved
                 .fetch_add(1, Ordering::Relaxed);
         }
         if !crate::nat::reserve_synced_source_nat_allocation_untracked(
@@ -215,7 +215,7 @@ impl crate::afxdp::Coordinator {
             && entry.generation < previous.generation
         {
             self.sessions
-                .install_stale_ignored
+                .counters.install_stale_ignored
                 .fetch_add(1, Ordering::Relaxed);
             return SyncedImportOutcome::RejectedStaleGeneration;
         }
@@ -276,7 +276,7 @@ impl crate::afxdp::Coordinator {
             let synced_cap = self.synced_import_cap();
             if synced_cap != 0 && synced_len >= synced_cap {
                 self.sessions
-                    .import_cap_drops
+                    .counters.import_cap_drops
                     .fetch_add(1, Ordering::Relaxed);
                 return SyncedImportOutcome::RejectedCapacity;
             }
@@ -329,7 +329,7 @@ impl crate::afxdp::Coordinator {
             && !self.reserve_synced_translation(&entry)
         {
             self.sessions
-                .import_reserve_refused
+                .counters.import_reserve_refused
                 .fetch_add(1, Ordering::Relaxed);
             return SyncedImportOutcome::RejectedReserve;
         }
@@ -486,7 +486,7 @@ impl crate::afxdp::Coordinator {
             && delete_gen < entry.generation
         {
             self.sessions
-                .delete_stale_ignored
+                .counters.delete_stale_ignored
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }

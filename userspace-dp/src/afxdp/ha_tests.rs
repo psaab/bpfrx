@@ -1572,10 +1572,18 @@ fn synced_snat_install_publishes_and_delete_releases_dnat_table_entry() {
 #[test]
 fn kick_owner_rg_export_empty_set_is_noop_and_consumes_no_sequence() {
     let coordinator = Coordinator::new();
-    let before = coordinator.sessions.export_seq.load(Ordering::Relaxed);
+    let before = coordinator
+        .sessions
+        .counters
+        .export_seq
+        .load(Ordering::Relaxed);
     let wait = coordinator.kick_owner_rg_export(&[], 0);
     assert_eq!(
-        coordinator.sessions.export_seq.load(Ordering::Relaxed),
+        coordinator
+            .sessions
+            .counters
+            .export_seq
+            .load(Ordering::Relaxed),
         before,
         "empty owner-RG export must not consume a sequence"
     );
@@ -2150,6 +2158,77 @@ fn reserve6600_forwarding() -> ForwardingState {
 
 /// A peer-synced forward entry whose NAT decision names `pool_port` on the
 /// single-address pool above.
+/// #7209: a `SessionManager` clone must SHARE its counters, not copy them.
+///
+/// This is the guard for the constraint that makes a session-domain handle
+/// possible at all. Every map on `SessionManager` was already `Arc`-backed, so
+/// a clone shared them — but the metric counters beside them were bare
+/// `AtomicU64`, which a clone COPIES. A handle built that way would take its
+/// bumps on a private copy: `Coordinator::synced_import_zone_unresolved_total()`
+/// would read zero forever, the Prometheus series would sit flat during exactly
+/// the degradation it exists to report, and the suite would stay green, because
+/// nothing else in the tree clones a `SessionManager`.
+///
+/// Asserted through the COORDINATOR's public accessor rather than by poking the
+/// field, so it binds what an operator actually sees rather than the layout.
+///
+/// The paired half matters as much: two SEPARATE Coordinators must NOT share.
+/// #6819 moved these counters off process globals precisely so one test's
+/// activity could not leak into another's assertions, and an `Arc` that was
+/// accidentally made static-like would satisfy the sharing leg while silently
+/// undoing that.
+#[test]
+fn session_manager_handle_shares_counters_7209() {
+    let coordinator = Coordinator::new();
+    let handle = coordinator.sessions.clone();
+
+    assert_eq!(
+        coordinator.synced_import_zone_unresolved_total(),
+        0,
+        "precondition: a fresh Coordinator reads zero (#6819)"
+    );
+
+    handle
+        .counters
+        .synced_import_zone_unresolved
+        .fetch_add(1, Ordering::Relaxed);
+
+    assert_eq!(
+        coordinator.synced_import_zone_unresolved_total(),
+        1,
+        "a bump taken through a CLONED SessionManager was not observed by the \
+         Coordinator that produced it — the clone copied the counter instead of \
+         sharing it. A session-domain handle built on this would take every bump \
+         on a private copy, so the metric reads zero while the degradation it \
+         reports is happening (#7209)"
+    );
+
+    // The other direction, so the test cannot pass on a one-way alias.
+    coordinator
+        .sessions
+        .counters
+        .synced_import_zone_unresolved
+        .fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        handle
+            .counters
+            .synced_import_zone_unresolved
+            .load(Ordering::Relaxed),
+        2,
+        "the handle must observe the Coordinator's bumps too"
+    );
+
+    // PAIRED CONTROL: separate Coordinators must stay independent (#6819).
+    let other = Coordinator::new();
+    assert_eq!(
+        other.synced_import_zone_unresolved_total(),
+        0,
+        "a SEPARATE Coordinator saw this one's bumps — the counters have become \
+         process-global again, which is what #6819 removed: as globals, every \
+         assertion about them depended on what every other test happened to do"
+    );
+}
+
 /// #7209: register one worker so `reserve_synced_translation` actually runs.
 ///
 /// Not boilerplate. `upsert_synced_session` gates the whole coordinator-side

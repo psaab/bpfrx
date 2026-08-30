@@ -37,6 +37,7 @@ impl crate::afxdp::Coordinator {
         }
         let sequence = self
             .sessions
+            .counters
             .export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);

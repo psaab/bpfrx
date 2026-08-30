@@ -1,33 +1,32 @@
 use super::*;
 
-/// Cross-thread session-table state shared between the coordinator,
-/// HA worker, and packet workers via `Arc<Mutex<...>>`.
+/// #7209: the session-manager's METRIC counters, held behind one `Arc` so a
+/// handle CLONED off `SessionManager` observes the SAME cells rather than
+/// copies.
 ///
-/// The 3 session tables (synced + nat + forward-wire) plus the
-/// owner-RG index live here together because they're written and
-/// queried as a unit by the HA bulk-sync, incremental-sync, and
-/// session-resolution paths. The `export_seq` counter is the
-/// per-RG ack sequence number that pairs with the export ack
-/// broadcast in HA `export_owner_rg_sessions`.
+/// Named `SessionManagerCounters`, not `SessionCounters`: `crate::session::
+/// SessionCounters` already exists and is a completely different thing — the
+/// per-SESSION packet/byte counters carried on a `SessionEntry`. These are
+/// per-MANAGER diagnostics. The two are in different modules so the compiler
+/// is content either way, which is exactly why the name has to carry the
+/// distinction.
+/// CLONED off `SessionManager` observes the SAME cells rather than copies.
 ///
-/// The three sync-import refusal counters below are PER-INSTANCE
-/// (`AtomicU64` fields, not process-global statics) for the same reason
-/// `Coordinator::last_quiesce_ms` and the `force_worker_*` seams are: a
-/// process-global counter is observable by every other `Coordinator` in the
-/// process. Production builds exactly one `Coordinator` (`server::lifecycle`),
-/// so the exported Prometheus value (`import_cap_drops`, via
-/// `server/helpers/status.rs` -> `protocol::control` -> the Go collector) is
-/// unchanged; the other two have no surface outside this binary at all — their
-/// accessors are called only from `ha_tests.rs`. (None of the three is in
-/// `proto/`: this crate has no gRPC dependency.) The change is observable only
-/// to tests, which build one `Coordinator` per `#[test]` and run them
-/// concurrently in a single process — as globals, every assertion about these
-/// counters depended on what every other test happened to do (#6819).
-pub(in crate::afxdp) struct SessionManager {
-    pub(in crate::afxdp) synced: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(in crate::afxdp) nat: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(in crate::afxdp) forward_wire: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
-    pub(in crate::afxdp) owner_rg_indexes: SharedSessionOwnerRgIndexes,
+/// This is not tidiness. Every other `SessionManager` field is already
+/// `Arc`-backed, so a clone shares the maps; bare `AtomicU64`s beside them
+/// would be COPIED, and a bump taken through the handle would never reach
+/// `Coordinator::*_total()`. The Prometheus series would then sit flat at zero
+/// during exactly the activity it exists to report, with the suite green
+/// throughout — nothing today clones a `SessionManager`, so nothing would
+/// notice. `session_manager_handle_shares_counters_7209` is the guard.
+///
+/// Created FRESH PER COORDINATOR, which is what keeps #6819 true: these were
+/// process globals once, and as globals every assertion about them depended on
+/// what every other test happened to do. Per-instance for #6819, shared by
+/// clone for the handle — an `Arc` satisfies both, a `static` satisfies only
+/// the second.
+#[derive(Default)]
+pub(in crate::afxdp) struct SessionManagerCounters {
     pub(in crate::afxdp) export_seq: AtomicU64,
     /// #2170 HA deferred-delete generation guard observability. These count how
     /// often the helper's in-memory SyncedSessionEntry generation guard refused
@@ -112,6 +111,45 @@ pub(in crate::afxdp) struct SessionManager {
     pub(in crate::afxdp) import_reserve_refused: AtomicU64,
 }
 
+/// Cross-thread session-table state shared between the coordinator,
+/// HA worker, and packet workers via `Arc<Mutex<...>>`.
+///
+/// The 3 session tables (synced + nat + forward-wire) plus the
+/// owner-RG index live here together because they're written and
+/// queried as a unit by the HA bulk-sync, incremental-sync, and
+/// session-resolution paths. The `export_seq` counter is the
+/// per-RG ack sequence number that pairs with the export ack
+/// broadcast in HA `export_owner_rg_sessions`.
+///
+/// The three sync-import refusal counters below are PER-INSTANCE
+/// (`AtomicU64` fields, not process-global statics) for the same reason
+/// `Coordinator::last_quiesce_ms` and the `force_worker_*` seams are: a
+/// process-global counter is observable by every other `Coordinator` in the
+/// process. Production builds exactly one `Coordinator` (`server::lifecycle`),
+/// so the exported Prometheus value (`import_cap_drops`, via
+/// `server/helpers/status.rs` -> `protocol::control` -> the Go collector) is
+/// unchanged; the other two have no surface outside this binary at all — their
+/// accessors are called only from `ha_tests.rs`. (None of the three is in
+/// `proto/`: this crate has no gRPC dependency.) The change is observable only
+/// to tests, which build one `Coordinator` per `#[test]` and run them
+/// concurrently in a single process — as globals, every assertion about these
+/// counters depended on what every other test happened to do (#6819).
+/// #7209: every field is `Arc`-backed, so a clone SHARES rather than copies.
+///
+/// That is what makes a session-domain handle possible: the handle is a clone,
+/// and a bump or an install taken through it is observed by the `Coordinator`
+/// that produced it. The `Clone` is therefore a load-bearing property, not a
+/// convenience — `session_manager_handle_shares_counters_7209` pins it, and
+/// would red if any field were ever changed to an owned value.
+#[derive(Clone)]
+pub(in crate::afxdp) struct SessionManager {
+    pub(in crate::afxdp) synced: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(in crate::afxdp) nat: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(in crate::afxdp) forward_wire: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    pub(in crate::afxdp) owner_rg_indexes: SharedSessionOwnerRgIndexes,
+    pub(in crate::afxdp) counters: Arc<SessionManagerCounters>,
+}
+
 impl SessionManager {
     pub(super) fn new() -> Self {
         Self {
@@ -119,12 +157,7 @@ impl SessionManager {
             nat: Arc::new(Mutex::new(FastMap::default())),
             forward_wire: Arc::new(Mutex::new(FastMap::default())),
             owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
-            export_seq: AtomicU64::new(0),
-            install_stale_ignored: AtomicU64::new(0),
-            synced_import_zone_unresolved: AtomicU64::new(0),
-            delete_stale_ignored: AtomicU64::new(0),
-            import_cap_drops: AtomicU64::new(0),
-            import_reserve_refused: AtomicU64::new(0),
+            counters: Arc::new(SessionManagerCounters::default()),
         }
     }
 }

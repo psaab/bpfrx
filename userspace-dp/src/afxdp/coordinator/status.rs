@@ -258,7 +258,7 @@ impl super::Coordinator {
     /// variant). The authoritative guard is in the Go cluster apply layer;
     /// this is the helper-side back-stop counter.
     pub fn session_install_stale_ignored_total(&self) -> u64 {
-        self.sessions.install_stale_ignored.load(Ordering::Relaxed)
+        self.sessions.counters.install_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #7209: peer-synced imports whose zone pair did not resolve, so the
@@ -266,7 +266,7 @@ impl super::Coordinator {
     /// `session_manager.rs` for what an operator actually loses.
     pub fn synced_import_zone_unresolved_total(&self) -> u64 {
         self.sessions
-            .synced_import_zone_unresolved
+            .counters.synced_import_zone_unresolved
             .load(Ordering::Relaxed)
     }
 
@@ -274,7 +274,7 @@ impl super::Coordinator {
     /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
     /// helper-side generation-aware delete).
     pub fn session_delete_stale_ignored_total(&self) -> u64 {
-        self.sessions.delete_stale_ignored.load(Ordering::Relaxed)
+        self.sessions.counters.delete_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #5674: total peer-synced session imports rejected by the coordinator's
@@ -295,14 +295,14 @@ impl super::Coordinator {
     /// therefore never trips it; firing semantics are unchanged by this wording.
     /// Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
     pub fn synced_import_cap_drops_total(&self) -> u64 {
-        self.sessions.import_cap_drops.load(Ordering::Relaxed)
+        self.sessions.counters.import_cap_drops.load(Ordering::Relaxed)
     }
 
     /// #6600: peer-synced imports refused because this node could not reserve
     /// the translated NAT port the session names. See
     /// `SessionManager::import_reserve_refused` for what a nonzero value means.
     pub fn synced_import_reserve_refused_total(&self) -> u64 {
-        self.sessions.import_reserve_refused.load(Ordering::Relaxed)
+        self.sessions.counters.import_reserve_refused.load(Ordering::Relaxed)
     }
 
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
