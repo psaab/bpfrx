@@ -287,7 +287,28 @@ connectionless and exempt:
   wins). Residual, tracked separately: one client carries one facility,
   so a host naming two mappable facilities can still honor only the one
   it stamps, and which one that is depends on selector order — honoring
-  both needs a source facility on the event envelope.
+  both needs a source facility on the event envelope (#7187).
+- **The `file` and `user` sinks keep every authored selector (#7187).**
+  The discussion above is about the `host` sink, which has always
+  appended into `SyslogHostConfig.Facilities`. The other two sinks held a
+  SCALAR facility/severity pair and the compiler ASSIGNED into it inside
+  the per-child loop, so `file messages { daemon info; authorization
+  warning; }` compiled to exactly one selector — the LAST one parsed —
+  and every earlier pair was gone before any renderer, validator or
+  `show` command could observe it. Nothing could diagnose it because the
+  config was reduced at compile time. Both now carry
+  `Selectors []SyslogFacility`, and the rsyslog render joins them with
+  `;` into the one drop-in the destination owns
+  (`daemon.info;authorization.warning<TAB>/var/log/messages`) — rsyslog's
+  selector field already expresses that OR, which is Junos' meaning for
+  several statements under one stanza. Two knock-ons worth knowing:
+  an empty selector list still renders `*.*`, as an unset scalar pair
+  did; and an unsafe selector (the #5797 belt) now drops ITSELF rather
+  than the whole destination, because deleting an operator's safe
+  selectors because a sibling was poisoned is a worse outcome than the
+  injection it defends against. For a one-selector destination that is
+  bit-identical to the old behaviour — nothing safe survives, and the
+  destination is skipped.
 - **Unmapped facility names are reported, not silent (#5797).**
   `ParseFacility` returns `FacilityLocal0` for any name it does not know,
   which makes an authored `local0` indistinguishable from a name the

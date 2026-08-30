@@ -704,8 +704,9 @@ system {
 	if sl.Users[0].User != "*" {
 		t.Errorf("user = %q, want *", sl.Users[0].User)
 	}
-	if sl.Users[0].Facility != "any" || sl.Users[0].Severity != "emergency" {
-		t.Errorf("user facility/severity = %q/%q, want any/emergency", sl.Users[0].Facility, sl.Users[0].Severity)
+	if len(sl.Users[0].Selectors) != 1 || sl.Users[0].Selectors[0].Facility != "any" ||
+		sl.Users[0].Selectors[0].Severity != "emergency" {
+		t.Errorf("user selectors = %+v, want one any/emergency", sl.Users[0].Selectors)
 	}
 	if len(sl.Hosts) != 1 {
 		t.Fatalf("hosts count = %d, want 1", len(sl.Hosts))

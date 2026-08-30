@@ -98,8 +98,8 @@ func TestSyslogRenderOmitsUnsafeFileToken_5797(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "evil", Facility: tc.facility, Severity: tc.severity},
-				{Name: "audit", Facility: "daemon", Severity: "info"},
+				{Name: "evil", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
+				{Name: "audit", Selectors: []config.SyslogFacility{{Facility: "daemon", Severity: "info"}}},
 			}, nil)
 
 			if body, ok := renderedFor(cfg, renderPrefix+"evil.conf"); ok {
@@ -132,8 +132,8 @@ func TestSyslogRenderOmitsUnsafeUserToken_5797(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg(nil, []*config.SyslogUserConfig{
-				{User: "root", Facility: tc.facility, Severity: tc.severity},
-				{User: "operator", Facility: "daemon", Severity: "info"},
+				{User: "root", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
+				{User: "operator", Selectors: []config.SyslogFacility{{Facility: "daemon", Severity: "info"}}},
 			})
 
 			if body, ok := renderedFor(cfg, renderPrefix+"user-root.conf"); ok {
@@ -173,7 +173,7 @@ func TestSyslogRenderSafeTokensReachOutput_5797(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+				{Name: "d", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
 			}, nil)
 
 			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
@@ -231,9 +231,9 @@ func TestSyslogRenderNativeSelectorSyntaxReachesOutput_6829(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+				{Name: "d", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
 			}, []*config.SyslogUserConfig{
-				{User: "root", Facility: tc.facility, Severity: tc.severity},
+				{User: "root", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
 			})
 
 			// The FILE call site.
@@ -287,8 +287,8 @@ func TestSyslogRenderOmitsMalformedFacilityList_6829(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "evil", Facility: tc.facility, Severity: "info"},
-				{Name: "audit", Facility: "auth,authpriv", Severity: "info"},
+				{Name: "evil", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: "info"}}},
+				{Name: "audit", Selectors: []config.SyslogFacility{{Facility: "auth,authpriv", Severity: "info"}}},
 			}, nil)
 
 			if body, ok := renderedFor(cfg, renderPrefix+"evil.conf"); ok {
@@ -329,8 +329,8 @@ func TestSyslogRenderRemovesStaleDropinOnUnsafeToken_5797(t *testing.T) {
 	// The operator (or a peer sync) changes `audit`'s facility to an injecting
 	// value. `ops` is untouched.
 	cfg := syslogCfg([]*config.SyslogFileConfig{
-		{Name: "audit", Facility: "daemon;*.* @@collector.example:514", Severity: "info"},
-		{Name: "ops", Facility: "daemon", Severity: "info"},
+		{Name: "audit", Selectors: []config.SyslogFacility{{Facility: "daemon;*.* @@collector.example:514", Severity: "info"}}},
+		{Name: "ops", Selectors: []config.SyslogFacility{{Facility: "daemon", Severity: "info"}}},
 	}, nil)
 
 	changed := reconcileSyslogDropins(dir, renderPrefix, syslogDropinContents(cfg, renderPrefix))
@@ -358,7 +358,7 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 	t.Run("file skip warns", func(t *testing.T) {
 		buf := captureRenderedWarnings(t)
 		syslogDropinContents(syslogCfg([]*config.SyslogFileConfig{
-			{Name: "audit", Facility: "daemon;*.*", Severity: "info"},
+			{Name: "audit", Selectors: []config.SyslogFacility{{Facility: "daemon;*.*", Severity: "info"}}},
 		}, nil), renderPrefix)
 
 		got := buf.String()
@@ -374,7 +374,7 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 	t.Run("user skip warns", func(t *testing.T) {
 		buf := captureRenderedWarnings(t)
 		syslogDropinContents(syslogCfg(nil, []*config.SyslogUserConfig{
-			{User: "root", Facility: "daemon", Severity: "info;*.*"},
+			{User: "root", Selectors: []config.SyslogFacility{{Facility: "daemon", Severity: "info;*.*"}}},
 		}), renderPrefix)
 
 		got := buf.String()
@@ -391,8 +391,8 @@ func TestSyslogRenderWarnsOnSkippedDestination_5797(t *testing.T) {
 	t.Run("safe config is quiet", func(t *testing.T) {
 		buf := captureRenderedWarnings(t)
 		syslogDropinContents(syslogCfg(
-			[]*config.SyslogFileConfig{{Name: "audit", Facility: "authorization", Severity: "info"}},
-			[]*config.SyslogUserConfig{{User: "*", Facility: "any", Severity: "emergency"}},
+			[]*config.SyslogFileConfig{{Name: "audit", Selectors: []config.SyslogFacility{{Facility: "authorization", Severity: "info"}}}},
+			[]*config.SyslogUserConfig{{User: "*", Selectors: []config.SyslogFacility{{Facility: "any", Severity: "emergency"}}}},
 		), renderPrefix)
 
 		if got := buf.String(); strings.Contains(got, "unsafe selector token") {
@@ -471,7 +471,8 @@ func TestSyslogRenderUnsafeFacilityIsLoadReachable_5797(t *testing.T) {
 			"into the compiler, which makes it unconditional and blackout-boots a node "+
 			"carrying a config an older binary accepted (#1960).", err)
 	}
-	if len(cfg.System.Syslog.Files) != 1 || cfg.System.Syslog.Files[0].Facility != injecting {
+	if len(cfg.System.Syslog.Files) != 1 || len(cfg.System.Syslog.Files[0].Selectors) != 1 ||
+		cfg.System.Syslog.Files[0].Selectors[0].Facility != injecting {
 		t.Fatalf("compiled facility = %+v, want the verbatim %q — the reachability premise of "+
 			"this test no longer holds", cfg.System.Syslog.Files, injecting)
 	}
@@ -1017,7 +1018,7 @@ func TestSyslogRenderRejectsLeadingHyphenSelector_6829(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+				{Name: "d", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
 			}, nil)
 			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
 			if ok {
@@ -1056,7 +1057,7 @@ func TestSyslogRenderKeepsInteriorHyphens_6829(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := syslogCfg([]*config.SyslogFileConfig{
-				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+				{Name: "d", Selectors: []config.SyslogFacility{{Facility: tc.facility, Severity: tc.severity}}},
 			}, nil)
 			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
 			if !ok {

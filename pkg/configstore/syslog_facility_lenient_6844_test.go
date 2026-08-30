@@ -80,7 +80,8 @@ func TestLoadToleratesAnInjectableSyslogFacility_6844(t *testing.T) {
 	// And the value survived unchanged: the tolerant path warns, it does not
 	// silently rewrite. The render belt is what keeps it off disk.
 	files := st.ActiveConfig().System.Syslog.Files
-	if len(files) != 1 || files[0].Facility != "daemon;*.* /tmp/pwn" {
+	if len(files) != 1 || len(files[0].Selectors) != 1 ||
+		files[0].Selectors[0].Facility != "daemon;*.* /tmp/pwn" {
 		t.Errorf("loaded facility = %+v, want the verbatim value — the tolerant path "+
 			"must warn, not rewrite", files)
 	}

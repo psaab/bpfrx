@@ -506,8 +506,11 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 						// facility/severity pair — do not append as one.
 					default:
 						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
-							file.Facility = fac
-							file.Severity = sev
+							// #7187: APPEND. This assigned, so a file naming two
+							// facilities kept only the last one parsed and the
+							// earlier selectors vanished before any render.
+							file.Selectors = append(file.Selectors,
+								SyslogFacility{Facility: fac, Severity: sev})
 						}
 					}
 				}
@@ -530,8 +533,10 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 						// #4303 S-1: recognized user modifiers, not a pair.
 					default:
 						if fac, sev, ok := syslogFacilitySeverity(prop); ok {
-							user.Facility = fac
-							user.Severity = sev
+							// #7187: APPEND, for the same reason as the file
+							// sink above.
+							user.Selectors = append(user.Selectors,
+								SyslogFacility{Facility: fac, Severity: sev})
 						}
 					}
 				}
