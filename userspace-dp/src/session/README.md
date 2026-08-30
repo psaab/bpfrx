@@ -488,6 +488,126 @@ push is removed) and `afxdp/worker/loop_body/mod.rs`'s
 `delete_synced_invalidation_walks_every_binding` — RED if the
 invalidate loop is removed).
 
+## Static input-filter revalidation stamp (#7212)
+
+Junos firewall filters are stateless and evaluated on every packet, so a filter
+attached or tightened after a session exists applies to that flow immediately.
+The dataplane's session-hit fast path re-evaluated an interface INPUT filter only
+when its verdict genuinely varies per packet (#1430 DSCP / #2362 per-packet L4),
+so a purely STATIC address/protocol/port `then discard` added later was never
+rechecked and the flow forwarded until it idled out (#5858, closed against
+#7212).
+
+`SessionEntry.filter_revalidated_gen` closes it. It records the
+`ValidationState::config_generation` this direction's input-filter verdict was
+last computed under:
+
+* `install` stamps `SessionTable::filter_revalidation_gen`, which
+  `poll_binding_process_descriptor` publishes once per pass from the SAME
+  `ValidationState` the pass classifies packets against — so the stamp a session
+  carries and the generation it is later compared to can never come from
+  different publishes.
+* `upsert_synced` stamps `0`, which is never a live generation. A peer-synced
+  session therefore revalidates against THIS node's filter state on the first
+  packet it forwards after a promotion — the failover fence, obtained from the
+  import default rather than from cross-node plumbing.
+
+The key the stamp is read and written through is the entry's CANONICAL key, and
+the poll path does not hold one: `ResolvedFlowSessionDecision::key` is
+`ResolvedSessionKey::QueryKey` on a local session-table hit — the tuple the
+packet carried. For most established hits that IS the entry's key, including an
+ordinary source-NAT reply: the pair install stores the reverse companion under
+`reverse_session_key(forward, nat)`, which is already the wire reply tuple, so
+the reply resolves through the PRIMARY index. But `lookup_with_origin` also
+resolves through the reverse-translated ALIAS index, and an entry reached that
+way is stored under a DIFFERENT key than the one that found it — a
+primary-index-only probe reports it fresh forever, never revalidates it, never
+re-stamps it, and a teardown handed the wire tuple deletes nothing.
+
+`stale_filter_revalidation_key` resolves the wire tuple the same two ways
+`lookup_with_origin` does — the primary key WITH its stale-handle guard (a
+`key_to_handle` hit whose stored key does not match is a reused slab slot and
+must not fall through to the alias index, where a live alias entry for the same
+tuple would resolve a DIFFERENT session), then the reverse-translated index with
+its own `is_reverse` + round-trip validation — and answers the staleness
+question in the SAME probe, so the established-hit path pays one hash rather
+than three. The verdict then carries the resolved key rather than a bool, so the
+teardown acts on the session that was judged.
+
+Those are the only two indexes an established HIT resolves through.
+`forward_wire_index` and `nat_reverse_index` are also reachable from
+`lookup_session_across_scopes`, but both surface as
+`ResolvedSessionKey::Canonical`, so they primary-probe cleanly.
+
+A `None` from that probe covers two answers. Either the entry is already judged
+under this `(generation, ingress)` — the common one — or this worker's table
+holds no entry for the tuple, because the hit was served from the SHARED map
+without a local install (the #2120 transient synced-hit path) or because a
+reverse-NAT repair's install was refused at `max_sessions`. In those there is
+nothing local to stamp or tear down; the transient window is bounded by
+`maybe_promote_synced_session` installing the entry `UNVALIDATED`, and both are
+tracked in #8114.
+
+On an established-session HIT, `evaluate_input_filter_on_session_hit`
+(`afxdp/poll_descriptor/filter.rs`) does ONE `iface_filter_v{4,6}_fast` lookup
+and branches: a per-packet-varying filter keeps its existing per-packet
+re-evaluation; a static filter is re-derived only when the stamp is stale. The
+re-derivation is side-effect free (`NonRoutingCountPolicy::Never` — no
+`then count`, no `then log`, no policer meter), and only the ACCEPT exit
+re-stamps. A DENY deliberately leaves the stamp stale: the caller revokes the
+session, so normally there is no entry left to stamp, and if the teardown ever
+failed to take, a stamped entry would say "already judged under the live
+generation" and be FORWARDED for the rest of the generation under a filter that
+denies it. Unstamped, the next packet re-derives the same DENY and drops — the
+same failure, fail-closed instead of fail-open.
+
+A session the filter still
+PERMITS costs one term walk per config generation and is otherwise untouched —
+critically including its NAT translation, since a purged-and-recreated permitted
+SNAT flow reinstalls on a DIFFERENT translated port and breaks. Only on a DENY
+does the ordinary counted evaluator run, so the one newly-denied packet is
+counted, logged and rejected exactly once.
+
+Why the stamp is per-ENTRY and not on `SessionMetadata`: it is node-local derived
+state like `established` / `handshake_pending`, carried on no wire and not part
+of session identity. Why there is no stored ingress ifindex: forward and reverse
+are separate entries with separate stamps, and each revalidates against the
+interface the packet in hand actually arrived on — an OBSERVATION, where the
+forward half's `resolution.egress_ifindex` would be a PREDICTION of where the
+reply lands that asymmetric routing can falsify (see "True ingress-interface
+identity on the session (#4983)" above for why `ingress_ifindex` is `0` on the
+reverse companion).
+
+Revocation reuses `delete_terminal_filtered_session` (#5622): forward + reverse
+deleted, source-NAT / NAT64 reservation released exactly once via the forward
+entry, forward close delta emitted even when the reverse half hit the deny.
+Both directions' keys go onto `WorkerScratch::scratch_filter_revoked_keys`, which
+`worker/lifecycle.rs` drains under the `left`/`current`/`right` split borrow and
+evicts from EVERY binding of this worker in the SAME tick — a session does not
+carry the ingress ifindex the cache is keyed on, and the two directions of one
+flow are routinely cached on different bindings. Sibling WORKERS evict on their
+next tick through the `replicate_session_delete` -> `DeleteSynced` -> #6457 path
+the teardown already queues; that is the same promptness the operator's own
+`clear security flow session` has.
+
+`config_generation` is a SUPERSET trigger — it advances on every commit, not
+only on filter edits. (It does NOT advance on a `BumpFIBGeneration`: that path
+assigns `validation.fib_generation` alone and republishes, reusing the same
+forwarding `Arc` so the #1188 worker short-circuit still hits. An earlier
+revision of this paragraph claimed it did, which over-stated the cost.) The
+superset is deliberate: the
+re-derivation can only DROP a session the current filter denies, so an extra
+revalidation of a permitted flow is a no-op, and it is gated behind the single
+fast-map lookup that only an interface with an input filter attached ever passes.
+A generation bump already invalidates every flow-cache entry
+(`FlowCacheStamp::config_generation`), so the packet that pays for the
+revalidation is one already taking the session path.
+
+Regression coverage: `session/filter_revalidation_7212_tests.rs` (stamp
+lifecycle) and `afxdp/poll_descriptor/filter_revalidation_7212_tests.rs`
+(verdict, side-effect freedom, the NAT-alias reverse half, the fragment purity
+case, the DENY-exit fail-closed stamp, and the pinned permitted-SNAT case).
+
 ## Per-session byte/packet accounting (#2501)
 
 Each `SessionEntry` carries a `SessionCounters` (`fwd_packets`, `fwd_bytes`,

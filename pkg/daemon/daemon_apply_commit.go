@@ -285,9 +285,11 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 	// and still syncs to the peer, but the operator sees the failure and can
 	// re-commit). Matches how applyErr's non-fatal best-effort subsystem errors
 	// are surfaced here rather than aborting the commit.
-	// #5858: one entry point for both halves — the policy clear that revokes,
-	// and the input-filter advisory for the tightening that cannot be revoked
-	// today. Bound together so a commit path cannot wire one without the other.
+	// #5858/#7212: the ONE commit-time entry point for "authorization the
+	// operator just changed, versus sessions already established". It is the
+	// policy clear alone since #7212 moved the interface-input-filter half into
+	// the dataplane (lazy per-tuple revalidation on the session-hit path); the
+	// commit-time advisory that stood in for it is deleted.
 	clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
@@ -487,9 +489,9 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// policy deletion/tightening that could not fully drop this node's synced
 		// sessions is not silently swallowed. A non-fatal partial clear does not
 		// abort the (already-promoted) sync — it is joined into the return only.
-		// #5858: one entry point for both halves — the policy clear that revokes,
-		// and the input-filter advisory for the tightening that cannot be revoked
-		// today. Bound together so a commit path cannot wire one without the other.
+		// #5858/#7212: the ONE commit-time entry point (see the commit path
+		// above). Policy clear only since #7212 moved the interface-input-filter
+		// half into the dataplane.
 		clearErr := d.reportSessionAuthorizationChanges(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict

@@ -61,6 +61,12 @@ pub(super) struct DbgCounters {
     /// #3610/M07: host-inbound-traffic admission denies, distinct from
     /// `policy_deny` (transit security-policy denies).
     pub(super) host_inbound_deny: u64,
+    /// #7212: established sessions REVOKED by a static interface INPUT filter
+    /// revalidation, distinct from `policy_deny` (a security-policy verdict on a
+    /// NEW flow) and from the #1430/#2362 per-packet re-eval drops, which drop a
+    /// packet without revoking the session. Counted once per revoked SESSION,
+    /// not per dropped packet.
+    pub(super) filter_revoked_sessions: u64,
     pub(super) ha_inactive: u64,
     pub(super) no_egress_binding: u64,
     pub(super) build_fail: u64,
@@ -116,6 +122,7 @@ impl DbgCounters {
         self.neg_neigh_fast_fail += dbg_poll.neg_neigh_fast_fail;
         self.policy_deny += dbg_poll.policy_deny;
         self.host_inbound_deny += dbg_poll.host_inbound_deny;
+        self.filter_revoked_sessions += dbg_poll.filter_revoked_sessions;
         self.ha_inactive += dbg_poll.ha_inactive;
         self.no_egress_binding += dbg_poll.no_egress_binding;
         self.build_fail += dbg_poll.build_fail;
@@ -171,7 +178,7 @@ pub(super) fn emit_periodic_report(
     let secs = elapsed as f64 / 1_000_000_000.0;
     eprintln!(
         "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
-         no_route={} miss_neigh={} neg_ff={} pol_deny={} hib_deny={} ha_inact={} no_egress={} build_fail={} \
+         no_route={} miss_neigh={} neg_ff={} pol_deny={} hib_deny={} filt_revoked={} ha_inact={} no_egress={} build_fail={} \
          tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
          DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
          SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over_1514={}/seg_miss={} \
@@ -192,6 +199,7 @@ pub(super) fn emit_periodic_report(
         dbg.neg_neigh_fast_fail,
         dbg.policy_deny,
         dbg.host_inbound_deny,
+        dbg.filter_revoked_sessions,
         dbg.ha_inactive,
         dbg.no_egress_binding,
         dbg.build_fail,

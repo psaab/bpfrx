@@ -473,6 +473,18 @@ pub(crate) struct TermMatchExtra<'a> {
     pub(crate) ports_unknown: bool,
 }
 
+// #7212 CONTRACT, stated here because this is where the next author looks.
+// `Filter::varies_per_packet_within_flow()` summarises the reads of this struct
+// made by `per_packet_l4_matches` ALONE. It does NOT summarise
+// `port_terms_match`, which reads `is_fragment` / `l4_present` /
+// `ports_unknown` gated on a PORT constraint. The static input-filter
+// revalidation depends on knowing exactly which reads that predicate covers, so
+// it passes `TermMatchExtra::default()` and derives the flow's 5-tuple verdict
+// rather than this packet's. A new read of this struct from outside
+// `per_packet_l4_matches` must be re-checked against that argument — see the
+// `Never` bullet in `filter/README.md`.
+
+
 impl<'a> TermMatchExtra<'a> {
     /// #3077: drop the borrowed L3 slice, yielding a `'static`-lifetime copy
     /// safe to STORE in a deferred request (`PendingForwardRequest`) that
@@ -1129,3 +1141,10 @@ impl Default for CachedTxSelectionFilterResult {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #7212: the side-effect-free static verdict (`NonRoutingCountPolicy::Never`).
+// Its own file rather than another block in the 9k-line `tests.rs`, per the
+// modularity rule on test files.
+#[cfg(test)]
+#[path = "static_verdict_7212_tests.rs"]
+mod static_verdict_7212_tests;

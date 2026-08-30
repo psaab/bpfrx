@@ -88,10 +88,10 @@ use reject_reply::{deny_reply_and_emit, enqueue_filter_reject_reply};
 use resolver_enqueue::try_enqueue_resolver;
 
 use filter::{
-    emit_input_filter_log_match,
-    evaluate_dscp_sensitive_input_filter_on_session_hit, evaluate_non_pbr_input_filter,
-    evaluate_non_pbr_input_filter_counters_cached, evaluate_non_pbr_input_filter_log_only,
-    filter_terminal, host_inbound_gated_lo0_action,
+    collect_revoked_flow_cache_keys, emit_input_filter_log_match,
+    evaluate_input_filter_on_session_hit,
+    evaluate_non_pbr_input_filter, evaluate_non_pbr_input_filter_counters_cached,
+    evaluate_non_pbr_input_filter_log_only, filter_terminal, host_inbound_gated_lo0_action,
 };
 
 // Per-batch packet processing lifted from `poll_binding` (#678).
@@ -148,6 +148,12 @@ pub(super) fn poll_binding_process_descriptor(
     worker_ctx: &WorkerContext,
     telemetry: &mut TelemetryContext,
 ) {
+    // #7212: publish the generation this pass forwards under BEFORE any packet
+    // is processed, so a session installed during the pass is stamped with the
+    // SAME `ValidationState` its admitting filter verdict was computed against,
+    // and the established-hit revalidation compares against that same value. One
+    // u64 store per binding per tick.
+    sessions.set_filter_revalidation_gen(validation.config_generation);
     let mut received = binding.xsk.rx.receive(available);
     binding.scratch.scratch_recycle.clear();
     binding.scratch.scratch_forwards.clear();
@@ -657,15 +663,24 @@ pub(super) fn poll_binding_process_descriptor(
                         // above already resolved the same handle exactly once.
                         flow_cache_policy_counter = bound_policy_counter;
                         apply_nat_on_fabric = true;
-                        if let Some(input_filter_eval) =
-                            evaluate_dscp_sensitive_input_filter_on_session_hit(
-                                worker_ctx.forwarding,
-                                packet_frame,
-                                Some(flow),
-                                meta,
-                                Some(resolved.metadata.ingress_zone),
-                            )
-                        {
+                        // #1430/#2362 per-packet re-eval + #7212 static
+                        // revalidation, folded onto ONE per-interface input
+                        // filter lookup. `None` — no input filter on this
+                        // ingress interface in this family, or a static filter
+                        // whose verdict this session already carries under the
+                        // live config generation — is the common case and costs
+                        // exactly that one lookup.
+                        if let Some(input_filter_hit) = evaluate_input_filter_on_session_hit(
+                            worker_ctx.forwarding,
+                            sessions,
+                            &resolved.key,
+                            packet_frame,
+                            Some(flow),
+                            meta,
+                            Some(resolved.metadata.ingress_zone),
+                        ) {
+                            let input_filter_eval = input_filter_hit.eval;
+                            let input_filter_revoked_key = input_filter_hit.revoked_key;
                             // #2521/#3615: a filter `then reject` synthesizes a
                             // TCP RST / ICMP unreachable back toward the source
                             // (same machinery as policy reject); `discard` stays
@@ -703,6 +718,77 @@ pub(super) fn poll_binding_process_descriptor(
                                 );
                             }
                             if input_filter_eval.action != crate::filter::FilterAction::Accept {
+                                if let Some(revoked_key) = input_filter_revoked_key {
+                                    // #7212: the verdict came from a STATIC
+                                    // input-filter revalidation, so the filter
+                                    // now denies this FLOW, not merely this
+                                    // packet. Revoke the session: pair-aware
+                                    // teardown (#5622 deletes forward AND
+                                    // reverse, releases the source-NAT / NAT64
+                                    // reservation exactly once via the forward
+                                    // entry, and emits the FORWARD close delta
+                                    // even when the reverse half is the one that
+                                    // hit the deny), then evict both directions'
+                                    // flow-cache slots on every binding of this
+                                    // worker in THIS tick.
+                                    //
+                                    // Without the eviction the descriptor
+                                    // outlives the session it was seeded from —
+                                    // the #6457 failure mode — and the revoked
+                                    // 5-tuple keeps forwarding off a cached
+                                    // `RewriteDescriptor` with no session row.
+                                    //
+                                    // TWO windows remain, and both are stated
+                                    // rather than claimed closed. The keys are
+                                    // drained in `worker/lifecycle.rs` after
+                                    // this RX BATCH, so a LATER descriptor in
+                                    // the SAME batch, arriving on a sibling
+                                    // binding of this worker that holds a
+                                    // current-generation slot for the tuple, can
+                                    // still hit it — bounded by the remainder of
+                                    // one batch. Sibling WORKERS evict on their
+                                    // next tick via the
+                                    // `replicate_session_delete` -> DeleteSynced
+                                    // -> #6457 path the teardown already queues.
+                                    // Both are the promptness every other
+                                    // revocation primitive here has, including
+                                    // the operator's own `clear security flow
+                                    // session`; closing the first would mean
+                                    // breaking the RX batch on every revocation,
+                                    // which is a packet-path cost paid by every
+                                    // configuration to bound a window measured
+                                    // in microseconds. #8114.
+                                    // #7212: `revoked_key` is the CANONICAL key
+                                    // the revalidation resolved — NOT
+                                    // `resolved.key`, which is the WIRE tuple
+                                    // and, on the NAT reverse-translated alias
+                                    // path, names no entry in the primary index.
+                                    delete_terminal_filtered_session(
+                                        sessions,
+                                        binding.bpf_maps.session_map_fd,
+                                        conntrack_v4_fd,
+                                        conntrack_v6_fd,
+                                        worker_ctx.shared_sessions,
+                                        worker_ctx.shared_nat_sessions,
+                                        worker_ctx.shared_forward_wire_sessions,
+                                        &worker_ctx.shared_owner_rg_indexes,
+                                        worker_ctx.peer_worker_commands,
+                                        worker_ctx.forwarding,
+                                        &revoked_key,
+                                        resolved.decision,
+                                        &resolved.metadata,
+                                        resolved.origin,
+                                        now_ns,
+                                        worker_id,
+                                    );
+                                    collect_revoked_flow_cache_keys(
+                                        &resolved.key,
+                                        &revoked_key,
+                                        resolved.decision.nat,
+                                        &mut binding.scratch.scratch_filter_revoked_keys,
+                                    );
+                                    telemetry.dbg.filter_revoked_sessions += 1;
+                                }
                                 binding.scratch.scratch_recycle.push(desc.addr);
                                 continue;
                             }

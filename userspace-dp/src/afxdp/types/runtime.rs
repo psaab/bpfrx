@@ -468,6 +468,16 @@ pub(in crate::afxdp) struct DebugPollCounters {
     /// transit security-policy deny in the periodic debug report.
     #[allow(dead_code)]
     pub(in crate::afxdp) host_inbound_deny: u64,
+    /// #7212: established sessions REVOKED by a static interface INPUT filter
+    /// revalidation — the operator attached or tightened a purely static
+    /// address/protocol/port filter and an already-established flow is now
+    /// denied by it. Distinct from `policy_deny` (a security-policy verdict on a
+    /// NEW flow) and from the per-packet #1430/#2362 re-eval drops, which drop a
+    /// packet without revoking the session. Counted once per revoked session,
+    /// not per dropped packet: the session is torn down on the first denied
+    /// packet and every later packet of that 5-tuple takes the session-MISS path.
+    #[allow(dead_code)]
+    pub(in crate::afxdp) filter_revoked_sessions: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) ha_inactive: u64,
     #[allow(dead_code)]

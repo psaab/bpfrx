@@ -403,41 +403,60 @@ pub(super) struct ConntrackPublishRecord {
     pub(super) session_id: u64,
 }
 
+// #8105: the recorder is THREAD-LOCAL, not process-global.
+//
+// It was a `static Mutex<Vec<..>>`, and the guard below could not close the
+// hole that created, as its own comment said: the writer is production code on
+// the install path and cannot take a lock, so a mutex can only serialize
+// READERS against each other. The population that has to be excluded is every
+// test that DRIVES A PUBLISH, and `cargo test` runs those in parallel with the
+// sampler by default. Any of them landing inside a sampler's freshly-cleared
+// window shows up there as rows the sampler did not publish — a NAMED test
+// going red on roughly half of full-suite runs, with a row count that varies.
+// Guarding the writers one file at a time does not converge: at the time of
+// writing the polluting rows came from three different topologies in two
+// different files, and every new poll-path test is another writer.
+//
+// A thread-local recorder removes the shared state instead of arbitrating it.
+// Each sampler drives its descriptor SYNCHRONOUSLY on its own test thread, so
+// its publishes and only its publishes land in its own vector; a concurrent
+// test on another thread is invisible by construction rather than by
+// convention. There is nothing left for a future test author to forget.
+//
+// Contract for a future sampler: the publish must happen on the SAME thread
+// that samples. Every current driver (`tests_support::txn_run_descriptor` and
+// the poll-path harnesses) is synchronous, so this holds; a sampler that ever
+// moves the drive onto a spawned thread has to collect there too.
 #[cfg(test)]
-pub(super) static CONNTRACK_PUBLISHES: std::sync::Mutex<Vec<ConntrackPublishRecord>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// #6965: the ONE mutex that serializes tests SAMPLING `CONNTRACK_PUBLISHES`.
-///
-/// Module scope for the same reason as `checksum::DNAT_COUNTER_GUARD` (#6872):
-/// a `static` declared inside a test function body is unnameable from any other
-/// function, so two tests each declaring one lock private mutexes and exclude
-/// nobody. This does NOT mutually exclude the writer below — that is production
-/// code on the install path and must not take a lock — it serializes the
-/// samplers against each other, which is the shape that breaks.
-#[cfg(test)]
-pub(super) static CONNTRACK_PUBLISH_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// #6965: clear the recorder and return the guard, so a sampling test cannot
-/// forget either half.
-#[cfg(test)]
-pub(super) fn take_conntrack_publish_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = CONNTRACK_PUBLISH_GUARD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    CONNTRACK_PUBLISHES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    guard
+thread_local! {
+    static CONNTRACK_PUBLISHES: std::cell::RefCell<Vec<ConntrackPublishRecord>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// #6965/#8105: clear this thread's recorder so a sampling test starts from a
+/// known-empty state.
+///
+/// It still returns a value the caller binds to `_guard`, so the three existing
+/// `let _guard = take_conntrack_publish_guard();` call sites are unchanged. The
+/// value is now inert — there is no cross-thread state left to hold a lock over
+/// — but keeping the shape means the clear cannot be separated from the sample
+/// by a later edit, which is the half of the original design that was load
+/// bearing.
+#[cfg(test)]
+#[must_use]
+pub(super) fn take_conntrack_publish_guard() -> ConntrackPublishSampling {
+    CONNTRACK_PUBLISHES.with(|records| records.borrow_mut().clear());
+    ConntrackPublishSampling
+}
+
+/// The `take_conntrack_publish_guard` return value. Carries no state; it exists
+/// so the clear-then-sample pairing keeps a name at the call site.
+#[cfg(test)]
+pub(super) struct ConntrackPublishSampling;
 
 #[cfg(test)]
 pub(super) fn conntrack_publishes() -> Vec<ConntrackPublishRecord> {
-    CONNTRACK_PUBLISHES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    CONNTRACK_PUBLISHES.with(|records| records.borrow().clone())
 }
 
 pub(super) fn publish_bpf_conntrack_entry(
@@ -469,10 +488,8 @@ pub(super) fn publish_bpf_conntrack_entry(
     // path — which is fd-independent.
     #[cfg(test)]
     {
-        CONNTRACK_PUBLISHES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(ConntrackPublishRecord {
+        CONNTRACK_PUBLISHES.with(|records| {
+            records.borrow_mut().push(ConntrackPublishRecord {
                 is_reverse: metadata.is_reverse,
                 ingress_ifindex: metadata.ingress_ifindex,
                 ingress_vlan_id: metadata.ingress_vlan_id,
@@ -481,6 +498,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 app_id,
                 session_id,
             });
+        });
     }
     // #919: zones are now u16 in SessionMetadata; the round-trip
     // name→id lookup the old code did is gone.

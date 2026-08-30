@@ -351,6 +351,40 @@ mod expire;
 mod install;
 mod lookup;
 
+/// #7212: the `(config generation, logical ingress interface)` pair a session's
+/// static input-filter verdict was derived under.
+///
+/// Both halves are needed because the verdict is a function of BOTH: the
+/// generation says WHICH filter snapshot judged it, the interface says WHOSE
+/// filter did. A stamp carrying only the generation silently claims an
+/// interface change was already adjudicated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FilterRevalidationStamp {
+    generation: u64,
+    logical_ingress_ifindex: i32,
+}
+
+impl FilterRevalidationStamp {
+    /// "No static input-filter verdict has been derived for this entry."
+    ///
+    /// It can never collide with a live stamp: generation `0` is the value
+    /// `SessionTable` holds before the first poll pass publishes one, and the Go
+    /// control plane's snapshot generation is a monotone counter that starts at
+    /// 1 — so no live packet is ever classified at generation 0
+    /// (`classify_metadata` also requires `snapshot_installed`).
+    pub(crate) const UNVALIDATED: Self = Self {
+        generation: 0,
+        logical_ingress_ifindex: 0,
+    };
+
+    fn live(generation: u64, logical_ingress_ifindex: i32) -> Self {
+        Self {
+            generation,
+            logical_ingress_ifindex,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SessionEntry {
     decision: SessionDecision,
@@ -436,6 +470,63 @@ struct SessionEntry {
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
     /// stale duplicate (lazy-delete discriminator).
     wheel_tick: u64,
+    /// #7212: the `(config generation, logical ingress interface)` this
+    /// direction's static input-filter verdict was last derived under, or
+    /// [`FilterRevalidationStamp::UNVALIDATED`].
+    ///
+    /// A purely STATIC (address / protocol / port) input filter's verdict is a
+    /// pure function of `(ingress interface, family, 5-tuple)`. The 5-tuple and
+    /// the family are the session key; the other two are what this records, so
+    /// the stamp names EVERY input the verdict depended on. An earlier revision
+    /// recorded only the generation, which made the stamp claim more than it
+    /// knew: at a fixed generation, a same-direction packet arriving on a
+    /// DIFFERENT interface (asymmetric routing, a redundancy-group member
+    /// change) is adjudicated by that interface's filter, and a
+    /// generation-only stamp reported the session already judged.
+    ///
+    /// It is written ONLY by `mark_filter_revalidated`, from the established-hit
+    /// path that actually ran the interface's filter. Every INSTALL — forward,
+    /// reverse companion, peer-synced import alike — stamps `UNVALIDATED`, and
+    /// that uniformity is deliberate rather than lazy:
+    ///
+    ///   * the REVERSE companion is pre-installed alongside the forward session
+    ///     and its ingress is explicitly UNOBSERVED at that point (the same
+    ///     reason `SessionMetadata::ingress_ifindex` is `0` for it, #4983), so
+    ///     no filter has adjudicated it and a live stamp would be a false claim
+    ///     that one had;
+    ///   * a PEER-SYNCED import carries the peer's adjudication, made against
+    ///     the peer's interfaces, which is the failover fence;
+    ///   * the FORWARD install's verdict WAS just computed by the session-MISS
+    ///     path, so a live stamp would be truthful there — but it would be the
+    ///     only truthful case, and buying it costs a per-install branch to keep
+    ///     one static term walk off each new session's second packet. That walk
+    ///     is side-effect free and is paid only on an interface with an input
+    ///     filter attached, which is the gate every arm passes through first.
+    ///
+    /// The established-session HIT path compares this against
+    /// `(SessionTable::filter_revalidation_gen, the packet's logical ingress)`;
+    /// on a mismatch it re-derives the static verdict ONCE, re-stamps here on
+    /// ACCEPT, and revokes the session on DENY. A DENY deliberately does NOT
+    /// re-stamp — see `afxdp/poll_descriptor/filter.rs`.
+    ///
+    /// `config_generation` is a SUPERSET trigger: it advances on every commit,
+    /// not only on filter edits. It does NOT advance on a `BumpFIBGeneration` —
+    /// `Coordinator::bump_fib_generation` assigns `validation.fib_generation`
+    /// alone and republishes, reusing the published forwarding `Arc` so the
+    /// #1188 worker short-circuit still hits — which an earlier revision of this
+    /// comment claimed, over-stating the cost. That is
+    /// deliberate and safe — the re-derivation can only DROP a session the
+    /// current filter denies, so an extra revalidation of a permitted flow is a
+    /// no-op, and its cost is gated behind a single `iface_filter_v{4,6}_fast`
+    /// lookup that only an interface with an input filter attached ever passes.
+    /// A generation bump already invalidates every flow-cache entry
+    /// (`FlowCacheStamp::config_generation`), so the packet that pays for the
+    /// revalidation is one already taking the session path.
+    ///
+    /// Node-local derived state, like `established` and `handshake_pending`:
+    /// `SessionEntry` carries no serde, so this is on no wire and is not part of
+    /// session identity.
+    filter_revalidated: FilterRevalidationStamp,
     /// #2120: the RG epoch (`rg_epochs[owner_rg_id]`, or the node-level
     /// `rg_epochs[0]` for `owner_rg_id <= 0`) recorded the last time this
     /// entry was self-healed (the expire pass observed this node START
@@ -650,6 +741,16 @@ pub(crate) struct SessionTable {
     /// `upsert_synced_with_origin`). Empty = no zone configures a syn-flood
     /// timeout, byte-identical to pre-#3527.
     opening_overrides: FxHashMap<u16, u64>,
+    /// #7212: the live `ValidationState::config_generation` this worker is
+    /// forwarding under. The established-hit static input-filter revalidation
+    /// compares a session's stamp against it, and `mark_filter_revalidated`
+    /// writes it. Refreshed from the same `validation` the poll pass classifies
+    /// packets against (`poll_binding_process_descriptor`), so the generation a
+    /// session is stamped with and the generation it is compared to can never
+    /// come from different publishes. `0` until the first poll pass, which is
+    /// also `FilterRevalidationStamp::UNVALIDATED`'s generation and is never
+    /// live.
+    filter_revalidation_gen: u64,
     epoch_counter: u64,
     expired: u64,
     create_drops: u64,
@@ -841,6 +942,8 @@ impl SessionTable {
             // #3527: empty until a forwarding snapshot with a per-zone
             // syn-flood timeout is applied via `set_opening_overrides`.
             opening_overrides: FxHashMap::default(),
+            // #7212: no poll pass has published a generation yet.
+            filter_revalidation_gen: 0,
             epoch_counter: 0,
             expired: 0,
             create_drops: 0,
@@ -956,6 +1059,118 @@ impl SessionTable {
     pub fn set_timeouts(&mut self, timeouts: SessionTimeouts) {
         self.timeouts = timeouts;
     }
+
+    /// #7212: publish the config generation this worker is forwarding under.
+    /// Called once per poll pass from `poll_binding_process_descriptor` with the
+    /// SAME `ValidationState` the pass classifies packets against, so a verdict
+    /// derived during the pass is stamped with the generation it was actually
+    /// derived under.
+    pub(crate) fn set_filter_revalidation_gen(&mut self, generation: u64) {
+        self.filter_revalidation_gen = generation;
+    }
+
+    /// #7212: the generation installs stamp and the established-hit
+    /// revalidation compares against.
+    pub(crate) fn filter_revalidation_gen(&self) -> u64 {
+        self.filter_revalidation_gen
+    }
+
+    /// #7212: resolve a WIRE tuple to the entry it names, and answer in ONE
+    /// probe whether that entry still lacks a static input-filter verdict
+    /// derived under the live generation on `logical_ingress_ifindex`.
+    ///
+    /// `Some(canonical key)` means "stale — re-derive, then stamp THIS key".
+    /// `None` means either "already judged under this (generation, ingress)" or
+    /// "this worker holds no entry for the tuple".
+    ///
+    /// **Why the two questions are one call.** The caller is on the
+    /// established-hit path, which has already resolved this key once inside
+    /// `lookup_with_origin`. Asking separately cost a second `key_to_handle`
+    /// hash plus a third for the staleness probe, and a `SessionKey` clone,
+    /// on EVERY packet of every session on an interface with an input filter —
+    /// the entire population the feature serves — to answer a question that is
+    /// "no" for all but one packet per session per generation. Folded, the
+    /// common answer costs one hash and one comparison, and the clone happens
+    /// only on the rare stale exit.
+    ///
+    /// **Why a wire tuple has to be resolved at all.**
+    /// `ResolvedFlowSessionDecision::key` is `ResolvedSessionKey::QueryKey` on a
+    /// local session-table hit — the tuple the packet carried — and a reverse
+    /// entry reached through the NAT reverse-translated ALIAS index is stored
+    /// under a DIFFERENT key than the one that found it. A primary-index-only
+    /// probe reports such an entry fresh forever: never revalidated, never
+    /// revoked, never re-stamped, and a teardown handed the wire tuple deletes
+    /// nothing.
+    ///
+    /// Resolution mirrors `lookup_with_origin` exactly, including its
+    /// stale-handle guard: a `key_to_handle` hit whose stored key does NOT match
+    /// is a freed-and-reused slab slot and yields `None` rather than falling
+    /// through to the alias index — where a live alias entry for the same tuple
+    /// would resolve a DIFFERENT session, which the caller would then revoke.
+    pub(crate) fn stale_filter_revalidation_key(
+        &self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) -> Option<SessionKey> {
+        let record = match self.key_to_handle.get(key).copied() {
+            Some(handle) => {
+                let record = self.entries.get(handle as usize)?;
+                if record.key != *key {
+                    // Stale primary handle: same guard `lookup_with_origin`
+                    // applies. Falling through to the alias index here could
+                    // resolve a different live session under this tuple.
+                    return None;
+                }
+                record
+            }
+            None => {
+                let handle = self.resolve_reverse_translated_handle(key)?;
+                self.entries.get(handle as usize)?
+            }
+        };
+        let live = FilterRevalidationStamp::live(
+            self.filter_revalidation_gen,
+            logical_ingress_ifindex,
+        );
+        (record.entry.filter_revalidated != live).then(|| record.key.clone())
+    }
+
+    /// #7212: record that this direction's static input-filter verdict has been
+    /// re-derived under the live generation on `logical_ingress_ifindex`.
+    ///
+    /// Takes the CANONICAL key — the one
+    /// [`SessionTable::stale_filter_revalidation_key`] just handed back — so it
+    /// is a primary-index write. Idempotent; a miss is a no-op (the session was
+    /// torn down between the probe and here).
+    pub(crate) fn mark_filter_revalidated(
+        &mut self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) {
+        let stamp =
+            FilterRevalidationStamp::live(self.filter_revalidation_gen, logical_ingress_ifindex);
+        if let Some(handle) = self.key_to_handle.get(key).copied()
+            && let Some(record) = self.entries.get_mut(handle as usize)
+            && record.key == *key
+        {
+            record.entry.filter_revalidated = stamp;
+        }
+    }
+
+    /// #7212 test view: the boolean half of
+    /// [`SessionTable::stale_filter_revalidation_key`]. A `.is_some()` over the
+    /// SAME call, not a second implementation, so it cannot answer differently
+    /// from what production asks.
+    #[cfg(test)]
+    pub(crate) fn filter_revalidation_stale(
+        &self,
+        key: &SessionKey,
+        logical_ingress_ifindex: i32,
+    ) -> bool {
+        self.stale_filter_revalidation_key(key, logical_ingress_ifindex)
+            .is_some()
+    }
+
 
     /// #3527: install the per-screened-zone half-open (`tcp_opening_ns`)
     /// timeout overrides (zone id → ns), driven from each zone's `syn-flood
@@ -2445,3 +2660,10 @@ fn session_timeout_ns(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #7212: the static input-filter revalidation stamp lifecycle. Its own file
+// rather than another block in the 8k-line `tests.rs`, per the modularity rule
+// on test files.
+#[cfg(test)]
+#[path = "filter_revalidation_7212_tests.rs"]
+mod filter_revalidation_7212_tests;
