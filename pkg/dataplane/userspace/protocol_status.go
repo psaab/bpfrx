@@ -447,6 +447,29 @@ type ProcessStatus struct {
 	// for an older helper that does not send the key.
 	SharedSessionPoisonRecoveries uint64 `json:"shared_session_poison_recoveries,omitempty"`
 
+	// SessionInstallStaleIgnored is xpf_userspace_session_install_stale_ignored_total
+	// (#2170/#7398): stale-generation session INSTALLS refused by the helper's
+	// in-memory SyncedSessionEntry guard. The authoritative guard is the Go
+	// cluster apply layer; this is the helper-side back-stop, so nonzero means a
+	// delayed peer install arrived after a newer generation was committed and the
+	// helper declined to regress it. Decodes to 0 for a helper that predates
+	// #7398, which reads the same as "never happened".
+	SessionInstallStaleIgnored uint64 `json:"session_install_stale_ignored,omitempty"`
+
+	// SessionDeleteStaleIgnored is xpf_userspace_session_delete_stale_ignored_total
+	// (#2170/#7398): the DELETE half of the same guard. Nonzero means a delete
+	// for a generation older than the committed entry was ignored rather than
+	// being allowed to remove a session a newer generation installed.
+	SessionDeleteStaleIgnored uint64 `json:"session_delete_stale_ignored,omitempty"`
+
+	// SyncedImportReserveRefused is xpf_userspace_synced_import_reserve_refused_total
+	// (#6600/#7398): peer-synced imports refused because this node could not
+	// reserve the translated NAT port the session names. Sustained growth means
+	// the standby cannot hold the primary's translations, so those flows will not
+	// survive a failover — which is why it is worth an operator's attention
+	// BEFORE the failover rather than after.
+	SyncedImportReserveRefused uint64 `json:"synced_import_reserve_refused,omitempty"`
+
 	// SyncedImportZoneUnresolved is xpf_userspace_synced_import_zone_unresolved_total.
 	// Decodes to 0 against a helper that predates #7209, which reads the same as
 	// "never happened" — acceptable here because the metric is diagnostic rather

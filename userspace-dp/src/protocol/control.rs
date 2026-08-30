@@ -566,6 +566,33 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "shared_session_poison_recoveries", default)]
     pub shared_session_poison_recoveries: u64,
+    /// #2170/#7398: stale-generation session INSTALLS refused by the helper's
+    /// in-memory `SyncedSessionEntry` guard (the delayed-stale-install
+    /// variant). The authoritative guard is the Go cluster apply layer; this
+    /// is the helper-side back-stop, so a nonzero value means a delayed peer
+    /// install arrived after a newer generation had already been committed and
+    /// the helper declined to regress it. Surfaced as
+    /// `xpf_userspace_session_install_stale_ignored_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "session_install_stale_ignored", default)]
+    pub session_install_stale_ignored: u64,
+    /// #2170/#7398: stale-generation session DELETES refused by the same
+    /// helper-side guard. Nonzero means a delete for a generation older than
+    /// the committed entry arrived and was ignored rather than being allowed
+    /// to remove a session a newer generation had installed. Surfaced as
+    /// `xpf_userspace_session_delete_stale_ignored_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "session_delete_stale_ignored", default)]
+    pub session_delete_stale_ignored: u64,
+    /// #6600/#7398: peer-synced imports refused because this node could not
+    /// reserve the translated NAT port the session names. Sustained growth
+    /// means the standby cannot hold the primary's translations, so those
+    /// flows will not survive a failover — the counter an operator needs
+    /// BEFORE the failover rather than after. Surfaced as
+    /// `xpf_userspace_synced_import_reserve_refused_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "synced_import_reserve_refused", default)]
+    pub synced_import_reserve_refused: u64,
     /// #7209: peer-synced imports whose zone pair did not resolve, so the
     /// source-NAT reservation skipped #6211's zone narrowing. Surfaced as
     /// `xpf_userspace_synced_import_zone_unresolved_total`.

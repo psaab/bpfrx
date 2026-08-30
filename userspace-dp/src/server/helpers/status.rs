@@ -159,6 +159,16 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.worker_command_queue_drops = state.afxdp.worker_command_queue_drops_total();
     state.status.shared_session_poison_recoveries =
         state.afxdp.shared_session_poison_recoveries_total();
+    // #7398: the three counters below were computed, unit-tested and never
+    // assigned into ProcessStatus, so they reached no operator through status,
+    // gRPC or Prometheus. They are the queue the UNSURFACED allowlist below
+    // existed to hold; wiring them is what empties it.
+    state.status.session_install_stale_ignored =
+        state.afxdp.session_install_stale_ignored_total();
+    state.status.session_delete_stale_ignored =
+        state.afxdp.session_delete_stale_ignored_total();
+    state.status.synced_import_reserve_refused =
+        state.afxdp.synced_import_reserve_refused_total();
     // #7209: peer-synced imports whose zone pair did not resolve, so the
     // source-NAT reservation skipped #6211's narrowing. Expected nonzero while
     // a config apply is in flight (sync_session reads the PUBLISHED forwarding
@@ -604,11 +614,12 @@ mod status_wiring_tests {
     /// before it was surfaced — so the list is a visible queue rather than a
     /// permission slip. Adding a counter here means deciding NOT to show it to
     /// an operator; prefer wiring it.
-    const UNSURFACED: &[&str] = &[
-        "session_delete_stale_ignored_total",
-        "session_install_stale_ignored_total",
-        "synced_import_reserve_refused_total",
-    ];
+    // #7398 emptied this queue: all three former entries are now assigned into
+    // `ProcessStatus` and exported as Prometheus counters. An EMPTY allowlist
+    // is the intended steady state — the dead-entry rejection below means a
+    // stale entry fails the gate, so leaving names here after wiring them
+    // would break the build rather than rot silently.
+    const UNSURFACED: &[&str] = &[];
 
     fn read(rel: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);

@@ -320,6 +320,37 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"zone configuration has drifted.",
 		nil, nil,
 	)
+	// #7398: three counters the Coordinator computed and never surfaced.
+	// Wiring is only half the job — a nil *prometheus.Desc field COMPILES and
+	// only fails as a segfault inside pkg/api, so a green build proves nothing
+	// about the descriptor. The metric-count guard is what actually binds these.
+	c.userspaceSessionInstallStaleIgnored = prometheus.NewDesc(
+		"xpf_userspace_session_install_stale_ignored_total",
+		"Stale-generation peer session INSTALLS refused by the helper's "+
+			"in-memory SyncedSessionEntry guard (#2170). The authoritative "+
+			"guard is the Go cluster apply layer; this is the helper-side "+
+			"back-stop, so nonzero means a delayed peer install arrived after "+
+			"a newer generation had been committed and the helper declined to "+
+			"regress it. Expected to be 0 outside config churn.",
+		nil, nil,
+	)
+	c.userspaceSessionDeleteStaleIgnored = prometheus.NewDesc(
+		"xpf_userspace_session_delete_stale_ignored_total",
+		"Stale-generation peer session DELETES refused by the same "+
+			"helper-side generation guard (#2170). Nonzero means a delete for "+
+			"a generation older than the committed entry was ignored rather "+
+			"than allowed to remove a session a newer generation installed.",
+		nil, nil,
+	)
+	c.userspaceSyncedImportReserveRefused = prometheus.NewDesc(
+		"xpf_userspace_synced_import_reserve_refused_total",
+		"Peer-synced imports refused because this node could not reserve "+
+			"the translated NAT port the session names (#6600). Sustained "+
+			"growth means the standby cannot hold the primary's translations, "+
+			"so those flows will NOT survive a failover — this is the "+
+			"pre-failover warning, not a post-mortem.",
+		nil, nil,
+	)
 	c.userspaceSharedSessionPoisonRecoveries = prometheus.NewDesc(
 		"xpf_userspace_shared_session_poison_recoveries_total",
 		"Shared-session mutex poison recoveries across every "+

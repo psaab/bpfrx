@@ -482,6 +482,10 @@ type xpfCollector struct {
 	userspaceWorkerCommandQueueDrops       *prometheus.Desc
 	userspaceSharedSessionPoisonRecoveries *prometheus.Desc
 	userspaceSyncedImportZoneUnresolved    *prometheus.Desc
+	// #7398: three Coordinator counters that were computed and never shown.
+	userspaceSessionInstallStaleIgnored *prometheus.Desc
+	userspaceSessionDeleteStaleIgnored  *prometheus.Desc
+	userspaceSyncedImportReserveRefused *prometheus.Desc
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
 	// over a Not-ECT inner) — nonzero flags a misbehaving tunnel ingress
 	// that ECT-marked the outer for un-ECN inner traffic on a congested
@@ -940,6 +944,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceWorkerCommandQueueDrops
 	ch <- c.userspaceSharedSessionPoisonRecoveries
 	ch <- c.userspaceSyncedImportZoneUnresolved
+	ch <- c.userspaceSessionInstallStaleIgnored
+	ch <- c.userspaceSessionDeleteStaleIgnored
+	ch <- c.userspaceSyncedImportReserveRefused
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceGreEncapDfOversizeDrops

@@ -1055,6 +1055,28 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #7398: the emit helper dereferences these three, so a literal that
+		// omits them segfaults rather than failing an assertion — the reason
+		// the issue calls out that a green BUILD proves nothing about a
+		// descriptor.
+		userspaceSessionInstallStaleIgnored: prometheus.NewDesc(
+			"xpf_userspace_session_install_stale_ignored_total",
+			"stale-generation session installs ignored",
+			nil,
+			nil,
+		),
+		userspaceSessionDeleteStaleIgnored: prometheus.NewDesc(
+			"xpf_userspace_session_delete_stale_ignored_total",
+			"stale-generation session deletes ignored",
+			nil,
+			nil,
+		),
+		userspaceSyncedImportReserveRefused: prometheus.NewDesc(
+			"xpf_userspace_synced_import_reserve_refused_total",
+			"synced imports refused for want of a NAT reservation",
+			nil,
+			nil,
+		),
 		userspaceSyncedImportZoneUnresolved: prometheus.NewDesc(
 			"xpf_userspace_synced_import_zone_unresolved_total",
 			"synced imports that skipped the #6211 zone narrowing",
@@ -1188,7 +1210,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2402/#6641: shared-session poison-recovery counter emitted
 		// unconditionally.
 		SharedSessionPoisonRecoveries: 5,
-		SyncedImportZoneUnresolved:    7,
+		// #7398: distinct values so an assertion cannot pass by reading the
+		// neighbouring field — a mis-wired descriptor emits a series either way.
+		SessionInstallStaleIgnored: 21,
+		SessionDeleteStaleIgnored:  22,
+		SyncedImportReserveRefused: 23,
+		SyncedImportZoneUnresolved: 7,
 		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
 		// emitted unconditionally.
 		GreDecapEcnIllegalDropsTotal: 3,
@@ -1306,9 +1333,14 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// refused-alias PAIR (cross-domain + protocol) = 48. The pair is counted as
 	// TWO because they are deliberately distinct series; if a later change folds
 	// them into one total this census is the guard that notices. Plus the
-	// #7209 synced_import_zone_unresolved_total counter = 49.
-	if len(got) != 49 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 49 metrics, got %d", len(got))
+	// #7209 synced_import_zone_unresolved_total counter = 49. Plus the #7398
+	// TRIO that emptied the status-wiring allowlist —
+	// session_install_stale_ignored_total, session_delete_stale_ignored_total
+	// and synced_import_reserve_refused_total = 52. Counted as three because
+	// they are distinct series; folding any two together is a change this
+	// census is here to notice.
+	if len(got) != 52 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 52 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1368,6 +1400,11 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// unconditionally, so a 0 is a real "no worker panic touched HA session
 	// state" signal rather than an absent series.
 	assertCounterClose(t, got, c.userspaceSharedSessionPoisonRecoveries, nil, 5)
+	// #7398: assert the VALUE, not merely that a series exists — a descriptor
+	// wired to the wrong status field emits a series too.
+	assertCounterClose(t, got, c.userspaceSessionInstallStaleIgnored, nil, 21)
+	assertCounterClose(t, got, c.userspaceSessionDeleteStaleIgnored, nil, 22)
+	assertCounterClose(t, got, c.userspaceSyncedImportReserveRefused, nil, 23)
 	// #7209: synced imports that skipped the #6211 zone narrowing. Emitted
 	// unconditionally like its neighbours, so a 0 is a real "every synced
 	// import resolved its zones" signal rather than an absent series. The
