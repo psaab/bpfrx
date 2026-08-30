@@ -100,6 +100,8 @@ fn lan_to_xfrmi_timeout_does_not_arm_the_dead_host_cache_6710() {
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
 
         assert!(

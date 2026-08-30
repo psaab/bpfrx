@@ -123,6 +123,8 @@
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
     }
 
@@ -487,6 +489,8 @@
                     binding, left, 0, right, &lookup, &mirror_targets, &forwarding,
                     &dynamic_neighbors, None, 1_000_000_100, unsafe { &*area },
                     &mut shared_recycles,
+                    None,
+                    &mut BatchCounters::default(),
                 );
             }
             let t0 = Instant::now();
@@ -495,6 +499,8 @@
                     binding, left, 0, right, &lookup, &mirror_targets, &forwarding,
                     &dynamic_neighbors, None, 1_000_000_100, unsafe { &*area },
                     &mut shared_recycles,
+                    None,
+                    &mut BatchCounters::default(),
                 );
             }
             let per = t0.elapsed().as_nanos() as f64 / reps as f64;
@@ -519,6 +525,8 @@
                 binding, left, 0, right, &lookup, &mirror_targets, &forwarding,
                 &dynamic_neighbors, None, due_now, unsafe { &*area },
                 &mut shared_recycles,
+                None,
+                &mut BatchCounters::default(),
             );
             let per_due = t1.elapsed().as_nanos() as f64;
             let visited = n.min(PENDING_NEIGH_SWEEP_BUDGET);
@@ -610,6 +618,8 @@
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
 
         assert!(bindings[0].pending_neigh.is_empty());
@@ -724,6 +734,8 @@
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
 
         // The packet was dropped (recycled to fill ring, queue drained).
@@ -872,6 +884,8 @@
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
 
         assert!(bindings[0].pending_neigh.is_empty(), "packet must dispatch");
@@ -961,6 +975,8 @@
             // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
+            None,
+            &mut BatchCounters::default(),
         );
 
         assert!(

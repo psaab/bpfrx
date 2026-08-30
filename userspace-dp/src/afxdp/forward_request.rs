@@ -314,85 +314,27 @@ pub(super) fn build_live_forward_request_from_frame(
                 now_ns,
             )
         });
-    // #3608: an output firewall-filter `then reject` on the transit forward path
-    // now emits the SAME active reply as the input/lo0 path (#2521) — a TCP RST
-    // for TCP, an ICMP/ICMPv6 admin-prohibited unreachable otherwise — instead
-    // of the historical silent drop. The reply reflects the ORIGINAL inbound
-    // frame back toward the source via the ingress interface (the source is
-    // reachable on the reverse path), reusing the shared reject-synthesis +
-    // #2238 output-classification + #2472 rate-limit + fail-closed budget gate.
-    // `then discard` and three-color-policer drops stay silent (`cos.reject`
-    // isolates the reject subset of `cos.drop`). Enqueue the reply FIRST so the
-    // filter-log below reports the TRUTHFUL action (#3615): a reject whose reply
-    // fail-closes (budget/rate/parse/output-filter, or a missing tx-pipeline
-    // context) logs DENY, not REJECT.
-    let reject_reply_enqueued = if cos.drop && cos.reject {
-        match (reject_reply, tx_selection_flow) {
-            (Some(reply), Some(flow)) => {
-                crate::afxdp::poll_descriptor::reject_reply::enqueue_filter_reject_reply(
-                    reply.tx_pipeline,
-                    forwarding,
-                    ingress_ident.ifindex,
-                    frame,
-                    meta,
-                    flow,
-                    reply.counters,
-                    // #6854: the OUTPUT-filter reject path carries its own
-                    // resolved message-type on the CoS selection.
-                    cos.reject_message,
-                )
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
-    // #5467: a flowless packet (non-first fragment / non-query ICMP) has NO
-    // `tx_selection_flow`, yet an interface output `then log` term may have
-    // matched its L3 tuple inside `resolve_cos_tx_selection_at` (the flowless
-    // enforcement gate). Rebuild the L3-only flow (ports 0) SOLELY to attribute
-    // that filter-log event so egress logging is not silently bypassed. The
-    // reject reply above stays gated on `tx_selection_flow`, so a flowless deny
-    // remains a silent drop (#3615 — no L4 header to synthesize a reply from).
-    let flowless_log_flow = if tx_selection_flow.is_none() && cos.filter_log.is_some() {
-        crate::afxdp::frame::l3_session_flow_from_meta(meta)
-    } else {
-        None
-    };
-    let log_flow = tx_selection_flow.or(flowless_log_flow.as_ref());
-    if let (Some(filter_log), Some(flow)) = (cos.filter_log, log_flow) {
-        let ingress_zone_id = fabric_ingress_zone
-            .filter(|id| forwarding.zone_id_to_name.contains_key(id))
-            .or_else(|| {
-                forwarding
-                    .ifindex_to_zone_id
-                    .get(&(meta.ingress_ifindex as i32))
-                    .copied()
-            })
-            .unwrap_or(0);
-        // #6713: shared resolver — see `ForwardingState::egress_zone_id`. A
-        // MAC-less interface (IPsec xfrmi) has no `egress` row, so reading that
-        // map directly logged to-zone 0 for a correctly-zoned tunnel.
-        let egress_zone_id = forwarding.egress_zone_id(decision.resolution.egress_ifindex);
-        emit_filter_log_event(
-            event_stream,
-            flow,
+    // #7176 (C179-001): the reject-reply + filter-log side effects of a
+    // dropping output-filter verdict live in `apply_cos_drop_side_effects` so
+    // the DEFERRED neighbor-retry flush (neighbor_dispatch.rs) applies exactly
+    // the same ones. They used to be inline here and only here, which is why a
+    // packet buffered pending ARP/ND lost its `then reject` reply and its
+    // `then log` event entirely.
+    apply_cos_drop_side_effects(
+        &cos,
+        CoSDropSideEffects {
+            forwarding,
             meta,
-            ingress_zone_id,
-            egress_zone_id,
-            filter_log.filter_id,
-            filter_log.term_id,
-            filter_log.action,
-            FilterLogSource::Output,
-            // #2520: AppID via the hot-path app_catalog.lookup.
-            resolve_flow_app_id(&forwarding.app_catalog, flow),
-            // #3608/#3615: reports whether the `then reject` reply above actually
-            // went out; a `then accept`/`then discard` term, or a reject that
-            // fail-closed, keeps this false so the log is truthful.
-            reject_reply_enqueued,
+            ingress_ifindex: ingress_ident.ifindex,
+            egress_ifindex: decision.resolution.egress_ifindex,
+            fabric_ingress_zone,
             now_ns,
-        );
-    }
+        },
+        frame,
+        tx_selection_flow,
+        reject_reply,
+        event_stream,
+    );
     if cos.drop {
         return None;
     }
@@ -422,4 +364,124 @@ pub(super) fn build_live_forward_request_from_frame(
         // per-forwarded-packet `term_match_extra_from_frame(..).to_static()`
         // that produced write-only data.
     })
+}
+
+/// #7176 (C179-001): the reject-reply and filter-log side effects owed by a
+/// DROPPING output-filter verdict, in one place so every consumer of a
+/// `CoSTxSelection` applies the same ones.
+///
+/// This block used to live inline in `build_live_forward_request_from_frame`
+/// and nowhere else. The deferred neighbor-retry flush
+/// (`neighbor_dispatch::retry_pending_neigh`) resolves the very same
+/// `CoSTxSelection` when a packet buffered pending ARP/ND is finally flushed,
+/// but read only `.drop` — so a `then reject` term degraded to a silent
+/// discard and a `then log` term emitted nothing, for every packet that
+/// happened to arrive before its neighbor was resolved. `CoSTxSelection`'s own
+/// contract says otherwise: `reject` exists so "the TX/CoS consumer can
+/// synthesize the active reject reply ... instead of the silent drop".
+///
+/// Kept as a shared helper rather than duplicated: the ordering here is
+/// load-bearing (#3615 requires the reply be enqueued BEFORE the log so the
+/// logged action is truthful), and a second copy is what produced the original
+/// divergence.
+///
+/// Returns whether a reject reply was actually enqueued, which the filter-log
+/// event reports as the truthful action.
+pub(super) struct CoSDropSideEffects<'a> {
+    pub(super) forwarding: &'a ForwardingState,
+    pub(super) meta: UserspaceDpMeta,
+    pub(super) ingress_ifindex: i32,
+    pub(super) egress_ifindex: i32,
+    pub(super) fabric_ingress_zone: Option<u16>,
+    pub(super) now_ns: u64,
+}
+
+pub(super) fn apply_cos_drop_side_effects(
+    cos: &CoSTxSelection,
+    ctx: CoSDropSideEffects<'_>,
+    frame: &[u8],
+    tx_selection_flow: Option<&SessionFlow>,
+    reject_reply: Option<ForwardRejectReply<'_>>,
+    event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+) -> bool {
+    // #3608: an output firewall-filter `then reject` on the transit forward path
+    // now emits the SAME active reply as the input/lo0 path (#2521) — a TCP RST
+    // for TCP, an ICMP/ICMPv6 admin-prohibited unreachable otherwise — instead
+    // of the historical silent drop. The reply reflects the ORIGINAL inbound
+    // frame back toward the source via the ingress interface (the source is
+    // reachable on the reverse path), reusing the shared reject-synthesis +
+    // #2238 output-classification + #2472 rate-limit + fail-closed budget gate.
+    // `then discard` and three-color-policer drops stay silent (`cos.reject`
+    // isolates the reject subset of `cos.drop`). Enqueue the reply FIRST so the
+    // filter-log below reports the TRUTHFUL action (#3615): a reject whose reply
+    // fail-closes (budget/rate/parse/output-filter, or a missing tx-pipeline
+    // context) logs DENY, not REJECT.
+    let reject_reply_enqueued = if cos.drop && cos.reject {
+        match (reject_reply, tx_selection_flow) {
+            (Some(reply), Some(flow)) => {
+                crate::afxdp::poll_descriptor::reject_reply::enqueue_filter_reject_reply(
+                    reply.tx_pipeline,
+                    ctx.forwarding,
+                    ctx.ingress_ifindex,
+                    frame,
+                    ctx.meta,
+                    flow,
+                    reply.counters,
+                    // #6854: the OUTPUT-filter reject path carries its own
+                    // resolved message-type on the CoS selection.
+                    cos.reject_message,
+                )
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    // #5467: a flowless packet (non-first fragment / non-query ICMP) has NO
+    // `tx_selection_flow`, yet an interface output `then log` term may have
+    // matched its L3 tuple inside `resolve_cos_tx_selection_at` (the flowless
+    // enforcement gate). Rebuild the L3-only flow (ports 0) SOLELY to attribute
+    // that filter-log event so egress logging is not silently bypassed. The
+    // reject reply above stays gated on `tx_selection_flow`, so a flowless deny
+    // remains a silent drop (#3615 — no L4 header to synthesize a reply from).
+    let flowless_log_flow = if tx_selection_flow.is_none() && cos.filter_log.is_some() {
+        crate::afxdp::frame::l3_session_flow_from_meta(ctx.meta)
+    } else {
+        None
+    };
+    let log_flow = tx_selection_flow.or(flowless_log_flow.as_ref());
+    if let (Some(filter_log), Some(flow)) = (cos.filter_log, log_flow) {
+        let ingress_zone_id = ctx.fabric_ingress_zone
+            .filter(|id| ctx.forwarding.zone_id_to_name.contains_key(id))
+            .or_else(|| {
+                ctx.forwarding
+                    .ifindex_to_zone_id
+                    .get(&(ctx.meta.ingress_ifindex as i32))
+                    .copied()
+            })
+            .unwrap_or(0);
+        // #6713: shared resolver — see `ForwardingState::egress_zone_id`. A
+        // MAC-less interface (IPsec xfrmi) has no `egress` row, so reading that
+        // map directly logged to-zone 0 for a correctly-zoned tunnel.
+        let egress_zone_id = ctx.forwarding.egress_zone_id(ctx.egress_ifindex);
+        emit_filter_log_event(
+            event_stream,
+            flow,
+            ctx.meta,
+            ingress_zone_id,
+            egress_zone_id,
+            filter_log.filter_id,
+            filter_log.term_id,
+            filter_log.action,
+            FilterLogSource::Output,
+            // #2520: AppID via the hot-path app_catalog.lookup.
+            resolve_flow_app_id(&ctx.forwarding.app_catalog, flow),
+            // #3608/#3615: reports whether the `then reject` reply above actually
+            // went out; a `then accept`/`then discard` term, or a reject that
+            // fail-closed, keeps this false so the log is truthful.
+            reject_reply_enqueued,
+            ctx.now_ns,
+        );
+    }
+    reject_reply_enqueued
 }

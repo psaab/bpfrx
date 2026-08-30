@@ -8,7 +8,7 @@ use crate::screen::ScreenPacketInfo;
 
 const RT_FLOW_ACTION_DENY: u8 = 0;
 const RT_FLOW_ACTION_PERMIT: u8 = 1;
-const RT_FLOW_ACTION_REJECT: u8 = 2;
+pub(in crate::afxdp) const RT_FLOW_ACTION_REJECT: u8 = 2;
 const RT_FLOW_CLOSE_REASON_POLICY: u8 = 5;
 // #3610: a host-inbound-traffic admission deny (the ingress zone's
 // `host-inbound-traffic` gate rejecting a host-bound / control-plane packet) is

@@ -2051,6 +2051,8 @@ pub(super) fn assert_decapped_missing_neighbor_never_buffered_or_retried(vlan_id
         // umem area), and the test is single-threaded.
         unsafe { &*area },
         &mut shared_recycles,
+        None,
+        &mut BatchCounters::default(),
     );
     for (i, b) in bindings.iter().enumerate() {
         assert!(
