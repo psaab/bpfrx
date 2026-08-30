@@ -1025,7 +1025,7 @@ fn build_synced_session_entry_preserves_fabric_ingress() {
     };
 
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert!(entry.metadata.fabric_ingress);
     assert!(entry.origin.is_peer_synced());
     assert_eq!(entry.metadata.owner_rg_id, 1);
@@ -1053,7 +1053,7 @@ fn build_synced_session_entry_applies_log_flags() {
         ..SessionSyncRequest::default()
     };
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert!(entry.metadata.log_session_init, "log_session_init applied");
     assert!(entry.metadata.log_session_close, "log_session_close applied");
 
@@ -1063,7 +1063,7 @@ fn build_synced_session_entry_applies_log_flags() {
         log_session_close: true,
         ..req.clone()
     };
-    let entry_close = build_synced_session_entry(&req_close, &test_zone_name_to_id())
+    let entry_close = build_synced_session_entry(&req_close, &test_zone_name_to_id(), 0)
         .expect("synced session entry");
     assert!(!entry_close.metadata.log_session_init);
     assert!(entry_close.metadata.log_session_close);
@@ -1074,7 +1074,7 @@ fn build_synced_session_entry_applies_log_flags() {
         log_session_close: false,
         ..req
     };
-    let entry_none = build_synced_session_entry(&req_none, &test_zone_name_to_id())
+    let entry_none = build_synced_session_entry(&req_none, &test_zone_name_to_id(), 0)
         .expect("synced session entry");
     assert!(!entry_none.metadata.log_session_init);
     assert!(!entry_none.metadata.log_session_close);
@@ -1106,7 +1106,7 @@ fn build_synced_session_entry_applies_policy_fields_3301() {
         ..SessionSyncRequest::default()
     };
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert_eq!(entry.metadata.policy_id, 42, "policy_id must be applied");
     assert_eq!(
         entry.metadata.policy_counter_idx, 7,
@@ -1133,7 +1133,7 @@ fn build_synced_session_entry_applies_policy_fields_3301() {
         req_legacy.inactivity_timeout, 0,
         "missing inactivity_timeout defaults to 0"
     );
-    let entry_legacy = build_synced_session_entry(&req_legacy, &test_zone_name_to_id())
+    let entry_legacy = build_synced_session_entry(&req_legacy, &test_zone_name_to_id(), 0)
         .expect("legacy synced session still installs (not rejected)");
     assert_eq!(entry_legacy.metadata.policy_id, 0);
     assert_eq!(entry_legacy.metadata.policy_counter_idx, 0);
@@ -1160,7 +1160,7 @@ fn build_synced_session_entry_preserves_tunnel_endpoint_id() {
     };
 
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 3);
     assert_eq!(entry.decision.resolution.egress_ifindex, 586);
     assert_eq!(
@@ -1193,7 +1193,7 @@ fn build_synced_session_entry_prefers_id_over_legacy_zone_name() {
         ..SessionSyncRequest::default()
     };
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert_eq!(entry.metadata.ingress_zone, 1);
     assert_eq!(entry.metadata.egress_zone, 2);
 }
@@ -1219,7 +1219,7 @@ fn build_synced_session_entry_falls_back_to_zone_name_when_id_zero() {
         ..SessionSyncRequest::default()
     };
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     let m = test_zone_name_to_id();
     assert_eq!(entry.metadata.ingress_zone, m["lan"]);
     assert_eq!(entry.metadata.egress_zone, m["wan"]);
@@ -1247,7 +1247,7 @@ fn build_synced_session_entry_unknown_zone_name_does_not_drop_session() {
         ..SessionSyncRequest::default()
     };
     let entry =
-        build_synced_session_entry(&req, &test_zone_name_to_id()).expect("synced session entry");
+        build_synced_session_entry(&req, &test_zone_name_to_id(), 0).expect("synced session entry");
     assert_eq!(entry.metadata.ingress_zone, 0);
     assert_eq!(entry.metadata.egress_zone, 0);
 }
@@ -4228,6 +4228,7 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
     for protocol in &traversable {
         let err = build_synced_session_key(
             &sync_req(v6, *protocol, "2001:db8::11", "2001:db8::22"),
+            0,
             SyncedKeyIntent::Install,
         )
             .expect_err(&format!(
@@ -4251,6 +4252,7 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
     for protocol in [6u8, 17, 50, 58, 59, 47] {
         let key = build_synced_session_key(
             &sync_req(v6, protocol, "2001:db8::11", "2001:db8::22"),
+            0,
             SyncedKeyIntent::Install,
         )
         .unwrap_or_else(|e| {
@@ -4263,6 +4265,7 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
     for protocol in &traversable {
         let key = build_synced_session_key(
             &sync_req(libc::AF_INET as u8, *protocol, "192.0.2.1", "192.0.2.2"),
+            0,
             SyncedKeyIntent::Install,
         )
         .unwrap_or_else(|e| panic!("#6923: IPv4 protocol {protocol} must still import: {e}"));
@@ -4275,6 +4278,7 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
         build_synced_session_entry(
             &sync_req(v6, 60, "2001:db8::11", "2001:db8::22"),
             &test_zone_name_to_id(),
+            0,
         )
         .is_err(),
         "#6923: the upsert path must refuse the same key the delete path refuses"

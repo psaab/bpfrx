@@ -284,42 +284,77 @@ next-hops, preference 0). The wire specimen lives in
       stored into BOTH the full `ha.runtime` view's forwarding Arc AND the worker fast-path
       `ha.fabrics` Arc so no reader retains the stale peer.
 
-## Session identity is VRF-CAPABLE but not yet VRF-POPULATED (#2387 / #7160)
+## Session identity is VRF-POPULATED (#2387 / #7160)
 
 The FIB route model above is table-scoped for route + local-delivery
-*selection*. Session/flow *identity* is being made table-scoped to match,
-in two phases. **Phase 1 has landed; the limitation below is still live in
-production** because nothing sets the field yet.
+*selection*. Session/flow *identity* is table-scoped to match, in two
+phases. **Both have landed.** Phase 1 (PR #8098) put the field on the key;
+phase 2 populates it, which is what actually closes the cross-tenant
+forward-direction collision.
 
 - **`SessionKey` carries a `routing_domain: u32`** (`session/key.rs`,
-  #7160). `0` is the default routing instance. All five key transforms
-  (`forward_wire_key`, `translated_session_key`, `reverse_wire_key`,
-  `reverse_canonical_key`, `reverse_session_key`) PRESERVE it, because a
-  flow's routing domain is the same in both directions — that symmetry is
-  what allows it on the key at all, and is the axis on which it differs
-  from #6928's `ingress_ifindex`/`ingress_vlan_id` (session VALUE,
-  asymmetric, node-local).
-- **Phase 2 is not done: nothing populates the field.** Every value in the
-  tree is `0`, so today two flows with identical 5-tuples in different
-  routing instances still share one conntrack entry, and the
-  established-session fast path still short-circuits before
-  `ingress_route_table_override` — tenant B inherits tenant A's cached
-  egress, NAT and **policy** decision. The commit-time overlap warning
-  (`pkg/config/compiler_validate_vrf_overlap.go`) remains the operator's
-  only signal. Phase 2 threads `StableRoutingInstanceTableID(name)` — a
-  pure, collision-gated function of the instance NAME, therefore identical
-  on both HA nodes by construction — through the control plane and onto the
-  session-sync wire.
-- **Phase 2 still does NOT need a version bump** — see the wire bullet
-  below, which is plan v5 §0a's correction of §4d and remains in force. The
-  domain rides as a length-gated trailing VALUE field and domain 0 decodes
-  an old peer's omitted field to the default instance, so a non-VRF cluster
-  stays bit-identical across the mixed-version window. #7160's issue text
-  says Option B "bumps the HA wire"; that quotes the superseded §4d, and
-  taking it at face value would break rolling upgrade for no reason. Phase 1
-  does not touch `userspace-dp/src/protocol/` at all;
-  `userspace-dp/tests/vrf_session_identity_doc_guard.rs` enforces that split
-  and fires when phase 2 begins.
+  #7160). `0` is the default routing instance, so every deployment with no
+  routing-instance interface membership keeps byte-identical session
+  identity.
+- **It is stamped from the LOGICAL ingress interface**, at one site — the
+  poll path's stage 9b, immediately after fabric-ingress classification
+  (`poll_descriptor/mod.rs`, `forwarding::ingress_routing_domain`). Every
+  key the descriptor derives (lookup key, installed forward key, reverse
+  companion, index entries) therefore carries one consistent domain. The
+  NUMBER is `StableRoutingInstanceTableID(name)` — a pure, collision-gated
+  function of the instance NAME — computed in Go
+  (`routingInstanceDomain`, `pkg/dataplane/userspace/routes.go`) and shipped
+  per interface on the config snapshot, never re-hashed in Rust: both HA
+  nodes run the same function over the same config, so the value cannot
+  drift between them.
+- **Why the ingress interface and nothing else.** The reverse key is built
+  by swapping the forward key's fields and never observes the reply, so the
+  domain must be a quantity a packet resolves from its own arrival. A PBR
+  `then routing-instance` ASSIGNMENT is not one — the reply ingresses on an
+  interface the PBR term never touches — so PBR-steered flows on an
+  `instance-type forwarding` instance with no member interfaces stay domain
+  0 in both directions, and #7924's strict-path rejection of overlap + PBR
+  remains what covers that shape.
+- **Forward isolation is exact; reverse matching is domain-PREFERRING.**
+  The collision #7160 exists to close is a forward-direction one — tenant
+  B's packets hitting tenant A's conntrack entry and inheriting its cached
+  egress, NAT and **policy** verdict. Forward lookups go through
+  `key_to_handle` on the full key, so two tenants now hold two entries.
+  The reverse side cannot be keyed the same way: this dataplane's transit
+  route lookup is **not** VRF-isolated (see the PBR bullet below), so a flow
+  that ingresses on a routing-instance member interface and egresses out of
+  the default instance is a real, working configuration whose reply resolves
+  a DIFFERENT domain. `reverse_wire_key` / `reverse_canonical_key`
+  therefore build the reverse-match index with `routing_domain: 0`, and
+  `find_forward_nat_match` walks the (1:N) bucket in two passes — preferring
+  a candidate whose forward session carries the reply's own domain, and
+  falling back to a domain-agnostic match only when none does. Two
+  contained tenants demux exactly; a non-contained flow keeps forwarding as
+  it did before the field existed. `forward_wire_key`,
+  `translated_session_key` and `reverse_session_key` still PRESERVE the
+  domain — they name another key of the same direction, or navigate between
+  the two halves of one flow.
+- **HA import DERIVES the domain; it is not carried as its own wire field.**
+  The domain is a pure function of the flow's ingress interface and the
+  config, both nodes run identical config, and #7095 already resolves the
+  peer's cluster-stable ingress NAME into this node's own ifindex/vlan
+  before the request reaches the helper
+  (`Coordinator::synced_routing_domain`). Sending the number as well would
+  be a second spelling of one fact that could disagree with the first. A
+  session whose ingress identity the peer could not name (fabric-redirected,
+  #7096; no cluster-stable name) imports at domain 0 — the pre-#7160
+  identity — so it re-adjudicates through policy after a failover instead of
+  being taken over. That is a correctness-preserving degradation, not a
+  bypass, and it is the price of not maintaining two spellings.
+- **Residuals, named.** (a) The Go-side session store is still keyed on the
+  bare 5-tuple (`dataplane.SessionKeyV4`), so two tenants' identical
+  5-tuples still collide THERE; that bounds HA sync fidelity for such a
+  config, and is unchanged by this work. (b) A `clear security flow session`
+  delete arrives as a bare 5-tuple with no ingress identity, so the helper
+  retries the delete once per configured domain
+  (`Coordinator::routing_domains`) rather than missing a VRF session.
+  (c) Per-VRF default FIB — the thing that would make the reply direction
+  symmetric by construction — is Track B-ext and remains out of scope.
 - **PBR `then routing-instance` is the ONLY per-VRF forwarding path.** An
   interface's native `routing_instance` selects only the connected-route
   table NAME (#2388 above) — it does NOT scope a transit packet's
@@ -344,14 +379,17 @@ production** because nothing sets the field yet.
   non-first fragment / L3-only packet has no L4 header to reflect), drop
   silently. An accept-only routing-instance term still returns `Table(<ri>)`
   and forwards — normal PBR is unchanged.
-- **PBR per-VRF forwarding is NOT session-isolated.** Because the identity
-  is the bare 5-tuple, the established-session fast path
-  (`resolve_flow_session_decision`) runs BEFORE the PBR table override, so
-  a second flow with the same 5-tuple in a different routing-instance hits
-  the first flow's conntrack session and inherits its cached egress / NAT /
-  policy decision — wrong-VRF forwarding. This is reachable only with
-  overlapping L3 address space + PBR + simultaneous identical 5-tuples (a
-  niche multi-tenant config), but it is real, not purely latent.
+- **PBR per-VRF forwarding is still not session-isolated BY THE PBR TERM.**
+  The established-session fast path (`resolve_flow_session_decision`) runs
+  BEFORE the PBR table override, and #7160 did not change that ordering —
+  it changed the identity the fast path looks up. Where the routing
+  instances have MEMBER INTERFACES, the ingress-derived `routing_domain`
+  now separates the two flows before the fast path can conflate them. Where
+  the steering instance is `instance-type forwarding` with no member
+  interfaces (the `test/incus/fbf-two-upstream-config.set` shape), both
+  directions resolve domain 0 and the identity is unchanged — that shape is
+  covered by #7924's strict-path rejection of overlap + PBR, not by the
+  key.
 - **#3096 NAT-scope-vs-session-cache coherence contract.** #3096 made NAT
   rule *selection* routing-instance-aware at session CREATE
   (`ifindex_to_routing_instance` + `NatScopeCtx`). But the established fast
@@ -388,41 +426,62 @@ production** because nothing sets the field yet.
   different detections. If #7160's Option B lands, the metric goes to zero and
   stays there, which is itself the confirmation.
 
-  The warning states the limitation and points at #2387; it deliberately
-  does NOT promise a fix, because none is committed to. The candidate fix
-  (Track B) *would* add a **symmetric routing-domain id** to `SessionKey` +
-  `FlowCacheLookup` + the reverse-key transforms — if taken, the
-  discriminator MUST be the routing-domain id (symmetric across
-  forward/reply), NOT zone or ingress-ifindex (asymmetric → breaks conntrack
-  reverse matching). Whether to take it is an open maintainer decision on
-  #2387, not a scheduled change.
-- **The HA session-sync wire does NOT need a version bump** (corrected in
-  plan v5 §0a; the plan's own §4d said otherwise). The domain does not have
-  to live in the fixed-width wire KEY block — it rides as a length-gated
-  trailing **value** field, exactly like #2170 `Generation`, #3301
-  `AppTimeout`/`PolicyCounterIdx`, #4565 `Nat64SnatV4`, #5274 `ConfigEpoch`
-  and #5212 `RTFlowSessionID` (`pkg/cluster/sync_protocol.go`; the
-  `SessionSyncRequest` control-socket struct is all `#[serde(default)]`).
-  The receiver folds it into the key it reconstructs. Interning **domain 0
-  = the default routing-instance** makes an old peer's omitted field decode
-  to the default VRF, so a non-VRF cluster is bit-identical across the
-  mixed-version window and `CurrentHAProtocolVersion` never moves.
-- **The trailing-value shape has since been USED, by #7188.** The GRE tunnel
-  discriminator rides exactly this way — `SessionValue{,V6}.TunnelDiscriminator`
-  on the cluster wire (after the #7095 `IngressIfaceFold`),
+  The warning states the limitation and points at #2387. Track B is no
+  longer a candidate — it is decided and shipped (#7160 phases 1 and 2), and
+  the discriminator is the routing-domain id exactly as the plan required:
+  config-derived, never a kernel ifindex (#6928 declined to sync one for the
+  reason that a node-local number names a different NIC on the peer), and
+  never zone or ingress-ifindex on the key. What #7160 did NOT do is make
+  the reply direction symmetric by construction; that is per-VRF default FIB
+  (Track B-ext) and stays out of scope.
+- **The HA session-sync wire does NOT need a version bump**, and #7160
+  phase 2 did not take one (corrected in plan v5 §0a; the plan's own §4d
+  said otherwise, and #7160's issue text quotes §4d). Two independent
+  reasons, and the second is the one that shipped:
+  - the domain never had to live in the fixed-width wire KEY block. It
+    could ride as a length-gated trailing **value** field, exactly like
+    #2170 `Generation`, #3301 `AppTimeout`/`PolicyCounterIdx`, #4565
+    `Nat64SnatV4`, #5274 `ConfigEpoch` and #5212 `RTFlowSessionID`
+    (`pkg/cluster/sync_protocol.go`; the `SessionSyncRequest`
+    control-socket struct is all `#[serde(default)]`), with the receiver
+    folding it into the key it reconstructs.
+  - it does not ride at all. The importing node DERIVES it from the
+    cluster-stable ingress identity #7095 already carries and already
+    resolves to a LOCAL ifindex, so there is no new field to keep in sync
+    and no mixed-version window to reason about.
+  Interning **domain 0 = the default routing-instance** is what makes both
+  safe: an absent or unresolvable ingress identity decodes to the default
+  VRF, a non-VRF cluster is bit-identical either way, and
+  `CurrentHAProtocolVersion` never moves.
+- **The trailing-value shape has since been USED, by #7188** — by the GRE
+  tunnel discriminator, which took the route the domain considered and
+  declined. It rides as `SessionValue{,V6}.TunnelDiscriminator` on the cluster
+  wire (after the #7095 `IngressIfaceFold`),
   `SessionSyncRequest.tunnel_discriminator` to the peer helper, and a trailing
-  u64 on both binary HA delta frames — and the receiver folds it into the key it
-  reconstructs. No `CurrentHAProtocolVersion` bump, as this bullet predicted.
-  One correction the routing-domain plan does NOT anticipate: **`0` must be
+  u64 on both binary HA delta frames; the receiver folds it into the key it
+  reconstructs. No `CurrentHAProtocolVersion` bump, as the bullet above says
+  there need not be.
+
+  The two identity axes are carried by OPPOSITE mechanisms, and the reason is
+  worth stating because it is not a preference. The routing domain is
+  DERIVABLE on the importing node — #7095 already carries a cluster-stable
+  ingress identity and already resolves it locally — so #7160 derives it and
+  ships no field. An RFC 2890 Key is not derivable from anything the peer
+  sends: it lives in the GRE header of a packet only the ORIGINATING node saw.
+  It has to ride, or it is lost.
+
+  That forces a distinction the derived axis never needs: **`0` must be
   RESERVED for "the peer did not carry this field", separate from the field's
-  own zero-value class.** `serde(default)` and a short record both yield `0`, so
-  `0` is the one value a peer emits without meaning to; if it also spells a real
-  class, a peer that cannot express the identity is indistinguishable from one
-  that deliberately said "default". #7188 needs that distinction to WITHHOLD a
-  protocol-47 session from a peer that predates the field rather than importing
-  it aliased. Interning "domain 0 = the default routing-instance" gives up
-  exactly that distinction, which is safe for #7160 only because every legacy
-  session genuinely IS in the default instance. Full write-up:
+  own zero-value class.** `serde(default)` and a short record both yield `0`,
+  so `0` is the one value a peer emits without meaning to; if it also spells a
+  real class, a peer that cannot express the identity is indistinguishable from
+  one that deliberately said "default", and #7188 must tell those apart to
+  WITHHOLD a protocol-47 session from a peer that predates the field rather
+  than importing it aliased. Interning "domain 0 = the default
+  routing-instance" spends exactly that distinction — which costs #7160
+  nothing, because an unresolvable ingress identity and a legacy session are
+  both genuinely in the default instance, whereas for a tunnel key they are
+  not the same statement at all. Full write-up:
   `docs/session-sync-architecture.md`, "Tunnel Session-Identity Discriminator".
 - **Do NOT "decline the hit and fall through"** as a cheap mitigation.
   `install_with_protocol_with_origin` opens with an unconditional

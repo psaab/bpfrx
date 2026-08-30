@@ -1481,6 +1481,13 @@ impl Coordinator {
     }
 }
 
+// #7160 (#2387): the routing-domain accessors the session-sync handler calls.
+// Split out of this file to keep it under the modularity floor
+// (docs/engineering-style.md); it is one cohesive pair of readers over
+// `self.forwarding`, so it is a clean seam rather than an arbitrary cut.
+#[path = "routing_domain.rs"]
+mod routing_domain;
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

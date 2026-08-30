@@ -543,6 +543,11 @@ mod tests_icmp_reject_reversal;
 #[cfg(test)]
 #[path = "tests_embedded_poll_filter.rs"]
 mod tests_embedded_poll_filter;
+// #7160 (#2387): the routing-domain stamp on the REAL poll path — the WIRING,
+// which no unit-level cell can reach.
+#[cfg(test)]
+#[path = "tests_routing_domain_7160.rs"]
+mod tests_routing_domain_7160;
 #[cfg(test)]
 #[path = "tests_fabric_zone_stamp.rs"]
 mod tests_fabric_zone_stamp;

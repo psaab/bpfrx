@@ -8236,71 +8236,303 @@ fn two_routing_domains_sharing_a_5tuple_are_distinct_sessions_7160() {
     );
 }
 
-/// Every key transform must CARRY the routing domain. A flow's routing domain
-/// is the same in both directions, and a transform that zeroes it re-creates
-/// the collision on the reverse path only — where no single-VRF test can see
-/// it. Each transform is asserted by name so a failure says which one dropped
-/// it, rather than reporting "a transform" and leaving the reader to bisect.
+/// The five key transforms split into two groups, and each half is asserted by
+/// name so a failure says which transform moved rather than "a transform".
+///
+/// Phase 1 had all five PRESERVING the domain, on the belief that a flow's
+/// routing domain is the same in both directions. Phase 2 measured that and it
+/// is false here: the transit route lookup is not VRF-isolated (it uses the
+/// default table unless a PBR term overrides it), so a flow that ingresses on
+/// a routing-instance member interface and egresses out of the default
+/// instance is a working configuration whose REPLY resolves a different
+/// domain. Keying the reverse-match index on the forward domain blackholes
+/// every such flow's replies.
+///
+///   * SAME-DIRECTION transforms preserve: they name another key of the same
+///     direction, or navigate between the two halves of one flow.
+///   * REVERSE-MATCH transforms zero: they build the index a REPLY is looked
+///     up under, and the reply's domain is spent on a preference instead
+///     (`find_forward_nat_match`), not on the bucket key.
 #[test]
-fn every_key_transform_preserves_the_routing_domain_7160() {
+fn key_transforms_split_same_direction_preserve_from_reverse_match_zero_7160() {
     const DOMAIN: u32 = 0xABCD_1234;
     let mut key = key_v4();
     key.routing_domain = DOMAIN;
     let nat = decision().nat;
 
-    let cases: [(&str, SessionKey); 5] = [
+    let same_direction: [(&str, SessionKey); 3] = [
         ("forward_wire_key", super::key::forward_wire_key(&key, nat)),
         (
             "translated_session_key",
             super::key::translated_session_key(&key, nat),
-        ),
-        ("reverse_wire_key", super::key::reverse_wire_key(&key, nat)),
-        (
-            "reverse_canonical_key",
-            super::key::reverse_canonical_key(&key, nat),
         ),
         (
             "reverse_session_key",
             super::key::reverse_session_key(&key, nat),
         ),
     ];
-
-    for (name, derived) in cases {
+    for (name, derived) in same_direction {
         assert_eq!(
             derived.routing_domain, DOMAIN,
-            "{name} dropped the routing domain ({:#x} -> {:#x}). A derived key \
-             in domain 0 collides with the default instance, so tenant traffic \
-             would match a default-instance session on this path. Preserve the \
-             source key's routing_domain; do NOT use Default::default().",
+            "{name} dropped the routing domain ({:#x} -> {:#x}). It names \
+             another key of the SAME direction (or the flow's other half), so \
+             a derived key in domain 0 would collide with the default instance \
+             on that path.",
             DOMAIN, derived.routing_domain
         );
     }
+
+    let reverse_match: [(&str, SessionKey); 2] = [
+        ("reverse_wire_key", super::key::reverse_wire_key(&key, nat)),
+        (
+            "reverse_canonical_key",
+            super::key::reverse_canonical_key(&key, nat),
+        ),
+    ];
+    for (name, derived) in reverse_match {
+        assert_eq!(
+            derived.routing_domain, 0,
+            "{name} carried the forward domain ({:#x}) onto a REVERSE-MATCH \
+             key. That key is the bucket a REPLY is looked up under, and this \
+             dataplane routes transit traffic in the DEFAULT table unless a PBR \
+             term overrides it — so a flow whose egress leaves its routing \
+             instance has a reply that resolves another domain and would now \
+             find no bucket at all. That is a forwarding outage, not a \
+             hardening; the isolation lives in find_forward_nat_match's \
+             two-pass preference.",
+            DOMAIN
+        );
+    }
+
+    // And the zeroing must be a REWRITE, not a wholesale loss of identity: the
+    // rest of the reverse key still has to be the reverse of this flow.
+    let rev = super::key::reverse_wire_key(&key, nat);
+    assert_eq!(rev.src_ip, key.dst_ip);
+    assert_eq!(rev.dst_ip, key.src_ip);
 }
 
-/// The behavioural consequence: a reply that arrives in a DIFFERENT routing
-/// domain must not be matched to this session. Without the field both keys
-/// were identical and the reply matched, which is how tenant B inherited
-/// tenant A's policy decision.
+/// The behavioural consequence at the LOOKUP layer, which is the layer that
+/// decides which tenant's cached decision a reply inherits.
+///
+/// Two tenants, identical 5-tuples, contained in their own routing instances
+/// (their replies arrive on interfaces in the same instance, so each reply
+/// resolves its own domain). Both forward sessions land in ONE reverse bucket,
+/// because the reverse-match index is domain-agnostic by construction. The
+/// two-pass preference is the only thing that demuxes them.
+///
+/// FAIL-ON-REVERT: delete the preference in `find_forward_nat_match` and this
+/// goes red — bucket order is install order, so tenant B's reply would take
+/// tenant A's session and inherit its egress, NAT and policy decision.
 #[test]
-fn a_reply_in_another_routing_domain_does_not_match_the_session_7160() {
-    let mut forward = key_v4();
-    forward.routing_domain = 0x1111_1111;
+fn each_contained_tenants_reply_resolves_its_own_session_7160() {
+    const DOMAIN_A: u32 = 0x0001_86A1;
+    const DOMAIN_B: u32 = 0x0001_86A2;
+    let mut table = SessionTable::new();
     let nat = decision().nat;
 
-    let same_domain_reply = super::key::reverse_wire_key(&forward, nat);
-    assert!(
-        super::key::reply_matches_forward_session(&forward, nat, &same_domain_reply),
-        "the reply in the SAME routing domain must still match — if this fails \
-         the field has broken ordinary conntrack reverse matching, which is a \
-         far worse regression than the bug it fixes"
+    let mut tenant_a = key_v4();
+    tenant_a.routing_domain = DOMAIN_A;
+    let mut tenant_b = key_v4();
+    tenant_b.routing_domain = DOMAIN_B;
+
+    assert!(table.install_with_protocol(
+        tenant_a.clone(),
+        decision(),
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+    assert!(table.install_with_protocol(
+        tenant_b.clone(),
+        decision(),
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+
+    // The reply each tenant's own interface produces: the reverse tuple, in
+    // that tenant's domain.
+    let mut reply_a = super::key::reverse_wire_key(&tenant_a, nat);
+    reply_a.routing_domain = DOMAIN_A;
+    let mut reply_b = reply_a.clone();
+    reply_b.routing_domain = DOMAIN_B;
+
+    let matched_a = table
+        .find_forward_nat_match(&reply_a)
+        .expect("tenant A's reply found no session at all — the domain-agnostic \
+                 reverse bucket is not being probed");
+    assert_eq!(
+        matched_a.key.routing_domain, DOMAIN_A,
+        "tenant A's reply resolved a session in domain {:#x} instead of its own \
+         {:#x}. The reply now inherits another tenant's cached egress, NAT and \
+         policy decision on the return path.",
+        matched_a.key.routing_domain, DOMAIN_A
     );
 
-    let mut other_domain_reply = same_domain_reply.clone();
-    other_domain_reply.routing_domain = 0x2222_2222;
-    assert!(
-        !super::key::reply_matches_forward_session(&forward, nat, &other_domain_reply),
-        "a reply in a DIFFERENT routing domain matched this session — this is \
-         the #2387 cross-tenant collision: tenant B's traffic inherits tenant \
-         A's cached egress, NAT and policy decision"
+    let matched_b = table
+        .find_forward_nat_match(&reply_b)
+        .expect("tenant B's reply found no session at all");
+    assert_eq!(
+        matched_b.key.routing_domain, DOMAIN_B,
+        "tenant B's reply resolved a session in domain {:#x} instead of its own \
+         {:#x}",
+        matched_b.key.routing_domain, DOMAIN_B
+    );
+}
+
+/// The regression this design exists to avoid, stated as a cell.
+///
+/// A flow that ingresses on a routing-instance member interface and egresses
+/// out of the DEFAULT instance is a real, working configuration — this
+/// dataplane's transit route lookup is not VRF-isolated, so the reply comes
+/// back on a default-instance interface and resolves domain 0. Its session was
+/// installed in the ingress interface's domain. If the reverse-match index
+/// carried that domain, this reply would find nothing, the reverse direction
+/// would be adjudicated as a new flow from the wrong zone pair, and the flow
+/// would break outright.
+///
+/// FAIL-ON-REVERT: make `reverse_wire_key` / `reverse_canonical_key` preserve
+/// the domain again and this goes red.
+#[test]
+fn a_reply_from_outside_the_flows_domain_still_resolves_its_session_7160() {
+    const DOMAIN: u32 = 0x0001_86A3;
+    let mut table = SessionTable::new();
+    let nat = decision().nat;
+
+    let mut forward = key_v4();
+    forward.routing_domain = DOMAIN;
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        decision(),
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+
+    // The reply arrives on a default-instance interface: domain 0, not DOMAIN.
+    let mut reply = super::key::reverse_wire_key(&forward, nat);
+    reply.routing_domain = 0;
+
+    let matched = table.find_forward_nat_match(&reply).expect(
+        "a reply arriving in the default instance found no session for a flow \
+         that ingressed in a routing instance. This dataplane routes transit \
+         traffic in the DEFAULT table unless a PBR term overrides it, so this \
+         is not an exotic shape — it is what an interface-bound routing \
+         instance with no PBR does today, and this miss breaks the flow.",
+    );
+    assert_eq!(matched.key.routing_domain, DOMAIN);
+    assert_eq!(matched.key, forward);
+}
+
+/// The NAT'd twin of the cell above, and it is not redundant with it.
+///
+/// With no NAT, `reverse_wire_key` and `reverse_canonical_key` produce the SAME
+/// tuple, so the index carries one bucket that either transform's zeroing is
+/// enough to place at domain 0 — and a revert of just ONE of them leaves that
+/// cell green. Measured: reverting `reverse_wire_key` alone did exactly that.
+/// Under NAT the two transforms produce DIFFERENT tuples, the reply arrives on
+/// the WIRE tuple, and only `reverse_wire_key`'s zeroing puts that bucket where
+/// the reply can find it.
+///
+/// FAIL-ON-REVERT: make `reverse_wire_key` preserve the domain and this goes
+/// red on its own, without needing `reverse_canonical_key` reverted too.
+#[test]
+fn a_natted_reply_from_outside_the_flows_domain_still_resolves_its_session_7160() {
+    const DOMAIN: u32 = 0x0001_86A5;
+    let mut table = SessionTable::new();
+
+    // Source NAT: the reply comes back addressed to the POOL tuple, which is
+    // what `reverse_wire_key` names and `reverse_canonical_key` does not.
+    let mut decision = decision();
+    decision.nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 80, 41))),
+        rewrite_src_port: Some(40001),
+        ..NatDecision::default()
+    };
+    let nat = decision.nat;
+
+    let mut forward = key_v4();
+    forward.routing_domain = DOMAIN;
+    assert_ne!(
+        super::key::reverse_wire_key(&forward, nat),
+        super::key::reverse_canonical_key(&forward, nat),
+        "the fixture must NAT — with the two reverse transforms producing one \
+         tuple this cell cannot distinguish which of them zeroes the domain"
+    );
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        decision,
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+
+    // The reply the SERVER sends: addressed to the pool tuple, arriving on a
+    // default-instance interface.
+    let mut reply = super::key::reverse_wire_key(&forward, nat);
+    reply.routing_domain = 0;
+
+    let matched = table.find_forward_nat_match(&reply).expect(
+        "a NAT'd reply arriving in the default instance found no session for a \
+         flow that ingressed in a routing instance — the reverse WIRE bucket is \
+         keyed on the forward domain, so the pool tuple the server actually \
+         replies to is unreachable and the flow breaks",
+    );
+    assert_eq!(matched.key, forward);
+}
+
+/// A single-instance deployment must be bit-identical to pre-#7160: every key
+/// is domain 0, so the preference pass accepts exactly what the fallback would
+/// and the reverse bucket walk is unchanged.
+#[test]
+fn a_default_instance_reply_resolves_exactly_as_before_7160() {
+    let mut table = SessionTable::new();
+    let nat = decision().nat;
+
+    let forward = key_v4();
+    assert_eq!(forward.routing_domain, 0);
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        decision(),
+        metadata(),
+        1_000,
+        PROTO_TCP,
+        TCP_SYN,
+    ));
+
+    let reply = super::key::reverse_wire_key(&forward, nat);
+    assert_eq!(reply.routing_domain, 0);
+    let matched = table
+        .find_forward_nat_match(&reply)
+        .expect("the default-instance reply must still resolve its session");
+    assert_eq!(matched.key, forward);
+}
+
+/// `reverse_match_key` is the ONE name for the domain-agnostic convention, so
+/// the index side and the probe side cannot drift. It must be identity on a
+/// domain-0 key (so a single-instance deployment allocates nothing extra) and
+/// must change ONLY the domain otherwise.
+#[test]
+fn reverse_match_key_zeroes_only_the_domain_7160() {
+    let plain = key_v4();
+    assert_eq!(
+        super::key::reverse_match_key(&plain),
+        plain,
+        "a domain-0 key must come back unchanged"
+    );
+
+    let mut scoped = key_v4();
+    scoped.routing_domain = 0x0001_86A4;
+    let probed = super::key::reverse_match_key(&scoped);
+    assert_eq!(probed.routing_domain, 0);
+    let mut expected = scoped.clone();
+    expected.routing_domain = 0;
+    assert_eq!(
+        probed, expected,
+        "reverse_match_key changed something other than the routing domain"
     );
 }

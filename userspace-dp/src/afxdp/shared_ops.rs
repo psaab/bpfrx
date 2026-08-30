@@ -557,7 +557,28 @@ pub(super) fn lookup_shared_forward_nat_match(
     reply_key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
     // #2402: recover poison (see lookup_shared_session).
-    lock_shared_recover(shared_nat_sessions).get(reply_key).cloned()
+    let map = lock_shared_recover(shared_nat_sessions);
+    // #7160 (#2387): the shared NAT map is published under BOTH reverse keys —
+    // `reverse_session_key` (which PRESERVES the routing domain) and
+    // `reverse_canonical_key` (which zeroes it, being a reverse-MATCH key).
+    // Probe in that order so a reply that resolved the flow's own domain
+    // demuxes to its own tenant's entry, and a reply that arrived in another
+    // domain still resolves through the domain-agnostic entry. This is the
+    // same preference `find_forward_nat_match` applies to the local 1:N
+    // bucket, expressed as two probes because this map is 1:1.
+    //
+    // A domain-0 reply key makes the second probe identical to the first;
+    // `reverse_match_key` returns the key unchanged in that case, so a
+    // deployment with no routing-instance interface membership pays one
+    // lookup, exactly as before.
+    if let Some(exact) = map.get(reply_key).cloned() {
+        return Some(exact);
+    }
+    let probe = crate::session::reverse_match_key(reply_key);
+    if probe == *reply_key {
+        return None;
+    }
+    map.get(&probe).cloned()
 }
 
 pub(super) fn lookup_shared_forward_wire_match(

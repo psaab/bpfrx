@@ -57,7 +57,7 @@ fn two_keyed_gre_tunnels_sharing_a_5_tuple_sync_as_two_sessions_7188() {
 
     for key in [100u32, 200u32] {
         let req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::Keyed(key).to_wire());
-        let entry = build_synced_session_entry(&req, &zones)
+        let entry = build_synced_session_entry(&req, &zones, 0)
             .unwrap_or_else(|e| panic!("keyed-GRE tunnel {key} must import: {e}"));
         assert_eq!(
             entry.key.discriminator,
@@ -128,7 +128,7 @@ fn a_peer_that_cannot_express_the_discriminator_has_its_gre_session_withheld_718
     // Tag 0 is what `#[serde(default)]` and a short length-gated record both
     // produce, i.e. exactly what an older daemon sends.
     let req = gre_sync_req(PROTO_GRE, 0);
-    let err = build_synced_session_entry(&req, &zones).expect_err(
+    let err = build_synced_session_entry(&req, &zones, 0).expect_err(
         "a protocol-47 record whose peer could not state the discriminator must be \
          WITHHELD; importing it guesses which of two tunnels it names, and the \
          install's unconditional remove_entry makes that guess EVICT the other",
@@ -153,7 +153,7 @@ fn a_peer_that_cannot_express_the_discriminator_has_its_gre_session_withheld_718
 fn an_explicitly_stated_none_on_protocol_47_still_imports_7188() {
     let zones = rustc_hash::FxHashMap::default();
     let req = gre_sync_req(PROTO_GRE, TunnelDiscriminator::None.to_wire());
-    let entry = build_synced_session_entry(&req, &zones).expect(
+    let entry = build_synced_session_entry(&req, &zones, 0).expect(
         "an explicit `None` from a peer that CAN express the discriminator is a \
          statement about the session, not an inability to make one",
     );
@@ -169,7 +169,7 @@ fn a_legacy_peers_non_gre_session_still_imports_as_none_7188() {
     let mut req = gre_sync_req(PROTO_TCP, 0);
     req.src_port = 5001;
     req.dst_port = 443;
-    let entry = build_synced_session_entry(&req, &zones)
+    let entry = build_synced_session_entry(&req, &zones, 0)
         .expect("a legacy peer's TCP session must still import unchanged");
     assert_eq!(entry.key.discriminator, TunnelDiscriminator::None);
 }
@@ -186,8 +186,12 @@ fn a_legacy_peers_non_gre_session_still_imports_as_none_7188() {
 /// why the install arm fails closed and this one does not.
 #[test]
 fn a_delete_without_a_discriminator_is_not_refused_7188() {
-    let key = build_synced_session_key(&gre_sync_req(PROTO_GRE, 0), SyncedKeyIntent::Delete)
-        .expect("a delete for a protocol-47 key must not be refused");
+    let key = build_synced_session_key(
+        &gre_sync_req(PROTO_GRE, 0),
+        0,
+        SyncedKeyIntent::Delete,
+    )
+    .expect("a delete for a protocol-47 key must not be refused");
     assert_eq!(
         key.discriminator,
         TunnelDiscriminator::None,
@@ -215,6 +219,7 @@ fn every_discriminator_class_survives_the_sync_path_distinctly_7188() {
     for class in classes {
         let key = build_synced_session_key(
             &gre_sync_req(PROTO_GRE, class.to_wire()),
+            0,
             SyncedKeyIntent::Install,
         )
         .unwrap_or_else(|e| panic!("{class:?} must rebuild: {e}"));
