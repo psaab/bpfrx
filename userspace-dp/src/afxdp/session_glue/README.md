@@ -133,6 +133,28 @@ than stopping at the first hit. Stopping at the first hit stranded the other
 reservation permanently. The sweep cannot over-free: `release_flow` /
 `rollback_flow` return false unless the stored translated tuple matches.
 
+#6979 F3: an accepted same-key REPLACEMENT releases the replaced session's
+reservation before installing the new one — but only when the new entry will
+not re-reserve the flow. Most replacements need nothing: `reserve_flow` is
+keyed on the ORIGINAL 5-tuple (`SourceNatFlowKey` carries no translated
+field), so a NAT -> different-NAT re-decision finds the incumbent under the
+same flow and retires it with release semantics (#6528). The hole was the
+replacement that never REACHES `reserve_flow` — the reserve is gated on
+`is_peer_synced() && !is_reverse` at the call site and again on
+`nat.rewrite_src.is_some()` inside
+`reserve_synced_source_nat_allocation_with_holder` — so a NAT -> NO-NAT
+re-decision (the active re-evaluates a reused 5-tuple after its NAT rule is
+withdrawn), a flip to a reverse entry, or a peer-synced -> local-origin
+replace installed the new session and stranded the old port forever:
+delete-sync releases the CURRENT decision, which no longer names it.
+`handle_upsert_synced` captures the previous `(decision, metadata)` before
+`upsert_synced_with_origin` discards `_previous` and, when
+`new_entry_reserves` is false, runs the SAME teardown pair delete-sync uses.
+The condition is load-bearing in both directions: releasing unconditionally
+would drop this worker's holder bit and re-take it on a same-tuple refresh
+(HA sync reconnect, periodic re-upsert), opening a window for another
+worker's local allocation to steal the port.
+
 #6211 F2: the synced entry is fanned out to EVERY worker while the allocator
 is one shared `Arc`, so N workers reserve the same `(flow, translated)` and
 each releases it independently. `LiveAllocation.holders` (a `u128` bitmask

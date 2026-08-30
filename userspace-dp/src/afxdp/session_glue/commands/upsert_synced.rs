@@ -98,6 +98,24 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
     }
 
     let metadata = entry.metadata.clone();
+    // #6979 F3: the REPLACED session's reservation identity, captured before
+    // `upsert_synced_with_origin` removes the entry and discards `_previous`.
+    //
+    // Most replacements need nothing here: `reserve_flow` is keyed on the
+    // ORIGINAL 5-tuple (`SourceNatFlowKey`), so when the new decision also
+    // reserves, it finds the incumbent under the same flow and retires it with
+    // release semantics (#6528). That covers a NAT -> different-NAT re-decision.
+    //
+    // It does NOT cover a replacement that never reaches `reserve_flow`. The
+    // reserve is gated twice — here on `is_peer_synced() && !is_reverse`, and
+    // inside `reserve_synced_source_nat_allocation_with_holder` on
+    // `nat.rewrite_src.is_some()` — so a NAT -> NO-NAT re-decision (the active
+    // re-evaluates a reused 5-tuple after its NAT rule is withdrawn), a flip to
+    // a reverse entry, or a peer-synced -> local-origin replace all install the
+    // new session while the old port stays reserved forever. Nothing else frees
+    // it: delete-sync releases the CURRENT decision, which no longer names that
+    // port.
+    let previous_reservation = sessions.entry_with_origin(&key);
     if sessions.upsert_synced_with_origin(
         SessionInstall {
             key: entry.key,
@@ -113,6 +131,39 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
         },
         allow_replace_local,
     ) {
+        // #6979 F3: release the replaced session's reservation when the new
+        // entry will NOT re-reserve this flow. Mirrors `handle_delete_synced`'s
+        // teardown exactly — same helpers, same holder id — because it is the
+        // same operation: this worker is no longer forwarding the old
+        // translated tuple. When the new entry DOES reserve, this is skipped
+        // and `reserve_flow`'s own stale-tuple eviction does the retire, so the
+        // port is never released twice and a same-tuple refresh keeps its
+        // holder bit (a release/re-reserve would open a window where another
+        // worker's local allocation could steal the port).
+        let new_entry_reserves = entry.origin.is_peer_synced()
+            && !metadata.is_reverse
+            && entry.decision.nat.rewrite_src.is_some();
+        if !new_entry_reserves {
+            if let Some((prev_decision, prev_metadata, _)) = previous_reservation {
+                release_source_nat_allocation_for_worker(
+                    &forwarding.iface_nat_allocators,
+                    &forwarding.source_nat_rules,
+                    &key,
+                    prev_decision.nat,
+                    prev_metadata.is_reverse,
+                    now_ns,
+                    worker_id,
+                );
+                crate::nat64::release_nat64_allocation_for_worker(
+                    &forwarding.nat64,
+                    &key,
+                    prev_decision.nat,
+                    prev_metadata.is_reverse,
+                    now_ns,
+                    worker_id,
+                );
+            }
+        }
         // #4388: reserve the synced session's translated NAT pool port in this
         // node's LOCAL source-NAT allocator. The standby imports the active
         // node's pre-computed NAT decision but never runs `allocate_translation`,
