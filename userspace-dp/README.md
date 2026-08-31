@@ -277,6 +277,25 @@ logging rules, not these specific hot-path constants.
   time but also blocks exhaustive construction outside the defining
   crate, changing a public contract to solve a test-hygiene problem.
 
+  **Generalised.** A second cell,
+  `additive_wire_exhaustive_literals_only_ever_decrease_7689`, ratchets
+  the whole additive-wire population — a `Default` impl, at least one
+  `#[serde(default)]` field, and >= 8 fields — at **124 exhaustive
+  literals across 23 structs**, and no struct may gain one. The ceiling
+  fails in BOTH directions: a count below its ceiling also reds, with an
+  instruction to tighten it, so ground gained is held.
+
+  The population is deliberately narrow, and the two exclusions are the
+  load-bearing part. "Every struct with a `Default` impl" is **1497**
+  literals, most harmless — `FirewallFilterSnapshot` is 276 of 276
+  exhaustive and costs nothing, because it has three fields and does not
+  grow. Exhaustiveness is only a tax on a struct that GAINS fields. And a
+  NON-wire struct is excluded on purpose: an additive `#[serde(default)]`
+  field is invisible to an older peer by design, so a literal breaking on
+  one breaks for no reason, whereas adding a field to an internal struct
+  is an ordinary breaking change and the compile error at each site is
+  review pressure worth keeping.
+
 ## Subdir READMEs
 
 See `src/afxdp/README.md`, `src/server/README.md`, `src/session/README.md`,
