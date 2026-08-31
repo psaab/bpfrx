@@ -572,6 +572,10 @@ mod tests_nat64_tunnel;
 mod tests_gre_local_delivery;
 #[cfg(test)]
 mod tests_gre_outer_bound_6748;
+// #7541: the same bound with an IPv6 OUTER. Separate module rather than added to
+// the file above so the v4 cells' file-level docstring stays true about itself.
+#[cfg(test)]
+mod tests_gre_outer_bound_v6_7541;
 #[cfg(test)]
 mod pkt_len_fixture_drift_6883_tests;
 #[cfg(test)]
