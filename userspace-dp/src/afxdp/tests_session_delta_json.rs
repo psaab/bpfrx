@@ -248,11 +248,11 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
     // [n-32..n-28] policy_id, [n-28..n-24] policy_counter_idx,
     // [n-24..n-20] inactivity secs, [n-20..n-16] snat_v4,
     // [n-16..n-8] session id, [n-8..n] #7188 tunnel discriminator.
-    let snat = &payload[n - 20..n - 16];
+    let snat = &payload[n - 24..n - 20];
     BinaryAttribution {
-        policy_id: u32_at(n - 32),
-        policy_counter_idx: u32_at(n - 28),
-        app_timeout: u32_at(n - 24),
+        policy_id: u32_at(n - 36),
+        policy_counter_idx: u32_at(n - 32),
+        app_timeout: u32_at(n - 28),
         nat64: payload[26] & FLAG_NAT64 != 0,
         nat64_snat_v4: if snat == [0, 0, 0, 0] {
             String::new()
@@ -260,7 +260,7 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
             format!("{}.{}.{}.{}", snat[0], snat[1], snat[2], snat[3])
         },
         tunnel_discriminator: u64::from_le_bytes(
-            payload[n - 8..n].try_into().expect("8 bytes"),
+            payload[n - 12..n - 4].try_into().expect("8 bytes"),
         ),
     }
 }

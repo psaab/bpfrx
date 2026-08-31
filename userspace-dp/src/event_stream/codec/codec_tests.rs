@@ -799,12 +799,13 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
         FLAG_NAT64,
         "nat64 decision must set flags bit 1<<5"
     );
-    // snat_v4 sits at [n-20 .. n-16]: #5212 appended an 8-byte session_id after
-    // the 4-byte snat_v4, and #7188 appended an 8-byte tunnel discriminator
-    // after that, so snat_v4 is two fields from the tail.
+    // snat_v4 sits at [n-24 .. n-20]. Running total from the tail, newest
+    // first: #7239 routing_domain 4, #7188 discriminator 8, #5212 session_id 8
+    // — so snat_v4 is three fields from the end. Every append behind it moves
+    // this window, which is why the total is spelled out rather than assumed.
     let n = payload.len();
     assert_eq!(
-        &payload[n - 20..n - 16],
+        &payload[n - 24..n - 20],
         &[203, 0, 113, 5],
         "snat_v4 must be the translated pool source (before the trailing id and \
          the #7188 discriminator)"
@@ -843,17 +844,18 @@ fn test_encode_session_open_carries_session_id_5212() {
     );
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     let n = payload.len();
-    // The session id is the second-from-last field: #7188 appended an 8-byte
-    // tunnel discriminator BEHIND it, so it sits at [n-16 .. n-8]. The 4 bytes
-    // before it are the #4565 snat_v4 (all-zero for this non-NAT64 v4 session),
-    // which must be undisturbed by either append.
+    // The session id is now THIRD from last: #7188 appended an 8-byte
+    // discriminator behind it and #7239 a 4-byte routing domain behind that, so
+    // it sits at [n-20 .. n-12]. The 4 bytes before it are the #4565 snat_v4
+    // (all-zero for this non-NAT64 v4 session), which must be undisturbed by
+    // any of the appends.
     assert_eq!(
-        u64::from_le_bytes(payload[n - 16..n - 8].try_into().unwrap()),
+        u64::from_le_bytes(payload[n - 20..n - 12].try_into().unwrap()),
         session_id,
         "the session-id u64 must carry the stable session id"
     );
     assert_eq!(
-        &payload[n - 20..n - 16],
+        &payload[n - 24..n - 20],
         &[0, 0, 0, 0],
         "the snat_v4 field must still precede the session id, unchanged"
     );
@@ -872,7 +874,7 @@ fn test_encode_session_open_carries_session_id_5212() {
     let p0 = &frame0.data[FRAME_HEADER_SIZE..frame0.len as usize];
     let n0 = p0.len();
     assert_eq!(
-        u64::from_le_bytes(p0[n0 - 16..n0 - 8].try_into().unwrap()),
+        u64::from_le_bytes(p0[n0 - 20..n0 - 12].try_into().unwrap()),
         0,
         "a zero session id writes zero on the wire"
     );
@@ -894,14 +896,15 @@ fn test_encode_session_open_carries_policy_fields_3301() {
         EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false, 0);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     // #3301 trailing block: policy_id, policy_counter_idx, inactivity_timeout
-    // (seconds), each u32 LE. #4565 appended a 4-byte snat_v4 AFTER this block,
-    // #5212 a further 8-byte session_id AFTER that, and #7188 an 8-byte tunnel
-    // discriminator last, so the policy fields are now at [n-32 .. n-20]
-    // (snat_v4 = [n-20 .. n-16], id = [n-16 .. n-8], discriminator = last 8).
+    // (seconds), each u32 LE. Everything appended AFTER it, newest last:
+    // #4565 snat_v4 4, #5212 session_id 8, #7188 discriminator 8, #7239
+    // routing_domain 4 = 24 trailing bytes. So the policy block is at
+    // [n-36 .. n-24], snat_v4 = [n-24 .. n-20], id = [n-20 .. n-12],
+    // discriminator = [n-12 .. n-4], routing_domain = last 4.
     let n = p.len();
-    let policy_id = u32::from_le_bytes(p[n - 32..n - 28].try_into().unwrap());
-    let counter_idx = u32::from_le_bytes(p[n - 28..n - 24].try_into().unwrap());
-    let inact_secs = u32::from_le_bytes(p[n - 24..n - 20].try_into().unwrap());
+    let policy_id = u32::from_le_bytes(p[n - 36..n - 32].try_into().unwrap());
+    let counter_idx = u32::from_le_bytes(p[n - 32..n - 28].try_into().unwrap());
+    let inact_secs = u32::from_le_bytes(p[n - 28..n - 24].try_into().unwrap());
     assert_eq!(policy_id, 42, "policy_id must ride the open frame");
     assert_eq!(counter_idx, 7, "policy_counter_idx must ride the open frame");
     assert_eq!(inact_secs, 30, "inactivity_timeout (ns->s) must ride the open frame");
@@ -1150,7 +1153,7 @@ fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
 
     let tail = |frame: &EventFrame| {
         let end = frame.len as usize;
-        u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap())
+        u64::from_le_bytes(frame.data[end - 12..end - 4].try_into().unwrap())
     };
     assert_eq!(
         tail(&first),
@@ -1165,13 +1168,63 @@ fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
          one key for both and the second install would evict the first (#7188)"
     );
     // The field is APPENDED: everything before it is unchanged, so the two
-    // frames differ ONLY in these 8 bytes.
-    let body = |frame: &EventFrame| frame.data[FRAME_HEADER_SIZE..frame.len as usize - 8].to_vec();
+    // frames differ ONLY in these 8 bytes. #7239 appended a further 4 behind
+    // it, so the common prefix now stops 12 from the end.
+    let body =
+        |frame: &EventFrame| frame.data[FRAME_HEADER_SIZE..frame.len as usize - 12].to_vec();
     assert_eq!(
         body(&first),
         body(&second),
         "fixture check: the two frames must be identical apart from the \
          discriminator, otherwise this test is not measuring the aliasing shape"
+    );
+}
+
+/// #7239: the ROUTING DOMAIN is now the tail of BOTH frames, appended behind
+/// the #7188 discriminator. These two cells pin that — and pinning it is what
+/// makes the `end - 12..end - 4` reads above legible rather than magic: the
+/// discriminator moved because something was appended behind it, and this says
+/// what.
+///
+/// FAIL-ON-REVERT: drop either `key.routing_domain` write from
+/// `event_stream/codec/session_sync.rs` and the matching cell reads the
+/// discriminator's high half instead.
+#[test]
+fn session_open_frames_carry_the_routing_domain_7239() {
+    let mut key = keyed_gre_key_7188(200);
+    key.routing_domain = 100_007;
+    let frame = EventFrame::encode_session_open(
+        7,
+        &key,
+        &test_decision(),
+        &test_metadata(),
+        &FxHashMap::default(),
+        false,
+        0,
+    );
+    let end = frame.len as usize;
+    assert_eq!(
+        u32::from_le_bytes(frame.data[end - 4..end].try_into().unwrap()),
+        100_007,
+        "the open frame must carry the key's routing domain as its trailing u32"
+    );
+}
+
+/// The CLOSE frame needs it for the reason #7188 needed the discriminator here:
+/// a close names the session to RETRACT, and two routing instances sharing a
+/// 5-tuple are two sessions, so a close without the domain retracts the wrong
+/// tenant's session or none.
+#[test]
+fn session_close_frames_carry_the_routing_domain_7239() {
+    let mut key = keyed_gre_key_7188(200);
+    key.routing_domain = 100_007;
+    let frame = EventFrame::encode_session_close(7, &key, 1, 0, 300, 1000);
+    let end = frame.len as usize;
+    assert_eq!(
+        u32::from_le_bytes(frame.data[end - 4..end].try_into().unwrap()),
+        100_007,
+        "the close frame must carry the routing domain, or it retracts a \
+         session in the wrong routing instance"
     );
 }
 
@@ -1183,7 +1236,7 @@ fn session_close_frames_carry_the_tunnel_discriminator_7188() {
     let frame = EventFrame::encode_session_close(7, &keyed_gre_key_7188(200), 1, 0, 300, 1000);
     let end = frame.len as usize;
     assert_eq!(
-        u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap()),
+        u64::from_le_bytes(frame.data[end - 12..end - 4].try_into().unwrap()),
         crate::session::TunnelDiscriminator::Keyed(200).to_wire()
     );
     // The #3075 zone ids must still sit where they did — the discriminator is
@@ -1209,7 +1262,7 @@ fn session_open_frames_state_none_explicitly_for_non_tunnel_protocols_7188() {
         0,
     );
     let end = frame.len as usize;
-    let tail = u64::from_le_bytes(frame.data[end - 8..end].try_into().unwrap());
+    let tail = u64::from_le_bytes(frame.data[end - 12..end - 4].try_into().unwrap());
     assert_ne!(
         tail, 0,
         "0 is RESERVED for `not carried`; a TCP session must still STATE its `None` \
