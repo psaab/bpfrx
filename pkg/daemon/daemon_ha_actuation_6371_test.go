@@ -138,7 +138,7 @@ func primeRG1Primary(t *testing.T, d *Daemon) {
 // update fires after the test returns.
 func demoteRG1(t *testing.T, d *Daemon) {
 	t.Helper()
-	if err := d.cluster.ManualFailover(1); err != nil {
+	if _, err := d.cluster.ManualFailover(1); err != nil {
 		t.Fatalf("ManualFailover(1): %v", err)
 	}
 	var ev cluster.ClusterEvent

@@ -3098,6 +3098,25 @@ outside the monitor loop:
   write (single-RG returns nil; batch skips that member) if it changed. Keep
   `failoverInProgress` cleaned up on every exit path so a superseded failover
   cannot wedge the next one.
+- **A supersede is a correct outcome, so the CALLER has to be able to see it
+  (#8000).** The error is nil whether the failover applied or a reset claimed
+  it, so `err == nil` cannot distinguish them: a batch with one superseded
+  member reported a full handoff. `ManualFailover` therefore returns a
+  `FailoverOutcome` (`FailoverApplied` / `FailoverSuperseded`) and
+  `ManualFailoverBatch` a `BatchFailoverResult` naming which RGs `Applied` and
+  which were `Superseded` (`Partial()` when any were). The singular operator
+  paths — CLI `request chassis cluster failover` and the gRPC system action —
+  print "was superseded by a concurrent reset; no failover performed" rather
+  than reporting a failover they did not perform. `ManualFailoverBatch` has
+  exactly ONE production caller, the peer-driven `OnRemoteFailoverBatch`
+  callback, which logs the applied/superseded split. The remote callbacks also
+  DISARM the #5640 fence barrier for each superseded member: a supersede
+  enqueues no demotion event, so nothing will ever actuate that barrier and the
+  applied-ack burns the full fence timeout before returning `timed out waiting
+  for local fence actuation of redundancy group N` — a real error, naming the
+  right RG, blaming the wrong subsystem. Applied members KEEP their barrier;
+  disarming those would let the peer promote into the two-owner window #5640
+  exists to close.
 - **Owner-side transfer-out lease — a requester-side abort must not strand the
   demoted owner (#5079).** `RequestPeerFailover` drives the remote owner through
   `ManualFailover` (SecondaryHold, VRRP resigned) on the ACK, BEFORE the

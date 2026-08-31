@@ -308,7 +308,7 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	<-m.Events()
 
 	// Manual failover.
-	m.ManualFailover(0)
+	_, _ = m.ManualFailover(0)
 	drainEvents(m, 1)
 
 	// Peer heartbeat arrives.
@@ -359,7 +359,7 @@ func TestElection_DualResign_TimeGuard(t *testing.T) {
 
 	// Manual failover — just set, should NOT clear even if peer is also in
 	// transfer-out state.
-	m.ManualFailover(0)
+	_, _ = m.ManualFailover(0)
 	drainEvents(m, 1)
 
 	// Peer also transferred out.
