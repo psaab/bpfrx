@@ -148,5 +148,8 @@ pub(crate) fn reserve_nat64_pool_port(
         ip: IpAddr::V4(snat_v4),
         port,
     };
+    // #7360: NAT64 pools have no persistent-NAT lease concept — the lease is a
+    // source-NAT rule property (`SourceNatRule::persistent_nat`) and this is the
+    // NAT64 translated-port domain — so this stays the non-persistent entry point.
     allocator.reserve_flow(flow, translated, addr_index, deterministic, now_ns, holder)
 }
