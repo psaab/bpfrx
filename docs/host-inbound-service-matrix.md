@@ -1521,8 +1521,11 @@ unlike #6515:
 - Configs **in this repo** author zone-level `dhcp` today —
   `test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
   `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`. The
-  `ha-cluster-userspace` `lan` zone even carries a comment explaining that it
-  MUST admit dhcp or client DISCOVER to the firewall is denied. The advisory
+  `ha-cluster-userspace` `lan` zone carries a comment recording why the token is
+  authored there: the firewall's own DHCP **client** renewals on `reth1`, which
+  ARE daddr-matched. (Until #8060 that comment gave the DHCP *server*'s
+  DISCOVER/SOLICIT path as the reason — the one path the token provably does
+  NOT gate, per the bypass section above.) The advisory
   fires on exactly that zone (`reth1`) and on nothing else in those files — the
   `mgmt` and `control` zones' members are lifelines, which are excluded from
   host-inbound deny scoping and so are skipped.
