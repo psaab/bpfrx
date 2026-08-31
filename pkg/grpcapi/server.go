@@ -181,37 +181,46 @@ type Config struct {
 // Server implements the BpfrxService gRPC service.
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
-	store                 *configstore.Store
-	dp                    grpcRuntime
-	eventBuf              *logging.EventBuffer
-	gc                    *conntrack.GC
-	routing               *routing.Manager
-	frr                   *frr.Manager
-	ipsec                 *ipsec.Manager
-	cluster               *cluster.Manager
-	dhcp                  *dhcp.Manager
-	dhcpServer            *dhcpserver.Manager
-	rpmResultsFn          func() []*rpm.ProbeResult
-	ipmonStatusFn         func() []ipmon.PolicyStatus
-	natPoolAlarmsFn       func() []natpoolalarm.ActiveAlarm
-	feedsFn               func() map[string]feeds.FeedInfo
-	feedOverlayFn         func() map[string][]string
-	lldpNeighborsFn       func() []*lldp.Neighbor
-	ddnsStatsFn           func() *dhcpserver.DDNSStats
-	ddnsOwnedRecordsFn    func() []dhcpserver.DDNSOwnedRecordView
-	surfaceADDNSStatsFn   func() *ddnspkg.SurfaceAStats
-	surfaceADDNSStatusFn  func() []ddnspkg.SurfaceAStatusView
-	surfaceADDNSForceFn   func(force bool) (bool, string)
-	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
-	commitFn              func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
-	commitConfirmedFn     func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
-	zeroizeFn             func(ctx context.Context, wipe func() error) error
-	vrrpMgr               *vrrp.Manager
-	raMgr                 *ra.Manager
-	fwdSampler            *fwdstatus.Sampler
-	startTime             time.Time
-	addr                  string
-	version               string
+	// unenforceableDenyWarned dedups the #7172 cut-5b advisory that a class's
+	// deny-commands pattern can never fire on this surface. It is a property of
+	// the CONFIG, not of a request, and the check runs on the authorization
+	// path — so without a dedup it would log at REQUEST rate, which this
+	// project's logging rules forbid outright for anything per-request.
+	//
+	// Keyed by class AND pattern, so a commit that CHANGES the pattern warns
+	// again rather than being suppressed by the earlier one.
+	unenforceableDenyWarned sync.Map
+	store                   *configstore.Store
+	dp                      grpcRuntime
+	eventBuf                *logging.EventBuffer
+	gc                      *conntrack.GC
+	routing                 *routing.Manager
+	frr                     *frr.Manager
+	ipsec                   *ipsec.Manager
+	cluster                 *cluster.Manager
+	dhcp                    *dhcp.Manager
+	dhcpServer              *dhcpserver.Manager
+	rpmResultsFn            func() []*rpm.ProbeResult
+	ipmonStatusFn           func() []ipmon.PolicyStatus
+	natPoolAlarmsFn         func() []natpoolalarm.ActiveAlarm
+	feedsFn                 func() map[string]feeds.FeedInfo
+	feedOverlayFn           func() map[string][]string
+	lldpNeighborsFn         func() []*lldp.Neighbor
+	ddnsStatsFn             func() *dhcpserver.DDNSStats
+	ddnsOwnedRecordsFn      func() []dhcpserver.DDNSOwnedRecordView
+	surfaceADDNSStatsFn     func() *ddnspkg.SurfaceAStats
+	surfaceADDNSStatusFn    func() []ddnspkg.SurfaceAStatusView
+	surfaceADDNSForceFn     func(force bool) (bool, string)
+	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
+	commitFn                func(ctx context.Context, authority configstore.CommitAuthority, comment string) (*config.Config, error)
+	commitConfirmedFn       func(ctx context.Context, authority configstore.CommitAuthority, minutes int) (*config.Config, error)
+	zeroizeFn               func(ctx context.Context, wipe func() error) error
+	vrrpMgr                 *vrrp.Manager
+	raMgr                   *ra.Manager
+	fwdSampler              *fwdstatus.Sampler
+	startTime               time.Time
+	addr                    string
+	version                 string
 	// listenersFn returns the effective management-listener snapshot for
 	// `show system services` (#6385). Wired from Config.ListenersFn; nil in a
 	// no-daemon unit-test build.

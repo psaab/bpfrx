@@ -311,9 +311,57 @@ because matching is partial rather than anchored.
 **Prefix-form `SystemAction` verbs have no entry and cannot get one.** The
 handler's default branch parses `cluster-failover*` and the `userspace-*`
 control forms out of a packed string, so they have no case label to
-enumerate. `systemActionPermission` already charges them the destructive
-floor; a consumer must treat a verb with no entry the way it treats an
-unmapped method rather than assuming the table is total.
+enumerate. The verb table's completeness guard reads case labels, so it is a
+floor over what the handler **dispatches**, not a census of what it
+**accepts** — and a complete-looking table is exactly how these would become
+allow-by-omission. The gate denies them explicitly, by the same rule as any
+other unmapped verb.
+
+### The gate (#7172 cut 5b)
+
+`authorizeRPC` evaluates the calling class's `deny-commands` regexes against
+the mapped command, **after** the coarse permission check and never instead
+of it. `config.OperationalDenyRegexesFor` owns "whose regexes are in force",
+and `pkg/cli`'s cut-3 gate delegates to the same function, so the two
+surfaces cannot come to disagree about which classes are restricted or about
+leaf **presence** (`deny-commands ""` denies everything; an absent leaf
+denies nothing).
+
+**Deny only.** `allow-commands` commits today and is documented as inert;
+enforcing it would be a lockout on upgrade, because an allow regex is an
+allowlist. It goes live in cut 6 with the #6838 retirement.
+
+**Every uncertain path denies, and only for a class that configured
+regexes** — a class with none pays nothing:
+
+| case | why it denies |
+|---|---|
+| regexes do not compile | validated at commit, so this config arrived by a path that did not validate |
+| no canonical command (config-mode method, a method named absent, an unknown topic, a prefix-form verb, an unreadable request) | not knowing which command we hold, we cannot know a deny regex fails to match it |
+
+**The two surfaces do NOT match the same string, and a populated table is not
+evidence that they do.** `pkg/cli` matches the full canonicalized line,
+argument values and output pipe included. This gate matches the command
+**path**, because the remote CLI parses the line client-side — `ping
+10.0.0.1` arrives as `Ping{Host:"10.0.0.1"}`. So:
+
+- a deny written against a **path** (`request system reboot`, the shape
+  Junos' own examples use) is enforced identically on both, since matching is
+  partial rather than anchored;
+- a deny written against **argument text** (`show route table secret-vrf`) is
+  enforced on the box and **not** here — an under-deny, i.e. fail-open for
+  that class of pattern. `TestArgumentLevelDenyIsOnBoxOnly7172` asserts the
+  difference in one place rather than leaving it in prose.
+
+The operator is told which of their patterns this affects.
+`unenforceableDenyPatterns` asks whether a pattern matches **any** command
+this listener can produce; one that matches none can never fire here, and is
+logged once per class. That check deliberately does **not** inspect the
+pattern: `regexp.LiteralPrefix` returns `""` for `^show route table
+secret-vrf`, so a literal-prefix heuristic would cover the unanchored
+spelling and silently miss the **anchored** one — the spelling Juniper's
+guidance tells operators to use. A guard that covers one spelling of the same
+intent reads as coverage and is not.
 
 ## Callers
 
