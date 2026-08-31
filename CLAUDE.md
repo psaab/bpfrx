@@ -128,6 +128,18 @@ make test-mutate-lib # Self-test the mutation-harness scoring library
                      #   a -race failure emits no `--- FAIL` line at all, and
                      #   `make`'s echoed Makefile comments are not a build
                      #   break.
+                     #   #7611 added the FIFTH void shape, a HANG, which is the
+                     #   worst: the other four each leave a trace (a compiler
+                     #   diagnostic, an unchanged tree, a panic trace, a DATA
+                     #   RACE banner) and a hang leaves none — and its blast
+                     #   radius exceeds its own cell, because the budget it
+                     #   burns belonged to every LATER cell, so one hang can be
+                     #   recorded as a screen full of escapes nobody earned.
+                     #   mutate.sh bounds each cell (MUTATE_CELL_TIMEOUT) and
+                     #   treats an unfinished run as VOID; go's own -timeout
+                     #   panic is the informative signal because its goroutine
+                     #   dump NAMES the stuck test. Never score a run that
+                     #   consumed its whole budget.
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
 make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:

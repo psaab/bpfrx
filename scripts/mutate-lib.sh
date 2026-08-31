@@ -19,6 +19,16 @@
 #   3. A -race failure has NO `--- FAIL` line. It emits `WARNING: DATA RACE`
 #      and a package-level FAIL, so a `^--- FAIL` counter scores a genuine race
 #      red as a PASS.
+#   4. A HANG prints nothing a `^--- FAIL` scan can see, and its blast radius
+#      exceeds its own cell. The other void shapes each leave a trace -- a
+#      compiler diagnostic, an unchanged tree, a panic trace, a DATA RACE
+#      banner. A mutation that makes a test wait forever leaves none: the run
+#      burns its whole time budget and is killed, so the log ends mid-stream
+#      with no verdict marker at all. Worse, the budget it consumed belonged to
+#      every LATER cell in the batch, and those produce no output either -- so
+#      one hang can be recorded as a screen full of escapes nobody earned.
+#      (Seen on #7611: a contract change made `Run` retry a bind failure
+#      forever, and a test calling it with context.Background() never returned.)
 
 # mutation_lang_of FILE -> go|rust|unknown
 mutation_lang_of() {
@@ -72,6 +82,30 @@ mutation_infra_broken() {
 	grep -qiE 'no space left on device|cannot allocate memory' "$1"
 }
 
+# mutation_timed_out LOG -> 0 when the run did not FINISH.
+#
+# Two spellings, and a harness needs both because they arrive from different
+# places:
+#
+#   - go's own `-timeout` fires INSIDE the run and prints `panic: test timed out
+#     after 10m0s` followed by a goroutine dump naming the stuck test. That dump
+#     is the only thing that identifies the subject, which is why a cell should
+#     always be run under an explicit -timeout rather than left to an external
+#     kill: without it you know a cell did not finish and nothing else.
+#   - an EXTERNAL kill (the runner's own budget, a CI step limit) leaves no
+#     marker at all. The caller detects that from the exit status or the elapsed
+#     time and passes timedout=yes to mutation_verdict directly; this function
+#     cannot see it, and pretending otherwise would be the same "absence read as
+#     evidence" mistake the whole library exists to avoid.
+#
+# Deliberately NOT keyed on the word "timeout" alone: `--- FAIL` bodies say
+# "timeout" constantly (context deadlines, dial timeouts, an assertion message
+# about a configured timeout), and matching those would score healthy kills as
+# void.
+mutation_timed_out() {
+	grep -qE '^panic: test timed out after ' "$1"
+}
+
 # mutation_go_build_broken / mutation_rust_build_broken LOG
 # A Go build break, WITHOUT matching `make`'s own echoed Makefile comments.
 #
@@ -105,26 +139,48 @@ mutation_go_failed() {
 mutation_rust_collected() { grep -cE '^test .* \.\.\. ' "$1"; }
 mutation_rust_failed() { grep -cE '^test .* \.\.\. FAILED' "$1"; }
 
-# mutation_verdict APPLIED BUILT COLLECTED FAILED INFRA -> verdict string
+# mutation_verdict APPLIED BUILT COLLECTED FAILED INFRA [TIMEDOUT] -> verdict
 #
 # Order matters. Each earlier condition makes the later numbers meaningless, so
 # a harness that checks them in the wrong order reports a confident verdict
 # derived from a number it should not have trusted.
+#
+# TIMEDOUT sits AFTER the build check and BEFORE the collected/failed numbers,
+# and that position is the whole point. A timed-out run has usually collected
+# and even failed some tests, so both numbers are non-zero and look scoreable —
+# but they describe the PREFIX of a run that never finished. Scoring on them
+# turns "we do not know" into a confident KILLED or ESCAPED. It cannot go first:
+# a run that also hit a full disk or failed to build has a more specific
+# explanation, and reporting the timeout would send the reader after a hang that
+# is a symptom rather than the cause.
+#
+# TIMEDOUT is optional so existing callers keep working; omitted means "the
+# caller did not check", which is not the same as "no". A caller that cannot
+# distinguish a completed run from a killed one should say so rather than pass
+# no.
 mutation_verdict() {
-	local applied="$1" built="$2" collected="$3" failed="$4" infra="$5"
+	local applied="$1" built="$2" collected="$3" failed="$4" infra="$5" timedout="${6:-no}"
 	if [ "$infra" = yes ]; then printf 'VOID(infrastructure: disk or memory)\n'; return; fi
 	if [ "$applied" != yes ]; then printf 'VOID(mutation not applied)\n'; return; fi
 	if [ "$built" != yes ]; then printf 'VOID(build break)\n'; return; fi
+	if [ "$timedout" = yes ]; then printf 'VOID(run did not finish: timeout)\n'; return; fi
 	if [ "$collected" -eq 0 ]; then printf 'VOID(no tests collected)\n'; return; fi
 	if [ "$failed" -gt 0 ]; then printf 'KILLED\n'; return; fi
 	printf 'ESCAPED\n'
 }
 
 # mutation_score_log LANG LOG APPLIED -> "BUILT COLLECTED FAILED VERDICT"
+# mutation_score_log LANG LOG APPLIED [TIMEDOUT] -> "BUILT COLLECTED FAILED VERDICT"
+#
+# TIMEDOUT lets a caller report an EXTERNAL kill, which leaves no marker in the
+# log for this function to find. Omitted, the log is still checked for go's own
+# in-run timeout panic.
 mutation_score_log() {
-	local lang="$1" log="$2" applied="$3" built collected failed infra
+	local lang="$1" log="$2" applied="$3" ext_timedout="${4:-no}" built collected failed infra timedout
 	infra=no
 	mutation_infra_broken "$log" && infra=yes
+	timedout="$ext_timedout"
+	mutation_timed_out "$log" && timedout=yes
 	case "$lang" in
 	go)
 		built=yes; mutation_go_build_broken "$log" && built=no
@@ -140,5 +196,5 @@ mutation_score_log() {
 		printf 'no 0 0 REFUSED(no gate covers this language)\n'; return ;;
 	esac
 	printf '%s %s %s %s\n' "$built" "$collected" "$failed" \
-		"$(mutation_verdict "$applied" "$built" "$collected" "$failed" "$infra")"
+		"$(mutation_verdict "$applied" "$built" "$collected" "$failed" "$infra" "$timedout")"
 }

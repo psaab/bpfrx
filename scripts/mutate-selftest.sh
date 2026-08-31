@@ -151,6 +151,53 @@ EOF
 ck "rust build break is VOID" "no 0 0 VOID(build break)" \
 	"$(mutation_score_log rust "$W/rust-build.log" yes)"
 
+echo "== the HANG (#7611) =="
+# The fifth void shape, and the only one that leaves NO trace a `^--- FAIL`
+# scan can see. go's own -timeout fires inside the run and prints a panic plus
+# the goroutine dump naming the stuck test; the run has by then collected and
+# even FAILED real tests, so both numbers look scoreable and are not — they
+# describe the prefix of a run that never finished.
+cat > "$W/timeout.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+--- FAIL: TestUnrelated (0.01s)
+panic: test timed out after 10m0s
+running tests:
+	TestRunReturnsOnBindFailure (600s)
+
+goroutine 1 [running]:
+testing.(*M).startAlarm.func1()
+FAIL	github.com/psaab/xpf/pkg/grpcapi	600.005s
+EOF
+ck "a timed-out run is VOID even though it collected and failed tests" 	"yes 2 1 VOID(run did not finish: timeout)" 	"$(mutation_score_log go "$W/timeout.log" yes)"
+
+# The discriminator that keeps the detector honest: "timeout" appears in
+# ordinary failure text constantly. Matching the bare word would score real
+# kills as void, which is the same loss in the other direction.
+cat > "$W/timeout-word.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+--- FAIL: TestDialDeadline (0.01s)
+    dial_test.go:41: context deadline exceeded: dial timeout after 5s
+FAIL	github.com/psaab/xpf/pkg/frr	0.30s
+EOF
+ck "the WORD timeout in a failure body is still a kill" "yes 2 1 KILLED" 	"$(mutation_score_log go "$W/timeout-word.log" yes)"
+
+# An EXTERNAL kill leaves no marker at all, so the caller must report it. This
+# is the case that loses a whole BATCH: the budget the hang consumed belonged
+# to every later cell, and each of those produces an empty log.
+ck "an externally killed run is VOID when the caller reports it" 	"yes 2 0 VOID(run did not finish: timeout)" 	"$(mutation_score_log go "$W/escape.log" yes yes)"
+ck "the same log without the caller's flag scores normally" "yes 2 0 ESCAPED" 	"$(mutation_score_log go "$W/escape.log" yes)"
+
+# ORDERING: a build break and a timeout in one log must report the build break.
+# The timeout is a symptom there, and naming it sends the reader after a hang
+# that is not the cause.
+cat > "$W/build-and-timeout.log" <<'EOF'
+# github.com/psaab/xpf/pkg/natshow
+pkg/natshow/source.go:180:5: undefined: armed
+FAIL	github.com/psaab/xpf/pkg/natshow [build failed]
+panic: test timed out after 10m0s
+EOF
+ck "a build break outranks a timeout in the same log" 	"no 1 0 VOID(build break)" "$(mutation_score_log go "$W/build-and-timeout.log" yes)"
+
 echo
 if [ "$fails" -eq 0 ]; then
 	echo "mutate-selftest: all checks passed"
