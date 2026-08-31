@@ -725,10 +725,35 @@ link-local prepend — and asserts the config constants equal exactly that, so a
 wire-format change the constants did not follow fails the suite instead of
 silently splitting the validator from the builder.
 
-**Not covered:** an EMPTY (or entirely unparseable) VIP list. Such an instance
-also holds its group without advertising, but it claims no addresses, so there
-is nothing for a second master to collide over. It is a distinct defect tracked
-separately.
+**The EMPTY (or entirely unparseable) VIP list is covered separately, at commit
+only (#7577).** Such an instance also holds its group without advertising, but
+it claims no addresses, so there is nothing for a second master to collide over
+— a silent no-op group rather than a duplicate-address hazard.
+
+`pkg/config`'s `validateVRRPVIPEmptyStrict` hard-rejects an explicit
+`vrrp-group` with no parseable virtual address at commit / commit-check, with
+the usual `#1960` lenient downgrade on the tolerant load / peer-sync path. Three
+things about its scope are deliberate and load-bearing:
+
+- **Explicit `vrrp-group` blocks ONLY.** `CollectRethInstances` already skips a
+  RETH with no VIPs, so no instance is synthesized and there is nothing to claim
+  a group. Extending the gate to RETH units would reject configuration that is
+  correct today. `TestRethUnitWithNoAddressesIsNotRejected7577` pins this.
+- **Reject-only.** `checkAdvertCapacity` deliberately does **not** carry the
+  lower bound, so `UpdateInstances` and `becomeMaster` still accept a VIP-less
+  instance. Adding it would change the behaviour of the 22 `pkg/vrrp` tests that
+  construct VIP-less instances as a state-machine fixture — a behaviour change
+  riding along with a bug fix — and its worst case is worse: a commit rejection
+  fails loudly on a config the operator is editing, while a runtime refusal
+  removes a group from the election on a node already running.
+- **No runtime guard backs the lenient downgrade**, unlike the oversized case
+  above. A leniently-loaded empty group therefore keeps today's behaviour rather
+  than being held out of the election. That is intended — the tolerant path must
+  not brick a node over a group that is merely inert.
+
+The "advertisable" predicate is `countVRRPVIPFamilies`, the same split the send
+path performs, so the gate cannot disagree with the sender about what counts as
+an address (#6539 shared authority).
 
 ### RETH ownership modes and nil config slots (#6780)
 
