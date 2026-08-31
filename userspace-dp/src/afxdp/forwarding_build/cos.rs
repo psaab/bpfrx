@@ -1174,6 +1174,82 @@ pub(super) fn build_cos_iface_config(
     }))
 }
 
+/// #7337: the interface-level CoS references that name another CoS entity by
+/// string, filtered to those that are NON-EMPTY but resolve to nothing.
+///
+/// A dangling reference here is unenforced, and before this it was unenforced
+/// SILENTLY, in two different shapes:
+///
+///   - the interface contributes no other usable CoS state, so the #1183 gate
+///     in [`build_cos_iface_config`] drops it from `CoSState` entirely; or
+///   - the interface is admitted on some OTHER input (a shaping rate, say) and
+///     the dangling classifier / rewrite-rule simply never installs — the
+///     lookups in [`build_cos_dscp_queue_table`] and its siblings are
+///     `if let Some(..) = table.get(name)`, so an unresolvable name falls
+///     through to an unset table and returns `Ok`.
+///
+/// The second shape is the more misleading of the two, and it is the reason
+/// this reports per-reference rather than only on the skip path: the interface
+/// IS in `CoSState`, so an operator reading the runtime sees CoS active on it
+/// with no indication that the classifier they configured is doing nothing.
+///
+/// This REPORTS; it deliberately does not reject. The strict Go commit gate
+/// `validateClassOfServiceInterfaceRefsStrict` (#8107) already makes a dangling
+/// reference uncommittable — it checks a superset of these five — so anything
+/// arriving here came over the LENIENT boot / HA-peer-sync path that #1960
+/// exists to keep working. Returning `Err` would convert one degraded interface
+/// into a node that will not take a config, which is the brick #1960 forbids,
+/// and it would also overrule the deliberate skip pinned by
+/// `build_cos_state_skips_interface_with_unresolvable_named_references`
+/// (admitting such an interface re-triggers the #1183 owner-worker collapse).
+/// Silence was the whole defect; the applied behaviour was already correct.
+pub(super) fn dangling_cos_interface_refs(
+    iface: &InterfaceSnapshot,
+    tables: &ClassifierTables<'_>,
+) -> Vec<(&'static str, String)> {
+    [
+        (
+            "scheduler-map",
+            &iface.cos_scheduler_map,
+            tables
+                .scheduler_maps
+                .contains_key(iface.cos_scheduler_map.as_str()),
+        ),
+        (
+            "dscp classifier",
+            &iface.cos_dscp_classifier,
+            tables
+                .dscp_classifiers
+                .contains_key(iface.cos_dscp_classifier.as_str()),
+        ),
+        (
+            "ieee-802.1 classifier",
+            &iface.cos_ieee8021_classifier,
+            tables
+                .ieee8021_classifiers
+                .contains_key(iface.cos_ieee8021_classifier.as_str()),
+        ),
+        (
+            "inet-precedence classifier",
+            &iface.cos_inet_precedence_classifier,
+            tables
+                .inet_precedence_classifiers
+                .contains_key(iface.cos_inet_precedence_classifier.as_str()),
+        ),
+        (
+            "dscp rewrite-rule",
+            &iface.cos_dscp_rewrite_rule,
+            tables
+                .dscp_rewrite_rules
+                .contains_key(iface.cos_dscp_rewrite_rule.as_str()),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, name, resolved)| !name.is_empty() && !resolved)
+    .map(|(kind, name, _)| (kind, name.clone()))
+    .collect()
+}
+
 /// CoS state orchestrator. Pre-#1342 this was a single 312-LOC
 /// function; #1342 split it into [`build_cos_classifier_tables`]
 /// + [`build_cos_iface_config`] + this slim orchestrator.
@@ -1216,7 +1292,28 @@ pub(super) fn build_cos_state(
         if iface.ifindex <= 0 {
             continue;
         }
-        if let Some(cfg) = build_cos_iface_config(iface, &tables)? {
+        // #7337: report a dangling interface reference BEFORE the admission
+        // decision, so the shape where the interface is admitted on another
+        // input and the reference is silently inert is reported too — not only
+        // the shape where the interface is dropped.
+        let dangling = dangling_cos_interface_refs(iface, &tables);
+        let built = build_cos_iface_config(iface, &tables)?;
+        for (kind, name) in &dangling {
+            eprintln!(
+                "xpf-userspace-dp: WARNING: interface ifindex {} names {} {:?}, which this \
+                 snapshot's class-of-service does not define — that reference is UNENFORCED{}",
+                iface.ifindex,
+                kind,
+                name,
+                if built.is_none() {
+                    " and the interface contributes no usable CoS state, so no CoS is programmed \
+                     on it at all"
+                } else {
+                    " (the interface is still programmed, without it)"
+                }
+            );
+        }
+        if let Some(cfg) = built {
             // #3995: build the per-interface loss-priority classification +
             // rewrite tables alongside the interface config so the DSCP rewrite
             // resolves on (forwarding-class, loss-priority) at TX time.
@@ -1233,3 +1330,6 @@ pub(super) fn build_cos_state(
 
 #[cfg(test)]
 mod remainder_temporal_tests_6846;
+
+#[cfg(test)]
+mod dangling_refs_7337;

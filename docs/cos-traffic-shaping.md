@@ -1166,6 +1166,26 @@ Important current behavior:
   surplus weight). Before the fix a scheduler typo silently handed the
   class the LARGEST best-effort surplus share instead of its intended
   guarantee — a fail-open now closed.
+- an INTERFACE-level reference naming an entity that is not defined — a
+  `scheduler-map`, a `dscp` / `ieee-802.1` / `inet-precedence` classifier, or a
+  `dscp` rewrite-rule — is likewise hard-rejected at strict commit
+  (`validateClassOfServiceInterfaceRefsStrict`, #8107, which checks seven such
+  links including `output-traffic-control-profile` and the inert `ieee-802.1`
+  rewrite-rule). As with the scheduler case above, a config from an older
+  binary or a peer sync can still carry one over the lenient load path, and the
+  APPLIED behaviour is deliberately unchanged: either the interface contributes
+  no other usable CoS state and is skipped entirely (the #1183 gate — admitting
+  it would build a rate-0 best-effort queue and re-trigger the owner-worker
+  redirect collapse), or it is admitted on some other input (a `shaping-rate`,
+  say) and the dangling reference simply installs nothing. What changed in
+  #7337 is that this is no longer SILENT: `dangling_cos_interface_refs` reports
+  each unresolvable reference, naming the interface, the reference kind, and
+  whether the interface was programmed at all. The second shape is the one that
+  most misleads — the interface IS in `CoSState`, so the runtime shows CoS
+  active on it while the configured classifier does nothing. The report does
+  not reject the snapshot: on the lenient path that would turn one degraded
+  interface into a node that will not take a config, which is exactly the brick
+  #1960 exists to prevent.
 - `transmit-rate exact` prevents that queue from borrowing surplus by default
 - adding `surplus-sharing` on the scheduler (#915) opts an `exact` queue
   into surplus participation while keeping the per-queue rate as a
