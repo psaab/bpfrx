@@ -149,6 +149,30 @@ struct UserspaceDpMeta {
 }
 
 const _: [(); 96] = [(); mem::size_of::<UserspaceDpMeta>()];
+// #7464: the two facts #5192's accepted-residual decision RESTS on, neither of
+// which anything asserted. Both are compile-time only and emit no code, so the
+// tracked userspace_xdp_bpfel.o is unchanged.
+//
+// 1. The zero-copy path's alignment argument depends on this. The store site
+//    calls `bpf_xdp_adjust_meta` with a negative
+//    `meta_len = size_of::<UserspaceDpMeta>()`, so `data_meta = data - 96`, and
+//    the whole "the UB is unreachable on the zero-copy fast path because that
+//    path is in fact aligned" argument requires that offset to PRESERVE
+//    8-alignment.
+//
+//    The size assertion above happens to imply it today. The implication was
+//    nowhere stated, so growing the struct to 100 bytes and updating that
+//    assertion to 100 — an ordinary, reviewable edit — would silently move the
+//    UB from a generic-XDP portability concern onto the PRIMARY forwarding
+//    path, with nothing failing. A check that fails to a value
+//    indistinguishable from healthy.
+const _: () = assert!(mem::size_of::<UserspaceDpMeta>() % 8 == 0);
+// 2. The accepted residual is scoped to an 8-byte alignment demand, which comes
+//    from `config_generation: u64`. The layout block pins the size and six
+//    offsets and NO alignment, so a future field raising the demand past 8 would
+//    widen the residual on every path with no signal. This is the assertion the
+//    prior analysis noted was missing and did not add.
+const _: () = assert!(mem::align_of::<UserspaceDpMeta>() == 8);
 const _: [(); 18] = [(); mem::offset_of!(UserspaceDpMeta, ingress_pcp)];
 const _: [(); 19] = [(); mem::offset_of!(UserspaceDpMeta, ingress_vlan_present)];
 const _: [(); 20] = [(); mem::offset_of!(UserspaceDpMeta, ingress_zone)];

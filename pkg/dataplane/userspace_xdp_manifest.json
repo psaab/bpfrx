@@ -48,7 +48,7 @@
     },
     {
       "path": "userspace-xdp/src/lib.rs",
-      "sha256": "35f93e1ce58a22e08c7559c73b64df18c86f679b69b2f79dfd311361616d839b"
+      "sha256": "651fd3cab77c45bb7087bf158a3872eca3f228d8eb5a928e5472dbf36dc66557"
     }
   ]
 }
