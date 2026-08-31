@@ -80,7 +80,14 @@ import (
 // and they are a JUDGEMENT, not a measurement — recorded as such so whoever
 // revisits this knows which inputs were which:
 //
-//   - MEASURED: the object at 784,175/1,000,000, 21.58% headroom.
+//   - MEASURED at 268346838: the object at 784,175/1,000,000, 21.58% headroom.
+//     DATED DELIBERATELY (#8241). The object has since moved -- 801,448 as of
+//     eaf589bac, 19.86% -- and this derivation is NOT re-run against it. The
+//     figure records which inputs the 15% judgement was made from, so a reader
+//     who checks the live object and gets a different number can tell that this
+//     is an old derivation rather than a stale claim about today. Renumbering
+//     it would silently re-derive the JUDGEMENT below, which is the one thing
+//     this block exists to keep separable from the measurement.
 //   - JUDGED:   the 87,000-insn structural-change cost the property is defined
 //     against. That is the number to revisit.
 //
