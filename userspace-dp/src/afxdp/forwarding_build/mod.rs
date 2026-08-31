@@ -563,11 +563,21 @@ fn build_fallible_forwarding_state(
     // extraction into the session tuple) is a deferred feature. Carried here so
     // `show security flow` reflects real plumbed state, not a phantom field.
     state.gre_acceleration = snapshot.flow.gre_acceleration;
+    // #7342: the three `security flow tcp-session` windows #6539 documented as
+    // accepted-only now arrive on the wire. Named fields rather than three more
+    // positional `u64`s — see `TcpSessionWindowSecs`. Each `0` leaves its window
+    // at the dataplane default, so an unset leaf, and a snapshot from a Go
+    // binary that predates #7342, both reap exactly as before.
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
         snapshot.flow.tcp_session_timeout,
         snapshot.flow.udp_session_timeout,
         snapshot.flow.icmp_session_timeout,
-    );
+    )
+    .with_tcp_session_windows(crate::session::TcpSessionWindowSecs {
+        initial: snapshot.flow.tcp_initial_timeout,
+        closing: snapshot.flow.tcp_closing_timeout,
+        time_wait: snapshot.flow.tcp_time_wait_timeout,
+    });
     // #3527: per-screened-zone half-open (`tcp_opening_ns`) overrides from each
     // zone's `syn-flood timeout`. The leaf maps to the Junos
     // half-completed-connection queue window, NOT the screen-rate substrate

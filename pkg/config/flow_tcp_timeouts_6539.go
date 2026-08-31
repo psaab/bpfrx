@@ -73,6 +73,14 @@ func TCPSessionTimeoutDataplaneDefault(leaf string) (int, bool) {
 		return DataplaneTCPOpeningWindowSecs, true
 	case TCPSessionClosingTimeoutLeaf:
 		return DataplaneTCPClosingWindowSecs, true
+	case TCPSessionTimeWaitTimeoutLeaf:
+		// #7342: TIME_WAIT now exists as a distinct state, so it has a default
+		// window to report. It is the same value as closing-timeout's, and
+		// deliberately so: an operator who sets neither leaf must see exactly
+		// the reaping they saw before the state was split, and before #7342
+		// every post-FIN close — half or fully closed — reaped on this one
+		// window.
+		return DataplaneTCPClosingWindowSecs, true
 	default:
 		return 0, false
 	}
@@ -95,22 +103,25 @@ type TCPSessionTimeoutEnforcement struct {
 }
 
 // tcpSessionTimeoutEnforcement is the table itself, in Junos config order.
+// #7342: all four are enforced. The three that were not each needed a
+// different thing, and the order matters for why this is one change:
+//
+//   - initial-timeout and closing-timeout needed only a wire carrier — they map
+//     1:1 onto windows the dataplane already had (`tcp_opening_ns`, and the
+//     post-FIN window);
+//   - time-wait-timeout needed a STATE first. `session_timeout_ns` split a TCP
+//     close only into RST and not-RST, so there was no TIME_WAIT window
+//     distinct from closing-timeout's, and a carrier would have had nothing to
+//     drive. `SessionEntry` now tracks a FIN per DIRECTION, so a close with a
+//     FIN in both is TIME_WAIT and a close with one is CLOSING.
+//
+// Carrying all three behind one additive wire bump is why this is one protocol
+// change, one cluster smoke and one release note rather than three.
 var tcpSessionTimeoutEnforcement = []TCPSessionTimeoutEnforcement{
 	{Leaf: TCPSessionEstablishedTimeoutLeaf, Enforced: true},
-	{
-		Leaf: TCPSessionInitialTimeoutLeaf,
-		Note: fmt.Sprintf("not enforced — dataplane reaps half-open sessions on a fixed %ds window",
-			DataplaneTCPOpeningWindowSecs),
-	},
-	{
-		Leaf: TCPSessionClosingTimeoutLeaf,
-		Note: fmt.Sprintf("not enforced — dataplane reaps a FIN close on a fixed %ds window",
-			DataplaneTCPClosingWindowSecs),
-	},
-	{
-		Leaf: TCPSessionTimeWaitTimeoutLeaf,
-		Note: "not enforced — dataplane has no TIME_WAIT state",
-	},
+	{Leaf: TCPSessionInitialTimeoutLeaf, Enforced: true},
+	{Leaf: TCPSessionClosingTimeoutLeaf, Enforced: true},
+	{Leaf: TCPSessionTimeWaitTimeoutLeaf, Enforced: true},
 }
 
 // TCPSessionTimeoutLeaves returns the enforcement table in Junos config order.
@@ -139,6 +150,24 @@ func TCPSessionTimeoutNote(leaf string) string {
 // means unset, and warning about a knob the operator never set would train
 // them to ignore the advisory.
 func unenforcedTCPSessionTimeouts(ts *TCPSessionConfig) []string {
+	return unenforcedTCPSessionTimeoutsIn(tcpSessionTimeoutEnforcement, ts)
+}
+
+// unenforcedTCPSessionTimeoutsIn is the body, against a caller-supplied table.
+//
+// #7342 made every entry in the production table `Enforced`, so the advisory
+// path this feeds is now INERT — and an inert path is one whose claims nothing
+// checks. It is kept rather than deleted because
+// `TestTCPSessionTimeoutTableCoversSchema_6539` exists precisely so that a
+// FIFTH timeout leaf added to the schema cannot render unannotated and
+// unadvised; deleting the machinery would remove the thing that test protects.
+// Taking the table as a parameter is what lets a test drive it with a synthetic
+// unenforced leaf, so the mechanism stays proven while the production data no
+// longer exercises it.
+func unenforcedTCPSessionTimeoutsIn(
+	table []TCPSessionTimeoutEnforcement,
+	ts *TCPSessionConfig,
+) []string {
 	if ts == nil {
 		return nil
 	}
@@ -148,7 +177,7 @@ func unenforcedTCPSessionTimeouts(ts *TCPSessionConfig) []string {
 		TCPSessionTimeWaitTimeoutLeaf: ts.TimeWaitTimeout,
 	}
 	var out []string
-	for _, e := range tcpSessionTimeoutEnforcement {
+	for _, e := range table {
 		if e.Enforced {
 			continue
 		}

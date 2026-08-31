@@ -8,13 +8,19 @@ import (
 	"testing"
 )
 
-// #6539: `security flow tcp-session initial/closing/time-wait-timeout` are
-// modeled, parsed and committable but have NO dataplane wire carrier and no
-// live consumer, while REST, CLI and gRPC all printed them in the same shape
-// as the one leaf that IS carried. These tests bind the two halves of the fix:
-// the commit-time advisory fires for exactly the unenforced leaves, and the
-// enforcement table stays in agreement with the schema and with the Rust
-// constants its operator-facing text quotes.
+// #6539 recorded that `security flow tcp-session
+// initial/closing/time-wait-timeout` were modeled, parsed and committable but
+// had NO dataplane wire carrier, while REST, CLI and gRPC printed them in the
+// same shape as the one leaf that IS carried. #7342 carried all three and made
+// them live, so the half of these tests that pinned "not enforced" now pins the
+// opposite — that is the fix landing, not a guard being loosened.
+//
+// What did NOT change is the reason the file exists: the enforcement table is
+// the single authority the advisory and all three render surfaces read, it must
+// stay in agreement with the schema, and its operator-facing text must keep
+// quoting the Rust constants it claims to. Those cells are untouched, and the
+// advisory MECHANISM is still exercised — against a synthetic table — because
+// it is what a fifth timeout leaf would fall into.
 
 // findTCPSessionTimeoutAdvisory returns the #6539 timeout advisory, or "".
 // It is keyed on the issue number so it can never collide with the sibling
@@ -30,43 +36,65 @@ func findTCPSessionTimeoutAdvisory(cfg *Config) string {
 	return ""
 }
 
-// Each unenforced timeout leaf, set alone, must produce the advisory AND the
-// advisory must name that specific leaf — a generic catch-all would pass even
-// if the leaf were silently dropped.
-func TestTCPSessionTimeoutAdvisory_PerLeaf_6539(t *testing.T) {
+// #7342: every tcp-session timeout leaf is enforced, so setting ANY of them —
+// alone or together — must produce NO accepted-only advisory.
+//
+// Driven per leaf rather than as one combined config so a leaf that regressed
+// to unenforced is named, and driven through the real compile so it is the
+// production table being read rather than a copy.
+func TestTCPSessionTimeoutAdvisory_SilentWhenEnforced_7342(t *testing.T) {
 	for _, leaf := range []string{
+		TCPSessionEstablishedTimeoutLeaf,
 		TCPSessionInitialTimeoutLeaf,
 		TCPSessionClosingTimeoutLeaf,
 		TCPSessionTimeWaitTimeoutLeaf,
 	} {
 		t.Run(leaf, func(t *testing.T) {
 			cfg := compileSetLines(t, []string{"set security flow tcp-session " + leaf + " 45"})
-			adv := findTCPSessionTimeoutAdvisory(cfg)
-			if adv == "" {
-				t.Fatalf("%s did not emit the #6539 advisory; warnings=%v", leaf, cfg.Warnings)
+			// Liveness first: a config that did not compile the leaf would be
+			// silent for the wrong reason, and every assertion below would pass.
+			if cfg.Security.Flow.TCPSession == nil {
+				t.Fatalf("%s did not compile into TCPSession; the silence below is vacuous", leaf)
 			}
-			if !strings.Contains(adv, leaf) {
-				t.Fatalf("#6539 advisory does not name leaf %q: %q", leaf, adv)
-			}
-			// The advisory must name ONLY the leaf that was set. Without this
-			// the per-leaf assertion above would pass on an advisory that
-			// blanket-lists all three regardless of what the operator set.
-			for _, other := range []string{
-				TCPSessionInitialTimeoutLeaf,
-				TCPSessionClosingTimeoutLeaf,
-				TCPSessionTimeWaitTimeoutLeaf,
-			} {
-				if other == leaf {
-					continue
-				}
-				// closing-timeout is not a substring of the others, and
-				// time-wait-timeout / initial-timeout share no prefix, so a
-				// plain Contains is an honest test here.
-				if strings.Contains(adv, other) {
-					t.Fatalf("advisory for %q wrongly also names %q: %q", leaf, other, adv)
-				}
+			if adv := findTCPSessionTimeoutAdvisory(cfg); adv != "" {
+				t.Fatalf("%s is enforced since #7342 but still emits the accepted-only advisory: %q",
+					leaf, adv)
 			}
 		})
+	}
+}
+
+// The advisory MECHANISM must still work, because it is what a fifth timeout
+// leaf would fall into. #7342 left the production table with nothing
+// unenforced, so this drives the body against a SYNTHETIC table — otherwise the
+// path is inert code whose claims nothing checks, and it would rot until the
+// next leaf silently reproduced #6539.
+func TestTCPSessionTimeoutAdvisoryMechanismStillWorks_7342(t *testing.T) {
+	synthetic := []TCPSessionTimeoutEnforcement{
+		{Leaf: TCPSessionEstablishedTimeoutLeaf, Enforced: true},
+		{Leaf: TCPSessionInitialTimeoutLeaf, Note: "synthetic"},
+		{Leaf: TCPSessionClosingTimeoutLeaf, Enforced: true},
+		{Leaf: TCPSessionTimeWaitTimeoutLeaf, Note: "synthetic"},
+	}
+	ts := &TCPSessionConfig{
+		EstablishedTimeout: 600,
+		InitialTimeout:     45,
+		ClosingTimeout:     15,
+		// TimeWaitTimeout deliberately UNSET: the helper reports only leaves the
+		// operator actually configured, and a version that reported every
+		// unenforced leaf regardless would pass a fixture that set them all.
+	}
+	got := unenforcedTCPSessionTimeoutsIn(synthetic, ts)
+	want := []string{TCPSessionInitialTimeoutLeaf}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("unenforcedTCPSessionTimeoutsIn = %v, want %v — the advisory body no longer "+
+			"selects configured-AND-unenforced leaves, so a fifth leaf would render unannotated",
+			got, want)
+	}
+	// And the production table selects nothing, which is what makes the
+	// production advisory silent rather than merely unreached.
+	if live := unenforcedTCPSessionTimeouts(ts); len(live) != 0 {
+		t.Fatalf("production table still reports unenforced leaves %v after #7342", live)
 	}
 }
 
@@ -86,37 +114,24 @@ func TestTCPSessionTimeoutAdvisory_EstablishedNotWarned_6539(t *testing.T) {
 	}
 }
 
-// All three unenforced leaves together fold into ONE advisory naming all
-// three, and the advisory does not fire when none is set.
-func TestTCPSessionTimeoutAdvisory_FoldsAndSilence_6539(t *testing.T) {
+// All three formerly-unenforced leaves set together must produce NO advisory,
+// and the compile must still be the thing under test: a zone-only config is the
+// control that proves the search is not simply always finding nothing.
+func TestTCPSessionTimeoutAdvisory_AllThreeSilent_7342(t *testing.T) {
 	cfg := compileSetLines(t, []string{
 		"set security flow tcp-session initial-timeout 45",
 		"set security flow tcp-session closing-timeout 15",
 		"set security flow tcp-session time-wait-timeout 90",
 	})
-	count := 0
+	if ts := cfg.Security.Flow.TCPSession; ts == nil ||
+		ts.InitialTimeout != 45 || ts.ClosingTimeout != 15 || ts.TimeWaitTimeout != 90 {
+		t.Fatalf("the three leaves did not compile as set (%+v); the silence below is vacuous",
+			cfg.Security.Flow.TCPSession)
+	}
 	for _, w := range cfg.Warnings {
 		if strings.Contains(w, "#6539") {
-			count++
+			t.Fatalf("a #6539 accepted-only advisory survived #7342: %q", w)
 		}
-	}
-	if count != 1 {
-		t.Fatalf("expected exactly one folded #6539 advisory, got %d; warnings=%v", count, cfg.Warnings)
-	}
-	adv := findTCPSessionTimeoutAdvisory(cfg)
-	for _, leaf := range []string{
-		TCPSessionInitialTimeoutLeaf, TCPSessionClosingTimeoutLeaf, TCPSessionTimeWaitTimeoutLeaf,
-	} {
-		if !strings.Contains(adv, leaf) {
-			t.Fatalf("folded advisory missing %q: %q", leaf, adv)
-		}
-	}
-
-	// A zone-only config must stay silent — proves the advisory is gated on
-	// the leaves and not merely on compilation running.
-	quiet := compileSetLines(t, []string{"set security zones security-zone trust"})
-	if adv := findTCPSessionTimeoutAdvisory(quiet); adv != "" {
-		t.Fatalf("unexpected #6539 advisory with no tcp-session stanza: %q", adv)
 	}
 }
 
@@ -161,11 +176,14 @@ func TestTCPSessionTimeoutTableCoversSchema_6539(t *testing.T) {
 	}
 }
 
-// Exactly one leaf may be marked enforced, and it must be established-timeout.
-// This is the claim the whole fix rests on; if a future change carries another
-// leaf to the wire it must flip the table here (which retires its annotation
-// from all three surfaces and its line from the advisory at once).
-func TestTCPSessionTimeoutTableEnforcedSet_6539(t *testing.T) {
+// #7342: EVERY tcp-session timeout leaf is enforced, so none may carry a
+// render annotation and every one must render its value unannotated.
+//
+// The invariant this really pins is the two-way agreement — enforced implies no
+// note, unenforced implies a note AND an annotated cell — which is what keeps
+// the three surfaces from disagreeing with the advisory. #7342 changes which
+// side of it each leaf sits on, not the invariant.
+func TestTCPSessionTimeoutTableEnforcedSet_7342(t *testing.T) {
 	var enforced []string
 	for _, e := range TCPSessionTimeoutLeaves() {
 		if e.Enforced {
@@ -182,11 +200,22 @@ func TestTCPSessionTimeoutTableEnforcedSet_6539(t *testing.T) {
 			t.Errorf("AnnotateTCPSessionTimeout(%q) left the cell unannotated: %q", e.Leaf, got)
 		}
 	}
-	if len(enforced) != 1 || enforced[0] != TCPSessionEstablishedTimeoutLeaf {
-		t.Fatalf("enforced leaves = %v, want exactly [%s]", enforced, TCPSessionEstablishedTimeoutLeaf)
+	want := []string{
+		TCPSessionEstablishedTimeoutLeaf,
+		TCPSessionInitialTimeoutLeaf,
+		TCPSessionClosingTimeoutLeaf,
+		TCPSessionTimeWaitTimeoutLeaf,
 	}
-	if got := AnnotateTCPSessionTimeout(TCPSessionEstablishedTimeoutLeaf, "600s"); got != "600s" {
-		t.Fatalf("established-timeout must render unannotated, got %q", got)
+	if len(enforced) != len(want) {
+		t.Fatalf("enforced leaves = %v, want all four %v", enforced, want)
+	}
+	for i, leaf := range want {
+		if enforced[i] != leaf {
+			t.Fatalf("enforced leaves = %v, want %v (Junos config order)", enforced, want)
+		}
+		if got := AnnotateTCPSessionTimeout(leaf, "600s"); got != "600s" {
+			t.Fatalf("%s is enforced and must render unannotated, got %q", leaf, got)
+		}
 	}
 }
 
@@ -228,11 +257,15 @@ func TestTCPSessionTimeoutWindowsMatchRust_6539(t *testing.T) {
 	}
 }
 
-// TCPSessionTimeoutDataplaneDefault must report a window for the three leaves
-// that have one and NONE for time-wait, whose state the dataplane does not
-// model. A surface that printed "(default)" for time-wait would be making the
-// same kind of unbacked enforcement claim this issue is about.
-func TestTCPSessionTimeoutDataplaneDefault_6539(t *testing.T) {
+// TCPSessionTimeoutDataplaneDefault must report a window for all four leaves.
+//
+// #6539 returned nothing for time-wait because the dataplane had no TIME_WAIT
+// state, and printing "(default)" for it would have been the same unbacked
+// enforcement claim that issue was about. #7342 gave it a state, so it has a
+// window — and that window is deliberately the SAME as closing-timeout's,
+// because before the state was split every post-FIN close reaped on that one
+// window and an operator who sets neither leaf must see no change.
+func TestTCPSessionTimeoutDataplaneDefault_7342(t *testing.T) {
 	cases := []struct {
 		leaf     string
 		wantSecs int
@@ -241,7 +274,7 @@ func TestTCPSessionTimeoutDataplaneDefault_6539(t *testing.T) {
 		{TCPSessionEstablishedTimeoutLeaf, DataplaneTCPEstablishedWindowSecs, true},
 		{TCPSessionInitialTimeoutLeaf, DataplaneTCPOpeningWindowSecs, true},
 		{TCPSessionClosingTimeoutLeaf, DataplaneTCPClosingWindowSecs, true},
-		{TCPSessionTimeWaitTimeoutLeaf, 0, false},
+		{TCPSessionTimeWaitTimeoutLeaf, DataplaneTCPClosingWindowSecs, true},
 	}
 	for _, tc := range cases {
 		got, ok := TCPSessionTimeoutDataplaneDefault(tc.leaf)
