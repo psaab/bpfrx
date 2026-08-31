@@ -107,6 +107,38 @@ func (c *xpfCollector) initWorkerDescriptors() {
 			"means the collisions observed are same-source reuse.",
 		[]string{"worker_id"}, nil,
 	)
+	// #7919: a by-key session lookup that MISSED, split by cause. `touch_if_stale`
+	// and `account_packet` both resolve through the same by-key lookup and both
+	// bail SILENTLY on a miss, which is why a live transit session can report
+	// Pkts: 0 / Bytes: 0 while forwarding normally -- the accounting and the
+	// keepalive touch fail together and neither says so.
+	//
+	// Labelled per worker and NOT summed: the measured symptom is non-uniform
+	// (one of three concurrent flows accounted correctly while two froze), and a
+	// process-wide total cannot separate "one worker misses everything" from
+	// "every worker misses occasionally".
+	c.workerSessionLookupMissNoHandle = prometheus.NewDesc(
+		"xpf_userspace_worker_session_lookup_miss_no_handle_total",
+		"Cumulative by-key session lookups on this userspace worker that found "+
+			"NO handle in the key index -- the session was never installed under "+
+			"the probed key, or was removed (#7919).",
+		[]string{"worker_id"}, nil,
+	)
+	c.workerSessionLookupMissStaleHandle = prometheus.NewDesc(
+		"xpf_userspace_worker_session_lookup_miss_stale_handle_total",
+		"Cumulative by-key session lookups on this userspace worker whose handle "+
+			"resolved but pointed OUTSIDE the session slab -- a stale handle "+
+			"surviving its record (#7919).",
+		[]string{"worker_id"}, nil,
+	)
+	c.workerSessionLookupMissKeyMismatch = prometheus.NewDesc(
+		"xpf_userspace_worker_session_lookup_miss_key_mismatch_total",
+		"Cumulative by-key session lookups on this userspace worker whose handle "+
+			"resolved to a LIVE record whose stored key differs from the one asked "+
+			"for -- the key index and the slab disagree, so the lookup finds a "+
+			"session and correctly refuses to account against it (#7919).",
+		[]string{"worker_id"}, nil,
+	)
 	c.workerSessionCreateDrops = prometheus.NewDesc(
 		"xpf_userspace_worker_session_create_drops_total",
 		"Cumulative session installs refused at the max_sessions cap on "+

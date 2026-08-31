@@ -421,6 +421,14 @@ type xpfCollector struct {
 	workerSessionTableCapacity               *prometheus.Desc
 	workerNatReverseKeyCollisions            *prometheus.Desc
 	workerNatReverseKeyCollisionsDistinctSrc *prometheus.Desc
+	// #7919: by-key lookup misses per worker, split by cause. Deliberately
+	// three metrics rather than one with a `cause` label -- the reporting box
+	// showed one of three concurrent flows accounting correctly while two
+	// froze, so the per-worker split is the discriminator, and a summed or
+	// label-collapsed form would destroy it.
+	workerSessionLookupMissNoHandle    *prometheus.Desc
+	workerSessionLookupMissStaleHandle *prometheus.Desc
+	workerSessionLookupMissKeyMismatch *prometheus.Desc
 	// #1861: install-refusal trio (per-worker + aggregate).
 	workerSessionCreateDrops             *prometheus.Desc
 	workerSessionInstallAdmissionRefused *prometheus.Desc
@@ -914,6 +922,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerSessionTableCapacity
 	ch <- c.workerNatReverseKeyCollisions
 	ch <- c.workerNatReverseKeyCollisionsDistinctSrc
+	ch <- c.workerSessionLookupMissNoHandle
+	ch <- c.workerSessionLookupMissStaleHandle
+	ch <- c.workerSessionLookupMissKeyMismatch
 	ch <- c.workerSessionCreateDrops
 	ch <- c.workerSessionInstallAdmissionRefused
 	ch <- c.workerSessionInstallPartial
