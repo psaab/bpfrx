@@ -560,11 +560,7 @@ func (d userspaceShimCompileDataplane) DeleteStaleDNATStaticV6(map[DNATKeyV6]boo
 func (d userspaceShimCompileDataplane) DeleteStaleStaticNAT(map[StaticNATKeyV4]bool, map[StaticNATKeyV6]bool) {
 }
 
-func (d userspaceShimCompileDataplane) DeleteStaleNAT64(uint32, map[NAT64PrefixKey]bool) {
-}
 func (d userspaceShimCompileDataplane) ZeroStaleScreenConfigs(uint32) {}
-func (d userspaceShimCompileDataplane) ZeroStaleNATPoolConfigs(uint32) {
-}
 func (d userspaceShimCompileDataplane) DeleteStaleIfaceFilter(map[IfaceFilterKey]bool) {
 }
 func (d userspaceShimCompileDataplane) ZeroStaleFilterConfigs(uint32) {}

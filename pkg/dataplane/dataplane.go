@@ -436,9 +436,7 @@ type DataPlane interface {
 	DeleteStaleDNATStatic(written map[DNATKey]bool)
 	DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool)
 	DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool)
-	DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool)
 	ZeroStaleScreenConfigs(maxID uint32)
-	ZeroStaleNATPoolConfigs(startID uint32)
 	DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool)
 	ZeroStaleFilterConfigs(startID uint32)
 

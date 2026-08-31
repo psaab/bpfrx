@@ -81,9 +81,7 @@ func (idProbeDP) DeleteStaleDNATStatic(written map[DNATKey]bool)           {}
 func (idProbeDP) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool)       {}
 func (idProbeDP) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool) {
 }
-func (idProbeDP) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {}
-func (idProbeDP) ZeroStaleNATPoolConfigs(startID uint32)                                 {}
-func (idProbeDP) GetPersistentNAT() *PersistentNATTable                                  { var z *PersistentNATTable; return z }
+func (idProbeDP) GetPersistentNAT() *PersistentNATTable { var z *PersistentNATTable; return z }
 
 // idProbeConfig exercises every ID-assigning phase that the validate-pre-pass
 // would run: zones (ZoneIDs), screen profiles (ScreenIDs), the address book

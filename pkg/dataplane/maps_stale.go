@@ -195,30 +195,6 @@ func (m *Manager) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writte
 	}
 }
 
-// DeleteStaleNAT64 zeroes stale nat64_configs entries and removes stale prefix map entries.
-func (m *Manager) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {
-	if zm, present, _ := m.lookupMapLocked("nat64_configs"); present {
-		var empty NAT64Config
-		for i := count; i < 4; i++ {
-			zm.Update(i, empty, ebpf.UpdateAny)
-		}
-	}
-	if hm, present, _ := m.lookupMapLocked("nat64_prefix_map"); present {
-		var key NAT64PrefixKey
-		var val []byte
-		iter := hm.Iterate()
-		var stale []NAT64PrefixKey
-		for iter.Next(&key, &val) {
-			if !writtenPrefixes[key] {
-				stale = append(stale, key)
-			}
-		}
-		for _, k := range stale {
-			hm.Delete(k)
-		}
-	}
-}
-
 // ZeroStaleScreenConfigs zeroes screen_configs entries above maxID.
 func (m *Manager) ZeroStaleScreenConfigs(maxID uint32) {
 	zm, present, _ := m.lookupMapLocked("screen_configs")
@@ -228,33 +204,6 @@ func (m *Manager) ZeroStaleScreenConfigs(maxID uint32) {
 	empty := ScreenConfig{}
 	for i := maxID + 1; i < 64; i++ {
 		zm.Update(i, empty, ebpf.UpdateAny)
-	}
-}
-
-// ZeroStaleNATPoolConfigs zeroes nat_pool_configs and nat_pool_ips entries
-// for pool IDs from startID onwards.
-func (m *Manager) ZeroStaleNATPoolConfigs(startID uint32) {
-	if zm, present, _ := m.lookupMapLocked("nat_pool_configs"); present {
-		empty := NATPoolConfig{}
-		for i := startID; i < 32; i++ {
-			zm.Update(i, empty, ebpf.UpdateAny)
-		}
-	}
-	if v4Map, present, _ := m.lookupMapLocked("nat_pool_ips_v4"); present {
-		var zeroV4 uint32
-		start := startID * MaxNATPoolIPsPerPool
-		end := uint32(32) * MaxNATPoolIPsPerPool
-		for i := start; i < end; i++ {
-			v4Map.Update(i, zeroV4, ebpf.UpdateAny)
-		}
-	}
-	if v6Map, present, _ := m.lookupMapLocked("nat_pool_ips_v6"); present {
-		zeroV6 := NATPoolIPV6{}
-		start := startID * MaxNATPoolIPsPerPool
-		end := uint32(32) * MaxNATPoolIPsPerPool
-		for i := start; i < end; i++ {
-			v6Map.Update(i, zeroV6, ebpf.UpdateAny)
-		}
 	}
 }
 

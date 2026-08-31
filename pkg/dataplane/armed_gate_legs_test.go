@@ -233,9 +233,7 @@ func armedGateInvoke() map[string]func(m *Manager) error {
 		"DeleteStaleDNATStatic":   func(m *Manager) error { m.DeleteStaleDNATStatic(nil); return nil },
 		"DeleteStaleDNATStaticV6": func(m *Manager) error { m.DeleteStaleDNATStaticV6(nil); return nil },
 		"DeleteStaleStaticNAT":    func(m *Manager) error { m.DeleteStaleStaticNAT(nil, nil); return nil },
-		"DeleteStaleNAT64":        func(m *Manager) error { m.DeleteStaleNAT64(0, nil); return nil },
 		"ZeroStaleScreenConfigs":  func(m *Manager) error { m.ZeroStaleScreenConfigs(0); return nil },
-		"ZeroStaleNATPoolConfigs": func(m *Manager) error { m.ZeroStaleNATPoolConfigs(0); return nil },
 		"DeleteStaleIfaceFilter":  func(m *Manager) error { m.DeleteStaleIfaceFilter(nil); return nil },
 		"ZeroStaleFilterConfigs":  func(m *Manager) error { m.ZeroStaleFilterConfigs(0); return nil },
 
@@ -1211,56 +1209,6 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			}
 		})
 
-		t.Run(name+"_ZeroStaleNATPoolConfigs_all_present", func(t *testing.T) {
-			// All-three-present complement (r2-7 "middle" continuation):
-			// configs AND both IP maps present — every map must be zeroed
-			// from startID, not just the first.
-			m := New()
-			cfgs := newArray(t, "nat_pool_configs", uint32(sizeOf[NATPoolConfig]()), 32)
-			v4 := newArray(t, "nat_pool_ips_v4", 4, 32*MaxNATPoolIPsPerPool)
-			v6 := newArray(t, "nat_pool_ips_v6", uint32(sizeOf[NATPoolIPV6]()), 32*MaxNATPoolIPsPerPool)
-			m.maps["nat_pool_configs"] = cfgs
-			m.maps["nat_pool_ips_v4"] = v4
-			m.maps["nat_pool_ips_v6"] = v6
-			m.loaded.Store(armed)
-
-			cfg := NATPoolConfig{NumIPs: 7}
-			if err := cfgs.Update(3, cfg, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed nat_pool_configs: %v", err)
-			}
-			slot := uint32(3 * MaxNATPoolIPsPerPool)
-			if err := v4.Update(slot, uint32(0x0a000001), ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed v4: %v", err)
-			}
-			v6val := NATPoolIPV6{}
-			v6val.IP[0] = 0x2a
-			if err := v6.Update(slot, v6val, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed v6: %v", err)
-			}
-			m.ZeroStaleNATPoolConfigs(3)
-			var backCfg NATPoolConfig
-			if err := cfgs.Lookup(uint32(3), &backCfg); err != nil {
-				t.Fatalf("read back configs: %v", err)
-			}
-			if backCfg != (NATPoolConfig{}) {
-				t.Fatalf("nat_pool_configs[3] = %+v, want zero (all-present continuation)", backCfg)
-			}
-			var got4 uint32
-			if err := v4.Lookup(slot, &got4); err != nil {
-				t.Fatalf("read back v4: %v", err)
-			}
-			if got4 != 0 {
-				t.Fatalf("nat_pool_ips_v4 slot = %#x, want 0", got4)
-			}
-			var got6 NATPoolIPV6
-			if err := v6.Lookup(slot, &got6); err != nil {
-				t.Fatalf("read back v6: %v", err)
-			}
-			if got6 != (NATPoolIPV6{}) {
-				t.Fatalf("nat_pool_ips_v6 slot = %+v, want zero", got6)
-			}
-		})
-
 		t.Run(name+"_GetMapStats_all_descriptors_reported", func(t *testing.T) {
 			// Two descriptor maps present (one countable hash, one
 			// non-countable array), the rest absent — both must be reported
@@ -1301,63 +1249,6 @@ func TestManager_ArmedGate_ContinuationLegsPrivileged(t *testing.T) {
 			var out StaticNATValueV6
 			if err := v6.Lookup(stale, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
 				t.Fatalf("stale v6 entry survives (err=%v) — the absent-v4 path did not continue", err)
-			}
-		})
-
-		t.Run(name+"_DeleteStaleNAT64_absent_configs_continues", func(t *testing.T) {
-			// nat64_configs ABSENT, nat64_prefix_map present with a stale
-			// prefix — the absent first access must continue to the prefix
-			// cleanup.
-			m := New()
-			pm := newHash(t, "nat64_prefix_map", uint32(sizeOf[NAT64PrefixKey]()), uint32(sizeOf[NAT64Config]()), 8)
-			m.maps["nat64_prefix_map"] = pm
-			m.loaded.Store(armed)
-
-			stale := NAT64PrefixKey{}
-			if err := pm.Update(stale, NAT64Config{}, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed nat64_prefix_map: %v", err)
-			}
-			m.DeleteStaleNAT64(0, nil)
-			var out NAT64Config
-			if err := pm.Lookup(stale, &out); !errors.Is(err, ebpf.ErrKeyNotExist) {
-				t.Fatalf("stale prefix survives (err=%v) — the absent-configs path did not continue", err)
-			}
-		})
-
-		t.Run(name+"_ZeroStaleNATPoolConfigs_absent_configs_continues", func(t *testing.T) {
-			// nat_pool_configs ABSENT, nat_pool_ips_v4 present with a stale
-			// IP slot — the absent first access must continue to the IP
-			// zeroing.
-			m := New()
-			v4 := newArray(t, "nat_pool_ips_v4", 4, 32*MaxNATPoolIPsPerPool)
-			v6 := newArray(t, "nat_pool_ips_v6", uint32(sizeOf[NATPoolIPV6]()), 32*MaxNATPoolIPsPerPool)
-			m.maps["nat_pool_ips_v4"] = v4
-			m.maps["nat_pool_ips_v6"] = v6
-			m.loaded.Store(armed)
-
-			slot := uint32(3 * MaxNATPoolIPsPerPool) // pool 3, first slot
-			if err := v4.Update(slot, uint32(0x0a000001), ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed nat_pool_ips_v4: %v", err)
-			}
-			v6val := NATPoolIPV6{}
-			v6val.IP[0] = 0x2a
-			if err := v6.Update(slot, v6val, ebpf.UpdateAny); err != nil {
-				t.Fatalf("seed nat_pool_ips_v6: %v", err)
-			}
-			m.ZeroStaleNATPoolConfigs(3)
-			var got uint32
-			if err := v4.Lookup(slot, &got); err != nil {
-				t.Fatalf("read back nat_pool_ips_v4: %v", err)
-			}
-			if got != 0 {
-				t.Fatalf("nat_pool_ips_v4 slot = %#x, want 0 — the absent-configs path did not continue to the IP zeroing", got)
-			}
-			var got6 NATPoolIPV6
-			if err := v6.Lookup(slot, &got6); err != nil {
-				t.Fatalf("read back nat_pool_ips_v6: %v", err)
-			}
-			if got6 != (NATPoolIPV6{}) {
-				t.Fatalf("nat_pool_ips_v6 slot = %+v, want zero — the v4 leg did not continue to v6", got6)
 			}
 		})
 

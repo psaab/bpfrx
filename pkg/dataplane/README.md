@@ -1065,6 +1065,19 @@ snap`, and there are two of them — one per acceptance path).
     `checksum_neutrality`, `checksum_neutrality_64`). Retiring the `maps_nat.go`
     writers and the `DataPlane` NAT interface surface themselves remains the
     sibling cleanup (#7268 scope 2-4).
+    **#7804** finished that surface by retiring the two stale sweepers #7268
+    left behind, `DeleteStaleNAT64` and `ZeroStaleNATPoolConfigs`. Same
+    argument, re-measured: `nat64_configs`, `nat64_prefix_map`,
+    `nat_pool_configs` and `nat_pool_ips_v4/v6` are each declared ZERO times in
+    `userspace-xdp/src/lib.rs`, so the writes had nowhere to land, and neither
+    method had a production caller. What is NOT retired, and the reasoning is
+    recorded in `nat_write_surface_retired_7268_test.go`: the three sweepers
+    that DO have callers (`DeleteStaleZonePairPolicies`,
+    `ZeroStaleScreenConfigs`, `ZeroStaleFilterConfigs`) write maps that are
+    equally shim-undeclared, but each opens with `lookupMapLocked`, which
+    misses on the deployed dataplane — so their commit-path cost is one
+    mutex-guarded map miss, not a write, and retiring them would edit the
+    COMPILE PATH rather than delete an unreferenced declaration.
   - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
     HOST-PURE phases against a discarding dataplane BEFORE the zones phase
     performs the first destructive host netlink mutation, so a config that
