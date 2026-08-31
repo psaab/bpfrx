@@ -234,7 +234,11 @@ pub(in crate::afxdp) fn log_fabric_skip_transition(
 }
 
 pub struct Coordinator {
-    pub(crate) bpf_maps: BpfMaps,
+    /// #7209: **the REFCOUNT is the guarantee, not the swap.** Do NOT simplify
+    /// to a `Mutex<BpfMaps>` or a plain field — a mutex serialises access
+    /// without extending any lifetime, and every test would still pass, because
+    /// nothing reads these concurrently yet. Rationale on `BpfMaps` itself.
+    pub(crate) bpf_maps: ArcSwap<BpfMaps>,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, LocalTunnelDelivery>>>,
     /// #1881: GRE local-origin thread lifecycle entries keyed by
@@ -420,7 +424,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new() -> Self {
         Self {
-            bpf_maps: BpfMaps::default(),
+            bpf_maps: ArcSwap::from_pointee(BpfMaps::default()),
             slow_path: None,
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
@@ -700,9 +704,12 @@ impl Coordinator {
         // nothing can name them again. Why all ids, and why this is not the
         // `dead`-keyed sweep, is on `retire_all_worker_holders`.
         self.retire_all_worker_holders();
+        // #7209: ONE load bound to a local — two loads could straddle a store
+        // and mix generations, and the local keeps the fds alive for the call.
+        let maps = self.bpf_maps.load();
         self.workers.stop_and_clear(
-            self.bpf_maps.map_fd.as_ref(),
-            self.bpf_maps.heartbeat_map_fd.as_ref(),
+            maps.map_fd.as_ref(),
+            maps.heartbeat_map_fd.as_ref(),
         );
         self.mirror_targets
             .store(Arc::new(MirrorTargetMap::default()));
@@ -728,13 +735,10 @@ impl Coordinator {
             .map(|slow| slow.status())
             .unwrap_or_default();
         self.slow_path = None;
-        self.bpf_maps.map_fd = None;
-        self.bpf_maps.heartbeat_map_fd = None;
-        self.bpf_maps.session_map_fd = None;
-        self.bpf_maps.conntrack_v4_fd = None;
-        self.bpf_maps.conntrack_v6_fd = None;
-        self.bpf_maps.dnat_table_fd = None;
-        self.bpf_maps.dnat_table_v6_fd = None;
+        // #7209: ONE store of the whole set; the previous set's fds close when
+        // the last holder releases (see `BpfMaps`). With no readers this is
+        // identical to the seven field assignments it replaces.
+        self.bpf_maps.store(Arc::new(BpfMaps::default()));
         self.forwarding = ForwardingState::default();
         // #6592: reset BOTH halves before the single worker-visible publish.
         // `self.validation` was defaulted further down pre-#6592 — after the

@@ -237,7 +237,11 @@ impl crate::afxdp::Coordinator {
         nat: NatDecision,
         is_reverse: bool,
     ) {
-        let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref() else {
+        // #7209: the loaded set is bound to `maps` for the whole publish, so the
+        // descriptor cannot be closed between this check and the write below.
+        // The `Arc` is the lifetime guarantee; re-loading per read would not be.
+        let maps = self.bpf_maps.load();
+        let Some(session_map_fd) = maps.session_map_fd.as_ref() else {
             self.sessions
                 .synced_import_unpublished
                 .fetch_add(1, Ordering::Relaxed);
@@ -444,9 +448,13 @@ impl crate::afxdp::Coordinator {
         // process-global `dnat_table` map is a single shared object, so this
         // once-per-synced-session publish (not per worker) mirrors the primary.
         if !entry.metadata.is_reverse {
+            // #7209: hold the loaded set across the publish — `DnatTableFds`
+            // carries RAW descriptors, so the guard must outlive the call that
+            // uses them.
+            let maps = self.bpf_maps.load();
             let dnat_fds = DnatTableFds {
-                v4: self.bpf_maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
-                v6: self.bpf_maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
+                v4: maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
+                v6: maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
             };
             if !publish_dnat_table_entry(&dnat_fds, &entry.key, entry.decision.nat) {
                 // #4393/#2244: a failed publish (map at capacity / kernel
@@ -564,7 +572,8 @@ impl crate::afxdp::Coordinator {
             }
         });
         if let Some(entry) = removed_entry.as_ref() {
-            if let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref() {
+            let maps = self.bpf_maps.load();
+            if let Some(session_map_fd) = maps.session_map_fd.as_ref() {
                 delete_session_map_entry_for_removed_session(
                     session_map_fd.fd,
                     &entry.key,
@@ -582,9 +591,12 @@ impl crate::afxdp::Coordinator {
             // used, so it byte-matches the insert key; a non-SNAT / reverse
             // entry is a no-op.
             if !entry.metadata.is_reverse {
+                // #7209: same as the publish twin — the guard must outlive the
+                // call that uses the raw descriptors.
+                let maps = self.bpf_maps.load();
                 let dnat_fds = DnatTableFds {
-                    v4: self.bpf_maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
-                    v6: self.bpf_maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
+                    v4: maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
+                    v6: maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
                 };
                 delete_dnat_table_entry(&dnat_fds, &entry.key, entry.decision.nat);
             }
