@@ -1508,10 +1508,14 @@ The verdict is `config.FlowServerExcludedReason`, shared with
 `buildFlowExportSnapshot`. Both consumers of a flow-server refuse an
 absent or out-of-range port: the userspace snapshot builder skips it
 (`CollectorPort` is a `u16` on the wire, #1977), and the Go exporter
-that actually sends the records (`pkg/flowexport`, #2130) omits the port
-from the collector address and then fails to dial it
-(`missing port in address`). `pkg/showaudit` enumerates all three
-renderers so a fourth cannot be added unannotated.
+that actually sends the records (`pkg/flowexport`, #2130) excludes it
+from the collector set at build time (#8163). Before #8163 the exporter
+instead carried it through and failed to dial it
+(`missing port in address`), which was fatal for the whole collector
+group and, through `reconcileFlowExporter`'s build loop, for every other
+group as well — so one portless `flow-server` disabled flow export
+entirely. `pkg/showaudit` enumerates all three renderers so a fourth
+cannot be added unannotated.
 
 ## Firewall-filter `then dscp` rewrites the dataplane does not install (#7422)
 

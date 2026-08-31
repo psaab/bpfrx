@@ -660,6 +660,61 @@ restoring the constant `1` flips them RED),
 and `TestStableExporterIDHASymmetry` (deterministic id + protocol
 disambiguation).
 
+## Unusable collectors are excluded at build time (#8163)
+
+`collectInstanceVersionCollectors` drops a `flow-server` that can never
+receive a record — no `port`, or a port outside 1-65535 — before it
+reaches `CollectorConfig`. The verdict is the shared
+`config.FlowServerExcludedReason`, the SAME predicate the show surfaces
+annotate `NOT INSTALLED` with (#7422), so the exporter and
+`show security flow monitoring` cannot disagree about which collectors
+are live.
+
+Why it has to happen HERE and not further down, because the blast radius
+is the whole point:
+
+- `dialCollectors` treats a dial failure as fatal for the entire group —
+  it closes every socket opened so far and returns the error.
+- `NewExporter` / `NewIPFIXExporter` propagate that out of the
+  constructor, so the exporter object is never built.
+- `Daemon.reconcileFlowExporter` builds the full replacement set in a
+  loop and `return`s on the FIRST constructor error (`daemon_flowexport.go`).
+
+So one unusable `flow-server` disabled NetFlow **and** IPFIX export for
+every template/family group, not just its own siblings. Under the #3742
+build-before-swap design the previously-running exporters were kept, so a
+reload left stale export up; on a boot with nothing running it published
+the empty bundle and export was simply off, with a `slog.Warn` and
+`Daemon.FlowExportError()` — which no show surface, REST field or metric
+reads — as the only record.
+
+Severity comes from reachability: nothing validates a flow-server port at
+commit (`validateSamplingTemplateRefsStrict` checks template references
+only), so `set forwarding-options sampling instance s1 family inet output
+flow-server 10.0.0.2` with no `port` commits cleanly. This was an
+operator typo silently disabling flow export, not a drift-only state.
+
+Two nearby behaviours are deliberately NOT changed:
+
+- **`reconcileFlowExporter` still returns on the first constructor
+  error.** That is the #3742 availability design for a TRANSIENT failure
+  (a pinned source-address bind before the source interface is up,
+  collector DNS): keeping the old exporters running beats swapping in a
+  degraded set. The collectors excluded above are decidable from config
+  and can never succeed later, which is what makes dropping them safe and
+  a dial-time tolerance unsafe.
+- **`dialCollectors` still fails the group on a dial error.** A
+  well-formed collector that is merely unreachable must stay fatal at
+  construction; per-collector unreachability is handled afterwards by the
+  #2464 write-health path below.
+
+The `if fs.Port > 0` guard before `net.JoinHostPort` is kept even though
+the exclusion makes `Port >= 1` on every path that reaches it. It is the
+fail-loud leg: if the exclusion is ever moved or bypassed, a bare address
+dies at dial with a named error, whereas an unconditional `JoinHostPort`
+would emit `host:0` — which dials successfully and discards every record
+silently.
+
 ## Per-collector write-health (#2464)
 
 Flow export is forensics/compliance data; a collector going unreachable
