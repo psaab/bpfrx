@@ -524,7 +524,7 @@ was emitted, covering interface-level AND unit-level records.
 | **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but xpf doesn't configure it) |
 | **Aggregate Routes** | `routing-options aggregate route ...` | Aggregate (summary) routes with policy control, different from generate routes in contributing route behavior | Medium | Partial (generate routes implemented but aggregate semantics differ) |
 | **Martian Addresses** | `routing-options martians ... allow/exact/orlonger` | Configure additional martian (reserved) address filtering or allow specific martians | Low | Missing |
-| **Forwarding Table Export** | `routing-options forwarding-table export ...` | Apply routing policy to routes exported from routing table to forwarding table. Used for ECMP load-balancing policy. | Medium | Partial (parsed but not fully wired to FRR) |
+| **Forwarding Table Export** | `routing-options forwarding-table export ...` | Apply routing policy to routes exported from routing table to forwarding table. Used for ECMP load-balancing policy. | Medium | Modelled as a GLOBAL ECMP toggle, by design (#7455) — see note below |
 | **Multipath** | `routing-options multipath` | Protocol-independent load balancing for L3 VPN next-hops | Low | Missing |
 | **Maximum ECMP Paths** | `routing-options maximum-ecmp N` | Limit number of ECMP paths installed in forwarding table | Low | Missing |
 | **Nonstop Routing** | `routing-options nonstop-routing` | Maintain routing state during Routing Engine switchover | Low | Missing |
@@ -1466,3 +1466,34 @@ Tier-2 gaps from the `#2008` parity audit researched in
   idle-yield) is lab-gated and deferred per the research doc — the busy-poll
   cold-start latency sensitivity (#1782) is the reason it needs explicit
   validation before enabling.
+
+## Forwarding-table export is a global ECMP toggle, not a policy chain (#7455)
+
+Junos accepts a policy CHAIN at `routing-options forwarding-table export`. xpf
+accepts exactly ONE policy, and this is a deliberate model rather than an
+unfinished implementation — the previous wording here ("parsed but not fully
+wired to FRR") read as the latter and understated what is actually enforced.
+
+**What xpf derives.** `resolveECMP` (`pkg/frr/config_render.go`) reduces the one
+named policy to two booleans: any term carrying `load-balance` sets
+`ecmpMaxPaths = 64`, and `consistent-hash` selects the hashing mode. There is no
+per-route evaluation and no composition rule, because there is no per-route
+forwarding-policy model to compose into.
+
+**The contract is enforced, not merely documented.** A list carrying more than
+one policy is hard-rejected at commit
+(`compiler_validate_strict_routing.go`, "forwarding-table export declares N
+policies"), with the error stating that it renders as a SINGLE ECMP policy, and
+downgraded to a warning on the tolerant load / peer-sync path per #1960. So an
+operator cannot silently get chain semantics they did not receive.
+
+**Why the obvious shortcut is refused.** OR-ing the terms of several policies
+together would accept the Junos spelling while computing a different answer than
+Junos. That is worse than the current rejection precisely because it is silent:
+a loud refusal tells the operator their config means something else here, and a
+quiet reinterpretation does not.
+
+Implementing the chain needs a per-route forwarding-policy evaluation with a
+stated composition rule and a rendering target able to express it — a feature,
+not a wiring gap. #7455 records the measurement behind that decision.
+
