@@ -332,6 +332,23 @@ type SessionValue struct {
 	// It is HA-wire metadata only and is not part of the on-map C conntrack
 	// ABI.
 	IngressIfaceFold uint32
+	// RoutingDomain is the #7239 (#7160/#2387) session-key ROUTING DOMAIN,
+	// carried as a length-gated trailing sync-only field like IngressIfaceFold
+	// above. It is NOT part of the BPF ABI: the helper stamps it at INSTALL and
+	// it reaches here on the session delta, so no C struct moves.
+	//
+	// It exists because the peer used to DERIVE the domain from IngressIfaceFold,
+	// and that fold is computed on the SEND path against the CURRENT config
+	// (#7239) — so an ifindex recycled onto a sibling between install and sync
+	// folded to the sibling's name and the session was imported into the
+	// sibling's routing domain. If the two interfaces are in different routing
+	// instances that is a cross-tenant mis-file, and a CONFIDENT one, because
+	// the helper's two-pass reverse preference matches a reply in the wrong
+	// tenant's domain on pass 1.
+	//
+	// 0 is the default routing instance: a legal value, and what an old peer's
+	// absent field decodes to.
+	RoutingDomain uint32
 
 	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
 	// as encoded by the Rust helper's TunnelDiscriminator::to_wire
@@ -666,6 +683,23 @@ type SessionValueV6 struct {
 	// through their own encoder and decoder; wiring only the v4 pair leaves
 	// every IPv6 session degraded after a failover.
 	IngressIfaceFold uint32
+	// RoutingDomain is the #7239 (#7160/#2387) session-key ROUTING DOMAIN,
+	// carried as a length-gated trailing sync-only field like IngressIfaceFold
+	// above. It is NOT part of the BPF ABI: the helper stamps it at INSTALL and
+	// it reaches here on the session delta, so no C struct moves.
+	//
+	// It exists because the peer used to DERIVE the domain from IngressIfaceFold,
+	// and that fold is computed on the SEND path against the CURRENT config
+	// (#7239) — so an ifindex recycled onto a sibling between install and sync
+	// folded to the sibling's name and the session was imported into the
+	// sibling's routing domain. If the two interfaces are in different routing
+	// instances that is a cross-tenant mis-file, and a CONFIDENT one, because
+	// the helper's two-pass reverse preference matches a reply in the wrong
+	// tenant's domain on pass 1.
+	//
+	// 0 is the default routing instance: a legal value, and what an old peer's
+	// absent field decodes to.
+	RoutingDomain uint32
 
 	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
 	// as encoded by the Rust helper's TunnelDiscriminator::to_wire

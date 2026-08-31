@@ -143,6 +143,22 @@ type SessionSyncRequest struct {
 	// WITHHOLDS a protocol-47 session rather than importing it aliased (#7188
 	// decision 2); every other protocol imports unchanged.
 	TunnelDiscriminator uint64 `json:"tunnel_discriminator"`
+	// RoutingDomain is the #7239 (#7160/#2387) session-key ROUTING DOMAIN,
+	// carried on both delta transports so a peer-imported session is keyed in
+	// the domain the flow ACTUALLY arrived in.
+	//
+	// It is CARRIED rather than re-derived on the peer. The importing node used
+	// to resolve it from the #7095 cluster-stable ingress fold, which is
+	// computed on the SEND path against the CURRENT config — so an ifindex
+	// recycled onto a sibling between install and sync folded to the sibling's
+	// name and the session was imported into the sibling's routing domain. This
+	// value is stamped at install from the interface the flow arrived on, so no
+	// later recycle can move it.
+	//
+	// 0 is the default routing instance and is a LEGAL value, not a sentinel —
+	// which is also what an old helper's omitted field decodes to, and what
+	// every deployment with no routing-instance interface membership carries.
+	RoutingDomain uint32 `json:"routing_domain,omitempty"`
 }
 
 // SessionDeltaInfo is the HA session-open/close delta as it reaches this
@@ -291,4 +307,18 @@ type SessionDeltaInfo struct {
 	// None class), which makes the peer helper withhold a protocol-47 session
 	// instead of aliasing it (#7188 decision 2, rolling-upgrade safe).
 	TunnelDiscriminator uint64 `json:"tunnel_discriminator,omitempty"`
+	// RoutingDomain is the #7239 (#7160/#2387) session-key ROUTING DOMAIN, on
+	// both delta transports (the binary open/close frames and the JSON
+	// RPC-fallback delta). Stamped at INSTALL from the interface the flow
+	// actually arrived on, so a later ifindex recycle cannot move it.
+	//
+	// It participates in the DERIVED schema fingerprint (#7194): the extractor
+	// in pkg/daemon reads the json tag and ignores `omitempty`, and the Rust
+	// half emits every field because SessionDeltaInfo has no
+	// `skip_serializing_if` — so both sides list this name and the fingerprints
+	// stay equal. A leg that carried it while the other did not would be caught
+	// there rather than silently reading 0.
+	//
+	// 0 is the default routing instance — a legal value, not a sentinel.
+	RoutingDomain uint32 `json:"routing_domain,omitempty"`
 }

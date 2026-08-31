@@ -1267,6 +1267,23 @@ pub(crate) struct SessionDeltaInfo {
     /// exact pre-#6312 behaviour of this leg.
     #[serde(rename = "rt_flow_session_id", default)]
     pub rt_flow_session_id: u64,
+    /// #7239 (#7160/#2387): the session key's ROUTING DOMAIN, mirrored from the
+    /// binary open frame's trailing u32 onto the JSON RPC-fallback delta so a
+    /// session recovered through this leg carries the same identity.
+    ///
+    /// Both legs must carry it or the field means "not carried" on one of them,
+    /// and 0 is a LEGAL value here (the default routing instance) rather than a
+    /// sentinel — so a leg that silently omits it does not look absent, it
+    /// looks like the default instance, which is a wrong answer rather than a
+    /// missing one. That is the #6949 lesson on this exact struct, where the
+    /// JSON leg carried none of the attribution fields the binary leg did.
+    ///
+    /// Additive and rolling-upgrade safe both ways: an old helper omits the key
+    /// and `default` decodes 0; an old daemon ignores a key it does not know;
+    /// and 0 is what every deployment with no routing-instance interface
+    /// membership carries anyway.
+    #[serde(rename = "routing_domain", default)]
+    pub routing_domain: u32,
     /// #6949: the admitting policy's firewall metadata, at parity with the
     /// binary open frame's trailing #3301 fields. Derived with the frame's from
     /// the single-source `SessionSyncAttribution` (`session/sync_attribution.rs`).

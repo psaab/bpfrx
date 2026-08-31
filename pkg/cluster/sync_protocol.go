@@ -225,6 +225,20 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	// (#7188 decision 2). Every other protocol is unaffected.
 	binary.LittleEndian.PutUint64(buf[off:], val.TunnelDiscriminator)
 	off += 8
+	// #7239 (#7160/#2387): the session key's ROUTING DOMAIN (length-gated
+	// trailing field). CARRIED rather than derived on the peer: the importing
+	// node used to resolve the domain from IngressIfaceFold above, and that
+	// fold is stamped on the SEND path against the CURRENT config, so an
+	// ifindex recycled onto a sibling between install and sync imported the
+	// session into the SIBLING's routing domain — a cross-tenant mis-file in
+	// the field #7160 added to prevent one. This value is stamped at INSTALL
+	// from the interface the flow actually arrived on, so no later recycle can
+	// move it. Old decoders stop after TunnelDiscriminator; absent => 0, the
+	// default routing instance, which is legal and is the pre-#7160 behaviour.
+	// Like every trailing field since #2170 it does NOT bump
+	// SessionSyncWireVersion.
+	binary.LittleEndian.PutUint32(buf[off:], val.RoutingDomain)
+	off += 4
 	return buf[:off]
 }
 func encodeSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) []byte {
@@ -357,6 +371,20 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	// stop after IngressIfaceFold; absent => 0, the RESERVED "not carried" tag.
 	binary.LittleEndian.PutUint64(buf[off:], val.TunnelDiscriminator)
 	off += 8
+	// #7239 (#7160/#2387): the session key's ROUTING DOMAIN (length-gated
+	// trailing field). CARRIED rather than derived on the peer: the importing
+	// node used to resolve the domain from IngressIfaceFold above, and that
+	// fold is stamped on the SEND path against the CURRENT config, so an
+	// ifindex recycled onto a sibling between install and sync imported the
+	// session into the SIBLING's routing domain — a cross-tenant mis-file in
+	// the field #7160 added to prevent one. This value is stamped at INSTALL
+	// from the interface the flow actually arrived on, so no later recycle can
+	// move it. Old decoders stop after TunnelDiscriminator; absent => 0, the
+	// default routing instance, which is legal and is the pre-#7160 behaviour.
+	// Like every trailing field since #2170 it does NOT bump
+	// SessionSyncWireVersion.
+	binary.LittleEndian.PutUint32(buf[off:], val.RoutingDomain)
+	off += 4
 	return buf[:off]
 }
 
@@ -576,6 +604,14 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
 	}
+	// #7239: length-gated trailing routing domain. Absent => 0 (the default
+	// routing instance), which is what a peer predating this field sends and
+	// what every deployment with no routing-instance interface membership
+	// carries.
+	if off+4 <= len(payload) {
+		val.RoutingDomain = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
 	return key, val, true
 }
 
@@ -734,6 +770,14 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	if off+8 <= len(payload) {
 		val.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off:])
 		off += 8
+	}
+	// #7239: length-gated trailing routing domain. Absent => 0 (the default
+	// routing instance), which is what a peer predating this field sends and
+	// what every deployment with no routing-instance interface membership
+	// carries.
+	if off+4 <= len(payload) {
+		val.RoutingDomain = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
 	}
 	return key, val, true
 }

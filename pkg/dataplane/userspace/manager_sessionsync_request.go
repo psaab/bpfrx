@@ -39,6 +39,15 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 			req.IngressIfindex = int(ifindex)
 			req.IngressVLANID = vlan
 		}
+		// #7239 (#7160/#2387): hand the helper the domain the SENDER stamped at
+		// install, so it does not have to re-derive one from the fold resolved
+		// just above. The fold is computed on the sender's SEND path against
+		// its CURRENT config, so an ifindex recycled onto a sibling between
+		// install and sync resolves here to the sibling — and deriving the
+		// domain from that files the session in the sibling's routing instance.
+		// A carried domain cannot drift that way; 0 means the default instance,
+		// which is what a peer predating the field sends.
+		req.RoutingDomain = val.RoutingDomain
 		req.EgressZoneID = val.EgressZone
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
@@ -138,6 +147,15 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 			req.IngressIfindex = int(ifindex)
 			req.IngressVLANID = vlan
 		}
+		// #7239 (#7160/#2387): hand the helper the domain the SENDER stamped at
+		// install, so it does not have to re-derive one from the fold resolved
+		// just above. The fold is computed on the sender's SEND path against
+		// its CURRENT config, so an ifindex recycled onto a sibling between
+		// install and sync resolves here to the sibling — and deriving the
+		// domain from that files the session in the sibling's routing instance.
+		// A carried domain cannot drift that way; 0 means the default instance,
+		// which is what a peer predating the field sends.
+		req.RoutingDomain = val.RoutingDomain
 		req.EgressZoneID = val.EgressZone
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)

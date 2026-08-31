@@ -217,6 +217,29 @@ impl EventFrame {
         buf[pos..pos + 8].copy_from_slice(&key.discriminator.to_wire().to_le_bytes());
         pos += 8;
 
+        // #7239 (#7160/#2387): [+32:+36] the session key's ROUTING DOMAIN (u32
+        // LE), trailing/length-gated after the #7188 discriminator.
+        //
+        // Carried, not re-derived on the peer, and that distinction is the
+        // whole point. The importing node used to resolve the domain from the
+        // #7095 cluster-stable ingress fold, which `stampIngressIfaceFold`
+        // computes on the SEND path against the CURRENT config — so an ifindex
+        // recycled onto a sibling between install and sync folded to the
+        // sibling's name, and the peer imported the session into that
+        // sibling's routing domain. If the two interfaces sit in different
+        // routing instances that is a cross-tenant mis-file, in the field
+        // #7160 added to prevent exactly that, and it is a CONFIDENT one: the
+        // two-pass preference in `find_forward_nat_match` matches a reply in
+        // the wrong tenant's domain on pass 1.
+        //
+        // This value is stamped at INSTALL, from the interface the flow
+        // actually arrived on — it is already on the key — so no later recycle
+        // can change it. 0 is the default routing instance, which is also what
+        // an old Go decoder length-skipping these 4 bytes reads, and what every
+        // deployment with no routing-instance interface membership carries.
+        buf[pos..pos + 4].copy_from_slice(&key.routing_domain.to_le_bytes());
+        pos += 4;
+
         // Write header
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_OPEN, seq);
@@ -288,6 +311,18 @@ impl EventFrame {
         // An old Go decoder length-skips these 8 bytes.
         buf[pos..pos + 8].copy_from_slice(&key.discriminator.to_wire().to_le_bytes());
         pos += 8;
+
+        // #7239 (#7160/#2387): the ROUTING DOMAIN (u32 LE), trailing after the
+        // #7188 discriminator, for the same reason #7188 needed to be here at
+        // all. A close names the session to RETRACT, and two routing instances
+        // sharing a 5-tuple are two sessions — so a close that could not carry
+        // the domain would retract the wrong tenant's session, or none. The
+        // open frame carries it, so the close must too or the two frames name
+        // different keys. An old Go decoder length-skips these 4 bytes and
+        // retracts in the default instance, which is what it did before the
+        // field existed.
+        buf[pos..pos + 4].copy_from_slice(&key.routing_domain.to_le_bytes());
+        pos += 4;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;
         write_header(&mut buf, payload_len, MSG_SESSION_CLOSE, seq);
