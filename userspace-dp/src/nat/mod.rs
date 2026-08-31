@@ -102,6 +102,9 @@ mod tests_destination;
 #[cfg(test)]
 #[path = "tests_pool.rs"]
 mod tests_pool;
+// #7560 residual: the derived report gate (nat64 omitted a field from its own).
+#[cfg(test)]
+mod tests_reseed_report_gate_7560;
 // #7481: the Rust half of the shared NAT match-prefix corpus differential.
 #[cfg(test)]
 #[path = "tests_prefix_corpus_7481.rs"]
@@ -184,6 +187,8 @@ pub(crate) use source::{
 #[cfg(test)]
 pub(crate) use source::{reserve_synced_source_nat_allocation, rollback_source_nat_allocation};
 pub(crate) use source::retire_worker_from_pool_rules;
+// #7560 residual: nat64.rs is the third reseed call site and needs the same note.
+pub(crate) use source::report_dropped_leases;
 // #6979: reachable from the afxdp coordinator test that binds the retirement
 // wiring; the primitive itself stays covered by nat::tests_pool.
 pub(crate) use allocator::TranslatedTuple;
