@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
@@ -108,8 +109,14 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 		return nil
 
 	case clusterfailover.KindRGFailover:
-		if err := c.cluster.ManualFailover(op.RG); err != nil {
+		outcome, err := c.cluster.ManualFailover(op.RG)
+		if err != nil {
 			return err
+		}
+		// #8000: see the gRPC twin — a supersede must not read as "triggered".
+		if outcome == cluster.FailoverSuperseded {
+			fmt.Printf("Manual failover for redundancy group %d was superseded by a concurrent reset; no failover performed\n", op.RG)
+			return nil
 		}
 		fmt.Printf("Manual failover triggered for redundancy group %d\n", op.RG)
 		return nil

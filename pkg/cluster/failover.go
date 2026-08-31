@@ -37,16 +37,44 @@ import (
 // Unlike ForceSecondary, this preserves the group's monitor-derived weight
 // and advertises an explicit transfer-out state so the peer can claim
 // primary without relying on weight-zero election semantics.
-func (m *Manager) ManualFailover(rgID int) error {
+// FailoverOutcome reports what a manual-failover request actually did to one
+// redundancy group (#8000).
+//
+// It exists because "no error" and "the failover happened" are not the same
+// thing on this path, and the difference is invisible to the caller. A
+// `ResetFailover` landing in the unlocked pre-hook window bumps the RG's
+// failover generation, and the reset WINS: the trailing SecondaryHold write is
+// abandoned and nil is returned (#5246, pinned by
+// failover_races_5245_5246_test.go). That is correct and must not become an
+// error — but reporting it as plain success is what left an operator unable to
+// tell which RGs of a batch actually moved.
+type FailoverOutcome int
+
+const (
+	// FailoverApplied: the RG was placed in SecondaryHold by this request.
+	FailoverApplied FailoverOutcome = iota
+	// FailoverSuperseded: a concurrent ResetFailover won; this request made no
+	// change. NOT an error — the reset is the operator's newer intent.
+	FailoverSuperseded
+)
+
+func (o FailoverOutcome) String() string {
+	if o == FailoverSuperseded {
+		return "superseded"
+	}
+	return "applied"
+}
+
+func (m *Manager) ManualFailover(rgID int) (FailoverOutcome, error) {
 	m.mu.Lock()
 	rg, ok := m.groups[rgID]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("redundancy group %d not found", rgID)
+		return FailoverApplied, fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	if m.failoverInProgress[rgID] {
 		m.mu.Unlock()
-		return fmt.Errorf("failover already in progress for redundancy group %d, please wait", rgID)
+		return FailoverApplied, fmt.Errorf("failover already in progress for redundancy group %d, please wait", rgID)
 	}
 	m.failoverInProgress[rgID] = true
 	// Snapshot the per-RG failover generation before releasing m.mu for the
@@ -101,12 +129,12 @@ func (m *Manager) ManualFailover(rgID int) error {
 	defer delete(m.failoverInProgress, rgID)
 
 	if preHookErr != nil {
-		return preHookErr
+		return FailoverApplied, preHookErr
 	}
 
 	rg, ok = m.groups[rgID]
 	if !ok {
-		return fmt.Errorf("redundancy group %d not found", rgID)
+		return FailoverApplied, fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	// If a ResetFailover ran during the unlocked pre-hook window it bumped
 	// this RG's failover generation. The trailing SecondaryHold write below
@@ -115,7 +143,11 @@ func (m *Manager) ManualFailover(rgID int) error {
 	// intact. failoverInProgress is cleared by the deferred delete above.
 	if m.failoverGen[rgID] != failoverGen {
 		slog.Info("cluster: manual failover superseded by reset, abandoning", "rg", rgID)
-		return nil
+		// #8000: report the supersede rather than a bare nil. The caller needs
+		// it for two things a plain success cannot express — telling the
+		// operator the RG did NOT move, and dropping the fence barrier it armed,
+		// which nothing will now actuate.
+		return FailoverSuperseded, nil
 	}
 	oldState := rg.State
 	// A fresh manual failover supersedes any prior remote transfer-out lease on
@@ -131,7 +163,7 @@ func (m *Manager) ManualFailover(rgID int) error {
 		m.sendEvent(rg.GroupID, oldState, rg.State, "Manual failover")
 	}
 	slog.Info("cluster: manual failover", "rg", rgID)
-	return nil
+	return FailoverApplied, nil
 }
 
 // ForceSecondary sets weight to 0 for all redundancy groups, forcing this node
@@ -551,27 +583,64 @@ func failoverBatchKey(rgIDs []int) string {
 	return strings.Join(parts, ",")
 }
 
+// BatchFailoverResult reports, per redundancy group, what a batch request
+// actually did (#8000).
+//
+// Superseded is not a failure list. A member lands there when a concurrent
+// ResetFailover won the race for it (#5246) — the reset is the operator's newer
+// intent and the skip is correct. What was missing is that the batch returned
+// nil either way, so a caller could not tell a full handoff from a partial one,
+// and the fence barrier armed for a skipped member was left for the applied-ack
+// to time out on.
+type BatchFailoverResult struct {
+	// Applied are the RGs this request placed in SecondaryHold.
+	Applied []int
+	// Superseded are the RGs a concurrent reset claimed. No error, no change.
+	Superseded []int
+}
+
+// Partial reports whether any member was superseded, i.e. the batch did NOT do
+// what it was asked in full.
+func (r BatchFailoverResult) Partial() bool { return len(r.Superseded) > 0 }
+
 // ManualFailoverBatch forces multiple redundancy groups to transfer out of
 // primary together. Used for full data-plane handoff so a paired move does not
 // transiently pass through split ownership.
-func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
+//
+// #8000: returns the per-RG outcome. The error is reserved for a request that
+// failed — an unknown member, a rejected pre-hook — and never for a supersede,
+// which is a correct outcome the caller must still be able to see.
+func (m *Manager) ManualFailoverBatch(rgIDs []int) (BatchFailoverResult, error) {
+	var res BatchFailoverResult
 	ids, err := normalizeFailoverRGIDs(rgIDs)
 	if err != nil {
-		return err
+		return res, err
 	}
 	if len(ids) == 1 {
-		return m.ManualFailover(ids[0])
+		// The single-member batch delegates, so the batch's own contract
+		// depends on the singular path reporting its outcome too — which is why
+		// #8000 could not be fixed on the batch alone.
+		outcome, err := m.ManualFailover(ids[0])
+		if err != nil {
+			return res, err
+		}
+		if outcome == FailoverSuperseded {
+			res.Superseded = append(res.Superseded, ids[0])
+		} else {
+			res.Applied = append(res.Applied, ids[0])
+		}
+		return res, nil
 	}
 
 	m.mu.Lock()
 	for _, rgID := range ids {
 		if _, ok := m.groups[rgID]; !ok {
 			m.mu.Unlock()
-			return fmt.Errorf("redundancy group %d not found", rgID)
+			return res, fmt.Errorf("redundancy group %d not found", rgID)
 		}
 		if m.failoverInProgress[rgID] {
 			m.mu.Unlock()
-			return fmt.Errorf("failover already in progress for redundancy groups %v, please wait", ids)
+			return res, fmt.Errorf("failover already in progress for redundancy groups %v, please wait", ids)
 		}
 	}
 	batchGen := make(map[int]uint64, len(ids))
@@ -635,7 +704,7 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 	}()
 
 	if preHookErr != nil {
-		return preHookErr
+		return res, preHookErr
 	}
 
 	// #7176 (C179-065): a member REMOVED from config during the unlocked
@@ -662,7 +731,7 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 	for _, rgID := range ids {
 		rg := m.groups[rgID]
 		if rg == nil {
-			return fmt.Errorf("redundancy group %d not found", rgID)
+			return res, fmt.Errorf("redundancy group %d not found", rgID)
 		}
 		resolved = append(resolved, rg)
 	}
@@ -674,13 +743,20 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 		// its failover generation — its reset wins; skip the SecondaryHold
 		// write so we don't clobber it (#5246).
 		if m.failoverGen[rgID] != batchGen[rgID] {
+			// #8000: record it. The skip itself is #5246 working as designed
+			// and stays exactly as it was; what changes is that the caller can
+			// now SEE it, instead of the batch reporting a full handoff and
+			// leaving the applied-ack to time out on a barrier nothing will
+			// actuate.
 			slog.Info("cluster: manual failover batch member superseded by reset, skipping", "rg", rgID)
+			res.Superseded = append(res.Superseded, rgID)
 			continue
 		}
 		oldState := rg.State
 		// Fresh batch failover supersedes any prior remote transfer-out lease;
 		// the remote path re-arms after this returns (#5079).
 		m.clearRemoteTransferOutLeaseLocked(rgID)
+		res.Applied = append(res.Applied, rgID)
 		rg.ManualFailover = true
 		rg.ManualFailoverAt = now
 		rg.State = StateSecondaryHold
@@ -690,7 +766,7 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 		}
 	}
 	slog.Info("cluster: manual failover batch", "rgs", ids)
-	return nil
+	return res, nil
 }
 
 // RequestPeerFailoverBatch asks the peer to transfer multiple redundancy

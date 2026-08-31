@@ -47,7 +47,7 @@ func TestManualFailoverBatch_MissingMemberReports_7176(t *testing.T) {
 	})
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- m.ManualFailoverBatch([]int{0, 1}) }()
+	go func() { _, err := m.ManualFailoverBatch([]int{0, 1}); errCh <- err }()
 	<-hookStarted
 
 	// RG1 disappears from config during the unlocked window.
@@ -86,7 +86,7 @@ func TestManualFailoverBatch_AllPresentSucceeds_7176(t *testing.T) {
 	))
 	drainEvents(m, 4)
 
-	if err := m.ManualFailoverBatch([]int{0, 1}); err != nil {
+	if _, err := m.ManualFailoverBatch([]int{0, 1}); err != nil {
 		t.Fatalf("ManualFailoverBatch on a healthy pair = %v, want nil", err)
 	}
 	moved := 0
@@ -124,7 +124,7 @@ func TestManualFailoverBatch_SupersededStillReturnsNil_7176(t *testing.T) {
 	})
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- m.ManualFailoverBatch([]int{0, 1}) }()
+	go func() { _, err := m.ManualFailoverBatch([]int{0, 1}); errCh <- err }()
 	<-hookStarted
 	// Supersede RG1 — its generation bumps, the batch must skip it and, per
 	// #5246, still report success.

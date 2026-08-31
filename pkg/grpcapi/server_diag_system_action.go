@@ -573,8 +573,17 @@ func (s *Server) executeClusterFailover(ctx context.Context, req *pb.SystemActio
 		}, nil
 
 	case clusterfailover.KindRGFailover:
-		if err := s.cluster.ManualFailover(op.RG); err != nil {
+		outcome, err := s.cluster.ManualFailover(op.RG)
+		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		// #8000: a supersede is not an error — a concurrent `reset` is the
+		// operator's newer intent — but reporting it as "triggered" tells them
+		// a failover happened when none did.
+		if outcome == cluster.FailoverSuperseded {
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("Manual failover for redundancy group %d was superseded by a concurrent reset; no failover performed", op.RG),
+			}, nil
 		}
 		return &pb.SystemActionResponse{
 			Message: fmt.Sprintf("Manual failover triggered for redundancy group %d", op.RG),

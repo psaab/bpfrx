@@ -27,7 +27,7 @@ func TestRemoteTransferOutLeaseRestoresOwnerWhenNoCommitArrives(t *testing.T) {
 
 	// Peer failover request → demote to secondary-hold, then arm the lease
 	// exactly as the daemon's OnRemoteFailover wiring does.
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -92,7 +92,7 @@ func TestRemoteTransferOutLeaseClearIsReqIDBound(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -126,14 +126,14 @@ func TestLocalManualFailoverClearsRemoteTransferOutLease(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
 	m.ArmRemoteTransferOutLease([]int{0}, 7)
 
 	// A fresh local manual failover supersedes the lease (no re-arm follows).
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("second ManualFailover() error = %v", err)
 	}
 	m.mu.Lock()
@@ -161,7 +161,7 @@ func TestResetFailoverClearsRemoteTransferOutLease(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -204,7 +204,7 @@ func TestRemoteTransferOutLeaseRestoresBatchOwners(t *testing.T) {
 	<-m.Events()
 	<-m.Events()
 
-	if err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
+	if _, err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
 		t.Fatalf("ManualFailoverBatch() error = %v", err)
 	}
 	<-m.Events()

@@ -112,7 +112,7 @@ func TestUpdateConfig_PreservesState(t *testing.T) {
 	}
 
 	// Manually failover RG 0.
-	m.ManualFailover(0)
+	_, _ = m.ManualFailover(0)
 
 	// Re-apply config with updated priority but same groups.
 	cfg2 := makeConfig(
@@ -271,7 +271,7 @@ func TestManualFailover(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events() // election event
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -321,7 +321,7 @@ func TestManualFailover_PreHookRunsBeforeResign(t *testing.T) {
 		return nil
 	})
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatal(err)
 	}
 	if !called {
@@ -339,7 +339,7 @@ func TestManualFailover_PreHookErrorPreventsResign(t *testing.T) {
 		return fmt.Errorf("boom")
 	})
 
-	if err := m.ManualFailover(0); err == nil {
+	if _, err := m.ManualFailover(0); err == nil {
 		t.Fatal("expected pre-manual-failover hook error")
 	}
 
@@ -369,7 +369,7 @@ func TestManualFailover_RetryablePreHookRetriesThenSucceeds(t *testing.T) {
 		return nil
 	})
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	if attempts != 3 {
@@ -398,7 +398,7 @@ func TestManualFailover_RetryablePreHookTimeoutKeepsPrimary(t *testing.T) {
 		return &RetryablePreFailoverError{Err: fmt.Errorf("still busy")}
 	})
 
-	if err := m.ManualFailover(0); err == nil {
+	if _, err := m.ManualFailover(0); err == nil {
 		t.Fatal("expected retryable pre-hook timeout error")
 	}
 	if attempts < 2 {
@@ -415,7 +415,7 @@ func TestManualFailover_RetryablePreHookTimeoutKeepsPrimary(t *testing.T) {
 
 func TestManualFailover_UnknownRG(t *testing.T) {
 	m := NewManager(0, 1)
-	if err := m.ManualFailover(99); err == nil {
+	if _, err := m.ManualFailover(99); err == nil {
 		t.Error("expected error for unknown RG")
 	}
 }
@@ -437,14 +437,15 @@ func TestManualFailover_RejectsBackToBack(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- m.ManualFailover(0)
+		_, err := m.ManualFailover(0)
+		errCh <- err
 	}()
 
 	// Wait for the first failover to enter the pre-hook.
 	<-hookStarted
 
 	// Second failover for the same RG should be rejected immediately.
-	err := m.ManualFailover(0)
+	_, err := m.ManualFailover(0)
 	if err == nil {
 		t.Fatal("expected error for back-to-back failover on same RG")
 	}
@@ -488,13 +489,14 @@ func TestManualFailover_DifferentRGsAllowed(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- m.ManualFailover(0)
+		_, err := m.ManualFailover(0)
+		errCh <- err
 	}()
 
 	<-hookStarted
 
 	// RG 1 failover should succeed even though RG 0 is in progress.
-	if err := m.ManualFailover(1); err != nil {
+	if _, err := m.ManualFailover(1); err != nil {
 		t.Fatalf("failover for different RG should succeed: %v", err)
 	}
 
@@ -515,7 +517,7 @@ func TestManualFailover_InProgressClearedOnPreHookError(t *testing.T) {
 	})
 
 	// First attempt fails.
-	if err := m.ManualFailover(0); err == nil {
+	if _, err := m.ManualFailover(0); err == nil {
 		t.Fatal("expected pre-hook error")
 	}
 
@@ -524,7 +526,7 @@ func TestManualFailover_InProgressClearedOnPreHookError(t *testing.T) {
 	m.SetPreManualFailoverHook(func(rgID int) error {
 		return nil
 	})
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("retry after failed failover should succeed: %v", err)
 	}
 }
@@ -970,7 +972,7 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
 	<-m.Events()
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -1019,7 +1021,7 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
 	<-m.Events()
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -1068,7 +1070,7 @@ func TestFinalizePeerTransferOutClearsSecondaryHold(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	<-m.Events()
@@ -1095,7 +1097,7 @@ func TestFinalizePeerTransferOutBatchClearsSecondaryHold(t *testing.T) {
 	<-m.Events()
 	<-m.Events()
 
-	if err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
+	if _, err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
 		t.Fatalf("ManualFailoverBatch() error = %v", err)
 	}
 	<-m.Events()
@@ -1235,7 +1237,7 @@ func TestHandlePeerTimeoutSuppressedDuringRecentTransferCommitGrace(t *testing.T
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	m.mu.Lock()
@@ -1302,7 +1304,7 @@ func TestFinalizePeerTransferOutClearsStaleInboundTransferGrace(t *testing.T) {
 		t.Fatal("should be primary after local transfer commit")
 	}
 
-	if err := m.ManualFailover(0); err != nil {
+	if _, err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
 	if err := m.FinalizePeerTransferOut(0); err != nil {
@@ -1356,7 +1358,7 @@ func TestFinalizePeerTransferOutBatchClearsStaleInboundTransferGrace(t *testing.
 		t.Fatal("both redundancy groups should be primary after local batch transfer commit")
 	}
 
-	if err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
+	if _, err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
 		t.Fatalf("ManualFailoverBatch() error = %v", err)
 	}
 	if err := m.FinalizePeerTransferOutBatch([]int{1, 2}); err != nil {
@@ -1495,7 +1497,7 @@ func TestResetFailover(t *testing.T) {
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	m.ManualFailover(0)
+	_, _ = m.ManualFailover(0)
 	<-m.Events() // drain failover event
 
 	if err := m.ResetFailover(0); err != nil {
@@ -1907,7 +1909,7 @@ func TestLocalPriorities_SecondaryGets100(t *testing.T) {
 	drainEvents(m, 2)
 
 	// Manually failover RG 1 → secondary.
-	m.ManualFailover(1)
+	_, _ = m.ManualFailover(1)
 	drainEvents(m, 1)
 
 	prios := m.LocalPriorities()

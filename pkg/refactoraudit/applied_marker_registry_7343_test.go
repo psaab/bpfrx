@@ -49,6 +49,16 @@ var notMarkerFiles7343 = map[string][]markerStmt{
 	// Accumulators — appending to a result slice.
 	"pkg/vrrp/instance_vip.go":                                {{`res.applied = append(res.applied, vip)`, 2}},
 	"pkg/dataplane/userspace/manager_sessionsync_transmit.go": {{`res.applied = append(res.applied, i)`, 1}},
+	// #8000: BatchFailoverResult is a local `var res` that is only ever
+	// RETURNED (never assigned into m.*), so these two record what one call
+	// did for its caller. Nothing stores them and nothing re-reads them to
+	// decide whether to converge, which is what a marker would need a driver
+	// for. The two statements are the commit loop and the one-member
+	// delegation arm.
+	"pkg/cluster/failover.go": {
+		{`res.Applied = append(res.Applied, ids[0])`, 1},
+		{`res.Applied = append(res.Applied, rgID)`, 1},
+	},
 	// Read-outs into a display view or a snapshot returned to a caller.
 	"pkg/cli/cli_show_security_filters.go": {{`v.appliedGen = cr.Generation`, 1}},
 	"pkg/cluster/sync_bulk.go":             {{`snap.AppliedConfigGen = s.lastAppliedConfigGen.Load()`, 1}},
@@ -118,13 +128,13 @@ var markerFiles7343 = map[string]markerFile{
 	},
 	"pkg/dataplane/userspace/manager_generation.go": {
 		Driver: "statusLoop", DriverPkg: "pkg/dataplane/userspace",
-		Why:    "guard: skipped entirely unless fullSnapshotWasPublished",
-		Stmts:  []markerStmt{{`m.publishedSnapshot = m.lastSnapshot.Generation`, 1}},
+		Why:   "guard: skipped entirely unless fullSnapshotWasPublished",
+		Stmts: []markerStmt{{`m.publishedSnapshot = m.lastSnapshot.Generation`, 1}},
 	},
 	"pkg/dataplane/userspace/applied_nat_view.go": {
 		Driver: "statusLoop", DriverPkg: "pkg/dataplane/userspace",
-		Why:    "guard: skipped while deferWorkers is set; the rebind reconcile captures it later",
-		Stmts:  []markerStmt{{`m.appliedSnapshot = appliedSnapshot{`, 1}},
+		Why:   "guard: skipped while deferWorkers is set; the rebind reconcile captures it later",
+		Stmts: []markerStmt{{`m.appliedSnapshot = appliedSnapshot{`, 1}},
 	},
 	"pkg/feeds/feeds.go": {
 		Driver: "refreshLoop", DriverPkg: "pkg/feeds",
@@ -138,7 +148,7 @@ var markerFiles7343 = map[string]markerFile{
 	},
 	"pkg/ddns/surface_a.go": {
 		Driver: "reconcileScopeLocked", DriverPkg: "pkg/ddns",
-		Why:   "early return: the publish error returns above the stamp and records backoff",
+		Why: "early return: the publish error returns above the stamp and records backoff",
 		Stmts: []markerStmt{
 			{`rt.lastPublished = now`, 1},
 			{`v.LastPublished = rt.lastPublished`, 2},

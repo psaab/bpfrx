@@ -128,7 +128,8 @@ func TestManualFailover_ResetDuringPreHookWins(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- m.ManualFailover(0)
+		_, err := m.ManualFailover(0)
+		errCh <- err
 	}()
 
 	// Wait for ManualFailover to enter the pre-hook (m.mu released here).

@@ -319,10 +319,25 @@ func (d *Daemon) wireSessionSyncFailoverCallbacks(ss *cluster.SessionSync) {
 		// cannot actuate-and-forget before WaitFailoverApplied observes
 		// it. The applied-ack (sync layer) then waits on this barrier.
 		barrier := d.armFailoverActuation(rgID, reqID)
-		if err := d.cluster.ManualFailover(rgID); err != nil {
+		outcome, err := d.cluster.ManualFailover(rgID)
+		if err != nil {
 			d.disarmFailoverActuation(rgID, reqID, barrier)
 			slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
 			return err
+		}
+		// #8000: a supersede enqueues NO demotion event, so nothing will ever
+		// actuate this barrier. Left armed, the applied-ack below waits the full
+		// fence timeout and then reports "timed out waiting for local fence
+		// actuation of redundancy group N" — a real error, naming the right RG,
+		// and blaming the wrong subsystem: the fencing path is fine, a
+		// concurrent reset simply won. Dropping the barrier makes
+		// WaitFailoverApplied return immediately (it returns nil when none is
+		// armed), so the correct outcome stops being reported as an
+		// infrastructure fault.
+		if outcome == cluster.FailoverSuperseded {
+			d.disarmFailoverActuation(rgID, reqID, barrier)
+			slog.Info("cluster: remote failover superseded by reset; no transfer performed",
+				"rg", rgID, "req_id", reqID)
 		}
 		// #5079: bind an auto-restore lease to this request. If the
 		// requester aborts after this ACK (or crashes / loses the fabric)
@@ -345,12 +360,25 @@ func (d *Daemon) wireSessionSyncFailoverCallbacks(ss *cluster.SessionSync) {
 		for _, rgID := range rgIDs {
 			barriers[rgID] = d.armFailoverActuation(rgID, reqID)
 		}
-		if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
+		res, err := d.cluster.ManualFailoverBatch(rgIDs)
+		if err != nil {
 			for _, rgID := range rgIDs {
 				d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
 			}
 			slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
 			return err
+		}
+		// #8000: same as the singular path, per skipped member. Without this a
+		// PARTIALLY applied batch reported full success here and then failed the
+		// applied-ack with a fence timeout on whichever member the reset won —
+		// so the operator was told the wrong thing twice, in two different
+		// directions, about the same request.
+		for _, rgID := range res.Superseded {
+			d.disarmFailoverActuation(rgID, reqID, barriers[rgID])
+		}
+		if res.Partial() {
+			slog.Warn("cluster: remote batch failover partially applied; members superseded by reset",
+				"rgs", rgIDs, "applied", res.Applied, "superseded", res.Superseded, "req_id", reqID)
 		}
 		// #5079: bind auto-restore leases to this request across the set.
 		d.cluster.ArmRemoteTransferOutLease(rgIDs, reqID)
