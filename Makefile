@@ -90,7 +90,28 @@ test-shim-run:
 		echo "test-shim-run: needs root (BPF program load). Re-run with sudo."; \
 		exit 1; \
 	fi
-	go test ./pkg/dataplane/userspace/ -run 'TestFragment|TestNonFirstFragment' -v -count=1
+	# #7494/#6743-r2-N3: a `-run` predicate is a claim about the names of tests
+	# that do not exist yet, and it fails SILENTLY in the only direction that
+	# matters -- a cell whose name stops matching is not skipped-and-reported,
+	# it is invisible. This target shipped with `TestFragment|TestNonFirstFragment`,
+	# which does not match `TestV6...`, so it printed a clean 4/4 while the v6
+	# cells never executed. A bare count cannot catch that either: the regex also
+	# matches unrelated tests in this package (TestFilterSnapshotIsFragmentSerialized),
+	# so the total is inflated by cells from other files. So the check is by NAME:
+	# every `func Test...` in the file must appear as a `=== RUN` line.
+	@out=$$(go test ./pkg/dataplane/userspace/ -run 'TestV6|TestFragment|TestNonFirstFragment' -v -count=1 2>&1); \
+	status=$$?; \
+	echo "$$out"; \
+	missing=''; \
+	for n in $$(grep -oE '^func Test[A-Za-z0-9_]+' pkg/dataplane/userspace/fragment_disposition_7494_test.go | sed 's/^func //'); do \
+		echo "$$out" | grep -q "^=== RUN   $$n$$" || missing="$$missing $$n"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "test-shim-run: these cells exist but did NOT run:$$missing"; \
+		echo "test-shim-run: the -run predicate has stopped matching them. Widen it or drop it."; \
+		exit 1; \
+	fi; \
+	exit $$status
 
 test-go: test-race-dp
 	# go vet gate scoped to pkg/flowexport (#2224): catches the

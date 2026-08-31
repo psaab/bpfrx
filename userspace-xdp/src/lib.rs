@@ -69,7 +69,8 @@ mod binding_index;
 mod ipv6_ext_walk;
 use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
 use ipv6_ext_walk::{
-    EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, eh_class, eh_class_table, read_bytes,
+    EH_CLASS_TERMINAL, FragHdr, MAX_EXT_HDRS, PROTO_FRAGMENT_NO_L4, eh_class, eh_class_table,
+    read_bytes,
 };
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
@@ -1338,7 +1339,31 @@ fn parse_ipv4(
         return None;
     }
     unsafe { read_bytes(data, data_end, l3_offset as usize, ihl) }?;
-    let protocol = iph[9];
+    // #7494: a non-first fragment has no L4 header -- the bytes at the resolved
+    // offset are payload. Substituting the sentinel routes it into parse_l4's
+    // EXISTING unknown-protocol arm, which returns zeroed ports and cannot
+    // fail. That closes both exposures at one site:
+    //
+    //   #1  no payload-derived tuple reaches live_userspace_session_action.
+    //       The session lookup can never match -- the helper only ever installs
+    //       real protocols -- so a fragment is a GUARANTEED MISS, deliberately,
+    //       and falls through to the XSK redirect where the helper adjudicates.
+    //   #5  parse_l4's TCP arm returns None when the payload byte it reads as a
+    //       data-offset nibble is < 5, and the caller turns None into
+    //       drop_degraded_transit. That made the DISPOSITION OF A FRAGMENT
+    //       SELECTABLE BY ITS OWN PAYLOAD. The unknown-protocol arm cannot
+    //       fail, so that drop disappears.
+    //
+    // A guard at the branch point CANNOT do this: parse_l4 runs here, inside
+    // the parser, so #5's drop happens before any later consumer sees the
+    // packet. That is why this is in the parser and not beside the session
+    // lookup.
+    let non_first_fragment = (u16::from_be_bytes([iph[6], iph[7]]) & 0x1FFF) != 0;
+    let protocol = if non_first_fragment {
+        PROTO_FRAGMENT_NO_L4
+    } else {
+        iph[9]
+    };
     let tos = iph[1];
     let l4_offset = l3_offset.checked_add(ihl as u16)?;
     let (payload_offset, tcp_flags, flow_src_port, flow_dst_port, icmp_type) =

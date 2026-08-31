@@ -59,6 +59,13 @@ func TestUserspaceXDPShimObjectMatchesSourceManifest(t *testing.T) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "userspace-xdp shim source is out of lockstep with the tracked object.\n")
 	fmt.Fprintf(&b, "The embedded pkg/dataplane/userspace_xdp_bpfel.o may be STALE.\n")
+	// The rule, not the fact. This guard was documented as "the manifest hashes
+	// the shim sources by content", which is true and does not fire when you
+	// need it -- a fact has to be recalled, a rule attached to the action does
+	// not. Someone editing ONLY a comment in a shim source reasonably expects
+	// no rebuild, and that is exactly the edit that reds here.
+	fmt.Fprintf(&b, "This fires on ANY change to a shim source, INCLUDING a comment-only\n")
+	fmt.Fprintf(&b, "edit: the manifest hashes these files by content, not by meaning.\n")
 	fmt.Fprintf(&b, "Fix: run `make generate` to rebuild the object and refresh %s.\n\n",
 		UserspaceXDPManifestRelPath)
 

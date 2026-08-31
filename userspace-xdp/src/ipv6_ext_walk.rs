@@ -157,6 +157,26 @@ pub unsafe fn read_bytes<'a>(
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// #7494: the value `parse_ipv4`/`parse_ipv6` substitute for the real upper-
+/// layer protocol when the packet is a NON-FIRST fragment, i.e. when there is
+/// no L4 header at the resolved offset to read. It routes the packet into
+/// `parse_l4`'s existing unknown-protocol arm, which returns zeroed ports and
+/// CANNOT fail.
+///
+/// It lives in this shared module, not in the shim, so that BOTH sides of the
+/// boundary can assert about it: `tests_shim_ext_parity.rs` pulls this file in
+/// by source path -- described, not spelled, per this module's own comment
+/// above -- and can therefore check the value against userspace-dp's
+/// `ipv6_ext_header_is_traversable` set, which no other location can see.
+///
+/// The value is NOT free to change. 253 and 254 are already load-bearing on
+/// this same wire field -- they are members of the traversable set, which the
+/// helper reads as "the shim gave up mid-chain" -- so a sentinel chosen as
+/// "some high unused number" could silently reclassify every fragment. 255 is
+/// IANA-Reserved and is a member of neither that set nor any protocol the shim
+/// branches on.
+pub const PROTO_FRAGMENT_NO_L4: u8 = 255;
+
 /// The terminal an extension-header walk lands on, plus the fragment sighting
 /// the caller needs to know whether the bytes THERE are an L4 header at all.
 ///

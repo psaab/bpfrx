@@ -1,7 +1,12 @@
 # #7494 — consuming the #6704 non-first-fragment sighting
 
-**Status:** plan, not an implementation. Every shape below carries a measured
-figure or is explicitly marked unmeasured.
+**Status:** the IPv4 half is IMPLEMENTED; the IPv6 half is blocked on headroom.
+Every shape below carries a measured figure or is explicitly marked unmeasured.
+
+**§6 was rewritten after its original recommendation was measured WRONG.** It
+recommended a guard at the branch point. That guard is structurally incapable
+of fixing exposure #5, and a reader who followed it would have built the wrong
+thing and measured it as a success.
 
 **Base:** master `3e91d4ae0`. The shim is unchanged from `35399d2b3`, so every
 number here is current for both.
@@ -114,47 +119,3 @@ difference between B4 (805,941) and this (805,394).
 instrument, not a correctness one. On this issue it is doing so much work that
 a PASS reads as validation, and R1 and R2 are both cases where it would not be.
 
-## 5. IPv6 is unsolved, and B6 says why
-
-IPv4 needs one masked load at a fixed offset (`frag_off & 0x1FFF`). IPv6 has no
-fixed position for the Fragment header, so re-deriving means walking the chain
-again — and B6 measures that second walk as **REJECT**.
-
-That is not "IPv6 is impossible", it is "this channel is too expensive for
-IPv6". What it rules out, given §2:
-
-- carrying it out of `parse_ipv6` on `ParsedPacket` — shape A, REJECT;
-- making the L4 *values* depend on the predicate — the body's rows 2/3, REJECT;
-- re-deriving by re-walking — B6, REJECT.
-
-**The untested channel is a non-drop decline at the parse dispatch**: let the
-parser distinguish "could not parse" (drop, today's behaviour) from "valid but
-not L4-inspectable" (fall through to the XSK redirect). That adds a discriminant
-to the *return* of parse rather than a field to `ParsedPacket`, so §3 does not
-obviously apply to it — but "does not obviously apply" is exactly the reasoning
-that produced shape A, and it is **unmeasured**. It is the next run.
-
-## 6. Recommendation
-
-**Do not split v4 from v6 on this cost asymmetry.** The exposure set is
-identical, the correct disposition is identical, and a v4-only fix leaves
-`parse_l4` reading fragment payload as a TCP header on the family the issue was
-filed about. Different cost, same contract — a v4/v6 pair that drifts because
-one half was cheaper is a known failure shape here.
-
-So: measure §5's dispatch channel before committing. If it fits, land both
-halves together at a combined cost that §2 says has room. If it does not, #7494
-becomes a decision about whether the sighting is worth buying headroom for, and
-that decision should be taken with 48,552 on the table rather than the 222,099
-the stale prose implied.
-
-## 7. What is NOT measured
-
-1. **`wg_steer_to_kernel`** (`lib.rs:618`) runs *before* the block B4 guards and
-   is L4-keyed on `flow_dst_port`. It is one of the four exposures the issue
-   lists, and B4 does not cover it. A complete fix guards it too, at unmeasured
-   additional cost.
-2. **`should_fallback_early`** — not audited for L4 dependence.
-3. **Behaviour.** No fragment has been put through any of these shapes. Every
-   number here is a headroom measurement. Per §4, that is precisely the axis on
-   which R1 and R2 both look fine.

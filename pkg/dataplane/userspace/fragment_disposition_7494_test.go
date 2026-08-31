@@ -255,11 +255,12 @@ func TestFragmentSessionPlantingIsObservable(t *testing.T) {
 // fragment PAYLOAD. A collision with a live PASS_TO_KERNEL session hands the
 // fragment to the kernel instead of the userspace helper.
 //
-// CHARACTERIZATION, NOT AN ENDORSEMENT. The assertions below pin the CURRENT,
-// WRONG behaviour so that it cannot change unnoticed. When #7494 lands, a
-// non-first fragment must reach the helper regardless of what its payload
-// collides with, and this cell MUST go red -- inverting it is part of that
-// change, not a fix to this test.
+// This cell was written as characterization of the DEFECT and has been
+// re-pointed now that #7494's IPv4 half has landed. It previously asserted the
+// fragment WAS diverted to the kernel; it now asserts it is not. The history
+// matters: the exposure was demonstrated before it was fixed, so this is a
+// regression test with a measured red behind it rather than an assertion
+// written after the fact.
 func TestNonFirstFragmentIsAdjudicatedByPayloadKeyedSession_7494(t *testing.T) {
 	coll := fragLoad(t)
 	frag := ipv4Frame(0x00b9) // offset 185 -> a NON-FIRST fragment
@@ -269,10 +270,9 @@ func TestNonFirstFragmentIsAdjudicatedByPayloadKeyedSession_7494(t *testing.T) {
 	if dControl["REDIRECT_ERR"] == 0 {
 		t.Fatalf("without a planted session the fragment did not reach the XSK "+
 			"redirect (reasons=%v); the cell is not exercising the path it "+
-			"claims to. IF #7494 HAS LANDED THIS RED IS EXPECTED: a fragment "+
-			"should still reach the helper, so a PARSE_FAIL here means the fix "+
-			"took the must-not-build blackhole shape. Invert or repair this "+
-			"cell -- do not delete it", dControl)
+			"claims to. A PARSE_FAIL here means the fix took the must-not-build "+
+			"blackhole shape -- declining in the parser lands on "+
+			"drop_degraded_transit and discards every legitimate fragment", dControl)
 	}
 
 	// The tuple the shim derives from PAYLOAD bytes, not from any real header.
@@ -283,12 +283,14 @@ func TestNonFirstFragmentIsAdjudicatedByPayloadKeyedSession_7494(t *testing.T) {
 	retHit, dHit := fragRun(t, coll, frag)
 	t.Logf("COLLISION fragment + payload-keyed session -> ret=%d reasons=%v", retHit, dHit)
 
-	if dHit["PASS_TO_KERNEL"] == 0 {
-		t.Errorf("EXPECTED the #7494 exposure to still be present: a non-first "+
-			"fragment should currently be adjudicated by a session keyed on its "+
-			"PAYLOAD bytes and sent to the kernel, but reasons=%v. If #7494 has "+
-			"landed, that is the intended outcome -- invert this cell to assert "+
-			"REDIRECT_ERR instead of deleting it", dHit)
+	if dHit["REDIRECT_ERR"] == 0 || dHit["PASS_TO_KERNEL"] > 0 {
+		t.Errorf("a non-first IPv4 fragment was adjudicated by a session keyed on "+
+			"its PAYLOAD bytes (reasons=%v). #7494's sentinel makes the session "+
+			"lookup a GUARANTEED MISS for fragments -- the helper only ever "+
+			"installs real protocols -- so the fragment must fall through to the "+
+			"XSK redirect regardless of what its payload collides with. A "+
+			"PASS_TO_KERNEL here means the sentinel is not reaching "+
+			"live_userspace_session_action", dHit)
 	}
 }
 
@@ -300,8 +302,10 @@ func TestNonFirstFragmentIsAdjudicatedByPayloadKeyedSession_7494(t *testing.T) {
 // So the same fragment of the same flow is DROPPED or FORWARDED depending on
 // its content. Both arms are asserted so neither can silently become the other.
 //
-// CHARACTERIZATION, as above: when #7494 lands both payload values must produce
-// the same disposition, and this cell must go red.
+// Re-pointed with #7494's IPv4 half: both payload values must now produce the
+// SAME disposition, and it must be the helper rather than a drop. The pre-fix
+// behaviour -- 0x00 dropped, 0x50 forwarded -- was measured, so the inversion
+// below is a recorded transition rather than a fresh guess.
 func TestNonFirstFragmentDispositionDependsOnPayloadBytes_7494(t *testing.T) {
 	coll := fragLoad(t)
 
@@ -316,10 +320,13 @@ func TestNonFirstFragmentDispositionDependsOnPayloadBytes_7494(t *testing.T) {
 	t.Logf("payload byte 0x00 -> ret=%d reasons=%v", retLow, dLow)
 	t.Logf("payload byte 0x50 -> ret=%d reasons=%v", retHigh, dHigh)
 
-	if dLow["PARSE_FAIL"] == 0 {
-		t.Errorf("a non-first fragment whose payload byte is 0x00 was expected to "+
-			"be DROPPED via PARSE_FAIL, got reasons=%v. If #7494 has landed this "+
-			"is the intended outcome -- invert the cell", dLow)
+	if dLow["PARSE_FAIL"] > 0 {
+		t.Errorf("a non-first IPv4 fragment was DROPPED via PARSE_FAIL because of "+
+			"its own payload byte (reasons=%v). This is the #7494 exposure-#5 "+
+			"regression: parse_l4's TCP arm returns None when the payload byte it "+
+			"reads as a data-offset nibble is < 5, which makes a fragment's "+
+			"disposition selectable by an off-path party. The sentinel must route "+
+			"fragments to the unknown-protocol arm, which cannot fail", dLow)
 	}
 	if dHigh["REDIRECT_ERR"] == 0 {
 		t.Errorf("a non-first fragment whose payload byte is 0x50 was expected to "+
@@ -329,12 +336,156 @@ func TestNonFirstFragmentDispositionDependsOnPayloadBytes_7494(t *testing.T) {
 			"is the blackhole shape the plan rejects. Invert or repair -- do not "+
 			"delete", dHigh)
 	}
-	if reflect.DeepEqual(dLow, dHigh) {
-		t.Errorf("both payload values produced the SAME disposition (%v). This "+
-			"cell exists because they differ. IF #7494 HAS LANDED THIS RED IS "+
-			"EXPECTED and is the goal: both payloads must share a disposition, "+
-			"and it must be the helper, not a drop. Re-point this cell at the "+
-			"new invariant -- do not delete it. If #7494 has NOT landed, the "+
-			"fixture stopped discriminating", dLow)
+	if !reflect.DeepEqual(dLow, dHigh) {
+		t.Errorf("the two payload values produced DIFFERENT dispositions "+
+			"(0x00=%v, 0x50=%v). After #7494 a non-first fragment's fate must not "+
+			"depend on its own payload at all -- that independence IS the "+
+			"invariant, and this is the cell that holds it", dLow, dHigh)
+	}
+}
+
+// ipv6Frame builds ethernet + IPv6 + a real Fragment extension header + TCP-ish
+// payload. This CANNOT be an adaptation of the v4 builder: the v4 sighting is
+// one masked load at a fixed offset, while the v6 sighting only exists if the
+// frame carries an actual extension-header chain for the shim's walk to
+// traverse. A v6 cell built by copying the v4 assertion would assert about a
+// packet that never enters the walk -- passing, and testing nothing.
+//
+// fragOff is the raw 16-bit Fragment-header field: offset in the high 13 bits,
+// M flag in bit 0. A non-zero OFFSET is what makes it a non-first fragment.
+func ipv6Frame(fragOff uint16, dataOffByte byte) []byte {
+	p := make([]byte, 128)
+	p[12], p[13] = 0x86, 0xdd // ETH_P_IPV6
+	ip := p[14:]
+	ip[0] = 0x60                                          // version 6
+	binary.BigEndian.PutUint16(ip[4:], uint16(128-14-40)) // payload length
+	ip[6] = 44                                            // next header = Fragment
+	ip[7] = 64                                            // hop limit
+	copy(ip[8:24], []byte{0x20, 0x01, 5, 0x59, 0x85, 0x85, 0xbf, 1, 0, 0, 0, 0, 0, 0, 0, 50})
+	copy(ip[24:40], []byte{0x20, 0x01, 5, 0x59, 0x85, 0x85, 0xbf, 2, 0, 0, 0, 0, 0, 0, 0, 60})
+
+	frag := p[14+40:] // the Fragment extension header, 8 bytes
+	frag[0] = unix.IPPROTO_TCP
+	frag[1] = 0
+	binary.BigEndian.PutUint16(frag[2:], fragOff)
+	binary.BigEndian.PutUint32(frag[4:], 0xdeadbeef) // identification
+
+	l4 := p[14+40+8:]
+	binary.BigEndian.PutUint16(l4[0:], 12345)
+	binary.BigEndian.PutUint16(l4[2:], 443)
+	l4[12] = dataOffByte
+	return p
+}
+
+func fragSessionKeyV6(srcPort, dstPort uint16) fragSessionKey {
+	var src, dst [16]byte
+	copy(src[:], []byte{0x20, 0x01, 5, 0x59, 0x85, 0x85, 0xbf, 1, 0, 0, 0, 0, 0, 0, 0, 50})
+	copy(dst[:], []byte{0x20, 0x01, 5, 0x59, 0x85, 0x85, 0xbf, 2, 0, 0, 0, 0, 0, 0, 0, 60})
+	return fragSessionKey{
+		AddrFamily: 10, Protocol: unix.IPPROTO_TCP,
+		SrcPort: srcPort, DstPort: dstPort, SrcAddr: src, DstAddr: dst,
+	}
+}
+
+// TestV6FixtureReachesTheWalk is the fixture control, and it is the cell that
+// makes the v6 cells below mean anything. A v6 frame that does not actually
+// enter the extension-header walk would produce a clean-looking disposition for
+// entirely the wrong reason. A FIRST fragment (offset 0) must parse normally
+// and reach the helper; if this does not hold, the frame is malformed and every
+// v6 result here is VOID rather than negative.
+func TestV6FixtureReachesTheWalk(t *testing.T) {
+	coll := fragLoad(t)
+	ret, d := fragRun(t, coll, ipv6Frame(0x0000, 0x50)) // offset 0 => FIRST fragment
+	t.Logf("v6 FIRST fragment (offset 0) -> ret=%d reasons=%v", ret, d)
+	if d["PARSE_FAIL"] > 0 {
+		t.Fatalf("the v6 fixture does not parse (reasons=%v). The frame is "+
+			"malformed -- IPv6 header, Fragment header chain, or lengths -- so "+
+			"the v6 cells below are VOID, not evidence that v6 is unaffected", d)
+	}
+}
+
+// TestV6NonFirstFragmentExposuresAreStillLive_7494 is the BUILT form of the v6
+// gap. #7494's v4 half has a measured fix (+92 insns, protocol sentinel); the
+// v6 half does not -- four structurally different channels were rejected by the
+// kernel verifier, so the sighting cannot currently be consumed for IPv6.
+//
+// A comment saying that goes stale and nothing enforces it. This cell asserts
+// the exposures are STILL LIVE for IPv6, so the suite cannot go green and read
+// as "fragments are handled" while half of both exposures is untouched.
+//
+// It must be re-pointed, not deleted, when the v6 half lands. Tracked as #8249;
+// four channels are measured REJECT there with their total_states, so nobody
+// re-derives the dead ends.
+func TestV6NonFirstFragmentExposuresAreStillLive_7494(t *testing.T) {
+	coll := fragLoad(t)
+	frag := ipv6Frame(0x00b8, 0x50) // offset 23 => NON-FIRST fragment
+
+	key := fragSessionKeyV6(12345, 443)
+	if err := coll.Maps["userspace_sessions"].Put(&key, uint8(2)); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	retHit, dHit := fragRun(t, coll, frag)
+	t.Logf("v6 non-first fragment + payload-keyed session -> ret=%d reasons=%v", retHit, dHit)
+
+	lowRet, dLow := fragRun(t, coll, ipv6Frame(0x00b8, 0x00))
+	t.Logf("v6 non-first fragment, payload byte 0x00 -> ret=%d reasons=%v", lowRet, dLow)
+
+	if dHit["PASS_TO_KERNEL"] == 0 && dLow["PARSE_FAIL"] == 0 {
+		t.Errorf("neither v6 exposure reproduced (session-collision=%v, "+
+			"payload-drop=%v). IF THE #7494 v6 HALF HAS LANDED THIS RED IS "+
+			"EXPECTED and is the goal -- re-point this cell at the fixed "+
+			"invariant rather than deleting it. If it has NOT landed, the v6 "+
+			"fixture has stopped reaching the code it targets", dHit, dLow)
+	}
+}
+
+// TestFragmentNeverCreatesASession_7494 proves the premise that clears every
+// operator-visible surface. #7494's sentinel is a value no real protocol has,
+// and the argument that it never reaches an operator rests on fragments never
+// producing a session at all -- if one did, protocol 255 would surface in
+// `show security flow session` and in flow export, and someone would eventually
+// "fix" it by mapping it back to TCP.
+//
+// That was an inference from reading the code. This asserts it: run fragments
+// of both families through and require the session table to be untouched.
+func TestFragmentNeverCreatesASession_7494(t *testing.T) {
+	coll := fragLoad(t)
+	sessions := coll.Maps["userspace_sessions"]
+
+	count := func() int {
+		n := 0
+		var k fragSessionKey
+		var v uint8
+		it := sessions.Iterate()
+		for it.Next(&k, &v) {
+			n++
+		}
+		if err := it.Err(); err != nil {
+			t.Fatalf("iterate sessions: %v -- the instrument is dead and an "+
+				"empty table would prove nothing", err)
+		}
+		return n
+	}
+
+	if before := count(); before != 0 {
+		t.Fatalf("session table is not empty at start (%d entries); this cell "+
+			"cannot distinguish an install from pre-existing state", before)
+	}
+
+	for _, pkt := range [][]byte{
+		ipv4Frame(0x00b9),       // v4 non-first fragment
+		ipv4Frame(0x0000),       // v4 non-fragment, for contrast
+		ipv6Frame(0x00b8, 0x50), // v6 non-first fragment
+		ipv6Frame(0x0000, 0x50), // v6 first fragment
+	} {
+		fragRun(t, coll, pkt)
+	}
+
+	if after := count(); after != 0 {
+		t.Errorf("%d session(s) were installed by running fragments through the "+
+			"shim. The shim is not supposed to install sessions at all -- the "+
+			"helper does -- so this both breaks the #7494 sentinel's "+
+			"operator-visibility argument and means protocol %d can reach "+
+			"`show security flow session`", after, 255)
 	}
 }
