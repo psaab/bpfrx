@@ -340,6 +340,15 @@ type FlowSnapshot struct {
 	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
 	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
 	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
+	// #7342: the three `security flow tcp-session` windows #6539 recorded as
+	// having no wire carrier. Seconds, 0=unset (the helper keeps its default).
+	// `omitempty` + Rust `serde(default)` is the repo's skew-tolerant additive
+	// pattern (#1961): a helper that predates #7342 ignores them, and a Go
+	// binary that predates it omits them, and in both directions every window
+	// stays where it was.
+	TCPInitialTimeout  int `json:"tcp_initial_timeout,omitempty"`
+	TCPClosingTimeout  int `json:"tcp_closing_timeout,omitempty"`
+	TCPTimeWaitTimeout int `json:"tcp_time_wait_timeout,omitempty"`
 	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
 	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
 	// GREAcceleration carries `security flow gre-performance-acceleration`

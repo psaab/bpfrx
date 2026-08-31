@@ -72,9 +72,19 @@ func TestShowFlowTimeoutsAnnotateUnenforced_6539(t *testing.T) {
 		if !strings.Contains(line, tc.value) {
 			t.Errorf("%s row lost the configured value %s: %q", tc.label, tc.value, line)
 		}
+		// #7342: every tcp-session timeout is enforced now, so the shared
+		// table hands back no annotation and the row must render the bare
+		// value. Reading the note from the table rather than hard-coding "no
+		// annotation" is what keeps this surface tied to the single authority:
+		// if a future leaf becomes unenforced, this asserts the annotation
+		// appears instead.
 		note := config.TCPSessionTimeoutNote(tc.leaf)
 		if note == "" {
-			t.Fatalf("config table says %q is enforced; this test is stale", tc.leaf)
+			if strings.Contains(line, "not enforced") {
+				t.Errorf("%s row still carries a not-enforced annotation for an ENFORCED leaf, "+
+					"so the CLI reports a configured value as inert: %q", tc.label, line)
+			}
+			continue
 		}
 		if !strings.Contains(line, note) {
 			t.Errorf("%s row does not carry the shared not-enforced annotation, so the CLI reports "+
@@ -139,18 +149,29 @@ func TestShowFlowTimeoutsUnsetDefaultsAreTheDataplanes_6539(t *testing.T) {
 	if !strings.Contains(init, wantInit) {
 		t.Errorf("unset initial-timeout must render the dataplane half-open window %q: %q", wantInit, init)
 	}
-	if !strings.Contains(init, config.TCPSessionTimeoutNote(config.TCPSessionInitialTimeoutLeaf)) {
-		t.Errorf("unset initial-timeout row lost its not-enforced annotation: %q", init)
+	if strings.Contains(init, "not enforced") {
+		t.Errorf("unset initial-timeout row still carries a not-enforced annotation: %q", init)
 	}
 
+	// #7342: time-wait HAS a state now, so it has a default to report. Before
+	// the close-state split there was nothing distinct to time out and printing
+	// "(default)" would have been an unbacked enforcement claim; the split is
+	// what turned that from a lie into a fact.
 	tw := lineWith("TCP time-wait timeout:")
 	if tw == "" {
 		t.Fatalf("no TCP time-wait row rendered.\n%s", out)
 	}
-	if strings.Contains(tw, "(default)") {
-		t.Errorf("the dataplane has no TIME_WAIT state, so time-wait must claim no default: %q", tw)
+	wantTW := strconv.Itoa(config.DataplaneTCPClosingWindowSecs) + "s (default)"
+	if !strings.Contains(tw, wantTW) {
+		t.Errorf("unset time-wait-timeout must render the dataplane window %q: %q", wantTW, tw)
 	}
-	if !strings.Contains(tw, "not set") {
-		t.Errorf("unset time-wait-timeout should render as not set: %q", tw)
+	// And it is deliberately the SAME window closing-timeout reports: an
+	// operator who sets neither leaf must see the reaping they saw before the
+	// state was split. A different default here would be a behaviour change
+	// dressed as a rendering one.
+	cl := lineWith("TCP closing timeout:")
+	if !strings.Contains(cl, wantTW) {
+		t.Errorf("closing and time-wait must report the SAME unset default (%q); closing: %q",
+			wantTW, cl)
 	}
 }

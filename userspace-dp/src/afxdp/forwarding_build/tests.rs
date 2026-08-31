@@ -8418,3 +8418,67 @@ fn rejected_apply_then_retry_is_a_reachable_sequence_7015() {
         );
     }
 }
+
+/// #7342: each `security flow tcp-session` window on the wire lands in ITS OWN
+/// `SessionTimeouts` field.
+///
+/// This binds the WIRING — the struct-literal assignment in
+/// `build_forwarding_state` — not the function it calls.
+/// `with_tcp_session_windows` is tested directly in
+/// `session/tcp_close_state_7342_tests.rs`, and that test passes with the two
+/// close fields transposed here, because it never reads `snapshot.flow`. The
+/// four values are deliberately distinct from each other and from every
+/// default, so a transposition is named by the value rather than merely
+/// unequal — and closing vs time-wait is the pair that would transpose
+/// silently, being adjacent, same-typed, and different only by which state
+/// they govern.
+#[test]
+fn each_tcp_session_timeout_lands_in_its_own_session_timeout_field_7342() {
+    let mut snapshot = ConfigSnapshot::default();
+    snapshot.flow.tcp_session_timeout = 611;
+    snapshot.flow.tcp_initial_timeout = 47;
+    snapshot.flow.tcp_closing_timeout = 13;
+    snapshot.flow.tcp_time_wait_timeout = 149;
+    snapshot.flow.udp_session_timeout = 71;
+    snapshot.flow.icmp_session_timeout = 23;
+
+    let state = build_forwarding_state(&snapshot);
+    let t = state.session_timeouts;
+    for (label, got, want_secs) in [
+        ("established", t.tcp_established_ns, 611u64),
+        ("initial", t.tcp_opening_ns, 47),
+        ("closing", t.tcp_closing_ns, 13),
+        ("time_wait", t.tcp_time_wait_ns, 149),
+        ("udp", t.udp_ns, 71),
+        ("icmp", t.icmp_ns, 23),
+    ] {
+        assert_eq!(
+            got,
+            want_secs * 1_000_000_000,
+            "the {label} window did not come from its own wire field — two \
+             adjacent same-typed seconds values are transposed"
+        );
+    }
+}
+
+/// The same wiring with the three #7342 fields ABSENT: every window must hold
+/// its dataplane default.
+///
+/// This is the skew case — a Go binary that predates #7342 omits the fields, so
+/// `serde(default)` gives 0 — and it is what makes "an existing config reaps
+/// exactly as before" true rather than merely intended. Without it the cell
+/// above would pass an implementation that treated 0 as a literal zero window,
+/// which reaps every session instantly.
+#[test]
+fn absent_tcp_session_timeout_fields_keep_the_dataplane_defaults_7342() {
+    let state = build_forwarding_state(&ConfigSnapshot::default());
+    let t = state.session_timeouts;
+    let base = crate::session::SessionTimeouts::default();
+    assert_eq!(t.tcp_established_ns, base.tcp_established_ns);
+    assert_eq!(t.tcp_opening_ns, base.tcp_opening_ns);
+    assert_eq!(t.tcp_closing_ns, base.tcp_closing_ns);
+    assert_eq!(t.tcp_time_wait_ns, base.tcp_time_wait_ns);
+    // ...and the two close windows are the same, so a pre-#7342 peer's
+    // sessions reap exactly where they did before the state was split.
+    assert_eq!(t.tcp_closing_ns, t.tcp_time_wait_ns);
+}

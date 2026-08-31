@@ -285,6 +285,21 @@ pub(crate) struct FlowSnapshot {
     pub tcp_mss_gre_out: u16,
     #[serde(rename = "tcp_session_timeout", default)]
     pub tcp_session_timeout: u64,
+    /// #7342: `security flow tcp-session initial-timeout` — the half-open
+    /// (handshake-incomplete) window. Seconds; `0` = unset, keep the dataplane
+    /// default. Additive with `serde(default)`, so a snapshot from a Go binary
+    /// that predates #7342 omits it and every window stays where it was
+    /// (#1961 both-sides skew discipline).
+    #[serde(rename = "tcp_initial_timeout", default)]
+    pub tcp_initial_timeout: u64,
+    /// #7342: `security flow tcp-session closing-timeout` — the Junos CLOSING
+    /// window, a FIN seen in one direction. Seconds; `0` = unset.
+    #[serde(rename = "tcp_closing_timeout", default)]
+    pub tcp_closing_timeout: u64,
+    /// #7342: `security flow tcp-session time-wait-timeout` — the Junos
+    /// TIME_WAIT window, a FIN seen in both directions. Seconds; `0` = unset.
+    #[serde(rename = "tcp_time_wait_timeout", default)]
+    pub tcp_time_wait_timeout: u64,
     #[serde(rename = "udp_session_timeout", default)]
     pub udp_session_timeout: u64,
     #[serde(rename = "icmp_session_timeout", default)]

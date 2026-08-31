@@ -255,6 +255,7 @@ pub(crate) fn run() -> Result<(), String> {
             shared_session_poison_recoveries: 0,
             session_install_stale_ignored: 0,
             session_delete_stale_ignored: 0,
+            session_delete_dropped_released: 0,
             synced_import_reserve_refused: 0,
             synced_import_unknown_routing_domain: 0,
             synced_import_zone_unresolved: 0,

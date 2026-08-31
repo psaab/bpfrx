@@ -8659,3 +8659,642 @@ fn rename_onto_a_new_pool_name_carries_live_reservations_6979() {
          live translation must still be carried, or it is freed while its session lives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6979 F1 half 1 — occupancy-dependent selection made a synced import land in
+// the WRONG allocator, and the wrongness only detonated at failover.
+//
+// PASS 1 reserves on a rule the ACTIVE could have matched. When that rule's
+// allocator REFUSED (a local flow already holds the identity), the old code
+// fell through to PASS 2, which takes the first rule whose pool merely
+// CONTAINS the translated address — so an overlapping sibling accepted and the
+// session was published with its reservation in an allocator the active never
+// used.
+//
+// Measured at the parent, two rules whose pools both own 203.0.113.10, with a
+// local squatter on 203.0.113.10:20000 in rule A's allocator:
+//
+//   step1  accepted=true   A.used=1 (squatter)  B.used=1 (F)
+//   step2  squatter retires  A.used=0           B.used=1
+//   step3  new A-flow granted the SAME tuple F holds in B: true
+//
+// A never learned about F, so once the squatter retired it re-issued the
+// identity F was still live on. A refused import publishes nothing; a
+// wrong-allocator reservation is silent until failover.
+// ---------------------------------------------------------------------------
+
+fn f1_overlapping_rules() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-a".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-a".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-b".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-b".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+fn f1_tuple() -> TranslatedTuple {
+    TranslatedTuple {
+        ip: "203.0.113.10".parse().unwrap(),
+        port: 20000,
+    }
+}
+
+fn f1_import(rules: &[SourceNatRule]) -> bool {
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        rules,
+        &key,
+        NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().unwrap()),
+            rewrite_src_port: Some(20000),
+            ..NatDecision::default()
+        },
+        false,
+        Some(("lan", "wan")),
+        0,
+    )
+}
+
+/// THE BINDING, and a fail-on-revert for the whole ruling.
+///
+/// RED AT THE PARENT on both assertions: the import is ACCEPTED and pool B
+/// records the reservation the active booked in pool A.
+#[test]
+fn a_pass1_refusal_does_not_fall_through_to_a_sibling_allocator_6979_f1() {
+    let rules = f1_overlapping_rules();
+
+    // A local flow already holds the identity in rule A's allocator — the
+    // transient collision that makes PASS 1 refuse.
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(
+        rules[0].pool_allocator.reserve_flow(
+            squatter,
+            f1_tuple(),
+            0,
+            false,
+            0,
+            NatHolder::Untracked,
+        ),
+        "fixture: rule A must hold the identity first, or PASS 1 never refuses \
+         and this cell tests the ordinary accept path"
+    );
+
+    assert!(
+        !f1_import(&rules),
+        "the import was ACCEPTED after PASS 1 refused. PASS 1 could see which rule \
+         the active matched and that rule's allocator declined; falling through let \
+         PASS 2 book the reservation in an overlapping sibling instead. The session \
+         is then published with a translation this node records in the wrong \
+         allocator, and rule A re-issues the identity the moment its squatter \
+         retires (#6979 F1)"
+    );
+
+    let statuses = source_nat_pool_statuses(&rules);
+    assert_eq!(
+        statuses[1].used_ports, 0,
+        "pool B booked a reservation for a flow the ACTIVE translated under pool A. \
+         That is the latent half: nothing is wrong until failover, when A hands the \
+         same (address, port) to a new flow because it never learned about this one"
+    );
+    assert_eq!(
+        statuses[0].used_ports, 1,
+        "and pool A must still hold ONLY its own squatter — the refusal must not \
+         disturb the live allocation that caused it"
+    );
+}
+
+/// THE FALL-THROUGH CONTROL, and the reason the fix is a two-way distinction
+/// rather than a short-circuit.
+///
+/// `NothingToReserve` — no rule the standby can confirm as a match owns the
+/// translated address — is NOT a refusal. It is the shape interface-mode SNAT
+/// always produces, and what genuine config drift looks like. It must still
+/// fall through to PASS 2.
+///
+/// Fires on: returning `false` for `NothingToReserve` as well. That mutation
+/// passes the binding cell above and every other #6979 cell, and silently stops
+/// interface-mode synced sessions from reserving anything.
+#[test]
+fn a_pass1_nothing_to_reserve_still_falls_through_6979_f1() {
+    // Both rules match the zone pair, and NEITHER pool owns the translated
+    // address the active used — the interface-mode shape.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-a".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pool-a".to_string(),
+        pool_addresses: vec!["198.51.100.7/32".to_string()],
+        port_low: 20000,
+        port_high: 20099,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    assert!(
+        f1_import(&rules),
+        "a PASS 1 `NothingToReserve` was treated as a refusal. No rule's pool owns \
+         203.0.113.10, which is exactly what interface-mode SNAT and genuine config \
+         drift look like — it must fall through to PASS 2 and the interface domain, \
+         or every interface-mode synced session stops reserving (#7581, #6751)"
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[0].used_ports,
+        0,
+        "and the pool that owns a DIFFERENT address must book nothing"
+    );
+}
+
+/// The refusal must be REACHABLE BY THE OPERATOR, not merely correct.
+///
+/// The ruling trades a reservation for a refusal, and that trade is only the
+/// better half because the refusal is observable. `may_publish` is what the
+/// coordinator turns into `SyncedImportOutcome::RejectedReserve` and the
+/// `import_reserve_refused` bump, so this pins the value the counter path
+/// keys on. Without it the reasoning behind the whole change rests on an
+/// increment nobody checked.
+#[test]
+fn a_refused_pass1_import_reports_do_not_publish_6979_f1() {
+    let rules = f1_overlapping_rules();
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(rules[0].pool_allocator.reserve_flow(
+        squatter,
+        f1_tuple(),
+        0,
+        false,
+        0,
+        NatHolder::Untracked
+    ));
+
+    assert!(
+        !f1_import(&rules),
+        "the reserve must report DO-NOT-PUBLISH — that false is the sole input to \
+         the coordinator's RejectedReserve arm and its import_reserve_refused bump"
+    );
+}
+
+/// PASS 2's first-acceptor fall-through is a CLAIM, so it gets a cell.
+///
+/// The fix leaves PASS 2 byte-identical on purpose: it is the un-narrowed
+/// pre-#6211 fallback reached when the zone pair cannot be resolved or the
+/// nodes' config has drifted, where "the first rule whose pool contains the
+/// address" is the only question that can be asked. Making it strict too would
+/// refuse imports on a standby that simply cannot resolve zones — an HA node's
+/// entire first sync, before any snapshot is applied.
+///
+/// MEASURED GAP, which is why this exists: mutating PASS 2 to stop at the first
+/// pool owner escaped the whole suite — 5125 collected, zero red. The claim in
+/// the code comment was unbound, so a later change could have made PASS 2
+/// strict and nothing would have said so.
+///
+/// Fires on: passing `true` for `stop_at_first_owner` at the PASS 2 call site.
+#[test]
+fn pass2_still_falls_through_a_refusing_owner_6979_f1() {
+    let rules = f1_overlapping_rules();
+
+    // Rule A holds the identity; rule B's pool owns the same address, free.
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(rules[0].pool_allocator.reserve_flow(
+        squatter,
+        f1_tuple(),
+        0,
+        false,
+        0,
+        NatHolder::Untracked
+    ));
+
+    // NO zone pair — the standby cannot resolve zones, so PASS 1 is skipped
+    // entirely and PASS 2 answers alone. That is an HA node's first sync.
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let accepted = reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().unwrap()),
+            rewrite_src_port: Some(20000),
+            ..NatDecision::default()
+        },
+        false,
+        None,
+        0,
+    );
+
+    assert!(
+        accepted,
+        "PASS 2 refused an import it used to accept. With no resolvable zone pair \
+         there is no way to reproduce the ACTIVE's rule choice, so the only \
+         available question is which rule's pool contains the address — and \
+         refusing there would reject every import on a standby that has not yet \
+         applied a snapshot (#6979 F1 keeps PASS 2 byte-identical on purpose)"
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[1].used_ports,
+        1,
+        "and the fall-through must have booked the reservation in the sibling that \
+         accepted — that IS the pre-#6211 behaviour being preserved"
+    );
+}
+
+// --- #7360: persistent-NAT lease reconstruction on the HA standby ------------
+//
+// THE FIXTURE IS THE WHOLE TEST, twice over.
+//
+// (1) A SINGLE-ADDRESS pool makes an address assertion pass by construction, and
+//     under `address-persistent` the address survives a failover for free
+//     anyway — `sticky_pool_index` is a pure function of `(src_ip, pool_len)`
+//     and the standby recomputes the same hash. So the property that can
+//     actually fail is the PORT, and the address is only worth asserting on a
+//     rule WITHOUT `address-persistent`, where it genuinely varies. Every cell
+//     below uses a multi-address pool with interleaved decoy flows from a
+//     SECOND client, so a chooser that had moved on cannot return to the same
+//     slot by luck.
+//
+// (2) ONE session proves nothing. A persistent lease is shared by every flow
+//     from one client, so the defect only appears with TWO sessions sharing a
+//     translation — which is also the shape that exposes the session DROP.
+
+/// The 4-address persistent pool both nodes run. HA requires identical config,
+/// so the standby's rule set is built from the same snapshot.
+fn ha_persistent_rules_7360(address_persistent: bool) -> Vec<SourceNatRule> {
+    persistent_pool_rules_with_options(
+        300,
+        40000,
+        40010,
+        vec!["203.0.113.10", "203.0.113.11", "203.0.113.12", "203.0.113.13"],
+        address_persistent,
+    )
+}
+
+/// Import one session onto the standby through the REAL synced-reserve path —
+/// the same call `handle_upsert_synced` makes.
+fn import_synced_7360(
+    standby: &[SourceNatRule],
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    active: &NatDecision,
+    now_ns: u64,
+) {
+    reserve_synced_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        standby,
+        &session_key(src_port, dst_ip, dst_port),
+        NatDecision {
+            rewrite_src: active.rewrite_src,
+            rewrite_src_port: active.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        None,
+        now_ns,
+    );
+}
+
+/// Other clients admitted on the standby before our client comes back, so a
+/// round-robin or least-used chooser has moved on. Without these a 4-address
+/// pool can still hand out the original slot by construction.
+fn decoy_flows_7360(standby: &[SourceNatRule], now_ns: u64) {
+    for p in [21000u16, 21001, 21002, 21003, 21004] {
+        let _ = tuple_snat_lookup_from_src(standby, "10.0.1.200", p, "9.9.9.9", 53, now_ns);
+    }
+}
+
+/// FAIL-ON-REVERT: the standby holds no lease at all before this change.
+/// `persistent_leases` is the defect stated as a number — the synced-reserve
+/// path inserted `LiveAllocation { persistent_key: None, .. }` and never
+/// touched `persistent_by_source`.
+#[test]
+fn standby_rebuilds_a_persistent_lease_from_synced_sessions_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(
+        source_nat_pool_statuses(&active)[0].persistent_leases,
+        1,
+        "fixture: the ACTIVE must hold a lease, or the standby has nothing to rebuild"
+    );
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &first, 1);
+
+    let statuses = source_nat_pool_statuses(&standby);
+    let status = &statuses[0];
+    assert_eq!(
+        status.persistent_leases, 1,
+        "the standby must reconstruct the persistence binding from the session it \
+         imported. 0 means a failover hands this client a different translated \
+         port, which is the property persistent-NAT exists to provide (#7360)"
+    );
+    assert_eq!(
+        status.live_flows, 1,
+        "the imported session must still hold its own reservation (#4388)"
+    );
+}
+
+/// The session DROP, which is the half #7360 was not filed for.
+///
+/// Two flows from one client share ONE translated tuple — that is what a lease
+/// is. On the standby they are two different `SourceNatFlowKey`s, so
+/// `reserve_flow` misses its `live_by_flow` early-return, falls through to
+/// `occupancy.reserve(port)` and fails on the already-set bit. The refusal
+/// returns `RejectedReserve` BEFORE `publish_shared_session`, so the second
+/// session was not imported at all.
+///
+/// FAIL-ON-REVERT: without the lease-join the standby ends with
+/// `live_flows == 1` for two imported sessions.
+#[test]
+fn standby_imports_every_session_sharing_a_persistent_lease_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let a1 = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+    let a2 = expect_snat_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 2));
+    // Fixture check: this really is the lease-sharing shape. If the two flows
+    // took different tuples there would be no shared occupancy bit and this
+    // cell would pass with the defect present.
+    assert_eq!(
+        (a1.rewrite_src, a1.rewrite_src_port),
+        (a2.rewrite_src, a2.rewrite_src_port),
+        "fixture: both flows must share ONE translated tuple, or nothing collides"
+    );
+    let active_statuses = source_nat_pool_statuses(&active);
+    let active_status = &active_statuses[0];
+    assert_eq!(active_status.persistent_leases, 1);
+    assert_eq!(active_status.live_flows, 2);
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &a1, 1);
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &a2, 2);
+
+    let statuses = source_nat_pool_statuses(&standby);
+    let status = &statuses[0];
+    assert_eq!(
+        status.live_flows, active_status.live_flows,
+        "every session sharing a persistent translation must reach the standby. \
+         Fewer means the client's other sessions were REFUSED on the occupancy \
+         bit their own lease already holds — they are not degraded across the \
+         failover, they were never there (#7360)"
+    );
+    assert_eq!(
+        status.persistent_leases, 1,
+        "the two sessions share ONE lease, not two"
+    );
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
+
+/// The acceptance property, on the PORT — the axis that can actually fail.
+///
+/// After the failover the same client opens a NEW connection. On the active
+/// this reuses the lease (`pool_snat_persistent_reuses_same_source_tuple`); the
+/// promoted standby must do the same.
+#[test]
+fn a_persistent_client_keeps_its_translated_port_after_failover_7360() {
+    let active = ha_persistent_rules_7360(true);
+    let before = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(true);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &before, 1);
+    decoy_flows_7360(&standby, 2);
+
+    // Promoted. The client returns to a DIFFERENT remote, as it would.
+    let after = expect_snat_decision(tuple_snat_lookup(&standby, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(
+        after.rewrite_src_port, before.rewrite_src_port,
+        "the client's translated PORT must survive the failover. This is the axis \
+         that fails: under `address-persistent` the ADDRESS survives for free \
+         because `sticky_pool_index` is a pure function of (src_ip, pool_len), so \
+         asserting the address here would measure the hash rather than the repair"
+    );
+}
+
+/// The ADDRESS, asserted on the ONLY rule shape where it can vary: no
+/// `address-persistent`, multi-address pool, decoys interleaved. Under
+/// `address-persistent` this assertion would pass with the defect present.
+#[test]
+fn a_persistent_client_keeps_its_translated_address_after_failover_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let before = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &before, 1);
+    decoy_flows_7360(&standby, 2);
+
+    let after = expect_snat_decision(tuple_snat_lookup(&standby, 12345, "1.1.1.1", 443, 3));
+    assert_eq!(
+        (after.rewrite_src, after.rewrite_src_port),
+        (before.rewrite_src, before.rewrite_src_port),
+        "without `address-persistent` the pool address is chosen per allocation, so \
+         BOTH halves of the translated tuple must come from the rebuilt lease"
+    );
+}
+
+/// The refcount SYMMETRY, which is what makes the rebuilt lease safe rather
+/// than a leak.
+///
+/// Before #7360 a synced persistent flow carried `persistent_key: None`, so
+/// `unlink_live_allocation_locked` freed its port directly on release. Now the
+/// port belongs to the LEASE and is not freed per-flow — which is correct, and
+/// is exactly why the decrement has to work. A lease whose `active_flows` never
+/// reaches zero is never idle, so it never enters `lease_expirations` and no GC
+/// path can reclaim it; `reserve_flow`'s own comment names that end state.
+///
+/// FAIL-ON-REVERT: drop the `complete_persistent_lease_locked` decrement (or
+/// create the lease without joining it to the flow) and the lease stays at a
+/// non-zero refcount, so it never lands in the idle-expiry index and
+/// `assert_persistent_expiry_indexes_consistent` fires.
+#[test]
+fn releasing_every_synced_flow_makes_the_rebuilt_lease_idle_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let a1 = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+    let a2 = expect_snat_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 2));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &a1, 1);
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &a2, 2);
+    assert_eq!(source_nat_pool_statuses(&standby)[0].live_flows, 2);
+
+    // Both synced sessions close on the standby, as they would when the peer
+    // delete-syncs them or they age out.
+    for (dst, dport, decision) in [("8.8.8.8", 53u16, &a1), ("1.1.1.1", 443u16, &a2)] {
+        release_source_nat_allocation(
+            &InterfaceNatAllocators::default(),
+            &standby,
+            &session_key(12345, dst, dport),
+            NatDecision {
+                rewrite_src: decision.rewrite_src,
+                rewrite_src_port: decision.rewrite_src_port,
+                ..NatDecision::default()
+            },
+            false,
+            3,
+        );
+    }
+
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 0,
+        "both synced flows must have released"
+    );
+    // The lease survives its flows — that is the persistence window — but it
+    // must now be IDLE and therefore reclaimable.
+    assert_eq!(
+        statuses[0].persistent_leases, 1,
+        "the lease outlives its flows for the persistence timeout; dropping it \
+         here would end persistence the moment the last flow closed"
+    );
+    // The invariant that catches a leaked refcount: a lease with
+    // `active_flows == 0` MUST be in both expiry indexes, and one with active
+    // flows must be in neither.
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
+
+/// A synced flow joining an IDLE lease must take it OUT of the idle-expiry
+/// index. Found by a mutation ESCAPE: none of the cells above reach
+/// `was_idle == true`, because the first import CREATES the lease at
+/// `active_flows = 1` and the second joins one that already has a flow.
+///
+/// The production sequence that does reach it is ordinary — a persistent client
+/// pauses (its synced flows release, the lease goes idle and enters
+/// `lease_expirations`), then resumes (a new session syncs and joins it). The
+/// branch is therefore reachable, not inert.
+///
+/// What it costs if it is wrong: a lease sitting in the idle-expiry index while
+/// it has a LIVE flow is GC-eligible, so the reaper can reclaim it and free a
+/// pool port the flow is still forwarding through — a translated tuple handed to
+/// two flows at once.
+///
+/// FAIL-ON-REVERT: drop the `was_idle` guard's
+/// `remove_lease_expiration_locked` call and
+/// `assert_persistent_expiry_indexes_consistent` fires, because the lease is in
+/// the index with `active_flows > 0`.
+#[test]
+fn a_synced_flow_rejoining_an_idle_lease_leaves_the_expiry_index_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &first, 1);
+
+    // The client goes quiet: its one synced flow closes. The lease survives for
+    // the persistence window and is now IDLE — in the expiry index.
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &standby,
+        &session_key(12345, "8.8.8.8", 53),
+        NatDecision {
+            rewrite_src: first.rewrite_src,
+            rewrite_src_port: first.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        2,
+    );
+    {
+        let live = standby[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "fixture: the lease must be IDLE and indexed here, or the cell never \
+             reaches the `was_idle` branch it exists to bind"
+        );
+    }
+
+    // The client comes back. A new session for the SAME source syncs in and
+    // joins the idle lease — `was_idle == true`.
+    let resumed = expect_snat_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 3));
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &resumed, 3);
+
+    let live = standby[0].pool_allocator.debug_live();
+    assert!(
+        live.lease_expirations.is_empty(),
+        "a lease with a live flow must NOT sit in the idle-expiry index — the GC \
+         reaps from that index, so leaving it there frees a pool port the flow is \
+         still using. Present: {:?}",
+        live.lease_expirations
+    );
+    drop(live);
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
+
+/// The drift REFUSAL, bound by a cell that names it.
+///
+/// A lease that already names a DIFFERENT translated tuple than the wire does is
+/// config drift or a stale import, and the reservation is refused rather than
+/// retargeted — the same "never steal" posture as the occupancy CAS.
+///
+/// This exists because the mutation that disables the refusal reds only
+/// `synced_eviction_drops_the_persistent_lease_refcount_6528`, a pre-existing
+/// test that constructs a drift scenario incidentally. That is coverage today
+/// and none tomorrow: a guard added deliberately should not depend on another
+/// issue's fixture keeping a shape it never promised to keep.
+///
+/// FAIL-ON-REVERT: remove the `lease.translated != translated` refusal and the
+/// second import is accepted, so the standby holds a flow pointing at a tuple
+/// its own lease does not own.
+#[test]
+fn a_synced_import_conflicting_with_an_existing_lease_is_refused_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &first, 1);
+    assert_eq!(source_nat_pool_statuses(&standby)[0].persistent_leases, 1);
+
+    // A second session for the SAME source arrives naming a DIFFERENT translated
+    // port — what a config-drifted or stale peer would send.
+    let drifted = NatDecision {
+        rewrite_src: first.rewrite_src,
+        rewrite_src_port: first.rewrite_src_port.map(|p| p + 1),
+        ..NatDecision::default()
+    };
+    assert_ne!(
+        drifted.rewrite_src_port, first.rewrite_src_port,
+        "fixture: the drifted decision must actually differ, or nothing conflicts"
+    );
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &drifted, 2);
+
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 1,
+        "a synced import whose tuple contradicts this source's existing lease must \
+         be REFUSED, not published: accepting it leaves a live flow pointing at a \
+         tuple the lease does not own, so the flow's release would not return the \
+         port the lease still claims"
+    );
+    assert_eq!(statuses[0].persistent_leases, 1, "the lease is unchanged");
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}

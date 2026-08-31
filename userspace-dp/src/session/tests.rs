@@ -3,6 +3,13 @@
 // session/tests.rs alongside the structural split that introduced the
 // session/ directory module and session/key.rs.
 // Loaded as a sibling submodule via `#[path = "tests.rs"]` from session/mod.rs.
+//
+// #7342: `key_v4`, `tcp_key_v6`, `decision`, `metadata` and
+// `install_forward_reverse_pair` are `pub(in crate::session)` because the
+// close-state split's own test file drives the SAME fixtures. Sharing them
+// rather than copying is deliberate: a second copy of `install_forward_reverse_pair`
+// would let the two files disagree about what a forward/reverse pair looks
+// like, and the whole subject of that file is how the two halves interact.
 
 use crate::test_zone_ids::*;
 use super::*;
@@ -18,7 +25,7 @@ use super::wheel::{FAR_FUTURE_OFFSET, WHEEL_BUCKETS, WHEEL_TICK_NS};
 use crate::tcp_flags::{TCP_ACK, TCP_SYN};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-fn key_v4() -> SessionKey {
+pub(in crate::session) fn key_v4() -> SessionKey {
     SessionKey {
         addr_family: 2,
         protocol: PROTO_TCP,
@@ -58,14 +65,14 @@ fn resolution() -> ForwardingResolution {
     }
 }
 
-fn decision() -> SessionDecision {
+pub(in crate::session) fn decision() -> SessionDecision {
     SessionDecision {
         resolution: resolution(),
         nat: NatDecision::default(),
     }
 }
 
-fn metadata() -> SessionMetadata {
+pub(in crate::session) fn metadata() -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
@@ -169,7 +176,7 @@ fn lookup_does_not_clone_policy_counter_arc_5445() {
 
 /// #4109: a TCP IPv6 forward key. The shared `key_v6()` is UDP, but the TCP
 /// state-machine tests need a v6 TCP flow to cover the second address family.
-fn tcp_key_v6() -> SessionKey {
+pub(in crate::session) fn tcp_key_v6() -> SessionKey {
     SessionKey {
         addr_family: 10,
         protocol: PROTO_TCP,
@@ -199,7 +206,7 @@ fn reverse_key_of(forward: &SessionKey) -> SessionKey {
 /// state-machine tests do not depend on them). Returns the reverse-companion
 /// key. Deltas emitted by the two installs are drained so a later assertion on
 /// close/open deltas sees only what the test itself produced.
-fn install_forward_reverse_pair(
+pub(in crate::session) fn install_forward_reverse_pair(
     table: &mut SessionTable,
     forward: &SessionKey,
     now_ns: u64,

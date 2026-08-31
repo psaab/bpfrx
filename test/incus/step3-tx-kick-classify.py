@@ -215,6 +215,41 @@ def classify(
     else:
         verdict = "INCONCLUSIVE"
 
+    # #7424 row 1: an empty or truncated capture reduces to 12 all-zero blocks.
+    # Every one of them satisfies t1_out_block (retry_delta 0 < RETRY_OUT, then
+    # `count_delta == 0` returns True), so t1_out_holds is vacuously true and
+    # the report prints "the TX-kick hypothesis is ruled out" — a definitive
+    # negative about the dataplane, from a file in which nothing was measured.
+    #
+    # This mirrors step2's C175-HC-070 guard by name, and the two-condition
+    # shape is load-bearing rather than belt-and-braces. Zero KICKS alone is a
+    # legitimate OUT: a valid capture in which the dataplane simply never
+    # kicked is real evidence, and refusing it would discard a true negative.
+    # What is not evidence is a capture with no HISTOGRAM either — a normalised
+    # block sums to 1.0, so a zero sum means the block was never populated.
+    # Requiring both separates "measured, and there were no kicks" from
+    # "nothing was measured at all".
+    #
+    # step1 emits `shape = np.zeros(16)` on an empty capture and its K2
+    # no-evidence guard is traffic-gated (`if c == 0 and txp > 10_000`), so it
+    # stays silent when txp == 0 — this is the only place the shape can be
+    # caught downstream.
+    no_histogram = all(float(sum(b["shape"])) == 0.0 for b in hist_blocks)
+    no_kick_evidence = all(
+        int(b["tx_kick_count_delta"]) == 0
+        and int(b["tx_kick_retry_delta"]) == 0
+        and int(b["tx_kick_sum_ns_delta"]) == 0
+        for b in hist_blocks
+    )
+    insufficient_reason = None
+    if no_histogram and no_kick_evidence:
+        verdict = "INSUFFICIENT"
+        insufficient_reason = (
+            "no TX-kick evidence: all 12 blocks have a zero-sum histogram AND "
+            "zero kick count/retry/sum — the capture was empty or truncated; "
+            "refusing a definitive OUT"
+        )
+
     retry_series = [b["retry_count_delta"] for b in per_block]
     kick_mean_series = [b["kick_latency_mean_ns"] for b in per_block]
 
@@ -234,6 +269,7 @@ def classify(
 
     return {
         "verdict": verdict,
+        "insufficient_reason": insufficient_reason,
         "elevated_threshold_T_D1": threshold,
         "elevated_blocks": elevated,
         "T_D1": T_D1,
@@ -444,6 +480,16 @@ def main(argv: list[str] | None = None) -> int:
         f"rho_retry={diag['rho_retry']} rho_kick={diag['rho_kick']}",
         file=sys.stderr,
     )
+    # #7424 row 1: a non-zero exit for INSUFFICIENT, mirroring step2. Returning
+    # 0 here would let a caller that checks only the exit status treat "nothing
+    # was measured" as a successful ruling-out, which is the whole defect one
+    # layer up from the verdict string.
+    if diag["verdict"] == "INSUFFICIENT":
+        print(
+            f"INSUFFICIENT: {diag['insufficient_reason']}",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

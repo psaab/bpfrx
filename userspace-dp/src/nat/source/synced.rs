@@ -243,8 +243,8 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // A synced session always carries a real L4 protocol, so `tuple_unknown`
     // is false — the address-only `match_source_nat` wrapper's sentinel
     // (#5687) does not apply here.
-    if let Some((from_zone, to_zone)) = synced_zones
-        && reserve_synced_on_first_pool_owner(
+    if let Some((from_zone, to_zone)) = synced_zones {
+        match reserve_synced_on_first_pool_owner(
             rules.iter().filter(|rule| {
                 rule.matches_ignoring_scope(
                     from_zone,
@@ -257,14 +257,64 @@ fn reserve_synced_source_nat_allocation_with_holder(
                     flow.dst_port,
                 )
             }),
+            // #6979 F1: PASS 1 reproduces the active's choice, so it stops at
+            // the first pool-owning candidate rather than searching for one
+            // that accepts.
+            true,
             flow,
             rewrite_src,
             nat.rewrite_src_port,
             now_ns,
             holder,
-        ) == SyncedReserveOutcome::Reserved
-    {
-        return true;
+        ) {
+            SyncedReserveOutcome::Reserved => return true,
+            // #6979 F1: a PASS 1 REFUSAL is final. It does NOT fall through.
+            //
+            // A refusal here means the standby CAN see which rule the active
+            // matched, that rule's pool owns the translated address, and its
+            // allocator declined because a different live allocation already
+            // holds the identity. Falling through asked PASS 2 the same
+            // question with the narrowing removed, and PASS 2 answers by
+            // taking the first rule whose pool merely CONTAINS the address —
+            // so an overlapping sibling accepts and the session is published
+            // with its reservation booked in an allocator the active never
+            // used.
+            //
+            // That is not a smaller loss than refusing; it is a LATENT one.
+            // Measured at the parent of this change, with two rules whose
+            // pools both own 203.0.113.10 and a local squatter on
+            // 203.0.113.10:20000 in rule A's allocator:
+            //
+            //   step1  accepted=true   A.used=1 (squatter)  B.used=1 (F)
+            //   step2  squatter retires  A.used=0           B.used=1
+            //   step3  new A-flow granted the SAME tuple F holds in B: true
+            //
+            // The import was ACCEPTED, F was recorded in B, and once the
+            // squatter retired nothing in A knew about F — so A re-issued the
+            // identity F is still live on. A refused import publishes nothing;
+            // a wrong-allocator reservation is silent until failover.
+            //
+            // This deliberately weakens #6211's "no configuration can come out
+            // of #6211 with FEWER reservations than it had" for the REFUSAL
+            // case only. The trade is acceptable because the refusal is
+            // OBSERVABLE: the coordinator's caller turns this `false` into
+            // `SyncedImportOutcome::RejectedReserve` and bumps
+            // `import_reserve_refused`, surfaced as
+            // `xpf_userspace_synced_import_reserve_refused_total` (#8101),
+            // whose help text already says those flows will not survive a
+            // failover. Fail-loud is only the better half of this trade
+            // because that counter exists, so the increment is bound by a test
+            // rather than assumed.
+            SyncedReserveOutcome::Refused => return false,
+            // #7581 / #6751: NOT a refusal. No rule the standby can confirm as
+            // a match owns the translated address — the shape interface-mode
+            // SNAT always produces, and also what genuine config drift looks
+            // like. This MUST still fall through, or interface-mode synced
+            // sessions stop reserving anything and drift stops degrading
+            // gracefully. The whole fix is that these two outcomes are
+            // different answers and only one of them stops the search.
+            SyncedReserveOutcome::NothingToReserve => {}
+        }
     }
     // #6211 PASS 2 — the pre-#6211 behaviour, unchanged: the first rule whose
     // pool CONTAINS the translated address, with no zone/tuple narrowing.
@@ -284,6 +334,11 @@ fn reserve_synced_source_nat_allocation_with_holder(
     // `rewrite_src == None` early return above.
     match reserve_synced_on_first_pool_owner(
         rules.iter(),
+        // PASS 2 keeps the pre-#6211 first-acceptor scan, byte-identical.
+        // Bound by `pass2_still_falls_through_a_refusing_owner_6979_f1` — this
+        // claim was unbound until then, and mutating it to `true` escaped the
+        // entire suite (5125 collected, zero red).
+        false,
         flow,
         rewrite_src,
         nat.rewrite_src_port,
@@ -410,8 +465,29 @@ impl SyncedReserveOutcome {
     }
 }
 
+/// #6979 F1: `stop_at_first_owner` makes the scan reproduce the ACTIVE node's
+/// rule choice instead of searching for one that will say yes.
+///
+/// PASS 1 passes `true`. Its candidate set is already "rules the active could
+/// have matched", in snapshot order — which IS the Junos specificity precedence
+/// (#4161) the active itself resolves with. So the FIRST candidate whose pool
+/// owns the translated address is the active's rule, and if that rule's
+/// allocator declines, the honest answer is `Refused`. Walking on to the next
+/// candidate answers a DIFFERENT question ("who will accept?") and books the
+/// reservation in an allocator the active never used.
+///
+/// PASS 2 passes `false` and is byte-identical to before: it is the
+/// un-narrowed pre-#6211 fallback for a zone pair the standby cannot resolve or
+/// a config that has drifted, where "first rule whose pool contains the
+/// address" is the only question that can be asked.
+///
+/// A QUARANTINED first owner (#7076) returns `Refused` under
+/// `stop_at_first_owner` for the same reason it produced `Refused` before —
+/// candidacy is kept, only the allocator is skipped — so blocking the import
+/// still mirrors the active's `Unavailable`.
 fn reserve_synced_on_first_pool_owner<'a>(
     rules: impl Iterator<Item = &'a SourceNatRule>,
+    stop_at_first_owner: bool,
     flow: SourceNatFlowKey,
     rewrite_src: IpAddr,
     rewrite_src_port: Option<u16>,
@@ -467,6 +543,9 @@ fn reserve_synced_on_first_pool_owner<'a>(
             // today's behaviour while removing its dependence on the shape of
             // `impl Default for PortAllocator`.
             if rule.pool_failure.is_some() {
+                if stop_at_first_owner {
+                    return SyncedReserveOutcome::Refused;
+                }
                 continue;
             }
             if rule
@@ -475,6 +554,11 @@ fn reserve_synced_on_first_pool_owner<'a>(
                 .is_ok()
             {
                 return SyncedReserveOutcome::Reserved;
+            }
+            // #6979 F1: the active's rule declined. Under `stop_at_first_owner`
+            // that is the answer, not a reason to ask a sibling.
+            if stop_at_first_owner {
+                return SyncedReserveOutcome::Refused;
             }
             continue;
         };
@@ -499,6 +583,9 @@ fn reserve_synced_on_first_pool_owner<'a>(
         // mirroring the active node's `Unavailable`) and never
         // `NothingToReserve` (which would fall through to the interface domain).
         if rule.pool_failure.is_some() {
+            if stop_at_first_owner {
+                return SyncedReserveOutcome::Refused;
+            }
             continue;
         }
         // #5178: tag the reservation deterministic iff this rule runs a
@@ -506,7 +593,33 @@ fn reserve_synced_on_first_pool_owner<'a>(
         // `free_no_recycle` and the standby's recycle queue does not grow under
         // synced-session churn — matching the active node's
         // `allocate_deterministic_v4` release path.
-        if rule.pool_allocator.reserve_flow(
+        // #7360: hand the allocator this rule's persistence identity when the
+        // rule runs `persistent-nat`, so the reservation JOINS the source's
+        // lease (creating it on the first session) instead of competing with it
+        // for the occupancy bit. Without this a persistent client's 2nd..Nth
+        // sessions were refused on the bit their own lease already held, and
+        // `handle_upsert_synced` dropped them before publishing.
+        //
+        // The key is derived from the same `flow` the rule match used, through
+        // the SAME `persistent_source_key` helper the local path calls, so the
+        // standby's lease is keyed identically to the active's — including the
+        // `permit` shape, which decides whether the remote endpoint is folded
+        // in (#2823).
+        //
+        // PORT-BEARING ARM ONLY. The address-only arm above (`port
+        // no-translation` / a port-less protocol) takes the #6041 lease path,
+        // whose synced form mints the reverse-identity token and no lease. It
+        // needs a third variant — mint the token AND join the lease at the
+        // address the WIRE named, rather than choosing one the way
+        // `reserve_address_only_persistent` does — so it is tracked as #8132
+        // rather than bolted on here. Its session-drop half does not exist:
+        // an address-only allocation holds no port bit, and its
+        // `AddressOnlyReverseKey` folds in the remote, so two flows from one
+        // client to different remotes never collide.
+        let persistent = rule
+            .persistent_nat
+            .then(|| (flow.persistent_source_key(rule.persistent_nat_permit), rule.persistent_nat_timeout_ns));
+        if rule.pool_allocator.reserve_flow_maybe_persistent(
             flow,
             TranslatedTuple {
                 ip: rewrite_src,
@@ -516,8 +629,14 @@ fn reserve_synced_on_first_pool_owner<'a>(
             rule.deterministic_v4.is_some(),
             now_ns,
             holder,
+            persistent,
         ) {
             return SyncedReserveOutcome::Reserved;
+        }
+        // #6979 F1: see the address-only arm. The first pool-owning candidate
+        // is the ACTIVE's rule; its refusal is the answer.
+        if stop_at_first_owner {
+            return SyncedReserveOutcome::Refused;
         }
     }
     if saw_candidate {

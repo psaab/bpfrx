@@ -284,8 +284,40 @@ pub(crate) struct SessionTimeouts {
     /// default) on every construction path. A future config knob would set
     /// it here without touching the state machine.
     pub(crate) tcp_opening_ns: u64,
+    /// #7342: `security flow tcp-session closing-timeout`, the Junos CLOSING
+    /// window — a FIN has been seen in ONE direction and the close handshake has
+    /// not completed. Held at `TCP_CLOSING_TIMEOUT_NS` when the operator has not
+    /// set the leaf, which is the window this state has always reaped on.
+    pub(crate) tcp_closing_ns: u64,
+    /// #7342: `security flow tcp-session time-wait-timeout`, the Junos TIME_WAIT
+    /// window — a FIN has been seen in BOTH directions.
+    ///
+    /// Before #7342 there was no such state: `session_timeout_ns` split a TCP
+    /// close only into RST and not-RST, so a fully-closed session reaped on the
+    /// same window as a half-closed one. That is why #6539 could annotate
+    /// `time-wait-timeout` as "no TIME_WAIT state" rather than "no wire
+    /// carrier" — there was nothing for a carrier to drive. The default is
+    /// `TCP_CLOSING_TIMEOUT_NS`, so an operator who sets neither leaf sees
+    /// byte-identical reaping to pre-#7342.
+    pub(crate) tcp_time_wait_ns: u64,
     pub(crate) udp_ns: u64,
     pub(crate) icmp_ns: u64,
+}
+
+/// #7342: the three `security flow tcp-session` windows #6539 documented as
+/// accepted-only, in seconds, as they arrive on the wire. `0` means "unset —
+/// keep the dataplane default".
+///
+/// A named-field struct rather than three more positional `u64`s on
+/// `from_seconds`: the three are same-typed and adjacent, so a transposition
+/// would be silent, and it would be silent in the direction that matters —
+/// closing and time-wait differ by 4s versus 150s of Junos default session
+/// lifetime, not by a type error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TcpSessionWindowSecs {
+    pub(crate) initial: u64,
+    pub(crate) closing: u64,
+    pub(crate) time_wait: u64,
 }
 
 impl Default for SessionTimeouts {
@@ -293,6 +325,8 @@ impl Default for SessionTimeouts {
         Self {
             tcp_established_ns: DEFAULT_TCP_SESSION_TIMEOUT_NS,
             tcp_opening_ns: DEFAULT_TCP_OPENING_TIMEOUT_NS,
+            tcp_closing_ns: TCP_CLOSING_TIMEOUT_NS,
+            tcp_time_wait_ns: TCP_CLOSING_TIMEOUT_NS,
             udp_ns: DEFAULT_UDP_SESSION_TIMEOUT_NS,
             icmp_ns: DEFAULT_ICMP_SESSION_TIMEOUT_NS,
         }
@@ -309,10 +343,15 @@ impl SessionTimeouts {
             } else {
                 DEFAULT_TCP_SESSION_TIMEOUT_NS
             },
-            // #3152: the half-open window is not snapshot-driven yet; it stays
-            // at the Junos-parity default regardless of the configured
-            // established timeout (the two are independent windows).
+            // #3152/#7342: the half-open window's own leaf
+            // (`tcp-session initial-timeout`) arrives through
+            // `with_tcp_session_windows`; this base keeps the Junos-parity
+            // default, which is what an unset leaf leaves in place. The two
+            // windows are independent — a configured established-timeout has
+            // never governed the half-open state.
             tcp_opening_ns: DEFAULT_TCP_OPENING_TIMEOUT_NS,
+            tcp_closing_ns: TCP_CLOSING_TIMEOUT_NS,
+            tcp_time_wait_ns: TCP_CLOSING_TIMEOUT_NS,
             udp_ns: if udp_secs > 0 {
                 secs_to_ns_saturating(udp_secs)
             } else {
@@ -325,6 +364,96 @@ impl SessionTimeouts {
             },
         }
     }
+
+    /// #7342: layer the three `security flow tcp-session` windows onto a base
+    /// built by [`SessionTimeouts::from_seconds`].
+    ///
+    /// Separate from `from_seconds` so its existing three arguments keep their
+    /// meaning and their call sites, and so the three new windows arrive as
+    /// NAMED fields. `0` in any of them means unset and leaves that window at
+    /// its dataplane default, which is the same `0 = default` convention the
+    /// established / UDP / ICMP seconds already use on this wire — so a snapshot
+    /// from a control plane that does not send them at all (`serde(default)`)
+    /// produces byte-identical windows to pre-#7342.
+    pub(crate) fn with_tcp_session_windows(mut self, secs: TcpSessionWindowSecs) -> Self {
+        if secs.initial > 0 {
+            self.tcp_opening_ns = secs_to_ns_saturating(secs.initial);
+        }
+        if secs.closing > 0 {
+            self.tcp_closing_ns = secs_to_ns_saturating(secs.closing);
+        }
+        if secs.time_wait > 0 {
+            self.tcp_time_wait_ns = secs_to_ns_saturating(secs.time_wait);
+        }
+        self
+    }
+}
+
+/// #7342: which close window a TCP session reaps on.
+///
+/// Junos distinguishes CLOSING (after the first FIN) from TIME_WAIT (after the
+/// close handshake completes); before #7342 this dataplane had ONE post-FIN
+/// window and so could express neither leaf. `Reset` is not a Junos leaf at all
+/// — it is #3046's abort window, an xpf control that keeps a reset flood from
+/// pinning table entries — and it is deliberately NOT operator-configurable
+/// here: `rst-invalidate-session` is the Junos knob for that behaviour and is
+/// tracked separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TcpCloseClass {
+    /// #3046: a RST was observed. Sticky — a later graceful FIN cannot promote
+    /// the entry back to a longer window.
+    Reset,
+    /// Junos CLOSING: a FIN in ONE direction; the close is in progress.
+    Closing,
+    /// Junos TIME_WAIT: a FIN in BOTH directions; the close completed.
+    TimeWait,
+}
+
+impl TcpCloseClass {
+    /// The class a SINGLE packet can establish on its own.
+    ///
+    /// Never `TimeWait`: one packet carries one direction's FIN, and TIME_WAIT
+    /// is a statement about both. A session installed BY a closing packet is
+    /// therefore CLOSING, which is also what it was before #7342.
+    #[inline]
+    fn from_packet(tcp_flags: u8) -> Self {
+        if has_rst(tcp_flags) {
+            Self::Reset
+        } else {
+            Self::Closing
+        }
+    }
+}
+
+impl SessionEntry {
+    /// #7342: the close class this entry's accumulated state puts it in.
+    ///
+    /// Only meaningful once `closing` is set; the callers all check that first,
+    /// because an OPEN session's window comes from `session_timeout_ns` instead.
+    #[inline]
+    fn tcp_close_class(&self) -> TcpCloseClass {
+        if self.reset {
+            TcpCloseClass::Reset
+        } else if self.fin_own && self.fin_peer {
+            TcpCloseClass::TimeWait
+        } else {
+            TcpCloseClass::Closing
+        }
+    }
+}
+
+/// #7342: THE close-window formula. Four sites used to carry their own copy of
+/// "RST → 2s, else 30s" — `session_timeout_ns`, the read path in `lookup.rs`,
+/// the companion mirror in `propagate_tcp_state_to_companion`, and the HA
+/// promote in `update_session` — and adding a third arm to each is exactly the
+/// drift this repo's one-formula rule exists to prevent. They all call here.
+#[inline]
+pub(crate) fn tcp_close_window_ns(class: TcpCloseClass, timeouts: &SessionTimeouts) -> u64 {
+    match class {
+        TcpCloseClass::Reset => TCP_RST_TIMEOUT_NS,
+        TcpCloseClass::Closing => timeouts.tcp_closing_ns,
+        TcpCloseClass::TimeWait => timeouts.tcp_time_wait_ns,
+    }
 }
 const MAX_SESSION_DELTAS: usize = 4096;
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
@@ -332,7 +461,7 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 // so the conntrack submodules (install, lookup, expire) keep referencing
 // TCP_FIN/TCP_RST via `super::*`. The session-closing test is the shared
 // `is_closing` predicate.
-use crate::tcp_flags::{TCP_FIN, TCP_RST, has_rst, is_closing, is_initial_syn, is_syn_ack};
+use crate::tcp_flags::{TCP_FIN, TCP_RST, has_fin, has_rst, is_closing, is_initial_syn, is_syn_ack};
 
 #[allow(unused_macros)]
 macro_rules! debug_log {
@@ -356,6 +485,9 @@ macro_rules! debug_log {
 mod expire;
 mod install;
 mod lookup;
+// #7342: the read path's close/promotion signal bundle, applied to the
+// forward<->reverse companion by `propagate_tcp_state_to_companion` below.
+use lookup::TcpStatePropagation;
 
 /// #7212: the `(config generation, logical ingress interface)` pair a session's
 /// static input-filter verdict was derived under.
@@ -409,6 +541,32 @@ struct SessionEntry {
     created_ns: u64,
     expires_after_ns: u64,
     closing: bool,
+    /// #7342: a FIN was observed in THIS entry's own direction.
+    ///
+    /// Forward and reverse are two independent entries, so "this entry's
+    /// direction" is exactly the direction its own packets travel. Set on the
+    /// read path when a FIN arrives here, and mirrored onto the companion's
+    /// `fin_peer` by `propagate_tcp_state_to_companion` — so both halves
+    /// converge on the same `(own, peer)` pair from either side.
+    ///
+    /// FIN specifically, not `is_closing`: that predicate is FIN **or** RST, and
+    /// a RST is an abort with no close handshake to complete. A reset session
+    /// takes `TcpCloseClass::Reset` and never reaches TIME_WAIT.
+    ///
+    /// It could not be derived from the state that already existed.
+    /// `observed_tcp_flags` looks like the answer and is not: `account_packet`
+    /// OR-folds BOTH directions' flags onto the FORWARD entry on purpose, so
+    /// NetFlow's `tcpControlBits` reports the whole flow. `observed_tcp_flags &
+    /// TCP_FIN` is therefore true after ONE fin, and a TIME_WAIT detector built
+    /// on it would put every half-closed session straight into TIME_WAIT — a
+    /// mistake no single-FIN test could see.
+    ///
+    /// Node-local derived state, like `established` and `handshake_pending`:
+    /// `SessionEntry` carries no serde, so this is on no wire.
+    fin_own: bool,
+    /// #7342: a FIN was observed in the COMPANION's direction. Written only by
+    /// `propagate_tcp_state_to_companion`; see `fin_own`.
+    fin_peer: bool,
     /// #3046: set once this TCP session has been seen carrying a RST. It is
     /// sticky (never cleared back to false while the entry lives) so that a
     /// stray reordered non-RST segment arriving after the RST cannot promote
@@ -1620,17 +1778,30 @@ impl SessionTable {
     /// A missing companion (e.g. a `FabricRedirect` flow with no local reverse
     /// entry, or a half already independently reaped) is a no-op — the same
     /// fail-open posture as `account_packet`'s reverse hop.
+    /// #7342: takes the `TcpStatePropagation` the read path already builds,
+    /// rather than its fields spread over five positional `bool`s. Adding the
+    /// FIN signal would have made that eight arguments, four of them same-typed
+    /// and adjacent — the repeated-parameter-cluster shape this repo's API rule
+    /// says to fold into a context struct, and one where a transposition
+    /// between `close`, `reset` and `fin` would be silent.
     pub(in crate::session) fn propagate_tcp_state_to_companion(
         &mut self,
         matched_key: &SessionKey,
-        matched_nat: NatDecision,
         now_ns: u64,
-        close: bool,
-        reset: bool,
-        established: bool,
-        handshake_completed: bool,
+        propagate: TcpStatePropagation,
     ) {
+        let TcpStatePropagation {
+            nat: matched_nat,
+            close,
+            reset,
+            fin,
+            established,
+            handshake_completed,
+        } = propagate;
         let companion_key = reverse_session_key(matched_key, matched_nat);
+        // Copy the windows out before the `&mut self.entries` borrow below:
+        // `SessionTimeouts` is `Copy`, so this is a register move, not a clone.
+        let timeouts = self.timeouts;
         let mut shortened = false;
         if let Some(entry) = self.entry_by_key_mut(&companion_key) {
             if established {
@@ -1670,12 +1841,18 @@ impl SessionTable {
                 // entry (a graceful FIN cannot clear an already-observed RST).
                 entry.closing = true;
                 entry.reset |= reset;
+                // #7342: the matched half's FIN is the COMPANION's peer-side
+                // FIN. Once both halves have seen a FIN in each direction the
+                // close handshake is complete and both reap on TIME_WAIT rather
+                // than CLOSING. Mirrored rather than derived: an entry cannot
+                // see the other direction's segments, and `observed_tcp_flags`
+                // cannot stand in for this — it is OR-folded across both
+                // directions on purpose (#2749), so it is already true after
+                // ONE fin.
+                entry.fin_peer |= fin;
                 entry.last_seen_ns = now_ns;
-                entry.expires_after_ns = if entry.reset {
-                    TCP_RST_TIMEOUT_NS
-                } else {
-                    TCP_CLOSING_TIMEOUT_NS
-                };
+                entry.expires_after_ns =
+                    tcp_close_window_ns(entry.tcp_close_class(), &timeouts);
                 shortened = true;
             }
         }
@@ -1845,6 +2022,15 @@ impl SessionTable {
             // established window. A plain assignment here let that happen,
             // leaving a FIN'd session lingering 10× too long (#3489).
             record.entry.closing |= matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
+            // #7342: sticky like `closing`/`reset`. The peer bit is not
+            // knowable here — this path promotes a peer-synced entry from one
+            // node's view, and the FIN-direction pair is node-local derived
+            // state that does not cross the HA wire — so a promoted half-closed
+            // session reaps on CLOSING until this node observes the other
+            // direction's FIN itself. That is the shorter window of the two by
+            // Junos default, so the failure direction is a session reaped early
+            // rather than one held past its close.
+            record.entry.fin_own |= matches!(protocol, PROTO_TCP) && has_fin(tcp_flags);
             // #3152/#4109: promote OPENING -> ESTABLISHED only on a genuine
             // reverse SYN-ACK (sticky, mirrors lookup.rs). Only a SYN-ACK
             // (`is_syn_ack`, not merely any ACK) on the REVERSE half (the
@@ -1863,11 +2049,7 @@ impl SessionTable {
             record.entry.established |=
                 matches!(protocol, PROTO_TCP) && is_syn_ack(tcp_flags) && metadata.is_reverse;
             record.entry.expires_after_ns = if record.entry.closing {
-                if record.entry.reset {
-                    TCP_RST_TIMEOUT_NS
-                } else {
-                    TCP_CLOSING_TIMEOUT_NS
-                }
+                tcp_close_window_ns(record.entry.tcp_close_class(), &self.timeouts)
             } else {
                 // #3227: a real-traffic refresh re-stamps the idle window from
                 // the (possibly updated) metadata's per-app override.
@@ -2636,15 +2818,14 @@ fn session_timeout_ns(
     match protocol {
         PROTO_TCP => {
             if is_closing(tcp_flags) {
-                // #3046: a RST close is reaped on the short timeout; only a
-                // graceful FIN-only close gets the full 30s TIME_WAIT-style
-                // window. #3227: the per-app override never extends a closing
+                // #3046: a RST close is reaped on the short abort window.
+                // #7342: everything else is CLOSING — a single packet cannot
+                // establish TIME_WAIT, which is a statement about BOTH
+                // directions, so the entry-state callers
+                // (`SessionEntry::tcp_close_class`) are the only ones that can
+                // reach it. #3227: the per-app override never extends a closing
                 // session's reap window.
-                if has_rst(tcp_flags) {
-                    TCP_RST_TIMEOUT_NS
-                } else {
-                    TCP_CLOSING_TIMEOUT_NS
-                }
+                tcp_close_window_ns(TcpCloseClass::from_packet(tcp_flags), timeouts)
             } else if !established {
                 // #3152: handshake-incomplete (OPENING / half-open) — the
                 // short opening window. The per-app override does NOT apply
@@ -2666,6 +2847,12 @@ fn session_timeout_ns(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #7342: the CLOSING vs TIME_WAIT close-state split and the three
+// `security flow tcp-session` windows it makes configurable.
+#[cfg(test)]
+#[path = "tcp_close_state_7342_tests.rs"]
+mod tcp_close_state_7342_tests;
 
 // #7212: the static input-filter revalidation stamp lifecycle. Its own file
 // rather than another block in the 8k-line `tests.rs`, per the modularity rule

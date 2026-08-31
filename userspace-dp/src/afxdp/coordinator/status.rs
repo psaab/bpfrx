@@ -277,6 +277,14 @@ impl super::Coordinator {
         self.sessions.delete_stale_ignored.load(Ordering::Relaxed)
     }
 
+    /// #6979 F4: `DeleteSynced` commands dropped by a full worker command queue
+    /// whose NAT reservation the coordinator released on the worker's behalf.
+    pub fn session_delete_dropped_released_total(&self) -> u64 {
+        self.sessions
+            .delete_dropped_released
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// #5674: total peer-synced session imports rejected by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`; peer-synced

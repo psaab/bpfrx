@@ -623,13 +623,13 @@ func ValidateConfig(cfg *Config) []string {
 				"security flow tcp-session %s configured but accepted-only — the userspace dataplane does not track TCP sequence/window state and does not enforce these knobs (config-only parity, #2078)",
 				strings.Join(unenforced, ", ")))
 		}
-		// #6539: the three tcp-session TIMEOUT leaves (initial / closing /
-		// time-wait) get their own line because their consequence is SPECIFIC
-		// rather than "no effect" (the #5804 rule): the dataplane DOES bound
-		// each of those session states, just on a fixed window the operator
-		// cannot move. Text and enforced/unenforced split both come from
-		// flow_tcp_timeouts_6539.go, the same authority the three `show`
-		// surfaces read.
+		// #6539/#7342: the three tcp-session TIMEOUT leaves (initial / closing
+		// / time-wait) get their own line. #6539's said they were
+		// accepted-only; #7342 made them live and INVERTED it to say so,
+		// because the population carrying a configured value is exactly the
+		// operators who set one after being told it did nothing. Text comes
+		// from flow_tcp_timeouts_6539.go, the same authority the three `show`
+		// surfaces read. TEMPORARY — #8129 tracks deleting it.
 		if adv := tcpSessionTimeoutAdvisory(ts); adv != "" {
 			warnings = append(warnings, adv)
 		}
