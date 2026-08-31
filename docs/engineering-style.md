@@ -885,6 +885,28 @@ they repeatedly bite:
     orphans" and it was buried 30s later under a #6952 self-deadlock claim).
     A body that genuinely parks never finishes, so the deadlock path is
     untouched.
+  - **Score a cell on four facts, never on rc: applied, built, collected,
+    named-FAIL.** `rc != 0` is not "the tests failed". A build break, a panic
+    before collection, and a full disk all exit non-zero with no failing test.
+    A harness keying on rc calls them kills; one keying on "no named FAIL"
+    calls them escapes. They are VOID, and the two wrong answers are the two
+    that end the investigation. `scripts/mutate-lib.sh` encodes the ordering —
+    infrastructure, then applied, then built, then collected, then failures —
+    because each earlier condition makes the later numbers meaningless.
+  - **A harness must REFUSE a cell it could not have observed.** A runner that
+    gates in one language scores every mutation in another as an ESCAPE,
+    because nothing it ran could possibly have failed — and an escape is a
+    claim that the code is untested. Derive the language set from the
+    mutation's touched paths and emit "cannot score", never a verdict, when a
+    touched language has no configured gate. `make test-mutate-lib` pins this.
+  - **A `-race` failure has no `--- FAIL` line.** It emits `WARNING: DATA
+    RACE` plus a package-level FAIL, so a `^--- FAIL` counter scores a genuine
+    race red as a PASS. Count both.
+  - **Count collection in PACKAGES, not in result lines.** If `collected`
+    includes `--- FAIL` lines it moves with the failure count, and a package
+    that failed to BUILD hides behind another package's extra failures.
+  - **Commit before mutating.** A harness that restores files by checkout or
+    copy will eat uncommitted work; this has cost a full fix rewrite.
 - **Shared-cluster lock protocol (#1875).** The loss userspace cluster
   is shared by concurrent agents; ownership is serialized by the
   advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in

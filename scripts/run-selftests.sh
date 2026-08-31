@@ -129,6 +129,9 @@ scripts/dist/selftest.sh
 scripts/dist/install.sh
 scripts/dist/build-apt-repo.sh
 scripts/run-selftests.sh
+scripts/mutate-lib.sh
+scripts/mutate.sh
+scripts/mutate-selftest.sh
 test/incus/fbf-steering-lib.sh
 test/incus/fbf-steering-selftest.sh
 test/incus/test-fbf-steering.sh
@@ -182,6 +185,11 @@ done
 hdr "shell self-tests"
 run_shell scripts/image/test-grow-root.sh
 run_shell scripts/dist/selftest.sh
+# #7423: the mutation harness's scoring library. Hermetic (fixture logs). The
+# refusal cell is the one that matters -- a runner that gates in one language
+# scores every cross-language mutation as an ESCAPE, which is a claim that the
+# code is untested.
+run_shell scripts/mutate-selftest.sh
 # AF_XDP reproducer strict-warning build — fail-on-revert gate for #4906
 # (HC-081 uninitialized-counter false PASS). SKIPs on a host without a C
 # toolchain / libbpf-dev / libxdp-dev / xxd.

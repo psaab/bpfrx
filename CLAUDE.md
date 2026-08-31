@@ -114,6 +114,16 @@ make test-deploy     # Build -> push xpfd+cli+helper (each sha256-verified ==
                      #   sbin symlinks, #2162/#2176). Override target instance with
                      #   XPF_INSTANCE=<name> (default xpf-fw).
 make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
+make test-mutate-lib # Self-test the mutation-harness scoring library
+                     #   (scripts/mutate-lib.sh). Hermetic — fixture logs, no
+                     #   repo/compiler/cluster. The cell that matters is the
+                     #   REFUSAL one: a runner gating in ONE language scores
+                     #   every cross-language mutation as an ESCAPE, because
+                     #   nothing it ran could have failed — and an escape is a
+                     #   claim that the code is untested. Also pins the three
+                     #   verdicts that are neither kill nor escape: a build
+                     #   break, a -race failure (no `--- FAIL` line at all),
+                     #   and a full disk (which reds NAMED tests).
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
 make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:
