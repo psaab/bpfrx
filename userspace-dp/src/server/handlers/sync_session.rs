@@ -47,12 +47,26 @@ pub(super) fn handle(
     // field sends — so it falls through to the derivation, preserving the
     // pre-#7239 behaviour for an old peer, #8116's unresolvable-domain refusal
     // included.
-    let resolved_domain = if sync_req.routing_domain != 0 {
-        Some(sync_req.routing_domain)
-    } else {
-        guard
+    // Three states, decoded rather than defaulted (#7188's shape, and its
+    // reason). PRESENT means the sender stated a domain — including the DEFAULT
+    // instance, which is a statement and not a silence, so it does NOT fall
+    // through to the derivation. ABSENT is a peer predating the field, which
+    // keeps the pre-#7239 behaviour including #8116's unresolvable-domain
+    // refusal. UNRECOGNIZED is a value this build cannot place, and coercing it
+    // into a domain would file the session under an identity we cannot
+    // reproduce — the reasoning #7188 refuses on, transferred verbatim.
+    let resolved_domain = match crate::session::routing_domain_from_wire(sync_req.routing_domain) {
+        crate::session::WireRoutingDomain::Present(domain) => Some(domain),
+        crate::session::WireRoutingDomain::Absent => guard
             .afxdp
-            .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id)
+            .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id),
+        crate::session::WireRoutingDomain::Unrecognized => {
+            guard.afxdp.note_unknown_routing_domain_import();
+            response.ok = false;
+            response.error =
+                format!("{SYNCED_IMPORT_REFUSED_PREFIX}routing-domain-unrecognized");
+            return;
+        }
     };
     match sync_req.operation.as_str() {
         "upsert" if resolved_domain.is_none() => {

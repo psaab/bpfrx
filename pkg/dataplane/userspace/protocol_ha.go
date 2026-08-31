@@ -155,9 +155,12 @@ type SessionSyncRequest struct {
 	// value is stamped at install from the interface the flow arrived on, so no
 	// later recycle can move it.
 	//
-	// 0 is the default routing instance and is a LEGAL value, not a sentinel —
-	// which is also what an old helper's omitted field decodes to, and what
-	// every deployment with no routing-instance interface membership carries.
+	// This is the ENCODED value, forwarded opaquely: Go never interprets it.
+	// #7239 reserves 0 for "the sender did not state a domain" and encodes the
+	// DEFAULT instance as a distinct non-zero marker, so absence and
+	// default-instance stay distinguishable end to end — the #7188 reserved-zero
+	// shape, for the same reason. `userspace-dp/src/session/routing_domain_wire.rs`
+	// owns the encoding; the only correct thing to do here is carry it unchanged.
 	RoutingDomain uint32 `json:"routing_domain,omitempty"`
 }
 
@@ -319,6 +322,8 @@ type SessionDeltaInfo struct {
 	// stay equal. A leg that carried it while the other did not would be caught
 	// there rather than silently reading 0.
 	//
-	// 0 is the default routing instance — a legal value, not a sentinel.
+	// The ENCODED value (see the SessionSyncRequest field above): 0 means the
+	// sender did not state a domain, and the default instance has its own
+	// non-zero marker. Carried opaquely; Go never decodes it.
 	RoutingDomain uint32 `json:"routing_domain,omitempty"`
 }

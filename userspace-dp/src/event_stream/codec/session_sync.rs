@@ -237,7 +237,8 @@ impl EventFrame {
         // can change it. 0 is the default routing instance, which is also what
         // an old Go decoder length-skipping these 4 bytes reads, and what every
         // deployment with no routing-instance interface membership carries.
-        buf[pos..pos + 4].copy_from_slice(&key.routing_domain.to_le_bytes());
+        buf[pos..pos + 4]
+            .copy_from_slice(&crate::session::routing_domain_to_wire(key.routing_domain).to_le_bytes());
         pos += 4;
 
         // Write header
@@ -321,7 +322,8 @@ impl EventFrame {
         // different keys. An old Go decoder length-skips these 4 bytes and
         // retracts in the default instance, which is what it did before the
         // field existed.
-        buf[pos..pos + 4].copy_from_slice(&key.routing_domain.to_le_bytes());
+        buf[pos..pos + 4]
+            .copy_from_slice(&crate::session::routing_domain_to_wire(key.routing_domain).to_le_bytes());
         pos += 4;
 
         let payload_len = (pos - FRAME_HEADER_SIZE) as u32;

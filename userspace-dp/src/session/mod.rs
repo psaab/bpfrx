@@ -54,6 +54,12 @@ mod key;
 // "the peer could not state one" — two answers a plain `TunnelDiscriminator`
 // cannot carry.
 pub(crate) use discriminator::{TunnelDiscriminator, WireDiscriminator};
+// #7239: the routing domain's HA-wire encoding. Reserved-zero, three-state
+// decode — #7188's shape, for #7188's reason.
+mod routing_domain_wire;
+pub(crate) use routing_domain_wire::{
+    WireRoutingDomain, routing_domain_from_wire, routing_domain_to_wire,
+};
 pub(crate) use key::*;
 mod entry;
 pub(crate) use entry::*;

@@ -236,7 +236,7 @@ pub(in crate::afxdp) fn session_delta_info(
         // interface the flow actually arrived on — which is the whole reason it
         // is carried rather than re-derived on the peer from an ingress fold
         // that can name a recycled sibling.
-        routing_domain: delta.key.routing_domain,
+        routing_domain: crate::session::routing_domain_to_wire(delta.key.routing_domain),
         // #6949: carry the admitting policy's firewall metadata on the JSON leg
         // too. The binary open frame has carried policy_id/policy_counter_idx
         // since #3301 and the app timeout since #3227; this leg carried none,

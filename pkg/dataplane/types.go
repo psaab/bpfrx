@@ -346,8 +346,10 @@ type SessionValue struct {
 	// the helper's two-pass reverse preference matches a reply in the wrong
 	// tenant's domain on pass 1.
 	//
-	// 0 is the default routing instance: a legal value, and what an old peer's
-	// absent field decodes to.
+	// Carried OPAQUELY: this is the #7239 encoded value, not a raw domain. 0
+	// means the sender did not state one, and the default instance has its own
+	// non-zero marker, so absence and default-instance stay distinguishable
+	// across every hop. Only the helper encodes and decodes it.
 	RoutingDomain uint32
 
 	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
@@ -697,8 +699,10 @@ type SessionValueV6 struct {
 	// the helper's two-pass reverse preference matches a reply in the wrong
 	// tenant's domain on pass 1.
 	//
-	// 0 is the default routing instance: a legal value, and what an old peer's
-	// absent field decodes to.
+	// Carried OPAQUELY: this is the #7239 encoded value, not a raw domain. 0
+	// means the sender did not state one, and the default instance has its own
+	// non-zero marker, so absence and default-instance stay distinguishable
+	// across every hop. Only the helper encodes and decodes it.
 	RoutingDomain uint32
 
 	// TunnelDiscriminator is the #7188 tunnel session-identity discriminator,
