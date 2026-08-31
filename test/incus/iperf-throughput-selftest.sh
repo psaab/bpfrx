@@ -111,5 +111,47 @@ if grep -q "grep -oP '\[\\d.\]+\\s+Gbits'" "$FAILOVER"; then
 fi
 ok "the Gbits-only inline parse is gone"
 
+# ── #7673: the gate must not measure a SHAPED CoS class ────────────────────
+#
+# iperf3 defaults to destination port 5201, and cos-iperf-config.set maps 5201
+# to `iperf-100m`, a `transmit-rate 100m exact` class. Measuring that against
+# MIN_THROUGHPUT=1.0 Gbps fails by construction, at ~92-94 Mbits/s, with every
+# failover assertion passing -- which reads exactly like a forwarding
+# regression rather than like a misdirected probe.
+#
+# These assert the AGREEMENT between two files rather than pinning either to a
+# literal. Pinning the port alone would encode which side is trusted, and the
+# side that was wrong here is the one nobody suspected.
+COS_SET="$(dirname "$0")/cos-iperf-config.set"
+
+grep -q -- '-p ${IPERF_PORT}' "$FAILOVER" \
+	|| bad "test-failover.sh does not pass -p \${IPERF_PORT} to iperf3 — it will use the 5201 default, which is the 100m-shaped class"
+ok "the iperf3 client is given an explicit port"
+
+port=$(sed -n 's/^IPERF_PORT="\${IPERF_PORT:-\([0-9]*\)}"/\1/p' "$FAILOVER")
+[ -n "$port" ] || bad "could not read the IPERF_PORT default out of test-failover.sh — this cell would otherwise pass having checked nothing"
+ok "IPERF_PORT default is readable ($port)"
+
+# Which forwarding-class does that port land in, per the CoS config the smoke
+# applies? Read it in two steps -- port to term, term to class -- rather than
+# assuming it is still term 11.
+term=$(sed -n "s/^set firewall family inet filter bandwidth-output term \([0-9]*\) from destination-port ${port}$/\1/p" "$COS_SET" | head -1)
+[ -n "$term" ] || bad "port $port matches no 'from destination-port' term in cos-iperf-config.set — the smoke would be measuring an unclassified path"
+ok "port $port is classified by filter term $term"
+
+fc=$(sed -n "s/^set firewall family inet filter bandwidth-output term ${term} then forwarding-class \(.*\)$/\1/p" "$COS_SET" | head -1)
+[ -n "$fc" ] || bad "filter term $term has no 'then forwarding-class' line — cannot tell which class port $port lands in"
+ok "port $port maps to forwarding-class $fc"
+
+# The class must be UNSHAPED: its scheduler must carry no transmit-rate.
+sched=$(sed -n "s/^set class-of-service scheduler-maps [^ ]* forwarding-class $fc scheduler \(.*\)$/\1/p" "$COS_SET" | head -1)
+[ -n "$sched" ] || bad "forwarding-class $fc has no scheduler in the scheduler-map — cannot tell whether it is shaped"
+ok "forwarding-class $fc uses scheduler $sched"
+
+if grep -q "^set class-of-service schedulers $sched transmit-rate" "$COS_SET"; then
+	bad "the smoke's iperf port $port lands in $fc/$sched, which HAS a transmit-rate — the throughput gate is measuring a deliberately shaped class (#7673)"
+fi
+ok "scheduler $sched carries no transmit-rate (unshaped)"
+
 echo
 echo "iperf-throughput-lib self-test: $PASS passed"
