@@ -3805,20 +3805,23 @@ pub(super) fn poll_binding_process_descriptor(
 
                     // (3) Zone security policy — only for TRANSIT
                     //     (ForwardCandidate). Local delivery (host-inbound) is
-                    //     #3292; NoRoute is NOT adjudicated here and does NOT
-                    //     drop — it is slow-path eligible
-                    //     (ForwardingDisposition::is_slow_path_eligible) and is
-                    //     REINJECTED to the kernel FIB, which forwards it with
-                    //     no zone policy, session, NAT or screen. This comment
-                    //     claimed "NoRoute drops anyway" until #7409; that was
-                    //     false, and being false in the SAFE direction is why
-                    //     the gap went unexamined for so long. #7409 narrows the
-                    //     exposure by importing kernel-learned routes into the
-                    //     helper FIB so NoRoute becomes rare rather than routine,
-                    //     but does NOT close it: the FIB is refreshed only on
-                    //     commit and ip-monitoring actuation, so a route learned
-                    //     between pushes still lands here. Do not "fix" this by
-                    //     dropping NoRoute — that black-holes every learned
+                    //     #3292; NoRoute is adjudicated in its OWN arm as of
+                    //     #7480, not here — see `ForwardingDisposition::NoRoute`
+                    //     below, which evaluates the computable zone pair and
+                    //     downgrades a denied frame to PolicyDenied so the
+                    //     trailing #1913 chokepoint refuses it. Until #7480 it
+                    //     was reinjected to the kernel FIB unadjudicated, which
+                    //     forwards with no zone policy, session, NAT or screen.
+                    //     This comment claimed "NoRoute drops anyway" until
+                    //     #7409; that was false, and being false in the SAFE
+                    //     direction is why the gap went unexamined for so long.
+                    //     #7409 narrowed the exposure by importing
+                    //     kernel-learned routes into the helper FIB, but does
+                    //     NOT close it: the FIB is refreshed only on commit and
+                    //     ip-monitoring actuation, so a route learned between
+                    //     pushes still resolves NoRoute. That surviving window
+                    //     is why #7480 ADJUDICATES rather than drops — dropping
+                    //     NoRoute outright black-holes every learned
                     //     destination for the width of that window;
                     //     MissingNeighbor keeps its
                     //     own cold-path arm, which now enforces this SAME zone
@@ -4589,6 +4592,128 @@ pub(super) fn poll_binding_process_descriptor(
                                             meta.ingress_ifindex,
                                         );
                                     }
+                                }
+                            }
+                            // #7480: adjudicate the zone pair BEFORE the trailing
+                            // #1913 chokepoint hands this frame to the kernel FIB.
+                            //
+                            // A NoRoute frame is slow-path eligible, so without this
+                            // it is reinjected to xpf-usp0 and the kernel forwards it
+                            // with no zone policy, session, NAT or screen — and
+                            // nothing downstream catches it: there is no nftables
+                            // `hook forward` chain at all, ip_forward is force-enabled
+                            // while armed, and rp_filter is deliberately 0 on the TUN.
+                            // The destination is attacker-chosen, so this is the
+                            // steerable half of #6664.
+                            //
+                            // NOT a drop of NoRoute. #7409's importer BOUNDS the
+                            // divergence but does not close it — the snapshot is
+                            // pushed on commit and ip-monitoring actuation only, with
+                            // no netlink route subscription — so a route learned
+                            // between pushes must still reach the kernel. Dropping
+                            // NoRoute outright would black-hole every learned
+                            // destination for the width of that window, and on a fresh
+                            // boot until the first push. Adjudicating instead keeps the
+                            // delegation for PERMITTED flows and removes it only for
+                            // flows the operator's policy already denies.
+                            //
+                            // Shape follows the #4024 MissingNeighbor arm rather than
+                            // inventing a second convention: evaluate, then downgrade
+                            // the disposition to PolicyDenied and let the existing
+                            // chokepoint refuse it fail-closed with the accounting that
+                            // already exists. That keeps ONE authority for "may this
+                            // reach the kernel" (#6664) instead of two that agree today.
+                            //
+                            // The egress is unresolved by definition here, so
+                            // `to_zone_id` is the #3110 unzoned sentinel 0 and the
+                            // evaluation falls through to the DEFAULT action. On a
+                            // Junos-default deny box that means a NoRoute frame now
+                            // drops. That is the intended fix and it is
+                            // availability-visible on upgrade.
+                            //
+                            // Flow-backed vs flowless mirrors #3291/#4024: a real flow
+                            // is evaluated with its ports and `l4_present = true`, so a
+                            // port-bearing permit term still matches and a permitted
+                            // flow is not over-gated; a flowless packet (non-first
+                            // fragment / no L4) is rebuilt from meta and evaluated with
+                            // ports = 0 and `l4_present = false`, so port-bearing terms
+                            // fail closed while address/protocol/`any` still match.
+                            let ingress_logical = resolve_ingress_logical_ifindex(
+                                worker_ctx.forwarding,
+                                meta.ingress_ifindex as i32,
+                                meta.ingress_vlan_id,
+                            )
+                            .unwrap_or(meta.ingress_ifindex as i32);
+                            let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
+                                worker_ctx.forwarding,
+                                ingress_logical,
+                                ingress_zone_override,
+                                decision.resolution.egress_ifindex,
+                            );
+                            // A frame with NO derivable L3 identity falls through
+                            // UNADJUDICATED, matching the three sibling sites (the
+                            // association-HIT arm, the session-MISS arm and the
+                            // MissingNeighbor policy arm). That is deliberate: those
+                            // sites carry an explicit invariant that they must not
+                            // diverge on what the filter sees, and the disposition
+                            // question for all of them is tracked in #7890. See the
+                            // `L3_CTX_NONE_UNKNOWN_FAMILY` doc block in
+                            // frame/inspect.rs, which this arm is now enumerated in.
+                            // The reachable case is a dst-unspecified packet, which
+                            // that doc notes "dies at NoRoute".
+                            let synthetic_l3;
+                            let adjudicated = match flow.as_ref() {
+                                Some(f) => Some((f, true)),
+                                None => {
+                                    synthetic_l3 =
+                                        crate::afxdp::frame::l3_session_flow_from_meta(meta);
+                                    synthetic_l3.as_ref().map(|f| (f, false))
+                                }
+                            };
+                            if let Some((adj_flow, l4_present)) = adjudicated {
+                                let ports = l4_present.then(|| {
+                                    (adj_flow.forward_key.src_port, adj_flow.forward_key.dst_port)
+                                });
+                                let policy_icmp = policy_packet_icmp(packet_frame, meta);
+                                if let Some(policy_result) =
+                                    crate::afxdp::forwarding::noroute_policy_denial(
+                                        &worker_ctx.forwarding.policy,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        adj_flow.src_ip,
+                                        adj_flow.dst_ip,
+                                        meta.protocol,
+                                        ports,
+                                        policy_icmp,
+                                        desc.len as u64,
+                                    )
+                                {
+                                    let owner_rg_id = owner_rg_for_resolution(
+                                        worker_ctx.forwarding,
+                                        decision.resolution,
+                                    );
+                                    emit_policy_deny_event(
+                                        worker_ctx.event_stream,
+                                        adj_flow,
+                                        &decision.nat,
+                                        meta,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        owner_rg_id,
+                                        policy_result.policy_id,
+                                        policy_result.action,
+                                        0,
+                                        // SILENT drop. There is no route to the
+                                        // destination, so a `reject` term cannot be
+                                        // honoured by sending anything onward; #3615's
+                                        // rule is that such a deny logs the truthful
+                                        // DENY rather than claiming a reject occurred.
+                                        false,
+                                        now_ns,
+                                    );
+                                    telemetry.dbg.policy_deny += 1;
+                                    decision.resolution.disposition =
+                                        ForwardingDisposition::PolicyDenied;
                                 }
                             }
                         }

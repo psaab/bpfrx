@@ -3026,7 +3026,14 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,
   `NoRoute`, and `MissingNeighbor`
   (`ForwardingDisposition::is_slow_path_eligible`, the single source of
-  truth). `PolicyDenied`, `HAInactive`, `DiscardRoute` and — since #6664 —
+  truth). #7480: `NoRoute` is additionally ADJUDICATED against the
+  computable zone pair in its own `poll_descriptor` arm before the trailing
+  chokepoint — a denied frame is downgraded to `PolicyDenied` and refused
+  there. Its egress is unresolved by construction (`egress_ifindex: 0`), so
+  the to-zone is the #3110 unzoned sentinel and the verdict is the DEFAULT
+  action: a zone-pair or `junos-global` permit does NOT rescue it. It stays
+  slow-path eligible because #7409 bounds the kernel/helper FIB divergence
+  without closing it, so a PERMITTED NoRoute frame must still be delegated. `PolicyDenied`, `HAInactive`, `DiscardRoute` and — since #6664 —
   `NextTableUnsupported` are NOT eligible: reinjecting them would hand the
   packet to the kernel FIB and silently bypass a zone-policy DENY / HA gate
   / discard route (#1913), or forward an unresolvable inter-VRF next-table

@@ -1658,14 +1658,23 @@ pub(in crate::afxdp) fn parse_session_flow_from_meta(meta: UserspaceDpMeta) -> O
 ///
 /// These COUNT; they do not change disposition. The callers still forward, and
 /// deliberately so: the same `if let Some(l3_flow)` gate exists on the
-/// association-HIT arm, the session-MISS arm and the MissingNeighbor policy arm,
-/// and the hit/miss pair carries an explicit invariant that they must not
-/// diverge on what the filter sees. Making one arm discard would break that
-/// invariant while leaving the bypass reachable through the others. The
-/// disposition question is tracked separately in #7890 (which covers all three
-/// sites — the hit arm, the miss arm, and the MissingNeighbor policy arm — since
-/// changing one alone would break the stated hit/miss parity invariant while
-/// leaving the bypass reachable through the others). This counter exists so the
+/// association-HIT arm, the session-MISS arm, the MissingNeighbor policy arm
+/// and — since #7480 — the NoRoute policy arm, and the hit/miss pair carries an
+/// explicit invariant that they must not diverge on what the filter sees. Making
+/// one arm discard would break that invariant while leaving the bypass reachable
+/// through the others. The disposition question is tracked separately in #7890
+/// (which covers the hit arm, the miss arm, and the MissingNeighbor policy arm —
+/// since changing one alone would break the stated hit/miss parity invariant
+/// while leaving the bypass reachable through the others).
+///
+/// #7480 added the FOURTH such site and deliberately kept the same
+/// fall-through, so this enumeration stays accurate: a NoRoute frame with no
+/// derivable L3 identity is NOT adjudicated and is still delegated to the kernel
+/// — which for the reachable leg means a dst-unspecified packet, the one this
+/// doc notes "dies at NoRoute". Bringing that arm under #7890 rather than
+/// diverging from the other three is the deliberate choice; #7480 narrowed the
+/// bypass for every frame that HAS an L3 identity, which is all of them in
+/// production unless `L3_CTX_NONE_UNSPECIFIED_ADDR` is moving. This counter exists so the
 /// seam cannot be silently widened by a future metadata change.
 pub(in crate::afxdp) static L3_CTX_NONE_UNKNOWN_FAMILY: AtomicU64 = AtomicU64::new(0);
 

@@ -22,7 +22,11 @@ import (
 //   - No less-specific route covers the destination in the helper FIB
 //     (typically: no config default) -> the lookup resolves NoRoute, the
 //     frame is slow-path eligible (userspace-dp is_slow_path_eligible), and
-//     it is REINJECTED to xpf-usp0. The kernel then forwards it via the
+//     it is REINJECTED to xpf-usp0. #7480 now adjudicates that reinject
+//     against the computable zone pair, so a frame the operator's policy
+//     denies is refused instead of delegated; what follows describes the
+//     pre-#7480 behaviour and still describes a POLICY-PERMITTED frame,
+//     which is delegated by design. The kernel then forwards it via the
 //     learned route with no zone policy, no session, no NAT and no screen —
 //     and nothing downstream catches it (there is no nftables `hook
 //     forward` chain at all, ip_forward is force-enabled while armed, and
