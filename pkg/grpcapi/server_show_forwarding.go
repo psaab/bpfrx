@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -139,7 +140,8 @@ func (s *Server) showForwardingOptions(cfg *config.Config, buf *strings.Builder)
 		}
 		if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
 			buf.WriteString("Sampling:\n")
-			for name, inst := range fo.Sampling.Instances {
+			for _, name := range sortedInstanceNames(fo.Sampling.Instances) {
+				inst := fo.Sampling.Instances[name]
 				fmt.Fprintf(buf, "  Instance: %s\n", name)
 				if inst.InputRate > 0 {
 					fmt.Fprintf(buf, "    Input rate: 1/%d\n", inst.InputRate)
@@ -196,7 +198,8 @@ func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *str
 		if pm == nil || len(pm.Instances) == 0 {
 			buf.WriteString("No port-mirroring instances configured\n")
 		} else {
-			for name, inst := range pm.Instances {
+			for _, name := range sortedInstanceNames(pm.Instances) {
+				inst := pm.Instances[name]
 				fmt.Fprintf(buf, "Instance: %s\n", name)
 				if inst.InputRate > 0 {
 					fmt.Fprintf(buf, "  Input rate: 1/%d\n", inst.InputRate)
@@ -240,4 +243,25 @@ func flowServerNotInstalledSuffix(fs *config.FlowServer) string {
 		return ""
 	}
 	return "  [NOT INSTALLED: " + reason + "]"
+}
+
+// sortedInstanceNames returns a map's keys in a stable order.
+//
+// #7357: every `show forwarding-options` renderer iterated its instance map
+// with a bare `range`, which Go randomises per run. The listings therefore
+// changed order between two calls with identical config -- an operator diffing
+// captures sees churn that is not there, and any golden or transcript over
+// these surfaces is unstable for a reason unrelated to the config.
+//
+// Generic over the value type because the same defect appeared in BOTH the
+// port-mirroring and sampling families, whose instance types differ. The
+// issue named only the two port-mirroring renderers and said its census was a
+// FLOOR; measuring the tree found six sites across three files.
+func sortedInstanceNames[T any](m map[string]T) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
