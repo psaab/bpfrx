@@ -198,6 +198,46 @@ panic: test timed out after 10m0s
 EOF
 ck "a build break outranks a timeout in the same log" 	"no 1 0 VOID(build break)" "$(mutation_score_log go "$W/build-and-timeout.log" yes)"
 
+echo "== the SPLICE (#8213) =="
+# Parallel `go test -v` interleaves output MID-LINE. The anchored `^--- FAIL`
+# this library used to count misses a spliced marker entirely, and the cell
+# scores as an ESCAPE — which reads as "the fix is not bound" and argues for
+# weakening the TEST. The damaging direction.
+cat > "$W/spliced.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+    frr_test.go:88: waiting for reload--- FAIL: TestSpliced (0.01s)
+FAIL	github.com/psaab/xpf/pkg/frr	0.30s
+EOF
+ck "a SPLICED --- FAIL is still a kill" "yes 2 1 KILLED" 	"$(mutation_score_log go "$W/spliced.log" yes)"
+
+# grep -c counts LINES; two markers can share one spliced line.
+cat > "$W/spliced-double.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+  x--- FAIL: TestA (0.01s)  y--- FAIL: TestB (0.02s)
+FAIL	github.com/psaab/xpf/pkg/frr	0.30s
+EOF
+ck "two markers on one spliced line count as two" "yes 2 2 KILLED" 	"$(mutation_score_log go "$W/spliced-double.log" yes)"
+
+# The complement that keeps the loosened pattern honest: prose ABOUT the marker
+# must not register. `--- FAIL: ` with colon and space is what distinguishes a
+# real marker from a mention.
+cat > "$W/prose.log" <<'EOF'
+ok  	github.com/psaab/xpf/pkg/cli	6.409s
+# a harness that keys on --- FAIL is unsound under parallel -v
+ok  	github.com/psaab/xpf/pkg/natshow	0.02s
+EOF
+ck "prose mentioning the marker without a name is not a failure" "yes 2 0 ESCAPED" 	"$(mutation_score_log go "$W/prose.log" yes)"
+
+echo "== ATTRIBUTION (#8213, the half counting cannot fix) =="
+# A spliced kill whose package ALSO has a clean unrelated failure counts >= 1,
+# so rc and count AGREE and the cell scores KILLED — for the wrong test.
+ck "a kill naming the intended test is a real kill" "KILLED" 	"$(mutation_verdict_for_target KILLED TestTarget TestTarget TestOther)"
+ck "a kill that does NOT name the target is not a kill" 	"ESCAPED(other tests failed: TestOther)" 	"$(mutation_verdict_for_target KILLED TestTarget TestOther)"
+# A VOID must not be refined: an unfinished run has no trustworthy names, and
+# refining it would repeat the "score the prefix" error the timeout ordering
+# exists to prevent.
+ck "a VOID verdict is not refined by names" "VOID(build break)" 	"$(mutation_verdict_for_target 'VOID(build break)' TestTarget TestOther)"
+
 echo
 if [ "$fails" -eq 0 ]; then
 	echo "mutate-selftest: all checks passed"

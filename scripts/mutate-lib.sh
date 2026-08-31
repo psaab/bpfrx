@@ -29,6 +29,25 @@
 #      one hang can be recorded as a screen full of escapes nobody earned.
 #      (Seen on #7611: a contract change made `Run` retry a bind failure
 #      forever, and a test calling it with context.Background() never returned.)
+#   5. `^--- FAIL` is an UNSOUND instrument, and it is the one used to detect
+#      the four shapes above (#8213). Under parallel `go test -v` the output of
+#      concurrently running tests interleaves MID-LINE, so a real
+#      `--- FAIL: TestX` can be spliced into another test's failure text and no
+#      longer start at column 0. The anchored grep misses it and the cell scores
+#      as an ESCAPE -- and an escape reads as "the fix is not bound", which
+#      argues for weakening the TEST. It does not merely lose a signal; it
+#      manufactures a case for deleting a guard that works.
+#
+#      Two fixes, because there are two halves:
+#        - COUNTING is made splice-tolerant below (unanchored, occurrence-wise).
+#          That recovers the missed kill.
+#        - ATTRIBUTION cannot be fixed by counting AT ALL. If your cell's
+#          `--- FAIL` is spliced but another test in the same package fails
+#          cleanly, the count is still >= 1 and the cell scores as a KILL FOR
+#          THE WRONG TEST, with rc and count agreeing and nothing looking
+#          wrong. Only a NAME can distinguish "my cell's test failed" from
+#          "something failed" -- see mutation_go_failed_names_json and
+#          mutation_verdict_for_target.
 
 # mutation_lang_of FILE -> go|rust|unknown
 mutation_lang_of() {
@@ -129,11 +148,34 @@ mutation_rust_build_broken() {
 mutation_go_collected() { grep -cE '^(ok|FAIL|\?)[[:space:]]' "$1"; }
 
 # mutation_go_failed LOG -> named failing tests, INCLUDING races.
+#
+# UNANCHORED and counted per OCCURRENCE, not per line (#8213). Parallel `go
+# test -v` interleaves output mid-line, so a real `--- FAIL: TestX` can end up
+# after other text on its line, and two of them can share one line. `grep -c`
+# counts LINES, so even the unanchored form would under-count a doubly-spliced
+# line; `grep -o` counts the marker itself.
+#
+# `--- FAIL: ` with the colon and space, rather than `--- FAIL`, so a log that
+# merely discusses the marker in prose does not register. That is a weaker
+# guard than anchoring was against prose, and the trade is deliberate: prose
+# containing the exact go marker is rare and produces a VOID-shaped over-count,
+# while a spliced miss produces an ESCAPE that argues for deleting a real test.
 mutation_go_failed() {
 	local named races
-	named=$(grep -cE '^--- FAIL' "$1")
+	named=$(grep -oE -- '--- FAIL: ' "$1" | grep -c . )
 	races=$(grep -cE '^WARNING: DATA RACE' "$1")
 	printf '%s\n' "$((named + races))"
+}
+
+# mutation_go_failed_names_json JSONLOG -> sorted unique failing test names.
+#
+# The ONLY sound attribution. `go test -json` emits one JSON object per event,
+# so a name can never be spliced into another line by construction. Requires
+# the driver to run `go test -json`; a `make`-driven gate cannot produce it,
+# which is why the count-based path above still exists and is still needed.
+mutation_go_failed_names_json() {
+	jq -r 'select(.Action=="fail") | select(.Test != null) | .Test' <"$1" |
+		sort -u
 }
 
 mutation_rust_collected() { grep -cE '^test .* \.\.\. ' "$1"; }
@@ -167,6 +209,38 @@ mutation_verdict() {
 	if [ "$collected" -eq 0 ]; then printf 'VOID(no tests collected)\n'; return; fi
 	if [ "$failed" -gt 0 ]; then printf 'KILLED\n'; return; fi
 	printf 'ESCAPED\n'
+}
+
+# mutation_verdict_for_target VERDICT TARGET NAMES... -> refined verdict
+#
+# The attribution half of #8213, and the reason a count can never close it: a
+# spliced `--- FAIL` whose package ALSO contains a cleanly-failing unrelated
+# test still counts >= 1, so the cell scores KILLED with rc and count in
+# agreement and nothing looking wrong. It is a kill FOR THE WRONG TEST, and it
+# certifies coverage the cell never demonstrated.
+#
+# Given the verdict a counting scorer produced, the test the cell was written
+# to kill, and the failing NAMES from a -json run, this reports:
+#
+#   KILLED                  - the intended test failed. The only real kill.
+#   ESCAPED(other tests failed: ...)
+#                           - something failed, but not the target. NOT a kill:
+#                             the mutation is unbound and the run is also red
+#                             for an unrelated reason, which is two findings,
+#                             not one.
+#
+# Only refines a KILLED verdict. A VOID stays VOID — an unfinished or unbuilt
+# run has no trustworthy names to compare, and refining it would be the same
+# "score the prefix" error the timeout ordering exists to prevent.
+mutation_verdict_for_target() {
+	local verdict="$1" target="$2"
+	shift 2
+	if [ "$verdict" != KILLED ]; then printf '%s\n' "$verdict"; return; fi
+	local n
+	for n in "$@"; do
+		if [ "$n" = "$target" ]; then printf 'KILLED\n'; return; fi
+	done
+	printf 'ESCAPED(other tests failed: %s)\n' "$*"
 }
 
 # mutation_score_log LANG LOG APPLIED -> "BUILT COLLECTED FAILED VERDICT"

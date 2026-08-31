@@ -140,6 +140,16 @@ make test-mutate-lib # Self-test the mutation-harness scoring library
                      #   panic is the informative signal because its goroutine
                      #   dump NAMES the stuck test. Never score a run that
                      #   consumed its whole budget.
+                     #   #8213: `^--- FAIL` is itself UNSOUND — parallel
+                     #   `go test -v` interleaves MID-LINE, so a real
+                     #   `--- FAIL` can land off column 0 and the cell scores
+                     #   as an ESCAPE, which argues for weakening the TEST.
+                     #   Counting is now splice-tolerant; ATTRIBUTION is not
+                     #   fixable by counting at all (a spliced kill beside an
+                     #   unrelated clean failure scores KILLED for the WRONG
+                     #   test, with rc and count agreeing). Score
+                     #   `go test -json` on Action=="fail" and compare the
+                     #   NAME against the cell's target.
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
 make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:

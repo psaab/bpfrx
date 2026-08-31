@@ -107,6 +107,18 @@ PY
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 		"$label" "$file" "$lang" "$applied" "$built" "$collected" "$failed" "$verdict" >> "$OUT"
 	echo "[$label] $verdict (collected=$collected failed=$failed log=$log)"
+	# #8213 attribution: this driver gates through `make`, which cannot emit
+	# `go test -json`, so its KILLED verdicts are COUNT-based — they say
+	# something failed, not that YOUR cell's test failed. If another test in the
+	# package was already red, a cell that changed nothing scores KILLED with rc
+	# and count in agreement and nothing looking wrong.
+	#
+	# Said at the point of use rather than in a comment, because the reader who
+	# needs it is the one reading this line. A JSON-capable driver should use
+	# mutation_go_failed_names_json + mutation_verdict_for_target instead.
+	if [ "$verdict" = KILLED ]; then
+		echo "         ^ count-based: confirm the failing test is the one this cell targets"
+	fi
 
 	cp "$orig" "$REPO/$file"
 done < "$SPEC"
