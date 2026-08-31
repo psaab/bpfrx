@@ -391,6 +391,18 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_delete_stale_ignored", default)]
     pub session_delete_stale_ignored: u64,
+    /// #6979 F4: synced-session deletes whose `DeleteSynced` command was
+    /// dropped by a full worker command queue, and whose NAT reservation the
+    /// coordinator therefore released on that worker's behalf.
+    ///
+    /// Nonzero means a worker command queue hit its bound during a delete. The
+    /// reservation is not leaked — that is what this counts — but the same
+    /// dropped command also cost that worker its local session-table and BPF
+    /// map teardown for the key, so a climbing value is real backpressure, not
+    /// bookkeeping. Surfaced as
+    /// `xpf_userspace_session_delete_dropped_released_total`.
+    #[serde(rename = "session_delete_dropped_released", default)]
+    pub session_delete_dropped_released: u64,
     /// #6600/#7398: peer-synced imports refused because this node could not
     /// reserve the translated NAT port the session names. Sustained growth
     /// means the standby cannot hold the primary's translations, so those

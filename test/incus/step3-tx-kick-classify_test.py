@@ -277,3 +277,82 @@ def test_tx_kick_delta_fields_missing_rejected(tmp_path):
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ------------------------------------------------------------- 7424 ----
+def test_all_zero_capture_is_insufficient_not_out_7424():
+    """An empty/truncated capture must not produce a definitive OUT.
+
+    Every all-zero block satisfies `t1_out_block` — retry_delta 0 is below
+    RETRY_OUT, then `count_delta == 0` returns True — so `t1_out_holds` is
+    VACUOUSLY true and the report prints "the TX-kick hypothesis is ruled
+    out": a definitive negative about the dataplane, from a file in which
+    nothing was measured. Mirrors step2's C175-HC-070 guard.
+    """
+    blocks = [
+        {
+            "b": i,
+            "shape": [0.0] * 16,
+            "tx_kick_retry_delta": 0,
+            "tx_kick_count_delta": 0,
+            "tx_kick_sum_ns_delta": 0,
+            "tx_kick_hist_delta": [0] * 16,
+        }
+        for i in range(12)
+    ]
+    diag = classify_mod.classify(blocks)
+    assert diag["verdict"] == "INSUFFICIENT", (
+        "an all-zero capture produced a definitive %s — nothing was measured, "
+        "so there is nothing to rule out" % diag["verdict"]
+    )
+    assert "empty or truncated" in (diag["insufficient_reason"] or "")
+
+
+def test_valid_capture_with_zero_kicks_is_still_out_7424():
+    """The over-reach control, and the reason the guard needs TWO conditions.
+
+    Zero KICKS alone is a legitimate OUT: a valid capture in which the
+    dataplane simply never kicked is real evidence, and refusing it would
+    discard a true negative. Only the absence of a HISTOGRAM as well means
+    nothing was measured — a normalised block sums to 1.0, so a zero sum is
+    the tell. Without this cell, a guard keyed on `count_delta == 0` alone
+    would pass the sibling test above while breaking every real OUT.
+    """
+    blocks = make_12_blocks(
+        [0.99] * 12,
+        retry=[0] * 12,
+        count=[0] * 12,
+        sum_ns=[0] * 12,
+    )
+    diag = classify_mod.classify(blocks)
+    assert diag["verdict"] == "OUT", (
+        "a VALID capture whose dataplane never kicked was reported as %s; "
+        "that is a real measurement and a real negative result"
+        % diag["verdict"]
+    )
+    assert diag["insufficient_reason"] is None
+
+
+def test_zero_histogram_with_kick_evidence_is_not_insufficient_7424():
+    """The other half of the two-condition guard.
+
+    A block carrying kick counts is evidence even if its histogram is empty,
+    so the no-evidence shape requires BOTH to be absent. This cell fails if
+    the guard is keyed on the histogram alone.
+    """
+    blocks = [
+        {
+            "b": i,
+            "shape": [0.0] * 16,
+            "tx_kick_retry_delta": 0,
+            "tx_kick_count_delta": 5,
+            "tx_kick_sum_ns_delta": 100,
+            "tx_kick_hist_delta": [0] * 16,
+        }
+        for i in range(12)
+    ]
+    diag = classify_mod.classify(blocks)
+    assert diag["verdict"] != "INSUFFICIENT", (
+        "blocks carrying kick counts were treated as no-evidence; a capture "
+        "with kicks measured something"
+    )
