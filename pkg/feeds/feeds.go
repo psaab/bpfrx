@@ -559,8 +559,29 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 		// referencing policy fails CLOSED (see the doc comment). A persisted feed
 		// carried forward across a reconfigure (#5282) still has its last-good
 		// prefixes here, so this never re-opens the re-fetch window.
-		seen := make(map[string]struct{})
-		merged := make([]string, 0)
+		// #7174 C12b: establish readiness AND the union's upper bound in one
+		// pre-pass, before allocating anything.
+		//
+		// The ruling on that row was to bound the ALLOCATION, not the data.
+		// A per-feed cap already exists (maxFeedPrefixes, enforced at fetch),
+		// but this union across feeds and bindings previously started from
+		// `make([]string, 0)` and an unsized map and regrew on every append —
+		// the memory spike the row describes. Capping the DATA was rejected
+		// deliberately: these feeds drive security policy, so truncating a
+		// deny-list fails OPEN while truncating an allow-list fails CLOSED —
+		// the same code with opposite failure directions depending on how the
+		// operator uses the feed. That is a product decision and does not
+		// belong in an allocation row.
+		//
+		// The sum of constituent lengths is an upper bound because dedup can
+		// only shrink the result, so this never under-allocates and the output
+		// is byte-identical to the unsized version.
+		//
+		// Doing readiness here rather than inside the merge is the second
+		// half: a binding with any unready constituent is OMITTED, and the
+		// old shape discovered that only after merging every prefix of every
+		// feed ahead of the unready one. That work was always discarded.
+		total := 0
 		allReady := true
 		for _, feedName := range binding.FeedNames {
 			fs, ok := m.feeds[feedName]
@@ -568,6 +589,15 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 				allReady = false
 				break
 			}
+			total += len(fs.prefixes)
+		}
+		if !allReady {
+			continue
+		}
+		seen := make(map[string]struct{}, total)
+		merged := make([]string, 0, total)
+		for _, feedName := range binding.FeedNames {
+			fs := m.feeds[feedName]
 			// Dedup across the binding's feeds; deep-copy from the live state.
 			for _, p := range fs.prefixes {
 				if _, dup := seen[p]; dup {
@@ -576,9 +606,6 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 				seen[p] = struct{}{}
 				merged = append(merged, p)
 			}
-		}
-		if !allReady {
-			continue
 		}
 		sort.Strings(merged)
 		out[name] = merged
