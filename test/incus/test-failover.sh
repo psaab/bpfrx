@@ -71,6 +71,22 @@ MIN_SESSIONS=4          # minimum established sessions (control + some data stre
 SYNC_WAIT=5             # seconds to wait for session sync sweep
 REBOOT_WAIT=60          # max WALL-CLOCK seconds to wait for fw0 to come back (#1880)
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
+# #7673: the CoS output filter classifies by DESTINATION PORT, and iperf3
+# defaults to 5201 -- which cos-iperf-config.set maps to `iperf-100m`, a
+# `transmit-rate 100m exact` class. Measuring a deliberately-100Mbit-shaped
+# class against a 1.0 Gbps floor fails by construction, and it fails looking
+# exactly like a forwarding regression (~92-94 Mbits/s, every failover
+# assertion passing). 5211 is the `iperf-uncapped` term, whose scheduler
+# carries no transmit-rate.
+#
+# This only bites once apply-cos-config.sh has been run, and the CoS config
+# survives until the next deploy wipes it -- so the gate passed or failed
+# depending on what the PREVIOUS agent left on the cluster. That is why it
+# reproduced on master and read as a real regression.
+#
+# iperf-throughput-selftest.sh asserts this port still maps to an unshaped
+# class, so the two files cannot drift apart silently.
+IPERF_PORT="${IPERF_PORT:-5211}"
 
 PASS=0
 FAIL=0
@@ -193,7 +209,7 @@ sleep 1
 
 # ── Phase 1: Start iperf3 ───────────────────────────────────────────
 
-info "Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} → ${IPERF_TARGET}"
+info "Starting iperf3 -P${IPERF_STREAMS} -t${IPERF_DURATION} -p${IPERF_PORT} → ${IPERF_TARGET}"
 
 # iperf3 server handles one client at a time. After a previous test
 # disrupts connections (session clear / failover), the server may hold
@@ -204,7 +220,7 @@ for attempt in 1 2 3; do
 	incus exec "$CLUSTER_LAN_HOST" -- pkill -9 iperf3 2>/dev/null || true
 	sleep 1
 	incus exec "$CLUSTER_LAN_HOST" -- bash -c \
-		"iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
+		"iperf3 --forceflush --connect-timeout 5000 -t ${IPERF_DURATION} -c ${IPERF_TARGET} -p ${IPERF_PORT} -P ${IPERF_STREAMS} > /tmp/iperf3-failover.log 2>&1 &"
 
 	sleep 8  # all parallel streams must be fully established
 
