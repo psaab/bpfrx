@@ -195,6 +195,21 @@ See the deploy backing table in
   in ~1ms.
 - **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval`
   is milliseconds internally, centiseconds on wire per RFC 5798.
+- **Deafness windows and the extended master-down timer (#7579)**: a BACKUP
+  promotes when its master-down timer expires, and that arm is deliberately
+  UNGATED by `preempt` — RFC 5798's preempt governs displacing a master you can
+  HEAR, not filling an apparent vacancy. So in any window where the node is
+  deaf, the ~97ms timer a 30ms RETH interval produces is the only thing between
+  a healthy peer and a second MASTER claiming its VIPs. TWO such windows exist
+  and both arm `deafMasterDownInterval` (3s) when `preempt=false`:
+  **process start**, before the AF_PACKET receiver is capturing; and
+  **sync-hold release**, which fires as bulk session sync completes — when a
+  just-rebooted node is installing synced sessions and about to do VIP work, so
+  a ~97ms scheduling gap on the receiver is unremarkable. Missing the second one
+  produced an observed ~12.9s window in which BOTH nodes held RG0 and had GARP'd
+  for the same RETH VIPs. Self-limiting in both cases: `handleBackupRx` resets
+  to the short interval on the FIRST advert heard, so a peer that is actually
+  alive costs nothing and normal ~60ms failover timing is unchanged.
 - **Async GARP**: `becomeMaster()` runs GARP in a goroutine; critical
   path is addVIPs → sendAdvert → emitEvent (sync), then
   `go sendGARP(false)`. `sendGARP(force)` has two gates — per-epoch dedup

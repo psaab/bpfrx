@@ -2256,6 +2256,7 @@ Matches Junos behavior when `preempt` is NOT configured on a redundancy group.
 - **Bug:** With 30ms RETH intervals, masterDown timer (~97ms) fires before AF_PACKET receiver starts capturing peer adverts — returning node erroneously becomes MASTER within 85ms
 - **Fix:** Extended initial masterDown timer to 3 seconds when `preempt=false` (either from config or sync hold)
 - After first received advert, `handleBackupRx` resets to normal short interval — fast failover detection preserved
+- **#7579 follow-up:** that shield is one-shot at startup, and the SAME deafness window reopens at sync-hold release (the timer is short again by then). The release path now re-arms the identical interval when it declines to promote; see `masterDownAfterSyncHoldRelease`.
 
 #### 4. Add `ResignRG()` to VRRP Manager (`pkg/vrrp/manager.go`)
 - Forces all VRRP instances for a given RG to resign

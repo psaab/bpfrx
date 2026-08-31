@@ -69,6 +69,62 @@ type VRRPEvent struct {
 	VIPs      []string
 }
 
+// deafMasterDownInterval is the master-down interval used while this node is
+// NOT preempting and has heard no peer advertisement — the window in which it
+// cannot yet distinguish "there is no master" from "I am not listening yet".
+//
+// A BACKUP promotes when the master-down timer expires, and that arm is
+// deliberately ungated by `preempt` (RFC 5798: preempt governs displacing a
+// master you can HEAR, not filling an apparent vacancy). So during any window
+// where this node is deaf, the ~97ms timer that a 30ms RETH advertise interval
+// produces is the only thing standing between a healthy peer and a second
+// MASTER claiming its VIPs.
+//
+// TWO such windows exist and both are now covered:
+//
+//   - process start, before the AF_PACKET receiver is capturing (the original
+//     mitigation, in run());
+//   - sync-hold release (#7579), which fires as bulk session sync completes —
+//     when a just-rebooted node is installing synced sessions and about to do
+//     VIP work, so a ~97ms scheduling gap on the receiver is unremarkable.
+//
+// Self-limiting in both: handleBackupRx resets the timer to the normal short
+// interval on the FIRST advert received, so this interval only ever applies
+// while nothing has been heard.
+const deafMasterDownInterval = 3 * time.Second
+
+// initialMasterDownInterval is the master-down interval run() arms at startup.
+//
+// EXTRACTED so the deafness policy is checkable rather than a literal inside a
+// run-loop local (#7579). It is the STARTUP half of the pair; the release half
+// is masterDownAfterSyncHoldRelease below, and the two sharing
+// deafMasterDownInterval is what stops one drifting from the other.
+func (vi *vrrpInstance) initialMasterDownInterval() time.Duration {
+	if !vi.getPreempt() {
+		return deafMasterDownInterval
+	}
+	return vi.masterDownInterval()
+}
+
+// masterDownAfterSyncHoldRelease reports the master-down interval to arm when a
+// sync-hold release did NOT promote, and whether to re-arm at all (#7579).
+//
+// Returns (_, false) for a node that IS preempting — including the priority-255
+// address owner, for which getPreempt() is true irrespective of the no-preempt
+// flag. Such a node wants the short interval and a prompt promotion, and
+// re-arming it would be a failover regression.
+//
+// Returns (deafMasterDownInterval, true) otherwise: the release declined to
+// promote, so this node stays BACKUP, and it is entering the second deafness
+// window described on deafMasterDownInterval. Self-limiting — handleBackupRx
+// resets to the short interval on the first advert heard.
+func (vi *vrrpInstance) masterDownAfterSyncHoldRelease() (time.Duration, bool) {
+	if vi.getPreempt() {
+		return 0, false
+	}
+	return deafMasterDownInterval, true
+}
+
 // vrrpInstance is a per-VRRP-group state machine goroutine.
 type vrrpInstance struct {
 	mu               sync.RWMutex
@@ -987,6 +1043,42 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 			} else {
 				vi.rearmForRetry(masterDownTimer)
 			}
+			break
+		}
+		// #7579: the release did NOT promote (preempt=false and no
+		// address-owner override), and this is the second deafness window.
+		//
+		// run() already extends the masterDown timer at STARTUP for exactly
+		// this reason — see the comment there: with a 30ms RETH interval the
+		// ~97ms timer can fire before the AF_PACKET receiver is capturing peer
+		// adverts, and the node then promotes into a healthy peer. That shield
+		// is one-shot: handleBackupRx drops the timer back to the short
+		// interval on the first advert received, so by the time the sync hold
+		// releases — typically seconds later — it is long spent.
+		//
+		// Sync-hold release is at least as predictable a deaf moment as
+		// startup. It fires the instant bulk session sync completes, which is
+		// when a just-rebooted node is installing synced sessions and is about
+		// to do VIP work; a ~97ms scheduling gap on the receiver goroutine
+		// there is unremarkable. The masterDownTimer arm is UNGATED by
+		// `preempt` — correctly, since RFC 5798's preempt governs displacing a
+		// master you can HEAR, not filling an apparent vacancy — so nothing
+		// else stops the promotion, and the observed result was a 12.95s
+		// window in which both nodes held RG0 and GARP'd for the same RETH
+		// VIPs (#7579).
+		//
+		// Re-arming costs a delayed takeover ONLY while no advert has been
+		// heard since the release, because handleBackupRx resets to the short
+		// interval on the first one. So a peer that is actually alive costs
+		// nothing, and a peer that genuinely died during the hold is taken over
+		// after this interval instead of ~97ms — bounded, and cheap against a
+		// dual-owner window.
+		if d, rearm := vi.masterDownAfterSyncHoldRelease(); rearm {
+			stopAndDrainTimer(masterDownTimer)
+			masterDownTimer.Reset(d)
+			slog.Info("vrrp: sync hold released without preemption — extending the "+
+				"master-down timer while no peer advert has been heard (#7579)",
+				"key", vi.key(), "interval", d)
 		}
 	}
 	return false
@@ -1038,14 +1130,14 @@ func (vi *vrrpInstance) run() {
 	// (either from config or sync hold). With short RETH intervals (30ms),
 	// the normal masterDown timer (~97ms) can fire before the AF_PACKET
 	// receiver starts capturing peer adverts — causing the returning node
-	// to erroneously become MASTER. A 3s initial timer gives enough time
-	// for the receiver to initialize and for the cluster election to
+	// to erroneously become MASTER. An extended initial timer gives enough
+	// time for the receiver to initialize and for the cluster election to
 	// determine our role. After the first received advert, handleBackupRx
 	// resets the timer to the normal short interval.
-	initialMasterDown := vi.masterDownInterval()
-	if !vi.getPreempt() {
-		initialMasterDown = 3 * time.Second
-	}
+	//
+	// #7579: the SAME window reopens at sync-hold release; see the
+	// preemptNowCh case in stepBackup, which re-arms this interval.
+	initialMasterDown := vi.initialMasterDownInterval()
 	masterDownTimer := time.NewTimer(initialMasterDown)
 	defer masterDownTimer.Stop()
 
