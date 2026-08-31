@@ -10793,7 +10793,8 @@ the value sits in a single typed slot:
     config admitted leniently.
   - `security flow tcp-session` expanded to a container: `established-timeout`
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
-    `time-wait-timeout` (config-only, not wire-reaching — see **#6539** below)
+    `time-wait-timeout` (all four wire-reaching and enforced since **#7342**;
+    see **#6539** below for the interval when three of them were not)
     all `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
     NOT u64-max. This is the operator-facing reject; it stays in lockstep with
     the runtime saturation backstop `SessionTimeouts::from_seconds` (#2441),
@@ -10836,11 +10837,20 @@ the value sits in a single typed slot:
     fourth guard walks `setSchema` and fails if a new `*-timeout` leaf is
     declared under `tcp-session` without an entry in the table — otherwise the
     new leaf would render unannotated and reproduce #6539 for itself.
-    Enforcing the three is a separate, larger job: `initial-timeout` maps 1:1
-    onto `SessionTimeouts.tcp_opening_ns` and could be carried additively, but
-    `time-wait-timeout` has no state to attach to (`session_timeout_ns` splits a
-    close only into RST vs FIN), so it needs a close-state split in the Rust
-    session machine — and a wire bump owes a cluster smoke.
+    **#7342 enforced all three**, and the shape of that job is why they landed
+    together. `initial-timeout` mapped 1:1 onto `SessionTimeouts.tcp_opening_ns`
+    and needed only a carrier. `time-wait-timeout` had no state to attach one to
+    — `session_timeout_ns` split a close into RST vs not-RST, so there was no
+    TIME_WAIT window distinct from `closing-timeout`'s — so it needed a
+    close-state split in the Rust session machine FIRST: `SessionEntry` now
+    tracks a FIN per DIRECTION, mirrored between the forward and reverse halves,
+    and a close with a FIN in both is TIME_WAIT while one with a FIN in one is
+    CLOSING. Carrying all three behind ONE additive wire bump made that one
+    protocol change, one cluster smoke and one release note instead of two of
+    each. Every entry in the table is `Enforced` now, which retired the advisory
+    and all three render annotations at once; the advisory machinery is kept and
+    driven against a synthetic table, because the schema-coverage guard above
+    exists precisely so a FIFTH timeout leaf cannot render unannotated.
     The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
     `rst-invalidate-session` as the opt-in override) is in
     `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`

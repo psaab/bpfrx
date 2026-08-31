@@ -19,22 +19,26 @@ use super::*;
 /// Captured inside the `&mut self.entries` borrow (which pins the matched
 /// entry) and applied via `propagate_tcp_state_to_companion` after that borrow
 /// ends, since touching the companion needs a fresh `&mut self` probe.
-struct TcpStatePropagation {
+pub(in crate::session) struct TcpStatePropagation {
     /// The matched entry's own NAT decision — feeds `reverse_session_key` to
     /// recover the companion's key from the matched canonical key.
-    nat: NatDecision,
+    pub(in crate::session) nat: NatDecision,
     /// A FIN/RST advanced the matched entry into the close window (F17): stamp
     /// the same close/reset onto the companion and pull it onto the short
     /// window so both halves reap together.
-    close: bool,
+    pub(in crate::session) close: bool,
     /// The close carried RST (short 2s window), not a graceful FIN.
-    reset: bool,
+    pub(in crate::session) reset: bool,
+    /// #7342: the matched entry's own direction carried a FIN, so the companion
+    /// learns that ITS peer has closed. Distinct from `close`, which is FIN or
+    /// RST: only a FIN advances the close handshake toward TIME_WAIT.
+    pub(in crate::session) fin: bool,
     /// A reverse SYN-ACK promoted the matched (reverse) entry (F16): promote the
     /// forward companion too, so ESTABLISHED requires real handshake evidence.
-    established: bool,
+    pub(in crate::session) established: bool,
     /// #6752: the companion's `handshake_pending` must clear with this half's,
     /// or the companion probe keeps refusing to extend a flow that IS complete.
-    handshake_completed: bool,
+    pub(in crate::session) handshake_completed: bool,
 }
 
 impl SessionTable {
@@ -126,8 +130,16 @@ impl SessionTable {
                 entry.closing = true;
                 // #3046: a RST close is reaped on the short timeout. The flag
                 // is sticky so a later reordered non-RST segment cannot promote
-                // the entry back to the 30s graceful-FIN close window.
+                // the entry back to the graceful-FIN close window.
                 entry.reset |= has_rst(tcp_flags);
+                // #7342: record that THIS direction has FINed. Sticky, and
+                // gated on FIN specifically rather than on `is_closing` (which
+                // is FIN **or** RST) — a RST is an abort with no close
+                // handshake to complete, and `tcp_close_class` short-circuits
+                // on `reset` before it ever consults these bits. The companion's
+                // half of the pair is mirrored below by
+                // `propagate_tcp_state_to_companion`.
+                entry.fin_own |= has_fin(tcp_flags);
             }
             // #3152/#4109: promote OPENING -> ESTABLISHED only on a genuine
             // reverse SYN-ACK. Forward and reverse are two independent entries;
@@ -171,11 +183,10 @@ impl SessionTable {
             }
             entry.last_seen_ns = now_ns;
             entry.expires_after_ns = if is_tcp && entry.closing {
-                if entry.reset {
-                    TCP_RST_TIMEOUT_NS
-                } else {
-                    TCP_CLOSING_TIMEOUT_NS
-                }
+                // #7342: CLOSING vs TIME_WAIT is decided by the FIN-direction
+                // pair this entry has accumulated, through the one shared
+                // formula.
+                tcp_close_window_ns(entry.tcp_close_class(), &timeouts)
             } else {
                 // #3227: re-apply the admitting application's per-app idle
                 // timeout on every established refresh so the session keeps
@@ -200,6 +211,7 @@ impl SessionTable {
                 nat: entry.decision.nat,
                 close: do_close,
                 reset: is_tcp && has_rst(tcp_flags),
+                fin: is_tcp && has_fin(tcp_flags),
                 established: promote_from_reverse,
                 handshake_completed,
             };
@@ -229,15 +241,7 @@ impl SessionTable {
         // `key`) + its own nat, exactly as `account_packet` hops reverse→forward.
         // Skipped entirely when there is nothing to propagate.
         if propagate.close || propagate.established || propagate.handshake_completed {
-            self.propagate_tcp_state_to_companion(
-                &actual_key,
-                propagate.nat,
-                now_ns,
-                propagate.close,
-                propagate.reset,
-                propagate.established,
-                propagate.handshake_completed,
-            );
+            self.propagate_tcp_state_to_companion(&actual_key, now_ns, propagate);
         }
         // Push the canonical key (NOT the alias lookup `key`) into
         // the wheel. push_to_wheel re-reads the record to compute
