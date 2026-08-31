@@ -1156,6 +1156,11 @@ func refineBootEpochReporting(path string, published *atomic.Uint64, lastWrote u
 	// withEpochFileLock reports nothing itself, and giving it a return value
 	// would churn every one of its callers for a fact the caller can observe
 	// here for free.
+	// #7501: this process's identity, resolved ONCE outside the lock. Reading
+	// /proc inside the critical section would put an unbounded read in a place
+	// the fail-closed rule is trying to keep short, and the answer cannot change
+	// during a pass.
+	self := currentEpochOwnerCached()
 	ran := false
 	withEpochFileLock(path, func() {
 		ran = true
@@ -1316,9 +1321,50 @@ func refineBootEpochReporting(path string, published *atomic.Uint64, lastWrote u
 			// Either the clock stepped backwards — the wall-clock seed did not
 			// clear the previous incarnation — or another incarnation raised the
 			// file above us while we were running (withEpochFileLock's ordering
-			// note). Raise so this incarnation still strictly exceeds the file.
+			// note).
+			//
+			// #7501: those two are not the same, and raising is only right for
+			// the first. If the value belongs to a LIVE sibling incarnation,
+			// raising above it makes THIS process — which may be the one about
+			// to exit — the peer's floor, and the survivor is refused for the
+			// life of its process. Decline instead: the sibling's value is
+			// already higher, already on the wire, and already what the peer
+			// will latch, so leaving it alone is both correct and a no-op.
+			//
+			// Fails to RAISE on every uncertainty (no sidecar, unparseable
+			// sidecar, unreadable /proc, a different boot), because that is the
+			// pre-#7501 behaviour and the guard may only ever subtract an
+			// action. Failing the other way would let one stale sidecar pin
+			// this node below its peer's floor durably, which is a worse
+			// version of the lockout this closes.
+			if owner, ok := readEpochOwner(path); ok && !sameEpochOwner(owner, self) && epochOwnerAlive(owner) {
+				slog.Warn("cluster: HA boot-epoch state was written by a LIVE sibling "+
+					"incarnation; NOT raising above it (raising would make this process "+
+					"the peer's floor and get the survivor refused — #7501)",
+					"path", path, "persisted", prev, "published", epoch,
+					"owner_pid", owner.pid)
+				// Not a fault: a decision, so no persist is owed. The sibling's
+				// value stands and this incarnation keeps its own lower epoch,
+				// which the peer accepts because the sibling's is the floor.
+				return
+			}
 			epoch = next
 			published.Store(epoch)
+		}
+		// #7501: record WHO is writing, so a later refiner can tell a live
+		// sibling's value from a predecessor's. Best-effort and deliberately
+		// BEFORE the epoch write: a sidecar naming us while the epoch write
+		// then fails is harmless (a refiner finds our identity beside a value
+		// we did not write, and the worst it does is decline to raise above a
+		// value that is not ours — the safe direction), whereas an epoch
+		// written with a STALE sidecar from a previous owner would attribute
+		// our value to someone else, which is the unsafe direction.
+		if self.ok {
+			if err := writeEpochOwner(path, self.owner); err != nil {
+				slog.Warn("cluster: HA boot-epoch owner sidecar write failed; a concurrent "+
+					"incarnation cannot tell this value from a predecessor's (#7501). The "+
+					"epoch itself is unaffected.", "path", path, "err", err)
+			}
 		}
 		if err := fsatomic.WriteFileDurable(path, []byte(strconv.FormatUint(epoch, 10)+"\n"), 0o644); err != nil {
 			// NOT EVERY WRITE ERROR MEANS THE FILE DID NOT MOVE. A
