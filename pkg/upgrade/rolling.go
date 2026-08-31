@@ -305,6 +305,13 @@ func waitPredicate(rc RollingConfig, tolerateTransientErr bool, pred func() (boo
 			}
 			return fmt.Errorf("predicate not satisfied within %s", rc.DrainDeadline)
 		}
-		time.Sleep(rc.PollInterval)
+		// #7424: bound the sleep by the deadline. A raw Sleep(PollInterval)
+		// here overshoots `end` by up to one interval, and the deadline check
+		// above sits BEFORE the sleep — so a predicate that first becomes true
+		// AFTER the deadline was accepted as satisfied within it, and a genuine
+		// timeout was reported up to one interval late. This is the third
+		// caller of the helper kernel_drain.go already used for the same bug in
+		// this package (HelperHealthProbe, #5808).
+		sleepBounded(end, rc.PollInterval)
 	}
 }
