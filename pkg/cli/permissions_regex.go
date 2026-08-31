@@ -55,57 +55,13 @@ func (c *CLI) loginRegexesFor(class string) (config.CompiledLoginRegexes, bool, 
 // end-to-end until cut 6 retires the gate — which is what makes it safe to land
 // now, and also why its behaviour is pinned here rather than through a config.
 func loginRegexesFrom(cfg *config.Config, class string) (config.CompiledLoginRegexes, bool, error) {
-	if cfg == nil || cfg.System.Login == nil {
-		return config.CompiledLoginRegexes{}, false, nil
-	}
-	for _, lc := range cfg.System.Login.Classes {
-		if lc == nil || lc.Name != class {
-			continue
-		}
-		// #7172 cut 3 enforces DENY ONLY, deliberately, and this is not an
-		// oversight to be "completed" by a later reader.
-		//
-		// `deny-commands` cannot commit at all today — #6838's
-		// validateLoginClassDenyStrict hard-rejects it — so enforcing it
-		// changes nothing for any config that exists. `allow-commands`, by
-		// contrast, commits fine RIGHT NOW and is deliberately inert:
-		// compiler_system.go files it under "Neutral not-enforced knobs" and
-		// the advisory tells the operator so.
-		//
-		// Enforcing allow here would therefore be a LOCKOUT on upgrade, because
-		// an allow regex is an ALLOWLIST: a live class carrying
-		// `allow-commands "show interfaces"` would abruptly lose `show version`,
-		// `request support information` and `configure` — a restriction its
-		// author was explicitly told was inert. Allow enforcement lands in
-		// cut 6 alongside the gate's retirement, so both leaves go live in one
-		// step with one release note and no build in between surprises anyone.
-		allowSet := false
-		// PRESENCE, NOT VALUE, for the deny leaf: `deny-commands ""` and an
-		// absent deny-commands mean OPPOSITE things — an empty POSIX regex
-		// matches every command, so an empty deny denies EVERYTHING. Only
-		// DenyLeavesPresent can tell them apart, which is why the #6838 gate's
-		// classification table must outlive the gate itself.
-		denySet := false
-		for _, leaf := range lc.DenyLeavesPresent {
-			if leaf == "deny-commands" {
-				denySet = true
-				break
-			}
-		}
-		if !allowSet && !denySet {
-			return config.CompiledLoginRegexes{}, false, nil
-		}
-		compiled, err := config.CompileLoginRegexes(
-			config.LoginRegexPlainFamily,
-			lc.AllowCommands, allowSet,
-			lc.DenyCommands, denySet,
-		)
-		if err != nil {
-			return config.CompiledLoginRegexes{}, false, err
-		}
-		return compiled, true, nil
-	}
-	return config.CompiledLoginRegexes{}, false, nil
+	// #7172 cut 5b MOVED this decision into pkg/config so the gRPC gate and this
+	// one cannot come to disagree about WHOSE regexes are in force. The reasoning
+	// that used to live here — deny-only scoping, and leaf PRESENCE rather than
+	// value — moved with it and is in config.OperationalDenyRegexesFor. This stays
+	// as a named delegation so cut 3's tests keep driving the same code path they
+	// were written against.
+	return config.OperationalDenyRegexesFor(cfg, class)
 }
 
 // checkCommandRegex enforces the class's allow/deny command regexes against the

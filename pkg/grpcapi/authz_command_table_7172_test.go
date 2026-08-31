@@ -121,18 +121,6 @@ func TestEveryPricedMethodIsMappedOrNamedAbsent7172(t *testing.T) {
 	}
 }
 
-// The table is INERT in this cut. If something starts reading it before 5b
-// wires it deliberately, that is worth knowing — an authz input acquiring a
-// consumer by accident is how a half-built gate goes live.
-func TestCommandTableIsNotYetConsumed7172(t *testing.T) {
-	// Guard against the table being read by production code before 5b. Cut 5b
-	// deletes this test in the same change that adds the consumer, so its
-	// removal is a reviewed step rather than a silent one.
-	if len(methodCanonicalCommand) == 0 || len(methodsWithoutCanonicalCommand) == 0 {
-		t.Fatal("precondition: both tables must be populated for this to mean anything")
-	}
-}
-
 // everyWordIsAKeyword reports whether each word names a real node in the
 // operational tree, rather than being consumed by a value slot.
 //

@@ -249,6 +249,20 @@ func (s *Server) authorizeRPC(ctx context.Context, fullMethod string, req any) e
 	if err := authz.Authorize(cfg, p, required); err != nil {
 		return denyRPC(fullMethod, required, p, err)
 	}
+
+	// #7172 cut 5b: the class's fine-grained `deny-commands` regexes, AFTER the
+	// coarse permission bits and never instead of them — Junos authorizes the
+	// command family first and the regexes narrow within it.
+	//
+	// A SUPERUSER is exempt, and that is the same exemption authz.Authorize
+	// already makes rather than a second one invented here: uid 0 owns the
+	// config DB and the daemon process, so a regex denial would be theater, and
+	// p.Class is empty for a superuser anyway.
+	if !p.Superuser {
+		if err := s.authorizeRPCCommand(cfg, p.Class, fullMethod, req); err != nil {
+			return denyRPC(fullMethod, required, p, err)
+		}
+	}
 	return nil
 }
 
