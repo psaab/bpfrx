@@ -1549,7 +1549,9 @@ The peer-sync path is `syncAndApply`, and it does **not** reject. Both it
 and `applyAndSyncCommitted` route the error through
 `applyErrSkipsPeerSync`, which names exactly two fatal classes — a
 required-protocol-gate error (dataplane DISARMED, #2138) and a context
-cancel/deadline (the #2926 daemon-stop abort). Everything else is the
+CANCELLATION (the #2926 daemon-stop abort). Cancellation only: #7618 removed
+`context.DeadlineExceeded` from that set, because the apply context is
+cancel-only and a deadline there could only ever be a per-command budget. Everything else is the
 non-fatal best-effort class that **must** keep syncing, because the config
 is already committed + active and the dataplane armed; suppressing the
 sync there is the divergence #4034 fixed. In `syncAndApply` the same
@@ -1582,23 +1584,40 @@ against the REAL errors the reconcilers produce, and
 `TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790` is its paired
 positive control so the classifier cannot degrade to "nothing is fatal".
 
-#### One pre-existing gap, inherited not introduced (#7618)
+#### The command-deadline gap, closed in #7618
 
-`exec.CommandContext` has **two** error shapes at a deadline, and only one
-of them is safe here:
+`exec.CommandContext` has **two** error shapes at a deadline, and they used to
+be classified differently for no good reason:
 
 - the process **started** and was killed at the deadline → `*exec.ExitError`
-  ("signal: killed"), which is not a context error → correctly non-fatal;
+  ("signal: killed"), which is not a context error → always correctly
+  non-fatal;
 - the context expired **before fork/exec completed** → `Start` returns
   `ctx.Err()`, so the caller gets a **bare `context.DeadlineExceeded`** →
-  `applyErrSkipsPeerSync` cannot tell it from the #2926 daemon-stop abort
-  and classifies it FATAL, suppressing the push (or discarding a
-  peer-promoted config).
+  which `applyErrSkipsPeerSync` classified FATAL, suppressing the push (or
+  discarding a peer-promoted config).
 
 Which shape you get depends on whether fork/exec wins the race with the
 deadline — i.e. on machine load. This was observed for real: the cell that
-originally drove a live command against a short deadline passed unloaded
-and failed under a loaded full-package run.
+originally drove a live command against a short deadline passed unloaded and
+failed under a loaded full-package run.
+
+**#7618 removed `context.DeadlineExceeded` from the fatal set**, so both shapes
+are now non-fatal and the standby still receives the config. The clause had no
+true positive: the apply context is cancel-only end to end (`cmd/xpfd/main.go`
+passes `context.Background()`, `Run` wraps it in `signal.NotifyContext`, and
+`daemon_run.go` derives `applyCancelContext` with `context.WithCancel`), and
+both callers reach the pipeline as
+`applyConfigLocked(d.applyCancelCtx(), ...)`, so a #2926 abort always arrives
+as `context.Canceled`. `TestApplyCancelContextIsCancelOnly7618` binds that
+premise, so giving the chain a deadline reds a named cell rather than silently
+re-opening the gap.
+
+The exposure while it was open was bounded rather than permanent: the skip path
+never claims the #5863 (epoch × generation) marker, so the 30s
+`configSyncReconcileLoop` re-pushes, and a discarded peer config drives the
+#7328 nack/re-arm. Still a window in which a failover served stale config for a
+reason unrelated to the config.
 
 The gap is **not** specific to the credential reconcilers. Every apply-path
 command runner builds its own short context — `nftApplyPayload` (5s,
@@ -1707,7 +1726,8 @@ of the rejection set**, not on any caller discarding a return:
 `applyErrSkipsPeerSync` (`pkg/daemon/daemon_apply_commit.go`) closes that set
 over exactly two fatal classes — a required-protocol-gate error
 (`compileErrorMustAbortApply`, which leaves the dataplane **disarmed**) and a
-context cancellation/deadline from a daemon-stop abort. Every *other* error
+context CANCELLATION from a daemon-stop abort (#7618: cancellation only; a
+deadline is a per-command budget and still syncs). Every *other* error
 still syncs, "because the config is committed + active and the dataplane
 armed". An inventory-read failure is neither class, so on the peer-sync receive
 path (`syncAndApply`) the config stays **active and armed** and the failure is
