@@ -927,6 +927,20 @@ they repeatedly bite:
     `MustNewConstMetric` segfaulted — `GO_RC=2`, zero `--- FAIL` lines, 71
     packages `ok`. Gate on the exit code AND on packages-collected; score a
     cell on the four facts. Neither rule substitutes for the other.
+  - **A HANG is a fifth void shape, and the most expensive one.** A build
+    break, an edit that never applied, a panic and a `-race` red are the four
+    above; a test that never returns is a fifth. It emits no `--- FAIL`, no
+    compile signature and no panic trace, so every log heuristic reports
+    NOTHING — and unlike the others it consumes the whole time budget, so one
+    hang in a batch can lose every cell after it. Measured on #7611: giving the
+    primary gRPC listener a retry supervisor changed `Run` from "returns an
+    error on a bind failure" to "returns only when ctx is done", and an
+    existing cell that called it with `context.Background()` and asserted the
+    error stopped returning. The package went from 12s to a 600s timeout. What
+    identified it was the exit code plus the goroutine dump, not the log scan.
+    Run suites under an explicit `-timeout` so a hang becomes a reportable
+    failure with a stack rather than a stuck job, and treat a run that consumed
+    its whole budget as VOID until you have read the dump.
   - **A `-race` failure has no `--- FAIL` line.** It emits `WARNING: DATA
     RACE` plus a package-level FAIL, so a `^--- FAIL` counter scores a genuine
     race red as a PASS. Count both.
