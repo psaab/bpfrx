@@ -239,6 +239,26 @@ of `StartHealthDeadline`:
   the poll timer), so it never overshoots the deadline by a full poll
   interval.
 
+#### Every poll loop in `pkg/upgrade` bounds its sleep by the deadline (#7424)
+
+The overshoot above is a package-wide property, not a `HelperHealthProbe`
+one. `kernel_drain.go`'s two drain loops have used the `sleepBounded`
+helper since #5808; `rolling.go`'s `waitPredicate` was the last raw
+`time.Sleep(PollInterval)` in the package and now uses it too, so the
+helper takes the interval as a parameter rather than reading the
+`drainPollInterval` constant.
+
+The deadline check sits BEFORE the sleep, which is what made this a wrong
+ANSWER and not merely a late one: a predicate that first became true
+*after* the deadline was accepted as satisfied within it, and a genuine
+timeout was reported up to one poll interval late.
+
+Note for anyone adding a test here: every pre-existing fixture in this
+package uses `PollInterval: 1ms`, so the overshoot is 1ms and invisible to
+all of them. `rolling_bounded_sleep_7424_test.go` inverts the ratio — a
+50ms deadline against a 5s interval — because that is the smallest shape
+in which removing the bound changes an outcome.
+
 The gate distinguishes a definitive *not-ready* (retry until the deadline)
 from a deadline/cancellation: a deadline failure wraps the context cause,
 so callers can `errors.Is(err, context.DeadlineExceeded)`. The most-recent

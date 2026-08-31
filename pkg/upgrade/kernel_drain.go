@@ -114,23 +114,29 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration, allowMixedHA boo
 			}
 			return fmt.Errorf("drain did not complete within %s (peer did not take over / sync not clean; failed back)", deadline)
 		}
-		sleepBounded(dl)
+		sleepBounded(dl, drainPollInterval)
 	}
 }
 
-// sleepBounded sleeps for drainPollInterval, but never past dl — so a poll loop
+// sleepBounded sleeps for `interval`, but never past dl — so a poll loop
 // re-checks (and reports timeout) at the deadline rather than overshooting it by
 // up to a full interval.
-func sleepBounded(dl time.Time) {
+//
+// #7424: `interval` was `drainPollInterval` until rolling.go's waitPredicate
+// became the third caller. That loop polls on the caller-supplied
+// RollingConfig.PollInterval, so the interval is a parameter rather than a
+// package constant; the two kernel-drain callers pass drainPollInterval and are
+// unchanged in behaviour.
+func sleepBounded(dl time.Time, interval time.Duration) {
 	rem := time.Until(dl)
 	if rem <= 0 {
 		return
 	}
-	if rem < drainPollInterval {
+	if rem < interval {
 		time.Sleep(rem)
 		return
 	}
-	time.Sleep(drainPollInterval)
+	time.Sleep(interval)
 }
 
 // RejoinAndConfirm clears manual failover on the local node and confirms it is
@@ -196,6 +202,6 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 			}
 			return base
 		}
-		sleepBounded(dl)
+		sleepBounded(dl, drainPollInterval)
 	}
 }
