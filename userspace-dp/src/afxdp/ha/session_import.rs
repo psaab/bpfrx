@@ -565,18 +565,97 @@ impl crate::afxdp::Coordinator {
             );
         }
         // #6242: fan out to each worker's command queue via its runtime record.
-        for rec in self.workers.records.values() {
+        //
+        // #6979 F4: a DROPPED `DeleteSynced` is a permanently stranded NAT
+        // reservation, so the drop is repaired here instead of discarded.
+        //
+        // `push_bounded` returns false when the queue is at
+        // `MAX_PENDING_WORKER_COMMANDS`, and that return was ignored. Shared
+        // authority was already removed above, so the key is gone from replay
+        // and no later reconcile re-delivers the command; the worker that never
+        // received it keeps its holder bit set, and because that worker is
+        // ALIVE neither reclaim sweep can see it — `retire_dead_worker_holders`
+        // selects on the panic `dead` flag (#8069) and `retire_all_worker_holders`
+        // runs only at generation teardown (#7092). The port is then held for
+        // the life of the allocator.
+        //
+        // MEASURED, because the issue predicted otherwise. #6979's own closing
+        // note expects the holder-set to bound F4 to "that worker's bit is
+        // cleared". It does — for the route the finding NAMES, a worker that
+        // STOPS. The unbounded route is a worker that stays ALIVE and never
+        // receives the command at all. Probe at the parent of this change:
+        // queue-drop delta 1, pool port still occupied, `dead` false,
+        // dead-worker sweep freed 0.
+        //
+        // Releasing on the worker's behalf cannot OVER-release. The command was
+        // dropped, so that worker will never run this teardown itself; and
+        // `release_flow` no-ops unless `live_by_flow[flow].translated` equals
+        // this exact tuple, so a worker whose own `UpsertSynced` is still queued
+        // (no reservation taken yet) is untouched. The direction-of-error rule
+        // at `PortAllocator::drop_holder_locked` is satisfied: this clears the
+        // bit of a worker that provably cannot forward this flow again.
+        //
+        // NOT repaired here, deliberately: the same dropped command also means
+        // that worker never removes its LOCAL session-table and BPF map entries
+        // for the key. Shared authority governs which sessions exist and the
+        // process-wide session-map delete already ran above, so the NAT
+        // reservation is the part with no other owner. The wider signal is
+        // `WORKER_COMMAND_QUEUE_DROPS`.
+        for (worker_id, rec) in self.workers.records.iter() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);
-            worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
+            let queued =
+                worker_queue::push_bounded(&mut pending, WorkerCommand::DeleteSynced(key.clone()));
             if let Some(reverse_key) = &reverse_key {
                 worker_queue::push_bounded(
                     &mut pending,
                     WorkerCommand::DeleteSynced(reverse_key.clone()),
                 );
             }
+            // Release the command queue before touching allocator mutexes: the
+            // two are unrelated locks and holding both would invent an ordering.
+            drop(pending);
+            // Only the FORWARD key carries a NAT reservation. The reverse
+            // companion's teardown is a no-op by contract —
+            // `release_source_nat_allocation_with_mode` returns immediately on
+            // `is_reverse` — so repairing its drop would call a function that
+            // does nothing and count a repair that did not happen. Measured:
+            // repairing both made the counter read 2 for one stranded
+            // reservation, which is exactly the kind of number an operator
+            // would later have to explain.
+            if let Some(entry) = removed_entry.as_ref()
+                && !queued
+            {
+                self.release_dropped_delete_for_worker(entry, &key, *worker_id);
+            }
         }
+    }
+
+    /// #6979 F4: run the NAT teardown a worker will never run itself, because
+    /// its `DeleteSynced` was dropped by a full command queue.
+    ///
+    /// Byte-for-byte the call the worker makes when it processes the command,
+    /// with that worker's id as the holder — so the holder mask empties on the
+    /// same last-release rule and the port is returned exactly once.
+    fn release_dropped_delete_for_worker(
+        &self,
+        entry: &SyncedSessionEntry,
+        key: &SessionKey,
+        worker_id: u32,
+    ) {
+        self.sessions
+            .delete_dropped_released
+            .fetch_add(1, Ordering::Relaxed);
+        crate::nat::release_source_nat_allocation_for_worker(
+            &self.forwarding.iface_nat_allocators,
+            &self.forwarding.source_nat_rules,
+            key,
+            entry.decision.nat,
+            entry.metadata.is_reverse,
+            crate::afxdp::wg::counters::monotonic_now_ns(),
+            worker_id,
+        );
     }
 
     /// #4054 test seam: install a qualifying LOCAL forward session (owner-RG 0

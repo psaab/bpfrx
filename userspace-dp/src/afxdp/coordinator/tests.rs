@@ -7718,3 +7718,241 @@ mod routing_domain_7160 {
         assert_eq!(c.synced_routing_domain(10, 0), Some(0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// #6979 F4 — a DROPPED `DeleteSynced` stranded the worker's NAT reservation.
+//
+// The finding says the coordinator removes the key from shared authority BEFORE
+// queueing `DeleteSynced`, so "a worker that passes its command stage and then
+// stops in between never releases". That route is real and it is BOUNDED: the
+// worker is gone, so `retire_dead_worker_holders` (#8069, panic) or
+// `retire_all_worker_holders` (#7092, generation teardown) clears its bit.
+//
+// MEASURED at the parent of this change, the UNBOUNDED route is a different
+// one: `push_bounded` DROPS the command when the queue is at
+// `MAX_PENDING_WORKER_COMMANDS`, and its return was ignored. The worker stays
+// ALIVE — so neither sweep selects it, both being keyed on a worker that is
+// dead or being torn down — and shared authority is already gone, so no replay
+// re-delivers. Probe output at the parent: queue-drop delta 1, port still
+// occupied, `dead` false, dead-worker sweep freed 0.
+//
+// So the issue's own closing note ("bounded by the holder-set") is right about
+// the mechanism it names and wrong about the finding as a whole.
+// ---------------------------------------------------------------------------
+
+fn f4_pool_rules() -> Vec<crate::nat::SourceNatRule> {
+    crate::nat::parse_source_nat_rules(&[crate::SourceNATRuleSnapshot {
+        name: "snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "p".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 20000,
+        port_high: 20000,
+        ..crate::SourceNATRuleSnapshot::default()
+    }])
+}
+
+fn f4_key() -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: 6,
+        src_ip: "10.0.0.5".parse().unwrap(),
+        dst_ip: "198.51.100.9".parse().unwrap(),
+        src_port: 4000,
+        dst_port: 80,
+        discriminator: Default::default(),
+        routing_domain: 0,
+    }
+}
+
+fn f4_filler_key(i: usize) -> crate::session::SessionKey {
+    let mut key = f4_key();
+    key.src_port = 30000 + (i as u16 % 20000);
+    key.dst_port = 81;
+    key
+}
+
+/// Seat a synced session in shared authority with worker `worker_id` holding
+/// its pool reservation, exactly as an import followed by that worker's
+/// `UpsertSynced` would leave it.
+fn f4_seed(coordinator: &mut Coordinator, worker_id: u32) -> crate::nat::TranslatedTuple {
+    use crate::nat::NatHolder;
+    coordinator.forwarding.source_nat_rules = f4_pool_rules();
+    let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
+    coordinator.workers.records.insert(worker_id, rec);
+
+    let key = f4_key();
+    let translated = crate::nat::TranslatedTuple {
+        ip: "203.0.113.1".parse().unwrap(),
+        port: 20000,
+    };
+    let flow = crate::nat::SourceNatFlowKey {
+        protocol: key.protocol,
+        src_ip: key.src_ip,
+        dst_ip: key.dst_ip,
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+    };
+    let alloc = &coordinator.forwarding.source_nat_rules[0].pool_allocator;
+    assert!(
+        alloc.reserve_flow(flow, translated, 0, false, 1_000, NatHolder::Worker(worker_id)),
+        "fixture must take the reservation, or every assertion below is vacuous"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 20000),
+        "fixture precondition: the port is occupied before the delete"
+    );
+
+    f4_seed_shared_only(coordinator, &key, translated);
+    translated
+}
+
+/// Seed shared authority alone (no allocator reservation, no worker record).
+fn f4_seed_shared_only(
+    coordinator: &Coordinator,
+    key: &crate::session::SessionKey,
+    translated: crate::nat::TranslatedTuple,
+) {
+    // The session must be in SHARED AUTHORITY. Without it the delete finds
+    // no `removed_entry`, so there is no NAT decision to release and the cell
+    // would red for the wrong reason — measured while writing this: the first
+    // fixture seeded only the allocator and the binding cell failed with the
+    // fix applied.
+    let entry = crate::afxdp::worker::SyncedSessionEntry {
+        key: key.clone(),
+        decision: crate::afxdp::SessionDecision {
+            resolution: crate::afxdp::ForwardingResolution {
+                disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: crate::nat::NatDecision {
+                rewrite_src: Some(translated.ip),
+                rewrite_src_port: Some(translated.port),
+                ..crate::nat::NatDecision::default()
+            },
+        },
+        metadata: crate::session::SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            ingress_ifindex: 0,
+            ingress_vlan_id: 0,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        },
+        origin: crate::afxdp::SessionOrigin::SyncImport,
+        protocol: key.protocol,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    };
+    crate::afxdp::shared_ops::lock_shared_recover(&coordinator.sessions.synced)
+        .insert(key.clone(), entry);
+    assert!(
+        crate::afxdp::shared_ops::lock_shared_recover(&coordinator.sessions.synced)
+            .contains_key(&key),
+        "fixture: the session must be in shared authority, or the delete has no \
+         NAT decision to act on"
+    );
+}
+
+fn f4_fill_queue(coordinator: &Coordinator, worker_id: u32) {
+    use crate::afxdp::worker_queue::{self, MAX_PENDING_WORKER_COMMANDS};
+    let rec = coordinator.workers.records.get(&worker_id).expect("record");
+    let mut pending = worker_queue::lock_recover(&rec.handle.commands);
+    for i in 0..MAX_PENDING_WORKER_COMMANDS {
+        pending.push_back(crate::afxdp::WorkerCommand::DeleteSynced(f4_filler_key(i)));
+    }
+    assert_eq!(
+        pending.len(),
+        MAX_PENDING_WORKER_COMMANDS,
+        "fixture: the queue must be exactly at capacity so the next push is dropped"
+    );
+}
+
+/// THE BINDING. A `DeleteSynced` the queue drops must not leave the reservation
+/// behind: nothing else will ever free it.
+///
+/// RED AT THE PARENT: the port stays occupied for the life of the allocator.
+#[test]
+fn a_dropped_deletesynced_releases_the_workers_reservation_6979_f4() {
+    use crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_DROPS;
+    use std::sync::atomic::Ordering;
+
+    let mut coordinator = Coordinator::new();
+    f4_seed(&mut coordinator, 3);
+    f4_fill_queue(&coordinator, 3);
+
+    let drops_before = WORKER_COMMAND_QUEUE_DROPS.load(Ordering::Relaxed);
+    coordinator.delete_synced_session(f4_key());
+    assert!(
+        WORKER_COMMAND_QUEUE_DROPS.load(Ordering::Relaxed) > drops_before,
+        "fixture: the DeleteSynced must actually have been DROPPED — if the queue \
+         accepted it, this cell is testing the ordinary path and proves nothing"
+    );
+
+    assert!(
+        !coordinator.forwarding.source_nat_rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, 20000),
+        "the dropped DeleteSynced stranded 203.0.113.1:20000. Shared authority was \
+         already removed, so no replay re-delivers the command; the worker is ALIVE, \
+         so neither the dead-worker sweep (#8069) nor the generation-teardown sweep \
+         (#7092) can see its holder bit. The port is held for the life of the \
+         allocator (#6979 F4)"
+    );
+    assert_eq!(
+        coordinator.session_delete_dropped_released_total(),
+        1,
+        "the repair must be counted — a silent repair of a silent drop leaves an \
+         operator with no signal that a worker queue is saturating"
+    );
+}
+
+/// THE OVER-RELEASE CONTROL. When the command IS queued, the coordinator must
+/// NOT release: the worker will run the teardown itself, and releasing here too
+/// would free a `(pool addr, port)` while that worker is still forwarding
+/// through it — the direction of error `drop_holder_locked` forbids.
+///
+/// Fires on: releasing unconditionally instead of only on a dropped push.
+#[test]
+fn a_queued_deletesynced_leaves_the_release_to_the_worker_6979_f4() {
+    let mut coordinator = Coordinator::new();
+    f4_seed(&mut coordinator, 3);
+    // Queue NOT filled: the push succeeds.
+
+    coordinator.delete_synced_session(f4_key());
+
+    assert!(
+        coordinator.forwarding.source_nat_rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, 20000),
+        "the coordinator released a reservation the worker is still going to release \
+         itself. The command was queued, so the worker WILL run this teardown; \
+         freeing the port here hands it to a new flow while the old one is still \
+         being torn down (#6979 F4)"
+    );
+    assert_eq!(
+        coordinator.session_delete_dropped_released_total(),
+        0,
+        "and nothing was dropped, so the repair counter must stay at zero"
+    );
+}
+
+
