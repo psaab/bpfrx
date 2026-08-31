@@ -989,6 +989,28 @@ The release path (`ExitConfigureSession`) must match the session against
 `effectiveHolderLocked()` — `exclusiveHolder` when set, else
 `configHolder` — so a session releases the exact lock it holds.
 
+**Every exit clears BOTH fields.** `ExitConfigure`,
+`ExitConfigureSession`, `ForceExitConfigure` and the
+`reclaimStaleLockLocked` re-acquire all reset `configHolder` *and*
+`exclusiveHolder`, so no exit leaves a holder string behind for the next
+reader of `ConfigHolder()`.
+
+**#7635 (fixed):** `ExitConfigure` cleared only `exclusiveHolder`. A
+shared-mode lock taken by `EnterConfigureSession("X")` therefore left
+`configHolder == "X"` after the exit, and the public `ConfigHolder()`
+accessor returned that stale string alongside `locked == false`. It was
+never operator-visible — all three consumers (`clear system config-lock`
+in `pkg/cli`, the REST `clear-config-lock` action in `pkg/api`, and the
+gRPC diag action) check the `locked` bool first — and never exploitable,
+because `ensureHolderLocked` short-circuits on `!s.configDir` and because
+every in-tree caller of `ExitConfigure` pairs it with the unsessioned
+`EnterConfigure`. But neither of those is a property of the function, so
+the release is now complete on all four paths rather than resting on its
+callers. Guarded by
+`TestEveryConfigModeExitClearsBothHolders_7635`, which enters with a
+non-empty session id precisely because an `EnterConfigure()` fixture
+would pass vacuously.
+
 **#3979 (fixed):** the release guard previously compared only
 `configHolder`. An exclusive holder sets `exclusiveHolder` and leaves
 `configHolder` empty, so the guard saw `configHolder("") != sessionID`
