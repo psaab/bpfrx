@@ -1515,6 +1515,16 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		d.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off : off+8])
 		off += 8
 	}
+	// #7239: trailing routing domain (u32 LE), length-gated. The domain the
+	// flow's ingress interface belonged to AT INSTALL, so the peer keys the
+	// session where it actually arrived rather than re-deriving it from an
+	// ingress fold that a later ifindex recycle can point at a sibling. An old
+	// helper omits it => 0, the default routing instance, which is both a legal
+	// value and the pre-#7160 behaviour.
+	if off+4 <= len(payload) {
+		d.RoutingDomain = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
 
 	return d, true
 }
@@ -1595,6 +1605,14 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 	if len(payload) >= off+8 {
 		d.TunnelDiscriminator = binary.LittleEndian.Uint64(payload[off : off+8])
 		off += 8
+	}
+	// #7239: trailing routing domain (u32 LE), length-gated. A close names the
+	// session to RETRACT, and two routing instances sharing a 5-tuple are two
+	// sessions — so the retraction needs the same domain the open carried, for
+	// the same reason #7188 needed the discriminator here.
+	if len(payload) >= off+4 {
+		d.RoutingDomain = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
 	}
 
 	return d, true

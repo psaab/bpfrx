@@ -392,6 +392,13 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		// session adopts it and its SESSION_CREATE/CLOSE records correlate across
 		// nodes. 0 on a legacy helper => a fresh local id is allocated on import.
 		RTFlowSessionID: delta.RTFlowSessionID,
+		// #7239 (#7160/#2387): carry the domain the helper stamped at INSTALL,
+		// rather than letting the peer re-derive it from IngressIfaceFold. That
+		// fold is stamped on the SEND path against the CURRENT config, so an
+		// ifindex recycled onto a sibling between install and sync would import
+		// the session into the sibling's routing domain — a cross-tenant
+		// mis-file, and a confident one.
+		RoutingDomain: delta.RoutingDomain,
 		Created:         now,
 		LastSeen:        now,
 		Timeout:         userspaceSessionTimeout(delta.Protocol),
@@ -510,6 +517,13 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		// adopted by a peer-synced session so its RT_FLOW records correlate
 		// across HA nodes; 0 on a legacy helper => fresh local id on import.
 		RTFlowSessionID: delta.RTFlowSessionID,
+		// #7239 (#7160/#2387): carry the domain the helper stamped at INSTALL,
+		// rather than letting the peer re-derive it from IngressIfaceFold. That
+		// fold is stamped on the SEND path against the CURRENT config, so an
+		// ifindex recycled onto a sibling between install and sync would import
+		// the session into the sibling's routing domain — a cross-tenant
+		// mis-file, and a confident one.
+		RoutingDomain: delta.RoutingDomain,
 		Created:         now,
 		LastSeen:        now,
 		Timeout:         userspaceSessionTimeout(delta.Protocol),

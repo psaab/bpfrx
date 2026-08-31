@@ -230,6 +230,13 @@ pub(in crate::afxdp) fn session_delta_info(
         // cross-node correlation. 0 (a synthesized delta with no backing entry)
         // keeps the legacy "peer allocates a fresh local id" behaviour.
         rt_flow_session_id: delta.session_id,
+        // #7239 (#7160/#2387): carry the key's ROUTING DOMAIN on the JSON leg
+        // too, at parity with the binary open frame's trailing u32. The value
+        // comes off the KEY, so it is the domain stamped at install from the
+        // interface the flow actually arrived on — which is the whole reason it
+        // is carried rather than re-derived on the peer from an ingress fold
+        // that can name a recycled sibling.
+        routing_domain: crate::session::routing_domain_to_wire(delta.key.routing_domain),
         // #6949: carry the admitting policy's firewall metadata on the JSON leg
         // too. The binary open frame has carried policy_id/policy_counter_idx
         // since #3301 and the app timeout since #3227; this leg carried none,

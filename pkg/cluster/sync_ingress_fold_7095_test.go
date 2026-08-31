@@ -72,13 +72,15 @@ func TestIngressFoldRoundTripsOnTheWire_7095(t *testing.T) {
 // on the previous release.
 func TestLegacyPeerPayloadDecodesFoldAsUnknown_7095(t *testing.T) {
 	key := sessionKey7095()
-	// #7188 appended an 8-byte TunnelDiscriminator BEHIND the fold, so
-	// reproducing a pre-#7095 sender means cutting both: cutting only 4 would
-	// remove the discriminator and leave the fold intact, and this cell would
-	// then assert "absent fold decodes to 0" against a frame that still carries
-	// the fold — passing for the wrong reason.
+	// Every field appended BEHIND the fold widens this cut, and the cut must be
+	// widened with it or the cell passes for the wrong reason — it would remove
+	// the newer trailing field and leave the fold intact, then assert "absent
+	// fold decodes to 0" against a frame that still carries the fold.
+	//
+	// The running total: #7188's 8-byte TunnelDiscriminator, then #7239's
+	// 4-byte RoutingDomain, plus the 4-byte fold itself = 16.
 	full := encodeSessionV4Payload(key, sessionValue7095(0xABCD1234))
-	legacy := full[:len(full)-12]
+	legacy := full[:len(full)-16]
 
 	gotKey, got, ok := decodeSessionV4Payload(legacy)
 	if !ok {
@@ -122,8 +124,9 @@ func TestIngressFoldRoundTripsV6_7095(t *testing.T) {
 	if got.IngressIfaceFold != 0x0BADF00D {
 		t.Fatalf("v6 fold round-tripped as %#x, want %#x", got.IngressIfaceFold, uint32(0x0BADF00D))
 	}
-	// Cut the #7188 TunnelDiscriminator too — see the v4 cell above.
-	_, shortGot, ok := decodeSessionV6Payload(payload[:len(payload)-12])
+	// Cut every field appended behind the fold — see the v4 cell above for the
+	// running total (#7188 discriminator 8 + #7239 routing domain 4 + fold 4).
+	_, shortGot, ok := decodeSessionV6Payload(payload[:len(payload)-16])
 	if !ok || shortGot.IngressIfaceFold != 0 {
 		t.Fatalf("v6 legacy truncation: ok=%v fold=%#x, want ok=true fold=0",
 			ok, shortGot.IngressIfaceFold)

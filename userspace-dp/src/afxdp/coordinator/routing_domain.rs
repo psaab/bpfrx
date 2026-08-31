@@ -37,6 +37,21 @@ impl Coordinator {
         crate::afxdp::shared_ops::lock_shared_recover(&self.sessions.synced).len()
     }
 
+    /// Test seam: the routing domains of every entry in the shared synced map.
+    /// A count cannot tell "imported under the domain the sender stated" from
+    /// "imported under the one this node derived", and that distinction is the
+    /// whole of #7239.
+    #[cfg(test)]
+    pub(crate) fn synced_session_routing_domains_for_test(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = crate::afxdp::shared_ops::lock_shared_recover(&self.sessions.synced)
+            .keys()
+            .map(|k| k.routing_domain)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Test seam: declare an interface a routing-instance member without
     /// building a whole `ConfigSnapshot`. The two fields are
     /// `pub(in crate::afxdp)`, so a `server::tests` cell that needs a

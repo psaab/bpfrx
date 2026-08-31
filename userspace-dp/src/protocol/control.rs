@@ -575,6 +575,27 @@ pub(crate) struct SessionSyncRequest {
     /// pre-#7095 behaviour: no ingress identity, zone approximation on display.
     #[serde(rename = "ingress_ifindex", default)]
     pub ingress_ifindex: i32,
+    /// #7239 (#7160/#2387): the session's ROUTING DOMAIN as the SENDER stamped
+    /// it at install, from the interface the flow actually arrived on.
+    ///
+    /// Preferred over deriving one from `ingress_ifindex` above, because that
+    /// ifindex is resolved from the #7095 fold, and the fold is computed on the
+    /// sender's SEND path against its CURRENT config — so an ifindex recycled
+    /// onto a sibling between install and sync resolves to the sibling, and a
+    /// derived domain files the session in the sibling's routing instance. A
+    /// carried value cannot drift that way.
+    ///
+    /// 0 is NOT a sentinel here: it is the default routing instance, and it is
+    /// also what a peer predating this field sends. The handler therefore
+    /// prefers a NON-ZERO carried value and otherwise falls back to the
+    /// derivation, which keeps the pre-#7239 behaviour — including #8116's
+    /// unresolvable-domain refusal — for an old peer. The residual is a
+    /// legitimately-default-instance session from a NEW peer during a recycle,
+    /// which still derives; that is strictly narrower than deriving every
+    /// session, and closing it needs a carried "domain is stated" bit rather
+    /// than a magic value.
+    #[serde(rename = "routing_domain", default)]
+    pub routing_domain: u32,
     #[serde(rename = "ingress_vlan_id", default)]
     pub ingress_vlan_id: u16,
     #[serde(rename = "owner_rg_id", default)]

@@ -210,12 +210,24 @@ func TestSessionValueFieldCountIsPinned7097(t *testing.T) {
 		typ  reflect.Type
 		want int
 	}{
-		// 37/38 since #7188 added TunnelDiscriminator (36/37 after #7095's
-		// IngressIfaceFold). Both are classified as NOT node-local and are
-		// therefore absent from ScrubNodeLocal / nodeLocalSessionFields — see
-		// the note on nodeLocalSessionFields.
-		{"SessionValue", reflect.TypeOf(SessionValue{}), 37},
-		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 38},
+		// 38/39 since #7239 added RoutingDomain (37/38 after #7188's
+		// TunnelDiscriminator, 36/37 after #7095's IngressIfaceFold). All three
+		// are classified NOT node-local and are therefore absent from
+		// ScrubNodeLocal / nodeLocalSessionFields — see the note on
+		// nodeLocalSessionFields.
+		//
+		// The #7239 classification, stated rather than assumed, because this is
+		// the step #6928 skipped: RoutingDomain is
+		// `StableRoutingInstanceTableID(name)`, a pure function of the
+		// routing-instance NAME. Both nodes compute the SAME number for the same
+		// instance from identical config, with no synced or persisted state.
+		// That is exactly the property that makes it legal on the wire, and it
+		// is what distinguishes it from IngressIfindex — an ifindex is
+		// node-local and names a different NIC on the peer, which is why #6928
+		// declined to sync one and why #7095 had to invent a name fold instead.
+		// A cluster-stable number needs no scrub.
+		{"SessionValue", reflect.TypeOf(SessionValue{}), 38},
+		{"SessionValueV6", reflect.TypeOf(SessionValueV6{}), 39},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.typ.NumField(); got != tc.want {

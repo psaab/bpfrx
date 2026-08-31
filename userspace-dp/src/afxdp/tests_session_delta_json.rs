@@ -198,6 +198,10 @@ fn delta_with_attribution() -> SessionDelta {
             discriminator: Default::default(),
             routing_domain: 0,
     };
+    // #7239: a NON-DEFAULT domain, so the two legs have something to disagree
+    // ABOUT. With 0 here both legs would emit the same encoded default marker
+    // and a leg that dropped the field entirely would still look equal.
+    delta.key.routing_domain = 100_007;
     delta.metadata.policy_id = 4242;
     delta.metadata.policy_counter_idx = 9;
     // 1800 s, expressed in ns: exercises the ns -> s conversion rather than a
@@ -248,11 +252,11 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
     // [n-32..n-28] policy_id, [n-28..n-24] policy_counter_idx,
     // [n-24..n-20] inactivity secs, [n-20..n-16] snat_v4,
     // [n-16..n-8] session id, [n-8..n] #7188 tunnel discriminator.
-    let snat = &payload[n - 20..n - 16];
+    let snat = &payload[n - 24..n - 20];
     BinaryAttribution {
-        policy_id: u32_at(n - 32),
-        policy_counter_idx: u32_at(n - 28),
-        app_timeout: u32_at(n - 24),
+        policy_id: u32_at(n - 36),
+        policy_counter_idx: u32_at(n - 32),
+        app_timeout: u32_at(n - 28),
         nat64: payload[26] & FLAG_NAT64 != 0,
         nat64_snat_v4: if snat == [0, 0, 0, 0] {
             String::new()
@@ -260,7 +264,7 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
             format!("{}.{}.{}.{}", snat[0], snat[1], snat[2], snat[3])
         },
         tunnel_discriminator: u64::from_le_bytes(
-            payload[n - 8..n].try_into().expect("8 bytes"),
+            payload[n - 12..n - 4].try_into().expect("8 bytes"),
         ),
     }
 }
@@ -587,5 +591,62 @@ fn session_delta_info_states_none_explicitly_for_non_tunnel_protocols_7188() {
     assert_eq!(
         info.tunnel_discriminator,
         crate::session::TunnelDiscriminator::None.to_wire()
+    );
+}
+
+
+/// #7239: the two delta legs must agree on the ROUTING DOMAIN, for the reason
+/// #6949 exists on this same struct — a field carried by the binary leg and not
+/// the JSON one is not an error anywhere, it is a 0 at the consumer, and 0 here
+/// is a legal encoded value rather than an obvious absence.
+///
+/// The mutation matrix caught this gap: dropping `routing_domain` from the JSON
+/// producer left the whole suite green, because the #6949 parity cell compares
+/// policy attribution and nothing compared this field.
+///
+/// FAIL-ON-REVERT: stop populating `routing_domain` in
+/// `afxdp::session_delta_info` and this reds.
+#[test]
+fn session_delta_json_and_binary_agree_on_the_routing_domain_7239() {
+    let delta = delta_with_attribution();
+    let frame = EventFrame::encode_session_open(
+        1,
+        &delta.key,
+        &delta.decision,
+        &delta.metadata,
+        &FxHashMap::default(),
+        delta.fabric_redirect_sync,
+        delta.session_id,
+    );
+    let payload = &frame.as_bytes()[FRAME_HEADER_SIZE..];
+    let n = payload.len();
+    let binary = u32::from_le_bytes(payload[n - 4..n].try_into().expect("4 bytes"));
+
+    let info = session_delta_info(&test_binding_identity(), &delta, &zone_names());
+    let json = serde_json::to_value(info).expect("delta serializes");
+    let json_domain = json
+        .get("routing_domain")
+        .unwrap_or_else(|| {
+            panic!(
+                "the JSON session-delta leg carries no `routing_domain` key at all, so every \
+                 session recovered through the drain fallback or a FullResync export imports \
+                 the encoded ABSENT value while the binary open frame carries a real domain: {json}"
+            )
+        })
+        .as_u64()
+        .expect("routing_domain is a number") as u32;
+
+    assert_eq!(
+        json_domain, binary,
+        "the two session-delta legs disagree on the routing domain. The JSON leg's \
+         value decodes to a DIFFERENT routing instance than the binary leg's, so a \
+         session recovered through the fallback is keyed in the wrong tenant's \
+         identity space — which is the #7239 defect arriving by the other transport."
+    );
+    assert_ne!(
+        binary,
+        crate::session::routing_domain_to_wire(0),
+        "fixture check: the domain must be non-default, or a leg that dropped the \
+         field entirely would still compare equal"
     );
 }

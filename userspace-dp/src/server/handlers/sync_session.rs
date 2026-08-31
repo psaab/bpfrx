@@ -34,9 +34,40 @@ pub(super) fn handle(
     //   * DELETE proceeds at domain 0 and lets the per-domain sweep below do
     //     the work. A refused delete LEAKS a session; a delete that sweeps one
     //     domain too many removes nothing that was not named by the 5-tuple.
-    let resolved_domain = guard
-        .afxdp
-        .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id);
+    // #7239: PREFER the domain the sender stamped at install over one derived
+    // here from the resolved ingress identity. The derivation is downstream of
+    // the #7095 fold, which the sender computes against its CURRENT config, so
+    // an ifindex recycled onto a sibling between install and sync makes the
+    // derivation name the wrong tenant — confidently, since the two-pass
+    // reverse preference then matches a reply in that tenant's domain on pass
+    // 1. A carried value is immune to a later recycle by construction.
+    //
+    // Non-zero means the sender STATED a tenant domain. Zero is ambiguous on
+    // the wire — it is both the default instance and what a peer predating the
+    // field sends — so it falls through to the derivation, preserving the
+    // pre-#7239 behaviour for an old peer, #8116's unresolvable-domain refusal
+    // included.
+    // Three states, decoded rather than defaulted (#7188's shape, and its
+    // reason). PRESENT means the sender stated a domain — including the DEFAULT
+    // instance, which is a statement and not a silence, so it does NOT fall
+    // through to the derivation. ABSENT is a peer predating the field, which
+    // keeps the pre-#7239 behaviour including #8116's unresolvable-domain
+    // refusal. UNRECOGNIZED is a value this build cannot place, and coercing it
+    // into a domain would file the session under an identity we cannot
+    // reproduce — the reasoning #7188 refuses on, transferred verbatim.
+    let resolved_domain = match crate::session::routing_domain_from_wire(sync_req.routing_domain) {
+        crate::session::WireRoutingDomain::Present(domain) => Some(domain),
+        crate::session::WireRoutingDomain::Absent => guard
+            .afxdp
+            .synced_routing_domain(sync_req.ingress_ifindex, sync_req.ingress_vlan_id),
+        crate::session::WireRoutingDomain::Unrecognized => {
+            guard.afxdp.note_unknown_routing_domain_import();
+            response.ok = false;
+            response.error =
+                format!("{SYNCED_IMPORT_REFUSED_PREFIX}routing-domain-unrecognized");
+            return;
+        }
+    };
     match sync_req.operation.as_str() {
         "upsert" if resolved_domain.is_none() => {
             guard.afxdp.note_unknown_routing_domain_import();

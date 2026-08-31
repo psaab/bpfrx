@@ -4662,6 +4662,64 @@ mod routing_domain_delete_7160 {
         );
     }
 
+    /// #7239, and the cell the mutation matrix said was missing: the import must
+    /// USE the domain the sender stated, not one it derives locally.
+    ///
+    /// The fixture is the recycle, staged: this node's ingress map says
+    /// ifindex 24 is in DOMAIN (so the derivation would answer DOMAIN), and the
+    /// request carries ingress_ifindex 24 together with a DIFFERENT stated
+    /// domain. That is exactly what a recycled ifindex produces — the fold
+    /// resolves to a sibling this node knows, while the sender's install-time
+    /// domain is the truth. If the import derives, the session is filed under
+    /// DOMAIN; if it uses what was carried, under CARRIED.
+    ///
+    /// A fixture where the two AGREE proves nothing, which is why they differ.
+    ///
+    /// FAIL-ON-REVERT: make the `Present` arm derive instead of using the
+    /// carried value and this reds. (The matrix caught that mutation escaping:
+    /// its only "failure" was an unrelated flake.)
+    #[test]
+    fn an_import_uses_the_carried_domain_not_the_derived_one_7239() {
+        const DERIVED: u32 = 100_001;
+        const CARRIED: u32 = 100_009;
+        assert_ne!(DERIVED, CARRIED, "fixture: the two must differ to discriminate");
+
+        let mut afxdp = afxdp::Coordinator::new();
+        afxdp.seed_routing_domain_for_test(24, DERIVED);
+        let state = Arc::new(Mutex::new(ServerState {
+            status: ProcessStatus::default(),
+            snapshot: None,
+            afxdp,
+            state_writer: Arc::new(StateWriter::new()),
+        }));
+
+        let mut request = req("sync_session");
+        let mut sync = upsert_request();
+        // The ingress identity the fold resolved to on THIS node...
+        sync.ingress_ifindex = 24;
+        // ...and the domain the SENDER stamped at install, encoded.
+        sync.routing_domain = CARRIED;
+        request.session_sync = Some(sync);
+
+        let response = run_request(state.clone(), request);
+        assert!(response.ok, "unexpected error: {}", response.error);
+
+        let guard = state.lock().expect("server state");
+        let domains = guard.afxdp.synced_session_routing_domains_for_test();
+        assert!(
+            domains.contains(&CARRIED),
+            "the session was NOT filed under the domain the sender stated \
+             ({CARRIED}); found {domains:?}. Deriving instead means a recycled \
+             ifindex files a tenant's session in a sibling's routing instance — \
+             the #7239 defect."
+        );
+        assert!(
+            !domains.contains(&DERIVED),
+            "the session was filed under the LOCALLY DERIVED domain ({DERIVED}) \
+             even though the sender stated {CARRIED}; found {domains:?}"
+        );
+    }
+
     /// FAIL-ON-REVERT: drop the per-domain retry in
     /// `server/handlers/sync_session.rs` and the domain-scoped session survives
     /// a delete whose caller was told it succeeded.
