@@ -142,3 +142,37 @@ would each survive into implementation as a surprise. F5/F6 are argument
 hygiene.
 
 v2 must lead with the transient/persistent split, not with the option table.
+
+---
+
+## F4 addendum — the diff v2 owes, computed. The gap list was incomplete.
+
+F4 asked for the create-vs-adopt branch diff rather than the one instance the
+plan named. `ensureVLANSubInterface` (`compiler_iface.go:197-275`):
+
+| step | CREATE path | ADOPT path |
+|---|---|---|
+| provenance check | n/a | `vlanAdoptionRefusal` → hard `errVLANAdoptRefused` (`:210`) |
+| bring up | `LinkSetUp`, error **RETURNED** (`:263`) | `LinkSetUp` only if `OperState != OperUp`, error **LOGGED** (`:228-233`) |
+| `accept_ra=0` | written, warn-only (`:268`) | **not written at all** |
+
+So there are **two** divergences, not the one the plan lists:
+
+1. **M3 `accept_ra` is create-only** — as the plan says.
+2. **`LinkSetUp` is fatal on create and silent on adopt.** This one is worse
+   and the plan misses it entirely. An abort between `LinkAdd` and `LinkSetUp`
+   leaves a DOWN child. The re-drive takes the adopt branch, nudges it up, and
+   **swallows a persistent failure** — returning `created=false, err=nil`. The
+   apply reports SUCCESS with the interface still down.
+
+That is converge-forward failing to do either of the two things it promises: it
+neither converges nor fails. And it is invisible, because the in-tree comment at
+`:224-231` justifies the swallow on the reasoning that "a failed nudge leaves
+the child DOWN, so nothing forwards through it and the #6916 harm does not
+arise" — which is sound for the steady-state apply it was written for and
+false for a re-drive that is supposed to be a convergence guarantee.
+
+**This is the finding that most sharpens F1.** Converge-forward does not merely
+fail to terminate against a persistent failure (F1); on this path it terminates
+in a FALSE SUCCESS. v2 must treat "the re-drive's own error handling differs
+from the first drive's" as a design constraint, not an implementation detail.
