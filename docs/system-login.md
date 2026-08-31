@@ -434,6 +434,52 @@ learned to parse it. A test pins the table's key set against the schema in both
 directions, so a `class` leaf added without a classification reds the suite
 instead of silently defaulting to unrestricted.
 
+#### The `*-regexps` family is NOT implemented (#7971)
+
+Junos has a **second**, parallel family of command/configuration restrictions:
+
+```
+allow-commands-regexps / deny-commands-regexps
+allow-configuration-regexps / deny-configuration-regexps
+```
+
+**xpf does not implement it.** There is no schema leaf, so a `-regexps`
+statement is rejected at commit as an unknown leaf rather than accepted and
+ignored — the safe posture, and the same one `deny-commands` gets for a
+different reason. An operator following Juniper's documentation and writing
+`set system login class limited deny-commands-regexps "..."` will see the
+commit refused; that is intended, not a bug, and the restriction should be
+expressed with a narrower `permissions` set.
+
+It is called out separately from the unmodelled leaves above because it is not
+merely absent — **it inverts the precedence rule of the family xpf does
+implement**:
+
+| family | when a command matches both an allow and a deny |
+|---|---|
+| plain (`allow-commands` / `deny-commands`) | **allow wins** |
+| `*-regexps` | **deny wins** |
+
+The matching subject differs too: Juniper documents each `-regexps` string as
+evaluated against the **full path** of the command, which is why it is
+described as faster than the plain statements.
+
+Both differences matter for whoever implements this. The natural approach —
+reuse the precedence logic that "already handles allow vs deny" — produces
+**silently wrong semantics in the unsafe direction**: a `deny-commands-regexps`
+that loses to an `allow-commands-regexps` is a privilege escalation, introduced
+by a change that looks like straightforward reuse of tested code. So precedence
+must be **per-family data, not a constant**, and the test that binds it needs a
+config carrying *both* families with a command matching an allow in one and a
+deny in the other — a single-family fixture cannot tell a per-family rule from a
+shared one.
+
+`pkg/config/login_regex.go` already records this distinction in its header
+comment for exactly that reason. Note that the file's presence does **not** mean
+the family is available: it compiles the *plain* family's patterns, and the
+`-regexps` precedence note there is a warning left for a future implementer,
+not a live code path.
+
 #### Tolerant path: fold to the repair floor
 
 On the **tolerant** load / peer-sync path the rejection is downgraded so an
