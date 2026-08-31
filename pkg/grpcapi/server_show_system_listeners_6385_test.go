@@ -132,15 +132,43 @@ func TestGRPCEffectiveListenerBindFailure(t *testing.T) {
 	addr := occupied.Addr().String()
 
 	s := NewServer(addr, Config{})
-	if err := s.Run(context.Background()); err == nil {
-		t.Fatal("Run should fail binding an already-bound address")
+
+	// #7611: Run is now SUPERVISED — a bind failure is retried with bounded
+	// backoff rather than returned, so Run blocks until ctx is done. The
+	// property this cell exists for is unchanged and still asserted below: a
+	// listener that failed to bind must report StateFailed with the REQUESTED
+	// address, never the requested address rendered as if it were serving
+	// (the pre-#6401 behaviour).
+	//
+	// The old shape asserted `Run` returned an error. That assertion cannot
+	// survive supervision and is not what #6385/#6401 are about; keeping it by
+	// giving Run a pre-cancelled context would assert the shutdown path, not
+	// the bind-failure path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = s.Run(ctx); close(done) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var ln sysservices.Listener
+	for time.Now().Before(deadline) {
+		if ln = s.EffectiveListener(); ln.State == sysservices.StateFailed {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	ln := s.EffectiveListener()
 	if ln.State != sysservices.StateFailed {
 		t.Errorf("bind-failure state = %v, want StateFailed: %+v", ln.State, ln)
 	}
 	if ln.Addr != addr {
 		t.Errorf("failed listener addr = %q, want requested %q", ln.Addr, addr)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancel — the supervisor must exit on ctx done (#7611)")
 	}
 }
 

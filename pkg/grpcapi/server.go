@@ -248,9 +248,14 @@ type Server struct {
 	// tracks pre-bind → serving → failed. The daemon reads them via
 	// EffectiveListener so the CLI reports what the listener is truly doing, not
 	// the requested --grpc-addr.
-	effMu              sync.Mutex
-	effAddr            string
-	effState           grpcListenState
+	effMu    sync.Mutex
+	effAddr  string
+	effState grpcListenState
+	// primaryEscalations counts primary-listener faults reported at ERROR
+	// rather than Warn (#7611). It is the queryable form of the escalation
+	// policy on supervisePrimaryListener, so the levels can be bound as a
+	// property rather than by matching log text.
+	primaryEscalations atomic.Uint64
 	fabricPeerAddrFn   func() []string
 	fabricVRFDevice    string
 	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
@@ -527,31 +532,167 @@ func (s *Server) Run(ctx context.Context) error {
 			"requested", s.addr, "clamped", clamped)
 		s.addr = clamped
 	}
-	lis, err := net.Listen("tcp", s.addr)
-	if err != nil {
-		// The bind failed — record Failed so `show system services` reports the
-		// requested address as (bind failed), not as if it were serving
-		// (#6385/#6401). The daemon logs the returned error non-fatally.
-		s.setListenState("", grpcFailed)
-		return fmt.Errorf("gRPC listen: %w", err)
-	}
-	// Record the effective serving address (post-clamp, post-bind) so
-	// `show system services` reports what the primary gRPC listener actually
-	// bound, not the requested --grpc-addr (#6385). lis.Addr() is authoritative
-	// (e.g. a ":50051" wildcard clamp resolves to a concrete host:port).
-	s.setListenState(lis.Addr().String(), grpcListening)
+	// #7611: supervise, rather than bind-once. Before this a bind or serve
+	// fault was TERMINAL — `Run` is called exactly once from
+	// `startGRPCServer`, so the loopback endpoint was gone for the life of the
+	// process and every gRPC-driven surface (the remote `cli`, `show`, `clear`,
+	// commit) with it. The fabric listener has had this since #5047; this is
+	// the second of the two listeners that comment applies to.
+	//
+	// Returns nil on a clean ctx-cancel shutdown. The pre-#7611 contract
+	// returned the serve error, which the daemon logged non-fatally; with a
+	// supervisor there is no terminal error to return.
+	s.supervisePrimaryListener(ctx, primarySupervisorConfig{
+		backoffBase:  primaryBackoffBase,
+		backoffMax:   primaryBackoffMax,
+		healthyServe: primaryHealthyServe,
+		listen: func(context.Context) (net.Listener, error) {
+			return net.Listen("tcp", s.addr)
+		},
+		serve: func(ctx context.Context, lis net.Listener) error {
+			return s.serveUntilDone(ctx, s.buildPrimaryServer(), lis)
+		},
+	})
+	return nil
+}
 
-	srv := s.buildPrimaryServer()
-	slog.Info("gRPC server listening", "addr", s.addr)
-	// serveUntilDone returns when the serve loop exits (ctx cancel on a clean
-	// shutdown, or a Serve error). Either way the listener is no longer serving,
-	// so clear the bound address to Failed — a later local-console `show system
-	// services` must not report a stale bound address for a dead server
-	// (#6401). serveUntilDone is shared with the fabric listener, so the clear
-	// lives HERE (Run) and never in the shared helper.
-	runErr := s.serveUntilDone(ctx, srv, lis)
-	s.setListenState("", grpcFailed)
-	return runErr
+// Backoff shape for the primary listener supervisor. Deliberately the same
+// order of magnitude as the fabric listener's: the loopback bind is cheap and a
+// transient fault should recover in well under a second, while a permanent one
+// must not spin.
+const (
+	primaryBackoffBase  = 100 * time.Millisecond
+	primaryBackoffMax   = 30 * time.Second
+	primaryHealthyServe = 30 * time.Second
+)
+
+type primarySupervisorConfig struct {
+	backoffBase  time.Duration
+	backoffMax   time.Duration
+	healthyServe time.Duration
+	// listen binds a fresh loopback listener. The #5035/#5278 clamp is NOT
+	// here: it mutates s.addr and must run once, before the loop, or a
+	// re-bind would re-clamp an already-clamped address and re-warn on every
+	// retry.
+	listen func(ctx context.Context) (net.Listener, error)
+	// serve serves the primary gRPC service until it faults or ctx is
+	// cancelled. nil means a clean shutdown, not a fault.
+	serve func(ctx context.Context, lis net.Listener) error
+}
+
+// primaryListenerEscalations counts faults reported at ERROR rather than Warn.
+//
+// This is the queryable form of the escalation policy below, so a test can bind
+// it as a property instead of grepping log output — a log-string assertion
+// would be a probe keyed to the message text rather than to the behaviour, and
+// would survive a change that silently downgraded the level.
+func (s *Server) primaryListenerEscalations() uint64 {
+	return s.primaryEscalations.Load()
+}
+
+// supervisePrimaryListener retries the loopback bind/serve with bounded
+// exponential backoff while ctx is live.
+//
+// WHY THE LOG LEVELS DIFFER FROM THE FABRIC SUPERVISOR, which is otherwise the
+// model for this function. The fabric listener's state is exported through
+// `setFabricListenerUp` into cluster health, so a fault is observable off-box
+// and its log can sit at Warn with per-tick Debug. The primary listener's state
+// reaches `sysservices.Listeners` and no further: the local console CLI reads it
+// in-process, and `show system services` reads it OVER THE GRPC THAT IS DOWN. It
+// is on neither REST nor Prometheus (#8195).
+//
+// So mirroring the fabric levels verbatim would have made this quieter than the
+// code it replaces: today a fault is logged exactly once at Error, and a naive
+// supervisor turns that into a periodic Warn plus Debug ticks. A permanent bind
+// failure would become LESS visible while the issue was closed as fixed.
+//
+// The policy is therefore: ERROR on the first fault of a run, and ERROR again
+// once the backoff reaches its cap — the point at which the fault is no longer
+// plausibly transient — with Warn in between and Debug for the waits. A serve
+// session that stayed up for `healthyServe` resets the run, so a recovered
+// listener that faults again months later is loud again.
+func (s *Server) supervisePrimaryListener(ctx context.Context, cfg primarySupervisorConfig) {
+	backoff := cfg.backoffBase
+	firstOfRun := true
+	escalatedAtCap := false
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		lis, err := cfg.listen(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.setListenState("", grpcFailed)
+			s.reportPrimaryFault("gRPC listener bind failed; will retry",
+				err, backoff, cfg, &firstOfRun, &escalatedAtCap)
+			if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
+				return
+			}
+			continue
+		}
+
+		// Record the effective serving address (post-clamp, post-bind) so
+		// `show system services` reports what the listener actually bound, not
+		// the requested --grpc-addr (#6385). lis.Addr() is authoritative (a
+		// ":50051" wildcard clamp resolves to a concrete host:port). Re-set on
+		// every successful re-bind so the state tracks reality across retries
+		// rather than latching at Failed (#6401).
+		s.setListenState(lis.Addr().String(), grpcListening)
+		slog.Info("gRPC server listening", "addr", lis.Addr().String())
+
+		start := time.Now()
+		serveErr := cfg.serve(ctx, lis)
+		// The listener is no longer serving either way, so clear the bound
+		// address — a later console `show system services` must not report a
+		// stale address for a dead server (#6401). serveUntilDone is shared
+		// with the fabric listener, so this clear lives here and never in it.
+		s.setListenState("", grpcFailed)
+
+		if ctx.Err() != nil || serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped) {
+			slog.Info("gRPC server stopped", "addr", s.addr)
+			return
+		}
+
+		if time.Since(start) >= cfg.healthyServe {
+			backoff = cfg.backoffBase
+			firstOfRun = true
+			escalatedAtCap = false
+		}
+		s.reportPrimaryFault("gRPC listener serve fault; will retry",
+			serveErr, backoff, cfg, &firstOfRun, &escalatedAtCap)
+		if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
+			return
+		}
+	}
+}
+
+// reportPrimaryFault applies the escalation policy described on
+// supervisePrimaryListener and counts every ERROR-level report.
+func (s *Server) reportPrimaryFault(
+	msg string,
+	err error,
+	backoff time.Duration,
+	cfg primarySupervisorConfig,
+	firstOfRun *bool,
+	escalatedAtCap *bool,
+) {
+	atCap := backoff >= cfg.backoffMax
+	escalate := *firstOfRun || (atCap && !*escalatedAtCap)
+	if atCap {
+		*escalatedAtCap = true
+	}
+	*firstOfRun = false
+
+	if escalate {
+		s.primaryEscalations.Add(1)
+		slog.Error(msg+" (the local gRPC control surface is DOWN: the remote cli, show, clear and commit are unavailable until it re-binds)",
+			"addr", s.addr, "backoff", backoff, "at_backoff_cap", atCap, "err", err)
+		return
+	}
+	slog.Warn(msg, "addr", s.addr, "backoff", backoff, "err", err)
 }
 
 // buildPrimaryServer constructs the primary (loopback) gRPC server with the
