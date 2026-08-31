@@ -327,10 +327,50 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 //     dataplane is DISARMED (fail-closed, #2138). The commit is reported failed;
 //     pushing a config that would disarm the standby's dataplane too is strictly
 //     worse than letting the operator fix it and re-commit.
-//   - A context cancellation/deadline (#2926 boundary abort): the apply was
-//     aborted mid-pipeline by a daemon stop. The local node is tearing down;
-//     the next boot re-applies in full and the reverse-sync-on-reconnect
-//     converges the peer, so a push racing the transport teardown is avoided.
+//   - A context CANCELLATION (#2926 boundary abort): the apply was aborted
+//     mid-pipeline by a daemon stop. The local node is tearing down; the next
+//     boot re-applies in full and the reverse-sync-on-reconnect converges the
+//     peer, so a push racing the transport teardown is avoided.
+//
+// #7618: context.DeadlineExceeded was in that second class and is NOT any
+// more, because it never had a true positive there.
+//
+// The apply context cannot expire. It is cancel-only end to end —
+// cmd/xpfd/main.go passes context.Background(), Run wraps it in
+// signal.NotifyContext (SIGTERM/SIGINT), and daemon_run.go derives
+// applyCancelContext with context.WithCancel — and BOTH callers reach the
+// pipeline as applyConfigLocked(d.applyCancelCtx(), ...), so no caller can
+// inject a deadline (syncAndApply's own ctx parameter is not used for the
+// apply). A #2926 abort therefore always surfaces as context.Canceled.
+//
+// Every DeadlineExceeded that reaches here is instead a PER-COMMAND budget
+// from a runner rooted at context.Background(), fully detached from the apply
+// context: nftApplyPayload's 5s (lo0Err, hostInboundErr — joined since
+// #3392/#3333), daemon_dns.go's systemctl calls (dnsErr, #6792), and
+// runCommandStdinTimeout's 15s (the #6790 credential operands). exec has two
+// error shapes at a deadline: a process that STARTED and was killed yields
+// *exec.ExitError ("signal: killed") and was always classified correctly,
+// while a context that expired BEFORE fork/exec completed yields a bare
+// context.DeadlineExceeded. Which one you get is decided by whether fork/exec
+// wins the race — i.e. by machine load, which is why this was observed only
+// under a loaded full-package run.
+//
+// "My useradd took 15s" is not "the daemon is stopping", and treating it as
+// such made applyAndSyncCommitted skip the push to the standby and
+// syncAndApply DISCARD a peer-promoted config. Both recover — the #5863
+// (epoch x generation) marker is never claimed on the skip path so the 30s
+// configSyncReconcileLoop re-pushes, and a discard drives the #7328
+// nack/re-arm — so the exposure is bounded rather than permanent. It is still
+// a window in which a failover serves stale config, for a reason unrelated to
+// the config.
+//
+// Deleting the clause rather than giving the command deadline its own sentinel
+// is deliberate. A sentinel threaded through three runners would add wire
+// surface to make a distinction that the Canceled/DeadlineExceeded split
+// already draws, and the deletion's worst case is bounded: it can only stop
+// suppressing the sync for a deadline-shaped abort, and no such abort exists
+// on this path. TestApplyCancelContextIsCancelOnly7618 binds that premise so
+// it is checked rather than asserted here.
 func applyErrSkipsPeerSync(err error) bool {
 	if err == nil {
 		return false
@@ -338,7 +378,7 @@ func applyErrSkipsPeerSync(err error) bool {
 	if compileErrorMustAbortApply(err) {
 		return true
 	}
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(err, context.Canceled)
 }
 
 // pushCommittedConfigToPeer pushes the current active config to the cluster

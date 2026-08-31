@@ -855,7 +855,9 @@ top of `handleConfigSync`) and never re-entered `syncAndApply` to correct it,
 making the omission permanent (visible at failover). The classifier
 `applyErrSkipsPeerSync` (shared with the commit path) still distinguishes the two
 FATAL classes — a required-protocol-gate error (dataplane DISARMED, #2138) and a
-daemon-stop context abort (#2926) — where the config is not live-forwarding and
+daemon-stop context CANCELLATION (#2926; #7618 narrowed this from
+cancel-or-deadline, since a deadline on this path is always a per-command
+budget rather than an abort) — where the config is not live-forwarding and
 the invalidators are correctly skipped; on those `syncAndApply` returns a nil
 config plus the error. Any other tail error is surfaced (joined with any partial
 #5578 invalidation error) AFTER the invalidators run, so the high-water mark does

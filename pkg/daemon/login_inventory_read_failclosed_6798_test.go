@@ -698,7 +698,14 @@ func TestUnreadableInventoryErrorDoesNotSkipPeerSync_6798(t *testing.T) {
 		t.Error("context.Canceled no longer skips peer sync; a daemon-stop abort " +
 			"would push a half-applied config at the peer")
 	}
-	if !applyErrSkipsPeerSync(context.DeadlineExceeded) {
-		t.Error("context.DeadlineExceeded no longer skips peer sync")
+	// #7618: the deadline half INVERTED — kept as a control on the same input
+	// rather than removed. context.Canceled above is the class that must still
+	// skip; a bare deadline is a per-command budget and must NOT, or an
+	// unreadable-inventory run that also happened to hit a command timeout
+	// would strand the peer for the second reason after this cell cleared the
+	// first.
+	if applyErrSkipsPeerSync(context.DeadlineExceeded) {
+		t.Error("context.DeadlineExceeded skips peer sync again; a per-command " +
+			"deadline is not a daemon-stop abort (#7618)")
 	}
 }

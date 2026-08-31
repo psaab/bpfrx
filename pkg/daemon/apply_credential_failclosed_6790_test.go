@@ -453,8 +453,17 @@ func TestApplyErrSkipsPeerSyncStillCatchesTheFatalClasses6790(t *testing.T) {
 		t.Error("context.Canceled is no longer classified fatal — a daemon-stop " +
 			"abort would now push a half-applied config to the standby (#2926)")
 	}
-	if !applyErrSkipsPeerSync(fmt.Errorf("wrapped: %w", context.DeadlineExceeded)) {
-		t.Error("a wrapped context.DeadlineExceeded is no longer classified fatal")
+	// #7618 INVERTED this line rather than deleting it, so the control keeps
+	// watching the same input. A wrapped context.DeadlineExceeded is now
+	// NON-fatal: the apply context is cancel-only, so a deadline reaching the
+	// classifier is always a per-command budget (nft 5s, systemctl, useradd
+	// 15s), never the #2926 abort. The Canceled and protocol-gate assertions
+	// above and below still carry this cell's original purpose — the
+	// classifier cannot degrade to "nothing is fatal".
+	if applyErrSkipsPeerSync(fmt.Errorf("wrapped: %w", context.DeadlineExceeded)) {
+		t.Error("a wrapped context.DeadlineExceeded is classified fatal again; a " +
+			"local command running out of ITS OWN budget would once more skip the " +
+			"push to the standby (#7618)")
 	}
 	gate := fmt.Errorf("apply: %w", dpuserspace.ErrPolicySchedulerProtocolIncompatible)
 	if !applyErrSkipsPeerSync(gate) {
@@ -490,42 +499,95 @@ func killedByTimeoutErr6790(t *testing.T) error {
 	return fmt.Errorf("create user admin: %w", err)
 }
 
-// TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790 pins a PRE-EXISTING
-// discrimination gap in applyErrSkipsPeerSync that this PR does not fix and
-// does not introduce — see the tracking issue named below.
+// TestACommandDeadlineIsNotADaemonStopAbort7618 is the INVERSION of
+// TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790, performed in the
+// change that fixed the gap that cell existed to pin — as its own comment
+// instructed.
 //
 // exec.CommandContext has TWO error shapes at a deadline. If the process
 // STARTED, the kill surfaces as *exec.ExitError ("signal: killed") — the cell
-// above. But if the context expires BEFORE fork/exec completes, Start returns
-// ctx.Err() and CombinedOutput hands back a BARE context.DeadlineExceeded.
+// above, which was always classified correctly. If the context expires BEFORE
+// fork/exec completes, Start returns ctx.Err() and CombinedOutput hands back a
+// BARE context.DeadlineExceeded. Which shape you get is decided by whether
+// fork/exec wins the race with the deadline, i.e. by machine load, which is
+// why the misclassification appeared only under a loaded full-package run.
 //
-// applyErrSkipsPeerSync cannot tell that apart from the #2926 daemon-stop abort
-// it is actually looking for, so it classifies a per-command 15s timeout as
-// FATAL: applyAndSyncCommitted skips the push to the standby and syncAndApply
-// DISCARDS the peer-promoted config. "My useradd took 15s" is not "the daemon
-// is stopping".
+// #7618 removed context.DeadlineExceeded from applyErrSkipsPeerSync's fatal
+// set because it never had a true positive there: the apply context is
+// cancel-only end to end (see TestApplyCancelContextIsCancelOnly7618), so a
+// #2926 daemon-stop abort always arrives as context.Canceled, and every
+// DeadlineExceeded reaching the classifier is a per-command budget from a
+// runner rooted at context.Background().
 //
-// Tracking issue: #7618.
-//
-// This is NOT new here. Every apply-path command runner builds its own short
-// context — nftApplyPayload (5s, produces lo0Err/hostInboundErr, joined since
-// #3392/#3333) and daemon_dns.go's systemctl disable/mask (produces dnsErr,
-// joined since #6792) — so the same misclassification already reaches the same
-// classifier through operands that predate this change. #6790 adds more members
-// to an already-exposed population; it does not create the exposure. Fixing it
-// means giving the per-command deadline its own sentinel so it is never mistaken
-// for a daemon-stop abort, which changes behaviour for five existing operands
-// and belongs in its own PR.
-//
-// This cell exists so the gap is a tripwire rather than folklore: when that PR
-// lands, THIS test reds and must be inverted in the same change.
-func TestACommandDeadlineIsMisclassifiedAsADaemonStopAbort6790(t *testing.T) {
+// "My useradd took 15s" is not "the daemon is stopping": the standby must
+// still receive the config.
+func TestACommandDeadlineIsNotADaemonStopAbort7618(t *testing.T) {
 	preExpired := fmt.Errorf("create user admin: %w", context.DeadlineExceeded)
-	if !applyErrSkipsPeerSync(preExpired) {
-		t.Fatal("a bare context.DeadlineExceeded from a pre-expired command start " +
-			"is no longer classified as the daemon-stop abort class. If that is " +
-			"because the per-command deadline now carries its own sentinel, this " +
-			"is the FIX landing — invert this cell and update the #1960 section " +
-			"of docs/system-login.md in the same change.")
+	if applyErrSkipsPeerSync(preExpired) {
+		t.Fatal("a bare context.DeadlineExceeded from a pre-expired command start is " +
+			"still classified as the daemon-stop abort class, so applyAndSyncCommitted " +
+			"skips the push to the standby and syncAndApply DISCARDS a peer-promoted " +
+			"config because a local useradd/nft/systemctl ran out of ITS OWN budget")
+	}
+}
+
+// TestADaemonStopAbortStillSuppressesTheSync7618 is the other half, and
+// without it the change above is indistinguishable from deleting the whole
+// clause.
+//
+// The #2926 abort must STILL suppress the sync: the local node is tearing
+// down, the next boot re-applies in full, and reverse-sync-on-reconnect
+// converges the peer, so a push racing the transport teardown is avoided.
+func TestADaemonStopAbortStillSuppressesTheSync7618(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"bare", context.Canceled},
+		{"wrapped", fmt.Errorf("apply aborted at phase boundary: %w", context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !applyErrSkipsPeerSync(tc.err) {
+				t.Fatal("a #2926 daemon-stop context abort no longer suppresses the peer " +
+					"sync; the fix for #7618 was over-applied and now pushes config from a " +
+					"node that is tearing down")
+			}
+		})
+	}
+}
+
+// TestApplyCancelContextIsCancelOnly7618 binds the PREMISE the #7618 deletion
+// rests on, rather than leaving it as prose in a doc comment.
+//
+// The argument is: DeadlineExceeded can be dropped from the fatal set because
+// the apply context can never produce it. That is only true while the context
+// is cancel-only — cmd/xpfd/main.go passes context.Background(), Run wraps it
+// in signal.NotifyContext, and daemon_run.go derives applyCancelContext with
+// context.WithCancel. If anyone ever gives that chain a deadline, a genuine
+// abort could arrive as DeadlineExceeded and would no longer suppress the
+// sync. This cell is what makes that a red rather than a silent regression.
+func TestApplyCancelContextIsCancelOnly7618(t *testing.T) {
+	d := &Daemon{}
+	ctx, cancel := context.WithCancel(context.Background())
+	d.applyCancelContext, d.applyCancel = ctx, cancel
+	defer cancel()
+
+	if dl, ok := d.applyCancelCtx().Deadline(); ok {
+		t.Fatalf("the apply context carries a deadline (%v); a #2926 abort could now "+
+			"surface as context.DeadlineExceeded, which #7618 removed from the fatal "+
+			"set — restore the discrimination before adding one", dl)
+	}
+	// And the error it DOES produce is the one the classifier still treats as
+	// fatal. Asserting the absence of a deadline alone would not catch a chain
+	// that started reporting some third error.
+	cancel()
+	if err := d.applyCancelCtx().Err(); !applyErrSkipsPeerSync(err) {
+		t.Fatalf("a cancelled apply context yields %v, which applyErrSkipsPeerSync does "+
+			"NOT classify as fatal; the #2926 abort would push config from a node that "+
+			"is tearing down", err)
+	}
+	// Non-vacuity: the nil-context fallback must not be what was measured.
+	if (&Daemon{}).applyCancelCtx().Done() != nil {
+		t.Fatal("the nil fallback is no longer context.Background()")
 	}
 }
