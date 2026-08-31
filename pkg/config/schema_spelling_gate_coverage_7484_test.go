@@ -161,7 +161,7 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-const gateCoverageFloor = 692
+const gateCoverageFloor = 699
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -189,7 +189,48 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// TestStreamSourceInterfaceCompiles_6875, its validator by
 	// TestStreamSourceInterfaceIsValidated_6875, and both apply paths by the
 	// daemon and CLI cells; it is blind to THIS instrument only.
-	gateBlindUnreachable: 144,
+	// #7492 lowered this 144 -> 137: a `security log stream <*>` parent
+	// prerequisite (`host`) rescued all seven of that parent's leaves. See the
+	// row in schema_spelling_differential_gate_test.go for the measurement.
+	//
+	// WHAT THE REMAINING 137 ACTUALLY ARE, measured rather than assumed —
+	// because this number reads as a debt to pay down and a quarter of it can
+	// never be paid. The 137 span 66 parents and are TWO populations, counted:
+	//
+	//   - DECLARED INERT — 33 leaves. The schema itself says nothing reads
+	//     them, so "varying it changed nothing" is the TRUTH rather than a gap.
+	//     NO prerequisite can ever rescue these; only implementing the feature
+	//     would, and that is not gate work. Counted by the project's own
+	//     phrasings: "not implemented" 21 (the 20 leaves under
+	//     `dhcp-local-server`/`dhcpv6-local-server group <*> interface <*>`,
+	//     plus `security log profile <*> category session field-extra-name`),
+	//     "retired, ignored" 9 (the legacy DPDK `system dataplane` tree),
+	//     "(ignored)" 1, "accepted-but-inert" 1, "accepted but not yet
+	//     enforced" 1.
+	//
+	//   - NOT DECLARED INERT — 104 leaves, and this is an UPPER BOUND on what
+	//     prereq rows could ever recover, not a count of recoverable work. The
+	//     parent stanza compiles to nothing without a sibling, so the leaf
+	//     varied its value against an absent object; a gateParentPrereq row
+	//     fixes that, and they come in clumps — one row rescued 13 (bgp group),
+	//     another 7 (security log stream). But absence of an inertness marker
+	//     only proves a leaf was never DECLARED dead: a leaf nothing reads,
+	//     whose description does not admit it, is silently inert and sits in
+	//     this bucket looking rescuable. Treat 104 as a ceiling on the
+	//     opportunity, never as a backlog.
+	//
+	// So do NOT read this ceiling as 137 missing tests. At least 33 are
+	// correctly reported and always will be. #7492's original plan — a GENERAL
+	// per-parent prerequisite synthesis — was tried and refuted by measurement:
+	// it recovered 2 while one hand-written row recovered 13. The productive
+	// path is hand-written rows for clumped parents in the second bucket.
+	//
+	// This constant is the tracker. #7492 was CLOSED rather than retitled
+	// because the ratchet above enforces on every run what an open issue would
+	// only describe: a new row must tighten gateCoverageFloor, and a regression
+	// cannot pass. The issue's own count rotted four times (228 -> 215 -> 144
+	// -> 137); a number that lives beside the code it measures cannot.
+	gateBlindUnreachable: 137,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a

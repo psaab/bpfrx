@@ -690,6 +690,16 @@ var gateParentPrereq = map[string]string{
 	// Verified: 13 leaves under `protocols bgp group <*>` move from no-verdict
 	// to compared.
 	"protocols bgp group <*>": "neighbor 10.211.199.1;",
+	// #7492: a `security log stream` with no `host` compiles to NOTHING —
+	// cfg.Security.Log.Streams["s"] stays nil — so every stream-level leaf
+	// (severity, facility, category, source-address, source-interface, ...)
+	// varied its value against an absent object and looked inert. One host is
+	// enough to materialise the stream.
+	//
+	// Measured before adding, the way the BGP row above was: this parent's
+	// unreachable count goes 7 -> 0 and its compared count 1 -> 8. All seven
+	// are rescued; none is a flag in disguise.
+	"security log stream <*>": "host 10.211.199.1;",
 }
 
 // gateLeafPrereq returns the parent prerequisite for this leaf as a brace body
