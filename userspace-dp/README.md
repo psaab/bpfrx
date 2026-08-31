@@ -262,6 +262,21 @@ logging rules, not these specific hot-path constants.
   (`userspace-dp/src/afxdp/worker/mod.rs`), so there is no live
   6-second grace window.
 
+- **Wire struct literals carry `..Default::default()` (#7689).** An
+  ADDITIVE snapshot field — one with `#[serde(default)]`, designed to be
+  invisible to an older peer — is still a compile break at every
+  EXHAUSTIVE struct literal in tests, because those literals enumerate
+  every field. Most wire structs are already well defended by convention
+  (`InterfaceSnapshot`: 1 exhaustive literal of 402;
+  `FirewallTermSnapshot`: 12 of 330). `CoSSchedulerSnapshot` was the
+  outlier at 72 of 74, which is why #6846's two new fields broke 71
+  literals across five files. Those were converted, and
+  `cos_scheduler_snapshot_literals_carry_an_update_tail_7689`
+  (`src/protocol/cos_literal_guard_7689.rs`) keeps the count at zero.
+  Deliberately NOT `#[non_exhaustive]`: that forces the tail at compile
+  time but also blocks exhaustive construction outside the defining
+  crate, changing a public contract to solve a test-hygiene problem.
+
 ## Subdir READMEs
 
 See `src/afxdp/README.md`, `src/server/README.md`, `src/session/README.md`,
