@@ -104,7 +104,6 @@ impl std::fmt::Display for ReconcileError {
 /// `teardown.rs` (it gates the 500ms mlx5 quiesce sleep alongside the
 /// `will_rebind` flag, which is not needed outside teardown).
 pub(in crate::afxdp) struct PreservedReconcileState {
-    pub(super) synced_sessions: Vec<SyncedSessionEntry>,
     pub(super) slow_path: Option<Arc<SlowPathReinjector>>,
     /// #1873 R-D (AGY code r3): the tunnel-owner map (id -> logical
     /// interface name) captured BEFORE `stop_inner(false)` resets
@@ -371,13 +370,12 @@ impl Coordinator {
         // build has already succeeded and `apply_snapshot` reuses
         // `fds.forwarding`. The `Option` return is retained for signature
         // stability; the `else` arm is now defensively unreachable.
-        let Some(fds) = snapshot::apply_snapshot(
+        let Some((fds, tunnel_purge_ids)) = snapshot::apply_snapshot(
             self,
             snapshot,
             preserved.slow_path,
             &preserved.tunnel_owners,
             preserved.snapshot_was_installed,
-            &mut preserved.synced_sessions,
             fds,
             crate::slowpath::set_if_mtu,
         ) else {
@@ -394,7 +392,7 @@ impl Coordinator {
             bindings,
             fds,
             ring_entries,
-            preserved.synced_sessions,
+            &tunnel_purge_ids,
         );
         // Reflect the real per-binding state either way — a partial spawn
         // (some workers up, then a spawn aborted the rest) still needs the

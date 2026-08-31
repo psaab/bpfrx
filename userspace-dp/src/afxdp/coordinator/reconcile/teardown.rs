@@ -53,7 +53,18 @@ fn quiesce(coord: &mut Coordinator, d: Duration) {
 /// `false` and skips the quiesce.
 pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> PreservedReconcileState {
     let had_live_workers = !coord.workers.records.is_empty();
-    let synced_sessions = coord.snapshot_shared_session_entries();
+    // #8157: the synced-session set is NO LONGER captured here. It used to be
+    // cloned before `stop_inner(false)` and replayed at bringup, which left a
+    // window: an entry landing in the shared map between this point and the
+    // replay was absent from the captured Vec, never published to the new
+    // session map, and never replayed — while still being answered to Go as
+    // installed. The replay now reads the live map at replay time instead, so
+    // a late arrival is included by construction. Safe because
+    // `stop_inner(false)` does NOT clear `sessions.synced` (the clear is gated
+    // on `clear_synced_state`, which only full shutdown passes), so the map
+    // survives the teardown intact — see #6652, whose own regression note is
+    // "stop_inner(false) replaced the workers and bring-up replayed nothing,
+    // while the shared map still held them".
     // #1873 R-D (AGY code r3): capture the tunnel-owner map and the
     // installed flag BEFORE stop_inner defaults coord.forwarding and
     // coord.validation — apply_snapshot's remap purge diffs against
@@ -90,7 +101,6 @@ pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> Preserved
         quiesce(coord, TEARDOWN_QUIESCE);
     }
     PreservedReconcileState {
-        synced_sessions,
         slow_path,
         tunnel_owners,
         snapshot_was_installed,

@@ -135,7 +135,7 @@ pub(super) fn bring_up_workers(
     bindings: &mut [BindingStatus],
     fds: ReconcileSnapshotFds,
     ring_entries: usize,
-    preserved_synced_sessions: Vec<SyncedSessionEntry>,
+    tunnel_purge_ids: &[u16],
 ) -> Result<(), WorkerBringUpError> {
     let ring_entries = clamp_ring_entries(ring_entries);
     // Phase: PLAN. Build the per-worker binding plans (+ live/identities +
@@ -154,7 +154,7 @@ pub(super) fn bring_up_workers(
     // Phase: REPLAY. Build the per-worker command queues and replay preserved
     // synced sessions into the session map — BEFORE launch.
     let worker_command_queues =
-        replay_preserved_sessions(coord, &workers, &preserved_synced_sessions, session_map_raw_fd);
+        replay_preserved_sessions(coord, &workers, tunnel_purge_ids, session_map_raw_fd);
     // Phase: RESOLVER (best-effort, ATTEMPTED before worker launch so every
     // worker's `WorkerSharedDataplane::from_coord` clones a live handle). A
     // spawn failure leaves it `None` and workers still launch (with
@@ -429,10 +429,41 @@ fn publish_runtime(
 /// the queues) BEFORE launch, recording the `ReplayedSynced` stage when any
 /// replayed. Returns the shared command-queue map the spawn loop hands to each
 /// worker. Verbatim move of the pre-#6240 inline block.
-fn replay_preserved_sessions(
+/// #8157: the replay set is derived from the LIVE shared synced map HERE,
+/// rather than from a `Vec` cloned before `tear_down`.
+///
+/// The old shape had a window. `teardown::tear_down` cloned
+/// `snapshot_shared_session_entries()` before `stop_inner(false)`, and the
+/// replay published that clone — so an entry landing in the shared map between
+/// the clone and this point was absent from the replay, never published to the
+/// new session map (the fd is `None` for the whole reconcile), and never
+/// replayed, while `upsert_synced_session` still answered Go `Applied`. A split
+/// truth with no signal.
+///
+/// Reading the map here closes it by construction: the read happens after every
+/// arrival the reconcile could race. This is sound because `stop_inner(false)`
+/// does NOT clear `sessions.synced` — the clear is gated on
+/// `clear_synced_state`, which only full shutdown passes (see #6652).
+///
+/// The tunnel-remap filter MOVED here with the set it applies to.
+/// `apply_snapshot` computes `tunnel_purge_ids` and has already purged those
+/// sessions from the live map, so for every entry that predates the purge the
+/// filter is redundant — it is kept for the one case it still covers, an entry
+/// for a purged tunnel arriving AFTER the purge. It calls the same
+/// `filter_replayed_synced_sessions` predicate the snapshot phase used, not a
+/// paraphrase, so the two cannot disagree about what a purged tunnel is.
+///
+/// NOT REACHABLE TODAY: the snapshot-wide `ServerState` mutex excludes
+/// `sync_session` for the whole reconcile, so nothing can arrive in the window
+/// this closes. #7209 is what makes it reachable, and this is its prerequisite
+/// — landing it afterwards would mean shipping the race first.
+/// Visibility is `pub(in crate::afxdp)` for the #8157 test in `ha_tests.rs`,
+/// which reuses that module's synced-session fixtures rather than duplicating
+/// them here — a duplicated fixture is a fixture that drifts.
+pub(in crate::afxdp) fn replay_preserved_sessions(
     coord: &mut Coordinator,
     workers: &BTreeMap<u32, Vec<BindingPlan>>,
-    preserved_synced_sessions: &[SyncedSessionEntry],
+    tunnel_purge_ids: &[u16],
     session_map_raw_fd: core::ffi::c_int,
 ) -> Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> {
     let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> = Arc::new(
@@ -442,8 +473,10 @@ fn replay_preserved_sessions(
             .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
             .collect(),
     );
+    let mut replay_entries = coord.snapshot_shared_session_entries();
+    crate::afxdp::coordinator::filter_replayed_synced_sessions(&mut replay_entries, tunnel_purge_ids);
     let replayed_synced_sessions = coord.replay_synced_sessions(
-        preserved_synced_sessions,
+        &replay_entries,
         worker_command_queues.as_ref(),
         session_map_raw_fd,
     );
