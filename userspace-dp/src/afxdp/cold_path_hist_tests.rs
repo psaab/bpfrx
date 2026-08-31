@@ -935,19 +935,54 @@ fn snapshot_under_concurrent_writer_never_tears() {
         }
         count
     });
-    // Give the writer time to spin up under parallel test load.
-    // Without this, on a heavily contended test run the reader can
-    // finish all 1000 snapshots before the writer publishes more
-    // than a handful of times, which would fail the `writer_iters
-    // > 10` sanity assertion below.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    let slot = 5usize;
+
+    // #8139: WAIT for the writer's first publish instead of sleeping a fixed
+    // 20ms and hoping it happened.
+    //
+    // The 20ms literal was a bet on the scheduler. This box routinely sits at
+    // load 40+ with several agents running --release gates at once, and under
+    // that the writer thread can be starved through the whole spin-up AND the
+    // reader loop. The reader then takes 1000 perfectly coherent all-zero
+    // snapshots and the old `max_samples > 0` assertion fired with "reader
+    // observed only zero samples across 1000 coherent and 0 retry-exhausted
+    // snapshots".
+    //
+    // That message named the tell without acting on it: 0 retry-exhausted
+    // means the seqlock behaved flawlessly. The test was asserting that the
+    // WRITER MADE PROGRESS, which is a property of the scheduler, not of the
+    // histogram. Because `cargo test` aborts at the first failing binary, that
+    // scheduler accident took the whole `make test-rust` gate down with it.
+    //
+    // This is the same distinction #7650 already drew for the coherence floor
+    // below, so it gets the same treatment: an explicit, generously bounded
+    // observability precondition that fails with a message saying what it is.
+    // 10s is ~500x the old literal; a writer that cannot publish once in that
+    // window is a real problem worth failing on.
+    const WRITER_SPINUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    let spinup_start = std::time::Instant::now();
+    let mut writer_published = false;
+    while spinup_start.elapsed() < WRITER_SPINUP_DEADLINE {
+        if let Some(snap) = atomics.snapshot() {
+            if snap.samples[slot] > 0 {
+                writer_published = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        writer_published,
+        "OBSERVABILITY PRECONDITION FAILED, NOT A TEAR: the writer published \
+         nothing in {WRITER_SPINUP_DEADLINE:?}, so the reader window would \
+         have opened on an idle writer and measured the scheduler rather than \
+         the seqlock. Nothing here indicts the histogram."
+    );
     // Reader: take 1000 snapshots, assert monotonic samples per
     // slot AND cross-field invariants (Codex code-r3 NIT: the
     // weaker oracle would pass even if every snapshot returned
     // default zero after retry-exhaustion).
-    let slot = 5usize;
     let mut last_samples = 0u64;
-    let mut max_samples = 0u64;
     let mut at_least_one_observed_increase = false;
     let mut coherent_snapshots = 0u64;
     let mut retry_exhausted_snapshots = 0u64;
@@ -987,17 +1022,16 @@ fn snapshot_under_concurrent_writer_never_tears() {
             "torn epoch: samples={s} != bucket_sum={bucket_sum} for slot {slot}"
         );
         last_samples = s;
-        max_samples = max_samples.max(s);
     }
     stop.store(true, AOrd::Relaxed);
     let writer_iters = writer.join().expect("writer thread panicked");
-    // Sanity-1: at least one COHERENT snapshot must have been
-    // nonzero. None counts as "stale, retry" and is excluded.
-    assert!(
-        max_samples > 0,
-        "reader observed only zero samples across {coherent_snapshots} coherent and \
-             {retry_exhausted_snapshots} retry-exhausted snapshots"
-    );
+    // #8139: the former Sanity-1 ("at least one coherent snapshot was nonzero")
+    // is deleted, not rewritten. The spin-up gate above now establishes that
+    // the writer published BEFORE the reader window opened, and `samples` is
+    // asserted monotonic non-decreasing below, so a nonzero first observation
+    // is guaranteed by construction. Keeping the assertion would leave a cell
+    // that can no longer fail — and a vacuous assertion is worse than no
+    // assertion, because the next reader counts it as coverage.
     // Sanity-2: at least one snapshot must show an INCREASE over
     // the prior one, proving we actually observed publishes
     // arriving during the reader loop.
