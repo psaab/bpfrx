@@ -79,6 +79,19 @@ install: build build-ctl
 test: test-go test-rust
 
 # Go suite. Invocation preserved exactly from the pre-#4006 `test` target.
+# #7494: behavioural coverage for the shim's own control flow, via
+# BPF_PROG_TEST_RUN against the tracked object. Loading a BPF program needs
+# privilege, so these cells SKIP under `make test-go` and only really run here.
+# They exist because the #1864 verifier gate is a HEADROOM instrument, not a
+# correctness one: two distinct WRONG implementations of the #7494 fragment fix
+# both pass it, and nothing else in the tree can tell them apart.
+test-shim-run:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "test-shim-run: needs root (BPF program load). Re-run with sudo."; \
+		exit 1; \
+	fi
+	go test ./pkg/dataplane/userspace/ -run 'TestFragment|TestNonFirstFragment' -v -count=1
+
 test-go: test-race-dp
 	# go vet gate scoped to pkg/flowexport (#2224): catches the
 	# atomic.Uint64-copy regression class (ExportConfig embeds the live
