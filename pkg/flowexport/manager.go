@@ -211,7 +211,51 @@ func collectInstanceVersionCollectors(inst *config.SamplingInstance, version str
 			continue
 		}
 		for _, fs := range fam.FlowServers {
+			// A nil entry cannot be version-resolved (resolveFlowServerVersion
+			// dereferences fs.Version), so guard before it rather than relying
+			// on the compiler's collection never holding one.
+			if fs == nil {
+				continue
+			}
 			if resolveFlowServerVersion(fs, hasV9, hasIPFIX) != version {
+				continue
+			}
+			// #8163: drop a flow-server that can never receive a record HERE,
+			// where the collector list is BUILT — not downstream where the
+			// failure is caught.
+			//
+			// dialCollectors treats a dial failure as fatal for the whole
+			// group (it closes every socket opened so far and returns the
+			// error), NewExporter propagates it out of the constructor, and
+			// Daemon.reconcileFlowExporter's build loop `return`s on the FIRST
+			// constructor error. So a single unusable flow-server disabled
+			// NetFlow/IPFIX export for EVERY template/family group, not just
+			// its own siblings — and on a boot with nothing previously running
+			// it published the empty bundle, leaving export simply off.
+			//
+			// Catching it further down would not do. Making the daemon loop
+			// `continue` would rescue the OTHER groups while still dropping
+			// this collector's healthy siblings, and tolerating dial failures
+			// inside dialCollectors would also swallow a well-formed collector
+			// that is merely unreachable — a transient the #3742
+			// build-before-swap design deliberately keeps fatal so the old
+			// exporters stay up instead of being replaced by a degraded set.
+			// The collectors excluded here are decidable from config and can
+			// never succeed later, which is exactly what makes dropping them
+			// safe.
+			//
+			// The verdict is the SHARED config.FlowServerExcludedReason, the
+			// same predicate `show security flow monitoring` and
+			// `show forwarding-options` annotate NOT INSTALLED (#7422), so the
+			// exporter and the show surfaces cannot disagree about which
+			// collectors are live. Two spellings would drift in opposite
+			// directions: an exporter skipping what the renderer calls active
+			// lies to the operator, and one dialling what the renderer calls
+			// dead cries wolf.
+			if reason := config.FlowServerExcludedReason(fs); reason != "" {
+				slog.Warn("flowexport: skipping flow-server that cannot receive records",
+					"instance", inst.Name, "address", fs.Address, "port", fs.Port,
+					"version", version, "reason", reason)
 				continue
 			}
 			addr := fs.Address

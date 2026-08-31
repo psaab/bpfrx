@@ -99,11 +99,31 @@ func TestCollectorAddress_IPv6IsBracketed(t *testing.T) {
 	}
 }
 
-// TestCollectorAddress_NoPortLeavesBareAddress documents that a flow server
-// with no explicit port (Port == 0) is left as a bare address (no ":0"
-// appended). JoinHostPort is only reached when Port > 0, so this path is
-// unchanged by #2183.
-func TestCollectorAddress_NoPortLeavesBareAddress(t *testing.T) {
+// TestCollectorAddress_NoPortIsExcludedEntirely is the #8163 successor to
+// TestCollectorAddress_NoPortLeavesBareAddress.
+//
+// That test documented, correctly for its time, that a flow-server with no
+// explicit port was carried through as a BARE address with no ":0" appended.
+// #8163 changed the contract rather than the formatting: such a collector can
+// never receive a record (net.Dial rejects the bare host with "missing port in
+// address"), and carrying it to dialCollectors made that failure fatal for the
+// whole group — and, through reconcileFlowExporter's build loop, for every
+// other group too. config.FlowServerExcludedReason now drops it where the
+// collector list is built.
+//
+// The test MOVES with the code instead of being deleted or loosened: its
+// subject is still "what does a portless flow-server produce", and the answer
+// is now "nothing at all". Deleting it would have quietly retired the only
+// cell watching this input shape.
+//
+// The `if fs.Port > 0` guard in collectInstanceVersionCollectors is kept
+// deliberately even though the exclusion above makes Port >= 1 on every path
+// that reaches it. It is the FAIL-LOUD leg: if the exclusion is ever moved or
+// bypassed, a bare address dies at dial with a named error, whereas an
+// unconditional JoinHostPort would emit "host:0", which dials successfully and
+// discards every record silently. Defence-in-depth, in the direction that
+// stays diagnosable.
+func TestCollectorAddress_NoPortIsExcludedEntirely(t *testing.T) {
 	fo := &config.ForwardingOptionsConfig{
 		Sampling: &config.SamplingConfig{
 			Instances: map[string]*config.SamplingInstance{
@@ -120,14 +140,11 @@ func TestCollectorAddress_NoPortLeavesBareAddress(t *testing.T) {
 	}
 
 	ec := BuildExportConfig(v9Svc(), fo)
-	if ec == nil {
-		t.Fatal("expected non-nil ExportConfig")
-	}
-	if len(ec.Collectors) != 1 {
-		t.Fatalf("collectors = %d, want 1", len(ec.Collectors))
-	}
-	if got := ec.Collectors[0].Address; got != "2001:db8::9" {
-		t.Errorf("collector address = %q, want bare %q", got, "2001:db8::9")
+	if ec != nil && len(ec.Collectors) != 0 {
+		t.Fatalf("a flow-server with no `port` produced collectors %v; it can "+
+			"never receive a record, and carrying it here makes the dial "+
+			"failure fatal for every other collector in the group (#8163)",
+			ec.Collectors)
 	}
 }
 
