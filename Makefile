@@ -417,7 +417,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -437,6 +437,16 @@ test-deploy: build build-ctl
 # against a mocked fake VM. No incus, no cluster, no network — pure bash logic.
 test-deploy-lib:
 	bash ./test/incus/deploy-lib-selftest.sh
+
+# Self-test the mutation-harness scoring library (scripts/mutate-lib.sh).
+# Hermetic: fixture logs only, no repo/compiler/cluster. The cell that matters
+# is the REFUSAL one -- a single-language runner scores every cross-language
+# mutation as an ESCAPE, because nothing it ran could have failed, and an
+# escape is a claim that the code is untested. Also pins the three verdicts
+# that are neither a kill nor an escape: a build break, a -race failure (which
+# emits no `--- FAIL` line at all), and a full disk (which reds NAMED tests).
+test-mutate-lib:
+	bash ./scripts/mutate-selftest.sh
 
 # Self-test the #1875 shared-cluster lock cell (with-cluster.sh contention
 # matrix) and the #4020 destructive-smoke lock preamble (every reboot/
