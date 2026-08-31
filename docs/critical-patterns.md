@@ -89,8 +89,45 @@ non-trivial code. This page is the quick-reference gotcha list.
     `NamePolicy` order — onboard (`eno`), slot (`ens`), path (`enp`) —
     because a device commonly carries several at once and the first the
     policy resolves is the one udev assigns. `eth` is accepted last only,
-    and a MAC-based `enx` name never. #7415 tracks the one divergence that
-    could not be reproduced on available hardware.
+    and a MAC-based `enx` name never.
+  - **The ARI arithmetic is deliberately NOT implemented in the fallback
+    (#7415, recorded here rather than left open).** systemd's `net_id`
+    reinterprets the PCI slot and function fields as one 8-bit function
+    number when ARI is enabled, i.e. `func += slot * 8`. `pciAddrToEnp`
+    does not do this, so on an ARI device at a non-zero slot the two would
+    disagree.
+    That divergence could not be REPRODUCED: it needs an ARI-enabled,
+    **non-VF** network function at a **non-zero** PCI slot, and no such
+    device was available. The discriminator, for anyone who has one:
+    ```bash
+    for d in /sys/bus/pci/devices/*/; do
+      [ "$(cat $d/ari_enabled 2>/dev/null)" = 1 ] || continue
+      [ -e "$d/physfn" ] && continue                   # skip VFs
+      case "$(basename $d)" in *:00.*) continue;; esac # skip slot 0
+      [ -d "$d/net" ] && echo "DISCRIMINATOR: $(basename $d)"
+    done
+    ```
+    On such a device, compare `udevadm test-builtin net_id
+    /sys/class/net/<if>` against `pciAddrToEnp`. Multi-function ARI
+    endpoints that are not SR-IOV VFs — some multi-port NICs and
+    accelerator cards — are the likely candidates.
+    It was not implemented on argument rather than oversight. #6677 made
+    udev authoritative (`deriveKernelName` reads `ID_NET_NAME_PATH` from
+    `/run/udev/data/n<ifindex>`, which already accounts for ARI, the VF
+    parent and the port suffix), so the fallback runs only when udev data
+    is ABSENT — early boot before settle, or a container. The residual is
+    therefore reachable only on a host that simultaneously has an ARI
+    non-VF NIC at a non-zero slot AND no udev data for it. Adding
+    arithmetic that cannot be demonstrated, to a nearly unreachable path,
+    in a function that silently renames network interfaces, is risk
+    without measurable benefit: **a naming fix that guesses is worse than
+    none.**
+    If someone confirms the divergence on real hardware, the change is
+    `func += slot * 8` in `pciAddrToEnp` when
+    `/sys/bus/pci/devices/<addr>/ari_enabled` is `1` — which requires the
+    helper to take the device PATH rather than the address string, since
+    ARI is a property of the device — plus a fixture built from that
+    hardware's real `udevadm` output, keeping the udev-first path primary.
   - **Collision-safe positional rename (#4178).** The positional loop
     (`renamePositional`) is two-pass, like device-map mode: it captures
     every NIC's `OriginalName=` from the existing `.link` set BEFORE
