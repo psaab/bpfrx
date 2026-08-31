@@ -942,6 +942,38 @@ since #1861 via the worker-runtime status path as
   (the call sites pair the count with `debug_assert!` per the #1855
   contract above).
 
+#### By-key lookup misses (#7919)
+
+`record_by_key` / `record_by_key_mut` are the resolvers behind
+`touch_if_stale` and `account_packet`, and both bail **silently** on a
+miss. A flow whose key does not resolve is therefore neither accounted
+nor keepalive-touched, and nothing says so — which is the measured shape
+of #7919: `show security flow session` reporting `Pkts: 0, Bytes: 0` for
+a live transit flow while a sibling flow on the same box accounts
+perfectly, every frozen row carrying `idle ≈ age` because `last_seen`
+never moved either.
+
+Three `AtomicU64` counters (atomic, unlike their plain-`u64` siblings,
+because `record_by_key` takes `&self`) split the miss by cause, exported
+per worker as `session_lookup_miss_{no_handle,stale_handle,key_mismatch}`:
+
+- `no_handle` — no handle in the key index. The session was never
+  installed under this key, or was removed.
+- `stale_handle` — a handle resolved but pointed past the slab: a handle
+  outliving its record.
+- `key_mismatch` — a handle resolved to a LIVE record whose stored key
+  differs. The index and the record disagree, so the lookup finds a
+  session and correctly refuses to account against it.
+
+They are split, and exported **per worker**, because #7919 is
+per-session rather than global — one of three concurrent flows accounted
+correctly on the measured box, so any explanation predicting uniform
+behaviour is already wrong, and a process-wide total cannot separate
+"one worker misses everything" from "every worker misses occasionally".
+
+The counters are instrumentation, not a fix: they exist to settle WHICH
+of the three stories holds before anyone changes a disposition.
+
 Decision record: `docs/research/1861-install-txn/plan.md`.
 
 ### UpsertLocal is in the uncapped sync family (#1870)

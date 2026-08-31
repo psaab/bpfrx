@@ -1193,6 +1193,10 @@ impl super::Coordinator {
                     // #4800: per-worker transit new-flow installs.
                     new_flow_installs: s.new_flow_installs,
                     session_create_drops: s.session_create_drops,
+                    // #7919
+                    session_lookup_miss_no_handle: s.session_lookup_miss_no_handle,
+                    session_lookup_miss_stale_handle: s.session_lookup_miss_stale_handle,
+                    session_lookup_miss_key_mismatch: s.session_lookup_miss_key_mismatch,
                     session_install_admission_refused: s.session_install_admission_refused,
                     session_install_partial: s.session_install_partial,
                     dead,

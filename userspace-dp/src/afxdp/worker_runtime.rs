@@ -134,6 +134,14 @@ pub(crate) struct WorkerRuntimeCounters {
     /// SessionTable (`SessionTable::create_drops` — previously
     /// write-only/invisible).
     pub session_create_drops: u64,
+    /// #7919: by-key session-lookup misses on this worker, split by cause —
+    /// (no handle in the index, stale handle past the slab, handle resolving to
+    /// a record whose key differs). Both `touch_if_stale` and `account_packet`
+    /// bail SILENTLY on a miss, so a frozen `Pkts: 0` row was previously
+    /// indistinguishable from a genuinely idle flow.
+    pub session_lookup_miss_no_handle: u64,
+    pub session_lookup_miss_stale_handle: u64,
+    pub session_lookup_miss_key_mismatch: u64,
     /// #1861: cumulative pair-admission preflight refusals (one per
     /// refused flow) from `SessionTable::admission_refused`.
     pub session_install_admission_refused: u64,
@@ -220,6 +228,9 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub nat_reverse_key_collisions_distinct_src: AtomicU64,
     /// #1861: install-refusal trio (same Relaxed cumulative pattern).
     pub session_create_drops: AtomicU64,
+    pub session_lookup_miss_no_handle: AtomicU64,
+    pub session_lookup_miss_stale_handle: AtomicU64,
+    pub session_lookup_miss_key_mismatch: AtomicU64,
     pub session_install_admission_refused: AtomicU64,
     pub session_install_partial: AtomicU64,
     /// #4800: per-worker transit new-flow installs (same Relaxed
@@ -305,6 +316,9 @@ impl WorkerRuntimeAtomics {
             nat_reverse_key_collisions: AtomicU64::new(0),
             nat_reverse_key_collisions_distinct_src: AtomicU64::new(0),
             session_create_drops: AtomicU64::new(0),
+            session_lookup_miss_no_handle: AtomicU64::new(0),
+            session_lookup_miss_stale_handle: AtomicU64::new(0),
+            session_lookup_miss_key_mismatch: AtomicU64::new(0),
             session_install_admission_refused: AtomicU64::new(0),
             session_install_partial: AtomicU64::new(0),
             new_flow_installs: AtomicU64::new(0),
@@ -373,6 +387,12 @@ impl WorkerRuntimeAtomics {
         // #1861: install-refusal trio, same Relaxed cumulative cadence.
         self.session_create_drops
             .store(c.session_create_drops, Ordering::Relaxed);
+        self.session_lookup_miss_no_handle
+            .store(c.session_lookup_miss_no_handle, Ordering::Relaxed);
+        self.session_lookup_miss_stale_handle
+            .store(c.session_lookup_miss_stale_handle, Ordering::Relaxed);
+        self.session_lookup_miss_key_mismatch
+            .store(c.session_lookup_miss_key_mismatch, Ordering::Relaxed);
         self.session_install_admission_refused
             .store(c.session_install_admission_refused, Ordering::Relaxed);
         self.session_install_partial
@@ -481,6 +501,15 @@ impl WorkerRuntimeAtomics {
                 .nat_reverse_key_collisions_distinct_src
                 .load(Ordering::Relaxed),
             session_create_drops: self.session_create_drops.load(Ordering::Relaxed),
+            session_lookup_miss_no_handle: self
+                .session_lookup_miss_no_handle
+                .load(Ordering::Relaxed),
+            session_lookup_miss_stale_handle: self
+                .session_lookup_miss_stale_handle
+                .load(Ordering::Relaxed),
+            session_lookup_miss_key_mismatch: self
+                .session_lookup_miss_key_mismatch
+                .load(Ordering::Relaxed),
             session_install_admission_refused: self
                 .session_install_admission_refused
                 .load(Ordering::Relaxed),

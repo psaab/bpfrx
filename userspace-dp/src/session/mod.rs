@@ -4,6 +4,7 @@ use crate::nat64::Nat64ReverseInfo;
 use rustc_hash::{FxHashMap, FxHashSet, FxSeededState};
 use smallvec::SmallVec;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 
@@ -918,6 +919,33 @@ pub(crate) struct SessionTable {
     epoch_counter: u64,
     expired: u64,
     create_drops: u64,
+    /// #7919: why a by-key session lookup MISSED, split by cause.
+    ///
+    /// `record_by_key` / `record_by_key_mut` both bail SILENTLY on a miss
+    /// (`None => return` at their call sites), so a flow whose key does not
+    /// resolve is neither accounted nor touched and NOTHING says so. That is
+    /// the measured shape of #7919: `show security flow session` reports
+    /// `Pkts: 0, Bytes: 0` for a live transit flow while a sibling flow on the
+    /// same box accounts perfectly, and every frozen row has `idle ~= age` —
+    /// `last_seen` never moved either, which is only possible if BOTH
+    /// `touch_if_stale` and `account_packet` missed the same lookup.
+    ///
+    /// Split by cause because the three need different fixes and the issue is
+    /// explicit that guessing costs half the time. `AtomicU64` rather than the
+    /// plain `u64` its sibling counters use because `record_by_key` takes
+    /// `&self`.
+    ///
+    /// No handle in the key index at all — the session was never installed
+    /// under this key, or was removed.
+    lookup_miss_no_handle: AtomicU64,
+    /// A handle resolved but pointed outside the slab — a stale handle
+    /// surviving its record.
+    lookup_miss_stale_handle: AtomicU64,
+    /// A handle resolved to a LIVE record whose stored key differs from the
+    /// one asked for. This is the interesting one for #7919: it means the key
+    /// index and the record disagree, so the lookup finds a session and
+    /// correctly refuses to account against it.
+    lookup_miss_key_mismatch: AtomicU64,
     /// #1861 §5.1: pair-admission preflight refusals — one per REFUSED
     /// FLOW (not per missing slot). Bumped by `note_admission_refused`
     /// from the new-flow refusal arms when `can_admit` fails at/near
@@ -1111,6 +1139,9 @@ impl SessionTable {
             epoch_counter: 0,
             expired: 0,
             create_drops: 0,
+            lookup_miss_no_handle: AtomicU64::new(0),
+            lookup_miss_stale_handle: AtomicU64::new(0),
+            lookup_miss_key_mismatch: AtomicU64::new(0),
             admission_refused: 0,
             install_partial: 0,
             delta_drops: 0,
@@ -1581,9 +1612,23 @@ impl SessionTable {
     /// vs reused-slot hazard — Copilot review).
     #[inline]
     fn record_by_key(&self, key: &SessionKey) -> Option<&SessionRecord> {
-        let handle = self.handle_for_key(key)?;
-        let record = self.entries.get(handle as usize)?;
+        // #7919: count the miss HERE rather than at the call sites. The two
+        // callers (`touch_if_stale`, `account_packet`) are textually
+        // near-identical to other lookups in the same file, and instrumenting
+        // the wrong one of such a pair is a mistake this campaign has already
+        // made once. Counting inside the resolver cannot pick the wrong site.
+        let Some(handle) = self.handle_for_key(key) else {
+            self.lookup_miss_no_handle.fetch_add(1, AtomicOrdering::Relaxed);
+            return None;
+        };
+        let Some(record) = self.entries.get(handle as usize) else {
+            self.lookup_miss_stale_handle
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return None;
+        };
         if record.key != *key {
+            self.lookup_miss_key_mismatch
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return None;
         }
         Some(record)
@@ -1592,12 +1637,60 @@ impl SessionTable {
     /// Mut version of `record_by_key`. Same key-equality validation.
     #[inline]
     fn record_by_key_mut(&mut self, key: &SessionKey) -> Option<&mut SessionRecord> {
-        let handle = self.handle_for_key(key)?;
-        let record = self.entries.get_mut(handle as usize)?;
+        // #7919: same three causes as the shared-ref twin above. Counted in
+        // both because `account_packet` resolves through THIS one while
+        // `touch_if_stale` resolves through that one — a miss that froze the
+        // counters without freezing `last_seen` (or the reverse) would be a
+        // materially different story, and only per-function counts can show it.
+        let Some(handle) = self.handle_for_key(key) else {
+            self.lookup_miss_no_handle.fetch_add(1, AtomicOrdering::Relaxed);
+            return None;
+        };
+        let Some(record) = self.entries.get_mut(handle as usize) else {
+            self.lookup_miss_stale_handle
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return None;
+        };
         if record.key != *key {
+            self.lookup_miss_key_mismatch
+                .fetch_add(1, AtomicOrdering::Relaxed);
             return None;
         }
         Some(record)
+    }
+
+    /// #7919 TEST SEAM: point `key` at `handle` in the key index, bypassing
+    /// install.
+    ///
+    /// The stale-handle and key-mismatch causes are INTERNAL INCONSISTENCIES —
+    /// the index disagreeing with the slab — and are unreachable through the
+    /// public API by construction. That is exactly why they are worth counting
+    /// (either one means a real bug), and exactly why a cell cannot reach them
+    /// without a seam.
+    ///
+    /// Without this, a test can only exercise the no-handle cause, and a
+    /// mutation collapsing the three counters into one ESCAPES — measured. A
+    /// test named "separates the three causes" that exercises one is a false
+    /// claim in its own name.
+    #[cfg(test)]
+    pub(crate) fn debug_force_handle(&mut self, key: &SessionKey, handle: u32) {
+        self.key_to_handle.insert(key.clone(), handle);
+    }
+
+    /// #7919 TEST SEAM: the handle currently indexed for `key`.
+    #[cfg(test)]
+    pub(crate) fn debug_handle_for_key(&self, key: &SessionKey) -> Option<u32> {
+        self.handle_for_key(key)
+    }
+
+    /// #7919: cumulative by-key lookup misses on this worker's table, split by
+    /// cause: (no handle, stale handle, key mismatch).
+    pub(crate) fn lookup_miss_counts(&self) -> (u64, u64, u64) {
+        (
+            self.lookup_miss_no_handle.load(AtomicOrdering::Relaxed),
+            self.lookup_miss_stale_handle.load(AtomicOrdering::Relaxed),
+            self.lookup_miss_key_mismatch.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// Convenience: borrow the entry only (skipping the canonical

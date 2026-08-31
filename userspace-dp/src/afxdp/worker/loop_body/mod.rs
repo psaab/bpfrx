@@ -523,6 +523,11 @@ pub(crate) fn worker_loop(
                 // #1861: install-refusal trio from the worker's
                 // SessionTable (create_drops was write-only before).
                 wr_counters.session_create_drops = sessions.create_drops();
+                // #7919: (no handle, stale handle, key mismatch)
+                let (miss_nh, miss_sh, miss_km) = sessions.lookup_miss_counts();
+                wr_counters.session_lookup_miss_no_handle = miss_nh;
+                wr_counters.session_lookup_miss_stale_handle = miss_sh;
+                wr_counters.session_lookup_miss_key_mismatch = miss_km;
                 wr_counters.session_install_admission_refused = sessions.admission_refused();
                 wr_counters.session_install_partial = sessions.install_partial();
                 // #1760 W1: durable artifact for the reverse-key-collision
