@@ -94,3 +94,22 @@ func (m *Manager) SetHeartbeatRestartNotifyFunc(fn func()) {
 	defer m.mu.Unlock()
 	m.hbRestartNotifyFn = fn
 }
+
+// SetRGForwardingFunc registers the callback that reports a redundancy group's
+// DATAPLANE-side state (applied rg_active and VRRP mastership) for
+// `show chassis cluster status`.
+//
+// #7367: without it the status render carries no forwarding term at all, so a
+// node that owns an RG but forwards nothing for it is indistinguishable from a
+// healthy primary. The daemon owns the rgStateMachine, so the value has to come
+// back across this boundary rather than being read here.
+//
+// Returning ok=false for a group omits the sub-line for that group. That is
+// deliberate: a group the daemon has no state machine for has no forwarding
+// state to report, and rendering a default would assert something false about
+// the dataplane.
+func (m *Manager) SetRGForwardingFunc(fn func(rgID int) (RGForwarding, bool)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rgForwardingFn = fn
+}

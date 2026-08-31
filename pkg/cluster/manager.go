@@ -473,6 +473,12 @@ type Manager struct {
 	// transferReadinessFn reports whether explicit manual failover can be
 	// attempted for the local RG right now and, if not, why.
 	transferReadinessFn func(rgID int) (bool, []string)
+
+	// rgForwardingFn reports the DATAPLANE-side view of a redundancy group —
+	// applied rg_active and VRRP mastership. Supplied by the daemon, which owns
+	// the rgStateMachine; nil in tests and before wiring, in which case the
+	// forwarding sub-line is omitted entirely rather than rendered as a guess.
+	rgForwardingFn func(rgID int) (RGForwarding, bool)
 	// localTransferCommitReadyFn runs on the requesting node after local
 	// ownership has been committed but before the final peer-demotion
 	// commit is sent. The daemon uses this to ensure the target node has

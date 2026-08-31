@@ -409,6 +409,8 @@ func (d *Daemon) wireClusterPeerFailoverHooks(ss *cluster.SessionSync) {
 	d.cluster.SetRemoteTransferOutLeaseDuration(2*d.localFailoverCommitTimeout + 20*time.Second)
 	d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 	d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
+	// #7367: surface the dataplane's view of each RG in the status render.
+	d.cluster.SetRGForwardingFunc(d.rgForwardingStatus)
 	// #1792: while our heartbeat sockets restart (VRF rebind),
 	// keep the peer's suppression guard fed with fresh sync
 	// traffic so a >500ms restart does not fire a false
