@@ -486,6 +486,22 @@ type ProcessStatus struct {
 	// "never happened" — acceptable here because the metric is diagnostic rather
 	// than a gate, and an old helper genuinely has no degraded imports to report.
 	SyncedImportZoneUnresolved uint64 `json:"synced_import_zone_unresolved,omitempty"`
+
+	// SyncedImportUnpublished is xpf_userspace_synced_import_unpublished_total:
+	// peer-synced imports the helper's local-replace guard ADMITTED but could
+	// not publish, because no kernel session map existed at the time.
+	//
+	// Nonzero is expected, not a fault. The map is absent on a standby taking
+	// bulk sync before its first snapshot apply and between a worker teardown
+	// and the next bring-up; every reconcile opens by capturing the whole
+	// shared synced map and replays it once the new map is up, so those
+	// imports are published shortly afterwards rather than lost.
+	//
+	// It exists as the instrument for #7209: taking sync_session off the
+	// helper's snapshot-wide mutex opens a window in which such an import is
+	// acked to Go as installed and then neither published nor replayed. Decodes
+	// to 0 against a helper predating the field.
+	SyncedImportUnpublished uint64 `json:"synced_import_unpublished,omitempty"`
 	// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side ECN
 	// combine because the outer header carried a CE mark over an inner
 	// packet that was Not-ECT (the illegal combination — a congested

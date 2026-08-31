@@ -428,6 +428,16 @@ pub(crate) struct ProcessStatus {
     /// `xpf_userspace_synced_import_zone_unresolved_total`.
     #[serde(default)]
     pub synced_import_zone_unresolved: u64,
+    /// #7209: peer-synced imports the local-replace guard ADMITTED but which
+    /// had no kernel session map to publish into. Surfaced as
+    /// `xpf_userspace_synced_import_unpublished_total`.
+    ///
+    /// Additive / defaulted: decodes to 0 against a helper that predates this
+    /// field, which reads as "never happened". Acceptable because the counter
+    /// is diagnostic and, on a pre-#7209 helper, the window it reports is
+    /// genuinely closed by the snapshot-wide mutex.
+    #[serde(default)]
+    pub synced_import_unpublished: u64,
     /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
     /// ECN combine because the outer header carried a CE mark over an
     /// inner packet that was Not-ECT (the illegal combination — a

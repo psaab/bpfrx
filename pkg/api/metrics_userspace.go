@@ -864,6 +864,17 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SyncedImportZoneUnresolved),
 	)
 
+	// #7209: imports admitted by the local-replace guard with no kernel
+	// session map to publish into. Emitted unconditionally like its
+	// neighbours: a 0 is the real "every admitted import reached the map"
+	// signal, and an absent series cannot be told from a helper that never
+	// reports it.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSyncedImportUnpublished,
+		prometheus.CounterValue,
+		float64(status.SyncedImportUnpublished),
+	)
+
 	// #2315: GRE-decap RFC 6040 4.2 illegal-combination drops (outer CE
 	// over a Not-ECT inner). Emitted unconditionally so a 0 is a real
 	// "no illegal combinations seen" signal rather than an absent series.

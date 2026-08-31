@@ -296,6 +296,27 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"are still enqueueing to it (#6929).",
 		nil, nil,
 	)
+	c.userspaceSyncedImportUnpublished = prometheus.NewDesc(
+		"xpf_userspace_synced_import_unpublished_total",
+		"Peer-synced session imports the helper's local-replace guard "+
+			"ADMITTED but could not publish to the kernel session map, "+
+			"because no session map existed at the time. Counts the GAP "+
+			"only: declining to publish because the PEER owns the "+
+			"redundancy group is the correct outcome and is not counted, "+
+			"and a counter folding the two together would sit "+
+			"permanently nonzero on a healthy node. Nonzero is expected "+
+			"rather than a fault -- the map is absent on a standby "+
+			"taking bulk sync before its first snapshot apply and "+
+			"between a worker teardown and the next bring-up, and every "+
+			"reconcile opens by capturing the whole shared synced map "+
+			"and replaying it once the new map is up, so those imports "+
+			"are published shortly after rather than lost. It exists as "+
+			"the instrument for #7209: taking sync_session off the "+
+			"helper's snapshot-wide mutex opens a window where such an "+
+			"import is acked to Go as installed and then neither "+
+			"published nor replayed, with no signal today.",
+		nil, nil,
+	)
 	c.userspaceSyncedImportZoneUnresolved = prometheus.NewDesc(
 		"xpf_userspace_synced_import_zone_unresolved_total",
 		"Peer-synced session imports whose (from-zone, to-zone) pair "+

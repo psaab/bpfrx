@@ -270,6 +270,16 @@ impl super::Coordinator {
             .load(Ordering::Relaxed)
     }
 
+    /// #7209: peer-synced imports that passed the local-replace guard but had
+    /// no kernel session map to publish into. See the field's doc on
+    /// `session_manager.rs` for why a nonzero value is expected today and what
+    /// it is the instrument for.
+    pub fn synced_import_unpublished_total(&self) -> u64 {
+        self.sessions
+            .synced_import_unpublished
+            .load(Ordering::Relaxed)
+    }
+
     /// #2170: total stale-generation deletes refused by the helper's
     /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
     /// helper-side generation-aware delete).
