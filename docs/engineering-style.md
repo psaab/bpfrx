@@ -899,6 +899,17 @@ they repeatedly bite:
     claim that the code is untested. Derive the language set from the
     mutation's touched paths and emit "cannot score", never a verdict, when a
     touched language has no configured gate. `make test-mutate-lib` pins this.
+  - **A GATE and a mutation CELL pull opposite ways on `rc`.** The rule above
+    is about scoring a cell, where `rc != 0` must not be read as "the tests
+    failed". Running `make test-go` / `make test-rust` to decide whether a
+    change is shippable is the inverse case: there `rc` is the only signal that
+    catches a panic, because a panic emits no `--- FAIL` line anywhere in the
+    log. A `^--- FAIL`-counting gate reads a SIGSEGV as a clean run. Measured
+    on #7209: a new Prometheus emit landed in a function a test drives with a
+    partially-initialised collector, so the new `*prometheus.Desc` was nil and
+    `MustNewConstMetric` segfaulted — `GO_RC=2`, zero `--- FAIL` lines, 71
+    packages `ok`. Gate on the exit code AND on packages-collected; score a
+    cell on the four facts. Neither rule substitutes for the other.
   - **A `-race` failure has no `--- FAIL` line.** It emits `WARNING: DATA
     RACE` plus a package-level FAIL, so a `^--- FAIL` counter scores a genuine
     race red as a PASS. Count both.
