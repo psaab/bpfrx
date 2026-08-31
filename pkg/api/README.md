@@ -2626,12 +2626,40 @@ the drop fails loudly instead of going quietly vacuous.
     `persistent-nat`, `persistent-nat-detail`, `nat-source-rule-detail`,
     `nat-dest-rule-detail`, which reach `pkg/natshow`'s walks and are
     reachable over the FABRIC listener. The two RPCs `AcquireCtx` and sample
-    the lease inside `countNATSessions`; the four `ShowText` topics take the
+    the lease inside `countNATSessions`; the four `ShowText` topics took the
     plain `Acquire` (the existing ShowText precedent) because `pkg/natshow` is
-    shared with `pkg/cli` and takes no context — the admission half lands now,
-    the cancellation half is the stated residual. Because both surfaces alias
-    ONE `diagcmd.SessionWalkLimiter`, an un-cancellable gRPC walk was actively
-    degrading the REST twin that does honour cancellation.
+    shared with `pkg/cli` and took no context — the admission half landed in
+    #6553, the cancellation half was the stated residual. Because both surfaces
+    alias ONE `diagcmd.SessionWalkLimiter`, an un-cancellable gRPC walk was
+    actively degrading the REST twin that does honour cancellation.
+    **#7315 closes that residual and corrects its count.** `pkg/natshow`'s
+    walking renderers (`RenderPersistentDetail`, `RenderSourceRuleDetail`,
+    `RenderDestRuleDetail`) now take a `context.Context`, the `ShowText`
+    handlers `AcquireCtx` and pass the lease context down, and `pkg/cli` passes
+    `context.Background()` (a local render has no request to cancel and does
+    not draw on the shared limiter). The three hand-copied
+    `IterateSessions`/`IterateSessionsV6` pairs collapse into ONE
+    `walkSessionValues` authority inside `pkg/natshow` whose visitor callbacks
+    have no `bool` return, so a renderer cannot decide to keep walking and a
+    NEW renderer inherits the cancellation check instead of having to remember
+    it — the same shape `countNATSessions` gives the gRPC NAT RPCs. Admission
+    bounds CONCURRENCY and the lease bounds DURATION; they fail independently,
+    since a handler can hold its slot correctly and still walk the whole table
+    for a client that has hung up. The count correction: only **three** of the
+    four `ShowText` topics walk. `persistent-nat` (`RenderPersistent`) reads
+    only `PersistentNATTable.All()`, an O(bindings) snapshot copy of an
+    in-process map under that table's own RWMutex — it touches no conntrack
+    bucket — so it takes no context (a cancellation guarantee over nothing);
+    #6553's line cites for it, `persistent.go:85`/`:102`, are both inside
+    `RenderPersistentDetail`. Its admission slot is deliberately KEPT: the
+    snapshot is still an O(bindings) allocation on a fabric-reachable surface,
+    and dropping an existing bound is a separate judgement from adding
+    cancellation. Pinned by `pkg/natshow/walk_cancellation_7315_test.go`
+    (mechanism) and `pkg/grpcapi/nat_showtext_cancellation_7315_test.go`
+    (the WIRING — nothing in `pkg/natshow` can see a handler passing
+    `context.Background()` instead of the request context), both counting
+    VISITED ROWS with a live-context control, because a rendered tally of 0 is
+    also what "the walk never ran" looks like.
     #6553 also single-sources the NAT pool port formula
     (`config.NATPoolTotalPorts`): `(portHigh - portLow + 1) * addrCount` had
     been written out five times and had already diverged — only this REST

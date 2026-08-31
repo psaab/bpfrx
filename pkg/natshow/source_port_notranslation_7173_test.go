@@ -2,6 +2,7 @@ package natshow
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ import (
 func renderSourcePools(t *testing.T, cfg *config.Config) string {
 	t.Helper()
 	var buf bytes.Buffer
-	RenderSourceRuleDetail(&buf, cfg, nil, nil)
+	RenderSourceRuleDetail(context.Background(), &buf, cfg, nil, nil)
 	return buf.String()
 }
 

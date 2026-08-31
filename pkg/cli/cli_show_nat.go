@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -518,7 +519,10 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 
 func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow.
-	natshow.RenderSourceRuleDetail(os.Stdout, cfg, c.dp, c.applyResult)
+	// #7315: context.Background() — a local CLI render has no request to
+	// cancel and no admission lease (the CLI does not draw on the shared
+	// diagcmd.SessionWalkLimiter, which bounds the REST/gRPC surfaces).
+	natshow.RenderSourceRuleDetail(context.Background(), os.Stdout, cfg, c.dp, c.applyResult)
 	return nil
 }
 
@@ -905,7 +909,8 @@ func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow. The
 	// shared renderer carries the full nil/empty guard; the
 	// showNATDestination dispatcher keeps its own pre-guard.
-	natshow.RenderDestRuleDetail(os.Stdout, cfg, c.dp, c.applyResult)
+	// #7315: context.Background() — see showNATSourceRuleDetail.
+	natshow.RenderDestRuleDetail(context.Background(), os.Stdout, cfg, c.dp, c.applyResult)
 	return nil
 }
 
@@ -951,7 +956,8 @@ func (c *CLI) showPersistentNAT() error {
 
 func (c *CLI) showPersistentNATDetail() error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow.
-	natshow.RenderPersistentDetail(os.Stdout, c.dp)
+	// #7315: context.Background() — see showNATSourceRuleDetail.
+	natshow.RenderPersistentDetail(context.Background(), os.Stdout, c.dp)
 	return nil
 }
 

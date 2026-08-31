@@ -29,6 +29,28 @@
 // consolidation of the import that already lived in the two source
 // files, not #1451 regressing. natshow must never import pkg/grpcapi or
 // pkg/cli.
+//
+// # Session walks and cancellation
+//
+// Three of the renderers here tally live sessions by walking the FULL v4+v6
+// conntrack table: RenderPersistentDetail, RenderSourceRuleDetail and
+// RenderDestRuleDetail. Each takes a context.Context and routes its walk
+// through the single walkSessionValues authority (walk.go), which is the ONLY
+// place that samples the context — a per-renderer visitor cannot decide to
+// keep walking, so a renderer added later inherits the check.
+//
+// The context is the caller's ADMISSION-LEASE context on the gRPC ShowText
+// path (diagcmd.Limiter.AcquireCtx via pkg/grpcapi/server_show_nat.go) and
+// context.Background() on the local CLI path, which has no request to cancel.
+// Admission bounds how MANY walks run at once; the lease bounds how LONG one
+// runs for a client that has already disconnected. Both matter because REST
+// and gRPC alias ONE 4-slot diagcmd.SessionWalkLimiter (#6553 admission,
+// #7315 cancellation).
+//
+// RenderPersistent is NOT one of the walking renderers and takes no context:
+// its only dataplane read is PersistentNATTable.All(), an in-process snapshot
+// copy. Renderers that read config alone (RenderStatic, RenderStaticRule,
+// RenderNPTv6) take no context for the same reason.
 package natshow
 
 import (

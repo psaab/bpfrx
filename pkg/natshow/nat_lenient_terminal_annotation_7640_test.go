@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func actionlessSourceCfg7640() *config.Config {
 // assertion reds.
 func TestActionlessSourceRuleIsNotRenderedAsInterface7640(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, actionlessSourceCfg7640(), nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, actionlessSourceCfg7640(), nil, nil)
 	got := b.String()
 
 	if strings.Contains(got, "Action:                  interface") {
@@ -61,7 +62,7 @@ func TestActionlessSourceRuleIsNotRenderedAsInterface7640(t *testing.T) {
 // disappears while every other line still renders — the pre-#7640 silence.
 func TestLenientlyAdmittedSourceRuleIsAnnotated7640(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, actionlessSourceCfg7640(), nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, actionlessSourceCfg7640(), nil, nil)
 	got := b.String()
 
 	if !strings.Contains(got, "ADMITTED BY TOLERANT LOAD") {
@@ -88,7 +89,7 @@ func TestHealthyRuleIsNotAnnotated7640(t *testing.T) {
 		Rules: []*config.NATRule{{Name: "ok", Then: config.NATThen{Interface: true}}},
 	}}
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, cfg, nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, cfg, nil, nil)
 	got := b.String()
 
 	if strings.Contains(got, "ADMITTED BY TOLERANT LOAD") {
@@ -109,7 +110,7 @@ func TestAnnotationIsScopedToTheNamedRule7640(t *testing.T) {
 		&config.NATRule{Name: "healthy", Then: config.NATThen{Interface: true}})
 
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, cfg, nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, cfg, nil, nil)
 	got := b.String()
 
 	if n := strings.Count(got, "ADMITTED BY TOLERANT LOAD"); n != 1 {

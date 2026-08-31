@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -13,13 +14,16 @@ import (
 // including pool details, translation hit counters, and active session
 // counts per rule-set.
 //
+// ctx is the admission-lease context (#7315); the v4+v6 session tally below
+// stops on cancellation via the shared walkSessionValues authority.
+//
 // crFn lazily supplies the apply result (zone-ID and NAT-counter maps);
 // it is invoked only after the empty-config guard, preserving the
 // master ordering where the consumer's applyResult() was called after
 // the guard (so an empty config never touches dataplane state). A nil
 // crFn, or a crFn returning nil, reproduces the "not loaded" path (no
 // session counts, no translation hits).
-func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
+func RenderSourceRuleDetail(ctx context.Context, w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		io.WriteString(w, "No source NAT rules configured\n")
 		return
@@ -37,28 +41,37 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 	// bare 0 whether the dataplane had reported or never been armed. All three
 	// now read the same thing, so they cannot disagree about whether the numbers
 	// below are measurements.
+	//
+	// #7315 keeps `armed` EXACTLY as #7423 defined it and calls the shared walk
+	// authority inside it. An earlier revision of #7315 hoisted the
+	// `dp != nil && dp.IsLoaded()` half down into walkSessionValues and left
+	// only `cr != nil` here — which would have widened `armed` for the two
+	// renders below that have nothing to do with the walk (the translation-hits
+	// gate and the rule-set aggregate line), reintroducing exactly the
+	// unmeasured-state claim #7423 removed.
 	armed := dp != nil && dp.IsLoaded() && cr != nil
 	if armed {
 		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
 		for name, id := range cr.ZoneIDs {
 			zoneByID[id] = name
 		}
-		if err := dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		}); err != nil {
-			scanErr = err
-		}
-		if err := dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		}); err != nil && scanErr == nil {
-			scanErr = err
-		}
+		// walkSessionValues re-tests dp/IsLoaded internally. That is a
+		// deliberate double-check, not dead code: `armed` also gates the
+		// translation-hits read and the rule-set aggregate below, so it
+		// cannot be narrowed to the walk; and the helper is shared with
+		// RenderPersistentDetail, which has no `armed` and needs the guard
+		// of its own. Neither is removable in favour of the other.
+		scanErr = walkSessionValues(ctx, dp,
+			func(val dataplane.SessionValue) {
+				if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			},
+			func(val dataplane.SessionValueV6) {
+				if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			})
 	}
 
 	noteSessionScanError(w, scanErr)

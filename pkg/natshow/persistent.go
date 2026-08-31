@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -28,6 +29,15 @@ func persistentNATTable(dp Reader) *dataplane.PersistentNATTable {
 
 // RenderPersistent renders the persistent-NAT bindings table with
 // remaining timeout per binding.
+//
+// It takes NO context because it drives NO conntrack walk. #7315's premise
+// listed it among the four walking ShowText topics, citing persistent.go:85
+// and :102 — but both of those lines are inside RenderPersistentDetail
+// below. This renderer's only dataplane read is PersistentNATTable.All(),
+// an O(bindings) snapshot copy of an in-process map taken under that
+// table's own RWMutex (#4811); it touches no conntrack bucket and holds no
+// session-store lock. A ctx parameter here would be a cancellation
+// guarantee with nothing to cancel.
 func RenderPersistent(w io.Writer, dp Reader) {
 	// #2114/#6743-F2: single resolution — see persistentNATTable.
 	table := persistentNATTable(dp)
@@ -56,7 +66,9 @@ func RenderPersistent(w io.Writer, dp Reader) {
 
 // RenderPersistentDetail renders per-binding detail for persistent-NAT
 // bindings, including current session counts per (NAT IP, NAT port).
-func RenderPersistentDetail(w io.Writer, dp Reader) {
+// ctx is the admission-lease context (#7315); the v4+v6 session tally below
+// stops on cancellation via the shared walkSessionValues authority.
+func RenderPersistentDetail(ctx context.Context, w io.Writer, dp Reader) {
 	// #2114/#6743-F2: single resolution — see persistentNATTable.
 	table := persistentNATTable(dp)
 	if table == nil {
@@ -80,9 +92,8 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 		port uint16
 	}
 	sessionCounts := make(map[natKey]int)
-	var scanErr error
-	if dp.IsLoaded() {
-		if err := dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+	scanErr := walkSessionValues(ctx, dp,
+		func(val dataplane.SessionValue) {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				// SessionValue.NATSrcIP is a `uint32` holding the IP's
 				// network-order bytes in native-endian word form (the
@@ -95,22 +106,14 @@ func RenderPersistentDetail(w io.Writer, dp Reader) {
 				binary.NativeEndian.PutUint32(ip4[:], val.NATSrcIP)
 				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
 			}
-			return true
-		}); err != nil {
-			scanErr = err
-		}
-		if err := dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		},
+		func(val dataplane.SessionValueV6) {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				// Match conntrack/gc.go:397 — no Unmap, the binding
 				// stores the 16-byte form for v6 NAT.
-				addr := netip.AddrFrom16(val.NATSrcIP)
-				sessionCounts[natKey{addr, val.NATSrcPort}]++
+				sessionCounts[natKey{netip.AddrFrom16(val.NATSrcIP), val.NATSrcPort}]++
 			}
-			return true
-		}); err != nil && scanErr == nil {
-			scanErr = err
-		}
-	}
+		})
 
 	noteSessionScanError(w, scanErr)
 	fmt.Fprintf(w, "Total persistent NAT bindings: %d\n\n", len(bindings))

@@ -329,6 +329,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/natshow/source.go` | #1687 — shared source-NAT rule-detail renderer iterates legacy `SessionKey`/`Value` via the `Reader`. |
 | `pkg/natshow/dest.go` | #1687 — shared destination-NAT rule-detail renderer iterates legacy `SessionKey`/`Value` via the `Reader`. |
 | `pkg/natshow/persistent.go` | #1687 — shared persistent-NAT renderers iterate legacy `SessionKey`/`Value` and read `PersistentNATTable` via the `Reader`. |
+| `pkg/natshow/walk.go` | #7315 — the single cancellable session-walk authority (`walkSessionValues`) the three walking NAT renderers route through; names the same legacy `SessionKey`/`Value` the three per-renderer copies it replaced already named. Net-neutral: the iterations moved OUT of `persistent.go`/`source.go`/`dest.go` into this file rather than a new consumer appearing. |
 
 ### Safe-Delete Blockers
 

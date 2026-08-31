@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -91,8 +92,8 @@ func builderExcluded(t *testing.T, c natExclusionCase, cfg *config.Config) bool 
 func rendererExcluded(t *testing.T, cfg *config.Config) bool {
 	t.Helper()
 	var buf bytes.Buffer
-	natshow.RenderSourceRuleDetail(&buf, cfg, nil, nil)
-	natshow.RenderDestRuleDetail(&buf, cfg, nil, nil)
+	natshow.RenderSourceRuleDetail(context.Background(), &buf, cfg, nil, nil)
+	natshow.RenderDestRuleDetail(context.Background(), &buf, cfg, nil, nil)
 	natshow.RenderStatic(&buf, cfg)
 	natshow.RenderStaticRule(&buf, cfg, true)
 	natshow.RenderStaticRule(&buf, cfg, false)
@@ -282,8 +283,8 @@ func TestNATExclusionAnnotationCarriesAReason_6534(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := compileSetLenient5717(t, c.cmds)
 			var buf bytes.Buffer
-			natshow.RenderSourceRuleDetail(&buf, cfg, nil, nil)
-			natshow.RenderDestRuleDetail(&buf, cfg, nil, nil)
+			natshow.RenderSourceRuleDetail(context.Background(), &buf, cfg, nil, nil)
+			natshow.RenderDestRuleDetail(context.Background(), &buf, cfg, nil, nil)
 			natshow.RenderStaticRule(&buf, cfg, true)
 			natshow.RenderNPTv6(&buf, cfg)
 
@@ -327,8 +328,8 @@ func TestNATHealthyConfigRendersUnannotated_6534(t *testing.T) {
 	})
 	if rendererExcluded(t, cfg) {
 		var buf bytes.Buffer
-		natshow.RenderSourceRuleDetail(&buf, cfg, nil, nil)
-		natshow.RenderDestRuleDetail(&buf, cfg, nil, nil)
+		natshow.RenderSourceRuleDetail(context.Background(), &buf, cfg, nil, nil)
+		natshow.RenderDestRuleDetail(context.Background(), &buf, cfg, nil, nil)
 		natshow.RenderStaticRule(&buf, cfg, true)
 		t.Fatalf("healthy NAT config rendered a #6534 NOT INSTALLED annotation:\n%s", buf.String())
 	}

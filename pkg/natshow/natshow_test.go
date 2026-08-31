@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"encoding/binary"
 	"net/netip"
 	"strings"
@@ -66,7 +67,7 @@ func TestRenderSourceRuleDetailGolden(t *testing.T) {
 	cfg := natFixtureConfig()
 	dp := dataplane.New() // IsLoaded() == false -> no session counts
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, cfg, dp, nil)
+	RenderSourceRuleDetail(context.Background(), &b, cfg, dp, nil)
 	want := "source NAT rule: r1\n" +
 		"  Rule-set: rs-src                        ID: 1\n" +
 		"    From zone: trust    To zone: untrust\n" +
@@ -89,7 +90,7 @@ func TestRenderSourceRuleDetailGolden(t *testing.T) {
 
 func TestRenderSourceRuleDetailEmpty(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, &config.Config{}, nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, &config.Config{}, nil, nil)
 	if got, want := b.String(), "No source NAT rules configured\n"; got != want {
 		t.Fatalf("empty source: got=%q want=%q", got, want)
 	}
@@ -99,7 +100,7 @@ func TestRenderDestRuleDetailGolden(t *testing.T) {
 	cfg := natFixtureConfig()
 	dp := dataplane.New()
 	var b strings.Builder
-	RenderDestRuleDetail(&b, cfg, dp, nil)
+	RenderDestRuleDetail(context.Background(), &b, cfg, dp, nil)
 	want := "destination NAT rule: d1\n" +
 		"  Rule-set: rs-dst                        ID: 1\n" +
 		"    From zone: untrust    To zone: dmz\n" +
@@ -129,7 +130,7 @@ func TestRenderDestRuleDetailEmpty(t *testing.T) {
 	withEmptyRuleSets.Security.NAT.Destination = &config.DestinationNATConfig{RuleSets: nil}
 	for _, c := range []*config.Config{nil, {}, withEmptyRuleSets} {
 		var b strings.Builder
-		RenderDestRuleDetail(&b, c, nil, nil)
+		RenderDestRuleDetail(context.Background(), &b, c, nil, nil)
 		if got, want := b.String(), "No destination NAT rules configured\n"; got != want {
 			t.Fatalf("empty dest: got=%q want=%q", got, want)
 		}
@@ -200,7 +201,7 @@ func TestRenderPersistentEmpty(t *testing.T) {
 
 func TestRenderPersistentDetailNilReader(t *testing.T) {
 	var b strings.Builder
-	RenderPersistentDetail(&b, nil)
+	RenderPersistentDetail(context.Background(), &b, nil)
 	if got, want := b.String(), "Persistent NAT table not available\n"; got != want {
 		t.Fatalf("nil reader: got=%q want=%q", got, want)
 	}
@@ -261,7 +262,7 @@ func TestRenderSourceRuleDetailLoadedGolden(t *testing.T) {
 		NATCounterIDs: map[string]uint32{dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "rs-src", "r1"): 5},
 	}
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })
+	RenderSourceRuleDetail(context.Background(), &b, cfg, dp, func() *dataplane.ApplyResult { return cr })
 	want := "source NAT rule: r1\n" +
 		"  Rule-set: rs-src                        ID: 1\n" +
 		"    From zone: trust    To zone: untrust\n" +
@@ -296,7 +297,7 @@ func TestRenderDestRuleDetailLoadedGolden(t *testing.T) {
 		NATCounterIDs: map[string]uint32{dataplane.NATCounterKey(dataplane.NATCounterTypeDest, "rs-dst", "d1"): 6},
 	}
 	var b strings.Builder
-	RenderDestRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })
+	RenderDestRuleDetail(context.Background(), &b, cfg, dp, func() *dataplane.ApplyResult { return cr })
 	want := "destination NAT rule: d1\n" +
 		"  Rule-set: rs-dst                        ID: 1\n" +
 		"    From zone: untrust    To zone: dmz\n" +
@@ -373,7 +374,7 @@ func TestRenderPersistentDetailLoadedGolden(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	RenderPersistentDetail(&b, dp)
+	RenderPersistentDetail(context.Background(), &b, dp)
 	got := b.String()
 	if !strings.Contains(got, "Total persistent NAT bindings: 1\n\n") {
 		t.Fatalf("detail count missing: %q", got)
@@ -406,7 +407,7 @@ func TestRenderPersistentDetailPermitModes(t *testing.T) {
 			Permit:   p,
 		})
 		var b strings.Builder
-		RenderPersistentDetail(&b, &fakeReader{pnat: pnat})
+		RenderPersistentDetail(context.Background(), &b, &fakeReader{pnat: pnat})
 		return b.String()
 	}
 
