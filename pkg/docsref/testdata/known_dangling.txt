@@ -125,3 +125,12 @@ docs/research/3295-filter-failopen/plan.md
 docs/research/4146-junos-host-direct-deny/plan.md
 # cited by: docs/userspace-dnat-plan.md, pkg/config/compiler_interface_addr_nat_warning_5837_test.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_nat_iface_addr.go
 docs/research/5837-xdp-dnat-before-local/plan.md
+
+# cited by: docs/research/6749-armed-state/RETIRED.md
+#
+# The #6749 armed-state plan (v8.41, CONVERGED PLAN-READY) lives only on branch
+# research/6749-armed-state at 352a9869c. It is deliberately NOT merged: #7546
+# retired it, and RETIRED.md records why and states the trigger for taking it
+# up again. This is the "the plan genuinely will not land" case the registry
+# exists for — not rot, a decision.
+docs/research/6749-armed-state/plan.md
