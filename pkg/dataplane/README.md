@@ -1446,19 +1446,36 @@ consumed.** `parse_ipv6` / `parse_ipv4` still pass the bytes at the
 resolved L4 offset to `parse_l4`, so on `IPv6 || Fragment(frag_off != 0,
 next = TCP)` the shim reads fragment PAYLOAD as a TCP header where this
 crate refuses those bytes. That half is **#7494**, and it is blocked on a
-MEASURED verifier wall rather than on design: at a 777,901-instruction
-baseline (22.21% headroom under the 1M cap), carrying the sighting costs
-6,274 and fits, while every shape that ACTS on it — masking the parsed L4
-values, masking just the two ports, carrying the flag as a `ParsedPacket`
-field, forking the session block with any address-keyed check in the new
-arm, or gating the single existing lookup — was rejected by the kernel
-verifier at 1,000,001 instructions. The branch is free; correlating an L4
+MEASURED verifier wall rather than on design: carrying the sighting fits,
+while every shape that ACTS on it — masking the parsed L4 values, masking
+just the two ports, carrying the flag as a `ParsedPacket` field, forking
+the session block with any address-keyed check in the new arm, or gating
+the single existing lookup — was rejected by the kernel verifier at
+1,000,001 instructions. The branch is free; correlating an L4
 register with a packet-derived predicate defeats state pruning. The full
 matrix is in #7494; do not attempt the values-suppression shape without
-re-running `make generate`. The emitted facts, meanwhile, travel
-with the artifact so a consumer of a prebuilt object — the Debian
-packaging path never compiles the shim crate — can check the walk's
-constants without a Rust toolchain.
+re-running `make generate`.
+
+The budget those shapes must fit inside is SMALLER than the kernel's 1M
+cap, and reading the headroom percentage against that cap overstates the
+available room by roughly 4x. `shimverify` exits 4 — a hard failure, not a
+warning — once headroom falls below the floor, and `build-userspace-xdp.sh`
+admits only exit 0 as a measured pass, so the install-blocking ceiling is
+850,000 processed instructions rather than 1,000,000. A shape that "fits
+under 1M" can still be unshippable.
+
+This paragraph deliberately states NO absolute instruction baseline. The
+object's count moves with every shim change, so a figure pinned here goes
+stale by the next merge with nobody editing the sentence — the same rot
+`TestReadmeFloorFigureMatchesTheConstants` documents one section over. The
+figure previously pinned here had drifted 23,547 instructions light by the
+time #7494 was picked up, over 1836 commits, with no edit to this file.
+The current measurement lives in #7494, dated to the commit it was taken
+at, which is where a figure that moves belongs.
+
+The emitted facts, meanwhile, travel with the artifact so a consumer of a
+prebuilt object — the Debian packaging path never compiles the shim
+crate — can check the walk's constants without a Rust toolchain.
 
 This also fixes a scope gap a compile-time assertion could not: an
 assertion in the shim only runs when the shim crate is COMPILED, which the

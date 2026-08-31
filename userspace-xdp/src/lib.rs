@@ -1397,11 +1397,16 @@ fn parse_ipv6(
     // — masking the parsed L4 values, forking the session block, gating the
     // ICMP-type steering, even a lone extra `is_local_destination` on the
     // fragment path — was REJECTED by the kernel verifier at 1,000,001
-    // processed instructions against the 1,000,000 cap, from this object's
-    // 777,901 baseline. Carrying the sighting costs 6,274 and fits; consuming
-    // it does not fit until the shim buys headroom. The full matrix is in the
-    // successor issue. What the sighting buys today is that the fragment
-    // dimension is finally COMPARABLE: userspace-dp's executable parity corpus
+    // processed instructions against the 1,000,000 cap. Carrying the sighting
+    // fits; consuming it does not fit until the shim buys headroom — and the
+    // headroom to buy is measured against the 850,000 install-blocking ceiling
+    // (`shimverify` exits 4 below the 15% floor, and the build recipe admits
+    // only exit 0), NOT against the 1,000,000 cap. No absolute baseline is
+    // quoted here on purpose: it moves with every shim change and rots without
+    // anyone editing this comment. The successor issue carries the full matrix
+    // and the current figure, dated to the commit it was measured at. What the
+    // sighting buys today is that the fragment dimension is finally
+    // COMPARABLE: userspace-dp's executable parity corpus
     // reads this field against its own `non_first_fragment_offset_seen`, which
     // was impossible while the walk returned a bare `(offset, protocol)`.
     let (offset, protocol) = (walk.offset, walk.protocol);
