@@ -1121,7 +1121,11 @@ func (c *CLI) showForwardingOptions() error {
 					continue
 				}
 				for _, fs := range fam.FlowServers {
-					fmt.Printf("    Flow server: %s:%d\n", fs.Address, fs.Port)
+					// #6565 row 11 / #7422: annotate a collector the snapshot
+					// builder skips, using its own verdict (see
+					// flowServerNotInstalledSuffix).
+					fmt.Printf("    Flow server: %s:%d%s\n", fs.Address, fs.Port,
+						flowServerNotInstalledSuffix(fs))
 					if fs.Version9Template != "" {
 						fmt.Printf("      Version 9 template: %s\n", fs.Version9Template)
 					}

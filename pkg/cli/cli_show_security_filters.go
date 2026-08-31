@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
@@ -111,7 +112,7 @@ func (c *CLI) showFirewallFilters() error {
 					fmt.Printf("    then loss-priority %s\n", term.LossPriority)
 				}
 				if term.DSCPRewrite != "" {
-					fmt.Printf("    then dscp %s\n", term.DSCPRewrite)
+					fmt.Print(filterDSCPRewriteLine(term.DSCPRewrite))
 				}
 				if term.Log {
 					fmt.Printf("    then log\n")
@@ -289,7 +290,7 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 			fmt.Printf("    then loss-priority %s\n", term.LossPriority)
 		}
 		if term.DSCPRewrite != "" {
-			fmt.Printf("    then dscp %s\n", term.DSCPRewrite)
+			fmt.Print(filterDSCPRewriteLine(term.DSCPRewrite))
 		}
 		if term.Log {
 			fmt.Printf("    then log\n")
@@ -546,4 +547,32 @@ func (c *CLI) printFirewallEffectiveBanner() {
 		fmt.Println("  Desired: active configuration (not acknowledged).")
 		fmt.Println()
 	}
+}
+
+// filterDSCPRewriteLine renders one `then dscp` / `then traffic-class` line for
+// `show firewall`, annotating a rewrite the dataplane does NOT install.
+//
+// #6565 row 8 / #7422: the snapshot builder DROPS an unresolvable rewrite
+// (pkg/dataplane/userspace/filters.go — "CoS marking lost — the term still
+// matches and acts") while both call sites printed it unconditionally, so
+// `show firewall` reported a marking the dataplane was not applying. The
+// commit gate (config.validateFilterDSCPStrict, #3309) hard-rejects such a
+// token, but the tolerant load / cluster config-sync path (#1960 no-brick)
+// downgrades that to a warning and the config goes ACTIVE — which is the state
+// this renderer is reached in.
+//
+// Annotate rather than hide: the operator authored the line and needs to see
+// BOTH that it is configured and that it is not installed. Hiding it would
+// make `show firewall` disagree with `show configuration`.
+//
+// EXTRACTED from the two call sites so the guard has a subject: two renderers
+// of one field drift exactly the way the renderer and the builder did, and a
+// test that could only reach one of them would certify the other.
+func filterDSCPRewriteLine(rewrite string) string {
+	if _, ok := dataplane.ResolveFilterDSCP(rewrite); ok {
+		return fmt.Sprintf("    then dscp %s\n", rewrite)
+	}
+	return fmt.Sprintf("    then dscp %s  [NOT INSTALLED: unresolvable dscp/"+
+		"traffic-class value — no CoS marking is applied; the term still "+
+		"matches and acts]\n", rewrite)
 }

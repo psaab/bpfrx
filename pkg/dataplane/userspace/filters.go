@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -219,10 +218,11 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			if d == "" {
 				continue
 			}
-			if val, ok := dataplane.DSCPValues[strings.ToLower(d)]; ok {
+			// #7422: the SAME resolver `show firewall` renders from, so the
+			// builder's emit condition and the renderer's installed-or-not
+			// verdict cannot drift (dataplane.ResolveFilterDSCP).
+			if val, ok := dataplane.ResolveFilterDSCP(d); ok {
 				snap.DSCPValues = append(snap.DSCPValues, val)
-			} else if v, err := strconv.Atoi(d); err == nil && v >= 0 && v <= 63 {
-				snap.DSCPValues = append(snap.DSCPValues, uint8(v))
 			} else {
 				snap.DSCPMatchUnrepresentable = true
 			}
@@ -236,11 +236,8 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// (the pre-#3406 builder emitted NO rewrite and NO signal) so the lost CoS
 		// marking is operator-visible.
 		if term.DSCPRewrite != "" {
-			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCPRewrite)]; ok {
+			if val, ok := dataplane.ResolveFilterDSCP(term.DSCPRewrite); ok {
 				rewrite := val
-				snap.DSCPRewrite = &rewrite
-			} else if v, err := strconv.Atoi(term.DSCPRewrite); err == nil && v >= 0 && v <= 63 {
-				rewrite := uint8(v)
 				snap.DSCPRewrite = &rewrite
 			} else {
 				slog.Warn("dropping unresolvable filter term dscp/traffic-class rewrite "+

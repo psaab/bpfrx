@@ -149,7 +149,10 @@ func (s *Server) showForwardingOptions(cfg *config.Config, buf *strings.Builder)
 						continue
 					}
 					for _, fs := range fam.FlowServers {
-						fmt.Fprintf(buf, "    Flow server: %s:%d\n", fs.Address, fs.Port)
+						// #6565 row 11 / #7422: annotate a collector the
+						// snapshot builder skips, using its own verdict.
+						fmt.Fprintf(buf, "    Flow server: %s:%d%s\n", fs.Address,
+							fs.Port, flowServerNotInstalledSuffix(fs))
 						if fs.Version9Template != "" {
 							fmt.Fprintf(buf, "      Version 9 template: %s\n", fs.Version9Template)
 						}
@@ -217,4 +220,24 @@ func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *str
 			}
 		}
 	}
+}
+
+// flowServerNotInstalledSuffix returns the `[NOT INSTALLED: <reason>]` suffix
+// for a flow-server (collector) the userspace snapshot builder refuses to
+// install, or "" when it installs.
+//
+// #6565 row 11 / #7422: the verdict is config.FlowServerExcludedReason — the
+// SAME predicate buildFlowExportSnapshots consults — so the renderer and the
+// builder cannot disagree about which collectors are live. Unlike most #6534
+// families this state is reachable through a clean commit: nothing validates
+// the flow-server port at commit time, so `flow-server 10.0.0.1` with no
+// `port` lands in the active config, is skipped by the builder, and used to
+// print as `Collector: 10.0.0.1` — the `:0` suffix suppressed, so it read as a
+// healthy collector on the default port.
+func flowServerNotInstalledSuffix(fs *config.FlowServer) string {
+	reason := config.FlowServerExcludedReason(fs)
+	if reason == "" {
+		return ""
+	}
+	return "  [NOT INSTALLED: " + reason + "]"
 }

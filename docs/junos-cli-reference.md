@@ -245,6 +245,18 @@ Maximum-sessions: 4194304
   the local CLI (`pkg/cli/cli_show_flow.go`, from `userspaceDataplaneStatus()`).
   When no dataplane status is available the value renders `unknown` rather than
   a fabricated authoritative bound.
+- **The cluster-PEER `node<N>:` block was fixed later, in #7422.** In cluster
+  mode the local CLI prints a second block for the peer node, and that block
+  kept the hardcoded `10000000` for two years after #5323 removed it from the
+  local block 45 lines above. It now renders the peer's own
+  `GetSessionSummaryResponse.max_sessions` — a value that was already on the
+  wire and discarded — and `unknown` when the peer reported none. The #5323
+  regression test could not catch it: its fixture leaves `CLI.cluster` nil, so
+  the peer branch never executes, and `CLI.cluster` is a concrete
+  `*cluster.Manager` that no unit fixture can construct. The render is now
+  extracted as `renderPeerSessionSummary` so it is testable without a live
+  cluster, with a source-level cell asserting `showFlowSession` still delegates
+  to it.
 - **Multicast/Failed/Services-offload counters stay `0`.** The AF_XDP helper
   publishes no multicast/failed-session counters, so those Junos rows are
   reported as `0` for format parity (documented follow-up, not authoritative).
@@ -1464,6 +1476,79 @@ on the runtime interface table and are NOT annotated: an output interface
 that does not resolve to an ifindex, and an ingress interface already
 claimed by a lower-sorted instance (one output per ingress ifindex).
 Annotating those needs the resolved ifindex map threaded to the surface.
+
+## Flow collectors the dataplane does not install (#7422)
+
+Three commands render a `flow-server` from configuration — the CLI
+`show security flow monitoring`, the CLI `show forwarding-options` and
+its gRPC twin. All three annotate a collector that receives no flow
+records:
+
+```
+Sampling Instance: s1
+  Input rate: 1/100
+  Family inet:
+    Collector: 10.0.0.1:2055
+    Collector: 10.0.0.2  [NOT INSTALLED: no `port` configured — the collector is not installed and receives no flow records]
+```
+
+Port 0 is the case to know about, and it is why this row mattered:
+`show security flow monitoring` suppresses the `:0` suffix entirely, so
+before the annotation a portless collector rendered as
+`Collector: 10.0.0.2` — indistinguishable from a healthy collector on a
+default port.
+
+This is reachable through an ORDINARY `commit`, not only through the
+lenient load path: nothing validates a flow-server port at commit time
+(the strict sampling gate checks template references only), so
+`set forwarding-options sampling instance s1 family inet output
+flow-server 10.0.0.2` with no `port` commits cleanly.
+
+The verdict is `config.FlowServerExcludedReason`, shared with
+`buildFlowExportSnapshot`. Both consumers of a flow-server refuse an
+absent or out-of-range port: the userspace snapshot builder skips it
+(`CollectorPort` is a `u16` on the wire, #1977), and the Go exporter
+that actually sends the records (`pkg/flowexport`, #2130) omits the port
+from the collector address and then fails to dial it
+(`missing port in address`). `pkg/showaudit` enumerates all three
+renderers so a fourth cannot be added unannotated.
+
+## Firewall-filter `then dscp` rewrites the dataplane does not install (#7422)
+
+`show firewall` and `show firewall filter <name>` annotate a
+`then dscp` / `then traffic-class` rewrite whose value the snapshot
+builder cannot resolve:
+
+```
+Filter: mark (family inet)
+  Term: dropped
+    from protocol udp
+    then dscp not-a-code-point  [NOT INSTALLED: unresolvable dscp/traffic-class value — no CoS marking is applied; the term still matches and acts]
+    then accept
+```
+
+The annotation says the term still ACTS on purpose. Unlike a `from dscp`
+MATCH value — where an unresolvable token fails the whole snapshot closed
+(`SnapshotIntegrityError::UnrepresentableFilterDSCP`, #3406) — an
+unresolvable REWRITE is CoS-only and merely warn/no-ops, because failing
+forwarding closed over a lost marking would be worse than the marking.
+`NOT INSTALLED` alone would read as "this term does nothing", which is
+the opposite of the truth.
+
+Unlike the flow-collector and port-mirroring rows this one is NOT
+reachable through an ordinary `commit`: `validateFilterDSCPStrict`
+(#3309) hard-rejects the token. It is reached through the tolerant path
+(#1960 no-brick) — `Store.Load` at boot, or HA peer config-sync
+(`Store.SyncApply`) from a possibly-un-upgraded primary — which
+downgrades the strict validators and lets the config go active with the
+bad token intact. That is exactly the situation an operator reads
+`show firewall` in: a standby that took a config from its peer and is
+not marking traffic the config says it marks.
+
+Both the builder and the renderer now resolve the token through the one
+exported `dataplane.ResolveFilterDSCP`, so they cannot drift; the
+commit-gate mirror in `pkg/config` (which cannot import `pkg/dataplane`)
+is pinned to it by a bidirectional drift guard.
 
 ## Security: NAT rules the dataplane does not install (#6534)
 

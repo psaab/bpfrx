@@ -12,6 +12,7 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 // topTalkerEntry holds a session's display info for sorting.
@@ -628,20 +629,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		// Fetch and display peer node summary in cluster mode.
 		if c.cluster != nil && c.cluster.PeerAlive() {
 			if peerResp := c.fetchPeerSessionSummary(); peerResp != nil {
-				fmt.Println()
-				fmt.Printf("node%d:\n", peerResp.NodeId)
-				fmt.Println("--------------------------------------------------------------------------")
-				fmt.Printf("Unicast-sessions: %d\n", peerResp.ForwardOnly)
-				fmt.Printf("Multicast-sessions: 0\n")
-				fmt.Printf("Services-offload-sessions: 0\n")
-				fmt.Printf("Failed-sessions: 0\n")
-				fmt.Printf("Sessions-in-drop-flow: 0\n")
-				fmt.Printf("Sessions-in-use: %d\n", peerResp.ForwardOnly)
-				fmt.Printf("  Valid sessions: %d\n", peerResp.ForwardOnly)
-				fmt.Printf("  Pending sessions: 0\n")
-				fmt.Printf("  Invalidated sessions: 0\n")
-				fmt.Printf("  Sessions in other states: 0\n")
-				fmt.Printf("Maximum-sessions: 10000000\n")
+				fmt.Print(renderPeerSessionSummary(peerResp))
 			}
 		}
 		return nil
@@ -1246,7 +1234,14 @@ func (c *CLI) showFlowMonitoring() error {
 					if fs.SourceAddress != "" {
 						srcStr = fmt.Sprintf(" source %s", fs.SourceAddress)
 					}
-					fmt.Printf("    Collector: %s%s%s%s\n", fs.Address, portStr, srcStr, tmplStr)
+					// #6565 row 11 / #7422: a collector the snapshot builder
+					// SKIPS (no port, or a port outside the u16 wire range)
+					// used to render exactly like a healthy one — with port 0
+					// the `:0` suffix is suppressed too, so `Collector:
+					// 10.0.0.1` read as an active export target on the default
+					// port. Ask the builder's own verdict.
+					fmt.Printf("    Collector: %s%s%s%s%s\n", fs.Address, portStr,
+						srcStr, tmplStr, flowServerNotInstalledSuffix(fs))
 				}
 			}
 			showSamplingFamily("inet", inst.FamilyInet)
@@ -1313,4 +1308,69 @@ func (c *CLI) showFlowMonitoringStatistics() error {
 		}
 	}
 	return nil
+}
+
+// renderPeerSessionSummary renders the cluster-peer half of
+// `show security flow session summary`.
+//
+// EXTRACTED so it can be tested (#6565 row 3 / #7422). `c.cluster` is a
+// concrete `*cluster.Manager` and the peer block is gated on
+// `c.cluster != nil && c.cluster.PeerAlive()`, so a CLI-level fixture cannot
+// reach it without a live cluster — which is exactly why the #5323 regression
+// test could not catch this row. That test greps its output for "10000000",
+// but its fixture leaves `cluster` nil, so the peer branch never runs and the
+// assertion is physically unable to see the literal it was written to catch.
+// A guard that cannot reach its subject is not a guard; pulling the render out
+// is what makes the fail-on-revert cell real.
+func renderPeerSessionSummary(peerResp *pb.GetSessionSummaryResponse) string {
+	var b strings.Builder
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "node%d:\n", peerResp.NodeId)
+	fmt.Fprintln(&b, "--------------------------------------------------------------------------")
+	fmt.Fprintf(&b, "Unicast-sessions: %d\n", peerResp.ForwardOnly)
+	fmt.Fprintf(&b, "Multicast-sessions: 0\n")
+	fmt.Fprintf(&b, "Services-offload-sessions: 0\n")
+	fmt.Fprintf(&b, "Failed-sessions: 0\n")
+	fmt.Fprintf(&b, "Sessions-in-drop-flow: 0\n")
+	fmt.Fprintf(&b, "Sessions-in-use: %d\n", peerResp.ForwardOnly)
+	fmt.Fprintf(&b, "  Valid sessions: %d\n", peerResp.ForwardOnly)
+	fmt.Fprintf(&b, "  Pending sessions: 0\n")
+	fmt.Fprintf(&b, "  Invalidated sessions: 0\n")
+	fmt.Fprintf(&b, "  Sessions in other states: 0\n")
+	// The PEER's real capacity, not the hardcoded 10000000 #5323 was written to
+	// delete. The LOCAL branch was fixed there; this one was missed, and
+	// `peerResp.MaxSessions` has been on the wire the whole time
+	// (`GetSessionSummaryResponse` field 12, set from the peer's own helper
+	// status in `grpcapi/server_sessions.go`).
+	//
+	// Same `> 0 ? : "unknown"` shape as the local branch, and for the same
+	// reason: a peer that returned no helper status has an UNKNOWN bound, and
+	// "unknown" is the honest answer where a fabricated authoritative number is
+	// not.
+	if peerResp.MaxSessions > 0 {
+		fmt.Fprintf(&b, "Maximum-sessions: %d\n", peerResp.MaxSessions)
+	} else {
+		fmt.Fprintf(&b, "Maximum-sessions: unknown\n")
+	}
+	return b.String()
+}
+
+// flowServerNotInstalledSuffix returns the `[NOT INSTALLED: <reason>]` suffix
+// for a flow-server (collector) the userspace snapshot builder refuses to
+// install, or "" when it installs.
+//
+// #6565 row 11 / #7422: the verdict is config.FlowServerExcludedReason — the
+// SAME predicate buildFlowExportSnapshots consults — so the renderer and the
+// builder cannot disagree about which collectors are live. Unlike most #6534
+// families this state is reachable through a clean commit: nothing validates
+// the flow-server port at commit time, so `flow-server 10.0.0.1` with no
+// `port` lands in the active config, is skipped by the builder, and used to
+// print as `Collector: 10.0.0.1` — the `:0` suffix suppressed, so it read as a
+// healthy collector on the default port.
+func flowServerNotInstalledSuffix(fs *config.FlowServer) string {
+	reason := config.FlowServerExcludedReason(fs)
+	if reason == "" {
+		return ""
+	}
+	return "  [NOT INSTALLED: " + reason + "]"
 }
