@@ -80,6 +80,20 @@ type recordingDP struct {
 	ifaceSetupCalls   int
 }
 
+// #7754: recordingDP presents as the REAL pass. Stated explicitly rather than
+// inherited: it embeds discardingDataPlane, which carries
+// `xpfValidationPass() -> true`, and Go embedding is transitive — so without
+// this override every CompileConfig(&recordingDP{}, ...) in the package runs
+// the real pass against a DataPlane the compiler believes is the discarded
+// validation pre-pass.
+//
+// Measured before changing: adding this override moves NOTHING in the package
+// (full `go test ./pkg/dataplane/` green, zero FAILs). The existing recordingDP
+// tests assert on host mutation — SetZoneConfig call counts and the tripwire
+// error — not on anything isValidationPass gates, so the fixture was simply
+// mis-marked rather than depending on the wrong classification.
+func (*recordingDP) xpfValidationPass() bool { return false }
+
 func (r *recordingDP) SetZoneConfig(zoneID uint16, zc ZoneConfig) error {
 	r.zoneConfigCalls++
 	return errStopBeforeHostReconcile
@@ -467,6 +481,12 @@ type failOneDP struct {
 	discardingDataPlane
 	fail string
 }
+
+// #7754: failOneDP presents as the PRE-PASS, which is correct — it exists to
+// probe the pre-pass's own phase bodies. Declared explicitly anyway, because an
+// inherited classification is indistinguishable from an unconsidered one, and
+// the census below requires every embedder to say which pass it is.
+func (failOneDP) xpfValidationPass() bool { return true }
 
 func (d failOneDP) errIf(method string) error {
 	if d.fail == method {
