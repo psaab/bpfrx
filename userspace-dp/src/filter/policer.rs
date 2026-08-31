@@ -882,6 +882,27 @@ mod tests {
         const PIR: u64 = 1_000_000_000;
         const PBS: u64 = 5_000_000;
 
+        // #7841: the non-vacuity guard at the end of this test asserts that
+        // the threads actually interleaved. That is a property of the
+        // SCHEDULER, not of the policer, and on a loaded box (this repo's CI
+        // runs ten-plus concurrent gates) the threads can degenerate to serial
+        // execution — the guard then reds a test whose subject is fine.
+        //
+        // Retrying rather than deleting or weakening the guard: a serial run
+        // genuinely proved nothing about the refill RACE, so accepting it would
+        // make the cell silently vacuous, which is what the guard exists to
+        // prevent. What a serial run does still prove is the refill
+        // ARITHMETIC, so the over-grant and under-grant assertions are checked
+        // on EVERY attempt and a real defect fails on the first one — only the
+        // contention precondition is retried.
+        //
+        // Failing after MAX_ATTEMPTS is deliberate and is not a flake: eight
+        // threads failing to interleave five times running is a real signal
+        // (a single-core runner, or a policer that serialises internally),
+        // and it reports the per-attempt rates so the reader can tell which.
+        const MAX_ATTEMPTS: usize = 5;
+        let mut attempt_rates: Vec<f64> = Vec::new();
+        for attempt in 1..=MAX_ATTEMPTS {
         let policer = Arc::new(tr_tcm(CIR, CBS, PIR, PBS, true));
         // Prime both refill clocks at t=0 from ONE thread. Without this the
         // first thread to reach `refill()` stamps `last_refill_ns` at ITS
@@ -985,10 +1006,23 @@ mod tests {
         // serial execution — in which case the two assertions above proved
         // nothing about the refill race and the result must not read as
         // covered.
-        assert!(
-            interleaved > 0,
-            "no op observed another thread's clock advance: the threads ran \
-             serially and the refill race was never exercised"
+        attempt_rates.push(100.0 * interleaved as f64 / total_ops as f64);
+        if interleaved > 0 {
+            return;
+        }
+        eprintln!(
+            "#7841: attempt {attempt}/{MAX_ATTEMPTS} degenerated to serial \
+             execution (0 interleaved ops); the over/under-grant assertions \
+             passed, retrying for a contended run"
+        );
+        }
+        panic!(
+            "no op observed another thread's clock advance in {MAX_ATTEMPTS} \
+             attempts: the threads ran serially every time and the refill race \
+             was never exercised. Per-attempt contention rates: {attempt_rates:?}. \
+             A loaded box normally still measures 99.4-99.7%, so five consecutive \
+             zeroes indicates a single-core runner or a policer that serialises \
+             internally rather than scheduler noise (#7841)."
         );
     }
 
