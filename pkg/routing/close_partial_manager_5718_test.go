@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -373,4 +374,11 @@ func TestClosePartialTestManagersDoesNotPanic_5718(t *testing.T) {
 			t.Fatalf("Close left %d keepalive runner(s) registered", remaining)
 		}
 	})
+}
+
+// RuleAddDSCP satisfies ruleOps. These domains (probe pins / rib-group leaks /
+// reconcile) never emit a DSCP selector, so a call here means a rule was routed
+// down the wrong path — fail loudly rather than silently accepting it.
+func (closeGuardRuleOps) RuleAddDSCP(*netlink.Rule, uint8) error {
+	return fmt.Errorf("unexpected RuleAddDSCP: this domain emits no DSCP selectors")
 }

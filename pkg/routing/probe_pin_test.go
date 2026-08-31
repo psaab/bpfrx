@@ -499,3 +499,10 @@ func TestProbePinApplyRollbackFailureStillReportsFailed(t *testing.T) {
 		t.Fatalf("re-apply must converge to exactly 2 rules + 2 routes: %+v / %+v", ops.rules, ops.routes)
 	}
 }
+
+// RuleAddDSCP satisfies ruleOps. These domains (probe pins / rib-group leaks /
+// reconcile) never emit a DSCP selector, so a call here means a rule was routed
+// down the wrong path — fail loudly rather than silently accepting it.
+func (f *fakeProbePinOps) RuleAddDSCP(*netlink.Rule, uint8) error {
+	return fmt.Errorf("unexpected RuleAddDSCP: this domain emits no DSCP selectors")
+}

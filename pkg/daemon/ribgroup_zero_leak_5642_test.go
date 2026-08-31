@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -168,4 +169,11 @@ func TestReconcileRouteLeakSnapshotSkipsBumpOnDuplicate(t *testing.T) {
 			t.Fatalf("calls = %v: FIB generation bumped after a duplicate-skip", dp.calls)
 		}
 	}
+}
+
+// RuleAddDSCP satisfies ruleOps. These domains (probe pins / rib-group leaks /
+// reconcile) never emit a DSCP selector, so a call here means a rule was routed
+// down the wrong path — fail loudly rather than silently accepting it.
+func (f *fakeRuleOps5642) RuleAddDSCP(*netlink.Rule, uint8) error {
+	return fmt.Errorf("unexpected RuleAddDSCP: this domain emits no DSCP selectors")
 }

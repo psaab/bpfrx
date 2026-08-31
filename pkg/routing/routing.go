@@ -82,9 +82,9 @@ func New() (*Manager, error) {
 	// cycle: BindInterfaceToVRF takes no lock); vrf is constructed first.
 	m.tunnel = &tunnelManager{ops: h, vrfBinder: m.vrf, keepalives: make(map[string]*keepaliveRunner)}
 	m.xfrm = &xfrmManager{ops: h}
-	m.nextTbl = &nextTableManager{ops: h}
-	m.ribGroup = &ribGroupManager{ops: h}
-	m.pbr = &pbrManager{ops: h}
+	m.nextTbl = &nextTableManager{ops: dscpRuleOps{h}}
+	m.ribGroup = &ribGroupManager{ops: dscpRuleOps{h}}
+	m.pbr = &pbrManager{ops: dscpRuleOps{h}}
 	m.probePin = &probePinManager{ops: h}
 	m.bond = &bondManager{ops: h}
 	m.reth = &rethManager{ops: h} // Clear is live (LinkList/LinkDel)

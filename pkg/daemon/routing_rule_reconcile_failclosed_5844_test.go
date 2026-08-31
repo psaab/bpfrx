@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -193,4 +194,11 @@ func TestApplyTailReconcilesSurfacesMgmtRouteError_5867(t *testing.T) {
 		t.Fatalf("returned commit error must include the mgmt-VRF route failure via the "+
 			"tail errors.Join wiring, got %v", err)
 	}
+}
+
+// RuleAddDSCP satisfies ruleOps. These domains (probe pins / rib-group leaks /
+// reconcile) never emit a DSCP selector, so a call here means a rule was routed
+// down the wrong path — fail loudly rather than silently accepting it.
+func (f *fakeRuleOps5844) RuleAddDSCP(*netlink.Rule, uint8) error {
+	return fmt.Errorf("unexpected RuleAddDSCP: this domain emits no DSCP selectors")
 }
