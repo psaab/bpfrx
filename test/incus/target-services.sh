@@ -38,10 +38,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "${SCRIPT_DIR}/cluster-env.sh" ]] && source "${SCRIPT_DIR}/cluster-env.sh" 2>/dev/null || true
 
 TARGET_V4="${TARGET_V4:-${IPERF_TARGET4:-172.16.80.200}}"
-# The probe runs from a container on-path to the target, not from the
-# workstation: the workstation has no route onto VLAN 80, so a probe from
-# here would report every port closed on a perfectly healthy target.
-PROBE_FROM="${PROBE_FROM:-xpf-userspace-fw0}"
+# The probe runs from the container the harnesses actually SEND from, not
+# from the workstation and not from a firewall node.
+#
+# The workstation is excluded for the obvious reason: it has no route onto
+# VLAN 80, so a probe from there reports every port closed on a perfectly
+# healthy target.
+#
+# A FIREWALL NODE is excluded for a much less obvious one, and this script
+# used to default to `xpf-userspace-fw0` and get it wrong (#8164). The
+# firewall FORWARDS VLAN-80 traffic; it does not originate it. Its own host
+# stack cannot open a TCP connection to the target even when every service is
+# up. Measured on the standing loss cluster, same instrument (bash /dev/tcp),
+# same 24 ports, same target, at the same moment:
+#
+#   from loss:cluster-userspace-host   OPEN: 23 / 24   (only 6200 closed)
+#   from loss:xpf-userspace-fw0        OPEN:  0 / 24
+#   from loss:xpf-userspace-fw1        (same — closed)
+#
+# ICMP and ARP succeed from the firewall throughout (`ping` 0% loss, neigh
+# REACHABLE), and `ip route get 172.16.80.200` there resolves with
+# `src 172.16.80.8` — an address `ge-0-0-2.80` does not carry, it is a
+# RETH/VRRP VIP. So the firewall vantage answers a question nobody asked and
+# fails to "everything closed", which is indistinguishable from the target
+# host having died. #7100 and #7159 were both parked for weeks as "blocked on
+# lab hardware, every TCP port closed" on exactly this reading; the services
+# were up the whole time and only the single port 6200 was genuinely down.
+#
+# Defaulting to the cluster env's own LAN host (rather than a literal) also
+# makes the probe correct on any env: cluster-env.sh derives
+# CLUSTER_LAN_HOST_NAME from each env file's LAN_HOST.
+PROBE_FROM="${PROBE_FROM:-${CLUSTER_LAN_HOST_NAME:-${LAN_HOST:-cluster-userspace-host}}}"
 INCUS_REMOTE="${INCUS_REMOTE:-loss}"
 
 IPERF_PORTS=(5200 5201 5202 5203 5204 5205 5206 5207 5208 5209 5210 5211)
