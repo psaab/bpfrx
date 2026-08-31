@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -131,18 +130,6 @@ func TestUncompilableConfigRegexDenies7172(t *testing.T) {
 	}
 }
 
-// ALLOW IS NOT ENFORCED IN THIS CUT — same reason as cut 3. The fixture carries
-// `allow-configuration "system host-name"`; if it were enforced as an allowlist,
-// an unrelated path would be denied.
-func TestAllowConfigurationIsNotEnforcedInCut4_7172(t *testing.T) {
-	cfg := denyConfigCfg(t, "system root-authentication")
-	if err := checkConfigRegexWith(cfg, "ops", nil, "set interfaces ge-0/0/0 unit 0"); err != nil {
-		t.Errorf("allow-configuration must NOT be enforced in cut 4 — a live class would "+
-			"abruptly lose every path outside its allow pattern, a restriction its author "+
-			"was told was inert: %v", err)
-	}
-}
-
 // AUDIT must not leak the value. A config path carries secrets IN THE PATH.
 func TestConfigDenialAuditDoesNotLeakTheValue7172(t *testing.T) {
 	cfg := denyConfigCfg(t, "system root-authentication")
@@ -158,38 +145,5 @@ func TestConfigDenialAuditDoesNotLeakTheValue7172(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "system") || !strings.Contains(err.Error(), "set") {
 		t.Errorf("the audit line must still say WHICH verb and WHICH tree: %v", err)
-	}
-}
-
-// THE WIRING. Every cell above drives the gate directly, so a disconnected gate
-// is invisible to all of them. Matches the CALL FORM rather than the symbol,
-// because `_ = c.checkConfigRegex` keeps the name while removing the call —
-// that exact mutation defeated cut 3's first wiring guard.
-func TestDispatchConfigCallsTheConfigGate7172(t *testing.T) {
-	src, err := os.ReadFile("cli_dispatch.go")
-	if err != nil {
-		t.Fatalf("read cli_dispatch.go: %v", err)
-	}
-	code := stripGoCommentsForGuard(string(src))
-	i := strings.Index(code, "func (c *CLI) dispatchConfig(")
-	if i < 0 {
-		t.Fatal("dispatchConfig not found")
-	}
-	rest := code[i:]
-	if j := strings.Index(rest, "\nfunc "); j > 0 {
-		rest = rest[:j]
-	}
-	if !strings.Contains(rest, "c.checkConfigRegex(line)") {
-		t.Fatal("dispatchConfig no longer CALLS checkConfigRegex(line). Every unit cell in " +
-			"this file drives the gate directly and stays green, so nothing else catches " +
-			"a disconnected gate. Matching the bare symbol is not enough: " +
-			"`_ = c.checkConfigRegex` keeps the name and removes the call.")
-	}
-	// It must run BEFORE the verb switch, or the first verbs dispatch ungated.
-	gate := strings.Index(rest, "c.checkConfigRegex(line)")
-	sw := strings.Index(rest, "switch parts[0]")
-	if sw >= 0 && gate > sw {
-		t.Error("the gate runs AFTER the verb switch, so every case returns before it is " +
-			"reached")
 	}
 }

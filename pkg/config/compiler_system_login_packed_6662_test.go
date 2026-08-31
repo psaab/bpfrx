@@ -153,11 +153,20 @@ func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 		t.Errorf("EncryptedPassword = %q, want the configured hash", u.EncryptedPassword.Reveal())
 	}
 
-	// The safety net the packed drop disabled. It used to be the "MORE
-	// PERMISSIVE" deny-commands advisory; #5831 replaced that advisory with a
-	// hard rejection, so what a dropped body costs is now measured on the
-	// leaves this fixture still carries — the #4304 per-class advisory, which
-	// only fires because the class survived the nested spelling at all.
+	// The safety net the packed drop disabled, measured on the TYPED CONFIG
+	// rather than on an advisory string.
+	//
+	// It has been re-aimed twice, and the reason matters. Originally it read
+	// the #4304 "MORE PERMISSIVE" deny-commands advisory; #5831 replaced that
+	// with a hard rejection, so it moved to the #4304 per-class advisory naming
+	// `allow-commands` as recognized-but-unenforced; #7172 cut 6 ENFORCES
+	// allow-commands, so that advisory no longer names it and the assertion
+	// went red for a reason unrelated to the packed-body bug.
+	//
+	// Twice is the signal: this cell was asserting on the nearest observable
+	// rather than on its own subject. Its subject is that a NESTED class body
+	// is not dropped, and the direct evidence is the leaf arriving in the typed
+	// class. That survives every future change to how the leaf is treated.
 	var advisory string
 	for _, w := range cfg.Warnings {
 		if strings.Contains(w, `system login class "ops"`) && strings.Contains(w, "recognized (custom RBAC)") {
@@ -165,11 +174,15 @@ func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 		}
 	}
 	if advisory == "" {
-		t.Fatalf("the #4304 per-class advisory did not fire; warnings: %v", cfg.Warnings)
+		t.Fatalf("the #4304 per-class advisory did not fire, so the class did not survive "+
+			"the nested spelling at all; warnings: %v", cfg.Warnings)
 	}
-	if !strings.Contains(advisory, "allow-commands") {
-		t.Errorf("advisory does not name the recognized-but-unenforced leaf the fixture "+
-			"carries: %q", advisory)
+	if len(cfg.System.Login.Classes) == 0 {
+		t.Fatal("no login classes compiled")
+	}
+	if got := cfg.System.Login.Classes[0].AllowCommands; got != "show .*" {
+		t.Errorf("the nested class body was dropped: AllowCommands = %q, want the "+
+			"configured pattern. This is the #6662 packed-body bug's direct symptom.", got)
 	}
 }
 

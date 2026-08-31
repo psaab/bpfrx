@@ -144,29 +144,49 @@ func TestCustomLoginClassNoPrivEsc(t *testing.T) {
 	}
 }
 
-// TestCustomLoginClassDenyCommandsRejected supersedes the #4304 FIX 2
-// advisory. #4304 accepted a deny-commands class at commit and merely warned
-// that it was MORE PERMISSIVE than the Junos config; #5831 concluded that
-// telling an operator their restriction is inert is not good enough when we
-// can simply refuse it, and made the strict path hard-reject.
+// TestCustomLoginClassDenyCommandsIsEnforcedNotRejected traces the full arc of
+// this statement's treatment, because the test that used to live here asserted
+// the OPPOSITE and a reader needs to know that was correct at the time.
 //
-// The #4304 intent — an operator must never silently get a class weaker than
-// they wrote — is preserved and strengthened here: strict rejects outright, and
-// the tolerant path folds the class down to the repair floor rather than
-// leaving it MORE-permissive (see TestLoginClassDenyToleratedButFolded,
-// TestLoginClassDenyFoldKeepsTheRepairPath and the rest of
-// login_class_deny_5831_test.go).
-func TestCustomLoginClassDenyCommandsRejected(t *testing.T) {
+//   - #4304 accepted a deny-commands class and warned it was MORE PERMISSIVE
+//     than the Junos config said.
+//   - #5831/#6838 concluded that telling an operator their restriction is inert
+//     is not good enough when we can simply refuse it, and hard-rejected it.
+//     That was right while xpf could not enforce the regex.
+//   - #7172 cut 6 implements the regex on every dispatch surface, so refusing
+//     it became the opposite error. The class commits and the restriction is
+//     real.
+//
+// The #4304 intent is unchanged throughout and is now met directly rather than
+// by refusal: an operator must never silently get a class weaker OR stronger
+// than they wrote.
+func TestCustomLoginClassDenyCommandsIsEnforcedNotRejected(t *testing.T) {
 	tree := buildTree4303(t, []string{
 		"set system login class limited permissions all",
 		`set system login class limited deny-commands "request system reboot"`,
 		"set system login user carol class limited",
 	})
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("a class carrying an unenforced deny-commands must be REJECTED at commit, not accepted with an advisory")
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("a deny-commands class must commit now that #7172 enforces it: %v", err)
 	}
-	if !strings.Contains(err.Error(), "limited") || !strings.Contains(err.Error(), "deny-commands") {
-		t.Fatalf("rejection must name the class and the offending leaf; got %q", err)
+	lc := cfg.System.Login.Classes[0]
+	if lc.DenyCommands != "request system reboot" {
+		t.Errorf("the pattern must survive compilation verbatim; got %q", lc.DenyCommands)
+	}
+	// And it must be REACHABLE by the enforcement path, which reads presence
+	// rather than value. A class whose pattern compiled but whose presence went
+	// unrecorded would commit and restrict nothing — the #5831 fail-open
+	// wearing the shape of a fix.
+	rules, ok, err := OperationalLoginRegexesFor(cfg, "limited")
+	if err != nil || !ok {
+		t.Fatalf("the committed class must yield compiled rules (ok=%v err=%v)", ok, err)
+	}
+	if rules.Evaluate("request system reboot").Allowed {
+		t.Error("the committed deny-commands does not deny its own pattern — the statement " +
+			"is accepted and inert, which is exactly the #5831 defect")
+	}
+	if !rules.Evaluate("show version").Allowed {
+		t.Error("a narrow deny must stay narrow; `show version` was denied")
 	}
 }
