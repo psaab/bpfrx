@@ -176,3 +176,42 @@ false for a re-drive that is supposed to be a convergence guarantee.
 fail to terminate against a persistent failure (F1); on this path it terminates
 in a FALSE SUCCESS. v2 must treat "the re-drive's own error handling differs
 from the first drive's" as a design constraint, not an implementation detail.
+
+---
+
+## F7 — MAJOR (new). OQ-3 answered by measurement: §9's test plan is not writable today.
+
+The plan asks §9 for "abort at site *k*, re-drive, assert convergence — for *k*
+across the set", and then asks in OQ-3 whether the 23 seams are injectable. They
+are not. Measured:
+
+`grep -rn "Seam" --include=*.go pkg/dataplane/ | grep -v _test` returns seams in
+`proxyarp.go` (`neighListSeam`, `neighSetSeam`, `neighDelSeam`,
+`linkByIndexSeam`, `proxyARPSysctlSeam`) and **exactly one** in the Phase-2
+mutation path: `vlanLinkByNameSeam` (`compiler_iface.go:185`).
+
+That one is a **lookup** seam, not a **write** seam. Every write in the
+inventory — `netlink.LinkAdd`, `LinkSetUp`, `LinkSetDown`, `LinkSetMTU`,
+`LinkSetTxQLen`, `LinkDel`, `AddrAdd`, `AddrDel`, `runEthtool`, `os.WriteFile`
+— is called directly on the package.
+
+So **0 of 23 write sites can be failed on demand today.** §9's central test is
+not a test to be written; it is a test that requires ~8 new write seams (one per
+verb) as a prerequisite, on the hottest and most destructive path in the
+compiler, introduced for testability alone.
+
+**Consequences for v2, and they are not small:**
+
+1. The seam work must be listed as P0, ahead of P1-P4, and sized. A plan whose
+   acceptance criterion cannot be observed is not a plan.
+2. It changes the P1+P2-only option in OQ-6 from "smaller" to "**the only cut
+   testable with what exists**": the M3 gap and the adopt-path swallow are both
+   reachable through the single existing `vlanLinkByNameSeam` (make the lookup
+   return an existing-but-down link, or a link that fails
+   `vlanAdoptionRefusal`), and `planAddressReconcile` is already pure and
+   directly testable. P3/P4 are the parts that need the new seams.
+3. It is also an argument the plan should have made for itself: the codebase
+   put a seam at the one place #6916 needed to prove something, and nowhere
+   else. That is evidence about how much appetite there has been for making
+   this path failable — and a plan that needs 8 more should say so out loud
+   rather than discover it in implementation.
