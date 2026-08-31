@@ -2932,3 +2932,44 @@ fn gre_inner_v6_bailout_defers_to_the_shim_classifier_6886() {
         );
     }
 }
+
+/// #7494: the shim's non-first-fragment sentinel must not collide with the set
+/// userspace-dp reads as "the shim gave up mid-chain".
+///
+/// This is the assertion the enumeration behind #7494 showed was needed. 253
+/// and 254 ARE members of that set and sit one step from the chosen value, so a
+/// sentinel picked as "some high unused number" would silently reclassify every
+/// non-first fragment as an exhausted walk -- and
+/// `traversable_predicate_matches_walker_behaviour_over_all_256_values` would
+/// have codified the mistake rather than caught it, because 254 is a legitimate
+/// member.
+///
+/// The value's safety currently rests on two facts that live in different
+/// crates, which is exactly the shape that rots. This file already
+/// `#[path]`-includes the shim's shared module AND can call userspace-dp's
+/// predicate, so it is the only place the two can be checked against each
+/// other. It fails if either side moves.
+#[test]
+fn shim_fragment_sentinel_is_not_a_traversable_next_header() {
+    use crate::afxdp::frame::inspect::ipv6_ext_header_is_traversable;
+
+    let sentinel = shim_walk::PROTO_FRAGMENT_NO_L4;
+
+    assert!(
+        !ipv6_ext_header_is_traversable(sentinel),
+        "the #7494 fragment sentinel ({sentinel}) is a member of the traversable \
+         set, which userspace-dp reads as \"the shim gave up mid-chain\". A \
+         fragment would be reclassified as an exhausted walk. 253 and 254 are \
+         real members -- pick a value outside the set."
+    );
+
+    // The neighbours, asserted positively, so this cell fails if the traversable
+    // set itself is narrowed and the hazard silently stops existing. A guard
+    // whose premise has evaporated should be re-examined, not left passing.
+    assert!(
+        ipv6_ext_header_is_traversable(253) && ipv6_ext_header_is_traversable(254),
+        "253/254 are no longer traversable; the collision hazard this cell \
+         guards has changed shape and the sentinel's justification needs \
+         re-reading"
+    );
+}

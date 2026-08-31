@@ -3264,7 +3264,11 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
          test walk that directory; source pulled in from elsewhere — or a crate pulled in from a \
          `-L` search path — would be invisible to every one of them, the exact fail-open this \
          refusal exists to close. Extend the walk before adding any of them. (Prose tripping \
-         this is a false RED; reword it.)",
+         this is a false RED. The convention is DESCRIBE THE ATTRIBUTE, DO NOT SPELL IT -- say \
+         \"pulled in by source path\" rather than writing the bracket-path token; see the \
+         module comment in userspace-xdp/src/lib.rs, which says \"described, not spelled\", and \
+         the one at the top of ipv6_ext_walk.rs. This message previously named only the \
+         prohibition, and a doc comment explaining WHY the shared module exists tripped it.)",
         root.display()
     );
 
