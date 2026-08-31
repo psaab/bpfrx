@@ -903,6 +903,12 @@ func (c *CLI) showRoutingOptions() error {
 		return nil
 	}
 	ro := &cfg.RoutingOptions
+	// #7357: which static routes buildRouteSnapshots DROPS. Computed once for
+	// the whole config because the next-table window verdict is order-dependent
+	// — it depends on how many eligible global leaks precede a route, so it
+	// cannot be decided per row. Same predicate the builder consults, so a
+	// dropped route cannot render here as an installed one.
+	staticExcluded := config.StaticRouteExclusions(cfg)
 	hasContent := false
 
 	if ro.AutonomousSystem > 0 {
@@ -929,6 +935,7 @@ func (c *CLI) showRoutingOptions() error {
 			}
 			if sr.NextTable != "" {
 				fmt.Printf("  %-24s %-20s %-6s %s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference), "")
+				printStaticRouteNotInstalled(staticExcluded, sr)
 				continue
 			}
 			for i, nh := range sr.NextHops {
@@ -961,6 +968,7 @@ func (c *CLI) showRoutingOptions() error {
 			}
 			if sr.NextTable != "" {
 				fmt.Printf("  %-40s %-30s %-6s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference))
+				printStaticRouteNotInstalled(staticExcluded, sr)
 				continue
 			}
 			for i, nh := range sr.NextHops {
@@ -1004,6 +1012,9 @@ func (c *CLI) showRoutingInstances(detail bool) error {
 		fmt.Println("No routing instances configured")
 		return nil
 	}
+	// #7357: a per-instance `next-table` is never programmed (#5830), so this
+	// surface must not print it as a live forwarding decision.
+	staticExcluded := config.StaticRouteExclusions(cfg)
 
 	if !detail {
 		fmt.Printf("%-20s %-16s %-6s %s\n", "Instance", "Type", "Table", "Interfaces")
@@ -1076,6 +1087,7 @@ func (c *CLI) showRoutingInstances(detail bool) error {
 				// count.
 				if sr.NextTable != "" {
 					fmt.Printf("    %s -> next-table %s\n", sr.Destination, sr.NextTable)
+					printStaticRouteNotInstalled(staticExcluded, sr)
 					continue
 				}
 				for _, nh := range sr.NextHops {
@@ -1212,4 +1224,18 @@ func sortedInstanceNames[T any](m map[string]T) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// printStaticRouteNotInstalled emits the `NOT INSTALLED` line for a static
+// route buildRouteSnapshots drops, or nothing when it publishes it.
+//
+// #7357: a dropped route rendered as configured reads as an installed one —
+// the #6534 archetype, and sharpest for `next-table`, whose whole point is a
+// forwarding decision. The verdict is config.StaticRouteExclusions, the SAME
+// map the builder's predicate produces, so the renderer and the builder cannot
+// disagree about which routes are live.
+func printStaticRouteNotInstalled(excluded map[*config.StaticRoute]string, sr *config.StaticRoute) {
+	if reason := excluded[sr]; reason != "" {
+		fmt.Printf("      NOT INSTALLED: %s\n", reason)
+	}
 }
