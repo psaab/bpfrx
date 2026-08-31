@@ -2651,10 +2651,25 @@ the drop fails loudly instead of going quietly vacuous.
     in-process map under that table's own RWMutex — it touches no conntrack
     bucket — so it takes no context (a cancellation guarantee over nothing);
     #6553's line cites for it, `persistent.go:85`/`:102`, are both inside
-    `RenderPersistentDetail`. Its admission slot is deliberately KEPT: the
-    snapshot is still an O(bindings) allocation on a fabric-reachable surface,
-    and dropping an existing bound is a separate judgement from adding
-    cancellation. Pinned by `pkg/natshow/walk_cancellation_7315_test.go`
+    `RenderPersistentDetail`. **#8151 resolves the budget it draws
+    from.** Its admission slot is KEPT — the snapshot is still an O(bindings)
+    allocation on a fabric-reachable surface, and dropping a bound from a
+    peer-reachable surface is a security-shaped change that should not be a
+    side effect of correcting an accounting error — but it now takes
+    `diagcmd.SnapshotReadLimiter`, its own budget, rather than
+    `SessionWalkLimiter`. Charging it to the session budget was exploitable,
+    not merely inaccurate: `MaxConcurrentSessionWalks` is 4, REST and gRPC
+    alias ONE limiter, and `ShowText` is on `fabricAllowedUnaryMethods`, so a
+    cluster peer polling `persistent-nat` could hold all four slots and make
+    genuine scans (`GET /api/v1/sessions`, `GetSessions`, `GetStatus`'s
+    `SessionCount`) start refusing. The two budgets are sized independently
+    because they bound different costs — a map copy versus per-bucket BPF-map
+    locks held across the whole v4+v6 table — so tying them would make one a
+    hostage to the other's tuning. Pinned by
+    `TestPersistentNATUsesTheSnapshotBudget8151`, which asserts the
+    independence in BOTH directions: saturating either budget must not refuse
+    the other's topic. One direction alone would pass on an implementation
+    that had merely renamed the shared limiter. Pinned by `pkg/natshow/walk_cancellation_7315_test.go`
     (mechanism) and `pkg/grpcapi/nat_showtext_cancellation_7315_test.go`
     (the WIRING — nothing in `pkg/natshow` can see a handler passing
     `context.Background()` instead of the request context), both counting

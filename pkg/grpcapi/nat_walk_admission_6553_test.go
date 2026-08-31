@@ -157,7 +157,16 @@ func saturateSessionWalkLimiter(t *testing.T) func() {
 	return release
 }
 
-// TestGRPCNATWalkSurfacesAcquireTheSharedLimiter6553 covers all six surfaces.
+// TestGRPCNATWalkSurfacesAcquireTheSharedLimiter6553 covers the five surfaces
+// that genuinely walk the conntrack table.
+//
+// #8151 removed `persistent-nat` from this list — not because the assertion
+// got inconvenient, but because it was asserting the wrong thing. That topic
+// copies an in-process map and never touches a conntrack bucket, so charging
+// it to the session budget let a fabric peer starve real scans. It now takes
+// diagcmd.SnapshotReadLimiter and is covered by
+// TestPersistentNATUsesTheSnapshotBudget8151 below, which asserts BOTH
+// directions of the independence.
 // Each is driven twice: refused while the shared budget is saturated, admitted
 // once a slot frees. The second half is not decoration — it is what catches a
 // gate that acquires and never releases.
@@ -172,10 +181,6 @@ func TestGRPCNATWalkSurfacesAcquireTheSharedLimiter6553(t *testing.T) {
 		}},
 		{"GetNATDestination", func(s *Server) error {
 			_, err := s.GetNATDestination(context.Background(), &pb.GetNATDestinationRequest{})
-			return err
-		}},
-		{"ShowText/persistent-nat", func(s *Server) error {
-			_, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "persistent-nat"})
 			return err
 		}},
 		{"ShowText/persistent-nat-detail", func(s *Server) error {
@@ -318,4 +323,87 @@ func TestNATPoolTotalPortsIsSingleSourced6553(t *testing.T) {
 			}
 		}
 	}
+}
+
+// #8151: `persistent-nat` must draw from the snapshot budget, and the two
+// budgets must be INDEPENDENT.
+//
+// These cells saturate the REAL limiters rather than substituting fresh
+// single-slot ones, and that is the whole design of the test. A mutation
+// aliasing `SnapshotReadLimiter = SessionWalkLimiter` ESCAPED the first
+// version, because each helper swapped in its own new instance — the
+// substitution destroyed the aliasing before the assertion could observe it.
+// The test was structurally incapable of failing for the reason it existed.
+//
+// Draining the real limiters means the counts must match the real caps, so
+// both are read from diagcmd rather than hardcoded; if a cap changes, the
+// drain follows it instead of silently under-filling and admitting on a free
+// slot.
+func drainLimiter(t *testing.T, l *diagcmd.Limiter, n int) func() {
+	t.Helper()
+	releases := make([]func(), 0, n)
+	for i := 0; i < n; i++ {
+		release, err := l.Acquire()
+		if err != nil {
+			t.Fatalf("could not drain slot %d of %d: %v", i+1, n, err)
+		}
+		releases = append(releases, release)
+	}
+	if l.InFlight() != n {
+		t.Fatalf("drained %d slots but InFlight()=%d — the limiter is not saturated "+
+			"and the assertion below would pass on a free slot", n, l.InFlight())
+	}
+	return func() {
+		for _, r := range releases {
+			r()
+		}
+	}
+}
+
+func TestPersistentNATUsesTheSnapshotBudget8151(t *testing.T) {
+	persistentNAT := func(s *Server) error {
+		_, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "persistent-nat"})
+		return err
+	}
+	// A genuine session-walk surface, standing for "the scans that were being
+	// starved". GetNATPoolStats takes the session budget.
+	sessionWalk := func(s *Server) error {
+		_, err := s.GetNATPoolStats(context.Background(), &pb.GetNATPoolStatsRequest{})
+		return err
+	}
+
+	t.Run("persistent-nat is bounded by the snapshot budget", func(t *testing.T) {
+		s := newNATWalkServer(t, natWalkDP{})
+		undo := drainLimiter(t, diagcmd.SnapshotReadLimiter, diagcmd.MaxConcurrentSnapshotReads)
+		if err := persistentNAT(s); err == nil {
+			undo()
+			t.Fatal("persistent-nat was admitted with the snapshot budget saturated — " +
+				"the bound was dropped rather than moved (#8151 keeps it: ShowText is " +
+				"fabric-reachable and the O(bindings) copy is still worth bounding)")
+		}
+		undo()
+		if err := persistentNAT(s); err != nil {
+			t.Fatalf("persistent-nat still refused after the slots freed: %v — the gate "+
+				"acquires and never releases", err)
+		}
+	})
+
+	t.Run("a saturated snapshot budget does not refuse a session walk", func(t *testing.T) {
+		s := newNATWalkServer(t, natWalkDP{rows: 4})
+		defer drainLimiter(t, diagcmd.SnapshotReadLimiter, diagcmd.MaxConcurrentSnapshotReads)()
+		if err := sessionWalk(s); err != nil {
+			t.Fatalf("a session walk was refused while only the SNAPSHOT budget was "+
+				"saturated: %v — the two budgets are the same instance", err)
+		}
+	})
+
+	t.Run("a saturated session budget does not refuse persistent-nat", func(t *testing.T) {
+		s := newNATWalkServer(t, natWalkDP{})
+		defer drainLimiter(t, diagcmd.SessionWalkLimiter, diagcmd.MaxConcurrentSessionWalks)()
+		if err := persistentNAT(s); err != nil {
+			t.Fatalf("persistent-nat was refused while only the SESSION budget was "+
+				"saturated: %v — this is the starvation #8151 fixes, in the direction "+
+				"a fabric peer polling the session surfaces would cause", err)
+		}
+	})
 }
