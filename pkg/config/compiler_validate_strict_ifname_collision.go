@@ -208,5 +208,161 @@ func validateInterfaceNameCollisionStrict(cfg *Config) error {
 			derivedOwner[dev] = ref
 		}
 	}
+
+	// Third pass: the DERIVED per-unit SUB-INTERFACE device names (#7795).
+	//
+	// A logical unit that is not a tunnel still gets its own Linux device when
+	// it carries a vlan-id or a non-zero unit number, and that device name has
+	// the same `<base>.<n>` shape an operator may author directly. So
+	// `ge-0/0/0 unit 100 vlan-id 100` and an authored `ge-0/0/0.100` are two
+	// config objects on ONE kernel device, exactly as #6964's tunnel case.
+	//
+	// THE DEVICE NAME COMES FROM ResolveKernelIfName, NOT FROM A LOCAL
+	// fmt.Sprintf. Pass 2 binds to unit.Tunnel.Name — the value the compiler
+	// assigned — so the gate cannot drift from the naming scheme it polices.
+	// There is no equivalent stored field here: a sub-interface device name is
+	// never assigned, only computed on demand. The authority is therefore the
+	// resolver itself, and calling it is the closest available form of the same
+	// constraint.
+	//
+	// That choice is load-bearing rather than stylistic. The issue describes
+	// this defect as the VLAN derivation, `base + "." + vlan-id`. Re-deriving
+	// that literally would have policed HALF the shape: types.go also resolves a
+	// non-zero unit with NO vlan-id to `base + "." + unit-number`, so
+	// `ge-0/0/0 unit 100` collides with an authored `ge-0/0/0.100` just as
+	// surely. Calling the resolver covers both, and covers whatever a future
+	// derivation adds, without this gate being told.
+	//
+	// SKIPPED, not reported, in two cases — both by design, both established by
+	// reading the resolver rather than assumed:
+	//
+	//   - a unit whose device IS the interface's own base device. That is
+	//     unit 0 with no vlan-id, which the resolver collapses onto the base
+	//     (types.go: `if unit.Number == 0 { return kernelBase }`). The authored
+	//     pass already claimed that name for this same interface, so reporting
+	//     it would reject every ordinary `unit 0` in the tree — the
+	//     over-rejection this gate must not commit.
+	//   - a unit carrying a tunnel. The resolver returns unit.Tunnel.Name for
+	//     those, so pass 2 has already adjudicated the identical name; running
+	//     it again here would report one collision twice, with two different
+	//     messages naming two different derivations for one device.
+	subOwner := make(map[string]string)
+	for _, name := range names {
+		ifc := cfg.Interfaces.Interfaces[name]
+		if ifc == nil {
+			continue
+		}
+		// A RETH IS SKIPPED ENTIRELY, and this is a scope correction to the
+		// issue rather than a convenience.
+		//
+		// #7795 frames every `<base>.<n>` device shared by two config objects
+		// as a defect. For a reth it is not. A reth's units resolve onto the
+		// PHYSICAL MEMBER's device, so `reth1 unit 100 vlan-id 100` lands on
+		// ge-0-0-1.100 — exactly where an interface authored `ge-0/0/1.100`
+		// lands — and #6722 established that this aliasing is LEGAL and built
+		// the resolution for it: "the dotted name is a real, separate
+		// configured interface AND an alias of a reth unit ... Resolving the
+		// AUTHORED binding through the aliasing does" (egress_zone_identity_
+		// 6722_test.go, case C). Rejecting it here would un-ship that decision.
+		//
+		// The collapse case is the same story one step simpler: `reth1 unit 0`
+		// becomes the member device, which the authored pass already claimed
+		// for the member itself.
+		//
+		// So the reth aliasing is OUT OF SCOPE for this gate, not merely
+		// exempted from part of it. A non-reth interface still has no
+		// equivalent resolution and its collisions are genuine.
+		if cfg.ResolveReth(name) != name {
+			continue
+		}
+		base := LinuxIfName(name)
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			if unit.Tunnel != nil && unit.Tunnel.Name != "" {
+				// Pass 2 owns this device name.
+				continue
+			}
+			ref := fmt.Sprintf("%s.%d", name, unitNum)
+			dev := cfg.ResolveKernelIfName(ref)
+			if dev == "" || dev == base {
+				// unit 0 with no vlan-id: shares the base device by design.
+				continue
+			}
+			if len(dev) > maxLinuxIfNameLen {
+				return fmt.Errorf(
+					"unit %s needs Linux device name %q (%d bytes), over the kernel "+
+						"IFNAMSIZ limit of %d bytes; a sub-interface device is the "+
+						"interface's canonical name plus \".\" and its vlan-id (or unit "+
+						"number when no vlan-id is set), so the kernel cannot create it "+
+						"and the unit's addresses would silently never materialize — "+
+						"shorten the interface name or renumber the unit",
+					ref, dev, len(dev), maxLinuxIfNameLen)
+			}
+			if owner, ok := firstByLinux[dev]; ok {
+				return fmt.Errorf(
+					"interface %q and unit %s both resolve to the same Linux device name "+
+						"%q (a sub-interface device is the interface's canonical name plus "+
+						"\".\" and its vlan-id, or its unit number when no vlan-id is set); "+
+						"pkg/routing keys the device's addresses, VRF claim and zone by that "+
+						"name, so the two would reconcile ONE kernel device twice per commit "+
+						"and delete each other's addresses off it — and the order is the "+
+						"interface map's, so there is no stable winner — rename one of the two",
+					owner, ref, dev)
+			}
+			// THE CROSS-PRODUCT, and its REACHABILITY stated honestly.
+			//
+			// Three sources of a device name means three PAIRS. Pass 3 runs
+			// last and checks both prior registries, which closes all three —
+			// but this particular branch, sub-interface vs per-unit TUNNEL,
+			// cannot fire today, and it carries no test cell for that reason.
+			//
+			// The two derivations produce disjoint shapes. A sub-interface
+			// device is `<base>.<digits>` and a tunnel device is
+			// `<base>u<digits>`; both end in a digit run, and the character
+			// immediately before that run is "." in one form and "u" in the
+			// other. One position cannot be both, so the two can never be
+			// equal — whatever the bases are, including bases that themselves
+			// contain dots or a trailing "u".
+			//
+			// It is retained rather than deleted for the same reason pass 2
+			// retains its own unreachable derived-vs-derived branch: the
+			// argument rests on the SEPARATOR characters, and a future change
+			// to either naming scheme — a "." separator for tunnels, a "u" for
+			// sub-interfaces — breaks it. The hole must not reopen silently.
+			//
+			// The pairwise structure is at its limit here. It works because
+			// there are exactly three sources; a fourth derivation would need
+			// every pass to check every prior one, and the durable form at that
+			// point is a single owner map all passes register into rather than
+			// one map per pass.
+			if owner, ok := derivedOwner[dev]; ok {
+				return fmt.Errorf(
+					"per-unit tunnel %s and unit %s both resolve to the same Linux device "+
+						"name %q (one from the tunnel device's \"u<unit>\" suffix, the other "+
+						"from a sub-interface's vlan-id or unit number); they would reconcile "+
+						"ONE kernel device twice per commit, with no stable winner — rename "+
+						"one of the two interfaces",
+					owner, ref, dev)
+			}
+			if other, ok := subOwner[dev]; ok {
+				return fmt.Errorf(
+					"units %s and %s both resolve to the same Linux device name %q (a "+
+						"sub-interface device is the interface's canonical name plus \".\" "+
+						"and its vlan-id, or its unit number when no vlan-id is set); they "+
+						"would reconcile ONE kernel device twice per commit, with no stable "+
+						"winner — give one of them a different vlan-id",
+					other, ref, dev)
+			}
+			subOwner[dev] = ref
+		}
+	}
 	return nil
 }
