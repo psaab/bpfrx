@@ -296,7 +296,6 @@ func TestEveryConfigCommittingSmokeUsesTheMarkerGate_6936(t *testing.T) {
 	const dir = "../../test/incus"
 	// name -> tracking issue for the known-ungated scripts.
 	exempt := map[string]string{
-		"wg-interop.sh": "#7792",
 	}
 
 	entries, err := os.ReadDir(dir)
