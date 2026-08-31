@@ -181,3 +181,59 @@ fn both_reinject_refusal_points_call_slow_path_admit_6664() {
          only place a regression there is visible."
     );
 }
+
+/// #7480: the raw reinject primitive's caller set, pinned.
+///
+/// `maybe_reinject_slow_path_from_frame` hands ANY parseable L3 frame to the
+/// kernel. Its own doc block is what a caller reads before deciding it may
+/// bypass `is_slow_path_eligible`, so that enumeration is a security-relevant
+/// claim — and it was WRONG. #1946 wrote "the ONE INTENTIONAL unfiltered
+/// caller"; #6664 discovered a second (the host-terminated IPsec passthrough in
+/// `poll_stages.rs`, which calls the primitive with a SYNTHETIC `LocalDelivery`
+/// decision) and corrected the SIBLING comment at the `handle_forward_build_failure`
+/// call site while leaving the primitive's own doc saying "ONE". Two spellings
+/// of the same fact in one file, disagreeing, with the stale one on the item a
+/// caller actually reads.
+///
+/// A comment cannot be kept true by review, so this pins the set instead. The
+/// four production sites are two filtered and two unfiltered:
+///
+///   * `tx/dispatch/slow_path.rs` x2 — the filtered `maybe_reinject_slow_path`
+///     wrapper (routes through `slow_path_admit`), and the UNFILTERED
+///     `handle_forward_build_failure` ForwardCandidate fallback;
+///   * `poll_descriptor/mod.rs` x1 — the #1913 trailing chokepoint, filtered;
+///   * `poll_stages.rs` x1 — the UNFILTERED IPsec passthrough.
+///
+/// FAIL-ON-REVERT: any new production call site reds here. That is the point —
+/// a new caller is a new way to hand an unadjudicated frame to the kernel FIB,
+/// and it must be classified as filtered or unfiltered, added to this list, and
+/// reflected in the primitive's doc block in the same change.
+#[test]
+fn raw_reinject_primitive_caller_set_is_pinned_7480() {
+    let sites = production_call_sites("maybe_reinject_slow_path_from_frame(");
+    let mut files: Vec<String> = sites.iter().map(|s| rel(&s.file)).collect();
+    files.sort();
+
+    let expected = vec![
+        "afxdp/poll_descriptor/mod.rs".to_string(),
+        "afxdp/poll_stages.rs".to_string(),
+        "afxdp/tx/dispatch/slow_path.rs".to_string(),
+        "afxdp/tx/dispatch/slow_path.rs".to_string(),
+    ];
+
+    let listed: Vec<String> = sites
+        .iter()
+        .map(|s| format!("{}:{}", rel(&s.file), s.line))
+        .collect();
+
+    assert_eq!(
+        files, expected,
+        "the raw reinject primitive's production caller set changed. Found {listed:?}.\n\
+         Every caller of this primitive can hand an unadjudicated frame to the \
+         kernel FIB, where there is no nftables `hook forward` chain, ip_forward \
+         is force-enabled while armed, and rp_filter is 0 on the TUN — so nothing \
+         downstream re-checks it. A new site must be classified filtered vs \
+         unfiltered, listed here, AND reflected in the primitive's doc block, \
+         which is what a future caller reads before bypassing the predicate."
+    );
+}
