@@ -261,22 +261,24 @@ type ALGConfig struct {
 
 // TCPSessionConfig holds TCP session timeout configuration.
 //
-// #6539: only EstablishedTimeout reaches the dataplane. The other three are
-// parsed, typed, committed and stored here and go no further — the wire struct
-// has no field for them and no consumer reads them, so they capture operator
-// intent only. flow_tcp_timeouts_6539.go is the authority for that split; the
-// commit advisory and all three `show` surfaces read it, and a test in
-// pkg/dataplane/userspace fails if a carrier appears without the table being
-// updated. The per-field "unset =>" comments below name the window the
-// DATAPLANE falls back to (userspace-dp/src/session/mod.rs), not the Junos
-// default — an unset leaf lowers as 0 and never carries the Junos value, so
-// quoting Junos here is what let three surfaces print 1800s for a session that
-// actually idles out at 300s.
+// flow_tcp_timeouts_6539.go is the SINGLE authority for two facts about the
+// four timeout leaves: which ones the dataplane enforces
+// (TCPSessionTimeoutEnforcement) and what window each falls back to when the
+// operator leaves it unset (TCPSessionTimeoutDataplaneDefault). Both are read
+// by the commit advisory and all three `show` surfaces.
+//
+// Deliberately not restated here. These fields used to carry per-field
+// "NOT enforced" comments and the type doc used to describe the #6539
+// enforced/unenforced split; #7342 made all four enforced and every one of
+// those sentences silently became false, because the guard that exists binds
+// the wire carrier to the TABLE and nothing binds prose to a table. A comment
+// that repeats the authority is one more place to be wrong the next time the
+// authority moves, so the pointer above is all that is kept.
 type TCPSessionConfig struct {
-	EstablishedTimeout   int  // enforced; unset => 300s (DEFAULT_TCP_SESSION_TIMEOUT_NS)
-	InitialTimeout       int  // NOT enforced; half-open reaps at 20s (DEFAULT_TCP_OPENING_TIMEOUT_NS)
-	ClosingTimeout       int  // NOT enforced; FIN close reaps at 30s (TCP_CLOSING_TIMEOUT_NS)
-	TimeWaitTimeout      int  // NOT enforced; the dataplane has no TIME_WAIT state
+	EstablishedTimeout   int
+	InitialTimeout       int
+	ClosingTimeout       int
+	TimeWaitTimeout      int
 	NoSynCheck           bool // allow mid-stream TCP session creation
 	NoSynCheckInTunnel   bool // allow mid-stream TCP for tunnel traffic only
 	RstInvalidateSession bool // immediately expire session on RST
