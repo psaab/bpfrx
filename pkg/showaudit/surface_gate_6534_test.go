@@ -104,6 +104,28 @@ var families = []family{
 		Unannotated:       nil, // closed by #7348
 	},
 	{
+		// #7357 items 3-5, plus the #5830 per-instance case the issue does not
+		// list. buildRouteSnapshots drops four classes of static route and the
+		// `show routing-options` / `show routing-instances` renderers printed
+		// all of them as configured. Sharpest for `next-table`, whose entire
+		// content IS a forwarding decision.
+		//
+		// This family has TWO builder predicates because one of the four
+		// reasons is order-dependent: the kernel caps global next-table leaks
+		// at NextTableRuleWindow ip rules, so whether a route falls outside the
+		// window depends on how many eligible ones precede it.
+		// StaticRouteExcludedReason answers the three per-route causes;
+		// StaticRouteExclusions walks the whole config for the fourth.
+		Name:        "static route",
+		Collections: []string{"RoutingOptions.StaticRoutes", "RoutingOptions.Inet6StaticRoutes"},
+		// The builder calls the whole-config map, not the per-route helper:
+		// the map owns the order-dependent window, so routing the builder
+		// through it is what makes the window a SINGLE implementation.
+		BuilderPredicates: []string{"StaticRouteExclusions"},
+		SurfacePredicates: []string{"StaticRouteExclusions"},
+		Unannotated:       nil, // closed by #7357
+	},
+	{
 		// #6565 row 11 / #7422. Unlike its siblings this family is NOT a
 		// lenient-path-only backstop: nothing validates a flow-server port at
 		// commit time, so `flow-server 10.0.0.1` with no `port` commits
@@ -165,7 +187,21 @@ var families = []family{
 // fail-closed verdict. The convention is what makes the population
 // enumerable, so the gate enforces it rather than trusting it: a builder
 // exclusion spelled outside this family has no row and no test.
-var dropPredicateName = regexp.MustCompile(`(?:Excluded|Unusable|Disarmed)Reason$|Unsupported$|Undefined$`)
+//
+// #7357 added the `*Exclusions` shape, and it is a WIDENING of what this gate
+// sees rather than a loosening. Every name matched before is still matched; a
+// builder call to a new `*Exclusions` function now also REQUIRES a registry
+// row, where previously it would have passed unseen.
+//
+// The shape exists because one verdict in the static-route family is
+// ORDER-DEPENDENT — whether a next-table route falls outside the kernel's
+// capped ip-rule window depends on how many eligible routes precede it — so it
+// cannot be a `func(x) string` over a single object. A whole-config walk
+// returning a per-object map is the only form that can express it, and the
+// alternative was to implement the window TWICE (once in the builder's loop,
+// once for the renderer) and bind the pair with a test. One implementation the
+// gate can see beats two implementations it cannot.
+var dropPredicateName = regexp.MustCompile(`(?:Excluded|Unusable|Disarmed)Reason$|Exclusions$|Unsupported$|Undefined$`)
 
 // ---------------------------------------------------------------------------
 // Tests

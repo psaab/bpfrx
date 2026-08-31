@@ -312,6 +312,11 @@ func (s *Server) showRoutingOptions(cfg *config.Config, buf *strings.Builder) {
 		buf.WriteString("No active configuration\n")
 	} else {
 		ro := &cfg.RoutingOptions
+		// #7357: which static routes buildRouteSnapshots DROPS. Same shared
+		// predicate the builder and the local CLI consult, so this surface
+		// cannot render a dropped route as installed. Computed for the whole
+		// config because the next-table window verdict is order-dependent.
+		staticExcluded := config.StaticRouteExclusions(cfg)
 		hasContent := false
 		if ro.AutonomousSystem > 0 {
 			fmt.Fprintf(buf, "Autonomous system: %d\n\n", ro.AutonomousSystem)
@@ -335,6 +340,9 @@ func (s *Server) showRoutingOptions(cfg *config.Config, buf *strings.Builder) {
 				}
 				if sr.NextTable != "" {
 					fmt.Fprintf(buf, "  %-24s %-20s %s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference))
+					if reason := staticExcluded[sr]; reason != "" {
+						fmt.Fprintf(buf, "      NOT INSTALLED: %s\n", reason)
+					}
 					continue
 				}
 				for i, nh := range sr.NextHops {
@@ -366,6 +374,9 @@ func (s *Server) showRoutingOptions(cfg *config.Config, buf *strings.Builder) {
 				}
 				if sr.NextTable != "" {
 					fmt.Fprintf(buf, "  %-40s %-30s %s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference))
+					if reason := staticExcluded[sr]; reason != "" {
+						fmt.Fprintf(buf, "      NOT INSTALLED: %s\n", reason)
+					}
 					continue
 				}
 				for i, nh := range sr.NextHops {
