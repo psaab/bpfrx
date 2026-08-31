@@ -67,8 +67,25 @@ func TestPeerDoneMeansTheSlotIsBack_6977(t *testing.T) {
 		}
 	}
 
+	// #7882: hold the lookup INSIDE the hook so the occupancy check below is
+	// deterministic.
+	//
+	// `connContext` takes the token synchronously and the spawned goroutine
+	// releases it with a defer, so after connContext returns the token is held
+	// -- until the lookup finishes. The previous form ran an instantaneous
+	// `select`/`default` occupancy SAMPLE right after, which reds whenever the
+	// lookup completed first: a free slot then exists and the cell reports
+	// "the lookup did not take one", which is the opposite of what happened.
+	// On a loaded box that ordering is a coin flip.
+	//
+	// Blocking in the hook makes the in-flight window last exactly as long as
+	// this test wants it to, so the sample becomes an observation.
+	entered := make(chan struct{})
+	release := make(chan struct{})
 	s := &Server{}
 	s.peerLookupFn = func(net.Addr, net.Addr) authz.PeerIdentity {
+		close(entered)
+		<-release
 		return authz.PeerIdentity{UID: 0, OK: true, Local: true}
 	}
 	c1, c2 := net.Pipe()
@@ -81,6 +98,16 @@ func TestPeerDoneMeansTheSlotIsBack_6977(t *testing.T) {
 		t.Fatal("connContext did not attach a pendingPeer; this cell is not observing the " +
 			"path it names")
 	}
+	// #7882: wait for the lookup to be demonstrably INSIDE the hook before
+	// asserting occupancy. Reaching here means the token is held and cannot
+	// yet have been released, because the release is deferred past this point.
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the peer lookup never entered the injected resolver; the occupancy " +
+			"assertion below would be sampling a window that never opened")
+	}
+
 	// The lookup took the last token, so the pool is full while it runs.
 	select {
 	case peerLookupSlots <- struct{}{}:
@@ -89,6 +116,10 @@ func TestPeerDoneMeansTheSlotIsBack_6977(t *testing.T) {
 			"not take one, so the release this cell is about never happens")
 	default:
 	}
+
+	// Let the lookup finish; its deferred release is what the invariant below
+	// observes.
+	close(release)
 
 	select {
 	case <-p.done:
