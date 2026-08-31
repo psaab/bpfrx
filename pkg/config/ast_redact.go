@@ -226,6 +226,42 @@ func urlLeafIndices(fp []string) []int {
 					out = append(out, j)
 				}
 			}
+		case "hostname":
+			// #8104: `security dynamic-address feed-server <s> hostname`.
+			// resolveBaseURL joins this with a feed's path to build the fetch
+			// URL, so it accepts a FULL URL including userinfo -- the typed
+			// route has redacted it since #6733, whose own comment names the
+			// leak shape ("an operator who writes user:token@feeds.example
+			// here leaks it through the authenticated REST GET"). That fix
+			// covered the JSON surface only; the AST route rendered the same
+			// credential verbatim on `show configuration`, the gRPC config
+			// RPCs and the on-box CLI until #8104.
+			//
+			// Gated on `feed-server` exactly like `path`: `hostname` is a
+			// generic keyword and is a bare host under `security ike gateway
+			// dynamic`, `security ipsec gateway dynamic` and the per-unit
+			// `dynamic-dns` blocks, none of which the typed route redacts.
+			// RedactURL is a no-op on a bare host anyway (#6609), so the gate
+			// is about not making a claim the typed side does not make.
+			if containsAnyOf(fp[:i], "feed-server") {
+				for j := i + 1; j < len(fp); j++ {
+					out = append(out, j)
+				}
+			}
+		case "endpoint":
+			// #8104: `interfaces <if> [unit <u>] tunnel wireguard peer <p>
+			// endpoint`. WgPeerConfig.MarshalJSON has run this through
+			// RedactURL since the peer type gained a marshaller; the AST route
+			// did not, so a `user:token@host` endpoint rendered verbatim.
+			//
+			// Gated on `wireguard` for the same reason as `hostname`: the
+			// keyword is generic enough that an unqualified case would claim
+			// leaves the typed route says nothing about.
+			if containsAnyOf(fp[:i], "wireguard") {
+				for j := i + 1; j < len(fp); j++ {
+					out = append(out, j)
+				}
+			}
 		case "archive-sites":
 			// #7511: an archive TRANSFER url — `scp://user:pw@host/dir` — which
 			// lives only in the raw AST and is never promoted to a typed field,
