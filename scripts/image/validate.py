@@ -773,6 +773,47 @@ def guest_sh(inst, script):
                           capture_output=True, text=True).returncode == 0
 
 
+def guest_absent(inst, path):
+    """Return True iff `path` is OBSERVABLY absent in the guest (#7424 row 2).
+
+    The negative assertions this replaces ran an in-guest existence probe
+    through `guest(...)` and treated a zero return code as "the path is there",
+    which fails OPEN. `incus exec` exits non-zero both when the in-guest
+    `test -e` finds nothing AND when incus itself could not run the command --
+    instance not running, agent not up yet, connection refused. Only `== 0` was
+    tested, so those two are indistinguishable and every transport failure
+    scored as "absent, PASS". The unearned greens were the central negative
+    claims of scenarios A and C: "the factory boot installed no config" and
+    "the REJECT wrote nothing".
+
+    Note the asymmetry that hid this: the sibling POSITIVE assertions are
+    `if not guest_sh(...): fail(...)`, so a transport failure makes THEM fail
+    closed. Only the negatives were exposed, which is why the file looked
+    uniformly careful.
+
+    The fix is to require the guest to SAY which it is. A token can only be
+    produced by a shell that actually ran, so a transport failure yields no
+    token and is reported as an unobserved check rather than as absence. This
+    is the pattern the file already uses three times and states the reason for
+    at :384 ("a probe that silently produced nothing cannot be mistaken for a
+    clean run") and :704-706 ("a gate that could not observe the property it
+    exists to assert has not asserted it").
+    """
+    r = subprocess.run(
+        ["incus", "exec", inst, "--", "sh", "-c",
+         f'if [ -e {shlex.quote(path)} ]; then echo XPF_PRESENT; else echo XPF_ABSENT; fi'],
+        capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    if out == "XPF_ABSENT":
+        return True
+    if out == "XPF_PRESENT":
+        return False
+    fail(f"could not observe whether {path} exists in {inst} "
+         f"(rc={r.returncode}, stdout={out!r}, stderr={(r.stderr or '').strip()!r}) — "
+         "this is NOT evidence of absence. A gate that could not observe the "
+         "property it exists to assert has not asserted it (#7424)")
+
+
 class Harness:
     def __init__(self, qcow2, metadata, net, keep, verify_sig=True):
         self.qcow2, self.metadata, self.net, self.keep = qcow2, metadata, net, keep
@@ -1102,9 +1143,9 @@ class Harness:
         if not guest_sh(a, '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"'):
             fail("sshd effective config does not pin PermitEmptyPasswords no")
         self.assert_ab_kernel_channel(a)
-        if guest(a, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
+        if not guest_absent(a, "/etc/xpf/xpf.conf"):
             fail("unexpected /etc/xpf/xpf.conf")
-        if guest(a, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
+        if not guest_absent(a, "/etc/xpf/.day0-config-applied"):
             fail("unexpected day-0 stamp")
         if not guest_sh(a,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "no config medium found"'):
@@ -1348,9 +1389,9 @@ class Harness:
         if not guest_sh(c,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "REJECTED by commit-check"'):
             fail("day-0 loader did not log the commit-check REJECT")
-        if guest(c, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
+        if not guest_absent(c, "/etc/xpf/xpf.conf"):
             fail("invalid config was installed")
-        if guest(c, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
+        if not guest_absent(c, "/etc/xpf/.day0-config-applied"):
             fail("stamp written on REJECT")
         self.wait_fxp0_dhcp(c)
         if not guest_sh(c, '[ "$(hostname)" != xpf-day0-c ]'):
