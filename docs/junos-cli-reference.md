@@ -1482,8 +1482,11 @@ source NAT rule: r1
       Destination addresses: 0.0.0.0/0
     Action:                  pool nope
     Status:                  NOT INSTALLED — references an undefined pool
-    Number of sessions:      0
 ```
+
+(#7423 row 4 removed the per-rule `Number of sessions:` line this example used
+to end with. The zone-pair session total now prints once per rule-set instead;
+the `Status:` annotation this section documents is unaffected.)
 
 The annotation appears on `show security nat source rule detail`,
 `destination rule detail`, `static [rule [detail]]`, and `nptv6`. It is
@@ -1552,6 +1555,21 @@ source NAT rule: source-as-bci
   - Sub-fields at 4-space indent under Action.
 - **Counters:** `Translation hits`, `Successful sessions`, `Number of sessions` at 2-space indent.
 - Action `off` means NAT is explicitly disabled for that rule.
+
+### xpf divergence (#7423 rows 3-4)
+
+`Number of sessions` is a per-RULE counter in the capture. xpf cannot attribute
+a session to a NAT rule — a session carries ingress/egress zone ids and no rule
+identity — so there is nothing to attribute with. Rendering it in the captured
+shape printed one zone-pair total under every rule in the set, so five rules
+over four hundred sessions printed `400` five times and summing the column gave
+five times the truth. xpf reports the number it can actually measure, once per
+rule-set, labelled as the zone-pair aggregate it is.
+
+`Translation hits` renders `n/a (dataplane not armed)` when the dataplane has
+not reported. `Manager.ReadNATRuleCounter` is a map read with no error path, so
+an unarmed read returns `(zero, nil)` and is indistinguishable from a measured
+zero; the REST sibling already refuses rather than printing one (#5046).
 
 ---
 
@@ -1678,6 +1696,33 @@ ALG Status:
 - Each line: 2-space indent, name (~9 chars left-aligned), ` : ` separator (space-colon-space), value.
 - Values: `Enabled` or `Disabled` (capitalized).
 - **Note:** NOT per-node output (no node0/node1 headers). This is a single global output.
+
+### xpf divergence (#7423 row 6)
+
+xpf does **not** reproduce this row set, and the difference is deliberate.
+
+The capture above is real vSRX output. The pre-#7423 CLI cloned it literally —
+including the sample VALUES — so `show security alg` printed `H323 : Enabled`
+and seven more `Enabled` rows for ALGs this product has no code for. A capture
+is a record of what another box printed, not a description of local state;
+rendering one as local state is the defect. This section is left exactly as
+captured, because it is still the correct record of what Junos prints.
+
+All three xpf surfaces — CLI, gRPC and REST — render this stanza, and they
+share one wording authority (`ALGStatusText` / `ALGModeledProtos` in
+`pkg/config/alg_status_7423.go`) rather than three copies. Only the CLI ever had
+the fabricated rows, but all three printed `enabled`, which overstates every one
+of them; fixing the CLI alone would have left the three describing the same four
+ALGs differently, which `flow_tcp_timeouts_6539.go` calls always-a-bug.
+
+xpf renders the four ALGs `security alg` actually models (dns/ftp/sip/tftp) and
+reports what they do rather than that they are on: they tag the conntrack row
+(`alg_type_for_session`) and never pinhole a data channel, so none is
+`Enabled`. TFTP is weaker again — its wire bit has no consumer at all. Any
+`security alg <proto>` the operator configured for an unmodeled proto is
+rendered too, marked `configured (not implemented)`, since that stanza is
+accepted at commit (#4232) and would otherwise be invisible here. See
+`renderALG` in `pkg/cli/cli_show_security_objects.go`.
 
 ---
 

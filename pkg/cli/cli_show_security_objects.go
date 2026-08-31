@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -295,34 +297,52 @@ func (c *CLI) showALG() error {
 		fmt.Println("No active configuration")
 		return nil
 	}
-
-	alg := &cfg.Security.ALG
-	fmt.Println("ALG Status:")
-
-	printALG := func(name string, disabled bool) {
-		status := "Enabled"
-		if disabled {
-			status = "Disabled"
-		}
-		fmt.Printf("  %-9s: %s\n", name, status)
-	}
-
-	printALG("DNS", alg.DNSDisable)
-	printALG("FTP", alg.FTPDisable)
-	printALG("H323", false)
-	printALG("MGCP", false)
-	printALG("MSRPC", false)
-	printALG("PPTP", false)
-	printALG("RSH", true)
-	printALG("RTSP", false)
-	printALG("SCCP", false)
-	printALG("SIP", alg.SIPDisable)
-	printALG("SQL", true)
-	printALG("SUNRPC", false)
-	printALG("TALK", false)
-	printALG("TFTP", alg.TFTPDisable)
-	printALG("IKE-ESP", true)
-	printALG("TWAMP", true)
-
+	renderALG(os.Stdout, &cfg.Security.ALG)
 	return nil
+}
+
+// renderALG writes the `show security alg` body.
+//
+// #7423 row 6: this used to print SIXTEEN rows, twelve of them hard-coded
+// literals with no config behind them — eight of those claiming `Enabled` for
+// ALGs (H323, MGCP, MSRPC, PPTP, RTSP, SCCP, SUNRPC, TALK) that do not exist
+// anywhere in this product. `security alg` has exactly four schema children,
+// and the gRPC and REST surfaces render only those four, so the fabrication
+// was CLI-only.
+//
+// The four real ones are also reported more carefully than "Enabled". Nothing
+// in the userspace dataplane does data-channel pinholing: the ALG bits reach
+// exactly one consumer, `alg_type_for_session`, which stamps a tag on the
+// conntrack row for `show security flow session` and nothing else. So
+// "enabled" would overstate three of them, and TFTP has no `alg_type` at all —
+// its wire bit is `#[allow(dead_code)]` in the Rust helper, whose own comment
+// says it "has no consumer here".
+//
+// Failure direction is availability, not a security hole: an operator
+// believing an ALG is inspecting traffic may leave a pinhole unconfigured.
+//
+// Deleting the ghost rows alone would have introduced a SECOND honesty defect
+// in the opposite direction. `security alg <proto>` for a proto outside the
+// four is ACCEPTED at commit and recorded in UnsupportedProtos (#4232), which
+// drives an accepted-but-inert advisory — so an operator can have `alg h323`
+// in the running config. Printing only the four would make that stanza
+// invisible here, where before it at least appeared (as a fabricated
+// `Enabled`). Those protos are therefore rendered too, marked as what they
+// are, which is also what makes the closing note true.
+//
+// It takes an io.Writer rather than printing directly so the rows can be
+// asserted without a configstore round-trip.
+func renderALG(w io.Writer, alg *config.ALGConfig) {
+	fmt.Fprintln(w, "ALG Status:")
+
+	printALG := func(name, status string) {
+		fmt.Fprintf(w, "  %-9s: %s\n", name, status)
+	}
+	for _, proto := range config.ALGModeledProtos() {
+		printALG(config.ALGDisplayName(proto), config.ALGStatusText(proto, alg.ALGDisabled(proto)))
+	}
+	for _, proto := range alg.ALGUnmodeledConfigured() {
+		printALG(config.ALGDisplayName(proto), config.ALGStatusUnmodeled())
+	}
+	fmt.Fprintln(w, "  (DNS, FTP, SIP and TFTP are the only ALGs this product models)")
 }

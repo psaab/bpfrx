@@ -169,17 +169,17 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 		if cfg == nil {
 			buf.WriteString("No active configuration\n")
 		} else {
+			// #7423 row 6: see the note on the gRPC copy. `enabled` overstated
+			// all four; wording, proto set and order are shared via pkg/config.
 			alg := cfg.Security.ALG
-			boolStr := func(b bool) string {
-				if b {
-					return "enabled"
-				}
-				return "disabled"
+			for _, proto := range config.ALGModeledProtos() {
+				fmt.Fprintf(&buf, "%-5s %s\n", config.ALGDisplayName(proto)+":",
+					config.ALGStatusText(proto, alg.ALGDisabled(proto)))
 			}
-			fmt.Fprintf(&buf, "SIP:  %s\n", boolStr(!alg.SIPDisable))
-			fmt.Fprintf(&buf, "FTP:  %s\n", boolStr(!alg.FTPDisable))
-			fmt.Fprintf(&buf, "TFTP: %s\n", boolStr(!alg.TFTPDisable))
-			fmt.Fprintf(&buf, "DNS:  %s\n", boolStr(!alg.DNSDisable))
+			for _, proto := range alg.ALGUnmodeledConfigured() {
+				fmt.Fprintf(&buf, "%-5s %s\n", config.ALGDisplayName(proto)+":",
+					config.ALGStatusUnmodeled())
+			}
 		}
 
 	case "dynamic-address":

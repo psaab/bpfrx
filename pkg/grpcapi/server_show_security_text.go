@@ -903,11 +903,19 @@ func (s *Server) showAlg(cfg *config.Config, buf *strings.Builder) {
 	if cfg == nil {
 		buf.WriteString("No active configuration\n")
 	} else {
+		// #7423 row 6: these printed `enabled`, which overstates every one of
+		// them; nothing in the dataplane pinholes a data channel. Wording, proto
+		// set and order come from pkg/config so this surface cannot drift from
+		// the CLI and REST copies. Only the layout is local.
 		alg := cfg.Security.ALG
-		fmt.Fprintf(buf, "SIP:  %s\n", boolStatus(!alg.SIPDisable))
-		fmt.Fprintf(buf, "FTP:  %s\n", boolStatus(!alg.FTPDisable))
-		fmt.Fprintf(buf, "TFTP: %s\n", boolStatus(!alg.TFTPDisable))
-		fmt.Fprintf(buf, "DNS:  %s\n", boolStatus(!alg.DNSDisable))
+		for _, proto := range config.ALGModeledProtos() {
+			fmt.Fprintf(buf, "%-5s %s\n", config.ALGDisplayName(proto)+":",
+				config.ALGStatusText(proto, alg.ALGDisabled(proto)))
+		}
+		for _, proto := range alg.ALGUnmodeledConfigured() {
+			fmt.Fprintf(buf, "%-5s %s\n", config.ALGDisplayName(proto)+":",
+				config.ALGStatusUnmodeled())
+		}
 	}
 }
 

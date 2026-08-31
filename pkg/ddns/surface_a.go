@@ -281,13 +281,17 @@ const (
 // the successfully-owned ones), what is currently published, the last-published
 // time, and the last error.
 type SurfaceAStatusView struct {
-	Interface     string
-	Unit          int
-	Family        int
-	FQDN          string
-	Provider      string
-	State         string // one of the SurfaceAState* constants (#2843)
-	Published     string // current published address ("" = none)
+	Interface string
+	Unit      int
+	Family    int
+	FQDN      string
+	Provider  string
+	State     string // one of the SurfaceAState* constants (#2843)
+	// Published is the last CONFIRMED published address ("" = none confirmed).
+	// It is NOT "what is live right now" when State is pending: see the #7423
+	// note in StatusViews for why that is unknowable during a publish
+	// write-ahead window (#5334).
+	Published     string
 	LastPublished time.Time
 	LastError     string
 	LastErrorAt   time.Time
@@ -2099,7 +2103,34 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 		}
 		owned, isOwned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
 		if isOwned {
+			// #7423 row 5: while PublishPending is true, AddrText holds the
+			// DESIRED address — "the phantom desired value that AddrText holds
+			// until the wire confirms", as PriorAddrText's own doc puts it.
+			// Reporting AddrText as `Published` told the operator the new
+			// address was live at exactly the moment it was not, which is the
+			// same window the State below was mis-reporting.
+			//
+			// What this field means during a pending publish is deliberately
+			// LAST CONFIRMED, not "what is live". Those differ, and the
+			// difference is not knowable here: per the #5334 analysis in
+			// README.md a pending record has the byte-identical shape for two
+			// crash windows — one where the prior value is still live, one
+			// where the new value already landed and only the confirm-save was
+			// lost. `withdrawOwnedLocked` deletes BOTH candidates for exactly
+			// this reason. So no single address in this column can be asserted
+			// live; the honest pairing is the last value the system actually
+			// confirmed, next to a State that says `pending`.
+			//
+			// PriorAddrText is used UNCONDITIONALLY when pending, including
+			// when it is empty. An empty prior means a FIRST publish that has
+			// not confirmed — nothing has ever been live at this name — and the
+			// column renders "-". Falling back to AddrText there would
+			// reintroduce the exact defect for the one case where the claim is
+			// least supportable.
 			v.Published = owned.AddrText
+			if owned.PublishPending {
+				v.Published = owned.PriorAddrText
+			}
 			if owned.FQDN != "" {
 				v.FQDN = owned.FQDN
 			}
@@ -2111,8 +2142,29 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 			v.LastErrorAt = rt.lastErrAt
 		}
 		switch {
-		case isOwned:
+		// #7423 row 5: ownership is not settlement. A record written ahead of
+		// the wire add carries PublishPending=true, and its own type doc says
+		// "with PublishPending=true the record is NOT settled" — yet this arm
+		// consulted only `isOwned`, so after a crash in the write-ahead window
+		// the operator read `published` for an address public DNS had never
+		// served.
+		//
+		// This is deliberately a NARROWING of the owned arm rather than a
+		// reordering of the switch. The obvious-looking fix — moving the
+		// `lastErr` arm above `isOwned`, since the issue observes that owned
+		// wins over it — would make a healthy settled scope that once hit a
+		// transient error report `error` while its RR is live and correct. The
+		// pending bit is what actually distinguishes the two cases, and it
+		// covers the reported symptom too: a re-publish that keeps failing
+		// leaves PublishPending=true (set by the write-ahead save at every
+		// attempt, cleared only by the confirm-save), so such a scope now falls
+		// through to `pending` on its own.
+		case isOwned && !owned.PublishPending:
 			v.State = SurfaceAStatePublished
+		case isOwned && owned.PublishPending:
+			// Desired, not confirmed. `pending` already means exactly this
+			// elsewhere in this switch: configured, not settled on the wire.
+			v.State = SurfaceAStatePending
 		case rt != nil && rt.noBackend:
 			v.State = SurfaceAStateUnpublished
 		case rt != nil && rt.lastErr != "":

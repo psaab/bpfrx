@@ -1,6 +1,6 @@
 {
   "address-book": "Addresses:\n  host1                10.0.1.1/32\n",
-  "alg": "SIP:  disabled\nFTP:  enabled\nTFTP: enabled\nDNS:  enabled\n",
+  "alg": "DNS:  session-tagged (no data-channel pinholing)\nFTP:  session-tagged (no data-channel pinholing)\nSIP:  disabled\nTFTP: configured (not enforced)\n",
   "backup-router": "Backup router: 192.0.2.1\n  Destination: 10.0.0.0/8\n",
   "bfd-peers": "FRR not available\n",
   "buffers": "Userspace Buffer Utilization:\n  unavailable: helper status does not include bounded userspace capacity gauges\n  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n  dynamic status fields: session_table_entries/max_sessions, per_binding[].flow_cache_capacity, neighbor_cache_capacity\n  bindings[] mirrors with the same fields are also accepted\n\nUserspace Status Counters:\nCounter                          Scope                           Value\n----------------------------------------------------------------------\nSYN-cookie challenges            aggregate                           2\nSYN-cookie ACK valid             aggregate                           5\n",

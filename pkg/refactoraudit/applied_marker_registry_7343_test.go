@@ -143,6 +143,12 @@ var markerFiles7343 = map[string]markerFile{
 			{`rt.lastPublished = now`, 1},
 			{`v.LastPublished = rt.lastPublished`, 2},
 			{`v.Published = owned.AddrText`, 1},
+			// #7423 row 5: the pending-window override. Same read-out into the
+			// status view as the line above, and it narrows what the view
+			// claims rather than widening it -- while PublishPending is set the
+			// view reports the last CONFIRMED address instead of the desired
+			// one, which is the safe direction for a convergence marker.
+			{`v.Published = owned.PriorAddrText`, 1},
 		},
 	},
 	"pkg/daemon/rg_state.go": {
