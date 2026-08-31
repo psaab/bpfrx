@@ -280,6 +280,11 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			// a trailing note instead of a "read failed" warning naming a fault
 			// that does not exist.
 			var unpublished int
+			// #8177: rows whose counter was NOT read because policy-stats is
+			// disabled and the rule carries no `count`. Counted separately from
+			// `unpublished` because they are different facts: unpublished means
+			// the helper has not reported yet, this means nobody looked.
+			var statsDisabled int
 			// #4344: read the whole policy set from ONE snapshot (O(P+C), one
 			// brief dataplane lock) via the #3965 bulk reader instead of a
 			// per-policy ReadPolicyCounters loop. Built only when the dataplane
@@ -340,6 +345,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 								readErr = err
 							}
 						}
+					} else if !statsEnabled && !pol.Count {
+						// #8177: the "0" above was never read. Explicit rather
+						// than an `else`, because the other way into this branch
+						// is readPolicy == nil (dataplane not loaded), which is
+						// a different fact and must not be counted here.
+						statsDisabled++
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						zpp.FromZone, zpp.ToZone, pol.Name, action, hits)
@@ -383,6 +394,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 								readErr = err
 							}
 						}
+					} else if !statsEnabled && !pol.Count {
+						// #8177: the "0" above was never read. Explicit rather
+						// than an `else`, because the other way into this branch
+						// is readPolicy == nil (dataplane not loaded), which is
+						// a different fact and must not be counted here.
+						statsDisabled++
 					}
 					// #3286/#4626: a scoped global (#3148) shows its zone SET
 					// in the From/To columns instead of the all-zones "*"; an
@@ -399,6 +416,17 @@ func (c *CLI) handleShowSecurity(args []string) error {
 			if unpublished > 0 {
 				fmt.Printf("note: %d policy counter(s) not yet published by the dataplane "+
 					"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
+			}
+			// #8177: the detail/brief table renders a well-formed "0" for every
+			// row when the knob is off, and an operator reads "this policy has
+			// not matched" when the surface was never asked to look. Wording is
+			// byte-identical to the #7776 hit-count twins so the four renderers
+			// cannot drift into saying different things about one state.
+			if statsDisabled > 0 {
+				fmt.Printf("note: %d policy count(s) read 0 because policy-stats is disabled "+
+					"system-wide, not because no traffic matched (enable with "+
+					"`set security policy-stats system-wide enable`, or add `count` to an "+
+					"individual policy)\n", statsDisabled)
 			}
 			return nil
 		}

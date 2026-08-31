@@ -202,6 +202,9 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		pi := PolicyInfo{
 			FromZone: zpp.FromZone,
 			ToZone:   zpp.ToZone,
+			// #8177: see the field comment in types.go for why this
+			// system-wide knob is repeated per zone-pair block.
+			PolicyStatsEnabled: statsEnabled,
 		}
 		for i, rule := range zpp.Policies {
 			// #3476: skip a nil rule (Policies is []*Policy) like the
@@ -307,8 +310,9 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// from the loop above).
 	if len(cfg.Security.GlobalPolicies) > 0 {
 		pi := PolicyInfo{
-			FromZone: "*",
-			ToZone:   "*",
+			FromZone:           "*",
+			ToZone:             "*",
+			PolicyStatsEnabled: statsEnabled, // #8177
 		}
 		for i, rule := range cfg.Security.GlobalPolicies {
 			if rule == nil {

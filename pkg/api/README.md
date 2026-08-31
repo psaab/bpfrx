@@ -118,6 +118,31 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     - gRPC `GetPolicies`: the additive `PolicyRule.hit_counters_unavailable`
       (field 23) carries the same flag; the RPC succeeds. The remote CLI
       renders `Hit count: not available` / an `n/a` Hits cell.
+
+    **Distinct from policy-stats being OFF (#8177).** `hit_counters_unavailable`
+    means counter-ELIGIBLE but unanswered; a rule that is not eligible is
+    signalled by `count=false`. Eligibility has TWO inputs, `statsEnabled ||
+    rule.count`, and only the second used to be on the wire — so "stats on,
+    count=false" (the counter WAS read; 0 means no traffic) and "stats off,
+    count=false" (never read; 0 means nothing) serialized identically. Both
+    structured surfaces now carry the system-wide knob: `policy_stats_enabled`
+    on `GetPoliciesResponse`, and the same field repeated on each REST
+    `PolicyInfo` block — repeated because this endpoint's payload is a bare
+    array inside the generic envelope, so there is no per-endpoint place to hang
+    a system-wide field without breaking `data`'s shape. Setting
+    `hit_counters_unavailable` for the stats-off case was the tempting shortcut
+    and would redefine a shipped field rather than add one.
+
+    The four TEXT surfaces (CLI `hit-count` and `brief`, gRPC `hit-count` and
+    `detail`) instead print a trailing `note: N policy count(s) read 0 because
+    policy-stats is disabled system-wide`. The wording is byte-identical across
+    all four; N is NOT, and must not be made so — each surface renders a
+    different row population (the hit-count table includes the implicit
+    default-policy row, the brief and detail views do not).
+
+    The Prometheus collector is deliberately NOT in that list: it SKIPS the
+    series rather than emitting a zero, because an absent sample is not a zero
+    sample and a time series has nowhere to carry the note.
     - CLI `show security policies hit-count` / `brief` and the gRPC text
       hit-count / detail renderers: the count cell reads `n/a` with a
       trailing `note: N policy counter(s) not yet published by the
