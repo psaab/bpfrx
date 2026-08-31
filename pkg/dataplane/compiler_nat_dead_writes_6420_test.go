@@ -141,14 +141,6 @@ func (d *natWriteTripwireDP) DeleteStaleStaticNAT(map[StaticNATKeyV4]bool, map[S
 	d.record("DeleteStaleStaticNAT")
 }
 
-func (d *natWriteTripwireDP) DeleteStaleNAT64(uint32, map[NAT64PrefixKey]bool) {
-	d.record("DeleteStaleNAT64")
-}
-
-func (d *natWriteTripwireDP) ZeroStaleNATPoolConfigs(uint32) {
-	d.record("ZeroStaleNATPoolConfigs")
-}
-
 // TestNATWriteTripwireIsArmed_6420 is the tripwire's own non-vacuity control.
 // Without it, a tripwire whose overrides silently stopped shadowing the
 // embedded shim (a signature drift promotes the call to discardingDataPlane's

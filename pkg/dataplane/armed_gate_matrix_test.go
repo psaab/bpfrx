@@ -93,9 +93,7 @@ var managerMethodClasses = map[string]string{
 	"DeleteStaleDNATStatic":       "class2",
 	"DeleteStaleDNATStaticV6":     "class2",
 	"DeleteStaleStaticNAT":        "class2",
-	"DeleteStaleNAT64":            "class2",
 	"ZeroStaleScreenConfigs":      "class2",
-	"ZeroStaleNATPoolConfigs":     "class2",
 	"DeleteStaleIfaceFilter":      "class2",
 	"ZeroStaleFilterConfigs":      "class2",
 
@@ -238,8 +236,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 142 {
-		t.Fatalf("exported *Manager method inventory = %d, want 142 (the 164 census minus the 23 NAT write methods retired in #7268, plus ArmCoverageSummary added in #7191 — the writers for snat_rules, static_nat_*, nptv6_rules, nat_pool_*, snat_egress_ips and nat64_* maps, none of which the AF_XDP shim declares); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 140 {
+		t.Fatalf("exported *Manager method inventory = %d, want 140 (the 164 census minus the 23 NAT write methods retired in #7268, plus ArmCoverageSummary added in #7191, minus DeleteStaleNAT64 and ZeroStaleNATPoolConfigs retired in #7804 — the writers for snat_rules, static_nat_*, nptv6_rules, nat_pool_*, snat_egress_ips and nat64_* maps, none of which the AF_XDP shim declares); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {
@@ -1209,16 +1207,11 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_stale.go", "DeleteStaleDNATStaticV6", "map", `"dnat_table_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleIfaceFilter", "map", `"iface_filter_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleIfaceZone", "map", `"iface_zone_map"`, "optional"},
-	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_configs"`, "optional"}, // leg: multi-map stale cleanups process ALL maps (continuation)
-	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_prefix_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v4"`, "optional"}, // (same continuation pattern)
 	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleVlanIface", "map", `"vlan_iface_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleZonePairPolicies", "map", `"zone_pair_policies"`, "optional"},
 	{"maps_stale.go", "ZeroStaleFilterConfigs", "map", `"filter_configs"`, "optional"},
-	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_configs"`, "optional"}, // (same)
-	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_ips_v4"`, "optional"},
-	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_ips_v6"`, "optional"},
 	{"maps_stale.go", "ZeroStaleScreenConfigs", "map", `"screen_configs"`, "optional"},
 	{"maps_stats.go", "GetMapStats", "map", "<dynamic>", "optional"}, // leg: every descriptor reported (continuation)
 }

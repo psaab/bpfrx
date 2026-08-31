@@ -218,9 +218,7 @@ func (discardingDataPlane) DeleteStaleDNATStatic(written map[DNATKey]bool)     {
 func (discardingDataPlane) DeleteStaleDNATStaticV6(written map[DNATKeyV6]bool) {}
 func (discardingDataPlane) DeleteStaleStaticNAT(writtenV4 map[StaticNATKeyV4]bool, writtenV6 map[StaticNATKeyV6]bool) {
 }
-func (discardingDataPlane) DeleteStaleNAT64(count uint32, writtenPrefixes map[NAT64PrefixKey]bool) {}
-func (discardingDataPlane) ZeroStaleScreenConfigs(maxID uint32)                                    {}
-func (discardingDataPlane) ZeroStaleNATPoolConfigs(startID uint32)                                 {}
+func (discardingDataPlane) ZeroStaleScreenConfigs(maxID uint32) {}
 func (discardingDataPlane) GetPersistentNAT() *PersistentNATTable {
 	var z *PersistentNATTable
 	return z

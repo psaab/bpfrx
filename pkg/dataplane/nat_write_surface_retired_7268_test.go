@@ -26,6 +26,29 @@ import (
 // and SetDNATEntry/SetDNATEntryV6 are called on the HA session-sync receive
 // path (session_store.go PutClusterSyncedV4). Those are live writes into a live
 // map and must keep working.
+// #7804 Q2, answered here rather than left open in the issue.
+//
+// The issue asks, of the three stale sweepers that DO have production callers
+// (DeleteStaleZonePairPolicies -> compiler.go, ZeroStaleScreenConfigs ->
+// compiler_iface.go, ZeroStaleFilterConfigs -> compiler_filter.go), whether
+// writing to a map no loaded program reads is work worth doing on the commit
+// path at all.
+//
+// Measured: zone_pair_policies, screen_configs and filter_configs are each
+// declared ZERO times in userspace-xdp/src/lib.rs, so those writes are inert
+// for the same reason the retired ones were. But the cost is already nil, and
+// that is the part the issue could not see: every one of them opens with
+// lookupMapLocked, which reads m.maps -- populated only by
+// publishShimRegistryLocked from the shim's own collection. On the deployed
+// userspace dataplane the name is absent, `present` is false, and the function
+// returns before constructing a key. The commit-path cost is one
+// mutex-guarded map miss, not a write.
+//
+// So the answer is: not worth removing for cost, and removing them is NOT the
+// same change as this one. These have live callers, so retiring them edits the
+// COMPILE PATH rather than deleting an unreferenced declaration -- a different
+// blast radius and its own review. Deliberately out of scope here.
+
 func TestRetiredNATWriteSurfaceStaysOff(t *testing.T) {
 	retired := []string{
 		"SetSNATRule", "SetSNATRuleV6", "ClearSNATRules", "ClearSNATRulesV6",
@@ -37,6 +60,13 @@ func TestRetiredNATWriteSurfaceStaysOff(t *testing.T) {
 		"SetNAT64Config", "SetNAT64Count", "ClearNAT64Configs",
 		"ClearDNATStatic", "ClearDNATStaticV6",
 		"DeleteStaleSNATRules", "DeleteStaleSNATRulesV6",
+		// #7804: the same argument, measured again for the two stale sweepers
+		// #7268 left behind. nat64_configs, nat64_prefix_map, nat_pool_configs
+		// and nat_pool_ips_v4/v6 are each declared 0 times in
+		// userspace-xdp/src/lib.rs (dnat_table, the control, is declared 9
+		// times) -- so these wrote to maps that do not exist on the deployed
+		// dataplane, and they had no production caller to write from either.
+		"DeleteStaleNAT64", "ZeroStaleNATPoolConfigs",
 	}
 
 	dpType := reflect.TypeOf((*DataPlane)(nil)).Elem()
