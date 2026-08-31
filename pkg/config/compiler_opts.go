@@ -2221,6 +2221,24 @@ type compileOpts struct {
 	// lenientRethVRRPGroupID.
 	lenientVRRPVIPCount bool
 
+	// lenientVRRPVIPEmpty (#7577) downgrades the VRRP empty-virtual-address gate
+	// (validateVRRPVIPEmptyStrict) from a hard compile error to a cfg.Warnings
+	// entry. An explicit `vrrp-group` with no parseable virtual address claims
+	// its group and advertises nothing: sendAdvert emits a per-family advert only
+	// when that family's slice is non-empty, so Marshal is never reached and its
+	// MinAdvertAddrCount floor never fires, while becomeMaster returns true
+	// regardless and seats the instance in the election as a silent
+	// non-advertising MASTER.
+	//
+	// UNLIKE the #6779 oversized case, there is NO pkg/vrrp runtime guard behind
+	// this downgrade -- UpdateInstances and becomeMaster both accept a VIP-less
+	// instance today. So a leniently-loaded empty group keeps exactly the current
+	// behaviour rather than being held out of the election. That is intended: the
+	// tolerant path must not brick a node over a group that is merely inert, and
+	// an empty set claims no addresses, so unlike an oversized one it cannot
+	// produce a duplicate-address collision.
+	lenientVRRPVIPEmpty bool
+
 	// lenientDNATToScope (#3444) downgrades the destination-NAT rule-set
 	// `to` scope reject (validateDNATRuleSetToScopeAST) from a hard compile
 	// error to a cfg.Warnings entry. Junos destination NAT rule-sets have
@@ -2587,6 +2605,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
 		lenientVRRPVIPCount:                    true,
+		lenientVRRPVIPEmpty:                    true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
 		lenientNATTerminalAction:               true,

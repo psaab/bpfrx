@@ -156,6 +156,30 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #7577 VRRP empty-virtual-address gate -- the LOWER-bound sibling of the
+	// #6779 cardinality gate above. Strict on commit / commit-check
+	// (hard-reject an explicit `vrrp-group` whose virtual-address set is empty
+	// or entirely unparseable). sendAdvert emits a per-family advert only when
+	// that family's address slice is non-empty, so with no parseable address
+	// Marshal is never reached and its MinAdvertAddrCount floor never fires --
+	// yet becomeMaster returns true regardless, seating the instance in the
+	// election as a MASTER that advertises nothing and is indistinguishable
+	// from a healthy one on every operator surface. Explicit groups ONLY:
+	// CollectRethInstances already skips a RETH with no VIPs, so a RETH-derived
+	// instance is never synthesized and checking one would reject correct
+	// config. Lenient on load / peer-sync (#1960 no-brick) -- and note that,
+	// unlike #6779, no pkg/vrrp runtime guard backs that downgrade, so a
+	// leniently-loaded empty group keeps today's behaviour rather than being
+	// held out of the election.
+	if err := validateVRRPVIPEmptyStrict(cfg); err != nil {
+		if opts.lenientVRRPVIPEmpty {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("vrrp empty virtual-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
 	// reserved sentinel — "junos-global" is reclassified by the userspace
