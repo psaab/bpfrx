@@ -1289,7 +1289,14 @@ impl ForwardingDisposition {
     ///     tunnel-delivery channel) — this is the intended destination.
     ///   - `NoRoute`: userspace has no route, but the kernel FIB may
     ///     (e.g. a route the helper has not yet learned); let the kernel
-    ///     try, rate-limited.
+    ///     try, rate-limited. #7480: eligibility here is necessary but no
+    ///     longer sufficient — the NoRoute arm in `poll_descriptor`
+    ///     adjudicates the computable zone pair first and downgrades a
+    ///     denied frame to `PolicyDenied`, so only a POLICY-PERMITTED
+    ///     NoRoute frame reaches the kernel. The disposition stays eligible
+    ///     because #7409's importer bounds the FIB divergence without
+    ///     closing it; dropping it outright would black-hole every learned
+    ///     destination between snapshot pushes.
     ///   - `MissingNeighbor`: route exists, ARP/NDP unresolved; the kernel
     ///     can resolve and forward (the userspace prober runs in parallel).
     ///

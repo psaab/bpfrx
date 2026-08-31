@@ -237,3 +237,52 @@ fn raw_reinject_primitive_caller_set_is_pinned_7480() {
          which is what a future caller reads before bypassing the predicate."
     );
 }
+
+/// #7480: the NoRoute arm must actually ADJUDICATE before the trailing
+/// chokepoint, and must express its refusal as a `PolicyDenied` downgrade.
+///
+/// WHY A SOURCE GUARD. Same reason as the two above: the call site is inside
+/// `poll_binding_process_descriptor`, which no test in this crate can drive (it
+/// needs a live binding, a UMEM and a descriptor ring). The policy SEMANTICS are
+/// unit-tested against `noroute_policy_denial` directly; what no behavioural test
+/// in this crate can see is whether the arm still calls it. Every existing cargo
+/// test passed both before and after the behaviour change, which is the
+/// demonstration rather than the assumption.
+///
+/// FAIL-ON-REVERT: delete the adjudication from the NoRoute arm, or stop
+/// downgrading to `PolicyDenied` (so the frame stays slow-path eligible and is
+/// handed to the kernel FIB), and this reds.
+#[test]
+fn noroute_arm_adjudicates_before_reinjecting_7480() {
+    let path = repo_src().join("afxdp/poll_descriptor/mod.rs");
+    let lines = code_lines(&path);
+
+    let start = lines
+        .iter()
+        .position(|l| l.contains("ForwardingDisposition::NoRoute =>"))
+        .expect("the NoRoute arm is gone from poll_descriptor");
+    // The arm ends where the next disposition arm begins.
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.contains("ForwardingDisposition::MissingNeighbor =>"))
+        .map(|off| start + 1 + off)
+        .expect("the MissingNeighbor arm no longer follows NoRoute; re-anchor this guard");
+
+    let arm = lines[start..end].join("\n");
+
+    assert!(
+        arm.contains("noroute_policy_denial"),
+        "the NoRoute arm no longer adjudicates the zone pair. Without it a NoRoute \
+         frame is slow-path eligible and the trailing #1913 chokepoint hands it to \
+         the kernel FIB, which forwards it with no zone policy, session, NAT or \
+         screen — the #6664 bypass, on the leg an attacker steers by choosing the \
+         destination."
+    );
+    assert!(
+        arm.contains("ForwardingDisposition::PolicyDenied"),
+        "the NoRoute arm evaluates policy but no longer downgrades a denied frame \
+         to PolicyDenied. The downgrade IS the enforcement: it is what makes the \
+         existing chokepoint refuse the frame and account the fail-closed drop. \
+         Evaluating without downgrading is a policy check whose result is discarded."
+    );
+}

@@ -77,6 +77,85 @@ pub(super) fn zone_pair_for_flow_with_override(
 /// Returns `(0, 0)` segments for ifindexes not in the zone maps; the
 /// caller treats `0` as "unknown" and falls back to default policy.
 #[inline]
+/// #7480: the NoRoute slow-path adjudication decision, extracted so it can be
+/// tested.
+///
+/// A `NoRoute` frame is slow-path eligible, so before #7480 it was reinjected to
+/// the kernel FIB with no zone policy, session, NAT or screen — and nothing
+/// downstream re-checks it. The destination is attacker-chosen, which is what
+/// makes it the steerable half of #6664.
+///
+/// This lives here, as a function, for one reason: the call site is the NoRoute
+/// arm of `poll_binding_process_descriptor`, which NO test in this crate can
+/// drive (it needs a live binding, a UMEM and a descriptor ring — the same
+/// reason #6664 had to use a source guard). Inlining the decision there would
+/// make it unbindable; as a function the policy semantics are unit-testable and
+/// only the wiring needs a source guard.
+///
+/// Returns `Some(result)` when the flow is DENIED and the caller must downgrade
+/// the disposition to `PolicyDenied`; `None` when it is permitted and the
+/// kernel delegation stands.
+///
+/// `ports` carries the flow-backed vs flowless distinction in ONE place, which
+/// is the part that is easy to get wrong:
+///   * `Some((src, dst))` — a real flow. Evaluated with its ports and
+///     `l4_present = true`, so a port-bearing permit term still matches and a
+///     permitted flow is not over-gated into a false drop.
+///   * `None` — a flowless packet (non-first fragment / no L4). Evaluated with
+///     ports 0 and `l4_present = false`, so port-bearing terms fail CLOSED while
+///     address/protocol/`any` terms still match. Parity with the #3291 flowless
+///     ForwardCandidate gate and the #4024 MissingNeighbor arm.
+///
+/// WHAT THIS ACTUALLY DECIDES FOR NoRoute, stated plainly so no one reads more
+/// into the generality of the signature than is there. Both `NoRoute`
+/// constructors in `fib.rs` set `egress_ifindex: 0`, so the caller always
+/// resolves `to_zone_id = 0` — the #3110 unzoned sentinel. #3110 makes a flow
+/// with an unknown egress zone ineligible for BOTH zone-pair policies and
+/// `junos-global`, so every NoRoute evaluation falls through to the DEFAULT
+/// action. Consequences worth knowing before changing this:
+///
+///   * on a Junos-default deny box a NoRoute frame now DROPS — the intended fix,
+///     and availability-visible on upgrade;
+///   * an operator's `permit` rule for the ingress zone pair does NOT rescue it,
+///     because no zone-pair rule is even consulted;
+///   * the `ports` distinction below therefore does not change the outcome on
+///     TODAY's only call path. It is honoured anyway so the helper stays correct
+///     for a caller that supplies a resolved egress zone, and it is unit-tested
+///     as a contract rather than left as an untested claim — but do not read the
+///     port handling as load-bearing for NoRoute.
+pub(in crate::afxdp) fn noroute_policy_denial(
+    policy: &crate::policy::PolicyState,
+    from_zone_id: u16,
+    to_zone_id: u16,
+    src_ip: std::net::IpAddr,
+    dst_ip: std::net::IpAddr,
+    protocol: u8,
+    ports: Option<(u16, u16)>,
+    policy_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+) -> Option<crate::policy::PolicyEvaluationResult> {
+    let l4_present = ports.is_some();
+    let (src_port, dst_port) = ports.unwrap_or((0, 0));
+    let result = crate::policy::evaluate_policy_result_l3_aware(
+        policy,
+        from_zone_id,
+        to_zone_id,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        policy_icmp,
+        packet_len,
+        l4_present,
+    );
+    if matches!(result.action, crate::policy::PolicyAction::Permit) {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 pub(super) fn zone_pair_ids_for_flow_with_override(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -201,3 +280,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests_icmp_family_7520.rs"]
 mod tests_icmp_family_7520;
+// #7480: the NoRoute slow-path adjudication cells.
+#[cfg(test)]
+#[path = "tests_noroute_adjudication_7480.rs"]
+mod tests_noroute_adjudication_7480;
