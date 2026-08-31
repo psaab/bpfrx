@@ -540,3 +540,8 @@ pub(crate) struct CoSActiveFlowCountStatus {
     #[serde(rename = "active_flow_count", default)]
     pub active_flow_count: u32,
 }
+
+// #7689: the exhaustive-literal guard for this file's CoSSchedulerSnapshot.
+#[cfg(test)]
+#[path = "cos_literal_guard_7689.rs"]
+mod cos_literal_guard_7689;
