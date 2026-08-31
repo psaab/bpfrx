@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -106,6 +107,20 @@ func (d *Daemon) shellCommitConfirmedFn() func(context.Context, int) (*config.Co
 	return func(ctx context.Context, minutes int) (*config.Config, error) {
 		return d.commitConfirmedAndApplyOperator(ctx, configstore.InternalCommitter(), minutes)
 	}
+}
+
+// grpcRunErrIsFatal reports whether an error from grpcapi Server.Run must END
+// the daemon rather than be logged and survived (#8233).
+//
+// Named rather than inlined at the call site so it can be bound by a test: an
+// `errors.Is` buried in a goroutine can be deleted without changing anything a
+// test observes, and the condition it selects for is the whole point of #8233.
+//
+// Only the management-port-held case. Every other Run error stays non-fatal,
+// which is the pre-#8233 behaviour and is correct for the faults the listener
+// supervisor exists to ride out.
+func grpcRunErrIsFatal(err error) bool {
+	return errors.Is(err, grpcapi.ErrManagementPortHeld)
 }
 
 // startGRPCServer constructs and launches the gRPC API server goroutine.
@@ -269,6 +284,14 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		defer wg.Done()
 		if err := grpcSrv.Run(ctx); err != nil {
 			slog.Error("gRPC server error", "err", err)
+			// #8233: a management port held by another xpfd is not a fault to
+			// log and survive. Running on means a second daemon writing to the
+			// same host and the same epoch files with every gRPC-driven surface
+			// dead and no external signal (#8195). Everything else Run can
+			// return stays non-fatal, exactly as before.
+			if grpcRunErrIsFatal(err) {
+				d.signalFatal(err)
+			}
 		}
 	}()
 	slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)

@@ -991,8 +991,11 @@ type heartbeatAuthState struct {
 	//     #6169 spent real effort removing (see the HANGING-store case below):
 	//     fail-open on a wedged fsync buys nothing over today, fail-closed lets
 	//     a disk fault refuse a healthy peer.
-	//   - CROSS-PROCESS LOCKING on that path, for the same SO_REUSEPORT reason
-	//     withEpochFileLock exists.
+	//   - CROSS-PROCESS LOCKING on that path, for the same concurrent-incarnation
+	//     reason withEpochFileLock exists. (Not SO_REUSEPORT: that was this
+	//     comment's stated reason until #8233 and it was false for the primary
+	//     listener. The conclusion is unaffected — overlapping incarnations are
+	//     still reachable.)
 	//   - It STRICTLY WORSENS the legitimate rollback, which is the common case
 	//     and the one with no attacker in it. Today a restart clears the latch
 	//     and the downgraded peer is accepted. With the latch durable, a

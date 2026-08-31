@@ -894,8 +894,10 @@ func (m *Manager) releaseBootEpochRefine() bool {
 // restart recovery (systemd Type=simple, TimeoutStopSec=20) the old unit is
 // reaped — SIGTERM, then SIGKILL at 20 s — BEFORE the new one starts, so a
 // restart never contends for this lock at all. What can contend is two
-// CONCURRENTLY RUNNING incarnations, which is the SO_REUSEPORT overlap
-// withEpochFileLock was written for (see
+// CONCURRENTLY RUNNING incarnations, which is the overlap withEpochFileLock was
+// written for (NOT an SO_REUSEPORT one — see that function's comment for the
+// #8233 correction; the primary listener sets no socket options and the second
+// bind does fail) (see
 // TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669), and there the
 // blocked party is the other node's refine WORKER, whose failure this file
 // already treats as survivable: it declines the persist and keeps the

@@ -839,13 +839,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if err != nil {
 				runErr = fmt.Errorf("CLI: %w", err)
 			}
+		case err := <-d.fatalCh:
+			// #8233: shut down and carry the reason out as the process exit
+			// status, rather than the zero a signal produces.
+			slog.Error("fatal condition; shutting down", "err", err)
+			runErr = err
 		case <-ctx.Done():
 			slog.Info("signal received, shutting down")
 		}
 	} else {
 		slog.Info("daemon mode (non-interactive), waiting for signals")
-		<-ctx.Done()
-		slog.Info("signal received, shutting down")
+		select {
+		case err := <-d.fatalCh:
+			// #8233: the only non-signal way out of the daemon-mode wait. Run
+			// returns this, so cmd/xpfd exits NON-ZERO and the operator sees
+			// which condition ended the daemon instead of a clean stop.
+			slog.Error("fatal condition; shutting down", "err", err)
+			runErr = err
+		case <-ctx.Done():
+			slog.Info("signal received, shutting down")
+		}
 	}
 
 	// ===== PHASE 7: Shutdown sequence (extracted to runShutdownSequence, #4662) =====

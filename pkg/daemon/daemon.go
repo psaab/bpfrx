@@ -77,6 +77,17 @@ type dpSlot struct{ v dataplane.RuntimeDataPlane }
 type Daemon struct {
 	opts  Options
 	store *configstore.Store
+	// fatalCh carries a condition that must END the daemon rather than be
+	// logged and survived (#8233). Buffered so the reporting goroutine never
+	// blocks, and single-shot: the first fatal wins and later ones are dropped,
+	// since the shutdown they trigger is already under way.
+	//
+	// Today the only producer is the gRPC supervisor giving up on a management
+	// port another xpfd holds. It is a channel rather than a direct cancel so
+	// the REASON reaches Run and becomes the process exit status — a bare
+	// cancel is indistinguishable from a SIGTERM, and "the daemon exited
+	// because a duplicate was running" is exactly the fact an operator needs.
+	fatalCh chan error
 	// dpCell is the #2114 single synchronized publication point for the
 	// runtime dataplane. A nil cell means no dataplane (NoDataplane mode,
 	// a retired-backend construction failure, or an arm-failure
@@ -1480,6 +1491,19 @@ func parseNodeIDFileContent(s string) (int, bool) {
 // constructed (#1893 — the store is fail-closed on an unusable
 // .configdb): a daemon that cannot persist configuration must not
 // boot pretending otherwise.
+// signalFatal reports a condition that must end the daemon. Non-blocking and
+// single-shot: a full channel means a fatal is already in flight, and the
+// shutdown it triggers is the same one this call wanted (#8233).
+func (d *Daemon) signalFatal(err error) {
+	if err == nil || d.fatalCh == nil {
+		return
+	}
+	select {
+	case d.fatalCh <- err:
+	default:
+	}
+}
+
 func New(opts Options) (*Daemon, error) {
 	if opts.ConfigFile == "" {
 		opts.ConfigFile = "/etc/xpf/xpf.conf"
@@ -1527,6 +1551,7 @@ func New(opts Options) (*Daemon, error) {
 		rgStates:                   make(map[int]*rgStateMachine),
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),
+		fatalCh:                    make(chan error, 1),
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
 		surfaceA:                   surfaceAState{reconcileNowCh: make(chan struct{}, 1)},
 		dhcpLeaseSync:              dhcpLeaseSyncState{nowCh: make(chan struct{}, 1)},

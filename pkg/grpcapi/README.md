@@ -118,6 +118,47 @@ up/down health is published via `FabricListenerUp(addr)` /
 `FabricListenerHealth()` and logged at Info/Warn on transitions (retry
 ticks are Debug).
 
+### Primary-listener supervision, and the one failure that is fatal (#7611/#8233)
+
+The primary (management) listener is supervised the same way, with one
+exception: **`EADDRINUSE` is bounded, and then it ends the daemon.**
+
+Unbounded retry there was how a second `xpfd` came up silently. The bind
+genuinely fails — the primary listener is a plain `net.Listen("tcp", addr)`
+with no `ListenConfig` and no `Control` hook, so it sets **no** socket options
+(`RunFabricListener` above *does* set `SO_REUSEPORT`, which is a different
+socket and the source of a long-lived misconception recorded in three
+`pkg/cluster` comments now corrected). The supervisor logged the failure,
+marked the listener Failed, backed off and retried forever, and `Run` returned
+nil — so the daemon started, everything else came up, and every gRPC-driven
+surface was gone with no external signal (#8195).
+
+**Why bounded rather than fatal on sight.** `test/incus/xpfd.service` sets
+`Restart=on-failure`, `RestartSec=1`, `TimeoutStopSec=20`. A restart starts the
+successor one second after the predecessor is asked to stop, and the
+predecessor has twenty seconds to exit — so `EADDRINUSE` at startup is
+*routinely* transient, and it is the predecessor legitimately shutting down.
+Failing immediately would turn a slow shutdown into a **restart loop**, because
+`Restart=on-failure` makes the fatal exit re-trigger the start. Whether the
+collision **resolves** is the only property separating a restart overlap from a
+steady-state duplicate, and a window is how you measure it:
+`primaryAddrInUseGrace` (30 s) is sized past `TimeoutStopSec`, and
+`TestPrimaryAddrInUseGraceExceedsUnitStopTimeout_8233` parses the unit so
+raising the stop timeout cannot silently reintroduce the loop.
+
+Scope: **only** `EADDRINUSE` — a permissions failure or a missing VRF is a
+different condition and stays supervised forever. The window measures a
+*continuous* run, reset by any successful bind or intervening error, so
+intermittent collisions cannot accumulate toward it. On expiry `Run` returns
+`ErrManagementPortHeld`, the daemon treats it as fatal (`grpcRunErrIsFatal`),
+and the process exits non-zero naming what it waited for.
+
+**What this does NOT close.** The mixed-version window. A supervisor that
+ignores the exit code can still start a second daemon, and nothing here helps a
+node already in the two-daemon state. #7501's live-sibling refiner remains the
+mechanism that **tolerates** that state; this reduces how often it is reached.
+The two are not alternatives.
+
 ## Server-side authorization (#5278)
 
 Every RPC on the primary listener — read, mutation and stream alike — is
