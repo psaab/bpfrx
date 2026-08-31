@@ -4002,17 +4002,22 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         //                       struct init and                   packet path
         //                       its key mix
         ("binding_index.rs",     3,               4,               3),
-        // #7464 (PR #8123) added a comment line spelling `ctx` —
-        // "does `bpf_xdp_adjust_meta(ctx, -meta_len)` with" — in the
-        // alignment-assert block, taking the count 17 -> 18. The tally counts
-        // comment and doc mentions on purpose and says so in its own failure
-        // message ("A comment or doc line that spells any of the three
-        // identifiers lands here too; that is a spurious RED, never a silent
-        // pass. If you are adding a legitimate mention, move the row
-        // deliberately and say why."). This is that move, said deliberately:
-        // the new mention is prose ABOUT the helper call, not a binding, so it
-        // adds no coordinate the #5173 bound is protecting.
-        ("lib.rs",               22,              3,               18),
+        // #7464 (PR #8123) added a comment line spelling `ctx` in the
+        // alignment-assert block, taking the count 17 -> 18. TWO fixes for
+        // that one red landed independently and in OPPOSITE directions: #8127
+        // reworded the comment so it names the helper without the token
+        // (source back to 17), and #8126 moved this row to 18. Each was green
+        // against a master lacking the other; together they were red again.
+        //
+        // Resolved at 17, keeping the reword. The tally does count comment and
+        // doc mentions on purpose — a version that ignored them could be paid
+        // off by moving a binding into a macro-generated doc string — and
+        // moving the row for a legitimate mention is a supported action its
+        // own failure message describes. But the mention was not needed: the
+        // comment reads no worse naming `bpf_xdp_adjust_meta` without its
+        // first argument, so the tighter bound is free and this row stays
+        // where the #5173 measurement put it.
+        ("lib.rs",               22,              3,               17),
     ];
 
     // ---- …and `ctx` may not be rebound AT ALL. ---------------------------
