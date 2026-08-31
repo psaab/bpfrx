@@ -103,6 +103,14 @@ unavailable issue text.
    only warned and returns success (`:219-237`). The inventory counts syntax,
    not recovery semantics.
 
+   **Claude F4-addendum adjudication:** the branch diff is real, but its claim
+   that create-path `LinkSetUp` is fatal to the apply is false. It is fatal only
+   to `ensureVLANSubInterface`; the caller hard-fails solely
+   `errVLANCreateFailed` and soft-skips this returned setup error
+   (`pkg/dataplane/compiler_iface.go:699-733`). The initial apply can therefore
+   false-succeed with a DOWN child before any retry exists. The addendum found a
+   real gap and understated it.
+
 4. **[CRITICAL] The “one reachable trigger” premise is false by inspection, and the actual failure set crosses multiple commit stages.**
 
    **Confirmed from code.** Phase 2 itself can hard-abort after an arbitrary
@@ -131,6 +139,17 @@ unavailable issue text.
    uncovered (`pkg/dataplane/compiler_validate_4960.go:40-65`). Section 2's
    reachability and OQ-6 cost calculation are therefore based on a false
    denominator.
+
+   **Claude F1 adjudication:** its central objection is correct, but its claimed
+   concrete trigger is not. A native driver refusal does not abort; generic
+   attach refusal does, and that untyped error can be transient or persistent.
+   There is also a plainly deterministic post-mutation rejection when an
+   XPF-referenced ifindex exceeds `MaxInterfaces`
+   (`pkg/dataplane/loader.go:1182-1203,1228-1233`). The decisive defect is not
+   that every reachable error is persistent. It is that the plan has no typed
+   retryability or publication-state model and therefore applies one retry
+   policy to transient, persistent, old-authority, new-authority, and unknown
+   outcomes.
 
 5. **[CRITICAL] The exact attach-abort path is unadjudicated transit, contradicting the plan's old-policy-only hazard and #7191 composition claim.**
 
@@ -263,9 +282,10 @@ unavailable issue text.
    **Confirmed from code.** `released_nic_tunables` retains failed ownership for
    “the next reconcile”; it does not emit or schedule that reconcile
    (`pkg/daemon/released_nic_tunables.go:56-62,126-142`). Its production wire
-   point is the full apply tail (`pkg/daemon/daemon_apply_tail.go:443-446`). The
-   available full-reapply events are boot, a qualifying DHCP lease change, and a
-   feed update (`pkg/daemon/daemon_run_bringup.go:536-541`;
+   point is the full apply tail (`pkg/daemon/daemon_apply_tail.go:443-446`). On
+   the local operator/primary path, the automatic/background full-reapply events
+   are boot, a qualifying DHCP lease change, and a feed update
+   (`pkg/daemon/daemon_run_bringup.go:536-541`;
    `pkg/daemon/daemon_dhcp.go:73-102`; `pkg/daemon/daemon_feeds.go:36-57`). None
    reliably follows an ordinary local abort. With no timer, zero future attempts
    is valid; synchronous attempts can block/hot-loop. Therefore “bounded retries
@@ -338,6 +358,17 @@ unavailable issue text.
    prefix convergence without named per-object operations or a privileged,
    deterministic harness.
 
+   **Claude F7 adjudication:** its measured “0 of 23” is false. `runEthtool` is
+   a replaceable package variable explicitly created for failure injection
+   (`pkg/dataplane/compiler.go:26-39`), and an existing test replaces it
+   (`pkg/dataplane/compiler_rxvlan_failclosed_5268_test.go:23-29`). The VLAN
+   operation also has the coarser `ensureVLANSubInterfaceFn` seam
+   (`pkg/dataplane/compiler_iface.go:159-163`). Those seams do not make the
+   ordinal site-*k* proof writable: netlink/procfs/sysfs operations remain mostly
+   direct, the VLAN seam hides rather than exposes its internal prefix, and
+   swallowed failures cannot drive an abort. F7's conclusion survives; its
+   count and proposed “~8 new seams” sizing do not.
+
 13. **[MAJOR] HA ordering is an unaddressed failure mode in the terminal-unarm design.**
 
    **Confirmed from code.** Ordinary dataplane errors remain peer-sync eligible;
@@ -348,6 +379,15 @@ unavailable issue text.
    therefore reach terminal local disarm/demotion before peer acceptance is
    known. The local box may stop carrying transit while the peer still enforces
    old policy or has also failed its apply.
+
+   Conversely, the peer-synced standby already has a role-specific retry chain:
+   a failed apply sends a NACK (`pkg/cluster/sync_conn_config.go:337-368`), the
+   sender invalidates its pushed marker
+   (`pkg/daemon/daemon_ha_comms_wiring.go:200-209`), and a 30-second loop
+   re-pushes (`pkg/daemon/daemon_ha_sync.go:599-621`); `ActiveApplied` keeps a
+   failed same-text config eligible for re-apply (`:648-667`). P3 does not
+   distinguish this already-owned standby debt from the unscheduled local
+   primary case.
 
    This is aggravated by #7191's one-way gate: once coverage disarms, recovery
    requires process restart (`pkg/daemon/daemon_arm_coverage_7191.go:32-37`), and
@@ -405,8 +445,8 @@ unavailable issue text.
 
 - **OQ-1:** Yes. P4 is an undo/ownership journal with an already-expanding
   boundary and no state machine. Kill it as proposed.
-- **OQ-2:** Fatal to P3. No event reliably re-fires, so “bounded attempts” has no
-  wall-clock meaning.
+- **OQ-2:** Fatal to P3 on the local operator/primary path. No event reliably
+  re-fires there, so “bounded attempts” has no wall-clock meaning.
 - **OQ-3:** Yes. Nondeterministic global order, per-site loops, direct calls, and
   swallowed failures make the stated `k` test non-controlling.
 - **OQ-4:** Some typed publication/authority outcome is a prerequisite. The next
@@ -415,10 +455,11 @@ unavailable issue text.
 - **OQ-5:** Generic attach failure must unarm immediately because a surface is
   unadjudicated. For other classes, unarm policy requires an explicit typed
   safety classification; retry count is not that classification.
-- **OQ-6:** P1-P4 is not proportionate. The `accept_ra` re-drive correction is
-  independently defensible. A typed, phase-aware P2 is also defensible as
-  operator evidence and as a prerequisite to any future recovery design. The
-  conditional adoption rule, P3, and P4 are not ready to ship. A future retry
+- **OQ-6:** P1-P4 is not proportionate. Ship a separate small slice: immediately
+  fail-close generic attach/pre-publication coverage failures; apply `accept_ra`
+  on create and adopt; make child `LinkSetUp` failure observable and consistent;
+  and carry a typed, phase-aware failure outcome for operator evidence. Do not
+  ship the conditional adoption provenance rule, P3, or P4. A future retry
   proposal must first classify measured transient errors, supply a real
   scheduler/backoff and supersession model, define its success predicate, and
   prove a fixed point.
@@ -427,4 +468,4 @@ The current recommendation is not repairable with nits. P3/P4 must be removed
 and the failure/authority model re-derived before another convergence proposal
 can be reviewed. This is a failed plan, not a request for implementation detail.
 
-VERDICT: PLAN-NEEDS-MAJOR
+VERDICT: PLAN-KILL
