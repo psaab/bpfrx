@@ -161,7 +161,7 @@ func classifyGateBlindLeaf(g gateLeaf) gateBlindClass {
 // +2 here. The gate itself asked for this: it reports a floor it can now beat
 // as "COVERAGE IMPROVED — TIGHTEN THE RATCHET (this is a good failure)", and
 // leaving it slack would let a later regression drop back to 689 unnoticed.
-const gateCoverageFloor = 692
+const gateCoverageFloor = 699
 
 var gateBlindCeiling = map[gateBlindClass]int{
 	// #7492 moved leaves out of `unreachable` in two rounds. The parent
@@ -189,7 +189,34 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// TestStreamSourceInterfaceCompiles_6875, its validator by
 	// TestStreamSourceInterfaceIsValidated_6875, and both apply paths by the
 	// daemon and CLI cells; it is blind to THIS instrument only.
-	gateBlindUnreachable: 144,
+	// #7492 lowered this 144 -> 137: a `security log stream <*>` parent
+	// prerequisite (`host`) rescued all seven of that parent's leaves. See the
+	// row in schema_spelling_differential_gate_test.go for the measurement.
+	//
+	// WHAT THE REMAINING 137 ACTUALLY ARE, measured rather than assumed —
+	// because this number reads as a debt to pay down and most of it is not
+	// debt. The 137 span 67 parents, and they are at least TWO populations:
+	//
+	//   - RESCUABLE: the parent stanza compiles to nothing without a sibling,
+	//     so the leaf varied its value against an absent object. A
+	//     gateParentPrereq row fixes these, and they come in clumps — one row
+	//     rescued 13 (bgp group), another 7 (security log stream).
+	//
+	//   - DECLARED INERT: the leaf is accepted for Junos compatibility and
+	//     nothing reads it, so "varying it changed nothing" is the TRUTH rather
+	//     than a gap. The schema says so itself: `system dataplane cores` is
+	//     "Legacy DPDK core count (retired, ignored)", `socket-mem` likewise,
+	//     and every unreachable leaf under `dhcp-local-server group <*>
+	//     interface <*>` is "(parsed, not implemented)". No prerequisite can
+	//     rescue these; only implementing the feature would, and that is not
+	//     gate work.
+	//
+	// So do NOT read this ceiling as 137 missing tests. #7492's original plan —
+	// a GENERAL per-parent prerequisite synthesis — was tried and refuted by
+	// measurement: it recovered 2 while one hand-written row recovered 13. The
+	// productive path is hand-written rows for clumped rescuable parents, and
+	// the floor for that path is however many leaves are declared inert.
+	gateBlindUnreachable: 137,
 	// #7132 raised this 175 -> 176 for `system ntp server ... prefer`.
 	//
 	// Raised deliberately, and it is the one kind of raise that is not a
