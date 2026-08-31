@@ -297,6 +297,15 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		counter(c.wgKeepalivesSentTotal, t.KeepalivesTxPersistent, t.Tunnel, "persistent")
 		counter(c.wgSessionsExpiredTotal, t.SessionsExpired, t.Tunnel)
 		counter(c.wgHandshakeAttemptsAbortedTotal, t.PendingAbortedAttemptWindow, t.Tunnel)
+		// #7936 endpoint resolver. Emitted for every WG tunnel, including one
+		// with no DNS endpoints at all: a tunnel of IP literals starts no
+		// resolver and reports zeros, and a zero series is the honest answer —
+		// suppressing it would make "no resolver" and "resolver never ran"
+		// indistinguishable from the absence of the metric.
+		counter(c.wgEndpointResolutionsTotal, t.EndpointResolveOk, t.Tunnel, "ok")
+		counter(c.wgEndpointResolutionsTotal, t.EndpointResolveFail, t.Tunnel, "fail")
+		counter(c.wgEndpointResolutionsTotal, t.EndpointFamilyMismatch, t.Tunnel, "family_mismatch")
+		counter(c.wgEndpointResolutionsTotal, t.EndpointChanged, t.Tunnel, "changed")
 
 		// #1434 multi-peer: one confirmed-session gauge per peer,
 		// labeled by tunnel + peer pubkey.

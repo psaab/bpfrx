@@ -178,4 +178,24 @@ type WgTunnelStatus struct {
 	KeepalivesTxPassive               uint64 `json:"keepalives_tx_passive,omitempty"`
 	KeepalivesTxPersistent            uint64 `json:"keepalives_tx_persistent,omitempty"`
 	PendingAbortedAttemptWindow       uint64 `json:"pending_aborted_attempt_window,omitempty"`
+
+	// #7936: endpoint-resolver telemetry (#7158's counters, now on the wire).
+	//
+	// `omitempty` matches every other field here and is what makes the change
+	// skew-tolerant in BOTH directions: an old helper that never emits these
+	// decodes to zero, and an old Go binary that never sets them emits nothing
+	// for a new helper to misread.
+	EndpointResolveOk   uint64 `json:"endpoint_resolve_ok,omitempty"`
+	EndpointResolveFail uint64 `json:"endpoint_resolve_fail,omitempty"`
+	// The name resolved but to no address of the family this interface's UDP
+	// socket can send from. The counter this row exists for: it is a
+	// configuration error that otherwise looks like a peer that never
+	// initiates.
+	EndpointFamilyMismatch uint64 `json:"endpoint_family_mismatch,omitempty"`
+	EndpointChanged        uint64 `json:"endpoint_changed,omitempty"`
+	// Most recent resolver failure text. No Prometheus home — an unbounded
+	// label would be worse than useless — so it is rendered on the
+	// `show security wireguard detail` line, where the count alone would not
+	// tell an operator WHICH name resolved to the wrong family.
+	EndpointLastError string `json:"endpoint_last_error,omitempty"`
 }

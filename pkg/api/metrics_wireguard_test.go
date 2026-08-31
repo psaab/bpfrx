@@ -53,6 +53,8 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
+		wgEndpointResolutionsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_endpoint_resolutions_total", "t", []string{"tunnel", "outcome"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		WgTunnels: []dpuserspace.WgTunnelStatus{{
@@ -115,6 +117,10 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			KeepalivesTxPassive:               42,
 			KeepalivesTxPersistent:            43,
 			PendingAbortedAttemptWindow:       44,
+			EndpointResolveOk:                 51,
+			EndpointResolveFail:               52,
+			EndpointFamilyMismatch:            53,
+			EndpointChanged:                   54,
 		}},
 	}
 
@@ -202,6 +208,13 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_keepalives_sent_total,kind=passive,tunnel=wg0":                            42,
 		"xpf_userspace_wg_keepalives_sent_total,kind=persistent,tunnel=wg0":                         43,
 		"xpf_userspace_wg_handshake_attempts_aborted_total,tunnel=wg0":                              44,
+		// #7936: one metric, four outcomes. The exact-set assertion is what
+		// makes this list load-bearing — a fifth outcome added without a row
+		// here reds rather than passing unnoticed.
+		"xpf_userspace_wg_endpoint_resolutions_total,outcome=ok,tunnel=wg0":              51,
+		"xpf_userspace_wg_endpoint_resolutions_total,outcome=fail,tunnel=wg0":            52,
+		"xpf_userspace_wg_endpoint_resolutions_total,outcome=family_mismatch,tunnel=wg0": 53,
+		"xpf_userspace_wg_endpoint_resolutions_total,outcome=changed,tunnel=wg0":         54,
 	}
 	if len(got) != len(want) {
 		t.Errorf("emitted %d series, want %d", len(got), len(want))
@@ -268,6 +281,8 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
 		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
+		wgEndpointResolutionsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_endpoint_resolutions_total", "t", []string{"tunnel", "outcome"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		// One peer (no session) so the per-peer session_confirmed gauge
@@ -294,9 +309,18 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	// one peer here) + 3 rekey reasons + 2 keepalive-sent kinds +
 	// 1 sessions-expired + 1 attempts-aborted; +2 hs reasons #4094
 	// (under_load_no_mac2 + cookie_reply_budget) + 3 cookie-reply events
-	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51.
-	if count != 51 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 51 (zeros are real signals)", count)
+	// #4094 (sent + mac2_ok [PR-A] + consumed [PR-B]) = 51;
+	// + 4 endpoint-resolution outcomes (#7936) = 55.
+	//
+	// The four #7936 series are emitted for a zeroed tunnel ON PURPOSE, and
+	// this count is where that decision is pinned. A tunnel whose peers are all
+	// IP literals starts no resolver at all, so its counters are legitimately
+	// zero — and suppressing the series would make "no resolver configured"
+	// indistinguishable from "the exporter does not know about this tunnel",
+	// which is the difference between a dashboard reading zero and a dashboard
+	// reading nothing.
+	if count != 55 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 55 (zeros are real signals)", count)
 	}
 }
 

@@ -10,6 +10,7 @@ mod refresh_bindings;
 mod session_manager;
 mod snapshot_refresh;
 mod status;
+mod status_wg;
 mod supervisor;
 mod tunnel_supervision;
 mod wg_control;

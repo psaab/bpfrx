@@ -84,6 +84,27 @@ func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time
 		if !detail {
 			continue
 		}
+		// #7936: endpoint resolution. Printed ONLY for a tunnel that actually
+		// resolves — a tunnel of IP literals starts no resolver, and four zeros
+		// under a heading would read as "resolution is failing" rather than
+		// "there is nothing to resolve".
+		if t.EndpointResolveOk+t.EndpointResolveFail+t.EndpointFamilyMismatch+
+			t.EndpointChanged > 0 || t.EndpointLastError != "" {
+			fmt.Fprintf(&b, "  Endpoint resolution: %d ok, %d failed, %d family-mismatch, %d changed\n",
+				t.EndpointResolveOk, t.EndpointResolveFail, t.EndpointFamilyMismatch,
+				t.EndpointChanged)
+			if t.EndpointFamilyMismatch > 0 {
+				// The count alone is not a diagnosis. This says what the
+				// condition IS, because it is the one resolver outcome an
+				// operator will otherwise read as "the peer just never
+				// initiates" — the name resolves, so DNS looks healthy.
+				b.WriteString("    family-mismatch: the name resolved, but to no address of " +
+					"this interface's socket family — the peer cannot be reached from here\n")
+			}
+			if t.EndpointLastError != "" {
+				fmt.Fprintf(&b, "    Last error:       %s\n", t.EndpointLastError)
+			}
+		}
 		b.WriteString("  Receive drops by reason:\n")
 		writeWgReasonRows(&b, []wgReasonRow{
 			{"malformed-header", t.DecapDropsMalformedHeader},

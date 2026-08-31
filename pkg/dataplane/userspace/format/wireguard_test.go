@@ -164,3 +164,50 @@ func TestFormatHandshakeAgeClamps(t *testing.T) {
 		t.Errorf("zero stamp = %q, want never", got)
 	}
 }
+
+// #7936: the endpoint-resolver line, and the three things that make it a
+// diagnosis rather than four numbers.
+//
+// `family_mismatch` is the outcome this whole change exists for: the name
+// resolves, so DNS looks healthy, and the peer simply never initiates — which
+// is indistinguishable from a dozen other causes unless something says what the
+// condition actually is.
+func TestWireguardDetailRendersEndpointResolution7936(t *testing.T) {
+	status := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{
+		Tunnel:                 "wg0",
+		EndpointResolveOk:      9,
+		EndpointFamilyMismatch: 3,
+		EndpointLastError:      "vpn.example.com: no AAAA for a v6 socket",
+	}}}
+	out := FormatWireguardStatus(status, true, time.Unix(1_770_000_000, 0))
+
+	for _, want := range []string{
+		"Endpoint resolution: 9 ok, 0 failed, 3 family-mismatch, 0 changed",
+		"the name resolved, but to no address of",
+		"vpn.example.com: no AAAA for a v6 socket",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail view is missing %q — the count alone does not tell an operator "+
+				"WHICH name resolved to the wrong family, which is the diagnosis:\n%s", want, out)
+		}
+	}
+}
+
+// The complement, and the reason the block is conditional: a tunnel of IP
+// literals starts no resolver at all, so four zeros under a heading would read
+// as "resolution is failing" when there is nothing to resolve.
+func TestWireguardDetailOmitsEndpointResolutionWhenNoResolver7936(t *testing.T) {
+	status := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{Tunnel: "wg0"}}}
+	out := FormatWireguardStatus(status, true, time.Unix(1_770_000_000, 0))
+	if strings.Contains(out, "Endpoint resolution") {
+		t.Errorf("a literal-endpoint tunnel runs no resolver; printing zeros would read as "+
+			"a failure:\n%s", out)
+	}
+	// And the non-detail view never carries it at all.
+	brief := FormatWireguardStatus(userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{
+		Tunnel: "wg0", EndpointFamilyMismatch: 3,
+	}}}, false, time.Unix(1_770_000_000, 0))
+	if strings.Contains(brief, "Endpoint resolution") {
+		t.Errorf("the one-glance view must stay one-glance:\n%s", brief)
+	}
+}

@@ -71,6 +71,45 @@ pub(crate) const WG_ENDPOINT_RETRY_INTERVAL_SECS: u64 = 5;
 /// teardown is not perceptibly delayed, large enough not to spin.
 const STOP_POLL_SLICE_MS: u64 = 250;
 
+/// The half of the resolver's state that an OPERATOR SURFACE needs, split out
+/// so the coordinator can hold it (#7936).
+///
+/// The resolver itself is a local of the WG control thread and is dropped when
+/// that thread exits — deliberately, because its lifetime must be exactly the
+/// thread's. That makes it unreachable from the 1 Hz status path, which is why
+/// #7158's counters were in-process only. Handing the thread an Arc the
+/// coordinator already holds is the same shape `recent_exceptions` uses for the
+/// same reason, and it keeps the counters readable across a control-thread
+/// restart rather than resetting them on every re-spawn.
+#[derive(Debug, Default)]
+pub(crate) struct WgEndpointResolverTelemetry {
+    pub(crate) counters: WgEndpointResolverCounters,
+    /// Most recent failure text. `family_mismatch` writes here too, because the
+    /// COUNT alone does not tell an operator which name resolved to the wrong
+    /// family — and that is the diagnosis this counter exists to enable.
+    pub(crate) last_error: Mutex<Option<String>>,
+}
+
+impl WgEndpointResolverTelemetry {
+    /// Load all four counters and the error text in one call, for the status
+    /// path. Relaxed loads: these are independent monotonic counters, and a
+    /// reader that saw a torn pair would draw no wrong conclusion from it —
+    /// there is no invariant BETWEEN them to preserve.
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, String) {
+        (
+            self.counters.resolve_ok.load(Ordering::Relaxed),
+            self.counters.resolve_fail.load(Ordering::Relaxed),
+            self.counters.family_mismatch.load(Ordering::Relaxed),
+            self.counters.endpoint_changed.load(Ordering::Relaxed),
+            self.last_error
+                .lock()
+                .ok()
+                .and_then(|e| e.clone())
+                .unwrap_or_default(),
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct WgEndpointResolverCounters {
     /// Lookups that returned at least one usable address.
@@ -92,9 +131,9 @@ struct ResolverShared {
     /// Last good address per peer. A peer absent from this map has never
     /// resolved; a peer present keeps its entry across failed lookups.
     resolved: Mutex<HashMap<[u8; 32], SocketAddr>>,
-    /// Most recent failure text, for the operator-facing surface.
-    last_error: Mutex<Option<String>>,
-    counters: WgEndpointResolverCounters,
+    /// Counters and last-error text, shared with the coordinator (#7936) so
+    /// they survive this thread and reach the status wire.
+    telemetry: Arc<WgEndpointResolverTelemetry>,
     stop: AtomicBool,
 }
 
@@ -114,14 +153,14 @@ impl WgEndpointResolver {
         tunnel_name: &str,
         targets: Vec<([u8; 32], String)>,
         socket_is_v6: bool,
+        telemetry: Arc<WgEndpointResolverTelemetry>,
     ) -> Option<Self> {
         if targets.is_empty() {
             return None;
         }
         let shared = Arc::new(ResolverShared {
             resolved: Mutex::new(HashMap::new()),
-            last_error: Mutex::new(None),
-            counters: WgEndpointResolverCounters::default(),
+            telemetry,
             stop: AtomicBool::new(false),
         });
         let thread_shared = Arc::clone(&shared);
@@ -159,8 +198,7 @@ impl WgEndpointResolver {
         Self {
             shared: Arc::new(ResolverShared {
                 resolved: Mutex::new(map),
-                last_error: Mutex::new(None),
-                counters: WgEndpointResolverCounters::default(),
+                telemetry: Arc::new(WgEndpointResolverTelemetry::default()),
                 stop: AtomicBool::new(true),
             }),
             join: None,
@@ -168,12 +206,17 @@ impl WgEndpointResolver {
     }
 
     pub(crate) fn counters(&self) -> &WgEndpointResolverCounters {
-        &self.shared.counters
+        &self.shared.telemetry.counters
     }
 
     /// Most recent failure text, for the operator surface.
     pub(crate) fn last_error(&self) -> Option<String> {
-        self.shared.last_error.lock().ok().and_then(|e| e.clone())
+        self.shared
+            .telemetry
+            .last_error
+            .lock()
+            .ok()
+            .and_then(|e| e.clone())
     }
 }
 
@@ -206,11 +249,16 @@ fn resolve_once(
                 let chosen = addrs.into_iter().find(|a| a.is_ipv6() == socket_is_v6);
                 match chosen {
                     Some(addr) => {
-                        shared.counters.resolve_ok.fetch_add(1, Ordering::Relaxed);
+                        shared
+                            .telemetry
+                            .counters
+                            .resolve_ok
+                            .fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut map) = shared.resolved.lock() {
                             let prior = map.insert(*pubkey, addr);
                             if prior != Some(addr) {
                                 shared
+                                    .telemetry
                                     .counters
                                     .endpoint_changed
                                     .fetch_add(1, Ordering::Relaxed);
@@ -219,6 +267,7 @@ fn resolve_once(
                     }
                     None => {
                         shared
+                            .telemetry
                             .counters
                             .family_mismatch
                             .fetch_add(1, Ordering::Relaxed);
@@ -235,7 +284,11 @@ fn resolve_once(
                 }
             }
             Err(e) => {
-                shared.counters.resolve_fail.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .telemetry
+                    .counters
+                    .resolve_fail
+                    .fetch_add(1, Ordering::Relaxed);
                 set_last_error(shared, format!("{host_port}: {e}"));
                 // Deliberately no removal from `resolved`: the last good
                 // address is retained across a failed lookup. See the module
@@ -256,7 +309,7 @@ fn resolve_once(
 }
 
 fn set_last_error(shared: &ResolverShared, msg: String) {
-    if let Ok(mut slot) = shared.last_error.lock() {
+    if let Ok(mut slot) = shared.telemetry.last_error.lock() {
         *slot = Some(msg);
     }
 }

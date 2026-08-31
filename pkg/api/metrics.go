@@ -712,6 +712,7 @@ type xpfCollector struct {
 	wgRekeysInitiatedTotal          *prometheus.Desc
 	wgKeepalivesSentTotal           *prometheus.Desc
 	wgSessionsExpiredTotal          *prometheus.Desc
+	wgEndpointResolutionsTotal      *prometheus.Desc
 	wgHandshakeAttemptsAbortedTotal *prometheus.Desc
 
 	// #2464: per-collector NetFlow v9 / IPFIX write-health. A flow-export
@@ -1078,6 +1079,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgRekeysInitiatedTotal
 	ch <- c.wgKeepalivesSentTotal
 	ch <- c.wgSessionsExpiredTotal
+	ch <- c.wgEndpointResolutionsTotal
 	ch <- c.wgHandshakeAttemptsAbortedTotal
 	ch <- c.flowExportCollectorWriteAttemptsTotal
 	ch <- c.flowExportCollectorWriteFailuresTotal
