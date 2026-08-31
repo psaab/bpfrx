@@ -114,8 +114,22 @@ PY
 	# and count in agreement and nothing looking wrong.
 	#
 	# Said at the point of use rather than in a comment, because the reader who
-	# needs it is the one reading this line. A JSON-capable driver should use
-	# mutation_go_failed_names_json + mutation_verdict_for_target instead.
+	# needs it is the one reading this line.
+	#
+	# DO NOT CLOSE THIS BY MAKING THIS DRIVER EMIT `go test -json`. That is the
+	# obvious repair and it is the wrong one: it would NARROW THE GATE. Gating
+	# through `make` is why the cell carries `go vet`, the targeted `-race`
+	# runs with `-count=2`, and on the Rust side `--release` and
+	# `--test-threads=1`. A bare per-package `go test -json` driver buys better
+	# attribution and pays for it in coverage — and a narrower gate that agrees
+	# with the old one is indistinguishable from a sufficient one until the day
+	# it is not.
+	#
+	# The fix, if one is wanted, is to make the GATE TARGETS emit
+	# machine-readable results alongside their normal output, so attribution
+	# costs no coverage (#8231). mutation_go_failed_names_json and
+	# mutation_verdict_for_target are for a caller that already has such a
+	# stream — not an invitation to bypass `make` to produce one.
 	if [ "$verdict" = KILLED ]; then
 		echo "         ^ count-based: confirm the failing test is the one this cell targets"
 	fi
