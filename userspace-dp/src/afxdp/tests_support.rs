@@ -2499,3 +2499,145 @@ pub(super) fn eth_ipv6_frag_frame(frag_off: u16, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+
+// ── #7541: IPv6-OUTER GRE fixtures ──────────────────────────────────────────
+//
+// #6748 bounded native GRE decap by the outer IP datagram, but every GRE frame
+// builder in the crate wrote an IPv4 outer, so the decap-level cells could only
+// exercise one family. `outer_datagram_end` is unit-tested for both, yet no v6
+// frame was ever decapped end-to-end — so a regression in how a v6 outer REACHES
+// that function (a wrong `l3_offset` for a v6 underlay, an extension-header
+// assumption, a `parse_outer_addresses` mismatch) had no cell.
+//
+// The v6 outer end is `l3 + 40 + Payload Length`, and Payload Length EXCLUDES
+// the 40-byte header — unlike IPv4's Total Length, which includes its own. That
+// difference is why these builders exist rather than a parameterised v4 one:
+// getting it wrong produces a frame that is self-consistent and tests nothing.
+
+/// The v6 tunnel tuple used by `gre_to_self_snapshot_v6` and every v6 builder
+/// below. Peer -> local, mirroring the v4 pair (203.0.113.9 -> 172.16.80.8).
+pub(super) const GRE_V6_PEER: [u8; 16] = [
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x09,
+];
+pub(super) const GRE_V6_LOCAL: [u8; 16] = [
+    0x20, 0x01, 0x05, 0x59, 0x85, 0x85, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0x00, 0x08,
+];
+
+/// `gre_to_self_snapshot` with an IPv6-outer tunnel endpoint, so
+/// `match_tunnel_endpoint` resolves a v6 frame. The endpoint is otherwise
+/// identical to the v4 one — same interface, ifindex, zone, mode and inner
+/// addressing — so a cell that behaves differently across the two families is
+/// isolating the OUTER family and nothing else.
+pub(super) fn gre_to_self_snapshot_v6() -> ConfigSnapshot {
+    let mut snapshot = gre_to_self_snapshot();
+    for ep in snapshot.tunnel_endpoints.iter_mut() {
+        ep.outer_family = "inet6".to_string();
+        ep.source = "2001:559:8585:80::8".to_string();
+        ep.destination = "2001:db8::109".to_string();
+        ep.transport_table = "inet6.0".to_string();
+    }
+    snapshot
+}
+
+/// Write the IPv6 outer header for a GRE frame whose GRE region (header +
+/// inner) is `gre`. Shared by both v6 builders so the Payload Length rule is
+/// stated once — the acceptance criterion for #7541 is that the two families
+/// cannot drift into testing different things, and two copies of this
+/// arithmetic is exactly how that starts.
+fn write_gre_v6_outer(frame: &mut Vec<u8>, vlan_id: u16, gre: &[u8]) {
+    write_eth_header(
+        frame,
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        vlan_id,
+        0x86dd,
+    );
+    // Version 6, TC 0, flow label 0.
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    // Payload Length: the bytes AFTER the 40-byte header — the GRE region only.
+    // (IPv4 writes 20 + gre.len() here; v6 must not include its own header.)
+    frame.extend_from_slice(&(gre.len() as u16).to_be_bytes());
+    frame.push(PROTO_GRE); // Next Header
+    frame.push(64); // Hop Limit
+    frame.extend_from_slice(&GRE_V6_PEER); // Source  = the remote endpoint
+    frame.extend_from_slice(&GRE_V6_LOCAL); // Dest   = us
+    frame.extend_from_slice(gre);
+}
+
+/// IPv6-outer flagless-GRE frame carrying `inner` (an IPv4 inner packet).
+/// The v6 mirror of `build_gre_to_self_outer_frame_v4`.
+pub(super) fn build_gre_to_self_outer_frame_v6(vlan_id: u16, inner: &[u8]) -> Vec<u8> {
+    let mut gre = Vec::new();
+    gre.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]); // flagless GRE, proto IPv4
+    gre.extend_from_slice(inner);
+    let mut frame = Vec::new();
+    write_gre_v6_outer(&mut frame, vlan_id, &gre);
+    frame
+}
+
+/// IPv6-outer GRE frame with option fields present. The v6 mirror of
+/// `build_gre_checksum_present_outer_frame_v4`, and it builds the GRE region
+/// the same way — separately, so the checksum covers exactly that region.
+pub(super) fn build_gre_checksum_present_outer_frame_v6(
+    vlan_id: u16,
+    flags: u16,
+    key: u32,
+    seq: u32,
+    inner: &[u8],
+) -> Vec<u8> {
+    let checksum_present = (flags & 0x8000) != 0;
+    let key_present = (flags & 0x2000) != 0;
+    let sequence_present = (flags & 0x1000) != 0;
+
+    let mut gre = Vec::new();
+    gre.extend_from_slice(&flags.to_be_bytes());
+    gre.extend_from_slice(&0x0800u16.to_be_bytes()); // inner proto IPv4
+    let checksum_field_at = if checksum_present {
+        let at = gre.len();
+        gre.extend_from_slice(&[0x00, 0x00]); // Checksum (filled below)
+        gre.extend_from_slice(&[0x00, 0x00]); // Reserved1
+        Some(at)
+    } else {
+        None
+    };
+    if key_present {
+        gre.extend_from_slice(&key.to_be_bytes());
+    }
+    if sequence_present {
+        gre.extend_from_slice(&seq.to_be_bytes());
+    }
+    gre.extend_from_slice(inner);
+    if let Some(at) = checksum_field_at {
+        let sum = checksum16(&gre);
+        gre[at] = (sum >> 8) as u8;
+        gre[at + 1] = sum as u8;
+    }
+
+    let mut frame = Vec::new();
+    write_gre_v6_outer(&mut frame, vlan_id, &gre);
+    frame
+}
+
+/// Shim-contract meta for an IPv6-outer GRE frame. The v6 mirror of
+/// `gre_to_self_outer_meta`: same VLAN-aware L3 offset, but AF_INET6 and a
+/// 40-byte fixed header, so `l4_offset`/`payload_offset` move accordingly.
+pub(super) fn gre_to_self_outer_meta_v6(vlan_id: u16, frame_len: usize) -> UserspaceDpMeta {
+    let l3: u16 = if vlan_id > 0 { 18 } else { 14 };
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 11,
+        ingress_vlan_id: vlan_id,
+        ingress_vlan_present: u8::from(vlan_id > 0),
+        l3_offset: l3,
+        l4_offset: l3 + 40,
+        payload_offset: l3 + 44,
+        pkt_len: frame_len as u16 - l3,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_GRE,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
