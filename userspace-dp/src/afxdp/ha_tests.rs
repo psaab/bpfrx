@@ -2873,3 +2873,165 @@ fn synced_import_outcome_reason_tokens_are_distinct_6785() {
         }
     }
 }
+
+/// #6979 F1: the same two overlapping pools as `reserve6600_forwarding`, plus a
+/// SECOND rule whose pool owns the identical address. Zones resolve, so PASS 1
+/// actually runs — without that the reserve takes the `synced_zones == None`
+/// path and never reaches the code under test.
+fn f1_overlapping_forwarding() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+        crate::SourceNATRuleSnapshot {
+            name: "snat-a".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-a".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+        crate::SourceNATRuleSnapshot {
+            name: "snat-b".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-b".to_string(),
+            pool_addresses: vec!["203.0.113.1/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+    ]);
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_LAN_ZONE_ID, "lan".to_string());
+    forwarding
+        .zone_id_to_name
+        .insert(TEST_WAN_ZONE_ID, "wan".to_string());
+    forwarding
+}
+
+/// #6979 F1: THE REFUSAL MUST BE VISIBLE.
+///
+/// The ruling trades a reservation for a refusal, and that trade is only the
+/// better half because the refusal is OBSERVABLE — #8101 surfaced
+/// `xpf_userspace_synced_import_reserve_refused_total` with help text saying
+/// those flows will not survive a failover. If the refusal path did not reach
+/// that counter, the reasoning the whole change rests on would be false while
+/// every unit-level cell still passed. So it is bound here rather than assumed.
+///
+/// A positive control runs first: without it a coordinator that refused every
+/// import would satisfy the refusal leg completely.
+#[test]
+fn a_pass1_refused_import_is_counted_and_not_published_6979_f1() {
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = f1_overlapping_forwarding();
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    coordinator.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &coordinator.forwarding,
+            &test_metadata(),
+        )
+        .is_some(),
+        "fixture: the zone pair MUST resolve, or PASS 1 is skipped entirely and \
+         this cell never reaches the code under test"
+    );
+
+    // POSITIVE CONTROL: a free identity is still admitted.
+    let free = reserve6600_entry(40001, 50001);
+    let free_key = free.key.clone();
+    coordinator.upsert_synced_session(free);
+    assert!(
+        synced6600_contains(&coordinator, &free_key),
+        "an import whose translated identity is FREE must still be admitted"
+    );
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        0,
+        "an admissible import must not be counted as a refusal"
+    );
+
+    // A local flow takes the identity in rule A's allocator ONLY. Rule B's pool
+    // owns the same address and is still free — that is the sibling PASS 1 used
+    // to fall through to.
+    let contended: u16 = 50000;
+    let local_flow = SessionKey {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 200)),
+        src_port: 44444,
+        ..test_key()
+    };
+    assert!(
+        coordinator.forwarding.source_nat_rules[0]
+            .pool_allocator
+            .reserve_flow(
+                crate::nat::SourceNatFlowKey {
+                    protocol: PROTO_TCP,
+                    src_ip: local_flow.src_ip,
+                    dst_ip: local_flow.dst_ip,
+                    src_port: local_flow.src_port,
+                    dst_port: local_flow.dst_port,
+                },
+                crate::nat::TranslatedTuple {
+                    ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                    port: contended,
+                },
+                0,
+                false,
+                1_000,
+                crate::nat::NatHolder::Untracked,
+            ),
+        "fixture: rule A must hold the contended identity, and rule B must not"
+    );
+    assert!(
+        !coordinator.forwarding.source_nat_rules[1]
+            .pool_allocator
+            .debug_is_port_occupied(0, contended),
+        "fixture: rule B must be FREE, or there is no sibling to fall through to \
+         and the cell cannot distinguish the fix from its absence"
+    );
+
+    let before = coordinator.synced_import_reserve_refused_total();
+    let clashing = reserve6600_entry(40002, contended);
+    let clashing_key = clashing.key.clone();
+    coordinator.upsert_synced_session(clashing);
+
+    assert!(
+        !synced6600_contains(&coordinator, &clashing_key),
+        "the import was PUBLISHED after PASS 1's rule refused. PASS 1 fell through \
+         to the overlapping sibling, which accepted, so the session went live with \
+         its reservation in an allocator the ACTIVE never used (#6979 F1)"
+    );
+    assert!(
+        !coordinator.forwarding.source_nat_rules[1]
+            .pool_allocator
+            .debug_is_port_occupied(0, contended),
+        "rule B booked the reservation for a flow the ACTIVE translated under rule \
+         A — the latent half, which only detonates at failover when A re-issues \
+         the identity it never learned about"
+    );
+    assert_eq!(
+        coordinator.synced_import_reserve_refused_total(),
+        before + 1,
+        "the refusal was NOT counted. The whole trade — a refused import instead of \
+         a wrong-allocator reservation — rests on the refusal being visible in \
+         xpf_userspace_synced_import_reserve_refused_total (#8101). An increment \
+         that does not happen makes the reasoning false while every unit cell \
+         still passes"
+    );
+    {
+        let pending = commands.lock().expect("commands");
+        assert!(
+            !pending.iter().any(|cmd| matches!(
+                cmd,
+                WorkerCommand::UpsertSynced(entry) if entry.key == clashing_key
+            )),
+            "a refused import must not be fanned out to any worker command queue"
+        );
+    }
+}
