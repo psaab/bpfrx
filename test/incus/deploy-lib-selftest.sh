@@ -1064,6 +1064,114 @@ node1   100       secondary      no       no       None
 	fi
 }
 
+# ── #7368 (rejoin phase): the same unscoped shape, both roles ────────
+# test_primacy_predicate_is_scoped_per_rg above covers the DEPLOY precondition.
+# These cover test-failover.sh's post-reboot rejoin assertions, which kept the
+# retired whole-output form after #7368 fixed the precondition.
+#
+# The rejoin check is an if/elif: `secondary` is tried first and `primary`
+# second. So the mixed state does not merely slip past one assertion — it
+# matches the FIRST branch and reports PASS, which makes the elif that names
+# the auto-preempt regression unreachable in the exact case it was written for.
+# The property is therefore two-sided: a mixed state must be rejected by BOTH
+# roles, so the phase falls through to its failure branch.
+
+STATUS_REJOIN_CLEAN="Redundancy group: 0 , Failover count: 1
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+
+Redundancy group: 1 , Failover count: 1
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+"
+
+# node0 auto-preempted for RG1 only. The regression, on a subset of RGs.
+STATUS_REJOIN_MIXED_PREEMPT="Redundancy group: 0 , Failover count: 1
+node0   200       secondary      no       no       None
+node1   100       primary        no       no       None
+
+Redundancy group: 1 , Failover count: 1
+node0   200       primary        no       no       None
+node1   100       secondary      no       no       None
+"
+
+test_rejoin_predicate_rejects_mixed_preempt() {
+	# Reproduce the retired grep's false accept first, so this cell cannot
+	# quietly stop testing the thing it was written for.
+	if printf '%s' "$STATUS_REJOIN_MIXED_PREEMPT" | grep -q "node0.*secondary"; then
+		: # the retired grep matches -> old code took the PASS branch
+	else
+		bad "rejoin: fixture no longer reproduces the retired grep's false accept"
+		return
+	fi
+	if printf '%s' "$STATUS_REJOIN_MIXED_PREEMPT" | deploy_node_role_every_rg_ok node0 secondary; then
+		bad "rejoin: node0 is PRIMARY for RG1 and the secondary predicate accepted it — this is the auto-preempt regression reported as PASS (#7368 shape)"
+		return
+	fi
+	# ...and the elif must not rescue it either, or a mixed state would be
+	# reported as a clean full preempt instead of the partial state it is.
+	if printf '%s' "$STATUS_REJOIN_MIXED_PREEMPT" | deploy_node_role_every_rg_ok node0 primary; then
+		bad "rejoin: mixed state accepted as primary-for-every-RG; the phase would name the wrong failure"
+		return
+	fi
+	ok "rejoin: RG1-only auto-preempt -> rejected by BOTH roles, so the phase fails"
+}
+
+test_rejoin_predicate_accepts_clean_rejoin() {
+	if ! printf '%s' "$STATUS_REJOIN_CLEAN" | deploy_node_role_every_rg_ok node0 secondary; then
+		bad "rejoin: rejected a correct no-auto-preempt rejoin (node0 secondary for every RG)"
+		return
+	fi
+	if ! printf '%s' "$STATUS_REJOIN_CLEAN" | deploy_node_role_every_rg_ok node1 primary; then
+		bad "rejoin: rejected node1 primary for every RG on a clean rejoin"
+		return
+	fi
+	ok "rejoin: clean rejoin (node0 secondary / node1 primary for every RG) -> accept"
+}
+
+test_rejoin_predicate_names_full_preempt() {
+	if printf '%s' "$STATUS_BOTH_RG_NODE0_PRIMARY" | deploy_node_role_every_rg_ok node0 secondary; then
+		bad "rejoin: accepted a fully auto-preempted node0 as secondary"
+		return
+	fi
+	if ! printf '%s' "$STATUS_BOTH_RG_NODE0_PRIMARY" | deploy_node_role_every_rg_ok node0 primary; then
+		bad "rejoin: full auto-preempt not recognised as primary-for-every-RG, so the phase cannot name it"
+		return
+	fi
+	ok "rejoin: full auto-preempt -> secondary rejects, primary accepts (the elif names it correctly)"
+}
+
+test_rejoin_predicate_rejects_empty() {
+	# Fail-closed, same reason as #6591: an unreadable status is not "fine".
+	if printf '%s' "" | deploy_node_role_every_rg_ok node0 secondary; then
+		bad "rejoin: accepted an EMPTY status — an unreadable cluster status must FAIL, not pass vacuously"
+	else
+		ok "rejoin: empty/unreadable status -> reject"
+	fi
+}
+
+test_rejoin_site_uses_the_scoped_predicate() {
+	local f="$SCRIPT_DIR/test-failover.sh" code missing=()
+	code=$(grep -v '^[[:space:]]*#' "$f")
+	grep -q 'deploy_node_role_every_rg_ok node0 secondary' <<<"$code" || missing+=("scoped node0-secondary rejoin check")
+	grep -q 'deploy_node_role_every_rg_ok node1 primary' <<<"$code" || missing+=("scoped node1-primary rejoin check")
+	# The retired UNSCOPED form must not come back. The test that matters is
+	# scoped-ness, not the substring: the failback loop legitimately writes
+	# `grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"`, and an
+	# earlier revision of this guard banned the substring outright and red on
+	# exactly that shape. A control cell proved it, so the ban now fires only on
+	# a role grep that is NOT scoped to a redundancy group on the same line.
+	local unscoped
+	unscoped=$(grep -E 'grep -q "node[01]\.\*(primary|secondary)"' <<<"$code" \
+		| grep -v 'Redundancy group:' || true)
+	[[ -z "$unscoped" ]] || missing+=("retired UNSCOPED role grep is back: ${unscoped//$'\n'/ ; }")
+	if (( ${#missing[@]} == 0 )); then
+		ok "rejoin: test-failover.sh uses the per-RG predicate for both roles and the unscoped greps are gone"
+	else
+		bad "rejoin: test-failover.sh wiring incomplete: ${missing[*]}"
+	fi
+}
+
 # ── Run ───────────────────────────────────────────────────────────────
 test_rolling_secondary_node0_primary
 test_rolling_secondary_node0_secondary
@@ -1104,6 +1212,11 @@ test_ownership_verdict_boundary_is_inclusive
 test_ownership_verdict_peer_below_min_is_not_divergence
 test_failover_script_wires_the_crossref
 test_primacy_predicate_is_scoped_per_rg
+test_rejoin_predicate_rejects_mixed_preempt
+test_rejoin_predicate_accepts_clean_rejoin
+test_rejoin_predicate_names_full_preempt
+test_rejoin_predicate_rejects_empty
+test_rejoin_site_uses_the_scoped_predicate
 test_preflight_pass_proceeds
 test_preflight_reject_hardfails
 test_preflight_reject_touches_nothing

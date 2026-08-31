@@ -392,21 +392,34 @@ fi
 # Wait for cluster to stabilize (gRPC takes ~15s after systemctl active)
 sleep 20
 
-# Verify fw0 is secondary (NOT primary — no auto-preempt)
+# Verify fw0 is secondary for EVERY redundancy group (NOT primary — no auto-preempt)
+#
+# These two assertions were `grep -q "node0.*secondary"` / `grep -q "node1.*primary"`
+# over the whole status output — the #7368 shape, which the precondition above
+# already fixed but which survived here. Unscoped, it does not just admit a
+# partial state: because the secondary branch is tried FIRST, a cluster that
+# auto-preempted for RG1 while staying secondary for RG0 matched it and reported
+# PASS, leaving the elif that names the auto-preempt regression unreachable in
+# precisely the mixed case it exists to catch. The failback loop below is already
+# per-RG (`grep -A1 "Redundancy group: $rg"`); this phase was the gap between it
+# and the per-RG precondition.
 fw0_status_after=$(incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null)
-if echo "$fw0_status_after" | grep -q "node0.*secondary"; then
-	pass "fw0 rejoined as secondary (no auto-preempt)"
-elif echo "$fw0_status_after" | grep -q "node0.*primary"; then
-	fail "fw0 auto-preempted to primary (should stay secondary)"
+if printf '%s\n' "$fw0_status_after" | deploy_node_role_every_rg_ok node0 secondary; then
+	pass "fw0 rejoined as secondary for every redundancy group (no auto-preempt)"
+elif printf '%s\n' "$fw0_status_after" | deploy_node_role_every_rg_ok node0 primary; then
+	fail "fw0 auto-preempted to primary for every redundancy group (should stay secondary)"
 else
-	fail "fw0 cluster status unclear: $fw0_status_after"
+	fail "fw0 is neither secondary nor primary for EVERY redundancy group after rejoin — a MIXED or unreadable state. A mixed state is itself the auto-preempt regression, on a subset of RGs:
+$fw0_status_after"
 fi
 
-# Verify fw1 is still primary
-if incus exec "$FW1" -- cli -c 'show chassis cluster status' 2>/dev/null | grep -q "node1.*primary"; then
-	pass "fw1 remains primary after fw0 rejoin"
+# Verify fw1 is still primary for EVERY redundancy group
+fw1_status_after=$(incus exec "$FW1" -- cli -c 'show chassis cluster status' 2>/dev/null)
+if printf '%s\n' "$fw1_status_after" | deploy_node_role_every_rg_ok node1 primary; then
+	pass "fw1 remains primary for every redundancy group after fw0 rejoin"
 else
-	fail "fw1 is not primary after fw0 rejoin"
+	fail "fw1 is not primary for every redundancy group after fw0 rejoin:
+$fw1_status_after"
 fi
 
 # Verify iperf3 still running

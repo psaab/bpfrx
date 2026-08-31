@@ -636,6 +636,25 @@ output. Measured: `secondary` contains no `primary` substring, so that grep
 was not wrong in the way it looks; it was **unscoped**, so a cluster with
 node0 SECONDARY for RG0 and primary for RG1 satisfied it.
 
+The **post-reboot rejoin** assertions kept that unscoped form until later, and
+there it was worse than admitting a partial state. The check is an if/elif that
+tries `grep -q "node0.*secondary"` first and `grep -q "node0.*primary"` second,
+so a cluster that auto-preempted for RG1 while staying secondary for RG0 matched
+the FIRST branch and reported PASS — leaving the elif that names the auto-preempt
+regression unreachable in exactly the mixed case it was written for. Both roles
+now use `deploy_node_role_every_rg_ok <node> <role>`, the generalisation of the
+primacy predicate (which is now `deploy_node_role_every_rg_ok node0 primary` and
+keeps its name, since that is the vocabulary the deploy path uses). A mixed state
+is rejected by BOTH roles, so the phase falls through to its failure branch and
+reports the partial preempt instead of passing.
+
+The failback loop further down was already scoped — it greps inside
+`grep -A1 "Redundancy group: $rg"` — so `grep -q "node0.*primary"` still appears
+there legitimately. The selftest's wiring guard therefore tests SCOPED-NESS, not
+the substring: it fires only on a role grep with no `Redundancy group:` scoping
+on the same line. An earlier revision banned the substring outright, and a
+control cell caught it reddening on exactly that legitimate shape.
+
 And the session assertion now cross-references the two independent checks the
 script already performed. Primacy is read from a field the node reports about
 ITSELF; the session count is a real measurement; they were never compared. In
