@@ -3157,3 +3157,88 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
          metric fire on every publish error too (#7209)"
     );
 }
+
+/// #7209: the worker-set gate is what keeps a peer-synced import OFF the
+/// reservation path when no worker is registered, and it is load-bearing in a
+/// way it did not used to be.
+///
+/// The gate is one operand of a short-circuiting conjunction
+/// (`ha/session_import.rs`):
+///
+/// ```ignore
+/// if entry.origin.is_peer_synced()
+///     && !entry.metadata.is_reverse
+///     && !self.workers.records.is_empty()          // <-- this one
+///     && !self.reserve_synced_translation(&entry)
+/// ```
+///
+/// `reserve_synced_translation` is the ONLY reader of `forwarding` on the
+/// import path. `stop_inner` clears `workers.records` in the same teardown that
+/// sets `self.forwarding` to `ForwardingState::default()`, so the gate is why an
+/// import arriving mid-reconcile never resolves against the empty table — and
+/// why the "give the import path a last-good forwarding view" design was
+/// measured to be inert and dropped.
+///
+/// TODAY the gate reads as an optimisation, and its in-tree comment justifies it
+/// as one: "nothing polls, so there is no racing local allocation to guard
+/// against, and an `Untracked` reservation that no worker ever adopts has no one
+/// to release it". AFTER #7209 takes `sync_session` off the snapshot-wide mutex
+/// it becomes part of why a concurrent import is SAFE. A refactor that hoists
+/// the reservation out of the conjunction, or reorders the operand after it,
+/// would silently reintroduce a read this issue proved impossible — with every
+/// other test still green, because nothing else observes it.
+///
+/// So: two legs whose ONLY difference is whether a worker is registered.
+///
+/// FAIL-ON-REVERT: delete `&& !self.workers.records.is_empty()`, or move it
+/// after the `reserve_synced_translation` call, and leg A reds — the no-worker
+/// import reaches the reservation, fails to resolve its zone pair against the
+/// fresh Coordinator's empty forwarding, and bumps the counter.
+#[test]
+fn no_worker_registered_keeps_a_synced_import_off_the_reservation_path_7209() {
+    // --- Leg A: NO worker -> the reservation must not run at all. ----------
+    let mut no_worker = Coordinator::new();
+    assert!(
+        no_worker.workers.records.is_empty(),
+        "fixture broken: a fresh Coordinator must have no worker records, or \
+         leg A is not exercising the gate"
+    );
+    assert!(
+        crate::afxdp::session_glue::synced_source_nat_zone_pair(
+            &no_worker.forwarding,
+            &test_metadata(),
+        )
+        .is_none(),
+        "fixture broken: the zone pair must be UNRESOLVABLE against a fresh \
+         Coordinator's empty forwarding, or reaching the reservation would bump \
+         nothing and leg A could not tell the two paths apart"
+    );
+
+    let before = no_worker.synced_import_zone_unresolved_total();
+    no_worker.upsert_synced_session(reserve6600_entry(43000, 23000));
+    assert_eq!(
+        no_worker.synced_import_zone_unresolved_total(),
+        before,
+        "a peer-synced import reached the source-NAT reservation with NO worker \
+         registered. The worker-set gate short-circuits that conjunction, and it \
+         is what keeps an import arriving mid-reconcile — when stop_inner has \
+         cleared the workers AND emptied the forwarding table — from resolving \
+         against an empty table. Hoisting the reservation out of the \
+         conjunction reintroduces exactly that read (#7209)"
+    );
+
+    // --- Leg B: a worker IS registered -> the reservation runs. ------------
+    // Without this leg, leg A passes on a build where the reservation never
+    // runs for ANY import, and the gate would not be what it measures.
+    let mut with_worker = Coordinator::new();
+    register_test_worker_7209(&mut with_worker);
+    let before_b = with_worker.synced_import_zone_unresolved_total();
+    with_worker.upsert_synced_session(reserve6600_entry(43001, 23001));
+    assert!(
+        with_worker.synced_import_zone_unresolved_total() > before_b,
+        "with a worker registered the same import must REACH the reservation \
+         and count its unresolved zone pair; if it does not, leg A proves \
+         nothing about the gate because the reservation is unreachable either \
+         way"
+    );
+}
