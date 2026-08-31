@@ -933,7 +933,13 @@ the NAT module applies it:
   apply-time index records every `(allocator, occupancy index)` that owns each
   SHARED pool address, and the rules that touch one hold it by `Arc`
   (`overlap_owners`); keying the counting pass by DISTINCT ALLOCATOR rather than
-  by rule is what bounds it to #6812's aggregate address budget. Every position
+  by rule is what keeps it proportional to #6812's aggregate address budget;
+  the `distinct` dedup and the per-rule assignment pass are bounded separately
+  by the number of REAL allocators (rules whose allocator has zero occupancy
+  slots are skipped, because `PortAllocator::default()` is a fresh `Arc` per
+  rule and counting those made the dedup quadratic in the rule count), and
+  owner counting is per distinct allocator rather than per address occurrence
+  so a pool repeating one of its own members is not its own peer. Every position
   is recorded, not just the first, because `expand_pool_address` does not
   deduplicate and each vector POSITION gets its own bitmap. The check runs AFTER
   the allocation, so two workers racing on two peer allocators cannot both

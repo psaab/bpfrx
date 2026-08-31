@@ -1064,6 +1064,11 @@ func (m *Manager) applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups ma
 		}
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
+		// #7367: mark the substitution so `show chassis cluster status` can
+		// distinguish this from a peer that actually reported secondary-hold.
+		// The State value and every election consequence are unchanged.
+		peerGroup.StateOverriddenLocally = true
+		peerGroup.OverrideReason = "transfer-out override"
 		newPeerGroups[rgID] = peerGroup
 	}
 	for rgID, until := range m.peerTransferCommitGraceUntil {
@@ -1077,6 +1082,10 @@ func (m *Manager) applyTransferCommitOverridesOnPeerStateLocked(newPeerGroups ma
 		}
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
+		// #7367: as above. Named separately from the transfer-out override
+		// because a grace window expires on its own and an override does not.
+		peerGroup.StateOverriddenLocally = true
+		peerGroup.OverrideReason = "transfer-commit grace"
 		newPeerGroups[rgID] = peerGroup
 	}
 	for rgID, until := range m.localTransferOutHoldUntil {

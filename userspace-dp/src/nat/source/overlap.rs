@@ -58,12 +58,22 @@ struct PoolAddressOwner {
 /// # Cost, bounded honestly
 ///
 /// The counting pass is keyed by DISTINCT ALLOCATOR, not by rule, so its size
-/// is the sum of each distinct pool's expanded address count — exactly the
-/// quantity #6812's aggregate budget caps (`max_addresses`, 1,048,576). A
-/// `/16` pool referenced by a thousand rules is ONE allocator and costs 65536
-/// counter entries, not a thousand times that. The owner lists built in the
-/// second pass cover only the addresses the first pass found shared, so a
-/// config with no overlap allocates none of them.
+/// is the sum of each distinct pool's expanded address count — the quantity
+/// #6812's aggregate budget caps (`max_addresses`, 1,048,576). A `/16` pool
+/// referenced by a thousand rules is ONE allocator, so `distinct.len() == 1`
+/// and the function returns before building any counters at all. The owner
+/// lists in the second pass cover only the addresses the first pass found
+/// SHARED, so a config with no overlap allocates none of them.
+///
+/// Two costs are bounded by a DIFFERENT quantity and are stated rather than
+/// folded into the budget claim, because the first version of this comment did
+/// fold them in and was wrong (Codex round 2 on PR #8111, findings 1 and 4):
+/// the `distinct` dedup is a linear `same_allocator` scan per candidate rule,
+/// which the `address_slots() == 0` skip below keeps proportional to the number
+/// of REAL allocators (`max_pools`) rather than to the rule count; and the
+/// final assignment pass compares each rule's allocator pointer against the
+/// touching set, which is rule count x `max_pools` pointer compares and touches
+/// no addresses.
 ///
 /// This replaces a first version that indexed per RULE and materialised a
 /// directed rule-peer map per pair; that was NOT bounded by the budget (a
@@ -162,11 +172,23 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
         return;
     }
 
-    // One entry per DISTINCT allocator. Bounded by #6812's `max_pools` (1024),
-    // and the linear `same_allocator` scan is over that, not over rules.
+    // One entry per DISTINCT allocator that can actually HOLD a port.
+    //
+    // The `address_slots() == 0` skip is load-bearing, not tidiness:
+    // `PortAllocator::default()` builds a FRESH `Arc` per rule, and every rule
+    // that never received a real allocator carries one — a pool rule that
+    // failed with no previous generation to drain, in particular. Counting
+    // those as distinct makes this linear `same_allocator` scan quadratic in
+    // the RULE count, which no budget bounds (Codex round 2 on PR #8111,
+    // finding 1: R(R-1)/2 comparisons). An empty allocator can never answer
+    // `holds_port` true, so it is not an occupancy domain and indexing it buys
+    // nothing. A #7717 draining pool keeps its RETAINED allocator, which has
+    // slots, so it is still indexed — the case that matters.
     let mut distinct: Vec<usize> = Vec::new();
     for (idx, rule) in out.iter().enumerate() {
-        if !rule.pool_mode || rule.pool_addresses_v4.is_empty() && rule.pool_addresses_v6.is_empty()
+        if !rule.pool_mode
+            || (rule.pool_addresses_v4.is_empty() && rule.pool_addresses_v6.is_empty())
+            || rule.pool_allocator.address_slots() == 0
         {
             continue;
         }
@@ -182,21 +204,35 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
         return;
     }
 
-    // PASS 1 — count owners per address. Keyed by distinct allocator, so the
-    // total is the #6812 aggregate ADDRESS budget and no `Vec` is allocated
-    // per address.
-    let mut count_v4 = FxHashMap::<Ipv4Addr, u32>::default();
-    let mut count_v6 = FxHashMap::<Ipv6Addr, u32>::default();
+    // PASS 1 — count how many DISTINCT ALLOCATORS cover each address.
+    //
+    // Each entry carries the last allocator that incremented it, so a pool
+    // whose own configured members repeat an address counts ONCE. Counting per
+    // OCCURRENCE instead reported `[X, X]` as shared with itself: the rule then
+    // received the index and paid the `SeqCst` fence and a map probe on every
+    // mint, for a pool with no peer at all (Codex round 2 on PR #8111,
+    // finding 2). Every occurrence is still INDEXED in pass 2 — that half is
+    // required, and is what round-1 finding 3 was about.
+    let mut count_v4 = FxHashMap::<Ipv4Addr, (u32, usize)>::default();
+    let mut count_v6 = FxHashMap::<Ipv6Addr, (u32, usize)>::default();
     for &idx in &distinct {
         for addr in &out[idx].pool_addresses_v4 {
-            *count_v4.entry(*addr).or_insert(0) += 1;
+            let slot = count_v4.entry(*addr).or_insert((0, usize::MAX));
+            if slot.1 != idx {
+                slot.0 += 1;
+                slot.1 = idx;
+            }
         }
         for addr in &out[idx].pool_addresses_v6 {
-            *count_v6.entry(*addr).or_insert(0) += 1;
+            let slot = count_v6.entry(*addr).or_insert((0, usize::MAX));
+            if slot.1 != idx {
+                slot.0 += 1;
+                slot.1 = idx;
+            }
         }
     }
-    let shared_v4 = count_v4.values().any(|&n| n > 1);
-    let shared_v6 = count_v6.values().any(|&n| n > 1);
+    let shared_v4 = count_v4.values().any(|&(n, _)| n > 1);
+    let shared_v6 = count_v6.values().any(|&(n, _)| n > 1);
     if !shared_v4 && !shared_v6 {
         return;
     }
@@ -207,7 +243,7 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
         let allocator = &out[idx].pool_allocator;
         let v4_len = out[idx].pool_addresses_v4.len();
         for (pos, addr) in out[idx].pool_addresses_v4.iter().enumerate() {
-            if count_v4.get(addr).copied().unwrap_or(0) < 2 {
+            if count_v4.get(addr).map_or(0, |&(n, _)| n) < 2 {
                 continue;
             }
             owners.v4.entry(*addr).or_default().push(PoolAddressOwner {
@@ -216,7 +252,7 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
             });
         }
         for (pos, addr) in out[idx].pool_addresses_v6.iter().enumerate() {
-            if count_v6.get(addr).copied().unwrap_or(0) < 2 {
+            if count_v6.get(addr).map_or(0, |&(n, _)| n) < 2 {
                 continue;
             }
             // The occupancy vector is v4 addresses first, then v6 — the same
@@ -230,20 +266,44 @@ pub(super) fn wire_overlap_peers(out: &mut [SourceNatRule]) {
 
     // Hand the index only to the rules whose pool actually touches a shared
     // address, so every other rule keeps the `Option::is_none` fast path.
+    //
+    // The address scan runs once per DISTINCT ALLOCATOR, not once per rule, for
+    // the same reason the counting pass does: rules are not bounded by #6812
+    // and addresses are. Doing it per rule would reintroduce the round-1 cost
+    // defect one loop later — 1024 rules over two overlapping `/16` pools is
+    // 67,108,864 hash lookups when it is 131,072. The per-rule step that
+    // remains is a pointer compare against the (at most `max_pools`) allocators
+    // that touch a shared address.
+    let touching: Vec<usize> = distinct
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            out[idx]
+                .pool_addresses_v4
+                .iter()
+                .any(|addr| owners.v4.contains_key(addr))
+                || out[idx]
+                    .pool_addresses_v6
+                    .iter()
+                    .any(|addr| owners.v6.contains_key(addr))
+        })
+        .collect();
+    if touching.is_empty() {
+        return;
+    }
     let owners = Arc::new(owners);
+    let touching_allocators: Vec<PortAllocator> = touching
+        .iter()
+        .map(|&idx| out[idx].pool_allocator.clone())
+        .collect();
     for rule in out.iter_mut() {
         if !rule.pool_mode {
             continue;
         }
-        let touches = rule
-            .pool_addresses_v4
+        if touching_allocators
             .iter()
-            .any(|addr| owners.v4.contains_key(addr))
-            || rule
-                .pool_addresses_v6
-                .iter()
-                .any(|addr| owners.v6.contains_key(addr));
-        if touches {
+            .any(|alloc| alloc.same_allocator(&rule.pool_allocator))
+        {
             rule.overlap_owners = Some(Arc::clone(&owners));
         }
     }
