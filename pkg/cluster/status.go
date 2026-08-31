@@ -153,9 +153,22 @@ func (m *Manager) FormatStatus() string {
 		// Peer node line (if alive).
 		if peerAlive {
 			if pg, ok := peerGroups[rg.GroupID]; ok {
+				// #7367: when THIS node substituted the peer's state, say so.
+				// Rendering the substituted value bare makes a locally-forced
+				// secondary-hold identical to one the peer reported, which is
+				// how an RG-ownership divergence can show as a healthy cluster
+				// on both nodes at once.
+				peerState := fmt.Sprintf("%v", pg.State)
+				if pg.StateOverriddenLocally {
+					reason := pg.OverrideReason
+					if reason == "" {
+						reason = "local override"
+					}
+					peerState = fmt.Sprintf("%v (local: %s)", pg.State, reason)
+				}
 				fmt.Fprintf(&b, "%-6s %-8d %-14s %-8s %-8s %s\n",
 					fmt.Sprintf("node%d", peerNodeID),
-					pg.Priority, pg.State, preempt, "no", "None")
+					pg.Priority, peerState, preempt, "no", "None")
 			}
 		}
 		fmt.Fprintln(&b)

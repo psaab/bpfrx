@@ -1268,6 +1268,27 @@ type PeerGroupState struct {
 	Priority int
 	Weight   int
 	State    NodeState
+	// StateOverriddenLocally records that `State` above is NOT what the peer
+	// reported — this node substituted it (#7367).
+	//
+	// applyTransferCommitOverridesOnPeerStateLocked rewrites `State` to
+	// StateSecondaryHold for an armed transfer-out override or an unexpired
+	// transfer-commit grace window, in the SAME map that feeds both the
+	// election and `show chassis cluster status`. So one write corrupts the
+	// operator's view of the peer at the same time as the election input, and
+	// the rendered `secondary-hold` is indistinguishable from one the peer
+	// actually sent.
+	//
+	// That is how the #6656 incident could show node0 printing node1 as
+	// secondary-hold while node1 printed itself primary, with neither node
+	// displaying anything anomalous. This flag does not change `State` or any
+	// election behaviour; it only lets the render say which of the two it is.
+	StateOverriddenLocally bool
+	// OverrideReason names WHICH mechanism substituted the state, because the
+	// two have different operator responses: a transfer-out override is armed
+	// until explicitly cleared, whereas a commit-grace window expires on its
+	// own. Empty when StateOverriddenLocally is false.
+	OverrideReason string
 }
 
 // heartbeatSender sends periodic heartbeat packets.
