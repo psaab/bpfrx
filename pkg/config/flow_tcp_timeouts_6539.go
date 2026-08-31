@@ -5,27 +5,34 @@ import (
 	"strings"
 )
 
-// #6539: of the four `security flow tcp-session <kind>-timeout` leaves, only
-// established-timeout actually reaches the dataplane.
+// #6539: the `security flow tcp-session <kind>-timeout` leaves, and whether
+// each one actually reaches the userspace AF_XDP dataplane.
 //
-// buildFlowSnapshot (pkg/dataplane/userspace/flow.go) lowers EstablishedTimeout
-// into FlowSnapshot.TCPSessionTimeout and the helper reads it back into
-// SessionTimeouts.tcp_established_ns. The other three are parsed, typed,
-// committed and stored in TCPSessionConfig and stop there: the wire struct
-// (pkg/dataplane/userspace/protocol.go) has no field for them and there is no
-// live consumer on either side. Before #6539 all three operator surfaces —
-// REST, CLI, gRPC — printed them in exactly the same shape as the enforced
-// one, so a deliberate hardening action (initial-timeout is the half-open /
-// SYN-flood bounding control) looked applied while doing nothing. That is
-// worse than a plainly unimplemented feature, because the surface an operator
-// checks AFTER committing confirms the false belief.
+// MECHANISM. buildFlowSnapshot (pkg/dataplane/userspace/flow.go) lowers a set
+// value into FlowSnapshot and the helper reads it back into SessionTimeouts
+// (userspace-dp/src/session/mod.rs). A leaf with no wire carrier, or with a
+// carrier but no live consumer on the far side, is committed and stored and
+// goes no further. The failure mode that motivated this file is that such a
+// leaf is INDISTINGUISHABLE on a `show` surface from one that works: before
+// #6539 all three operator surfaces printed every leaf in the same shape, so a
+// deliberate hardening action looked applied while doing nothing. That is worse
+// than a plainly unimplemented feature, because the surface an operator checks
+// AFTER committing confirms the false belief.
 //
-// This table is the SINGLE authority for that fact. The commit-time advisory
-// (compiler_validate_warn.go, the #2078 accepted-only doctrine) and all three
-// render surfaces read it, so an operator cannot be told one thing at commit
-// and a different thing by `show`. Three surfaces disagreeing about whether a
-// knob is enforced is always a bug and never a legitimate divergence, so they
-// share one authority rather than each carrying a copy of the wording.
+// The table below is the SINGLE authority for which leaves are enforced. The
+// commit-time advisory (compiler_validate_warn.go, the #2078 accepted-only
+// doctrine) and all three render surfaces read it, so an operator cannot be
+// told one thing at commit and a different thing by `show`. Three surfaces
+// disagreeing about whether a knob is enforced is always a bug and never a
+// legitimate divergence, so they share one authority rather than each carrying
+// a copy of the wording.
+//
+// Do not restate the table's contents in prose anywhere, including here. The
+// enforced/unenforced split changed once already (#7342) and every sentence
+// that had restated it — a file header, a type doc, three field comments, and
+// a function doc that ended up contradicting the switch four lines below it —
+// silently became false. Nothing binds prose to a table, and nothing cheaply
+// can; one statement of the fact is the fix.
 
 // Junos leaf names under `security flow tcp-session`. Callers key the
 // enforcement table by these rather than by a bare string literal.
@@ -61,10 +68,12 @@ const (
 // claim, and the CLI's were wrong in the same way the missing annotation was:
 // it printed established-timeout's Junos default of 1800s, but nothing in the
 // Go path ever fills that in — an unset leaf lowers as 0 and the helper falls
-// back to DEFAULT_TCP_SESSION_TIMEOUT_NS, so the session actually idles out at
-// 300s. time-wait-timeout returns false: the dataplane has no TIME_WAIT state,
-// so there is no window to report as its default (a graceful close reaps on
-// the FIN window, which is closing-timeout's).
+// back to its own constant, so the session actually idles out at 300s. Report
+// the DATAPLANE's fallback here, never the Junos book value.
+//
+// The second return distinguishes "this leaf has no window to report" from a
+// zero-valued one. Which leaves those are is the switch below; it is not
+// restated in this comment.
 func TCPSessionTimeoutDataplaneDefault(leaf string) (int, bool) {
 	switch leaf {
 	case TCPSessionEstablishedTimeoutLeaf:
