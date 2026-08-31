@@ -10,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/metadata"
@@ -193,36 +194,13 @@ func (s *Server) showForwardingOptions(cfg *config.Config, buf *strings.Builder)
 func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *strings.Builder) {
 	if cfg == nil {
 		buf.WriteString("No active configuration\n")
-	} else {
-		pm := cfg.ForwardingOptions.PortMirroring
-		if pm == nil || len(pm.Instances) == 0 {
-			buf.WriteString("No port-mirroring instances configured\n")
-		} else {
-			for _, name := range sortedInstanceNames(pm.Instances) {
-				inst := pm.Instances[name]
-				fmt.Fprintf(buf, "Instance: %s\n", name)
-				if inst.InputRate > 0 {
-					fmt.Fprintf(buf, "  Input rate: 1/%d\n", inst.InputRate)
-				} else {
-					buf.WriteString("  Input rate: all packets\n")
-				}
-				if len(inst.Input) > 0 {
-					fmt.Fprintf(buf, "  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
-				}
-				if inst.Output != "" {
-					fmt.Fprintf(buf, "  Output interface: %s\n", inst.Output)
-				}
-				// #6534: mirror of the cli.showPortMirroring annotation. These
-				// two renderers are byte-identical copies with no shared
-				// formatter, so BOTH must carry it — annotating one leaves the
-				// other lying, which is why the agreement test asserts both.
-				if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
-					fmt.Fprintf(buf, "  NOT INSTALLED: %s\n", reason)
-				}
-				buf.WriteString("\n")
-			}
-		}
+		return
 	}
+	// #7357: single-sourced with the CLI. These two were byte-identical
+	// copies with no shared formatter, and the comment that used to sit
+	// here said so — "annotating one leaves the other lying". Now there is
+	// one render and the parity test compares two callers of it.
+	buf.WriteString(dpformat.FormatPortMirroring(cfg))
 }
 
 // flowServerNotInstalledSuffix returns the `[NOT INSTALLED: <reason>]` suffix
