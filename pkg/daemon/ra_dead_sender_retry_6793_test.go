@@ -275,9 +275,27 @@ func TestReassertRechecksTheGateInsideTheSemaphore6793(t *testing.T) {
 	// gate INSIDE the semaphore and seeing the rebuilt sender — is unchanged:
 	// the goroutine still blocks on applySem, `healthy` still flips under
 	// probeMu before the release, and the re-check still happens after it.
+	// #7617: signal the OUTER gate check so the flip below cannot precede it.
+	//
+	// `reassertDeadRASendersOnce` checks the gate TWICE: once before
+	// `applySem.Acquire` and once after. This cell is about the INNER check.
+	// The previous construction was "start the goroutine, flip the gate,
+	// release the semaphore", synchronised only on `<-started` -- which fires
+	// when the goroutine BEGINS, not when it reaches the outer check. Lose that
+	// race and the outer check sees `healthy` already true, short-circuits, and
+	// the tick never queues at all: `applies` stays 0 and the cell passes
+	// GREEN even with the inner gate deleted. It was measuring the scheduler.
+	//
+	// The gate closure is the natural seam. Signalling on its first call means
+	// the outer check has RUN and returned true, so the tick is committed to
+	// acquiring the semaphore and the flip lands strictly between the two
+	// checks -- which is the state this cell exists to construct.
 	var probeMu sync.Mutex
 	healthy := false
+	outerChecked := make(chan struct{})
+	var outerOnce sync.Once
 	d.raHasDeadSendersFn = func() bool {
+		outerOnce.Do(func() { close(outerChecked) })
 		probeMu.Lock()
 		defer probeMu.Unlock()
 		return !healthy
@@ -292,8 +310,19 @@ func TestReassertRechecksTheGateInsideTheSemaphore6793(t *testing.T) {
 	}()
 	<-started
 
-	// The tick is now blocked on the semaphore (or about to be). Simulate the
-	// commit having rebuilt the sender, then let the tick through.
+	// Wait for the OUTER check specifically. A timeout here is a different
+	// failure from the one below and says so: the tick never consulted the
+	// gate, so nothing this cell asserts would mean anything.
+	select {
+	case <-outerChecked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reassert tick never called the gate, so it never reached the " +
+			"outer check; the assertion below would pass without the inner " +
+			"re-check ever running (#7617)")
+	}
+
+	// The tick has passed the outer gate and is acquiring the semaphore.
+	// Simulate the commit having rebuilt the sender, then let the tick through.
 	probeMu.Lock()
 	healthy = true
 	probeMu.Unlock()
