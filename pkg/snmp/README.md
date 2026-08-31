@@ -629,8 +629,9 @@ packet handlers, and MIB view that call into them.
   `TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551` (v2c call site,
   `agent.go`), and
   `TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551` (v3 call site,
-  `v3.go`). The v3 cost guard measures ALLOCATIONS rather than wall time, so
-  machine load cannot move it.
+  `v3.go`). BOTH cost guards measure ALLOCATIONS rather than wall time, so
+  machine load cannot move them — the v2c one measured wall time until #8211,
+  and flaked under full-suite load in diffs that could not reach `pkg/snmp`.
   Equivalence-vs-unbounded and encoder-parity guards:
   `TestGetBulkBoundedMatchesUnbounded_6551`,
   `TestVarbindEncodedLenMatchesEncoder_6551`.
