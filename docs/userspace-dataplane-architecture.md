@@ -3058,6 +3058,13 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   in #1946 and the IPsec passthrough was never listed. The enumeration
   matters: it is the whole argument for why removing a disposition from
   `is_slow_path_eligible` is enforcement rather than decoration.
+  #7480 pins the set in
+  `userspace-dp/tests/slow_path_admit_single_site_6664.rs`
+  (`raw_reinject_primitive_caller_set_is_pinned_7480`), so a new call site
+  reds a test instead of silently invalidating this paragraph. #6664 fixed
+  this paragraph and the sibling comment at the build-failure call site but
+  left the primitive's OWN doc block saying "ONE" — the copy a caller reads
+  before bypassing the predicate — which is the gap #7480 closed.
   Note that `MissingNeighbor` IS slow-path-eligible, so a denied flow
   must be converted to `PolicyDenied` BEFORE it reaches the gate: the
   MissingNeighbor arm has its own policy evaluation (the main

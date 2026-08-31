@@ -1331,11 +1331,12 @@ impl ForwardingDisposition {
     ///     or one relaxed guard, would silently reopen the bypass. Fail closed
     ///     here so the dataplane's own posture is correct on its own terms.
     ///   - `ForwardCandidate` / `FabricRedirect`: handled by the forward /
-    ///     fabric path, never the generic slow path. The ONE intentional
-    ///     unfiltered `_from_frame` caller — the ForwardCandidate
-    ///     build-failure fallback in `tx/dispatch/slow_path.rs` — bypasses
-    ///     this predicate on purpose; see the doc on
-    ///     `maybe_reinject_slow_path_from_frame`. (#1946: `FabricRedirect`
+    ///     fabric path, never the generic slow path. Some callers bypass
+    ///     this predicate on purpose; the authoritative enumeration lives
+    ///     on `maybe_reinject_slow_path_from_frame` and is pinned by
+    ///     `raw_reinject_primitive_caller_set_is_pinned_7480`. Deliberately
+    ///     NOT restated here — this comment carried a stale count of its
+    ///     own until #7480, which is what a restatement does. (#1946: `FabricRedirect`
     ///     with no fabric XSK binding, or whose build/enqueue failed, is
     ///     dropped fail-closed + counted, never reinjected — a
     ///     cross-chassis L2 redirect is not kernel-FIB routable.)

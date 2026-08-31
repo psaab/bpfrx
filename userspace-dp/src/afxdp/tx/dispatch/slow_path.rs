@@ -199,17 +199,33 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
 /// `poll_descriptor::poll_binding_process_descriptor`, #1913), which both
 /// apply the predicate.
 ///
-/// The ONE INTENTIONAL unfiltered caller (disposition deliberately
+/// The TWO INTENTIONAL unfiltered callers (disposition deliberately
 /// outside the allow-list):
 ///   - `handle_forward_build_failure` (above): reinjects a
 ///     `ForwardCandidate` frame when the forward descriptor build fails
 ///     (ForwardCandidate IS a route the kernel FIB may legitimately
 ///     serve). That helper now drops `FabricRedirect` fail-closed BEFORE
 ///     reaching this primitive (#1946), so it never raw-reinjects a
-///     fabric frame.
-/// This caller relies on the unfiltered behavior; do NOT add a
-/// disposition filter inside this primitive (it would break it — #1913
+///     fabric frame. This is the only unfiltered caller that carries a
+///     RESOLVED disposition.
+///   - the host-terminated IPsec passthrough in `poll_stages.rs`
+///     (#6664): calls this primitive with a SYNTHETIC `LocalDelivery`
+///     decision, so it never carries a resolved disposition past the
+///     predicate. ESP/AH, ESP-in-UDP and NAT-T keepalives are
+///     unconditionally exempt; IKE faces its own host-inbound admit
+///     checks (#4323/#6471) before reaching this call.
+/// These callers rely on the unfiltered behavior; do NOT add a
+/// disposition filter inside this primitive (it would break them — #1913
 /// Path B, rejected).
+///
+/// #7480: this enumeration is PINNED by
+/// `tests/slow_path_admit_single_site_6664.rs`
+/// (`raw_reinject_primitive_caller_set_is_pinned_7480`), so a new call
+/// site reds rather than silently invalidating this list. It went stale
+/// once already: #1946 wrote "ONE", #6664 found the second caller and
+/// corrected the SIBLING comment at the build-failure call site while
+/// leaving this block — the one a caller actually reads before bypassing
+/// the predicate — saying "ONE".
 ///
 /// #1946: the former second unfiltered caller — the `tx/dispatch/mod.rs`
 /// FabricRedirect-Owned no-binding fallback — was removed; a
