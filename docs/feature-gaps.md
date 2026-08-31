@@ -1154,6 +1154,21 @@ drift) closed in `fix/2008-quickwins-batch1`:
   (`pkg/cli/cli_show_security.go`, `pkg/cli/cli_show_security_dispatch.go`).
   When `policy-stats system-wide enable` is absent (the default), all six
   report 0 per-rule counts; when set, they all report the same live counts.
+  **#7776 (DONE) — the two text hit-count renderers now SAY SO.** Reporting 0
+  is correct, but a well-formed `0` in a table is indistinguishable from "this
+  policy matched nothing", and #7776 was filed after exactly that misread cost
+  an investigation: an operator localizing a live deny read all-zero hit counts
+  on a node that was demonstrably denying packets, and the answer had to come
+  from the `POLICY_DENY` journal line instead. `show security policies
+  hit-count` (local CLI and its gRPC text twin) now emits a trailing note
+  counting the rows that read 0 *because the counter was never read*, with the
+  remedy. The note counts rows rather than asserting "every count reads 0",
+  because a rule carrying `count` IS read even when the system-wide knob is
+  off, so the blanket wording would be false for a mixed config. The remaining
+  four surfaces are unchanged: Prometheus already SKIPS rather than emitting a
+  zero, and the structured gRPC / REST responses would need an availability
+  FIELD rather than a trailing line — the same wire-surface shape deferred in
+  #7473.
   The raw read primitive (`Manager.ReadPolicyCounters`) and
   `clear security policies hit-count` stay ungated by design. The Rust increment
   (`policy.rs` `try_match_rule` for the first packet, plus the established

@@ -79,6 +79,14 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	// "n/a" and a trailing note says why. Same not-populated-vs-failed split
 	// `show security zones` makes for dataplane.ErrCounterNotPopulated (#6843).
 	var unpublished int
+	// #7776: rows whose counter was NOT read because policy-stats is disabled
+	// system-wide and the rule carries no per-rule `count`. Those cells render
+	// an authoritative-looking "0" that an operator reads as "this policy has
+	// not matched", when the truth is "this view was never asked to look".
+	// Counted rather than inferred from `!statsEnabled`, because a rule with
+	// `count` IS read even when the system-wide knob is off, so a blanket
+	// "every count reads 0" would be false for a mixed config.
+	var statsDisabled int
 	index := uint32(1)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -124,6 +132,15 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 						readErr = err
 					}
 				}
+			} else {
+				// Reached ONLY when policy-stats is off and the rule carries no
+				// `count`: this function early-returns unless the dataplane is
+				// loaded, so there is no third way in. Written bare rather than
+				// re-testing `!statsEnabled && !pol.Count`, which is tautological
+				// here -- a guard that cannot fail reads as protection and is not.
+				// The gRPC twin DOES need the explicit form; its read condition
+				// also carries `readPolicy != nil`.
+				statsDisabled++
 			}
 			fmt.Printf("%-8d%-17s%-18s%-24s%-14s%s\n",
 				index, zpp.FromZone, zpp.ToZone, pol.Name,
@@ -171,6 +188,15 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 						readErr = err
 					}
 				}
+			} else {
+				// Reached ONLY when policy-stats is off and the rule carries no
+				// `count`: this function early-returns unless the dataplane is
+				// loaded, so there is no third way in. Written bare rather than
+				// re-testing `!statsEnabled && !pol.Count`, which is tautological
+				// here -- a guard that cannot fail reads as protection and is not.
+				// The gRPC twin DOES need the explicit form; its read condition
+				// also carries `readPolicy != nil`.
+				statsDisabled++
 			}
 			// #3286/#4626: a scoped global (#3148) shows its zone SET in the
 			// From/To columns so counter-based validation is unambiguous;
@@ -213,6 +239,8 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 					readErr = err
 				}
 			}
+		} else {
+			statsDisabled++
 		}
 		fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
 			"-", "-", "-", dataplane.DefaultPolicyName,
@@ -224,6 +252,16 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	if unpublished > 0 {
 		fmt.Printf("note: %d policy counter(s) not yet published by the dataplane "+
 			"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
+	}
+	// #7776: without this the table renders a well-formed "0" for every row and
+	// an operator reads "this policy has not matched" when the surface was
+	// never asked to look -- an instrument answering "nothing" when it means
+	// "I cannot see".
+	if statsDisabled > 0 {
+		fmt.Printf("note: %d policy count(s) read 0 because policy-stats is disabled "+
+			"system-wide, not because no traffic matched (enable with "+
+			"`set security policy-stats system-wide enable`, or add `count` to an "+
+			"individual policy)\n", statsDisabled)
 	}
 	return nil
 }

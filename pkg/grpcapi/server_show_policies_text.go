@@ -145,6 +145,12 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// Render it "n/a" with a trailing note rather than an authoritative 0 under
 	// a warning naming a fault that does not exist.
 	var unpublished int
+	// #7776: rows whose counter was NOT read because policy-stats is disabled
+	// system-wide and the rule carries no per-rule `count`. Guarded on that
+	// cause explicitly rather than with a bare `else`, because the read
+	// condition also carries `readPolicy != nil` -- a bare else would count a
+	// not-loaded dataplane as a disabled-stats row and the note would lie.
+	var statsDisabled int
 	// #4344: read the whole policy set from ONE snapshot (O(P+C), one brief
 	// dataplane lock) via the #3965 bulk reader instead of a per-policy
 	// ReadPolicyCounters loop. Built only when the dataplane is loaded; falls
@@ -201,6 +207,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 						readErr = err
 					}
 				}
+			} else if !statsEnabled && !pol.Count {
+				statsDisabled++
 			}
 			totalPkts += pkts
 			totalBytes += bytes
@@ -259,6 +267,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 						readErr = err
 					}
 				}
+			} else if !statsEnabled && !pol.Count {
+				statsDisabled++
 			}
 			totalPkts += pkts
 			totalBytes += bytes
@@ -301,6 +311,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 					readErr = err
 				}
 			}
+		} else if !statsEnabled {
+			statsDisabled++
 		}
 		totalPkts += pkts
 		totalBytes += bytes
@@ -316,6 +328,17 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	if unpublished > 0 {
 		fmt.Fprintf(buf, "note: %d policy counter(s) not yet published by the dataplane "+
 			"(shown as n/a; the helper has not reported these rules yet)\n", unpublished)
+	}
+	// #7776: without this the table renders a well-formed "0" for every row and
+	// an operator reads "this policy has not matched" when the surface was
+	// never asked to look -- an instrument answering "nothing" when it means
+	// "I cannot see". Wording is kept byte-identical to the pkg/cli twin so the
+	// two renderers cannot drift into saying different things.
+	if statsDisabled > 0 {
+		fmt.Fprintf(buf, "note: %d policy count(s) read 0 because policy-stats is disabled "+
+			"system-wide, not because no traffic matched (enable with "+
+			"`set security policy-stats system-wide enable`, or add `count` to an "+
+			"individual policy)\n", statsDisabled)
 	}
 }
 
