@@ -242,9 +242,29 @@ deploy_rolling_rg_ids() {
 # check satisfied by any single group would pass while the others stayed
 # inverted.
 deploy_reassert_node0_primary_ok() {
-	awk '
+	deploy_node_role_every_rg_ok node0 primary
+}
+
+# deploy_node_role_every_rg_ok is the generalisation of the predicate above:
+# it reads `show chassis cluster status` on stdin and succeeds ONLY IF at least
+# one redundancy group is present AND <node> reads exactly <role> for EVERY one
+# of them. deploy_reassert_node0_primary_ok is (node0, primary) and keeps its
+# own name because it is the vocabulary the deploy path and #6591 use.
+#
+# #7368 fixed the DEPLOY precondition this way. The same unscoped shape survived
+# in test-failover.sh's post-reboot rejoin assertions, and there it was worse
+# than "can pass on a partial state": the rejoin check tried `node0.*secondary`
+# FIRST and `node0.*primary` second, so a cluster that auto-preempted for RG1
+# while staying secondary for RG0 matched the FIRST grep and reported PASS. The
+# elif that exists to name the auto-preempt regression was unreachable in exactly
+# the mixed case it was written for. A grep cannot express "every RG" in either
+# direction, so both roles need the scoped form, not just the primary one.
+deploy_node_role_every_rg_ok() {
+	local node="${1:?deploy_node_role_every_rg_ok: node required}"
+	local role="${2:?deploy_node_role_every_rg_ok: role required}"
+	awk -v node="$node" -v role="$role" '
 		/^Redundancy group:[[:space:]]/ { rg = $3; seen[rg] = 1; next }
-		/^node0[[:space:]]/ { if (rg != "" && $3 == "primary") { ok[rg] = 1 } }
+		$1 == node { if (rg != "" && $3 == role) { ok[rg] = 1 } }
 		END {
 			n = 0
 			for (g in seen) { n++; if (!(g in ok)) { exit 1 } }
