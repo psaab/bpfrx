@@ -112,7 +112,28 @@ type Manager struct {
 	restartTimerFn func(time.Duration, func())
 	cfg            config.UserspaceConfig
 	clusterHA      bool
-	generation     uint64
+	// helperHAStatePublished records whether THIS helper process has been sent a
+	// clustered HA inventory at least once (a successful update_ha_state with a
+	// non-empty group set). It is NOT derivable from len(m.haGroups): that is the
+	// MANAGER's view, which seedHAGroupInventoryLocked populates from config
+	// before any publish, so it is non-empty long before the helper knows
+	// anything.
+	//
+	// #7465: arming and inventory publication are independent.
+	// desiredForwardingArmedLocked never reads the helper's HA state — on a
+	// clustered node it returns true whenever any RG with ID>0 is configured — and
+	// the 1 Hz status poll calls syncDesiredForwardingStateLocked
+	// UNCONDITIONALLY while the HA publish above it is gated on an active
+	// signature, a 2s post-activation hold and a 5s throttle. Arming is cheap and
+	// eager; publication is expensive and reluctant. So a helper that holds a
+	// snapshot but no inventory gets armed, and the Rust per-packet gate reads an
+	// empty ha_state as "this box is not clustered" and delivers LocalDelivery
+	// traffic it would otherwise mark HAInactive.
+	//
+	// Cleared in resetAfterHelperGoneLocked: a new helper starts with an empty
+	// inventory, so the fact that the PREVIOUS one was told says nothing.
+	helperHAStatePublished bool
+	generation             uint64
 	// neighborReplaceGen is a dedicated monotonic counter for the #6034
 	// manager-neighbor replace-generation envelope. Every authoritative
 	// update_neighbors replace (RegenerateNeighborSnapshot, BumpFIBGeneration)

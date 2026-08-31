@@ -77,6 +77,43 @@ pub(in crate::afxdp) fn enforce_ha_resolution_snapshot(
     ) {
         return resolution;
     }
+    // An EMPTY ha_state means "this box is not clustered", so host-destined
+    // traffic is not gated on redundancy-group ownership. That reading is a
+    // CONTRACT, not an inference: the Go manager drives the map empty on purpose
+    // for a standalone node (clearHelperHAStateLocked), and the sibling gate
+    // below depends on it — a standalone node whose map was non-empty would mark
+    // every transit ForwardCandidate HAInactive and drop it, the #1928 outage.
+    //
+    // #7465 asked whether a CLUSTERED node can reach this branch, i.e. be
+    // forwarding while its inventory is still empty. Recording the answer so the
+    // next reader does not re-derive the theory from the issue title:
+    //
+    //   NOT reachable — the deferred-XSK-startup resume path in
+    //   manager_compile.go. It looks like a candidate because it publishes a
+    //   snapshot without an HA publish, but `pendingXSKStartup` requires
+    //   `m.publishedSnapshot != 0`, and resetAfterHelperGoneLocked zeroes that
+    //   on BOTH the crash-reap and explicit-stop paths (and nils m.proc, which
+    //   independently falsifies the same condition). On a clustered node the
+    //   only way to set it is the normal publish path, which runs
+    //   refreshHAStateFromMapsLocked + syncHAStateLocked — both fail-closed —
+    //   BEFORE it arms. So when the deferred branch runs, the live helper is
+    //   already holding an inventory and the deferral cannot empty it.
+    //
+    //   REACHABLE — an ordinary apply failure. Arming does not consult the
+    //   inventory: desiredForwardingArmedLocked returns true on a clustered node
+    //   whenever any RG with ID>0 is configured, and the 1 Hz poll calls
+    //   syncDesiredForwardingStateLocked unconditionally while the HA publish
+    //   above it is gated on an active signature plus a 2s hold and a 5s
+    //   throttle. An apply that fails between the snapshot publish and
+    //   syncHAStateLocked does NOT disarm or stop the helper (#5679 — the
+    //   daemon records a deferred commit error and continues), so the poll then
+    //   arms a helper that has never been told its inventory.
+    //
+    // That window is closed on the GO side, in syncDesiredForwardingStateLocked,
+    // which refuses to arm a clustered helper with no successful
+    // update_ha_state. It is closed there rather than here because the defect is
+    // the arm/publish ordering, not the representation: making the empty map
+    // tri-state would refine a signal the arm path never reads.
     if resolution.disposition == ForwardingDisposition::LocalDelivery && ha_state.is_empty() {
         return resolution;
     }

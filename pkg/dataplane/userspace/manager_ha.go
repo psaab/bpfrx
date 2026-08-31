@@ -65,6 +65,12 @@ func (m *Manager) syncHAStateLocked() error {
 	if err := m.requestLocked(req, &status); err != nil {
 		return err
 	}
+	// #7465: the helper now holds a clustered inventory. Recorded HERE, after
+	// the request succeeded, and deliberately NOT at the `len(m.haGroups) == 0`
+	// early return above — that path returns nil WITHOUT publishing anything, so
+	// treating it as a publish would mark the flag on exactly the case the gate
+	// exists to catch.
+	m.helperHAStatePublished = true
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
 	}
@@ -651,6 +657,36 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return err
 		}
+	}
+	// #7465: refuse to ARM a clustered helper that has never been sent an HA
+	// inventory. The helper's per-packet gate reads an empty ha_state as "this
+	// box is not clustered" and lets LocalDelivery through
+	// (forwarding/ha.rs enforce_ha_resolution_snapshot), so arming before the
+	// first update_ha_state opens a fail-OPEN window on host-destined traffic.
+	//
+	// This is reachable because an ORDINARY apply failure does not disarm or
+	// stop the helper — daemon_apply_dataplane.go records a deferred commit
+	// error and continues (#5679), and compileErrorMustAbortApply is true only
+	// for the required-protocol gate. So an apply that fails in the window
+	// between the snapshot publish and syncHAStateLocked (a transient control
+	// socket error in applyHelperStatusLocked, refreshHAStateFromMapsLocked or
+	// syncHAStateLocked) leaves a live helper holding a snapshot and no
+	// inventory — and the 1 Hz poll then arms it.
+	//
+	// Scoped exactly like the #6165 gate above: ARM direction only. A disarm
+	// must NEVER be blocked, and the delta check above has already established
+	// that desired != current, so reaching here with desired==true is an arm.
+	//
+	// Fail closed and LOUD: a clustered helper that is never told its inventory
+	// simply does not forward, and the error surfaces on the poll caller's log
+	// and the apply path. That is a bounded, visible availability loss, versus a
+	// silent fail-open on the packet path.
+	if desired && m.clusterHA && !m.helperHAStatePublished {
+		return fmt.Errorf(
+			"refusing to arm forwarding: chassis-cluster helper has no HA inventory yet " +
+				"(no successful update_ha_state); arming now would let the helper read an " +
+				"empty ha_state as standalone and deliver host-destined traffic it should " +
+				"gate on redundancy-group ownership")
 	}
 	if m.clusterHA {
 		slog.Info(

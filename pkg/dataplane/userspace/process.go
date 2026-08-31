@@ -431,6 +431,11 @@ func (m *Manager) resetAfterHelperGoneLocked() {
 	m.bindingsBusySince = time.Time{}
 	m.lastBindingsAutoRebind = time.Time{}
 	m.publishedSnapshot = 0
+	// #7465: a new helper starts with an EMPTY HA inventory, so the fact that the
+	// previous process had been told says nothing about this one. Without this
+	// clear the arm gate would pass on a restarted helper that has never been
+	// sent an inventory — the exact state it exists to refuse.
+	m.helperHAStatePublished = false
 	m.publishedPlanKey = ""
 	// #2079: forget the applied snapshot when the helper stops so a
 	// restarted helper does not expose a stale applied config before its
