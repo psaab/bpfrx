@@ -187,6 +187,43 @@ The reservation is now tri-state (`SyncedReserveOutcome`): `Reserved`,
 `NothingToReserve` is answered exactly like the long-standing
 `rewrite_src == None` early return one line above it.
 
+**#7209 — an admitted import with no kernel session map is now visible.** After
+the reservation, `upsert_synced_session` publishes the row to the kernel session
+map. That publish sat behind one conjunction:
+
+```rust
+if synced_entry_allows_local_replace(..) && let Some(fd) = ..session_map_fd
+```
+
+whose two operands mean opposite things. The FIRST failing is correct: the peer
+owns the redundancy group, so this node must not take the redirect. The SECOND
+failing is a gap — the entry is recorded in the shared `synced` map and answered
+to Go as installed, while no kernel row exists, and `SyncedImportOutcome::Applied`
+is returned with no refusal reason. `bpf_maps.session_map_fd` is `None` before
+the first successful reconcile and between `stop_inner` and the next
+`reconcile::bringup`, so an HA standby taking bulk sync before its first snapshot
+apply lands there for every session in the batch.
+
+**That is not a loss today**, and the counter is not an alarm. Every `reconcile`
+opens with `teardown::tear_down`, which captures the WHOLE shared synced map via
+`snapshot_shared_session_entries()` and replays it once the new map is up, so an
+entry recorded while the fd was absent is published by the next reconcile. The
+remaining window — an entry arriving BETWEEN that capture and the replay — is
+closed by the snapshot-wide `ServerState` mutex, which stops `sync_session` and
+`apply_snapshot` interleaving at all.
+
+That mutex is what #7209 proposes to remove, which is why the counter lands
+first. Once `sync_session` runs off it, an import in that window would be
+recorded, acked to Go as installed, never published and never replayed — with no
+signal anywhere. The conjunction is therefore split into one authority,
+`publish_synced_entry_or_note_unpublished`, and the absent-map arm bumps
+`xpf_userspace_synced_import_unpublished_total`. It counts the GAP only: the
+owner decision is not counted, or the metric would sit permanently nonzero on a
+healthy node, and a publish that was ATTEMPTED and failed stays with the #1789
+`session_publish_errors` counter. Whatever deferred-and-replay design accompanies
+#7209 can then be shown to drive this counter to zero rather than asserting the
+property from a reading of the lock graph.
+
 **#5305 — the forward install is transactional.** A forward cluster-synced
 install writes the pinned BPF session mirror FIRST, then mirrors the entry to
 the Rust helper. If the helper mirror fails (connect/write/decode), the install

@@ -3035,3 +3035,125 @@ fn a_pass1_refused_import_is_counted_and_not_published_6979_f1() {
         );
     }
 }
+
+/// #7209: `synced_import_unpublished` must count the GAP — an import the
+/// local-replace guard ADMITTED but which had no kernel session map to publish
+/// into — and must not count the ownership decision that used to share its
+/// `if`.
+///
+/// The two were one conjunction:
+///
+/// ```ignore
+/// if synced_entry_allows_local_replace(..) && let Some(fd) = ..session_map_fd
+/// ```
+///
+/// and they mean opposite things. The FIRST operand failing is correct
+/// behaviour: the peer owns the redundancy group, so this node must not take
+/// the redirect. The SECOND failing is a gap: the entry is recorded in the
+/// shared map and answered to Go as installed, while no kernel row exists. A
+/// counter that fired on "did not publish" would sit permanently nonzero on a
+/// healthy standby and report nothing, so the conjunction had to be split
+/// before either could be measured.
+///
+/// Three legs, and B and C are the ones that earn the metric:
+///
+///   A. admitted, no map -> COUNTS. A fresh `Coordinator` has
+///      `bpf_maps.session_map_fd == None`, which is not contrived: it is an HA
+///      standby taking bulk sync before its first snapshot apply, and the
+///      interval between `stop_inner` and the next `reconcile::bringup`.
+///   B. peer owns the RG, no map -> does NOT count. Without this leg the
+///      counter is a rename of "did not publish" and climbs on every healthy
+///      peer-owned import.
+///   C. admitted, map PRESENT -> does NOT count. `fd: -1` is a real descriptor
+///      that is not a map, so the publish is attempted and fails; that failure
+///      belongs to the #1789 publish-error counter, not to this one. Without
+///      leg C a counter bumped on every ADMITTED import passes both A and B.
+///
+/// Each leg asserts the guard's actual verdict first, so a fixture that stopped
+/// exercising its intended case fails loudly rather than passing vacuously.
+#[test]
+fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209() {
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+
+    // --- Leg A: admitted, and there is no map to publish into. -------------
+    let mut no_map = Coordinator::new();
+    register_test_worker_7209(&mut no_map);
+    assert!(
+        no_map.bpf_maps.session_map_fd.is_none(),
+        "fixture no longer exercises the ABSENT-MAP case — a fresh Coordinator \
+         must have no session map fd, or leg A proves nothing"
+    );
+    assert!(
+        crate::afxdp::session_glue::synced_entry_allows_local_replace(
+            &no_map.ha.rg_runtime.load(),
+            test_metadata().owner_rg_id,
+            now_secs,
+        ),
+        "fixture no longer exercises the ADMITTED case — with the local-replace \
+         guard refusing, leg A would count nothing for the wrong reason"
+    );
+    let before_a = no_map.synced_import_unpublished_total();
+    no_map.upsert_synced_session(reserve6600_entry(42000, 22000));
+    assert!(
+        no_map.synced_import_unpublished_total() > before_a,
+        "an import the local-replace guard ADMITTED, with no kernel session map \
+         to publish into, was not counted. That import is recorded in the shared \
+         map and answered to Go as installed while no kernel row exists; today \
+         the next reconcile's capture-and-replay covers it, but once #7209 takes \
+         sync_session off the snapshot-wide mutex an import in the \
+         capture-to-replay window is neither published nor replayed and there is \
+         no signal at all"
+    );
+
+    // --- Leg B: the PEER owns the RG -> not publishing is correct. ---------
+    let mut peer_owned = Coordinator::new();
+    register_test_worker_7209(&mut peer_owned);
+    peer_owned
+        .update_ha_state(&[HAGroupStatus {
+            rg_id: test_metadata().owner_rg_id,
+            active: true,
+            watchdog_timestamp: now_secs,
+            ..HAGroupStatus::default()
+        }])
+        .expect("update ha state");
+    assert!(
+        !crate::afxdp::session_glue::synced_entry_allows_local_replace(
+            &peer_owned.ha.rg_runtime.load(),
+            test_metadata().owner_rg_id,
+            monotonic_nanos() / 1_000_000_000,
+        ),
+        "fixture no longer exercises the OWNER-DECLINED case — leg B would then \
+         be a second copy of leg A and could not detect a counter that fires on \
+         every non-publish"
+    );
+    assert!(
+        peer_owned.bpf_maps.session_map_fd.is_none(),
+        "leg B must ALSO have no map, so the only difference from leg A is the \
+         owner decision"
+    );
+    let before_b = peer_owned.synced_import_unpublished_total();
+    peer_owned.upsert_synced_session(reserve6600_entry(42001, 22001));
+    assert_eq!(
+        peer_owned.synced_import_unpublished_total(),
+        before_b,
+        "an import this node correctly declined to publish because the PEER owns \
+         the redundancy group was counted as an unpublished gap. The metric then \
+         climbs on every healthy peer-owned import and stops meaning anything \
+         (#7209)"
+    );
+
+    // --- Leg C: a map IS present -> the gap counter must stay still. -------
+    let mut with_map = Coordinator::new();
+    register_test_worker_7209(&mut with_map);
+    with_map.bpf_maps.session_map_fd = Some(crate::afxdp::bpf_map::OwnedFd { fd: -1 });
+    let before_c = with_map.synced_import_unpublished_total();
+    with_map.upsert_synced_session(reserve6600_entry(42002, 22002));
+    assert_eq!(
+        with_map.synced_import_unpublished_total(),
+        before_c,
+        "an import that HAD a session map was counted as having none. fd -1 is \
+         not a map, so the publish is attempted and FAILS — that failure is the \
+         #1789 publish-error counter's, and folding it in here would make this \
+         metric fire on every publish error too (#7209)"
+    );
+}

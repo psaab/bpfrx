@@ -189,6 +189,69 @@ impl crate::afxdp::Coordinator {
         true
     }
 
+    /// Publish one synced session row to the kernel session map, or record that
+    /// there was no map to publish into (#7209).
+    ///
+    /// This exists to split a conjunction that conflated two very different
+    /// reasons for not publishing. The call sites read
+    ///
+    /// ```ignore
+    /// if synced_entry_allows_local_replace(..) && let Some(fd) = ..session_map_fd
+    /// ```
+    ///
+    /// where the FIRST operand failing is a deliberate ownership decision — the
+    /// peer owns the redundancy group, so this node must NOT take the redirect,
+    /// and not publishing is the correct outcome — while the SECOND failing is a
+    /// gap: the entry is recorded in the shared map and answered to Go as
+    /// installed, but no kernel row exists. Counting "did not publish" across
+    /// both would fire continuously on healthy peer-owned imports and report
+    /// nothing; only the second is reportable, and it is only separable once the
+    /// `&&` is split.
+    ///
+    /// WHEN THE MAP IS ABSENT. `bpf_maps.session_map_fd` is `None` before the
+    /// first successful reconcile and again between `Coordinator::stop_inner`
+    /// (which sets it to `None`) and `reconcile::bringup` (which re-sets it). An
+    /// HA standby that receives bulk session sync before its first snapshot
+    /// apply — the ordinary failover-preparation sequence — lands here for every
+    /// session in the batch.
+    ///
+    /// THIS IS NOT A LOSS TODAY, and the counter is not an alarm. Every
+    /// `reconcile` opens with `teardown::tear_down`, which captures the WHOLE
+    /// shared synced map via `snapshot_shared_session_entries()` and replays it
+    /// once the new map is up, so an entry recorded while the fd was absent is
+    /// published by the next reconcile. What closes the remaining window — an
+    /// entry arriving BETWEEN that capture and the replay — is the
+    /// snapshot-wide `ServerState` mutex, which today stops `sync_session` and
+    /// `apply_snapshot` interleaving at all.
+    ///
+    /// That mutex is what #7209 proposes to remove, which is why this counter
+    /// lands FIRST: once `sync_session` runs off it, an import in that window
+    /// would be recorded, acked to Go as installed, never published and never
+    /// replayed, with no signal anywhere. This makes the currently-benign
+    /// occurrences visible, so the deferred-and-replay design that must
+    /// accompany #7209 has an instrument that can be driven to zero rather than
+    /// a guarantee asserted from a reading of the lock graph.
+    fn publish_synced_entry_or_note_unpublished(
+        &self,
+        key: &SessionKey,
+        nat: NatDecision,
+        is_reverse: bool,
+    ) {
+        let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref() else {
+            self.sessions
+                .synced_import_unpublished
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        // #1789: a failed HA-upsert publish silently loses synced state (the
+        // shim takes the NO_SESSION degraded path). No binding context here, so
+        // bump the shared counter. Distinct from the absent-map arm above: this
+        // one HAD a map and the kernel refused the write.
+        if publish_live_session_entry(session_map_fd.fd, key, nat, is_reverse).is_err() {
+            SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) -> SyncedImportOutcome {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
@@ -400,21 +463,12 @@ impl crate::afxdp::Coordinator {
             ha_state.as_ref(),
             entry.metadata.owner_rg_id,
             now_secs,
-        ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
-        {
-            // #1789: a failed HA-upsert publish silently loses synced
-            // state (the shim takes the NO_SESSION degraded path). No
-            // binding context here, so bump the shared counter.
-            if publish_live_session_entry(
-                session_map_fd.fd,
+        ) {
+            self.publish_synced_entry_or_note_unpublished(
                 &entry.key,
                 entry.decision.nat,
                 entry.metadata.is_reverse,
-            )
-            .is_err()
-            {
-                SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
-            }
+            );
         }
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
@@ -435,20 +489,14 @@ impl crate::afxdp::Coordinator {
                 ha_state.as_ref(),
                 reverse.metadata.owner_rg_id,
                 now_secs,
-            ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
-            {
-                // #1789: same accounting for the synthesized reverse
-                // entry (was `let _ =`).
-                if publish_live_session_entry(
-                    session_map_fd.fd,
+            ) {
+                // #1789: same accounting for the synthesized reverse entry
+                // (was `let _ =`); #7209 folds it into the same authority.
+                self.publish_synced_entry_or_note_unpublished(
                     &reverse.key,
                     reverse.decision.nat,
                     true,
-                )
-                .is_err()
-                {
-                    SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
-                }
+                );
             }
         }
         // #6242: fan out to each worker's command queue via its runtime record.

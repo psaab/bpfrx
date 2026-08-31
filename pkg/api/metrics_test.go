@@ -1094,6 +1094,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceSyncedImportUnpublished: prometheus.NewDesc(
+			"xpf_userspace_synced_import_unpublished_total",
+			"synced imports admitted with no session map to publish into",
+			nil,
+			nil,
+		),
 		userspaceGreDecapEcnIllegalDrops: prometheus.NewDesc(
 			"xpf_userspace_gre_decap_ecn_illegal_drops_total",
 			"gre decap rfc6040 illegal-combo drops",
@@ -1227,6 +1233,7 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		SessionDeleteStaleIgnored:  22,
 		SyncedImportReserveRefused: 23,
 		SyncedImportZoneUnresolved: 7,
+		SyncedImportUnpublished:    31,
 		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
 		// emitted unconditionally.
 		GreDecapEcnIllegalDropsTotal: 3,
@@ -1357,8 +1364,15 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// because the two say different things to an operator: one means the
 	// standby cannot hold a translation, the other means it will not adopt a
 	// session under a domain nothing verified.
-	if len(got) != 53 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 53 metrics, got %d", len(got))
+	// synced_import_unpublished_total counter = 54 (#7209) — a peer-synced
+	// import the local-replace guard ADMITTED that had no kernel session map
+	// to publish into. Its own series rather than folded into the
+	// zone-unresolved counter above, because they report different failures:
+	// that one means the import was published with a degraded reservation,
+	// this one means it was not published at all while still being answered
+	// to Go as installed.
+	if len(got) != 54 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 54 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1429,6 +1443,13 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// fixture value is deliberately NOT 0 — a 0 here would pass against a
 	// collector that never emitted the series at all.
 	assertCounterClose(t, got, c.userspaceSyncedImportZoneUnresolved, nil, 7)
+	// #7209: synced imports the local-replace guard ADMITTED that had no
+	// kernel session map to publish into. Emitted unconditionally like its
+	// neighbours. The fixture value is distinct from every sibling above, so
+	// an emit wired to the wrong status field swaps two numbers that DIFFER,
+	// and it is non-zero so a collector that never emitted the series fails
+	// rather than matching a default.
+	assertCounterClose(t, got, c.userspaceSyncedImportUnpublished, nil, 31)
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapEcnIllegalDrops, nil, 3)

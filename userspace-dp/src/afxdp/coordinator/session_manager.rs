@@ -77,6 +77,31 @@ pub(in crate::afxdp) struct SessionManager {
     ///
     /// Surfaced via `Coordinator::synced_import_zone_unresolved_total()`.
     pub(in crate::afxdp) synced_import_zone_unresolved: AtomicU64,
+    /// #7209: peer-synced imports this node was ALLOWED to publish (the local
+    /// replace guard passed) but could not, because `bpf_maps.session_map_fd`
+    /// was `None` — there was no kernel session map to write into.
+    ///
+    /// Counts the GAP only, never the ownership decision it used to share an
+    /// `&&` with. Declining to publish because the PEER owns the redundancy
+    /// group is correct and is not counted; a counter folding the two together
+    /// would sit permanently nonzero on a healthy node and report nothing.
+    ///
+    /// Nonzero is EXPECTED, not a fault, on the ordinary paths where the map
+    /// does not exist yet: an HA standby taking bulk sync before its first
+    /// snapshot apply, and the interval between `stop_inner` and the next
+    /// `reconcile::bringup`. Those imports are not lost — every reconcile opens
+    /// by capturing the whole shared synced map and replays it once the new map
+    /// is up.
+    ///
+    /// What it is FOR is #7209. Once `sync_session` is taken off the
+    /// snapshot-wide `ServerState` mutex, an import landing between that
+    /// capture and the replay would be recorded, answered to Go as installed,
+    /// never published and never replayed. This is the instrument that makes
+    /// that window observable, so the deferred-and-replay design can be SHOWN
+    /// to drive it to zero rather than asserted from the lock graph.
+    ///
+    /// Surfaced via `Coordinator::synced_import_unpublished_total()`.
+    pub(in crate::afxdp) synced_import_unpublished: AtomicU64,
     /// #5674: peer-synced session imports REJECTED by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`
@@ -155,6 +180,7 @@ impl SessionManager {
             export_seq: AtomicU64::new(0),
             install_stale_ignored: AtomicU64::new(0),
             synced_import_zone_unresolved: AtomicU64::new(0),
+            synced_import_unpublished: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
             delete_dropped_released: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),

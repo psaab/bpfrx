@@ -185,6 +185,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // settled config means the nodes' zone config has drifted.
     state.status.synced_import_zone_unresolved = state.afxdp.synced_import_zone_unresolved_total();
 
+    // #7209: imports admitted by the local-replace guard that found no kernel
+    // session map. Expected nonzero on a standby taking bulk sync before its
+    // first apply and across a stop/re-bringup; those are replayed by the next
+    // reconcile's capture. It is the instrument for the window that opens if
+    // sync_session is taken off the snapshot-wide mutex without a
+    // deferred-and-replay path.
+    state.status.synced_import_unpublished = state.afxdp.synced_import_unpublished_total();
+
     // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
     // over a Not-ECT inner). Nonzero = a misbehaving tunnel ingress
     // ECT-marked the outer for un-ECN inner traffic on a congested path.

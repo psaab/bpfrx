@@ -482,6 +482,7 @@ type xpfCollector struct {
 	userspaceWorkerCommandQueueDrops       *prometheus.Desc
 	userspaceSharedSessionPoisonRecoveries *prometheus.Desc
 	userspaceSyncedImportZoneUnresolved    *prometheus.Desc
+	userspaceSyncedImportUnpublished       *prometheus.Desc
 	// #7398: three Coordinator counters that were computed and never shown.
 	userspaceSessionInstallStaleIgnored       *prometheus.Desc
 	userspaceSessionDeleteStaleIgnored        *prometheus.Desc
@@ -945,6 +946,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceWorkerCommandQueueDrops
 	ch <- c.userspaceSharedSessionPoisonRecoveries
 	ch <- c.userspaceSyncedImportZoneUnresolved
+	ch <- c.userspaceSyncedImportUnpublished
 	ch <- c.userspaceSessionInstallStaleIgnored
 	ch <- c.userspaceSessionDeleteStaleIgnored
 	ch <- c.userspaceSyncedImportReserveRefused
