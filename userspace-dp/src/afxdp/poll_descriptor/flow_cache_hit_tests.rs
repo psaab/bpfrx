@@ -31,7 +31,7 @@
 use super::*;
 use crate::afxdp::flow_cache::{FlowCacheEntry, FlowCacheStamp};
 use crate::afxdp::umem::MmapArea;
-use crate::ip_proto::PROTO_TCP;
+use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 use crate::test_zone_ids::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
@@ -139,6 +139,75 @@ fn vlan_tagged_tcp_v4_frame(option_words: usize) -> Vec<u8> {
         "the frame must carry exactly the datagram it declares"
     );
     frame
+}
+
+/// #7678: the UDP twin of `test_key`. The protocol is the ONLY field that
+/// differs, so a cell using it exercises the same cache set, the same
+/// addresses and the same ports as every TCP cell here — the one axis under
+/// test is the one that moves.
+fn udp_test_key() -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        protocol: PROTO_UDP,
+        ..test_key()
+    }
+}
+
+/// #7678: a VLAN-80-tagged IPv4/UDP datagram carrying `udp_test_key`'s tuple.
+///
+/// It must not be TCP. `reject_reply.rs` branches on `meta.protocol ==
+/// PROTO_TCP` and synthesizes a TCP RST on that arm, never consulting
+/// `reject_message` — so a reject cell built on the TCP frame builders cannot
+/// reach the ICMP code path at all, however the cached descriptor is set up.
+fn vlan_tagged_udp_v4_frame() -> Vec<u8> {
+    let key = udp_test_key();
+    let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (key.src_ip, key.dst_ip) else {
+        unreachable!("test key is v4")
+    };
+    // IHL 5 (20 bytes) + the 8-byte UDP header + 4 bytes of payload.
+    let udp_len: u16 = 8 + 4;
+    let total_len: u16 = 20 + udp_len;
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[
+        0xde, 0xad, 0xbe, 0xef, 0x00, 0x01, 0x02, 0xbf, 0x72, 0x00, 0x01, 0x01, 0x81, 0x00,
+    ]);
+    frame.extend_from_slice(&INGRESS_VLAN_ID.to_be_bytes());
+    frame.extend_from_slice(&[0x08, 0x00]);
+    frame.push(0x45);
+    frame.push(0x00);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&[0x12, 0x34, 0x40, 0x00, 64, PROTO_UDP, 0x00, 0x00]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&key.src_port.to_be_bytes());
+    frame.extend_from_slice(&key.dst_port.to_be_bytes());
+    frame.extend_from_slice(&udp_len.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    assert_eq!(
+        frame.len(),
+        18 + total_len as usize,
+        "the frame must carry exactly the datagram it declares"
+    );
+    frame
+}
+
+/// #7678: `test_meta` for the UDP frame. Derived the same way, with the
+/// protocol and ports taken from `udp_test_key` so the metadata, the frame and
+/// the looked-up key all describe one datagram.
+fn udp_test_meta(frame: &[u8]) -> UserspaceDpMeta {
+    let key = udp_test_key();
+    UserspaceDpMeta {
+        protocol: PROTO_UDP,
+        // A UDP datagram has no TCP flags; leaving the TCP ACK bit set would
+        // be a self-inconsistent packet.
+        tcp_flags: 0,
+        l4_offset: 18 + ((frame[18] & 0x0f) as u16) * 4,
+        payload_offset: frame.len() as u16,
+        pkt_len: frame.len() as u16,
+        flow_src_port: key.src_port,
+        flow_dst_port: key.dst_port,
+        ..test_meta(frame)
+    }
 }
 
 fn tcp_v4_ack_frame() -> Vec<u8> {
@@ -675,6 +744,39 @@ impl LiveCallSiteFixture {
     /// `forwarding_build::interfaces::populate_egress` sources each
     /// `EgressInterface::zone_id` from this same ledger — so the fixture stays
     /// a faithful model rather than a state the builder cannot produce.
+    /// #7678: give the INGRESS interface a primary IPv4 address.
+    ///
+    /// `build_reject_icmp_unreachable` sources a generated ICMP reply from the
+    /// ingress interface's primary address, and every stock egress entry in
+    /// this fixture carries `primary_v4: None` — so without this the builder
+    /// returns `None` and NOTHING is enqueued, whatever the cached descriptor
+    /// says. That is a silent nothing, not an error, which is why the cell
+    /// using this asserts the reply was enqueued before reading a byte of it.
+    ///
+    /// KEYED ON THE LOGICAL IFINDEX, NOT THE PHYSICAL ONE. `enqueue_reject_reply`
+    /// resolves `resolve_ingress_logical_ifindex(forwarding, ingress_ifindex,
+    /// meta.ingress_vlan_id)` BEFORE the egress lookup, and this fixture maps
+    /// `(6, VLAN 80) -> 20080`. An entry keyed on `PHYS_INGRESS_IFINDEX` is
+    /// therefore never consulted on a VLAN-tagged frame — measured: it leaves
+    /// `pending_tx_local` empty and looks exactly like the reject branch not
+    /// running at all.
+    fn with_ingress_primary_v4(mut self) -> Self {
+        self.forwarding.egress.insert(
+            LOGICAL_INGRESS_IFINDEX,
+            EgressInterface {
+                bind_ifindex: PHYS_INGRESS_IFINDEX,
+                vlan_id: INGRESS_VLAN_ID,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+                zone_id: TEST_TRUST_ZONE_ID,
+                redundancy_group: 0,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 1, 1)),
+                primary_v6: None,
+            },
+        );
+        self
+    }
+
     fn with_zone_accounting(mut self) -> Self {
         self.forwarding.egress.insert(
             EGRESS_IFINDEX,
@@ -856,6 +958,31 @@ struct StageSeed {
     /// Install a session for `test_key()` before the call, as
     /// `(install_ns, protocol, tcp_flags)`.
     session: Option<(u64, u8, u8)>,
+    /// #7678: TX-pipeline headroom for the reject-reply budget gate.
+    ///
+    /// `enqueue_reject_reply` passes through `syn_cookie_reply_budget_available`,
+    /// which needs BOTH `free_tx_frames.len() > SYN_COOKIE_REPLY_PENDING_RESERVE`
+    /// AND `admitted < max_pending_tx - reserve`. That reserve is `TX_BATCH_SIZE`
+    /// = 64, and the stock fixture carries 8 free frames with
+    /// `max_pending_tx: 64` — so the gate can NEVER admit on it (8 <= 64, and
+    /// `0 < 64 - 64` is false). The reply is built and then dropped at the
+    /// budget gate, which is indistinguishable from the reject branch never
+    /// running unless you instrument it.
+    ///
+    /// `None` keeps every pre-#7678 caller on the stock (8, 64) pipeline.
+    tx_headroom: Option<(usize, usize)>,
+    /// #7678: the `SessionFlow` handed to `stage_flow_cache_hit`, i.e. the key
+    /// the stage LOOKS UP with. `None` keeps every pre-#7678 caller on
+    /// `test_key()`.
+    ///
+    /// This seam is the whole reason a non-TCP cell was previously impossible.
+    /// The stage does not derive its key from the packet — it takes
+    /// `flow.forward_key` as a parameter — and this harness hardcoded that to
+    /// `test_key()` (`PROTO_TCP`). So re-keying only the CACHED ENTRY to a UDP
+    /// key made `entry.key != *key` in `FlowCache::lookup_with_observed_bytes`
+    /// and the lookup MISSED, no matter how the frame was built. Both sides
+    /// have to move together.
+    flow: Option<SessionFlow>,
     /// The `now_ns` handed to `stage_flow_cache_hit`. Separate from
     /// `install_ns` so a cell can choose whether the session is STALE at call
     /// time, which is the only axis `touch_if_stale` branches on.
@@ -865,7 +992,7 @@ struct StageSeed {
 impl Default for StageSeed {
     fn default() -> Self {
         // 1_000_000 is the `now_ns` every pre-#6997 caller passed inline.
-        Self { session: None, now_ns: 1_000_000 }
+        Self { session: None, now_ns: 1_000_000, flow: None, tx_headroom: None }
     }
 }
 
@@ -915,6 +1042,10 @@ fn run_stage_seeded(
     flow_state.flow_cache.insert(entry);
 
     let mut tx_pipeline_state = tx_pipeline();
+    if let Some((free_frames, max_pending)) = seed.tx_headroom {
+        tx_pipeline_state.free_tx_frames = (0..free_frames as u64).collect();
+        tx_pipeline_state.max_pending_tx = max_pending;
+    }
     let mut tx_counters_state = tx_counters();
     let mut scratch_state = scratch();
     let mut sessions = SessionTable::new();
@@ -942,11 +1073,11 @@ fn run_stage_seeded(
         counters: &mut counters,
     };
 
-    let flow = SessionFlow {
+    let flow = seed.flow.clone().unwrap_or_else(|| SessionFlow {
         src_ip: test_key().src_ip,
         dst_ip: test_key().dst_ip,
         forward_key: test_key(),
-    };
+    });
     let mut owned_packet_frame: Option<Vec<u8>> = None;
     let mut mirror_sample_counter = initial_sample_counter;
 
@@ -2530,6 +2661,7 @@ fn live_flow_cache_callsite_accounts_the_packet_onto_the_session_6997() {
             // through the accounting call rather than through the install.
             session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
             now_ns: INSTALL_NS,
+            ..StageSeed::default()
         },
     );
 
@@ -2613,6 +2745,7 @@ fn live_flow_cache_callsite_refreshes_only_a_stale_session_6997() {
         StageSeed {
             session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
             now_ns: STALE_NOW_NS,
+            ..StageSeed::default()
         },
     );
     assert!(
@@ -2642,6 +2775,7 @@ fn live_flow_cache_callsite_refreshes_only_a_stale_session_6997() {
         StageSeed {
             session: Some((INSTALL_NS, PROTO_TCP, 0x00)),
             now_ns: INSTALL_NS + 1_000,
+            ..StageSeed::default()
         },
     );
     assert!(
@@ -2827,5 +2961,204 @@ fn live_flow_cache_callsite_emits_the_cached_output_filter_log_6999() {
             .any(|e| e.reason == FilterLogSource::Input.wire_reason()),
         "an INPUT record was emitted for an entry whose descriptor carries no \
          input_filter_log: {events:?}"
+    );
+}
+
+/// #7678: the flow-cache REPLAY consumer of `then reject <message-type>`.
+///
+/// Four hops carry a filter term's reject message-type from the filter result
+/// to the ICMP builder. #6854 bound three; this is the fourth, and it was the
+/// one with nowhere to stand — hardcoding
+/// `cached_descriptor.tx_selection.reject_message` to the default left the
+/// ENTIRE suite green, so an operator's `then reject host-unreachable` would
+/// silently revert to administratively-prohibited on flow-cache-replayed
+/// traffic with nothing to notice.
+///
+/// THREE THINGS HAD TO BE TRUE AT ONCE, and each fails SILENTLY on its own —
+/// which is why the assertions below run in this order rather than jumping to
+/// the byte under test. Each earlier failure otherwise masquerades as the
+/// later one:
+///
+/// 1. **The lookup must HIT.** `stage_flow_cache_hit` does not derive its key
+///    from the packet — it takes `flow.forward_key` as a parameter — and this
+///    harness hardcoded that to `test_key()` (TCP). Re-keying only the cached
+///    entry made `entry.key != *key` and the lookup MISSED, measured as
+///    `tallies=(0,1,0)`. Both sides move together via `StageSeed.flow`.
+/// 2. **The frame must NOT be TCP.** `reject_reply.rs` branches on
+///    `meta.protocol == PROTO_TCP` and synthesizes a TCP RST on that arm,
+///    never consulting `reject_message`. A TCP frame cannot reach the ICMP
+///    code path however the descriptor is configured.
+/// 3. **The ingress interface needs a primary IPv4.** The reply is sourced
+///    from it; without one nothing is built at all.
+///
+/// FAIL-ON-REVERT: hardcode `flow_cache_hit.rs`'s `reject_message` read to
+/// `RejectMessage::ADMIN_PROHIBITED` and the final assertion reds with code 13.
+#[test]
+fn live_flow_cache_replay_carries_the_configured_reject_message_type_7678() {
+    let _bucket_guard = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        1_000_000,
+    );
+
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom).with_ingress_primary_v4();
+    let frame = vlan_tagged_udp_v4_frame();
+    let meta = udp_test_meta(&frame);
+
+    let mut entry = cached_entry();
+    entry.key = udp_test_key();
+    // `reject` is only ever true when `drop` is (flow_cache.rs), so setting it
+    // alone would be a state the producer cannot emit.
+    entry.descriptor.tx_selection.drop = true;
+    entry.descriptor.tx_selection.reject = true;
+    // `host-unreachable` — ICMPv4 type 3 code 1. Deliberately NOT the default
+    // (code 13): a cell using ADMIN_PROHIBITED here would pass against a
+    // hardcoded read and prove nothing.
+    entry.descriptor.tx_selection.reject_message = crate::filter::RejectMessage {
+        v4_code: 1,
+        v6_code: 1,
+    };
+
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        meta,
+        entry,
+        0,
+        StageSeed {
+            flow: Some(SessionFlow {
+                src_ip: udp_test_key().src_ip,
+                dst_ip: udp_test_key().dst_ip,
+                forward_key: udp_test_key(),
+            }),
+            // Enough headroom for the budget gate to admit; see StageSeed.
+            tx_headroom: Some((128, 256)),
+            ..StageSeed::default()
+        },
+    );
+
+    // (1) CHEAPEST AND EARLIEST. A miss means the stage never reached the
+    // replay path, so everything below would be measuring the miss path while
+    // reporting on the reject path.
+    assert_eq!(
+        run.flow_cache_tallies.0, 1,
+        "#7678 PREMISE: the cached entry must be HIT. tallies=(hits, misses, evictions)={:?} \
+         — a miss means the lookup key and the entry key disagree, and every assertion \
+         below would then be describing a path the stage did not take",
+        run.flow_cache_tallies
+    );
+
+    // (2) The reply must actually have been built. An absent frame read as a
+    // pass is the exact outcome this issue exists to prevent.
+    assert_eq!(
+        run.tx_pipeline.pending_tx_local.len(),
+        1,
+        "#7678 PREMISE: a cached `then reject` replay must enqueue exactly one ICMP reply \
+         on the ingress TX pipeline. If this is 0 the assertion below reads a frame that \
+         was never built and proves nothing — the exact wired-but-unasserted outcome this \
+         issue exists to close"
+    );
+    let reply = run
+        .tx_pipeline
+        .pending_tx_local
+        .front()
+        .expect("#7678: the ICMP reject reply must be queued on the ingress TX pipeline");
+
+    // (3) The byte under test.
+    let (ty, code) = icmp_type_code_v4_7678(&reply.bytes);
+    assert_eq!(
+        (ty, code),
+        (3, 1),
+        "#7678: the flow-cache REPLAY path must carry the cached term's message-type onto \
+         the wire — `host-unreachable` is ICMPv4 type 3 code 1. Code 13 means the hop from \
+         CachedTxSelectionDescriptor.reject_message to the builder carries the default, \
+         which is the hop #6854 left unbound and the whole suite otherwise cannot see"
+    );
+}
+
+/// Type/code of an ICMPv4 reply, skipping an optional 802.1Q tag. Local twin of
+/// the #6854 helper in `tests_bind_forward.rs`, which is a different module.
+fn icmp_type_code_v4_7678(frame: &[u8]) -> (u8, u8) {
+    let mut off = 14usize;
+    if frame.len() > 13 && u16::from_be_bytes([frame[12], frame[13]]) == 0x8100 {
+        off += 4;
+    }
+    assert!(frame.len() > off, "frame too short for an IPv4 header");
+    let ihl = usize::from(frame[off] & 0x0f) * 4;
+    let icmp = off + ihl;
+    assert!(
+        frame.len() > icmp + 1,
+        "frame too short for an ICMP type/code at offset {icmp}"
+    );
+    (frame[icmp], frame[icmp + 1])
+}
+
+/// #7678 OVER-REACH CONTROL, and the second user the issue asks for.
+///
+/// The cell above asserts code 1. On its own that passes for an assertion that
+/// happens to read a constant 1 from anywhere — including a builder that
+/// ignores `reject_message` entirely and a fixture that coincidentally agrees.
+/// This drives the SAME fixture with the DEFAULT message-type and requires code
+/// 13, so the two together show the byte on the wire TRACKS the cached field
+/// rather than being fixed at either value.
+///
+/// It also demonstrates the harness generalises past one value: only
+/// `reject_message` differs between the two cells.
+#[test]
+fn live_flow_cache_replay_default_reject_message_still_sends_admin_prohibited_7678() {
+    let _bucket_guard = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        1_000_000,
+    );
+
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom).with_ingress_primary_v4();
+    let frame = vlan_tagged_udp_v4_frame();
+    let meta = udp_test_meta(&frame);
+
+    let mut entry = cached_entry();
+    entry.key = udp_test_key();
+    entry.descriptor.tx_selection.drop = true;
+    entry.descriptor.tx_selection.reject = true;
+    entry.descriptor.tx_selection.reject_message = crate::filter::RejectMessage::ADMIN_PROHIBITED;
+
+    let run = run_stage_seeded(
+        &fixture,
+        &frame,
+        meta,
+        entry,
+        0,
+        StageSeed {
+            flow: Some(SessionFlow {
+                src_ip: udp_test_key().src_ip,
+                dst_ip: udp_test_key().dst_ip,
+                forward_key: udp_test_key(),
+            }),
+            tx_headroom: Some((128, 256)),
+            ..StageSeed::default()
+        },
+    );
+
+    assert_eq!(
+        run.flow_cache_tallies.0, 1,
+        "#7678 PREMISE: the cached entry must be HIT; tallies={:?}",
+        run.flow_cache_tallies
+    );
+    assert_eq!(
+        run.tx_pipeline.pending_tx_local.len(),
+        1,
+        "#7678 PREMISE: the replay must enqueue exactly one ICMP reply"
+    );
+    let reply = run
+        .tx_pipeline
+        .pending_tx_local
+        .front()
+        .expect("#7678: the ICMP reject reply must be queued");
+    assert_eq!(
+        icmp_type_code_v4_7678(&reply.bytes),
+        (3, 13),
+        "#7678: a cached reject with NO message-type must still send \
+         administratively-prohibited (ICMPv4 type 3 code 13). If this reads 1, the \
+         sibling cell's code-1 assertion is not tracking the cached field"
     );
 }
