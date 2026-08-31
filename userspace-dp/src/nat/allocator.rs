@@ -2365,6 +2365,15 @@ impl PortAllocator {
                 out.skipped_out_of_range += 1;
                 continue;
             }
+            // #7360: this pass calls the NON-persistent `reserve_flow`, which
+            // preserves today's behaviour bit-for-bit. It does not carry
+            // `persistent_by_source` either — the doc above records that as the
+            // same class of question as the address-only tokens, tracked
+            // separately (#6765) — so re-seeding a lease association would point
+            // the new allocation at a lease the NEW allocator does not hold.
+            // #7360 rebuilds leases on the HA IMPORT path; it does not change
+            // what a config-apply re-seed carries.
+            //
             // Preserve the holder set: an HA-synced flow is reserved once per
             // WORKER (#6211 F2) and the port must not be freed until the LAST
             // one lets go. Re-seeding with a single untracked holder would let
@@ -2421,7 +2430,37 @@ impl PortAllocator {
         matches!((port as u32).checked_sub(occ.port_low as u32), Some(o) if o < occ.range)
     }
 
+    /// #7360: the non-persistent entry point, unchanged in shape and semantics.
+    ///
+    /// `pub(crate)` because `afxdp` and the NAT64 port domain drive it, and it
+    /// deliberately does NOT mention `PersistentSourceKey` — that type is
+    /// `pub(super)` on purpose (see this file's visibility note), so the
+    /// lease-aware form is a `pub(super)` sibling reached only from
+    /// `nat::source`, where the rule's persistence config actually lives.
     pub(crate) fn reserve_flow(
+        &self,
+        flow: SourceNatFlowKey,
+        translated: TranslatedTuple,
+        addr_index: usize,
+        deterministic: bool,
+        now_ns: u64,
+        holder: NatHolder,
+    ) -> bool {
+        self.reserve_flow_maybe_persistent(
+            flow,
+            translated,
+            addr_index,
+            deterministic,
+            now_ns,
+            holder,
+            None,
+        )
+    }
+
+    /// #7360: reserve a synced flow, JOINING its source's persistent lease when
+    /// the matched rule runs `persistent-nat` (creating the lease on the first
+    /// session for that source).
+    pub(super) fn reserve_flow_maybe_persistent(
         &self,
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,
@@ -2434,6 +2473,12 @@ impl PortAllocator {
         // already uses.
         now_ns: u64,
         holder: NatHolder,
+        // #7360: `Some((key, timeout_ns))` when the rule this reservation
+        // matched runs `persistent-nat`. The standby cannot learn a lease any
+        // other way — session sync carries sessions, and a lease is a property
+        // of the SOURCE — so it is reconstructed here, from imports that
+        // actually succeeded.
+        persistent: Option<(PersistentSourceKey, u64)>,
     ) -> bool {
         if addr_index >= self.shared.occupancy.len() {
             return false;
@@ -2482,6 +2527,64 @@ impl PortAllocator {
             self.unlink_live_allocation_locked(&mut live, &flow, existing);
             Self::complete_persistent_lease_locked(&mut live, existing, now_ns);
         }
+        // #7360: a PERSISTENT synced flow joins its source's lease instead of
+        // reserving the port again.
+        //
+        // Two flows from one client under persistent NAT share ONE translated
+        // tuple — that is what a lease is for. They are DIFFERENT
+        // `SourceNatFlowKey`s (the destination differs), so the refresh
+        // early-return above does not catch the second one, and before this it
+        // fell through to the occupancy CAS below and failed on the bit its own
+        // lease already held. `reserve_synced_on_first_pool_owner` read that as
+        // `Refused`, and `handle_upsert_synced` returns `RejectedReserve`
+        // BEFORE `publish_shared_session` — so a persistent client's 2nd..Nth
+        // sessions were not merely un-leased on the standby, they were never
+        // imported at all.
+        //
+        // The local path never had this problem because
+        // `reuse_existing_lease_locked` does not call `reserve`: it points a new
+        // `LiveAllocation` at the tuple the lease already owns and bumps the
+        // refcount. This is the synced twin of that, and it is what makes the
+        // lease's `active_flows` mean what it says.
+        if let Some((persistent_key, timeout_ns)) = persistent {
+            if let Some(lease) = live.persistent_by_source.get(&persistent_key).copied() {
+                // A lease that names a DIFFERENT tuple than the wire does is
+                // config drift or a stale import. Refuse rather than retarget:
+                // the same posture as the "never steal" CAS below, and the
+                // caller falls through to the next rule.
+                if lease.translated != translated || lease.addr_index != addr_index {
+                    return false;
+                }
+                let was_idle = lease.active_flows == 0;
+                if let Some(lease) = live.persistent_by_source.get_mut(&persistent_key) {
+                    lease.active_flows = lease.active_flows.saturating_add(1);
+                }
+                // An ACTIVE lease must not sit in the idle-expiry index — the
+                // invariant `assert_persistent_expiry_indexes_consistent`
+                // states it, and `reuse_existing_lease_locked` maintains it the
+                // same way on the local path.
+                if was_idle {
+                    Self::remove_lease_expiration_locked(
+                        &mut live,
+                        lease.addr_index,
+                        lease.expires_at_ns,
+                        persistent_key,
+                    );
+                }
+                live.live_by_flow.insert(
+                    flow,
+                    LiveAllocation {
+                        translated,
+                        persistent_key: Some(persistent_key),
+                        addr_index,
+                        deterministic,
+                        address_only: false,
+                        holders: holder.bit(),
+                    },
+                );
+                return true;
+            }
+        }
         // Never steal a port owned by a DIFFERENT live allocation: the bit CAS
         // fails when the port is already occupied, so `reserve` returns false
         // and we leave the incumbent (and the caller falls through to the next
@@ -2491,11 +2594,50 @@ impl PortAllocator {
         if !self.shared.occupancy[addr_index].reserve(translated.port) {
             return false;
         }
+        // #7360: the FIRST session for this source mints the lease the rest will
+        // join. `active_flows` starts at 1 and is DERIVED from imports that
+        // actually succeeded — never carried from the peer, because the standby
+        // installs a strict subset of what the active sends (#6600 reserve
+        // refusal, #5674 capacity, #2170 stale generation, #7188's
+        // discriminator withhold). A carried count would credit the lease for
+        // sessions this node does not hold, and a refcount that never reaches
+        // zero is never idle, so the lease would never enter `lease_expirations`
+        // and no GC path could reclaim it.
+        //
+        // `expires_at_ns` is synthesized from the LOCAL clock, and that is
+        // sound rather than approximate: the reuse predicate is
+        // `active_flows > 0 || expires_at_ns > now_ns`, so while any flow is
+        // active the expiry is never consulted, and
+        // `complete_persistent_lease_locked` re-arms it from the local clock the
+        // moment the last flow releases. The peer's value could not be used
+        // anyway — it derives from `monotonic_nanos()` (CLOCK_MONOTONIC), which
+        // is boot-relative and meaningless across nodes.
+        //
+        // An IDLE lease (`active_flows == 0`, still inside its timeout) has no
+        // session to be rebuilt from and is out of scope here — see #8121.
+        let persistent_key = persistent.map(|(persistent_key, timeout_ns)| {
+            live.persistent_by_source.insert(
+                persistent_key,
+                PersistentLease {
+                    translated,
+                    addr_index,
+                    expires_at_ns: now_ns.saturating_add(timeout_ns.max(NS_PER_SEC)),
+                    timeout_ns,
+                    active_flows: 1,
+                    completed_flows: 0,
+                    activation_saw_completion: false,
+                    activation_previous_expires_at_ns: 0,
+                    activation_had_previous_lease: false,
+                    address_only: false,
+                },
+            );
+            persistent_key
+        });
         live.live_by_flow.insert(
             flow,
             LiveAllocation {
                 translated,
-                persistent_key: None,
+                persistent_key,
                 addr_index,
                 deterministic,
                 address_only: false,
