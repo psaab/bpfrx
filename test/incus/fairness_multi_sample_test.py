@@ -406,8 +406,21 @@ class FairnessMultiSampleTest(unittest.TestCase):
                 summary = fairness_multi_sample.run_samples(args)
 
             self.assertEqual(summary["verdict"], "PASS")
-            sleep.assert_has_calls([mock.call(0.25), mock.call(0.25)])
-            self.assertEqual(sleep.call_count, 2)
+            # #8136: count the COOLDOWN sleeps, not every sleep in the process.
+            # mock.patch.object(fairness_multi_sample.time, "sleep") patches the
+            # attribute on the SHARED stdlib time module, so `call_count` counts
+            # sleeps from anything else running inside the with-block too. The
+            # module itself has exactly one time.sleep — the cooldown — so a
+            # total of 178-230 (it varies per run, which is the tell) is other
+            # code, and pinning any of those numbers would be pinning noise.
+            # The property under test is "one cooldown between each pair of
+            # samples", which is what this asserts.
+            cooldowns = [c for c in sleep.call_args_list if c == mock.call(0.25)]
+            self.assertEqual(
+                len(cooldowns),
+                2,
+                f"3 samples must be separated by 2 cooldowns of 0.25s; got {cooldowns}",
+            )
             command = json.loads((out_dir / "sample-2" / "command.json").read_text(encoding="utf-8"))
             self.assertEqual(command["sample_cooldown_sec"], 0.25)
 
@@ -639,6 +652,14 @@ class FairnessMultiSampleTest(unittest.TestCase):
 
             env = {
                 **os.environ,
+                # #8136: this invokes the REAL harness against a FAKE target, so
+                # #8040's live target-service precheck is inapplicable by
+                # construction — it probes for listeners on the CoS ports and an
+                # incus handle for the target, neither of which a fixture has.
+                # The harness defines SKIP_TARGET_PRECHECK for exactly this; the
+                # test predates the precheck and had been failing invisibly
+                # since, because nothing ran this file.
+                "SKIP_TARGET_PRECHECK": "1",
                 "PATH": f"{tmp_path}:{os.environ['PATH']}",
                 "ARTIFACT_ROOT": str(out_root),
                 "CAPTURE_DATAPLANE": "0",
@@ -754,6 +775,14 @@ class FairnessMultiSampleTest(unittest.TestCase):
 
             env = {
                 **os.environ,
+                # #8136: this invokes the REAL harness against a FAKE target, so
+                # #8040's live target-service precheck is inapplicable by
+                # construction — it probes for listeners on the CoS ports and an
+                # incus handle for the target, neither of which a fixture has.
+                # The harness defines SKIP_TARGET_PRECHECK for exactly this; the
+                # test predates the precheck and had been failing invisibly
+                # since, because nothing ran this file.
+                "SKIP_TARGET_PRECHECK": "1",
                 "PATH": f"{tmp_path}:{os.environ['PATH']}",
                 "ARTIFACT_ROOT": str(out_root),
                 "CAPTURE_DATAPLANE": "0",
@@ -1240,6 +1269,8 @@ class FairnessMultiSampleTest(unittest.TestCase):
 
         env = {
             **os.environ,
+            # #8136: real harness, fake target — see the note above.
+            "SKIP_TARGET_PRECHECK": "1",
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
             "IPERF_BIN": str(fake_iperf),
             "FAIRNESS_EVAL": str(fake_eval),

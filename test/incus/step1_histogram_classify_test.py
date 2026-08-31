@@ -11,7 +11,11 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
+# #8136: pytest is not installed here and these run under `unittest
+# discover`. unittest_shim supplies the three pytest features this file
+# uses (raises/approx) plus the load_tests collector for its module-level
+# test functions, which unittest would otherwise not find at all.
+from unittest_shim import approx, collect_module_tests, raises
 import numpy as np
 
 
@@ -115,7 +119,7 @@ def test_kick_aggregation_sums_across_bindings():
 # ---------------------------------------------------------------- 13 ----
 def test_k0_i_empty_per_binding_rejected():
     snap = make_snap([])
-    with pytest.raises(ValueError, match="empty per_binding"):
+    with raises(ValueError, match="empty per_binding"):
         step1.sum_per_binding_kick(snap, 4)
 
 
@@ -125,7 +129,7 @@ def test_k0_ii_missing_key_rejected():
     snap = make_snap(
         [make_binding(kick_count=10, omit_kick_key="tx_kick_retry_count")]
     )
-    with pytest.raises(ValueError, match="tx_kick_retry_count.*pre-#826"):
+    with raises(ValueError, match="tx_kick_retry_count.*pre-#826"):
         step1.sum_per_binding_kick(snap, 0)
 
 
@@ -137,7 +141,7 @@ def test_k1_invariant_caught():
     snap = make_snap(
         [make_binding(kick_count=100, kick_hist=bad_hist)]
     )
-    with pytest.raises(ValueError, match="K1 violation"):
+    with raises(ValueError, match="K1 violation"):
         step1.sum_per_binding_kick(snap, 0)
 
 
@@ -159,7 +163,7 @@ def test_k2_invariant_caught():
     # Snap 0 is the cold — 0 packets, 0 kicks — fine. Make snap 3 bad.
     cumulative[0]["tx_packets"] = 0
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="K2 violation"):
+    with raises(ValueError, match="K2 violation"):
         step1.compute_blocks(snaps)
 
 
@@ -176,7 +180,7 @@ def test_k3_retry_backwards_caught():
         c["kick_retry"] = i  # normally monotonic
     cumulative[6]["kick_retry"] = 0  # reset
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="non-monotonic tx_kick_retry_count"):
+    with raises(ValueError, match="non-monotonic tx_kick_retry_count"):
         step1.compute_blocks(snaps)
 
 
@@ -193,7 +197,7 @@ def test_k3_sum_ns_backwards_caught():
     ]
     cumulative[6]["kick_sum_ns"] = 100  # reset below prior
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="non-monotonic tx_kick_latency_sum_ns"):
+    with raises(ValueError, match="non-monotonic tx_kick_latency_sum_ns"):
         step1.compute_blocks(snaps)
 
 
@@ -229,7 +233,7 @@ def test_k3_hist_bucket_backwards_caught():
     for i, s in enumerate(snaps):
         s["status"]["per_binding"][0]["tx_kick_retry_count"] = i
         s["status"]["per_binding"][0]["tx_kick_latency_sum_ns"] = 1000 * i
-    with pytest.raises(ValueError, match="non-monotonic tx_kick_latency_hist"):
+    with raises(ValueError, match="non-monotonic tx_kick_latency_hist"):
         step1.compute_blocks(snaps)
 
 
@@ -243,7 +247,7 @@ def test_twelve_snapshot_input_rejected(tmp_path):
     cold.write_text(json.dumps(snap))
     # 11 samples → total 12 — should reject.
     samples.write_text("\n".join([json.dumps(snap)] * 11) + "\n")
-    with pytest.raises(ValueError, match="expected 13 snapshots"):
+    with raises(ValueError, match="expected 13 snapshots"):
         step1.load_snapshots(tmp_path)
 
 
@@ -329,7 +333,7 @@ def test_i14_submit_count_backwards_caught():
     ]
     cumulative[6]["submit_count"] = 100  # reset below snap 5's 500
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="non-monotonic tx_submit_latency_count"):
+    with raises(ValueError, match="non-monotonic tx_submit_latency_count"):
         step1.compute_blocks(snaps)
 
 
@@ -348,7 +352,7 @@ def test_i14_submit_sum_ns_backwards_caught():
     ]
     cumulative[6]["submit_sum_ns"] = 100  # reset below prior
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="non-monotonic tx_submit_latency_sum_ns"):
+    with raises(ValueError, match="non-monotonic tx_submit_latency_sum_ns"):
         step1.compute_blocks(snaps)
 
 
@@ -367,7 +371,7 @@ def test_i14_tx_packets_backwards_caught():
     ]
     cumulative[6]["tx_packets"] = 100  # reset below prior
     snaps = make_13_snaps(cumulative)
-    with pytest.raises(ValueError, match="non-monotonic tx_packets"):
+    with raises(ValueError, match="non-monotonic tx_packets"):
         step1.compute_blocks(snaps)
 
 
@@ -410,7 +414,7 @@ def test_i14_submit_hist_reset_and_recover_caught():
     new_hist[5] = 0  # backwards from snap 6's cumulative 600
     reset["tx_submit_latency_hist"] = new_hist
     reset["tx_submit_latency_count"] = sum(new_hist)  # keep I13 (== bucket 0)
-    with pytest.raises(
+    with raises(
         ValueError, match=r"non-monotonic tx_submit_latency_hist\[5\]"
     ):
         step1.compute_blocks(snaps)
@@ -478,4 +482,10 @@ def test_only_cell_missing_target_returns_nonzero(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     import sys
-    sys.exit(pytest.main([__file__, "-v"]))
+    import unittest
+
+    unittest.main(verbosity=2)
+
+
+# #8136: unittest collects classes, not bare functions.
+load_tests = collect_module_tests(globals())

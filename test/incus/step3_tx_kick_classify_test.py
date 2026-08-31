@@ -12,7 +12,11 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pytest
+# #8136: pytest is not installed here and these run under `unittest
+# discover`. unittest_shim supplies the three pytest features this file
+# uses (raises/approx) plus the load_tests collector for its module-level
+# test functions, which unittest would otherwise not find at all.
+from unittest_shim import approx, collect_module_tests, raises
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -86,7 +90,7 @@ def test_block_delta_arithmetic_read_from_hist_blocks():
     )
     diag = classify_mod.classify(blocks)
     for blk in diag["per_block"]:
-        assert blk["kick_latency_mean_ns"] == pytest.approx(3000.0)
+        assert blk["kick_latency_mean_ns"] == approx(3000.0)
         assert blk["retry_count_delta"] == 50
         assert blk["kick_count_delta"] == 1000
 
@@ -242,7 +246,7 @@ def test_hist_blocks_wrong_length_rejected(tmp_path):
     blocks = make_12_blocks([0.99] * 12)[:11]  # 11 blocks
     path = tmp_path / "hist-blocks.jsonl"
     path.write_text("\n".join(json.dumps(b) for b in blocks) + "\n")
-    with pytest.raises(ValueError, match="expected 12 blocks"):
+    with raises(ValueError, match="expected 12 blocks"):
         classify_mod.validate_hist_blocks(
             classify_mod.load_jsonl(path), path
         )
@@ -254,7 +258,7 @@ def test_shape_wrong_length_rejected(tmp_path):
     blocks[3]["shape"] = [0.0] * 15  # wrong length
     path = tmp_path / "hist-blocks.jsonl"
     path.write_text("\n".join(json.dumps(b) for b in blocks) + "\n")
-    with pytest.raises(ValueError, match="shape length"):
+    with raises(ValueError, match="shape length"):
         classify_mod.validate_hist_blocks(
             classify_mod.load_jsonl(path), path
         )
@@ -268,7 +272,7 @@ def test_tx_kick_delta_fields_missing_rejected(tmp_path):
         del blk["tx_kick_retry_delta"]
     path = tmp_path / "hist-blocks.jsonl"
     path.write_text("\n".join(json.dumps(b) for b in blocks) + "\n")
-    with pytest.raises(ValueError, match="tx_kick_retry_delta"):
+    with raises(ValueError, match="tx_kick_retry_delta"):
         classify_mod.validate_hist_blocks(
             classify_mod.load_jsonl(path), path
         )
@@ -276,7 +280,9 @@ def test_tx_kick_delta_fields_missing_rejected(tmp_path):
 
 if __name__ == "__main__":
     import sys
-    sys.exit(pytest.main([__file__, "-v"]))
+    import unittest
+
+    unittest.main(verbosity=2)
 
 
 # ------------------------------------------------------------- 7424 ----
@@ -356,3 +362,7 @@ def test_zero_histogram_with_kick_evidence_is_not_insufficient_7424():
         "blocks carrying kick counts were treated as no-evidence; a capture "
         "with kicks measured something"
     )
+
+
+# #8136: unittest collects classes, not bare functions.
+load_tests = collect_module_tests(globals())
