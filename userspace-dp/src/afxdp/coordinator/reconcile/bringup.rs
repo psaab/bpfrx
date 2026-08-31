@@ -389,13 +389,19 @@ fn publish_runtime(
         dnat_fds: _,
         forwarding: _,
     } = fds;
-    coord.bpf_maps.map_fd = Some(map_fd);
-    coord.bpf_maps.heartbeat_map_fd = Some(heartbeat_map_fd);
-    coord.bpf_maps.session_map_fd = Some(session_map_fd);
-    coord.bpf_maps.conntrack_v4_fd = conntrack_v4_fd;
-    coord.bpf_maps.conntrack_v6_fd = conntrack_v6_fd;
-    coord.bpf_maps.dnat_table_fd = dnat_table_fd;
-    coord.bpf_maps.dnat_table_v6_fd = dnat_table_v6_fd;
+    // #7209: ONE store of the whole set, so a reader can never observe a
+    // half-populated generation (e.g. a live `session_map_fd` beside a stale
+    // `dnat_table_fd`). The previous set's descriptors are closed when the last
+    // holder releases its `Arc`.
+    coord.bpf_maps.store(Arc::new(crate::afxdp::coordinator::BpfMaps {
+        map_fd: Some(map_fd),
+        heartbeat_map_fd: Some(heartbeat_map_fd),
+        session_map_fd: Some(session_map_fd),
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        dnat_table_fd,
+        dnat_table_v6_fd,
+    }));
     let worker_binding_ifindexes = workers
         .iter()
         .map(|(worker_id, binding_plans)| {

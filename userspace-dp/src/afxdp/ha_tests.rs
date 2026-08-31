@@ -1520,7 +1520,12 @@ fn synced_snat_install_publishes_and_delete_releases_dnat_table_entry() {
     let mut coordinator = Coordinator::new();
     // A live v4 dnat_table fd so the publish/delete path is reached; -1 makes
     // the syscall a harmless EBADF after the keyed attempt is counted.
-    coordinator.bpf_maps.dnat_table_fd = Some(OwnedFd { fd: -1 });
+    // #7209: the descriptor set is published as a whole, so a test seeds it
+    // with one store rather than assigning a field.
+    coordinator.bpf_maps.store(std::sync::Arc::new(crate::afxdp::coordinator::BpfMaps {
+        dnat_table_fd: Some(OwnedFd { fd: -1 }),
+        ..Default::default()
+    }));
     let key = test_key();
 
     // Forward SNAT synced install must publish the reverse-SNAT entry.
@@ -3079,7 +3084,7 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
     let mut no_map = Coordinator::new();
     register_test_worker_7209(&mut no_map);
     assert!(
-        no_map.bpf_maps.session_map_fd.is_none(),
+        no_map.bpf_maps.load().session_map_fd.is_none(),
         "fixture no longer exercises the ABSENT-MAP case — a fresh Coordinator \
          must have no session map fd, or leg A proves nothing"
     );
@@ -3127,7 +3132,7 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
          every non-publish"
     );
     assert!(
-        peer_owned.bpf_maps.session_map_fd.is_none(),
+        peer_owned.bpf_maps.load().session_map_fd.is_none(),
         "leg B must ALSO have no map, so the only difference from leg A is the \
          owner decision"
     );
@@ -3145,7 +3150,10 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
     // --- Leg C: a map IS present -> the gap counter must stay still. -------
     let mut with_map = Coordinator::new();
     register_test_worker_7209(&mut with_map);
-    with_map.bpf_maps.session_map_fd = Some(crate::afxdp::bpf_map::OwnedFd { fd: -1 });
+    with_map.bpf_maps.store(std::sync::Arc::new(crate::afxdp::coordinator::BpfMaps {
+        session_map_fd: Some(crate::afxdp::bpf_map::OwnedFd { fd: -1 }),
+        ..Default::default()
+    }));
     let before_c = with_map.synced_import_unpublished_total();
     with_map.upsert_synced_session(reserve6600_entry(42002, 22002));
     assert_eq!(
@@ -3240,5 +3248,88 @@ fn no_worker_registered_keeps_a_synced_import_off_the_reservation_path_7209() {
          and count its unresolved zone pair; if it does not, leg A proves \
          nothing about the gate because the reservation is unreachable either \
          way"
+    );
+}
+
+/// #7209: a reader holding the loaded descriptor set keeps those descriptors
+/// OPEN across a teardown that replaces them. The refcount is the guarantee.
+///
+/// `BpfMaps` holds `Option<OwnedFd>`, and `OwnedFd::drop` calls `close(2)`. A
+/// reader that took a raw `fd` out of a plain field could have it closed
+/// underneath it by a concurrent `stop_inner` — a use-after-close, which is a
+/// LIFETIME failure and not a stale read, so republishing a "current" value
+/// cannot fix it. Publishing the set behind an `ArcSwap` fixes it because the
+/// old set is dropped only when the last holder releases.
+///
+/// Safe Rust prevents the race today: every mutator takes `&mut self`, so no
+/// `&self` reader can run concurrently. #7209 removes that guarantee by putting
+/// the Coordinator behind an `Arc`, and this field is what replaces it. The
+/// cell therefore binds the PROPERTY rather than driving the race — it holds a
+/// loaded guard across the teardown and asserts the descriptor it names is
+/// still open, which is exactly what a concurrent reader would depend on.
+///
+/// Liveness is checked with `fcntl(F_GETFD)` on the real descriptor rather than
+/// by inspecting the `Option`: an assertion on the struct would pass just as
+/// well if the fd had been closed, since the `Option` would still be `Some`.
+/// The question is whether the KERNEL still has it.
+///
+/// FAIL-ON-REVERT: make `stop_inner` drop the previous set in place (or make
+/// `bpf_maps` a plain field again) and the post-teardown `F_GETFD` returns
+/// `EBADF`.
+#[test]
+fn a_held_bpf_map_set_stays_open_across_teardown_7209() {
+    // A real descriptor, so `close` is observable. `dup(0)` gives one this
+    // process owns without opening a file.
+    let raw = unsafe { libc::dup(0) };
+    assert!(raw >= 0, "fixture: dup(0) failed, errno {}", unsafe {
+        *libc::__errno_location()
+    });
+
+    let mut coordinator = Coordinator::new();
+    coordinator
+        .bpf_maps
+        .store(std::sync::Arc::new(crate::afxdp::coordinator::BpfMaps {
+            session_map_fd: Some(crate::afxdp::bpf_map::OwnedFd { fd: raw }),
+            ..Default::default()
+        }));
+
+    // The reader's guard, taken BEFORE the teardown — this is the whole point.
+    let held = coordinator.bpf_maps.load_full();
+    assert_eq!(
+        held.session_map_fd.as_ref().map(|fd| fd.fd),
+        Some(raw),
+        "fixture: the held set must name the descriptor under test"
+    );
+
+    // The teardown replaces the whole set. Without the refcount this is where
+    // `raw` would be closed.
+    coordinator.stop_inner(false);
+    assert!(
+        coordinator.bpf_maps.load().session_map_fd.is_none(),
+        "fixture: stop_inner must have replaced the published set, or the \
+         assertion below passes because no teardown happened"
+    );
+
+    // Still open, because `held` is still alive.
+    let alive = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    assert!(
+        alive >= 0,
+        "the descriptor was CLOSED while a reader still held the set that owns \
+         it — F_GETFD returned {} (errno {}). That is a use-after-close for any \
+         concurrent reader, which is what #7209 makes possible by putting the \
+         Coordinator behind an Arc; the refcount, not the swap, is what \
+         prevents it",
+        alive,
+        unsafe { *libc::__errno_location() }
+    );
+
+    // Releasing the last holder closes it — the other half of the contract, and
+    // what keeps this from passing on an implementation that simply leaks.
+    drop(held);
+    let after = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    assert!(
+        after < 0,
+        "the descriptor is STILL open after the last holder was dropped, so the \
+         published set is leaking descriptors rather than deferring their close"
     );
 }

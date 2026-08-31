@@ -152,7 +152,12 @@ impl crate::afxdp::Coordinator {
             );
         }
         let current = self.ha.rg_runtime.load();
-        let session_map_fd = self.bpf_maps.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
+        // #7209: hold the loaded set for as long as the raw fd is used below —
+        // the `Arc` is what keeps the descriptor open across a concurrent
+        // teardown, so extracting the raw `fd` and dropping the guard would
+        // reintroduce the use-after-close this publish exists to prevent.
+        let maps = self.bpf_maps.load();
+        let session_map_fd = maps.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);
 
         // RG activation is still allowed to be a narrow ownership transition,
         // but split-RG continuity depends on rewarming the derived reverse
