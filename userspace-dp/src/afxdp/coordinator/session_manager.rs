@@ -41,6 +41,18 @@ pub(in crate::afxdp) struct SessionManager {
     /// `session_delete_stale_ignored_total()`.
     pub(in crate::afxdp) install_stale_ignored: AtomicU64,
     pub(in crate::afxdp) delete_stale_ignored: AtomicU64,
+    /// #6979 F4: `DeleteSynced` commands dropped by a full worker command queue
+    /// whose NAT reservation this coordinator released on the worker's behalf.
+    ///
+    /// Nonzero means a worker command queue hit
+    /// `MAX_PENDING_WORKER_COMMANDS` during a synced-session delete. The
+    /// reservation is NOT leaked — that is what this counter counts — but the
+    /// same dropped command also cost that worker its local session-table and
+    /// BPF map teardown for the key, so a climbing value is a real backpressure
+    /// signal and not merely bookkeeping. Pair it with
+    /// `WORKER_COMMAND_QUEUE_DROPS`, which counts every dropped command of any
+    /// kind.
+    pub(in crate::afxdp) delete_dropped_released: AtomicU64,
     /// #7209: peer-synced imports whose `(from_zone, to_zone)` pair could not
     /// be resolved locally, so the source-NAT reservation was booked WITHOUT
     /// #6211's zone narrowing.
@@ -144,6 +156,7 @@ impl SessionManager {
             install_stale_ignored: AtomicU64::new(0),
             synced_import_zone_unresolved: AtomicU64::new(0),
             delete_stale_ignored: AtomicU64::new(0),
+            delete_dropped_released: AtomicU64::new(0),
             import_cap_drops: AtomicU64::new(0),
             import_unknown_routing_domain: AtomicU64::new(0),
             import_reserve_refused: AtomicU64::new(0),
