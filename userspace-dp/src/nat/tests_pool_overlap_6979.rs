@@ -657,3 +657,122 @@ fn a_peer_holding_the_identity_at_a_duplicate_position_is_still_seen_6979() {
         Some(SourceNatFailureReason::PoolPeerAddressOverlap),
     );
 }
+
+/// MIXED FAMILY. A peer pool whose shared address is v6 while it ALSO carries a
+/// v4 address must be probed at `v4_len + position`, not at `position`.
+///
+/// Fires on: `index: v4_len + pos` -> `index: pos` in `wire_overlap_peers`.
+/// Every other cell here is v4-only or v6-ONLY, and a v6-only peer has
+/// `v4_len == 0`, which makes that mutation a no-op — measured: Codex round 2
+/// on PR #8111 supplied it as a mutation the eight-cell matrix misses, and it
+/// did.
+#[test]
+fn a_mixed_family_peers_v6_index_is_offset_past_its_v4_addresses_6979() {
+    const SHARED_V6: &str = "2001:db8::1";
+    const REMOTE_V6: &str = "2001:4860:4860::8888";
+
+    fn mixed_rule(
+        name: &str,
+        pool: &str,
+        source: &str,
+        addrs: &[&str],
+    ) -> SourceNATRuleSnapshot {
+        SourceNATRuleSnapshot {
+            name: name.to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec![source.to_string()],
+            pool_name: pool.to_string(),
+            pool_addresses: addrs.iter().map(|a| a.to_string()).collect(),
+            port_low: 20000,
+            port_high: 20000,
+            ..SourceNATRuleSnapshot::default()
+        }
+    }
+
+    // Pool b carries a v4 address FIRST, so the shared v6 address sits at
+    // occupancy slot 1, not slot 0. Pool a is v6-only, so its own index is 0 —
+    // the two disagree, which is the whole point.
+    let rules = parse_source_nat_rules(&[
+        mixed_rule(
+            "r2",
+            "b",
+            "2001:db8:2::/48",
+            &[&format!("{OTHER}/32"), &format!("{SHARED_V6}/128")],
+        ),
+        mixed_rule("r1", "a", "2001:db8:1::/48", &[&format!("{SHARED_V6}/128")]),
+    ]);
+    assert_eq!(
+        rules[0].pool_addresses_v4.len(),
+        1,
+        "fixture: the peer must carry a v4 address, or v4_len is 0 and the offset \
+         cannot be wrong"
+    );
+    assert_eq!(rules[0].pool_addresses_v6.len(), 1);
+
+    // The mixed peer takes the shared v6 identity first.
+    let held = identity(&mint_to(&rules, "2001:db8:2::7", 2222, REMOTE_V6))
+        .expect("the mixed-family peer must translate");
+    assert_eq!(held.0, SHARED_V6.parse::<IpAddr>().unwrap());
+
+    let attempt = mint_to(&rules, "2001:db8:1::7", 1111, REMOTE_V6);
+    assert_ne!(
+        identity(&attempt),
+        Some(held),
+        "the v6-only pool published {held:?}, which the mixed-family peer holds at \
+         occupancy slot v4_len + 0. Probing slot 0 reads the peer's unrelated V4 \
+         bitmap, finds it free, and publishes the duplicate (#6979 F6)"
+    );
+    assert_eq!(
+        failure_reason(&attempt),
+        Some(SourceNatFailureReason::PoolPeerAddressOverlap),
+    );
+}
+
+/// A pool whose OWN configured members repeat one address must not be reported
+/// as overlapping ITSELF.
+///
+/// Fires on: counting owners per address OCCURRENCE rather than per distinct
+/// ALLOCATOR. `[X, X]` then counts 2, the rule receives the shared-address
+/// index, and every one of its mints pays the `SeqCst` fence and a map probe
+/// for a pool that has no peer. The runtime still answers correctly — the
+/// same-allocator skip catches it — so only the WIRING can be asserted, and
+/// that is what this cell asserts. Codex round 2 on PR #8111, finding 2.
+#[test]
+fn a_pool_with_duplicate_members_is_not_its_own_peer_6979() {
+    fn rule_addrs(name: &str, pool: &str, source: &str, addrs: &[&str]) -> SourceNATRuleSnapshot {
+        SourceNATRuleSnapshot {
+            name: name.to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec![source.to_string()],
+            pool_name: pool.to_string(),
+            pool_addresses: addrs.iter().map(|a| format!("{a}/32")).collect(),
+            port_low: 20000,
+            port_high: 20001,
+            ..SourceNATRuleSnapshot::default()
+        }
+    }
+
+    let rules = parse_source_nat_rules(&[
+        rule_addrs("r1", "a", "10.0.0.0/24", &[SHARED, SHARED]),
+        rule_addrs("r2", "b", "10.1.0.0/24", &[OTHER]),
+    ]);
+    assert_eq!(
+        rules[0].pool_addresses_v4.len(),
+        2,
+        "fixture: pool a must carry the address at TWO positions"
+    );
+    assert!(
+        rules[0].overlap_owners.is_none(),
+        "pool a repeats one of its OWN addresses and shares nothing with pool b, so \
+         it must keep the `Option::is_none` fast path. Counting per occurrence \
+         instead reports it as shared with itself and puts a SeqCst fence and a map \
+         probe on every one of its mints (#6979 F6)"
+    );
+    assert!(rules[1].overlap_owners.is_none());
+    assert!(
+        identity(&mint(&rules, "10.0.0.7", 1111)).is_some(),
+        "and it must still translate normally"
+    );
+}

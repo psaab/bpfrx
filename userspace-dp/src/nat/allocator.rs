@@ -1154,6 +1154,20 @@ impl PortAllocator {
         }
     }
 
+    /// #6979 F6: how many pool-address occupancy slots does this allocator have?
+    ///
+    /// ZERO for `PortAllocator::default()`, which is what every rule that never
+    /// received a real allocator carries — a non-pool rule, and a pool rule that
+    /// failed without a previous generation to drain. Such an allocator can
+    /// never hold a port, so the overlap index skips it rather than treating
+    /// each one as its own occupancy domain (Codex round 2 on PR #8111,
+    /// finding 1: `PortAllocator::default()` builds a FRESH `Arc` per rule, so
+    /// counting them as distinct made the index's dedup scan quadratic in the
+    /// RULE count, which no budget bounds).
+    pub(crate) fn address_slots(&self) -> usize {
+        self.shared.occupancy.len()
+    }
+
     /// #6979 F6: do these two handles refer to the SAME allocator?
     ///
     /// Allocator sharing between rules is by `Arc`, so pointer identity is the

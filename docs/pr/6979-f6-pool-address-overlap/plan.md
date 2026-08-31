@@ -69,7 +69,7 @@ What narrows is minting:
    allocators — a *different allocator instance* — whose pool covers one or more
    of its own addresses, with the index each shared address has in that peer.
    The address relation is static, so it is resolved once; the occupancy is not,
-   so it is read at mint time. Empty for every rule of a config with no
+   so it is read at mint time. `None` for every rule of a config with no
    overlapping pools.
 2. **`reject_peer_owned_identity` (mint).** At the three PAT allocation sites,
    an allocation that lands on an identity a peer already owns is rolled back
@@ -90,7 +90,7 @@ What narrows is minting:
    distinguish its presence from its absence.
 
 Cost on the hot path for every config a strict commit accepts: one
-`Vec::is_empty`.
+`Option::is_none`.
 
 ### Rejected alternatives
 
@@ -142,10 +142,18 @@ fixed — every position is recorded.
 Pinned rather than fixed: the deterministic-v4 refusal costs the colliding
 subscriber its whole BLOCK, not one port, because `allocate_deterministic_v4`
 restarts its scan at the block start and the rollback frees the bit without
-recycling. The retry that would step past it is not expressible with the current
-allocator API (allocation is idempotent per flow key, so a second call returns
-the same tuple, and there is no public way to hold the rejected port claimed
-across retries). The direction is the project's stated one — at master that
+recycling.
+**Correction, round 2:** an earlier version of this paragraph said the retry
+"is not expressible with the current allocator API". That is FALSE, and Codex
+supplied the counter-example: `deterministic_indices_v4` yields
+`(ip_idx, block_idx)`, so the arm can enumerate later ports in the block and
+call `PortAllocator::reserve_flow` for each exact candidate, applying the peer
+check after every successful reserve — no held port is needed when the cursor
+names exact ports. (`reserve_flow` needs care there: it does not enforce
+`max_tracked_flows` and destructively removes an incumbent before a failed
+replacement, so the cleaner shape is a candidate predicate on
+`allocate_deterministic_v4` itself.) It is left unfixed here on SCOPE, not on
+impossibility. The direction is the project's stated one — at master that
 subscriber receives a duplicate identity instead — and
 `a_deterministic_collision_refuses_the_subscriber_6979` pins it with a block
 size of 4, so "the block was full" cannot be mistaken for the cause.
