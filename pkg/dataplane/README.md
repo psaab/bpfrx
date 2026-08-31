@@ -1118,6 +1118,26 @@ snap`, and there are two of them — one per acceptance path).
     "split pure planning from actuation" clause at this one site and is what
     makes the converged case provable without root. This does NOT undo the
     mutation; the apply transaction is a redesign and stays open on #4960.
+  - **One desired state per physical netdev, decided before the zone loop**
+    (#8119/#8120). `planPhysDesired` merges every zone interface reference that
+    resolves to a netdev into a single `physDesired` — the UNION of the untagged
+    units' addresses, one MTU, and a `skipAddrs` flag folding in DHCP / RETH /
+    fabric-parent ownership — and `mapZoneInterface` actuates it once. Before
+    this the same netdev was reconciled once per reference, each against that
+    reference's own desired state, and the last writer won. Two units of one
+    interface with no VLAN ID resolve to the same untagged netdev, a shape
+    strict validation deliberately accepts, so an apply deleted addresses it had
+    just added in an order Go randomises per run; and the interface-level and
+    unit-level MTU writes compared against ONE cached `netlink.Link` that
+    `LinkSetMTU` never refreshes, so they took turns and the MTU flapped between
+    the two configured values on every commit. A unit MTU still overrides the
+    interface-level one; between units the lowest unit number wins — arbitrary,
+    but decided, which map order was not. Sorting the zone map would have made
+    the outcome stable and still arbitrary, so the second writer is removed
+    rather than made to lose consistently. The witness is
+    `TestTwoAppliesOfOneConfigConverge_8119_8120`: a single apply is
+    self-consistent and passes on both defects, so the assertion has to span
+    two.
   - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
     #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
     half-applied state back: the helper's rejection lands at

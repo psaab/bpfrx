@@ -184,6 +184,26 @@ var errVLANAdoptRefused = errors.New("VLAN sub-interface adoption refused")
 // leaves it pointing at the real function.
 var vlanLinkByNameSeam = netlink.LinkByName
 
+// #8119/#8120: the netlink MUTATORS on the interface-reconcile path, behind
+// seams so a test can drive the real compileZones over a simulated host and
+// assert what TWO consecutive applies leave behind.
+//
+// A single apply is self-consistent, so a single-apply assertion passes on both
+// of those defects whichever way the zone map happened to iterate. The second
+// apply is the only witness that can contradict a reconcile, because it does
+// not share the assumption that one pass converges.
+//
+// Reads are NOT seamed: CompileResult's ifCache / linkCache / linkIdxMap are
+// package-visible maps a test seeds directly, which also reproduces the real
+// cache lifetime — one CompileResult per apply, populated once from the host.
+var (
+	linkSetMTUSeam     = netlink.LinkSetMTU
+	addrLinkByNameSeam = netlink.LinkByName
+	addrListSeam       = netlink.AddrList
+	addrAddSeam        = netlink.AddrAdd
+	addrDelSeam        = netlink.AddrDel
+)
+
 // ensureVLANSubInterface creates a Linux VLAN sub-interface if it doesn't exist.
 // Returns the sub-interface's ifindex and whether this call CREATED it.
 //
@@ -317,7 +337,7 @@ func isConfiguredVLANSubInterface(name string, cfg *config.Config) bool {
 // A FAILED AddrDel/AddrAdd does not set it: the address list is unchanged in
 // that direction, and those failures already warn on their own line.
 func reconcileInterfaceAddresses(ifaceName string, desired []string) bool {
-	link, err := netlink.LinkByName(ifaceName)
+	link, err := addrLinkByNameSeam(ifaceName)
 	if err != nil {
 		slog.Warn("cannot find interface for address reconciliation",
 			"name", ifaceName, "err", err)
@@ -326,7 +346,7 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) bool {
 	changed := false
 
 	// List current kernel addresses (both v4 and v6)
-	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	existing, err := addrListSeam(link, netlink.FAMILY_ALL)
 	if err != nil {
 		slog.Warn("failed to list addresses on interface",
 			"name", ifaceName, "err", err)
@@ -345,7 +365,7 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) bool {
 
 	for _, addr := range del {
 		key := addr.IPNet.String()
-		if err := netlink.AddrDel(link, addr); err != nil {
+		if err := addrDelSeam(link, addr); err != nil {
 			slog.Warn("failed to remove stale address from interface",
 				"addr", key, "name", ifaceName, "err", err)
 		} else {
@@ -356,7 +376,7 @@ func reconcileInterfaceAddresses(ifaceName string, desired []string) bool {
 	}
 
 	for _, addr := range add {
-		if err := netlink.AddrAdd(link, addr); err != nil {
+		if err := addrAddSeam(link, addr); err != nil {
 			if !strings.Contains(err.Error(), "exists") {
 				slog.Warn("failed to add address to interface",
 					"addr", addr.IPNet.String(), "name", ifaceName, "err", err)
@@ -539,6 +559,12 @@ type zoneMapState struct {
 	// redirect_capable or tx_ports — bpf_redirect_map sends the full Ethernet
 	// frame, but POINTOPOINT tunnels expect raw IP.
 	tunnelIfindexes map[int]bool
+	// #8119/#8120: the merged desired state per physical netdev, decided once
+	// per apply, plus the netdevs already actuated from it. Together they are
+	// what makes a second reference to one netdev a no-op instead of a second
+	// writer with a different opinion.
+	physDesired    map[string]*physDesired
+	physReconciled map[string]bool
 }
 
 func newZoneMapState() *zoneMapState {
@@ -548,6 +574,8 @@ func newZoneMapState() *zoneMapState {
 		attached:         make(map[int]bool),
 		attachedXDP:      make(map[int]bool),
 		tunnelIfindexes:  make(map[int]bool),
+		physDesired:      make(map[string]*physDesired),
+		physReconciled:   make(map[string]bool),
 	}
 }
 
@@ -607,6 +635,9 @@ func buildZoneConfig(zone *config.ZoneConfig, name string, zid uint16, result *C
 // can publish the deferred XDP/tunnel ifindex sets and delete stale entries.
 func programZoneMaps(dp DataPlane, cfg *config.Config, result *CompileResult) (*zoneMapState, error) {
 	st := newZoneMapState()
+	// Decide once, before the zone loop, so no ordering of that loop can change
+	// what the host ends up looking like.
+	st.physDesired = planPhysDesired(cfg)
 
 	// Interface -> routing table ID map from the routing instances.
 	ifaceTableID := buildIfaceTableIDMap(cfg)
@@ -766,7 +797,7 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			if unit, ok := ifCfg.Units[unitNum]; ok && unit.MTU > 0 {
 				if nl, err := result.cachedLinkByName(subName); err == nil {
 					if nl.Attrs().MTU != unit.MTU {
-						if err := netlink.LinkSetMTU(nl, unit.MTU); err != nil {
+						if err := linkSetMTUSeam(nl, unit.MTU); err != nil {
 							slog.Warn("failed to set VLAN sub-interface MTU",
 								"name", subName, "mtu", unit.MTU, "err", err)
 						} else {
@@ -874,14 +905,23 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		// Single cached netlink lookup for MTU, speed/duplex, and UP/DOWN.
 		nl, nlErr := result.cachedLinkByIndex(physIface.Index)
 
-		// Apply interface-level MTU from config
-		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.MTU > 0 && nlErr == nil {
-			if nl.Attrs().MTU != ifCfg.MTU {
-				if err := netlink.LinkSetMTU(nl, ifCfg.MTU); err != nil {
+		// #8119/#8120: the ONE MTU write for this netdev, of the value
+		// planPhysDesired already resolved from the interface-level leaf and
+		// every unit's override.
+		//
+		// There used to be a second write further down for the unit-level MTU.
+		// Both compared against this same cached link, and LinkSetMTU does not
+		// write back to the caller's Link — so the second comparison read a
+		// pre-write value and the two writes alternated on consecutive applies,
+		// flapping the interface MTU between the two configured values forever.
+		// One comparison against a cache that is still fresh cannot do that.
+		if pd := st.physDesired[physName]; pd != nil && pd.mtu > 0 && nlErr == nil {
+			if nl.Attrs().MTU != pd.mtu {
+				if err := linkSetMTUSeam(nl, pd.mtu); err != nil {
 					slog.Warn("failed to set MTU",
-						"name", physName, "mtu", ifCfg.MTU, "err", err)
+						"name", physName, "mtu", pd.mtu, "err", err)
 				} else {
-					slog.Info("set interface MTU", "name", physName, "mtu", ifCfg.MTU)
+					slog.Info("set interface MTU", "name", physName, "mtu", pd.mtu)
 				}
 			}
 		}
@@ -965,41 +1005,25 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 	// DHCP-managed interfaces are skipped — the DHCP client manages their addresses.
 	// RETH interfaces are skipped — VRRP manages their VIP addresses.
 	// Fabric parents are skipped — addresses go on the IPVLAN overlay (fab0/fab1).
-	if vlanID == 0 {
-		var addrs []string
-		isDHCP := false
-		isReth := false
-		isFabricParent := false
-		var unitMTU int
-		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil {
-			if unit, ok := ifCfg.Units[unitNum]; ok {
-				addrs = unit.Addresses
-				isDHCP = unit.DHCP || unit.DHCPv6
-				unitMTU = unit.MTU
-			}
-			if ifCfg.RedundancyGroup > 0 {
-				isReth = true
-			}
-			if ifCfg.LocalFabricMember != "" {
-				isFabricParent = true
-			}
-		}
-		if !isDHCP && !isReth && !isFabricParent {
-			if reconcileInterfaceAddresses(physName, addrs) {
+	// #8120: reconcile the netdev's addresses ONCE per apply, to the union of
+	// every untagged unit that resolves to it.
+	//
+	// This used to run per zone-interface reference, against that unit's own
+	// exact desired set. Two units of one interface with no VLAN ID resolve to
+	// the same netdev, so whichever the zone map yielded second deleted the
+	// addresses the first had just added — and which one that was changed per
+	// run, because Go randomises map iteration. The apply reported success
+	// either way. Reconciling the union once removes the second writer rather
+	// than making it lose consistently; a sort over the zone map would have
+	// made the outcome stable and still arbitrary.
+	//
+	// DHCP / RETH / fabric-parent suppression is folded into the plan: those
+	// addresses belong to the DHCP client, VRRP, or the IPVLAN overlay.
+	if vlanID == 0 && !st.physReconciled[physName] {
+		st.physReconciled[physName] = true
+		if pd := st.physDesired[physName]; pd != nil && !pd.skipAddrs {
+			if reconcileInterfaceAddresses(physName, pd.addrs) {
 				result.markHostMutated("reconciled interface addresses")
-			}
-		}
-		// Apply unit-level MTU (overrides interface-level MTU)
-		if unitMTU > 0 {
-			if nl, err := result.cachedLinkByName(physName); err == nil {
-				if nl.Attrs().MTU != unitMTU {
-					if err := netlink.LinkSetMTU(nl, unitMTU); err != nil {
-						slog.Warn("failed to set unit MTU",
-							"name", physName, "mtu", unitMTU, "err", err)
-					} else {
-						slog.Info("set unit MTU", "name", physName, "unit", unitNum, "mtu", unitMTU)
-					}
-				}
 			}
 		}
 	}
