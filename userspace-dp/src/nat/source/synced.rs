@@ -518,6 +518,17 @@ fn reserve_synced_on_first_pool_owner<'a>(
         // standby's lease is keyed identically to the active's — including the
         // `permit` shape, which decides whether the remote endpoint is folded
         // in (#2823).
+        //
+        // PORT-BEARING ARM ONLY. The address-only arm above (`port
+        // no-translation` / a port-less protocol) takes the #6041 lease path,
+        // whose synced form mints the reverse-identity token and no lease. It
+        // needs a third variant — mint the token AND join the lease at the
+        // address the WIRE named, rather than choosing one the way
+        // `reserve_address_only_persistent` does — so it is tracked as #8132
+        // rather than bolted on here. Its session-drop half does not exist:
+        // an address-only allocation holds no port bit, and its
+        // `AddressOnlyReverseKey` folds in the remote, so two flows from one
+        // client to different remotes never collide.
         let persistent = rule
             .persistent_nat
             .then(|| (flow.persistent_source_key(rule.persistent_nat_permit), rule.persistent_nat_timeout_ns));

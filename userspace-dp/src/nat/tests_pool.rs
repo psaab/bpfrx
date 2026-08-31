@@ -8909,3 +8909,120 @@ fn releasing_every_synced_flow_makes_the_rebuilt_lease_idle_7360() {
     // flows must be in neither.
     assert_persistent_expiry_indexes_consistent(&standby[0]);
 }
+
+/// A synced flow joining an IDLE lease must take it OUT of the idle-expiry
+/// index. Found by a mutation ESCAPE: none of the cells above reach
+/// `was_idle == true`, because the first import CREATES the lease at
+/// `active_flows = 1` and the second joins one that already has a flow.
+///
+/// The production sequence that does reach it is ordinary — a persistent client
+/// pauses (its synced flows release, the lease goes idle and enters
+/// `lease_expirations`), then resumes (a new session syncs and joins it). The
+/// branch is therefore reachable, not inert.
+///
+/// What it costs if it is wrong: a lease sitting in the idle-expiry index while
+/// it has a LIVE flow is GC-eligible, so the reaper can reclaim it and free a
+/// pool port the flow is still forwarding through — a translated tuple handed to
+/// two flows at once.
+///
+/// FAIL-ON-REVERT: drop the `was_idle` guard's
+/// `remove_lease_expiration_locked` call and
+/// `assert_persistent_expiry_indexes_consistent` fires, because the lease is in
+/// the index with `active_flows > 0`.
+#[test]
+fn a_synced_flow_rejoining_an_idle_lease_leaves_the_expiry_index_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &first, 1);
+
+    // The client goes quiet: its one synced flow closes. The lease survives for
+    // the persistence window and is now IDLE — in the expiry index.
+    release_source_nat_allocation(
+        &InterfaceNatAllocators::default(),
+        &standby,
+        &session_key(12345, "8.8.8.8", 53),
+        NatDecision {
+            rewrite_src: first.rewrite_src,
+            rewrite_src_port: first.rewrite_src_port,
+            ..NatDecision::default()
+        },
+        false,
+        2,
+    );
+    {
+        let live = standby[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.lease_expirations.len(),
+            1,
+            "fixture: the lease must be IDLE and indexed here, or the cell never \
+             reaches the `was_idle` branch it exists to bind"
+        );
+    }
+
+    // The client comes back. A new session for the SAME source syncs in and
+    // joins the idle lease — `was_idle == true`.
+    let resumed = expect_snat_decision(tuple_snat_lookup(&active, 12345, "1.1.1.1", 443, 3));
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &resumed, 3);
+
+    let live = standby[0].pool_allocator.debug_live();
+    assert!(
+        live.lease_expirations.is_empty(),
+        "a lease with a live flow must NOT sit in the idle-expiry index — the GC \
+         reaps from that index, so leaving it there frees a pool port the flow is \
+         still using. Present: {:?}",
+        live.lease_expirations
+    );
+    drop(live);
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
+
+/// The drift REFUSAL, bound by a cell that names it.
+///
+/// A lease that already names a DIFFERENT translated tuple than the wire does is
+/// config drift or a stale import, and the reservation is refused rather than
+/// retargeted — the same "never steal" posture as the occupancy CAS.
+///
+/// This exists because the mutation that disables the refusal reds only
+/// `synced_eviction_drops_the_persistent_lease_refcount_6528`, a pre-existing
+/// test that constructs a drift scenario incidentally. That is coverage today
+/// and none tomorrow: a guard added deliberately should not depend on another
+/// issue's fixture keeping a shape it never promised to keep.
+///
+/// FAIL-ON-REVERT: remove the `lease.translated != translated` refusal and the
+/// second import is accepted, so the standby holds a flow pointing at a tuple
+/// its own lease does not own.
+#[test]
+fn a_synced_import_conflicting_with_an_existing_lease_is_refused_7360() {
+    let active = ha_persistent_rules_7360(false);
+    let first = expect_snat_decision(tuple_snat_lookup(&active, 12345, "8.8.8.8", 53, 1));
+
+    let standby = ha_persistent_rules_7360(false);
+    import_synced_7360(&standby, 12345, "8.8.8.8", 53, &first, 1);
+    assert_eq!(source_nat_pool_statuses(&standby)[0].persistent_leases, 1);
+
+    // A second session for the SAME source arrives naming a DIFFERENT translated
+    // port — what a config-drifted or stale peer would send.
+    let drifted = NatDecision {
+        rewrite_src: first.rewrite_src,
+        rewrite_src_port: first.rewrite_src_port.map(|p| p + 1),
+        ..NatDecision::default()
+    };
+    assert_ne!(
+        drifted.rewrite_src_port, first.rewrite_src_port,
+        "fixture: the drifted decision must actually differ, or nothing conflicts"
+    );
+    import_synced_7360(&standby, 12345, "1.1.1.1", 443, &drifted, 2);
+
+    let statuses = source_nat_pool_statuses(&standby);
+    assert_eq!(
+        statuses[0].live_flows, 1,
+        "a synced import whose tuple contradicts this source's existing lease must \
+         be REFUSED, not published: accepting it leaves a live flow pointing at a \
+         tuple the lease does not own, so the flow's release would not return the \
+         port the lease still claims"
+    );
+    assert_eq!(statuses[0].persistent_leases, 1, "the lease is unchanged");
+    assert_persistent_expiry_indexes_consistent(&standby[0]);
+}
