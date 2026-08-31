@@ -174,4 +174,23 @@ func resolveDerivedConfig(cfg *Config, opts compileOpts) {
 			}
 		}
 	}
+
+	// 7. #7490 DHCP-scope withholding — stamp, per zone, the interface refs
+	// from which the ZONE-LEVEL `dhcp` / `bootp` authorization is withheld
+	// because the interface runs a DHCP server or relay and not the firewall's
+	// own client.
+	//
+	// MUST run LAST of the sub-steps here, and the reason is the lifeline set:
+	// HostInboundLifelineSet reads Chassis.Cluster's control/fabric interface
+	// names, and the fabric fixup in step 6 is what AUTO-POPULATES
+	// FabricInterface / Fabric1Interface on a vSRX-style config that names them
+	// only through fab0/fab1 member-interfaces. Stamping before step 6 would
+	// classify a fabric interface as non-lifeline on exactly the configs that
+	// use the canonical Junos spelling.
+	//
+	// It runs in this phase rather than in a validator because the P6/P7
+	// advisories READ the stamp — the #6519 advisory has to distinguish a
+	// zone-level token that still authorizes from one that no longer does —
+	// and because every consumer of the resolution holds only a *ZoneConfig.
+	stampZoneDHCPScopeWithheld(cfg)
 }

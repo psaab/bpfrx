@@ -258,10 +258,17 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 // that two zones claiming one firewall-local address with DIFFERING admission is
 // rejected, and a signature computed from a different combination rule than
 // enforcement uses would compare the wrong sets.
-func effectiveHostInboundSigLocal(zone *ZoneConfig, override *HostInboundTraffic) string {
+// #7490 added the unit ref. The zone-level `dhcp` / `bootp` authorization is
+// withheld per INTERFACE, so a signature computed without knowing which unit it
+// describes would compare a set enforcement does not use — and this gate's only
+// job is to compare the sets enforcement uses. Concretely: two zones claiming
+// one firewall-local address, identical but for one of them running a DHCP
+// server, now have DIFFERING admission and must be rejected; without the ref
+// their signatures would collide and the gate would pass.
+func effectiveHostInboundSigLocal(zone *ZoneConfig, ref string, override *HostInboundTraffic) string {
 	var zoneSvc, zoneProto []string
 	if zone != nil && zone.HostInboundTraffic != nil {
-		zoneSvc = zone.HostInboundTraffic.SystemServices
+		zoneSvc = zone.ZoneLevelSystemServicesFor(zone.HostInboundTraffic.SystemServices, ref)
 		zoneProto = zone.HostInboundTraffic.Protocols
 	}
 	var ovSvc, ovProto []string
@@ -349,7 +356,7 @@ func validateDuplicateHostLocalAddressStrict(cfg *Config) error {
 			// quarantined as cross-zone (M01), and pulling overrideByIface[ifName]
 			// here would reintroduce that cross-zone leak.
 			override := overrideByIface[unitName]
-			sig := effectiveHostInboundSigLocal(zone, override)
+			sig := effectiveHostInboundSigLocal(zone, unitName, override)
 
 			for _, a := range unit.Addresses {
 				if host, family := hostLocalAddrFamily(a); host != "" {

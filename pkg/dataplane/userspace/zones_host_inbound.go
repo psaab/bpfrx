@@ -198,7 +198,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if !configured(zone) {
 			continue
 		}
-		svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, nil)
+		svc, proto := effectiveHostInboundTokens(zone, "", nil)
 		getGroup(name, svc, proto, "")
 	}
 
@@ -242,7 +242,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if !configured(zone) {
 			continue
 		}
-		svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, overrideByIface[snap.Name])
+		svc, proto := effectiveHostInboundTokens(zone, snap.Name, overrideByIface[snap.Name])
 		var g *group
 		for _, a := range snap.Addresses {
 			host := hostIPFromCIDR(a.Address)
@@ -304,7 +304,7 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 			if !configured(zone) {
 				continue
 			}
-			svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, overrideByIface[unitName])
+			svc, proto := effectiveHostInboundTokens(zone, unitName, overrideByIface[unitName])
 			vgKeys := make([]string, 0, len(unit.VRRPGroups))
 			for k := range unit.VRRPGroups {
 				vgKeys = append(vgKeys, k)

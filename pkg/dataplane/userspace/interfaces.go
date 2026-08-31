@@ -533,16 +533,30 @@ func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) [
 	// without re-deriving it.
 	// HostInboundConfigured marks a present override (even an empty one →
 	// fail-closed) so an old Go binary that omits the field is distinguishable.
-	if overrideByIface := buildInterfaceHostInboundMap(cfg); len(overrideByIface) > 0 {
+	//
+	// #7490 added the SECOND reason to carry a per-interface set: an interface
+	// the zone-level `dhcp` / `bootp` authorization is WITHHELD from. Without
+	// it the flip would be silently half-done on this plane and only on this
+	// plane. The Rust picker (host_inbound_admits_iface) consults the
+	// per-interface table first and FALLS BACK to the zone-keyed table when the
+	// interface has no entry — so an interface that is withheld but declares no
+	// override would carry no entry, fall back, and be admitted by the very
+	// zone-level token that was withheld from it. The nft plane has no such
+	// hole, because it groups by resolved token signature rather than falling
+	// back, which is exactly why this needed finding rather than assuming.
+	{
+		overrideByIface := buildInterfaceHostInboundMap(cfg)
 		lifelines := hostInboundLifelineSet(cfg)
 		for i := range out {
-			ovr := overrideByIface[out[i].Name]
 			zone := cfg.Security.Zones[out[i].Zone]
-			if ovr == nil || zone == nil ||
-				hostInboundLifelineInterface(out[i].Name, lifelines) {
+			if zone == nil || hostInboundLifelineInterface(out[i].Name, lifelines) {
 				continue
 			}
-			svc, proto := effectiveHostInboundTokens(zone.HostInboundTraffic, ovr)
+			ovr := overrideByIface[out[i].Name]
+			if ovr == nil && !zone.WithholdsZoneLevelDHCPFor(out[i].Name) {
+				continue
+			}
+			svc, proto := effectiveHostInboundTokens(zone, out[i].Name, ovr)
 			out[i].HostInboundConfigured = true
 			out[i].HostInboundSystemServices = svc
 			out[i].HostInboundProtocols = proto
