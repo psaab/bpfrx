@@ -40,6 +40,10 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 
+	// #8073: keep the prior pass's statuses reachable. A transient netlink
+	// failure must not erase what we already knew about a monitored link --
+	// see the lookup branch below.
+	prev := mm.monitorStatus
 	mm.monitorStatus = make(map[int][]InterfaceMonitorStatus)
 	for _, rg := range groups {
 		var statuses []InterfaceMonitorStatus
@@ -65,7 +69,65 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 			linuxName := config.LinuxIfName(mon.Interface)
 			link, err := mm.ops.LinkByName(linuxName)
 			if err != nil {
-				// Interface doesn't exist — belongs to peer node. Skip.
+				// #8073: separate genuine absence from a transient lookup
+				// failure. The original comment was right about the INTENDED
+				// case -- a `chassis cluster interface-monitor` entry naming an
+				// interface that lives on the peer node really is absent here,
+				// and dropping it is correct. But `err != nil` also catches
+				// ENOBUFS under load, EINTR, and a busy or truncated netlink
+				// socket, and those took the same silent branch.
+				//
+				// That matters more than a missing row in `show chassis cluster
+				// interfaces`, because these statuses are not display-only: the
+				// config-apply tail feeds each one straight into
+				// cluster.Manager.SetMonitorWeight. An interface dropped here is
+				// absent from the slice entirely, so SetMonitorWeight is never
+				// CALLED for it and its recorded weight is not recomputed -- it
+				// persists stale. If a transient error coincided with the link
+				// actually going down, the interface kept its last-known Up
+				// weight and the RG did not demote.
+				//
+				// isLinkNotFound (vrf.go) is the predicate the sibling bond and
+				// tunnel managers already use for this exact conflation, and
+				// both RETAIN on the transient arm rather than treating the
+				// error as absence. The faithful mirror of that here is to carry
+				// the previous pass's status forward: it keeps the interface
+				// visible in `show`, and it keeps SetMonitorWeight being called
+				// with the last value we actually observed rather than silently
+				// not being called at all.
+				//
+				// Deliberately NOT synthesizing Up=false: demoting a redundancy
+				// group because a netlink lookup hiccuped would be a worse
+				// failure than reporting slightly stale state.
+				if !isLinkNotFound(err) {
+					if carried, ok := findPrevMonitorStatus(prev, rg.ID, mon.Interface); ok {
+						slog.Warn("interface monitor: link lookup failed, "+
+							"carrying forward the previous status",
+							"redundancy_group", rg.ID,
+							"interface", mon.Interface,
+							"linux_name", linuxName,
+							"carried_up", carried.Up,
+							"err", err)
+						// Re-clamp: the weight comes from the CURRENT config,
+						// not from the stale entry, so a weight change in this
+						// commit is still honored while the link state is not
+						// re-observed.
+						carried.Weight = weight
+						carried.ConfiguredWeight = mon.Weight
+						carried.Clamped = weightClamped
+						statuses = append(statuses, carried)
+						continue
+					}
+					// No prior observation to carry -- the first pass, or the
+					// interface is newly monitored. Nothing honest to report,
+					// so it is still dropped, but no longer silently.
+					slog.Warn("interface monitor: link lookup failed and no "+
+						"previous status to carry, omitting from monitor state",
+						"redundancy_group", rg.ID,
+						"interface", mon.Interface,
+						"linux_name", linuxName,
+						"err", err)
+				}
 				continue
 			}
 			up := linkAttrsUp(link.Attrs())
@@ -109,6 +171,21 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 //
 // This mirrors pkg/vrrp.linkAttrsUp, the canonical link-state read used by
 // VRRP track-interface detection (#2070).
+// findPrevMonitorStatus returns the previous pass's status for one monitored
+// interface in one redundancy group.
+//
+// #8073: extracted rather than inlined so the carry-forward decision is
+// directly testable. The slice is per-RG and short (one entry per configured
+// interface-monitor), so a linear scan is the right shape.
+func findPrevMonitorStatus(prev map[int][]InterfaceMonitorStatus, rgID int, iface string) (InterfaceMonitorStatus, bool) {
+	for _, st := range prev[rgID] {
+		if st.Interface == iface {
+			return st, true
+		}
+	}
+	return InterfaceMonitorStatus{}, false
+}
+
 func linkAttrsUp(attrs *netlink.LinkAttrs) bool {
 	switch attrs.OperState {
 	case netlink.OperUp:
