@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"testing"
 
@@ -21,13 +23,28 @@ func (l *monitorFakeLink) Type() string              { return "monitor-fake" }
 // the type still implements the full surface.
 type monitorFakeOps struct {
 	links map[string]netlink.Link
+
+	// #8073: hardErr[name] makes LinkByName return a NON-not-found
+	// (transient) error — ENOBUFS under load, EINTR, a truncated netlink
+	// socket. isLinkNotFound must be FALSE for it, which is the whole
+	// distinction the monitor lookup now draws.
+	hardErr map[string]error
 }
 
 func (o *monitorFakeOps) LinkByName(name string) (netlink.Link, error) {
+	if err, ok := o.hardErr[name]; ok {
+		return nil, err
+	}
 	if l, ok := o.links[name]; ok {
 		return l, nil
 	}
-	return nil, net.UnknownNetworkError("not found: " + name)
+	// #8073: an absent link must produce an error that isLinkNotFound
+	// RECOGNISES. This previously returned net.UnknownNetworkError, which
+	// isLinkNotFound reports false for — so the fake's "absent" case was
+	// indistinguishable from a transient failure. That was invisible while
+	// every caller treated the two identically, and it would have made the
+	// carry-forward test below pass for the wrong reason.
+	return nil, errLinkNotFound{fmt.Errorf("not found: %s", name)}
 }
 
 func (o *monitorFakeOps) LinkAdd(netlink.Link) error                     { return nil }
@@ -134,5 +151,86 @@ func TestInterfaceMonitor_CarrierState(t *testing.T) {
 					statuses[0].Up, tc.wantUp, tc.operState, tc.flags)
 			}
 		})
+	}
+}
+
+
+// #8073: a transient LinkByName failure must not silently drop a monitored
+// interface from cluster status.
+//
+// These statuses are not display-only: the config-apply tail feeds each one
+// into cluster.Manager.SetMonitorWeight. An interface dropped here is absent
+// from the slice, so SetMonitorWeight is never CALLED for it and its recorded
+// weight persists stale — meaning a link that went down during the transient
+// error keeps its last-known Up weight and the RG does not demote.
+//
+// The three passes are the test. Pass 2 alone would pass with the fix deleted
+// if the fake's absent-case error were unrecognised by isLinkNotFound (it was,
+// until this change), and pass 3 is the over-reach control: without it, a fix
+// that carried EVERY failed lookup forward would look correct while breaking
+// the peer-owned case this branch exists to serve.
+func TestTransientLookupCarriesForwardMonitorStatus_8073(t *testing.T) {
+	const ifName = "ge-0/0/5"
+	linuxName := config.LinuxIfName(ifName)
+
+	ops := &monitorFakeOps{links: map[string]netlink.Link{
+		linuxName: &monitorFakeLink{attrs: netlink.LinkAttrs{
+			Name:      linuxName,
+			OperState: netlink.OperUp,
+			Flags:     net.FlagUp,
+		}},
+	}}
+	mm := &monitorManager{
+		ops:           ops,
+		monitorStatus: make(map[int][]InterfaceMonitorStatus),
+	}
+	groups := []*config.RedundancyGroup{{
+		ID: 1,
+		InterfaceMonitors: []*config.InterfaceMonitor{
+			{Interface: ifName, Weight: 100},
+		},
+	}}
+
+	// Pass 1 — link present and up. Establishes the state to carry.
+	mm.Apply(groups)
+	if got := mm.monitorStatus[1]; len(got) != 1 || !got[0].Up {
+		t.Fatalf("pass 1: want one Up status, got %+v", got)
+	}
+
+	// Pass 2 — transient failure. The interface must SURVIVE with its last
+	// observed state, so SetMonitorWeight keeps being called for it.
+	ops.hardErr = map[string]error{linuxName: errors.New("ENOBUFS: netlink receive buffer overrun")}
+	mm.Apply(groups)
+	got := mm.monitorStatus[1]
+	if len(got) != 1 {
+		t.Fatalf("pass 2: a transient lookup failure dropped the monitored "+
+			"interface — its weight is now stranded, not recomputed; got %+v", got)
+	}
+	if !got[0].Up {
+		t.Errorf("pass 2: carried status must preserve the last OBSERVED state (Up=true); "+
+			"synthesizing Up=false would demote the RG on a netlink hiccup, got %+v", got[0])
+	}
+	if got[0].Interface != ifName {
+		t.Errorf("pass 2: carried the wrong interface: %q", got[0].Interface)
+	}
+
+	// Pass 2b — a weight change in the same commit must still be honored,
+	// since the weight comes from config and only the LINK STATE is stale.
+	groups[0].InterfaceMonitors[0].Weight = 40
+	mm.Apply(groups)
+	if got := mm.monitorStatus[1]; len(got) != 1 || got[0].Weight != 40 {
+		t.Errorf("pass 2b: carried status must take the CURRENT configured weight, got %+v", got)
+	}
+
+	// Pass 3 — OVER-REACH CONTROL. A genuine not-found means the interface
+	// belongs to the peer node, and dropping it is correct. A fix that
+	// carried every failed lookup forward would keep reporting an interface
+	// this node does not have.
+	ops.hardErr = nil
+	delete(ops.links, linuxName)
+	mm.Apply(groups)
+	if got := mm.monitorStatus[1]; len(got) != 0 {
+		t.Errorf("pass 3: a genuinely absent (peer-owned) interface must still be "+
+			"dropped, not carried forward; got %+v", got)
 	}
 }
