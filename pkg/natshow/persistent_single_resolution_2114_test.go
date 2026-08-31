@@ -2,6 +2,7 @@ package natshow
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -79,7 +80,7 @@ func TestRenderPersistentDetail_ResolvesTableOnce(t *testing.T) {
 	var panicked any
 	func() {
 		defer func() { panicked = recover() }()
-		RenderPersistentDetail(&buf, dp)
+		RenderPersistentDetail(context.Background(), &buf, dp)
 	}()
 
 	if panicked != nil {
@@ -107,7 +108,7 @@ func TestRenderPersistent_NoTableIsUnavailable(t *testing.T) {
 	}
 
 	buf.Reset()
-	RenderPersistentDetail(&buf, dp)
+	RenderPersistentDetail(context.Background(), &buf, dp)
 	if !strings.Contains(buf.String(), "Persistent NAT table not available") {
 		t.Fatalf("detail render output = %q, want the unavailable line", buf.String())
 	}

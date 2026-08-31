@@ -108,6 +108,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/natshow/source.go":                          "#1687 shared source-NAT rule-detail renderer iterates legacy SessionKey/Value via the Reader",
 	"pkg/natshow/dest.go":                            "#1687 shared dest-NAT rule-detail renderer iterates legacy SessionKey/Value via the Reader",
 	"pkg/natshow/persistent.go":                      "#1687 shared persistent-NAT renderers iterate legacy SessionKey/Value and read PersistentNATTable via the Reader",
+	"pkg/natshow/walk.go":                            "#7315 the single cancellable session-walk authority the three walking NAT renderers route through; names the same legacy SessionKey/Value the per-renderer copies it replaced already named (net-neutral — walk.go took those iterations OUT of persistent.go/source.go/dest.go, it did not add a new consumer)",
 }
 
 // retainedShimBoundaryBuildTagAllowlist enumerates files that may

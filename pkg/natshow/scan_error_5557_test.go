@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -78,7 +79,7 @@ func TestRenderPersistentDetail_SurfacesScanError_5557(t *testing.T) {
 		Timeout:  600 * time.Second,
 	})
 	var b strings.Builder
-	RenderPersistentDetail(&b, &scanErrReader{pnat: pnat})
+	RenderPersistentDetail(context.Background(), &b, &scanErrReader{pnat: pnat})
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("persistent detail did not surface the session-scan error; got:\n%s", b.String())
 	}
@@ -91,7 +92,7 @@ func TestRenderPersistentDetail_SurfacesScanError_5557(t *testing.T) {
 // RenderSourceRuleDetail and the caveat vanishes.
 func TestRenderSourceRuleDetail_SurfacesScanError_5557(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, natFixtureConfig(), &scanErrReader{},
+	RenderSourceRuleDetail(context.Background(), &b, natFixtureConfig(), &scanErrReader{},
 		func() *dataplane.ApplyResult { return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}} })
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("source detail did not surface the session-scan error; got:\n%s", b.String())
@@ -105,7 +106,7 @@ func TestRenderSourceRuleDetail_SurfacesScanError_5557(t *testing.T) {
 // RenderDestRuleDetail and the caveat vanishes.
 func TestRenderDestRuleDetail_SurfacesScanError_5557(t *testing.T) {
 	var b strings.Builder
-	RenderDestRuleDetail(&b, natFixtureConfig(), &scanErrReader{},
+	RenderDestRuleDetail(context.Background(), &b, natFixtureConfig(), &scanErrReader{},
 		func() *dataplane.ApplyResult { return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}} })
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("dest detail did not surface the session-scan error; got:\n%s", b.String())
@@ -132,7 +133,7 @@ func TestRenderPersistentDetail_SurfacesV6ScanError_5557(t *testing.T) {
 		Timeout:  600 * time.Second,
 	})
 	var b strings.Builder
-	RenderPersistentDetail(&b, &v6ScanErrReader{pnat: pnat})
+	RenderPersistentDetail(context.Background(), &b, &v6ScanErrReader{pnat: pnat})
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("persistent detail did not surface the v6 session-scan error; got:\n%s", b.String())
 	}
@@ -140,7 +141,7 @@ func TestRenderPersistentDetail_SurfacesV6ScanError_5557(t *testing.T) {
 
 func TestRenderSourceRuleDetail_SurfacesV6ScanError_5557(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, natFixtureConfig(), &v6ScanErrReader{},
+	RenderSourceRuleDetail(context.Background(), &b, natFixtureConfig(), &v6ScanErrReader{},
 		func() *dataplane.ApplyResult { return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}} })
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("source detail did not surface the v6 session-scan error; got:\n%s", b.String())
@@ -149,7 +150,7 @@ func TestRenderSourceRuleDetail_SurfacesV6ScanError_5557(t *testing.T) {
 
 func TestRenderDestRuleDetail_SurfacesV6ScanError_5557(t *testing.T) {
 	var b strings.Builder
-	RenderDestRuleDetail(&b, natFixtureConfig(), &v6ScanErrReader{},
+	RenderDestRuleDetail(context.Background(), &b, natFixtureConfig(), &v6ScanErrReader{},
 		func() *dataplane.ApplyResult { return &dataplane.ApplyResult{ZoneIDs: map[string]uint16{}} })
 	if !strings.Contains(b.String(), scanErrCaveat) {
 		t.Fatalf("dest detail did not surface the v6 session-scan error; got:\n%s", b.String())

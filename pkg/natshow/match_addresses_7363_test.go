@@ -2,6 +2,7 @@ package natshow
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -48,14 +49,14 @@ func matchCfg7363(dst config.NATMatch, src config.NATMatch) *config.Config {
 func renderDest7363(t *testing.T, m config.NATMatch) string {
 	t.Helper()
 	var b bytes.Buffer
-	RenderDestRuleDetail(&b, matchCfg7363(m, config.NATMatch{}), nil, nil)
+	RenderDestRuleDetail(context.Background(), &b, matchCfg7363(m, config.NATMatch{}), nil, nil)
 	return b.String()
 }
 
 func renderSource7363(t *testing.T, m config.NATMatch) string {
 	t.Helper()
 	var b bytes.Buffer
-	RenderSourceRuleDetail(&b, matchCfg7363(config.NATMatch{}, m), nil, nil)
+	RenderSourceRuleDetail(context.Background(), &b, matchCfg7363(config.NATMatch{}, m), nil, nil)
 	return b.String()
 }
 
@@ -146,10 +147,10 @@ func TestUnscopedRuleStillRendersAny7363(t *testing.T) {
 // The helper itself, at the boundaries the renderers cannot easily reach.
 func TestNatMatchAddressesPluralSupersedesSingular7363(t *testing.T) {
 	cases := []struct {
-		name                     string
-		cidr, bookName           string
-		cidrs, names             []string
-		want                     string
+		name           string
+		cidr, bookName string
+		cidrs, names   []string
+		want           string
 	}{
 		{name: "empty", want: ""},
 		{name: "singular cidr only", cidr: "10.0.0.0/8", want: "10.0.0.0/8"},

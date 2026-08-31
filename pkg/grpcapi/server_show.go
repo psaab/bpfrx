@@ -221,29 +221,33 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "persistent-nat":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		// #6553: full-table conntrack walk — admission-gated, error propagated.
-		if err := s.showPersistentNAT(&buf); err != nil {
+		// #6553: admission-gated, error propagated. NOT a conntrack walk —
+		// see showPersistentNAT (#7315).
+		if err := s.showPersistentNAT(ctx, &buf); err != nil {
 			return nil, err
 		}
 
 	case "nat-source-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		// #6553: full-table conntrack walk — admission-gated, error propagated.
-		if err := s.showNATSourceRuleDetail(cfg, &buf); err != nil {
+		// #6553: full-table conntrack walk — admission-gated, error
+		// propagated. #7315: the walk runs under the admission-lease ctx.
+		if err := s.showNATSourceRuleDetail(ctx, cfg, &buf); err != nil {
 			return nil, err
 		}
 
 	case "nat-dest-rule-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		// #6553: full-table conntrack walk — admission-gated, error propagated.
-		if err := s.showNATDestRuleDetail(cfg, &buf); err != nil {
+		// #6553: full-table conntrack walk — admission-gated, error
+		// propagated. #7315: the walk runs under the admission-lease ctx.
+		if err := s.showNATDestRuleDetail(ctx, cfg, &buf); err != nil {
 			return nil, err
 		}
 
 	case "persistent-nat-detail":
 		// #1043 Phase 3: case body extracted to server_show_nat.go
-		// #6553: full-table conntrack walk — admission-gated, error propagated.
-		if err := s.showPersistentNATDetail(&buf); err != nil {
+		// #6553: full-table conntrack walk — admission-gated, error
+		// propagated. #7315: the walk runs under the admission-lease ctx.
+		if err := s.showPersistentNATDetail(ctx, &buf); err != nil {
 			return nil, err
 		}
 

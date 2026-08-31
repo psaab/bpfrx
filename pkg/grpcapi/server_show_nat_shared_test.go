@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -74,13 +75,17 @@ func TestGRPCNATWrappersMatchSharedRenderers(t *testing.T) {
 	}{
 		{
 			"source-rule-detail",
-			func(b *strings.Builder) { s.showNATSourceRuleDetail(cfg, b) },
-			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, s.dp, s.applyResult) },
+			func(b *strings.Builder) { s.showNATSourceRuleDetail(context.Background(), cfg, b) },
+			func(b *strings.Builder) {
+				natshow.RenderSourceRuleDetail(context.Background(), b, cfg, s.dp, s.applyResult)
+			},
 		},
 		{
 			"dest-rule-detail",
-			func(b *strings.Builder) { s.showNATDestRuleDetail(cfg, b) },
-			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, s.dp, s.applyResult) },
+			func(b *strings.Builder) { s.showNATDestRuleDetail(context.Background(), cfg, b) },
+			func(b *strings.Builder) {
+				natshow.RenderDestRuleDetail(context.Background(), b, cfg, s.dp, s.applyResult)
+			},
 		},
 		{
 			"static",
@@ -94,13 +99,13 @@ func TestGRPCNATWrappersMatchSharedRenderers(t *testing.T) {
 		},
 		{
 			"persistent",
-			func(b *strings.Builder) { s.showPersistentNAT(b) },
+			func(b *strings.Builder) { s.showPersistentNAT(context.Background(), b) },
 			func(b *strings.Builder) { natshow.RenderPersistent(b, s.dp) },
 		},
 		{
 			"persistent-detail",
-			func(b *strings.Builder) { s.showPersistentNATDetail(b) },
-			func(b *strings.Builder) { natshow.RenderPersistentDetail(b, s.dp) },
+			func(b *strings.Builder) { s.showPersistentNATDetail(context.Background(), b) },
+			func(b *strings.Builder) { natshow.RenderPersistentDetail(context.Background(), b, s.dp) },
 		},
 	}
 

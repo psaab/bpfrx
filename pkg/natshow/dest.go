@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -19,10 +20,13 @@ import (
 // its own pre-guard; for the non-empty path it routes here and renders
 // identically.
 //
+// ctx is the admission-lease context (#7315); the v4+v6 session tally below
+// stops on cancellation via the shared walkSessionValues authority.
+//
 // crFn lazily supplies the apply result; like RenderSourceRuleDetail it
 // is invoked only after the empty-config guard, preserving the master
 // ordering where applyResult() ran after the guard.
-func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
+func RenderDestRuleDetail(ctx context.Context, w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		io.WriteString(w, "No destination NAT rules configured\n")
 		return
@@ -40,28 +44,33 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 	// bare 0 whether the dataplane had reported or never been armed. All three
 	// now read the same thing, so they cannot disagree about whether the numbers
 	// below are measurements.
+	//
+	// #7315 keeps `armed` EXACTLY as #7423 defined it and calls the shared walk
+	// authority inside it. An earlier revision of #7315 hoisted the
+	// `dp != nil && dp.IsLoaded()` half down into walkSessionValues and left
+	// only `cr != nil` here — which would have widened `armed` for the two
+	// renders below that have nothing to do with the walk (the translation-hits
+	// gate and the rule-set aggregate line), reintroducing exactly the
+	// unmeasured-state claim #7423 removed.
 	armed := dp != nil && dp.IsLoaded() && cr != nil
 	if armed {
 		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
 		for name, id := range cr.ZoneIDs {
 			zoneByID[id] = name
 		}
-		if err := dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		}); err != nil {
-			scanErr = err
-		}
-		if err := dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		}); err != nil && scanErr == nil {
-			scanErr = err
-		}
+		// walkSessionValues re-tests dp/IsLoaded internally — see the note in
+		// RenderSourceRuleDetail on why that double-check is deliberate.
+		scanErr = walkSessionValues(ctx, dp,
+			func(val dataplane.SessionValue) {
+				if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			},
+			func(val dataplane.SessionValueV6) {
+				if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			})
 	}
 
 	noteSessionScanError(w, scanErr)

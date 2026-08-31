@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -50,7 +51,7 @@ func actionlessDestCfg6823() *config.Config {
 // through" is a wording gap and not a renderer that annotated nothing.
 func TestActionlessDestRuleAnnotationNamesTheFallThrough6823(t *testing.T) {
 	var b strings.Builder
-	RenderDestRuleDetail(&b, actionlessDestCfg6823(), nil, nil)
+	RenderDestRuleDetail(context.Background(), &b, actionlessDestCfg6823(), nil, nil)
 	got := b.String()
 
 	if !strings.Contains(got, "ADMITTED BY TOLERANT LOAD") {
@@ -89,7 +90,7 @@ func TestActionlessDestRuleAnnotationNamesTheFallThrough6823(t *testing.T) {
 // same green.
 func TestActionlessDestRuleIsNotBlamedOnAPool6823(t *testing.T) {
 	var b strings.Builder
-	RenderDestRuleDetail(&b, actionlessDestCfg6823(), nil, nil)
+	RenderDestRuleDetail(context.Background(), &b, actionlessDestCfg6823(), nil, nil)
 	got := b.String()
 
 	if !strings.Contains(got, "NOT INSTALLED") {
@@ -129,7 +130,7 @@ func TestDestRuleWithADanglingPoolStillNamesThePool6823(t *testing.T) {
 		}},
 	}
 	var b strings.Builder
-	RenderDestRuleDetail(&b, cfg, nil, nil)
+	RenderDestRuleDetail(context.Background(), &b, cfg, nil, nil)
 	got := b.String()
 
 	if !strings.Contains(got, `address-less pool "nope"`) {
@@ -162,7 +163,7 @@ func TestHealthyDestRuleIsNotAnnotated6823(t *testing.T) {
 		}},
 	}
 	var b strings.Builder
-	RenderDestRuleDetail(&b, cfg, nil, nil)
+	RenderDestRuleDetail(context.Background(), &b, cfg, nil, nil)
 	got := b.String()
 
 	if strings.Contains(got, "ADMITTED BY TOLERANT LOAD") {

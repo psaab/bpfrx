@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -75,12 +76,16 @@ func TestCLINATWrappersMatchSharedRenderers(t *testing.T) {
 		{
 			"source-rule-detail",
 			func() error { return c.showNATSourceRuleDetail(cfg) },
-			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, dp, c.applyResult) },
+			func(b *strings.Builder) {
+				natshow.RenderSourceRuleDetail(context.Background(), b, cfg, dp, c.applyResult)
+			},
 		},
 		{
 			"dest-rule-detail",
 			func() error { return c.showNATDestinationRuleDetail(cfg) },
-			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, dp, c.applyResult) },
+			func(b *strings.Builder) {
+				natshow.RenderDestRuleDetail(context.Background(), b, cfg, dp, c.applyResult)
+			},
 		},
 		{
 			"static",
@@ -105,7 +110,7 @@ func TestCLINATWrappersMatchSharedRenderers(t *testing.T) {
 		{
 			"persistent-detail",
 			func() error { return c.showPersistentNATDetail() },
-			func(b *strings.Builder) { natshow.RenderPersistentDetail(b, dp) },
+			func(b *strings.Builder) { natshow.RenderPersistentDetail(context.Background(), b, dp) },
 		},
 	}
 

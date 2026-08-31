@@ -15,6 +15,7 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -38,33 +39,57 @@ func (s *Server) showNATNPTv6(cfg *config.Config, buf *strings.Builder) {
 }
 
 // acquireNATShowWalk takes a sessionWalkLimiter slot for a `show security nat`
-// topic that drives a full v4+v6 conntrack walk inside pkg/natshow (#6553).
+// topic that drives a full v4+v6 conntrack walk inside pkg/natshow (#6553),
+// and returns the ADMISSION-LEASE context the walk must run under (#7315).
 //
-// These four topics are reachable over the FABRIC listener (ShowText is on
-// fabricAllowedUnaryMethods), unlike the loopback-only NAT RPCs, and they were
-// walking the whole table with no admission at all. The plain Acquire (not
-// AcquireCtx) matches the existing ShowText precedent in server_show_flow.go
-// and server_show_system.go: pkg/natshow's Render* helpers take no context and
-// are shared with pkg/cli, so threading a lease context through them is a
-// cross-surface signature change tracked separately rather than smuggled in
-// here. The ADMISSION half is what stops a scrape flood from multiplying
-// concurrent table walks; the cancellation half is the stated residual.
+// These topics are reachable over the FABRIC listener (ShowText is on
+// fabricAllowedUnaryMethods), unlike the loopback-only NAT RPCs, and before
+// #6553 they walked the whole table with no admission at all.
+//
+// #6553 could only land the ADMISSION half: pkg/natshow's Render* helpers took
+// no context and are shared with pkg/cli, so it used the plain Acquire and
+// disclosed cancellation as a residual. #7315 threads the context through
+// pkg/natshow, so this now AcquireCtx's and hands the lease context down.
+// Admission bounds CONCURRENCY; the lease bounds DURATION under a
+// disconnected client — and the two fail independently, because a handler can
+// hold its slot correctly and still run the walk to completion after the
+// client is gone. That matters here specifically because REST and gRPC alias
+// ONE 4-slot diagcmd.SessionWalkLimiter: the slot a departed client's walk
+// keeps is a slot the REST surfaces that DO honour cancellation are queueing
+// for.
+//
+// AcquireCtx rather than Acquire also makes these topics consistent with
+// GetNATPoolStats / GetNATDestination (server_nat.go), which have taken the
+// lease form since #6553. There is no in-process delegation under ShowText
+// today, so the lease-REUSE arm of AcquireCtx is not exercised from here; it
+// is the cancellation propagation that is load-bearing.
 //
 // ShowText returns this handler error verbatim, so an over-cap topic surfaces
 // as codes.ResourceExhausted.
-func (s *Server) acquireNATShowWalk(what string) (func(), error) {
-	release, err := sessionWalkLimiter.Acquire()
+func (s *Server) acquireNATShowWalk(ctx context.Context, what string) (func(), context.Context, error) {
+	release, walkCtx, err := sessionWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted,
+		return nil, ctx, status.Errorf(codes.ResourceExhausted,
 			"%s: session scan concurrency limit reached; retry shortly", what)
 	}
-	return release, nil
+	return release, walkCtx, nil
 }
 
 // showPersistentNAT renders the persistent-NAT bindings table with
 // remaining timeout per binding.
-func (s *Server) showPersistentNAT(buf *strings.Builder) error {
-	release, err := s.acquireNATShowWalk("persistent-nat")
+//
+// It passes NO context to the renderer because RenderPersistent drives no
+// conntrack walk — its only dataplane read is an O(bindings) snapshot copy of
+// the in-process persistent-NAT map under that table's own RWMutex. #7315's
+// premise counted it among the four walking topics, citing two persistent.go
+// line numbers that are both inside RenderPersistentDetail. Giving it a
+// context would be a cancellation guarantee over nothing.
+//
+// The admission slot is KEPT even so: the snapshot is still an O(bindings)
+// allocation on a fabric-reachable surface, and dropping a bound that exists
+// is a separate judgement from adding the cancellation this change is about.
+func (s *Server) showPersistentNAT(ctx context.Context, buf *strings.Builder) error {
+	release, _, err := s.acquireNATShowWalk(ctx, "persistent-nat")
 	if err != nil {
 		return err
 	}
@@ -76,38 +101,38 @@ func (s *Server) showPersistentNAT(buf *strings.Builder) error {
 // showNATSourceRuleDetail renders detailed source NAT rule information,
 // including pool details, translation hit counters, and active session
 // counts per rule-set.
-func (s *Server) showNATSourceRuleDetail(cfg *config.Config, buf *strings.Builder) error {
-	release, err := s.acquireNATShowWalk("nat-source-rule-detail")
+func (s *Server) showNATSourceRuleDetail(ctx context.Context, cfg *config.Config, buf *strings.Builder) error {
+	release, walkCtx, err := s.acquireNATShowWalk(ctx, "nat-source-rule-detail")
 	if err != nil {
 		return err
 	}
 	defer release()
-	natshow.RenderSourceRuleDetail(buf, cfg, s.dp, s.applyResult)
+	natshow.RenderSourceRuleDetail(walkCtx, buf, cfg, s.dp, s.applyResult)
 	return nil
 }
 
 // showNATDestRuleDetail renders detailed destination NAT rule
 // information, including pool address/port, translation hit counters,
 // and active session counts per rule-set.
-func (s *Server) showNATDestRuleDetail(cfg *config.Config, buf *strings.Builder) error {
-	release, err := s.acquireNATShowWalk("nat-dest-rule-detail")
+func (s *Server) showNATDestRuleDetail(ctx context.Context, cfg *config.Config, buf *strings.Builder) error {
+	release, walkCtx, err := s.acquireNATShowWalk(ctx, "nat-dest-rule-detail")
 	if err != nil {
 		return err
 	}
 	defer release()
-	natshow.RenderDestRuleDetail(buf, cfg, s.dp, s.applyResult)
+	natshow.RenderDestRuleDetail(walkCtx, buf, cfg, s.dp, s.applyResult)
 	return nil
 }
 
 // showPersistentNATDetail renders per-binding detail for persistent-NAT
 // bindings, including current session counts per (NAT IP, NAT port).
-func (s *Server) showPersistentNATDetail(buf *strings.Builder) error {
-	release, err := s.acquireNATShowWalk("persistent-nat-detail")
+func (s *Server) showPersistentNATDetail(ctx context.Context, buf *strings.Builder) error {
+	release, walkCtx, err := s.acquireNATShowWalk(ctx, "persistent-nat-detail")
 	if err != nil {
 		return err
 	}
 	defer release()
-	natshow.RenderPersistentDetail(buf, s.dp)
+	natshow.RenderPersistentDetail(walkCtx, buf, s.dp)
 	return nil
 }
 

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"net/netip"
 	"strings"
 	"testing"
@@ -42,7 +43,7 @@ func TestShowPersistentNATDetailDoesNotPanicOnV6Binding(t *testing.T) {
 			t.Fatalf("showPersistentNATDetail panicked on v6 binding: %v", r)
 		}
 	}()
-	s.showPersistentNATDetail(&buf)
+	s.showPersistentNATDetail(context.Background(), &buf)
 
 	out := buf.String()
 	if !strings.Contains(out, "2001:559:8585:80::200") {

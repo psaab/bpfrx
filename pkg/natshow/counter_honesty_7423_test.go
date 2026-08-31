@@ -1,6 +1,7 @@
 package natshow
 
 import (
+	"context"
 	"io"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func (u *unarmedReader) GetPersistentNAT() *dataplane.PersistentNATTable { retur
 func TestTranslationHitsAreNotRenderedUnarmed_7423(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		render  func(io.Writer, *config.Config, Reader, func() *dataplane.ApplyResult)
+		render  func(context.Context, io.Writer, *config.Config, Reader, func() *dataplane.ApplyResult)
 		ruleSet string
 		key     string
 	}{
@@ -60,7 +61,7 @@ func TestTranslationHitsAreNotRenderedUnarmed_7423(t *testing.T) {
 				NATCounterIDs: map[string]uint32{tc.key: 5},
 			}
 			var b strings.Builder
-			tc.render(&b, natFixtureConfig(), dp, func() *dataplane.ApplyResult { return cr })
+			tc.render(context.Background(), &b, natFixtureConfig(), dp, func() *dataplane.ApplyResult { return cr })
 			out := b.String()
 
 			if strings.Contains(out, "Translation hits:        0 packets") {
@@ -102,7 +103,7 @@ func TestZonePairSessionCountAppearsOncePerRuleSet_7423(t *testing.T) {
 	}
 	cr := &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"trust": 7, "untrust": 8}}
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })
+	RenderSourceRuleDetail(context.Background(), &b, cfg, dp, func() *dataplane.ApplyResult { return cr })
 	out := b.String()
 
 	// Liveness: both rules really did render, or "printed once" is trivially
@@ -132,7 +133,7 @@ func TestZonePairSessionCountAppearsOncePerRuleSet_7423(t *testing.T) {
 // a bare `0` — indistinguishable from a genuinely idle rule set.
 func TestZonePairSessionCountIsNotZeroWhenUnarmed_7423(t *testing.T) {
 	var b strings.Builder
-	RenderSourceRuleDetail(&b, natFixtureConfig(), &unarmedReader{},
+	RenderSourceRuleDetail(context.Background(), &b, natFixtureConfig(), &unarmedReader{},
 		func() *dataplane.ApplyResult { return &dataplane.ApplyResult{} })
 	out := b.String()
 	if strings.Contains(out, "sessions for this zone pair: 0") {
@@ -169,7 +170,7 @@ func TestZonePairSessionCountAppearsOncePerRuleSetDest_7423(t *testing.T) {
 	}
 	cr := &dataplane.ApplyResult{ZoneIDs: map[string]uint16{"untrust": 8, "dmz": 9}}
 	var b strings.Builder
-	RenderDestRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })
+	RenderDestRuleDetail(context.Background(), &b, cfg, dp, func() *dataplane.ApplyResult { return cr })
 	out := b.String()
 
 	// Liveness: with one rule "printed once" is trivially true.
