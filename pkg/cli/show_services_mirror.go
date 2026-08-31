@@ -22,7 +22,8 @@ func (c *CLI) showPortMirroring() error {
 		return nil
 	}
 
-	for name, inst := range pm.Instances {
+	for _, name := range sortedInstanceNames(pm.Instances) {
+		inst := pm.Instances[name]
 		fmt.Printf("Instance: %s\n", name)
 		if inst.InputRate > 0 {
 			fmt.Printf("  Input rate: 1/%d\n", inst.InputRate)

@@ -1111,7 +1111,8 @@ func (c *CLI) showForwardingOptions() error {
 
 	if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
 		fmt.Println("Sampling:")
-		for name, inst := range fo.Sampling.Instances {
+		for _, name := range sortedInstanceNames(fo.Sampling.Instances) {
+			inst := fo.Sampling.Instances[name]
 			fmt.Printf("  Instance: %s\n", name)
 			if inst.InputRate > 0 {
 				fmt.Printf("    Input rate: 1/%d\n", inst.InputRate)
@@ -1158,7 +1159,8 @@ func (c *CLI) showForwardingOptions() error {
 
 	if fo.PortMirroring != nil && len(fo.PortMirroring.Instances) > 0 {
 		fmt.Println("Port mirroring:")
-		for name, inst := range fo.PortMirroring.Instances {
+		for _, name := range sortedInstanceNames(fo.PortMirroring.Instances) {
+			inst := fo.PortMirroring.Instances[name]
 			fmt.Printf("  Instance: %s\n", name)
 			if inst.InputRate > 0 {
 				fmt.Printf("    Sampling rate: 1/%d\n", inst.InputRate)
@@ -1189,4 +1191,25 @@ func (c *CLI) showForwardingOptions() error {
 		fmt.Println("No forwarding-options configured")
 	}
 	return nil
+}
+
+// sortedInstanceNames returns a map's keys in a stable order.
+//
+// #7357: every `show forwarding-options` renderer iterated its instance map
+// with a bare `range`, which Go randomises per run. The listings therefore
+// changed order between two calls with identical config -- an operator diffing
+// captures sees churn that is not there, and any golden or transcript over
+// these surfaces is unstable for a reason unrelated to the config.
+//
+// Generic over the value type because the same defect appeared in BOTH the
+// port-mirroring and sampling families, whose instance types differ. The
+// issue named only the two port-mirroring renderers and said its census was a
+// FLOOR; measuring the tree found six sites across three files.
+func sortedInstanceNames[T any](m map[string]T) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

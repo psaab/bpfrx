@@ -1199,7 +1199,8 @@ func (c *CLI) showFlowMonitoring() error {
 	}
 
 	if cfg.ForwardingOptions.Sampling != nil {
-		for name, inst := range cfg.ForwardingOptions.Sampling.Instances {
+		for _, name := range sortedInstanceNames(cfg.ForwardingOptions.Sampling.Instances) {
+			inst := cfg.ForwardingOptions.Sampling.Instances[name]
 			hasConfig = true
 			fmt.Printf("Sampling Instance: %s\n", name)
 			if inst.InputRate > 0 {
