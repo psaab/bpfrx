@@ -90,9 +90,22 @@ func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 		Lo0FilterInputV4:   cfg.System.Lo0FilterInputV4,
 		Lo0FilterInputV6:   cfg.System.Lo0FilterInputV6,
 	}
-	if cfg.Security.Flow.TCPSession != nil {
+	if ts := cfg.Security.Flow.TCPSession; ts != nil {
 		snap.TCPSessionTimeout = coerceWireSessionTimeout(
-			"tcp_session_timeout", cfg.Security.Flow.TCPSession.EstablishedTimeout)
+			"tcp_session_timeout", ts.EstablishedTimeout)
+		// #7342: the other three windows. Each goes through the same
+		// MaxDurationSeconds clamp as established-timeout, for the same reason —
+		// the helper multiplies seconds by 1e9 without checked arithmetic, so an
+		// out-of-range value would wrap into a SHORT window rather than a long
+		// one. Clamping here keeps the failure direction "held too long", which
+		// an operator can see, rather than "reaped instantly", which looks like
+		// a forwarding bug.
+		snap.TCPInitialTimeout = coerceWireSessionTimeout(
+			"tcp_initial_timeout", ts.InitialTimeout)
+		snap.TCPClosingTimeout = coerceWireSessionTimeout(
+			"tcp_closing_timeout", ts.ClosingTimeout)
+		snap.TCPTimeWaitTimeout = coerceWireSessionTimeout(
+			"tcp_time_wait_timeout", ts.TimeWaitTimeout)
 	}
 	snap.ALGDisableFlags = algDisableFlags(&cfg.Security.ALG)
 	return snap

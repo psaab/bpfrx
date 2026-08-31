@@ -52,9 +52,19 @@ func TestShowTextFlowTimeoutsAnnotateUnenforced_6539(t *testing.T) {
 		if !strings.Contains(line, tc.value) {
 			t.Errorf("%s row lost the configured value %s: %q", tc.label, tc.value, line)
 		}
+		// #7342: every tcp-session timeout is enforced now, so the shared
+		// table hands back no annotation and the row must render the bare
+		// value. Reading the note from the table rather than hard-coding "no
+		// annotation" is what keeps this surface tied to the single authority:
+		// if a future leaf becomes unenforced, this asserts the annotation
+		// appears instead.
 		note := config.TCPSessionTimeoutNote(tc.leaf)
 		if note == "" {
-			t.Fatalf("config table says %q is enforced; this test is stale", tc.leaf)
+			if strings.Contains(line, "not enforced") {
+				t.Errorf("%s row still carries a not-enforced annotation for an ENFORCED leaf, "+
+					"so REST reports a configured value as inert: %q", tc.label, line)
+			}
+			continue
 		}
 		if !strings.Contains(line, note) {
 			t.Errorf("%s row does not carry the shared not-enforced annotation, so REST reports a "+

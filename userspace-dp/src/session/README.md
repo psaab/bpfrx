@@ -50,14 +50,60 @@ structure.)
 
 ## Timeouts
 
-| Class | Default |
-|-------|---------|
-| TCP established | 300 s |
-| TCP opening (half-open) | 20 s |
-| UDP   | 60 s |
-| ICMP  | 60 s |
-| TCP closing (graceful FIN) | 30 s |
-| TCP closing (RST) | 2 s |
+| Class | Default | Operator leaf (#7342) |
+|-------|---------|-----------------------|
+| TCP established | 300 s | `security flow tcp-session established-timeout` |
+| TCP opening (half-open) | 20 s | `... initial-timeout` |
+| TCP CLOSING (FIN in one direction) | 30 s | `... closing-timeout` |
+| TCP TIME_WAIT (FIN in both directions) | 30 s | `... time-wait-timeout` |
+| TCP abort (RST) | 2 s | none — #3046, an xpf control |
+| UDP   | 60 s | `security flow udp-session session-timeout` |
+| ICMP  | 60 s | `security flow icmp-session session-timeout` |
+
+### CLOSING vs TIME_WAIT (#7342)
+
+Junos distinguishes CLOSING (after the first FIN) from TIME_WAIT (after the close
+handshake completes). Before #7342 this dataplane had ONE post-FIN window, so
+`closing-timeout` and `time-wait-timeout` had nothing to attach to independently
+— mapping either onto that window was a guess and mapping both was impossible,
+which is why #6539 could only record that neither was enforced.
+
+The discriminator is a FIN per DIRECTION, on `SessionEntry`:
+
+* `fin_own` — a FIN arrived in THIS entry's own direction, set on the read path.
+* `fin_peer` — mirrored from the companion by
+  `propagate_tcp_state_to_companion`, which already mirrors close state between
+  the two halves (#4109 F17).
+
+`SessionEntry::tcp_close_class` reads them: `reset` short-circuits to the abort
+window, both bits are TIME_WAIT, otherwise CLOSING. `tcp_close_window_ns` is the
+single formula that maps a class to a window — four sites used to carry their own
+copy of "RST → 2s, else 30s", and adding a third arm to each is the drift the
+one-formula rule exists to prevent.
+
+The bits are gated on FIN specifically, not on `is_closing` (which is FIN **or**
+RST): a RST is an abort with no close handshake to complete, and a reset session
+never reaches TIME_WAIT.
+
+**Why they could not be derived from existing state.**
+`SessionEntry.observed_tcp_flags` looks like the answer and is not.
+`account_packet` OR-folds BOTH directions' flags onto the FORWARD entry on
+purpose (#2749, so NetFlow's `tcpControlBits` reports the whole flow), so
+`observed_tcp_flags & TCP_FIN` is already true after ONE fin. A TIME_WAIT
+detector built on it would put every half-closed session straight into TIME_WAIT
+— and every single-FIN test would still pass.
+
+**Compatibility.** `tcp_closing_ns` and `tcp_time_wait_ns` both default to the
+window every post-FIN close already used, `0` on the wire means unset, and the
+three carriers are `omitempty` / `serde(default)`. An operator who sets neither
+leaf, a Go binary that predates #7342, and a helper that predates it all reap
+byte-identically to before the split; each of those three is pinned by its own
+cell in `tcp_close_state_7342_tests.rs` and
+`forwarding_build/tests.rs`.
+
+**Precedence.** The per-zone `screen ... syn-flood timeout` override (#3527)
+still beats the global `initial-timeout` for that zone's half-opens — a screen
+control an operator set per zone must not be outranked by a global default.
 
 **Per-application inactivity-timeout (#3227).** A custom application's
 `inactivity-timeout` (`set applications application <a> inactivity-timeout

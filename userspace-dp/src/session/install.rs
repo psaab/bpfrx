@@ -191,6 +191,13 @@ impl SessionTable {
                 ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
+                // #7342: a fresh install has seen exactly one packet, so at most
+                // one direction can have FINed and the companion's is unknown.
+                // A session installed BY a closing packet is therefore CLOSING,
+                // never TIME_WAIT — which is also the window it reaped on before
+                // the state existed.
+                fin_own: matches!(protocol, PROTO_TCP) && has_fin(tcp_flags),
+                fin_peer: false,
                 wheel_tick: 0,
                 // #2120: a freshly-installed entry has never been HELD and
                 // has not yet been self-healed. 0 is the never-self-healed
@@ -434,6 +441,13 @@ impl SessionTable {
                 ),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 reset: matches!(protocol, PROTO_TCP) && has_rst(tcp_flags),
+                // #7342: a fresh install has seen exactly one packet, so at most
+                // one direction can have FINed and the companion's is unknown.
+                // A session installed BY a closing packet is therefore CLOSING,
+                // never TIME_WAIT — which is also the window it reaped on before
+                // the state existed.
+                fin_own: matches!(protocol, PROTO_TCP) && has_fin(tcp_flags),
+                fin_peer: false,
                 wheel_tick: 0,
                 // #2120: a re-imported synced entry leaves the held world
                 // with a fresh `last_seen_ns`, so it carries no carried-over
