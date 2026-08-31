@@ -39,6 +39,7 @@ make_stub() {
 #!/usr/bin/env bash
 case "$1" in
   list) exit 0 ;;                       # no instance holds the target IP
+  exec) [[ -n "${STUB_EXEC_LOG:-}" ]] && echo "$2" >> "$STUB_EXEC_LOG" ;;
 esac
 # incus exec <remote>:<inst> -- <cmd...>
 for a in "$@"; do shift; [[ "$a" == "--" ]] && break; done
@@ -160,6 +161,68 @@ grep -q '6211' <<< "$out" \
     || fail "the failure report does not include the whole 24-port grid; a
 runner fixes one port at a time instead of seeing every hole:
 $out"
+
+# --- 4. the probe VANTAGE POINT (#8164) ---------------------------------
+#
+# This script used to probe from `xpf-userspace-fw0`. The firewall FORWARDS
+# VLAN-80 traffic and does not originate it, so its host stack cannot open TCP
+# to the target even when every service is up — measured on the standing loss
+# cluster, same instrument and same instant: 0/24 open from either firewall
+# node, 23/24 open from the LAN source container. The gate therefore reported
+# "24 of 24 target services are DOWN" against a target that was almost
+# entirely healthy, and that reading is indistinguishable from the host having
+# died. #7100 and #7159 were both parked for weeks on it.
+#
+# A wrong vantage point cannot be caught by any of the cells above: they
+# script the port table directly, so the subject returns the same answer
+# whichever instance it asks. The observable has to be WHICH INSTANCE the
+# probe ran on, which is why the stub now records it.
+EXEC_LOG="${TMP}/exec-targets"
+probe_target() {
+    : > "$EXEC_LOG"
+    OPEN_PORTS="$ALL" STUB_EXEC_LOG="$EXEC_LOG" "$@" bash "$SUBJECT" check 5202 \
+        > /dev/null 2>&1
+    # The instance ref of the port probe, minus the remote prefix.
+    grep -v '^$' "$EXEC_LOG" | tail -1 | sed 's/^[^:]*://'
+}
+
+got="$(probe_target env)"
+# Non-vacuity first: an empty log makes every assertion below vacuously true,
+# and a stub that stopped recording looks exactly like a passing subject.
+if [[ -z "$got" ]]; then
+    fail "the stub recorded no 'incus exec' target at all; section 4 asserts" \
+         "nothing and would stay green against any vantage point"
+else
+    case "$got" in
+        *fw0*|*fw1*)
+            fail "the default probe runs on '${got}', a FIREWALL node. The" \
+                 "firewall forwards VLAN-80 traffic and cannot originate TCP to" \
+                 "the target, so every port reads closed and the gate blocks" \
+                 "every per-class harness on a healthy target (#8164)" ;;
+        *) pass "default probe vantage is not a firewall node (${got})" ;;
+    esac
+fi
+
+# The env's OWN LAN host, not a literal. A subject that swapped one hardcoded
+# instance name for another passes the cell above and is still wrong on every
+# environment but this one.
+got="$(probe_target env CLUSTER_LAN_HOST_NAME=probe-canary-host)"
+if [[ "$got" != "probe-canary-host" ]]; then
+    fail "with CLUSTER_LAN_HOST_NAME=probe-canary-host the probe ran on" \
+         "'${got}'. The vantage must come from the cluster env's LAN_HOST" \
+         "(cluster-env.sh), or the script is hardcoded to one environment"
+else
+    pass "probe vantage follows the cluster env's LAN host"
+fi
+
+# And the explicit override still wins, so an operator can aim the probe
+# somewhere else without editing the script.
+got="$(probe_target env PROBE_FROM=explicit-probe-host)"
+if [[ "$got" != "explicit-probe-host" ]]; then
+    fail "PROBE_FROM=explicit-probe-host was ignored; the probe ran on '${got}'"
+else
+    pass "explicit PROBE_FROM override is honoured"
+fi
 
 # --- summary ------------------------------------------------------------
 if [[ $fails -eq 0 ]]; then
