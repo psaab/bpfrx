@@ -44,6 +44,12 @@ source "${SCRIPT_DIR}/wg-interop.env"
 XPF_CLUSTER_LOCK="${WG_CLUSTER_LOCK}"
 # shellcheck source=cluster-lock.sh
 source "${SCRIPT_DIR}/cluster-lock.sh"
+# #7792/#6440: the piped-stdin CLI is a REPL, not a batch runner -- it prints
+# `error: ...` for a failed command, continues, and exits 0. Every config
+# session below is gated on the CLI's own success MARKERS via this library
+# rather than on the session exit status, which proves nothing.
+# shellcheck source=./cos-apply-lib.sh
+source "${SCRIPT_DIR}/cos-apply-lib.sh"
 
 R="${WG_REMOTE}"
 FW0="${R}:${WG_FW0}"
@@ -431,7 +437,11 @@ commit
 exit
 quit
 EOF
-    grep -qE "commit complete" "${EVID}/wg-stanza-delete.txt" \
+    # #7792: line-anchored marker. The previous unanchored `grep -qE "commit
+    # complete"` was also satisfied by an `error: commit failed: ... commit
+    # complete ...` line, so a failed commit could report success.
+    cos_require_markers "wg stanza delete commit" "${EVID}/wg-stanza-delete.txt" \
+        "$COS_MARKER_COMMIT" \
         || warn "wg stanza delete commit: $(tail -2 "${EVID}/wg-stanza-delete.txt")"
     sleep 2
 }
@@ -501,7 +511,9 @@ commit
 exit
 quit
 EOF
-    grep -q "commit complete" "${EVID}/xpf-commit-$1.txt" \
+    # #7792: line-anchored marker (see wg_stanza_delete).
+    cos_require_markers "xpf commit ($1)" "${EVID}/xpf-commit-$1.txt" \
+        "$COS_MARKER_COMMIT" \
         || fail "xpf commit failed: $(cat "${EVID}/xpf-commit-$1.txt")"
 }
 
@@ -713,7 +725,10 @@ commit
 exit
 quit
 EOF
-    grep -q "commit complete" "${EVID}/p3-commit.txt" || fail "P3: endpoint-removal commit failed"
+    # #7792: line-anchored marker (see wg_stanza_delete).
+    cos_require_markers "P3 endpoint-removal commit" "${EVID}/p3-commit.txt" \
+        "$COS_MARKER_COMMIT" \
+        || fail "P3: endpoint-removal commit failed"
     sleep 3
     # Restart-runbook flush + reconfigure peer as INITIATOR.
     peer_wg_setup "${WG_XPF_OUTER4}:${WG_LISTEN_PORT}"
@@ -873,7 +888,13 @@ commit
 exit
 quit
 EOF
-    grep -qE "commit complete|path not found" "${EVID}/teardown-commit.txt" \
+    # #7792: teardown is idempotent, so EITHER marker is a success -- the
+    # stanza was removed, or it was already absent. cos_require_markers
+    # requires ALL of its markers, so this disjunction uses the single-marker
+    # predicate twice rather than forcing an AND that would fail on a re-run.
+    # Both are line-anchored, which the previous `grep -qE` was not.
+    cos_transcript_has_marker "${EVID}/teardown-commit.txt" "$COS_MARKER_COMMIT" \
+        || cos_transcript_has_marker "${EVID}/teardown-commit.txt" "path not found" \
         || fail "teardown commit failed: $(tail -3 "${EVID}/teardown-commit.txt")"
     ish "${FW0}" 'ip link del wg0 2>/dev/null; true'
     for n in "${FW0}" "${FW1}"; do
