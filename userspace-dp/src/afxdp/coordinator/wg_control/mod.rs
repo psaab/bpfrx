@@ -127,6 +127,11 @@ pub(super) fn wg_control_loop(
     // (pubkey, authored `host:port`). Empty for a tunnel of IP literals,
     // which starts no resolver thread at all.
     endpoint_hosts: Vec<([u8; 32], String)>,
+    // #7936: coordinator-owned resolver telemetry. Passed in rather than
+    // created here for the same reason `recent_exceptions` is: this thread
+    // writes it and the 1 Hz status path reads it, and the reader must not
+    // depend on the writer still being alive.
+    resolver_telemetry: Arc<crate::afxdp::wg::endpoint_resolver::WgEndpointResolverTelemetry>,
     recent_exceptions: Arc<Mutex<ExceptionEventRing>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -200,6 +205,13 @@ pub(super) fn wg_control_loop(
         &tunnel_name,
         endpoint_hosts,
         socket_is_v6,
+        // #7936: the telemetry object is the COORDINATOR's, cloned in here.
+        // The resolver is a local of this thread and dies with it, which is
+        // why #7158's counters never reached the status wire; handing it an
+        // Arc the coordinator already holds is the same shape
+        // `recent_exceptions` uses, and it keeps the counters continuous
+        // across a control-thread restart instead of resetting them.
+        resolver_telemetry,
     );
 
     run_wg_control_loop(
@@ -447,8 +459,7 @@ fn run_wg_control_loop(
                     // whose per-peer MTU was unresolvable at spawn
                     // (learned/roamed endpoint) falls back to the
                     // interface-level scalar — the pre-#5291 behaviour.
-                    let peer_outer_mtu =
-                        per_peer_outer_mtu.get(&pk).copied().unwrap_or(outer_mtu);
+                    let peer_outer_mtu = per_peer_outer_mtu.get(&pk).copied().unwrap_or(outer_mtu);
                     encap_and_send(
                         engine,
                         socket,
@@ -519,8 +530,16 @@ fn run_wg_control_loop(
                 if let Some(kind) = actions.send_keepalive {
                     if let Some(ep) = effective_endpoint {
                         send_keepalive(
-                            engine, socket, socket_is_v6, pk, ep, kind, now,
-                            &mut encap_buf, tunnel_name, recent_exceptions,
+                            engine,
+                            socket,
+                            socket_is_v6,
+                            pk,
+                            ep,
+                            kind,
+                            now,
+                            &mut encap_buf,
+                            tunnel_name,
+                            recent_exceptions,
                         );
                     } else {
                         pace_keepalive_skip(engine, pk, kind, now);
@@ -649,7 +668,8 @@ mod endpoint_adoption_7158_tests {
     /// DDNS name moved is reached without a commit or a daemon restart.
     #[test]
     fn a_resolved_endpoint_is_adopted_when_the_peer_is_silent_7158() {
-        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let resolver =
+            WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
         let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
         effective.insert(PK, addr("198.51.100.1:51820"));
         // Never heard from: no roam to protect.
@@ -678,7 +698,8 @@ mod endpoint_adoption_7158_tests {
     /// `apply_resolved_endpoints` and the roamed address is clobbered.
     #[test]
     fn a_live_roam_is_not_clobbered_by_dns_7158() {
-        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let resolver =
+            WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
         let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
         // The roamed address: learned from an authenticated datagram.
         effective.insert(PK, addr("198.51.100.77:33445"));
@@ -706,7 +727,8 @@ mod endpoint_adoption_7158_tests {
     /// #7158 is for.
     #[test]
     fn a_stale_roam_yields_to_dns_7158() {
-        let resolver = WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
+        let resolver =
+            WgEndpointResolver::with_resolved_for_test(&[(PK, addr("203.0.113.9:51820"))]);
         let mut effective: HashMap<[u8; 32], SocketAddr> = HashMap::new();
         effective.insert(PK, addr("198.51.100.77:33445"));
         let mut heard: HashMap<[u8; 32], u64> = HashMap::new();
@@ -733,6 +755,9 @@ mod endpoint_adoption_7158_tests {
         effective.insert(PK, addr("198.51.100.1:51820"));
         let heard: HashMap<[u8; 32], u64> = HashMap::new();
         apply_resolved_endpoints(None, &[PK], &mut effective, &heard, 1_000, "wg0");
-        assert_eq!(effective.get(&PK).copied(), Some(addr("198.51.100.1:51820")));
+        assert_eq!(
+            effective.get(&PK).copied(),
+            Some(addr("198.51.100.1:51820"))
+        );
     }
 }

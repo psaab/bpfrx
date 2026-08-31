@@ -31,8 +31,7 @@ pub(in crate::afxdp) struct WorkerHandle {
     /// runtime seqlock (window_gen). Worker thread writes via
     /// publish_from_local() every ~1s tick; coordinator status path
     /// reads via snapshot() at each /metrics scrape (~1 Hz default).
-    pub(in crate::afxdp) cold_path_atomics:
-        Arc<super::cold_path_hist::WorkerColdPathAtomics>,
+    pub(in crate::afxdp) cold_path_atomics: Arc<super::cold_path_hist::WorkerColdPathAtomics>,
     pub(in crate::afxdp) join: Option<JoinHandle<()>>,
 }
 
@@ -102,6 +101,15 @@ pub(crate) struct LocalTunnelSourceEntry {
 /// the defer-branch snapshot prune, and `stop_inner` — never by the
 /// finished sweep.
 pub(crate) struct WgControlEntry {
+    /// #7936: this tunnel's endpoint-resolver telemetry, owned HERE rather
+    /// than by the resolver, which is a local of the control thread and dies
+    /// with it. `None` on a tombstone created before any spawn.
+    ///
+    /// Held across restarts on purpose: a self-heal respawn reuses this Arc, so
+    /// the counters do not reset at the moment an operator is most likely to be
+    /// reading them.
+    pub(in crate::afxdp) resolver_telemetry:
+        Option<std::sync::Arc<crate::afxdp::wg::endpoint_resolver::WgEndpointResolverTelemetry>>,
     /// Live (or finished-but-unswept) thread handle. `None` = tombstone.
     pub(in crate::afxdp) handle: Option<LocalTunnelSourceHandle>,
     /// Address of the `Arc<WgEngine>` the thread was last spawned with.

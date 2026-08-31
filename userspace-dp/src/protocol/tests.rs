@@ -2433,6 +2433,13 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         keepalives_tx_passive: 42,
         keepalives_tx_persistent: 43,
         pending_aborted_attempt_window: 44,
+        // #7936 endpoint resolver (51.. — 45..50 are the cookie/under-load
+        // fields asserted below, so the ladder continues past them).
+        endpoint_resolve_ok: 51,
+        endpoint_resolve_fail: 52,
+        endpoint_family_mismatch: 53,
+        endpoint_changed: 54,
+        endpoint_last_error: "vpn.example.com: no AAAA for a v6 socket".to_string(),
     };
     let status = ProcessStatus {
         wg_tunnels: vec![row],
@@ -2459,6 +2466,18 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["hs_cookie_replies_sent"], 46);
     assert_eq!(wire_row["hs_rx_cookie_consumed"], 50);
     assert_eq!(wire_row["hs_rx_under_load_no_mac2"], 47);
+    // #7936: the four counters AND the error string. The string is asserted
+    // because it is the half a counter cannot carry — `endpoint_family_mismatch`
+    // says how often, this says which name and which family, and only the pair
+    // is actionable.
+    assert_eq!(wire_row["endpoint_resolve_ok"], 51);
+    assert_eq!(wire_row["endpoint_resolve_fail"], 52);
+    assert_eq!(wire_row["endpoint_family_mismatch"], 53);
+    assert_eq!(wire_row["endpoint_changed"], 54);
+    assert_eq!(
+        wire_row["endpoint_last_error"],
+        "vpn.example.com: no AAAA for a v6 socket"
+    );
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");
     assert_eq!(back.wg_tunnels.len(), 1);
@@ -2468,6 +2487,14 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(b.peers.len(), 1);
     assert_eq!(b.peers[0].peer_pubkey_hex, "ab".repeat(32));
     assert!(b.peers[0].session_confirmed);
+    assert_eq!(b.endpoint_resolve_ok, 51);
+    assert_eq!(b.endpoint_resolve_fail, 52);
+    assert_eq!(b.endpoint_family_mismatch, 53);
+    assert_eq!(b.endpoint_changed, 54);
+    assert_eq!(
+        b.endpoint_last_error,
+        "vpn.example.com: no AAAA for a v6 socket"
+    );
     assert_eq!(b.hs_initiations_created, 1);
     assert_eq!(b.decap_drops_buffer, 25);
     assert_eq!(b.tun_rx_drops_no_endpoint, 35);

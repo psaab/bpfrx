@@ -75,7 +75,12 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 			"rekeys_initiated_keepalive_no_session": 41,
 			"keepalives_tx_passive": 42,
 			"keepalives_tx_persistent": 43,
-			"pending_aborted_attempt_window": 44
+			"pending_aborted_attempt_window": 44,
+			"endpoint_resolve_ok": 51,
+			"endpoint_resolve_fail": 52,
+			"endpoint_family_mismatch": 53,
+			"endpoint_changed": 54,
+			"endpoint_last_error": "vpn.example.com: no AAAA for a v6 socket"
 		}]
 	}`
 	var status ProcessStatus
@@ -158,11 +163,26 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 		{"KeepalivesTxPassive", row.KeepalivesTxPassive, 42},
 		{"KeepalivesTxPersistent", row.KeepalivesTxPersistent, 43},
 		{"PendingAbortedAttemptWindow", row.PendingAbortedAttemptWindow, 44},
+		// #7936 endpoint resolver. The ladder values match the Rust-side
+		// literal in protocol/tests.rs so a swapped pair of json tags shows up
+		// as a wrong NUMBER on both sides rather than as two green suites.
+		{"EndpointResolveOk", row.EndpointResolveOk, 51},
+		{"EndpointResolveFail", row.EndpointResolveFail, 52},
+		{"EndpointFamilyMismatch", row.EndpointFamilyMismatch, 53},
+		{"EndpointChanged", row.EndpointChanged, 54},
 	}
 	for _, c := range ladder {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d (json tag drift?)", c.name, c.got, c.want)
 		}
+	}
+	// #7936: the STRING is checked separately because the ladder is uint64.
+	// It is not decoration — `endpoint_family_mismatch` counts how often, and
+	// only this says WHICH name resolved to the wrong family, which is the
+	// difference between a number and a diagnosis.
+	if row.EndpointLastError != "vpn.example.com: no AAAA for a v6 socket" {
+		t.Errorf("EndpointLastError = %q, want the resolver's retained text",
+			row.EndpointLastError)
 	}
 }
 

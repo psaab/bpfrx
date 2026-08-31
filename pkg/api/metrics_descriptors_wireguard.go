@@ -93,4 +93,14 @@ func (c *xpfCollector) initWireGuardDescriptors() {
 		"Pending WireGuard handshake reservations released by the REKEY_ATTEMPT_TIME (90s) give-up — a stale msg2 after this cannot complete the abandoned handshake (#1888 S5).",
 		[]string{"tunnel"}, nil,
 	)
+	// #7936: endpoint-resolver telemetry. ONE metric with an `outcome` label
+	// rather than four metrics, because the four counts are alternatives of the
+	// same event — a resolution attempt ended one of these ways — and an
+	// operator's question is which outcome dominates. Four separate series
+	// would make that a join.
+	c.wgEndpointResolutionsTotal = prometheus.NewDesc(
+		"xpf_userspace_wg_endpoint_resolutions_total",
+		"WireGuard peer-endpoint DNS resolutions by outcome (#7158, #7936). `family_mismatch` is the one worth alerting on: the name resolved but to no address of the family this interface's single UDP socket can send from, which otherwise presents as a peer that never initiates. `changed` counts actual endpoint moves, not lookups.",
+		[]string{"tunnel", "outcome"}, nil,
+	)
 }

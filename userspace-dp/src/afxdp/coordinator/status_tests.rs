@@ -463,3 +463,143 @@ mod exception_ring_merge_6101 {
         );
     }
 }
+
+/// #7936 THE PUBLICATION PATH — the thing this change is actually about.
+///
+/// Every other #7936 test drives a hand-built `WgTunnelStatus` or
+/// `ProcessStatus`: the wire round-trip, the Go mirror, the Prometheus series,
+/// the detail renderer. All of them stayed GREEN when the coordinator was made
+/// to ignore the telemetry entirely, and when the row was made to hard-code
+/// `endpoint_family_mismatch: 0` — both found by mutation, both the same
+/// failure as #7172 cut 6's m6: the surfaces AROUND the wiring were tested and
+/// the wiring was not.
+///
+/// This drives the real builder against a real `WgControlEntry`, so the two
+/// hops the counters actually take — resolver -> coordinator Arc, coordinator
+/// Arc -> wire row — are the subject rather than the assumption.
+#[test]
+fn wg_tunnel_status_carries_endpoint_resolver_counters_7936() {
+    use crate::afxdp::types::TunnelEndpoint;
+    use crate::afxdp::types::WgControlEntry;
+    use crate::afxdp::wg::endpoint_resolver::WgEndpointResolverTelemetry;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
+
+    const ID: u16 = 3;
+    let mut coord = Coordinator::new();
+    coord.forwarding.tunnel_endpoints.insert(
+        ID,
+        TunnelEndpoint {
+            id: ID,
+            logical_ifindex: 41,
+            interface_label: "wg0".into(),
+            interface: "wg0.0".into(),
+            redundancy_group: 0,
+            mode: "wireguard".into(),
+            outer_family: libc::AF_INET,
+            source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            key: 0,
+            ttl: 64,
+            transport_table: String::new(),
+            wg_listen_port: 51820,
+            wg_local_privkey: zeroize::Zeroizing::new([0u8; 32]),
+            wg_peers: Vec::new(),
+        },
+    );
+    coord.forwarding.wg_engines.insert(
+        ID,
+        std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+            crate::afxdp::wg::WgEngineConfig {
+                local_private_key: [7u8; 32].into(),
+                listen_port: 51820,
+                peers: Vec::new(),
+            },
+        )),
+    );
+
+    let telemetry = std::sync::Arc::new(WgEndpointResolverTelemetry::default());
+    telemetry.counters.resolve_ok.store(11, Ordering::Relaxed);
+    telemetry.counters.resolve_fail.store(12, Ordering::Relaxed);
+    telemetry.counters.family_mismatch.store(13, Ordering::Relaxed);
+    telemetry.counters.endpoint_changed.store(14, Ordering::Relaxed);
+    *telemetry.last_error.lock().expect("last_error") =
+        Some("vpn.example.com: no AAAA for a v6 socket".to_string());
+
+    coord.wg_control_threads.insert(
+        ID,
+        WgControlEntry {
+            handle: None,
+            engine_ptr: 0,
+            spawned_ifindex: 41,
+            spawned_tunnel_name: "wg0".into(),
+            spawned_outer_mtu: 1420,
+            spawned_per_peer_outer_mtu: std::collections::HashMap::new(),
+            last_spawn_attempt_ns: 0,
+            resolver_telemetry: Some(std::sync::Arc::clone(&telemetry)),
+        },
+    );
+
+    let rows = coord.wg_tunnel_statuses();
+    assert_eq!(rows.len(), 1, "one wireguard endpoint, one row");
+    let r = &rows[0];
+    // DISTINCT values per field: an implementation that read one counter and
+    // fanned it out, or that transposed two, would pass an all-equal fixture.
+    assert_eq!(r.endpoint_resolve_ok, 11);
+    assert_eq!(r.endpoint_resolve_fail, 12);
+    assert_eq!(r.endpoint_family_mismatch, 13);
+    assert_eq!(r.endpoint_changed, 14);
+    assert_eq!(
+        r.endpoint_last_error, "vpn.example.com: no AAAA for a v6 socket",
+        "the retained error text is what makes family_mismatch a diagnosis \
+         rather than a number"
+    );
+}
+
+/// The complement, and the reason the builder tolerates a missing entry: a
+/// tunnel of IP literals starts no resolver at all (#7158), so zeros are the
+/// TRUE answer rather than a fallback hiding a lookup failure.
+#[test]
+fn wg_tunnel_status_reports_zeros_without_a_resolver_7936() {
+    use crate::afxdp::types::TunnelEndpoint;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const ID: u16 = 4;
+    let mut coord = Coordinator::new();
+    coord.forwarding.tunnel_endpoints.insert(
+        ID,
+        TunnelEndpoint {
+            id: ID,
+            logical_ifindex: 42,
+            interface_label: "wg1".into(),
+            interface: "wg1.0".into(),
+            redundancy_group: 0,
+            mode: "wireguard".into(),
+            outer_family: libc::AF_INET,
+            source: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            destination: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            key: 0,
+            ttl: 64,
+            transport_table: String::new(),
+            wg_listen_port: 51821,
+            wg_local_privkey: zeroize::Zeroizing::new([0u8; 32]),
+            wg_peers: Vec::new(),
+        },
+    );
+    coord.forwarding.wg_engines.insert(
+        ID,
+        std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+            crate::afxdp::wg::WgEngineConfig {
+                local_private_key: [8u8; 32].into(),
+                listen_port: 51821,
+                peers: Vec::new(),
+            },
+        )),
+    );
+    // No wg_control_threads entry at all.
+    let rows = coord.wg_tunnel_statuses();
+    assert_eq!(rows.len(), 1, "a row is never dropped for missing telemetry");
+    assert_eq!(rows[0].endpoint_resolve_ok, 0);
+    assert_eq!(rows[0].endpoint_family_mismatch, 0);
+    assert!(rows[0].endpoint_last_error.is_empty());
+}

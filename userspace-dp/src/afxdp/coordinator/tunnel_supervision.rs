@@ -848,6 +848,16 @@ impl super::Coordinator {
                     .collect()
             })
             .unwrap_or_default();
+        // #7936: resolver telemetry is created HERE, by the coordinator, and
+        // REUSED across restarts of this tunnel's control thread. Creating it
+        // inside the thread would reset the counters on every self-heal
+        // respawn — and a respawn is exactly when an operator is reading them.
+        let resolver_telemetry = self
+            .wg_control_threads
+            .get(&id)
+            .and_then(|e| e.resolver_telemetry.clone())
+            .unwrap_or_default();
+        let thread_resolver_telemetry = Arc::clone(&resolver_telemetry);
         eprintln!(
             "xpf-userspace-dp: spawning WG control thread endpoint={id} tun={tunnel_name} port={listen_port}"
         );
@@ -862,6 +872,7 @@ impl super::Coordinator {
                     outer_mtu,
                     thread_per_peer_outer_mtu,
                     endpoint_hosts,
+                    thread_resolver_telemetry,
                     recent_exceptions,
                     stop_clone,
                 );
@@ -898,6 +909,7 @@ impl super::Coordinator {
                 spawned_outer_mtu: outer_mtu,
                 spawned_per_peer_outer_mtu: per_peer_outer_mtu,
                 last_spawn_attempt_ns: monotonic_nanos(),
+                resolver_telemetry: Some(resolver_telemetry),
             },
         );
     }

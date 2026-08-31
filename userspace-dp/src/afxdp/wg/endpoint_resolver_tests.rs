@@ -18,8 +18,7 @@ const UNRESOLVABLE: &str = "this-target-has-no-port";
 fn shared() -> ResolverShared {
     ResolverShared {
         resolved: Mutex::new(HashMap::new()),
-        last_error: Mutex::new(None),
-        counters: WgEndpointResolverCounters::default(),
+        telemetry: std::sync::Arc::new(WgEndpointResolverTelemetry::default()),
         stop: AtomicBool::new(false),
     }
 }
@@ -67,13 +66,13 @@ fn a_failed_lookup_retains_the_last_good_endpoint_7158() {
          (#7158)"
     );
     assert_eq!(
-        sh.counters.resolve_fail.load(Ordering::Relaxed),
+        sh.telemetry.counters.resolve_fail.load(Ordering::Relaxed),
         1,
         "the failure must be COUNTED — an operator whose tunnel is stale \
          because DNS is broken has to be able to see that from the box"
     );
     assert!(
-        sh.last_error.lock().unwrap().is_some(),
+        sh.telemetry.last_error.lock().unwrap().is_some(),
         "the failure text must be retained for the operator surface"
     );
 }
@@ -101,13 +100,16 @@ fn only_addresses_of_the_socket_family_are_adopted_7158() {
          never connects"
     );
     assert_eq!(
-        sh.counters.family_mismatch.load(Ordering::Relaxed),
+        sh.telemetry
+            .counters
+            .family_mismatch
+            .load(Ordering::Relaxed),
         1,
         "counted separately from resolve_fail: the name WORKS and the record \
          (or the tunnel's family) is wrong, which is a different operator action"
     );
     assert_eq!(
-        sh.counters.resolve_fail.load(Ordering::Relaxed),
+        sh.telemetry.counters.resolve_fail.load(Ordering::Relaxed),
         0,
         "a successful lookup of the wrong family is not a lookup failure"
     );
@@ -120,7 +122,13 @@ fn only_addresses_of_the_socket_family_are_adopted_7158() {
         sh4.resolved.lock().unwrap().get(&PK_A).copied(),
         Some("203.0.113.7:51820".parse().unwrap())
     );
-    assert_eq!(sh4.counters.family_mismatch.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        sh4.telemetry
+            .counters
+            .family_mismatch
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 /// #7158: `endpoint_changed` must count actual CHANGES, not lookups.
@@ -136,18 +144,24 @@ fn endpoint_changed_counts_changes_not_lookups_7158() {
     resolve_once(&sh, &t1, false);
     resolve_once(&sh, &t1, false);
     assert_eq!(
-        sh.counters.endpoint_changed.load(Ordering::Relaxed),
+        sh.telemetry
+            .counters
+            .endpoint_changed
+            .load(Ordering::Relaxed),
         1,
         "three lookups of an unchanged name are ONE change (the first, from \
          nothing to an address)"
     );
-    assert_eq!(sh.counters.resolve_ok.load(Ordering::Relaxed), 3);
+    assert_eq!(sh.telemetry.counters.resolve_ok.load(Ordering::Relaxed), 3);
 
     // The DDNS move.
     let t2 = vec![(PK_A, "198.51.100.9:51820".to_string())];
     resolve_once(&sh, &t2, false);
     assert_eq!(
-        sh.counters.endpoint_changed.load(Ordering::Relaxed),
+        sh.telemetry
+            .counters
+            .endpoint_changed
+            .load(Ordering::Relaxed),
         2,
         "an address change at the name must be counted"
     );
@@ -164,7 +178,7 @@ fn endpoint_changed_counts_changes_not_lookups_7158() {
 #[test]
 fn a_tunnel_with_no_hostname_peers_starts_no_resolver_7158() {
     assert!(
-        WgEndpointResolver::spawn("wg0", Vec::new(), false).is_none(),
+        WgEndpointResolver::spawn("wg0", Vec::new(), false, Default::default()).is_none(),
         "no hostname peers means no thread: every tunnel that existed before \
          #7158 must not acquire one"
     );

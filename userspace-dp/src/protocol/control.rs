@@ -456,6 +456,32 @@ pub(crate) struct WgTunnelStatus {
     pub keepalives_tx_persistent: u64,
     #[serde(rename = "pending_aborted_attempt_window", default)]
     pub pending_aborted_attempt_window: u64,
+    // --- endpoint resolver (#7158 counters, put on the wire by #7936) ---
+    //
+    // Present only for a tunnel with at least one DNS-hostname peer endpoint;
+    // a literal-only tunnel starts no resolver and reports zeros, which is
+    // indistinguishable from a resolver that has not run yet AND correct for
+    // both — there is nothing to resolve either way.
+    #[serde(rename = "endpoint_resolve_ok", default)]
+    pub endpoint_resolve_ok: u64,
+    #[serde(rename = "endpoint_resolve_fail", default)]
+    pub endpoint_resolve_fail: u64,
+    /// The name resolved, but to no address of the family this interface's
+    /// single UDP socket can send from. THE counter this row exists for: it is
+    /// a configuration error that otherwise presents as a peer that simply
+    /// never initiates, which is indistinguishable from a dozen other causes.
+    #[serde(rename = "endpoint_family_mismatch", default)]
+    pub endpoint_family_mismatch: u64,
+    #[serde(rename = "endpoint_changed", default)]
+    pub endpoint_changed: u64,
+    /// Most recent resolver failure text. Carried as a STRING because it is the
+    /// half a counter cannot express: `endpoint_family_mismatch` says how often,
+    /// and this says which name and which family — and only the pair makes the
+    /// condition actionable. It has no Prometheus home (a label of unbounded
+    /// cardinality would be worse than useless), so it is rendered on the
+    /// `show security wireguard detail` line instead.
+    #[serde(rename = "endpoint_last_error", default)]
+    pub endpoint_last_error: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
