@@ -127,21 +127,33 @@ var families = []family{
 		Name:              "source NAT rule",
 		Collections:       []string{"NAT.Source"},
 		BuilderPredicates: []string{"SourceNATPoolUnusableReason"},
-		SurfacePredicates: []string{"SourceNATPoolUnusableReason", "SourceNATPoolDisarmedReason", "SourceNATDisarmReasonText"},
+		// #7473: `SourceNATRuleNotInstalledReason` is the exported COMPOSITION
+		// — which pool map to consult and what to answer when the pool is
+		// absent — that pkg/cli, pkg/api and pkg/grpcapi now share instead of
+		// each re-deriving. It carries the verdict, so a renderer reaching it
+		// is annotated; without it here, moving that composition out of
+		// pkg/cli would report three correct renderers as lying.
+		SurfacePredicates: []string{"SourceNATPoolUnusableReason", "SourceNATPoolDisarmedReason", "SourceNATDisarmReasonText", "SourceNATRuleNotInstalledReason"},
 		// #7473 closed the CLI text renderers (showNATSourceRuleAll,
 		// showNATSourceRuleSet, showNATSourceSummary). What remains is the
 		// STRUCTURED half: a JSON or protobuf rule object cannot be fixed by
 		// appending a line, it needs a not_installed field, which is a wire
 		// surface change; and collectNATPoolMetrics is a third shape again, a
 		// Prometheus gauge computed over rules including the disarmed ones.
+		// #7473 closed the STRUCTURED half: the JSON and protobuf rule/pool
+		// objects now carry `not_installed` / `not_installed_reason` from the
+		// same composition the text renderers use.
+		//
+		// `collectNATPoolMetrics` REMAINS, deliberately. It is a Prometheus
+		// gauge, so there is no object to carry a field: its remedy is to omit
+		// the sample, which #7473's first half did for `xpf_nat_pool_used_ports`
+		// — but the gate cannot see that, because it reaches the verdict only
+		// transitively through `SourceNATPoolReportablePorts` and
+		// `reachesPredicate` does not follow calls into pkg/config. Registering
+		// that helper here WOULD drop the entry, and was rejected: it would
+		// delete the guard for the annotation work this surface still owes.
 		Unannotated: []string{
 			"pkg/api/metrics_nat.go:collectNATPoolMetrics",
-			"pkg/api/nat.go:natPoolStatsHandler",
-			"pkg/api/nat.go:natRuleStatsHandler",
-			"pkg/api/nat.go:natSourceHandler",
-			"pkg/grpcapi/server_nat.go:GetNATPoolStats",
-			"pkg/grpcapi/server_nat.go:GetNATRuleStats",
-			"pkg/grpcapi/server_nat.go:GetNATSource",
 		},
 		Successor: "#7473",
 	},
@@ -149,15 +161,12 @@ var families = []family{
 		Name:              "destination NAT rule",
 		Collections:       []string{"NAT.Destination"},
 		BuilderPredicates: []string{"DestinationNATRuleExcludedReason"},
-		SurfacePredicates: []string{"DestinationNATRuleExcludedReason"},
-		// #7473 closed the five CLI text renderers; the structured half
-		// remains (see the source family's note).
-		Unannotated: []string{
-			"pkg/api/nat.go:natDestHandler",
-			"pkg/grpcapi/server_nat.go:GetNATDestination",
-			"pkg/grpcapi/server_nat.go:GetNATRuleStats",
-		},
-		Successor: "#7473",
+		// #7473: plus the exported composition the three surfaces share — see
+		// the source family's note.
+		SurfacePredicates: []string{"DestinationNATRuleExcludedReason", "DestinationNATRuleNotInstalledReason"},
+		// #7473 closed the five CLI text renderers and then the structured
+		// half; every destination render surface now consults the verdict.
+		Unannotated: nil, // closed by #7473
 	},
 }
 

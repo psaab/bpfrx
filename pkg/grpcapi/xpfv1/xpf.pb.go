@@ -3664,13 +3664,27 @@ func (x *GetNATSourceResponse) GetRules() []*NATSourceInfo {
 }
 
 type NATSourceInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	FromZone      string                 `protobuf:"bytes,1,opt,name=from_zone,json=fromZone,proto3" json:"from_zone,omitempty"`
-	ToZone        string                 `protobuf:"bytes,2,opt,name=to_zone,json=toZone,proto3" json:"to_zone,omitempty"`
-	Type          string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
-	Pool          string                 `protobuf:"bytes,4,opt,name=pool,proto3" json:"pool,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	FromZone string                 `protobuf:"bytes,1,opt,name=from_zone,json=fromZone,proto3" json:"from_zone,omitempty"`
+	ToZone   string                 `protobuf:"bytes,2,opt,name=to_zone,json=toZone,proto3" json:"to_zone,omitempty"`
+	Type     string                 `protobuf:"bytes,3,opt,name=type,proto3" json:"type,omitempty"`
+	Pool     string                 `protobuf:"bytes,4,opt,name=pool,proto3" json:"pool,omitempty"`
+	// #7473: the snapshot builder's fail-closed verdict for this object.
+	//
+	// `not_installed` true means the userspace builder REFUSED to install it, so
+	// every other field here describes CONFIGURATION rather than live state --
+	// notably any hit counter, whose zero means "not armed" rather than "no
+	// traffic matched". `not_installed_reason` carries the operator-facing
+	// remedy from the same `pkg/config` predicate the CLI text renderers use, so
+	// the structured and text surfaces cannot disagree about which objects are
+	// armed.
+	//
+	// Additive: an older client that does not read these decodes them as
+	// false/"" and behaves exactly as before.
+	NotInstalled       bool   `protobuf:"varint,5,opt,name=not_installed,json=notInstalled,proto3" json:"not_installed,omitempty"`
+	NotInstalledReason string `protobuf:"bytes,6,opt,name=not_installed_reason,json=notInstalledReason,proto3" json:"not_installed_reason,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NATSourceInfo) Reset() {
@@ -3727,6 +3741,20 @@ func (x *NATSourceInfo) GetType() string {
 func (x *NATSourceInfo) GetPool() string {
 	if x != nil {
 		return x.Pool
+	}
+	return ""
+}
+
+func (x *NATSourceInfo) GetNotInstalled() bool {
+	if x != nil {
+		return x.NotInstalled
+	}
+	return false
+}
+
+func (x *NATSourceInfo) GetNotInstalledReason() string {
+	if x != nil {
+		return x.NotInstalledReason
 	}
 	return ""
 }
@@ -3834,8 +3862,22 @@ type NATDestInfo struct {
 	DstPort       uint32                 `protobuf:"varint,3,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
 	TranslateIp   string                 `protobuf:"bytes,4,opt,name=translate_ip,json=translateIp,proto3" json:"translate_ip,omitempty"`
 	TranslatePort uint32                 `protobuf:"varint,5,opt,name=translate_port,json=translatePort,proto3" json:"translate_port,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// #7473: the snapshot builder's fail-closed verdict for this object.
+	//
+	// `not_installed` true means the userspace builder REFUSED to install it, so
+	// every other field here describes CONFIGURATION rather than live state --
+	// notably any hit counter, whose zero means "not armed" rather than "no
+	// traffic matched". `not_installed_reason` carries the operator-facing
+	// remedy from the same `pkg/config` predicate the CLI text renderers use, so
+	// the structured and text surfaces cannot disagree about which objects are
+	// armed.
+	//
+	// Additive: an older client that does not read these decodes them as
+	// false/"" and behaves exactly as before.
+	NotInstalled       bool   `protobuf:"varint,6,opt,name=not_installed,json=notInstalled,proto3" json:"not_installed,omitempty"`
+	NotInstalledReason string `protobuf:"bytes,7,opt,name=not_installed_reason,json=notInstalledReason,proto3" json:"not_installed_reason,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NATDestInfo) Reset() {
@@ -3901,6 +3943,20 @@ func (x *NATDestInfo) GetTranslatePort() uint32 {
 		return x.TranslatePort
 	}
 	return 0
+}
+
+func (x *NATDestInfo) GetNotInstalled() bool {
+	if x != nil {
+		return x.NotInstalled
+	}
+	return false
+}
+
+func (x *NATDestInfo) GetNotInstalledReason() string {
+	if x != nil {
+		return x.NotInstalledReason
+	}
+	return ""
 }
 
 type GetScreenRequest struct {
@@ -6424,8 +6480,22 @@ type NATPoolStats struct {
 	AvailablePorts int32                  `protobuf:"varint,5,opt,name=available_ports,json=availablePorts,proto3" json:"available_ports,omitempty"`
 	Utilization    string                 `protobuf:"bytes,6,opt,name=utilization,proto3" json:"utilization,omitempty"`
 	IsInterface    bool                   `protobuf:"varint,7,opt,name=is_interface,json=isInterface,proto3" json:"is_interface,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// #7473: the snapshot builder's fail-closed verdict for this object.
+	//
+	// `not_installed` true means the userspace builder REFUSED to install it, so
+	// every other field here describes CONFIGURATION rather than live state --
+	// notably any hit counter, whose zero means "not armed" rather than "no
+	// traffic matched". `not_installed_reason` carries the operator-facing
+	// remedy from the same `pkg/config` predicate the CLI text renderers use, so
+	// the structured and text surfaces cannot disagree about which objects are
+	// armed.
+	//
+	// Additive: an older client that does not read these decodes them as
+	// false/"" and behaves exactly as before.
+	NotInstalled       bool   `protobuf:"varint,8,opt,name=not_installed,json=notInstalled,proto3" json:"not_installed,omitempty"`
+	NotInstalledReason string `protobuf:"bytes,9,opt,name=not_installed_reason,json=notInstalledReason,proto3" json:"not_installed_reason,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NATPoolStats) Reset() {
@@ -6505,6 +6575,20 @@ func (x *NATPoolStats) GetIsInterface() bool {
 		return x.IsInterface
 	}
 	return false
+}
+
+func (x *NATPoolStats) GetNotInstalled() bool {
+	if x != nil {
+		return x.NotInstalled
+	}
+	return false
+}
+
+func (x *NATPoolStats) GetNotInstalledReason() string {
+	if x != nil {
+		return x.NotInstalledReason
+	}
+	return ""
 }
 
 type NATRuleSetSessions struct {
@@ -7447,8 +7531,22 @@ type NATRuleStats struct {
 	DestinationMatch string                 `protobuf:"bytes,7,opt,name=destination_match,json=destinationMatch,proto3" json:"destination_match,omitempty"`
 	HitPackets       uint64                 `protobuf:"varint,8,opt,name=hit_packets,json=hitPackets,proto3" json:"hit_packets,omitempty"`
 	HitBytes         uint64                 `protobuf:"varint,9,opt,name=hit_bytes,json=hitBytes,proto3" json:"hit_bytes,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// #7473: the snapshot builder's fail-closed verdict for this object.
+	//
+	// `not_installed` true means the userspace builder REFUSED to install it, so
+	// every other field here describes CONFIGURATION rather than live state --
+	// notably any hit counter, whose zero means "not armed" rather than "no
+	// traffic matched". `not_installed_reason` carries the operator-facing
+	// remedy from the same `pkg/config` predicate the CLI text renderers use, so
+	// the structured and text surfaces cannot disagree about which objects are
+	// armed.
+	//
+	// Additive: an older client that does not read these decodes them as
+	// false/"" and behaves exactly as before.
+	NotInstalled       bool   `protobuf:"varint,10,opt,name=not_installed,json=notInstalled,proto3" json:"not_installed,omitempty"`
+	NotInstalledReason string `protobuf:"bytes,11,opt,name=not_installed_reason,json=notInstalledReason,proto3" json:"not_installed_reason,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NATRuleStats) Reset() {
@@ -7542,6 +7640,20 @@ func (x *NATRuleStats) GetHitBytes() uint64 {
 		return x.HitBytes
 	}
 	return 0
+}
+
+func (x *NATRuleStats) GetNotInstalled() bool {
+	if x != nil {
+		return x.NotInstalled
+	}
+	return false
+}
+
+func (x *NATRuleStats) GetNotInstalledReason() string {
+	if x != nil {
+		return x.NotInstalledReason
+	}
+	return ""
 }
 
 type GetNATDeterministicRequest struct {
@@ -8887,23 +8999,27 @@ const file_xpf_proto_rawDesc = "" +
 	"\fmax_sessions\x18\f \x01(\x04R\vmaxSessions\"\x15\n" +
 	"\x13GetNATSourceRequest\"C\n" +
 	"\x14GetNATSourceResponse\x12+\n" +
-	"\x05rules\x18\x01 \x03(\v2\x15.xpf.v1.NATSourceInfoR\x05rules\"m\n" +
+	"\x05rules\x18\x01 \x03(\v2\x15.xpf.v1.NATSourceInfoR\x05rules\"\xc4\x01\n" +
 	"\rNATSourceInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x12\n" +
 	"\x04type\x18\x03 \x01(\tR\x04type\x12\x12\n" +
-	"\x04pool\x18\x04 \x01(\tR\x04pool\"\x1a\n" +
+	"\x04pool\x18\x04 \x01(\tR\x04pool\x12#\n" +
+	"\rnot_installed\x18\x05 \x01(\bR\fnotInstalled\x120\n" +
+	"\x14not_installed_reason\x18\x06 \x01(\tR\x12notInstalledReason\"\x1a\n" +
 	"\x18GetNATDestinationRequest\"\xca\x01\n" +
 	"\x19GetNATDestinationResponse\x12)\n" +
 	"\x05rules\x18\x01 \x03(\v2\x13.xpf.v1.NATDestInfoR\x05rules\x12:\n" +
 	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12F\n" +
-	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xa1\x01\n" +
+	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xf8\x01\n" +
 	"\vNATDestInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
 	"\bdst_port\x18\x03 \x01(\rR\adstPort\x12!\n" +
 	"\ftranslate_ip\x18\x04 \x01(\tR\vtranslateIp\x12%\n" +
-	"\x0etranslate_port\x18\x05 \x01(\rR\rtranslatePort\"\x12\n" +
+	"\x0etranslate_port\x18\x05 \x01(\rR\rtranslatePort\x12#\n" +
+	"\rnot_installed\x18\x06 \x01(\bR\fnotInstalled\x120\n" +
+	"\x14not_installed_reason\x18\a \x01(\tR\x12notInstalledReason\"\x12\n" +
 	"\x10GetScreenRequest\"A\n" +
 	"\x11GetScreenResponse\x12,\n" +
 	"\ascreens\x18\x01 \x03(\v2\x12.xpf.v1.ScreenInfoR\ascreens\"\xbb\x01\n" +
@@ -9083,7 +9199,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x17GetNATPoolStatsResponse\x12*\n" +
 	"\x05pools\x18\x01 \x03(\v2\x14.xpf.v1.NATPoolStatsR\x05pools\x12:\n" +
 	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12F\n" +
-	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xea\x01\n" +
+	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xc1\x02\n" +
 	"\fNATPoolStats\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1f\n" +
@@ -9093,7 +9209,9 @@ const file_xpf_proto_rawDesc = "" +
 	"used_ports\x18\x04 \x01(\x05R\tusedPorts\x12'\n" +
 	"\x0favailable_ports\x18\x05 \x01(\x05R\x0eavailablePorts\x12 \n" +
 	"\vutilization\x18\x06 \x01(\tR\vutilization\x12!\n" +
-	"\fis_interface\x18\a \x01(\bR\visInterface\"f\n" +
+	"\fis_interface\x18\a \x01(\bR\visInterface\x12#\n" +
+	"\rnot_installed\x18\b \x01(\bR\fnotInstalled\x120\n" +
+	"\x14not_installed_reason\x18\t \x01(\tR\x12notInstalledReason\"f\n" +
 	"\x12NATRuleSetSessions\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1a\n" +
@@ -9167,7 +9285,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
 	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +
 	"\x17GetNATRuleStatsResponse\x12*\n" +
-	"\x05rules\x18\x01 \x03(\v2\x14.xpf.v1.NATRuleStatsR\x05rules\"\xa2\x02\n" +
+	"\x05rules\x18\x01 \x03(\v2\x14.xpf.v1.NATRuleStatsR\x05rules\"\xf9\x02\n" +
 	"\fNATRuleStats\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x1b\n" +
 	"\trule_name\x18\x02 \x01(\tR\bruleName\x12\x1b\n" +
@@ -9178,7 +9296,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\x11destination_match\x18\a \x01(\tR\x10destinationMatch\x12\x1f\n" +
 	"\vhit_packets\x18\b \x01(\x04R\n" +
 	"hitPackets\x12\x1b\n" +
-	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\"\xc8\x01\n" +
+	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12#\n" +
+	"\rnot_installed\x18\n" +
+	" \x01(\bR\fnotInstalled\x120\n" +
+	"\x14not_installed_reason\x18\v \x01(\tR\x12notInstalledReason\"\xc8\x01\n" +
 	"\x1aGetNATDeterministicRequest\x12?\n" +
 	"\tdirection\x18\x01 \x01(\x0e2!.xpf.v1.NATDeterministicDirectionR\tdirection\x12\x12\n" +
 	"\x04pool\x18\x02 \x01(\tR\x04pool\x12#\n" +

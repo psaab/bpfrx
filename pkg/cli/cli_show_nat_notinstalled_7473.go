@@ -34,14 +34,9 @@ import (
 // family has, and inventing a verdict for the interface case would be a claim
 // the builder never made.
 func sourceNATRuleNotInstalled(cfg *config.Config, rule *config.NATRule) string {
-	if cfg == nil || rule == nil || rule.Then.PoolName == "" {
-		return ""
-	}
-	pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-	if !ok || pool == nil {
-		return ""
-	}
-	return config.SourceNATPoolUnusableReason(pool)
+	// #7473: the composition moved to pkg/config so the CLI, REST and gRPC
+	// surfaces share it rather than each deciding which pool map to consult.
+	return config.SourceNATRuleNotInstalledReason(cfg, rule)
 }
 
 // sourceNATPoolNotInstalled reports why a source NAT pool is unusable, or "".
@@ -54,10 +49,8 @@ func sourceNATPoolNotInstalled(pool *config.NATPool) string {
 
 // destNATRuleNotInstalled reports why a destination NAT rule is excluded, or "".
 func destNATRuleNotInstalled(cfg *config.Config, rule *config.NATRule) string {
-	if cfg == nil || rule == nil || cfg.Security.NAT.Destination == nil {
-		return ""
-	}
-	return config.DestinationNATRuleExcludedReason(cfg.Security.NAT.Destination, rule)
+	// #7473: shared composition — see sourceNATRuleNotInstalled.
+	return config.DestinationNATRuleNotInstalledReason(cfg, rule)
 }
 
 // natNotInstalledLine renders the operator-facing annotation for a non-empty

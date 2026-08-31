@@ -193,6 +193,12 @@ func (s *Server) natSourceHandler(w http.ResponseWriter, _ *http.Request) {
 				info.Type = "pool"
 				info.Pool = rule.Then.PoolName
 			}
+			// #7473: carry the builder's verdict. Without it this object says
+			// "type: pool, pool: p1" for a rule that translates nothing.
+			if reason := config.SourceNATRuleNotInstalledReason(cfg, rule); reason != "" {
+				info.NotInstalled = true
+				info.NotInstalledReason = config.SourceNATDisarmReasonText(reason)
+			}
 			result = append(result, info)
 		}
 	}
@@ -221,6 +227,13 @@ func (s *Server) natDestHandler(w http.ResponseWriter, _ *http.Request) {
 				if pool.Port > 0 {
 					info.TranslatePort = uint16(pool.Port)
 				}
+			}
+			// #7473: the destination predicate returns operator prose already,
+			// so it is carried verbatim rather than expanded like the source
+			// token.
+			if reason := config.DestinationNATRuleNotInstalledReason(cfg, rule); reason != "" {
+				info.NotInstalled = true
+				info.NotInstalledReason = reason
 			}
 			result = append(result, info)
 		}
@@ -278,7 +291,7 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 		// survived even once the helper was running and had told us it installed
 		// nothing. It also under-reported every prefix member and missed the
 		// singular `address` field.
-		addrCount, _ := config.SourceNATPoolReportableAddresses(pool, name, overBudgetPools)
+		addrCount, poolDisarm := config.SourceNATPoolReportableAddresses(pool, name, overBudgetPools)
 		used := 0
 
 		if rp, ok := runtime[name]; ok {
@@ -323,14 +336,24 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, r *http.Request) {
 			util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
 		}
 
-		result = append(result, NATPoolStatsInfo{
+		// #7473: the reason was already computed above for the capacity
+		// fallback and discarded; binding it carries the builder's verdict onto
+		// the object instead of leaving a consumer to infer it from a zero
+		// capacity, which is ambiguous (no members, malformed member, and the
+		// aggregate budget all produce 0 and have different remedies).
+		info := NATPoolStatsInfo{
 			Name:           name,
 			Address:        strings.Join(pool.Addresses, ","),
 			TotalPorts:     totalPorts,
 			UsedPorts:      used,
 			AvailablePorts: avail,
 			Utilization:    util,
-		})
+		}
+		if poolDisarm != "" {
+			info.NotInstalled = true
+			info.NotInstalledReason = config.SourceNATDisarmReasonText(poolDisarm)
+		}
+		result = append(result, info)
 	}
 
 	// Interface-mode pools. Count forward SNAT sessions ONCE, keyed by the
@@ -474,7 +497,12 @@ func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			result = append(result, NATRuleStatsInfo{
+			// #7473: this object is the issue's archetype — it attaches a hit
+			// counter to a rule the dataplane may never have installed, where
+			// the 0 reads as "no traffic matched" rather than "not armed".
+			// This handler walks `NAT.Source` only, so the source predicate is
+			// the whole verdict here.
+			info := NATRuleStatsInfo{
 				RuleSet:    rs.Name,
 				RuleName:   rule.Name,
 				FromZone:   rs.FromZone,
@@ -484,7 +512,12 @@ func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
 				DstMatch:   dstMatch,
 				HitPackets: hitPkts,
 				HitBytes:   hitBytes,
-			})
+			}
+			if reason := config.SourceNATRuleNotInstalledReason(cfg, rule); reason != "" {
+				info.NotInstalled = true
+				info.NotInstalledReason = config.SourceNATDisarmReasonText(reason)
+			}
+			result = append(result, info)
 		}
 	}
 

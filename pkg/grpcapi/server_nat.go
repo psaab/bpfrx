@@ -47,6 +47,13 @@ func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb
 				info.Type = "pool"
 				info.Pool = rule.Then.PoolName
 			}
+			// #7473: carry the builder's verdict, from the same pkg/config
+			// composition the CLI and REST surfaces use, so the three cannot
+			// disagree about which rules are armed.
+			if reason := config.SourceNATRuleNotInstalledReason(cfg, rule); reason != "" {
+				info.NotInstalled = true
+				info.NotInstalledReason = config.SourceNATDisarmReasonText(reason)
+			}
 			resp.Rules = append(resp.Rules, info)
 		}
 	}
@@ -74,6 +81,12 @@ func (s *Server) GetNATDestination(ctx context.Context, _ *pb.GetNATDestinationR
 				if pool.Port > 0 {
 					info.TranslatePort = uint32(pool.Port)
 				}
+			}
+			// #7473: the destination predicate returns operator prose already,
+			// carried verbatim rather than expanded like the source token.
+			if reason := config.DestinationNATRuleNotInstalledReason(cfg, rule); reason != "" {
+				info.NotInstalled = true
+				info.NotInstalledReason = reason
 			}
 			resp.Rules = append(resp.Rules, info)
 		}
@@ -148,7 +161,7 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 		// under-reported a prefix member (a /24 installs 256, not 1), and
 		// missed the singular `address` field. The compiler's verdict answers
 		// all three; the shared multiplication above is unchanged.
-		totalPorts64, _ := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, grpcOverBudget)
+		totalPorts64, poolDisarm := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, grpcOverBudget)
 		var used64 int64
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {
@@ -173,14 +186,24 @@ func (s *Server) GetNATPoolStats(ctx context.Context, _ *pb.GetNATPoolStatsReque
 			util = fmt.Sprintf("%.1f%%", float64(used64)/float64(totalPorts64)*100)
 		}
 
-		resp.Pools = append(resp.Pools, &pb.NATPoolStats{
+		// #7473: the reason was computed above for the capacity and discarded
+		// into `_`. Binding it states the verdict instead of leaving a consumer
+		// to infer it from a zero capacity, which is ambiguous — no members, a
+		// malformed member and the aggregate budget all produce 0 and have
+		// different remedies.
+		poolInfo := &pb.NATPoolStats{
 			Name:           name,
 			Address:        strings.Join(pool.Addresses, ","),
 			TotalPorts:     clampInt32(totalPorts64),
 			UsedPorts:      clampInt32(used64),
 			AvailablePorts: clampInt32(avail64),
 			Utilization:    util,
-		})
+		}
+		if poolDisarm != "" {
+			poolInfo.NotInstalled = true
+			poolInfo.NotInstalledReason = config.SourceNATDisarmReasonText(poolDisarm)
+		}
+		resp.Pools = append(resp.Pools, poolInfo)
 	}
 
 	// Count active SNAT sessions and per-rule-set breakdown
@@ -315,7 +338,10 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 					return nil, status.Errorf(codes.Internal,
 						"NAT rule counter read failed for %s/%s: %v", rs.Name, rule.Name, err)
 				}
-				resp.Rules = append(resp.Rules, &pb.NATRuleStats{
+				// #7473: the archetype object — a hit counter on a rule the
+				// dataplane may never have installed, whose 0 reads as "no
+				// traffic matched" rather than "not armed".
+				srcInfo := &pb.NATRuleStats{
 					RuleSet:          rs.Name,
 					RuleName:         rule.Name,
 					FromZone:         rs.FromZone,
@@ -325,7 +351,12 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 					DestinationMatch: dstMatch,
 					HitPackets:       hitPkts,
 					HitBytes:         hitBytes,
-				})
+				}
+				if reason := config.SourceNATRuleNotInstalledReason(cfg, rule); reason != "" {
+					srcInfo.NotInstalled = true
+					srcInfo.NotInstalledReason = config.SourceNATDisarmReasonText(reason)
+				}
+				resp.Rules = append(resp.Rules, srcInfo)
 			}
 		}
 	}
@@ -354,7 +385,12 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 						return nil, status.Errorf(codes.Internal,
 							"NAT rule counter read failed for %s/%s: %v", rs.Name, rule.Name, err)
 					}
-					resp.Rules = append(resp.Rules, &pb.NATRuleStats{
+					// #7473: GetNATRuleStats is the ONE getter listed under both
+					// families in the #6534 census, because it has two append
+					// sites. Each takes its own family's predicate; annotating
+					// only the source arm would have satisfied a reader
+					// counting functions and left destination rules lying.
+					dstInfo := &pb.NATRuleStats{
 						RuleSet:          rs.Name,
 						RuleName:         rule.Name,
 						FromZone:         rs.FromZone,
@@ -363,7 +399,12 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 						DestinationMatch: dstMatch,
 						HitPackets:       hitPkts,
 						HitBytes:         hitBytes,
-					})
+					}
+					if reason := config.DestinationNATRuleNotInstalledReason(cfg, rule); reason != "" {
+						dstInfo.NotInstalled = true
+						dstInfo.NotInstalledReason = reason
+					}
+					resp.Rules = append(resp.Rules, dstInfo)
 				}
 			}
 		}

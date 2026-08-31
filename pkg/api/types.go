@@ -476,6 +476,13 @@ type NATSourceInfo struct {
 	ToZone   string `json:"to_zone"`
 	Type     string `json:"type"`
 	Pool     string `json:"pool,omitempty"`
+	// #7473: the snapshot builder's fail-closed verdict. NotInstalled true
+	// means every other field here is CONFIGURATION, not live state — a hit
+	// counter's zero then means "not armed", not "no traffic matched".
+	// Populated from the same pkg/config predicate the CLI text renderers use,
+	// so the two surfaces cannot disagree about which objects are armed.
+	NotInstalled       bool   `json:"not_installed,omitempty"`
+	NotInstalledReason string `json:"not_installed_reason,omitempty"`
 }
 
 // NATDestInfo holds destination NAT configuration.
@@ -485,6 +492,13 @@ type NATDestInfo struct {
 	DstPort       uint16 `json:"dst_port,omitempty"`
 	TranslateIP   string `json:"translate_ip"`
 	TranslatePort uint16 `json:"translate_port,omitempty"`
+	// #7473: the snapshot builder's fail-closed verdict. NotInstalled true
+	// means every other field here is CONFIGURATION, not live state — a hit
+	// counter's zero then means "not armed", not "no traffic matched".
+	// Populated from the same pkg/config predicate the CLI text renderers use,
+	// so the two surfaces cannot disagree about which objects are armed.
+	NotInstalled       bool   `json:"not_installed,omitempty"`
+	NotInstalledReason string `json:"not_installed_reason,omitempty"`
 }
 
 // NATDeterministicInfo is a deterministic source-NAT (CGNAT / NAPT64)
@@ -580,6 +594,13 @@ type NATPoolStatsInfo struct {
 	AvailablePorts int    `json:"available_ports"`
 	Utilization    string `json:"utilization"`
 	IsInterface    bool   `json:"is_interface,omitempty"`
+	// #7473: the snapshot builder's fail-closed verdict. NotInstalled true
+	// means every other field here is CONFIGURATION, not live state — a hit
+	// counter's zero then means "not armed", not "no traffic matched".
+	// Populated from the same pkg/config predicate the CLI text renderers use,
+	// so the two surfaces cannot disagree about which objects are armed.
+	NotInstalled       bool   `json:"not_installed,omitempty"`
+	NotInstalledReason string `json:"not_installed_reason,omitempty"`
 }
 
 // NATRuleStatsInfo holds NAT rule counters.
@@ -593,6 +614,13 @@ type NATRuleStatsInfo struct {
 	DstMatch   string `json:"destination_match"`
 	HitPackets uint64 `json:"hit_packets"`
 	HitBytes   uint64 `json:"hit_bytes"`
+	// #7473: the snapshot builder's fail-closed verdict. NotInstalled true
+	// means every other field here is CONFIGURATION, not live state — a hit
+	// counter's zero then means "not armed", not "no traffic matched".
+	// Populated from the same pkg/config predicate the CLI text renderers use,
+	// so the two surfaces cannot disagree about which objects are armed.
+	NotInstalled       bool   `json:"not_installed,omitempty"`
+	NotInstalledReason string `json:"not_installed_reason,omitempty"`
 }
 
 // VRRPInstanceInfo holds VRRP instance information.
