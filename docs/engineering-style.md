@@ -99,6 +99,7 @@ the mechanics, so this section is sequencing only.
    | Any change | `make cluster-deploy` (loss userspace cluster) + re-apply CoS (`./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0` — deploy wipes CoS) | `iperf3 -P 16 -t 30 -p 5211` → 172.16.80.200 | ≥ 23 Gbit/s, no regression vs previous run |
    | Admission / DSCP / scheduler / queueing | above + re-apply CoS (`./test/incus/apply-cos-config.sh <target>`) | `show class-of-service interface` | targeted counter (`flow_share`, `buffer`, `ecn_marked`) moves in the predicted direction — see [`cos-validation-notes.md`](cos-validation-notes.md) |
    | NAT / screens / filter / VLAN / IPsec | above | exercise that feature end-to-end from a test host | session / hit counters advance; negative case drops |
+   | HA / VRRP / session sync / fabric | `make cluster-deploy` | `make test-failover` + `make test-ha-crash` | 0 / very low packet loss across failover/failback, both nodes converge |
 
    **Use 5211, not 5203, for the throughput row — and the two are not
    interchangeable (#7610).** The same row tells you to apply
@@ -116,7 +117,27 @@ the mechanics, so this section is sequencing only.
    5203 is the right port when you are validating the **shaper** rather than the
    dataplane: there the pass criterion is ≈ 3 Gbit/s, and a result near 23 means
    the shaper is NOT engaging.
-   | HA / VRRP / session sync / fabric | `make cluster-deploy` | `make test-failover` + `make test-ha-crash` | 0 / very low packet loss across failover/failback, both nodes converge |
+
+   **`-P 16` is canonical, not illustrative — dropping it costs 4.4x.** The
+   invocation in the row IS the method; a figure reported without it is an
+   anecdote, not a measurement. Measured on a healthy fw0 with CoS applied,
+   minutes apart, on the SAME port 5211: **`-P 16 -t 30` → 23.1 Gbit/s,
+   single-stream → 5.23 Gbit/s.** So a lane that improvises
+   `iperf3 -c 172.16.80.200 -p 5211` reads 5.23 against a ≥ 23 bar and owns a
+   4.4x "regression" created entirely by its own invocation. #7480 did exactly
+   that, then spent a lock cell and two hypotheses on the gap — auditing
+   `cos-iperf-config.set`, `scheduler-uncapped` and `afxdp/cos/admission.rs`,
+   and concluding from single-stream numbers both that CoS state made figures
+   incomparable and that a 24g class "delivers 6.11" — before reading this row.
+   Both conclusions were retracted. **A number that disagrees with a documented
+   threshold is evidence about the INSTRUMENT before it is evidence about the
+   system**, and a mechanism hunt feels like rigour while being structurally
+   unable to detect a wrong invocation.
+
+   Omitting `-p` entirely is worse than substituting a port. iperf3's default is
+   **5201 → `iperf-100m` → `transmit-rate 100m exact`**, so a bare
+   `iperf3 -c 172.16.80.200` silently measures a 100 Mbit shaper (~96 Mbit/s
+   observed) instead of the dataplane.
 
    When a validation lane can't be run in the test env, say so
    explicitly in the PR body with the reason. Never claim success for
@@ -994,6 +1015,16 @@ they repeatedly bite:
     destructive script takes the lock before it mutates a node and
     fails RED if one drops the wiring. No cluster needed — private
     lock path, mocked incus.
+  - **A worktree with a QUEUED or RUNNING cluster cell is off-limits.** The
+    cell verifies the TREE it finds when the lock is granted, not the branch
+    name it was launched from, and a lock wait can be tens of minutes. Amend
+    during that window and you smoke-test one tree while shipping another —
+    with logs identical to a correct run. #7480 amended during a ~20 minute
+    wait; the cell recorded a different HEAD than the PR carried, and the
+    result transferred only because that diff happened to be comments-only
+    (`git diff <tested> <head>` → zero non-comment lines). That is luck, not
+    method. Kill the cell and re-launch if you must amend, and echo the tested
+    HEAD from inside the cell so the two can be compared afterwards.
   - Queue diagnosis: `cat /tmp/xpf-cluster.owner` +
     `fuser -v /tmp/xpf-cluster.lock`. A dead recorded pid with the
     lock still held means a child inherited the fd (pre-#1875 raw
