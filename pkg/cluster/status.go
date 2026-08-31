@@ -28,6 +28,7 @@ func (m *Manager) FormatStatus() string {
 	if m.kernelUpgradeHold {
 		kernelHold = m.kernelUpgradeHoldReason
 	}
+	rgForwardingFn := m.rgForwardingFn
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -150,6 +151,19 @@ func (m *Manager) FormatStatus() string {
 			rg.LocalPriority, rg.State, preempt, manual, monFails)
 		fmt.Fprintf(&b, "  Takeover ready: %s\n", readyStr)
 		fmt.Fprintf(&b, "  Transfer ready: %s\n", transferReadyStr)
+		// #7367: the forwarding sub-line. Placed AFTER the local node row and
+		// the two existing sub-lines, and indented, because the render is parsed
+		// by whole-line regexes: test-failover.sh does
+		// `grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"`, so a
+		// line inserted BETWEEN the header and the node row would consume the -A1
+		// window and break the smoke. Its first field is "Forwarding:", not a node
+		// token, for the same reason "Held secondary:" is (#4009).
+		if rgForwardingFn != nil {
+			if fwd, ok := rgForwardingFn(rg.GroupID); ok {
+				fmt.Fprintf(&b, "  Forwarding: %s\n",
+					FormatRGForwarding(rg.State == StatePrimary, fwd))
+			}
+		}
 		// Peer node line (if alive).
 		if peerAlive {
 			if pg, ok := peerGroups[rg.GroupID]; ok {

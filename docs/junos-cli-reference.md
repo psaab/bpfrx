@@ -2417,6 +2417,7 @@ Node   Priority Status               Preempt Manual   Monitor-failures
 
 Redundancy group: 0 , Failover count: 1
 node0  100      secondary            no      no       None
+  Forwarding: rg-active=inactive vrrp-master=none
 node1  1        primary              no      no       None
 
 Redundancy group: 1 , Failover count: 1
@@ -2427,6 +2428,22 @@ Redundancy group: 4 , Failover count: 1
 node0  0        secondary            no      no       IF
 node1  0        primary              no      no       IF
 ```
+
+The per-RG `Forwarding:` sub-line (#7367) reports the DATAPLANE's view: applied
+`rg_active` and VRRP mastership (`all` / `partial` / `none`). When it disagrees
+with ownership the line carries a trailing `-- DIVERGENCE: ...`:
+
+```
+Redundancy group: 0 , Failover count: 0
+node0  200      primary              no      no       None
+  Forwarding: rg-active=inactive vrrp-master=none -- DIVERGENCE: this node owns the group but is not forwarding for it
+```
+
+Without it, a node that owns a redundancy group while forwarding nothing for it
+renders identically to a healthy primary — the #6656 shape, which showed a
+healthy cluster on both nodes simultaneously. The line is omitted entirely when
+the daemon has no state machine for the group, rather than defaulting.
+
 
 ### Format Details
 

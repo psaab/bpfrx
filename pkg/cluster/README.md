@@ -273,6 +273,41 @@ and arms a `holdTimer` to re-run the election when the hold expires; the
 ready -> not-ready edge clears `ReadySince` and stops the timer, so a readiness
 flap restarts the hold rather than accumulating credit.
 
+**Ownership and FORWARDING are different properties too** (#7367). `FormatStatus`
+renders the cluster state machine's view — priority, state, preempt, manual,
+monitor-failures — and none of those terms says whether the node is actually
+forwarding. That is not a cosmetic gap: `rgStateMachine.reconcileLocked`
+computes `desired = clusterPri || allMasterLocked()` in non-strict mode, so
+ownership and forwarding are an **OR**, not an identity, and "owns the group and
+forwards nothing" is a representable state. It is the shape of the #6656
+incident, which rendered as a healthy cluster on **both** nodes at once.
+
+The per-RG `Forwarding:` sub-line closes that. The daemon supplies the
+dataplane's view through `SetRGForwardingFunc` (`hooks.go`) — it owns the
+`rgStateMachine`, so the value crosses the boundary rather than being read here
+— and `ClassifyRGForwarding` (`rg_forwarding.go`) compares it against ownership.
+Three notes on the design:
+
+- It reports **applied** `rg_active` (`IsActive()`), not `DesiredActive()`. A
+  group whose desired state is active but whose apply failed is exactly the
+  divergence being surfaced; the desired value would render it healthy.
+- Partial VRRP mastership is classified **before** the ownership comparison. It
+  is a defect under either ownership value, so filing it by ownership would put
+  one wire condition under two verdicts and hide half of them.
+- An unwired hook, or a group with no state machine, **omits** the line rather
+  than rendering a zero value. A default would assert "not forwarding" about a
+  group whose forwarding state is merely unknown.
+
+**The render is parsed by whole-line regexes, so line SHAPE is a contract.**
+`test/incus/test-failover.sh` greps `node1.*primary` over the entire output and
+does `grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"`;
+`test/incus/deploy-lib.sh` awk-matches `$1 == "node0"` inside an RG block and
+reads `$3` as the status. So a new line must (a) sit **after** the node rows, or
+it consumes the `-A1` window, (b) lead with a non-node first field, and (c)
+avoid the tokens `primary`/`secondary` anywhere. A line that can be read as a
+node row steers a rolling deploy into restarting the PRIMARY first (#4009).
+`TestForwardingLineIsNotParseableAsANodeRow7367` pins all three.
+
 **`Ready` and takeover-ELIGIBLE are different properties**, and the status
 render must not conflate them: inside the hold window an RG is `Ready` while
 every election gate still declines to promote it. `FormatStatus` /
