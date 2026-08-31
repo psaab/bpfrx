@@ -310,24 +310,34 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// inert instead of silently dropping it.
 	cfg.Warnings = append(cfg.Warnings, userspaceRetiredKnobWarnings(cfg)...)
 
-	// #5831: a custom login class carrying a RESTRICTIVE regex the coarse RBAC
-	// gate does not enforce (deny-commands / deny-configuration) is
-	// hard-rejected on commit / commit-check, because accepting it would leave
-	// the denied verbs ALLOWED while the config says they are denied. Lenient
-	// on load / peer-sync (#1960 no-brick) — but there the class is FOLDED to
-	// the repair floor ({view,configure} ∩ what it already held) rather than
-	// merely warned about, so the persisted-config path resolves the
-	// un-enforceable restriction in the restrictive direction instead of
-	// preserving the fail-open, WITHOUT taking away the only access that can
-	// delete the statement. Runs BEFORE the #4304 advisory so the advisory
-	// describes the post-fold permission set.
-	if err := validateLoginClassDenyStrict(cfg); err != nil {
-		if opts.lenientLoginClassDeny {
-			cfg.Warnings = append(cfg.Warnings, foldLoginClassDenyToRepairableFloor(cfg)...)
-		} else {
-			return err
-		}
-	}
+	// #7172 cut 6 RETIRED the #5831/#6838 admission gate that used to sit here.
+	//
+	// It hard-rejected a class carrying deny-commands / deny-configuration on
+	// commit, and folded it to a repair floor on the tolerant load path,
+	// because accepting the statement would have left the denied verbs ALLOWED
+	// while the config said otherwise — a restriction that does not restrict.
+	// Cuts 1-5b implement the restriction: both dispatch surfaces (pkg/cli's
+	// operational and config-mode gates, and the gRPC listener) now evaluate
+	// the regexes. Refusing a control we DO implement would be the opposite
+	// error, so the gate goes, exactly as its own comment said it would.
+	//
+	// TWO THINGS DELIBERATELY SURVIVE IT, and neither is obvious from the
+	// deletion:
+	//
+	//   - loginClassLeafRestrictive stays. It is not part of the gate; it
+	//     populates DenyLeavesPresent, which is the ONLY thing distinguishing
+	//     `deny-commands ""` (an empty POSIX regex — denies EVERY command) from
+	//     an absent leaf (denies nothing). Deleting the table with the gate
+	//     would collapse two opposite configurations into one.
+	//   - the tolerant path no longer folds anything, and must not. The fold
+	//     existed to resolve an UNENFORCEABLE statement in the restrictive
+	//     direction; now that the statement is enforced, folding would narrow
+	//     the class a second time on top of its own regexes.
+	//
+	// UPGRADE: a config carrying deny-commands / deny-configuration was
+	// REJECTED at commit before this and commits now — and takes effect. An
+	// operator carrying such a config through the rejection will find it
+	// suddenly enforced. docs/system-login.md carries the note.
 
 	// #4304 S-2: custom `system login class <name>` definitions are
 	// accepted-with-advisory — recognized so a valid vSRX RBAC config commits,

@@ -46,22 +46,16 @@ func (c *CLI) loginRegexesFor(class string) (config.CompiledLoginRegexes, bool, 
 	return loginRegexesFrom(cfg, class)
 }
 
-// loginRegexesFrom is the store-free half, so the cut-3 SCOPING decision (allow
-// deliberately not enforced) is assertable without a config store.
+// loginRegexesFrom resolves the operational allow/deny pair in force for class.
 //
-// That seam is not a convenience. No supported path puts a `deny-commands`
-// class into ActiveConfig today: the strict commit path rejects it (#6838) and
-// Store.Load leaves ActiveConfig nil. Cut 3's gate is therefore UNREACHABLE
-// end-to-end until cut 6 retires the gate — which is what makes it safe to land
-// now, and also why its behaviour is pinned here rather than through a config.
+// #7172 cut 5b moved the decision into pkg/config so this gate and the gRPC one
+// cannot come to disagree about WHOSE regexes are in force; cut 6 turned the
+// ALLOW half on there, for both of them at once. The scoping comment that used
+// to argue for deny-only here is gone with the scoping: `allow-commands` is
+// enforced now, and an allow regex is an allowlist, which is the upgrade note
+// docs/system-login.md carries.
 func loginRegexesFrom(cfg *config.Config, class string) (config.CompiledLoginRegexes, bool, error) {
-	// #7172 cut 5b MOVED this decision into pkg/config so the gRPC gate and this
-	// one cannot come to disagree about WHOSE regexes are in force. The reasoning
-	// that used to live here — deny-only scoping, and leaf PRESENCE rather than
-	// value — moved with it and is in config.OperationalDenyRegexesFor. This stays
-	// as a named delegation so cut 3's tests keep driving the same code path they
-	// were written against.
-	return config.OperationalDenyRegexesFor(cfg, class)
+	return config.OperationalLoginRegexesFor(cfg, class)
 }
 
 // checkCommandRegex enforces the class's allow/deny command regexes against the

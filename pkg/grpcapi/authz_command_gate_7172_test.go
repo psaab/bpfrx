@@ -1,7 +1,6 @@
 package grpcapi
 
 import (
-	"os"
 	"strings"
 	"testing"
 
@@ -86,7 +85,7 @@ func TestArgumentLevelDenyIsOnBoxOnly7172(t *testing.T) {
 	const pattern = "show route table secret-vrf"
 	cfg := gateCfg7172(t, pattern, true)
 
-	rules, ok, err := config.OperationalDenyRegexesFor(cfg, "ops")
+	rules, ok, err := config.OperationalLoginRegexesFor(cfg, "ops")
 	if err != nil || !ok {
 		t.Fatalf("precondition: the class must have compiled deny rules (ok=%v err=%v)", ok, err)
 	}
@@ -123,7 +122,7 @@ func TestUnenforceableDenyDetectionIsSpellingIndependent7172(t *testing.T) {
 		"^show route table secret-vrf", // anchored — LiteralPrefix returns "" here
 		".*secret-vrf",                 // no literal prefix at all
 	} {
-		rules, ok, err := config.OperationalDenyRegexesFor(gateCfg7172(t, pattern, true), "ops")
+		rules, ok, err := config.OperationalLoginRegexesFor(gateCfg7172(t, pattern, true), "ops")
 		if err != nil || !ok {
 			t.Fatalf("%q: precondition failed (ok=%v err=%v)", pattern, ok, err)
 		}
@@ -134,7 +133,7 @@ func TestUnenforceableDenyDetectionIsSpellingIndependent7172(t *testing.T) {
 	}
 	// And a pattern that DOES match a mapped command is not reported, or the
 	// warning would fire for every class and mean nothing.
-	rules, _, _ := config.OperationalDenyRegexesFor(
+	rules, _, _ := config.OperationalLoginRegexesFor(
 		gateCfg7172(t, "request system reboot", true), "ops")
 	if got := unenforceableDenyPatterns(rules); len(got) != 0 {
 		t.Errorf("a pattern that matches a mapped command is enforced on BOTH surfaces and "+
@@ -258,92 +257,72 @@ func TestEmptyDenyPatternDeniesEverything7172(t *testing.T) {
 	}
 }
 
-// THE WIRING. Every cell above drives authorizeRPCCommand DIRECTLY, so all of
-// them stay green if authorizeRPC stops calling it — VERIFIED, not assumed: a
-// mutation replacing the call with `error(nil)` left the entire suite green.
-// A gate nothing calls is not a gate, and this is the second time in this issue
-// that the unit cells alone certified a disconnected one (cut 3's own guard
-// carries the same note).
+// THE WIRING, now BEHAVIOURAL — the conversion #7172 cut 6 unblocks.
 //
-// Bound as a source-level agreement rather than behaviourally for the same
-// reason cut 3's is: no supported path puts a `deny-commands` class into
-// ActiveConfig today — strict commit rejects it (#6838) and Store.Load leaves
-// ActiveConfig nil — so a test driving a real client with a restricted class
-// cannot exist yet. Cut 6 retires that gate and converts this to a behavioural
-// test; its checklist already names this file.
+// Cut 5b bound this with a comment-stripped source scan, and said so: no
+// supported path could put a `deny-commands` class into ActiveConfig, because
+// #5831/#6838's admission gate rejected it at commit. That was the right
+// stand-in then and the wrong one forever. Cut 6 retired the gate, so the class
+// commits and the gate can be driven through a REAL client on a REAL listener.
 //
-// Comments are stripped so the guard cannot be satisfied by prose that merely
-// mentions the call — the rationale comment at the real call site names it.
-func TestAuthorizeRPCCallsTheCommandGate7172(t *testing.T) {
-	src, err := os.ReadFile("authz.go")
-	if err != nil {
-		t.Fatalf("read authz.go: %v", err)
-	}
-	code := stripGoCommentsForGuard7172(string(src))
-
-	i := strings.Index(code, "func (s *Server) authorizeRPC(")
-	if i < 0 {
-		t.Fatal("authorizeRPC not found — the enumeration source moved and a pass here " +
-			"would certify nothing")
-	}
-	body := code[i:]
-	if j := strings.Index(body, "\nfunc "); j > 0 {
-		body = body[:j]
-	}
-
-	if !strings.Contains(body, "s.authorizeRPCCommand(cfg, p.Class, fullMethod, req)") {
-		t.Fatal("authorizeRPC no longer CALLS authorizeRPCCommand with the resolved class. " +
-			"Matching the bare symbol is not enough — `_ = s.authorizeRPCCommand` keeps " +
-			"the name and disconnects the gate. Every unit cell in this file drives the " +
-			"gate directly and stays green, so nothing else catches this.")
-	}
-
-	// ORDER: the coarse permission check must come FIRST. Junos authorizes the
-	// command family with the permission bits and the regexes narrow within it,
-	// so a regex evaluated before authz.Authorize would be narrowing something
-	// the caller was never entitled to in the first place — and, worse, an
-	// allow-shaped decision there could read as authorization on its own.
-	coarse := strings.Index(body, "authz.Authorize(cfg, p, required)")
-	fine := strings.Index(body, "s.authorizeRPCCommand(")
-	if coarse < 0 {
-		t.Fatal("the coarse #5278 permission check is gone from authorizeRPC")
-	}
-	if fine < coarse {
-		t.Error("the #7172 command gate runs BEFORE the #5278 coarse permission check. It " +
-			"must narrow within the permission bits, never stand in for them")
-	}
+// Why it had to be replaced rather than kept alongside: a source scan asserts a
+// call EXISTS in a function body. It cannot see that the call is reached, that
+// the principal's class is the one resolved from the peer UID, or that the
+// denial actually reaches the caller. All three are asserted here, and the
+// escape that motivated the original guard — replacing the call with
+// `error(nil)` and watching every unit cell stay green — reds this too.
+//
+// The `limited` class holds `permissions all`, so the #5278 coarse gate admits
+// the RPC and anything refused here is refused by the COMMAND regex and nothing
+// else. That separation is the point: a denial from the coarse gate would prove
+// nothing about this one.
+const authzDenyConfig7172 = `
+system {
+    host-name authz-deny-test;
+    login {
+        class limited {
+            permissions all;
+            deny-commands "request system reboot";
+        }
+        user opsuser {
+            class limited;
+        }
+    }
 }
+`
 
-// stripGoCommentsForGuard7172 blanks // and /* */ comments so this source-level
-// guard cannot be satisfied by prose quoting the symbol it looks for. Copied
-// rather than shared because pkg/cli's twin is unexported in another package;
-// the two guard different files and neither is the other's SSOT.
-func stripGoCommentsForGuard7172(src string) string {
-	b := []byte(src)
-	out := make([]byte, len(b))
-	for i := range out {
-		out[i] = ' '
+func TestAuthorizeRPCEnforcesDenyCommandsEndToEnd7172(t *testing.T) {
+	usePasswdFixture5278(t)
+	s := NewServer("127.0.0.1:0", Config{Store: authzStore5278(t, authzDenyConfig7172)})
+	full := "/" + pb.BpfrxService_ServiceDesc.ServiceName + "/SystemAction"
+
+	// PRECONDITION: the class committed and carries the pattern. Without this
+	// the cell would pass against a config that never held the deny at all —
+	// which is exactly the state cut 6 changed, so it is worth asserting rather
+	// than assuming.
+	cfg := s.activeConfig()
+	rules, ok, err := config.OperationalLoginRegexesFor(cfg, "limited")
+	if err != nil || !ok {
+		t.Fatalf("the committed class must yield compiled rules (ok=%v err=%v) — if this "+
+			"fails, #6838's admission gate is back and the config never reached "+
+			"ActiveConfig", ok, err)
 	}
-	i := 0
-	for i < len(b) {
-		switch {
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
-			for i < len(b) && b[i] != '\n' {
-				i++
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
-			i += 2
-			for i+1 < len(b) && !(b[i] == '*' && b[i+1] == '/') {
-				if b[i] == '\n' {
-					out[i] = '\n'
-				}
-				i++
-			}
-			i = min(i+2, len(b))
-		default:
-			out[i] = b[i]
-			i++
-		}
+	_ = rules
+
+	// DENIED by the command regex, through the real authorization path.
+	if err := s.authorizeRPC(ctxWithPeerUID(authzUIDReadOnly), full,
+		&pb.SystemActionRequest{Action: "reboot"}); err == nil {
+		t.Error("SystemAction{reboot} maps to `request system reboot`, which this class " +
+			"denies — authorizeRPC admitted it, so the command gate is not reached")
 	}
-	return string(out)
+
+	// ADMITTED: same class, same coarse permission, a command the pattern does
+	// not match. Without this arm the cell would also pass if the gate denied
+	// everything, which is not the property under test.
+	if err := s.authorizeRPC(ctxWithPeerUID(authzUIDReadOnly),
+		"/"+pb.BpfrxService_ServiceDesc.ServiceName+"/GetStatus",
+		&pb.GetStatusRequest{}); err != nil {
+		t.Errorf("GetStatus maps to `show version`, which the pattern does not match, and "+
+			"the class holds `permissions all` — it must be admitted: %v", err)
+	}
 }

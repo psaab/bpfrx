@@ -192,6 +192,13 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					if loginClassLeafRestrictive[prop.Name()] {
 						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, prop.Name())
 					}
+					// #7172 cut 6: the same table-driven PRESENCE record for
+					// the ALLOW regexes, now that they are enforced. See
+					// AllowLeavesPresent for why an empty allow is not the same
+					// as an absent one once a deny is present too.
+					if loginClassLeafAllowRegex[prop.Name()] {
+						lc.AllowLeavesPresent = append(lc.AllowLeavesPresent, prop.Name())
+					}
 					switch prop.Name() {
 					case "permissions":
 						lc.Permissions = append(lc.Permissions, firewallMatchValues(prop)...)
@@ -1239,16 +1246,16 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 			sort.Strings(folded)
 			msg += fmt.Sprintf("; fine-grained permissions [%s] folded to view-only (xpf has no finer bucket)", strings.Join(folded, " "))
 		}
-		// Neutral not-enforced knobs (allow-* is a whitelist EXTENSION and
-		// idle-timeout is a session-lifetime knob; dropping them cannot make
-		// the class more permissive than the source config).
+		// Neutral not-enforced knobs. #7172 cut 6 removed allow-commands and
+		// allow-configuration from this list, because they are no longer
+		// inert — they are enforced as ALLOWLISTS on both dispatch surfaces.
+		// Leaving them here would tell an operator their allowlist does
+		// nothing at the exact commit where it starts denying everything it
+		// does not match, which is the "told the wrong reason, reaches for the
+		// wrong remedy" failure this file's advisories exist to avoid.
+		//
+		// idle-timeout genuinely remains recognized-but-unenforced.
 		var inert []string
-		if lc.AllowCommands != "" {
-			inert = append(inert, "allow-commands")
-		}
-		if lc.AllowConfiguration != "" {
-			inert = append(inert, "allow-configuration")
-		}
 		if lc.IdleTimeout > 0 {
 			inert = append(inert, "idle-timeout")
 		}

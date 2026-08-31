@@ -92,7 +92,7 @@ func (s *Server) authorizeRPCCommand(cfg *config.Config, class, fullMethod strin
 	if class == "" {
 		return nil
 	}
-	rules, ok, err := config.OperationalDenyRegexesFor(cfg, class)
+	rules, ok, err := config.OperationalLoginRegexesFor(cfg, class)
 	if err != nil {
 		return fmt.Errorf("login class %q has an invalid command regex: %w", class, err)
 	}

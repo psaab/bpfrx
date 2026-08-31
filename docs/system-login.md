@@ -384,55 +384,134 @@ outright (#5831, see the next section):
   `secret`, …) folds **down** to a **view-only floor**. Under-granting is
   deliberate: the coarse model must never silently grant config / control /
   maintenance from a narrow subsystem token.
-- `allow-commands` / `allow-configuration` / `idle-timeout` are **recognized
-  but NOT enforced** by the coarse gate (dropping a whitelist extension or a
-  session-lifetime knob cannot make the class more permissive); the advisory
-  names them.
-- **`deny-commands` / `deny-configuration` are HARD-REJECTED at commit**
-  (#5831) — see below.
+- `idle-timeout` is **recognized but NOT enforced** by the coarse gate
+  (dropping a session-lifetime knob cannot make the class more permissive); the
+  advisory names it.
+- **All four regex sub-statements are ENFORCED** since #7172 — `allow-commands`
+  and `allow-configuration` as ALLOWLISTS, `deny-commands` and
+  `deny-configuration` as denials, on both the CLI and the gRPC surface. Both
+  directions changed on upgrade; see below.
 
-### Restrictive regexes are refused, not accepted-and-ignored (#5831)
+### The four regex sub-statements are ENFORCED (#7172)
 
-The four regex sub-statements are **not symmetric**, and xpf treats the two
-halves differently:
+All four — `allow-commands`, `deny-commands`, `allow-configuration`,
+`deny-configuration` — are evaluated on every dispatch surface: the on-box CLI's
+operational and configuration paths, and the gRPC listener the remote `cli`
+speaks to.
 
-| Leaf | Junos direction | Effect of xpf ignoring it | xpf behavior |
-|---|---|---|---|
-| `allow-commands`, `allow-configuration` | **additive** — grants access *in addition to* the permission bits | class gets a **subset** of what was written — fail-**closed** | accepted, advisory |
-| `deny-commands`, `deny-configuration` | **restrictive** — subtracts from the permission bits | denied verbs stay **allowed** — fail-**open** | **rejected at commit** |
+> **UPGRADE NOTE — read this before upgrading if any class carries these
+> statements. Two behaviours change in opposite directions.**
 
-Until #5831, a class carrying `deny-commands` committed cleanly and enforced
-nothing: an operator writing
+#### 1. A `deny-*` class was REJECTED at commit and now commits — and takes effect
+
+Between #5831/#6838 and #7172, a class carrying `deny-commands` or
+`deny-configuration` was **hard-rejected** at `commit` / `commit-check`, and
+folded to a `{view, configure}` repair floor on the tolerant load path. That was
+correct while xpf could not enforce the regex: accepting the statement would
+have left the denied verbs allowed while the config said otherwise — a
+restriction that does not restrict, which is worse than a refusal.
+
+xpf enforces it now, so the refusal is gone and so is the fold. An operator who
+has been carrying such a config through the rejection will find that it commits
+**and that the denial is real**.
 
 ```
 set system login class limited permissions all
 set system login class limited deny-commands "request system zeroize"
 ```
 
-held a config saying the verb was denied and a box on which it was allowed. A
-security restriction accepted as inert state is worse than a refused one, so
-the strict `commit` / `commit-check` path now **hard-rejects** the class
-(`validateLoginClassDenyStrict`). Express the restriction with a narrower
-`permissions` set instead. Note that Junos gives `allow-commands` precedence
-over `deny-commands`, so a class pairing them is a deny-with-exceptions and is
-rejected on the deny leaf alone — no allow leaf makes a deny leaf safe to drop.
+Before: refused at commit. After: commits, and `limited` cannot zeroize — on the
+console, over `cli`, or over gRPC.
 
-Rejection keys off the **presence** of the leaf, not its value. `deny-commands
-""` and a valueless `deny-commands` both flatten to the empty string, so a
-value test would wave them through — yet an empty POSIX regex matches every
-command, i.e. denies *everything*, the most restrictive thing an operator can
-write.
+The fold is gone with it. It existed to resolve an *unenforceable* statement in
+the restrictive direction; with the regex enforced, folding would narrow the
+class a second time on top of its own pattern. A class's `permissions` are now
+exactly what was written.
 
-Which leaves count as restrictive is decided by one table,
-`loginClassLeafRestrictive` (`pkg/config/compiler_login_deny.go`), and that
-table is what the compiler consults when recording presence — not a per-leaf
-`case` arm. Adding a row is therefore the only edit needed to gate a new
-restrictive leaf. This matters because Junos has several xpf does not model
-yet (`deny-hidden-commands`, `access-start` / `access-end`, `allowed-days`):
-each would be a fresh instance of the same fail-open the moment the schema
-learned to parse it. A test pins the table's key set against the schema in both
-directions, so a `class` leaf added without a classification reds the suite
-instead of silently defaulting to unrestricted.
+#### 2. An `allow-*` regex is an ALLOWLIST, and it was inert until now
+
+This is the direction that can lock someone out, and it is silent.
+`allow-commands` and `allow-configuration` committed cleanly and were documented
+as **recognized, not enforced**. They are enforced now, and an allow regex does
+not merely *add* — anything it does not match is **denied**:
+
+```
+set system login class ops permissions all
+set system login class ops allow-commands "show interfaces"
+```
+
+Before: `ops` could run everything its permission bits allowed. After: `ops` can
+run `show interfaces` and **nothing else** — not `show version`, not
+`configure`. Audit for `allow-commands` / `allow-configuration` before
+upgrading; a class that carries one is narrowed to it.
+
+Nothing changes for a class carrying none of the four. The regexes are consulted
+only for a class that configured them, and every fail-closed path below is
+likewise scoped to those classes alone.
+
+#### Precedence: three tiers, and "allow wins" is not the whole rule
+
+Both surfaces evaluate the pair through one shared matcher. The tiers are
+Juniper's, except tier 3:
+
+| case | winner | source |
+|---|---|---|
+| the **identical pattern** in both leaves | **allow** | Juniper, stated outright |
+| **different** patterns, different matched lengths | the **longest matched substring**, whichever leaf it came from | Juniper, with the `commit` / `commit synchronize` worked example |
+| different patterns, **equal** matched lengths | **deny** | **xpf's interpretation of an underspecified rule** — not Junos behaviour |
+
+Tier 2 means a longer **deny** beats a shorter **allow**. "Allow always wins" is
+false, and implementing it would be a fail-open: `allow-commands "commit"` beside
+`deny-commands "commit synchronize"` must deny `commit synchronize`.
+
+Tier 1 giving allow the win reads like a fail-open and is not one — it is the
+deny-with-exceptions idiom the feature exists to support, and it is Junos
+parity. Tier 3 is ours, chosen fail-closed, and is flagged as ours so anyone
+with a real Junos box knows which sentence to go and check.
+
+Matching is **partial**, not anchored: `allow-commands "show interfaces"` admits
+`show interfaces terse`. Juniper's guidance to use anchors for complex patterns
+is only coherent if the default is partial, and the anchored spelling works
+too.
+
+#### An EMPTY pattern is not an absent one
+
+`deny-commands ""` and a valueless `deny-commands` both flatten to the empty
+string, and an empty POSIX regex matches at every position — so an empty deny
+**denies every command**, the most restrictive thing an operator can write. An
+absent deny denies nothing. The compiler records leaf **presence** separately
+from value for exactly this reason; a value test would wave the empty case
+through.
+
+The same applies to `allow-commands ""`, for a subtler reason: an empty allow
+matches everything, so alone it is indistinguishable from an absent allow — but
+beside `deny-commands ""` the two patterns are **identical**, which is tier 1,
+where allow wins and the class is allowed everything. Read the empty allow as
+absent and the same config denies everything instead.
+
+#### Fail-closed paths, all scoped to classes that configured regexes
+
+- a class whose regex does not **compile** is denied. Patterns are validated at
+  commit, so reaching evaluation with an uncompilable one means the config
+  arrived by a path that did not validate.
+- a command that cannot be **canonicalized** is denied on the CLI path: not
+  knowing which command is held, we cannot know a deny regex fails to match it.
+- an RPC with no **canonical command** is denied on the gRPC path — a
+  config-mode method, a routing-status RPC with no `cmdtree` command, an unknown
+  `ShowText` topic, or a prefix-form `SystemAction` verb.
+
+#### The two surfaces do not match the same string
+
+The on-box gate matches the full canonicalized line, **argument values and the
+output pipe included**. The gRPC gate matches the canonical command **path**,
+because the remote `cli` parses the line client-side and only a typed RPC
+crosses the wire — `ping 10.0.0.1` arrives as `Ping{Host:"10.0.0.1"}`.
+
+So a deny written against a **path** (`request system reboot`) is enforced
+identically on both. A deny written against **argument text**
+(`show route table secret-vrf`) is enforced on the box and **not** over gRPC.
+A pattern that can never fire on the gRPC surface is reported for the class, so
+this is visible rather than inferred.
 
 #### The `*-regexps` family is NOT implemented (#7971)
 
@@ -445,8 +524,9 @@ allow-configuration-regexps / deny-configuration-regexps
 
 **xpf does not implement it.** There is no schema leaf, so a `-regexps`
 statement is rejected at commit as an unknown leaf rather than accepted and
-ignored — the safe posture, and the same one `deny-commands` gets for a
-different reason. An operator following Juniper's documentation and writing
+ignored — the safe posture for a control that is not implemented. (Until #7172
+the plain `deny-commands` was refused for the same reason; it is enforced now,
+so only the `-regexps` family is still refused.) An operator following Juniper's documentation and writing
 `set system login class limited deny-commands-regexps "..."` will see the
 commit refused; that is intended, not a bug, and the restriction should be
 expressed with a narrower `permissions` set.
@@ -480,239 +560,12 @@ the family is available: it compiles the *plain* family's patterns, and the
 `-regexps` precedence note there is a warning left for a future implementer,
 not a live code path.
 
-#### Tolerant path: fold to the repair floor
+#### `load` is a named gap
 
-On the **tolerant** load / peer-sync path the rejection is downgraded so an
-already-persisted or peer-synced config still boots (#1960 no-brick) — but a
-bare warning would preserve exactly the fail-open the strict gate rejects, so
-that path additionally **folds the class**
-(`foldLoginClassDenyToRepairableFloor`) to
-
-```
-{ view, configure }  ∩  the permissions the class already held
-```
-
-The operator asked for strictly less than `permissions` grants and xpf cannot
-compute how much less, so it resolves the ambiguity in the restrictive
-direction — **bounded by repairability**.
-
-Two properties:
-
-- **Never widens.** `view` / `configure` appear only if the class already held
-  that bucket (or held `all`, which subsumes both). A class that granted
-  nothing keeps granting nothing.
-- **Never folds below the repair floor.** `configure` is exactly what the
-  runtime gate requires to enter configuration mode, and there is no
-  per-statement gate inside it, so `configure` *is* the self-repair channel.
-  Taking it away is the one reduction that cannot be undone from the box.
-- **Folds every block that carries the class name**, not only the block the
-  deny leaf is written on — see below.
-
-Everything else — `clear`, `control`, `maintenance`, and `all` itself — is
-dropped. So the motivating example above (`permissions all` + `deny-commands
-"request system zeroize"`) really does lose the ability to zeroize.
-
-##### Duplicate class names
-
-A config may spell `class limited` twice. That splits the class into two
-blocks, and the fold deliberately narrows **both**:
-
-```
-system {
-    login {
-        class limited { permissions all; }                        # <- also folded
-        class limited { permissions [ view configure ];
-                        deny-commands "request system zeroize"; }
-        user root { class limited; }
-    }
-}
-```
-
-The reason is that the runtime resolves a **name**, not a block:
-`config.ResolveClassPermissions` (`pkg/config/login_perms.go`) consults the
-system-defined table first and then walks the configured classes, returning the
-**first** entry whose name matches. Since #5561 that walk is no longer in
-`resolveClassPerms` (`pkg/cli/permissions.go`), which is now a five-line
-store-bound adapter reading `store.ActiveConfig()` and delegating (#7057) —
-elsewhere on this page `resolveClassPerms` names the runtime *call site*, which
-is still accurate, but the lookup itself lives one layer down. Folding only the offending block leaves
-whichever *other* block the reader happens to pick holding its full permission
-set — `permissions all` above — so the deny statement is again attached to a
-class the box does not enforce. Both orderings failed open before this was
-fixed (#6838 review B1): with the deny on the first block a name-keyed
-last-wins lookup folded the wrong object, and with it on the second block
-folding exactly the right object still left `all` live on the first.
-
-Folding the cohort makes the outcome independent of the reader's tie-break
-rule, which is the property that has to hold. It cannot over-restrict a
-bystander either: the floor is an intersection, so a sibling block is only ever
-narrowed to what it already held. The per-class warning reports the union on
-each side — *at most* this much before, *at most* this much after — because the
-config does not say which block answers.
-
-**The fold SKIPS a class name that shadows a built-in.** The same
-built-in-first lookup that makes a shadowing definition inert (see *built-in
-shadowing* below) means `MappedPermissions` is never read for such a name — on
-the CLI or on the REST control surface, both of which go through the shared
-`config.ResolveClassPermissions` evaluator (#5561) — so there is nothing for the
-floor to narrow. Folding it anyway changed no
-behaviour and produced two claims that were **false**: the per-class warning
-said the class had been "folded from `{super-user}` to `{configure,view}`"
-while `request system zeroize` stayed allowed and secrets stayed in cleartext,
-and the #4304 advisory — the fold's other reader — turned from `mapped to
-{super-user}` into `mapped to {configure,view}`, which is precisely the
-sentence the #6701 warning beside it calls out as untrue. The fold therefore
-stays silent for these names and leaves both claims as #6701 found them; the
-#6701 warning already states the truth for the shape, and the strict path
-rejects the config through that gate. This is a per-*name* skip, so a
-non-shadowing class in the same config is still folded normally.
-
-**Which class the strict gate names.** A config may carry several offending
-classes; the strict error reports exactly one, chosen by **first appearance of
-the class NAME** — not by the first offending *block*. So `class alpha` defined
-first, `class beta` carrying a deny, then a second `alpha` block carrying one,
-reports `alpha`. Both orderings are safe (both reject, and the message names
-the class *and* the offending leaf), but the choice is an operator-facing
-message and is pinned as a contract rather than left to the collection order.
-
-> [!WARNING]
-> **The fold reduces blast radius; it does not enforce the statement.** A
-> RETAINED bucket is a bucket where the deny does nothing, and the floor
-> retains two of them:
->
-> - `configure` — so `deny-configuration <anything>` is a complete no-op. xpf's
->   coarse model has only two configuration states, all or none, and "none" is
->   the state that strands repair, so the tolerant path keeps "all".
-> - `view` — which gates `show`, `ping`, `traceroute` and `monitor`, so a
->   `deny-commands` naming any of those (e.g. `deny-commands "show interfaces"`)
->   is *equally* a complete no-op.
->
-> Only denies aimed at `clear`, `control` or `maintenance` are actually stopped,
-> and then bluntly — the whole bucket goes, not the named command. **The
-> enforcement that exists is the strict gate refusing every commit** until the
-> statement is removed. The per-class warning names the retained set explicitly
-> so you can see which levels are unrestricted on your box.
-
-**Why not fold to view-only.** It would strand the box. `pkg/daemon`
-assigns the *configured* class to any OS user whose name matches a `system
-login user`, and `root` is an accepted user name — account provisioning skips
-root, the CLI class assignment does not. So this previously-accepted config
-
-```
-set system login class noc-admin permissions [ view configure ]
-set system login class noc-admin deny-configuration "security policies"
-set system login user root class noc-admin
-```
-
-binds the **console** operator to `noc-admin`. A view-only collapse would take
-`configure` away from the only login that could delete the offending statement,
-while the strict gate rejects every commit until it *is* deleted. A
-configure-only class would collapse to an empty permission set, which is worse.
-Recovery would need an out-of-band shell. Built-ins-first lookup in
-`resolveClassPerms` does not rescue this: it only decides which table answers
-for a class *name*, not that any actual login is bound to a built-in.
-
-#### Recovery if you already committed such a config
-
-An upgraded box that loads a persisted config carrying these statements emits
-the warning above. **If the class already held `configure` (or `all`)**, it
-stays usable for repair:
-
-1. Log in and run `configure` (retained by the fold).
-2. `delete system login class <name> deny-configuration` (and/or
-   `deny-commands`).
-3. `commit` — this is the first commit the strict gate lets through.
-
-**If it did not, this procedure is unavailable and you need the out-of-band
-shell** (#7058). The fold is an INTERSECTION — `{view, configure} ∩ what the
-class already held` — and per the "Never widens" rule above it does not grant a
-bucket the class lacked. A class whose Junos permission tokens map to neither
-`view` nor `configure` therefore folds to the **empty set**, and step 1 cannot
-run. Measured against `repairableFloorFold`
-(`pkg/config/compiler_login_deny.go`):
-
-| class holds | folds to |
-|---|---|
-| `maintenance`, `clear` | **empty** — no repair path |
-| `clear`, `control` | **empty** — no repair path |
-| `view` | `view` — can look, cannot repair |
-| `configure` | `configure` — repair path holds |
-| `all` | `view` + `configure` |
-
-The preceding paragraph and this one are each correct and were jointly
-inconsistent until #7058: "keeps the class usable for repair" was stated
-unconditionally, while the design deliberately never widens. The forcing
-function below is unchanged — but on a box in the empty-fold case the forcing
-function has nothing to force *with*, which is the situation the out-of-band
-shell exists for.
-
-Nothing else about the box can be committed until that statement is gone; that
-is the forcing function, not an accident.
-
-Full per-command deny **enforcement** (matching semantics plus coverage of
-every command and configuration dispatch point) remains open on #5831; this is
-the fail-closed half only.
-
-An undefined class (referenced by a user but never defined, and not a built-in)
-still **fails closed** at commit.
-
-A custom class **may not shadow a system-defined name** (#6701). At runtime
-`resolveClassPerms` consults `LoginClassPermissions` **first**, so a definition
-like
-
-```
-set system login class super-user permissions view
-```
-
-is completely **inert** — the built-in `[PermAll]` wins and the user holds every
-permission — while the compile advisory reported `mapped to xpf coarse
-permissions {view}`, i.e. told the operator the narrowing had taken effect. That
-is the same "configured restriction silently absent in the permissive direction"
-shape as the identity defect above, so a shadowing definition is now
-**hard-rejected at commit** naming the collision, and downgraded to a warning on
-the tolerant load / peer-sync path. Built-in-first precedence itself is
-deliberately unchanged: inverting it would let
-`class read-only permissions all` **escalate** a built-in, which is strictly
-worse. Pick a distinct class name, or reference the built-in directly.
-
-Inertness is why the #5831 deny fold skips these names on the tolerant path
-(above): nothing it could narrow is ever read, so folding one would only add a
-second, false narrowing claim next to the warning above.
-
-> **Compatibility break.** The system-defined names are `super-user`,
-> `operator`, `read-only`, `config-viewer` and `unauthorized`. A migrated vSRX
-> config that defines a **custom** class under one of those names — most
-> plausibly `config-viewer`, which reads like an ordinary site-defined name and
-> appears as one in this repository's own vSRX excerpt
-> (`docs/junos-config-display-reference.md`) — now fails strict import and the
-> next commit. This is intended: on Junos that definition was live, on xpf it
-> was already inert, and the old silence is exactly the defect. **Upgrade boot
-> does not brick** — the tolerant load path warns and keeps running — so the
-> break surfaces on the operator's next `commit` / `load override`, with the
-> collision named. Rename the class (`site-config-viewer`) and update the
-> `system login user <name> class <c>` references, or drop the definition and
-> reference the built-in.
-
-**Both gates are evaluated for BOTH cluster nodes.** The packed-body gate and
-the shadowing gate run **before** apply-group expansion and evaluate the
-effective view of node 0 **and** node 1. Without that, a body scoped to the peer
-
-```
-groups {
-    node1 { system { login { class super-user { permissions view; } } } }
-}
-apply-groups "${node}";
-```
-
-was stripped from node 0's view before either gate ran, so the commit passed on
-node 0; the standby then ingested the config through `Store.SyncApply`, which is
-the **tolerant** path and only warns. The stanza was live on node 1 with no
-strict check anywhere in the cluster. Now whichever node commits rejects it, and
-the verdict is identical on both. A body staged in a group that no
-`apply-groups` references stays inert and is not rejected — it renders on no
-node. (Same doctrine as the QinQ / vlan-map / unit-alias gates, and the
-AST-layer analogue of the peer-effective source-NAT replay in
-`compiler_peer_effective_snat.go`.)
+`deny-configuration` is matched against configuration-mutation verbs. `load
+merge` / `load override` carry their content in a file or a terminal stream that
+is not parsed at the time the verb is gated, so a verb gate cannot match against
+it. Restricting what an operator may `load` needs a different mechanism.
 
 ### Write the body as a block or as `set` — never packed on the line (#6662)
 

@@ -1,11 +1,12 @@
 package cli
 
 import (
-	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // #7172 cut 3 — operational deny-command enforcement.
@@ -118,111 +119,6 @@ func TestUnrestrictedClassStillGetsOrdinaryErrors7172(t *testing.T) {
 	}
 }
 
-// THE WIRING. Every cell above drives evaluateCommandRegex or
-// checkCommandRegex directly, so ALL of them stay green if dispatchOperational
-// stops calling the gate — verified: deleting the call left the suite green.
-// A gate nothing calls is not a gate.
-//
-// Bound as a source-level agreement rather than behaviourally because no
-// supported path puts a `deny-commands` class into ActiveConfig today: strict
-// commit rejects it (#6838) and Store.Load leaves ActiveConfig nil. Cut 6
-// retires the gate and this becomes testable through a committed config; until
-// then this is what stands between the gate and being silently disconnected.
-//
-// Comments are stripped so the guard cannot be satisfied by prose that merely
-// mentions the call — the rationale comment above the real call site names it.
-func TestDispatchOperationalCallsTheCommandGate7172(t *testing.T) {
-	src, err := os.ReadFile("cli_dispatch.go")
-	if err != nil {
-		t.Fatalf("read cli_dispatch.go: %v", err)
-	}
-	code := stripGoCommentsForGuard(string(src))
-	if !strings.Contains(code, "c.checkCommandRegex(line)") {
-		t.Fatal("dispatchOperational no longer CALLS checkCommandRegex(line). Matching the " +
-			"bare symbol is not enough — `_ = c.checkCommandRegex` keeps the name and " +
-			"disconnects the gate, and that mutation escaped an earlier version of this " +
-			"guard. The fine-grained " +
-			"deny-commands gate is disconnected: every unit cell in this file drives the " +
-			"gate directly and stays green, so nothing else catches this.")
-	}
-	// It must be in dispatchOperational specifically. A gate moved to
-	// dispatch() would leave `run <cmd>` from config mode ungated, because
-	// dispatchConfig's `case "run"` calls dispatchOperational DIRECTLY.
-	i := strings.Index(code, "func (c *CLI) dispatchOperational(")
-	if i < 0 {
-		t.Fatal("dispatchOperational not found")
-	}
-	rest := code[i:]
-	if j := strings.Index(rest, "\nfunc "); j > 0 {
-		rest = rest[:j]
-	}
-	if !strings.Contains(rest, "c.checkCommandRegex(line)") {
-		t.Error("checkCommandRegex is no longer called inside dispatchOperational. " +
-			"dispatch() is not sufficient: `case \"run\"` in config mode calls " +
-			"dispatchOperational directly, so `run request system reboot` would be ungated " +
-			"for anyone who can enter config mode.")
-	}
-}
-
-// stripGoCommentsForGuard blanks // and /* */ comments so a source-level guard
-// cannot be satisfied by prose quoting the symbol it looks for.
-func stripGoCommentsForGuard(src string) string {
-	b := []byte(src)
-	out := make([]byte, len(b))
-	for i := range out {
-		out[i] = ' '
-	}
-	i := 0
-	for i < len(b) {
-		switch {
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '/':
-			for i < len(b) && b[i] != '\n' {
-				i++
-			}
-		case b[i] == '/' && i+1 < len(b) && b[i+1] == '*':
-			i += 2
-			for i+1 < len(b) && !(b[i] == '*' && b[i+1] == '/') {
-				if b[i] == '\n' {
-					out[i] = '\n'
-				}
-				i++
-			}
-			i = min(i+2, len(b))
-		default:
-			out[i] = b[i]
-			i++
-		}
-	}
-	return string(out)
-}
-
-// SCOPING, asserted on the real decision rather than on hand-built rules:
-// loginRegexesFrom must never mark allow as set in cut 3.
-func TestLoginRegexesFromNeverEnforcesAllowInCut3_7172(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.System.Login = &config.LoginConfig{
-		Classes: []*config.LoginClass{{
-			Name:              "ops",
-			AllowCommands:     "show interfaces",
-			DenyCommands:      "request system reboot",
-			DenyLeavesPresent: []string{"deny-commands"},
-		}},
-	}
-	rules, ok, err := loginRegexesFrom(cfg, "ops")
-	if err != nil || !ok {
-		t.Fatalf("expected compiled rules, got ok=%v err=%v", ok, err)
-	}
-	// If allow were enforced this would be denied by the allowlist.
-	if err := evaluateCommandRegex(rules, "ops", "show version", ""); err != nil {
-		t.Errorf("allow-commands must NOT be enforced in cut 3 — a live class carrying "+
-			"`allow-commands \"show interfaces\"` would abruptly lose `show version` on "+
-			"upgrade, a restriction its author was told was inert: %v", err)
-	}
-	if err := evaluateCommandRegex(rules, "ops", "request system reboot", ""); err == nil {
-		t.Error("deny must still be enforced")
-	}
-}
-
 // A class whose deny regex does not compile must DENY, not skip.
 func TestUncompilableDenyRegexIsAnError7172(t *testing.T) {
 	cfg := &config.Config{}
@@ -237,31 +133,6 @@ func TestUncompilableDenyRegexIsAnError7172(t *testing.T) {
 		t.Fatal("a class whose deny regex does not compile must surface an error so the " +
 			"caller denies. Returning it as \"no rules\" would leave the class unrestricted, " +
 			"which is the fail-open direction on the leaf that matters.")
-	}
-}
-
-// ALLOW IS NOT ENFORCED IN THIS CUT, deliberately. An allow regex is an
-// allowlist, and `allow-commands` commits today as a documented no-op — so
-// enforcing it here would silently narrow live classes on upgrade. It lands in
-// cut 6 with the gate's retirement.
-func TestAllowCommandsIsNotEnforcedInCut3_7172(t *testing.T) {
-	// Rules built the way loginRegexesFor builds them: allow always unset.
-	rules, err := config.CompileLoginRegexes(config.LoginRegexPlainFamily,
-		"show interfaces", false, // present in config, NOT passed as set
-		"request system reboot", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A command outside the allow pattern must still be permitted, because the
-	// allowlist is not in force yet.
-	if err := evaluateCommandRegex(rules, "ops", "show version", ""); err != nil {
-		t.Errorf("cut 3 must not enforce allow-commands — a live class carrying "+
-			"`allow-commands \"show interfaces\"` would abruptly lose `show version`, "+
-			"a restriction its author was told was inert: %v", err)
-	}
-	// Deny still bites.
-	if err := evaluateCommandRegex(rules, "ops", "request system reboot", ""); err == nil {
-		t.Error("deny must still be enforced in cut 3")
 	}
 }
 
@@ -285,5 +156,203 @@ func TestCheckCommandRegexDeniesOnAnUncompilableRegex7172(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid command regex") {
 		t.Errorf("the refusal must say why: %v", err)
+	}
+}
+
+// denyClassStore7172 commits a class carrying a `deny-commands` regex.
+//
+// This helper CANNOT HAVE EXISTED before #7172 cut 6: #5831/#6838's admission
+// gate rejected exactly this config at commit, which is why cuts 3 and 4 bound
+// their wiring with source scans and said so. Its existence is the retirement.
+func denyClassStore7172(t *testing.T) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := store.LoadOverride(`
+system {
+    host-name deny-gate-test;
+    login {
+        class limited {
+            permissions all;
+            deny-commands "show version";
+            deny-configuration "system host-name";
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("a deny-commands class must COMMIT after #7172 cut 6 retired the "+
+			"#5831/#6838 admission gate — if this fails the gate is back: %v", err)
+	}
+	store.ExitConfigure()
+	if store.ActiveConfig() == nil {
+		t.Fatal("no active config after commit; the gate's retirement is what makes " +
+			"ActiveConfig non-nil for this class, and every behavioural cell below " +
+			"depends on it")
+	}
+	return store
+}
+
+// THE WIRING, BEHAVIOURAL — replacing cut 3's source scan, which existed only
+// because this test could not.
+//
+// A source scan asserts a call EXISTS in a function body. It cannot see that
+// the call is REACHED, nor that the class resolved for the session is the one
+// evaluated, nor that the refusal reaches the operator. All three are asserted
+// here by driving the real dispatcher.
+//
+// `run` from CONFIG MODE is covered deliberately: `case "run"` in dispatchConfig
+// calls dispatchOperational DIRECTLY, so a gate placed at dispatch() would leave
+// it open to anyone who can enter config mode. That was the reason cut 3's scan
+// checked WHICH function held the call, and it is preserved as behaviour here.
+// It drives dispatchOperational, NOT checkCommandRegex, and that distinction is
+// the whole reason this cell exists rather than a simpler one.
+//
+// Found by mutation, twice in this issue: a first draft of this test called
+// checkCommandRegex directly, and unwiring dispatchOperational — replacing the
+// call with `error(nil)` while keeping the symbol — left the ENTIRE suite green.
+// The source scan this replaces did catch that. A behavioural test that skips
+// the caller is a WEAKER guard than the scan it replaced, not a stronger one,
+// and it looks stronger, which is what makes it worth saying here.
+func TestDispatchOperationalEnforcesDenyCommands7172(t *testing.T) {
+	c := &CLI{store: denyClassStore7172(t), userClass: "limited"}
+
+	// THE DENIED COMMAND IS DELIBERATELY HARMLESS, and that is a correctness
+	// requirement of this cell rather than a convenience.
+	//
+	// The first draft denied `request system reboot`. When the gate was
+	// unwired, the dispatcher fell through into handleRequestSystem, which
+	// dereferenced a readline Instance this bare fixture does not have, and the
+	// mutation was "killed" by a SIGSEGV — no `--- FAIL` line, so a harness
+	// scoring on named failures records it as an ESCAPE, and a reader cannot
+	// tell the guard from the crash. Worse, the shape generalises badly: a
+	// wiring test whose control flow reaches a DESTRUCTIVE handler when the
+	// gate fails is one fixture change away from actually running it. #5278
+	// makes the same call for zeroize, and for the same reason.
+	//
+	// `show version` is denied by the fixture's pattern and safe to execute, so
+	// the unwired case returns cleanly and the assertion below is what fails.
+	err := c.dispatchOperational("show version")
+	if err == nil {
+		t.Fatal("dispatchOperational admitted a command the committed class denies — the " +
+			"gate is not reached from the dispatcher, so the class commits and restricts " +
+			"nothing, which is the #5831 defect wearing the shape of a fix")
+	}
+	if !strings.Contains(err.Error(), "denies") {
+		t.Errorf("the refusal must come from the command regex, not from the coarse "+
+			"permission gate — the class holds `permissions all` precisely so that any "+
+			"denial here is attributable to the regex: %v", err)
+	}
+
+	// A narrow deny must stay narrow, or the cell would also pass against a
+	// gate that denied everything. Asserted at the gate, not through a handler.
+	if err := c.checkCommandRegex("show interfaces"); err != nil {
+		t.Errorf("`show interfaces` is not matched by this class's pattern and must not be "+
+			"denied: %v", err)
+	}
+
+	// An unrestricted class on the SAME store is untouched.
+	other := &CLI{store: c.store, userClass: "no-such-class"}
+	if err := other.checkCommandRegex("show version"); err != nil {
+		t.Errorf("a class with no regexes must not be gated: %v", err)
+	}
+}
+
+// The same conversion for cut 4's config-mode gate, and it drives dispatchConfig
+// for the same reason the operational one drives dispatchOperational: calling
+// checkConfigRegex directly would leave the wiring unbound, which is exactly
+// what the mutation matrix caught on the sibling cell.
+func TestDispatchConfigEnforcesDenyConfiguration7172(t *testing.T) {
+	c := &CLI{store: denyClassStore7172(t), userClass: "limited"}
+
+	err := c.dispatchConfig("set system host-name evil")
+	if err == nil {
+		t.Fatal("dispatchConfig admitted a mutation the committed class denies — the gate " +
+			"is not reached from the dispatcher")
+	}
+	if !strings.Contains(err.Error(), "denies") {
+		t.Errorf("the refusal must come from the configuration regex: %v", err)
+	}
+
+	// A path the pattern does not match must not be denied. It may still fail
+	// for ordinary reasons (an incomplete `set`), so this asserts the DENIAL is
+	// absent rather than that the command succeeded — asserting success would
+	// couple this authorization cell to the config store's own grammar.
+	if err := c.dispatchConfig("set system services ssh"); err != nil &&
+		strings.Contains(err.Error(), "denies") {
+		t.Errorf("a path outside the pattern must not be denied: %v", err)
+	}
+}
+
+// allowClassStore7172 commits a class carrying ONLY an `allow-commands` regex.
+//
+// The cells this replaces asserted the opposite — that cut 3 must NOT enforce
+// allow — and they were right while `allow-commands` committed as a documented
+// no-op: enforcing it mid-series would have silently narrowed live classes on
+// upgrade, which is a lockout, not a hardening. Cut 6 turns it on together with
+// the #6838 retirement so both leaves change state in one step, with one
+// release note.
+//
+// Note what those cells could NOT have caught, which is why they are replaced
+// rather than inverted in place: they hard-coded allowSet=false when building
+// the rules, so they exercised the MATCHER's unset-allow branch and never the
+// resolver's scoping. They would have stayed green through this entire change.
+func allowClassStore7172(t *testing.T) *configstore.Store {
+	t.Helper()
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := store.LoadOverride(`
+system {
+    host-name allow-gate-test;
+    login {
+        class narrow {
+            permissions all;
+            allow-commands "show interfaces";
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	store.ExitConfigure()
+	return store
+}
+
+// AN ALLOW REGEX IS AN ALLOWLIST — the upgrade note in executable form.
+//
+// The class below holds `permissions all`, so the coarse gate admits
+// everything; anything refused here is refused by the allowlist alone. Before
+// cut 6 this class could run every command its permission bits allowed. Now it
+// can run `show interfaces` and nothing else — not `show version`, not
+// `configure`. That narrowing is the whole content of the release note, and it
+// is asserted rather than described.
+func TestAllowCommandsIsAnAllowlist7172(t *testing.T) {
+	c := &CLI{store: allowClassStore7172(t), userClass: "narrow"}
+
+	if err := c.checkCommandRegex("show interfaces"); err != nil {
+		t.Errorf("the allowed command must be permitted: %v", err)
+	}
+	for _, cmd := range []string{"show version", "request system reboot"} {
+		if err := c.checkCommandRegex(cmd); err == nil {
+			t.Errorf("%q is outside the class's allow-commands pattern and an allow regex "+
+				"is an ALLOWLIST — permitting it would make the statement inert, which is "+
+				"the #5831 defect this issue exists to close", cmd)
+		}
+	}
+	// SCOPING: a class with NO regexes is still unaffected. Without this arm
+	// the cell would also pass against a gate that denied everything for
+	// everyone.
+	other := &CLI{store: c.store, userClass: "no-such-class"}
+	if err := other.checkCommandRegex("show version"); err != nil {
+		t.Errorf("a class with no regexes must be unaffected: %v", err)
 	}
 }

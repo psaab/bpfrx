@@ -1,7 +1,6 @@
 package config
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -34,84 +33,6 @@ func buildLoginTree5831(t *testing.T, cmds []string) *ConfigTree {
 		}
 	}
 	return tree
-}
-
-// TestLoginClassDenyRejectedAtCommit is the core RED-on-revert guard: every
-// restrictive-regex spelling must be REFUSED by the strict commit path.
-//
-// The `quoted-empty` and `valueless` cases are the ones a value-based gate
-// (`lc.DenyCommands != ""`) would wave through — both flatten to the empty
-// string, indistinguishable from an absent leaf, yet an empty POSIX regex
-// matches every command, i.e. denies EVERYTHING. They are the edge where a
-// guard scoped to "non-empty deny regex" would be narrower than the claim
-// "a restriction is never accepted as inert".
-func TestLoginClassDenyRejectedAtCommit(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		line string
-		want string
-	}{
-		{"deny-commands", `set system login class limited deny-commands "request system zeroize"`, "deny-commands"},
-		{"deny-configuration", `set system login class limited deny-configuration "security policies"`, "deny-configuration"},
-		{"deny-commands quoted-empty", `set system login class limited deny-commands ""`, "deny-commands"},
-		{"deny-configuration quoted-empty", `set system login class limited deny-configuration ""`, "deny-configuration"},
-		{"deny-commands valueless", `set system login class limited deny-commands`, "deny-commands"},
-		{"deny-configuration valueless", `set system login class limited deny-configuration`, "deny-configuration"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			tree := buildLoginTree5831(t, []string{
-				"set system login class limited permissions all",
-				tc.line,
-				"set system login user carol class limited",
-			})
-			_, err := CompileConfig(tree)
-			if err == nil {
-				t.Fatalf("commit ACCEPTED a class carrying %s; xpf does not enforce it, "+
-					"so the restriction would be inert and the class MORE permissive than the config states", tc.want)
-			}
-			if !strings.Contains(err.Error(), "limited") || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("rejection must name the class and the offending leaf; got %q", err)
-			}
-		})
-	}
-}
-
-// TestLoginClassDenyRejectedHierarchicalShape pins the SECOND parser AST shape.
-// The flat `set` form lands the regex on a child node; the hierarchical block
-// form lands it on the leaf's own Keys. A gate that reads only one shape sees
-// only one spelling — the defect class currently open as #6817/#6818 — so the
-// hierarchical spelling must be rejected too.
-func TestLoginClassDenyRejectedHierarchicalShape(t *testing.T) {
-	src := `
-system {
-    login {
-        class limited {
-            permissions [ view ];
-            deny-commands "request system zeroize";
-        }
-    }
-}
-`
-	p := NewParser(src)
-	tree, errs := p.Parse()
-	if len(errs) > 0 {
-		t.Fatalf("parse: %v", errs)
-	}
-	// Guard the guard: if the hierarchical parse did not actually populate the
-	// leaf, this test would "pass" against a gate that never ran.
-	cfgLenient, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
-	}
-	if len(cfgLenient.System.Login.Classes) != 1 ||
-		len(cfgLenient.System.Login.Classes[0].DenyLeavesPresent) != 1 {
-		t.Fatalf("hierarchical shape did not record the deny leaf; classes=%+v",
-			cfgLenient.System.Login.Classes)
-	}
-
-	if _, err := CompileConfig(tree); err == nil {
-		t.Fatal("hierarchical `deny-commands` inside a class block was ACCEPTED at commit")
-	}
 }
 
 // TestLoginClassValidStillCommits is the POSITIVE CONTROL. Without it the
@@ -158,369 +79,6 @@ func TestLoginClassValidStillCommits(t *testing.T) {
 			}
 			if cfg.System.Login == nil || len(cfg.System.Login.Classes) != 1 {
 				t.Fatalf("expected the class to survive the commit; got %+v", cfg.System.Login)
-			}
-		})
-	}
-}
-
-// TestLoginClassDenyToleratedButFolded pins the tolerant load / peer-sync
-// behavior. #1960 says an already-persisted or peer-synced config must still
-// BOOT, so the strict rejection cannot simply be re-run here.
-//
-// But a bare warning would leave the runtime fail-open exactly where it
-// started. So the tolerant path resolves the un-enforceable restriction in the
-// RESTRICTIVE direction: `permissions all` + an unenforceable deny must NOT
-// keep PermAll, and must lose every operational-verb bucket the deny could
-// have targeted (clear / control / maintenance). What it keeps is the repair
-// floor — see TestLoginClassDenyFoldKeepsTheRepairPath.
-func TestLoginClassDenyToleratedButFolded(t *testing.T) {
-	tree := buildLoginTree5831(t, []string{
-		"set system login class limited permissions all",
-		`set system login class limited deny-commands "request system zeroize"`,
-		"set system login user carol class limited",
-	})
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("tolerant path must not brick an already-persisted config: %v", err)
-	}
-	if len(cfg.System.Login.Classes) != 1 {
-		t.Fatalf("expected 1 class; got %+v", cfg.System.Login.Classes)
-	}
-	lc := cfg.System.Login.Classes[0]
-
-	// Every bucket that would let this class run `request system zeroize` — the
-	// exact verb the config says is denied — must be gone. PermAll matches any
-	// required permission, so it alone would re-open the hole.
-	for _, banned := range []LoginClassPermission{PermAll, PermMaint, PermControl, PermClear} {
-		for _, p := range lc.MappedPermissions {
-			if p == banned {
-				t.Fatalf("class kept %s despite an unenforceable deny-commands: %v — "+
-					"the persisted-config path preserved the fail-open the strict gate rejects",
-					loginClassPermName(banned), lc.MappedPermissions)
-			}
-		}
-	}
-
-	var found string
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "limited") && strings.Contains(w, "deny-commands") {
-			found = w
-		}
-	}
-	if found == "" {
-		t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
-	}
-	// The old #4304 advisory said such a class was "MORE PERMISSIVE". After the
-	// fold that is the exact opposite of what happened, so no warning may still
-	// claim it.
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "limited") && strings.Contains(w, "MORE PERMISSIVE") {
-			t.Fatalf("warning still claims the folded class is MORE PERMISSIVE: %q", w)
-		}
-	}
-}
-
-// TestLoginClassDenyFoldNeverWidens pins the non-widening property of the fold
-// directly. A class granting NOTHING must not be handed view or configure
-// access by the fold — returning a literal {PermView, PermConfig} would do
-// exactly that, turning a restriction gate into a privilege GRANT. This is the
-// edge that keeps the repair floor from becoming a floor for classes that were
-// never above it.
-func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
-	// NOTE on how these assert (#6838 review). `PermView` is the `iota` ZERO
-	// value (types_system.go), so an expectation written as `got[0] != PermView`
-	// is satisfied by an uninitialised element — a fold that returned a
-	// zero-filled slice would pass while producing nonsense. Every expectation
-	// below is therefore the RENDERED set (describePerms, the same function the
-	// operator warning uses), which is a non-default value: a spurious zero
-	// shows up as a duplicate "view" and fails the comparison. This also binds
-	// the rendering the warning depends on.
-	t.Run("empty permission set stays empty", func(t *testing.T) {
-		for _, in := range [][]LoginClassPermission{nil, {}} {
-			if got := describePerms(repairableFloorFold(in)); got != "no permissions at all" {
-				t.Fatalf("fold GRANTED %s to a class that had no permissions at all", got)
-			}
-		}
-	})
-	t.Run("a set below the floor is not raised to it", func(t *testing.T) {
-		// clear/control/maintenance only: the class never held view or
-		// configure, so the fold must hand back neither. A literal-return fold
-		// would GRANT both.
-		got := describePerms(repairableFloorFold([]LoginClassPermission{PermClear, PermControl, PermMaint}))
-		if got != "no permissions at all" {
-			t.Fatalf("fold GRANTED %s to a class holding neither view nor configure", got)
-		}
-	})
-	t.Run("view without configure stays view-only", func(t *testing.T) {
-		got := describePerms(repairableFloorFold([]LoginClassPermission{PermView, PermClear}))
-		if got != "{view}" {
-			t.Fatalf("expected {view}; got %s (a widening if it names configure)", got)
-		}
-	})
-	t.Run("PermAll reduces to the floor", func(t *testing.T) {
-		// PermAll subsumes both floor buckets (checkPermission returns nil on
-		// PermAll for every required permission), so all -> {view,configure} is
-		// a strict reduction, not a widening.
-		got := describePerms(repairableFloorFold([]LoginClassPermission{PermAll}))
-		if got != "{configure,view}" {
-			t.Fatalf("all should reduce to {configure,view}; got %s", got)
-		}
-	})
-	t.Run("everything above the floor is dropped", func(t *testing.T) {
-		got := describePerms(repairableFloorFold(
-			[]LoginClassPermission{PermView, PermClear, PermControl, PermConfig, PermMaint}))
-		if got != "{configure,view}" {
-			t.Fatalf("expected {configure,view}; got %s", got)
-		}
-	})
-
-	// End-to-end. NOTE the token choice: `permissions unauthorized` does NOT
-	// produce an empty set — mapJunosPermissions folds it to the PermView floor
-	// like every other recognized-but-unmappable token. A class with NO
-	// `permissions` statement at all is the only shape that maps to the truly
-	// empty set, so that is the one that exercises the widening edge.
-	tree := buildLoginTree5831(t, []string{
-		`set system login class nobody deny-commands "request system zeroize"`,
-	})
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
-	}
-	lc := cfg.System.Login.Classes[0]
-	if len(lc.DenyLeavesPresent) == 0 {
-		t.Fatal("precondition: the deny leaf was not recorded, so the fold never ran")
-	}
-	if got := lc.MappedPermissions; len(got) != 0 {
-		t.Fatalf("tolerant fold GRANTED %v to a class that held no permissions at all", got)
-	}
-}
-
-// TestLoginClassDenyFoldKeepsTheRepairPath is the counter-example to
-// "the fold cannot lock an operator out".
-//
-// pkg/daemon/daemon_run.go:742 -> applyCLILoginClass (pkg/daemon/cli_rbac.go)
-// -> cli.ResolveLoginClass (pkg/cli/identity.go) -> configuredClass assigns the
-// CONFIGURED login class to the invoking OS credential, and `root` is a name the
-// username validator accepts (account PROVISIONING skips root; the CLI class
-// assignment does not). The inline loop this comment used to describe is gone
-// since #6701 (#7057). So the config below binds the CONSOLE operator to a
-// custom class. If the tolerant fold collapsed that class to view-only, the
-// only login that can delete the offending statement would lose `configure` —
-// while validateLoginClassDenyStrict rejects every commit until it IS deleted.
-// Recovery would need an out-of-band shell.
-//
-// "resolveClassPerms consults the built-ins first" does not rescue this: that
-// only decides which table answers for a class NAME, not that any login is
-// bound to a built-in.
-//
-// Note what the operator wrote: `permissions [view configure]` plus
-// `deny-configuration` means "configure everything EXCEPT security policies".
-// Removing ALL configure is more restrictive than they asked for, in the one
-// direction that is unrecoverable.
-func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
-	// Expectations are the RENDERED set (describePerms), not raw slices:
-	// `PermView` is the iota zero value, so a slice expectation whose first
-	// element is PermView can be satisfied by an uninitialised element
-	// (#6838 review). The rendered form is non-default.
-	for _, tc := range []struct {
-		name  string
-		lines []string
-		want  string
-	}{
-		{
-			// The reviewer's example, verbatim.
-			name: "configured root, view+configure, deny-configuration",
-			lines: []string{
-				"set system login class noc-admin permissions [ view configure ]",
-				`set system login class noc-admin deny-configuration "security policies"`,
-				"set system login user root class noc-admin",
-			},
-			want: "{configure,view}",
-		},
-		{
-			// A configure-only class folds to the EMPTY set under a view-only
-			// collapse — strictly worse than the case above, because the
-			// operator cannot even read the config to find the statement.
-			name: "configure-only class must not fold to nothing",
-			lines: []string{
-				"set system login class cfg-only permissions configure",
-				`set system login class cfg-only deny-configuration "security policies"`,
-				"set system login user root class cfg-only",
-			},
-			want: "{configure}",
-		},
-		{
-			// `permissions all` keeps the repair floor too — and only that.
-			name: "permissions all folds down to the floor, not past it",
-			lines: []string{
-				"set system login class su-ish permissions all",
-				`set system login class su-ish deny-commands "request system zeroize"`,
-				"set system login user root class su-ish",
-			},
-			want: "{configure,view}",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := CompileConfigLenient(buildLoginTree5831(t, tc.lines))
-			if err != nil {
-				t.Fatalf("tolerant path must not brick an already-persisted config: %v", err)
-			}
-			lc := cfg.System.Login.Classes[0]
-			if len(lc.DenyLeavesPresent) == 0 {
-				t.Fatal("precondition: the deny leaf was not recorded, so the fold never ran")
-			}
-			// Guard the guard: the user->class binding that makes this a
-			// LOCKOUT rather than a mere downgrade must actually be in the
-			// compiled config.
-			var bound bool
-			for _, u := range cfg.System.Login.Users {
-				if u.Name == "root" && u.Class == lc.Name {
-					bound = true
-				}
-			}
-			if !bound {
-				t.Fatalf("precondition: `user root class %s` did not compile; users=%+v",
-					lc.Name, cfg.System.Login.Users)
-			}
-
-			hasConfig := false
-			for _, p := range lc.MappedPermissions {
-				if p == PermConfig {
-					hasConfig = true
-				}
-			}
-			if !hasConfig {
-				t.Fatalf("fold STRANDED the box: class %q held `configure` before the fold and "+
-					"lost it (%v), but root is bound to that class and every commit is rejected "+
-					"until the statement is deleted — there is no in-band way to delete it",
-					lc.Name, lc.MappedPermissions)
-			}
-			if got := describePerms(lc.MappedPermissions); got != tc.want {
-				t.Fatalf("expected %s; got %s", tc.want, got)
-			}
-		})
-	}
-}
-
-// TestLoginClassDenyFoldWarningIsTrueForEveryDenyShape pins the operator-facing
-// text against the #6838 review finding.
-//
-// The floor retains {view, configure}. A deny AIMED AT A RETAINED BUCKET is
-// therefore a complete no-op — and both retained buckets are reachable targets:
-// `deny-configuration` targets PermConfig, and `deny-commands "show ..."` /
-// `"ping ..."` / `"monitor ..."` target PermView (requiredPermission). The
-// first revision of this warning carved out CONFIGURATION only, so the
-// view-level shape was described as restricted when it was not — the claim was
-// broader than the behaviour, which is the exact defect class #5831 is about.
-//
-// The warning is now generated from the retained set, so this test drives BOTH
-// shapes plus a control whose deny targets a DROPPED bucket, and requires the
-// same honest statement from all three.
-func TestLoginClassDenyFoldWarningIsTrueForEveryDenyShape(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		lines    []string
-		leaf     string
-		retained string // exactly what describePerms renders for the folded set
-	}{
-		{
-			name: "deny targets the retained CONFIGURE bucket",
-			lines: []string{
-				"set system login class noc-admin permissions [ view configure ]",
-				`set system login class noc-admin deny-configuration "security policies"`,
-			},
-			leaf:     "deny-configuration",
-			retained: "{configure,view}",
-		},
-		{
-			// The shape the first revision mis-described.
-			name: "deny targets the retained VIEW bucket",
-			lines: []string{
-				"set system login class noc-admin permissions [ view configure ]",
-				`set system login class noc-admin deny-commands "show interfaces"`,
-			},
-			leaf:     "deny-commands",
-			retained: "{configure,view}",
-		},
-		{
-			// Control: this deny targets PermMaint, which the fold DROPS. The
-			// warning must still not claim enforcement — the fold cannot know
-			// what the regex names.
-			name: "deny targets a DROPPED bucket",
-			lines: []string{
-				"set system login class noc-admin permissions all",
-				`set system login class noc-admin deny-commands "request system zeroize"`,
-			},
-			leaf:     "deny-commands",
-			retained: "{configure,view}",
-		},
-		{
-			// A DIFFERENT retained set. Without this case every expectation
-			// above is "{configure,view}", so a warning that hard-coded that
-			// string would pass the whole table while lying about any class
-			// that folds elsewhere. This is what makes "the message is derived
-			// from the retained set" a tested property rather than a claim.
-			name: "retained set is per-class, not a constant",
-			lines: []string{
-				"set system login class cfg-only permissions configure",
-				`set system login class cfg-only deny-configuration "security policies"`,
-			},
-			leaf:     "deny-configuration",
-			retained: "{configure}",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// The class name is the 5th token of `set system login class <name>
-			// ...`; deriving it keeps the fixture and the lookup from drifting
-			// apart when a case uses a different class.
-			class := strings.Fields(tc.lines[0])[4]
-			lines := append([]string{}, tc.lines...)
-			lines = append(lines, "set system login user root class "+class)
-			cfg, err := CompileConfigLenient(buildLoginTree5831(t, lines))
-			if err != nil {
-				t.Fatalf("lenient compile: %v", err)
-			}
-			var w string
-			for _, cand := range cfg.Warnings {
-				if strings.Contains(cand, class) && strings.Contains(cand, tc.leaf) {
-					w = cand
-				}
-			}
-			if w == "" {
-				t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
-			}
-			// It must name the retained set IN THE CLAIM-BEARING SLOT.
-			//
-			// Anchoring on the bare set ("{configure}") is NOT enough: the
-			// message also renders the PRE-fold set, and for a class that was
-			// already at the floor the two strings are identical, so a bare
-			// Contains passes even when the claim slot is hard-coded to
-			// something else entirely. A mutation that replaced the retained
-			// rendering with a literal "{configure,view}" survived exactly that
-			// way. "gated at <set>" is unique to the claim.
-			if !strings.Contains(w, "gated at "+tc.retained+" is") {
-				t.Fatalf("warning does not claim the retained set %s is unrestricted — "+
-					"the levels it names must be the ones the fold actually kept: %q",
-					tc.retained, w)
-			}
-			// ...and the fold's own before->after report must agree with it, so
-			// the two renderings cannot drift apart either.
-			if !strings.Contains(w, "to "+tc.retained+".") {
-				t.Fatalf("warning's folded-to set disagrees with the retained set %s: %q",
-					tc.retained, w)
-			}
-			// It must say those levels are unrestricted, in every shape.
-			if !strings.Contains(w, "COMPLETELY UNRESTRICTED") {
-				t.Fatalf("warning does not tell the operator the retained levels are "+
-					"unrestricted — a deny aimed at one of them is a silent no-op: %q", w)
-			}
-			// It must NOT claim the statement is enforced.
-			if !strings.Contains(w, "does NOT "+"enforce the statement") {
-				t.Fatalf("warning does not disclaim enforcement: %q", w)
-			}
-			// The forcing function, so the operator knows repair is mandatory.
-			if !strings.Contains(w, "every commit is rejected") {
-				t.Fatalf("warning does not tell the operator that commits stay blocked until repair: %q", w)
 			}
 		})
 	}
@@ -578,55 +136,6 @@ func TestLoginClassDenyPresenceSurvivesEmptyValue(t *testing.T) {
 	}
 }
 
-// TestLoginClassAdvisoryReportsPostFoldPermissions binds the one production
-// line #5831 changed in loginClassAdvisoryWarnings (#6838 review M2).
-//
-// That advisory used to render a fresh `mapJunosPermissions(lc.Permissions)`
-// call; it now renders lc.MappedPermissions, the EFFECTIVE set. The two are
-// identical for every class the fold did not touch, which is exactly why the
-// switch was invisible to the suite: reverting it left the failure set
-// byte-identical to baseline. On a FOLDED class they diverge, and the fresh
-// call tells the operator the class still holds buckets the fold removed —
-// `{super-user}` for a class that can no longer do anything but read and
-// configure.
-//
-// REVERT THAT REDS THIS: restore `mapped, _ := mapJunosPermissions(lc.Permissions)`
-// and range over `mapped` instead of `lc.MappedPermissions`.
-func TestLoginClassAdvisoryReportsPostFoldPermissions(t *testing.T) {
-	tree := buildLoginTree5831(t, []string{
-		"set system login class limited permissions all",
-		`set system login class limited deny-commands "request system zeroize"`,
-	})
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
-	}
-	lc := cfg.System.Login.Classes[0]
-	// Precondition: the fold must actually have bitten, or the two renderings
-	// agree and this test proves nothing.
-	if len(lc.MappedPermissions) != 2 {
-		t.Fatalf("precondition: expected the class folded to {view,configure}; got %v",
-			lc.MappedPermissions)
-	}
-
-	var advisory string
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "recognized (custom RBAC)") {
-			advisory = w
-		}
-	}
-	if advisory == "" {
-		t.Fatalf("the #4304 per-class advisory did not fire; warnings=%v", cfg.Warnings)
-	}
-	if strings.Contains(advisory, "super-user") {
-		t.Errorf("the advisory still reports the PRE-fold bucket set — it tells the operator "+
-			"the class holds super-user after the fold took it away:\n  %s", advisory)
-	}
-	if !strings.Contains(advisory, "{configure,view}") {
-		t.Errorf("the advisory does not report the post-fold set {configure,view}:\n  %s", advisory)
-	}
-}
-
 // TestLoginClassSchemaLeavesAreClassified_5831 is the schema-drift canary for
 // the deny gate (#6838 review M3), the sibling of
 // TestLoginInstanceKeywordsMatchSchema_6662 for the packed gate.
@@ -647,237 +156,246 @@ func TestLoginClassSchemaLeavesAreClassified_5831(t *testing.T) {
 		t.Fatal("setSchema has no `system login class` node with children")
 	}
 
-	for name := range class.children {
-		if _, ok := loginClassLeafRestrictive[name]; !ok {
-			t.Errorf("`login class %s` is in the schema but NOT classified in "+
-				"loginClassLeafRestrictive — if it is restrictive it is now accepted and "+
-				"enforced at no granularity, which is the #5831 fail-open; if it is not, "+
-				"say so with an explicit `false` row", name)
+	// #7172 cut 6 added the second table, and BOTH are pinned here. A leaf
+	// classified in one and forgotten in the other fails open: an unclassified
+	// restrictive leaf loses its presence record — the only thing separating an
+	// empty regex from an absent one — and an unclassified allow leaf silently
+	// stops being an allowlist.
+	for _, tbl := range []struct {
+		name  string
+		table map[string]bool
+	}{
+		{"loginClassLeafRestrictive", loginClassLeafRestrictive},
+		{"loginClassLeafAllowRegex", loginClassLeafAllowRegex},
+	} {
+		for name := range class.children {
+			if _, ok := tbl.table[name]; !ok {
+				t.Errorf("`login class %s` is in the schema but NOT classified in %s — a "+
+					"regex leaf with no row loses its PRESENCE record, and presence is the "+
+					"only thing separating an empty pattern from an absent one; if the leaf "+
+					"is neither restrictive nor an allow regex, say so with an explicit "+
+					"`false` row", name, tbl.name)
+			}
 		}
-	}
-	for name := range loginClassLeafRestrictive {
-		if _, ok := class.children[name]; !ok {
-			t.Errorf("loginClassLeafRestrictive classifies %q, which is not a `login class` "+
-				"schema child — the row gates nothing and overstates the table's coverage", name)
+		for name := range tbl.table {
+			if _, ok := class.children[name]; !ok {
+				t.Errorf("%s classifies %q, which is not a `login class` schema child — the "+
+					"row records nothing and overstates the table's coverage", tbl.name, name)
+			}
 		}
 	}
 }
 
 // TestLoginClassRestrictiveClassificationIsEnforced_5831 closes the canary's
-// other half: the classification must DRIVE the gate, not merely describe it.
+// other half: the classification must DRIVE the compiler, not merely describe
+// it. Without it, a correct table paired with a compiler that ignored it would
+// still fail open and the key-set canary above would stay green.
 //
-// Every leaf marked restrictive must reach DenyLeavesPresent and be refused at
-// commit; every leaf marked non-restrictive must not. Without this, a correct
-// table paired with a compiler that ignored it would still fail open, and the
-// key-set canary above would stay green.
+// #7172 cut 6 INVERTED one arm and kept the other, and the distinction is worth
+// reading carefully. What it used to assert:
+//
+//	restrictive leaf -> recorded in DenyLeavesPresent AND REJECTED at commit
+//
+// The rejection was #5831/#6838's admission gate, which existed only because
+// the regexes were not enforced. They are now, so the same config must COMMIT.
+// That arm is not loosened, it is FALSIFIED — keeping it would pin the very
+// gate this feature exists to remove.
+//
+// The presence arm is unchanged and was always the load-bearing one:
+// DenyLeavesPresent is the only thing separating `deny-commands ""` (an empty
+// POSIX regex — denies EVERY command) from an absent leaf (denies nothing). The
+// gate is gone; the table it was built on outlives it.
 func TestLoginClassRestrictiveClassificationIsEnforced_5831(t *testing.T) {
 	for leaf, restrictive := range loginClassLeafRestrictive {
 		if leaf == "permissions" {
 			continue // the identity leaf, not a sub-statement with a regex value
 		}
 		t.Run(leaf, func(t *testing.T) {
-			// A value every leaf accepts, including the integer idle-timeout.
-			value := "1"
 			tree := buildLoginTree5831(t, []string{
 				"set system login class limited permissions view",
-				"set system login class limited " + leaf + " " + value,
+				"set system login class limited " + leaf + " 1",
 			})
-			_, strictErr := CompileConfig(tree)
-
-			cfg, err := CompileConfigLenient(tree)
-			if err != nil {
-				t.Fatalf("lenient compile: %v", err)
+			cfg, strictErr := CompileConfig(tree)
+			if strictErr != nil {
+				t.Fatalf("%q must COMMIT on the strict path now that #7172 cut 6 retired the "+
+					"#5831/#6838 admission gate: the regexes are enforced, so refusing the "+
+					"statement would be refusing a control we implement: %v", leaf, strictErr)
 			}
 			got := len(cfg.System.Login.Classes[0].DenyLeavesPresent) > 0
-
 			if got != restrictive {
 				t.Fatalf("loginClassLeafRestrictive[%q]=%v but DenyLeavesPresent recorded=%v — "+
 					"the table and the compiler disagree about this leaf", leaf, restrictive, got)
-			}
-			if restrictive && strictErr == nil {
-				t.Errorf("%q is classified restrictive but the strict commit path ACCEPTED it — "+
-					"an unenforceable restriction is committable", leaf)
-			}
-			if !restrictive && strictErr != nil {
-				t.Errorf("%q is classified non-restrictive but the strict path rejected it: %v",
-					leaf, strictErr)
 			}
 		})
 	}
 }
 
-// TestLoginClassDenyRejectionMessageIsDedupedAndSorted binds the three
-// message-rendering lines this round's cohort fold added or made load-bearing
-// (#6838 review MINOR-2). Each was removable with the full pkg/config + pkg/cli
-// suites still green, so each is pinned here by the ONE string they all feed.
+// TestLoginClassAllowClassificationIsRecorded_7172 is the same property for the
+// ALLOW table cut 6 added.
 //
-// The fixture is the shape that makes all three observable at once — two blocks
-// under one name, with an overlapping leaf, an out-of-order leaf pair, and
-// overlapping permission sets:
-//
-//   - collectLoginClassDenyRejections `seen` dedup — the two blocks BOTH carry
-//     `deny-configuration`, which only became reachable when this round started
-//     concatenating the cohort's leaves. Without it: "deny-commands /
-//     deny-configuration / deny-configuration".
-//   - collectLoginClassDenyRejections sort.Strings(leaves) — the leaves arrive
-//     as [deny-configuration, deny-configuration, deny-commands]. Without it:
-//     "deny-configuration / deny-commands".
-//   - unionPerms' linear dedup scan — both blocks hold `view`, so the before-set
-//     and the after-set each accumulate it twice. Without it: "folded from
-//     {clear,configure,view,view} to {configure,view,view}".
-//
-// All three are message-rendering only: no permission changes and no
-// accept/reject changes ride on them. They are pinned because an operator
-// message IS this gate's product, and a rejection reading "deny-commands /
-// deny-configuration / deny-configuration" reads like a parser bug in the
-// operator's own config.
-func TestLoginClassDenyRejectionMessageIsDedupedAndSorted(t *testing.T) {
-	src := `
-system {
-    login {
-        class limited {
-            permissions [ view configure ];
-            deny-configuration "security policies";
-        }
-        class limited {
-            permissions [ view clear ];
-            deny-configuration "system services";
-            deny-commands "request system zeroize";
-        }
-    }
-}
-`
-	p := NewParser(src)
-	tree, errs := p.Parse()
-	if len(errs) > 0 {
-		t.Fatalf("parse: %v", errs)
-	}
-	cfg, err := CompileConfigLenient(tree)
-	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
-	}
-
-	// Guard the guard. Every one of the three reverts is only observable
-	// because of a specific property of this fixture, so assert the fixture
-	// rather than assume it: two blocks, one name, a leaf spelled on BOTH, the
-	// leaves recorded out of sorted order, and overlapping permission sets.
-	if len(cfg.System.Login.Classes) != 2 {
-		t.Fatalf("precondition: want the two-block duplicate-name shape; classes=%+v",
-			cfg.System.Login.Classes)
-	}
-	a, b := cfg.System.Login.Classes[0], cfg.System.Login.Classes[1]
-	if a.Name != "limited" || b.Name != "limited" {
-		t.Fatalf("precondition: both blocks must share a name; got %q and %q", a.Name, b.Name)
-	}
-	if len(a.DenyLeavesPresent) != 1 || a.DenyLeavesPresent[0] != "deny-configuration" {
-		t.Fatalf("precondition: first block must carry exactly deny-configuration; got %v",
-			a.DenyLeavesPresent)
-	}
-	if len(b.DenyLeavesPresent) != 2 ||
-		b.DenyLeavesPresent[0] != "deny-configuration" || b.DenyLeavesPresent[1] != "deny-commands" {
-		t.Fatalf("precondition: second block must carry deny-configuration THEN deny-commands "+
-			"(duplicated across blocks, and out of sorted order); got %v", b.DenyLeavesPresent)
-	}
-
-	var w string
-	for _, cand := range cfg.Warnings {
-		if strings.Contains(cand, "is NOT enforced by xpf's coarse RBAC model") {
-			w = cand
+// Not decoration: an allow leaf whose presence is not recorded stops being an
+// allowlist, and the config that makes a value test wrong is the one Juniper
+// documents by name — `allow-commands ""` beside `deny-commands ""` puts the
+// IDENTICAL pattern in both leaves, which is precedence tier 1, where allow
+// wins and the class is allowed everything. Lose the allow presence and the
+// same config denies everything instead.
+func TestLoginClassAllowClassificationIsRecorded_7172(t *testing.T) {
+	for leaf, isAllow := range loginClassLeafAllowRegex {
+		if leaf == "permissions" {
+			continue
 		}
-	}
-	if w == "" {
-		t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
-	}
-
-	// ONE assertion, three reverts. Every substring below is a rendering
-	// product of a different unbound line, so removing any one of them fails
-	// this comparison on a different clause.
-	const want = `system login class "limited": deny-commands / deny-configuration is NOT enforced ` +
-		`by xpf's coarse RBAC model (downgraded to a warning on the tolerant load / peer-sync ` +
-		`path). The class is folded from {clear,configure,view} to {configure,view}.`
-	if !strings.Contains(w, want) {
-		t.Fatalf("rejection message is not deduplicated / sorted as rendered.\n want: %s\n  got: %s",
-			want, w)
+		t.Run(leaf, func(t *testing.T) {
+			tree := buildLoginTree5831(t, []string{
+				"set system login class limited permissions view",
+				"set system login class limited " + leaf + " 1",
+			})
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			got := len(cfg.System.Login.Classes[0].AllowLeavesPresent) > 0
+			if got != isAllow {
+				t.Fatalf("loginClassLeafAllowRegex[%q]=%v but AllowLeavesPresent recorded=%v",
+					leaf, isAllow, got)
+			}
+		})
 	}
 }
 
-// TestLoginClassDenyStrictReportsFirstNameNotFirstOffendingBlock pins the
-// strict gate's "report one, deterministically" CHOICE (#6838 review NIT).
+// THE RETIREMENT, asserted as behaviour rather than as an absence.
 //
-// The rule is first-appearance-of-NAME, and only a straddle shape can tell it
-// apart from the competing first-appearance-of-the-OFFENDING-BLOCK rule: `alpha`
-// is defined first but its deny leaf lands on a LATER block, while `beta` sits
-// between them carrying a deny leaf of its own. Name order reports `alpha`;
-// block order reports `beta`.
+// A config carrying deny-commands was REJECTED at commit before cut 6 and
+// commits now — and takes effect. This is the upgrade note in executable form.
 //
-// Neither rule is unsafe — both reject, and the message names the class and the
-// offending leaf, so neither saves the operator a search. It is pinned because
-// nothing else pins it: the choice is invisible until a config has two offending
-// classes, and it is the sort of thing a later refactor of
-// collectLoginClassDenyRejections would flip silently while changing an
-// operator-facing message.
-//
-// REVERT THAT REDS THIS: in validateLoginClassDenyStrict, report
-// rejections[len(rejections)-1] instead of rejections[0], or key the grouping on
-// the offending block rather than the name.
-func TestLoginClassDenyStrictReportsFirstNameNotFirstOffendingBlock(t *testing.T) {
-	src := `
-system {
-    login {
-        class alpha {
-            permissions [ view ];
-        }
-        class beta {
-            permissions [ view ];
-            deny-commands "request system zeroize";
-        }
-        class alpha {
-            permissions [ view ];
-            deny-configuration "security policies";
-        }
-    }
-}
-`
-	p := NewParser(src)
-	tree, errs := p.Parse()
-	if len(errs) > 0 {
-		t.Fatalf("parse: %v", errs)
+// The permissions arm is the half a reader is most likely to miss. The tolerant
+// path used to FOLD such a class to a repair floor, because an unenforceable
+// restriction had to be resolved in the restrictive direction somehow. With the
+// regexes enforced, folding would narrow the class a SECOND time on top of its
+// own regexes — so the fold went with the gate, and this pins that the
+// permission set arrives untouched on BOTH paths.
+func TestDenyClassCommitsAndIsNotFolded_7172(t *testing.T) {
+	lines := []string{
+		"set system login class limited permissions all",
+		`set system login class limited deny-commands "request system zeroize"`,
 	}
+	for _, tc := range []struct {
+		name    string
+		compile func(*ConfigTree) (*Config, error)
+	}{
+		{"strict", CompileConfig},
+		{"lenient", CompileConfigLenient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := tc.compile(buildLoginTree5831(t, lines))
+			if err != nil {
+				t.Fatalf("a deny-commands class must commit after the retirement: %v", err)
+			}
+			lc := cfg.System.Login.Classes[0]
+			if lc.DenyCommands != "request system zeroize" {
+				t.Errorf("the pattern must survive compilation verbatim, got %q", lc.DenyCommands)
+			}
+			if len(lc.DenyLeavesPresent) != 1 || lc.DenyLeavesPresent[0] != "deny-commands" {
+				t.Errorf("presence must still be recorded, got %v", lc.DenyLeavesPresent)
+			}
+			// COMPARATIVE, not a literal: assert the permission set is what the
+			// SAME class gets without the deny leaf. Pinning a literal here
+			// would encode today's mapping of `permissions all` and would go
+			// red for a reason that has nothing to do with folding.
+			base, err := tc.compile(buildLoginTree5831(t, lines[:1]))
+			if err != nil {
+				t.Fatalf("control compile: %v", err)
+			}
+			want := base.System.Login.Classes[0].MappedPermissions
+			if len(want) == 0 {
+				t.Fatal("the control class has no mapped permissions, so this comparison " +
+					"would hold for a class folded to nothing")
+			}
+			if len(lc.MappedPermissions) != len(want) {
+				t.Fatalf("the deny leaf changed the permission set: got %v, want %v (the "+
+					"same class without the leaf). The repair-floor fold was #5831's answer "+
+					"to an UNENFORCEABLE restriction; with the regexes enforced it would "+
+					"narrow the class twice.", lc.MappedPermissions, want)
+			}
+			for i := range want {
+				if lc.MappedPermissions[i] != want[i] {
+					t.Fatalf("the deny leaf changed the permission set: got %v, want %v",
+						lc.MappedPermissions, want)
+				}
+			}
+		})
+	}
+}
 
-	// Guard the guard: the straddle is the whole test. If the compiler ever
-	// merges the two `alpha` blocks, or the deny leaves stop being recorded,
-	// the two candidate rules stop disagreeing and this passes vacuously.
-	cfgL, err := CompileConfigLenient(tree)
+// THE CASE THAT JUSTIFIES AllowLeavesPresent, and the only one that separates
+// presence-detection from value-detection for the ALLOW leaf.
+//
+// Found by mutation: replacing `allowSet := containsLoginLeaf(...)` with
+// `allowSet := allow != ""` left the whole suite green. Every other cell in
+// this issue uses a NON-EMPTY allow pattern, where the two readings agree — so
+// the long comment on AllowLeavesPresent explaining why they differ had no
+// guard at all, which is a claim, not a check.
+//
+// They differ here, and in opposite directions:
+//
+//	allow-commands "";  deny-commands "";
+//
+//	presence: allowSet=true, denySet=true, and the two patterns are IDENTICAL —
+//	          precedence tier 1, where allow wins. Everything is ALLOWED.
+//	value:    allowSet=false (the value is ""), denySet=true. A deny-only class
+//	          whose empty POSIX regex matches every command. Everything is DENIED.
+//
+// Tier 1 is Juniper's, stated outright, so the presence reading is the parity
+// answer. It also happens to be the permissive one, which is why this needs a
+// test rather than an argument: a reviewer hardening the value reading would be
+// choosing "safer" over correct, and nothing would have contradicted them.
+func TestEmptyAllowBesideEmptyDenyIsTier1_7172(t *testing.T) {
+	cfg, err := CompileConfig(buildLoginTree5831(t, []string{
+		"set system login class edge permissions all",
+		`set system login class edge allow-commands ""`,
+		`set system login class edge deny-commands ""`,
+	}))
 	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
+		t.Fatalf("compile: %v", err)
 	}
-	if len(cfgL.System.Login.Classes) != 3 {
-		t.Fatalf("precondition: want alpha/beta/alpha as three blocks; classes=%+v",
-			cfgL.System.Login.Classes)
-	}
-	for i, want := range []struct {
-		name string
-		deny int
-	}{{"alpha", 0}, {"beta", 1}, {"alpha", 1}} {
-		lc := cfgL.System.Login.Classes[i]
-		if lc.Name != want.name || len(lc.DenyLeavesPresent) != want.deny {
-			t.Fatalf("precondition: block %d is %q with %d deny leaves, want %q with %d — "+
-				"the straddle (first NAME offends LATER than a middle class) is not configured",
-				i, lc.Name, len(lc.DenyLeavesPresent), want.name, want.deny)
-		}
+	lc := cfg.System.Login.Classes[0]
+	// PRECONDITION: both leaves must be recorded present. Without this the cell
+	// would pass for a config that carried neither, which is a third outcome
+	// entirely.
+	if len(lc.AllowLeavesPresent) != 1 || len(lc.DenyLeavesPresent) != 1 {
+		t.Fatalf("both leaves must be recorded PRESENT despite empty values; "+
+			"allow=%v deny=%v", lc.AllowLeavesPresent, lc.DenyLeavesPresent)
 	}
 
-	_, err = CompileConfig(tree)
-	if err == nil {
-		t.Fatal("strict commit ACCEPTED a config with two unenforceable deny classes")
+	rules, ok, err := OperationalLoginRegexesFor(cfg, "edge")
+	if err != nil || !ok {
+		t.Fatalf("the class must yield compiled rules (ok=%v err=%v)", ok, err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, `system login class "alpha": deny-configuration is NOT enforced`) {
-		t.Errorf("strict gate does not report the FIRST class NAME (`alpha`, whose offending "+
-			"block is the LAST one) — the reporting rule changed: %s", msg)
+	d := rules.Evaluate("request system reboot")
+	if !d.Allowed {
+		t.Errorf("identical patterns in both leaves is precedence TIER 1, where allow wins "+
+			"— Juniper states it outright. Denying here means the empty allow was read as "+
+			"ABSENT, which turns the config into a deny-everything class: %s", d.Reason)
 	}
-	if strings.Contains(msg, "beta") {
-		t.Errorf("strict gate reported `beta`, i.e. the first offending BLOCK rather than the "+
-			"first offending NAME: %s", msg)
+	if d.DecidedBy != LoginRegexAllow {
+		t.Errorf("tier 1 must be decided by ALLOW, got %v (%s)", d.DecidedBy, d.Reason)
+	}
+
+	// THE CONTROL that makes the cell mean something: the SAME empty deny with
+	// NO allow leaf denies everything. Without this arm, a gate that allowed
+	// everything unconditionally would also pass.
+	cfgDenyOnly, err := CompileConfig(buildLoginTree5831(t, []string{
+		"set system login class edge permissions all",
+		`set system login class edge deny-commands ""`,
+	}))
+	if err != nil {
+		t.Fatalf("compile deny-only: %v", err)
+	}
+	denyOnly, ok, err := OperationalLoginRegexesFor(cfgDenyOnly, "edge")
+	if err != nil || !ok {
+		t.Fatalf("deny-only class must yield rules (ok=%v err=%v)", ok, err)
+	}
+	if denyOnly.Evaluate("request system reboot").Allowed {
+		t.Error("an empty deny with no allow leaf matches every command and must deny — " +
+			"if this permits, the presence record is not reaching the matcher at all")
 	}
 }

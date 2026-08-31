@@ -14,8 +14,8 @@ package config
 // pkg/cli.loginRegexesFrom is now a one-line delegation to this, so the cut-3
 // tests keep exercising the same code they always did.
 
-// OperationalDenyRegexesFor compiles the operational command regexes in force
-// for class, and reports whether the class has any at all.
+// OperationalLoginRegexesFor compiles the ALLOW and DENY command regexes in
+// force for class, and reports whether the class has any at all.
 //
 // ok=false is the overwhelmingly common case — a class with no fine-grained
 // rules — and callers MUST skip evaluation entirely rather than evaluate an
@@ -23,35 +23,49 @@ package config
 // ruleset: #7172's fail-closed arms (an unresolvable command, an unmappable
 // RPC) apply ONLY to a class that configured regexes.
 //
-// DENY ONLY, deliberately, and this is not an oversight for a later reader to
-// "complete". `allow-commands` commits today and is documented as inert
-// (compiler_system.go files it under "Neutral not-enforced knobs"). An allow
-// regex is an ALLOWLIST, so enforcing it here would be a LOCKOUT on upgrade: a
-// live class carrying `allow-commands "show interfaces"` would abruptly lose
-// `show version`, `configure`, and everything else — a restriction its author
-// was explicitly told was inert. Allow enforcement lands in cut 6 alongside the
-// #6838 retirement, so both leaves go live in one step with one release note.
-func OperationalDenyRegexesFor(cfg *Config, class string) (CompiledLoginRegexes, bool, error) {
-	return loginDenyRegexesFor(cfg, class, LoginRegexPlainFamily, "deny-commands", func(lc *LoginClass) string {
-		return lc.DenyCommands
-	})
+// #7172 cut 6 added the ALLOW half. Cuts 3-5b were deny-only on purpose:
+// `allow-commands` committed as a documented no-op, and an allow regex is an
+// ALLOWLIST, so enforcing it mid-series would have silently narrowed live
+// classes on upgrade. It goes live here, with the #6838 gate's retirement and
+// one release note, so both leaves change state in the same step.
+func OperationalLoginRegexesFor(cfg *Config, class string) (CompiledLoginRegexes, bool, error) {
+	return loginRegexesFor(cfg, class, LoginRegexPlainFamily,
+		"allow-commands", "deny-commands",
+		func(lc *LoginClass) (string, string) { return lc.AllowCommands, lc.DenyCommands })
 }
 
-// loginDenyRegexesFor is the shared body: find the class, decide leaf PRESENCE,
-// compile.
+// ConfigurationLoginRegexesFor is the same for the `*-configuration` pair, used
+// by the config-mode gate (cut 4).
+func ConfigurationLoginRegexesFor(cfg *Config, class string) (CompiledLoginRegexes, bool, error) {
+	return loginRegexesFor(cfg, class, LoginRegexPlainFamily,
+		"allow-configuration", "deny-configuration",
+		func(lc *LoginClass) (string, string) { return lc.AllowConfiguration, lc.DenyConfiguration })
+}
+
+// loginRegexesFor is the shared body: find the class, decide leaf PRESENCE for
+// both leaves, compile.
 //
-// PRESENCE, NOT VALUE, for the deny leaf, and the two are opposite. Both
-// `deny-commands ""` and a valueless `deny-commands` flatten to the empty
-// string, and an empty POSIX regex matches EVERY command — so an empty deny
-// denies everything, the most restrictive thing an operator can write, while an
-// ABSENT deny denies nothing. Only DenyLeavesPresent separates them, which is
-// why #6838's classification table has to outlive #6838's gate.
-func loginDenyRegexesFor(
+// PRESENCE, NOT VALUE, FOR BOTH — and the reason differs per leaf, which is why
+// this reads two presence lists rather than testing the strings.
+//
+//   - DENY: `deny-commands ""` and an absent deny-commands mean OPPOSITE
+//     things. An empty POSIX regex matches at every position, so an empty deny
+//     denies EVERY command — the most restrictive thing an operator can write —
+//     while an absent one denies nothing.
+//   - ALLOW: an empty allow matches everything, so on its own it is
+//     indistinguishable from an absent allow, and testing the value LOOKS
+//     sufficient. It is not, and the case that breaks it is the one Juniper
+//     documents by name: with `allow-commands ""` beside `deny-commands ""` the
+//     two patterns are IDENTICAL, which is precedence tier 1, and allow wins —
+//     so the class is allowed everything. Read the empty allow as absent and
+//     the same config denies everything instead. Opposite answers, from a value
+//     test that looked safe.
+func loginRegexesFor(
 	cfg *Config,
 	class string,
 	family LoginRegexFamily,
-	leaf string,
-	pattern func(*LoginClass) string,
+	allowLeaf, denyLeaf string,
+	patterns func(*LoginClass) (allow, deny string),
 ) (CompiledLoginRegexes, bool, error) {
 	if cfg == nil || cfg.System.Login == nil || class == "" {
 		return CompiledLoginRegexes{}, false, nil
@@ -60,23 +74,28 @@ func loginDenyRegexesFor(
 		if lc == nil || lc.Name != class {
 			continue
 		}
-		denySet := false
-		for _, present := range lc.DenyLeavesPresent {
-			if present == leaf {
-				denySet = true
-				break
-			}
-		}
-		if !denySet {
+		allowSet := containsLoginLeaf(lc.AllowLeavesPresent, allowLeaf)
+		denySet := containsLoginLeaf(lc.DenyLeavesPresent, denyLeaf)
+		if !allowSet && !denySet {
 			return CompiledLoginRegexes{}, false, nil
 		}
-		compiled, err := CompileLoginRegexes(family, "", false, pattern(lc), true)
+		allow, deny := patterns(lc)
+		compiled, err := CompileLoginRegexes(family, allow, allowSet, deny, denySet)
 		if err != nil {
 			return CompiledLoginRegexes{}, false, err
 		}
 		return compiled, true, nil
 	}
 	return CompiledLoginRegexes{}, false, nil
+}
+
+func containsLoginLeaf(list []string, leaf string) bool {
+	for _, l := range list {
+		if l == leaf {
+			return true
+		}
+	}
+	return false
 }
 
 // DenySource returns the deny pattern as the operator AUTHORED it, and whether

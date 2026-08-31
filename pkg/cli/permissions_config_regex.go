@@ -167,39 +167,13 @@ func configAuditRoot(path string) string {
 	return fields[0]
 }
 
-// configRegexesFrom compiles the class's deny-configuration rule.
+// configRegexesFrom resolves the `*-configuration` allow/deny pair in force for
+// class.
 //
-// ALLOW IS NOT ENFORCED, identically to cut 3 and for the identical reason:
-// `allow-configuration` commits today as a documented no-op, an allow regex is
-// an allowlist, and enforcing it mid-series would silently narrow live classes
-// on upgrade. It lands in cut 6 with the gate's retirement.
+// #7172 cut 6 turned the ALLOW half on and moved the whole decision into
+// pkg/config, so this gate, the operational gate and the gRPC gate all read one
+// implementation. The deny-only scoping comment that used to live here is gone
+// with the scoping.
 func configRegexesFrom(cfg *config.Config, class string) (config.CompiledLoginRegexes, bool, error) {
-	if cfg == nil || cfg.System.Login == nil {
-		return config.CompiledLoginRegexes{}, false, nil
-	}
-	for _, lc := range cfg.System.Login.Classes {
-		if lc == nil || lc.Name != class {
-			continue
-		}
-		denySet := false
-		for _, leaf := range lc.DenyLeavesPresent {
-			if leaf == "deny-configuration" {
-				denySet = true
-				break
-			}
-		}
-		if !denySet {
-			return config.CompiledLoginRegexes{}, false, nil
-		}
-		compiled, err := config.CompileLoginRegexes(
-			config.LoginRegexPlainFamily,
-			"", false,
-			lc.DenyConfiguration, denySet,
-		)
-		if err != nil {
-			return config.CompiledLoginRegexes{}, false, err
-		}
-		return compiled, true, nil
-	}
-	return config.CompiledLoginRegexes{}, false, nil
+	return config.ConfigurationLoginRegexesFor(cfg, class)
 }
