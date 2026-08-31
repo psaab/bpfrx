@@ -287,15 +287,19 @@ func (s *Store) IsExclusiveLocked() bool {
 
 // ExitConfigure exits configuration mode, discarding the candidate.
 //
-// NOTE (#6808): this clears exclusiveHolder but deliberately leaves
-// configHolder set — an asymmetry with ExitConfigureSession/ForceExitConfigure
-// that predates this change and is tracked separately. It is not exploitable
-// today only because ensureHolderLocked short-circuits on !s.configDir, i.e.
-// its safety rests on that short-circuit rather than on the field being clean.
-// The holder-epoch bump below is what makes this path safe for #6808 WITHOUT
-// depending on that: leaving config mode advances the epoch, so a commit
-// authorized before it fails verification regardless of the stale configHolder
-// string an epoch keyed off configHolder alone would have trusted.
+// #7635: this clears BOTH holder fields, matching ExitConfigureSession,
+// ForceExitConfigure and reclaimStaleLockLocked. It previously cleared only
+// exclusiveHolder, leaving a stale configHolder behind; that was safe solely
+// because ensureHolderLocked short-circuits on !s.configDir and because every
+// in-tree caller pairs it with the unsessioned EnterConfigure (sessionID ""),
+// so the field was empty anyway. Neither is a property of this function, and
+// the public ConfigHolder() accessor reported the stale string to any caller
+// that did not first check the locked bool. Leaving config mode is a release,
+// so the release is now complete here as it is on the other three paths.
+//
+// The #6808 holder-epoch bump below is independent of that and stays: it is
+// what makes this path safe without depending on the field being clean, so a
+// commit authorized before the exit fails verification afterwards.
 func (s *Store) ExitConfigure() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -304,6 +308,7 @@ func (s *Store) ExitConfigure() {
 	s.configDir = false
 	s.dirty = false
 	s.exclusiveHolder = ""
+	s.configHolder = ""
 	// #6808: the config lock was released — advance the holder epoch.
 	s.holderEpoch++
 	s.editPath = nil
