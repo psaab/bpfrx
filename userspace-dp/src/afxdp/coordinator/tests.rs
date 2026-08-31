@@ -7956,3 +7956,109 @@ fn a_queued_deletesynced_leaves_the_release_to_the_worker_6979_f4() {
 }
 
 
+
+/// #8157: the bringup replay derives its set from the LIVE shared synced map,
+/// and applies the tunnel-remap filter THERE.
+///
+/// Before this, `teardown::tear_down` cloned `snapshot_shared_session_entries()`
+/// before `stop_inner(false)` and bringup replayed that clone. An entry landing
+/// in the shared map between the clone and the replay was therefore absent from
+/// the replay, never published to the new session map (`session_map_fd` is
+/// `None` for the whole reconcile) and never replayed — while
+/// `upsert_synced_session` still answered Go `Applied`. A split truth with no
+/// signal.
+///
+/// WHAT THIS CELL CAN AND CANNOT BIND. It cannot drive the interleaving. Today
+/// the snapshot-wide `ServerState` mutex excludes `sync_session` for the whole
+/// reconcile, and bypassing the server does not help either, because
+/// `reconcile` takes `&mut self` so safe Rust forbids a concurrent `&self`
+/// upsert. #7209 is what makes the window reachable. So this binds the two
+/// properties the fix rests on rather than the race:
+///
+///   A. an entry in the shared map is replayed — and with the
+///      `preserved_synced_sessions` parameter DELETED, the live map is the only
+///      set the replay can read, so the compiler carries half of this;
+///   B. an entry whose tunnel the new snapshot purged is STILL filtered out.
+///
+/// B is the one that earns the cell. The filter used to run in `apply_snapshot`
+/// against the captured `Vec`; moving the read without moving the filter would
+/// resurrect purged sessions — including "half-dead pairs", since the predicate
+/// also drops a purged forward entry's derived reverse companion. Delete the
+/// `filter_replayed_synced_sessions` call at the new site and this reds.
+#[test]
+fn bringup_replay_reads_the_live_map_and_still_filters_purged_tunnels_8157() {
+    use std::collections::BTreeMap;
+
+    const PURGED_TUNNEL: u16 = 7;
+
+    let mut coordinator = Coordinator::new();
+
+    // Survivor: tunnel_endpoint_id 0, so no purge id can match it.
+    let survivor_key = f4_key();
+    f4_seed_shared_only(
+        &coordinator,
+        &survivor_key,
+        crate::nat::TranslatedTuple {
+            ip: "203.0.113.1".parse().unwrap(),
+            port: 40000,
+        },
+    );
+
+    // Purged: a DISTINCT key (or it replaces the survivor and the two legs
+    // collapse into one) carrying the tunnel the new snapshot remapped.
+    let mut purged_key = f4_key();
+    purged_key.src_port = survivor_key.src_port.wrapping_add(1);
+    f4_seed_shared_only(
+        &coordinator,
+        &purged_key,
+        crate::nat::TranslatedTuple {
+            ip: "203.0.113.1".parse().unwrap(),
+            port: 40001,
+        },
+    );
+    {
+        let mut shared = crate::afxdp::lock_shared_recover(&coordinator.sessions.synced);
+        let entry = shared
+            .get_mut(&purged_key)
+            .expect("the purged fixture entry is in shared authority");
+        entry.decision.resolution.tunnel_endpoint_id = PURGED_TUNNEL;
+    }
+
+    assert_eq!(
+        coordinator.snapshot_shared_session_entries().len(),
+        2,
+        "fixture broken: both entries must be in the LIVE shared map, or leg A \
+         proves nothing about reading it and leg B has nothing to filter"
+    );
+
+    // One worker, so the replay builds exactly one command queue to observe.
+    let workers: BTreeMap<u32, Vec<crate::afxdp::BindingPlan>> =
+        BTreeMap::from([(0u32, Vec::new())]);
+
+    // fd -1 makes the kernel publish fail — that is the #1789 counter's
+    // business; `replicate_session_upsert` still enqueues, which is what this
+    // cell reads.
+    let queues = super::reconcile::bringup::replay_preserved_sessions(
+        &mut coordinator,
+        &workers,
+        &[PURGED_TUNNEL],
+        -1,
+    );
+
+    let queued = queues
+        .get(&0)
+        .expect("one worker queue")
+        .lock()
+        .expect("queue lock")
+        .len();
+
+    assert_eq!(
+        queued, 1,
+        "the bringup replay enqueued {queued} commands, want exactly 1. TWO means \
+         the tunnel-remap filter did not run at the replay site, so a session \
+         whose tunnel the new snapshot purged is resurrected (and a forward \
+         entry drags its derived reverse companion with it — a half-dead pair). \
+         ZERO means the replay read nothing from the live shared map, which is \
+         the window #8157 closes and #7209 makes reachable."
+    );
+}

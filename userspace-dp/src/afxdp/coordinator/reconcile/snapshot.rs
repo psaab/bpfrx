@@ -541,10 +541,9 @@ pub(super) fn apply_snapshot(
     preserved_slow_path: Option<Arc<SlowPathReinjector>>,
     prior_tunnel_owners: &[(u16, String)],
     snapshot_was_installed: bool,
-    preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
     fds: ReconcileSnapshotFds,
     mtu_programmer: impl FnOnce(&str, i32) -> Result<(), String>,
-) -> Option<ReconcileSnapshotFds> {
+) -> Option<(ReconcileSnapshotFds, Vec<u16>)> {
     // #2484: the forwarding state was already built in the pre-teardown
     // preflight (`build_reconcile_forwarding`) and stashed on
     // `fds.forwarding`. REUSE it here rather than rebuilding — build-once,
@@ -609,12 +608,21 @@ pub(super) fn apply_snapshot(
         snapshot_was_installed,
     );
     coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
-    // The bringup phase replays `preserved_synced_sessions` (captured
-    // BEFORE this purge) into the shared maps — filter the purged ids
-    // AND their derived reverse companions out so the replay cannot
-    // resurrect them, whole or as half-dead pairs (code r3; companion
+    // #8157: the purge ids travel to the BRINGUP replay instead of being
+    // applied to a Vec here. The replay now derives its entries from the live
+    // shared map at replay time (see `replay_preserved_sessions`), so the
+    // filter has to run there, against that set, using this same predicate —
+    // the purged ids AND their derived reverse companions, so the replay
+    // cannot resurrect them whole or as half-dead pairs (code r3; companion
     // semantics per AGY code r4).
-    super::super::filter_replayed_synced_sessions(preserved_synced_sessions, &tunnel_purge_ids);
+    //
+    // The purge above has already removed them from the live map, so for every
+    // entry that existed before it the filter is redundant. It is retained for
+    // the one case it still covers: an entry for a purged tunnel that lands in
+    // the shared map AFTER this line. That cannot happen today (the
+    // snapshot-wide ServerState mutex excludes sync_session for the whole
+    // reconcile) and is exactly what #7209 makes reachable, which is why the
+    // filter must move rather than be dropped as dead.
     coord.forwarding = new_forwarding;
     // #6592: ONE worker-visible store carrying both halves. `coord.validation`
     // was assigned at the head of this function and `coord.forwarding` is the
@@ -667,7 +675,7 @@ pub(super) fn apply_snapshot(
     // here bring-up is guaranteed possible, so the publish above is
     // never stranded behind an FD-open failure. Hand the secured FDs to
     // the bring-up phase.
-    Some(fds)
+    Some((fds, tunnel_purge_ids))
 }
 
 #[cfg(test)]
@@ -872,7 +880,6 @@ mod slow_path_mtu_tests {
             Some(preserved.clone()),
             &[],
             true,
-            &mut Vec::new(),
             fds,
             // Injected succeeding SIOCSIFMTU seam (a real ioctl is privilege-gated
             // and non-deterministic under `cargo test`).
