@@ -314,8 +314,21 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			avail = fmt.Sprintf("%d", a)
 			util = fmt.Sprintf("%.1f%%", float64(p.used)/float64(p.total)*100)
 		}
-		fmt.Printf("%-20s %-20s %-8s %-8d %-12s %-12s\n",
-			p.name, p.address, ports, p.used, avail, util)
+		// #7473: the USED column was the one number in this row that ignored
+		// `poolDisarm`. Ports/Available/Utilization already render N/A for a
+		// refused pool (they are gated on the reportable capacity, which is 0),
+		// so the row printed "N/A  0  N/A  N/A" above its own NOT INSTALLED
+		// line — the single measured-looking figure being the one nobody
+		// measured. `compiler_nat.go` assigns a PoolID without consulting any
+		// disarm predicate, so the counter read behind `p.used` succeeds for a
+		// pool the builder refused and returns 0. Gated on the SAME
+		// `poolDisarm` the annotation below renders.
+		used := "N/A"
+		if poolDisarm == "" {
+			used = fmt.Sprintf("%d", p.used)
+		}
+		fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
+			p.name, p.address, ports, used, avail, util)
 		if poolDisarm != "" {
 			fmt.Println(natNotInstalledLine(poolDisarm, true))
 		}
@@ -381,7 +394,16 @@ func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
 			fmt.Printf("  Unusable: %s\n", config.SourceNATDisarmReasonText(unusable))
 		}
 
-		if cr != nil {
+		// #7473: the `Unusable:` line above and these counters were reached
+		// independently, so a disarmed pool printed both — a reason it is not
+		// installed, and then "Ports allocated: 0 / Ports available: 0" as
+		// though the number had been observed. `compiler_nat.go` assigns a
+		// PoolID without consulting any disarm predicate, so the lookup below
+		// succeeds for a refused pool and the counter reads 0. Same shared
+		// The gate is `unusable`, the SAME value the line above renders --
+		// not a second call to the predicate, which would be a second chance
+		// to disagree with it.
+		if cr != nil && unusable == "" {
 			if id, ok := cr.PoolIDs[name]; ok {
 				cnt, err := c.dp.ReadNATPortCounter(uint32(id))
 				if err == nil {

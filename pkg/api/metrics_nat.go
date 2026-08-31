@@ -33,12 +33,25 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		ports, _ := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, overBudget)
+		ports, unusable := config.SourceNATPoolReportablePorts(pool, name, portLow, portHigh, overBudget)
 		totalPorts := int(ports)
 		ch <- prometheus.MustNewConstMetric(c.natPoolTotalPorts, prometheus.GaugeValue,
 			float64(totalPorts), name)
 
-		if id, ok := cr.PoolIDs[name]; ok {
+		// #7473: a disarmed pool still HAS a PoolID — `compiler_nat.go` assigns
+		// them without consulting any disarm predicate — so this lookup
+		// succeeds and the counter reads 0. Publishing that as
+		// `xpf_nat_pool_used_ports` is the same fake zero the #5046 comment
+		// below refuses for a read failure, reached a different way: a missing
+		// series says "not installed", a 0 says "measured, and nothing is
+		// used", and monitoring cannot tell the second from health. Unlike the
+		// two CLI twins of this bug there is no adjacent annotation here — the
+		// sample is all a scrape sees — so omission is the only honest form.
+		//
+		// The reason was already computed for the capacity gauge above and
+		// DISCARDED into `_`. Binding it is the whole fix: one verdict, both
+		// samples, no second call that could disagree with the first.
+		if id, ok := cr.PoolIDs[name]; ok && unusable == "" {
 			cnt, err := dp.ReadNATPortCounter(uint32(id))
 			if err != nil {
 				// #5046: a port-counter read failure must not silently emit a
