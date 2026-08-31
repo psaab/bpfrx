@@ -42,16 +42,47 @@ func eventFor(name string) rpm.Event {
 }
 
 // waitFor polls fn until it returns true or the deadline elapses.
+// waitForTimeout bounds a FAILURE; it is not a performance budget.
+//
+// #7931: at 3s this helper timed out under parallel suite load, and the
+// timeout was not a scheduling hiccup. The conditions it waits on are driven by
+// real config COMMITS -- atomic DB persistence plus a JSONL audit journal, i.e.
+// file I/O -- serialized through the event engine's single worker.
+// `TestQueue_ConcurrentProbesSerialize` waits for EIGHT of them, so 3s is about
+// 375ms per commit: comfortable on an idle box, not on one running ten-plus
+// concurrent gates. The work genuinely takes longer; the condition is not
+// failing to happen.
+//
+// Raising it is close to free on the passing path, which is the reason this is
+// a shared change rather than a per-test override. When the condition holds,
+// `fn()` returns true on an early poll and the deadline is never reached, so no
+// passing test gets slower. The cost is paid only by a test that was going to
+// fail anyway, which then takes longer to say so -- and a slower true failure is
+// a better trade than a false one, because a false failure sends someone
+// chasing a defect that is not there.
+//
+// The 16 call sites all wait on the same class of condition (engine statistics
+// advancing after real commits), so a single bound is right; a per-site
+// deadline would be 16 independent bets on the same scheduler.
+const waitForTimeout = 30 * time.Second
+
 func waitFor(t *testing.T, what string, fn func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	start := time.Now()
+	deadline := start.Add(waitForTimeout)
+	polls := 0
 	for time.Now().Before(deadline) {
+		polls++
 		if fn() {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
+	// #7931: report elapsed and poll count. A timeout that polled thousands of
+	// times over the full window is a condition that never became true; one
+	// that polled a handful of times spent the window descheduled, which is a
+	// different diagnosis and points at the box rather than the code.
+	t.Fatalf("timed out waiting for %s after %v (%d polls)", what, time.Since(start), polls)
 }
 
 // #2139: a change-configuration action with two valid commands and one invalid
