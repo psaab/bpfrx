@@ -8659,3 +8659,275 @@ fn rename_onto_a_new_pool_name_carries_live_reservations_6979() {
          live translation must still be carried, or it is freed while its session lives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #6979 F1 half 1 — occupancy-dependent selection made a synced import land in
+// the WRONG allocator, and the wrongness only detonated at failover.
+//
+// PASS 1 reserves on a rule the ACTIVE could have matched. When that rule's
+// allocator REFUSED (a local flow already holds the identity), the old code
+// fell through to PASS 2, which takes the first rule whose pool merely
+// CONTAINS the translated address — so an overlapping sibling accepted and the
+// session was published with its reservation in an allocator the active never
+// used.
+//
+// Measured at the parent, two rules whose pools both own 203.0.113.10, with a
+// local squatter on 203.0.113.10:20000 in rule A's allocator:
+//
+//   step1  accepted=true   A.used=1 (squatter)  B.used=1 (F)
+//   step2  squatter retires  A.used=0           B.used=1
+//   step3  new A-flow granted the SAME tuple F holds in B: true
+//
+// A never learned about F, so once the squatter retired it re-issued the
+// identity F was still live on. A refused import publishes nothing; a
+// wrong-allocator reservation is silent until failover.
+// ---------------------------------------------------------------------------
+
+fn f1_overlapping_rules() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-a".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-a".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-b".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-b".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+fn f1_tuple() -> TranslatedTuple {
+    TranslatedTuple {
+        ip: "203.0.113.10".parse().unwrap(),
+        port: 20000,
+    }
+}
+
+fn f1_import(rules: &[SourceNatRule]) -> bool {
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        rules,
+        &key,
+        NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().unwrap()),
+            rewrite_src_port: Some(20000),
+            ..NatDecision::default()
+        },
+        false,
+        Some(("lan", "wan")),
+        0,
+    )
+}
+
+/// THE BINDING, and a fail-on-revert for the whole ruling.
+///
+/// RED AT THE PARENT on both assertions: the import is ACCEPTED and pool B
+/// records the reservation the active booked in pool A.
+#[test]
+fn a_pass1_refusal_does_not_fall_through_to_a_sibling_allocator_6979_f1() {
+    let rules = f1_overlapping_rules();
+
+    // A local flow already holds the identity in rule A's allocator — the
+    // transient collision that makes PASS 1 refuse.
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(
+        rules[0].pool_allocator.reserve_flow(
+            squatter,
+            f1_tuple(),
+            0,
+            false,
+            0,
+            NatHolder::Untracked,
+        ),
+        "fixture: rule A must hold the identity first, or PASS 1 never refuses \
+         and this cell tests the ordinary accept path"
+    );
+
+    assert!(
+        !f1_import(&rules),
+        "the import was ACCEPTED after PASS 1 refused. PASS 1 could see which rule \
+         the active matched and that rule's allocator declined; falling through let \
+         PASS 2 book the reservation in an overlapping sibling instead. The session \
+         is then published with a translation this node records in the wrong \
+         allocator, and rule A re-issues the identity the moment its squatter \
+         retires (#6979 F1)"
+    );
+
+    let statuses = source_nat_pool_statuses(&rules);
+    assert_eq!(
+        statuses[1].used_ports, 0,
+        "pool B booked a reservation for a flow the ACTIVE translated under pool A. \
+         That is the latent half: nothing is wrong until failover, when A hands the \
+         same (address, port) to a new flow because it never learned about this one"
+    );
+    assert_eq!(
+        statuses[0].used_ports, 1,
+        "and pool A must still hold ONLY its own squatter — the refusal must not \
+         disturb the live allocation that caused it"
+    );
+}
+
+/// THE FALL-THROUGH CONTROL, and the reason the fix is a two-way distinction
+/// rather than a short-circuit.
+///
+/// `NothingToReserve` — no rule the standby can confirm as a match owns the
+/// translated address — is NOT a refusal. It is the shape interface-mode SNAT
+/// always produces, and what genuine config drift looks like. It must still
+/// fall through to PASS 2.
+///
+/// Fires on: returning `false` for `NothingToReserve` as well. That mutation
+/// passes the binding cell above and every other #6979 cell, and silently stops
+/// interface-mode synced sessions from reserving anything.
+#[test]
+fn a_pass1_nothing_to_reserve_still_falls_through_6979_f1() {
+    // Both rules match the zone pair, and NEITHER pool owns the translated
+    // address the active used — the interface-mode shape.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-a".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pool-a".to_string(),
+        pool_addresses: vec!["198.51.100.7/32".to_string()],
+        port_low: 20000,
+        port_high: 20099,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    assert!(
+        f1_import(&rules),
+        "a PASS 1 `NothingToReserve` was treated as a refusal. No rule's pool owns \
+         203.0.113.10, which is exactly what interface-mode SNAT and genuine config \
+         drift look like — it must fall through to PASS 2 and the interface domain, \
+         or every interface-mode synced session stops reserving (#7581, #6751)"
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[0].used_ports,
+        0,
+        "and the pool that owns a DIFFERENT address must book nothing"
+    );
+}
+
+/// The refusal must be REACHABLE BY THE OPERATOR, not merely correct.
+///
+/// The ruling trades a reservation for a refusal, and that trade is only the
+/// better half because the refusal is observable. `may_publish` is what the
+/// coordinator turns into `SyncedImportOutcome::RejectedReserve` and the
+/// `import_reserve_refused` bump, so this pins the value the counter path
+/// keys on. Without it the reasoning behind the whole change rests on an
+/// increment nobody checked.
+#[test]
+fn a_refused_pass1_import_reports_do_not_publish_6979_f1() {
+    let rules = f1_overlapping_rules();
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(rules[0].pool_allocator.reserve_flow(
+        squatter,
+        f1_tuple(),
+        0,
+        false,
+        0,
+        NatHolder::Untracked
+    ));
+
+    assert!(
+        !f1_import(&rules),
+        "the reserve must report DO-NOT-PUBLISH — that false is the sole input to \
+         the coordinator's RejectedReserve arm and its import_reserve_refused bump"
+    );
+}
+
+/// PASS 2's first-acceptor fall-through is a CLAIM, so it gets a cell.
+///
+/// The fix leaves PASS 2 byte-identical on purpose: it is the un-narrowed
+/// pre-#6211 fallback reached when the zone pair cannot be resolved or the
+/// nodes' config has drifted, where "the first rule whose pool contains the
+/// address" is the only question that can be asked. Making it strict too would
+/// refuse imports on a standby that simply cannot resolve zones — an HA node's
+/// entire first sync, before any snapshot is applied.
+///
+/// MEASURED GAP, which is why this exists: mutating PASS 2 to stop at the first
+/// pool owner escaped the whole suite — 5125 collected, zero red. The claim in
+/// the code comment was unbound, so a later change could have made PASS 2
+/// strict and nothing would have said so.
+///
+/// Fires on: passing `true` for `stop_at_first_owner` at the PASS 2 call site.
+#[test]
+fn pass2_still_falls_through_a_refusing_owner_6979_f1() {
+    let rules = f1_overlapping_rules();
+
+    // Rule A holds the identity; rule B's pool owns the same address, free.
+    let squatter = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.99".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40099,
+        dst_port: 443,
+    };
+    assert!(rules[0].pool_allocator.reserve_flow(
+        squatter,
+        f1_tuple(),
+        0,
+        false,
+        0,
+        NatHolder::Untracked
+    ));
+
+    // NO zone pair — the standby cannot resolve zones, so PASS 1 is skipped
+    // entirely and PASS 2 answers alone. That is an HA node's first sync.
+    let key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let accepted = reserve_synced_source_nat_allocation_untracked(
+        &InterfaceNatAllocators::default(),
+        &rules,
+        &key,
+        NatDecision {
+            rewrite_src: Some("203.0.113.10".parse().unwrap()),
+            rewrite_src_port: Some(20000),
+            ..NatDecision::default()
+        },
+        false,
+        None,
+        0,
+    );
+
+    assert!(
+        accepted,
+        "PASS 2 refused an import it used to accept. With no resolvable zone pair \
+         there is no way to reproduce the ACTIVE's rule choice, so the only \
+         available question is which rule's pool contains the address — and \
+         refusing there would reject every import on a standby that has not yet \
+         applied a snapshot (#6979 F1 keeps PASS 2 byte-identical on purpose)"
+    );
+    assert_eq!(
+        source_nat_pool_statuses(&rules)[1].used_ports,
+        1,
+        "and the fall-through must have booked the reservation in the sibling that \
+         accepted — that IS the pre-#6211 behaviour being preserved"
+    );
+}
