@@ -62,18 +62,19 @@ var declaredUnsanitizedForks = []forkExemption{
 		"generic swanctl runner; its SA-listing caller sanitizes at ingest " +
 			"(sanitizeSAStatus) and its error path escapes the captured output"},
 
-	// ---- STREAMING sites: cannot be guarded without a shape change ----
-	{"../cli", "monitor_traffic.go", "handleMonitorTraffic",
-		"tcpdump wires cmd.Stdout straight to os.Stdout so there is no string " +
-			"to sanitize, and it is unbounded+interactive so buffering would " +
-			"break Ctrl-C and streaming. This is the MOST attacker-controlled " +
-			"surface in the class — tcpdump renders packet bytes as ASCII. " +
-			"Needs a line-wise sanitizing writer; tracked separately"},
-	{"../cli", "cli_request_ping.go", "handlePing",
-		"streams to os.Stdout; same shape change as tcpdump. Tracked separately"},
-	{"../cli", "cli_request_ping.go", "handleTraceroute",
-		"streams to os.Stdout AND resolves PTR records by default, so the bytes " +
-			"come from DNS an attacker may control. Tracked separately"},
+	// ---- STREAMING sites ----
+	//
+	// #7389: the three LOCAL CLI streaming sites are no longer exempt.
+	// termsafe.NewSanitizingWriter is the shape change #6584 said was needed:
+	// a line-wise io.Writer interposed between the command and the terminal,
+	// which preserves the streaming UX (Ctrl-C, incremental output) that made
+	// buffered capture unacceptable for tcpdump. handleMonitorTraffic,
+	// handlePing and handleTraceroute all use it now, so their entries are
+	// deleted rather than reworded — an allowlist entry is a claim, and this
+	// census checks its entries for staleness in BOTH directions.
+	//
+	// The gRPC twin below is a DIFFERENT shape (per-line protobuf sends, not
+	// an io.Writer) and stays exempt.
 	{"../grpcapi", "server_diag_ping.go", "streamDiagCmd",
 		"the gRPC ping/traceroute streamer — per-line sends, same shape change " +
 			"as the local CLI twins above. Tracked separately"},
@@ -217,7 +218,25 @@ func TestEveryCommandOutputDisplaySiteIsSanitizedOrDeclared6584(t *testing.T) {
 				// an empty body both counts are 0, and `0 >= 0` would have
 				// waved every package-scope fork through silently. The control
 				// run caught exactly that.
-				if haveBody && strings.Count(body, "termsafe.") >= strings.Count(body, callee+"(") {
+				//
+				// #7389: `wireSanitizedOutput(` counts as a sanitize. It is the
+				// named in-package wrapper that points a command's stdout AND
+				// stderr at termsafe.SanitizingWriter, for the streaming sites
+				// that wire an io.Writer instead of capturing a string.
+				//
+				// It has to be recognised HERE rather than left to the
+				// allowlist, because the alternative measured worse. With the
+				// two streams wired inline and separately, reverting only
+				// `cmd.Stdout` left the function still mentioning "termsafe."
+				// via `cmd.Stderr`, the relative count still passed, and the
+				// mutation ESCAPED. Routing both through one call makes the
+				// partial revert inexpressible — but then the body no longer
+				// says "termsafe." at all, so the count must know the wrapper's
+				// name. Deleting the call still reds, which is the property
+				// that matters.
+				sanitizes := strings.Count(body, "termsafe.") +
+					strings.Count(body, "wireSanitizedOutput(")
+				if haveBody && sanitizes >= strings.Count(body, callee+"(") {
 					return true
 				}
 				key := dir + "\x00" + name + "\x00" + fnName

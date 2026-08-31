@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -56,8 +55,10 @@ func (c *CLI) handlePing(args []string) error {
 	}()
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// #7389: sanitize this command's output before it reaches the
+	// terminal. See wireSanitizedOutput for why both streams go through one
+	// call.
+	defer wireSanitizedOutput(cmd)()
 	err := cmd.Run()
 	if ctx.Err() != nil {
 		return nil // cancelled by Ctrl-C or timeout
@@ -147,8 +148,10 @@ func (c *CLI) handleTraceroute(args []string) error {
 	}()
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// #7389: sanitize this command's output before it reaches the
+	// terminal. See wireSanitizedOutput for why both streams go through one
+	// call.
+	defer wireSanitizedOutput(cmd)()
 	err := cmd.Run()
 	if ctx.Err() != nil {
 		return nil // cancelled by Ctrl-C or timeout
