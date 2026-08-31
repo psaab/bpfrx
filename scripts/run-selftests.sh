@@ -189,7 +189,7 @@ run_shell scripts/dist/selftest.sh
 # refusal cell is the one that matters -- a runner that gates in one language
 # scores every cross-language mutation as an ESCAPE, which is a claim that the
 # code is untested.
-run_shell scripts/mutate-selftest.sh
+run_bash scripts/mutate-selftest.sh
 # AF_XDP reproducer strict-warning build — fail-on-revert gate for #4906
 # (HC-081 uninitialized-counter false PASS). SKIPs on a host without a C
 # toolchain / libbpf-dev / libxdp-dev / xxd.
@@ -241,6 +241,42 @@ run_bash test/incus/host-inbound-selftest.sh
 run_bash test/incus/iperf-throughput-selftest.sh
 run_bash test/incus/target-services-selftest.sh
 run_bash test/incus/with-cluster-selftest.sh
+
+# -- interpreter census (#8153) --
+#
+# run_shell forces `sh` regardless of the script's shebang. That is correct for
+# the POSIX legs, and it is a SYNTAX ERROR for a bash script: dash reports
+# "Bad substitution" on ${BASH_SOURCE[0]} and the leg fails for a reason that
+# has nothing to do with what it tests.
+#
+# scripts/mutate-selftest.sh was registered with run_shell and had been failing
+# that way on every `make selftest`. The doc comment on run_shell above already
+# describes this failure by name and run_bash already exists for it, so the
+# contract was written down and the registration did not follow it.
+#
+# The #7296 census below cannot catch this. It globs test/incus/*-selftest.sh,
+# and this script lives in scripts/ -- but even inside that glob it asks a
+# different question. "Is every self-test INVOKED" and "is every self-test
+# invoked with the interpreter it DECLARES" are different properties: a script
+# can be listed, be invoked, and execute none of what it tests.
+interp_mismatch=""
+interp_seen=0
+for reg in $(sed 's/#.*//' scripts/run-selftests.sh | sed -n 's/^run_shell \([^ ]*\).*/\1/p'); do
+	[ -f "$reg" ] || continue
+	interp_seen=$((interp_seen + 1))
+	case $(head -1 "$reg") in
+	*bash*) interp_mismatch="$interp_mismatch $reg" ;;
+	esac
+done
+if [ "$interp_seen" -eq 0 ]; then
+	# Matching no run_shell registrations would report a clean census over an
+	# empty set -- the swept-nothing pass #7296 guards against.
+	faill "interpreter census (matched NO run_shell registrations -- the sed is wrong)"
+elif [ -n "$interp_mismatch" ]; then
+	faill "interpreter census (bash-shebang scripts registered with run_shell, which forces sh:$interp_mismatch)"
+else
+	passl "interpreter census ($interp_seen run_shell legs, none declaring bash)"
+fi
 
 # -- self-test census (#7296) --
 #
