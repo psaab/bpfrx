@@ -29,8 +29,22 @@ mkdir -p "$WORK"
 # list is REFUSED rather than scored -- the property the whole design exists for.
 CONFIGURED_GATES="${MUTATE_GATES:-go rust}"
 
-gate_go() { (cd "$REPO" && make test-go) 2>&1; }
-gate_rust() { (cd "$REPO" && make test-rust) 2>&1; }
+# Per-cell wall-clock budget. A HANG is the one void shape that leaves no trace
+# in the log AND consumes the budget of every LATER cell -- one contract change
+# can be recorded as a screen full of escapes nobody earned (#7611). Bounding
+# each cell converts that into a single reportable VOID.
+#
+# `timeout` rather than trusting go's own -timeout: go's fires per PACKAGE and
+# prints the goroutine dump that names the stuck test (which is why the log-side
+# detector exists and is the better signal), but nothing bounds a `make` recipe
+# that blocks before go starts, and `cargo test` has no default timeout at all.
+# This is the outer bound; go's is the informative one.
+#
+# --kill-after because a process ignoring SIGTERM would otherwise still hang.
+MUTATE_CELL_TIMEOUT="${MUTATE_CELL_TIMEOUT:-2400}"
+
+gate_go() { (cd "$REPO" && timeout --kill-after=30s "$MUTATE_CELL_TIMEOUT" make test-go) 2>&1; }
+gate_rust() { (cd "$REPO" && timeout --kill-after=30s "$MUTATE_CELL_TIMEOUT" make test-rust) 2>&1; }
 
 printf 'cell\tfile\tlang\tapplied\tbuilt\tcollected\tfailed\tverdict\n' > "$OUT"
 
@@ -76,12 +90,20 @@ PY
 	git -C "$REPO" diff --quiet -- "$file" && applied=no
 
 	log="$WORK/cell-$label.log"
+	# TIMED OUT: `timeout` exits 124 when it fired. That is the ONLY evidence an
+	# externally killed run leaves -- the log just stops -- so it has to be read
+	# here and passed to the scorer, which cannot see it.
+	ext_timedout=no
 	case "$lang" in
 	go) gate_go > "$log" ;;
 	rust) gate_rust > "$log" ;;
 	esac
+	# 124 is `timeout`'s "I fired". Read plainly rather than folded into the
+	# invocation with `||`: this line decides whether a whole cell is scoreable,
+	# and a clever one-liner is the wrong place to be subtly wrong.
+	[ $? -eq 124 ] && ext_timedout=yes
 
-	read -r built collected failed verdict < <(mutation_score_log "$lang" "$log" "$applied")
+	read -r built collected failed verdict < <(mutation_score_log "$lang" "$log" "$applied" "$ext_timedout")
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 		"$label" "$file" "$lang" "$applied" "$built" "$collected" "$failed" "$verdict" >> "$OUT"
 	echo "[$label] $verdict (collected=$collected failed=$failed log=$log)"
