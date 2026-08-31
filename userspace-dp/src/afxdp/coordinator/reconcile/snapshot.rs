@@ -699,7 +699,7 @@ mod slow_path_mtu_tests {
         // path uses the injected programmer and asserts on mtu()/live_mtu,
         // which are set synchronously and read lock-free.
         let reinjector =
-            SlowPathReinjector::new("xpf-usp-wire0", 1500).expect("construct reinjector");
+            SlowPathReinjector::new_without_worker(1500);
         assert_eq!(reinjector.mtu(), 1500, "reinjector starts at the 1500 ceiling");
 
         let mut last_acted = 0i32;
@@ -745,7 +745,7 @@ mod slow_path_mtu_tests {
     #[test]
     fn startup_degraded_tun_self_heals_on_reconcile() {
         let reinjector =
-            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 9000).expect("construct reinjector");
+            SlowPathReinjector::new_without_worker(9000);
         // Reproduce the startup-SIOCSIFMTU-failure divergence deterministically:
         // mtu() records the creation-desired 9000, but the live TUN fell back to
         // 1500 and the path is degraded. (A real worker only reaches this via a
@@ -786,7 +786,7 @@ mod slow_path_mtu_tests {
     #[test]
     fn persistently_degraded_tun_is_deduped_no_ioctl_storm() {
         let reinjector =
-            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 9000).expect("construct reinjector");
+            SlowPathReinjector::new_without_worker(9000);
         reinjector.force_mtu_state_for_test(9000, 1500, true);
 
         let mut last_acted = 0i32;
@@ -833,7 +833,7 @@ mod slow_path_mtu_tests {
         // real device and race the assertions; its live_mtu stays at the 1500
         // default until reconcile moves it.
         let preserved = Arc::new(
-            SlowPathReinjector::new(OVERSIZE_TUN_NAME, 1500).expect("construct reinjector"),
+            SlowPathReinjector::new_without_worker(1500),
         );
         assert_eq!(preserved.mtu(), 1500, "preserved reinjector starts at 1500");
 

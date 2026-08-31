@@ -104,7 +104,7 @@ fn apply_mtu_status_clean_on_success() {
 /// jumbo frame would be Accepted; this asserts MtuExceeded + the counters.
 #[test]
 fn enqueue_refuses_frame_above_live_mtu() {
-    let reinjector = SlowPathReinjector::new("xpf-usp-test0", 9000).expect("spawn reinjector");
+    let reinjector = SlowPathReinjector::new_without_worker(9000);
     // Simulate a degraded TUN: the worker programmed (or failed to) and the
     // live MTU is the 1500 default. Force that state directly.
     reinjector
@@ -197,7 +197,7 @@ fn reprogram_mtu_status_keeps_live_on_failure() {
 #[test]
 fn reconcile_mtu_reprograms_live_tun_and_admission() {
     let reinjector =
-        SlowPathReinjector::new("xpf-usp-recon0", 1500).expect("construct reinjector");
+        SlowPathReinjector::new_without_worker(1500);
     // Force the deterministic 1500 startup state (the worker may not have run,
     // and without CAP_NET_ADMIN its TUN open fails — irrelevant to the MTU
     // admission gate, which is driven entirely by status.live_mtu).
@@ -239,6 +239,46 @@ fn reconcile_mtu_reprograms_live_tun_and_admission() {
     assert!(
         !matches!(after, Ok(EnqueueOutcome::MtuExceeded)),
         "after reconcile to 9000 the 8000-byte frame must not be MTU-refused"
+    );
+}
+
+/// #7820: a worker that cannot open its TUN must make `new` return `Err` with
+/// the CAUSE, not `Ok` wrapping a reinjector whose worker has already exited.
+///
+/// Before the startup handshake, `new` returned `Ok` the instant the thread was
+/// spawned. The worker then failed `open_tun`, recorded the reason, cleared
+/// `active` and returned — so the caller held a reinjector backed by a dropped
+/// receiver, every enqueue reported the downstream symptom "slow-path worker is
+/// not running", and the real reason was unreachable in `last_error`. The one
+/// production caller (`reconcile/snapshot.rs`) has an `Err` arm that publishes
+/// the cause into `last_slow_path_status`; this is what makes it reachable.
+///
+/// The device name is deliberately longer than IFNAMSIZ (15) so `open_tun`
+/// fails on EVERY machine. Relying on the suite being unprivileged would make
+/// this pass for an environmental reason and silently stop testing anything on
+/// a box with CAP_NET_ADMIN — the class of vacuous green that produced #7820 in
+/// the first place.
+#[test]
+fn new_reports_the_workers_tun_failure_rather_than_a_dead_ok() {
+    let too_long = "xpf-usp-name-well-past-ifnamsiz";
+    assert!(too_long.len() > 15, "the name must exceed IFNAMSIZ to fail everywhere");
+
+    // `expect_err` would need `Debug` on the reinjector; match instead.
+    let err = match SlowPathReinjector::new(too_long, 1500) {
+        Ok(_) => panic!(
+            "a reinjector whose TUN cannot open must not construct successfully \
+             — `new` returned Ok wrapping a worker that has already exited"
+        ),
+        Err(err) => err,
+    };
+
+    assert!(
+        !err.is_empty(),
+        "the constructor must carry the worker's recorded cause, not an empty string"
+    );
+    assert!(
+        !err.contains("slow-path worker is not running"),
+        "the constructor must report the CAUSE, not the downstream enqueue symptom: {err}"
     );
 }
 
