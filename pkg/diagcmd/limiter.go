@@ -152,3 +152,41 @@ const MaxConcurrentSessionWalks = 4
 // draw from the same MaxConcurrentSessionWalks budget, and a mix of REST+gRPC
 // scrapers cannot collectively exceed it. Mirrors DefaultLimiter.
 var SessionWalkLimiter = NewLimiter(MaxConcurrentSessionWalks)
+
+// MaxConcurrentSnapshotReads bounds control-surface reads that copy an
+// IN-PROCESS structure rather than walking the conntrack table.
+//
+// #8151: `show security nat persistent-nat` was charged against
+// MaxConcurrentSessionWalks, and it does not walk. `natshow.RenderPersistent`'s
+// only dataplane read is `PersistentNATTable.All()` — an O(bindings) snapshot
+// copy of a Go map under that table's own RWMutex (#4811). It touches no
+// conntrack bucket, holds no session-store lock, and contends with nothing on
+// the shared control socket. #6553 introduced the gate describing the topic as
+// one of four that "drive full v4+v6 conntrack walks"; that description was
+// wrong, and its own line cites point into `RenderPersistentDetail`, a
+// different function.
+//
+// Charging it to the session budget is not merely inaccurate, it is
+// exploitable: MaxConcurrentSessionWalks is 4, REST and gRPC alias ONE
+// limiter, and `ShowText` is on `fabricAllowedUnaryMethods` — so a cluster peer
+// polling `persistent-nat` could hold all four slots and make genuine session
+// scans (`GET /api/v1/sessions`, `GetSessions`, `GetStatus`'s SessionCount)
+// start refusing.
+//
+// The bound is KEPT rather than dropped. An O(bindings) allocation on a
+// fabric-reachable surface is still worth bounding, and removing a bound from
+// a peer-reachable surface is a security-shaped decision that should not be a
+// side effect of correcting which budget it draws from. What changes is that
+// it no longer competes with full-table scans.
+//
+// Sized independently of MaxConcurrentSessionWalks on purpose: the two bound
+// different costs (a map copy versus per-bucket BPF-map locks held across the
+// whole v4+v6 table), so tying them would make one a hostage to the other's
+// tuning.
+const MaxConcurrentSnapshotReads = 4
+
+// SnapshotReadLimiter is the process-wide limiter for the snapshot-copy reads
+// described above. Separate instance, separate budget: saturating it must not
+// refuse a session scan, and saturating SessionWalkLimiter must not refuse a
+// snapshot read.
+var SnapshotReadLimiter = NewLimiter(MaxConcurrentSnapshotReads)

@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	"github.com/psaab/xpf/pkg/natshow"
 )
 
@@ -66,6 +67,39 @@ func (s *Server) showNATNPTv6(cfg *config.Config, buf *strings.Builder) {
 //
 // ShowText returns this handler error verbatim, so an over-cap topic surfaces
 // as codes.ResourceExhausted.
+// acquireNATSnapshotRead takes a diagcmd.SnapshotReadLimiter slot for a
+// `show security nat` topic that copies an IN-PROCESS structure rather than
+// walking the conntrack table.
+//
+// #8151: `persistent-nat` used acquireNATShowWalk above, charging the
+// session-scan budget for work that is not a session scan.
+// `natshow.RenderPersistent`'s only dataplane read is
+// `PersistentNATTable.All()` — an O(bindings) snapshot copy under that table's
+// own RWMutex — so it touches no conntrack bucket and contends with nothing
+// the session walks contend for. Pinned by TestRenderPersistentDrivesNoWalk7315
+// and TestShowTextPersistentNATDrivesNoWalk7315, which count conntrack rows
+// visited and require zero; if a walk is ever added here those red, and this
+// topic must move back to acquireNATShowWalk.
+//
+// The bound is kept, on a separate budget. ShowText is fabric-reachable, so
+// this surface is peer-reachable and an O(bindings) allocation is still worth
+// bounding — but sharing the 4-slot session budget meant a peer polling
+// persistent-nat could starve `GET /api/v1/sessions`, `GetSessions` and
+// `GetStatus`'s SessionCount. Removing the bound outright would have been a
+// security-shaped change smuggled into a correction about which budget applies.
+//
+// No AcquireCtx: RenderPersistent takes no context and drives no cancellable
+// work, so a lease context here would be a cancellation guarantee over
+// nothing. Admission is the only half that means anything for a map copy.
+func (s *Server) acquireNATSnapshotRead(what string) (func(), error) {
+	release, err := diagcmd.SnapshotReadLimiter.Acquire()
+	if err != nil {
+		return nil, status.Errorf(codes.ResourceExhausted,
+			"%s: snapshot-read concurrency limit reached; retry shortly", what)
+	}
+	return release, nil
+}
+
 func (s *Server) acquireNATShowWalk(ctx context.Context, what string) (func(), context.Context, error) {
 	release, walkCtx, err := sessionWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
@@ -85,11 +119,11 @@ func (s *Server) acquireNATShowWalk(ctx context.Context, what string) (func(), c
 // line numbers that are both inside RenderPersistentDetail. Giving it a
 // context would be a cancellation guarantee over nothing.
 //
-// The admission slot is KEPT even so: the snapshot is still an O(bindings)
-// allocation on a fabric-reachable surface, and dropping a bound that exists
-// is a separate judgement from adding the cancellation this change is about.
-func (s *Server) showPersistentNAT(ctx context.Context, buf *strings.Builder) error {
-	release, _, err := s.acquireNATShowWalk(ctx, "persistent-nat")
+// #8151 resolved that judgement: the bound is kept but moved to
+// diagcmd.SnapshotReadLimiter, its own budget, so it no longer competes with
+// full-table scans. See acquireNATSnapshotRead.
+func (s *Server) showPersistentNAT(_ context.Context, buf *strings.Builder) error {
+	release, err := s.acquireNATSnapshotRead("persistent-nat")
 	if err != nil {
 		return err
 	}
