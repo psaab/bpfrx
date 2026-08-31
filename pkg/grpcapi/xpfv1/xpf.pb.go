@@ -2479,10 +2479,35 @@ func (*GetPoliciesRequest) Descriptor() ([]byte, []int) {
 }
 
 type GetPoliciesResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Policies      []*PolicyInfo          `protobuf:"bytes,1,rep,name=policies,proto3" json:"policies,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Policies []*PolicyInfo          `protobuf:"bytes,1,rep,name=policies,proto3" json:"policies,omitempty"`
+	// policy_stats_enabled reports `set security policy-stats system-wide
+	// enable` (#8177). It is the SECOND input of the per-rule eligibility gate,
+	// which is `statsEnabled || rule.count`; before this only `count` was on the
+	// wire, so two states rendered byte-identically:
+	//
+	//	A  stats ON,  count=false -> the counter WAS read; 0 means no traffic
+	//	B  stats OFF, count=false -> the counter was never read; 0 means nothing
+	//
+	// Both emit count=false, hit_counters_unavailable=false, hit_packets=0. A
+	// consumer could not tell an authoritative zero from an unmeasured one, which
+	// is the defect #7776 fixed on the text surfaces and left on these.
+	//
+	// ADDITIVE, and deliberately NOT a redefinition of either existing flag.
+	// hit_counters_unavailable keeps its documented meaning — counter-ELIGIBLE
+	// but no source answered — and count=false keeps signalling not-eligible.
+	// Setting hit_counters_unavailable for case B was the tempting shortcut and
+	// would contradict that shipped contract, lying to exactly the consumer that
+	// implemented the stated split correctly.
+	//
+	// System-wide rather than per-rule because the knob is: it is one field on
+	// the response, not a bool repeated across every rule. False on an older
+	// server, which reads the same as "stats off" — the conservative direction,
+	// since a consumer that treats an unmeasured zero as unmeasured loses
+	// nothing, while the reverse invents a measurement.
+	PolicyStatsEnabled bool `protobuf:"varint,2,opt,name=policy_stats_enabled,json=policyStatsEnabled,proto3" json:"policy_stats_enabled,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetPoliciesResponse) Reset() {
@@ -2520,6 +2545,13 @@ func (x *GetPoliciesResponse) GetPolicies() []*PolicyInfo {
 		return x.Policies
 	}
 	return nil
+}
+
+func (x *GetPoliciesResponse) GetPolicyStatsEnabled() bool {
+	if x != nil {
+		return x.PolicyStatsEnabled
+	}
+	return false
 }
 
 type PolicyInfo struct {
@@ -8873,9 +8905,10 @@ const file_xpf_proto_rawDesc = "" +
 	"configured\x12'\n" +
 	"\x0fsystem_services\x18\x03 \x03(\tR\x0esystemServices\x12\x1c\n" +
 	"\tprotocols\x18\x04 \x03(\tR\tprotocols\"\x14\n" +
-	"\x12GetPoliciesRequest\"E\n" +
+	"\x12GetPoliciesRequest\"w\n" +
 	"\x13GetPoliciesResponse\x12.\n" +
-	"\bpolicies\x18\x01 \x03(\v2\x12.xpf.v1.PolicyInfoR\bpolicies\"l\n" +
+	"\bpolicies\x18\x01 \x03(\v2\x12.xpf.v1.PolicyInfoR\bpolicies\x120\n" +
+	"\x14policy_stats_enabled\x18\x02 \x01(\bR\x12policyStatsEnabled\"l\n" +
 	"\n" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +

@@ -362,6 +362,14 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// the "Session statistics" block is per-policy hit-count display, so
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	// #8177: policies whose "Session statistics" block was OMITTED because the
+	// knob is off and the rule carries no `count`. This surface had no trailing
+	// note of any kind — its #7016 sibling case prints "not available (not yet
+	// published)", and the comment there says outright that omitting the block
+	// silently is indistinguishable from policy-stats being off. That is the
+	// state this counts: the block is simply absent, so the reader cannot tell
+	// "no counter for this rule" from "nobody looked at any rule".
+	var statsDisabledDetail int
 	// #4344: same #3965 bulk-reader migration as showPoliciesHitCount — read the
 	// policy set from ONE snapshot instead of a per-policy ReadPolicyCounters
 	// loop for the "Session statistics" block. Built only when the dataplane is
@@ -476,6 +484,11 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 						readErr = err
 					}
 				}
+			} else if !statsEnabled && !pol.Count {
+				// #8177: counted, not printed per-rule. A per-rule line would
+				// repeat one system-wide fact on every policy; one trailing
+				// note states it once and names how many rows it covers.
+				statsDisabledDetail++
 			}
 		}
 		policySetID++
@@ -561,12 +574,28 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 						readErr = err
 					}
 				}
+			} else if !statsEnabled && !pol.Count {
+				// #8177: counted, not printed per-rule. A per-rule line would
+				// repeat one system-wide fact on every policy; one trailing
+				// note states it once and names how many rows it covers.
+				statsDisabledDetail++
 			}
 		}
 		fmt.Fprintln(buf)
 	}
 	if readErr != nil {
 		fmt.Fprintf(buf, "warning: policy counter read failed (session statistics may be incomplete): %v\n", readErr)
+	}
+	// #8177: the note mechanism this surface was missing. Wording is
+	// byte-identical to the three sibling renderers, with "read 0" true here in
+	// the sense that the block was omitted rather than a zero printed — the
+	// operator-facing fact is the same one, and four different sentences about
+	// one state is what #7776 was written to stop.
+	if statsDisabledDetail > 0 {
+		fmt.Fprintf(buf, "note: %d policy count(s) read 0 because policy-stats is disabled "+
+			"system-wide, not because no traffic matched (enable with "+
+			"`set security policy-stats system-wide enable`, or add `count` to an "+
+			"individual policy)\n", statsDisabledDetail)
 	}
 }
 

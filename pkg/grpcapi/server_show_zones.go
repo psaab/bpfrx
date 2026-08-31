@@ -167,7 +167,14 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	if s.dp != nil && s.dp.IsLoaded() {
 		readPolicy = dpuserspace.NewPolicyCounterReader(s.dp, cfg, s.dp.ReadPolicyCounters)
 	}
-	resp := &pb.GetPoliciesResponse{}
+	// #8177: put the SECOND input of the eligibility gate on the wire. Without
+	// it, "stats on, count=false" (a read that returned 0) and "stats off,
+	// count=false" (no read at all) are byte-identical, so a structured consumer
+	// cannot tell an authoritative zero from an unmeasured one — the same defect
+	// #7776 fixed on the text surfaces. Neither `count` nor
+	// `hit_counters_unavailable` changes meaning; see the field comment in
+	// xpf.proto for why reusing the latter would have been wrong.
+	resp := &pb.GetPoliciesResponse{PolicyStatsEnabled: statsEnabled}
 	// #3336: span-accumulated runtime/RT_FLOW policy IDs, keyed
 	// [policySetID, sliceIndex] — the same identity the event path logs, so
 	// automation can join a policy_id back to a rule. The raw ordinal stays the

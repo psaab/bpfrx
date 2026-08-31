@@ -200,6 +200,25 @@ type PolicyInfo struct {
 	FromZone string       `json:"from_zone"`
 	ToZone   string       `json:"to_zone"`
 	Rules    []PolicyRule `json:"rules"`
+	// PolicyStatsEnabled reports `set security policy-stats system-wide
+	// enable` (#8177), the SECOND input of the per-rule eligibility gate
+	// (statsEnabled || rule.Count). Before this only Count was on the wire, so
+	// "stats on, count=false" (counter read, 0 means no traffic) and "stats
+	// off, count=false" (never read, 0 means nothing) serialized identically.
+	//
+	// Repeated on every zone-pair block rather than carried once, which the
+	// gRPC twin can do because GetPoliciesResponse is a message. This handler's
+	// payload is a bare []PolicyInfo inside the generic Response envelope, so
+	// there is no per-endpoint place to hang a system-wide field: adding one to
+	// Response would put it on every endpoint, and turning the payload into an
+	// object would change `data` from array to object and break every existing
+	// consumer. A redundant bool is the additive option, and the value is the
+	// same on every element by construction.
+	//
+	// Consequence worth knowing: with NO policies configured the array is empty
+	// and the flag is unobservable. That is benign — there are no counts to
+	// misread — but a consumer must not infer "stats off" from its absence.
+	PolicyStatsEnabled bool `json:"policy_stats_enabled"`
 }
 
 // PolicyRule holds a single policy rule with counters.

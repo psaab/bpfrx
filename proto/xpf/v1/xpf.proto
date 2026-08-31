@@ -315,6 +315,31 @@ message InterfaceHostInbound {
 message GetPoliciesRequest {}
 message GetPoliciesResponse {
   repeated PolicyInfo policies = 1;
+  // policy_stats_enabled reports `set security policy-stats system-wide
+  // enable` (#8177). It is the SECOND input of the per-rule eligibility gate,
+  // which is `statsEnabled || rule.count`; before this only `count` was on the
+  // wire, so two states rendered byte-identically:
+  //
+  //   A  stats ON,  count=false -> the counter WAS read; 0 means no traffic
+  //   B  stats OFF, count=false -> the counter was never read; 0 means nothing
+  //
+  // Both emit count=false, hit_counters_unavailable=false, hit_packets=0. A
+  // consumer could not tell an authoritative zero from an unmeasured one, which
+  // is the defect #7776 fixed on the text surfaces and left on these.
+  //
+  // ADDITIVE, and deliberately NOT a redefinition of either existing flag.
+  // hit_counters_unavailable keeps its documented meaning — counter-ELIGIBLE
+  // but no source answered — and count=false keeps signalling not-eligible.
+  // Setting hit_counters_unavailable for case B was the tempting shortcut and
+  // would contradict that shipped contract, lying to exactly the consumer that
+  // implemented the stated split correctly.
+  //
+  // System-wide rather than per-rule because the knob is: it is one field on
+  // the response, not a bool repeated across every rule. False on an older
+  // server, which reads the same as "stats off" — the conservative direction,
+  // since a consumer that treats an unmeasured zero as unmeasured loses
+  // nothing, while the reverse invents a measurement.
+  bool policy_stats_enabled = 2;
 }
 message PolicyInfo {
   string from_zone = 1;
