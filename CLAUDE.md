@@ -120,10 +120,14 @@ make test-mutate-lib # Self-test the mutation-harness scoring library
                      #   REFUSAL one: a runner gating in ONE language scores
                      #   every cross-language mutation as an ESCAPE, because
                      #   nothing it ran could have failed — and an escape is a
-                     #   claim that the code is untested. Also pins the three
-                     #   verdicts that are neither kill nor escape: a build
-                     #   break, a -race failure (no `--- FAIL` line at all),
-                     #   and a full disk (which reds NAMED tests).
+                     #   claim that the code is untested. Also pins the VOID
+                     #   cases, which are neither kill nor escape — a build
+                     #   break, a run that collected nothing, and a full disk
+                     #   (which reds NAMED tests and reads like a regression)
+                     #   — and separately two misreads that LOSE a real kill:
+                     #   a -race failure emits no `--- FAIL` line at all, and
+                     #   `make`'s echoed Makefile comments are not a build
+                     #   break.
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
 make test-cos-apply-lib # Self-test the #6440 CoS-apply CLI-transcript gate:
