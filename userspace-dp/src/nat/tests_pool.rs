@@ -9298,3 +9298,224 @@ fn a_synced_import_conflicting_with_an_existing_lease_is_refused_7360() {
     assert_eq!(statuses[0].persistent_leases, 1, "the lease is unchanged");
     assert_persistent_expiry_indexes_consistent(&standby[0]);
 }
+
+// ---------------------------------------------------------------------------
+// #7560: a partial-overlap pool change DROPS every persistent-NAT lease —
+// including leases on addresses the change retained — and said nothing.
+//
+// Carry-over is keyed on the whole SourceNatPoolAllocatorKey (pool name + both
+// full address lists + port range), so ANY address change misses the reuse
+// lookup and rebuilds the allocator. #6765 added reseed_retained_from to carry
+// live PORT ownership onto retained addresses; it deliberately does not carry
+// persistent_by_source.
+//
+// That drop is a policy question and this change does NOT decide it. What it
+// fixes is that the drop was invisible: the operator-facing line accounted for
+// carried translations and skipped address-only tokens, and persistent leases
+// appeared in NEITHER column — a true message whose shape implied the
+// accounting was complete.
+//
+// The two counts are separate because only one is a surprise. A lease on a
+// REMOVED address cannot be honoured; a lease on a RETAINED address was dropped
+// only because the key includes the whole address list.
+
+/// A port-translating PERSISTENT pool. Deliberately not `pool_no_translation`:
+/// address-only tokens are #8132's population and take a different reserve
+/// path, and mixing them here would make the counts below ambiguous.
+fn persistent_pool_snapshot_7560(pool_addresses: Vec<&str>) -> SourceNATRuleSnapshot {
+    SourceNATRuleSnapshot {
+        name: "snat-persist-7560".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "persist-pool-7560".to_string(),
+        pool_addresses: pool_addresses
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        port_low: 40000,
+        port_high: 40009,
+        persistent_nat: true,
+        persistent_nat_permit: "any-remote-host".to_string(),
+        persistent_nat_inactivity_timeout: 300,
+        ..SourceNATRuleSnapshot::default()
+    }
+}
+
+/// THE BINDER. Two leases, one on the address the pool RETAINS and one on the
+/// address it REMOVES, are both counted — in their own buckets.
+///
+/// FAIL-ON-REVERT: delete the counting loop in `reseed_retained_from` and both
+/// assertions read 0, which is exactly the silence #7560 is about.
+#[test]
+fn partial_overlap_counts_dropped_persistent_leases_by_bucket_7560() {
+    let now = NS_PER_SEC;
+    let rules = parse_source_nat_rules(&[persistent_pool_snapshot_7560(vec![
+        "203.0.113.10",
+        "203.0.113.11",
+    ])]);
+
+    // Two distinct sources so the round-robin puts one lease on each address.
+    let a = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    let b = expect_snat_decision(tuple_snat_lookup(&rules, 23456, "9.9.9.9", 53, 2));
+    assert_ne!(
+        a.rewrite_src, b.rewrite_src,
+        "setup: the two sources must land on DIFFERENT pool addresses, or this cell \
+         cannot distinguish the retained bucket from the removed one",
+    );
+
+    // Ground truth before the change: exactly two leases, one per address.
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert_eq!(
+            live.persistent_by_source.len(),
+            2,
+            "setup: expected one persistent lease per source; the fixture is not \
+             building the population this cell counts",
+        );
+        let mut indices: Vec<usize> = live
+            .persistent_by_source
+            .values()
+            .map(|l| l.addr_index)
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![0, 1],
+            "setup: the leases must sit on pool positions 0 and 1",
+        );
+    }
+
+    // The pool change: position 0 is RETAINED, position 1 is swapped out. The
+    // index map is what retained_pool_index_map produces for that change.
+    let fresh = PortAllocator::new(2, 40000, 40009);
+    let mut index_map = rustc_hash::FxHashMap::default();
+    index_map.insert(0usize, 0usize);
+    let outcome = fresh.reseed_retained_from(&rules[0].pool_allocator, &index_map, now);
+
+    assert_eq!(
+        outcome.dropped_persistent_on_retained, 1,
+        "a persistent lease on a RETAINED address was dropped and not counted. That is \
+         the population the #7560 decision is about — the operator changed a DIFFERENT \
+         address and this subscriber loses its binding anyway",
+    );
+    assert_eq!(
+        outcome.dropped_persistent_on_removed, 1,
+        "a persistent lease on a REMOVED address was dropped and not counted. Dropping \
+         it is unavoidable, but it must not be conflated with the retained bucket — that \
+         is what would bury the actionable number inside an expected one",
+    );
+}
+
+/// CONTROL. With no leases at all, both counters are ZERO.
+///
+/// Without this, "it counts dropped leases" is satisfied by a counter that
+/// counts something else — pool addresses, live flows, or simply increments.
+#[test]
+fn partial_overlap_counts_zero_dropped_leases_when_there_are_none_7560() {
+    let now = NS_PER_SEC;
+    // Same pool shape, but NOT persistent — so ordinary PAT, no leases.
+    let mut snap = persistent_pool_snapshot_7560(vec!["203.0.113.10", "203.0.113.11"]);
+    snap.persistent_nat = false;
+    snap.persistent_nat_permit = String::new();
+    let rules = parse_source_nat_rules(&[snap]);
+    let _ = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(
+        rules[0].pool_allocator.debug_live().persistent_by_source.len(),
+        0,
+        "setup: this control needs a pool with NO leases",
+    );
+
+    let fresh = PortAllocator::new(2, 40000, 40009);
+    let mut index_map = rustc_hash::FxHashMap::default();
+    index_map.insert(0usize, 0usize);
+    let outcome = fresh.reseed_retained_from(&rules[0].pool_allocator, &index_map, now);
+
+    assert_eq!(outcome.dropped_persistent_on_retained, 0);
+    assert_eq!(outcome.dropped_persistent_on_removed, 0);
+    assert!(
+        outcome.reseeded > 0,
+        "setup: the live PAT flow must still have been carried, or this control passed \
+         because the reseed pass did nothing at all",
+    );
+}
+
+/// The BEHAVIOUR the counters describe, asserted through the ordinary path so
+/// the count is not merely an internal number that agrees with itself.
+///
+/// A persistent source pinned to a RETAINED address is re-mapped after a
+/// partial-overlap change. This cell states today's behaviour; if the #7560
+/// decision later carries leases over, it reds and is the announcement.
+#[test]
+fn partial_overlap_drops_the_lease_of_a_retained_address_source_7560() {
+    let rules = parse_source_nat_rules(&[persistent_pool_snapshot_7560(vec![
+        "203.0.113.10",
+        "203.0.113.11",
+    ])]);
+    let first = expect_snat_decision(tuple_snat_lookup(&rules, 12345, "8.8.8.8", 53, 1));
+    assert_eq!(
+        first.rewrite_src.map(|ip| ip.to_string()).as_deref(),
+        Some("203.0.113.10"),
+        "setup: the pinned source must land on the address the change RETAINS",
+    );
+
+    let changed = persistent_pool_snapshot_7560(vec!["203.0.113.10", "203.0.113.12"]);
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[changed],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+        10,
+    );
+
+    assert_eq!(
+        refreshed[0].pool_allocator.debug_live().persistent_by_source.len(),
+        0,
+        "the rebuilt allocator carried a persistent lease. That may be the RIGHT \
+         behaviour — it is the open #7560 decision — but it is a change, and this cell \
+         is where it announces itself rather than arriving silently",
+    );
+}
+
+/// The MESSAGE, bound. The counters are only half the fix — the defect was that
+/// the operator was never told — so the note has to be asserted, not just the
+/// numbers behind it.
+#[test]
+fn dropped_persistent_lease_note_names_both_buckets_7560() {
+    use crate::nat::allocator::ReseedOutcome;
+
+    // Silent when there is nothing to say: this note must not appear on every
+    // ordinary pool change, or it becomes noise an operator learns to skip.
+    let quiet = ReseedOutcome {
+        reseeded: 5,
+        ..ReseedOutcome::default()
+    };
+    assert!(
+        crate::nat::source::dropped_persistent_lease_note("p", &quiet).is_none(),
+        "a pool change that dropped NO leases must produce no note",
+    );
+
+    let noisy = ReseedOutcome {
+        dropped_persistent_on_retained: 3,
+        dropped_persistent_on_removed: 7,
+        ..ReseedOutcome::default()
+    };
+    let note = crate::nat::source::dropped_persistent_lease_note("mypool", &noisy)
+        .expect("a note is owed when leases were dropped");
+    assert!(note.contains("mypool"), "the note must name the pool: {note}");
+    assert!(
+        note.contains('3') && note.contains('7'),
+        "the note must carry BOTH counts; reporting one number buries the actionable \
+         half inside the expected one: {note}",
+    );
+    assert!(
+        note.contains("RETAINED"),
+        "the note must say which bucket is the surprising one, or an operator cannot \
+         tell an unavoidable drop from a policy one: {note}",
+    );
+    // The consequence, not just the count. A number with no consequence is a
+    // statistic; the operator needs to know a subscriber will be re-mapped.
+    assert!(
+        note.contains("re-mapped"),
+        "the note must state the OPERATOR-VISIBLE consequence: {note}",
+    );
+}

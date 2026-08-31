@@ -232,6 +232,27 @@ pub(crate) struct ReseedOutcome {
     /// `reserve_flow` refused — the tuple is already owned in the new
     /// allocator. Expected to be zero on a freshly built allocator.
     pub(crate) refused: usize,
+    /// #7560: persistent-NAT leases the rebuild DROPPED whose address was
+    /// RETAINED by the pool change.
+    ///
+    /// This is the population the #7560 policy decision is about, and the one
+    /// that surprises an operator: they added or removed a DIFFERENT address,
+    /// and a subscriber pinned to an address that is still in the pool loses
+    /// its binding anyway. Carry-over is keyed on the whole
+    /// `SourceNatPoolAllocatorKey` (pool name + the full address lists + port
+    /// range), so ANY address change misses that lookup and drops every lease —
+    /// including leases on addresses the change never touched.
+    ///
+    /// Counted, not carried. Whether it SHOULD be carried is the open decision;
+    /// this makes the population measurable first, which is the precondition
+    /// that decision was waiting on.
+    pub(crate) dropped_persistent_on_retained: usize,
+    /// #7560: persistent-NAT leases dropped whose address the pool change
+    /// REMOVED. Unavoidable — the address is gone, so the binding cannot be
+    /// honoured — and counted separately for exactly that reason: conflating it
+    /// with the retained-address population above would make an unavoidable
+    /// drop look like the policy surprise, and hide the real number inside it.
+    pub(crate) dropped_persistent_on_removed: usize,
 }
 
 /// #6211 F2: which worker is taking or dropping a reservation.
@@ -2346,6 +2367,24 @@ impl PortAllocator {
         // this allocator's, so the two mutexes are never held at once.
         let carried: Vec<(SourceNatFlowKey, LiveAllocation)> = {
             let prev_live = prev.lock_live();
+            // #7560: count the persistent leases this pass is about to drop,
+            // split by whether their address survived the pool change. Done
+            // under the SAME lock acquisition as the live-set snapshot so the
+            // two counts describe one consistent instant, and so no second
+            // lock/release is added to a config-apply path.
+            //
+            // This pass does not carry `persistent_by_source` (see the comment
+            // in the loop below). Before #7560 it did not count it either, so
+            // the operator-facing line reported carried translations and
+            // skipped address-only tokens while every lease vanished in a
+            // column that did not exist.
+            for lease in prev_live.persistent_by_source.values() {
+                if index_map.contains_key(&lease.addr_index) {
+                    out.dropped_persistent_on_retained += 1;
+                } else {
+                    out.dropped_persistent_on_removed += 1;
+                }
+            }
             prev_live
                 .live_by_flow
                 .iter()

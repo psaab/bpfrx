@@ -1,3 +1,5 @@
+mod lease_note_7560;
+pub(super) use lease_note_7560::dropped_persistent_lease_note;
 // Source NAT (SNAT) rules + matching + lookup.
 //
 // Owns rule parsing from snapshots, the address/port-pool match
@@ -596,6 +598,10 @@ fn reseed_retained_pool(
         return;
     }
     let outcome = allocator.reseed_retained_from(&prev.allocator, &map, now_ns);
+    // #7560: own condition, own population — see lease_note_7560.rs.
+    if let Some(note) = dropped_persistent_lease_note(pool_name, &outcome) {
+        eprintln!("{note}");
+    }
     if outcome.skipped_out_of_range > 0 || outcome.skipped_address_only > 0 || outcome.refused > 0 {
         eprintln!(
             "xpf-dp: source-nat pool {pool_name:?} changed: carried {} live translation(s) onto \
