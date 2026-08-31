@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -493,5 +494,86 @@ func TestReadmeFloorFigureMatchesTheConstants(t *testing.T) {
 			"(UserspaceShimStructuralChangeInsns = %d). The floor's stated property is that it "+
 			"fires BEFORE a change that large lands; the README cannot explain the budget "+
 			"without it", wantStructural, UserspaceShimStructuralChangeInsns)
+	}
+}
+
+// TestNoAbsoluteInsnBaselineIsPinnedInProse forbids an absolute processed-insn
+// count from being stated AS A BASELINE in the two texts that explain the
+// shim's verifier budget: pkg/dataplane/README.md and the shim source.
+//
+// This is the generalization of TestReadmeFloorFigureMatchesTheConstants, and
+// it exists because that guard's own scope note predicted the escape. That
+// test binds the two CONSTANT-backed figures and says so explicitly, leaving
+// the baseline alone on the reasoning that asserting it "would mean
+// hardcoding 1,000,000 in the guard, i.e. inventing the third number the
+// guard exists to prevent". Correct — but the baseline was pinned in prose
+// anyway, one section earlier, and rotted exactly as that test's doc comment
+// describes: measured at 9e28d1c25, still reading 777,901 at 35399d2b3, 1836
+// commits and 23,547 instructions later, with nobody having edited either
+// sentence.
+//
+// The fix cannot be to pin a fresher number. The count moves with EVERY shim
+// change, so any absolute figure in prose is stale by the next merge that
+// touches the crate; a constant would red on unrelated edits and teach people
+// to update it without re-measuring, which is worse than no figure. So the
+// invariant is that a dated measurement belongs in the issue, and the prose
+// carries only the relationships that do not move.
+//
+// Shape, not phrase: the check is a comma-grouped number adjacent to the word
+// "baseline" within one sentence, so rewording the surrounding prose does not
+// defeat it while re-pinning a fresh figure ("at an 801,448-instruction
+// baseline") still reds. Sentence-bounded on purpose -- prose that names the
+// 1,000,000 cap and then says it pins no baseline is CORRECT and must not red.
+func TestNoAbsoluteInsnBaselineIsPinnedInProse(t *testing.T) {
+	// Adjacency in both directions, bounded by a sentence end so that a
+	// legitimate mention of the cap or ceiling in a NEARBY sentence does not
+	// false-red. Groups of 3 with separators is what an insn count looks like
+	// everywhere in this tree.
+	const num = `\d{1,3}(?:,\d{3})+`
+	pats := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)` + num + `[^.]{0,20}?\bbaselines?\b`),
+		regexp.MustCompile(`(?i)\bbaselines?\b[^.]{0,20}?` + num),
+	}
+
+	check := func(t *testing.T, path, text string) {
+		t.Helper()
+		for _, re := range pats {
+			if m := re.FindString(text); m != "" {
+				t.Errorf("%s pins an absolute instruction baseline in prose: %q\n"+
+					"The shim's processed-insn count moves with every change to the crate, so a "+
+					"figure written here is stale by the next merge without anyone editing the "+
+					"sentence -- that is how 777,901 survived 1836 commits while the object had "+
+					"moved to 801,448. State the relationships that do not move (carrying fits, "+
+					"consuming does not; the install-blocking ceiling is the floor, not the 1M "+
+					"cap) and put the dated measurement in the issue.", path, m)
+			}
+		}
+	}
+
+	raw, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	check(t, "pkg/dataplane/README.md", string(raw))
+
+	// Whole shim tree, matching TestShimCarriesFragHdrSizeAssertion's reasoning:
+	// the comment this guards has already moved between files once, and a
+	// path-keyed check false-passes on a move that changes nothing.
+	root := filepath.Join("..", "..", "userspace-xdp", "src")
+	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".rs") {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		check(t, p, string(b))
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %s: %v", root, err)
 	}
 }
