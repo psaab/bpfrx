@@ -144,6 +144,14 @@ func noteNotInstalledStatic(w io.Writer, reason string) {
 // the gRPC grpcRuntime (pkg/grpcapi/runtime.go) and the CLI cliRuntime
 // (pkg/cli/runtime.go) already satisfy it structurally. A nil Reader is
 // permitted and reproduces the "not loaded" / unavailable branches.
+// natCounterUnarmed is what a NAT counter renders as when the dataplane is not
+// armed (#7423 rows 3+4). It is a positive statement rather than an omitted
+// line: a missing row is easy to read past, and the defect being fixed is
+// precisely an operator trusting a number that was never measured. One constant
+// so the hits row and the session row cannot drift into saying different things
+// about the same condition.
+const natCounterUnarmed = "n/a (dataplane not armed)"
+
 type Reader interface {
 	IsLoaded() bool
 	IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error

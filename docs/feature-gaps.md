@@ -410,6 +410,16 @@ unrecognized protos, so an operator knows the stanza has no effect rather than
 believing an ALG was configured. A harder allowlist-reject at the `security
 alg <proto>` level is the deeper parity move and is deferred.
 
+`show security alg` no longer fabricates rows for them (#7423 row 6), and no
+surface reports an ALG as `enabled`. It had
+printed sixteen rows cloned from the vSRX capture in `docs/junos-cli-reference.md`,
+eight claiming `Enabled` for protos with no code behind them. It now renders the
+four modeled ALGs by what they actually do (session tagging, never pinholing)
+plus any configured unmodeled proto marked `configured (not implemented)`, so
+the advisory at commit and the `show` surface afterwards agree. The wording is
+shared by the CLI, gRPC and REST renderers through `pkg/config/alg_status_7423.go`,
+so the three cannot drift into describing the same ALG differently.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **H.323 ALG** | `security alg h323 ...` | VoIP: H.323 session tracking, media pinhole management, NAT for H.245/RAS | Low | Missing |

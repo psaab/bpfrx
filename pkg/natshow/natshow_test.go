@@ -77,7 +77,11 @@ func TestRenderSourceRuleDetailGolden(t *testing.T) {
 		"    Action:                  pool p-src\n" +
 		"    Pool addresses:          203.0.113.1\n" +
 		"    Port range:              1024-65535\n" +
-		"    Number of sessions:      0\n\n"
+		// #7423 rows 3+4: an UNARMED dataplane no longer renders measured-looking
+		// zeros. Both rows say so positively rather than being omitted.
+		"    Translation hits:        n/a (dataplane not armed)\n" +
+		"\n" +
+		"  Rule-set rs-src: sessions for this zone pair: n/a (dataplane not armed)\n\n"
 	if got := b.String(); got != want {
 		t.Fatalf("RenderSourceRuleDetail mismatch:\n got=%q\nwant=%q", got, want)
 	}
@@ -106,7 +110,10 @@ func TestRenderDestRuleDetailGolden(t *testing.T) {
 		"    Action:                  pool p-dst\n" +
 		"    Pool address:            10.0.30.5\n" +
 		"    Pool port:               8080\n" +
-		"    Number of sessions:      0\n\n"
+		// #7423 rows 3+4: see the source sibling.
+		"    Translation hits:        n/a (dataplane not armed)\n" +
+		"\n" +
+		"  Rule-set rs-dst: sessions for this zone pair: n/a (dataplane not armed)\n\n"
 	if got := b.String(); got != want {
 		t.Fatalf("RenderDestRuleDetail mismatch:\n got=%q\nwant=%q", got, want)
 	}
@@ -267,7 +274,10 @@ func TestRenderSourceRuleDetailLoadedGolden(t *testing.T) {
 		"    Pool addresses:          203.0.113.1\n" +
 		"    Port range:              1024-65535\n" +
 		"    Translation hits:        42 packets  4200 bytes\n" +
-		"    Number of sessions:      1\n\n"
+		"\n" +
+		// #7423 row 4: reported once at the scope it measures (the zone pair),
+		// not once per rule.
+		"  Rule-set rs-src: sessions for this zone pair: 1\n\n"
 	if got := b.String(); got != want {
 		t.Fatalf("loaded source detail mismatch:\n got=%q\nwant=%q", got, want)
 	}
@@ -298,7 +308,9 @@ func TestRenderDestRuleDetailLoadedGolden(t *testing.T) {
 		"    Pool address:            10.0.30.5\n" +
 		"    Pool port:               8080\n" +
 		"    Translation hits:        7 packets  700 bytes\n" +
-		"    Number of sessions:      1\n\n"
+		"\n" +
+		// #7423 row 4: see the source sibling.
+		"  Rule-set rs-dst: sessions for this zone pair: 1\n\n"
 	if got := b.String(); got != want {
 		t.Fatalf("loaded dest detail mismatch:\n got=%q\nwant=%q", got, want)
 	}

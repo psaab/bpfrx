@@ -32,7 +32,13 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 	type ruleSetKey struct{ from, to string }
 	rsSessions := make(map[ruleSetKey]int)
 	var scanErr error
-	if dp != nil && dp.IsLoaded() && cr != nil {
+	// #7423 rows 3+4: ONE armed predicate. The session scan already had this
+	// test; the translation-hits read did not, and the session count rendered a
+	// bare 0 whether the dataplane had reported or never been armed. All three
+	// now read the same thing, so they cannot disagree about whether the numbers
+	// below are measurements.
+	armed := dp != nil && dp.IsLoaded() && cr != nil
+	if armed {
 		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
 		for name, id := range cr.ZoneIDs {
 			zoneByID[id] = name
@@ -151,7 +157,16 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 				}
 			}
 
-			if dp != nil && cr != nil {
+			// #7423 row 3: gate the hits read on the SAME `armed` predicate the
+			// session scan above uses. `Manager.ReadNATRuleCounter` is a map
+			// read with no error path — it returns `(zero, nil)` when the
+			// helper has never reported — so on a published-but-UNARMED
+			// dataplane `err == nil` holds and this rendered a confident
+			// `Translation hits: 0`. The `err == nil` guard is NOT dead code
+			// (other implementations of the interface do error), it simply
+			// cannot fire for the production Manager, which is why the zero got
+			// through. The REST sibling already refuses instead (#5046).
+			if armed {
 				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := dp.ReadNATRuleCounter(uint32(cid))
@@ -160,10 +175,27 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 							cnt.Packets, cnt.Bytes)
 					}
 				}
+			} else if dp != nil {
+				fmt.Fprintf(w, "    Translation hits:        %s\n", natCounterUnarmed)
 			}
-
-			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
-			fmt.Fprintf(w, "    Number of sessions:      %d\n\n", sessions)
+			fmt.Fprint(w, "\n")
+		}
+		// #7423 row 4: this count is a ZONE-PAIR aggregate — every source-NAT
+		// session between `rs.FromZone` and `rs.ToZone`, which the scan above
+		// keys on the session's ingress/egress zone ids. It used to print
+		// inside the rule loop, so five rules over four hundred sessions
+		// printed `400` five times and summing the column gave five times the
+		// truth. Junos reports this per RULE; the dataplane cannot, because a
+		// session carries zone ids and no rule identity, so there is nothing to
+		// attribute with. Reporting it once at the scope it actually measures
+		// is the honest form available: the number is real, it was labelled
+		// with the wrong noun.
+		if armed {
+			fmt.Fprintf(w, "  Rule-set %s: sessions for this zone pair: %d\n\n",
+				rs.Name, rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}])
+		} else if dp != nil {
+			fmt.Fprintf(w, "  Rule-set %s: sessions for this zone pair: %s\n\n",
+				rs.Name, natCounterUnarmed)
 		}
 	}
 }
