@@ -1,259 +1,154 @@
-# Plan: converge-forward apply for the Phase-2 host mutation (#7289)
+# Plan: #7289 — what an abort after the Phase-2 host mutation should do
 
-**Status:** DRAFT v1 — awaiting r1 hostile review (Claude SMR + Codex + AGY).
-This is a `/research` deliverable. It STOPS at PLAN-READY / PLAN-KILL /
-PLAN-DEFER. No production code.
+**Status:** DRAFT v2 — r1 returned **PLAN-NEEDS-MAJOR from both available
+reviewers** (Claude SMR, Codex; AGY infra-blocked with 2 documented retries).
+v1's recommendation is **withdrawn**, not amended: P3 (re-drive engine) and P4
+(ownership ledger) are removed. This is a `/research` deliverable and stops at
+PLAN-READY / PLAN-KILL / PLAN-DEFER.
 
-**Verified against:** `origin/master` `f32aacbac`. Every premise is measured;
-the measurements and the four claims that did NOT survive contact with master
-are in `premise-check.md` beside this file, and the 23-site mutation inventory
-they rest on is in §4.1.
-
-**Relationship to the stranded plan.** `origin/research/4960-apply-txn`
-(`ad300b881`, two rounds PLAN-NEEDS-MAJOR) is reused as a source of ARGUMENTS,
-not of facts: its §4.4 carries a "(verified r1 N1)" annotation on a claim that
-was false at its own merge base (premise-check §B). Where this plan leans on it,
-it re-derives.
+**Verified against:** `origin/master` `f32aacbac`. Premises in
+`premise-check.md`; reviews in `claude-smr-plan-r1.md` and `codex-plan-r1.md`.
 
 ---
 
-## 1. Issue framing
+## 0. What r1 changed, stated before anything else
 
-`CompileConfig` Phase 2 (`compileZones`) mutates live host state. Steps after it
-can fail. There is no undo. The apply returns an error, the snapshot is never
-published, and the box is left with:
+v1 recommended converging forward. Both reviewers falsified it, on different
+grounds, and one of them falsified a claim in my own premise check.
 
-- **host** on the NEW topology,
-- **dataplane** armed and forwarding on the **OLD** policy,
-- **transit barrier** open, because nothing unarmed,
-- **configstore** with the new config promoted and persisted, commit reported
-  failed.
+**0a. Converge-forward has no fixed point in current code.** `LinkSetMTU` does
+not refresh the cached `netlink.Link` attrs in the pinned v1.3.1, and
+`cachedLinkByName`/`cachedLinkByIndex` share one object (`compiler.go:147-176`),
+so an interface with both an interface-level and a unit-level MTU **alternates
+between them on every apply**. Verified independently; filed as its own defect
+(#8119) because it is a steady-state bug, not an abort-path one. A phase that
+does not converge under repetition cannot be the basis of a convergence design.
 
-The hazard is not an outage. It is **enforcement of old policy over new
-topology while the operator has been told the commit failed**. A tightening
-commit is the sharp case — the same case #5679 names for its own half.
+**0b. The hazard is worse than I wrote, and it is a security hole.**
+`premise-check.md` §E said the divergence leaves "old policy over new topology".
+Codex finding 5 showed otherwise and I verified it: an attach failure returns
+before `ProveArmCoverage` publishes (`loader.go:309-330`), so the apply tail
+classifies coverage as `armCoverageUnknown` — and `evaluateArmCoverage` has **no
+case** for unknown (`daemon_arm_coverage_7191.go:78-112`). Nothing disarms. On a
+fresh boot, where the runtime is armed before the first per-interface attach,
+that leaves an **armed, open kernel transit path with an interface carrying no
+XDP shim at all** — the policy-free-router state #7191 exists to prevent.
 
-## 2. Honest scope / value framing
+That inverts the priority. The reachable case is not a staleness window to be
+converged away; it is an unadjudicated forwarding surface that must be closed
+**immediately**.
 
-Reachability is real but narrow: the one reachable trigger is
-`attachUserspaceShimXDP` failing on a driver that refuses the attach
-(`compiler_iface.go:191` says so, and `runPostMutationSteps` exists because of
-it). `preflightCheckIfindexCaps` is a second, rarer one. Everything else in
-`CompileConfig` after Phase 2 is effectively unreachable on the live shim path
-because `userspaceShimCompileDataplane`'s methods are no-ops (`loader.go:500+`).
+**0c. The 20/2/3 partition was not a partition**, the "one reachable trigger"
+premise was false, and the abort prefix is not merely nondeterministic — the
+**final** host state is, because two units of one physical interface may sit in
+different zones and each reconciles the same netdev to its own addresses and MTU
+under a nondeterministic zone-map order. That is a second live defect and needs
+its own issue.
 
-So this is a **low-frequency, high-consequence** defect. That shapes the
-recommendation: the fix must not cost hitlessness or add a failure mode to the
-99.99% path that never aborts.
+## 1. What this plan now proposes
 
-## 3. What is already shipped, and must be composed with rather than replaced
+Three items. None of them is a convergence engine, and the plan does not claim
+the abort becomes recoverable.
 
-Four mechanisms already exist. The stranded plan composes with none of them,
-which is the likeliest reason it took two PLAN-NEEDS-MAJOR rounds.
+**R1 — Close the unadjudicated surface immediately (the security fix).**
+A generic-attach failure must disarm, irrespective of any later retry design.
+Today it does not, because the coverage verdict is `unknown` and `unknown` is
+unhandled. The narrowest correct change is to make an attach failure a
+*published* incomplete coverage report, or to give `evaluateArmCoverage` an
+`unknown`-after-a-failed-apply case. This is the only item that closes the
+reachable case, and it composes with #7191 rather than inventing anything.
 
-| shipped | what it gives | cite |
-|---|---|---|
-| #6894 `validateBeforeMutate` | fallible host-pure phases validated BEFORE the first mutation | `compiler.go:371` |
-| #5679 / #5646 | ordinary apply failure defers the commit error and does NOT disarm; an identical re-apply "self-heals" | `daemon_apply_dataplane.go:176-191` |
-| #5275 / #7191 | fail-closed transit barrier gated on `dataplaneArmed`, management preserved, #1960 analysis DONE | `daemon_transit_gate.go:25-55` |
-| #7288 | the abort error names what already moved | `compiler_hostmutation_4960.go:99` |
+**R2 — A typed, phase-aware authority record (replacing v1's P2).**
+One "host mutated" bit cannot describe the state, because failures span
+pre-publication, ambiguous publication, and post-publication. What exists today:
+`recordCompileFailure` already records count/last-error/timestamp
+(`daemon_health.go:110-128`), and `hostMutations` already exists on
+`CompileResult` but is dropped by `ApplyResultFromCompileResult`
+(`apply.go:210-229`) so it dies with the result. R2 is to thread a typed outcome
+— which phase, which authority state — rather than to invent a store. It is
+operator evidence and a prerequisite for any future recovery design; it is not
+itself recovery.
 
-**The codebase has therefore already chosen clause 2's option (c) as its
-doctrine for this failure class.** #7289's residual is that Phase 2's host
-mutation sits outside that guarantee.
+**R3 — The `accept_ra` re-drive correction.** `accept_ra=0` is written only on
+the VLAN create path (`compiler_iface.go:268`); the adopt path returns at `:238`
+before reaching it, so a re-drive after an abort between `LinkAdd` and that
+write never retries it. Independently defensible, testable through the one
+existing seam, and both reviewers accept it.
 
-## 4. The measurement that decides clause 2
+**Explicitly NOT proposed:** a re-drive engine, an ownership ledger, an undo
+log, and the clause-1 planning/actuation split. Reasons in §2.
 
-### 4.1 The mutation inventory — 23 write sites, all in Phase 2
+## 2. Why the rejected options stay rejected
 
-Full table in the r1 investigation record; the shape is what matters:
+- **(a) undo log / (d) ownership ledger.** Codex OQ-1: the boundary is already
+  expanding and has no state machine; the foreign-bond class shows the ledger is
+  the wrong remedy rather than an undersized one. Withdrawn.
+- **(c) converge forward.** §0a: no fixed point in current code, and §0b: the
+  reachable class must not be retried at all, because retrying prolongs an
+  unadjudicated surface. Withdrawn as a *recommendation*; it may return as a
+  proposal once #8119 and the zone-order defect are fixed and a real
+  transient-error classification, scheduler, supersession rule and success
+  predicate exist.
+- **clause 1's split.** The snapshot must be built from POST-actuation live
+  state. An ordering diagnosis is not a prescription to swap. (Stated in v1 on
+  an inherited citation; re-derived here from `buildInterfaceSnapshots` reading
+  live child ifindex/MTU/MAC/addrs.)
 
-- **20 sites are already idempotent** by presence check or read-compare-write.
-  `ensureVLANSubInterface` returns early on an existing child
-  (`compiler_iface.go:203-207`); `planAddressReconcile` is a PURE planner whose
-  converged input yields an EMPTY plan (`:392`, and `AddrAdd` absorbs an
-  "exists" race at `:360`); every MTU/txqlen/ring/rxvlan write is
-  read-compare-write.
-- **2 correctness gaps** stop "converges regardless of where it aborted":
-  - **M3** `accept_ra=0` (`compiler_iface.go:268`) is written **only on the
-    create path**. A re-drive takes the adopt branch and returns at `:238`
-    before reaching it. If the create succeeded and this failed, nothing ever
-    retries it.
-  - **`errVLANAdoptRefused`** (`:210`) is a **soft skip**, not a failure. An
-    aborted apply can leave a device that later fails the adoption predicate,
-    and the re-drive then reports SUCCESS while converging to a *different*
-    end state.
-- **3 classes are not re-drivable at all**, and they are exactly the ones with
-  **no `markHostMutated` coverage today**:
-  - **M21** `netlink.LinkDel` on a `*netlink.Bond` (`:1593`). xpf-owned bonds
-    are recoverable (`ApplyBonds` runs at `daemon_apply.go:420`, BEFORE the
-    strip at `:442`). A **foreign** bond is gone for good.
-  - **M22** `AddrDel` on unmanaged NICs (`:1616`) — addresses on a NIC that is
-    not in the config, which therefore no apply re-adds.
-  - **one-way ratchets**: `rxvlan off`, ring buffers to max, RSS hash key
-    overwritten with a literal, txqlen raised, rps/xps/flow-cnt, and
-    `accept_ra`. None captured before writing; `applyEthtool` early-returns
-    when the new config sets nothing, so dropping `speed 10g` does not restore
-    autonegotiation.
+## 3. Acceptance clauses, re-scoped
 
-### 4.2 The abort prefix is NONDETERMINISTIC
+The issue's three clauses do not survive as written:
 
-`programZoneMaps` ranges a Go **map** over zones (`compiler_iface.go:450-462`).
-Which zone mutated before the abort is not fixed run-to-run. Any design must
-assume an **arbitrary interior prefix** of the mutation set landed — not a
-deterministic one. This alone kills a positional/journal-replay design.
+1. **"Restore the prior host plan or keep the control plane disabled."** R1
+   answers this for the reachable class — *keep disabled*, immediately, using
+   shipped machinery. Restore stays rejected.
+2. **"An apply that fails leaves a state the next apply converges."** Not
+   achievable today and this plan does not claim it. #8119 must land first;
+   even then it is a separate proposal.
+3. **The soft VLAN-name skips.** Two sites in different states (#6893 covers
+   one), and `compilePortMirroring`'s remains bare. Neither blocks R1-R3.
 
-### 4.3 There is no re-drive engine, and this is the load-bearing gap
+## 4. Test plan
 
-`applyActiveConfigResult` re-enters `CompileConfig` and therefore Phase 2, so
-the mechanism exists. Its triggers are a feed refetch (`daemon_feeds.go:57`),
-bringup, and a DHCP lease. **All event-driven, none unconditional.** The 1s
-`statusLoop` is level-triggered but explicitly scoped to manager↔helper state
-and never touches the compiler (`process_status.go:186-193`).
+R1 and R3 are testable with what exists: R1 through the coverage verdict
+classifier, which is a pure function; R3 through `vlanLinkByNameSeam`, the one
+seam in the path. R2 is testable at the `ApplyResult` boundary.
 
-And the failure record is **ephemeral**: `runPostMutationSteps` returns a
-string; the abort path never reaches `recordApplyResult` or `lastCompile`
-(`loader.go:329-334`). Nothing durable says "this apply aborted mid-mutation".
+**What is NOT testable today, and this is why P3/P4 are gone:** 0 of the 23
+write sites are injectable — the sole seam in the mutation path is a *lookup*
+seam. Any convergence proposal must first add write seams, on the most
+destructive path in the compiler, for testability alone.
 
-### 4.4 What this does NOT prescribe
+## 5. Open questions remaining
 
-The issue's clause 1 is "split pure planning from host+shim actuation". **This
-plan does not prescribe that split**, and the reason is measured rather than
-preferred: the snapshot must be built from POST-actuation live state
-(`buildInterfaceSnapshots` reads live child ifindex/MTU/MAC/addrs and the
-binding plan key includes the live ifindex) — the stranded plan's r1 6.1 found
-this and it still holds. An ordering diagnosis is not a prescription to swap.
+**OQ-A.** Is R1 correct as "disarm on any attach failure", or does it need the
+typed safety classification Codex's OQ-5 asks for? Retry count is explicitly not
+that classification.
 
-## 5. Path options
+**OQ-B.** Does R1 regress the #1960 no-brick posture for an already-committed
+config? My reading is no — management survives by construction — but a
+fresh-boot disarm is a bigger event than an apply-time one.
 
-**(a) Undo log / restore.** Write an undo record before each netlink call, and
-replay on abort. **Rejected.** The undo can itself fail, on a box whose
-interfaces may have been renamed underneath it; the abort prefix is
-nondeterministic (§4.2); and it is the model the stranded plan already dropped
-as unsound — "a journal cannot make netlink writes invisible". It is also the
-largest of the three.
+**OQ-C.** Should R2 land before R1? R1 is the security fix and is smaller; R2 is
+the evidence that makes the next design possible. They are independent.
 
-**(b) Unarm and hold.** On a post-Phase-2 abort, `setDataplane(nil)` and let
-the shipped #5275/#7191 barrier drop transit while management survives.
-**Rejected as the primary answer, kept as a sub-option.** It is far cheaper
-than the issue implies — the mechanism and its #1960 analysis are already
-shipped — but it converts a policy-staleness window into a forwarding outage
-for a failure whose most likely cause (a driver refusing an XDP attach) is
-persistent, so the box would stay down until an operator intervenes. That is
-the trade #1960 argues against for an already-committed config.
+## 6. Recommendation
 
-**(c) Converge forward.** Make Phase 2 idempotent under re-entry and re-drive
-the SAME config until it converges. **Recommended, but not free** — §6.
+**PLAN-DEFER on the convergence question; PLAN-READY is not claimed.**
 
-**(d) Hybrid: converge forward + an ownership ledger for the three
-non-re-drivable classes.** **This is the actual recommendation.** (c) alone
-cannot handle M21/M22/the ratchets, because no re-application of any config
-reconstructs state the config never described.
+The issue asks what an abort does to an already-mutated host. The honest answer
+r1 produced is that the question was mis-scoped: the reachable case is not a
+recovery problem but an **unadjudicated-surface problem**, and it has a shipped
+mechanism that is simply not reached. R1 closes it. R2/R3 are small and
+defensible. The convergence design the issue asks for is blocked behind two live
+defects (#8119 and the zone-order one) that must be fixed before any fixed-point
+claim can even be stated.
 
-## 6. Recommendation — (d), and what it honestly costs
+## 7. Revision log
 
-Four pieces, in dependency order. None requires a fence, a transaction, or a
-reordering of the compiler.
+**v2** — v1's recommendation withdrawn after r1. P3/P4 removed; §0a/§0b/§0c
+record what falsified them; two live defects extracted to their own issues; the
+recommendation is now R1 (security) + R2/R3 (small) with the convergence
+question explicitly deferred.
 
-**P1 — close the two idempotence gaps (§4.1).** Move M3 out of the create-only
-branch so a re-drive reaches it; make `errVLANAdoptRefused` fail rather than
-soft-skip *when the device was created by a prior aborted apply of this same
-config*. Small, local, and independently valuable.
-
-**P2 — make the abort durable.** Record "aborted after host mutation, at
-config generation N" somewhere that survives the failed apply. Today nothing
-does. This is the prerequisite for any retry, and it is also the thing that
-makes the acceptance criterion testable at all.
-
-**P3 — give the re-drive a trigger.** Not a timer. The in-repo pattern is
-`pkg/daemon/released_nic_tunables.go`: an ownership set, a level-triggered
-`owned - current` reconcile, and retry debt dropped only on success, with no
-timer. Its own header states the invariant this generalises: *"Every host/NIC
-mutation must be reverted when the interface leaves xpf ownership — not only
-when the process exits."*
-
-**P4 — an ownership ledger for M21/M22/the ratchets.** Only these three
-classes, and only their pre-state. This IS an undo log — but for 3 write
-classes rather than 23, for state the config cannot describe, and it is the
-same ledger shape already shipped in `released_nic_tunables.go`.
-
-**Sub-option (b) as the bounded fallback:** if P2 records an abort and P3's
-re-drive fails to converge after a bounded number of attempts, THEN unarm and
-engage the shipped barrier. That makes (b) the terminal state of a failed
-convergence rather than the first response to a single attach failure.
-
-## 7. Public API preservation
-
-No gRPC/REST/CLI signature changes. `ApplyResult` gains the abort record (P2);
-`ApplyResultFromCompileResult` (`apply.go:210-229`) currently drops
-`hostMutations` entirely, which is why nothing durable exists today.
-
-## 8. Hidden invariants the change must preserve
-
-- The snapshot is built from POST-actuation live state (§4.4).
-- Management must survive any fail-closed step (#1960).
-- `compileErrorMustAbortApply` vs the ordinary class is an EXISTING split; P2/P3
-  must key on it rather than inventing a parallel taxonomy.
-- Hitless address-only commits (`samePlanRefresh`) must not regress.
-- `markHostMutated`'s three coarse strings currently miss the most destructive
-  writes; P4 must not inherit that blind spot.
-
-## 9. Test plan — the controlling distinctions
-
-- **Idempotence, per site, from an arbitrary prefix.** Drive Phase 2, abort at
-  site *k*, re-drive, assert convergence — for *k* across the set, not for one
-  *k*. §4.2 means a single-*k* test proves nothing about the others.
-- **The M3 gap must RED before the fix.** A test that creates the child, fails
-  before `accept_ra`, re-drives, and asserts `accept_ra == 0`.
-- **The adopt-refusal gap must RED before the fix**: assert the re-drive FAILS
-  rather than reporting success with an `UnarmedSurface` record.
-- **A no-op re-drive changes nothing** — the control that stops P3 from
-  becoming a mutation source of its own.
-- **P4 ledger**: assert the pre-state is captured BEFORE the write, since a
-  ledger written after is exactly the race it exists to close.
-- Every one of these is a claim a test can red. The premise-check records three
-  in-tree comments this week whose claims no test held; this plan should not
-  add a fourth.
-
-## 10. Out of scope (explicitly)
-
-- The clause-1 planning/actuation split (§4.4 — measured as constrained, not
-  deferred by preference).
-- The fence-first model of the stranded plan.
-- #7078, #7079 (landed), the classifier-map generation coordination of clause 3
-  — clause 3 is a separate cut and this plan does not close it.
-
-## 11. Open questions for adversarial review
-
-**OQ-1.** Is (d)'s P4 ledger just (a) wearing a smaller hat? It is an undo log
-for 3 write classes. If a reviewer thinks the boundary is unstable — that P4
-grows to cover all 23 — then (d) collapses into (a) and should be judged as (a).
-
-**OQ-2.** Is P3's trigger sound without a timer? `released_nic_tunables.go` has
-an event that reliably re-fires. Does the abort path have one? If not, P3 needs
-a timer and the "no timer" discipline it copies does not transfer.
-
-**OQ-3.** §4.2's nondeterministic prefix — does it also break the *test* plan?
-Testing "abort at site k" requires injecting a failure at k, and 23 seams may
-not all be injectable without production hooks.
-
-**OQ-4.** Should clause 3 (publication generation ↔ classifier-map transaction)
-be a blocker? This plan says no. If a reviewer says a partial apply must be
-DETECTABLE by the next apply for P3 to be safe, clause 3 becomes a prerequisite
-and the scope roughly doubles.
-
-**OQ-5.** Is sub-option (b)-as-terminal-state right, or does any unarm on a
-committed config violate #1960 regardless of how many retries preceded it?
-
-**OQ-6.** Reachability: is one driver-refuses-attach failure worth P1-P4? A
-reviewer arguing PLAN-KILL would say ship P1+P2 (small, local, testable) and
-leave P3/P4, accepting that the operator re-commits. That is a coherent
-position and this plan does not dismiss it.
-
-## 12. Revision log
-
-### v1 (this revision)
-Initial draft. Premises measured at `f32aacbac`; four stale claims corrected in
-`premise-check.md`; recommendation is (d), with (a) rejected on the
-nondeterministic-prefix finding and (b) retained only as a bounded terminal
-state.
+**v1** — converge-forward + bounded ownership ledger. Falsified; kept in git
+history for the argument trail.

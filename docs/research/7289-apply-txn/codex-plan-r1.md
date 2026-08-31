@@ -59,10 +59,12 @@ unavailable issue text.
    one physical link to its own exact addresses and unit MTU
    (`pkg/dataplane/compiler_iface.go:964-1004`; address delete/add loop at
    `:344-369`). The userspace shim no-ops the zone-map call, but it does not
-   no-op those host writes. The last random zone wins the host state. An
-   identical apply can therefore flip addresses and MTU even when every syscall
-   succeeds. Section 4.2 is load-bearing against P3 itself: the plan has not
-   proved confluence and current accepted input supplies a counterexample.
+   no-op those host writes. The last random zone wins the exact-address
+   reconcile; stale cached MTU comparisons (Finding 1) make the MTU result
+   order-dependent rather than reliably last-writer-wins. An identical apply can
+   therefore flip addresses and MTU even when every syscall succeeds. Section
+   4.2 is load-bearing against P3 itself: the plan has not proved confluence and
+   current accepted input supplies a counterexample.
 
 3. **[CRITICAL] The 20/2/3 classification is not a real partition and omits actual non-reconstructible state.**
 
@@ -116,8 +118,9 @@ unavailable issue text.
    After Phase 2, two fallible bpffs cleanup functions return before the
    `runPostMutationSteps` wrapper (`pkg/dataplane/loader.go:301-318`). Snapshot
    construction then remains fallible (`pkg/dataplane/userspace/manager_compile.go:244-260`),
-   including live route/rule enumeration
-   (`pkg/dataplane/userspace/builder.go:54-82`). Bootstrap/classifier map
+   including live ip-rule enumeration during route-snapshot construction
+   (`pkg/dataplane/userspace/builder.go:77-82`;
+   `pkg/dataplane/userspace/routes.go:17-35,317-324`). Bootstrap/classifier map
    programming, process startup, protocol checks, and publication can all fail
    afterward (`pkg/dataplane/userspace/manager_compile.go:409-445`).
 
@@ -158,9 +161,11 @@ unavailable issue text.
    `CompileUserspaceShim` propagates `(nil, error)`
    (`pkg/dataplane/loader.go:262-265`). Userspace `ApplyConfig` likewise returns
    `(nil, error)` for every compile failure
-   (`pkg/dataplane/userspace/manager.go:468-477`). `ApplyResultFromCompileResult`
-   is reached only on success (`pkg/dataplane/apply.go:210-229`), and both
-   userspace result records are success-side (`pkg/dataplane/userspace/manager_compile.go:392-407,512-515`).
+   (`pkg/dataplane/userspace/manager.go:468-477`). The relevant
+   `ApplyResultFromCompileResult` record is reached only after
+   `CompileUserspaceShim` passes compile, cleanup, preflight, and attach
+   (`pkg/dataplane/loader.go:309-335`), and both outer userspace result records
+   are success-side (`pkg/dataplane/userspace/manager_compile.go:392-407,512-515`).
    Returning a non-nil ordinary `ApplyResult` on error is not an innocuous API
    tweak: daemon consumers treat it as authoritative input for session-sync zone
    maps and networkd (`pkg/daemon/daemon_apply_dataplane.go:227-230,272-297`).
@@ -288,9 +293,10 @@ unavailable issue text.
 
    **Confirmed from code.** The plan overreads each mechanism:
 
-   - #5679 does not install convergence. It records an ordinary error while
-     retaining the old dataplane and explicitly names an operator re-commit or
-     feed update as the future attempt
+   - #5679 does not install convergence. For the pre-publication failure class
+     its comment describes, it records an ordinary error while retaining the old
+     dataplane and explicitly names an operator re-commit or feed update as the
+     future attempt
      (`pkg/daemon/daemon_apply_dataplane.go:175-193`). That is fail-stale plus a
      conditional external event, not an autonomous converge-forward doctrine.
    - #6894 explicitly documents its uncovered post-mutation failures
