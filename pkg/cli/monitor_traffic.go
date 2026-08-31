@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/termsafe"
 )
 
 // handleMonitor dispatches monitor sub-commands.
@@ -250,12 +252,37 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	}()
 
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// #7389: sanitize this command's output before it reaches the
+	// terminal. See wireSanitizedOutput for why both streams go through one
+	// call.
+	defer wireSanitizedOutput(cmd)()
 	err = cmd.Run()
 	if ctx.Err() != nil {
 		fmt.Println() // newline after ^C
 		return nil
 	}
 	return err
+}
+
+// wireSanitizedOutput points cmd's stdout and stderr at line-wise sanitizing
+// writers and returns the flush to defer.
+//
+// #7389: extracted rather than written inline at each site, and it wires BOTH
+// streams together on purpose. The #6584 census is FUNCTION-level -- it asks
+// whether a forking function references termsafe at all -- so with the two
+// streams wired separately, reverting only `cmd.Stdout` left the function
+// still referencing termsafe through `cmd.Stderr` and the census stayed
+// GREEN. That was a measured escape, not a hypothetical: the mutation
+// survived. Routing both through one call makes the partial revert
+// inexpressible, so the only way to unwire a site is to delete the call --
+// which the census does catch.
+func wireSanitizedOutput(cmd *exec.Cmd) func() {
+	outw := termsafe.NewSanitizingWriter(os.Stdout)
+	errw := termsafe.NewSanitizingWriter(os.Stderr)
+	cmd.Stdout = outw
+	cmd.Stderr = errw
+	return func() {
+		_ = outw.Flush()
+		_ = errw.Flush()
+	}
 }
