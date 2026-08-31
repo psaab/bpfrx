@@ -36,6 +36,11 @@ fn snapshot_roundtrip() {
         session_install_admission_refused: 17,
         session_install_partial: 1,
         new_flow_installs: 9_876,
+        // #7919 / #7689: this literal enumerated every field, so three new
+        // counters broke it. Given a tail rather than three more lines — the
+        // cell asserts a ROUNDTRIP, so fields it does not name are exactly the
+        // ones it does not care about.
+        ..Default::default()
     };
     atomics.publish(&c, 0);
     let s = atomics.snapshot();

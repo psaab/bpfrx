@@ -8543,3 +8543,111 @@ fn reverse_match_key_zeroes_only_the_domain_7160() {
         "reverse_match_key changed something other than the routing domain"
     );
 }
+
+// #7919: the by-key lookup-miss counters, and the property that matters is
+// that they SEPARATE the three causes rather than reporting one number.
+//
+// The issue's own instruction, after three retired discriminators: "establish
+// WHICH, because they need different fixes and the cheap one is wrong half the
+// time." A single `lookup_miss` total would satisfy "we added instrumentation"
+// while leaving exactly that question open, so each cause is asserted to move
+// its OWN counter and to leave the other two alone.
+//
+// Both `touch_if_stale` and `account_packet` are driven, because they resolve
+// through different functions (`record_by_key` vs `record_by_key_mut`) and a
+// miss in one but not the other would be a materially different story than a
+// miss in both — which is what the cluster measurement actually observed
+// (`idle ~= age` on every frozen row means BOTH missed).
+#[test]
+fn lookup_miss_counters_separate_the_three_causes_7919() {
+    let mut table = SessionTable::new();
+    let key = key_v6();
+    let install_ns = 1_000_000_000u64;
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        install_ns,
+        PROTO_UDP,
+        0
+    ));
+
+    // CONTROL FIRST. A hit must move NOTHING — without this the assertions
+    // below pass for a counter that increments on every lookup.
+    table.touch_if_stale(&key, install_ns + 1);
+    table.account_packet(&key, 100, 0, 0);
+    assert_eq!(
+        table.lookup_miss_counts(),
+        (0, 0, 0),
+        "a session that RESOLVES must not count as a miss; a counter that moves \
+         here measures traffic, not failure"
+    );
+
+    // CAUSE 1: no handle in the index at all — a key never installed.
+    let mut absent = key_v6();
+    absent.src_port = absent.src_port.wrapping_add(1);
+    table.touch_if_stale(&absent, install_ns + 2);
+    let (nh, sh, km) = table.lookup_miss_counts();
+    assert_eq!(
+        (nh, sh, km),
+        (1, 0, 0),
+        "an uninstalled key must count as no-handle and nothing else"
+    );
+
+    // The SAME cause through the &mut resolver, which is the one
+    // `account_packet` uses. Both must count, or a frozen-counters-but-live-
+    // idle-timer split would be invisible.
+    table.account_packet(&absent, 100, 0, 0);
+    assert_eq!(
+        table.lookup_miss_counts(),
+        (2, 0, 0),
+        "account_packet resolves through record_by_key_mut and must count the \
+         same cause; counting only the shared-ref path would hide exactly the \
+         asymmetry #7919 used to diagnose this"
+    );
+
+    // CAUSE 2: a handle that outlived its record — resolves, but points past
+    // the slab. Unreachable through the public API, which is why it needs the
+    // seam and why it is worth counting at all.
+    let mut stale = key_v6();
+    stale.src_port = stale.src_port.wrapping_add(2);
+    table.debug_force_handle(&stale, u32::MAX);
+    table.touch_if_stale(&stale, install_ns + 3);
+    assert_eq!(
+        table.lookup_miss_counts(),
+        (2, 1, 0),
+        "a handle pointing past the slab must count as stale-handle ONLY — if \
+         this lands on no-handle the two causes are indistinguishable and the \
+         counters answer nothing"
+    );
+
+    // CAUSE 3: a handle resolving to a LIVE record whose stored key differs.
+    // The index and the slab disagree; the lookup finds a session and
+    // correctly refuses to account against it.
+    let installed_handle = table
+        .debug_handle_for_key(&key)
+        .expect("the installed session must have a handle");
+    let mut aliased = key_v6();
+    aliased.src_port = aliased.src_port.wrapping_add(3);
+    table.debug_force_handle(&aliased, installed_handle);
+    table.account_packet(&aliased, 100, 0, 0);
+    assert_eq!(
+        table.lookup_miss_counts(),
+        (2, 1, 1),
+        "a handle resolving to a record with a DIFFERENT key must count as \
+         key-mismatch ONLY. This is the cause that means the index and the slab \
+         disagree, which is a different bug from either sibling"
+    );
+
+    // The installed session must still be intact — none of the misses above,
+    // including the one that resolved ONTO its handle, may have disturbed it.
+    assert!(
+        table.entry_by_key(&key).is_some(),
+        "the installed session must survive a miss on a different key"
+    );
+    assert_eq!(
+        table.entry_by_key(&key).unwrap().last_seen_ns,
+        install_ns,
+        "the aliased lookup landed ON this record's handle and must not have          touched or accounted against it"
+    );
+}

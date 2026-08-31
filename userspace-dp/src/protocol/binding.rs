@@ -99,6 +99,22 @@ pub struct WorkerRuntimeStatus {
     /// for wire-additive compatibility with older daemons.
     #[serde(rename = "session_create_drops", default)]
     pub session_create_drops: u64,
+    /// #7919: PER-WORKER by-key session-lookup misses, split by cause.
+    ///
+    /// Per-worker rather than only aggregated because the defect is
+    /// per-session, not global: on the measured box one of three concurrent
+    /// flows accounted perfectly while the other two froze, so any explanation
+    /// predicting uniform behaviour is already wrong. A process-wide total
+    /// cannot separate "one worker is missing everything" from "every worker
+    /// misses occasionally", and those are different bugs.
+    ///
+    /// Additive (`default`), so an older peer decodes them as 0.
+    #[serde(rename = "session_lookup_miss_no_handle", default)]
+    pub session_lookup_miss_no_handle: u64,
+    #[serde(rename = "session_lookup_miss_stale_handle", default)]
+    pub session_lookup_miss_stale_handle: u64,
+    #[serde(rename = "session_lookup_miss_key_mismatch", default)]
+    pub session_lookup_miss_key_mismatch: u64,
     /// #1861: cumulative pair-admission preflight refusals (one per
     /// refused flow) on this worker's new-flow install path.
     #[serde(rename = "session_install_admission_refused", default)]
