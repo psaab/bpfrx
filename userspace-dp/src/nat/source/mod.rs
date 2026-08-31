@@ -1,5 +1,5 @@
 mod lease_note_7560;
-pub(super) use lease_note_7560::dropped_persistent_lease_note;
+pub(crate) use lease_note_7560::{dropped_persistent_lease_note, report_dropped_leases};
 // Source NAT (SNAT) rules + matching + lookup.
 //
 // Owns rule parsing from snapshots, the address/port-pool match
@@ -599,10 +599,8 @@ fn reseed_retained_pool(
     }
     let outcome = allocator.reseed_retained_from(&prev.allocator, &map, now_ns);
     // #7560: own condition, own population — see lease_note_7560.rs.
-    if let Some(note) = dropped_persistent_lease_note(pool_name, &outcome) {
-        eprintln!("{note}");
-    }
-    if outcome.skipped_out_of_range > 0 || outcome.skipped_address_only > 0 || outcome.refused > 0 {
+    report_dropped_leases(pool_name, &outcome);
+    if outcome.needs_report() {
         eprintln!(
             "xpf-dp: source-nat pool {pool_name:?} changed: carried {} live translation(s) onto \
              {} retained address(es); {} not carried (port outside the new range), {} \
@@ -696,12 +694,14 @@ fn carry_renamed_pool_reservations(
         }
         let map: FxHashMap<usize, usize> = (0..total).map(|i| (i, i)).collect();
         let outcome = allocator.reseed_retained_from(prev, &map, now_ns);
+        // #7560 residual: see lease_note_7560.rs "THE RENAME SITE".
+        report_dropped_leases(&key.pool_name, &outcome);
         eprintln!(
             "xpf-dp: source-nat pool {:?} appears to be pool {:?} renamed (same addresses and \
              port range): carried {} live translation(s) across the rename; {} refused \
-             (another pool already owns the identity), {} out of range (#6979)",
+             (another pool already owns the identity), {} out of range, {} address-only (#7560)",
             key.pool_name, prev_key.pool_name, outcome.reseeded, outcome.refused,
-            outcome.skipped_out_of_range,
+            outcome.skipped_out_of_range, outcome.skipped_address_only,
         );
     }
 }

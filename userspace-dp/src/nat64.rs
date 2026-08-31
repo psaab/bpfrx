@@ -1558,10 +1558,22 @@ impl Nat64State {
                                 &map,
                                 now_ns,
                             );
-                            if outcome.reseeded > 0
-                                || outcome.skipped_out_of_range > 0
-                                || outcome.refused > 0
-                            {
+                            // #7560 residual: the third reseed call site. The
+                            // counters are in the allocator so they are
+                            // populated here, but the note was wired only at
+                            // the SNAT pool-change site. Latent today — nothing
+                            // in nat64.rs allocates through the persistent-lease
+                            // path, so this should always be None — and wired
+                            // anyway, because "the counter exists but nobody
+                            // prints it" is the defect being fixed.
+                            crate::nat::report_dropped_leases(&snap.name, &outcome);
+                            // #7560 residual: this condition omitted
+                            // `skipped_address_only`, so a pass that skipped
+                            // ONLY address-only tokens printed NOTHING — the
+                            // population was counted and then swallowed by the
+                            // gate. Derived from ReseedOutcome now, so a new
+                            // population cannot be silently ungated here again.
+                            if outcome.reseeded > 0 || outcome.needs_report() {
                                 eprintln!(
                                     "xpf nat64: pool for rule {:?} changed: carried {} live \
                                      translation(s) onto {} retained address(es); {} not \

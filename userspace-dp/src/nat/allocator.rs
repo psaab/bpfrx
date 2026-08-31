@@ -255,6 +255,60 @@ pub(crate) struct ReseedOutcome {
     pub(crate) dropped_persistent_on_removed: usize,
 }
 
+impl ReseedOutcome {
+    /// #7560 residual: does the carried/skipped accounting have anything to say?
+    ///
+    /// DERIVED from the struct rather than restated at each call site, because
+    /// it was already wrong at two of the three. `nat64.rs` gated on
+    /// `reseeded || skipped_out_of_range || refused` and omitted
+    /// `skipped_address_only` entirely, so a pass that skipped ONLY
+    /// address-only tokens printed nothing at all; the #6979 rename site
+    /// printed a line but left that count out of it. A per-site condition has
+    /// to be updated everywhere a field is added, and was not — twice.
+    ///
+    /// This is deliberately NOT "fix the two sites". Two corrected conditions
+    /// are still three places to forget next time; a derived gate makes a
+    /// silently-ungated population unrepresentable.
+    ///
+    /// SCOPE: the populations THIS line accounts for. Dropped leases are a
+    /// different population with its own note (`dropped_persistent_lease_note`)
+    /// and its own condition, deliberately — see that file for why they are not
+    /// a column on this line. Folding them in here would print a
+    /// "0 not carried, 0 skipped, 0 refused" line on a lease-only drop, which
+    /// is the noise that teaches an operator to skip the line.
+    ///
+    /// `reseeded` alone does not make the line interesting: the carry
+    /// succeeding is the expected case. Every population that was NOT carried
+    /// does, because each is state the operator has lost.
+    pub(crate) fn needs_report(&self) -> bool {
+        // EXHAUSTIVE DESTRUCTURE, no `..` rest pattern, deliberately. Adding a
+        // field to ReseedOutcome FAILS TO COMPILE here until it is classified,
+        // so a new population cannot be silently ungated.
+        //
+        // Without this the gate is merely CENTRALISED: one hand-written
+        // disjunction that a new field slips past exactly as it slipped past
+        // three per-site conditions. I verified that by adding a field and
+        // populating it — needs_report() did not pick it up and no site's
+        // message mentioned it. One place to forget is better than three and is
+        // still a place to forget; the destructure makes it none.
+        let Self {
+            // Carried, not lost: the carry succeeding is the expected case and
+            // is not on its own a reason to print.
+            reseeded: _,
+            skipped_out_of_range,
+            skipped_address_only,
+            refused,
+            // Leases are a different population with their own note and its own
+            // condition (dropped_persistent_lease_note). Classified here as NOT
+            // gating this line, which is a decision rather than an omission —
+            // that is the whole point of being forced to name them.
+            dropped_persistent_on_retained: _,
+            dropped_persistent_on_removed: _,
+        } = *self;
+        skipped_out_of_range > 0 || skipped_address_only > 0 || refused > 0
+    }
+}
+
 /// #6211 F2: which worker is taking or dropping a reservation.
 ///
 /// `Untracked` reproduces the pre-#6211-F2 contract exactly — a reserve sets no
