@@ -509,7 +509,11 @@ Guard layers (`build-userspace-xdp.sh`):
      its own boundary holds for an 87,000-insn change and fails for an 88,000
      one. The 2.1 points above it are margin, and they are a JUDGEMENT — the
      21.58% headroom is measured, the 87,000-insn structural-change cost is
-     chosen, and the second is the one to revisit.
+     chosen, and the second is the one to revisit. **That 21.58% was measured at
+     `268346838`** and is dated deliberately (#8241): the object has since moved
+     to 801,448 / 19.86% (`eaf589bac`), and this derivation is not re-run against
+     it. It records which inputs the judgement was made from -- renumbering it
+     would re-derive the judgement, which is what the sentence above separates.
    - **The build now checks that the floor still satisfies its own property
      (#6884).** Nothing did before, and nothing could: "does it fire before the
      next structural change" is a fact about the RELATIONSHIP between the floor
@@ -1220,9 +1224,15 @@ authoritative list; quick recap:
 
 ### IPv6 extension-header walk: the shim's budget (#4555; re-measured #6884)
 
-> **Re-measured 2026-08-27 (#6884): the budget is no longer nearly spent.**
-> The tracked object is at **784,175 / 1,000,000 — 21.58% headroom** on
-> kernel 7.0.13, after #6676's runtime `binding_slot` extraction. The
+> **Re-measured at `3cfca758e` (#6884): the budget is no longer nearly spent.**
+> The tracked object was at **784,175 / 1,000,000 — 21.58% headroom** on
+> *that commit*. A DATE is not enough here and #8241 is why: `eaf589bac`
+> landed the same day and moved the object to **801,448 / 19.86%**, so
+> "2026-08-27" names two different budgets. Against the 15% install floor
+> (not the 1,000,000 kernel cap) that is 48,552 insns of usable slack, and a
+> shape that fits under the cap can still be unshippable.
+>
+> Measured on kernel 7.0.13, after #6676's runtime `binding_slot` extraction. The
 > table below is the #4555 measurement series and is retained because the
 > *couplings* it establishes still hold; its absolute counts are a
 > snapshot of a tree that has since moved by ~206k insns. Treat any
