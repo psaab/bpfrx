@@ -551,6 +551,24 @@ test-host-inbound-lib:
 	python3 -m unittest discover -s test/incus -p 'host_inbound_probe_test.py'
 	bash ./test/incus/cluster-cell-selftest.sh
 
+# #8136: the WHOLE test/incus Python suite. Before this, the only target that
+# ran any of it passed a LITERAL filename as the discovery pattern, so 1 of 21
+# files ran and the other 20 were executed by nothing — long enough for real
+# drift to accumulate in them unnoticed.
+#
+# Two separate mechanisms made a file contribute ZERO tests while the run
+# reported success, which is why harness_discovery_test.py exists alongside the
+# widened pattern: a hyphenated filename is not an importable module name and is
+# skipped without error, and a pytest-style module has no TestCase so nothing is
+# collected from it. Widening the pattern alone would have left both live for
+# the next file that lands.
+#
+# Hermetic: no cluster, no incus. The cases that invoke a real harness against a
+# fake target set SKIP_TARGET_PRECHECK, since #8040's live target-service probe
+# is inapplicable by construction there.
+test-incus-lib:
+	python3 -m unittest discover -s test/incus -p '*_test.py'
+
 # The on-wire host-inbound smoke itself (#6936 — needs the loss userspace
 # cluster). Reads the already-committed config, derives its probe targets from
 # it, and commits NOTHING. `--with-failover` adds the HA leg, which moves RG1
