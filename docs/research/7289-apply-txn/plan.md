@@ -1,10 +1,16 @@
 # Plan: #7289 — what an abort after the Phase-2 host mutation should do
 
-**Status:** DRAFT v2 — r1 returned **PLAN-NEEDS-MAJOR from both available
-reviewers** (Claude SMR, Codex; AGY infra-blocked with 2 documented retries).
+**Status:** DRAFT v2, UNREVIEWED. r1 killed v1: Codex returned **PLAN-KILL**
+("a failed plan, not a request for implementation detail") and Claude SMR
+returned **PLAN-NEEDS-MAJOR**; AGY was infra-blocked with 2 documented retries.
 v1's recommendation is **withdrawn**, not amended: P3 (re-drive engine) and P4
 (ownership ledger) are removed. This is a `/research` deliverable and stops at
 PLAN-READY / PLAN-KILL / PLAN-DEFER.
+
+**Correction on the record:** an earlier revision of this header, and the first
+round-status comment on #7289, reported Codex as PLAN-NEEDS-MAJOR. That was read
+from an incomplete mid-write snapshot of `codex-plan-r1.md` while the reviewer
+was still running. The findings were identical; the disposition was not.
 
 **Verified against:** `origin/master` `f32aacbac`. Premises in
 `premise-check.md`; reviews in `claude-smr-plan-r1.md` and `codex-plan-r1.md`.
@@ -68,6 +74,14 @@ pre-publication, ambiguous publication, and post-publication. What exists today:
 — which phase, which authority state — rather than to invent a store. It is
 operator evidence and a prerequisite for any future recovery design; it is not
 itself recovery.
+
+**R4 — Make the child `LinkSetUp` failure observable and consistent.**
+Its error is RETURNED on the VLAN create path (`compiler_iface.go:263`) and only
+LOGGED on the adopt path (`:228-233`), so a re-drive after an abort between
+`LinkAdd` and the set-up adopts a down child, fails to raise it, and reports
+SUCCESS. My own r1 pass found this and v2 initially recorded it as a finding
+without carrying it into the proposal; Codex's OQ-6 names it independently as
+part of the shippable slice. Added here.
 
 **R3 — The `accept_ra` re-drive correction.** `accept_ra=0` is written only on
 the VLAN create path (`compiler_iface.go:268`); the adopt path returns at `:238`
@@ -133,7 +147,8 @@ the evidence that makes the next design possible. They are independent.
 
 ## 6. Recommendation
 
-**PLAN-DEFER on the convergence question; PLAN-READY is not claimed.**
+**v1 is PLAN-KILLED. v2 is a re-derivation and is UNREVIEWED — PLAN-READY is
+not claimed and PLAN-DEFER is not yet earned, because no reviewer has seen v2.**
 
 The issue asks what an abort does to an already-mutated host. The honest answer
 r1 produced is that the question was mis-scoped: the reachable case is not a
@@ -145,7 +160,7 @@ claim can even be stated.
 
 ## 7. Revision log
 
-**v2** — v1's recommendation withdrawn after r1. P3/P4 removed; §0a/§0b/§0c
+**v2** — v1 PLAN-KILLED by Codex, PLAN-NEEDS-MAJOR by Claude SMR. Recommendation withdrawn. P3/P4 removed; §0a/§0b/§0c
 record what falsified them; two live defects extracted to their own issues; the
 recommendation is now R1 (security) + R2/R3 (small) with the convergence
 question explicitly deferred.
