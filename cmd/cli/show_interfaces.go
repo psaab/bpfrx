@@ -16,16 +16,16 @@ func (c *ctl) showInterfaces(args []string) error {
 		return c.showTextFiltered("interfaces-queue", selector)
 	}
 	if len(args) > 0 && args[0] == "tunnel" {
-		return c.showText("tunnels")
+		return c.showCommand("show interfaces tunnel")
 	}
 	if len(args) > 0 && args[0] == "extensive" {
-		return c.showText("interfaces-extensive")
+		return c.showCommand("show interfaces extensive")
 	}
 	if len(args) > 0 && args[0] == "statistics" {
-		return c.showText("interfaces-statistics")
+		return c.showCommand("show interfaces statistics")
 	}
 	if len(args) > 0 && args[0] == "detail" {
-		return c.showText("interfaces-detail")
+		return c.showCommand("show interfaces detail")
 	}
 	if len(args) >= 2 && args[len(args)-1] == "detail" {
 		return c.showTextFiltered("interfaces-detail", args[0])

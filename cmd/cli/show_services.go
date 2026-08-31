@@ -11,7 +11,7 @@ func (c *ctl) handleShowServices(args []string) error {
 	}
 	switch args[0] {
 	case "rpm":
-		return c.showText("rpm")
+		return c.showCommand("show services rpm")
 	case "ip-monitoring":
 		// #1827: only `ip-monitoring status` is valid per cmdtree.
 		rest := args[1:]
@@ -22,7 +22,7 @@ func (c *ctl) handleShowServices(args []string) error {
 		if rest[0] != "status" {
 			return fmt.Errorf("unknown ip-monitoring target: %s (expected `status`)", rest[0])
 		}
-		return c.showText("services-ip-monitoring-status")
+		return c.showCommand("show services ip-monitoring status")
 	case "application-identification":
 		// #653: surface what xpf AppID actually does today. Per
 		// cmdtree the only valid leaf is `application-identification
@@ -38,13 +38,13 @@ func (c *ctl) handleShowServices(args []string) error {
 			return fmt.Errorf("unknown application-identification target: %s "+
 				"(expected `status`)", rest[0])
 		}
-		return c.showText("application-identification-status")
+		return c.showCommand("show services application-identification status")
 	case "dynamic-dns":
 		// #2691 P2: Surface A (router/interface-address) DDNS status.
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("services-dynamic-dns-detail")
+			return c.showCommand("show services dynamic-dns detail")
 		}
-		return c.showText("services-dynamic-dns")
+		return c.showCommand("show services dynamic-dns")
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}

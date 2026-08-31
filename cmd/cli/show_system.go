@@ -16,7 +16,7 @@ func (c *ctl) handleShowSystem(args []string) error {
 	switch args[0] {
 	case "commit":
 		if len(args) >= 2 && args[1] == "history" {
-			return c.showText("commit-history")
+			return c.showCommand("show system commit history")
 		}
 		printRemoteTreeHelp("show system commit:", "show", "system", "commit")
 		return nil
@@ -100,11 +100,11 @@ func (c *ctl) handleShowSystem(args []string) error {
 	case "memory":
 		return c.showSystemInfo("memory")
 	case "storage":
-		return c.showText("storage")
+		return c.showCommand("show system storage")
 	case "processes":
 		return c.showSystemInfo("processes")
 	case "alarms":
-		return c.showText("alarms")
+		return c.showCommand("show system alarms")
 	case "users":
 		return c.showSystemInfo("users")
 	case "connections":
@@ -113,37 +113,37 @@ func (c *ctl) handleShowSystem(args []string) error {
 		fmt.Println("License: open-source (no license required)")
 		return nil
 	case "services":
-		return c.showText("system-services")
+		return c.showCommand("show system services")
 	case "ntp":
-		return c.showText("ntp")
+		return c.showCommand("show system ntp")
 	case "login":
-		return c.showText("login")
+		return c.showCommand("show system login")
 	case "syslog":
-		return c.showText("system-syslog")
+		return c.showCommand("show system syslog")
 	case "internet-options":
-		return c.showText("internet-options")
+		return c.showCommand("show system internet-options")
 	case "root-authentication":
-		return c.showText("root-authentication")
+		return c.showCommand("show system root-authentication")
 	case "backup-router":
-		return c.showText("backup-router")
+		return c.showCommand("show system backup-router")
 	case "buffers":
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("buffers-detail")
+			return c.showCommand("show system buffers detail")
 		}
-		return c.showText("buffers")
+		return c.showCommand("show system buffers")
 	case "boot-messages":
 		return c.showSystemInfo("boot-messages")
 	case "core-dumps":
-		return c.showText("core-dumps")
+		return c.showCommand("show system core-dumps")
 	case "kernel-upgrade":
 		// #6495: the #1930 kernel-channel state, rendered daemon-side through
 		// pkg/upgrade — the same implementation the console CLI uses.
-		return c.showText("kernel-upgrade")
+		return c.showCommand("show system kernel-upgrade")
 	case "bootstrap-import":
 		// #6496: the day-0 config-import verdict. Rendered daemon-side through
 		// pkg/bootstrapshow — the same implementation the in-process console
 		// CLI uses — so the two clients cannot show different answers.
-		return c.showText("bootstrap-import")
+		return c.showCommand("show system bootstrap-import")
 	default:
 		return fmt.Errorf("unknown show system target: %s", args[0])
 	}

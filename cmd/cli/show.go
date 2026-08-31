@@ -43,13 +43,13 @@ func (c *ctl) handleShow(args []string) error {
 				if len(args) >= 3 {
 					switch args[2] {
 					case "status":
-						return c.showText("chassis-cluster-status")
+						return c.showCommand("show chassis cluster status")
 					case "interfaces":
-						return c.showText("chassis-cluster-interfaces")
+						return c.showCommand("show chassis cluster interfaces")
 					case "information":
-						return c.showText("chassis-cluster-information")
+						return c.showCommand("show chassis cluster information")
 					case "statistics":
-						return c.showText("chassis-cluster-statistics")
+						return c.showCommand("show chassis cluster statistics")
 					case "control-plane", "data-plane", "ip-monitoring", "fabric":
 						// #5459: an UNRECOGNIZED sub-arg must surface a
 						// usage error, not silently render the default
@@ -63,21 +63,21 @@ func (c *ctl) handleShow(args []string) error {
 						return c.showTextFiltered(topic, filter)
 					}
 				}
-				return c.showText("chassis-cluster")
+				return c.showCommand("show chassis cluster")
 			case "environment":
-				return c.showText("chassis-environment")
+				return c.showCommand("show chassis environment")
 			case "forwarding":
-				return c.showText("chassis-forwarding")
+				return c.showCommand("show chassis forwarding")
 			case "hardware":
-				return c.showText("chassis-hardware")
+				return c.showCommand("show chassis hardware")
 			case "device-map":
 				if len(args) >= 3 && args[2] == "candidates" {
-					return c.showText("chassis-device-map-candidates")
+					return c.showCommand("show chassis device-map candidates")
 				}
-				return c.showText("chassis-device-map")
+				return c.showCommand("show chassis device-map")
 			}
 		}
-		return c.showText("chassis")
+		return c.showCommand("show chassis")
 
 	case "configuration":
 		format := pb.ConfigFormat_HIERARCHICAL
@@ -148,7 +148,7 @@ func (c *ctl) handleShow(args []string) error {
 				}
 				return c.showText(topic)
 			case "forwarding-class":
-				return c.showText("cos-forwarding-class")
+				return c.showCommand("show class-of-service forwarding-class")
 			}
 		}
 		printRemoteTreeHelp("show class-of-service:", "show", "class-of-service")
@@ -168,13 +168,13 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "route":
 		if len(args) >= 2 && args[1] == "terse" {
-			return c.showText("route-terse")
+			return c.showCommand("show route terse")
 		}
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("route-detail")
+			return c.showCommand("show route detail")
 		}
 		if len(args) >= 2 && args[1] == "summary" {
-			return c.showText("route-summary")
+			return c.showCommand("show route summary")
 		}
 		if len(args) >= 3 && args[1] == "instance" {
 			return c.showTextFiltered("route-instance", args[2])
@@ -218,34 +218,34 @@ func (c *ctl) handleShow(args []string) error {
 		return c.handleShowSystem(args[1:])
 
 	case "schedulers":
-		return c.showText("schedulers")
+		return c.showCommand("show schedulers")
 
 	case "snmp":
 		if len(args) >= 2 && args[1] == "v3" {
-			return c.showText("snmp-v3")
+			return c.showCommand("show snmp v3")
 		}
-		return c.showText("snmp")
+		return c.showCommand("show snmp")
 
 	case "lldp":
 		if len(args) >= 2 && args[1] == "neighbors" {
-			return c.showText("lldp-neighbors")
+			return c.showCommand("show lldp neighbors")
 		}
-		return c.showText("lldp")
+		return c.showCommand("show lldp")
 
 	case "dhcp-relay":
-		return c.showText("dhcp-relay")
+		return c.showCommand("show dhcp-relay")
 
 	case "dhcp-server":
 		if len(args) >= 2 && args[1] == "dynamic-dns" {
 			if len(args) >= 3 && args[2] == "detail" {
-				return c.showText("dhcp-server-dynamic-dns-detail")
+				return c.showCommand("show dhcp-server dynamic-dns detail")
 			}
-			return c.showText("dhcp-server-dynamic-dns")
+			return c.showCommand("show dhcp-server dynamic-dns")
 		}
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("dhcp-server-detail")
+			return c.showCommand("show dhcp-server detail")
 		}
-		return c.showText("dhcp-server")
+		return c.showCommand("show dhcp-server")
 
 	case "firewall":
 		// #4967: `show firewall [filter <name>] effective [family <f>]` renders
@@ -277,27 +277,27 @@ func (c *ctl) handleShow(args []string) error {
 			}
 			return c.showText(topic)
 		}
-		return c.showText("firewall")
+		return c.showCommand("show firewall")
 
 	case "flow-monitoring":
 		// #2464: `show flow-monitoring statistics` renders per-collector
 		// write-health; bare `show flow-monitoring` renders configuration.
 		if len(args) > 1 && args[1] == "statistics" {
-			return c.showText("flow-monitoring-statistics")
+			return c.showCommand("show flow-monitoring statistics")
 		}
-		return c.showText("flow-monitoring")
+		return c.showCommand("show flow-monitoring")
 
 	case "log":
 		if len(args) > 1 {
 			return c.showText("log:" + strings.Join(args[1:], ":"))
 		}
-		return c.showText("log")
+		return c.showCommand("show log")
 
 	case "services":
 		return c.handleShowServices(args[1:])
 
 	case "version":
-		return c.showText("version")
+		return c.showCommand("show version")
 
 	case "arp":
 		return c.showSystemInfo("arp")
@@ -307,44 +307,44 @@ func (c *ctl) handleShow(args []string) error {
 			return c.showSystemInfo("ipv6-neighbors")
 		}
 		if len(args) >= 2 && args[1] == "router-advertisement" {
-			return c.showText("ipv6-router-advertisement")
+			return c.showCommand("show ipv6 router-advertisement")
 		}
 		printRemoteTreeHelp("show ipv6:", "show", "ipv6")
 		return nil
 
 	case "policy-options":
-		return c.showText("policy-options")
+		return c.showCommand("show policy-options")
 
 	case "route-map":
-		return c.showText("route-map")
+		return c.showCommand("show route-map")
 
 	case "event-options":
-		return c.showText("event-options")
+		return c.showCommand("show event-options")
 
 	case "routing-options":
-		return c.showText("routing-options")
+		return c.showCommand("show routing-options")
 
 	case "routing-instances":
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("routing-instances-detail")
+			return c.showCommand("show routing-instances detail")
 		}
-		return c.showText("routing-instances")
+		return c.showCommand("show routing-instances")
 
 	case "forwarding-options":
 		if len(args) >= 2 && args[1] == "port-mirroring" {
-			return c.showText("forwarding-options-port-mirroring")
+			return c.showCommand("show forwarding-options port-mirroring")
 		}
-		return c.showText("forwarding-options")
+		return c.showCommand("show forwarding-options")
 
 	case "vlans":
-		return c.showText("vlans")
+		return c.showCommand("show vlans")
 
 	case "task":
-		return c.showText("task")
+		return c.showCommand("show task")
 
 	case "monitor":
 		if len(args) >= 3 && args[1] == "security" && args[2] == "flow" {
-			return c.showText("monitor-security-flow")
+			return c.showCommand("show monitor security flow")
 		}
 		printRemoteTreeHelp("show monitor:", "show", "monitor")
 		return nil
@@ -355,7 +355,7 @@ func (c *ctl) handleShow(args []string) error {
 }
 
 func (c *ctl) showRoutes() error {
-	return c.showText("route-all")
+	return c.showCommand("show route")
 }
 
 func (c *ctl) handleConfigShow(args []string) error {
@@ -475,6 +475,30 @@ func clusterSubsystemView(sub string, rest []string) (topic, filter string, err 
 		return "chassis-cluster-fabric-statistics", "", nil
 	}
 	return "", "", fmt.Errorf("unknown cluster subsystem: %s", sub)
+}
+
+// showCommand sends the ShowText topic that a canonical operational command
+// emits, resolving it through pkg/cmdtree — the SSOT both this binary and the
+// daemon's authorization gate read (#8058).
+//
+// Call sites name the COMMAND, not the topic. That is the point: the command is
+// self-evident in the switch arm a reader is already looking at, whereas a topic
+// string is an encoding detail that has to be looked up elsewhere to be
+// checked. Before #8058 those topic literals were a second, independent
+// transcription of the same correspondence the server holds, and nothing made
+// the two agree.
+//
+// An unresolvable command is a programming error in THIS file, not operator
+// input — the operator's line has already been dispatched to this arm — so it
+// fails loudly rather than guessing a topic. A guess is how the two sides would
+// start disagreeing again.
+func (c *ctl) showCommand(command string) error {
+	topic, ok := cmdtree.ShowTextTopicForCommand(command)
+	if !ok {
+		return fmt.Errorf("internal: no ShowText topic registered for %q; "+
+			"add it to showTextTopicCommand in pkg/cmdtree/showtext_topic.go", command)
+	}
+	return c.showTextFiltered(topic, "")
 }
 
 func (c *ctl) showText(topic string) error {

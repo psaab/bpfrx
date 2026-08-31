@@ -63,7 +63,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 	switch args[0] {
 	case "zones":
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("zones-detail")
+			return c.showCommand("show security zones detail")
 		}
 		return c.showZones()
 	case "policies":
@@ -120,7 +120,7 @@ func (c *ctl) handleShowSecurity(args []string) error {
 			if len(args) >= 4 && args[2] == "zone" {
 				return c.showText("screen-statistics:" + args[3])
 			}
-			return c.showText("screen-statistics-all")
+			return c.showCommand("show security screen statistics")
 		}
 		return c.showScreen()
 	case "flow":
@@ -128,13 +128,13 @@ func (c *ctl) handleShowSecurity(args []string) error {
 			return c.showFlowSession(args[2:])
 		}
 		if len(args) >= 2 && args[1] == "traceoptions" {
-			return c.showText("flow-traceoptions")
+			return c.showCommand("show security flow traceoptions")
 		}
 		if len(args) >= 2 && args[1] == "statistics" {
-			return c.showText("flow-statistics")
+			return c.showCommand("show security flow statistics")
 		}
 		if len(args) == 1 {
-			return c.showText("flow-timeouts")
+			return c.showCommand("show security flow")
 		}
 		return fmt.Errorf("usage: show security flow {session|statistics|traceoptions}")
 	case "nat":
@@ -154,25 +154,25 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		return c.showVRRP()
 	case "wireguard":
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("wireguard-detail")
+			return c.showCommand("show security wireguard detail")
 		}
 		if len(args) >= 2 && args[1] == "public-key" {
-			return c.showText("wireguard-public-key")
+			return c.showCommand("show security wireguard public-key")
 		}
-		return c.showText("wireguard")
+		return c.showCommand("show security wireguard")
 	case "alarms":
 		if len(args) >= 2 && args[1] == "detail" {
-			return c.showText("security-alarms-detail")
+			return c.showCommand("show security alarms detail")
 		}
-		return c.showText("security-alarms")
+		return c.showCommand("show security alarms")
 	case "alg":
-		return c.showText("alg")
+		return c.showCommand("show security alg")
 	case "dynamic-address":
-		return c.showText("dynamic-address")
+		return c.showCommand("show security dynamic-address")
 	case "address-book":
-		return c.showText("address-book")
+		return c.showCommand("show security address-book")
 	case "applications":
-		return c.showText("applications")
+		return c.showCommand("show security applications")
 	default:
 		return fmt.Errorf("unknown show security target: %s", args[0])
 	}
@@ -450,7 +450,7 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 }
 
 func (c *ctl) showScreen() error {
-	return c.showText("screen")
+	return c.showCommand("show security screen")
 }
 
 func (c *ctl) showMatchPolicies(args []string) error {
@@ -707,7 +707,7 @@ func (c *ctl) showIKE(args []string) error {
 		}
 		return nil
 	}
-	return c.showText("ike")
+	return c.showCommand("show security ike")
 }
 
 func (c *ctl) showIPsec(args []string) error {
@@ -720,7 +720,7 @@ func (c *ctl) showIPsec(args []string) error {
 		return nil
 	}
 	if len(args) > 0 && args[0] == "statistics" {
-		return c.showText("ipsec-statistics")
+		return c.showCommand("show security ipsec statistics")
 	}
 	printRemoteTreeHelp("show security ipsec:", "show", "security", "ipsec")
 	return nil

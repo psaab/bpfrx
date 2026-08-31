@@ -216,7 +216,7 @@ func (c *ctl) dispatchOperational(line string) error {
 
 	case "show":
 		if len(parts) >= 2 && parts[1] == "version" {
-			return c.showText("version")
+			return c.showCommand("show version")
 		}
 		return c.handleShow(parts[1:])
 
