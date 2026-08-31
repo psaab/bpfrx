@@ -49,3 +49,57 @@ func TestFilterDSCPResolvableMatchesDSCPValues(t *testing.T) {
 		}
 	}
 }
+
+// TestFilterDSCPResolvableAgreesWithTheBuildersResolver7422 upgrades the
+// numeric-range cell above from a PINNED LITERAL to an AGREEMENT.
+//
+// The cell above encodes 0..63 directly, which asserts that the config mirror
+// matches a number this test file believes; it cannot see the builder changing
+// its mind. Since #7422 the snapshot builder's emit condition is one exported
+// function — dataplane.ResolveFilterDSCP, which both pkg/dataplane/userspace/
+// filters.go and cli's `show firewall` renderer call — so the two spellings can
+// be compared directly instead of both being compared to a literal. When two
+// spellings must agree, assert the agreement: pinning one of them to a constant
+// silently picks a side, and the side picked is not always the correct one.
+//
+// The population deliberately mixes code-point names, case variants, decimal
+// boundaries, and tokens that are neither.
+func TestFilterDSCPResolvableAgreesWithTheBuildersResolver7422(t *testing.T) {
+	tokens := []string{
+		"", "ef", "EF", "Ef", "be", "af11", "AF43", "cs0", "cs7",
+		"-1", "0", "1", "62", "63", "64", "65", "255", "256",
+		"0x10", " 12", "12 ", "+12", "012", "1e2", "not-a-code-point",
+		"af99", "cs8", "dscp", "traffic-class",
+	}
+	var accepted int
+	for _, tok := range tokens {
+		_, builderOK := dataplane.ResolveFilterDSCP(tok)
+		configOK := config.FilterDSCPResolvable(tok)
+		// The empty token is the one legitimate asymmetry: the strict gate
+		// never asks about it (validateFilterDSCPStrict skips "" before
+		// calling filterDSCPResolvable) and the builder never emits it. Skip
+		// it rather than encode a fake agreement.
+		if tok == "" {
+			continue
+		}
+		if builderOK != configOK {
+			t.Errorf("token %q: dataplane.ResolveFilterDSCP accepts=%v but "+
+				"config.FilterDSCPResolvable accepts=%v. The commit gate and the "+
+				"snapshot builder now disagree about what resolves, which is "+
+				"either a commit that rejects a value the dataplane would emit "+
+				"or — worse — a commit that accepts a value the builder silently "+
+				"drops.", tok, builderOK, configOK)
+		}
+		if builderOK {
+			accepted++
+		}
+	}
+	// Non-vacuity. A resolver that rejected everything would make every
+	// comparison above agree, and this file would report a clean census over a
+	// predicate that accepts nothing.
+	if accepted < 10 {
+		t.Fatalf("only %d of %d tokens resolved; the population no longer "+
+			"exercises the accepting branch and the agreement above is between "+
+			"two constant `false`s", accepted, len(tokens))
+	}
+}

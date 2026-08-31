@@ -332,12 +332,29 @@ no runtime fact to read back, and `AppliedNATView` hands back the applied
 CONFIG, not the applied SNAPSHOT, so it does not carry the drop bit
 anyway. What the renderer is missing is the predicate, not a data path.
 
-Reachability, so severity is judged correctly: every one of these
-exclusions is a LENIENT-path backstop. The strict commit gate rejects the
-config outright, so the lying-show state is reachable only via
-`Store.Load` at boot or `Store.SyncApply` on HA peer-sync
-(`opts.lenientFirewallRefs`, #1960 no-brick) — which is exactly when an
-operator is reading `show` output to work out why traffic is not flowing.
+Reachability, so severity is judged correctly — and it is NOT uniform
+across families, so measure it rather than assuming:
+
+- **Lenient-path backstop.** The NAT families and the firewall-filter
+  `then dscp` rewrite (#7422) are here. The strict commit gate rejects
+  the config outright, so the lying-show state is reachable only via
+  `Store.Load` at boot or `Store.SyncApply` on HA peer-sync
+  (`opts.lenientFirewallRefs`, #1960 no-brick) — which is exactly when an
+  operator is reading `show` output to work out why traffic is not
+  flowing.
+- **Reachable through an ORDINARY commit.** A port-mirroring instance
+  with no `output interface` (#7354), a CoS entry naming an undefined
+  forwarding-class (#7348, a commit WARNING only) and a `flow-server`
+  with no `port` (#7422) all commit cleanly, because no strict gate
+  covers them. These are the severe ones: the operator did nothing
+  unusual and the show surface lied anyway.
+
+Do not write "every one of these is a lenient-path backstop" into a
+fixture comment without checking. A `Commit()`-based fixture for a
+lenient-only family passes only because the commit gate rejected the
+input and the test then asserted over an empty set; a lenient-path
+fixture for a commit-reachable family tests a harder route than the one
+operators take. `pkg/showaudit`'s registry rows record which is which.
 
 ## Persistence classes (#1894)
 

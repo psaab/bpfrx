@@ -56,6 +56,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/cli/cli_show_nat.go":                        "NAT display still uses legacy NAT/session metadata",
 	"pkg/cli/cli_show_security.go":                   "security display still uses legacy counters and filter types",
 	"pkg/cli/cli_show_security_dispatch.go":          "#1444: handleShowSecurity dispatcher relocated from cli.go; still uses legacy MaxRulesPerPolicy + counter accessors",
+	"pkg/cli/cli_show_security_filters.go":           "#7422: `show firewall` resolves a `then dscp` / `then traffic-class` rewrite through dataplane.ResolveFilterDSCP — the SAME resolver the snapshot builder uses — so the renderer cannot claim a CoS marking the builder dropped (mirrors daemon_nft.go's #3436 and netlink_lo0.go's #6387 use of the dataplane.DSCPValues SSOT); render-only, no legacy enforcement path",
 	"pkg/cli/cli_show_security_log.go":               "#2158: split from cli_show_security.go; still reads legacy screen GlobalCtr* counter constants",
 	"pkg/cli/cli_show_security_screen.go":            "#2158: split from cli_show_security.go; still reads legacy screen GlobalCtr* counter constants",
 	"pkg/cli/cli_show_security_zones.go":             "#3643: `show security zones` distinguishes dataplane.ErrCounterNotPopulated (per-zone counters HIDE) from a genuine read error; still names root dataplane counter types",

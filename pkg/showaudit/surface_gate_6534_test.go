@@ -104,6 +104,19 @@ var families = []family{
 		Unannotated:       nil, // closed by #7348
 	},
 	{
+		// #6565 row 11 / #7422. Unlike its siblings this family is NOT a
+		// lenient-path-only backstop: nothing validates a flow-server port at
+		// commit time, so `flow-server 10.0.0.1` with no `port` commits
+		// cleanly, is skipped by buildFlowExportSnapshots, and used to render
+		// as `Collector: 10.0.0.1` — the `:0` suffix suppressed, so it read as
+		// a healthy collector on the default port.
+		Name:              "flow-export collector (flow-server)",
+		Collections:       []string{"FlowServers"},
+		BuilderPredicates: []string{"FlowServerExcludedReason"},
+		SurfacePredicates: []string{"FlowServerExcludedReason"},
+		Unannotated:       nil, // closed by #7422
+	},
+	{
 		Name:              "static NAT / NPTv6 rule",
 		Collections:       []string{"NAT.Static"},
 		BuilderPredicates: []string{"StaticNATRuleExcludedReason", "NPTv6ScopeUnsupported"},

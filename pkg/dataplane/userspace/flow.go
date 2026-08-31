@@ -237,19 +237,24 @@ func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
 				continue
 			}
 			for _, server := range fam.FlowServers {
-				if server == nil || server.Address == "" {
-					continue
-				}
-				// #1977: CollectorPort is a Rust u16. Port 0 is the existing
-				// "absent" sentinel (skip silently); a negative or >65535 port
-				// is invalid — skip that server (do not abort the whole export)
-				// and warn so it is visible on a non-CLI path.
-				if server.Port == 0 {
-					continue
-				}
-				if server.Port < 0 || server.Port > math.MaxUint16 {
-					slog.Warn("userspace: skipping flow-server with out-of-range port (#1977)",
-						"address", server.Address, "port", server.Port)
+				// #1977: CollectorPort is a Rust u16, so an absent (0),
+				// negative or >65535 port cannot be exported — skip that
+				// server rather than abort the whole export.
+				//
+				// #6565 row 11 / #7422: the verdict is now the SHARED
+				// config.FlowServerExcludedReason, which the three show
+				// surfaces also call, so a skipped collector can no longer
+				// render as an active export target. The port-0 branch used to
+				// `continue` SILENTLY — unlike its out-of-range sibling — so
+				// there was not even a journal record; every exclusion now
+				// warns with the same reason string the operator sees.
+				if reason := config.FlowServerExcludedReason(server); reason != "" {
+					addr, port := "", 0
+					if server != nil {
+						addr, port = server.Address, server.Port
+					}
+					slog.Warn("userspace: skipping flow-server excluded from the snapshot",
+						"address", addr, "port", port, "reason", reason)
 					continue
 				}
 				snap := &FlowExportSnapshot{

@@ -63,7 +63,20 @@
 // predicate is what makes it visible here, and that convention is what
 // this package enforces rather than assumes.
 //
+// # Reachability is not uniform
+//
+// A registry row does not say how an operator GETS to the lying state,
+// and the families differ. The NAT rows are lenient-path-only backstops
+// (the strict commit gate rejects the config outright). The
+// port-mirroring, CoS and flow-collector (#7422) rows are reachable
+// through an ORDINARY commit, because no strict gate covers them —
+// which makes them the more severe ones, and makes a Commit()-based
+// fixture the right shape for them and the WRONG shape for the NAT
+// families. Each family's own agreement test states which route it
+// takes and pins the fixture to it.
+//
 // See surface_gate_6534_test.go, pkg/config/mirror_exclusion_reason.go,
-// pkg/config/nat_exclusion_reason.go, pkg/config/cos_exclusion_reason.go
-// and pkg/config/nptv6_scope.go.
+// pkg/config/nat_exclusion_reason.go, pkg/config/cos_exclusion_reason.go,
+// pkg/config/flow_server_exclusion_reason.go and
+// pkg/config/nptv6_scope.go.
 package showaudit

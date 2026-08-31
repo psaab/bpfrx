@@ -1553,7 +1553,11 @@ func validateFilterTerminalConflictStrict(cfg *Config) error {
 // pkg/dataplane imports pkg/config), so the name set is duplicated and pinned by
 // a drift-guard test (TestFilterDSCPResolvableMatchesDSCPValues) via the
 // exported FilterDSCPResolvable accessor — the same arrangement as
-// filterProtocolResolvable / appid.ProtocolNumber. Both `dscp` and
+// filterProtocolResolvable / appid.ProtocolNumber. Since #7422 the builder side
+// of that comparison is a single exported function,
+// dataplane.ResolveFilterDSCP, and the guard asserts AGREEMENT with it
+// (TestFilterDSCPResolvableAgreesWithTheBuildersResolver7422) rather than
+// pinning both sides to a literal range. Both `dscp` and
 // `traffic-class` (the IPv6 spelling) compile to the same fields and share the
 // same 0..63 / code-point-name range, so one check covers both.
 //
@@ -1570,7 +1574,9 @@ func validateFilterTerminalConflictStrict(cfg *Config) error {
 //   - REWRITE: an unresolvable `then dscp` NAME warn/no-ops (CoS-only, no match
 //     widening), and a raw numeric value >= 64 is failed closed by the Rust
 //     compiler (FilterDSCPOutOfRange, #3715) rather than masked into a different
-//     valid code point.
+//     valid code point. #7422: `show firewall` no longer renders that dropped
+//     rewrite as applied — it annotates it NOT INSTALLED, using the builder's
+//     own resolver (dataplane.ResolveFilterDSCP).
 //
 // The operator never reaches any of those states through a commit — this gate is
 // the primary defense. Mirrors validateFilterMatchValuesStrict.
@@ -1624,8 +1630,9 @@ func validateFilterDSCPStrict(cfg *Config) error {
 }
 
 // filterDSCPNames INLINE-mirrors the KEY set of dataplane.DSCPValues
-// (pkg/dataplane/types.go) — the code-point names the snapshot builder
-// (pkg/dataplane/userspace/filters.go) resolves for a firewall-filter dscp /
+// (pkg/dataplane/types.go) — the code-point names dataplane.ResolveFilterDSCP,
+// the resolver the snapshot builder (pkg/dataplane/userspace/filters.go) and
+// `show firewall` both call, accepts for a firewall-filter dscp /
 // traffic-class match or rewrite. pkg/config cannot import pkg/dataplane (import
 // cycle), so the names are duplicated here and pinned to the SSOT by the
 // drift-guard test TestFilterDSCPResolvableMatchesDSCPValues via the exported
@@ -1643,10 +1650,11 @@ var filterDSCPNames = map[string]bool{
 
 // filterDSCPResolvable reports whether a firewall-filter dscp / traffic-class
 // token (match or rewrite) is representable: a known code-point name
-// (case-insensitive, mirroring filters.go's strings.ToLower lookup) or an
+// (case-insensitive, mirroring the resolver's strings.ToLower lookup) or an
 // integer in 0..63 (the 6-bit DSCP field). It mirrors the snapshot builder's
 // emit condition branch-for-branch so commit and emission agree on what
-// resolves. Keep in sync with pkg/dataplane/userspace/filters.go.
+// resolves. Keep in sync with dataplane.ResolveFilterDSCP (#7422), which is now
+// the single spelling of that condition.
 func filterDSCPResolvable(token string) bool {
 	if filterDSCPNames[strings.ToLower(token)] {
 		return true

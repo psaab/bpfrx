@@ -2,6 +2,11 @@
 // and XDP/TC attachment for the xpf firewall dataplane.
 package dataplane
 
+import (
+	"strconv"
+	"strings"
+)
+
 // SessionKey mirrors the C struct session_key (5-tuple).
 type SessionKey struct {
 	SrcIP    [4]byte
@@ -1619,6 +1624,47 @@ const (
 	FilterActionReject  = 2
 	FilterActionRoute   = 3
 )
+
+// ResolveFilterDSCP resolves a firewall-filter `dscp` / `traffic-class` token
+// — a `from dscp` MATCH value or a `then dscp` REWRITE value — to its 6-bit
+// codepoint. It accepts a codepoint alias (case-insensitive, e.g. `ef`,
+// `af11`) or a decimal 0..63; anything else is UNREPRESENTABLE.
+//
+// #7422: this is the SINGLE SOURCE for a predicate that had two readers
+// disagreeing. The snapshot builder (pkg/dataplane/userspace/filters.go)
+// resolved the token and, on failure, dropped the `then dscp` rewrite with a
+// slog.Warn — while `show firewall` printed `then dscp <token>`
+// unconditionally, so the CLI reported a CoS marking the dataplane was not
+// applying. The builder and the renderer now ask the SAME function, which is
+// what stops them drifting again; a renderer that re-implemented the alias
+// table would be correct only until the table changed.
+//
+// pkg/config cannot import pkg/dataplane (import cycle), so the commit-time
+// gate keeps its own inline mirror (config.filterDSCPResolvable, #3309) — that
+// mirror is pinned to THIS function by the bidirectional drift guard
+// TestFilterDSCPResolvableMatchesDSCPValues.
+//
+// This is deliberately NOT a #6534 showaudit registry family. That registry
+// covers an object the builder REFUSES TO INSTALL, and its census is per
+// config collection: a dropped `then dscp` still installs the term, which
+// still matches and still acts (#3406 — a rewrite is CoS-only, so failing the
+// snapshot closed over it would brick forwarding for a marking). Registering
+// it against Firewall.FiltersInet would drag in every filter renderer,
+// including pkg/api/metrics_counters.go:emitFilters and the gRPC/REST text
+// surfaces that emit no `then dscp` at all, and demand they annotate a field
+// they never print.
+func ResolveFilterDSCP(token string) (uint8, bool) {
+	if token == "" {
+		return 0, false
+	}
+	if val, ok := DSCPValues[strings.ToLower(token)]; ok {
+		return val, true
+	}
+	if v, err := strconv.Atoi(token); err == nil && v >= 0 && v <= 63 {
+		return uint8(v), true
+	}
+	return 0, false
+}
 
 // DSCPValues maps DSCP codepoint names to numeric values.
 var DSCPValues = map[string]uint8{
