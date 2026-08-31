@@ -20,15 +20,30 @@ import (
 // Junos: a single zone-level token opens udp/67-68 on firewall-local addresses
 // the operator would have had to admit interface by interface.
 //
-// This file WARNS; it does not change enforcement. Withdrawing the zone-level
-// authorization is a NARROWING with a real population — configs in this repo
-// (test/incus/xpf-cluster-fw{0,1}.conf, docs/ha-cluster*.conf) author zone-level
-// `dhcp` today — and the traffic it would stop is not only a DHCP server's: the
-// firewall's own DHCP CLIENT on a zoned, non-lifeline interface needs udp/68
-// admitted for its unicast renewals, so a silent flip would cost that interface
-// its address rather than merely refuse a service. #6519 asks for the staged
-// treatment (advisory, then an all-planes flip in its own release) and this is
-// the advisory stage.
+// This file WARNS. The ENFORCEMENT half landed separately as #7490 and lives in
+// host_inbound_dhcp_flip_7490.go: the zone-level authorization is now WITHHELD
+// from an interface that runs a DHCP server or relay, and RETAINED everywhere
+// else. The split of responsibilities matters —
+//
+//   - the flip decides what is admitted, gated on hostInboundDHCPRolesFor below,
+//     which is why that classifier lives HERE and is shared rather than copied:
+//     an enforcement gate that disagreed with the advice would tell an operator
+//     to migrate one set of interfaces and withhold on a different one;
+//   - this advisory decides what the operator is TOLD, and after #7490 it has
+//     two things to say rather than one. On a withheld interface the token has
+//     stopped working and the message is an upgrade notice. On a retained one
+//     the deviation from Junos persists deliberately and the message says so.
+//
+// The retained half is not laziness. Junos does not accept these tokens at the
+// zone level for ANY role, so withholding for every role would be the more
+// faithful change; #7490 declined it because the vendor sentence is an argument
+// about a SERVER needing ingress identity and says nothing about a client, and
+// because #7489 established the token is load-bearing — the AF_XDP dataplane
+// enforces host-inbound fail-closed on the local-delivery path, so a zoned,
+// non-lifeline interface running the firewall's own DHCP client would lose
+// udp/68, its unicast renewals, and with them its ADDRESS. The resulting
+// per-role asymmetry is an xpf invention, not a Junos behaviour, and is
+// documented as such in docs/host-inbound-service-matrix.md.
 
 // hostInboundDHCPExceptionServices are the two `system-services` tokens Junos
 // documents as per-INTERFACE only. `dhcpv6` is deliberately NOT here: the
@@ -169,61 +184,143 @@ func validateHostInboundZoneLevelDHCPWarnings(cfg *Config) []string {
 			refs = append(refs, ref)
 		}
 		sort.Strings(refs)
-		var reached []string
+		// #7490: ask the UNFILTERED question — "does the ZONE-LEVEL stanza name
+		// this token for this interface" — and then split the answer by whether
+		// the flip still lets it authorize.
+		//
+		// Reading the EFFECTIVE set here, as stages 1 and 1.5 did, would make
+		// this advisory go SILENT on exactly the interfaces the flip just
+		// narrowed: their effective set no longer admits the token, so the
+		// operator whose DHCP server stopped receiving DISCOVER would be told
+		// nothing. The advisory has to keep firing on those and say something
+		// DIFFERENT, which is the whole upgrade path for this change.
+		//
+		// The predicate is now "the interface declares no stanza of its own AND
+		// the zone-level list names the token". That asserts #6515's replace
+		// rule, which stages 1/1.5 deliberately avoided asserting while the
+		// combination rule was still in flight — it has landed, and
+		// EffectiveHostInboundTokens implements replace unconditionally, so the
+		// two forms are now equivalent and this one survives the filter.
+		zoneSvc := zone.HostInboundTraffic.SystemServices
+		var withheldRefs, retainedRefs []string
 		var anyClient, anyIdle bool
 		for _, ref := range refs {
 			if HostInboundLifelineInterface(ref, lifelines) {
 				continue
 			}
-			effSvc, _, _ := zone.InterfaceHostInboundEffective(ref)
-			ownSvc, _, _ := zone.InterfaceHostInboundOverride(ref)
+			_, _, declared := zone.InterfaceHostInboundOverride(ref)
+			if declared {
+				continue
+			}
+			named := false
 			for _, tok := range hostInboundDHCPExceptionServices {
-				if hostInboundSetAdmitsService(effSvc, tok) &&
-					!hostInboundSetAdmitsService(ownSvc, tok) {
-					// #6519 stage 1.5: name WHY the token is load-bearing here.
-					// The role is the discriminator the deferred enforcement
-					// flip turns on, so the advisory computes it rather than
-					// leaving every reader to work it out per interface.
-					roles := hostInboundDHCPRolesFor(cfg, serverRefs, ref)
-					anyClient = anyClient || roles.client
-					anyIdle = anyIdle || (!roles.client && !roles.server)
-					reached = append(reached,
-						fmt.Sprintf("%s (%s)", ref, hostInboundDHCPRoleLabel(roles)))
+				if hostInboundSetAdmitsService(zoneSvc, tok) {
+					named = true
 					break
 				}
 			}
+			if !named {
+				continue
+			}
+			// #6519 stage 1.5: name WHY the token is load-bearing here. The role
+			// is the discriminator the #7490 flip turns on, so the advisory
+			// computes it rather than leaving every reader to work it out per
+			// interface.
+			roles := hostInboundDHCPRolesFor(cfg, serverRefs, ref)
+			entry := fmt.Sprintf("%s (%s)", ref, hostInboundDHCPRoleLabel(roles))
+			if zone.WithholdsZoneLevelDHCPFor(ref) {
+				withheldRefs = append(withheldRefs, entry)
+				continue
+			}
+			anyClient = anyClient || roles.client
+			anyIdle = anyIdle || (!roles.client && !roles.server)
+			retainedRefs = append(retainedRefs, entry)
 		}
-		if len(reached) == 0 {
+		if len(withheldRefs) == 0 && len(retainedRefs) == 0 {
 			continue
 		}
 		msg := fmt.Sprintf(
 			"zone %q host-inbound-traffic: system-services %s %s configured at the "+
 				"ZONE level, which Junos does not allow — DHCP and BOOTP are the "+
 				"host-inbound services Junos accepts only per interface, because the "+
-				"server must know the incoming interface to send replies. Here the "+
-				"zone-level token authorizes DHCP/BOOTP on %s, which Junos would "+
-				"require you to admit interface by interface. Move the token to "+
-				"`interfaces <if> host-inbound-traffic system-services ...` on the "+
-				"interfaces that need it — and note a per-interface stanza REPLACES "+
-				"the zone stanza (#6515), so restate the zone's other tokens there or "+
-				"they stop being admitted on that interface.",
-			name, strings.Join(toks, ", "), pluralIsAre(len(toks)),
-			strings.Join(reached, ", "))
-		if anyIdle {
-			msg += " An interface marked `no DHCP configured` runs neither a DHCP " +
-				"server/relay nor the firewall's own DHCP client, so the zone-level " +
-				"token opens udp/67-68 there for nothing — removing it narrows nothing " +
-				"in use."
+				"server must know the incoming interface to send replies.",
+			name, strings.Join(toks, ", "), pluralIsAre(len(toks)))
+		if len(withheldRefs) > 0 {
+			// THE NARROWING — stated with the mechanism #8060 MEASURED, not the
+			// one that reads more urgent.
+			//
+			// It is tempting to write "client DISCOVER is now DENIED". That is
+			// FALSE, and it is the exact sentence #8060 was filed to remove from
+			// this project's own reference config. DISCOVER/REQUEST never
+			// depended on this token: the XDP shim hands the 255.255.255.255
+			// broadcast straight to the kernel, and Kea's Dhcp4 runs in `raw`
+			// mode so it receives on an AF_PACKET socket delivered BEFORE the
+			// netfilter input hook — for a unicast to the interface's own
+			// address as well as for the broadcast. An nft INPUT drop counted
+			// the packet and Kea answered anyway (#6460, #7489, #8060).
+			//
+			// So for a dhcp-local-server this withdrawal is expected to be
+			// INERT on the request path, and telling an operator their DHCP
+			// just broke would send them to fix something that is not broken —
+			// the "wrong reason reaches for the wrong remedy" failure #6460
+			// exists to prevent. What the message must do instead is name what
+			// stopped (a zone-level authorization of udp/67-68 on this
+			// interface's firewall-local addresses), name what did not, and
+			// name the cases that are NOT covered by the bypass argument.
+			msg += fmt.Sprintf(
+				" This token NO LONGER authorizes DHCP/BOOTP on %s (#7490): xpf now "+
+					"withholds the zone-level authorization from an interface that "+
+					"runs a DHCP server or relay, matching Junos. For a "+
+					"`dhcp-local-server` this is expected to change nothing an "+
+					"operator can observe — a client's DISCOVER/REQUEST reaches Kea on "+
+					"an AF_PACKET socket ahead of netfilter and the XDP shim passes the "+
+					"broadcast straight to the kernel, so that path never went through "+
+					"this token (#6460, #8060). It is NOT covered for anything else on "+
+					"the interface that needs udp/67-68 delivered to the host — a DHCP "+
+					"relay's unicast leg, or the firewall's own DHCP client if one is "+
+					"configured here later, whose RENEW unicast to a zone address IS "+
+					"matched. To keep the authorization, restate it per interface: `set "+
+					"security zones security-zone %s interfaces <if> "+
+					"host-inbound-traffic system-services dhcp` — and note a "+
+					"per-interface stanza REPLACES the zone stanza (#6515), so restate "+
+					"the zone's other tokens there or they stop being admitted on that "+
+					"interface.",
+				strings.Join(withheldRefs, ", "), name)
 		}
-		if anyClient {
-			msg += " An interface marked `DHCP client` runs the firewall's OWN client, " +
-				"which needs udp/68 for its unicast renewals. The vendor rule quoted " +
-				"above is about a DHCP SERVER knowing its incoming interface and does " +
-				"not speak to the client, so on that interface the token is holding up " +
-				"the interface's ADDRESS, not merely a service — move it, do not drop it."
+		if len(retainedRefs) > 0 {
+			msg += fmt.Sprintf(
+				" The zone-level token still authorizes DHCP/BOOTP on %s, which Junos "+
+					"would require you to admit interface by interface. xpf retains it "+
+					"there DELIBERATELY (#7490).",
+				strings.Join(retainedRefs, ", "))
+			if anyClient {
+				msg += " An interface marked `DHCP client` runs the firewall's OWN " +
+					"client, which needs udp/68 for its unicast renewals. The vendor " +
+					"rule quoted above is about a DHCP SERVER knowing its incoming " +
+					"interface and does not speak to the client, so on that interface " +
+					"the token is holding up the interface's ADDRESS, not merely a " +
+					"service — withdrawing it would cost the interface its lease."
+			}
+			if anyIdle {
+				msg += " An interface marked `no DHCP configured` runs neither a DHCP " +
+					"server/relay nor the firewall's own DHCP client, so the zone-level " +
+					"token opens udp/67-68 there for nothing — removing it narrows " +
+					"nothing in use."
+			}
+			// The parity remedy survives the flip for this half: Junos does
+			// not accept the token at the zone level for ANY role, so an
+			// operator who wants parity still migrates. The #6515 caveat has to
+			// travel with the remedy wherever the remedy appears — following it
+			// verbatim drops every other service the zone admitted there, and
+			// the sibling #6515 advisory only says so on a LATER commit, after
+			// the narrowing has already been authored.
+			msg += " Keeping it is an xpf deviation from Junos, not Junos " +
+				"behaviour. To match Junos, move the token to `interfaces <if> " +
+				"host-inbound-traffic system-services ...` on the interfaces that " +
+				"need it — and note a per-interface stanza REPLACES the zone stanza " +
+				"(#6515), so restate the zone's other tokens there or they stop " +
+				"being admitted on that interface."
 		}
-		msg += " (#6519 parity deviation; xpf still enforces the zone-level " +
-			"authorization today.)"
 		warnings = append(warnings, msg)
 	}
 	return warnings

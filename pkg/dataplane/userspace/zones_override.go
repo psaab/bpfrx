@@ -27,10 +27,25 @@ import (
 //
 // Before #6515 this was a UNION (unionHostInboundTokens), so an interface stanza
 // could only ever WIDEN admission relative to the zone.
-func effectiveHostInboundTokens(zoneHI, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
+// #7490 added the (zone, ref) pair in place of the bare zone stanza. The
+// zone-level `dhcp` / `bootp` authorization is withheld from an interface that
+// runs a DHCP server or relay, which is a per-INTERFACE answer, so a builder
+// that passed only the zone's *HostInboundTraffic could not express it. Taking
+// the zone and the ref rather than a pre-filtered list is deliberate: it makes
+// every enforcement call site name the interface it is resolving FOR, and a
+// site that cannot name one is a site that was substituting the zone answer for
+// a per-interface one — which is the bug class this signature now refuses to
+// compile.
+//
+// ref may be empty for the deliberate zone-DEFAULT group (the seed view that
+// non-overridden interfaces accumulate into); an empty ref withholds nothing,
+// and a withheld interface simply lands in its own group with its own
+// signature.
+func effectiveHostInboundTokens(zone *config.ZoneConfig, ref string, ifaceHI *config.HostInboundTraffic) (svc, proto []string) {
 	var zs, zp, is, ip []string
-	if zoneHI != nil {
-		zs, zp = zoneHI.SystemServices, zoneHI.Protocols
+	if zone != nil && zone.HostInboundTraffic != nil {
+		zs = zone.ZoneLevelSystemServicesFor(zone.HostInboundTraffic.SystemServices, ref)
+		zp = zone.HostInboundTraffic.Protocols
 	}
 	if ifaceHI != nil {
 		is, ip = ifaceHI.SystemServices, ifaceHI.Protocols

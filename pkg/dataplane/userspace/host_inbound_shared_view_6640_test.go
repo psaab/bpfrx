@@ -74,7 +74,7 @@ func TestEnforcementFullAdmitsTheTwoPhysicalUnitShapes_6640(t *testing.T) {
 				t.Fatalf("the shared resolver produced no override for the unit key: %v", resolved)
 			}
 			svc, _ := effectiveHostInboundTokens(
-				cfg.Security.Zones["trust"].HostInboundTraffic, resolved["ge-0/0/0.0"])
+				cfg.Security.Zones["trust"], "ge-0/0/0.0", resolved["ge-0/0/0.0"])
 			var full bool
 			for _, s := range svc {
 				if config.HostInboundFullAdmitService(s) {

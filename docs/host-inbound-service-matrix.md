@@ -99,7 +99,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `https` / `webapi-ssl` | tcp 443 | tcp 443 | dual | Web-management HTTPS. Admit port = `webmgmt.HTTPSPort` = 443 = the listener bind (#5715, was 8443). Same contract as `http` above. |
 | `ping` | icmp/icmpv6 echo-request | ICMP type 8 (v4) / 128 (v6) | dual | Echo-request only; ICMP errors are global-accepted (see below). |
 | `dns` | udp 53, tcp 53 | udp 53, tcp 53 | dual | |
-| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). **Junos accepts these two per INTERFACE only** — see [DHCP and BOOTP are per-interface only in Junos (#6519)](#dhcp-and-bootp-are-per-interface-only-in-junos-6519). |
+| `dhcp` / `bootp` | udp {67, 68} | udp 67, 68 | **ip (v4)** | DHCPv4; must not open on v6 (#3225). **Junos accepts these two per INTERFACE only**; since #7490 a zone-level token is WITHHELD from a DHCP server/relay interface and retained elsewhere — see [DHCP and BOOTP are per-interface only in Junos (#6519)](#dhcp-and-bootp-are-per-interface-only-in-junos-6519). |
 | `dhcpv6` | udp {546, 547} | udp 546, 547 | **ip6** | DHCPv6; v6-only (#3225). |
 | `ntp` | udp 123 | udp 123 | dual | |
 | `snmp` | udp 161 | udp 161 | dual | |
@@ -1455,12 +1455,33 @@ authorizes udp/67-68 on the firewall-local addresses of every member interface �
 an over-authorization relative to Junos, which would make the operator admit the
 service interface by interface.
 
-**Status: WARN-only parity deviation. Enforcement is unchanged.**
+**Status: ENFORCED for the server/relay role since #7490; a deliberate
+deviation everywhere else.** A zone-level `dhcp` / `bootp` no longer authorizes
+udp/67-68 on a member interface that runs a DHCP **server or relay**. It still
+does on every other interface — the firewall's own DHCP **client**, an
+interface that is both, and one running neither.
+
+**That per-role asymmetry is an xpf invention, not a Junos behaviour.** Junos
+does not accept these two tokens at the zone level for **any** role. An operator
+who observes that a zone-level `dhcp` works for a client and not for a server,
+and concludes that is what Junos does, will carry that belief somewhere it is
+false. The reasoning is in "Why only the server role" below; the code is
+`pkg/config/host_inbound_dhcp_flip_7490.go`.
+
 `validateHostInboundZoneLevelDHCPWarnings`
-(`pkg/config/host_inbound_dhcp_scope_6519.go`) emits one commit-time advisory per
-zone, naming the token and the member interfaces the zone-level authorization
-actually reaches, with the remedy: move it to
-`interfaces <if> host-inbound-traffic system-services dhcp`.
+(`pkg/config/host_inbound_dhcp_scope_6519.go`) still emits one commit-time
+advisory per zone, and after #7490 it says one of two things per interface:
+
+| the interface is | the advisory says |
+|---|---|
+| **withheld** (DHCP server/relay) | the token **no longer authorizes** here; client DISCOVER is DENIED until you add `interfaces <if> host-inbound-traffic system-services dhcp`. This half is an **upgrade notice**, not a parity nicety |
+| **retained** (client, both, or idle) | the token still authorizes here, which Junos would not accept — and keeping it is an xpf deviation |
+
+The advisory deliberately asks the **unfiltered** question ("does the zone-level
+stanza name this token for this interface") rather than reading the effective
+set. Reading the effective set would make it go **silent on exactly the
+interfaces the flip just narrowed**, so the operator whose DHCP server stopped
+receiving DISCOVER would be told nothing.
 
 Three details that matter:
 
@@ -1513,29 +1534,126 @@ alone on the migrated interface. The sibling #6515 advisory does catch it and
 names the lost tokens, but only on a LATER commit, after the narrowing has
 already been authored. The message now carries the caveat up front.
 
-### Why the enforcement flip is staged separately
+### Why only the server role (#7490)
 
-Withdrawing the zone-level authorization is a NARROWING with a real population,
-unlike #6515:
+Junos accepts neither token at the zone level for any role, so withholding for
+every role would be the more faithful change. #7490 declined it, and the reason
+is the sentence the whole parity claim rests on:
 
-- Configs **in this repo** author zone-level `dhcp` today —
-  `test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
-  `docs/ha-cluster-loss.conf`, `docs/ha-cluster-userspace.conf`. The
-  `ha-cluster-userspace` `lan` zone carries a comment recording why the token is
-  authored there: the firewall's own DHCP **client** renewals on `reth1`, which
-  ARE daddr-matched. (Until #8060 that comment gave the DHCP *server*'s
-  DISCOVER/SOLICIT path as the reason — the one path the token provably does
-  NOT gate, per the bypass section above.) The advisory
-  fires on exactly that zone (`reth1`) and on nothing else in those files — the
-  `mgmt` and `control` zones' members are lifelines, which are excluded from
-  host-inbound deny scoping and so are skipped.
-- The traffic it would stop is not only a DHCP *server*'s. The firewall's own
-  DHCP **client** on a zoned, non-lifeline interface needs udp/68 admitted for
-  its unicast renewals, so a flip costs that interface its ADDRESS rather than
-  merely refusing a service — and the vendor rationale quoted above ("the server
-  must know the incoming interface") does not speak to the client case at all.
-- #6519 is filed as an enhancement and asks for the staged treatment: advisory,
-  then an all-planes flip in its own release with the shipped configs migrated.
+> "A DHCP server is configured only per interface because the incoming interface
+> must be known by the server to be able to send out DHCP replies."
+
+That is an argument about a **server** needing ingress identity. It says nothing
+about a client. Applying the rule past its own stated justification is an error
+`docs/engineering-style.md` names, and here the penalty is not a wrong warning:
+
+- **#7489 established the token is load-bearing.** The AF_XDP userspace
+  dataplane enforces host-inbound on its local-delivery path, **fail-closed** —
+  the earlier "AF_PACKET is upstream of netfilter" reasoning covered only one of
+  two enforcement planes.
+- So a zoned, non-lifeline interface running the firewall's **own DHCPv4
+  client** would lose udp/68, and with it its unicast lease renewals, and with
+  those its **address** — on a box whose recovery path may be a console.
+
+Hence: withhold where the vendor's reasoning reaches, and decline to extend it
+where it does not. Flipping every role remains available if strict parity is
+later judged worth an upgrade break; taking it **after** this change is a
+smaller step than taking it now, because the server/relay half has already
+moved.
+
+**An interface that is BOTH** a server/relay member and the firewall's own
+client is **retained**, not withheld. The predicate is `server AND NOT client`,
+and the conjunction is the point rather than an optimisation: on such an
+interface the client half is what holds up the address, so withholding on
+`server` alone would take the address from exactly the configuration the client
+carve-out exists to protect.
+
+**Lifelines are never withheld from.** They are excluded from host-inbound deny
+scoping entirely, so filtering their token list would change what the
+diagnostics render without changing what is admitted — inventing a divergence
+rather than closing one.
+
+### What the flip touches, and the one case it cannot express
+
+The withholding decision is derived **once per commit**
+(`stampZoneDHCPScopeWithheld`, run from the P5 `resolveDerivedConfig` phase) and
+stamped on each `ZoneConfig` as `DHCPScopeWithheld`. That is what lets
+`InterfaceHostInboundEffective` — the shared resolver every diagnostic surface
+and the nft view builder reach — apply it with no signature change, so
+enforcement and every description of it move together. It runs **last** of the
+P5 sub-steps because the lifeline set reads the cluster fabric interfaces that
+an earlier sub-step auto-populates.
+
+Two planes need explicit handling:
+
+- **nft (primary).** `BuildZoneHostInboundViews` groups by resolved token
+  signature, so a withheld interface simply lands in its own group.
+- **Rust AF_XDP (secondary).** Its picker consults the per-interface table first
+  and **falls back** to the zone-keyed table when the interface has no entry.
+  So `buildInterfaceSnapshots` now stamps a per-interface set for a withheld
+  interface even when it declares no stanza of its own; without that the flip
+  would be silently half-done on this plane only.
+
+**A zone-level `all` is expanded on a withheld interface.** `all` stands for the
+named-service union, which contains `dhcp` and `bootp`, and every plane expands
+it at the admission predicate rather than in the token list — so leaving it
+verbatim would re-authorize both through the back door. There is no token
+spelling for "all except dhcp", so the union is materialised and the rendered
+set for that interface reads as the expansion rather than `all`. That is the
+truthful rendering: `all` is no longer what the interface admits.
+
+**Uncovered residual: `any-service`.** The full-admit token is not a per-service
+union and is not expanded, so a zone-level `any-service` still admits udp/67-68
+on a withheld interface. The #6519 advisory has the same blind spot, and the two
+share one predicate deliberately — an enforcement gate that disagreed with the
+advice would tell an operator to migrate one set of interfaces and withhold on
+another. Closing it is a separate change to both.
+
+### What the flip does NOT mean: the server's request path was never gated
+
+Withholding this token from a `dhcp-local-server` interface is expected to
+change **nothing an operator can observe on the server's request path**, and
+saying otherwise is a documented defect in this repo's history (#8060).
+Measured on hardware (#6460, #7489, #8060):
+
+- a DHCPv4 **DISCOVER/REQUEST** is addressed to `255.255.255.255`; the XDP shim
+  hands that destination straight to the kernel, and Kea's `Dhcp4` runs in `raw`
+  mode so it receives on an **AF_PACKET** socket delivered *before* the
+  netfilter input hook. An nft INPUT drop **counted** the packet and Kea
+  answered anyway. The same holds for a unicast to the interface's own address,
+  because Kea's LPF admits both.
+- a DHCPv6 **SOLICIT** is addressed to `ff02::1:2`, and every per-zone rule is
+  scoped `<fam> daddr <zone unicast addrs>`, so a multicast destination matches
+  nothing and falls through to the base chain's `policy accept`.
+
+So the value of the flip is **parity and the removal of an over-authorization**
+— a zone-level token opening udp/67-68 on the firewall-local addresses of every
+member — not the prevention of an exposure that was live. What the bypass
+argument does **not** cover, and what the advisory therefore names: a DHCP
+relay's unicast leg, and the firewall's own DHCP client, whose RENEW **unicast**
+to a zone address *is* daddr-matched. Those are why the token still has to be
+expressible per interface.
+
+### The shipped configs were migrated with the flip
+
+`test/incus/xpf-cluster-fw{0,1}.conf`, `docs/ha-cluster.conf`,
+`docs/ha-cluster-loss.conf` and `docs/ha-cluster-userspace.conf` all authored a
+zone-level `dhcp` on a `lan` zone whose only member, `reth1`, runs the
+`dhcp-local-server`. Each now **also** admits `dhcp` on `reth1` through a
+per-interface stanza, restating the zone's other tokens because a per-interface
+stanza REPLACES the zone stanza (#6515). The effective set on `reth1` is
+unchanged, and a test walks all five to prove it — two of them are what
+`make test-failover` deploys, and the cluster LAN host gets its lease from that
+server.
+
+The **zone-level tokens were kept**, not deleted. #8060's non-goal is explicit
+that removing `dhcp` from that zone would be worse than the wrong comment it
+replaced, and keeping it costs nothing: `reth1` now resolves from its own
+stanza, and the zone level still covers any future member that declares none.
+
+The `mgmt` zone's zone-level `dhcp` in the `xpf-cluster-fw*` files was **not**
+touched: `fxp0` is a lifeline and runs the firewall's own client, so it is
+retained on both counts.
 
 ## Multi-member bracket body applies to every member (#6391) — UPGRADE NOTE
 

@@ -136,7 +136,22 @@ func HostInboundDenyReason(overridden, zoneConfigured bool) string {
 func (z *ZoneConfig) InterfaceHostInboundEffective(ref string) (svc, proto []string, overridden bool) {
 	var zoneSvc, zoneProto []string
 	if z != nil && z.HostInboundTraffic != nil {
-		zoneSvc = z.HostInboundTraffic.SystemServices
+		// #7490: the ZONE-LEVEL system-services list as it applies to THIS ref.
+		// The zone-level `dhcp` / `bootp` authorization is withheld from an
+		// interface that runs a DHCP server or relay (and not the firewall's own
+		// client), because the vendor rule those two tokens come from is an
+		// argument about a SERVER needing ingress identity.
+		//
+		// Applied HERE, inside the shared resolver, rather than at each caller:
+		// this one function is what sixteen diagnostic surfaces and the nft
+		// enforcement path both reach, and the #6640 lesson is that a rule
+		// copied to callers is a rule that grows a divergence. The stamp it
+		// reads is derived at compile (resolveDerivedConfig step 7) because the
+		// answer needs the whole *Config and this method has only a *ZoneConfig.
+		//
+		// Protocols are untouched: the exception is about two SYSTEM-SERVICES
+		// tokens.
+		zoneSvc = z.ZoneLevelSystemServicesFor(z.HostInboundTraffic.SystemServices, ref)
 		zoneProto = z.HostInboundTraffic.Protocols
 	}
 	if z == nil {
@@ -290,7 +305,11 @@ func (z *ZoneConfig) RenderInterfaceHostInbound(ref string, lifeline bool, l Hos
 	zoneConfigured := false
 	if z != nil && z.HostInboundTraffic != nil {
 		zoneConfigured = true
-		zoneSvc = z.HostInboundTraffic.SystemServices
+		// #7490: the zone-level line this render shows for ONE interface must be
+		// the zone level AS IT APPLIES THERE, or the diagnostic would print a
+		// `dhcp` the interface no longer admits — the exact shape of divergence
+		// this file exists to prevent.
+		zoneSvc = z.ZoneLevelSystemServicesFor(z.HostInboundTraffic.SystemServices, ref)
 		zoneProto = z.HostInboundTraffic.Protocols
 	}
 	effSvc, effProto, overridden := z.InterfaceHostInboundEffective(ref)

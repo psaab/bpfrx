@@ -393,7 +393,25 @@ type ZoneConfig struct {
 	// zone-level set empty. nil/empty = no per-interface override (pre-#3362
 	// zone-wide-only behaviour).
 	InterfaceHostInbound map[string]*HostInboundTraffic
-	TCPRst               bool // send TCP RST for non-SYN packets to closed ports
+	// DHCPScopeWithheld records the interface refs from which this zone's
+	// ZONE-LEVEL `dhcp` / `bootp` authorization is WITHHELD (#7490), keyed by
+	// the ref as the zone's Interfaces list spells it AND by each configured
+	// unit beneath a bare physical ref.
+	//
+	// DERIVED, not authored: stamped by resolveDerivedConfig (P5) via
+	// stampZoneDHCPScopeWithheld, because the answer needs the whole *Config
+	// (the dhcp-local-server / dhcp-relay membership and the interface's own
+	// DHCP client) while every consumer of the resolution has only a
+	// *ZoneConfig. Carrying it here is what lets
+	// InterfaceHostInboundEffective apply the flip with NO signature change,
+	// so all sixteen diagnostic surfaces move with enforcement instead of
+	// having to be migrated one by one — the #6640 divergence class.
+	//
+	// nil/absent = withheld from nothing, which is the pre-#7490 behaviour. A
+	// hand-built ZoneConfig that never went through the compiler therefore
+	// keeps the OLD, WIDER admission rather than silently narrowing.
+	DHCPScopeWithheld map[string]bool
+	TCPRst            bool // send TCP RST for non-SYN packets to closed ports
 	// AddressBook is the zone-local address book (#3061). A policy whose
 	// from-zone (source-address) or to-zone (destination-address) is this
 	// zone resolves a name against this book FIRST, then falls back to the

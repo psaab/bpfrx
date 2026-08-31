@@ -251,7 +251,8 @@ func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef stri
 	// #5878 phase 2: look the override up on the ref's canonical logical-unit
 	// identity so a query for ge-0/0/0.01 finds an override authored as
 	// ge-0/0/0.1 (buildInterfaceHostInboundMap now keys by the canonical unit).
-	svc, prot := effectiveHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[config.CanonicalInterfaceUnitRef(ifaceRef)])
+	canonRef := config.CanonicalInterfaceUnitRef(ifaceRef)
+	svc, prot := effectiveHostInboundTokens(zone, canonRef, buildInterfaceHostInboundMap(cfg)[canonRef])
 	v := ZoneHostInboundView{Zone: fromZone, Interfaces: []string{ifaceRef}, SystemServices: svc, Protocols: prot}
 	return classifyOneView(v, proto, hasProto, dstPort, icmpType, family)
 }
