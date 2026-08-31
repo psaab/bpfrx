@@ -251,6 +251,70 @@ reds rather than passing empty.
   that only ever binds TCP; a test serving over `bufconn` must inject
   `Config.PeerLookupFn`.
 
+## Canonical command tables (#7172)
+
+`authz_methods.go` answers *what permission does this RPC cost*.
+`authz_command_table.go` and `authz_command_table_topics.go` answer a
+different question — *what command is this RPC* — for `system login class`
+`allow-commands` / `deny-commands`, which are regexes matched against a
+command string.
+
+**Why the server has to answer it.** The remote `cli` parses the operator's
+line CLIENT-side and sends a typed RPC; the line never crosses the wire.
+`authorizeRPC` sees `("/xpfv1.BpfrxService/GetInterfaces",
+*pb.GetInterfacesRequest)` and nothing resembling a command, so
+`deny-commands "show interfaces"` — which `pkg/cli` enforces on the on-box
+CLI — would have nothing to match remotely. Adding a command string to the
+RPCs was rejected: it would be CLIENT-supplied, and an authorization
+decision derived from attacker-controlled input is not an authorization
+decision.
+
+**Three tables, because the two multiplexed methods are multiplexed here
+too.** `methodCanonicalCommand` keys on the short method name;
+`showTextTopicCommand` and `systemActionVerbCommand` key on the decoded
+request's topic and verb, exactly as `showTextTopicPermission` and
+`systemActionPermission` do. A method with no command entry must be NAMED
+in `methodsWithoutCanonicalCommand` with a reason, so an intended absence
+is distinguishable from a forgotten one.
+
+| Guard | Enumerates |
+|---|---|
+| `TestEveryPricedMethodIsMappedOrNamedAbsent7172` | `methodPermissions`, i.e. the pinned method set |
+| `TestEveryShowTextTopicHasACanonicalCommand7172` | `showTextTopicsFromDispatcher` — the same `server_show.go` literals the #5278 topic guard reads |
+| `TestEverySystemActionVerbHasACanonicalCommand7172` | the `case` labels of `switch req.Action` in `server_diag_system_action.go` |
+
+Plus a validity rule on every value: it must resolve against
+`cmdtree.OperationalTree` **to itself**, with every word a real command
+KEYWORD rather than a word a value slot absorbed (`show interfaces zzbogus`
+canonicalizes fine — value slots take operator data by design, #8094).
+
+**Completeness and canonicality are checked; ATTRIBUTION is not.**
+`chassis-cluster-status` mapped to some other real canonical command passes
+every test in this package. There is no server-side signal for which command
+reaches a topic: deriving it from the topic name reproduces about a third of
+the table (`TestTopicNameDerivationDoesNotReproduceTheTable7172` measures and
+logs the rate), and the handler name is `camelCase(topic)`, which restates
+the topic and agrees with it by construction. The only sound source is
+`cmd/cli`, which is not mechanically walkable today (computed topic strings,
+nested switches); making that mapping declarative is #8058. Until then, a
+reviewer checking these tables is the check.
+
+**Named gap: the entries are ARGUMENT-FREE.** `pkg/cli`'s gate matches a
+deny regex against the full canonicalized line *including* arguments and the
+output pipe. These strings have neither — a parameter-packed topic
+(`route-table:<name>`) maps to the command prefix that precedes the
+parameter (`show route table`). So a regex written against argument text
+matches on the box and not on the RPC; a regex written against the command
+path — the shape Junos' own examples use — matches identically on both,
+because matching is partial rather than anchored.
+
+**Prefix-form `SystemAction` verbs have no entry and cannot get one.** The
+handler's default branch parses `cluster-failover*` and the `userspace-*`
+control forms out of a packed string, so they have no case label to
+enumerate. `systemActionPermission` already charges them the destructive
+floor; a consumer must treat a verb with no entry the way it treats an
+unmapped method rather than assuming the table is total.
+
 ## Callers
 
 `cmd/xpfd` (instantiates and runs); `cmd/cli` (consumes); HTTP REST

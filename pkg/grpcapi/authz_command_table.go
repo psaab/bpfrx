@@ -30,12 +30,15 @@ package grpcapi
 // derivation would have been right for most entries and quietly wrong for some,
 // which is the worst distribution for an authz input.
 //
-// ── SCOPE OF THIS CUT ────────────────────────────────────────────────────
+// ── SCOPE OF THIS FILE ───────────────────────────────────────────────────
 //
-// Methods only. `ShowText`'s 129 topics and `SystemAction`'s 19 verbs are
-// priced from the DECODED REQUEST rather than the method name (see
-// methodPermission), so they need their own tables and land in 5a-2. This table
-// is inert: nothing reads it until 5b wires it into authorizeRPC.
+// Methods only. `ShowText`'s topics and `SystemAction`'s verbs are priced from
+// the DECODED REQUEST rather than the method name (see methodPermission), so
+// they get their own tables in authz_command_table_topics.go (cut 5a-2), which
+// also records the ATTRIBUTION limit both files share: canonicality and
+// completeness are machine-checked, but "is this the RIGHT command" is a review
+// responsibility on both. Both tables are inert: nothing reads either until 5b
+// wires them into authorizeRPC.
 
 // methodCanonicalCommand maps a short gRPC method name to the canonical
 // operational command it performs, for fine-grained deny-commands matching.
@@ -82,12 +85,20 @@ var methodCanonicalCommand = map[string]string{
 	"ListHistory":              "show system commit history",
 
 	// Operational actions.
-	"Ping":                      "ping",
-	"Traceroute":                "traceroute",
-	"MonitorPacketDrop":         "monitor security packet-drop",
-	"MonitorInterface":          "monitor interface",
-	"ClearSessions":             "clear security flow session",
-	"ClearCounters":             "clear firewall",
+	"Ping":              "ping",
+	"Traceroute":        "traceroute",
+	"MonitorPacketDrop": "monitor security packet-drop",
+	"MonitorInterface":  "monitor interface",
+	"ClearSessions":     "clear security flow session",
+	// `clear security counters`, NOT `clear firewall` — corrected in cut 5a-2.
+	// This RPC clears ALL dataplane counters (ClearAllCounters) and the only
+	// command that reaches it is `clear security counters` (cmd/cli/clear.go
+	// handleClearSecurity, case "counters"). `clear firewall all` reaches
+	// SystemAction{clear-firewall-counters} instead, which is where 5a-2's verb
+	// table maps it — the collision is what made the mistake visible. The
+	// original entry left `clear security counters` matched by nothing, which is
+	// the under-deny this table exists to prevent.
+	"ClearCounters":             "clear security counters",
 	"ClearDHCPClientIdentifier": "clear dhcp client-identifier",
 }
 
@@ -129,6 +140,6 @@ var methodsWithoutCanonicalCommand = map[string]string{
 	"GetISISStatus": "no `show isis` node exists in the operational tree",
 	"GetRIPStatus":  "no `show rip` node exists in the operational tree",
 	"GetVRRPStatus": "no `show vrrp` node exists in the operational tree",
-	"ShowText":      "priced from the decoded request; one method serves 129 topics (5a-2)",
-	"SystemAction":  "priced from the decoded request; one method serves 19 verbs (5a-2)",
+	"ShowText":      "priced from the decoded request; the topic selects the command (showTextTopicCommand)",
+	"SystemAction":  "priced from the decoded request; the verb selects the command (systemActionVerbCommand)",
 }
