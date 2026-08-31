@@ -1,4 +1,11 @@
-//! #7689: keep `CoSSchedulerSnapshot` struct literals non-exhaustive.
+//! #7689: keep additive-wire struct literals non-exhaustive.
+//!
+//! Two cells. The first pins `CoSSchedulerSnapshot` at ZERO exhaustive
+//! literals — it was the tree's outlier at 97% and the struct that paid #6846's
+//! 71-literal toll. The second is a per-struct RATCHET over the whole
+//! additive-wire population, added when the same shape turned up in four
+//! structs in a single session. Its header explains why the obvious
+//! generalisation of that observation is wrong.
 //!
 //! An ADDITIVE wire field — one carrying `#[serde(default)]`, designed to be
 //! invisible to older peers — is a compile break at every **exhaustive** struct
@@ -172,5 +179,203 @@ fn cos_scheduler_snapshot_literals_carry_an_update_tail_7689() {
          this ceiling with the reason — do not delete the assertion.",
         exhaustive.len(),
         exhaustive.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #7689 GENERALISED: the same tax, measured across the whole additive-wire
+// population rather than the one struct that paid it loudest.
+// ---------------------------------------------------------------------------
+//
+// WHY THE OBVIOUS GENERALISATION IS WRONG, measured before building this.
+//
+// The prompt for this was four structs needing `..Default::default()` in one
+// session: `CoSSchedulerSnapshot`, `StageSeed`, `ProcessStatus` and
+// `WorkerRuntimeCounters`. Four instances looks like a class. It is two.
+//
+//   CoSSchedulerSnapshot  13 fields  serde(default)  -> additive WIRE type
+//   ProcessStatus        153 fields  serde(default)  -> additive WIRE type
+//   StageSeed              4 fields  no derives      -> test-harness struct
+//   WorkerRuntimeCounters 20 fields  no serde at all -> internal counters
+//
+// The tax #7689 describes is specific: an ADDITIVE wire field carries
+// `#[serde(default)]` precisely so an older peer never sees it, so a test
+// literal breaking on it is pure friction with no review value. For a
+// NON-wire struct the opposite holds — adding a field is an ordinary breaking
+// change, and the compile error at each site is review pressure worth keeping.
+// Forcing `..Default::default()` onto `WorkerRuntimeCounters` would REMOVE a
+// signal rather than remove a cost.
+//
+// So a guard scoped to all four would be scoped to a class that does not
+// exist, and would actively weaken review on two of them.
+//
+// AND THE NAIVE POPULATION IS UNSHIPPABLE. "Every struct with a Default impl"
+// is 240 structs, 130 of which have at least one exhaustive literal, totalling
+// **1497** literals. Most are harmless: `FirewallFilterSnapshot` is 276 of 276
+// exhaustive and costs nothing, because it has three fields and does not grow.
+// Exhaustiveness is only a tax on a struct that GAINS fields.
+//
+// The population below is therefore: a Default impl, at least one
+// `#[serde(default)]` field, and >= 8 fields. That is 124 literals across 23
+// structs — tractable, and every one of them is a type designed to grow.
+//
+// WHY A RATCHET RATHER THAN AN ASSERTION OF ZERO. Converting 124 literals now
+// is a mechanical change across 23 structs and five subsystems, with real
+// conflict surface against every lane. The ceiling table records today's count
+// per struct and only ever goes DOWN: a struct drifting back toward
+// `CoSSchedulerSnapshot`'s 97% reds immediately, while the existing backlog
+// stays visible and shrinkable. Same shape as #7484's coverage ratchet.
+const ADDITIVE_WIRE_EXHAUSTIVE_CEILING: &[(&str, usize)] = &[
+    ("BindingCountersSnapshot", 2),
+    ("ConfigSnapshot", 15),
+    ("DestinationNATRuleSnapshot", 3),
+    ("ExceptionStatus", 1),
+    ("FabricSnapshot", 8),
+    ("FirewallTermSnapshot", 12),
+    ("FlowWorkerStatus", 1),
+    ("InjectPacketRequest", 1),
+    ("InterfaceSnapshot", 2),
+    ("MapPins", 2),
+    ("NAT64RuleSnapshot", 4),
+    ("NeighborSnapshot", 26),
+    ("PacketResolution", 1),
+    ("ProcessStatus", 1),
+    ("SessionDeltaInfo", 1),
+    ("SlowPathStatus", 1),
+    ("SourceNATRuleSnapshot", 1),
+    ("SourceNatPoolStatus", 1),
+    ("StaticNATRuleSnapshot", 34),
+    ("ThreeColorPolicerSnapshot", 2),
+    ("ThreeColorPolicerStatus", 2),
+    ("WgTunnelStatus", 2),
+    ("WorkerRuntimeStatus", 1),
+];
+
+/// Count exhaustive literals of `name` across the crate, using the same
+/// detection the CoSSchedulerSnapshot cell above proved out: comments and
+/// strings blanked first, non-literal matches (`-> X {`, `struct X {`) skipped,
+/// and the update tail identified by DEPTH-0 SEGMENT rather than by a `..`
+/// substring.
+fn exhaustive_literal_count(files: &[std::path::PathBuf], name: &str) -> usize {
+    let mut exhaustive = 0usize;
+    for path in files {
+        let raw = std::fs::read_to_string(path).expect("read source");
+        let src = blank_comments_and_strings(&raw);
+        let mut from = 0usize;
+        while let Some(hit) = src[from..].find(name) {
+            let start = from + hit;
+            from = start + name.len();
+            // whole-identifier match only
+            if start > 0 {
+                let prev = src.as_bytes()[start - 1];
+                if prev == b'_' || prev.is_ascii_alphanumeric() {
+                    continue;
+                }
+            }
+            let after = src[from..].trim_start();
+            if !after.starts_with('{') {
+                continue;
+            }
+            let brace = from + src[from..].find('{').expect("checked");
+            let pre = src[..start].trim_end();
+            if pre.ends_with("->")
+                || pre.ends_with("struct")
+                || pre.ends_with("impl")
+                || pre.ends_with("for")
+                || pre.ends_with("enum")
+            {
+                continue;
+            }
+            let bytes = src.as_bytes();
+            let mut i = brace + 1;
+            let mut depth = 1i32;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                continue;
+            }
+            if !has_update_tail(&src[brace + 1..i - 1]) {
+                exhaustive += 1;
+            }
+        }
+    }
+    exhaustive
+}
+
+/// The ratchet: no struct in the additive-wire population may gain exhaustive
+/// literals.
+///
+/// FAIL-ON-REVERT: strip `..Default::default()` from any literal of a listed
+/// struct and its row reds with both numbers.
+#[test]
+fn additive_wire_exhaustive_literals_only_ever_decrease_7689() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    afxdp_rs_files(&root, &mut files);
+
+    // NON-VACUITY. Both floors, for the same reason as the sibling cell: a scan
+    // that read nothing would report every count as 0, which is <= every
+    // ceiling, and the ratchet would certify a tree it never opened.
+    assert!(
+        files.len() >= 200,
+        "scan read only {} .rs files under src; the walk is broken and every \
+         count below would pass as 0",
+        files.len()
+    );
+
+    let mut regressions = Vec::new();
+    let mut improvements = Vec::new();
+    let mut total = 0usize;
+    for (name, ceiling) in ADDITIVE_WIRE_EXHAUSTIVE_CEILING {
+        let actual = exhaustive_literal_count(&files, name);
+        total += actual;
+        if actual > *ceiling {
+            regressions.push(format!(
+                "{name}: {actual} exhaustive literals, ceiling {ceiling} (+{})",
+                actual - ceiling
+            ));
+        } else if actual < *ceiling {
+            improvements.push(format!("{name}: {actual}, ceiling {ceiling}"));
+        }
+    }
+
+    // The second floor: the population must still be FOUND. If every struct
+    // were renamed or moved, every count would be 0 and the ratchet would read
+    // as a clean tree rather than a broken scan.
+    assert!(
+        total >= 80,
+        "found only {total} exhaustive literals across the whole population \
+         (expected ~124). The structs were renamed or the detection stopped \
+         matching, so this ratchet is measuring nothing"
+    );
+
+    assert!(
+        regressions.is_empty(),
+        "{} struct(s) in the additive-wire population GAINED exhaustive \
+         literals:\n  {}\n\nAn additive `#[serde(default)]` field is designed to \
+         be invisible to an older peer, so a literal that breaks on one breaks \
+         for no reason but its own enumeration. Add `..Default::default()` and \
+         keep only the fields the test asserts on. #6846 paid this toll at 71 \
+         literals in one change.",
+        regressions.len(),
+        regressions.join("\n  ")
+    );
+
+    // Improvements are not a failure, but the ceiling must be tightened or the
+    // ratchet silently stops ratcheting.
+    assert!(
+        improvements.is_empty(),
+        "{} struct(s) now have FEWER exhaustive literals than their ceiling. \
+         That is the fix working — tighten the ceiling in \
+         ADDITIVE_WIRE_EXHAUSTIVE_CEILING to the new numbers so the ground \
+         gained is held:\n  {}",
+        improvements.len(),
+        improvements.join("\n  ")
     );
 }
