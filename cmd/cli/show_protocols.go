@@ -54,7 +54,7 @@ func (c *ctl) handleShowProtocols(args []string) error {
 		return nil
 	case "bfd":
 		if len(args) >= 2 && args[1] == "peers" {
-			return c.showText("bfd-peers")
+			return c.showCommand("show protocols bfd peers")
 		}
 		printRemoteTreeHelp("show protocols bfd:", "show", "protocols", "bfd")
 		return nil

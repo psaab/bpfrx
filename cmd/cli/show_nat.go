@@ -16,9 +16,9 @@ func (c *ctl) handleShowNAT(args []string) error {
 	}
 	switch args[0] {
 	case "static":
-		return c.showText("nat-static")
+		return c.showCommand("show security nat static")
 	case "nptv6":
-		return c.showText("nat-nptv6")
+		return c.showCommand("show security nat nptv6")
 	case "source":
 		if len(args) >= 2 && args[1] == "summary" {
 			return c.showNATSourceSummary()
@@ -27,13 +27,13 @@ func (c *ctl) handleShowNAT(args []string) error {
 			return c.showNATPoolStats()
 		}
 		if len(args) >= 3 && args[1] == "persistent-nat-table" && args[2] == "detail" {
-			return c.showText("persistent-nat-detail")
+			return c.showCommand("show security nat source persistent-nat-table detail")
 		}
 		if len(args) >= 2 && args[1] == "persistent-nat-table" {
-			return c.showText("persistent-nat")
+			return c.showCommand("show security nat source persistent-nat-table")
 		}
 		if len(args) >= 3 && args[1] == "rule" && args[2] == "detail" {
-			return c.showText("nat-source-rule-detail")
+			return c.showCommand("show security nat source rule detail")
 		}
 		if len(args) >= 2 && args[1] == "rule" {
 			return c.showNATRuleStats("")
@@ -67,7 +67,7 @@ func (c *ctl) handleShowNAT(args []string) error {
 			return c.showNATDestinationPool()
 		}
 		if len(args) >= 3 && args[1] == "rule" && args[2] == "detail" {
-			return c.showText("nat-dest-rule-detail")
+			return c.showCommand("show security nat destination rule detail")
 		}
 		if len(args) >= 2 && args[1] == "rule" {
 			return c.showNATDNATRuleStats("")
@@ -95,7 +95,7 @@ func (c *ctl) handleShowNAT(args []string) error {
 		}
 		return nil
 	case "nat64":
-		return c.showText("nat64")
+		return c.showCommand("show security nat nat64")
 	default:
 		return fmt.Errorf("unknown show security nat target: %s", args[0])
 	}

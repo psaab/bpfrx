@@ -45,6 +45,11 @@ command here automatically propagates to all three frontends.
   by `show class-of-service classifier|rewrite-rule`, plus the ShowText
   topic encoding that carries those filters to the gRPC server. See
   "Shared argument grammars" below.
+- `ShowTextTopicCommands`, `CommandForShowTextTopic`,
+  `ShowTextTopicForCommand` — `showtext_topic.go`. The ShowText
+  topic <-> canonical operational command correspondence, read by the
+  remote CLI (command -> topic, to know what to send) and by the daemon's
+  authorization gate (topic -> command, to price `deny-commands`).
 
 ## Shared argument grammars
 
@@ -64,6 +69,32 @@ remotely than locally. One parser, one encoder and one decoder in this
 package make that class of divergence unrepresentable rather than
 something a mirrored test table has to catch. Per-frontend tests then
 assert only that each surface routes through these functions.
+
+`showtext_topic.go` is the second instance (#8058), and it is here for the
+same reason at a larger scale. The ShowText topic for a command existed
+twice on opposite sides of a trust boundary: the remote `cli` binary
+turned a command into a topic in nested switches, and `pkg/grpcapi` turned
+a topic back into a command to price `deny-commands`. Nothing made them
+agree, so a topic re-attributed to a different command on one side left
+the other authorizing against a command string no operator could type.
+
+An agreement test was the alternative and cannot be made sound here:
+recovering the command that reaches each topic needs an AST walk of the
+client's switches, and 18 of the topics are COMPUTED at their call sites,
+so a literal scan certifies the majority (measured: 104 of 123 base
+topics) and reports clean on the rest with nothing distinguishing the two.
+Both surfaces now read one table. The remote CLI's call sites name the
+COMMAND and resolve the topic through `ShowTextTopicForCommand`, which is
+what removed the second transcription — and it reads better besides, since
+the command is self-evident in the switch arm while a topic string is an
+encoding detail.
+
+Both sides importing this is not the server trusting the client. The
+table is a compile-time constant in the daemon binary that no client can
+influence, and the server already derives authorization input from this
+package (`Canonicalize`, #8057). What would be a trust violation — the
+server importing `cmd/cli`'s table — is a different thing and remains
+forbidden.
 
 ## Typed leaves
 
