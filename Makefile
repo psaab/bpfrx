@@ -481,6 +481,23 @@ test-cos-apply-lib:
 	bash ./test/incus/cos-apply-lib-selftest.sh
 	go test -count=1 -run 6440 ./cmd/cli/
 
+# Self-test the #7796 FBF DSCP ip-rule apply leg. The defect this guards is
+# INVISIBLE to a compile-side test: the pre-fix code built a well-formed
+# netlink.Rule that every build-side assertion accepted, and the failure was
+# entirely in what the KERNEL took — FRA_TOS is masked to IPTOS_TOS_MASK, so a
+# DSCP shifted into a TOS byte was rejected with EINVAL from dscp 8 up and the
+# whole commit failed.
+#
+# These cells SKIP without CAP_NET_ADMIN, which means `make test-go` does NOT
+# exercise them. That is exactly the shape that lets an apply-leg regression sit
+# green forever, so this target runs them under `unshare -rn` where they
+# actually execute. It SKIPS as a whole (not fails) where user namespaces are
+# unavailable, matching the other tool-gated legs.
+# Single-sourced with the `make selftest` leg: both run the SAME script, so the
+# target and the aggregate cannot drift into testing different things.
+test-rule-dscp-lib:
+	sh ./test/routing/selftest-rule-dscp_7796.sh
+
 # Self-test the #6936 FBF two-upstream steering verdicts. The defect this
 # guards is a NEGATIVE CELL THAT FAILS TO A HEALTHY VALUE: the main-table
 # pollution check counted matches, so "no leak" and "the probe returned

@@ -210,6 +210,14 @@ run_shell test/xsk-repro/selftest-multitoken-cc_6355.sh
 # the exact failure the reproducer exists to detect, reported as PASS. SKIPs
 # without cargo or offline-buildable deps.
 run_shell test/xsk-repro/selftest-probe-filter_6898.sh
+# #7796: the FBF DSCP ip-rule APPLY LEG. The defect was invisible to every
+# compile-side test — the pre-fix code built a well-formed netlink.Rule and the
+# kernel rejected it (FRA_TOS masks to IPTOS_TOS_MASK, so DSCP<<2 is refused from
+# dscp 8 up and the whole commit fails). The cells need CAP_NET_ADMIN, so under a
+# plain `go test` they SKIP — and a skipped cell reads identically to a passing
+# one. This leg runs them under `unshare -rn`. SKIPs without go/unshare or where
+# unprivileged user namespaces are unavailable.
+run_shell test/routing/selftest-rule-dscp_7796.sh
 # #6923: the chokepoint argument for the v6 conntrack publish path rests on
 # `refresh_bpf_conntrack_last_seen` being unable to CREATE a key, because it
 # updates with BPF_EXIST. "The flag is named EXIST" and "the kernel refuses

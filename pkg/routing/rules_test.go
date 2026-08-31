@@ -47,6 +47,10 @@ type fakeRuleOps struct {
 
 	adds int
 	dels int
+
+	// dscps records, per family and in add order, the DSCP each RuleAddDSCP
+	// call carried. netlink.Rule cannot hold it (#7796).
+	dscps map[int][]uint8
 }
 
 func newFakeRuleOps() *fakeRuleOps {
@@ -67,6 +71,21 @@ func (f *fakeRuleOps) RuleAdd(r *netlink.Rule) error {
 	}
 	f.adds++
 	f.rules[r.Family] = append(f.rules[r.Family], *r)
+	return nil
+}
+
+// RuleAddDSCP records the rule AND the DSCP it was installed with. The DSCP
+// must be recorded somewhere the assertions can see: netlink.Rule has no field
+// for it (that is the whole of #7796), so a fake that dropped it would let every
+// DSCP test pass while asserting nothing about the selector.
+func (f *fakeRuleOps) RuleAddDSCP(r *netlink.Rule, dscp uint8) error {
+	if err := f.RuleAdd(r); err != nil {
+		return err
+	}
+	if f.dscps == nil {
+		f.dscps = map[int][]uint8{}
+	}
+	f.dscps[r.Family] = append(f.dscps[r.Family], dscp)
 	return nil
 }
 
@@ -699,7 +718,7 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	p := &pbrManager{ops: ops}
 
 	rules := []PBRRule{
-		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
+		{Family: unix.AF_INET, DSCP: 46, DSCPSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
 		{Family: unix.AF_INET6, Src: "2001:db8::/32", TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
 		{Family: unix.AF_INET, Dst: "10.5.0.0/16", TableID: 101, Instance: "vr-b", IifName: "ge-0-0-1"},
 	}
@@ -774,7 +793,7 @@ func TestPBRApplyAggregatesAddErrors(t *testing.T) {
 	p := &pbrManager{ops: ops}
 
 	rules := []PBRRule{
-		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
+		{Family: unix.AF_INET, DSCP: 46, DSCPSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
 	}
 	err := p.Apply(rules)
 	if err == nil {
@@ -1039,5 +1058,51 @@ func TestRulesClearListErrorSurfaced(t *testing.T) {
 				t.Errorf("%s: AF_INET window rule should remain (its dump failed), count=%d", c.name, got)
 			}
 		})
+	}
+}
+
+// TestPBRApplyRoutesDSCPThroughRuleAddDSCP7796 binds the WIRING, not the encoder.
+//
+// The encoder is proven against the kernel in rule_dscp_kernel_7796_test.go, but
+// those cells SKIP without CAP_NET_ADMIN and they call RuleAddDSCP directly. If
+// the pbr applier went on calling plain RuleAdd for a DSCP rule, every one of
+// them would still pass while the shipped path emitted no DSCP selector at all —
+// a rule matching EVERY DSCP, which is the #3430 H2 over-match wearing the #7796
+// fix as a disguise.
+//
+// FAIL-ON-REVERT: change the applier's `if pbr.DSCPSet` branch back to
+// p.ops.RuleAdd(rule) and this cell reds while the kernel cells stay green.
+func TestPBRApplyRoutesDSCPThroughRuleAddDSCP7796(t *testing.T) {
+	ops := newFakeRuleOps()
+	p := &pbrManager{ops: ops}
+
+	rules := []PBRRule{
+		// A DSCP rule and a DSCP-LESS rule in the same apply: the applier has to
+		// send each down the right path, so a build that routes everything one
+		// way fails whichever way it picks.
+		{Family: unix.AF_INET, DSCP: 46, DSCPSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
+		{Family: unix.AF_INET, DSCP: 0, DSCPSet: true, TableID: 101, Instance: "vr-b", IifName: "ge-0-0-1"},
+		{Family: unix.AF_INET, Dst: "10.5.0.0/16", TableID: 102, Instance: "vr-c", IifName: "ge-0-0-2"},
+	}
+	if err := p.Apply(rules); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got := ops.dscps[unix.AF_INET]
+	if len(got) != 2 {
+		t.Fatalf("RuleAddDSCP called %d times, want 2 (one per DSCPSet rule); "+
+			"recorded=%v. A DSCP rule installed through plain RuleAdd carries NO "+
+			"dscp selector and matches every DSCP.", len(got), got)
+	}
+	if got[0] != 46 {
+		t.Errorf("first DSCP rule installed with dscp %d, want 46 (ef)", got[0])
+	}
+	// DSCP 0 must reach the wire as an installed selector, not be skipped.
+	if got[1] != 0 {
+		t.Errorf("second DSCP rule installed with dscp %d, want 0 (be/cs0)", got[1])
+	}
+	// The DSCP-less rule must NOT have gone through the DSCP path.
+	if total := ops.count(unix.AF_INET); total != 3 {
+		t.Errorf("expected 3 installed IPv4 rules total, got %d", total)
 	}
 }

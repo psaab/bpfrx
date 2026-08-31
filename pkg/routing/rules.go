@@ -24,6 +24,11 @@ type ruleOps interface {
 	RuleAdd(*netlink.Rule) error
 	RuleDel(*netlink.Rule) error
 	RuleList(family int) ([]netlink.Rule, error)
+	// RuleAddDSCP installs a rule carrying a DSCP selector. It is separate from
+	// RuleAdd because netlink's Rule cannot represent one: it has only the
+	// legacy `Tos` byte, which the kernel masks to IPTOS_TOS_MASK and which
+	// therefore rejects every DSCP >= 8 (#7796). See rule_dscp_linux.go.
+	RuleAddDSCP(rule *netlink.Rule, dscp uint8) error
 }
 
 // nextTableRulePriority is the base priority for next-table ip rules.
@@ -597,16 +602,23 @@ func (rg *ribGroupManager) clear() error {
 // firewall filter term with a routing-instance action.
 type PBRRule struct {
 	Family int   // unix.AF_INET or unix.AF_INET6
-	TOS    uint8 // TOS byte (DSCP << 2); only meaningful when TOSSet
-	// TOSSet distinguishes "match DSCP 0" (be / cs0 / numeric 0) from
-	// "no DSCP match" (#3430 H2). TOS==0 is a perfectly valid DSCP
+	DSCP   uint8 // raw 6-bit DiffServ code point (0-63); meaningful when DSCPSet
+	// DSCPSet distinguishes "match DSCP 0" (be / cs0 / numeric 0) from
+	// "no DSCP match" (#3430 H2). DSCP==0 is a perfectly valid code point
 	// (best-effort / class-selector 0); without an explicit presence flag
 	// the applier either skipped the rule (no address predicate) or widened
 	// it to ALL DSCP values (address predicate present). The rule emits a
-	// `tos` selector iff TOSSet is true.
-	TOSSet bool
-	Src    string // source CIDR, "" = any (no `from` selector)
-	Dst    string // destination CIDR, "" = any (no `to` selector)
+	// `dscp` selector iff DSCPSet is true.
+	//
+	// #7796: this used to be a TOS BYTE holding DSCP << 2, emitted as the
+	// netlink rule's legacy `Tos`. The kernel masks that byte to
+	// IPTOS_TOS_MASK (0x1E) and rejected every DSCP >= 8 with EINVAL, which
+	// failed the whole commit. The field is the 6-bit DSCP now because the
+	// selector it feeds (FRA_DSCP) is a DSCP, not a TOS — the shift was the
+	// bug, so the type no longer carries a shifted value at all.
+	DSCPSet bool
+	Src     string // source CIDR, "" = any (no `from` selector)
+	Dst     string // destination CIDR, "" = any (no `to` selector)
 	// IPProto, Sport and Dport mirror the L4 predicates a kernel `ip rule` CAN
 	// express (#3730): FRA_IP_PROTO, FRA_SPORT_RANGE and FRA_DPORT_RANGE. Before
 	// #3730 the FBF mirror emitted only the address/DSCP selectors and silently
@@ -728,10 +740,9 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 		}
 		rule.IifName = pbr.IifName
 
-		// Emit a tos selector iff the term actually matched a DSCP (#3430 H2).
-		if pbr.TOSSet {
-			rule.Tos = uint(pbr.TOS)
-		}
+		// The DSCP selector is NOT set on the netlink.Rule: it cannot represent
+		// one (#7796). It is carried to RuleAddDSCP below instead. rule.Tos is
+		// deliberately left zero — the encoder rejects a rule that sets both.
 		if pbr.Src != "" {
 			_, src, err := net.ParseCIDR(pbr.Src)
 			if err != nil {
@@ -762,13 +773,20 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 			rule.Dport = netlink.NewRulePortRange(pbr.Dport.Lo, pbr.Dport.Hi)
 		}
 
-		if err := p.ops.RuleAdd(rule); err != nil {
-			errs = append(errs, fmt.Errorf("add PBR rule instance %s table %d: %w", pbr.Instance, pbr.TableID, err))
+		// Emit a dscp selector iff the term actually matched a DSCP (#3430 H2).
+		addErr := error(nil)
+		if pbr.DSCPSet {
+			addErr = p.ops.RuleAddDSCP(rule, pbr.DSCP)
+		} else {
+			addErr = p.ops.RuleAdd(rule)
+		}
+		if addErr != nil {
+			errs = append(errs, fmt.Errorf("add PBR rule instance %s table %d: %w", pbr.Instance, pbr.TableID, addErr))
 			continue
 		}
 		slog.Info("PBR rule added",
 			"instance", pbr.Instance, "iif", pbr.IifName,
-			"tos", pbr.TOS, "tos_set", pbr.TOSSet,
+			"dscp", pbr.DSCP, "dscp_set", pbr.DSCPSet,
 			"src", pbr.Src, "dst", pbr.Dst, "ipproto", pbr.IPProto,
 			"sport", pbr.Sport.String(), "dport", pbr.Dport.String(),
 			"table", pbr.TableID)
@@ -834,13 +852,12 @@ func (p *pbrManager) clear() error {
 // representable ones and FAILS CLOSED for the rest:
 //
 //   - REPRESENTABLE (honored): source/destination address + prefix-list (FRA_SRC/
-//     FRA_DST), DSCP (rtmsg tos, DSCP-0 excepted — see below), `protocol`
+//     FRA_DST), DSCP — ANY value 0-63, carried in FRA_DSCP (#7796) — `protocol`
 //     (FRA_IP_PROTO), `source-port` (FRA_SPORT_RANGE) and `destination-port`
 //     (FRA_DPORT_RANGE). Multi-value protocol/port sets expand to one ip rule per
 //     value; a port range maps to a single [lo,hi] rule range.
 //   - UNREPRESENTABLE (fail-closed, whole term dropped + degraded): a non-empty
-//     address `except` set, a DSCP-0 match (the netlink layer writes tos only when
-//     non-zero and a zero tos matches ANY DSCP), `source-port-except` /
+//     address `except` set, an unknown DSCP name, `source-port-except` /
 //     `destination-port-except` (no negated port selector), `tcp-flags`,
 //     `icmp-type` / `icmp-code`, `is-fragment`, `flexible-match-range`, and any
 //     unresolved / unenforceable `from` leaf. Emitting the address/protocol/port
@@ -943,7 +960,7 @@ func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 //     logged concern).
 //   - degraded: the number of routing-instance filter terms DROPPED from the
 //     kernel FBF mirror (fail-closed under-steer to the main table) — an
-//     unrepresentable `except` set, a DSCP-0 match, a contradictory
+//     unrepresentable `except` set, an unknown DSCP name, a contradictory
 //     `routing-instance` + `discard`/`reject` term (#4534), an
 //     ip-rule-unrepresentable L4/per-packet predicate (#3730), or the
 //     maxPBRRules overflow (#3430 M3, counted as one condition). A non-zero
@@ -1049,7 +1066,7 @@ func sortAttachments(atts []pbrAttachment) {
 
 // buildPBRFromFilter extracts PBR rules from a single firewall filter.
 // The returned error slice carries per-term DEGRADED conditions (an
-// unrepresentable except set, a DSCP-0 match, or an ip-rule-unrepresentable
+// unrepresentable except set, an unknown DSCP name, or an ip-rule-unrepresentable
 // L4/per-packet predicate — #3730); the buildable rules are still returned.
 //
 // budget is the number of ip rules the caller can still install before the
@@ -1119,45 +1136,48 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			continue
 		}
 
-		// DSCP → TOS presence-tracked values (#2545 multi-value, #3430 H2).
-		// An ip rule carries a SINGLE tos, so a term with several `from dscp`
+		// DSCP presence-tracked values (#2545 multi-value, #3430 H2).
+		// An ip rule carries a SINGLE dscp, so a term with several `from dscp`
 		// values expands to one rule per DSCP (× the src/dst cross-product).
 		//
-		// DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule: the
-		// netlink layer (vishvananda/netlink) writes the rtmsg tos field only
-		// when non-zero (ruleHandle, rule_linux.go) and exposes no FRA_DSCP
-		// escape hatch, and the kernel treats a zero tos in a fib rule as
-		// "match ANY tos". Emitting a TOS=0 rule would therefore OVER-MATCH
-		// every DSCP — the exact #3430 H2 bug. So a DSCP-0 match value is
-		// DROPPED with a degraded build error (fail-safe under-steer), mirroring
-		// the non-empty `except` handling in resolvePBRDirection. Within a
-		// multi-value set (e.g. `from dscp [ be ef ]`) only the DSCP-0 value is
-		// dropped; the representable values still emit exact rules.
-		type tosEntry struct {
-			tos uint8
-			set bool
+		// #7796: DSCP 0 (be / cs0 / numeric 0) IS representable and is no longer
+		// dropped. The old drop was correct only for the legacy tos selector,
+		// where a zero byte is indistinguishable from "no selector" and therefore
+		// matches ANY DSCP. The rule now carries FRA_DSCP, where the ATTRIBUTE'S
+		// PRESENCE is the selector and its value is free to be 0 — the kernel
+		// renders such a rule as "dscp default" and matches only DSCP 0. Keeping
+		// the drop would have left `from dscp be` / `cs0` silently non-functional
+		// after the crash for every OTHER value was fixed.
+		//
+		// An UNPARSEABLE dscp is a different failure from DSCP 0 and now says so.
+		// dscpToTOS returned 0 both for `cs0`/`be` and for an unrecognised name, so
+		// a typo was reported as "matches DSCP 0" — a misleading message about a
+		// value the operator never wrote.
+		type dscpEntry struct {
+			dscp uint8
+			set  bool
 		}
-		var toses []tosEntry
+		var dscps []dscpEntry
 		hadDSCP := false
 		for _, d := range term.DSCPs {
 			if d == "" {
 				continue
 			}
 			hadDSCP = true
-			tos := dscpToTOS(d)
-			if tos == 0 {
+			v, ok := dscpValue(d)
+			if !ok {
 				errs = append(errs, fmt.Errorf(
-					"PBR filter %s term %s matches DSCP 0 (%q), which an ip rule "+
-						"cannot represent (the netlink layer has no FRA_DSCP and a zero "+
-						"tos matches ANY DSCP); steering for this DSCP-0 match is dropped",
+					"PBR filter %s term %s matches unknown DSCP %q (expected a DiffServ "+
+						"name such as ef/af31/cs3/be, or a number 0-63); steering for this "+
+						"match is dropped",
 					filter.Name, term.Name, d))
 				continue
 			}
-			toses = append(toses, tosEntry{tos: tos, set: true})
+			dscps = append(dscps, dscpEntry{dscp: v, set: true})
 		}
 		if hadDSCP {
-			if len(toses) == 0 {
-				// Every DSCP this term matched was DSCP-0 (all dropped above).
+			if len(dscps) == 0 {
+				// Every DSCP this term matched was unparseable (all dropped above).
 				// Emitting an address-only sentinel rule here would over-match
 				// ALL DSCP, so skip the term entirely — the degraded error is
 				// already recorded.
@@ -1165,8 +1185,8 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			}
 		} else {
 			// No DSCP constraint: a single unset entry so the address-only case
-			// still emits one rule (no tos selector).
-			toses = []tosEntry{{tos: 0, set: false}}
+			// still emits one rule (no dscp selector).
+			dscps = []dscpEntry{{dscp: 0, set: false}}
 		}
 
 		// Resolve source / destination scope, expanding prefix-lists and
@@ -1190,7 +1210,7 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		}
 
 		hasDSCP := false
-		for _, t := range toses {
+		for _, t := range dscps {
 			if t.set {
 				hasDSCP = true
 				break
@@ -1233,11 +1253,11 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		// ip rules; computing that product from the dimension lengths is O(1) and
 		// cannot overflow (pbrTermProduct saturates). A term whose product would
 		// exhaust the remaining priority-window budget is dropped WHOLE (fail-safe
-		// under-steer, matching the unrepresentable/DSCP-0 drops above) rather than
+		// under-steer, matching the unrepresentable/unknown-DSCP drops above) rather than
 		// allocating millions of PBRRule structs and truncating — the pre-cap
 		// memory/CPU exhaustion the 1000-rule cap was meant to bound but did not.
 		remaining := budget - len(rules)
-		product := pbrTermProduct(len(toses), len(protos), len(sports), len(dports), len(srcs), len(dsts))
+		product := pbrTermProduct(len(dscps), len(protos), len(sports), len(dports), len(srcs), len(dsts))
 		if remaining < 0 || product > remaining {
 			errs = append(errs, fmt.Errorf(
 				"PBR filter %s term %s expands to %s policy-based-routing ip rules "+
@@ -1252,7 +1272,7 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			return rules, errs, true
 		}
 
-		for _, t := range toses {
+		for _, t := range dscps {
 			for _, proto := range protos {
 				for _, sp := range sports {
 					for _, dp := range dports {
@@ -1260,8 +1280,8 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 							for _, dst := range dsts {
 								rules = append(rules, PBRRule{
 									Family:   family,
-									TOS:      t.tos,
-									TOSSet:   t.set,
+									DSCP:     t.dscp,
+									DSCPSet:  t.set,
 									IPProto:  proto,
 									Sport:    sp,
 									Dport:    dp,
@@ -1556,8 +1576,18 @@ func normalizePBRAddr(tok string) (cidr string, unconstrained bool, err error) {
 
 // dscpToTOS converts a DSCP name or numeric value to a TOS byte.
 // TOS byte = DSCP value << 2 (DSCP occupies the upper 6 bits of the TOS byte).
-func dscpToTOS(dscp string) uint8 {
-	// DSCP name → numeric value mapping (same values as dataplane.DSCPValues)
+func dscpValue(dscp string) (uint8, bool) {
+	// DSCP name → 6-bit code point (same values as dataplane.DSCPValues).
+	//
+	// #7796: this returns the RAW code point, not DSCP << 2. The shift existed
+	// to build a legacy TOS byte, and that shift was the defect — the kernel
+	// masks the tos byte to IPTOS_TOS_MASK and rejects everything from cs1 up.
+	//
+	// It also returns an explicit ok flag. The previous dscpToTOS returned 0
+	// both for the legitimate zero code points (cs0 / be / "0") and for an
+	// unrecognised name, so the caller could not tell "match best-effort" from
+	// "the operator typed a DSCP that does not exist" and reported both as
+	// "matches DSCP 0".
 	dscpValues := map[string]uint8{
 		"ef":   46,
 		"af11": 10, "af12": 12, "af13": 14,
@@ -1571,12 +1601,12 @@ func dscpToTOS(dscp string) uint8 {
 
 	name := strings.ToLower(dscp)
 	if val, ok := dscpValues[name]; ok {
-		return val << 2
+		return val, true
 	}
-	if v, err := strconv.Atoi(dscp); err == nil && v >= 0 && v <= 63 {
-		return uint8(v) << 2
+	if v, err := strconv.Atoi(dscp); err == nil && v >= 0 && v <= maxDSCP {
+		return uint8(v), true
 	}
-	return 0
+	return 0, false
 }
 
 // resolveRibTable maps a Junos rib name to its kernel routing table ID.

@@ -693,33 +693,46 @@ func TestRibGroupNeedsLeak(t *testing.T) {
 	}
 }
 
-func TestDscpToTOS(t *testing.T) {
+func TestDscpValue(t *testing.T) {
+	// #7796: the values are RAW 6-bit code points, not DSCP << 2. The shift
+	// built a legacy TOS byte and was the defect.
+	//
+	// The old table asserted {"invalid", 0} alongside {"be", 0}, {"cs0", 0} and
+	// {"0", 0} — four rows sharing one value, one of which meant "this name does
+	// not exist". A table like that CANNOT distinguish a parsed zero from a
+	// parse failure, so it encoded the conflation as expected behaviour. The ok
+	// flag is what separates them, which is why every row now asserts it.
 	tests := []struct {
 		dscp string
 		want uint8
+		ok   bool
 	}{
-		{"ef", 46 << 2},   // 0xB8 = 184
-		{"af43", 38 << 2}, // 0x98 = 152
-		{"af42", 36 << 2}, // 0x90 = 144
-		{"af41", 34 << 2}, // 0x88 = 136
-		{"af33", 30 << 2}, // 120
-		{"cs1", 8 << 2},   // 32
-		{"cs5", 40 << 2},  // 160
-		{"be", 0},         // best effort = 0
-		{"cs0", 0},        // cs0 = 0 → TOS = 0
-		{"46", 46 << 2},   // numeric DSCP
-		{"0", 0},          // zero
-		{"63", 63 << 2},   // max DSCP
-		{"invalid", 0},    // unknown name → 0
-		{"EF", 46 << 2},   // case-insensitive
-		{"AF43", 38 << 2}, // case-insensitive
+		{"ef", 46, true},
+		{"af43", 38, true},
+		{"af42", 36, true},
+		{"af41", 34, true},
+		{"af33", 30, true},
+		{"cs1", 8, true},
+		{"cs5", 40, true},
+		{"be", 0, true},    // best effort = 0, and it PARSES
+		{"cs0", 0, true},   // cs0 = 0, and it PARSES
+		{"46", 46, true},   // numeric DSCP
+		{"0", 0, true},     // zero, and it PARSES
+		{"63", 63, true},   // max DSCP
+		{"EF", 46, true},   // case-insensitive
+		{"AF43", 38, true}, // case-insensitive
+		// The rows the old table could not express: not-a-DSCP.
+		{"invalid", 0, false},
+		{"64", 0, false}, // out of range (6-bit max is 63)
+		{"-1", 0, false},
+		{"", 0, false},
 	}
 
 	for _, tt := range tests {
-		got := dscpToTOS(tt.dscp)
-		if got != tt.want {
-			t.Errorf("dscpToTOS(%q) = %d (0x%02X), want %d (0x%02X)",
-				tt.dscp, got, got, tt.want, tt.want)
+		got, ok := dscpValue(tt.dscp)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("dscpValue(%q) = %d,%v want %d,%v",
+				tt.dscp, got, ok, tt.want, tt.ok)
 		}
 	}
 }
@@ -777,14 +790,14 @@ func TestBuildPBRRules(t *testing.T) {
 		if comcast == nil || att == nil {
 			t.Fatal("expected rules for both Comcast-GigabitPro and ATT")
 		}
-		if comcast.TOS != 184 || !comcast.TOSSet {
-			t.Errorf("Comcast TOS = %d set=%v, want 184/true", comcast.TOS, comcast.TOSSet)
+		if comcast.DSCP != 46 || !comcast.DSCPSet {
+			t.Errorf("Comcast DSCP = %d set=%v, want 46/true (ef, unshifted)", comcast.DSCP, comcast.DSCPSet)
 		}
 		if comcast.TableID != 100 || comcast.Family != unix.AF_INET {
 			t.Errorf("Comcast table/family = %d/%d, want 100/AF_INET", comcast.TableID, comcast.Family)
 		}
-		if att.TOS != 152 || att.TableID != 101 {
-			t.Errorf("ATT TOS/table = %d/%d, want 152/101", att.TOS, att.TableID)
+		if att.DSCP != 38 || att.TableID != 101 {
+			t.Errorf("ATT DSCP/table = %d/%d, want 38/101 (af43, unshifted)", att.DSCP, att.TableID)
 		}
 	})
 
@@ -802,8 +815,8 @@ func TestBuildPBRRules(t *testing.T) {
 		if rules[0].Src != "10.0.1.0/24" {
 			t.Errorf("src = %q, want 10.0.1.0/24", rules[0].Src)
 		}
-		if rules[0].TOSSet {
-			t.Errorf("TOSSet = true, want false (no DSCP)")
+		if rules[0].DSCPSet {
+			t.Errorf("DSCPSet = true, want false (no DSCP)")
 		}
 		if rules[0].TableID != 101 {
 			t.Errorf("table = %d, want 101", rules[0].TableID)
@@ -1013,13 +1026,19 @@ func TestBuildPBRRules(t *testing.T) {
 		}
 	})
 
-	// H2: DSCP 0 (be / cs0 / numeric 0) is NOT representable as an ip rule (the
-	// netlink layer writes the rtmsg tos only when non-zero and has no FRA_DSCP
-	// escape hatch, and a zero tos matches ANY DSCP). The fail-safe disposition
-	// is DROP + degraded build error, NOT a silently over-matching rule.
-	// Pre-fix the builder emitted a TOSSet/TOS=0 rule that reached the wire with
-	// no tos selector and matched all DSCP.
-	t.Run("H2 dscp zero dropped and degraded", func(t *testing.T) {
+	// H2 (#3430) guarded a real property: a DSCP-0 match must never produce a
+	// rule that matches ANY DSCP. Under the legacy tos selector the only way to
+	// honour that was to DROP the term, because a zero tos byte is
+	// indistinguishable from "no tos selector".
+	//
+	// #7796 changes the mechanism, not the property. FRA_DSCP makes the
+	// ATTRIBUTE'S PRESENCE the selector, so DSCP 0 is now exactly expressible
+	// and the correct disposition is an exact rule rather than a drop. These
+	// subtests therefore assert the SAME anti-over-match property against the
+	// new behaviour: a DSCP-0 term emits a rule, and that rule carries the
+	// selector (DSCPSet true). A rule with DSCPSet false would be precisely the
+	// over-match #3430 H2 was written to prevent.
+	t.Run("H2 dscp zero emits an exact rule", func(t *testing.T) {
 		for _, d := range []string{"be", "cs0", "0"} {
 			filter := &config.FirewallFilter{
 				Name: "z",
@@ -1028,18 +1047,25 @@ func TestBuildPBRRules(t *testing.T) {
 				},
 			}
 			rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
-			if len(rules) != 0 {
-				t.Errorf("dscp %q: expected 0 rules (dropped), got %d: %+v", d, len(rules), rules)
+			if err != nil {
+				t.Errorf("dscp %q: unexpected degraded error: %v", d, err)
 			}
-			if err == nil {
-				t.Errorf("dscp %q: expected a degraded build error", d)
+			if len(rules) != 1 {
+				t.Fatalf("dscp %q: expected 1 exact rule, got %d: %+v", d, len(rules), rules)
+			}
+			if rules[0].DSCP != 0 {
+				t.Errorf("dscp %q: DSCP = %d, want 0", d, rules[0].DSCP)
+			}
+			if !rules[0].DSCPSet {
+				t.Errorf("dscp %q: DSCPSet = false — the rule would carry NO dscp "+
+					"selector and match every DSCP, which is the #3430 H2 over-match", d)
 			}
 		}
 	})
 
-	// H2: DSCP 0 combined with an address must NOT fall back to an address-only
-	// rule (that would over-match all DSCP from that source). Drop entirely.
-	t.Run("H2 dscp zero with address still dropped", func(t *testing.T) {
+	// The address case: a DSCP-0 term with a source must emit a rule that
+	// constrains BOTH, never an address-only rule.
+	t.Run("H2 dscp zero with address keeps both selectors", func(t *testing.T) {
 		filter := &config.FirewallFilter{
 			Name: "zaddr",
 			Terms: []*config.FirewallFilterTerm{
@@ -1047,17 +1073,23 @@ func TestBuildPBRRules(t *testing.T) {
 			},
 		}
 		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
-		if len(rules) != 0 {
-			t.Errorf("dscp-0 + address must emit 0 rules (no address-only over-match), got %d: %+v", len(rules), rules)
+		if err != nil {
+			t.Errorf("unexpected degraded error: %v", err)
 		}
-		if err == nil {
-			t.Error("expected a degraded build error")
+		if len(rules) != 1 {
+			t.Fatalf("expected 1 rule, got %d: %+v", len(rules), rules)
+		}
+		if !rules[0].DSCPSet || rules[0].DSCP != 0 {
+			t.Errorf("DSCP=%d set=%v, want 0/true — an address-only rule would "+
+				"over-match all DSCP from that source", rules[0].DSCP, rules[0].DSCPSet)
+		}
+		if rules[0].Src != "10.0.0.0/8" {
+			t.Errorf("Src = %q, want 10.0.0.0/8", rules[0].Src)
 		}
 	})
 
-	// H2: within a multi-value DSCP set only the DSCP-0 value is dropped; the
-	// representable values still emit exact rules (with the degraded error).
-	t.Run("H2 multi-value dscp drops only zero", func(t *testing.T) {
+	// A multi-value set containing zero now emits BOTH values.
+	t.Run("H2 multi-value dscp keeps zero and nonzero", func(t *testing.T) {
 		filter := &config.FirewallFilter{
 			Name: "zmulti",
 			Terms: []*config.FirewallFilterTerm{
@@ -1065,19 +1097,48 @@ func TestBuildPBRRules(t *testing.T) {
 			},
 		}
 		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
-		if len(rules) != 1 {
-			t.Fatalf("expected 1 rule (ef kept, be dropped), got %d: %+v", len(rules), rules)
+		if err != nil {
+			t.Errorf("unexpected degraded error: %v", err)
 		}
-		if rules[0].TOS != 184 || !rules[0].TOSSet {
-			t.Errorf("kept rule TOS=%d set=%v, want 184/true (ef)", rules[0].TOS, rules[0].TOSSet)
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 rules (be AND ef), got %d: %+v", len(rules), rules)
 		}
-		if err == nil {
-			t.Error("expected a degraded build error for the dropped be value")
+		got := map[uint8]bool{}
+		for _, r := range rules {
+			if !r.DSCPSet {
+				t.Errorf("rule %+v has DSCPSet false — it would match every DSCP", r)
+			}
+			got[r.DSCP] = true
+		}
+		if !got[0] || !got[46] {
+			t.Errorf("emitted DSCPs = %v, want both 0 (be) and 46 (ef)", got)
 		}
 	})
 
-	// A representable nonzero DSCP reaches the wire: TOSSet true, TOS nonzero.
-	t.Run("H2 nonzero dscp emits tos selector", func(t *testing.T) {
+	// An UNPARSEABLE dscp is a different failure from DSCP 0, and it is the one
+	// that must still drop + degrade.
+	t.Run("H2 unknown dscp dropped and degraded", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "bad",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "t", DSCPs: []string{"nonesuch"}, RoutingInstance: "ATT"},
+			},
+		}
+		rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 0 {
+			t.Errorf("unknown dscp must emit 0 rules, got %d: %+v", len(rules), rules)
+		}
+		if err == nil {
+			t.Fatal("expected a degraded build error for an unknown DSCP name")
+		}
+		if !strings.Contains(err.Error(), "unknown DSCP") {
+			t.Errorf("error %q should name the unknown DSCP rather than reporting "+
+				"it as a DSCP-0 match (the pre-#7796 conflation)", err)
+		}
+	})
+
+	// A representable nonzero DSCP reaches the wire as a RAW code point.
+	t.Run("H2 nonzero dscp emits dscp selector", func(t *testing.T) {
 		filter := &config.FirewallFilter{
 			Name: "nz",
 			Terms: []*config.FirewallFilterTerm{
@@ -1088,8 +1149,9 @@ func TestBuildPBRRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(rules) != 1 || rules[0].TOS != 184 || !rules[0].TOSSet {
-			t.Fatalf("expected 1 rule TOS=184/set, got %+v", rules)
+		// 46, NOT 184: a shifted value here is the #7796 defect.
+		if len(rules) != 1 || rules[0].DSCP != 46 || !rules[0].DSCPSet {
+			t.Fatalf("expected 1 rule DSCP=46/set, got %+v", rules)
 		}
 	})
 
@@ -1108,7 +1170,7 @@ func TestBuildPBRRules(t *testing.T) {
 		}
 		var anyR, hostR *PBRRule
 		for i := range rules {
-			if rules[i].TOSSet {
+			if rules[i].DSCPSet {
 				anyR = &rules[i]
 			} else {
 				hostR = &rules[i]
@@ -1386,7 +1448,7 @@ func TestBuildPBRRules(t *testing.T) {
 		if rules[0].Dport == nil || rules[0].Dport.Lo != 53 || rules[0].Dport.Hi != 53 {
 			t.Errorf("expected dport 53, got %s", rules[0].Dport)
 		}
-		if rules[0].Src != "" || rules[0].Dst != "" || rules[0].TOSSet {
+		if rules[0].Src != "" || rules[0].Dst != "" || rules[0].DSCPSet {
 			t.Errorf("port-only rule must carry no addr/dscp selector, got %+v", rules[0])
 		}
 	})
