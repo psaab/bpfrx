@@ -188,24 +188,91 @@ func unenforcedTCPSessionTimeoutsIn(
 	return out
 }
 
-// tcpSessionTimeoutAdvisory builds the commit-time accepted-only warning for
-// the configured-but-unenforced timeout leaves, or "" when none is set. It
-// states which windows ARE in force and points at the one half-open control
-// that an operator can actually move today, so the advisory is actionable
-// rather than merely discouraging.
+// tcpSessionTimeoutAdvisory builds the commit-time advisory for the tcp-session
+// timeout leaves, or "" when none of the newly-enforced three is set.
+//
+// #6539 shipped this saying "configured but accepted-only". #7342 made those
+// three leaves live, which turns that sentence false — and leaves a sharper
+// problem behind it: the population that configured one of them is exactly the
+// operators who did so AFTER being told it did nothing. For them the upgrade
+// silently activates a value they had no reason to keep realistic, and
+// `initial-timeout` is the sharp one, since a large value turns the half-open
+// window from a fixed 20s bound into a session-table pin.
+//
+// So the advisory is INVERTED rather than deleted: it now fires for exactly the
+// same set and says the value is in force. The surface an operator checks is
+// the commit they are about to run, not a release note they read last month —
+// saying nothing there is the failure mode #6539 was filed to fix, pointed the
+// other way.
+//
+// Two bounds are stated because they are what make activating defensible rather
+// than merely intended, and an operator cannot check either from the config
+// alone:
+//
+//   - an UNSET leaf stays unset. `0` means "use the dataplane default" on this
+//     wire, exactly as the established / UDP / ICMP seconds already do, so this
+//     changes nothing for anyone who never configured one.
+//   - a zone with `screen ... syn-flood timeout` (#3527) is already bounded
+//     regardless of `initial-timeout`: the per-zone override takes precedence
+//     over the global window for that zone's half-opens, so the screen control
+//     an operator set per zone cannot be outranked by a global default.
+//
+// It is deliberately NOT keyed to a magnitude. A threshold would need a
+// derivation nobody has, and a warning whose bound cannot be defended is one
+// operators learn to tune out — which costs the warnings that matter.
+//
+// TEMPORARY, and tracked so that is not merely an intention: #8129 exists to
+// delete this and nothing else. Automatic retirement would need a
+// release-version predicate, which is a mechanism with its own failure modes
+// for a message that costs one commit-time line — so the removal gets an object
+// instead, the way the UNSURFACED queue and the dead-entry-rejecting accepted
+// list do.
 func tcpSessionTimeoutAdvisory(ts *TCPSessionConfig) string {
-	leaves := unenforcedTCPSessionTimeouts(ts)
-	if len(leaves) == 0 {
+	if ts == nil {
 		return ""
 	}
+	// The three #7342 made live, in Junos config order. established-timeout is
+	// excluded: it has been enforced since long before #6539, so nothing about
+	// it changed and warning would be pure noise.
+	var set []string
+	for _, e := range []struct {
+		leaf  string
+		value int
+	}{
+		{TCPSessionInitialTimeoutLeaf, ts.InitialTimeout},
+		{TCPSessionClosingTimeoutLeaf, ts.ClosingTimeout},
+		{TCPSessionTimeWaitTimeoutLeaf, ts.TimeWaitTimeout},
+	} {
+		// Positive only: 0 is unset, and telling an operator that a knob they
+		// never set is now enforced is the noise this advisory has to avoid.
+		if e.value > 0 {
+			set = append(set, e.leaf)
+		}
+	}
+	if len(set) == 0 {
+		return ""
+	}
+	// The half-open warning is the sharp one, and it is CONDITIONAL: it applies
+	// only when initial-timeout is among the leaves set. Emitting it
+	// unconditionally would put a leaf name in the advisory that the operator
+	// did not configure — which is both confusing and the thing that turns a
+	// targeted warning into a blanket one nobody reads.
+	halfOpen := ""
+	if ts.InitialTimeout > 0 {
+		halfOpen = fmt.Sprintf(
+			" A large half-open window pins handshake-incomplete sessions in the session table for that "+
+				"long instead of bounding them at %ds, so it is a session-table exposure as well as a "+
+				"timeout; a zone with `screen ... syn-flood timeout` (#3527) stays bounded by that "+
+				"override regardless.",
+			DataplaneTCPOpeningWindowSecs)
+	}
 	return fmt.Sprintf(
-		"security flow tcp-session %s configured but accepted-only — these leaves have NO dataplane wire carrier "+
-			"(of the four tcp-session timeouts only established-timeout is carried), so the userspace dataplane keeps "+
-			"its fixed windows: a half-open/OPENING session reaps at %ds, a graceful FIN close at %ds and an RST abort "+
-			"at %ds, and there is no separate TIME_WAIT state to time out. The only half-open window an operator can "+
-			"move today is the per-zone `screen ... syn-flood timeout` override (#3527) (config-only parity, #6539)",
-		strings.Join(leaves, ", "),
-		DataplaneTCPOpeningWindowSecs, DataplaneTCPClosingWindowSecs, DataplaneTCPRSTWindowSecs)
+		"security flow tcp-session %s is now ENFORCED (#7342) — until this release these leaves were "+
+			"accepted-only and the dataplane kept fixed windows (half-open %ds, FIN close %ds); the value "+
+			"you committed now governs the session directly, so verify it is one you want in force. An "+
+			"UNSET leaf is unaffected (0 = keep the dataplane default).%s",
+		strings.Join(set, ", "),
+		DataplaneTCPOpeningWindowSecs, DataplaneTCPClosingWindowSecs, halfOpen)
 }
 
 // AnnotateTCPSessionTimeout appends leaf's not-enforced annotation to an
