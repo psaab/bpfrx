@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -92,14 +93,29 @@ func TestDetachXDPIsNotSelfSerializing7547(t *testing.T) {
 	// Hold both goroutines inside Close so the overlap is observed rather than
 	// raced for. A bounded spin, not a sleep: if the second never arrives the
 	// release below unblocks the first and the assertions report what happened.
+	//
+	// #8218 clause 2: the spin MUST yield. Without runtime.Gosched() this is a
+	// busy loop that never gives up its P, so on a loaded box the second
+	// goroutine is never scheduled, the spin expires, the first completes its
+	// whole sequence INCLUDING deleteXDPLink, and the second then finds no link
+	// and returns without ever calling Close. That reports "measured nothing"
+	// and reds an unrelated gate. Measured: GOMAXPROCS=1 degenerates 30/30
+	// without the yield and 0/30 with it, and the loop needs 1-93 iterations
+	// against this bound. The bound stays as the anti-hang guard — if someone
+	// adds the per-ifindex exclusion this cell exists to detect, the second
+	// goroutine never enters Close and this must terminate, not block.
 	for i := 0; i < 1_000_000 && fl.inClose.Load() < 2; i++ {
+		runtime.Gosched()
 	}
 	close(fl.release)
 	wg.Wait()
 
 	if got := fl.closes.Load(); got != 2 {
-		t.Errorf("Close() called %d times, want 2 — the fixture did not drive two "+
-			"concurrent detaches through the sequence, so this cell measured nothing", got)
+		t.Errorf("Close() called %d times, want 2 — DetachXDP now serializes itself, "+
+			"or the two detaches otherwise failed to overlap. Since #8218 the fixture "+
+			"yields, so scheduler starvation is no longer a plausible cause: read this "+
+			"as per-ifindex exclusion having been added, which is the GOOD change this "+
+			"tripwire exists to detect. Invert the cell rather than repairing it.", got)
 	}
 	// Simultaneity is a bonus observation, not the assertion. The load-bearing
 	// fact is that Close() ran TWICE on one handle; whether the two calls

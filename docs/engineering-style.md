@@ -437,6 +437,69 @@ Rules of thumb:
   otherwise: `configstore.New` is fail-closed (#1893) — there is no
   "file-only" fallback backend.
 
+## Time in tests (#8218)
+
+Four tests in four packages red full-suite gates under load, in diffs that
+could not reach the code they failed in. They look like one defect and are
+three, and the single rule "assert on work, not wall-clock" — which is how this
+was first written down — is correct for two of them and would damage the other
+two. Sort the test into a clause before applying it.
+
+**1. A pass criterion must never be a duration, or a ratio of durations.**
+Measure work: allocations, operations, syscalls, bytes. A count cannot be moved
+by machine load; a duration can, and a ratio of two durations can too, because
+the readings are taken at different moments and a scheduling hiccup landing on
+one of them moves the ratio and nothing else does.
+
+`TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551` (#8211) carried exactly
+the wrong rationale in its own comment — *"a ratio between two measurements of
+the same magnitude on the same machine, so machine load cancels out"* — and
+that sentence is why nobody looked at it. Ported to `testing.AllocsPerRun`,
+against its v3 twin which had always done it right, it reads 1.0x bounded and
+51.8x with the bound removed: the same threshold, now deterministic. When you
+port one of these, rewrite the rationale too. A false explanation of why a
+measurement is safe outlives the measurement.
+
+**2. A degeneracy guard must FAIL, not skip, when the state under test did not
+occur — and it should OBSERVE that state, not infer it from timing.** A skip is
+indistinguishable from a pass in every summary line and CI badge, so the guard
+stops running and nothing says so. The failure mode is perverse: the faster the
+machine, the likelier the vacuous pass.
+
+And before giving a degenerate state a verdict, check whether the FIXTURE
+caused it. `TestDetachXDPIsNotSelfSerializing7547` reported "this cell measured
+nothing" under load, and the cause was its own non-yielding busy-wait starving
+the second goroutine — `GOMAXPROCS=1` reproduced it 30/30, adding
+`runtime.Gosched()` removed it 0/30 and made the overlap structural rather than
+lucky. A cell that waits without yielding, sleeps for an interleaving, or races
+for a window is manufacturing its own degeneracy, and a new verdict class for
+it would have kept the flake and made it quieter. Reach for one only where the
+interleaving genuinely cannot be forced.
+
+**3. A deadline that bounds a WAIT is legitimate, and clause 1 does not reach
+it.** The duration is not the pass criterion — the assertion is already
+work-based — and the deadline exists so that a broken build fails instead of
+hanging. Applied literally here, clause 1 says delete it, which converts a
+flake into a hang: a hang prints nothing, has no `--- FAIL` line, and destroys
+every later test by eating the budget. Size it for the LOADED case and leave
+it.
+
+This is the same rule as *"A liveness backstop is not a timing assertion, and a
+red there is never fixed by raising it"* under Project-specific reminders,
+approached from the other end, and the two only appear to disagree. That bullet
+governs a backstop already sized orders of magnitude above the healthy path: if
+one of those reds, something is genuinely wedged and raising it hides a real
+defect. This clause governs a backstop that was never sized to that rule at all
+— `SetReadDeadline(2s)` (#8182), `time.After(3s)` (#8031) — where the fix is to
+bring it into compliance. Raising 3s to 60s is not "raising a bound to make a
+red go away"; it is sizing a backstop that was never a backstop.
+
+**Where this came from, and what is still open.** #8211 is fixed. #8207
+(`pkg/cluster` heartbeat probe) is clause 2 and #8182 / #8031 are clause 3;
+all three remain open. The rule is documented here rather than left in the
+tracker because a policy that lives only in an issue is not read before the
+next test is written, which is how this reached four packages.
+
 ## Review discipline
 
 ### Reviewing (adversarial by design)

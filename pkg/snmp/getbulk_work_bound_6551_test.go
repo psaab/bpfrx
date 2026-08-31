@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"math"
 	"testing"
-	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -201,6 +200,19 @@ func TestGetBulkBuildBounded_6551(t *testing.T) {
 		grid, len(built), len(returned), len(resp))
 }
 
+// getBulkAllocs is the v2c counterpart to v3GetBulkAllocs below, and measures
+// the same thing for the same reason: every grid cell allocates, so the count
+// rises with the number of cells actually walked. It is a COUNT, so machine
+// load cannot move it — which a duration could, and did (#8211).
+func getBulkAllocs(t *testing.T, a *Agent, req []byte) float64 {
+	t.Helper()
+	return testing.AllocsPerRun(3, func() {
+		if a.handlePacket(req) == nil {
+			t.Fatal("nil response")
+		}
+	})
+}
+
 // TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551 guards the v2c CALL SITE
 // (handleGetBulk, agent.go). The assertions above drive buildBulkVarbinds
 // directly with the real ceiling, so they would still pass if handleGetBulk
@@ -213,46 +225,39 @@ func TestGetBulkBuildBounded_6551(t *testing.T) {
 // its own ceiling, and unbounding it leaves every assertion here green —
 // TestGetBulkCostDoesNotScaleWithMaxRepetitionsV3_6551 below is its guard.
 //
-// It is a ratio between two measurements of the same magnitude on the same
-// machine, not an absolute deadline, so machine load cancels out. Pre-fix the
-// R*100 grid costs ~100x the R*1 grid (58,000 cells vs 580); post-fix both stop
-// at the same ~118 cells and the ratio sits near 1. The 10x threshold has an
-// order of magnitude of headroom on both sides.
+// Allocations are the work proxy, matching the v3 twin below — see
+// getBulkAllocs for why every grid cell allocates. Pre-fix the R*100 grid costs
+// ~100x the R*1 grid (58,000 cells vs 580); post-fix both stop at the same ~118
+// cells and the ratio sits near 1. The 10x threshold has an order of magnitude
+// of headroom on both sides.
+//
+// This measured WALL TIME until #8211. The rationale then recorded here was
+// that a ratio of two measurements on one machine makes load cancel out; that
+// is false, and the test flaked in full-suite gates at load ~39 while the diff
+// under review could not reach pkg/snmp. Load does not cancel because the two
+// readings are taken at different moments — a scheduling hiccup landing on one
+// of them moves the ratio and nothing else does. A count has no such exposure.
+// See docs/engineering-style.md, "Time in tests", clause 1.
 func TestGetBulkCostDoesNotScaleWithMaxRepetitions_6551(t *testing.T) {
 	a := bulkTestAgent(50)
 	oneRep, _ := maxRepeaterBulkRequest(t, "public", 1, []int{1, 3})
 	manyRep, repeaters := maxRepeaterBulkRequest(t, "public", 100, []int{1, 3})
 
-	timeReq := func(req []byte) time.Duration {
-		const iters = 5
-		a.handlePacket(req) // warm any lazily-built state
-		start := time.Now()
-		for i := 0; i < iters; i++ {
-			if a.handlePacket(req) == nil {
-				t.Fatal("nil response")
-			}
-		}
-		return time.Since(start) / iters
-	}
-
-	// Measure in both orders and keep the better (smallest) reading for each, so
-	// a scheduling hiccup landing on one measurement cannot manufacture a ratio.
-	one, many := timeReq(oneRep), timeReq(manyRep)
-	if second := timeReq(manyRep); second < many {
-		many = second
-	}
-	if second := timeReq(oneRep); second < one {
-		one = second
-	}
+	one, many := getBulkAllocs(t, a, oneRep), getBulkAllocs(t, a, manyRep)
+	// Not a Skip. A skip is indistinguishable from a pass in every summary line
+	// and CI badge, so the guard would silently stop running and nothing would
+	// say so. Zero allocations at M=1 cannot mean "unsuitable machine" now that
+	// the measure is a count — it can only mean the probe never reached the
+	// walk, which is a broken test. See docs/engineering-style.md clause 2.
 	if one <= 0 {
-		t.Skip("timer resolution too coarse to compare")
+		t.Fatalf("no allocations measured at max-repetitions=1 (%v); the probe is not measuring the walk", one)
 	}
 
-	ratio := float64(many) / float64(one)
-	t.Logf("%d repeaters: max-repetitions=1 %v, max-repetitions=100 %v (ratio %.1fx)",
+	ratio := many / one
+	t.Logf("%d repeaters: max-repetitions=1 %.0f allocs, max-repetitions=100 %.0f allocs (ratio %.1fx)",
 		repeaters, one, many, ratio)
 	if ratio > 10 {
-		t.Fatalf("GETBULK cost scales with max-repetitions: %v at M=1 vs %v at M=100 (%.1fx); "+
+		t.Fatalf("GETBULK cost scales with max-repetitions: %.0f allocs at M=1 vs %.0f at M=100 (%.1fx); "+
 			"the grid is still expanding past the response ceiling", one, many, ratio)
 	}
 }
