@@ -12,6 +12,13 @@ use std::time::{Duration, Instant};
 // Firewall-local traffic is reinjected through the slow path. Keep the queue
 // bounded, but do not rate-limit it so aggressively that normal TCP ACK
 // traffic collapses sender throughput.
+/// #7820: how long `SlowPathReinjector::new` waits for the worker to report
+/// live-or-failed before giving up and returning optimistically. `open_tun`
+/// resolves in microseconds; this bound exists so a pathological stall cannot
+/// wedge dataplane startup.
+const INIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Poll granularity for that handshake.
+const INIT_HANDSHAKE_POLL: Duration = Duration::from_millis(1);
 const DEFAULT_QUEUE_DEPTH: usize = 16_384;
 const DEFAULT_RATE_LIMIT_PACKETS_PER_SEC: u64 = 1_000_000;
 const DEFAULT_RATE_LIMIT_BYTES_PER_SEC: u64 = 4 * 1024 * 1024 * 1024;
@@ -210,6 +217,19 @@ impl SharedStatus {
         }
     }
 
+    /// #7820: the worker's recorded failure cause, or `None` if it has not
+    /// recorded one. Distinguishes "no error yet" from an error, which the
+    /// startup handshake needs and a bare `String` getter cannot express —
+    /// the empty string is the initial value, not a failure.
+    fn last_error_if_set(&self) -> Option<String> {
+        let err = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        if err.is_empty() {
+            None
+        } else {
+            Some(err.clone())
+        }
+    }
+
     /// #2471: apply the desired MTU to the live TUN and record the resulting
     /// status. On success the live MTU is the desired MTU and the path is not
     /// degraded. On failure the live MTU falls back to the kernel-default TUN
@@ -357,6 +377,39 @@ impl SlowPathReinjector {
             .name("xpf-slowpath".to_string())
             .spawn(move || slow_path_worker(&name, mtu, rx, thread_status))
             .map_err(|e| format!("spawn slow-path worker: {e}"))?;
+
+        // #7820: wait for the worker to report EITHER that it is live or why it
+        // is not, instead of returning Ok the instant the thread is spawned.
+        //
+        // `slow_path_worker` opens the TUN as its first act, and on failure it
+        // records the cause, clears `active`, and RETURNS. Without this
+        // handshake `new` had already handed back an `Ok` reinjector whose
+        // worker was gone and whose receiver was dropped, so the real cause
+        // ("TUNSETIFF ...: Operation not permitted", a name collision, a
+        // missing /dev/net/tun) sat unread in `last_error` while every
+        // subsequent enqueue failed with the downstream symptom
+        // "slow-path worker is not running". That is the production form of
+        // #7820: the one caller (`reconcile/snapshot.rs`) has an `Err` arm that
+        // surfaces the cause into `last_slow_path_status`, and it could never
+        // be reached.
+        //
+        // A timeout, not a block: `open_tun` either succeeds or fails
+        // promptly, so exceeding the deadline means something pathological and
+        // we prefer today's optimistic behaviour to hanging dataplane startup.
+        let deadline = Instant::now() + INIT_HANDSHAKE_TIMEOUT;
+        loop {
+            if status.active.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(err) = status.last_error_if_set() {
+                return Err(err);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(INIT_HANDSHAKE_POLL);
+        }
+
         Ok(Self {
             tx,
             limiter: Mutex::new(RateLimiter::new(
@@ -366,6 +419,45 @@ impl SlowPathReinjector {
             status,
             mtu: AtomicI64::new(mtu as i64),
         })
+    }
+
+    /// #7820: a reinjector with NO worker thread and NO TUN, for tests of the
+    /// enqueue-side logic.
+    ///
+    /// Six tests built a real `SlowPathReinjector` purely to exercise logic
+    /// that needs no device — the #2471 live-MTU admission gate and the day-2
+    /// reconcile, both driven entirely by `status.live_mtu`. Wherever the suite
+    /// runs without CAP_NET_ADMIN (which is everywhere it currently runs)
+    /// `open_tun` fails, so the worker exited immediately and dropped the
+    /// receiver. Those tests passed only when they won the race to enqueue
+    /// before the disconnect landed, and lost it under load — the whole of
+    /// #7820. One of them documented the dead worker in a comment and asserted
+    /// around it, accepting either outcome; that is a test that cannot fail for
+    /// the reason it was written.
+    ///
+    /// The receiver is deliberately `forget`-ed rather than returned: it must
+    /// outlive the reinjector for the channel to stay connected, and making
+    /// every call site thread a binding through would reintroduce the same
+    /// disconnect the moment one of them dropped it. Leaking one channel
+    /// endpoint per construction is confined to the test binary.
+    ///
+    /// `active` is set because the gate under test runs on the live path — not
+    /// as a claim that a device exists.
+    #[cfg(test)]
+    pub(crate) fn new_without_worker(mtu: i32) -> Self {
+        let status = Arc::new(SharedStatus::new());
+        let (tx, rx) = mpsc::sync_channel(DEFAULT_QUEUE_DEPTH);
+        std::mem::forget(rx);
+        status.active.store(true, Ordering::Relaxed);
+        Self {
+            tx,
+            limiter: Mutex::new(RateLimiter::new(
+                DEFAULT_RATE_LIMIT_PACKETS_PER_SEC,
+                DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
+            )),
+            status,
+            mtu: AtomicI64::new(mtu as i64),
+        }
     }
 
     /// The MTU the live slow-path TUN is currently programmed with. Equals the
