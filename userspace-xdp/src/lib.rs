@@ -154,7 +154,7 @@ const _: [(); 96] = [(); mem::size_of::<UserspaceDpMeta>()];
 // tracked userspace_xdp_bpfel.o is unchanged.
 //
 // 1. The zero-copy path's alignment argument depends on this. The store site
-//    does `bpf_xdp_adjust_meta(ctx, -meta_len)` with
+//    calls `bpf_xdp_adjust_meta` with a negative
 //    `meta_len = size_of::<UserspaceDpMeta>()`, so `data_meta = data - 96`, and
 //    the whole "the UB is unreachable on the zero-copy fast path because that
 //    path is in fact aligned" argument requires that offset to PRESERVE
