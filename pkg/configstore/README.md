@@ -1321,11 +1321,43 @@ owned by the `journal/` subpackage.
   oldest deleted). A pre-#1896 fat journal rotates to `.1` intact on
   the first append — old history stays readable until it ages out; no
   migration pass, and boot never reads the journal.
+- **Rotation defers to an in-flight append (#7174 C06)** — `Log`
+  releases `j.mu` before its fsync (#4829), so a writer can be parked
+  between its `f.Write` and its `f.Sync` while another writer rotates.
+  The renames are harmless (a rename preserves the inode, so the parked
+  writer's bytes move with it into `.1`), but rotation also UNLINKS the
+  oldest kept segment, and once that inode is gone the parked writer's
+  fsync still succeeds and `Log` still returns nil — the audit record is
+  lost with no error anywhere, because `Store.journalLog` only warns when
+  `Log` returns one. `maybeRotateLocked` therefore checks the inode of
+  the segment it is about to destroy against `Journal.inflight` (appends
+  registered under `j.mu` from their write until their fsync) and defers
+  the rotation when they match. Deferring cannot starve: the condition
+  names one OLD inode and later appends land on the current segment, so
+  the next append after that writer's fsync rotates; the cost is a
+  current segment that overshoots the threshold by one record. Reaching
+  the destroyed slot takes `maxSegments+1` rotations, so this is an
+  audit-integrity edge case rather than a routine loss — it is closed
+  because of how silently it fails, not how often.
+  Fail-on-revert: `TestRotationDoesNotDestroyInflightAppend7174C06` and
+  its control `TestRotationResumesAfterInflightAppendDrains7174C06`
+  (a guard that deferred forever would satisfy the first while disabling
+  retention).
 - **Durability** — appends are fsynced (operator-paced; the commit
   path already pays several fsyncs), `fsatomic.SyncDir` covers
   create/rotate namespace changes, and a torn tail (crash between
   write and fsync) is confined to one line: the reader's parse-or-skip
-  rule drops it and the next append starts on a fresh line.
+  rule drops it and the next append starts on a fresh line. The fsync
+  running with `j.mu` RELEASED is a **deliberate, reviewed choice**
+  (#4829), not an oversight: it is what keeps a concurrent `Tail` from
+  blocking for the writer's entire fsync, and the durability contract is
+  unchanged because `Log` returns success only after `f.Sync` (and, on a
+  namespace change, `SyncDir`) succeed. #7174 C06 listed it alongside the
+  rotation-unlink gap as one row; it was re-examined and left alone —
+  moving the fsync back under the lock reintroduces #4829, and
+  `TestTailNotBlockedByLogFsync` pins that it stays out. What the
+  off-lock fsync DOES create is the in-flight window the rotation bullet
+  above closes.
 - **Back-compat** — legacy v1 lines (with `before`/`after` payloads)
   decode tolerantly; unknown fields are ignored. A journal `Log`
   failure is a `slog.Warn`, never a commit failure, and the
