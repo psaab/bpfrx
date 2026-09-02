@@ -200,12 +200,22 @@ HEAD:
    only 14 or 18, and the one site that trusts a metadata offset
    whitelists exactly `14 | 18` (`tx/dispatch/mod.rs:1543-1546`). An
    `xfrmi` emits a bare L3 packet. Worse, **the L2 parse runs BEFORE the
-   ingress-set lookup** (`lib.rs:456-467` vs `:479`), so a raw-L3 frame is
-   `pass_non_ip_l2_direct`ed at `:463` without the ingress set ever being
-   consulted — and for an inner source address of the form `8.0.x.x`,
-   bytes `[12..14]` read as `0x0800` and the shim parses an IPv4 header
-   14 bytes into the real one. That is an attacker-selectable misparse,
-   not merely a miss.
+   ingress-set lookup** (`lib.rs:456-467` vs `:479`), so on a raw-L3 frame
+   bytes `[12..14]` are the first two octets of the IP SOURCE address and
+   an inner source of the form `8.0.x.x` reads as ethertype `0x0800`.
+   The consequence then depends on whether that ifindex is in the ingress
+   set, and BOTH branches are bad — see the correction note below for the
+   exact arithmetic:
+
+   - **not in the set** — the shifted parse's RESULT is discarded at the
+     gate, but `drop_degraded_transit` on a shifted-parse FAILURE is
+     reached *before* the gate, so the packet is `XDP_DROP`ped. A
+     source-address-selected drop.
+   - **in the set** — the gate passes and the garbage 5-tuple feeds
+     binding and session lookup.
+
+   Either way it is attacker-selectable by inner source address, not
+   merely a miss.
 2. **Queue collapse.** `planning.rs:792` computes
    `candidates.iter().map(|(_, rx)| *rx).min()` and `:827-828` builds a
    uniform `queue_count × interfaces` grid. There is **no per-interface
@@ -399,15 +409,20 @@ fail-on-revert test to design and is filed on its own.
    WireGuard half in order to share it with IPsec would couple the cheap
    half to the blocked half. Option E is IPsec's (B2's) cost, and it should
    be priced there.
-5. **Do not admit a tunnel netdev to the ingress set as a first step.**
-   Both planners place the ifindex in the ingress map before any binding
-   exists, and the shim's `BINDING_MISSING` arm then takes
-   `drop_degraded_transit`. So "un-exclude the interface and see what
-   breaks" is not an exploratory step — it is a black-holed tunnel. This
-   is also why the exclusion arms must not be deleted to make room for a
-   fix: `Tunnel` and `SecureTunnel` are two of eight classes sharing one
-   predicate, and removing either un-excludes only by removing the
-   fail-closed behaviour that currently keeps the tunnel alive.
+5. **Do not admit a tunnel netdev to the ingress set as a first step —
+   and note that ONE ALREADY IS.** Both planners place the ifindex in the
+   ingress map before any binding exists, and the shim's
+   `BINDING_MISSING` arm then takes `drop_degraded_transit`. So
+   "un-exclude the interface and see what breaks" is not an exploratory
+   step — it is a black-holed tunnel. This is also why the exclusion arms
+   must not be deleted to make room for a fix: `Tunnel` and
+   `SecureTunnel` are two of eight classes sharing one predicate, and
+   removing either un-excludes only by removing the fail-closed behaviour
+   that currently keeps the tunnel alive.
+
+   **This point was written as forward-looking advice and it is already
+   violated** — see the correction note below. The BASE row of a
+   canonically-spelled WireGuard tunnel is admitted today.
 
 ### What this decision does NOT claim
 
@@ -458,3 +473,77 @@ Acceptance for step 2:
 **Step 3** is the worker decap stage + the roaming report. **Step 4** is
 the IPsec capture measurement (B1's reachability on real hardware), which
 does not depend on steps 2–3.
+
+
+---
+
+## 5. CORRECTION (filed as #8279): a raw-L3 TUN is ALREADY in the ingress set
+
+Two things in this document need correcting, and the second changes a
+recommendation rather than a wording. Recorded here rather than silently
+edited above, because the reasoning that produced the error is worth
+keeping: **§2 Option B ground 1 was written about a HYPOTHETICAL
+interface B1 would introduce, and the parse ordering it relies on is a
+property of the CURRENT code.** Asking "is that ground live today?" is
+what found this.
+
+### 5.1 The consequence of the misparse depends on the ingress-set gate
+
+Ground 1 originally said the shim "parses an IPv4 header 14 bytes into
+the real one … an attacker-selectable misparse". True, but incomplete
+about what the misparse then DOES, and the two branches differ:
+
+`try_xdp_userspace` runs `parse_l2` -> `parse_ipv4`/`parse_ipv6` ->
+`let Some(parsed) = parsed else { drop_degraded_transit(...) }` -> and
+only THEN the `USERSPACE_INGRESS_IFACES` test. `drop_degraded_transit` is
+`Ok(xdp_action::XDP_DROP)`.
+
+On a raw IPv4 packet, bytes `[12..14]` are `src[0..2]`, so a source in
+`8.0.0.0/16` yields `eth_proto == 0x0800`; `parse_ipv4` then reads
+`iph[0] = src[2]` and returns `None` unless `src[2] >> 4 == 4` and
+`src[2] & 0x0f >= 5`. So for 241 of 256 values of `src[2]` the packet is
+**dropped before the gate**, and for `0x45`-`0x4f` a garbage `parsed`
+survives to the gate. `8.0.0.0/16` is allocated, routable space. The IPv6
+twin needs a source beginning `86dd:`, in reserved `8000::/1`.
+
+### 5.2 The WireGuard base row is admitted — recommendation 5 is already violated
+
+- `interfaces.go:371` sets the BASE row's flag as `Tunnel: iface.Tunnel != nil`
+  — **interface-level only**. The UNIT row at `:446` is the OR.
+- The zone fans UP from unit to base
+  (`pkg/config/host_inbound_effective_view.go`).
+- So `set interfaces wgN unit 0 tunnel mode wireguard` — the spelling this
+  repo calls canonical — yields a base row with `Tunnel = false` and a
+  Zone, matching no exclusion class.
+- And that netdev is raw L3: on a userspace-dataplane box every tunnel is
+  an anchor TUN (`daemon_run_routehelpers.go:63` `anchorOnly`, applied to
+  the unit-level tunnel at `:106`; `routing/tunnel.go:503-512` creates
+  `netlink.Tuntap{Mode: TUNTAP_MODE_TUN}` = ARPHRD_NONE).
+
+This is pinned green at HEAD by
+`TestRefusedNetdevNeedsEveryOwnerToAgree/canonical_wireguard_spelling`
+(`secure_tunnel_parent_redirect_6691_test.go`), which asserts
+`wantIngress: []uint32{10, 40}` and `wantRSS: [ge-0-0-0 wg1408]` where 40
+is the WireGuard TUN. The #6691 round-9 unanimity rule
+(`ingress_exclusions.go:578-580`) was introduced specifically to re-admit
+it, so this is long-standing and deliberate, not a regression.
+
+**It also corrects a premise #5618 and #7167 both carry** — that `wgN`
+rows are `Tunnel=true` and therefore excluded. That holds for the
+interface-level spelling and for the UNIT row. It does not hold for the
+base row under the canonical spelling.
+
+### 5.3 What this does NOT change
+
+The four grounds refuting B1 all still stand; ground 1's mechanism is
+sharper, not weaker. Options A, C and E are untouched: none of them
+turned on this. What changes is that "admit a tunnel netdev" is not a
+hypothetical hazard to avoid but a state to be **audited and decided**,
+and #8279 carries that.
+
+**Not yet verified, and it is the reachability hinge:** whether on a live
+box the XDP attach on a TUN succeeds, whether XDP runs on packets
+userspace WRITES into a TUN, and whether the AF_XDP binding on it
+succeeds or leaves the slot absent (which would take `BINDING_MISSING` ->
+`drop_degraded_transit`, a broader drop than the source-selected one).
+All three need hardware; the arithmetic above is from the source.

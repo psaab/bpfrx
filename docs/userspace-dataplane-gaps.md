@@ -538,6 +538,19 @@ IPsec through the `SecureTunnel` class, so the row is left out of
 `buildUserspaceIngressIfindexes` and of the AF_XDP binding plan, and
 `syncInterfaceAttachments` detaches the shim from the netdev.
 
+> **That is not true of the WireGuard BASE row under the canonical spelling
+> (#8279).** The base row's flag is `Tunnel: iface.Tunnel != nil`
+> (`interfaces.go:371`) — INTERFACE-level only; the unit row at `:446` is the
+> OR. The zone fans UP from the unit. So
+> `set interfaces wgN unit 0 tunnel mode wireguard` produces a base row with
+> `Tunnel = false` and a Zone, which matches no exclusion class and IS admitted
+> to both the ingress set and the RSS/binding allowlist — pinned by
+> `TestRefusedNetdevNeedsEveryOwnerToAgree/canonical_wireguard_spelling`. Since
+> a tunnel on a userspace-dataplane box is an anchor TUN (ARPHRD_NONE, raw L3)
+> and the shim's `parse_l2` is Ethernet-only, that admission is a defect in its
+> own right; #8279 carries it. Read the exclusion claim above as applying to
+> the UNIT row and to the interface-level spelling.
+
 **WireGuard is asymmetric: only the INBOUND direction bypasses (#7167).**
 WireGuard ENCAPSULATION already runs inside the AF_XDP worker, on a packet
 that has been through screen, flow cache, session, route, policy and NAT —
