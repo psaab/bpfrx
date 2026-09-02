@@ -1215,6 +1215,37 @@ snap`, and there are two of them — one per acceptance path).
     "split pure planning from actuation" clause at this one site and is what
     makes the converged case provable without root. This does NOT undo the
     mutation; the apply transaction is a redesign and stays open on #4960.
+  - **...and it survives the RETRY** (`hostdivergence_8285.go`, #8285). The
+    per-compile flag above and its "a converged re-apply annotates nothing"
+    property are each correct, and together they lost the evidence exactly where
+    it was needed. Apply #1 creates the VLAN child, aborts at the attach, and
+    annotates. The operator RETRIES — the expected response to a failed commit,
+    and the steady state once #7289's r1 established the reachable trigger is a
+    driver that refuses the attach *persistently*. The retry's Phase 2 is now
+    converged, so it records nothing, so the abort returns a bare
+    `attach userspace shim XDP: ...` with no mention that the box is still
+    diverged. The divergence is identical across the two attempts; only the
+    evidence disappeared.
+    `Manager.hostDivergence` is the STICKY per-BOX record — `hostMutations`
+    answers a per-COMPILE question ("did this compile move anything"), and
+    conflating the two is what produced the gap. `recordHostDivergence` on the
+    abort path merges the classes (two aborts moving different things leave the
+    UNION), `inheritHostDivergence` stamps them onto the next compile's result
+    before any abort site can fire, and only the compile SUCCESS tail clears
+    them — clearing anywhere else drops the fact while it is still true.
+    Nothing new is plumbed or rendered: the carrier is the ERROR, which is
+    returned unchanged through `manager_compile.go:246` and `manager.go:496` to
+    `daemon_apply_dataplane.go`, where it is both joined into the commit the
+    operator sees AND stored via `recordCompileFailure` -> `compileLastError`
+    -> `CompileHealthSnapshot` -> `/health`. #8285's own body proposed threading
+    `hostMutations` into `ApplyResult` instead; that is unreachable, because an
+    aborted apply never constructs one.
+    Fail-on-revert: `TestRetryAfterAbortStillReportsHostDivergence8285`, the
+    control `TestCleanAbortIsNotDecorated8285` (an always-annotate sticky flag
+    passes the first cell and reds here),
+    `TestSuccessfulApplyClearsHostDivergence8285`,
+    `TestSuccessiveAbortsAccumulateDivergence8285`, and the wiring guard
+    `TestCompileUserspaceShimWiresHostDivergence8285`.
   - **One desired state per physical netdev, decided before the zone loop**
     (#8119/#8120). `planPhysDesired` merges every zone interface reference that
     resolves to a netdev into a single `physDesired` — the UNION of the untagged
