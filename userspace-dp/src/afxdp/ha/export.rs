@@ -40,10 +40,10 @@ impl crate::afxdp::Coordinator {
             .export_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        let mut ack_atomics = Vec::with_capacity(self.workers.records.len());
+        let mut ack_atomics = Vec::with_capacity(self.workers.records().len());
         // #6242: enqueue the export command + collect the ack atomic via each
         // worker's runtime record.
-        for rec in self.workers.records.values() {
+        for rec in self.workers.records().values() {
             let handle = &rec.handle;
             // #1790/#1807: recover, don't early-return — one dead worker's
             // poisoned queue must not block session export for every

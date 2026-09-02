@@ -98,7 +98,27 @@ impl crate::afxdp::Coordinator {
     /// a test-only seam shadowing the real formula. With only those tests,
     /// deleting the trailing `.saturating_mul(2)` here leaves every cap
     /// assertion green.
-    pub(super) fn synced_import_cap(&self) -> usize {
+    /// #7209: the cap over an EXPLICIT records snapshot.
+    ///
+    /// Takes the MAP, not a count. `upsert_synced_session` must derive the cap
+    /// from the same snapshot it uses for the reservation gate and the fan-out
+    /// — once `sync_session` runs off the `ServerState` mutex, three
+    /// independent `records()` loads inside one import can straddle a teardown
+    /// and disagree: a cap sized for live workers, a gate that then sees none
+    /// and skips the reservation, a fan-out that finds some again.
+    ///
+    /// The `.len()` lives HERE rather than at the call site deliberately. An
+    /// earlier revision took a `worker_count: usize`, which moved the
+    /// worker-count SOURCING into `upsert_synced_session` where no cap test
+    /// could see it — the three assertions in
+    /// `synced_import_cap_production_formula_is_twice_the_logical_ceiling`
+    /// register N workers and would have stayed green with the live path
+    /// reading anything at all. Keeping the map as the parameter keeps the
+    /// sourcing inside the one function those assertions drive.
+    pub(super) fn synced_import_cap_for(
+        &self,
+        records: &std::collections::BTreeMap<u32, std::sync::Arc<crate::afxdp::coordinator::WorkerRuntimeRecord>>,
+    ) -> usize {
         #[cfg(test)]
         if self.synced_import_cap_override != 0 {
             // The override expresses a LOGICAL session ceiling; double it to the
@@ -106,8 +126,7 @@ impl crate::afxdp::Coordinator {
             // the production formula below so tests exercise the real arithmetic.
             return self.synced_import_cap_override.saturating_mul(2);
         }
-        self.workers
-            .records
+        records
             .len()
             .saturating_mul(crate::session::default_max_sessions())
             .saturating_mul(2)
@@ -216,13 +235,20 @@ impl crate::afxdp::Coordinator {
     /// session in the batch.
     ///
     /// THIS IS NOT A LOSS TODAY, and the counter is not an alarm. Every
-    /// `reconcile` opens with `teardown::tear_down`, which captures the WHOLE
-    /// shared synced map via `snapshot_shared_session_entries()` and replays it
-    /// once the new map is up, so an entry recorded while the fd was absent is
-    /// published by the next reconcile. What closes the remaining window — an
-    /// entry arriving BETWEEN that capture and the replay — is the
-    /// snapshot-wide `ServerState` mutex, which today stops `sync_session` and
-    /// `apply_snapshot` interleaving at all.
+    /// `reconcile` replays the shared synced map once the new map is up, so an
+    /// entry recorded while the fd was absent is published by the next
+    /// reconcile.
+    ///
+    /// CORRECTED (#8171). This paragraph used to say `teardown::tear_down`
+    /// captures the whole map via `snapshot_shared_session_entries()` before
+    /// the teardown, and that the remaining capture-to-replay window is closed
+    /// by the snapshot-wide `ServerState` mutex. That was true when written and
+    /// is not now: `replay_preserved_sessions` (`reconcile/bringup.rs`) derives
+    /// the replay set from the LIVE shared map at replay time — after every
+    /// arrival the reconcile could race — so the window is closed by
+    /// construction rather than by the lock. The historical shape is recorded
+    /// because the mutex-based reasoning it supported still appears elsewhere,
+    /// and because #7209 removes that mutex for `sync_session`.
     ///
     /// That mutex is what #7209 proposes to remove, which is why this counter
     /// lands FIRST: once `sync_session` runs off it, an import in that window
@@ -257,6 +283,23 @@ impl crate::afxdp::Coordinator {
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) -> SyncedImportOutcome {
+        // #7209: ONE snapshot of the worker set for this whole import.
+        //
+        // Three decisions below ask about the workers — the admission cap, the
+        // no-worker reservation gate, and the command fan-out — and they must
+        // agree with each other. They used to, for free: every mutator of the
+        // record map needed `&mut Coordinator`, which the snapshot-wide
+        // `ServerState` mutex made impossible to obtain while this ran. Once
+        // `sync_session` dispatches off that mutex, three separate loads can
+        // straddle a reconcile's teardown and disagree — a cap sized for live
+        // workers, a gate that then sees none (skipping the reservation), and a
+        // fan-out that finds some again (queueing a command for a session with
+        // no reservation). Or the reverse: reserve, then fan out to nobody,
+        // leaving an `Untracked` reservation with no worker to release it.
+        // Pinning the snapshot here makes the import internally consistent
+        // whatever the reconcile does, which is the property the mutex was
+        // providing incidentally.
+        let worker_records = self.workers.records_snapshot();
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha.rg_runtime.load();
         // #5154: read the stored entry AND the map length under ONE RECOVERED
@@ -358,7 +401,7 @@ impl crate::afxdp::Coordinator {
         // registered yet — early boot / teardown) disables the bound so a
         // transient window never rejects legitimate imports.
         if previous_entry.is_none() && !entry.metadata.is_reverse {
-            let synced_cap = self.synced_import_cap();
+            let synced_cap = self.synced_import_cap_for(&worker_records);
             if synced_cap != 0 && synced_len >= synced_cap {
                 self.sessions
                     .import_cap_drops
@@ -410,7 +453,7 @@ impl crate::afxdp::Coordinator {
         // shape as the zero-ceiling carve-out above, and for the same reason.
         if entry.origin.is_peer_synced()
             && !entry.metadata.is_reverse
-            && !self.workers.records.is_empty()
+            && !worker_records.is_empty()
             && !self.reserve_synced_translation(&entry)
         {
             self.sessions
@@ -508,7 +551,7 @@ impl crate::afxdp::Coordinator {
             }
         }
         // #6242: fan out to each worker's command queue via its runtime record.
-        for rec in self.workers.records.values() {
+        for rec in worker_records.values() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);
@@ -661,7 +704,7 @@ impl crate::afxdp::Coordinator {
         // process-wide session-map delete already ran above, so the NAT
         // reservation is the part with no other owner. The wider signal is
         // `WORKER_COMMAND_QUEUE_DROPS`.
-        for (worker_id, rec) in self.workers.records.iter() {
+        for (worker_id, rec) in self.workers.records().iter() {
             // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
             let mut pending = worker_queue::lock_recover(&rec.handle.commands);

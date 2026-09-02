@@ -230,7 +230,7 @@ pub(super) fn bring_up_workers(
     coord.last_reconcile_stage = ReconcileStage::Spawned {
         // #6242: the `Spawned` stage's `handles` field is the worker COUNT,
         // now sourced from the consolidated `records` map (was `handles`).
-        handles: coord.workers.records.len(),
+        handles: coord.workers.records().len(),
         identities: coord.workers.identities.len(),
         live: coord.workers.live.len(),
     };
@@ -855,7 +855,14 @@ fn spawn_workers(
                 // means "spawn succeeded and all four owners exist"; a failed
                 // worker never reaches here, so its locals just drop (the #4952
                 // differential: launched records are never touched).
-                coord.workers.records.insert(
+                // #7209: ONE `register` call publishes the record and takes
+                // ownership of the join handle. The handle no longer rides
+                // inside `WorkerHandle` — consuming it needed `&mut` on the
+                // record, which is the only thing that stopped the record from
+                // being publishable behind an `Arc` for the off-lock import
+                // path. `WorkerManager::stop_and_clear` still joins it, in the
+                // same signal-all-then-join-all order.
+                coord.workers.register(
                     worker_id,
                     WorkerRuntimeRecord {
                         handle: WorkerHandle {
@@ -866,12 +873,12 @@ fn spawn_workers(
                             cos_status,
                             runtime_atomics,
                             cold_path_atomics,
-                            join: Some(join),
                         },
                         panic: record_panic,
                         exception_ring: record_exception_ring,
                         last_resolution: record_last_resolution,
                     },
+                    Some(join),
                 );
             }
             Err(err) => {

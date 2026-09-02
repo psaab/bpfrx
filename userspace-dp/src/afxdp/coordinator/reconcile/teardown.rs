@@ -52,7 +52,7 @@ fn quiesce(coord: &mut Coordinator, d: Duration) {
 /// teardown with no following bind (`no_snapshot` / shutdown) passes
 /// `false` and skips the quiesce.
 pub(super) fn tear_down(coord: &mut Coordinator, will_rebind: bool) -> PreservedReconcileState {
-    let had_live_workers = !coord.workers.records.is_empty();
+    let had_live_workers = !coord.workers.records().is_empty();
     // #8157: the synced-session set is NO LONGER captured here. It used to be
     // cloned before `stop_inner(false)` and replayed at bringup, which left a
     // window: an entry landing in the shared map between this point and the

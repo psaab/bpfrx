@@ -72,7 +72,7 @@ impl crate::afxdp::Coordinator {
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             // #6242: fan out demote commands via each worker's runtime record.
-            for rec in self.workers.records.values() {
+            for rec in self.workers.records().values() {
                 // #1790/#1807: recover from a poisoned worker command mutex
                 // instead of early-returning. The new HA state was already
                 // published via rg_runtime.store above, so an Err here would
@@ -113,7 +113,7 @@ impl crate::afxdp::Coordinator {
             eprintln!(
                 "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
-                self.workers.records.len(),
+                self.workers.records().len(),
                 // #6653 sweep: log-only, but the same non-recovering pattern —
                 // a poisoned mutex reported shared_sessions=0 in the RG
                 // activation line, which is the single most misleading number
@@ -137,7 +137,7 @@ impl crate::afxdp::Coordinator {
 
         let worker_commands = self
             .workers
-            .records
+            .records()
             .values()
             .map(|rec| rec.handle.commands.clone())
             .collect::<Vec<_>>();

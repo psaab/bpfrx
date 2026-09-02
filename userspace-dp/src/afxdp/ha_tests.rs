@@ -248,7 +248,6 @@ fn test_worker_handle(commands: Arc<Mutex<VecDeque<WorkerCommand>>>) -> WorkerHa
         cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
         runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
         cold_path_atomics: Arc::new(super::cold_path_hist::WorkerColdPathAtomics::new()),
-        join: None,
     }
 }
 
@@ -257,9 +256,10 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = test_forwarding_state_split_rgs();
     let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(worker_commands.clone())),
+        None,
     );
 
     let entry = SyncedSessionEntry {
@@ -362,9 +362,10 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
     for (worker_id, queue) in worker_queues.iter().enumerate() {
-        coordinator.workers.records.insert(
+        coordinator.workers.register(
             worker_id as u32,
             WorkerRuntimeRecord::for_test(test_worker_handle(queue.clone())),
+            None,
         );
     }
 
@@ -733,9 +734,10 @@ fn refusal_counters_are_per_coordinator_not_process_global() {
     // Entry cap = 2 (logical override 1, doubled for the synthesized reverse).
     busy.synced_import_cap_override = 1;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    busy.workers.records.insert(
+    busy.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     let key = test_key();
@@ -893,9 +895,10 @@ fn upsert_synced_session_rejects_over_ceiling_import_and_does_not_fan_out() {
     const LOGICAL_CEILING: u16 = 3;
     coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     let before = coordinator.synced_import_cap_drops_total();
@@ -1011,9 +1014,10 @@ fn over_ceiling_import_rejected_on_poisoned_shared_mutex() {
     const LOGICAL_CEILING: u16 = 3;
     coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     // Fill to the ENTRY cap (2×LOGICAL_CEILING): each admitted forward
@@ -1099,7 +1103,7 @@ fn synced_import_cap_production_formula_is_twice_the_logical_ceiling() {
     // No workers registered (early boot / teardown): a zero ceiling DISABLES
     // the bound, so a transient window never rejects legitimate imports.
     assert_eq!(
-        coordinator.synced_import_cap(),
+        coordinator.synced_import_cap_for(&coordinator.workers.records()),
         0,
         "an unregistered-worker coordinator must report a zero (disabled) \
          ceiling, not a nonzero cap that would reject during early boot"
@@ -1108,15 +1112,16 @@ fn synced_import_cap_production_formula_is_twice_the_logical_ceiling() {
     const WORKERS: usize = 3;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
     for worker in 0..WORKERS {
-        coordinator.workers.records.insert(
+        coordinator.workers.register(
             worker as u32,
             WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+            None,
         );
     }
 
     let logical_ceiling = WORKERS * per_worker;
     assert_eq!(
-        coordinator.synced_import_cap(),
+        coordinator.synced_import_cap_for(&coordinator.workers.records()),
         2 * logical_ceiling,
         "the production ENTRY cap must be TWICE the logical ceiling \
          (worker_count * DEFAULT_MAX_SESSIONS), because each admitted forward \
@@ -1125,7 +1130,7 @@ fn synced_import_cap_production_formula_is_twice_the_logical_ceiling() {
     // Stated separately and explicitly: dropping the trailing 2x is the #5674
     // regression, and it yields exactly the logical ceiling.
     assert_ne!(
-        coordinator.synced_import_cap(),
+        coordinator.synced_import_cap_for(&coordinator.workers.records()),
         logical_ceiling,
         "the ENTRY cap must not equal the LOGICAL ceiling — that is the \
          pre-#5674 sizing that silently under-syncs a peer above ~50% load"
@@ -1603,8 +1608,7 @@ fn kick_owner_rg_export_enqueues_command_then_wait_completes_on_ack() {
     let ack = handle.session_export_ack.clone();
     coordinator
         .workers
-        .records
-        .insert(0, WorkerRuntimeRecord::for_test(handle));
+        .register(0, WorkerRuntimeRecord::for_test(handle), None);
 
     let wait = coordinator.kick_owner_rg_export(&[1, 2], 0);
 
@@ -2159,7 +2163,7 @@ fn reserve6600_forwarding() -> ForwardingState {
 /// #7209: register one worker so `reserve_synced_translation` actually runs.
 ///
 /// Not boilerplate. `upsert_synced_session` gates the whole coordinator-side
-/// reservation on `!self.workers.records.is_empty()` — with no worker nothing
+/// reservation on `!self.workers.records().is_empty()` — with no worker nothing
 /// polls, so there is no racing local allocation to guard against and the
 /// reserve is deliberately skipped. A fixture without a worker therefore never
 /// reaches the code under test, and every leg below would pass by never
@@ -2167,9 +2171,10 @@ fn reserve6600_forwarding() -> ForwardingState {
 /// failed in the right direction: leg A red because the counter stayed 0.
 fn register_test_worker_7209(coordinator: &mut Coordinator) {
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands)),
+        None,
     );
 }
 
@@ -2321,9 +2326,10 @@ fn upsert_synced_session_refuses_import_whose_nat_port_is_locally_owned_6600() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = reserve6600_forwarding();
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     // (a) POSITIVE CONTROL FIRST. Without it a coordinator that refused every
@@ -2482,9 +2488,10 @@ fn upsert_synced_session_rolls_back_source_nat_when_nat64_refuses_6600() {
         },
     ]);
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     // A NAT64 decision naming pool port 51000 on 203.0.113.1.
@@ -2710,9 +2717,10 @@ fn coordinator_pre_publish_reserve_uses_the_workers_zone_pair_6600() {
         .insert(TEST_WAN_ZONE_ID, "wan".to_string());
     coordinator.forwarding = forwarding;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     // Non-vacuity: the zone pair must actually RESOLVE, or both the fix and the
@@ -2818,9 +2826,10 @@ fn upsert_synced_session_reports_capacity_refusal_6785() {
     const LOGICAL_CEILING: u16 = 2;
     coordinator.synced_import_cap_override = LOGICAL_CEILING as usize;
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
 
     // A full symmetric-peer logical set fits and must all report Applied — the
@@ -2934,9 +2943,10 @@ fn a_pass1_refused_import_is_counted_and_not_published_6979_f1() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = f1_overlapping_forwarding();
     let commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.records.insert(
+    coordinator.workers.register(
         0,
         WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        None,
     );
     assert!(
         crate::afxdp::session_glue::synced_source_nat_zone_pair(
@@ -3176,7 +3186,7 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
 /// ```ignore
 /// if entry.origin.is_peer_synced()
 ///     && !entry.metadata.is_reverse
-///     && !self.workers.records.is_empty()          // <-- this one
+///     && !self.workers.records().is_empty()          // <-- this one
 ///     && !self.reserve_synced_translation(&entry)
 /// ```
 ///
@@ -3198,7 +3208,7 @@ fn synced_import_unpublished_counts_the_absent_map_not_the_owner_decision_7209()
 ///
 /// So: two legs whose ONLY difference is whether a worker is registered.
 ///
-/// FAIL-ON-REVERT: delete `&& !self.workers.records.is_empty()`, or move it
+/// FAIL-ON-REVERT: delete `&& !self.workers.records().is_empty()`, or move it
 /// after the `reserve_synced_translation` call, and leg A reds — the no-worker
 /// import reaches the reservation, fails to resolve its zone pair against the
 /// fresh Coordinator's empty forwarding, and bumps the counter.
@@ -3207,7 +3217,7 @@ fn no_worker_registered_keeps_a_synced_import_off_the_reservation_path_7209() {
     // --- Leg A: NO worker -> the reservation must not run at all. ----------
     let mut no_worker = Coordinator::new();
     assert!(
-        no_worker.workers.records.is_empty(),
+        no_worker.workers.records().is_empty(),
         "fixture broken: a fresh Coordinator must have no worker records, or \
          leg A is not exercising the gate"
     );

@@ -138,7 +138,6 @@ fn seeded_worker(coord: &mut Coordinator, worker_id: u32) -> Arc<WorkerRuntimeAt
         cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
         runtime_atomics: Arc::new(WorkerRuntimeAtomics::new()),
         cold_path_atomics: Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new()),
-        join: None,
     };
     let atomics = Arc::clone(&handle.runtime_atomics);
 
@@ -166,7 +165,7 @@ fn seeded_worker(coord: &mut Coordinator, worker_id: u32) -> Arc<WorkerRuntimeAt
     );
 
     let rec = WorkerRuntimeRecord::for_test(handle);
-    coord.workers.records.insert(worker_id, rec);
+    coord.workers.register(worker_id, rec, None);
     atomics
 }
 
@@ -360,8 +359,8 @@ fn worker_runtime_status_binds_dead_and_panic_message_6961() {
     atomics.dead.store(true, AtomicOrdering::Relaxed);
     *coord
         .workers
-        .records
-        .get_mut(&1)
+        .records()
+        .get(&1)
         .expect("seeded worker")
         .panic
         .lock()
@@ -381,8 +380,8 @@ fn worker_runtime_status_binds_dead_and_panic_message_6961() {
     let _atomics = seeded_worker(&mut coord, 2);
     *coord
         .workers
-        .records
-        .get_mut(&2)
+        .records()
+        .get(&2)
         .expect("seeded worker")
         .panic
         .lock()
@@ -457,13 +456,11 @@ fn worker_runtime_status_binds_the_cold_path_scalars_6961() {
         cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
         runtime_atomics: Arc::new(WorkerRuntimeAtomics::new()),
         cold_path_atomics: Arc::new(WorkerColdPathAtomics::new()),
-        join: None,
     };
     let cold = Arc::clone(&handle.cold_path_atomics);
     coord
         .workers
-        .records
-        .insert(9, WorkerRuntimeRecord::for_test(handle));
+        .register(9, WorkerRuntimeRecord::for_test(handle), None);
 
     // Five distinct values, none of them 0, none equal to another. 0 would be
     // fatal here specifically: `sample_phase == 0` with all-zero samples is the

@@ -205,15 +205,25 @@ the first successful reconcile and between `stop_inner` and the next
 apply lands there for every session in the batch.
 
 **That is not a loss today**, and the counter is not an alarm. Every `reconcile`
-opens with `teardown::tear_down`, which captures the WHOLE shared synced map via
-`snapshot_shared_session_entries()` and replays it once the new map is up, so an
-entry recorded while the fd was absent is published by the next reconcile. The
-remaining window — an entry arriving BETWEEN that capture and the replay — is
-closed by the snapshot-wide `ServerState` mutex, which stops `sync_session` and
-`apply_snapshot` interleaving at all.
+replays the shared synced map once the new session map is up, so an entry
+recorded while the fd was absent is published by the next reconcile.
 
-That mutex is what #7209 proposes to remove, which is why the counter lands
-first. Once `sync_session` runs off it, an import in that window would be
+**Corrected by #8171 — the capture→replay window is closed by construction, not
+by the mutex.** This section previously said `teardown::tear_down` captures the
+whole map via `snapshot_shared_session_entries()` before `stop_inner(false)` and
+that an entry arriving between that capture and the replay was excluded only by
+the snapshot-wide `ServerState` mutex. That was true when written and is no
+longer: `replay_preserved_sessions` (`reconcile/bringup.rs`) now derives the
+replay set from the LIVE shared map at replay time — after every arrival the
+reconcile could race — carrying `filter_replayed_synced_sessions` with it so a
+remapped-tunnel session is not resurrected. `stop_inner(false)` does not clear
+`sessions.synced` (the clear is gated on `clear_synced_state`, which only full
+shutdown passes, #6652), which is what makes the live read sound. The historical
+shape is recorded here because the mutex-based reasoning it supported still
+appears in older comments.
+
+That mutex is what #7209 removes for `sync_session`, which is why the counter
+landed first. Before #8171, an import arriving in that window would have been
 recorded, acked to Go as installed, never published and never replayed — with no
 signal anywhere. The conjunction is therefore split into one authority,
 `publish_synced_entry_or_note_unpublished`, and the absent-map arm bumps

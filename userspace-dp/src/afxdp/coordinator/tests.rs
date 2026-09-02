@@ -2303,7 +2303,7 @@ fn teardown_quiesce_skipped_when_no_live_workers() {
 fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
     let mut coordinator = gre1881_coordinator_with_worker();
     assert!(
-        !coordinator.workers.records.is_empty(),
+        !coordinator.workers.records().is_empty(),
         "precondition: a live worker handle is seeded (had_live_workers == true)"
     );
     let mut bindings: Vec<BindingStatus> = Vec::new();
@@ -2315,7 +2315,7 @@ fn teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers() {
     );
     assert_eq!(coordinator.last_reconcile_stage.to_string(), "no_snapshot");
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "the seeded worker WAS torn down (proves had_live_workers held)"
     );
     assert_eq!(
@@ -2346,7 +2346,7 @@ fn teardown_quiesce_fires_when_live_workers_and_snapshot_rebinds() {
     let _neigh_serial = crate::afxdp::neigh_monitor_test_serial();
     let mut coordinator = StoppedCoordinator::wrap(gre1881_coordinator_with_worker()); // #6637
     assert!(
-        !coordinator.workers.records.is_empty(),
+        !coordinator.workers.records().is_empty(),
         "precondition: had_live_workers == true"
     );
     // All-OK mandatory pins so the map-FD preflight + forwarding build
@@ -3617,7 +3617,6 @@ fn gre1881_fake_worker_handle() -> WorkerHandle {
         cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
         runtime_atomics: Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new()),
         cold_path_atomics: Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new()),
-        join: None,
     }
 }
 
@@ -3627,8 +3626,7 @@ fn gre1881_coordinator_with_worker() -> Coordinator {
     // slots) as one op.
     coordinator
         .workers
-        .records
-        .insert(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()));
+        .register(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()), None);
     coordinator
 }
 
@@ -4359,7 +4357,7 @@ fn post_spawn_inthread_bind_failure_fails_closed_5143() {
     // (c) the newly-started worker was STOPPED + JOINED and its coordinator
     // state cleared — no leaked live-but-unbound worker.
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "the partially-bound worker must be stopped/joined (no leaked handle)"
     );
     assert!(
@@ -4435,30 +4433,32 @@ fn reconcile_partial_spawn_failure_preserves_launched_records_6242() {
     // (b) THE DIFFERENTIAL: workers 0 and 1 LAUNCHED — their records SURVIVE
     // (no stop_inner ran); worker 2 (the failed spawn) has NO record.
     assert_eq!(
-        coordinator.workers.records.len(),
+        coordinator.workers.records().len(),
         2,
         "launched workers 0 and 1 keep their records (differential rollback)"
     );
     assert!(
-        coordinator.workers.records.contains_key(&0)
-            && coordinator.workers.records.contains_key(&1),
+        coordinator.workers.records().contains_key(&0)
+            && coordinator.workers.records().contains_key(&1),
         "workers 0 and 1 launched before the failure and must still be registered"
     );
     assert!(
-        !coordinator.workers.records.contains_key(&2),
+        !coordinator.workers.records().contains_key(&2),
         "the failed worker never registered a record (post-spawn insert)"
     );
 
     // (c) each surviving record carries ALL FOUR owners together — a live
     // (joinable) handle AND its panic / exception-ring / last-resolution slots.
     for wid in [0u32, 1] {
-        let rec = coordinator
-            .workers
-            .records
-            .get(&wid)
-            .expect("launched worker record");
+        let records = coordinator.workers.records();
+        let rec = records.get(&wid).expect("launched worker record");
+        // #7209: the join handle moved from `rec.handle.join` into
+        // `WorkerManager::joins` so the record could be published behind an
+        // `Arc`. The property asserted is unchanged — a LAUNCHED worker is
+        // still joinable, which is the #4952 differential against a spawn
+        // failure — only its owner moved, so the assertion moved with it.
         assert!(
-            rec.handle.join.is_some(),
+            coordinator.workers.has_join_handle(wid),
             "launched worker {wid} keeps a joinable handle (still live)"
         );
         // The three observability Arcs are the SAME allocations registered with
@@ -4477,7 +4477,7 @@ fn reconcile_partial_spawn_failure_preserves_launched_records_6242() {
     // teardown that reclaims them). stop_inner clears ALL records in one step.
     coordinator.stop_inner(false);
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "teardown clears every launched record"
     );
 }
@@ -4512,7 +4512,7 @@ fn reconcile_bind_incomplete_clears_all_records_6242() {
     );
     // stop_inner cleared the WHOLE fleet — every record, not just worker 0.
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "bind-incomplete fail-close clears ALL worker records (records.clear via stop_inner)"
     );
     assert!(
@@ -4537,7 +4537,7 @@ fn stop_inner_drops_worker_record_owners_exactly_once_6242() {
     let panic = rec.panic.clone();
     let exception_ring = rec.exception_ring.clone();
     let last_resolution = rec.last_resolution.clone();
-    coordinator.workers.records.insert(0, rec);
+    coordinator.workers.register(0, rec, None);
 
     // Two owners each: the registered record + our external clone.
     assert_eq!(Arc::strong_count(&panic), 2, "record + external clone own the panic slot");
@@ -4548,7 +4548,7 @@ fn stop_inner_drops_worker_record_owners_exactly_once_6242() {
 
     // records.clear() dropped the record — and its four owners — exactly once.
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "stop_inner clears the records map"
     );
     assert_eq!(
@@ -7218,7 +7218,7 @@ fn refresh_runtime_snapshot_publishes_every_sibling_before_the_view() {
 ///   - the "no worker survives" half is ALREADY pinned, by
 ///     `teardown_quiesce_skipped_on_no_snapshot_even_with_live_workers` — a
 ///     cell whose stated subject is #2522 quiesce timing, but which seeds a
-///     live worker and asserts `workers.records.is_empty()`. Removing the
+///     live worker and asserts `workers.records().is_empty()`. Removing the
 ///     teardown reds it too.
 ///   - the "the dangerous state is actually REACHED" half was pinned by
 ///     nothing. Deleting `self.forwarding = ForwardingState::default()` from
@@ -7249,8 +7249,7 @@ fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
     // A LIVE worker record: the reader that must not survive.
     coordinator
         .workers
-        .records
-        .insert(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()));
+        .register(0, WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle()), None);
 
     // A POPULATED host-inbound table: the state that must be emptied. Both
     // halves matter — with an empty table the "it was emptied" assertion is
@@ -7260,7 +7259,7 @@ fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
     coordinator.forwarding.zone_host_inbound.insert(ZONE, zone);
 
     assert!(
-        !coordinator.workers.records.is_empty(),
+        !coordinator.workers.records().is_empty(),
         "fixture broken: there must be a live worker record BEFORE the reconcile, \
          or this cell cannot tell a teardown from a no-op"
     );
@@ -7295,7 +7294,7 @@ fn no_snapshot_reconcile_leaves_no_reader_for_the_empty_table_6873() {
     // ...and NOTHING survives that could observe it. This is the invariant that
     // makes a `snapshot_installed` gate at the admit site unnecessary.
     assert!(
-        coordinator.workers.records.is_empty(),
+        coordinator.workers.records().is_empty(),
         "a worker record survived a no-snapshot reconcile — it would be reading a \
          forwarding state whose empty zone_host_inbound admits EVERY host-bound \
          packet (#6873). The teardown-before-early-exit ordering is what prevents \
@@ -7324,7 +7323,7 @@ fn retire_dead_worker_holders_reclaims_only_dead_workers_6979() {
     let mut coordinator = Coordinator::new();
     let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
     let atomics = rec.handle.runtime_atomics.clone();
-    coordinator.workers.records.insert(3, rec);
+    coordinator.workers.register(3, rec, None);
 
     // A live interface-mode allocation held by worker 3.
     let egress: std::net::IpAddr = "192.0.2.7".parse().unwrap();
@@ -7446,7 +7445,7 @@ fn refresh_status_reclaims_dead_worker_holders_6979() {
     let mut coordinator = Coordinator::new();
     let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
     let atomics = rec.handle.runtime_atomics.clone();
-    coordinator.workers.records.insert(5, rec);
+    coordinator.workers.register(5, rec, None);
 
     let egress: std::net::IpAddr = "192.0.2.8".parse().unwrap();
     let alloc = coordinator
@@ -7514,7 +7513,7 @@ fn stop_inner_retires_holders_for_all_allocator_families_7092() {
     let mut coordinator = Coordinator::new();
     let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
     let atomics = rec.handle.runtime_atomics.clone();
-    coordinator.workers.records.insert(2, rec);
+    coordinator.workers.register(2, rec, None);
     assert!(
         !atomics.dead.load(Ordering::Relaxed),
         "the worker must be HEALTHY: a replan retires a live generation, and a \
@@ -7781,7 +7780,7 @@ fn f4_seed(coordinator: &mut Coordinator, worker_id: u32) -> crate::nat::Transla
     use crate::nat::NatHolder;
     coordinator.forwarding.source_nat_rules = f4_pool_rules();
     let rec = WorkerRuntimeRecord::for_test(gre1881_fake_worker_handle());
-    coordinator.workers.records.insert(worker_id, rec);
+    coordinator.workers.register(worker_id, rec, None);
 
     let key = f4_key();
     let translated = crate::nat::TranslatedTuple {
@@ -7874,7 +7873,8 @@ fn f4_seed_shared_only(
 
 fn f4_fill_queue(coordinator: &Coordinator, worker_id: u32) {
     use crate::afxdp::worker_queue::{self, MAX_PENDING_WORKER_COMMANDS};
-    let rec = coordinator.workers.records.get(&worker_id).expect("record");
+    let records = coordinator.workers.records();
+    let rec = records.get(&worker_id).expect("record");
     let mut pending = worker_queue::lock_recover(&rec.handle.commands);
     for i in 0..MAX_PENDING_WORKER_COMMANDS {
         pending.push_back(crate::afxdp::WorkerCommand::DeleteSynced(f4_filler_key(i)));
