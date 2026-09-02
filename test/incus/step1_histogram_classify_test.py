@@ -480,12 +480,21 @@ def test_only_cell_missing_target_returns_nonzero(tmp_path, monkeypatch):
     assert rc != 0
 
 
+
+
+# #8136: unittest collects classes, not bare functions.
+load_tests = collect_module_tests(globals())
+
+
+# #8278: the __main__ block must be LAST. unittest.main() collects at
+# call time and never returns, so anything below it -- a `load_tests`
+# collector, or a test function appended later -- does not exist yet
+# when collection happens. step3 had three `_7424` cases defined after
+# this block and ran 11 of its 14 tests under `python3 <file>` while
+# `unittest discover` ran all 14; step1 ran none of its 17. Both
+# reported success.
 if __name__ == "__main__":
     import sys
     import unittest
 
     unittest.main(verbosity=2)
-
-
-# #8136: unittest collects classes, not bare functions.
-load_tests = collect_module_tests(globals())

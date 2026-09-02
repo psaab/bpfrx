@@ -183,6 +183,69 @@ for t in scripts/image/test_*.py scripts/dist/test_*.py scripts/deploy/test_*.py
 	run_py "$t"
 done
 
+# ── 3b. python unittest self-tests under test/incus/ (#8278) ──
+#
+# These were reached by NO target. Section 3 above globs the PREFIX
+# convention (test_*.py) in four scripts/ directories; test/incus/ uses
+# the SUFFIX convention (*_test.py) and was not in the directory list at
+# all -- so even test_mouse_latency_shell_test.py, which satisfies both
+# conventions, went unrun. 22 files, 377 cases. That is #7296 repeating
+# in the other half: it added a census so an eighth SHELL self-test could
+# not accumulate unreached, and that census globs *-selftest.sh only.
+#
+# Run through `unittest discover` rather than executed directly: two of
+# these are pytest-style modules collected by a load_tests shim
+# (test/incus/unittest_shim.py, #8136), and a runner that executes a
+# file whose collector is installed later measures nothing while
+# reporting success. harness_discovery_test.py now asserts the two ways
+# agree, so this runner may use either -- discovery is chosen because it
+# does not depend on a file having a __main__ block at all.
+#
+# The file list is a GLOB, not a hand-maintained list, so a 23rd file
+# cannot accumulate unreached the way the first 22 did. The census below
+# guards the remaining failure: a glob that matches nothing would sweep
+# an empty set and report a clean pass.
+hdr "test/incus python self-tests"
+incus_py_ran=0
+incus_py_seen=""
+if command -v python3 >/dev/null 2>&1; then
+	for t in test/incus/*_test.py test/incus/test_*.py; do
+		[ -f "$t" ] || continue
+		# test_mouse_latency_shell_test.py matches both globs.
+		case " $incus_py_seen " in
+		*" $t "*) continue ;;
+		esac
+		incus_py_seen="$incus_py_seen $t"
+		incus_py_ran=$((incus_py_ran + 1))
+		out=$(python3 -m unittest discover -s test/incus -p "$(basename "$t")" 2>&1)
+		rc=$?
+		ran=$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9][0-9]*\) test.*/\1/p' | head -1)
+		if [ "$rc" -eq 5 ]; then
+			# unittest's "NO TESTS RAN". A registered file that executes
+			# nothing is indistinguishable from a passing one by every
+			# signal except this exit code, so it must be a FAIL and not
+			# a pass or a skip.
+			faill "$t (NO TESTS RAN -- registered but measures nothing)"
+		elif [ "$rc" -eq 0 ]; then
+			passl "$t (${ran:-?} tests)"
+		else
+			faill "$t"
+			printf '%s\n' "$out" | sed 's/^/      /'
+		fi
+	done
+else
+	skipl "test/incus python self-tests (python3 not installed)"
+fi
+
+incus_py_on_disk=$(ls test/incus/*_test.py test/incus/test_*.py 2>/dev/null | sort -u | wc -l)
+if [ "$incus_py_ran" -eq 0 ] && [ "$incus_py_on_disk" -gt 0 ]; then
+	faill "test/incus python census (ran 0 of $incus_py_on_disk files -- the glob matched nothing)"
+elif [ "$incus_py_ran" -ne "$incus_py_on_disk" ]; then
+	faill "test/incus python census (ran $incus_py_ran of $incus_py_on_disk files on disk)"
+else
+	passl "test/incus python census ($incus_py_ran files, all invoked)"
+fi
+
 # ── 4. shell self-tests ──
 hdr "shell self-tests"
 run_shell scripts/image/test-grow-root.sh
