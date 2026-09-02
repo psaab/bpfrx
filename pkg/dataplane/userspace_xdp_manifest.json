@@ -12,7 +12,7 @@
   "inputs": [
     {
       "path": ".cargo/config.toml",
-      "sha256": "61e88aadeaed0c3a130163ea75a56227b09a1e53ef93e87a332ea46267cd0b0c"
+      "sha256": "26c894f81ad6bda714788e486309d193619af35217084be007e05136bb5bef8c"
     },
     {
       "path": "bpf/headers/xpf_common.h",
