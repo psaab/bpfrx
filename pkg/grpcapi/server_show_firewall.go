@@ -410,6 +410,13 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			for _, reason := range res.ContentRejectionReasons {
 				fmt.Fprintf(buf, "    %s\n", reason)
 			}
+		case res.UnzonedIngress:
+			// #8318: the runtime denies an unzoned ingress unconditionally
+			// (#6682). Reporting it through the default: arm below would print
+			// "Default deny ..." — naming the operator's default-policy as the
+			// cause, which is actively wrong on a permit-all box.
+			fmt.Fprintf(buf, "Ingress zone unknown (%s -> %s): transit denied\n", fromZone, toZone)
+			fmt.Fprintf(buf, "  %s\n", policymatch.UnzonedIngressShowLine)
 		case res.HostInboundUnmatched:
 			// #3285: host-bound traffic — the dataplane host gate returns None
 			// (local delivery; no transit global/default fallback). Do NOT
