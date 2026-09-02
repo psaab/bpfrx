@@ -942,9 +942,21 @@ pub(crate) struct SessionTable {
     /// surviving its record.
     lookup_miss_stale_handle: AtomicU64,
     /// A handle resolved to a LIVE record whose stored key differs from the
-    /// one asked for. This is the interesting one for #7919: it means the key
-    /// index and the record disagree, so the lookup finds a session and
-    /// correctly refuses to account against it.
+    /// one asked for: the key index and the slab disagree, so the lookup finds
+    /// a session and correctly refuses to account against it.
+    ///
+    /// CORRECTION: this was previously labelled "the interesting one for
+    /// #7919". That is a prediction, not a fact, and it is wrong for the whole
+    /// class of causes it was written for. `handle_for_key` is
+    /// `key_to_handle.get(key)` over the WHOLE SessionKey, so a probe whose key
+    /// differs in any field finds no entry at all and lands on
+    /// `lookup_miss_no_handle`. Reaching THIS counter requires the index and
+    /// the slab to disagree about a key that IS present — a reused-slot hazard,
+    /// not a key-construction difference.
+    ///
+    /// Someone reading `no_handle` while primed to expect `key_mismatch` would
+    /// reasonably conclude the session was never installed and go looking at
+    /// the install path. Read the three as equals.
     lookup_miss_key_mismatch: AtomicU64,
     /// #1861 §5.1: pair-admission preflight refusals — one per REFUSED
     /// FLOW (not per missing slot). Bumped by `note_admission_refused`
@@ -1637,11 +1649,22 @@ impl SessionTable {
     /// Mut version of `record_by_key`. Same key-equality validation.
     #[inline]
     fn record_by_key_mut(&mut self, key: &SessionKey) -> Option<&mut SessionRecord> {
-        // #7919: same three causes as the shared-ref twin above. Counted in
-        // both because `account_packet` resolves through THIS one while
-        // `touch_if_stale` resolves through that one — a miss that froze the
-        // counters without freezing `last_seen` (or the reverse) would be a
-        // materially different story, and only per-function counts can show it.
+        // #7919: same three causes as the shared-ref twin above, incrementing
+        // the SAME three counters.
+        //
+        // CORRECTION: an earlier version of this comment said the split was
+        // per-function — that `account_packet` resolving through here and
+        // `touch_if_stale` resolving through the twin made a
+        // frozen-counters-but-live-idle-timer split visible. It does not.
+        // There are three counters, split by CAUSE, and both functions add to
+        // all three; nothing here records WHICH resolver missed. That sentence
+        // described instrumentation that was never built, and it read as a
+        // statement of fact, so it was relayed into a work assignment as an
+        // available discriminator. It is not one.
+        //
+        // The counting is in both functions so that no miss goes UNCOUNTED,
+        // which is a weaker and true claim. If the per-function split is ever
+        // actually wanted, it needs new fields — do not infer it from these.
         let Some(handle) = self.handle_for_key(key) else {
             self.lookup_miss_no_handle.fetch_add(1, AtomicOrdering::Relaxed);
             return None;

@@ -83,10 +83,15 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	// install partial counters) = 32 +
 	// #4800 per-worker transit new-flow install counter = 33.
 	// #6751 distinct-source subset of the reverse-key collision counter = 34.
+	// #7919 by-key lookup misses, split by cause (no-handle + stale-handle +
+	// key-mismatch = 3) = 37. Three metrics rather than one `cause`-labelled
+	// family: the discriminator that matters is PER WORKER, and the measured
+	// symptom is non-uniform across concurrent flows, so a collapsed form
+	// would destroy exactly what they were added to show.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*34 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*34, len(got))
+	if len(got) != 3*37 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*37, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -337,6 +342,12 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		// #6751: the DIFFERENT-SOURCE subset of the collision counter above.
 		workerNatReverseKeyCollisionsDistinctSrc: mk(
 			"xpf_userspace_worker_session_nat_reverse_key_collisions_distinct_src_total"),
+		// #7919 by-key lookup misses, split by cause. Three separate metrics
+		// rather than one `cause`-labelled family: the split that matters is
+		// PER WORKER, and collapsing these would destroy the discriminator.
+		workerSessionLookupMissNoHandle:    mk("xpf_userspace_worker_session_lookup_miss_no_handle_total"),
+		workerSessionLookupMissStaleHandle: mk("xpf_userspace_worker_session_lookup_miss_stale_handle_total"),
+		workerSessionLookupMissKeyMismatch: mk("xpf_userspace_worker_session_lookup_miss_key_mismatch_total"),
 		// #1861 install-refusal trio.
 		workerSessionCreateDrops:             mk("xpf_userspace_worker_session_create_drops_total"),
 		workerSessionInstallAdmissionRefused: mk("xpf_userspace_worker_session_install_admission_refused_total"),
@@ -411,6 +422,10 @@ func collectFromEmitWorkerRuntime(
 		c.workerSessionTableCapacity:               {},
 		c.workerNatReverseKeyCollisions:            {},
 		c.workerNatReverseKeyCollisionsDistinctSrc: {},
+		// #7919 by-key lookup misses, split by cause.
+		c.workerSessionLookupMissNoHandle:    {},
+		c.workerSessionLookupMissStaleHandle: {},
+		c.workerSessionLookupMissKeyMismatch: {},
 		// #1861 install-refusal trio.
 		c.workerSessionCreateDrops:             {},
 		c.workerSessionInstallAdmissionRefused: {},
@@ -2819,5 +2834,60 @@ func TestEmitCoSSojourn_LabelsValuesAndGaugeType(t *testing.T) {
 	}
 	if !reflect.DeepEqual(values, want) {
 		t.Fatalf("sojourn metric values: got %+v, want %+v", values, want)
+	}
+}
+
+// TestEmitWorkerSessionLookupMisses7919 pins the VALUES, not just that the
+// three metrics are emitted. The descriptor-set check above proves a metric
+// exists; it cannot tell a correctly-wired counter from one reading a
+// neighbouring field, and #7919 is an investigation where that distinction
+// decides which code path gets blamed.
+//
+// Distinct primes per cause so a copy-paste that emits the same field three
+// times, or swaps two, fails rather than passing on equal values.
+func TestEmitWorkerSessionLookupMisses7919(t *testing.T) {
+	c := newCollectorWithWorkerDescsOnly()
+	status := dpuserspace.ProcessStatus{
+		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{{
+			WorkerID:                     2,
+			SessionLookupMissNoHandle:    7,
+			SessionLookupMissStaleHandle: 11,
+			SessionLookupMissKeyMismatch: 13,
+		}},
+	}
+	want := map[string]float64{
+		"xpf_userspace_worker_session_lookup_miss_no_handle_total":    7,
+		"xpf_userspace_worker_session_lookup_miss_stale_handle_total": 11,
+		"xpf_userspace_worker_session_lookup_miss_key_mismatch_total": 13,
+	}
+	seen := map[string]bool{}
+	for _, m := range collectFromEmitWorkerRuntime(t, c, status) {
+		name := descName(m.Desc())
+		exp, ok := want[name]
+		if !ok {
+			continue
+		}
+		seen[name] = true
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("%s: write: %v", name, err)
+		}
+		if got := pb.GetCounter().GetValue(); got != exp {
+			t.Errorf("%s = %v, want %v — the metric is emitted but carries the "+
+				"wrong field; a per-cause counter reading its neighbour would "+
+				"send whoever reads it to the wrong code path", name, got, exp)
+		}
+		if len(pb.GetLabel()) != 1 || pb.GetLabel()[0].GetValue() != "2" {
+			t.Errorf("%s: want a single worker_id=2 label, got %v — the per-worker "+
+				"split IS the discriminator here (the measured symptom is "+
+				"non-uniform across concurrent flows), so an unlabelled or summed "+
+				"form would destroy what these were added to show",
+				name, pb.GetLabel())
+		}
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("%s was never emitted", name)
+		}
 	}
 }

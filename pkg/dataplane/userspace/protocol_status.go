@@ -729,6 +729,26 @@ type WorkerRuntimeStatus struct {
 	// leak from one host reusing an ephemeral port, and only the former is what
 	// PAT-on-collision would fix.
 	NatReverseKeyCollisionsDistinctSrc uint64 `json:"nat_reverse_key_collisions_distinct_src,omitempty"`
+	// #7919: by-key session-lookup misses on this worker's table, split by
+	// cause. The dataplane has published these on the wire since the #7919
+	// instrumentation landed; nothing on this side decoded them, so a counter
+	// added FOR live diagnosis was readable only from Rust unit tests.
+	//
+	// PER-WORKER on purpose, and they must not be summed into a single
+	// process-wide number. The measured symptom is not uniform -- on the
+	// reporting box one of three concurrent flows accounted correctly while
+	// the other two froze -- and a total cannot separate "one worker is
+	// missing everything" from "every worker misses occasionally". Those are
+	// different bugs with different fixes, and the split is the whole reason
+	// the counters exist.
+	//
+	// Causes: NoHandle = the key is not in the index at all; StaleHandle = a
+	// handle resolved but pointed outside the slab; KeyMismatch = a handle
+	// resolved to a LIVE record whose stored key differs from the one asked
+	// for. omitempty for mixed-version back-compat.
+	SessionLookupMissNoHandle    uint64 `json:"session_lookup_miss_no_handle,omitempty"`
+	SessionLookupMissStaleHandle uint64 `json:"session_lookup_miss_stale_handle,omitempty"`
+	SessionLookupMissKeyMismatch uint64 `json:"session_lookup_miss_key_mismatch,omitempty"`
 	// #1861: per-worker install-refusal trio (see the ProcessStatus
 	// aggregate fields for semantics). omitempty for back-compat.
 	SessionCreateDrops             uint64 `json:"session_create_drops,omitempty"`

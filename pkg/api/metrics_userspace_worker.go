@@ -72,6 +72,13 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.CounterValue, float64(w.NatReverseKeyCollisions), label)
 		ch <- prometheus.MustNewConstMetric(c.workerNatReverseKeyCollisionsDistinctSrc,
 			prometheus.CounterValue, float64(w.NatReverseKeyCollisionsDistinctSrc), label)
+		// #7919: by-key lookup misses, split by cause.
+		ch <- prometheus.MustNewConstMetric(c.workerSessionLookupMissNoHandle,
+			prometheus.CounterValue, float64(w.SessionLookupMissNoHandle), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionLookupMissStaleHandle,
+			prometheus.CounterValue, float64(w.SessionLookupMissStaleHandle), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionLookupMissKeyMismatch,
+			prometheus.CounterValue, float64(w.SessionLookupMissKeyMismatch), label)
 		// #1861: per-worker install-refusal trio.
 		ch <- prometheus.MustNewConstMetric(c.workerSessionCreateDrops,
 			prometheus.CounterValue, float64(w.SessionCreateDrops), label)
