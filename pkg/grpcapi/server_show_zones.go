@@ -374,6 +374,8 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	// sees the same default-deny/permit row REST/CLI/text/Prometheus render.
 	// Counts gate on policy-stats like every other rule.
 	{
+		// #7422 row 13: EFFECTIVE flags, shared with the #3534 advisory.
+		defLogInit, defLogClose := config.EffectiveDefaultPolicyLogFlags(cfg)
 		defRule := &pb.PolicyRule{
 			Name:         dataplane.DefaultPolicyName,
 			Action:       policyActionStr(cfg.Security.DefaultPolicy),
@@ -388,9 +390,12 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			// this, structured automation reading GetPolicies sees the
 			// default-deny/permit boundary as unlogged while the dataplane emits
 			// default-verdict session-init/close records.
-			Log:             cfg.Security.DefaultPolicyLogSessionInit || cfg.Security.DefaultPolicyLogSessionClose,
-			LogSessionInit:  cfg.Security.DefaultPolicyLogSessionInit,
-			LogSessionClose: cfg.Security.DefaultPolicyLogSessionClose,
+			// #7422 row 13: the flags as they BEHAVE — inert under a
+			// default-DENY/REJECT, which installs no session for the
+			// session-init/close records to fire on.
+			Log:             defLogInit || defLogClose,
+			LogSessionInit:  defLogInit,
+			LogSessionClose: defLogClose,
 			// #3623: presence-wrapped; the default row always carries the sentinel.
 			PolicyId: proto.Uint32(dataplane.DefaultPolicySentinelID),
 			RuleId:   dataplane.DefaultPolicyName,

@@ -344,7 +344,10 @@ the userspace dataplane admission boundary is in
   `icmp6_nd` / `icmp6_error` / `icmp4_error`; AGGREGATE across all zones because
   those accept rules are global, not per-zone). Policy-based
   routing (filter-based-forwarding) build health is exported as the
-  config-derived gauges `xpf_pbr_rules_installed` and `xpf_pbr_degraded_terms`
+  gauges `xpf_pbr_rules_desired` (config-derived), `xpf_pbr_rules_applied`
+  (kernel readback, omitted when the read fails) and `xpf_pbr_degraded_terms`
+  — with `xpf_pbr_rules_installed` retained as a deprecated alias of
+  `xpf_pbr_rules_desired`
   (#4422 — the count of routing-instance filter terms dropped from the kernel
   FBF mirror by the fail-closed under-steer rule; see `docs/multi-wan.md`).
 - **SNMP**: system + ifTable MIB. Community `clients` source-IP restriction

@@ -196,9 +196,13 @@ func ZoneDetailPolicySummary(cfg *config.Config, zone string, schedActive map[st
 	// and the default-policy log posture (DefaultPolicyLogSessionInit/Close),
 	// which requests RT_FLOW session logging for flows that hit the implicit
 	// default verdict.
+	// #7422 row 13: the EFFECTIVE flags. Under a default-DENY/REJECT no
+	// session is installed, so the session-init/close records never fire and
+	// rendering the modifier claims logging that does not happen.
+	defLogInit, defLogClose := config.EffectiveDefaultPolicyLogFlags(cfg)
 	defLog := &config.PolicyLog{
-		SessionInit:  cfg.Security.DefaultPolicyLogSessionInit,
-		SessionClose: cfg.Security.DefaultPolicyLogSessionClose,
+		SessionInit:  defLogInit,
+		SessionClose: defLogClose,
 	}
 	defMods := zoneDetailModifiers(dataplane.DefaultPolicySentinelID, "", false, defLog, false, false, false)
 	lines = append(lines, fmt.Sprintf("    [default] %s: %s %s",

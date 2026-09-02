@@ -37,6 +37,19 @@ security {
         security-zone untrust;
     }
     policies {
+        // #7422 row 13: the default verdict is now PERMIT-ALL, and that is
+        // load-bearing rather than incidental. The session-init/session-close
+        // records fire only for a default-PERMIT (the only verdict that
+        // installs a session), so under the previous implicit deny-all these
+        // flags were accepted-but-inert (#3534) and the row below asserted a
+        // log posture the dataplane never enforced. #3670's property — audit
+        // tooling must not read the boundary as unlogged while the dataplane
+        // IS emitting — is preserved exactly, on the config where it is true.
+        // The deny-all suppression is covered by
+        // TestDefaultPolicyLogSuppressedUnderDenyDefault7422.
+        default-policy {
+            permit-all;
+        }
         default-policy-log {
             session-init;
             session-close;

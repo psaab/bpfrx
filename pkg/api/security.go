@@ -401,6 +401,8 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// default-deny/permit hits — the most security-relevant boundary — without
 	// scraping logs. Counts gate on policy-stats like every other rule.
 	{
+		// #7422 row 13: EFFECTIVE flags, shared with the #3534 advisory.
+		defLogInit, defLogClose := config.EffectiveDefaultPolicyLogFlags(cfg)
 		defRule := PolicyRule{
 			Name:         dataplane.DefaultPolicyName,
 			Action:       policyActionStr(cfg.Security.DefaultPolicy),
@@ -414,9 +416,14 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 			// configured rows expose Log/LogSessionInit/LogSessionClose (#3336)
 			// so audit tooling does not read the most security-relevant
 			// boundary as unlogged while the dataplane is emitting the records.
-			Log:             cfg.Security.DefaultPolicyLogSessionInit || cfg.Security.DefaultPolicyLogSessionClose,
-			LogSessionInit:  cfg.Security.DefaultPolicyLogSessionInit,
-			LogSessionClose: cfg.Security.DefaultPolicyLogSessionClose,
+			// #7422 row 13: report the flags as they BEHAVE, not as configured.
+			// A default-DENY/REJECT installs no session, so the
+			// session-init/close records never fire and reporting them true
+			// tells audit tooling the boundary is logged when nothing logs.
+			// Shared with the #3534 commit advisory so the two cannot disagree.
+			Log:             defLogInit || defLogClose,
+			LogSessionInit:  defLogInit,
+			LogSessionClose: defLogClose,
 			PolicyID:        dataplane.DefaultPolicySentinelID,
 			RuleID:          dataplane.DefaultPolicyName,
 		}
