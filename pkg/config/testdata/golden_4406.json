@@ -206,6 +206,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -306,14 +335,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
@@ -1497,6 +1549,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -1597,14 +1678,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
@@ -2787,6 +2891,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -2887,14 +3020,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
@@ -4077,6 +4233,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -4177,14 +4362,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
@@ -5368,6 +5576,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -5468,14 +5705,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
@@ -6658,6 +6918,35 @@
               "ToRoutingInstance": "",
               "Rules": [
                 {
+                  "Name": "pool-snat",
+                  "Match": {
+                    "SourceAddress": "10.0.61.240/28",
+                    "SourceAddresses": [
+                      "10.0.61.240/28"
+                    ],
+                    "SourceAddressName": "",
+                    "SourceAddressNames": null,
+                    "DestinationAddress": "",
+                    "DestinationAddresses": null,
+                    "DestinationAddressName": "",
+                    "DestinationAddressNames": null,
+                    "DestinationPort": 0,
+                    "DestinationPorts": null,
+                    "InvalidDestinationPorts": null,
+                    "ReversedDestinationPortRanges": null,
+                    "Protocol": "",
+                    "Protocols": null,
+                    "Application": "",
+                    "Applications": null
+                  },
+                  "Then": {
+                    "Type": 0,
+                    "Interface": false,
+                    "PoolName": "pool-snat-pool",
+                    "Off": false
+                  }
+                },
+                {
                   "Name": "snat",
                   "Match": {
                     "SourceAddress": "0.0.0.0/0",
@@ -6758,14 +7047,37 @@
               ]
             }
           ],
-          "SourcePools": {},
+          "SourcePools": {
+            "pool-snat-pool": {
+              "Name": "pool-snat-pool",
+              "Address": "",
+              "Addresses": [
+                "172.16.80.7/32"
+              ],
+              "Port": 0,
+              "PortLow": 30000,
+              "PortHigh": 30999,
+              "PortNoTranslation": false,
+              "PortOverloadingFactor": 0,
+              "RoutingInstance": "",
+              "PersistentNAT": null,
+              "Deterministic": null
+            }
+          },
           "AddressPersistent": false,
           "Destination": null,
           "Static": null,
           "NAT64": null,
           "NATv6v4": null,
           "PoolUtilizationAlarm": null,
-          "ProxyARP": null,
+          "ProxyARP": [
+            {
+              "Interface": "reth0.80",
+              "Addresses": [
+                "172.16.80.7/32"
+              ]
+            }
+          ],
           "SourceInterfacePortOverloadingOff": false
         },
         "Screen": {},
