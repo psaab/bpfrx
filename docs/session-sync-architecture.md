@@ -1089,6 +1089,41 @@ Both halves of this directional correctness are regression-pinned by
 epoch is REFUSED at a receiver that applied a newer config (the protected
 config-authority → peer direction) and ADMITTED at the config authority (whose
 receive high-water never advances — the inert fail-OPEN reverse direction), and
+
+**#7323 — "the authority's receive high-water never advances" is true only of an
+authority that has NEVER been a secondary.** `lastAppliedConfigGen` is written
+by `recordAppliedConfigGen` and cleared by exactly two things: `initGenState`
+(construction) and `resetRecvGen` (the peer's bulk re-prime). **Nothing clears
+it on a role transition.** So a node that was the secondary, applied the
+authority's config, and was then promoted to RG0 carries that high-water into
+its authority life, and its guard is **LIVE** until the next bulk re-prime.
+
+Measured, same receiver, opposite verdicts decided only by the top bit:
+
+| receiver | barrier | untagged epoch 3 | top-bit-tagged epoch 3 |
+|---|---|---|---|
+| never-applied authority | 0 | admitted (inert) | admitted |
+| **promoted** authority | 10 | **REFUSED** | **admitted** |
+
+That is what #7323's rolling-upgrade argument turns on. Its claim that a legacy
+receiver reading a tagged value is *"fail-OPEN, i.e. exactly today's behaviour"*
+holds only where the barrier is 0. Against a live barrier today's behaviour is
+REFUSE, so the tag does not preserve the status quo — it converts a working
+fail-CLOSED guard into fail-OPEN on a receiver that cannot report it happened.
+A rolling upgrade necessarily involves a failover, so the promoted-authority
+state is the normal path through one rather than an exotic case.
+
+The exposure is bounded — the window is promotion until the peer's next bulk
+re-prime, not forever — and the sender cannot scope around it, because the
+non-authority doing the stamping has no way to know whether the receiver's
+barrier is live. That is what makes this a negotiation problem rather than an
+encoding one.
+
+Pinned by `config_epoch_promoted_authority_7323_test.go`, which asserts CURRENT
+behaviour (it does not implement the tag) so the premise cannot rot again the
+way this paragraph's wording did. The existing `sync_config_epoch_active_active_6284_test.go`
+is not wrong: its INERT arm constructs a never-applied authority, which is a
+real state — just not the only one.
 the sender-side root cause is pinned too (`recordAppliedConfigGen` advances the
 receive high-water but never the send-stamp `configGenCounter`, so a
 non-authority stamps its synced-out sessions with the frozen boot-seed epoch).
