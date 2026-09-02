@@ -23,14 +23,6 @@ import (
 // loop test can shorten it.
 var proxyARPReassertInterval = 30 * time.Second
 
-// proxyARPOwnershipPollInterval is how often the reassert loop re-evaluates RG
-// ownership for the configured proxy-arp interfaces (#8297). It matches the RG
-// state loop's own 2s cadence, so proxy-ARP converges on the same beat the
-// ownership it follows does. The poll itself takes no locks beyond the
-// rgStateMachine read and never touches netlink; only a CHANGE costs a
-// reconcile.
-var proxyARPOwnershipPollInterval = 2 * time.Second
-
 // proxyARPReconcileFn is the function the re-assert loop invokes each tick. It
 // is a package var so the loop test can substitute a counting fake without
 // touching netlink/procfs; production wiring is (*Daemon).reconcileProxyARP.
@@ -92,14 +84,11 @@ var ifaceIndexByName = func(name string) (int, error) {
 // this interface" and write the responder sysctl to 0 on a live interface.
 // Before #6536 the resolution failure was logged and dropped, and those two
 // conditions were indistinguishable to every downstream consumer.
-// #8297: takes the OWNED entry subset rather than reading cfg directly, so an
-// interface whose redundancy group this node does not own never enters the
-// desired set (and the #4955 teardown below sweeps whatever a prior state left).
-func proxyARPIfaceMap(cfg *config.Config, entries []*config.ProxyARPEntry) (byJunos map[string]int, names map[int]string, unresolved []string) {
+func proxyARPIfaceMap(cfg *config.Config) (byJunos map[string]int, names map[int]string, unresolved []string) {
 	byJunos = make(map[string]int)
 	names = make(map[int]string)
 	seenUnresolved := make(map[string]bool)
-	for _, entry := range entries {
+	for _, entry := range cfg.Security.NAT.ProxyARP {
 		if _, ok := byJunos[entry.Interface]; ok {
 			continue
 		}
@@ -190,11 +179,7 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	ifaceNames := map[int]string{}
 	var unresolved []string
 	if hasEntries {
-		// #8297: only the interfaces whose RG this node currently owns. A
-		// standalone box and a non-RG interface are never gated — see
-		// proxyarp_rg_ownership_8297.go.
-		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMap(cfg,
-			proxyARPOwnedEntries(cfg, func(n string) bool { return d.proxyARPOwnsInterface(cfg, n) }))
+		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMap(cfg)
 	}
 
 	// Always run the reconcile: even with zero configured entries it sweeps the
@@ -329,29 +314,12 @@ func diffProxyResponders(prev, cur map[string]map[int]struct{}) map[string]map[i
 func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
 	t := time.NewTicker(proxyARPReassertInterval)
 	defer t.Stop()
-	// #8297: the 30s beat is too slow for a failover. A demoted node would keep
-	// answering for up to 30 seconds, and an upstream that cached its MAC in
-	// that window sends pool return traffic to a node that no longer owns the
-	// address. The ownership fingerprint is cheap — one config lookup and one
-	// rgStateMachine read per configured entry, no netlink and no applySem — so
-	// it is polled on a short ticker and a reconcile runs only when the answer
-	// actually MOVED. The 30s beat is unchanged and still covers everything a
-	// fingerprint cannot see.
-	own := time.NewTicker(proxyARPOwnershipPollInterval)
-	defer own.Stop()
-	last := d.proxyARPOwnershipFingerprint(d.store.ActiveConfig())
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			d.reassertProxyARPOnce(ctx)
-			last = d.proxyARPOwnershipFingerprint(d.store.ActiveConfig())
-		case <-own.C:
-			if fp := d.proxyARPOwnershipFingerprint(d.store.ActiveConfig()); fp != last {
-				last = fp
-				d.reassertProxyARPOnce(ctx)
-			}
 		}
 	}
 }
