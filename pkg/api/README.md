@@ -2700,6 +2700,47 @@ the drop fails loudly instead of going quietly vacuous.
     `context.Background()` instead of the request context), both counting
     VISITED ROWS with a live-context control, because a rendered tally of 0 is
     also what "the walk never ran" looks like.
+    **#7294 makes the discipline structural rather than remembered.** Every
+    extension above — #5433, #5708, #5779, #5782, #5939, #6216, #6553, #7315,
+    #8151 — was a surface someone noticed was walking without admission, and
+    each was pinned by its own behavioural test covering exactly that surface.
+    Nothing failed when a NEW scan surface appeared, which is what #6216 was:
+    `natPoolStatsHandler` drove the identical walk and bypassed the bound until
+    a human noticed. `pkg/diagcmd/session_walk_registration_7294_test.go` is a
+    registration guard over `pkg/api` and `pkg/grpcapi` — it parses both
+    packages, finds every call of a session-scan primitive (`IterateSessions`,
+    `IterateSessionsV6`, `IterateSessions[V6]From`, `BatchIterateSessions[V6]`,
+    `SessionCount`) plus the `pkg/natshow` carriers that reach one, and
+    requires each such function to be admitted either directly or through every
+    caller that reaches it. Adding a scanning endpoint without an acquire fails
+    the build's test gate, with the function named.
+    Three properties it was built to have, each verified by mutation rather
+    than asserted. It matches CALL POSITION, so `apiRuntimeDataPlane`'s
+    `SessionCount()` interface field is not a scan. It requires the SESSION-WALK
+    budget specifically, so the #8151 shape — a surface that acquires, but on
+    `SnapshotReadLimiter` — still reds; a guard asking only "does it acquire?"
+    would have rated that compliant. And it admits through a caller or a
+    dedicated acquire helper (one that returns the release closure, like
+    `acquireNATShowWalk`) but NOT through arbitrary transitive reachability:
+    the first version propagated admission callee-to-caller, which silently
+    marked every handler a partly-acquiring `ShowText` dispatcher reaches as
+    covered, and deleting the real acquire from `showSessionsTop` or
+    `GetSessions` left it green.
+    Scope is `pkg/api` + `pkg/grpcapi`, the two packages where a new endpoint
+    can appear and the ones `MaxConcurrentSessionWalks` documents itself as
+    bounding. `pkg/cli` is deliberately outside: it has 18 scan sites and no
+    acquires, and it runs IN-PROCESS in the daemon, but there is exactly one
+    non-test `cli.New(...)` call site, it is inside `if isInteractive()`, and a
+    REPL runs one command at a time — so the console contributes at most one
+    concurrent walk rather than a flood, and the remote `cli` binary is bounded
+    at the gRPC surface it connects through. The daemon-internal background
+    walkers (`conntrack` GC sweep, cluster bulk/conn sweeps,
+    `warmNeighborCache`, policy invalidation, `ReconcileClusterBulk`) are
+    outside for a different reason: they are not request-driven, so a REQUEST
+    admission budget is the wrong instrument. Both groups are named in the test
+    file so a later reader knows they were considered; pulling either in scope
+    would mean ~20 exemption entries, and a list like that drifts until the
+    guard stops meaning anything.
     #6553 also single-sources the NAT pool port formula
     (`config.NATPoolTotalPorts`): `(portHigh - portLow + 1) * addrCount` had
     been written out five times and had already diverged — only this REST
