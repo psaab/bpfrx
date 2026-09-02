@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust test-race-dp audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity test-harness-ledger-lib harness-compare harness-ledger-lint
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust test-race-dp audit-check test-connectivity test-wire-properties test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity test-harness-ledger-lib harness-compare harness-ledger-lint
 
 all: generate build build-ctl
 
@@ -776,6 +776,12 @@ test-connectivity:
 	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
 		--gate test-connectivity --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
 		-- ./test/incus/test-connectivity.sh $(MODE)
+
+# On-wire properties test (PMTUD reflection + NPTv6 checksum neutrality)
+test-wire-properties:
+	./test/incus/harness-result.sh run \
+		--gate test-wire-properties --adapter ha-smoke --env $(HARNESS_ENV) --hermetic \
+		-- ./test/incus/test-wire-properties.sh
 
 # Cluster failover test (iperf3 through reboot — requires cluster + iperf3 server)
 test-failover:
