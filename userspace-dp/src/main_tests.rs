@@ -5391,3 +5391,136 @@ fn expansion_does_not_overwrite_an_existing_slots_arm_state_6749() {
     );
     assert!(out[1].armed, "the new slot must inherit the armed box state");
 }
+
+/// #8279: the userspace-ingress test must precede the L3 PARSE, because the
+/// parse's failure arm is a DROP.
+///
+/// THE DEFECT. `try_xdp_userspace` used to run `parse_l2`, then the L3 parse,
+/// then `drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL)` on
+/// a parse failure, and only THEN test the ingress map. So a frame on an
+/// ifindex this shim does not adjudicate could still be DROPPED by it.
+///
+/// WHY THAT IS REACHABLE, and it is not the interface set anyone would guess.
+/// The shim is attached to a strictly LARGER set than the ingress set: every
+/// zoned netdev goes into `st.xdpIfindexes` (`pkg/dataplane/compiler_iface.go`),
+/// tunnels included — the comment there says so ("Tunnels need XDP for ingress")
+/// — and `syncInterfaceAttachments` reconciles the difference away only at the
+/// two POST-acceptance points, deliberately (#5485). A tunnel netdev on a
+/// userspace-dataplane box is an anchor TUN: ARPHRD_NONE, raw L3, **no Ethernet
+/// header**. Measured on a live kernel rather than assumed — a generic-XDP
+/// program attaches to such a TUN, runs on packets userspace WRITES into it,
+/// and sees the bare IP header (byte 0 = 0x45, bytes 12..14 = the IP SOURCE
+/// octets), against an ARPHRD_ETHER control on the same harness that saw
+/// 0x0800 at the same offset.
+///
+/// So `parse_l2` reads the source-address octets as an ethertype. A source in
+/// `8.0.0.0/16` reads as `ETH_P_IP`, the shifted `parse_ipv4` reads the third
+/// source octet as version/IHL, and 241 of its 256 values fail — dropping the
+/// packet. The packet's fate was selectable by its own source address, on an
+/// interface this shim has no authority over.
+///
+/// WHY A SOURCE GUARD. The property is an ORDER inside a BPF program that no
+/// test in this workspace can execute — the same reason #5173's index path and
+/// #7480's wiring are pinned rather than run. What is pinned here is exactly
+/// the ordering, not a spelling.
+///
+/// WHY TOKEN SEQUENCES AND NOT BARE NAMES. `shim_token_vec` tokenizes comments
+/// and string literals like code (see the #5173 module notes), and the fix's own
+/// comment names `parse_ipv4` and `drop_degraded_transit` in prose ABOVE the
+/// gate. A bare-identifier ordering check would read those prose tokens and go
+/// RED on correct code. Each needle below is a CALL-SHAPED sequence that prose
+/// does not reproduce, and each is asserted to occur exactly ONCE so a needle
+/// that has stopped matching fails loudly instead of making the ordering
+/// vacuously true.
+#[test]
+fn shim_ingress_test_precedes_the_l3_parse_8279() {
+    let lib = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("userspace-xdp/src/lib.rs");
+    let src = std::fs::read_to_string(&lib).expect("read shim lib.rs");
+
+    // Scope to `try_xdp_userspace`'s body. `degraded_ctrl_disabled_action` has
+    // a BYTE-IDENTICAL parse arm, and it deliberately never consults the
+    // ingress map: with `ctrl.enabled == 0` the shim must fail closed on EVERY
+    // attached interface, adjudicated or not (#5485 relies on exactly that).
+    // Applying this ordering rule there would invert that posture, so the slice
+    // is the point, not an implementation convenience.
+    let start = src
+        .find("\nfn try_xdp_userspace(")
+        .expect("#8279: `fn try_xdp_userspace(` not found -- the slice below would be empty");
+    let rest = &src[start + 1..];
+    let end = rest[1..]
+        .find("\nfn ")
+        .map(|i| i + 1)
+        .expect("#8279: no following top-level `fn` -- the slice would run to EOF");
+    let body = &rest[..end];
+    let toks = shim_token_vec(body);
+    assert!(
+        toks.len() > 200,
+        "#8279: the `try_xdp_userspace` slice is only {} tokens, which is far too \
+         short to be the real function -- the slice markers have drifted and every \
+         assertion below would be testing the wrong text",
+        toks.len()
+    );
+
+    fn only_index(toks: &[String], needle: &[&str], label: &str) -> usize {
+        let hits: Vec<usize> = toks
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, w)| w.iter().zip(needle).all(|(a, b)| a.as_str() == *b))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "#8279: expected exactly ONE {label} site in the shim, found {}. \
+             The ordering assertion below is meaningless unless each site is \
+             unique -- a needle that stopped matching would make it vacuously \
+             true, and a SECOND site would make \"first occurrence\" the wrong \
+             question. Needle: {needle:?}",
+            hits.len()
+        );
+        hits[0]
+    }
+
+    let gate = only_index(
+        &toks,
+        &["USERSPACE_INGRESS_IFACES", ".", "get", "(", "&", "ingress_ifindex", ")"],
+        "userspace-ingress map lookup",
+    );
+    let parse_v4 = only_index(
+        &toks,
+        &["parse_ipv4", "(", "data", ",", "data_end", ","],
+        "parse_ipv4 call",
+    );
+    let parse_v6 = only_index(
+        &toks,
+        &["parse_ipv6", "(", "data", ",", "data_end", ","],
+        "parse_ipv6 call",
+    );
+    let parse_fail = only_index(
+        &toks,
+        &[
+            "drop_degraded_transit", "(", "ctrl", ",",
+            "USERSPACE_FALLBACK_REASON_PARSE_FAIL", ")",
+        ],
+        "parse-failure drop",
+    );
+
+    for (label, idx) in [
+        ("the IPv4 parse", parse_v4),
+        ("the IPv6 parse", parse_v6),
+        ("the parse-failure DROP", parse_fail),
+    ] {
+        assert!(
+            gate < idx,
+            "#8279: {label} is reached BEFORE the userspace-ingress test \
+             (gate at token {gate}, {label} at token {idx}). The shim is \
+             attached to more interfaces than it adjudicates, and a raw-L3 \
+             netdev in that gap has its IP SOURCE octets read as an ethertype \
+             -- so with this ordering a packet's fate is selectable by its own \
+             source address on an interface the shim has no authority over. \
+             The ingress test must come first."
+        );
+    }
+}

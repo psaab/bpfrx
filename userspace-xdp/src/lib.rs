@@ -457,14 +457,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     else {
         return Ok(cpumap_or_pass(ctrl));
     };
-    let parsed = match eth_proto {
-        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
-        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
-        _ => return Ok(pass_non_ip_l2_direct()),
-    };
-    let Some(parsed) = parsed else {
-        return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
-    };
+    if eth_proto != ETH_P_IP && eth_proto != ETH_P_IPV6 {
+        return Ok(pass_non_ip_l2_direct());
+    }
 
     // #5173: this statement is pinned token-for-token by the parity tests, and
     // the name it binds is bounded twice over there — to exactly one `let`
@@ -476,9 +471,49 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // NOTHING rejects a reduction of it by type — pinning where it comes from,
     // bounding the name, and pinning how it is passed is the whole defence.
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
+    // #8279: this test USED to sit below the L3 parse, and the parse's failure
+    // arm is a DROP (`drop_degraded_transit`), so an ifindex this shim does not
+    // adjudicate could still have its traffic dropped here. That is reachable:
+    // the shim is attached to a strictly LARGER set than the ingress set (every
+    // zoned netdev, tunnels included — `compiler_iface.go` puts tunnel ifindexes
+    // in `st.xdpIfindexes`), and `syncInterfaceAttachments` only reconciles the
+    // difference away at the two post-acceptance points, deliberately (#5485).
+    // A tunnel netdev is raw L3 with NO Ethernet header, so `parse_l2` reads
+    // bytes [12..14] — the IP SOURCE octets — as the ethertype; an inner source
+    // in 8.0.0.0/16 reads as ETH_P_IP and the shifted `parse_ipv4` then fails
+    // for 241 of the 256 possible values of the third source octet. The packet's
+    // fate was therefore selectable by its own source address, on an interface
+    // this shim has no authority over.
+    //
+    // Moved ABOVE the L3 parse so a non-adjudicated ifindex never reaches the
+    // parser at all. This is also the property `manager_compile.go`'s #5485
+    // rationale already claims ("an ifindex absent from userspace_ingress_ifaces
+    // takes cpumap_or_pass") — the claim was true of every arm except the parse
+    // failure, and is now true of all of them.
+    //
+    // Deliberately NOT hoisted above the non-IP arm directly above: ARP and LLDP
+    // must keep taking `pass_non_ip_l2_direct` (a plain XDP_PASS) on EVERY
+    // interface. Routing them through `cpumap_or_pass` instead would send them
+    // to a remote CPU, which does not drive the local L2 state machine — see
+    // that function's own comment. Placing the test here changes the fate of no
+    // packet except the one this fixes.
     if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
     }
+
+    let parsed = match eth_proto {
+        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
+        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
+        // Unreachable by construction — the guard above already returned for
+        // every other ethertype. Kept because `eth_proto` is a bare u16 and the
+        // match must be total, and because it names the SAME action the guard
+        // takes, so a future edit that weakened the guard would not silently
+        // change what a non-IP frame does here.
+        _ => return Ok(pass_non_ip_l2_direct()),
+    };
+    let Some(parsed) = parsed else {
+        return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+    };
     let native_gre =
         parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0;
 

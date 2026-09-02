@@ -1034,7 +1034,50 @@ while the applied snapshot no longer lists it. In both ctrl states that
 is at least as strict as the detached state it precedes: an ifindex
 absent from `userspace_ingress_ifaces` takes `cpumap_or_pass`, which is
 the kernel path a detached interface would have taken anyway, and a
-still-disabled ctrl drops its transit. Nothing in the window between the
+still-disabled ctrl drops its transit.
+
+> **#8279 — that safety claim was FALSE for one arm, and the fix is what
+> makes the paragraph above true.** "An ifindex absent from
+> `userspace_ingress_ifaces` takes `cpumap_or_pass`" held for three of the
+> shim's four arms. The fourth — an L3 PARSE FAILURE — took
+> `drop_degraded_transit`, and it sat ABOVE the ingress-map test, so it
+> applied to interfaces this dataplane does not adjudicate.
+>
+> It mattered because **the attach set is strictly larger than the ingress
+> set**: `compiler_iface.go` puts every zoned netdev into
+> `st.xdpIfindexes`, tunnels included ("Tunnels need XDP for ingress"),
+> and `syncInterfaceAttachments` reconciles the difference away only at
+> the two post-acceptance points. A tunnel netdev on a userspace-dataplane
+> box is an anchor TUN — ARPHRD_NONE, raw L3, **no Ethernet header** — so
+> the shim's Ethernet-only `parse_l2` read bytes `[12..14]`, the IP SOURCE
+> octets, as an ethertype. A source in `8.0.0.0/16` reads as `ETH_P_IP`;
+> the shifted `parse_ipv4` then reads the third source octet as
+> version/IHL and fails for 241 of its 256 values, dropping the packet.
+> The packet's fate was selectable by its own source address on an
+> interface the shim has no authority over.
+>
+> Measured on a live kernel rather than reasoned: a generic-XDP program
+> DOES attach to such a TUN, DOES run on packets userspace writes into it,
+> and sees the bare IP header (byte 0 `0x45`, bytes `[12..14]` = the
+> source octets) — against an ARPHRD_ETHER control on the same harness
+> that saw `0x0800` at the same offset.
+>
+> The ingress-map test now precedes the L3 parse
+> (`userspace-xdp/src/lib.rs`), pinned by
+> `shim_ingress_test_precedes_the_l3_parse_8279`. It is deliberately NOT
+> hoisted above the non-IP arm: ARP and LLDP must keep taking
+> `pass_non_ip_l2_direct` (a plain `XDP_PASS`) on every interface, because
+> `cpumap_or_pass` would send them to a remote CPU that does not drive the
+> local L2 state machine.
+>
+> **Residual, not covered by the ordering fix.** The ctrl-DISABLED path
+> (`degraded_ctrl_disabled_action`) never consults the ingress map at all,
+> by design — a disabled ctrl must fail closed on every attached
+> interface. On a raw-L3 netdev its local/control exemption is evaluated
+> against a misparsed header, so what it exempts there is not trustworthy.
+> That is an interface-ADMISSION question — a raw-L3 netdev should not be
+> carrying this shim at all — and nothing checks a netdev's link type
+> before admitting it. Tracked on #8279. Nothing in the window between the
 old detach site and the publish reads the attachment set —
 `entryProgramsLocked` (`maps_sync.go`) is the only other `XDPLinks()`
 reader and it is status reporting — so moving the detach costs no
