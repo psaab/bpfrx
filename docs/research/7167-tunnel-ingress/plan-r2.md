@@ -3,6 +3,21 @@
 Continues `plan-r1.md`. Written at `1ca966a8d`, still before any
 implementation.
 
+> **SUPERSEDED IN PART — read `adjudication.md` first.** §2 and §3 below
+> conclude that a Shape B (`bind-interface`-only) tunnel's OUTBOUND
+> LAN → tunnel traffic is unadjudicated kernel forwarding, via
+> `NoRoute` → `is_slow_path_eligible()` → reinject. That was true when it
+> was measured and is **no longer the current behaviour**: #7480 added
+> `forwarding::noroute_policy_denial` to the `NoRoute` arm of
+> `poll_binding_process_descriptor`, which evaluates policy BEFORE the
+> slow-path chokepoint and rewrites the disposition to `PolicyDenied` (not
+> slow-path eligible) on a non-permit verdict. Because the egress is
+> unresolved, the to-zone is the #3110 sentinel 0 and the evaluation falls
+> to the DEFAULT action — so the outbound direction is fail-CLOSED on a
+> `deny-all` default box and retains the fail-open behaviour described
+> below only on a `permit-all` default. §0 (the resolvable-ifindex
+> constraint) and §5 (the corrections to r1) still stand as written.
+
 **Status: r1's blocking §3 measurement is ANSWERED, and answering it also
 CORRECTS a conclusion recorded in the issue's own comment thread. The correction
 matters more than the answer, because it inverts the safety reading of one of
