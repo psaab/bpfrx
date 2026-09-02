@@ -546,7 +546,14 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 				qv.forwardingClass = className
 				if sched := cfg.ClassOfService.Schedulers[entry.Scheduler]; sched != nil {
 					qv.exact = sched.TransmitRateExact
-					qv.guaranteeEnabled = sched.TransmitRateBytes > 0
+					// #6565 row 4 / #7422: ANY of the three transmit-rate
+					// forms is a guarantee. Keying on TransmitRateBytes alone
+					// made a `percent`/`remainder` scheduler read as
+					// unguaranteed, and the gate at the runtime merge below
+					// then DISCARDED the dataplane's resolved rate for it --
+					// throwing away the true value while it was in hand.
+					qv.guaranteeEnabled = sched.TransmitRateBytes > 0 ||
+						sched.TransmitRatePercent > 0 || sched.TransmitRateRemainder
 					qv.surplusSharing = sched.SurplusSharing
 					qv.equalFlowEnforcement = sched.EqualFlowEnforcement
 					qv.equalFlowTargetPolicy = sched.EqualFlowTargetPolicy

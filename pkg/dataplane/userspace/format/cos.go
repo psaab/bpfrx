@@ -168,6 +168,37 @@ func (q cosQueueView) hasWaterfillTelemetry() bool {
 		q.waterfillPhase1SelectedNoProgress != 0
 }
 
+// formatSchedulerTransmitRate renders a scheduler's configured transmit-rate
+// in whichever of the three Junos forms it was authored.
+//
+// #6565 row 4 / #7422: this used to read TransmitRateBytes alone. The three
+// forms are MUTUALLY EXCLUSIVE (validateClassOfServiceStrict), so a scheduler
+// authored as `transmit-rate percent 30` has TransmitRateBytes == 0 and
+// rendered as "-" — which reads as "no guarantee configured" for a queue that
+// is in fact shaped.
+//
+// The dataplane resolves both non-absolute forms live: percent against the
+// interface's shaping rate (cos_effective_transmit_rate_bytes, #4228 Gap 2)
+// and remainder against the resolved sibling set (#6846's pre-pass). So the
+// configured form is real, and rendering the AUTHORED form is honest here —
+// the absolute value it resolves to depends on the interface and belongs on
+// the interface view, not the scheduler table.
+func formatSchedulerTransmitRate(sched *config.CoSScheduler) string {
+	if sched == nil {
+		return "-"
+	}
+	if sched.TransmitRateBytes > 0 {
+		return formatCoSRate(sched.TransmitRateBytes)
+	}
+	if sched.TransmitRatePercent > 0 {
+		return fmt.Sprintf("percent %g", sched.TransmitRatePercent)
+	}
+	if sched.TransmitRateRemainder {
+		return "remainder"
+	}
+	return "-"
+}
+
 func formatCoSRate(bytesPerSecond uint64) string {
 	if bytesPerSecond == 0 {
 		return "-"
