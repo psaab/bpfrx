@@ -227,6 +227,45 @@ func (m *Manager) lookupProgramLocked(name string) (p *ebpf.Program, present boo
 	return p, present, classifyRegistry(&m.loaded, len(m.maps))
 }
 
+// takeRegistryHandles returns the non-nil map and program handles
+// currently in the registry, for a caller that must CLOSE their FDs.
+//
+// It ACQUIRES m.mu itself and returns with it released -- so it is NOT a
+// "...Locked" helper and must not be called with the lock already held; a
+// sync.Mutex is not reentrant and that would self-deadlock. The caller does
+// the closing afterwards, with no lock held (#6740: a handle Close() is a
+// syscall). Building the snapshot is not a syscall, so it is safe under m.mu;
+// only the Close() loop must be outside.
+//
+// It exists so Teardown does not touch m.maps / m.programs directly (#7755).
+// The registry canary permits raw access only in the scoped lookup helpers and
+// the whole-batch publisher, and adding Teardown to that allowlist would widen
+// exactly the surface the canary defends. Routing through a named helper keeps
+// the invariant the canary states: every registry access lives in one of a
+// small set of functions that can be reviewed together.
+//
+// It deliberately does NOT remove the entries. Closing is not clearing — the
+// registry stays populated so classifyRegistry still reads registryRetained,
+// registryObsoleteLocked can still refuse and count, and injected test fixtures
+// are untouched. Only the FDs go.
+func (m *Manager) takeRegistryHandles() ([]*ebpf.Map, []*ebpf.Program) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	maps := make([]*ebpf.Map, 0, len(m.maps))
+	for _, h := range m.maps {
+		if h != nil {
+			maps = append(maps, h)
+		}
+	}
+	programs := make([]*ebpf.Program, 0, len(m.programs))
+	for _, p := range m.programs {
+		if p != nil {
+			programs = append(programs, p)
+		}
+	}
+	return maps, programs
+}
+
 // shimRegistryPublishHook runs INSIDE the publisher's m.mu hold BEFORE
 // the loaded.Store(true) step (#2114 A3 blocked-Start test seam: readers
 // gated on the hold observe the pre-arm state and block; after release

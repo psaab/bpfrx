@@ -1411,14 +1411,33 @@ func (m *Manager) Teardown() error {
 	err := teardownCleanupFn()
 	// #6741: Cleanup has just destroyed the pinned kernel objects, so every
 	// handle still in m.maps / m.programs now refers to an obsolete forwarding
-	// generation. Record the boundary so a lookup that serves one can be
-	// counted. The registry itself is deliberately NOT cleared — the retained
-	// state is what the #2114 A3 proceed-on-retained rule acts on, and changing
-	// that is the deferred half of #6741.
+	// generation. Record the boundary so a lookup that serves one is refused
+	// and counted.
+	//
+	// The registry is deliberately NOT cleared, and #7755 CLOSES the orphaned
+	// FDs without clearing it. Why closing is not clearing, why the original
+	// justification for not clearing was hollowed out by the change that cited
+	// it, and why publishing the boundary BEFORE the snapshot is what closes the
+	// window (order, not atomicity -- takeRegistryHandles takes its own hold):
+	// see "Teardown closes the orphaned FDs" in README.md.
 	m.mu.Lock()
 	m.registryObsoleteFrom = m.registryGeneration
 	m.obsoleteEpochLogged = false
 	m.mu.Unlock()
+	staleMaps, stalePrograms := m.takeRegistryHandles()
+
+	// #6740: these Close() calls are syscalls and run with m.mu RELEASED, using
+	// the same snapshot-then-close idiom Close() uses for the link handles.
+	for _, h := range staleMaps {
+		if err := h.Close(); err != nil {
+			slog.Warn("teardown: closing orphaned shim map handle", "err", err)
+		}
+	}
+	for _, p := range stalePrograms {
+		if err := p.Close(); err != nil {
+			slog.Warn("teardown: closing orphaned shim program handle", "err", err)
+		}
+	}
 	// #6740: scoped section around the clears. teardownCleanupFn's unpin/remove
 	// sweep runs BEFORE it, never under the lock.
 	m.mu.Lock()
