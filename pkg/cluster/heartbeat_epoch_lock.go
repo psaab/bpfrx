@@ -20,13 +20,31 @@ import (
 // across PROCESSES, not merely within one.
 //
 // Within a process the one file this guards has a single writer at a time
-// (Manager.startBootEpochRefine admits one refine worker), but nothing in xpf
-// enforces a single daemon instance: there is no pidfile, and the gRPC listener
-// sets SO_REUSEPORT (pkg/grpcapi/server.go), so a second xpfd does NOT fail on a
-// port collision the way it otherwise would. Two overlapping incarnations could
-// therefore interleave read-modify-write, and an interleaved one can lose the
-// update the other just made. An advisory lock on a sidecar file is cheaper than
-// reasoning about whether the race is reachable.
+// (Manager.startBootEpochRefine admits one refine worker), but two overlapping
+// daemon incarnations could interleave read-modify-write, and an interleaved one
+// can lose the update the other just made. An advisory lock on a sidecar file is
+// cheaper than reasoning about whether the race is reachable.
+//
+// WHY OVERLAPPING INCARNATIONS ARE POSSIBLE — corrected in #8233. An earlier
+// revision of this comment said the primary gRPC listener sets SO_REUSEPORT
+// (pkg/grpcapi/server.go) so a second xpfd does not fail on a port collision.
+// That is wrong twice over, and the second half is the trap: server.go DOES set
+// SO_REUSEPORT — on the FABRIC listener, RunFabricListener — so a reader who
+// greps the file finds the option and concludes the correction is the error. The
+// PRIMARY management listener is a plain net.Listen("tcp", s.addr) with no
+// ListenConfig and no Control hook, and a second xpfd's bind on it DOES fail
+// with EADDRINUSE.
+//
+// What let the second daemon survive was supervisePrimaryListener treating every
+// bind failure as transient — log, back off, retry forever — while Run returned
+// nil, so the daemon came up with a permanently dead management listener. #8233
+// bounds the EADDRINUSE retry and then exits.
+//
+// THE CONCLUSION IS UNCHANGED and this lock is still required. #8233 reduces how
+// often two incarnations overlap; it does not make it unreachable — a supervisor
+// that ignores the exit code can still start a second daemon, and nothing helps a
+// node already in that state. See #7501's live-sibling refiner, which TOLERATES
+// it, and which this lock complements rather than duplicates.
 //
 // IT DOES NOT ORDER INCARNATIONS, and an earlier revision of this comment said
 // it did ("publish epochs that are not strictly ordered — which is precisely the

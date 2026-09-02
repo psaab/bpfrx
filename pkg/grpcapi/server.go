@@ -542,10 +542,11 @@ func (s *Server) Run(ctx context.Context) error {
 	// Returns nil on a clean ctx-cancel shutdown. The pre-#7611 contract
 	// returned the serve error, which the daemon logged non-fatally; with a
 	// supervisor there is no terminal error to return.
-	s.supervisePrimaryListener(ctx, primarySupervisorConfig{
-		backoffBase:  primaryBackoffBase,
-		backoffMax:   primaryBackoffMax,
-		healthyServe: primaryHealthyServe,
+	return s.supervisePrimaryListener(ctx, primarySupervisorConfig{
+		backoffBase:    primaryBackoffBase,
+		backoffMax:     primaryBackoffMax,
+		healthyServe:   primaryHealthyServe,
+		addrInUseGrace: primaryAddrInUseGrace,
 		listen: func(context.Context) (net.Listener, error) {
 			return net.Listen("tcp", s.addr)
 		},
@@ -553,7 +554,6 @@ func (s *Server) Run(ctx context.Context) error {
 			return s.serveUntilDone(ctx, s.buildPrimaryServer(), lis)
 		},
 	})
-	return nil
 }
 
 // Backoff shape for the primary listener supervisor. Deliberately the same
@@ -564,12 +564,48 @@ const (
 	primaryBackoffBase  = 100 * time.Millisecond
 	primaryBackoffMax   = 30 * time.Second
 	primaryHealthyServe = 30 * time.Second
+	// primaryAddrInUseGrace bounds how long the primary listener will keep
+	// retrying an EADDRINUSE before giving up and failing the daemon (#8233).
+	//
+	// SIZED AGAINST TimeoutStopSec IN THE UNIT, NOT PICKED. test/incus/
+	// xpfd.service sets Restart=on-failure / RestartSec=1 / TimeoutStopSec=20,
+	// so a restart starts the new process ONE second after the old one is asked
+	// to stop while the old one has TWENTY to exit. EADDRINUSE at startup is
+	// therefore routinely transient — it is the predecessor legitimately
+	// shutting down — and anything shorter than TimeoutStopSec turns a slow
+	// shutdown into a restart LOOP, because Restart=on-failure makes a fatal
+	// exit the very thing that re-triggers the start.
+	//
+	// TestPrimaryAddrInUseGraceExceedsUnitStopTimeout_8233 parses the unit and
+	// fails if this stops clearing it, so raising TimeoutStopSec cannot
+	// silently reintroduce that loop.
+	primaryAddrInUseGrace = 30 * time.Second
 )
+
+// ErrManagementPortHeld reports that the primary gRPC listener could not bind
+// because something else already holds the management port, and kept failing
+// for longer than primaryAddrInUseGrace (#8233).
+//
+// The daemon treats this as FATAL. Before #8233 the supervisor retried every
+// bind failure forever and Run returned nil, so a second xpfd came up with a
+// permanently dead management listener and no external signal (#8195) — every
+// gRPC-driven surface gone, the rest of the daemon running and writing to the
+// same host and the same epoch files.
+//
+// It does NOT close the mixed-version window: a supervisor that ignores the
+// exit code can still start a second daemon, and nothing here helps a node
+// already in the two-daemon state. #7501's live-sibling refiner remains the
+// mechanism that TOLERATES that state; this reduces how often it is reached.
+var ErrManagementPortHeld = errors.New("management port already bound by another process")
 
 type primarySupervisorConfig struct {
 	backoffBase  time.Duration
 	backoffMax   time.Duration
 	healthyServe time.Duration
+	// addrInUseGrace bounds retries of an EADDRINUSE bind before the supervisor
+	// gives up and returns ErrManagementPortHeld. A test sets it small; nothing
+	// else varies it.
+	addrInUseGrace time.Duration
 	// listen binds a fresh loopback listener. The #5035/#5278 clamp is NOT
 	// here: it mutates s.addr and must run once, before the loop, or a
 	// re-bind would re-clamp an already-clamped address and re-warn on every
@@ -611,28 +647,66 @@ func (s *Server) primaryListenerEscalations() uint64 {
 // plausibly transient — with Warn in between and Debug for the waits. A serve
 // session that stayed up for `healthyServe` resets the run, so a recovered
 // listener that faults again months later is loud again.
-func (s *Server) supervisePrimaryListener(ctx context.Context, cfg primarySupervisorConfig) {
+func (s *Server) supervisePrimaryListener(ctx context.Context, cfg primarySupervisorConfig) error {
 	backoff := cfg.backoffBase
 	firstOfRun := true
 	escalatedAtCap := false
+	// #8233: when the CURRENT run of consecutive EADDRINUSE failures began.
+	// Zero means the last bind attempt was not EADDRINUSE, so an intermittent
+	// collision that resolves cannot accumulate toward the deadline.
+	var addrInUseSince time.Time
 
 	for {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		lis, err := cfg.listen(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return nil
+			}
+			// #8233: EADDRINUSE is the one bind failure that says something
+			// ELSE already owns the management port. Every other failure — a
+			// permissions error, a missing VRF, a transient netlink fault — is
+			// a different condition and stays supervised forever, which is what
+			// the supervisor was built for.
+			//
+			// It is bounded rather than fatal on sight because the unit's own
+			// restart timing makes it ROUTINELY transient: RestartSec=1 against
+			// TimeoutStopSec=20 means the successor starts while the
+			// predecessor may still hold the port. Failing immediately would
+			// turn a slow shutdown into a restart loop, since Restart=on-failure
+			// makes the fatal exit re-trigger the start. Whether it RESOLVES is
+			// the only property that separates a restart overlap from a
+			// steady-state duplicate, and a bounded window is how you measure
+			// that.
+			if errors.Is(err, syscall.EADDRINUSE) && cfg.addrInUseGrace > 0 {
+				if addrInUseSince.IsZero() {
+					addrInUseSince = time.Now()
+				}
+				if held := time.Since(addrInUseSince); held >= cfg.addrInUseGrace {
+					s.setListenState("", grpcFailed)
+					slog.Error("management port is still held after waiting; another xpfd is already running — exiting rather than running with a dead management listener",
+						"addr", s.addr, "waited", held.Round(time.Second),
+						"grace", cfg.addrInUseGrace, "err", err)
+					return fmt.Errorf("%w: %s held for %s: %w",
+						ErrManagementPortHeld, s.addr, held.Round(time.Second), err)
+				}
+			} else {
+				addrInUseSince = time.Time{}
 			}
 			s.setListenState("", grpcFailed)
 			s.reportPrimaryFault("gRPC listener bind failed; will retry",
 				err, backoff, cfg, &firstOfRun, &escalatedAtCap)
 			if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
-				return
+				return nil
 			}
 			continue
 		}
+		// A successful bind ends any EADDRINUSE run: a later collision is a new
+		// event and gets the full window again, rather than inheriting a
+		// deadline from one that already resolved.
+		addrInUseSince = time.Time{}
 
 		// Record the effective serving address (post-clamp, post-bind) so
 		// `show system services` reports what the listener actually bound, not
@@ -653,7 +727,7 @@ func (s *Server) supervisePrimaryListener(ctx context.Context, cfg primarySuperv
 
 		if ctx.Err() != nil || serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped) {
 			slog.Info("gRPC server stopped", "addr", s.addr)
-			return
+			return nil
 		}
 
 		if time.Since(start) >= cfg.healthyServe {
@@ -664,7 +738,7 @@ func (s *Server) supervisePrimaryListener(ctx context.Context, cfg primarySuperv
 		s.reportPrimaryFault("gRPC listener serve fault; will retry",
 			serveErr, backoff, cfg, &firstOfRun, &escalatedAtCap)
 		if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
-			return
+			return nil
 		}
 	}
 }
