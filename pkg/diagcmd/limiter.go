@@ -153,6 +153,42 @@ const MaxConcurrentSessionWalks = 4
 // scrapers cannot collectively exceed it. Mirrors DefaultLimiter.
 var SessionWalkLimiter = NewLimiter(MaxConcurrentSessionWalks)
 
+// MaxConcurrentRemoteWalks bounds PEER-DIRECTED session work: a fan-out that
+// fetches the cluster peer's session table and drives NO local walk (#7294
+// item 3, the #5968 redesign).
+//
+// Before this, those paths (PeerSessions / PeerSessionSummary /
+// PeerZonePairSummary in pkg/grpcapi/peer_only_5968.go) took a slot from
+// SessionWalkLimiter. That was deliberate rather than accidental — skipping
+// admission entirely would have retired the #5880 lease-propagation guard on
+// the path it was written for — but it charges LOCAL scan budget for work that
+// touches no local bucket. At capacity 4 shared across REST and gRPC, a burst
+// of peer-directed requests could refuse genuine local scans while the local
+// table was untouched.
+//
+// Sized to match MaxConcurrentSessionWalks rather than chosen freely: the
+// point is to stop peer work COMPETING with local work, not to loosen what
+// bounds it. An unleased peer call was bounded by 4 slots before and is
+// bounded by 4 slots now.
+//
+// GLOBAL, not per-peer. A per-peer budget would fail to bound N peers, which
+// is the whole reason to bound a fabric-reachable surface at all. This cluster
+// has one peer today, so the distinction is untestable here and is a design
+// choice for the general case.
+//
+// SOLE CONSUMER today: the three peer-only entry points. A shared budget bounds
+// the SUM, not each contributor, so adding a consumer here silently tightens it
+// for the existing ones — that is a decision to make deliberately, not a
+// refactor.
+const MaxConcurrentRemoteWalks = 4
+
+// RemoteWalkLimiter is the process-wide budget for peer-directed session work.
+// Separate instance, separate budget, mirroring SnapshotReadLimiter (#8151):
+// saturating it must not refuse a local scan, and saturating SessionWalkLimiter
+// must not refuse a peer fetch. That independence is the whole deliverable and
+// is asserted in BOTH directions by the #7294 tests.
+var RemoteWalkLimiter = NewLimiter(MaxConcurrentRemoteWalks)
+
 // MaxConcurrentSnapshotReads bounds control-surface reads that copy an
 // IN-PROCESS structure rather than walking the conntrack table.
 //

@@ -30,6 +30,12 @@ import (
 // certifies that change instead of checking it, so this binding lands
 // BEFORE the change rather than with it.
 //
+// #7294 item 3 UPDATE: peer-directed work now takes diagcmd.RemoteWalkLimiter
+// rather than the session-walk budget, so this cell was restated onto that
+// limiter. The reason it had to exist BEFORE that change is unchanged and is
+// the point: without it the move would have been made under a guard that could
+// not observe it.
+//
 // Measured on the tree as it stands: REST delegates in-process to exactly
 // four gRPC methods (`svc.` in pkg/api/sessions.go) — PeerSessions at :476,
 // PeerSessionSummary at :753, PeerZonePairSummary at :998, and
@@ -40,13 +46,20 @@ import (
 // across an in-process delegation, and this file is where that fact is
 // checked rather than assumed.
 func TestPeerOnlyReusesAnAncestorLease7294(t *testing.T) {
-	orig := sessionWalkLimiter
-	sessionWalkLimiter = diagcmd.NewLimiter(1)
-	defer func() { sessionWalkLimiter = orig }()
+	// RESTATED, not relaxed (#7294 item 3). Until the remote budget existed
+	// this cell drove sessionWalkLimiter, and that was correct: it was the
+	// limiter these paths took. Item 3 moved peer-directed work to its own
+	// budget, so the SAME property is now asserted on the budget that actually
+	// governs the path. The assertion is unchanged in strength — an unleased
+	// call at capacity must still be refused — only in which limiter it is
+	// made against.
+	orig := remoteWalkLimiter
+	remoteWalkLimiter = diagcmd.NewLimiter(1)
+	defer func() { remoteWalkLimiter = orig }()
 
-	// Take the only slot the way the REST boundary does, keeping the leased
+	// Take the only slot the way an ancestor would, keeping the leased
 	// context. Capacity is now exhausted for anyone WITHOUT that lease.
-	release, leased, err := sessionWalkLimiter.AcquireCtx(context.Background())
+	release, leased, err := remoteWalkLimiter.AcquireCtx(context.Background())
 	if err != nil {
 		t.Fatalf("seed AcquireCtx: %v", err)
 	}
