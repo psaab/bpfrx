@@ -131,6 +131,21 @@ type Journal struct {
 	// does not stall behind it (#4829); production always uses
 	// (*os.File).Sync. Called with j.mu RELEASED.
 	syncFile func(*os.File) error
+	// inflight counts appends whose bytes are written but whose fsync has
+	// not completed yet, keyed by the INODE they were written to (#7174
+	// C06). Guarded by j.mu. Key 0 is the sentinel for "inode could not be
+	// determined" — no real inode is 0, and rotation treats an outstanding
+	// sentinel as unproven and defers, because it cannot show the segment it
+	// is about to destroy is not the one being fsynced.
+	//
+	// This exists because the durability step runs with j.mu RELEASED
+	// (#4829), so a writer can be parked between its f.Write and its f.Sync
+	// while another writer rotates. Renames are harmless — they preserve the
+	// inode, so the parked writer's bytes just move to ".1" — but the
+	// rotation also DESTROYS the oldest segment, and once that inode is
+	// unlinked the parked writer's fsync still succeeds and Log still returns
+	// SUCCESS for an audit record that no longer exists anywhere.
+	inflight map[uint64]int
 }
 
 // Option configures a Journal.
@@ -157,6 +172,7 @@ func New(path string, opts ...Option) *Journal {
 		maxSegmentBytes: DefaultMaxSegmentBytes,
 		maxSegments:     DefaultMaxSegments,
 		syncFile:        (*os.File).Sync,
+		inflight:        make(map[uint64]int),
 	}
 	for _, o := range opts {
 		o(j)
@@ -266,11 +282,17 @@ func (j *Journal) Log(entry *Entry) error {
 		return fmt.Errorf("marshal journal entry: %w", err)
 	}
 
-	f, created, rotated, err := j.appendLocked(data)
+	f, ino, created, rotated, err := j.appendLocked(data)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// #7174 C06: the append is registered as in flight from the moment
+	// appendLocked's f.Write returns until this fsync completes, so a
+	// concurrent rotation cannot destroy the inode underneath it. Deferred so
+	// every return path below clears it — a leaked registration would defer
+	// rotation for the life of the process.
+	defer j.releaseInflight(ino)
 
 	// Durability with j.mu RELEASED (see the method doc). Do NOT move
 	// these back under the lock: that reintroduces #4829, where a Tail
@@ -299,7 +321,7 @@ func (j *Journal) Log(entry *Entry) error {
 // so the buffered f.Write completes and is visible in the page cache
 // before the lock is released — any concurrent Tail that then acquires
 // j.mu sees a complete record, never a torn one.
-func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, err error) {
+func (j *Journal) appendLocked(data []byte) (f *os.File, ino uint64, created, rotated bool, err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -307,7 +329,7 @@ func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, 
 
 	rotated, err = j.maybeRotateLocked()
 	if err != nil {
-		return nil, false, false, err
+		return nil, 0, false, false, err
 	}
 
 	if _, statErr := os.Stat(j.path); os.IsNotExist(statErr) {
@@ -360,27 +382,32 @@ func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, 
 	// component.
 	f, err = os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
-		return nil, false, false, fmt.Errorf("open journal: %w", err)
+		return nil, 0, false, false, fmt.Errorf("open journal: %w", err)
 	}
-	if fi, statErr := f.Stat(); statErr != nil {
+	fi, statErr := f.Stat()
+	if statErr != nil {
 		f.Close()
-		return nil, false, false, fmt.Errorf("stat journal after open: %w", statErr)
-	} else if !fi.Mode().IsRegular() {
+		return nil, 0, false, false, fmt.Errorf("stat journal after open: %w", statErr)
+	}
+	if !fi.Mode().IsRegular() {
 		mode := fi.Mode()
 		f.Close()
-		return nil, false, false, fmt.Errorf(
+		return nil, 0, false, false, fmt.Errorf(
 			"journal path %s is not a regular file (mode %s) — refusing to append the "+
 				"audit journal into it", j.path, mode)
 	}
+	// #7174 C06: the inode this record is about to land in. maybeRotateLocked
+	// will not destroy it while the fsync is outstanding.
+	ino = inodeOf(fi)
 
 	// Torn-tail self-heal: a crash between a previous write and its
 	// fsync can leave a partial final line. Starting this record on a
 	// fresh line confines the damage to that one record (which the
 	// tail reader's parse-or-skip rule already drops).
 	buf := make([]byte, 0, len(data)+2)
-	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 {
+	if tail, tailErr := f.Stat(); tailErr == nil && tail.Size() > 0 {
 		last := make([]byte, 1)
-		if _, readErr := f.ReadAt(last, fi.Size()-1); readErr == nil && last[0] != '\n' {
+		if _, readErr := f.ReadAt(last, tail.Size()-1); readErr == nil && last[0] != '\n' {
 			buf = append(buf, '\n')
 		}
 	}
@@ -389,9 +416,36 @@ func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, 
 
 	if _, writeErr := f.Write(buf); writeErr != nil {
 		f.Close()
-		return nil, false, false, fmt.Errorf("write journal entry: %w", writeErr)
+		return nil, 0, false, false, fmt.Errorf("write journal entry: %w", writeErr)
 	}
-	return f, created, rotated, nil
+	// #7174 C06: registered under j.mu, released by Log after the fsync. The
+	// registration has to happen HERE, before the lock is dropped, or a
+	// rotation could slip between the write and the registration.
+	j.inflight[ino]++
+	return f, ino, created, rotated, nil
+}
+
+// inodeOf reports fi's inode number, or 0 when it cannot be determined. 0 is a
+// sentinel, not a real inode: rotation treats an outstanding 0 as an append it
+// cannot place and defers rather than destroying a segment it cannot prove is
+// unrelated (#7174 C06).
+func inodeOf(fi os.FileInfo) uint64 {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return st.Ino
+}
+
+// releaseInflight clears one in-flight append registration for ino (#7174 C06).
+func (j *Journal) releaseInflight(ino uint64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if n := j.inflight[ino]; n > 1 {
+		j.inflight[ino] = n - 1
+	} else {
+		delete(j.inflight, ino)
+	}
 }
 
 // maybeRotateLocked rotates the current segment when it is at or over
@@ -399,10 +453,37 @@ func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, 
 // segment shifts up one slot, and the current file becomes ".1". A
 // crash mid-shift can leave a gap in the segment sequence (lost oldest
 // retention); Tail tolerates gaps. Caller holds j.mu.
+//
+// #7174 C06: rotation DEFERS while an append to the segment it would destroy
+// is still in flight. Exactly one inode dies per rotation — the oldest kept
+// segment, removed below (the shifting renames only replace paths whose inode
+// that Remove already unlinked) — and the renames themselves are harmless
+// because a rename preserves the inode, so a parked writer's bytes simply move
+// with it into ".1".
+//
+// The window exists because the durability step runs with j.mu RELEASED
+// (#4829): a writer is registered in j.inflight from its f.Write until its
+// f.Sync returns, and in that gap another writer can rotate. It takes
+// maxSegments+1 rotations for a parked writer's inode to reach the oldest slot
+// — three full segments of appends at the defaults — which is why this is an
+// audit-integrity edge case rather than a routine loss. It is worth closing
+// anyway because of HOW it fails: the parked writer's fsync on an unlinked
+// inode SUCCEEDS, so Log returns success, the caller
+// (Store.journalLog) has nothing to log a warning about, and the audit record
+// is simply not there. Nothing anywhere reports a loss.
+//
+// Deferring is safe against starvation: the condition names ONE OLD inode, and
+// new appends land on the current segment (a different inode), so nothing that
+// arrives later can extend the deferral. The next append after that writer's
+// fsync rotates. The cost of deferring is a current segment that overshoots
+// maxSegmentBytes by one record.
 func (j *Journal) maybeRotateLocked() (bool, error) {
 	fi, err := os.Stat(j.path)
 	if err != nil || fi.Size() < j.maxSegmentBytes {
 		return false, nil // missing/unreadable current segment: nothing to rotate
+	}
+	if j.oldestSegmentHasInflightAppendLocked() {
+		return false, nil
 	}
 	if err := os.Remove(j.segmentPath(j.maxSegments)); err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("rotate journal: remove oldest segment: %w", err)
@@ -421,6 +502,36 @@ func (j *Journal) maybeRotateLocked() (bool, error) {
 	// owner-only here so rotation never widens exposure (#5188).
 	chmodOwnerOnly(j.segmentPath(1))
 	return true, nil
+}
+
+// oldestSegmentHasInflightAppendLocked reports whether the segment the next
+// rotation would DESTROY still has an append whose fsync has not completed
+// (#7174 C06). Caller holds j.mu.
+//
+// Lstat, not Stat: a symlink planted at a segment path must be identified as
+// the symlink's own inode. Following it would compare against the TARGET's
+// inode, which is never one of ours, so a planted link would silently defeat
+// the guard — and the rest of this package already refuses to follow a
+// symlinked segment (chmodOwnerOnly, and appendLocked's O_NOFOLLOW).
+func (j *Journal) oldestSegmentHasInflightAppendLocked() bool {
+	// The 0 sentinel means some in-flight append's inode could not be
+	// determined. Nothing can be proven about it, so defer.
+	if j.inflight[0] > 0 {
+		slog.Warn("journal: deferring rotation, an append with an unidentified segment is in flight")
+		return true
+	}
+	oldest := j.segmentPath(j.maxSegments)
+	fi, err := os.Lstat(oldest)
+	if err != nil {
+		return false // nothing there to destroy
+	}
+	ino := inodeOf(fi)
+	if ino == 0 || j.inflight[ino] == 0 {
+		return false
+	}
+	slog.Warn("journal: deferring rotation, an append to the oldest segment is still being fsynced",
+		"segment", oldest)
+	return true
 }
 
 // Tail returns up to limit most-recent entries in oldest-first order
