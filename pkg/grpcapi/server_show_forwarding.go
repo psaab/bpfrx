@@ -200,7 +200,7 @@ func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *str
 	// copies with no shared formatter, and the comment that used to sit
 	// here said so — "annotating one leaves the other lying". Now there is
 	// one render and the parity test compares two callers of it.
-	buf.WriteString(dpformat.FormatPortMirroring(cfg))
+	buf.WriteString(dpformat.FormatPortMirroring(cfg, s.mirrorExclusions()))
 }
 
 // flowServerNotInstalledSuffix returns the `[NOT INSTALLED: <reason>]` suffix
@@ -242,4 +242,23 @@ func sortedInstanceNames[T any](m map[string]T) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// mirrorExclusions reads the #7357 §2 runtime verdicts off the applied
+// snapshot, or nil when the backend keeps none. Capability assertion for the
+// same reason as the CLI twin: a nil-returning stub would be
+// indistinguishable from "nothing was excluded".
+func (s *Server) mirrorExclusions() []dpuserspace.MirrorExclusion {
+	// Through dpProbe(), NOT the stored dp field. #2114: under the live
+	// indirection the field holds a wrapper, so a type assertion on it
+	// answers "capability absent" for a HEALTHY backend that implements the
+	// method — which here would render an armed instance as un-annotated,
+	// the exact lie this change exists to stop.
+	// TestOptionalCapabilityProbesUseDPProbe is the canary; it caught this.
+	if m, ok := s.dpProbe().(interface {
+		MirrorExclusions() []dpuserspace.MirrorExclusion
+	}); ok {
+		return m.MirrorExclusions()
+	}
+	return nil
 }

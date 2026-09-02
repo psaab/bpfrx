@@ -65,7 +65,7 @@ func TestMirrorBuilderDropsMatchThePredicate_6534(t *testing.T) {
 					"no longer constructs the case it names", gotReason != "", gotReason, c.wantExcluded)
 			}
 
-			snaps := buildMirrorConfigSnapshots(cfg, ifaces)
+			snaps, _ := buildMirrorConfigSnapshots(cfg, ifaces)
 			builderExcluded := len(snaps) == 0
 			if builderExcluded != c.wantExcluded {
 				verdict := "the builder PUBLISHED an instance the predicate calls excluded, " +

@@ -273,7 +273,13 @@ type ConfigSnapshot struct {
 	ClassOfService        *ClassOfServiceSnapshot     `json:"class_of_service,omitempty"`
 	FlowExport            *FlowExportSnapshot         `json:"flow_export,omitempty"`
 	MirrorConfigs         []MirrorConfigSnapshot      `json:"mirror_configs,omitempty"`
-	AddressBooks          []AddressBookSnapshot       `json:"address_books,omitempty"`
+	// MirrorExclusions records the port-mirroring entries this snapshot's
+	// build REFUSED to install for a runtime reason (#7357 §2). Carried on
+	// the snapshot so a show surface renders the verdict that was actually
+	// applied rather than re-deriving one from a live interface table that
+	// may have moved since.
+	MirrorExclusions []MirrorExclusion     `json:"mirror_exclusions,omitempty"`
+	AddressBooks     []AddressBookSnapshot `json:"address_books,omitempty"`
 	// AppCatalog is the L3/L4 application-identification catalog (#2008 M5):
 	// the ordered (protocol, port-range) -> app_id classification table the
 	// dataplane uses to stamp app_id on a new session. Additive field — an
@@ -333,13 +339,13 @@ type AddressBookSnapshot struct {
 }
 
 type FlowSnapshot struct {
-	AllowDNSReply      bool `json:"allow_dns_reply,omitempty"`
-	AllowEmbeddedICMP  bool `json:"allow_embedded_icmp,omitempty"`
-	TCPMSSAllTCP       int  `json:"tcp_mss_all_tcp,omitempty"`
-	TCPMSSIPsecVPN     int  `json:"tcp_mss_ipsec_vpn,omitempty"`
-	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
-	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
-	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
+	AllowDNSReply     bool `json:"allow_dns_reply,omitempty"`
+	AllowEmbeddedICMP bool `json:"allow_embedded_icmp,omitempty"`
+	TCPMSSAllTCP      int  `json:"tcp_mss_all_tcp,omitempty"`
+	TCPMSSIPsecVPN    int  `json:"tcp_mss_ipsec_vpn,omitempty"`
+	TCPMSSGreIn       int  `json:"tcp_mss_gre_in,omitempty"`
+	TCPMSSGreOut      int  `json:"tcp_mss_gre_out,omitempty"`
+	TCPSessionTimeout int  `json:"tcp_session_timeout,omitempty"` // seconds, 0=default
 	// #7342: the three `security flow tcp-session` windows #6539 recorded as
 	// having no wire carrier. Seconds, 0=unset (the helper keeps its default).
 	// `omitempty` + Rust `serde(default)` is the repo's skew-tolerant additive
@@ -349,8 +355,8 @@ type FlowSnapshot struct {
 	TCPInitialTimeout  int `json:"tcp_initial_timeout,omitempty"`
 	TCPClosingTimeout  int `json:"tcp_closing_timeout,omitempty"`
 	TCPTimeWaitTimeout int `json:"tcp_time_wait_timeout,omitempty"`
-	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
-	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
+	UDPSessionTimeout  int `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
+	ICMPSessionTimeout int `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
 	// GREAcceleration carries `security flow gre-performance-acceleration`
 	// (#3360). On vSRX this extracts the GRE key/call-id into the session tuple
 	// so multiple GRE tunnels between the same endpoints map to distinct
