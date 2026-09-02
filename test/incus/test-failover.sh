@@ -250,8 +250,18 @@ POOL_LAN_IF="${POOL_LAN_IF:-$(incus exec "$CLUSTER_LAN_HOST" -- \
 # below would then report a confident NAT-allocator defect for an admission
 # event. "Total sessions:" is the listing's own terminator, so its presence is
 # what separates "ran and found none" from "did not run".
+# POOL_QUERY_ERR carries the last query's stderr, so a VOID can say WHY.
+POOL_QUERY_ERR=""
 pool_session_count() {
 	local node="$1" out
+	# stderr is CAPTURED, not discarded. Verified on the path this actually
+	# runs: cmd/cli/show_flow.go calls GetSessions and on error does
+	# `return fmt.Errorf(...)` BEFORE printing "Total sessions:", and
+	# cmd/cli/main.go writes `error: %v` to stderr. So the absence of the
+	# terminator is a sound refusal signal — and the reason is on stderr, which
+	# an earlier version threw away, leaving a VOID that could not be acted on.
+	POOL_QUERY_ERR=$(incus exec "$node" -- cli -c \
+		"show security flow session source-prefix ${POOL_SRC}" 2>&1 >/dev/null || true)
 	out=$(incus exec "$node" -- cli -c \
 		"show security flow session source-prefix ${POOL_SRC}" 2>/dev/null || true)
 	if ! grep -q "Total sessions:" <<<"$out"; then
@@ -427,7 +437,7 @@ elif [[ -z "$POOL_LAN_IF" ]]; then
 else
 	pool_fw0=$(pool_session_count "$FW0")
 	if [[ "$pool_fw0" == VOID ]]; then
-		fail "#8280: fw0's session query returned no listing, so pool-mode NAT was NOT MEASURED. This is most likely session-scan ADMISSION (the surface is gated on a 4-slot budget shared across REST and gRPC), not a NAT defect — re-run when nothing else is scanning rather than reading it as an allocator failure"
+		fail "#8280: fw0's session query returned no listing, so pool-mode NAT was NOT MEASURED. This is most likely session-scan ADMISSION (the surface is gated on a 4-slot budget shared across REST and gRPC), not a NAT defect — re-run when nothing else is scanning rather than reading it as an allocator failure. Query stderr: ${POOL_QUERY_ERR:-<none>}"
 	elif [[ "$pool_fw0" -ge 1 ]]; then
 		pass "fw0 translated $pool_fw0 pool-mode session(s) to $POOL_NAT_ADDR (PortAllocator::claim ran)"
 	else
@@ -436,7 +446,7 @@ else
 
 	pool_fw1=$(pool_session_count "$FW1")
 	if [[ "$pool_fw1" == VOID ]]; then
-		fail "#8280: fw1's session query returned no listing, so the standby import was NOT MEASURED — see the admission note on the fw0 assertion above"
+		fail "#8280: fw1's session query returned no listing, so the standby import was NOT MEASURED — see the admission note on the fw0 assertion above. Query stderr: ${POOL_QUERY_ERR:-<none>}"
 	elif [[ "$pool_fw1" -ge 1 ]]; then
 		pass "fw1 imported $pool_fw1 pool-mode session(s) (reserve_flow -> occupancy.reserve)"
 	else
@@ -618,7 +628,7 @@ if [[ "$POOL_NAT_SMOKE" == 1 && -n "$POOL_LAN_IF" ]]; then
 	sleep 5
 	post_pool=$(pool_session_count "$FW0")
 	if [[ "$post_pool" == VOID ]]; then
-		fail "#8280: the post-failback session query returned no listing, so the allocator's state after the role change was NOT MEASURED — see the admission note above. A VOID here is NOT evidence the allocator is healthy"
+		fail "#8280: the post-failback session query returned no listing, so the allocator's state after the role change was NOT MEASURED — see the admission note above. A VOID here is NOT evidence the allocator is healthy. Query stderr: ${POOL_QUERY_ERR:-<none>}"
 	elif [[ "$post_pool" -ge 1 ]]; then
 		pass "the pool allocator still hands out a translation after a full primary->secondary->primary cycle"
 	else
