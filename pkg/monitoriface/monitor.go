@@ -57,6 +57,27 @@ type Snapshot struct {
 	Collisions         uint64
 	Userspace          *UserspaceSnapshot
 	Timestamp          time.Time
+
+	// #7422 row 10: per-counter-group validity. Two INDEPENDENT reads populate
+	// this snapshot and each could fail silently — the dataplane counter read
+	// (RxBytes/TxBytes/RxPkts/TxPkts) and the kernel link statistics
+	// (errors/drops/frame/carrier/collisions, and the byte/packet FALLBACK).
+	// Before this, both were `if err == nil { ... }` with no else, so a failed
+	// read left the fields at zero and the renderer printed 0 — a value
+	// indistinguishable from a genuinely idle interface. The Userspace group 15
+	// lines below already carried a StatusNote on failure; these two did not,
+	// and that asymmetry is what the row names.
+	//
+	// DELIBERATELY TWO FIELDS, NOT ONE. The two groups are read from different
+	// epochs — the dataplane's own counters and the kernel's link stats — and a
+	// single note spanning both would tell an operator that "the counters" are
+	// unavailable when one source is fine. That is the epoch-mixing this row
+	// exists to flag, reproduced in the fix.
+	//
+	// Empty means the group was read successfully (or was not attempted, which
+	// the renderer distinguishes by the reader being absent).
+	DataplaneCountersNote string
+	KernelStatsNote       string
 }
 
 type trafficCounters struct {
@@ -496,10 +517,19 @@ func ReadSnapshot(counterReader CounterReader, statusReader StatusReader, kernel
 			snap.TxBytes = ctrs.TxBytes
 			snap.RxPkts = ctrs.RxPackets
 			snap.TxPkts = ctrs.TxPackets
+		} else {
+			// #7422 row 10: without this the fields stay 0 and render as a
+			// genuinely idle interface.
+			snap.DataplaneCountersNote = err.Error()
 		}
 	}
 
 	link, err := netlink.LinkByName(kernelName)
+	if err != nil {
+		// #7422 row 10: a failed link lookup left every error/drop counter at
+		// zero, which reads as a healthy interface rather than an unread one.
+		snap.KernelStatsNote = err.Error()
+	}
 	if err == nil {
 		if stats := link.Attrs().Statistics; stats != nil {
 			snap.RxErrors = stats.RxErrors
@@ -515,6 +545,10 @@ func ReadSnapshot(counterReader CounterReader, statusReader StatusReader, kernel
 				snap.RxPkts = stats.RxPackets
 				snap.TxPkts = stats.TxPackets
 			}
+		} else {
+			// The link resolved but carries no statistics block. Distinct from
+			// a failed lookup and equally invisible in the rendered zeros.
+			snap.KernelStatsNote = "link carries no statistics"
 		}
 	}
 
@@ -583,6 +617,14 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	currCounters := displayTrafficCounters(snap)
 
 	fmt.Fprintf(w, "Traffic statistics (interface counters + userspace XSK traffic): Current delta\n")
+	// #7422 row 10: annotate the group whose read FAILED, so a rendered 0 is
+	// not read as an idle interface. Per group, because the dataplane counters
+	// and the kernel link stats are separate reads from separate epochs and one
+	// note for both would misreport a healthy source as unavailable.
+	if snap.DataplaneCountersNote != "" {
+		fmt.Fprintf(w, "  Note: dataplane counters unavailable (%s) — byte/packet values below are NOT a measurement\n",
+			snap.DataplaneCountersNote)
+	}
 	fmt.Fprintf(w, "  Input  bytes:         %20d (%d bps)    [%d]\n", currCounters.rxBytes, rxBps, rxBytesDelta)
 	fmt.Fprintf(w, "  Output bytes:         %20d (%d bps)    [%d]\n", currCounters.txBytes, txBps, txBytesDelta)
 	fmt.Fprintf(w, "  Input  packets:       %20d (%d pps)    [%d]\n", currCounters.rxPkts, rxPps, rxPktsDelta)
@@ -601,6 +643,13 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	}
 
 	fmt.Fprintf(w, "Error statistics:                                  Current delta\n")
+	// #7422 row 10: the kernel link statistics feed EVERY line in this block,
+	// plus the byte/packet fallback above, so a failed read renders a clean
+	// interface rather than an unread one.
+	if snap.KernelStatsNote != "" {
+		fmt.Fprintf(w, "  Note: kernel link statistics unavailable (%s) — the zeros below are NOT a measurement\n",
+			snap.KernelStatsNote)
+	}
 	fmt.Fprintf(w, "  Input  errors:        %20d          [%d]\n", snap.RxErrors, rxErrDelta)
 	fmt.Fprintf(w, "  Output errors:        %20d          [%d]\n", snap.TxErrors, txErrDelta)
 	fmt.Fprintf(w, "  Input  drops:         %20d          [%d]\n", snap.RxDrops, rxDropDelta)

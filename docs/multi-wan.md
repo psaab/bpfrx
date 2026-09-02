@@ -369,15 +369,38 @@ How it lands (the `instance-type forwarding` divergence fix):
   match the rule and be mis-steered into the wrong uplink's VRF. A filter
   attached to several interfaces expands to one iif-scoped rule per
   interface rather than a single global rule.
-- **PBR build-health metrics (#4422)**: `xpf_pbr_rules_installed`
+- **PBR build-health metrics (#4422, #7422)**: `xpf_pbr_rules_desired`
   gauges the number of kernel `ip rule` FBF entries the active config
-  yields (the desired-install set), and `xpf_pbr_degraded_terms` gauges
+  yields (the desired-install set), `xpf_pbr_rules_applied` counts the
+  FBF rules actually present in the kernel (read back by counting ip
+  rules in the PBR priority band), and `xpf_pbr_degraded_terms` gauges
   the number of routing-instance filter terms DROPPED from the kernel
   mirror by the fail-closed rule above. A sustained
   `xpf_pbr_degraded_terms > 0` means the kernel slow path under-steers
   vs the userspace fast path — an operator alerting hook for a config
   whose FBF cannot be fully represented as `ip rule`s. There is
-  deliberately no "widened" metric: the builder never widens an
+  **`xpf_pbr_rules_installed` is a DEPRECATED ALIAS of
+  `xpf_pbr_rules_desired`** and carries the identical value. It was named
+  for an applied fact and derived from a desired one, so a rule the
+  builder produced but the kernel refused counted as installed — the
+  metric an operator alerts on could not see the failure it exists to
+  catch. It keeps its current config-derived meaning rather than being
+  re-pointed at `_applied`: redefining a published metric's meaning under
+  existing alert expressions moves the semantics underneath an unchanged
+  consumer, and renaming outright fails to an alert that stops firing,
+  which is invisible until it is needed. **Removal is not scheduled** —
+  the trigger is that every alert expression and dashboard panel
+  selecting it has moved to one of the two replacements, and that
+  compatibility surface needs a named owner.
+
+  `xpf_pbr_rules_applied` is **omitted entirely** when the netlink
+  readback fails, rather than published as 0: a fabricated zero against a
+  non-zero desired count looks exactly like a total install failure. A
+  missing series is a visible gap; a fabricated one is a false alarm.
+  A partial read (one address family failing) invalidates the whole
+  count for the same reason.
+
+  There is deliberately no "widened" metric: the builder never widens an
   unrepresentable match (fail-closed), so an over-steer is never
   mirrored. Both gauges are config-derived and emitted even in a
   config-only / degraded boot.

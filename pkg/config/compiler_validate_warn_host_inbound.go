@@ -259,12 +259,11 @@ func validateDefaultPolicyLogWarnings(cfg *Config) []string {
 	if cfg == nil {
 		return nil
 	}
-	if !cfg.Security.DefaultPolicyLogSessionInit && !cfg.Security.DefaultPolicyLogSessionClose {
-		return nil
-	}
-	// Meaningful for permit-all (a session is installed). deny-all/reject-all
-	// install no session, so the session-init/close records never fire.
-	if cfg.Security.DefaultPolicy == PolicyPermit {
+	// #7422 row 13: the DECISION lives in DefaultPolicyLogFlagsInert so this
+	// advisory and the three renderers that surface the flags cannot disagree
+	// about which case is inert. The wording below stays here; only the
+	// predicate is shared.
+	if !DefaultPolicyLogFlagsInert(cfg) {
 		return nil
 	}
 	var modes []string

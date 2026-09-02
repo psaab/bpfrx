@@ -182,8 +182,20 @@ func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
 		cfg = c.srv.store.ActiveConfig()
 	}
 	installed, degraded := routing.PBRBuildStats(cfg)
+	// #7422 row 12: _installed and _desired are emitted from the SAME value, so
+	// the alias cannot drift. Deliberately not `float64(installed)` twice from
+	// two call sites — one call, one number, two names.
 	ch <- prometheus.MustNewConstMetric(c.pbrRulesInstalled,
 		prometheus.GaugeValue, float64(installed))
+	ch <- prometheus.MustNewConstMetric(c.pbrRulesDesired,
+		prometheus.GaugeValue, float64(installed))
+	// The applied readback is OMITTED on failure rather than reported as 0 —
+	// see the descriptor. A missing series is a visible gap in a dashboard; a
+	// fabricated zero is an alert firing for a failure that did not happen.
+	if applied, ok := routing.PBRAppliedCountLive(); ok {
+		ch <- prometheus.MustNewConstMetric(c.pbrRulesApplied,
+			prometheus.GaugeValue, float64(applied))
+	}
 	ch <- prometheus.MustNewConstMetric(c.pbrDegradedTerms,
 		prometheus.GaugeValue, float64(degraded))
 }
