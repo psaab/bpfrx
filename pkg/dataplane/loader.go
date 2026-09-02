@@ -1414,62 +1414,19 @@ func (m *Manager) Teardown() error {
 	// generation. Record the boundary so a lookup that serves one is refused
 	// and counted.
 	//
-	// The registry itself is still deliberately NOT cleared, but the ORIGINAL
-	// reason no longer holds and is corrected here (#7755). It read: "the
-	// retained state is what the #2114 A3 proceed-on-retained rule acts on".
-	// That was true AS WRITTEN — `registryRetained` (armed_gate.go) lists "a
-	// Teardown-retained bootstrap manager" as one of its three classes, and
-	// every class proceeded. #6741 AC1 then made lookupMapLocked and
-	// lookupProgramLocked REFUSE while `registryObsoleteLocked` holds, which
-	// removed this window from A3 operationally. So the sentence justifying the
-	// decision was hollowed out by the very change that cited it, and no reader
-	// could tell, because neither comment dated itself.
-	//
-	// The reasons that DO survive, and are the ones to weigh if this is ever
-	// revisited: a non-empty m.maps is what `classifyRegistry` reads to
-	// distinguish registryRetained from registryFresh, `registryObsoleteLocked`
-	// needs the entries present to refuse and count at all, and test fixtures
-	// inject handles directly. Clearing would change all three; closing the
-	// FDs, which #7755 does below, changes none of them.
+	// The registry is deliberately NOT cleared, and #7755 CLOSES the orphaned
+	// FDs without clearing it. Why closing is not clearing, why the original
+	// justification for not clearing was hollowed out by the change that cited
+	// it, and why publishing the boundary BEFORE the snapshot is what closes the
+	// window (order, not atomicity -- takeRegistryHandles takes its own hold):
+	// see "Teardown closes the orphaned FDs" in README.md.
 	m.mu.Lock()
 	m.registryObsoleteFrom = m.registryGeneration
 	m.obsoleteEpochLogged = false
 	m.mu.Unlock()
-	// #7755: snapshot the registry's map/program handles so their FDs can be
-	// closed below. This is a SECOND, SEPARATE hold — takeRegistryHandles
-	// acquires m.mu itself — and it deliberately does not share the one above.
-	// What closes the window is ORDER, not atomicity: the obsolescence boundary
-	// is published first, and #6741 AC1's lookupMapLocked/lookupProgramLocked
-	// refuse from that instant, so no lookup landing between the two holds can
-	// be served a handle this function is about to close.
 	staleMaps, stalePrograms := m.takeRegistryHandles()
 
-	// #7755: CLOSE the orphaned handles, and deliberately do NOT clear the
-	// registry entries.
-	//
-	// THE LEAK. Close() closes only the XDP/TC link handles and the Cleanup
-	// above unpins WITHOUT closing, so before this every m.maps / m.programs FD
-	// survived the bootstrap cycle that created it. Each retained FD also keeps
-	// its kernel object alive, so an FD and its locked memory accumulated per
-	// cycle — the recurrence paths are bootstrap.go's enterBootstrapMode and the
-	// standalone first-commit timeout in daemon_apply_commit.go.
-	//
-	// CLOSING IS NOT CLEARING. The entries stay, so `registryObsoleteLocked` and
-	// the #6741 counters see exactly what they saw before, `classifyRegistry`
-	// still reads the same non-empty m.maps, and every test fixture that injects
-	// handles is unaffected. Only the FDs go.
-	//
-	// SECONDARY, AND NARROW. `lookupMapLocked` releases m.mu before its caller
-	// makes the syscall, so a handle taken just before this boundary can still
-	// be used just after it. That window is microseconds inside a single
-	// accessor — no accessor returns a registry handle and nothing caches one,
-	// so there is no long-lived escaped handle in the tree — but within it a
-	// mutation previously SUCCEEDED against an orphan nothing forwards through.
-	// A closed FD makes the same call return EBADF (cilium/ebpf's
-	// sys.ErrClosedFd) instead, which is the reported-error direction: no site
-	// in pkg/dataplane/maps_*.go treats a map write failure as fatal.
-	//
-	// #6740: the Close() calls are syscalls and run with m.mu RELEASED, using
+	// #6740: these Close() calls are syscalls and run with m.mu RELEASED, using
 	// the same snapshot-then-close idiom Close() uses for the link handles.
 	for _, h := range staleMaps {
 		if err := h.Close(); err != nil {

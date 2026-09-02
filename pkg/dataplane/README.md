@@ -861,6 +861,56 @@ per-epoch log. It is **not** wired to Prometheus: the API collector reaches the
 dataplane through the narrow `apiRuntimeDataPlane` interface (47 references plus
 several test fakes), and widening that is a separable change with its own review.
 
+### Teardown closes the orphaned FDs (#7755)
+
+`publishShimRegistryLocked` overwrites `m.maps` / `m.programs` without closing
+the handles it displaces, and `Teardown` did not close them either: `Close()`
+handles only the XDP/TC links, and `teardownCleanupFn` unpins *without* closing.
+Every registry FD therefore survived the bootstrap cycle that created it,
+keeping its kernel object and locked memory alive — once per
+`enterBootstrapMode`, once per the standalone first-commit timeout in
+`daemon_apply_commit.go`.
+
+**This is the mutation-time half of AC1 above.** AC1 refuses handles obtained
+*after* the Teardown boundary. A handle obtained just before it and held across
+was neither refused nor counted, and the check that would cover it cannot be
+written under `m.mu`, because #6740 forbids holding the lock across a BPF
+syscall. A closed FD *is* that check, enforced by the kernel with no lock held:
+the mutation returns `EBADF` (`sys.ErrClosedFd`) instead of silently succeeding
+against an orphan nothing forwards through. The exposure is narrow —
+`lookupMapLocked` releases `m.mu` before its caller makes the syscall, but no
+accessor returns a registry handle and nothing caches one, so the window is
+microseconds inside a single accessor. `EBADF` is also the safe direction: no
+site in `maps_*.go` treats a map-write failure as fatal.
+
+**Closing is not clearing.** The entries stay, so `classifyRegistry` still reads
+a non-empty `m.maps` to distinguish `registryRetained` from `registryFresh`,
+`registryObsoleteLocked` still has the entries it needs to refuse and count, and
+fixtures that inject handles are unaffected. Only the FDs go.
+
+**A hollowed rationale, recorded because it is the interesting part.** The
+original comment justified not clearing with "the retained state is what the
+#2114 A3 proceed-on-retained rule acts on". That was true *as written* —
+`registryRetained` lists a Teardown-retained bootstrap manager as one of its
+three classes, and every class proceeded. AC1 then made the lookups REFUSE while
+`registryObsoleteLocked` holds, which removed this window from A3 operationally.
+The sentence justifying the decision was hollowed out by the very change that
+cited it, and no reader could tell, because neither comment dated itself. The
+reasons that *do* survive are the three in the paragraph above.
+
+**Ordering, not atomicity.** `takeRegistryHandles` acquires `m.mu` itself, so
+the snapshot is a second, separate hold — it is deliberately not a `...Locked`
+helper, and calling it under the lock would self-deadlock. What closes the
+window is that the obsolescence boundary is published *first*: AC1 refuses from
+that instant, so no lookup landing between the two holds can be served a handle
+Teardown is about to close.
+
+**Canary.** The snapshot goes through a named helper rather than adding
+`Teardown` to `registryAccessAllowlist`, which would widen exactly the surface
+the canary defends. Ranging the registry inside an allowlisted function is now
+an accepted shape; `bad_rangenolock.go` keeps that from meaning "range is
+permitted *anywhere*".
+
 ## Live-indirection primitives (#2114 / #6743 r6)
 
 `live.go` carries the three things the daemon's `liveDataPlane` adapter
