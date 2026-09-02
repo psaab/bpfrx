@@ -12,6 +12,21 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
+// leaseProbeCluster MODELS the in-process gRPC session service; it is not
+// that service. What this file binds is the REST half of #5880 — that the
+// handler acquires, stamps the lease and re-stamps the request before
+// delegating — and a stub delegate is the right instrument for that: it
+// isolates the boundary from whatever the delegate happens to do.
+//
+// It is NOT a binding on the delegate. If the real peer-only methods stop
+// re-acquiring the session-walk limiter (which is exactly what #7294 item 3's
+// separate remote budget does), this stub goes on re-acquiring it and this
+// test goes on passing, describing a delegation shape that no longer exists.
+// The production binding for the delegate's half lives in
+// pkg/grpcapi/peer_only_lease_reuse_7294_test.go, which drives the real
+// PeerSessions/PeerSessionSummary/PeerZonePairSummary under a real lease at
+// capacity. Change one, check the other.
+//
 // leaseProbeCluster is a ClusterSessionService that models the in-process gRPC
 // session service: its GetSessions re-enters the SAME session-walk limiter via
 // AcquireCtx (exactly as the real grpcapi.Server.GetSessions now does). With the
