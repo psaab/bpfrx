@@ -337,6 +337,47 @@ inline archive-site passwords).
   fields dropped — an EMPTY tree — booting a committed-empty config (loss of
   policy) instead of failing closed. This restores at the inner layer the same
   no-empty-load-on-unknown property the outer envelope provides.
+- **#4888's guard tested four of the envelope's five fields (#8288).** The two
+  guards above had a GAP BETWEEN them and a `{"prf":"sha256"}` body fell through
+  it. #7454's key-presence guard is consulted only inside the decode-FAILURE
+  branch, and that body is well-formed JSON which decodes cleanly, so it never
+  ran. #4888's discriminator then tested `Format || Salt || Nonce || Data` —
+  **omitting PRF** — so a body whose only envelope key was `prf` satisfied "no
+  format AND no AES-GCM fields", which is precisely how the code defines a
+  genuine plaintext body. Result: the empty-tree committed-empty boot that both
+  guards exist to prevent, reached by the seam between them, and silent for the
+  same #4579 reason as #7454.
+
+  Confirmed by execution, with `{"salt":"x"}` refused in the same probe as a
+  control so the result is not vacuous:
+
+  ```
+  body={"prf":"sha256"}                 -> ok=false err=<nil>   (PLAINTEXT passthrough)
+  body={"prf":"sha256","Children":null} -> same
+  body={"salt":"x"}                     -> refused
+  ```
+
+  **Fixed by using `len(envKeys) > 0` there, deliberately NOT by appending
+  `|| env.PRF != ""`.** The obvious fix works, but the defect IS a five-field
+  struct guarded by a hand-maintained four-field list, and adding a fifth item
+  reproduces the shape that caused it. `envKeys` is derived from the body and
+  answers the question #7454 already answers, so it cannot drift out of sync
+  with the struct.
+
+  It is also strictly stronger, and that is intended: `{"format":""}` carries
+  the key with an empty value, which the field test passed through and key
+  presence refuses. A body that names an envelope key at all was meant to be an
+  envelope. The refusal now also names which keys it saw, so the operator is not
+  sent looking for a `format` field the body does not have.
+
+  The over-rejection risk is bounded by a property of the data, not by hope, and
+  it is asserted rather than left to this paragraph:
+  `TestPlaintextTreeCarriesNoEnvelopeKeys8288` marshals both an empty and a
+  populated `ConfigTree` and fails if either carries an envelope key. That
+  matters because `config.ConfigTree` has exactly ONE field (`Children`), so
+  adding a second whose JSON name collided with one of the five would make every
+  plaintext load fail closed — a brick on upgrade — and the cell says so at the
+  point of change.
 - **A wrong JSON TYPE on an envelope field fails closed too (#7454).** #4888's
   guard sits AFTER the initial unmarshal, and that unmarshal swallowed every
   error as *"not the envelope object shape at all — a genuine plaintext body.
