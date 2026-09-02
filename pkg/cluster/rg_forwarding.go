@@ -15,9 +15,16 @@ import "fmt"
 // cluster on both nodes at once.
 type RGForwarding struct {
 	// Active is rg_active as the daemon last APPLIED it to the dataplane —
-	// rgStateMachine.IsActive(), not the desired value. The distinction is
-	// the whole point: a node whose desired state is active but whose apply
-	// failed is exactly the case this render exists to surface.
+	// rgStateMachine.AppliedActive(), not the desired value. A node whose
+	// desired state is active but whose apply failed is exactly the case this
+	// render exists to surface.
+	//
+	// #8326: this comment previously named IsActive(), which returns the
+	// DESIRED value, so the field's documented contract and its actual
+	// producer disagreed and the field carried the desired value under a
+	// doc promising the applied one. Corrected on both sides at once, because
+	// a doc that describes the intended behaviour of code that does something
+	// else is worse than no doc: it answers the reviewer's question wrongly.
 	Active bool
 
 	// AllVRRPMaster reports whether this node is VRRP master on EVERY member

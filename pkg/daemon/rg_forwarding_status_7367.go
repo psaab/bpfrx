@@ -23,12 +23,16 @@ func (d *Daemon) rgForwardingStatus(rgID int) (cluster.RGForwarding, bool) {
 	if s == nil {
 		return cluster.RGForwarding{}, false
 	}
-	// IsActive is the APPLIED value, not DesiredActive. The distinction is the
-	// point of the render: a group whose desired state is active but whose
-	// apply failed is exactly the divergence being surfaced, and reporting the
-	// desired value would render it as healthy.
+	// #8326: AppliedActive, not IsActive. The comment that stood here asserted
+	// "IsActive is the APPLIED value, not DesiredActive" and was FALSE --
+	// IsActive returns s.active (desired) and DesiredActive returned the same
+	// field, so there was no distinction to draw. The sentence named the exact
+	// failure it caused: a group whose desired state is active but whose apply
+	// failed rendered as healthy, which is the divergence this surface exists
+	// to show. It was reassuring enough that a reviewer checking this precise
+	// question would have stopped reading.
 	return cluster.RGForwarding{
-		Active:        s.IsActive(),
+		Active:        s.AppliedActive(),
 		AllVRRPMaster: s.AllVRRPMaster(),
 		AnyVRRPMaster: s.AnyVRRPMaster(),
 	}, true

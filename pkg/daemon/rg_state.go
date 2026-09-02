@@ -126,11 +126,34 @@ func (s *rgStateMachine) SetVRRP(iface string, isMaster bool) rgTransition {
 	return s.reconcileLocked()
 }
 
-// IsActive returns the current desired rg_active value.
+// IsActive returns the DESIRED rg_active value — what the state machine wants
+// the dataplane to be, not what it is.
+//
+// #8326: the name does not say "desired" and that ambiguity was load-bearing.
+// A comment in rg_forwarding_status_7367.go asserted "IsActive is the APPLIED
+// value, not DesiredActive", which was false, and the render built on it
+// reported a redundancy group as forwarding whenever the state machine merely
+// WANTED it to be — including when the apply failed, which is the exact case
+// that render exists to surface. Use AppliedActive for what was actually
+// written to the dataplane.
 func (s *rgStateMachine) IsActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.active
+}
+
+// AppliedActive returns the rg_active value the daemon last SUCCESSFULLY
+// applied to the dataplane, which is what the node is actually forwarding on.
+//
+// Distinct from IsActive by construction, not by convention: they read
+// different fields, and they diverge for the whole window between a desired
+// change and its successful apply — which includes forever, when the apply
+// keeps failing. That window is the one an operator consults
+// `show chassis cluster` to detect, so a status surface must read this.
+func (s *rgStateMachine) AppliedActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applied
 }
 
 // Epoch returns the current epoch counter.
@@ -283,12 +306,12 @@ func (s *rgStateMachine) NeedsApply() bool {
 	return s.applyPending
 }
 
-// DesiredActive returns the current desired active state.
-func (s *rgStateMachine) DesiredActive() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.active
-}
+// #8326: DesiredActive was REMOVED. It returned s.active — byte-identical to
+// IsActive — and had no non-test caller. Two names for one field is what made
+// "IsActive is the APPLIED value, not DesiredActive" read as a considered
+// distinction rather than a mistake: the sentence is only plausible if the two
+// accessors differ, and nothing in the code said they did not. The pair that
+// exists now, IsActive and AppliedActive, reads different fields.
 
 // RecordApplied records that `active` was written to the dataplane for the
 // transition tr, and reports whether that record was ACCEPTED (#6799).

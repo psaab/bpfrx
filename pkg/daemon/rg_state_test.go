@@ -258,7 +258,7 @@ func TestRGStateMachine_DesiredVsApplied(t *testing.T) {
 	if !s.NeedsApply() {
 		t.Error("should need apply after activation")
 	}
-	if !s.DesiredActive() {
+	if !s.IsActive() {
 		t.Error("desired should be active")
 	}
 
