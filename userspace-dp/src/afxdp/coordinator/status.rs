@@ -519,7 +519,7 @@ impl super::Coordinator {
     /// nonzero value flags a peer offering PPTP to a GRE tunnel endpoint
     /// xpf has no ALG to terminate.
     pub fn gre_decap_unsupported_version_refusals_total(&self) -> u64 {
-        crate::afxdp::gre::GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed)
+        self.forwarding.gre_decap_counters.unsupported_version_refusals()
     }
 
     /// #2472: locally-generated ICMP/ICMPv6 Time Exceeded replies dropped

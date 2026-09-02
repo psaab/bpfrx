@@ -285,7 +285,47 @@ pub(in crate::afxdp) fn gre_checksum_counter_test_lock() -> std::sync::MutexGuar
 /// nonzero value means a peer is offering PPTP/enhanced GRE to a
 /// configured GRE tunnel endpoint; xpf has no PPTP ALG (see #6842) so
 /// that traffic is not terminated here.
-pub(in crate::afxdp) static GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// #8291: the cumulative store, reached through `ForwardingState` rather than a
+/// process-global `static`.
+///
+/// `Clone` shares the inner `Arc`, exactly like `ZoneCounterStore` /
+/// `FloodCounterStore` (#3651): cloning the forwarding state for a worker
+/// publish and carrying it forward across config applies both keep the total
+/// alive, and `forwarding_build::attach_carried_counters` does the carry at the
+/// same call site as its two siblings so one cannot be dropped without the
+/// others.
+///
+/// WHY THIS MOVED, since it is a production change made for test isolation and
+/// a reader will reasonably ask. As a `static` it was one cell shared by every
+/// test in the process, and `tests_gre_version_6842` asserts a THREE-ROW table
+/// of which two rows are "must NOT count" — an UPPER bound, which a shared
+/// global under concurrent writers cannot provide at all. The family failed 19
+/// of 20 parallel runs. The alternatives were worse: a sink parameter on the
+/// decap path (a hot-path precedent), an undetectable "only sound
+/// single-threaded" dependency (libtest does not expose the effective thread
+/// count, so no cell can check it), or relaxing the countable row to a lower
+/// bound — which fixes only 1 of 3 rows, leaves the family at 3/20, and turns a
+/// false RED into a false GREEN because `>=` cannot tell this test's refusal
+/// from a sibling's.
+///
+/// Moving it costs nothing on any path: `note_unsupported_gre_version` already
+/// takes `&ForwardingState`, and it is `#[cold] #[inline(never)]`.
+#[derive(Clone, Debug, Default)]
+pub(in crate::afxdp) struct GreDecapCounters {
+    unsupported_version_refusals: std::sync::Arc<AtomicU64>,
+}
+
+impl GreDecapCounters {
+    /// Account one version refusal. The only mutator.
+    pub(in crate::afxdp) fn note_unsupported_version_refusal(&self) {
+        self.unsupported_version_refusals
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(in crate::afxdp) fn unsupported_version_refusals(&self) -> u64 {
+        self.unsupported_version_refusals.load(Ordering::Relaxed)
+    }
+}
 
 /// Cold-path bookkeeping for the version refusal above.
 ///
@@ -327,7 +367,7 @@ fn note_unsupported_gre_version(frame: &[u8], meta: UserspaceDpMeta, forwarding:
     if !offered_to_gre_endpoint {
         return;
     }
-    GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    forwarding.gre_decap_counters.note_unsupported_version_refusal();
 }
 
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
