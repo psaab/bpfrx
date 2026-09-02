@@ -17,6 +17,17 @@ pub(in crate::afxdp) struct XdpOptions {
     pub(in crate::afxdp) flags: u32,
 }
 
+/// #7209: **every field is `Arc`-backed, and that is load-bearing.** The
+/// worker's `JoinHandle` used to live here as an `Option<JoinHandle<()>>` and
+/// was consumed with `join.take()`, which is the only thing that ever needed
+/// `&mut` on a `WorkerRuntimeRecord`. It now lives in `WorkerManager::joins`
+/// (lifecycle state, one producer in `reconcile/bringup.rs` and one consumer in
+/// `WorkerManager::stop_and_clear`) so the record can be published behind an
+/// `Arc` and read by the off-lock peer-synced import path.
+///
+/// Adding a non-`Arc` field back here re-imposes `&mut` on the record and
+/// breaks that. If you need per-worker mutable state, put it behind its own
+/// `Arc<Mutex<..>>` / atomic like the four slots above.
 pub(in crate::afxdp) struct WorkerHandle {
     pub(in crate::afxdp) stop: Arc<AtomicBool>,
     pub(in crate::afxdp) heartbeat: Arc<AtomicU64>,
@@ -32,7 +43,6 @@ pub(in crate::afxdp) struct WorkerHandle {
     /// publish_from_local() every ~1s tick; coordinator status path
     /// reads via snapshot() at each /metrics scrape (~1 Hz default).
     pub(in crate::afxdp) cold_path_atomics: Arc<super::cold_path_hist::WorkerColdPathAtomics>,
-    pub(in crate::afxdp) join: Option<JoinHandle<()>>,
 }
 
 pub(in crate::afxdp) struct LocalTunnelSourceHandle {

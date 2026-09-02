@@ -651,7 +651,7 @@ impl super::Coordinator {
         }
         // #6242: drain each worker's exception ring off its runtime record
         // (was the standalone `worker_exception_rings` map).
-        for rec in self.workers.records.values() {
+        for rec in self.workers.records().values() {
             if let Ok(ring) = rec.exception_ring.lock() {
                 events.extend(ring.iter().cloned());
             }
@@ -688,7 +688,7 @@ impl super::Coordinator {
         }
         // #6242: pick the newest across each worker's last-resolution slot off
         // its runtime record (was the standalone `worker_last_resolution` map).
-        for rec in self.workers.records.values() {
+        for rec in self.workers.records().values() {
             if let Ok(last) = rec.last_resolution.lock() {
                 consider(last.clone());
             }
@@ -706,7 +706,7 @@ impl super::Coordinator {
     pub fn cos_statuses(&self) -> Vec<crate::protocol::CoSInterfaceStatus> {
         let snapshots: Vec<Vec<_>> = self
             .workers
-            .records
+            .records()
             .values()
             .map(|rec| rec.handle.cos_status.load().iter().cloned().collect())
             .collect();
@@ -922,7 +922,7 @@ impl super::Coordinator {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
         self.workers
-            .records
+            .records()
             .iter()
             .map(|(_, rec)| {
                 monotonic_timestamp_to_datetime(
@@ -936,7 +936,7 @@ impl super::Coordinator {
     }
 
     pub fn worker_count(&self) -> usize {
-        self.workers.records.len()
+        self.workers.records().len()
     }
 
     /// #869: snapshot per-worker busy/idle runtime counters.  Each row is
@@ -1014,7 +1014,7 @@ impl super::Coordinator {
         use std::sync::atomic::Ordering;
         let now_ns = crate::afxdp::wg::counters::monotonic_now_ns();
         let mut freed = 0;
-        for (worker_id, rec) in self.workers.records.iter() {
+        for (worker_id, rec) in self.workers.records().iter() {
             let atomics = &rec.handle.runtime_atomics;
             if !select(atomics) {
                 continue;
@@ -1047,7 +1047,7 @@ impl super::Coordinator {
 
     pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
         self.workers
-            .records
+            .records()
             .iter()
             .map(|(worker_id, rec)| {
                 let handle = &rec.handle;

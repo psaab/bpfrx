@@ -1474,14 +1474,11 @@ impl Coordinator {
             cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
             runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
             cold_path_atomics: Arc::new(super::cold_path_hist::WorkerColdPathAtomics::new()),
-            join: None,
         };
         // #6242: register the whole runtime record (handle + empty
         // observability slots) as one op — the export test only drives the
         // handle's `session_export_ack`.
-        self.workers
-            .records
-            .insert(worker_id, WorkerRuntimeRecord::for_test(handle));
+        self.workers.register(worker_id, WorkerRuntimeRecord::for_test(handle), None);
         ack
     }
 }

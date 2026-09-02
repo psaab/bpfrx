@@ -296,7 +296,6 @@ mod exception_ring_merge_6101 {
             cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
             runtime_atomics: Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new()),
             cold_path_atomics: Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new()),
-            join: None,
         }
     }
 
@@ -309,7 +308,7 @@ mod exception_ring_merge_6101 {
     ) {
         let mut rec = WorkerRuntimeRecord::for_test(dummy_handle());
         rec.exception_ring = exception_ring;
-        coord.workers.records.insert(worker_id, rec);
+        coord.workers.register(worker_id, rec, None);
     }
 
     /// #6242: register a worker whose runtime record carries the given
@@ -321,7 +320,7 @@ mod exception_ring_merge_6101 {
     ) {
         let mut rec = WorkerRuntimeRecord::for_test(dummy_handle());
         rec.last_resolution = last_resolution;
-        coord.workers.records.insert(worker_id, rec);
+        coord.workers.register(worker_id, rec, None);
     }
 
     #[test]
@@ -366,7 +365,7 @@ mod exception_ring_merge_6101 {
         // Teardown: removing worker 0's record (#6242: the whole runtime
         // record, which drops its exception ring with it) drops its events from
         // the drain; worker 1 + control remain, still sorted.
-        coord.workers.records.remove(&0);
+        coord.workers.remove_record_for_test(0);
         let after: Vec<String> = coord
             .recent_exceptions()
             .into_iter()
@@ -455,7 +454,7 @@ mod exception_ring_merge_6101 {
 
         // Teardown of the newest slot → the next-newest (worker 1, t+20) wins.
         // #6242: removing worker 0's record drops its last-resolution slot.
-        coord.workers.records.remove(&0);
+        coord.workers.remove_record_for_test(0);
         let after = coord.last_resolution().expect("resolution");
         assert_eq!(
             after.egress_ifindex, 20,

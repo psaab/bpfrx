@@ -56,9 +56,14 @@ pub(in crate::afxdp) static WORKER_COMMAND_QUEUE_POISON_RECOVERIES: AtomicU64 = 
 ///
 ///   - `spawn_supervised_worker` catches a `worker_loop` panic, sets
 ///     `runtime_atomics.dead = true` and lets the thread exit;
-///   - the worker RECORD is never removed — nothing calls `records.remove`;
-///   - every producer fans out with `for rec in self.workers.records.values()`
-///     and no `dead` check, so it keeps pushing into that queue forever.
+///   - the worker RECORD is never removed — no PRODUCTION path removes a single
+///     record (registration is post-spawn-success and teardown publishes an
+///     empty map; #7209's `remove_record_for_test` is `cfg(test)` only);
+///   - every producer fans out with `for rec in workers.records().values()` —
+///     since #7209 that reads the published `ArcSwap` rather than an owned
+///     `BTreeMap`, which changes WHERE the set comes from and nothing about
+///     this argument — and no `dead` check, so it keeps pushing into that queue
+///     forever.
 ///
 /// The `dead` flag is read only by `coordinator/status.rs`, for diagnostics. So
 /// after any worker panic the queues grow without bound until memory is
