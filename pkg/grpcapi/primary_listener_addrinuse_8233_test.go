@@ -62,7 +62,18 @@ func TestPrimaryAddrInUseGraceExceedsUnitStopTimeout_8233(t *testing.T) {
 // A persistent EADDRINUSE must END the daemon rather than be retried forever.
 func TestPersistentAddrInUseIsFatal_8233(t *testing.T) {
 	s := &Server{addr: "127.0.0.1:0"}
-	err := s.supervisePrimaryListener(context.Background(), primarySupervisorConfig{
+	// BOUNDED DELIBERATELY. The defect this test guards is "retries forever",
+	// so the failure mode of the code under test is a HANG, and an unbounded
+	// context makes the test inherit it: disabling the fatal branch made this
+	// case run until the CI timeout killed the whole package, which reports a
+	// void rather than a diagnosis. 10s is ~400x the 20ms grace plus a 2ms
+	// backoff cap, so a correct supervisor returns in ~25ms and never comes
+	// near it. The deadline is not the pass condition -- expiry returns
+	// something that is not ErrManagementPortHeld, so the assertion below
+	// still fails, and it fails with a message instead of a timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := s.supervisePrimaryListener(ctx, primarySupervisorConfig{
 		backoffBase:    time.Millisecond,
 		backoffMax:     2 * time.Millisecond,
 		healthyServe:   time.Hour,
