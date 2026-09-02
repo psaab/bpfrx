@@ -77,22 +77,45 @@ func TestChassisRedundancyGroupIDFailsCommit(t *testing.T) {
 	}
 }
 
+// #8317 NARROWED THIS DELIBERATELY — read before "restoring" the 255s.
+//
+// This cell asserted that 255 groups (ids 0..254) and an id of exactly 255
+// commit cleanly, because both fit the uint8 heartbeat wire fields. That was
+// true of the WIRE and false of the dataplane: the id is used directly as the
+// index into the `rg_active` / `ha_watchdog` arrays, which hold
+// MaxRedundancyGroups (16) entries. A BPF array with max_entries 16 returns
+// E2BIG at key 16, and `UpdateRGActive` propagates that error before recording
+// the group or syncing HA state, so an id >= 16 could COMMIT but never
+// ACTIVATE — its RETH interfaces never forwarded and the reconcile loop retried
+// forever.
+//
+// So the old assertions pinned commit-acceptance of configs that could not
+// function. The bound is now the array length, and the in-range boundary moves
+// with it. This is a narrowing of what commits, and it is intentional: it turns
+// a silent runtime failure into a loud commit-time one. No WORKING config
+// loses, because no config with an id >= 16 was ever working.
+//
+// The alternative — growing the arrays to 256 so those ids function — is
+// recorded on #8317. It would preserve the original 255s but costs a Go + Rust
+// (`MAX_RG_EPOCHS`) + shim-rebuild change; the bound is Go-only.
 func TestChassisRedundancyGroupInRangeCommits(t *testing.T) {
-	// The boundary: 255 groups (ids 0..254) and an id of exactly 255 both fit
-	// the uint8 wire fields and must commit cleanly.
-	tree := buildTree(t, rgSetLines(MaxHeartbeatRedundancyGroups))
+	// The boundary is now the dataplane array length: MaxRedundancyGroups
+	// groups (ids 0..MaxRedundancyGroups-1) and an id of exactly
+	// MaxRedundancyGroups-1 must commit cleanly. Derived from the constant, not
+	// spelled as a literal, so growing the arrays moves this with them.
+	tree := buildTree(t, rgSetLines(MaxRedundancyGroups))
 	if _, err := CompileConfig(tree); err != nil {
-		t.Fatalf("commit rejected %d in-range redundancy-groups: %v", MaxHeartbeatRedundancyGroups, err)
+		t.Fatalf("commit rejected %d in-range redundancy-groups: %v", MaxRedundancyGroups, err)
 	}
 
 	boundary := buildTree(t, []string{
 		"set chassis cluster cluster-id 1",
 		"set chassis cluster authentication-key test-cluster-psk-6611",
 		"set chassis cluster redundancy-group 0 node 0 priority 200",
-		fmt.Sprintf("set chassis cluster redundancy-group %d node 1 priority 100", MaxHeartbeatRedundancyGroupID),
+		fmt.Sprintf("set chassis cluster redundancy-group %d node 1 priority 100", MaxRedundancyGroups-1),
 	})
 	if _, err := CompileConfig(boundary); err != nil {
-		t.Fatalf("commit rejected a boundary redundancy-group id %d: %v", MaxHeartbeatRedundancyGroupID, err)
+		t.Fatalf("commit rejected a boundary redundancy-group id %d: %v", MaxRedundancyGroups-1, err)
 	}
 
 	// A cluster with no redundancy-group stanza at all is unaffected.

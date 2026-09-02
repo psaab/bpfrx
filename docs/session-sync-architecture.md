@@ -2476,13 +2476,33 @@ redundancy-group set** — `handleEventStreamFullResync` calls
 `primaryOwnerRGIDs(cfg)`, which walks `cfg.Chassis.Cluster.RedundancyGroups`
 (the same live active config `buildZoneIDs` reads) and keeps every id the node
 is `IsLocalPrimary` for. It does **not** iterate a fixed `0..15` range. Junos
-redundancy-group ids are not bounded to 15 (the `<group-id>` config slot has no
-validator and is parsed via an unbounded `strconv.Atoi`), so the old hardcoded
+redundancy-group ids were not bounded to 15, so the old hardcoded
 `for rgID := 0; rgID < 16` loop silently skipped any RG with id >= 16 — its
 owned sessions were never re-exported on a FullResync, so the standby never
 received them and they were dropped on a failover of that RG (#4028). This
 mirrors the live-config enumeration the watchdog/fence paths use
 (`currentRedundancyGroups`, #3917).
+
+> **#8317 narrowed the input, and #4028's enumeration is still load-bearing —
+> do not simplify it back to a fixed loop.** A strict commit now refuses an id
+> at or above `MaxRedundancyGroups` (16), because that id is used directly as
+> the index into the dataplane's `rg_active` / `ha_watchdog` arrays: a BPF array
+> with `max_entries` 16 accepts an update at key 15 and returns E2BIG at 16, and
+> `UpdateRGActive` propagates that error before recording the group or syncing
+> HA state, so such an RG never activates and its RETH interfaces never forward.
+>
+> That bounds what an operator can newly commit. It does **not** bound what this
+> code can be handed. The typed-leaf and strict-compile gates are strict only on
+> the operator commit path; `Store.Load` and `Store.SyncApply` deliberately
+> downgrade a violation to a warning (#1319 PR 2, the #1960 no-brick doctrine),
+> so a config persisted by an older binary — or peer-synced from one mid-upgrade
+> — can still carry an id >= 16 and reach exactly this enumeration. Walking the
+> configured set rather than `0..15` remains correct for that reason.
+>
+> The commit bound is derived from `config.MaxRedundancyGroups`, of which
+> `dataplane.MaxRedundancyGroups` is an alias, so the bound and the array length
+> cannot drift apart. Before #8317 the 16 existed only as the arrays'
+> `max_entries` and nothing connected it to the id an operator types.
 
 **The export ack-wait runs OFF the global `ServerState` lock (#2962).** The
 helper-side control-socket dispatcher (`server/handlers/mod.rs`) holds a single
