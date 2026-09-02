@@ -239,24 +239,28 @@ impl crate::afxdp::Coordinator {
     /// entry recorded while the fd was absent is published by the next
     /// reconcile.
     ///
-    /// CORRECTED (#8171). This paragraph used to say `teardown::tear_down`
+    /// CORRECTED (#8157 / PR #8171). This paragraph used to say `teardown::tear_down`
     /// captures the whole map via `snapshot_shared_session_entries()` before
     /// the teardown, and that the remaining capture-to-replay window is closed
     /// by the snapshot-wide `ServerState` mutex. That was true when written and
-    /// is not now: `replay_preserved_sessions` (`reconcile/bringup.rs`) derives
+    /// is not now: `replay_preserved_sessions` (`reconcile/bringup.rs`, which cites
+    /// #8157) derives
     /// the replay set from the LIVE shared map at replay time — after every
     /// arrival the reconcile could race — so the window is closed by
     /// construction rather than by the lock. The historical shape is recorded
     /// because the mutex-based reasoning it supported still appears elsewhere,
-    /// and because #7209 removes that mutex for `sync_session`.
+    /// and because #7209 PROPOSES to remove that mutex for `sync_session` —
+    /// which has not happened: `sync_session` still dispatches under it.
     ///
-    /// That mutex is what #7209 proposes to remove, which is why this counter
-    /// lands FIRST: once `sync_session` runs off it, an import in that window
-    /// would be recorded, acked to Go as installed, never published and never
-    /// replayed, with no signal anywhere. This makes the currently-benign
-    /// occurrences visible, so the deferred-and-replay design that must
-    /// accompany #7209 has an instrument that can be driven to zero rather than
-    /// a guarantee asserted from a reading of the lock graph.
+    /// Why this counter landed FIRST, in the past tense the correction above
+    /// requires: BEFORE #8157/#8171, an import arriving in the capture-to-replay
+    /// window would have been recorded, acked to Go as installed, never
+    /// published and never replayed, with no signal anywhere. The replay now
+    /// reads the live map, so that particular loss is closed by construction.
+    /// The counter remains worth having because the absent-fd publish skip is
+    /// still reachable on its own (a standby taking bulk sync before its first
+    /// apply), and it makes those benign occurrences visible rather than
+    /// asserted from a reading of the lock graph.
     fn publish_synced_entry_or_note_unpublished(
         &self,
         key: &SessionKey,

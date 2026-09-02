@@ -716,7 +716,8 @@ impl Coordinator {
             .store(Arc::new(MirrorTargetMap::default()));
         // #6242: the per-worker panic slots (#925) + exception rings +
         // last-resolution slots (#5289) are dropped by `stop_and_clear` above
-        // as part of `records.clear()` — one drop per worker record, not three
+        // as part of the teardown's record publish (#7209 `clear_records`,
+        // formerly `records.clear()`) — one drop per worker record, not three
         // separate `Coordinator.*.clear()` calls followed by the dead
         // content-clear loops the old layout ran (see below).
         self.cos_owner_worker_by_queue.clear();
@@ -803,7 +804,8 @@ impl Coordinator {
         // `.lock().clear()`), but `stop_and_clear` above already emptied the
         // maps via `.clear()`, so those loops iterated an empty map and never
         // executed a body — dead since #5289. Dropping each record's ring +
-        // slot `Arc` in `records.clear()` frees the underlying storage; there
+        // slot `Arc` dropped by the teardown's record publish (#7209
+        // `clear_records`) frees the underlying storage; there
         // is nothing left to content-clear. The loops are removed, not
         // duplicated onto `records`.
         if let Ok(mut recent) = self.recent_session_deltas.lock() {
