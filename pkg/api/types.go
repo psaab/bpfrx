@@ -757,6 +757,12 @@ type MatchPoliciesResult struct {
 	// a client can branch on the posture without string-parsing. False for a
 	// concrete policy match and for HostInboundUnmatched.
 	DefaultUsed bool `json:"default_used,omitempty"`
+
+	// UnzonedIngress is true when the query's FROM zone is not a known zone.
+	// The dataplane denies such a flow unconditionally (#6682) instead of
+	// consulting default-policy, so the verdict must not be attributed to the
+	// default — on a permit-all box that attribution is actively false (#8318).
+	UnzonedIngress bool `json:"unzoned_ingress,omitempty"`
 	// QueriedFromZone/QueriedToZone echo the zone pair the caller ASKED about
 	// (#3627 M06). Unlike FromZone/ToZone (the SCOPE of the MATCHED policy, set
 	// only on a positive match), these are populated on EVERY response —

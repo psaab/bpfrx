@@ -647,6 +647,21 @@ type Result struct {
 	// default-policy.
 	DefaultUsed bool
 
+	// UnzonedIngress is true when the query's FROM zone is not a known zone, so
+	// the runtime denies it unconditionally (#6682) rather than falling through
+	// to default-policy (#8318).
+	//
+	// It exists because the verdict is otherwise indistinguishable from a
+	// default-deny, and on a `permit-all` box that misattribution is actively
+	// false: `DisplayAction` would render "deny (default)" and the show surfaces
+	// "Default deny (no matching policy ...)" for a deny the default did not
+	// produce. Modelled on HostInboundUnmatched, which carries a different
+	// terminal condition out of the matcher for the same reason.
+	//
+	// The EGRESS side has no such flag on purpose — an unknown ToZone really
+	// does fall through to default-policy in the runtime.
+	UnzonedIngress bool
+
 	// ContentRejected is true when the simulated config references policy
 	// content the userspace snapshot builder fails the WHOLE snapshot closed on
 	// (#3727) — today, an application-set a policy names that cannot be expanded
@@ -946,6 +961,19 @@ const HostInboundActionString = "host-inbound (local delivery subject to host-in
 // each other or from HostInboundActionString (#3627). Like the action string it
 // states that local delivery is gated by host-inbound-traffic admission
 // (default-deny for a no-stanza zone), not that it unconditionally proceeds.
+// UnzonedIngressActionString is the operator-facing verdict rendered for a
+// query whose FROM zone is not a known zone (#8318). The runtime denies such a
+// flow unconditionally (#6682) instead of consulting default-policy, so this
+// must NOT render as "deny (default)" — on a permit-all box that would name the
+// operator's default as the cause of a deny it did not produce.
+const UnzonedIngressActionString = "deny (ingress zone unknown — transit on an interface in no zone is denied unconditionally; default-policy NOT applied)"
+
+// UnzonedIngressShowLine is the human-readable one-line explanation the CLI /
+// `show` / `request` match-policies surfaces print after an "Ingress zone
+// unknown ..." header, kept here as the SSOT for the same reason
+// HostInboundShowLine is.
+const UnzonedIngressShowLine = "unzoned ingress: an interface in no zone resolves to the reserved zone id 0, which is ineligible for zone-pair, wildcard and junos-global policies; the dataplane denies rather than falling through to default-policy (#6682)"
+
 const HostInboundShowLine = "host-inbound: local delivery subject to host-inbound-traffic service admission (a zone with no host-inbound-traffic stanza denies by default; transit global/default-policy NOT applied)"
 
 // ContentRejectedActionString is the operator-facing verdict rendered for a
@@ -984,6 +1012,8 @@ func (r Result) DisplayAction() string {
 		return ContentRejectedActionString
 	case r.HostInboundUnmatched:
 		return HostInboundActionString
+	case r.UnzonedIngress:
+		return UnzonedIngressActionString
 	case !r.Matched:
 		return ActionString(r.Action) + " (default)"
 	default:
@@ -1139,7 +1169,37 @@ func Match(cfg *config.Config, q Query) (res Result) {
 	// analogue of id 0, so it must fall straight through to the configured
 	// default-policy rather than wrongly matching a `from-zone any` / `to-zone
 	// any` / global rule.
-	if !zoneKnown(cfg, q.FromZone) || !zoneKnown(cfg, q.ToZone) {
+	// #8318: the two sides are NOT symmetric at the terminal action, and this
+	// branch used to collapse them. Eligibility IS symmetric — that is what the
+	// paragraph above describes, and it is unchanged: an unknown zone on either
+	// side is excluded from the zone-pair, wildcard and global tiers, exactly as
+	// the runtime's `from_id != 0 && to_id != 0` gate does. What differs is what
+	// happens AFTER that exclusion.
+	//
+	// The runtime denies an unzoned INGRESS unconditionally (#6682,
+	// policy.rs `if from_id == 0`), without consulting default-policy: Junos does
+	// not pass transit on an interface that is in no zone, and screens were
+	// already skipped for it. It deliberately does NOT do the same for the
+	// EGRESS side — its comment says denying on `to_id` "would risk
+	// black-holing a correctly-configured path to fix a case that has not been
+	// shown to occur. It still falls through to the default below" (#6713 is the
+	// cited precedent: a MAC-less xfrmi egress resolving to 0 for an unrelated
+	// reason).
+	//
+	// Collapsing both into `DefaultUsed: true` agreed with the runtime only
+	// because `deny-all` is the default default-policy, so both sides denied and
+	// the divergence was invisible. Under `permit-all` the simulator said PERMIT
+	// where the dataplane drops — on the surface an operator uses to VERIFY
+	// policy before trusting it, which is the worst place for it: they conclude
+	// the policy is right and look elsewhere.
+	if !zoneKnown(cfg, q.FromZone) {
+		// DefaultUsed is deliberately FALSE: its own contract is "Action is the
+		// configured default-policy", and this Deny is not — it overrides the
+		// default. Reporting true here would tell an operator on a permit-all
+		// box that their default produced a deny.
+		return Result{UnzonedIngress: true, Action: config.PolicyDeny}
+	}
+	if !zoneKnown(cfg, q.ToZone) {
 		return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
 	}
 

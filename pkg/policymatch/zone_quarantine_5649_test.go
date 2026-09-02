@@ -61,8 +61,11 @@ func TestQuarantinedZoneNoTransitMatch(t *testing.T) {
 	if res.Matched {
 		t.Fatalf("quarantined from-zone z214 matched a transit rule the runtime dropped (#5649); res = %+v", res)
 	}
-	if !res.DefaultUsed || res.Action != config.PolicyDeny {
-		t.Fatalf("want default-policy deny for a quarantined zone, got %+v", res)
+	// #8318: a QUARANTINED zone is unknown to the built snapshot, so as a FROM
+	// zone it is the unzoned-ingress deny rather than a default-policy verdict.
+	// Verdict unchanged (deny); only the attribution moved.
+	if !res.UnzonedIngress || res.Action != config.PolicyDeny {
+		t.Fatalf("want unzoned-ingress deny for a quarantined from-zone, got %+v", res)
 	}
 }
 

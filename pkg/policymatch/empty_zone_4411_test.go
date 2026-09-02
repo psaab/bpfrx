@@ -56,14 +56,30 @@ func TestMatchEmptyZoneFallsToDefault(t *testing.T) {
 		{"from-zone empty", "", "untrust"},
 		{"to-zone empty", "trust", ""},
 	}
+	// #8318: an empty FROM zone is the unconditional unzoned-ingress deny; an
+	// empty TO zone still falls through to default-policy, because the runtime
+	// deliberately declines to deny on to_id == 0 ("would risk black-holing a
+	// correctly-configured path"). Both are DENY under this deny-all fixture —
+	// which is why one branch could stand in for both — so the rows now assert
+	// WHICH.
+	fromUnknown := func(from string) bool { return from == "" }
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			res := Match(cfg, Query{FromZone: c.from, ToZone: c.to, Protocol: "tcp", DstPort: 80})
 			if res.Matched {
 				t.Fatalf("empty-zone query matched a both-any rule (#4411 A6); res = %+v", res)
 			}
-			if !res.DefaultUsed || res.Action != config.PolicyDeny {
-				t.Fatalf("want default-policy deny for an empty-zone query, got %+v", res)
+			if res.Action != config.PolicyDeny {
+				t.Fatalf("want deny for an empty-zone query, got %+v", res)
+			}
+			if fromUnknown(c.from) {
+				if !res.UnzonedIngress || res.DefaultUsed {
+					t.Fatalf("an empty FROM zone must be the unzoned-ingress deny, "+
+						"not a default-policy verdict, got %+v", res)
+				}
+			} else if !res.DefaultUsed || res.UnzonedIngress {
+				t.Fatalf("an empty TO zone must still fall through to default-policy "+
+					"(the runtime does not deny on to_id == 0), got %+v", res)
 			}
 		})
 	}

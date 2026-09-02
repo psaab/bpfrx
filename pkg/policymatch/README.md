@@ -276,6 +276,41 @@ surfaces additionally
 REJECT a missing from/to-zone (HTTP 400 / `InvalidArgument`) for parity with
 the CLI, which already requires both zones (#3355 H06).
 
+**#8318 — eligibility is symmetric, the TERMINAL ACTION is not.** Everything
+above is about ELIGIBILITY and is unchanged: an unknown zone on EITHER side is
+excluded from the zone-pair, wildcard and global tiers, which is what
+`zoneKnown` "mirrors the runtime UNCONDITIONALLY" means. What happens AFTER that
+exclusion differs by side, and the simulator used to collapse the two:
+
+| case | dataplane | simulator (before #8318) |
+|---|---|---|
+| unknown **ToZone** | falls through to default-policy | default-policy — agreed |
+| unknown **FromZone**, `deny-all` | Deny | Deny — agreed, coincidentally |
+| unknown **FromZone**, `permit-all` | **Deny** | **Permit** — DIVERGED |
+
+The runtime denies an unzoned INGRESS unconditionally, without consulting
+default-policy (#6682, `policy.rs`: `if from_id == 0`) — Junos does not pass
+transit on an interface in no zone, and screens were already skipped for it. It
+deliberately does NOT do the same for the egress side: denying on `to_id` "would
+risk black-holing a correctly-configured path to fix a case that has not been
+shown to occur" (#6713 is the cited precedent, a MAC-less xfrmi egress resolving
+to 0 for an unrelated reason).
+
+Because `deny-all` is the default default-policy, both sides denied and the
+divergence was invisible. It mattered on the surface an operator uses to VERIFY
+policy before trusting it: a `permit-all` box reported PERMIT for a flow the
+dataplane drops, so the operator concluded the policy was right and looked
+elsewhere.
+
+The FROM arm now returns `Result{UnzonedIngress: true, Action: PolicyDeny}`.
+`DefaultUsed` is deliberately **false** there — its contract is "Action is the
+configured default-policy", and this deny overrides it; reporting true would
+render "deny (default)" and name a default that produced no such thing.
+`UnzonedIngress` exists for the same reason `HostInboundUnmatched` does: the
+verdict is otherwise indistinguishable from a default-deny in operator-facing
+output. Pinned by `unzoned_ingress_parity_8318_test.go`, whose fixture MUST use
+`permit-all` — under `deny-all` a cell passes on the broken code.
+
 A `to-zone junos-host` query takes the separate **host gate** (#3285,
 `matchJunosHost` ↔ `evaluate_junos_host_policy`): exact `from-zone <ingress>
 to-zone junos-host`, then `from-zone any to-zone junos-host`, then a GLOBAL

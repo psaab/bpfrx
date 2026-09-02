@@ -51,8 +51,16 @@ func TestUndefinedFromZoneNoWildcardMatch(t *testing.T) {
 	if res.Matched {
 		t.Fatalf("undefined from-zone matched a wildcard/global rule (#3355); res = %+v", res)
 	}
-	if !res.DefaultUsed || res.Action != config.PolicyDeny {
-		t.Fatalf("want default-policy deny for an undefined zone, got %+v", res)
+	// #8318: verdict unchanged (deny); attribution moved. An undefined FROM
+	// zone is the unconditional unzoned-ingress deny, not a default-policy
+	// verdict — the runtime denies from_id == 0 without consulting
+	// default-policy (#6682). This fixture is deny-all, where the two are
+	// indistinguishable by action alone.
+	if !res.UnzonedIngress || res.Action != config.PolicyDeny {
+		t.Fatalf("want unzoned-ingress deny for an undefined from-zone, got %+v", res)
+	}
+	if res.DefaultUsed {
+		t.Fatalf("an unzoned-ingress deny must not be attributed to default-policy, got %+v", res)
 	}
 }
 
@@ -121,8 +129,10 @@ func TestNoZonesDefinedNoTransitMatch(t *testing.T) {
 	if res.Matched {
 		t.Fatalf("no-zones config matched a transit rule the runtime would never evaluate (#3355 drift); res = %+v", res)
 	}
-	if !res.DefaultUsed || res.Action != config.PolicyDeny {
-		t.Fatalf("want default-policy deny for a no-zones config, got %+v", res)
+	// #8318: with NO zones defined, "trust" is unknown on both sides; the FROM
+	// check runs first, so this is the unzoned-ingress deny. Verdict unchanged.
+	if !res.UnzonedIngress || res.Action != config.PolicyDeny {
+		t.Fatalf("want unzoned-ingress deny for a no-zones config, got %+v", res)
 	}
 }
 
