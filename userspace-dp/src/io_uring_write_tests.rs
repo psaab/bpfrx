@@ -797,22 +797,31 @@ fn measure_teardown_residual_7106() {
 ///
 /// Observed through the production counters, which are also the operator signal
 /// the condition otherwise has none of. They are process-global and cumulative,
-/// so this asserts a DELTA. Exact equality is correct under the project's
-/// mandated `-- --test-threads=1` (parallel `cargo test` deadlocks this crate
-/// anyway); a concurrent registry drop is the only thing that could inflate it.
+/// #8291: this used to sample the PROCESS counters and assert a delta, with a
+/// comment resting the exactness on the mandated `-- --test-threads=1`. That
+/// was the flake: the accounting is written by `InflightRegistry::drop`, so
+/// every test that drops a non-empty registry is a writer — 28 of this module's
+/// tests construct one — and a non-atomic read-act-read delta over shared state
+/// cannot survive twenty-eight concurrent writers. It is now a PRIVATE sink, so
+/// the assertion is ABSOLUTE and depends on nothing any other test does.
 ///
 /// FAIL-ON-REVERT: delete `impl Drop for InflightRegistry` and `Vec`'s Drop
 /// frees the buffer again — both deltas are 0 and this goes RED.
 #[test]
 fn unproven_buffers_are_retained_not_freed_7106() {
     const PAYLOAD: usize = 4096;
-    let before_bufs = super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
-    let before_bytes = super::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let retained = std::sync::Arc::new(super::RetainedCounters::new());
+    assert_eq!(
+        (retained.buffers(), retained.bytes()),
+        (0, 0),
+        "a fresh sink starts empty, or the absolute assertions below could pass \
+         on state this test did not create"
+    );
     {
         // A fatal ring: every wait returns the permanent error, so the drain
         // can prove nothing and retains the entry.
         let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EBADF);
-        let mut reg = InflightRegistry::new();
+        let mut reg = InflightRegistry::with_retained_for_test(std::sync::Arc::clone(&retained));
         let out = write_all(&mut ring, &mut reg, vec![0u8; PAYLOAD], false, "slow-path");
         assert!(
             matches!(out, WriteResult::Deferred { fatal_ring: true, .. }),
@@ -827,14 +836,14 @@ fn unproven_buffers_are_retained_not_freed_7106() {
     } // the registry drops HERE — this is the subject.
 
     assert_eq!(
-        super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) - before_bufs,
+        retained.buffers(),
         1,
         "the unproven buffer must be RETAINED at registry drop, not freed. \
          Freeing it hands an allocation the kernel may still be writing into \
          back to the allocator (#7106)"
     );
     assert_eq!(
-        super::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before_bytes,
+        retained.bytes(),
         PAYLOAD as u64,
         "the retained BYTES must be accounted too — the count alone does not \
          tell an operator how much memory a retiring ring abandoned"
@@ -850,10 +859,13 @@ fn unproven_buffers_are_retained_not_freed_7106() {
 /// drain works.
 #[test]
 fn a_proven_drain_retains_nothing_7106() {
-    let before_bufs = super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+    // #8291: private sink, so "retains nothing" is an ABSOLUTE zero rather than
+    // "unchanged since a moment ago" — the latter is satisfied by a sibling
+    // test's drop landing between the two reads and this one leaking too.
+    let retained = std::sync::Arc::new(super::RetainedCounters::new());
     {
         let mut ring = FakeRing::new(vec![], vec![]).with_repeat_err(libc::EINTR);
-        let mut reg = InflightRegistry::new();
+        let mut reg = InflightRegistry::with_retained_for_test(std::sync::Arc::clone(&retained));
         let out = write_all(&mut ring, &mut reg, vec![0u8; 64], false, "slow-path");
         assert!(matches!(out, WriteResult::Deferred { .. }));
         // The storm ends: the write's terminal CQE surfaces and is reaped.
@@ -866,8 +878,8 @@ fn a_proven_drain_retains_nothing_7106() {
         );
     }
     assert_eq!(
-        super::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed),
-        before_bufs,
+        retained.buffers(),
+        0,
         "a registry that proved every entry terminal must leak NOTHING; a \
          Drop that forgets unconditionally would leak on every ordinary ring \
          retirement"

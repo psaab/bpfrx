@@ -77,9 +77,9 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // #7106: process-global, not per-binding — a registry that retains buffers
     // is being dropped, so the count has to outlive it.
     state.status.io_uring_retained_buffers_total =
-        crate::io_uring_write::RETAINED_BUFFERS.load(std::sync::atomic::Ordering::Relaxed);
+        crate::io_uring_write::process_retained().buffers();
     state.status.io_uring_retained_bytes_total =
-        crate::io_uring_write::RETAINED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        crate::io_uring_write::process_retained().bytes();
     // #2375: distinct-hop capacity-drop gate at pending_neigh admission
     // (a NEW unresolved hop refused because the map is at
     // MAX_PENDING_NEIGH) — the scan/upstream-outage failure mode, kept

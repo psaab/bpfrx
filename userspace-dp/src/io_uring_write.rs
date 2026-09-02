@@ -209,19 +209,70 @@ pub(crate) struct InflightRegistry {
     next_id: u64,
     /// Owned buffers for writes still considered in flight.
     inflight: Vec<InFlightWrite>,
+    /// #8291: where `Drop` accounts retained buffers. Production is
+    /// [`process_retained`]; a test may hand in a private sink so its
+    /// assertions do not sample state every other test writes to.
+    retained: std::sync::Arc<RetainedCounters>,
 }
 
-/// #7106: buffers this process has RETAINED rather than freed, because the
-/// teardown drain could not prove the kernel was done with them. Cumulative and
-/// process-global: a registry that leaks is being dropped, so a per-registry
-/// counter would be destroyed with the thing it describes.
+/// #7106: buffers a registry RETAINED rather than freed, because the teardown
+/// drain could not prove the kernel was done with them. Cumulative.
 ///
 /// There is otherwise no operator-visible signal that a ring abandoned buffers
 /// — the condition is silent by construction, since the whole point is that
 /// nothing further will be heard about those writes.
-pub(crate) static RETAINED_BUFFERS: AtomicU64 = AtomicU64::new(0);
-/// Bytes held by [`RETAINED_BUFFERS`].
-pub(crate) static RETAINED_BYTES: AtomicU64 = AtomicU64::new(0);
+///
+/// #8291: reached through an `Arc` rather than being a bare `static`. The
+/// original rationale for a process-global — "a registry that leaks is being
+/// dropped, so a per-registry counter would be destroyed with the thing it
+/// describes" — is EXACTLY RIGHT and is why this is not simply moved into
+/// `InflightRegistry`. An `Arc` satisfies it: the sink outlives the registry
+/// because every holder keeps it alive, so `Drop` can record into something
+/// that survives the drop. Production still has exactly one, [`process_retained`].
+///
+/// What that buys is test isolation. The accounting is written by
+/// `InflightRegistry::drop`, so EVERY test that drops a non-empty registry is a
+/// writer — measured, 28 of this module's tests construct one — while only two
+/// sample the counters. Against a shared static those two could not be made
+/// reliable by any amount of guarding, because you cannot serialise two readers
+/// against twenty-eight writers. With a private sink per sampling test the
+/// question does not arise, and the assertions become ABSOLUTE rather than a
+/// non-atomic read-act-read delta.
+pub(crate) struct RetainedCounters {
+    buffers: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl RetainedCounters {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buffers: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Account one teardown's retained buffers. The only mutator.
+    fn record(&self, buffers: u64, bytes: u64) {
+        self.buffers.fetch_add(buffers, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn buffers(&self) -> u64 {
+        self.buffers.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// The PROCESS sink: what the operator-visible status surface reports, and what
+/// every production `InflightRegistry` accounts into.
+pub(crate) fn process_retained() -> &'static std::sync::Arc<RetainedCounters> {
+    static PROCESS_RETAINED: std::sync::LazyLock<std::sync::Arc<RetainedCounters>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(RetainedCounters::new()));
+    &PROCESS_RETAINED
+}
 
 /// #7106: leak, rather than free, any entry the teardown drain could not prove
 /// terminal.
@@ -270,8 +321,7 @@ impl Drop for InflightRegistry {
             // the kernel may still write into it.
             std::mem::forget(entry);
         }
-        RETAINED_BUFFERS.fetch_add(count, Ordering::Relaxed);
-        RETAINED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        self.retained.record(count, bytes);
         eprintln!(
             "xpf-userspace-dp: io_uring teardown retained {count} unproven buffer(s)              ({bytes} bytes) — the kernel may still reference them, so they are              leaked rather than freed (#7106)"
         );
@@ -285,9 +335,22 @@ const MAX_WAIT_RETRIES: u32 = 4096;
 
 impl InflightRegistry {
     pub(crate) fn new() -> Self {
+        Self::with_retained(std::sync::Arc::clone(process_retained()))
+    }
+
+    /// #8291: build a registry that accounts into `retained` instead of the
+    /// process sink. Test-only: production has exactly one sink, and giving it
+    /// a second would split the operator-visible number in two.
+    #[cfg(test)]
+    pub(crate) fn with_retained_for_test(retained: std::sync::Arc<RetainedCounters>) -> Self {
+        Self::with_retained(retained)
+    }
+
+    fn with_retained(retained: std::sync::Arc<RetainedCounters>) -> Self {
         Self {
             next_id: 1,
             inflight: Vec::new(),
+            retained,
         }
     }
 
