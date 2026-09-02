@@ -340,6 +340,11 @@ var registryAccessAllowlist = map[string]bool{
 	"lookupMapLocked":           true,
 	"lookupProgramLocked":       true,
 	"publishShimRegistryLocked": true,
+	// #7755: the Teardown FD-close snapshot. Added as a HELPER rather than
+	// by allowlisting Teardown itself — the canary defends "registry access
+	// lives only in a small reviewable set of functions", and naming the
+	// caller would have widened that set instead of preserving it.
+	"takeRegistryHandles": true,
 }
 
 // unwrapOwnerIdent strips any parenthesization and pointer-dereference
@@ -725,6 +730,30 @@ func registryCanaryViolations(t *testing.T, root string) []string {
 					if id, ok := p.Fun.(*ast.Ident); ok && id.Name == "len" {
 						shapeOK = true
 					}
+				case *ast.RangeStmt:
+					// #7755: iterating the registry is NOT an alias escape, and
+					// this check's own stated hazard is aliasing — "container
+					// returned/aliased/assigned/passed". A `range` COPIES each
+					// key and value into fresh locals; the container reference
+					// does not outlive the statement, so nothing can read it
+					// after the lock is dropped. The rule was broader than its
+					// rationale, which is why it caught a safe operation
+					// (Teardown enumerating handles to CLOSE their FDs, where
+					// map names are dynamic so there is nothing to index by).
+					//
+					// This does NOT weaken the lock requirement: the domination
+					// check below is separate and still demands the access
+					// follow an m.mu.Lock in this function with no direct
+					// unlock, so `range` without the lock is still a violation.
+					// Nor does it widen the ALLOWLIST — only allowlisted
+					// functions reach this switch at all.
+					//
+					// The negatives test drives every real aliasing shape
+					// (assign, struct field, return, argument) plus
+					// range-without-lock, and each must still fail.
+					if p.X == sel {
+						shapeOK = true
+					}
 				}
 				if !shapeOK {
 					shapeViolations = append(shapeViolations,
@@ -842,6 +871,31 @@ func (m *Manager) publishShimRegistryLocked(prog *ebpf.Program, collMaps, shared
 		m.maps[name] = umap
 	}
 	m.loaded.Store(true)
+}
+
+func (m *Manager) takeRegistryHandles() []*ebpf.Map {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*ebpf.Map, 0, len(m.maps))
+	for _, h := range m.maps {
+		out = append(out, h)
+	}
+	return out
+}
+`
+	// #7755: the range refinement must not have loosened the LOCK requirement.
+	// The good fixture above ranges the registry under m.mu and is clean; this
+	// is the identical shape with the lock removed and it must still fail. It
+	// is the negative the refinement owes -- without it, "range is permitted"
+	// would be indistinguishable from "range is permitted anywhere".
+	rangeNoLock := `package dataplane
+
+func (m *Manager) takeRegistryHandles() []*ebpf.Map {
+	out := make([]*ebpf.Map, 0, len(m.maps))
+	for _, h := range m.maps {
+		out = append(out, h)
+	}
+	return out
 }
 `
 	rawAccess := `package dataplane
@@ -1023,6 +1077,7 @@ func (m *Manager) sneakyHelperValue(name string) *ebpf.Map {
 		t.Fatalf("well-formed fixture reported violations: %v", violations)
 	}
 
+	write("bad_rangenolock.go", rangeNoLock)
 	write("bad_raw.go", rawAccess)
 	write("bad_alias.go", aliasEscape)
 	write("bad_unlock.go", unlockBeforeAccess)
@@ -1072,6 +1127,8 @@ func (m *Manager) sneakyHelperValue(name string) *ebpf.Map {
 			saw["alias"] = true
 		case strings.Contains(v, "unlock-before-access"):
 			saw["unlock"] = true
+		case strings.Contains(v, "bad_rangenolock.go") && strings.Contains(v, "without any m.mu.Lock"):
+			saw["rangenolock"] = true
 		case strings.Contains(v, "bad_paramlock.go") && strings.Contains(v, "without any m.mu.Lock"):
 			saw["paramlock"] = true
 		case strings.Contains(v, "bad_closurelock.go") && strings.Contains(v, "without any m.mu.Lock"):
@@ -1090,7 +1147,7 @@ func (m *Manager) sneakyHelperValue(name string) *ebpf.Map {
 			saw["methodvalue"] = true
 		}
 	}
-	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder", "paren", "twohop", "typealias", "methodvalue", "paramlock", "crossfilealias", "chainedalias", "ptralias", "multiparen", "crossobject", "closurelock", "varmethodvalue", "helpermethodvalue"} {
+	for _, k := range []string{"raw", "recvAlias", "renamedRecv", "alias", "unlock", "nolock", "storeOrder", "paren", "twohop", "typealias", "methodvalue", "paramlock", "crossfilealias", "chainedalias", "ptralias", "multiparen", "crossobject", "closurelock", "varmethodvalue", "helpermethodvalue", "rangenolock"} {
 		if !saw[k] {
 			t.Errorf("canary missed synthetic negative %q; violations:\n%s", k, strings.Join(violations, "\n"))
 		}
