@@ -170,16 +170,28 @@ type CoSScheduler struct {
 	TransmitRateBytes uint64
 	TransmitRateExact bool
 	// TransmitRatePercent (#4228 Gap 2) carries the Junos `transmit-rate
-	// percent <n>` form: a share (0,100] of the bound interface's rate. It is
-	// accepted for vSRX-config import parity but ACCEPTED-BUT-INERT — the
-	// userspace dataplane consumes an absolute byte/sec TransmitRateBytes, and
-	// xpf does not yet resolve the percent against the interface's shaping-rate
-	// (a commit advisory surfaces this). Mutually exclusive with
-	// TransmitRateBytes and TransmitRateRemainder (validateClassOfServiceStrict).
+	// percent <n>` form: a share (0,100] of the bound interface's rate.
+	// Mutually exclusive with TransmitRateBytes and TransmitRateRemainder
+	// (validateClassOfServiceStrict).
+	//
+	// #6565 row 4 / #7422: this comment said ACCEPTED-BUT-INERT and that "xpf
+	// does not yet resolve the percent against the interface's shaping-rate".
+	// That was true when written and is NOT true now — the dataplane resolves
+	// it live in cos_effective_transmit_rate_bytes
+	// (userspace-dp/src/afxdp/forwarding_build/cos.rs), and the field is on the
+	// wire as transmit_rate_percent. A rationale outlives the fix that
+	// invalidates it unless something re-reads it, and this one had gone on to
+	// justify a renderer printing "-" for a queue that is in fact shaped.
 	TransmitRatePercent float64
 	// TransmitRateRemainder (#4228 Gap 2) carries the Junos `transmit-rate
-	// remainder` form (a share of the leftover bandwidth). Same accepted-but-
-	// inert status as TransmitRatePercent.
+	// remainder` form (a share of the leftover bandwidth).
+	//
+	// Also resolved live, but by a different mechanism and later (#6846):
+	// percent is a function of the scheduler and its interface, so it resolves
+	// per-scheduler; remainder means "whatever the interface's shaping rate has
+	// left after every SIBLING queue resolves", so it needs a pre-pass over the
+	// sibling set. Recorded because the two are easy to assume share an
+	// implementation and they do not.
 	TransmitRateRemainder bool
 	Priority              string
 	// BufferSizeBytes preserves the legacy explicit byte-size path.

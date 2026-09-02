@@ -750,7 +750,7 @@ func FormatCoSSchedulerMaps(cfg *config.Config, nameFilter string) string {
 					if sched.Priority != "" {
 						priority = sched.Priority
 					}
-					rate = formatCoSRate(sched.TransmitRateBytes)
+					rate = formatSchedulerTransmitRate(sched)
 					buffer = formatSchedulerBuffer(sched)
 					exact = yesNo(sched.TransmitRateExact)
 				}
