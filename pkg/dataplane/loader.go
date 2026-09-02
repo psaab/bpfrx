@@ -298,11 +298,22 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	//
 	// Blast radius, and why this MOVES rather than becoming recoverable:
 	// docs/log/7079.md. Bound by TestPinCleanupsRunAfterCompileConfig_7079.
+	//
+	// #7289 R1: each of the three aborts below returns AFTER Phase 2 has
+	// mutated the host and BEFORE the arm-coverage proof at the tail, so each
+	// one used to leave the published #7191 verdict describing a DIFFERENT
+	// apply — absent on the first, stale-and-affirmative on every later one —
+	// and the daemon's gate disarmed nothing either way. Routing them through
+	// abortAfterHostMutation publishes a LIVE proof first, so the gate decides
+	// from this apply's real kernel state. Note removeUserspaceShimXDPLinkPins
+	// below runs BEFORE the attach: after it, a failed attach can leave the
+	// interface with no XDP program at all, which is exactly the surface the
+	// proof has to adjudicate.
 	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
-		return nil, err
+		return nil, m.abortAfterHostMutation(result, err)
 	}
 	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
-		return nil, err
+		return nil, m.abortAfterHostMutation(result, err)
 	}
 	removeUserspaceShimXDPLinkPins()
 
@@ -314,7 +325,7 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 			return m.attachUserspaceShimXDP(r)
 		},
 	); err != nil {
-		return nil, err
+		return nil, m.abortAfterHostMutation(result, err)
 	}
 	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it
 	// sees real link state, reports what a gating build would have decided,
