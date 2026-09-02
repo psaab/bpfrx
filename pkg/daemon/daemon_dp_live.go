@@ -394,6 +394,28 @@ func (a liveDataPlane) GetSessionV6(key dataplane.SessionKeyV6) (dataplane.Sessi
 	return s.GetSessionV6(key)
 }
 
+// MirrorExclusions forwards the #7357 §2 port-mirroring readback when the
+// published backend keeps one (the userspace dataplane does; the retained BPF
+// shim has no snapshot builder and so has nothing to report).
+//
+// A capability assertion rather than a widening of the dataplane interface:
+// every other backend would have to grow a stub method that returns nil, and a
+// stub that returns nil is indistinguishable from "there are no exclusions",
+// which is the failure this whole issue is about. An absent capability is
+// reported as absent.
+func (a liveDataPlane) MirrorExclusions() []dpuserspace.MirrorExclusion {
+	s, err := a.resolve()
+	if err != nil {
+		return nil
+	}
+	if m, ok := s.(interface {
+		MirrorExclusions() []dpuserspace.MirrorExclusion
+	}); ok {
+		return m.MirrorExclusions()
+	}
+	return nil
+}
+
 func (a liveDataPlane) SessionCount() (v4, v6 int) {
 	s, err := a.resolve()
 	if err != nil {

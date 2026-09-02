@@ -1469,6 +1469,52 @@ That asymmetry is why the local copy was the last one still rendering a
 dropped instance as armed; `pkg/showaudit` now enumerates every renderer
 of the collection so a fourth copy cannot be added unannotated.
 
+### Runtime drops: interfaces that do not resolve (#7357)
+
+Three further drops depend on the **runtime interface table** rather than
+the committed config, so the shared config predicate above cannot see
+them. The builder now records the verdict it reached at apply time and
+the surfaces render it, at the granularity the drop happened at:
+
+| condition | dropped | rendered as |
+|---|---|---|
+| output interface has no ifindex | the whole instance | `NOT INSTALLED:` on the instance |
+| an input interface has no ifindex | that input only | `[NOT INSTALLED: …]` beside the input |
+| an input's ifindex is already mirrored by another instance | that input only | `[NOT INSTALLED: … already mirrored by instance <name>]` |
+
+The granularity matters. An instance whose output resolves but whose
+second input is claimed is **partially installed** — its first input is
+mirroring. Marking the whole instance `NOT INSTALLED` would lie in the
+opposite direction to the defect above. So an instance with a dropped
+input expands to one line per input:
+
+```
+Instance: span2
+  Input rate: 1/100
+  Input interfaces:
+    ge-0/0/0.0
+    ge-0/0/1.0  [NOT INSTALLED: ingress interface ge-0/0/1.0 already mirrored by instance span1]
+  Output interface: ge-0/0/9.0
+```
+
+An instance with no dropped inputs keeps the single joined
+`Input interfaces: a, b` line, unchanged.
+
+**What is rendered is the APPLIED verdict, not a fresh derivation.**
+`show forwarding-options port-mirroring` answers *what is installed*. An
+ifindex is a runtime identity that moves across a netdev recreate, so
+re-resolving interface names against a live table at render time would
+answer a different question — *what would be installed if the builder ran
+again now*. Where those two disagree the applied answer is the true one,
+and the disagreement means a missed rebuild: a bug in a different
+component, which a re-deriving renderer would silently paper over.
+
+Consequently the annotation is absent, rather than wrong, on a backend
+that keeps no applied snapshot (the retained BPF shim). The surfaces
+report the capability as absent instead of substituting an empty
+verdict — an empty verdict is indistinguishable from "nothing was
+excluded", which is the failure this whole family is about.
+
 Coverage is deliberately partial. The annotation covers the drops
 decidable from configuration — no output interface, and a negative input
 rate. The builder drops an instance for two further reasons that depend

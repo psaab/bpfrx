@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // FormatPortMirroring renders `show forwarding-options port-mirroring`.
@@ -29,7 +30,20 @@ import (
 // Output is byte-identical to what both call sites produced before, including
 // the trailing blank line after each instance — the parity test asserts the
 // two surfaces agree, so a change here must move both together by construction.
-func FormatPortMirroring(cfg *config.Config) string {
+//
+// #7357 §2: `excluded` carries the runtime verdicts the snapshot builder
+// reached at APPLY time — the three drops that depend on the interface table
+// (output ifindex unresolved, input ifindex unresolved, ingress already
+// mirrored) and which a config-only renderer cannot evaluate. Pass nil when
+// the applied snapshot is unavailable; the render then degrades to the
+// config-only annotation rather than claiming anything it does not know.
+//
+// Annotated at the granularity the drop OCCURRED at. An instance-level
+// exclusion suppresses the whole instance; an input-level one marks that input
+// and leaves the rest of the instance rendering normally, because an instance
+// with one claimed input is PARTIALLY installed and a whole-instance
+// NOT INSTALLED would lie in the other direction.
+func FormatPortMirroring(cfg *config.Config, excluded []userspace.MirrorExclusion) string {
 	if cfg == nil {
 		return "No port-mirroring instances configured\n"
 	}
@@ -48,6 +62,21 @@ func FormatPortMirroring(cfg *config.Config) string {
 	// differently on successive runs of the same command.
 	sort.Strings(names)
 
+	// Index the applied verdicts. Instance-level and input-level are kept
+	// apart on purpose — see the granularity note above.
+	instExcluded := map[string]string{}
+	inputExcluded := map[string]map[string]string{}
+	for _, e := range excluded {
+		if e.Input == "" {
+			instExcluded[e.Instance] = e.Reason
+			continue
+		}
+		if inputExcluded[e.Instance] == nil {
+			inputExcluded[e.Instance] = map[string]string{}
+		}
+		inputExcluded[e.Instance][e.Input] = e.Reason
+	}
+
 	var b strings.Builder
 	for _, name := range names {
 		inst := pm.Instances[name]
@@ -58,7 +87,23 @@ func FormatPortMirroring(cfg *config.Config) string {
 			b.WriteString("  Input rate: all packets\n")
 		}
 		if len(inst.Input) > 0 {
-			fmt.Fprintf(&b, "  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+			// The joined one-line form is preserved EXACTLY when nothing about
+			// this instance's inputs was excluded, so the common case stays
+			// byte-identical to the pre-#7357 output. Only an instance with a
+			// dropped input expands to one line per input, which is where the
+			// operator needs to see WHICH input and why.
+			if len(inputExcluded[name]) == 0 {
+				fmt.Fprintf(&b, "  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+			} else {
+				b.WriteString("  Input interfaces:\n")
+				for _, in := range inst.Input {
+					if reason := inputExcluded[name][in]; reason != "" {
+						fmt.Fprintf(&b, "    %s  [NOT INSTALLED: %s]\n", in, reason)
+					} else {
+						fmt.Fprintf(&b, "    %s\n", in)
+					}
+				}
+			}
 		}
 		if inst.Output != "" {
 			fmt.Fprintf(&b, "  Output interface: %s\n", inst.Output)
@@ -69,6 +114,11 @@ func FormatPortMirroring(cfg *config.Config) string {
 		// dataplane mirrors nothing at all. Verdict shared with
 		// buildMirrorSnapshots so the two cannot disagree.
 		if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
+			fmt.Fprintf(&b, "  NOT INSTALLED: %s\n", reason)
+		} else if reason := instExcluded[name]; reason != "" {
+			// #7357 §2: a runtime drop the config predicate cannot see. Only
+			// reached when the config predicate did NOT fire, so an instance
+			// excluded for both reasons prints one line, not two.
 			fmt.Fprintf(&b, "  NOT INSTALLED: %s\n", reason)
 		}
 		b.WriteString("\n")

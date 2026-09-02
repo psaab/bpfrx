@@ -24,7 +24,7 @@ func TestBuildMirrorConfigSnapshots(t *testing.T) {
 		{Name: "ge-0/0/1.0", LinuxName: "ge-0-0-1.0", Ifindex: 22},
 	}
 
-	got := buildMirrorConfigSnapshots(cfg, interfaces)
+	got, _ := buildMirrorConfigSnapshots(cfg, interfaces)
 	want := []MirrorConfigSnapshot{{IngressIfindex: 11, OutputIfindex: 22, Rate: 50}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mirror snapshots = %+v, want %+v", got, want)
@@ -89,7 +89,7 @@ func TestBuildMirrorConfigSnapshotsScopeDropsDuplicateIngressIfindex(t *testing.
 		{Name: "ge-0/0/1.0", LinuxName: "ge-0-0-1.0", Ifindex: 22},
 	}
 
-	got := buildMirrorConfigSnapshots(cfg, interfaces)
+	got, _ := buildMirrorConfigSnapshots(cfg, interfaces)
 	want := []MirrorConfigSnapshot{{IngressIfindex: 11, OutputIfindex: 22, Rate: 0}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mirror snapshots = %+v, want first-owner entry kept, duplicate scope-dropped %+v", got, want)
@@ -112,7 +112,7 @@ func TestBuildMirrorConfigSnapshotsSkipsMissingOutputIfindex(t *testing.T) {
 		{Name: "ge-0/0/9.0", LinuxName: "ge-0-0-9.0", Ifindex: 0},
 	}
 
-	got := buildMirrorConfigSnapshots(cfg, interfaces)
+	got, _ := buildMirrorConfigSnapshots(cfg, interfaces)
 	if len(got) != 0 {
 		t.Fatalf("mirror snapshots = %+v, want missing output ifindex skipped", got)
 	}
@@ -145,7 +145,7 @@ func TestBuildMirrorConfigSnapshotsScopeDropsNegativeInputRate(t *testing.T) {
 		{Name: "ge-0/0/2.0", LinuxName: "ge-0-0-2.0", Ifindex: 33},
 	}
 
-	got := buildMirrorConfigSnapshots(cfg, interfaces)
+	got, _ := buildMirrorConfigSnapshots(cfg, interfaces)
 	want := []MirrorConfigSnapshot{{IngressIfindex: 33, OutputIfindex: 22, Rate: 5}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mirror snapshots = %+v, want negative-rate instance dropped, valid one kept %+v", got, want)

@@ -21,9 +21,41 @@ import (
 // config written by an older build). It replaces the pre-#3972
 // whole-table-fail-closed-on-warn behavior that dropped every valid mirror
 // session on a single bad entry.
-func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []MirrorConfigSnapshot {
+// MirrorExclusion records ONE port-mirroring entry the builder refused to
+// install, and why (#7357 §2).
+//
+// WHY A RECORD RATHER THAN A PREDICATE. Every other #6534 family is closed by
+// a shared config predicate both the builder and the renderers call, so they
+// cannot disagree. These three drops cannot be: they depend on the runtime
+// ifindex table, which a config-only renderer has no access to.
+//
+// The obvious alternative — hand the renderer the resolved ifindex map so it
+// can re-derive — answers a DIFFERENT QUESTION from the one the operator
+// asked. `show forwarding-options port-mirroring` asks what IS installed. A
+// re-derivation against a live interface table reports what WOULD be installed
+// if the builder ran again now, and an ifindex is a runtime identity that
+// moves across a netdev recreate. When those two disagree the truthful answer
+// is still the applied one, and the disagreement means a MISSED REBUILD — a
+// bug in a different component that a re-deriving renderer would silently
+// paper over. That is this issue's own failure mode reintroduced one layer up.
+//
+// So the builder records the verdict it actually reached, at apply time, and
+// the renderer prints that.
+//
+// Input is empty for an instance-level drop and set for an input-level one.
+// The granularity is not cosmetic: an instance whose output resolves but whose
+// second input is claimed is PARTIALLY installed, and marking the whole
+// instance NOT INSTALLED would lie in the other direction — the same defect
+// with the sign flipped.
+type MirrorExclusion struct {
+	Instance string `json:"instance"`
+	Input    string `json:"input,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) ([]MirrorConfigSnapshot, []MirrorExclusion) {
 	if cfg == nil || cfg.ForwardingOptions.PortMirroring == nil || len(cfg.ForwardingOptions.PortMirroring.Instances) == 0 {
-		return nil
+		return nil, nil
 	}
 	ifindexByName := make(map[string]int, len(interfaces))
 	for _, iface := range interfaces {
@@ -43,6 +75,7 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 
 	seenIngress := make(map[int]string)
 	out := make([]MirrorConfigSnapshot, 0)
+	var excluded []MirrorExclusion
 	for _, name := range instanceNames {
 		inst := cfg.ForwardingOptions.PortMirroring.Instances[name]
 		if inst == nil {
@@ -61,6 +94,9 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 		if reason := config.PortMirroringInstanceExcludedReason(inst); reason != "" {
 			slog.Warn("port-mirroring: skipping instance (fail-closed)",
 				"name", name, "reason", reason, "rate", inst.InputRate, "output", inst.Output)
+			// Not recorded here: the renderers already annotate this one from
+			// the shared config predicate, and recording it too would make the
+			// same instance print NOT INSTALLED twice.
 			continue
 		}
 		outputIfindex := ifindexByName[inst.Output]
@@ -70,6 +106,10 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 		if outputIfindex <= 0 {
 			slog.Warn("port-mirroring output interface not found",
 				"name", name, "interface", inst.Output)
+			excluded = append(excluded, MirrorExclusion{
+				Instance: name,
+				Reason:   "output interface " + inst.Output + " has no ifindex",
+			})
 			continue
 		}
 
@@ -81,6 +121,11 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 			if ingressIfindex <= 0 {
 				slog.Warn("port-mirroring input interface not found",
 					"name", name, "interface", input)
+				excluded = append(excluded, MirrorExclusion{
+					Instance: name,
+					Input:    input,
+					Reason:   "input interface " + input + " has no ifindex",
+				})
 				continue
 			}
 			if previous, ok := seenIngress[ingressIfindex]; ok {
@@ -88,6 +133,11 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 				// by name) owns it. Skip the conflicting entry, keep the rest.
 				slog.Warn("port-mirroring: skipping duplicate ingress interface (one output per ingress interface)",
 					"name", name, "interface", input, "ifindex", ingressIfindex, "owner", previous)
+				excluded = append(excluded, MirrorExclusion{
+					Instance: name,
+					Input:    input,
+					Reason:   "ingress interface " + input + " already mirrored by instance " + previous,
+				})
 				continue
 			}
 			seenIngress[ingressIfindex] = name
@@ -98,5 +148,5 @@ func buildMirrorConfigSnapshots(cfg *config.Config, interfaces []InterfaceSnapsh
 			})
 		}
 	}
-	return out
+	return out, excluded
 }

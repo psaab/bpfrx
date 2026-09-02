@@ -37,7 +37,7 @@ func mirrorCfg7357() *config.Config {
 }
 
 func TestFormatPortMirroringAnnotatesOnlyTheDroppedInstance_7357(t *testing.T) {
-	out := FormatPortMirroring(mirrorCfg7357())
+	out := FormatPortMirroring(mirrorCfg7357(), nil)
 
 	// The dropped instance (no `output interface`) must be annotated...
 	if !strings.Contains(out, "NOT INSTALLED") {
@@ -66,7 +66,7 @@ func TestFormatPortMirroringAnnotatesOnlyTheDroppedInstance_7357(t *testing.T) {
 }
 
 func TestFormatPortMirroringSortsInstances_7357(t *testing.T) {
-	out := FormatPortMirroring(mirrorCfg7357())
+	out := FormatPortMirroring(mirrorCfg7357(), nil)
 	alpha := strings.Index(out, "Instance: alpha-dropped")
 	zeta := strings.Index(out, "Instance: zeta-healthy")
 	if alpha < 0 || zeta < 0 {
@@ -80,10 +80,10 @@ func TestFormatPortMirroringSortsInstances_7357(t *testing.T) {
 
 func TestFormatPortMirroringEmptyAndNil_7357(t *testing.T) {
 	const want = "No port-mirroring instances configured\n"
-	if got := FormatPortMirroring(nil); got != want {
-		t.Errorf("FormatPortMirroring(nil) = %q, want %q", got, want)
+	if got := FormatPortMirroring(nil, nil); got != want {
+		t.Errorf("FormatPortMirroring(nil, nil) = %q, want %q", got, want)
 	}
-	if got := FormatPortMirroring(&config.Config{}); got != want {
+	if got := FormatPortMirroring(&config.Config{}, nil); got != want {
 		t.Errorf("FormatPortMirroring(empty) = %q, want %q", got, want)
 	}
 }

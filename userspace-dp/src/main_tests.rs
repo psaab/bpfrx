@@ -2249,6 +2249,55 @@ fn config_snapshot_three_color_policers_roundtrip() {
     );
 }
 
+/// #7357 §2: `mirror_exclusions` is a Go-side diagnostic the helper never
+/// consumes, and it must stay that way in BOTH directions.
+///
+/// The Go builder now records why a port-mirroring entry was refused so the
+/// show surfaces can render the applied verdict. The helper has no use for it
+/// and models no field for it — which is fine only because the DTOs carry no
+/// `#[serde(deny_unknown_fields)]`. That is an ABSENCE, and an absence is
+/// exactly what a later hardening commit removes without realising a
+/// mixed-version wire depended on it (the #6853 lesson, same shape).
+///
+/// So this pins it: a snapshot carrying the new key must still decode, and the
+/// entries the helper DOES consume must survive intact rather than the parse
+/// failing or the unknown key displacing them.
+#[test]
+fn config_snapshot_tolerates_mirror_exclusions_7357() {
+    let json = r#"{
+        "version": 1,
+        "generation": 42,
+        "generated_at": "2026-05-17T00:00:00Z",
+        "summary": {
+            "host_name": "fw",
+            "dataplane_type": "userspace",
+            "interface_count": 0,
+            "zone_count": 0,
+            "policy_count": 0,
+            "scheduler_count": 0,
+            "ha_enabled": false
+        },
+        "mirror_configs": [
+            {"ingress_ifindex": 11, "output_ifindex": 22, "rate": 100}
+        ],
+        "mirror_exclusions": [
+            {"instance": "span1", "reason": "output interface ge-0/0/9.0 has no ifindex"},
+            {"instance": "span2", "input": "ge-0/0/0.0", "reason": "ingress interface ge-0/0/0.0 already mirrored by instance span1"}
+        ]
+    }"#;
+    let snap: ConfigSnapshot = serde_json::from_str(json)
+        .expect("a snapshot carrying mirror_exclusions must still decode on the helper");
+    assert_eq!(
+        snap.mirror_configs,
+        vec![MirrorConfigSnapshot {
+            ingress_ifindex: 11,
+            output_ifindex: 22,
+            rate: 100,
+        }],
+        "the unknown mirror_exclusions key must not disturb the entries the helper does consume"
+    );
+}
+
 #[test]
 fn config_snapshot_mirror_configs_roundtrip() {
     let json = r#"{

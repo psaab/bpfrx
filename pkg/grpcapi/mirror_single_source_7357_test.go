@@ -30,7 +30,7 @@ func TestGRPCPortMirroringRoutesThroughTheSharedFormatter_7357(t *testing.T) {
 	var buf strings.Builder
 	s.showForwardingOptionsPortMirroring(cfg, &buf)
 
-	want := dpformat.FormatPortMirroring(cfg)
+	want := dpformat.FormatPortMirroring(cfg, nil)
 	if buf.String() != want {
 		t.Errorf("the gRPC port-mirroring text is not what dpformat.FormatPortMirroring "+
 			"produced, so this surface is rendering from its own copy again (#7357).\n"+

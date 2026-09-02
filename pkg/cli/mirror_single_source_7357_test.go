@@ -25,7 +25,7 @@ func TestCLIPortMirroringRoutesThroughTheSharedFormatter_7357(t *testing.T) {
 		}
 	})
 
-	want := dpformat.FormatPortMirroring(c.store.ActiveConfig())
+	want := dpformat.FormatPortMirroring(c.store.ActiveConfig(), nil)
 	if got != want {
 		t.Errorf("the local CLI port-mirroring text is not what "+
 			"dpformat.FormatPortMirroring produced, so this surface is rendering from its "+

@@ -81,6 +81,7 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 	if err != nil {
 		return nil, err
 	}
+	mirrorConfigs, mirrorExclusions := buildMirrorConfigSnapshots(cfg, interfaces)
 	snap := &ConfigSnapshot{
 		Version:       ProtocolVersion,
 		Generation:    generation,
@@ -124,7 +125,8 @@ func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg conf
 		ThreeColorPolicers:    buildThreeColorPolicerSnapshots(cfg),
 		ClassOfService:        buildClassOfServiceSnapshot(cfg),
 		FlowExport:            buildFlowExportSnapshot(cfg),
-		MirrorConfigs:         buildMirrorConfigSnapshots(cfg, interfaces),
+		MirrorConfigs:         mirrorConfigs,
+		MirrorExclusions:      mirrorExclusions,
 		AddressBooks:          addressBooks,
 		AppCatalog:            appCatalog,
 		Config:                cfg,
