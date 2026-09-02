@@ -50,3 +50,11 @@ test/xsk-repro/libbpf-xsk-shared-test
 #                                              (with_extension, so .json is REPLACED)
 *.actual.json
 *.json.actual
+
+# Harness run output (#8302 review). newflow-ceiling-harness.sh:139 writes
+# ARTIFACT_ROOT="$ROOT_DIR/artifacts/..." into the REPO ROOT, and nothing
+# ignored it — so `git add -A` after a measurement run swept JSON output into
+# the commit. Verified by probe: an untracked artifacts/ showed as `?? artifacts/`.
+# The two pre-existing "artifacts" mentions in this file are COMMENTS, not
+# patterns, which is why a grep for the word looked like coverage.
+/artifacts/
