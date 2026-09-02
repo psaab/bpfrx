@@ -15,3 +15,39 @@
 # out of band. See #3595.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+# #8291: this crate's test suite REQUIRES single-threaded execution, and until
+# now that requirement lived only in the Makefile recipe — so a bare
+# `cargo test`, which is what everyone runs while iterating, silently violated
+# it and reddened about one run in three.
+#
+# The requirement is deliberate and documented in two places, for two
+# independent reasons:
+#
+#   * the Makefile's own note — "some dataplane socket tests can wedge in
+#     __skb_wait_for_more_packets when run concurrently; single-threaded
+#     execution avoids the intermittent hang";
+#   * `afxdp/checksum.rs`'s #6872 canary — the process-global DNAT counters are
+#     bumped by `publish_dnat_table_entry` / `delete_dnat_table_entry`, which are
+#     PRODUCTION functions on the DNAT path and must not take a lock. Dozens of
+#     tests call them without any guard. That comment states the consequence
+#     outright: "the reason the unguarded writers do not corrupt a sample today
+#     is that this crate's suite runs `--test-threads=1`".
+#
+# So this cannot be fixed by guarding more tests, and that was measured before
+# concluding it: serialising the SAMPLING cells in `tests_gre_version_6842` left
+# it failing 17 of 20 runs (from 19), because the other cells in the same file
+# bump the counter as a SIDE EFFECT without reading it. Serialising readers
+# against readers cannot exclude a writer.
+#
+# Setting it here makes the documented requirement automatic instead of
+# conventional — the same reason the link-arg above is set here rather than
+# expected as an out-of-band RUSTFLAGS. `make test-rust` still passes
+# `--test-threads=1` explicitly, which is now belt-and-braces rather than the
+# only thing standing between a developer and a flaky suite.
+#
+# Note this is a FLOOR, not a ceiling on intent: an explicit
+# `cargo test -- --test-threads=N` on the command line still wins, so anyone
+# deliberately hunting concurrency bugs can still ask for parallelism.
+[env]
+RUST_TEST_THREADS = "1"
