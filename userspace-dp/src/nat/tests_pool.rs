@@ -9519,3 +9519,243 @@ fn dropped_persistent_lease_note_names_both_buckets_7560() {
         "the note must state the OPERATOR-VISIBLE consequence: {note}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #7174 M13: HA-reserved NAT ports never invalidated from the recycle FIFO.
+// ---------------------------------------------------------------------------
+
+/// Allocate one PAT translation for a distinct flow, returning the translated
+/// tuple. `nth` only has to vary the flow key; the pool address is fixed.
+fn m13_allocate(
+    alloc: &PortAllocator,
+    addrs: &[Ipv4Addr],
+    nth: u16,
+) -> Result<TranslatedTuple, SourceNatFailureReason> {
+    let flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.51".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40_000 + nth,
+        dst_port: 443,
+    };
+    alloc.allocate_translation(
+        flow,
+        PoolAddressFamily::V4(addrs),
+        0,
+        false,
+        false,
+        PersistentNatPermit::TargetHostPort,
+        0,
+        1_000,
+        NatHolder::Untracked,
+    )
+}
+
+/// #7174 M13 fail-on-revert: a claim against an address whose every port is
+/// occupied must not walk the recycle FIFO.
+///
+/// This is the pathology the row is actually about, and it is invisible to a
+/// test that only reads the return value: an exhausted address returns `None`
+/// with or without the fix, so the ONLY thing that separates them is how many
+/// tokens the claim walked to get there. The fixture therefore has to contain a
+/// genuinely EXHAUSTED address — every port reserved out of band, every token
+/// still queued, which is exactly the post-HA-role-churn shape the row
+/// describes — and the assertion is on `debug_recycle_scan_pops`.
+///
+/// Pre-fix cost: 4 pops per failed claim x 8 claims = 32, plus a 4-element
+/// retain allocation each time, repeated for as long as callers keep trying the
+/// address (`None` is the CORRECT answer, so nothing self-corrects).
+#[test]
+fn pool_snat_exhausted_address_does_not_walk_recycle_fifo_7174_m13() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    // Range 1024..=1027 (4 ports).
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    // Fresh cursor spent, so the recycle ring is the only source.
+    alloc.debug_set_cursor(0, 4);
+    alloc.debug_set_recycled(0, vec![1024, 1025, 1026, 1027]);
+    // Every port reserved out of band (the HA reserve path): bits set, tokens
+    // still queued. The row's exact state.
+    for port in 1024..=1027u16 {
+        alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), port);
+    }
+    assert_eq!(
+        alloc.debug_occupied_counter(0),
+        4,
+        "fixture must be genuinely EXHAUSTED, not merely churned — otherwise the \
+         short-circuit is never reached and this test measures nothing",
+    );
+    assert_eq!(
+        alloc.debug_recycled_ports(0).len(),
+        4,
+        "fixture must still hold every reserved port's stale FIFO token",
+    );
+
+    let before = alloc.debug_recycle_scan_pops(0);
+    for nth in 0..8u16 {
+        assert!(
+            m13_allocate(&alloc, &addrs, nth).is_err(),
+            "a fully occupied address must not hand out a translation",
+        );
+    }
+    assert_eq!(
+        alloc.debug_recycle_scan_pops(0) - before,
+        0,
+        "a failed claim on a fully occupied address must not pop a single recycle \
+         token; walking the FIFO to rediscover 'full' is O(queue) per FAILED claim \
+         and never amortizes",
+    );
+
+    // The short-circuit must not have consumed or reordered the ring: the
+    // address has to recover the instant a port is released.
+    assert_eq!(
+        alloc.debug_recycled_ports(0),
+        vec![1024, 1025, 1026, 1027],
+        "the FIFO must be untouched by a short-circuited claim",
+    );
+    alloc.debug_clear_owner(0, IpAddr::V4(pool_ip), 1026);
+    let translated = m13_allocate(&alloc, &addrs, 100)
+        .expect("a released port must be claimable again through the recycle ring");
+    assert_eq!(translated.port, 1026);
+}
+
+/// The control for the test above, and the one that decides whether the
+/// short-circuit is AIMED right rather than merely powerful: an address that is
+/// NOT full must still scan its FIFO past the occupied tokens and claim the free
+/// one. A gate that fired one port early — or unconditionally — would pass the
+/// exhausted-address assertion above and silently turn a working pool into
+/// spurious exhaustion, which is precisely the failure #7174's analysis rejected
+/// a bare scan budget for.
+#[test]
+fn pool_snat_partially_occupied_address_still_scans_recycle_fifo_7174_m13() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1027);
+    alloc.debug_set_cursor(0, 4);
+    alloc.debug_set_recycled(0, vec![1024, 1025, 1026, 1027]);
+    // Three of four reserved out of band: occupied == 3, range == 4.
+    for port in [1024u16, 1025, 1026] {
+        alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), port);
+    }
+    assert_eq!(alloc.debug_occupied_counter(0), 3);
+
+    let before = alloc.debug_recycle_scan_pops(0);
+    let translated = m13_allocate(&alloc, &addrs, 0)
+        .expect("a free port behind three occupied tokens must still be found");
+    assert_eq!(translated.port, 1027);
+    assert_eq!(
+        alloc.debug_recycle_scan_pops(0) - before,
+        4,
+        "the scan must walk past the occupied tokens to reach the free one",
+    );
+    // 062-10: the three collided tokens are retained, not discarded.
+    assert_eq!(
+        alloc.debug_recycled_ports(0),
+        vec![1024, 1025, 1026],
+        "collided tokens must be retained at the BACK, never dropped",
+    );
+}
+
+/// #7174 M13, second accumulation source: the retain policy can create a SECOND
+/// token for one port, so the ring grows past the address's whole port range.
+///
+/// Sequence (one HA churn cycle): port 1025 is freed through `free_recycle`
+/// (token #1), then reserved out of band, so a claim pops token #1, finds the
+/// bit set and RETAINS it (062-10). When the out-of-band owner later releases
+/// through `free_recycle`, the `1 -> 0` transition pushes token #2 — and token
+/// #1 is still queued. Repeat per churn cycle and the ring exceeds `range`:
+/// unbounded memory, and every duplicate is one more pop for every later claim.
+#[test]
+fn pool_snat_recycle_ring_never_holds_a_duplicate_token_7174_m13() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1025);
+    alloc.debug_set_cursor(0, 2);
+    // 1025 was freed through the recycle path; 1024 is free behind it.
+    alloc.debug_set_recycled(0, vec![1025, 1024]);
+    // 1025 is now reserved out of band, so the pop below collides and retains.
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1025);
+
+    let translated = m13_allocate(&alloc, &addrs, 0).expect("1024 is free");
+    assert_eq!(translated.port, 1024);
+    assert_eq!(
+        alloc.debug_recycled_ports(0),
+        vec![1025],
+        "the collided token is retained at the back",
+    );
+
+    // The out-of-band owner releases through the RECYCLING path — the same path
+    // an HA-reserved plain-PAT flow takes (`unlink_live_allocation_locked` frees
+    // with recycle=true for a non-deterministic record).
+    assert!(
+        alloc.debug_free_recycle(0, 1025),
+        "the seeded owner's bit must have been set",
+    );
+    assert_eq!(
+        alloc.debug_recycled_ports(0),
+        vec![1025],
+        "a port already queued must not be queued a SECOND time; two tokens for one \
+         port is how the ring grows past `range` across HA role churn",
+    );
+    assert!(
+        alloc.debug_recycled_ports(0).len() as u32 <= 2,
+        "the ring is bounded by the address's port range",
+    );
+
+    // The surviving token is still good: 1025 must be claimable.
+    let translated = m13_allocate(&alloc, &addrs, 1).expect("1025 is free again");
+    assert_eq!(translated.port, 1025);
+}
+
+/// The `occupied` counter that gates the exhausted-address short-circuit must
+/// agree with the bitmap it summarises. Asserting the AGREEMENT rather than a
+/// literal is what keeps this honest: a claim/free path that stopped
+/// maintaining the counter would drift, and drift in the "counter too high"
+/// direction is a spurious exhaustion on a pool that still has free ports.
+#[test]
+fn pool_snat_occupancy_counter_agrees_with_bitmap_7174_m13() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let addrs = [pool_ip];
+    let alloc = PortAllocator::new(1, 1024, 1031);
+
+    // Fresh-cursor claims.
+    let mut ports = Vec::new();
+    for nth in 0..5u16 {
+        ports.push(
+            m13_allocate(&alloc, &addrs, nth)
+                .expect("a fresh address must hand out ports")
+                .port,
+        );
+    }
+    assert_eq!(
+        alloc.debug_occupied_counter(0) as usize,
+        alloc.debug_occupied_count()
+    );
+    assert_eq!(alloc.debug_occupied_counter(0), 5);
+
+    // Out-of-band reserve (0 -> 1) and out-of-band clear (1 -> 0).
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1031);
+    assert_eq!(
+        alloc.debug_occupied_counter(0) as usize,
+        alloc.debug_occupied_count()
+    );
+    // A second reserve of the SAME port loses the CAS and must not double-count.
+    alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1031);
+    assert_eq!(alloc.debug_occupied_counter(0), 6);
+    alloc.debug_clear_owner(0, IpAddr::V4(pool_ip), 1031);
+    // A second clear of the same port frees nothing and must not double-count.
+    alloc.debug_clear_owner(0, IpAddr::V4(pool_ip), 1031);
+    assert_eq!(alloc.debug_occupied_counter(0), 5);
+    assert_eq!(
+        alloc.debug_occupied_counter(0) as usize,
+        alloc.debug_occupied_count()
+    );
+
+    // Recycling free (1 -> 0 plus a queued token).
+    assert!(alloc.debug_free_recycle(0, ports[0]));
+    assert_eq!(alloc.debug_occupied_counter(0), 4);
+    assert_eq!(
+        alloc.debug_occupied_counter(0) as usize,
+        alloc.debug_occupied_count()
+    );
+}

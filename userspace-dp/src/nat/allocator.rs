@@ -773,19 +773,129 @@ impl PortAllocatorLiveState {
     }
 }
 
+/// #7174 (M13): the FIFO recycle ring plus a per-offset "already queued" bitset,
+/// held together under ONE mutex so a port can hold AT MOST ONE token.
+///
+/// Without the bitset the queue grows without bound across HA role churn, and
+/// the growth is NOT the mechanism M13's title names. The retain policy
+/// (`claim` re-queues a token whose bit was set at pop time, 062-10) is what
+/// creates the duplicate: the port is occupied, so its token goes back; when the
+/// occupant later releases through `free_recycle` the `1 -> 0` transition pushes
+/// a SECOND token for the same port. Repeat per churn cycle and the queue
+/// exceeds the address's whole port `range` — unbounded memory, and every
+/// duplicate is one more pop the recycled phase has to walk.
+///
+/// With the bitset the queue length is bounded by `range` structurally: a push
+/// for an already-queued offset is dropped, and the token that IS queued is
+/// equally good (the FIFO holds ports, not identities).
+#[derive(Debug)]
+struct RecycleRing {
+    queue: VecDeque<u16>,
+    /// One bit per in-range offset: set iff a token for that offset is in
+    /// `queue`. Sized like `AddressOccupancy::words`, but allocated LAZILY on
+    /// the first push: a pool may declare up to `MAX_POOL_PREFIX_HOSTS`
+    /// addresses and every one of them already carries a `words` bitmap, so
+    /// sizing this one eagerly would double a per-ADDRESS allocation for every
+    /// address in the pool — including the ones that never recycle a port.
+    /// Empty means "nothing has ever been queued here", which is exactly when
+    /// no dedup state is needed.
+    queued: Vec<u64>,
+    /// `queued`'s length once allocated, kept because `push` is the only place
+    /// that can allocate it and it has no other route to `range`.
+    nwords: usize,
+}
+
+impl RecycleRing {
+    fn new(range: u32) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queued: Vec::new(),
+            nwords: (range as usize).div_ceil(64),
+        }
+    }
+
+    #[inline]
+    fn is_queued(&self, offset: u32) -> bool {
+        let w = (offset / 64) as usize;
+        match self.queued.get(w) {
+            Some(word) => word & (1u64 << (offset % 64)) != 0,
+            // Not yet allocated: nothing has ever been queued, so nothing is.
+            None => false,
+        }
+    }
+
+    #[inline]
+    fn mark(&mut self, offset: u32) {
+        if self.queued.is_empty() {
+            self.queued = vec![0u64; self.nwords];
+        }
+        let w = (offset / 64) as usize;
+        debug_assert!(
+            w < self.queued.len(),
+            "recycle offset {offset} outside the ring's range"
+        );
+        if let Some(word) = self.queued.get_mut(w) {
+            *word |= 1u64 << (offset % 64);
+        }
+    }
+
+    #[inline]
+    fn unmark(&mut self, offset: u32) {
+        let w = (offset / 64) as usize;
+        if let Some(word) = self.queued.get_mut(w) {
+            *word &= !(1u64 << (offset % 64));
+        }
+    }
+
+    /// Queue a token for `port`. `offset` is `offset_of(port)`: `None` means the
+    /// port is out of this address's range (a stale token — `claim` drops it on
+    /// pop), which is not deduped because it owns no bit. Returns true iff a
+    /// token was actually queued.
+    fn push(&mut self, port: u16, offset: Option<u32>) -> bool {
+        if let Some(offset) = offset {
+            if self.is_queued(offset) {
+                return false;
+            }
+            self.mark(offset);
+        }
+        self.queue.push_back(port);
+        true
+    }
+}
+
 /// #2852 Phase 1: per-pool-address atomic occupancy for lock-free port claim.
 ///
 /// `words` is the occupancy bitmap (bit set => that port offset is claimed);
 /// a `fetch_or` CAS is the sole port-ownership arbiter and replaces the
 /// pre-#2852 `owner_by_translated` map. `cursor` is the monotonic fresh-port
 /// hand-out counter (the pre-#2852 `next_port_offset_by_addr`). `recycle` is
-/// the #3011 FIFO reuse ring, behind a per-ADDRESS mutex (never the global
-/// allocator mutex). `port_low`/`range` map ports to bit offsets.
+/// the #3011 FIFO reuse ring — a [`RecycleRing`], which since #7174 M13 pairs
+/// the queue with a per-offset "already queued" bitset so a port holds at most
+/// one token — behind a per-ADDRESS mutex (never the global allocator mutex).
+/// `port_low`/`range` map ports to bit offsets.
 #[derive(Debug)]
 struct AddressOccupancy {
     words: Vec<AtomicU64>,
     cursor: AtomicU32,
-    recycle: Mutex<VecDeque<u16>>,
+    recycle: Mutex<RecycleRing>,
+    /// #7174 (M13): live count of set bits in `words`, maintained by the two
+    /// (and only two) sites that transition a bit — `claim_offset` (0 -> 1) and
+    /// `free_offset` (1 -> 0). `Relaxed` is sufficient: the ONE consumer that
+    /// makes a decision from it reads it while holding `recycle`, and every
+    /// `free_recycle` decrements it while holding the same mutex, so the value
+    /// a claimer sees is exact with respect to the FIFO contents it is about to
+    /// walk. See `claim`.
+    occupied: AtomicU32,
+    /// #7174 (M13): tokens popped by the recycled phase of `claim`, cumulative.
+    /// This is the quantity the row is about — "allocation cost spikes after HA
+    /// role churn" is a statement about how many tokens a claim walks — and it
+    /// is the ONLY externally visible difference between walking a full
+    /// address's FIFO and short-circuiting it, because both return `None`. A
+    /// test that asserted only the return value would be satisfied by no fix at
+    /// all. Same shape as `gc_lock_acquisitions`, including its `#[cfg(test)]`
+    /// gating: a pure test seam owes the production claim path nothing.
+    #[cfg(test)]
+    recycle_scan_pops: AtomicU64,
     port_low: u16,
     range: u32,
 }
@@ -800,7 +910,10 @@ impl AddressOccupancy {
         Self {
             words,
             cursor: AtomicU32::new(0),
-            recycle: Mutex::new(VecDeque::new()),
+            recycle: Mutex::new(RecycleRing::new(range)),
+            occupied: AtomicU32::new(0),
+            #[cfg(test)]
+            recycle_scan_pops: AtomicU64::new(0),
             port_low,
             range,
         }
@@ -840,7 +953,14 @@ impl AddressOccupancy {
     fn claim_offset(&self, offset: u32) -> bool {
         let w = (offset / 64) as usize;
         let mask = 1u64 << (offset % 64);
-        self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0
+        let won = self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0;
+        if won {
+            // #7174 M13: exactly one increment per 0 -> 1 transition. The CAS
+            // return value is what makes it exact — a losing racer does not
+            // count the bit it did not win.
+            self.occupied.fetch_add(1, Ordering::Relaxed);
+        }
+        won
     }
 
     /// Clear the bit at `offset`. Returns true iff it was set (1 -> 0).
@@ -848,7 +968,12 @@ impl AddressOccupancy {
     fn free_offset(&self, offset: u32) -> bool {
         let w = (offset / 64) as usize;
         let mask = 1u64 << (offset % 64);
-        self.words[w].fetch_and(!mask, Ordering::Release) & mask != 0
+        let freed = self.words[w].fetch_and(!mask, Ordering::Release) & mask != 0;
+        if freed {
+            // #7174 M13: exactly one decrement per 1 -> 0 transition.
+            self.occupied.fetch_sub(1, Ordering::Relaxed);
+        }
+        freed
     }
 
     #[inline]
@@ -895,22 +1020,56 @@ impl AddressOccupancy {
         // RETAINED (re-queued at the back), never discarded (062-10). The
         // retain buffer allocates lazily only on an actual collision.
         let mut recycle = self.recycle.lock().unwrap_or_else(|e| e.into_inner());
-        let mut retained: Vec<u16> = Vec::new();
+
+        // #7174 (M13): an address with EVERY port occupied cannot yield a claim,
+        // so do not walk the FIFO to discover that.
+        //
+        // This is the pathology the row is actually about. Retained tokens go to
+        // the BACK (`push` below), so K out-of-band-reserved tokens queued ahead
+        // of free ones cost O(K) ONCE and then migrate behind the free ones —
+        // the HA-churn spike amortizes itself. What does NOT amortize is the
+        // EXHAUSTED address: with the free tokens gone the FIFO is K reserved
+        // tokens and nothing else, so every claim popped all K, retained all K,
+        // allocated a K-element retain buffer, and returned None. `None` is the
+        // correct answer there, so nothing self-corrected: O(K) per FAILED
+        // claim, for as long as callers kept trying that address.
+        //
+        // The test is EXACT rather than a budget, which is what makes it safe.
+        // The earlier analysis on #7174 rejected a bare scan budget because
+        // `None` on budget exhaustion is read by callers as "this address is
+        // full", turning a slow allocation into a spuriously dropped NAT
+        // translation — a budget needs a way to tell "scanned enough" from
+        // "genuinely full". `occupied == range` IS that discriminator: every
+        // set bit is an offset < range, so the equality holds iff no port is
+        // free. And it is exact with respect to the FIFO this claimer is about
+        // to walk, not merely a hint, because `free_recycle` decrements the
+        // counter and queues the token under THIS mutex: a free that has not
+        // yet taken the lock has not pushed a token either, so a full scan
+        // would miss it identically.
+        if self.occupied.load(Ordering::Relaxed) >= self.range {
+            return None;
+        }
+
+        let mut retained: Vec<(u16, u32)> = Vec::new();
         let mut claimed = None;
-        while let Some(port) = recycle.pop_front() {
-            match self.offset_of(port) {
-                Some(offset) if self.claim_offset(offset) => {
+        while let Some(port) = recycle.queue.pop_front() {
+            #[cfg(test)]
+            self.recycle_scan_pops.fetch_add(1, Ordering::Relaxed);
+            // An out-of-range (stale) port yields None and is DROPPED: it owns
+            // no bit, so it was never marked and there is nothing to unmark.
+            if let Some(offset) = self.offset_of(port) {
+                recycle.unmark(offset);
+                if self.claim_offset(offset) {
                     claimed = Some(port);
                     break;
                 }
-                // Out-of-range (stale) ports are dropped; occupied ports are
-                // retained so a transient collision cannot shrink the pool.
-                Some(_) => retained.push(port),
-                None => {}
+                // Occupied: retained so a transient collision cannot shrink the
+                // pool (062-10).
+                retained.push((port, offset));
             }
         }
-        if !retained.is_empty() {
-            recycle.extend(retained);
+        for (port, offset) in retained {
+            recycle.push(port, Some(offset));
         }
         claimed
     }
@@ -921,13 +1080,18 @@ impl AddressOccupancy {
         let Some(offset) = self.offset_of(port) else {
             return false;
         };
+        // #7174 (M13): the bit clear and the token push happen under ONE
+        // acquisition of the recycle mutex. That is what lets `claim`'s
+        // exhausted-address test be exact rather than a hint: a claimer holding
+        // this mutex cannot observe a decremented `occupied` whose token has not
+        // been queued yet, nor a queued token whose decrement it has not seen.
+        // The bit itself stays a lock-free atomic; the critical section grows by
+        // one `fetch_and` on a path that already took this mutex to push.
+        let mut recycle = self.recycle.lock().unwrap_or_else(|e| e.into_inner());
         if !self.free_offset(offset) {
             return false;
         }
-        self.recycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(port);
+        recycle.push(port, Some(offset));
         true
     }
 
@@ -953,6 +1117,12 @@ impl AddressOccupancy {
 
     /// Count of currently-occupied ports on this address (popcount over the
     /// bitmap). Cold path (snapshot / tests only).
+    ///
+    /// Deliberately NOT read from the `occupied` counter (#7174 M13): the
+    /// popcount is derived from the bitmap itself, so it stays an INDEPENDENT
+    /// oracle for the counter rather than a second name for it. A test asserts
+    /// the two agree after a workload; if they ever diverge, that assertion is
+    /// the thing that can see it.
     fn occupied_count(&self) -> usize {
         self.words
             .iter()
@@ -1315,6 +1485,7 @@ impl PortAllocator {
                 .recycle
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .queue
                 .iter()
                 .copied()
                 .collect(),
@@ -1323,10 +1494,54 @@ impl PortAllocator {
     }
 
     /// Test-only: replace the FIFO recycle queue for pool address `addr_index`.
+    /// Goes through `RecycleRing::push` so the #7174 M13 dedup bitset stays
+    /// consistent with the queue — an injected duplicate is dropped exactly as
+    /// a production duplicate would be.
     #[cfg(test)]
     pub(super) fn debug_set_recycled(&self, addr_index: usize, ports: Vec<u16>) {
         if let Some(occ) = self.shared.occupancy.get(addr_index) {
-            *occ.recycle.lock().unwrap_or_else(|e| e.into_inner()) = VecDeque::from(ports);
+            let mut recycle = occ.recycle.lock().unwrap_or_else(|e| e.into_inner());
+            *recycle = RecycleRing::new(occ.range);
+            for port in ports {
+                let offset = occ.offset_of(port);
+                recycle.push(port, offset);
+            }
+        }
+    }
+
+    /// Test-only: free `port` on pool address `addr_index` through the
+    /// RECYCLING path — the same path a plain-PAT record takes in
+    /// `unlink_live_allocation_locked` (recycle = !deterministic). Returns true
+    /// iff the occupancy bit was set.
+    #[cfg(test)]
+    pub(super) fn debug_free_recycle(&self, addr_index: usize, port: u16) -> bool {
+        match self.shared.occupancy.get(addr_index) {
+            Some(occ) => occ.free_recycle(port),
+            None => false,
+        }
+    }
+
+    /// Test-only: tokens popped by the recycled phase of `claim` on pool
+    /// address `addr_index` since construction (#7174 M13). The seam that makes
+    /// the exhausted-address short-circuit MEASURABLE — the return value is
+    /// `None` with or without it.
+    #[cfg(test)]
+    pub(super) fn debug_recycle_scan_pops(&self, addr_index: usize) -> u64 {
+        match self.shared.occupancy.get(addr_index) {
+            Some(occ) => occ.recycle_scan_pops.load(Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
+    /// Test-only: the #7174 M13 live occupancy counter for pool address
+    /// `addr_index`, read WITHOUT the popcount. Paired with
+    /// `debug_occupied_count` (which popcounts the bitmap) it binds the
+    /// agreement between the counter and the bitmap it summarises.
+    #[cfg(test)]
+    pub(super) fn debug_occupied_counter(&self, addr_index: usize) -> u32 {
+        match self.shared.occupancy.get(addr_index) {
+            Some(occ) => occ.occupied.load(Ordering::Relaxed),
+            None => 0,
         }
     }
 
@@ -3436,7 +3651,11 @@ impl PortAllocator {
         drop(live);
         // used_ports is the total set bits across the lock-free occupancy
         // bitmaps (popcount). Cold path (1/s status poll), so recomputing it
-        // rather than maintaining a hot-path atomic is fine.
+        // is fine — and deliberate even though #7174 M13 now maintains a live
+        // `occupied` counter per address: keeping this a popcount leaves the
+        // bitmap an INDEPENDENT oracle for that counter rather than a second
+        // name for it (`pool_snat_occupancy_counter_agrees_with_bitmap_7174_m13`
+        // asserts they agree).
         let used_ports: u64 = self
             .shared
             .occupancy
