@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Hermetic self-test for test/incus/mouse-elephant-lib.sh (#7159).
+# Hermetic self-test for test/incus/mouse-elephant-lib.sh (#7159, #8270).
 #
 # The defect under guard is INVISIBLE to any assertion on the rep
 # script's exit code or artifacts: the old stop path (`kill` on the
@@ -38,10 +38,17 @@ LIB="${SCRIPT_DIR}/mouse-elephant-lib.sh"
 . "$LIB"
 
 TMP="$(mktemp -d)"
-MARKER="xpf-mouse-elephant-selftest-$$"
+BASE="xpf-mouse-elephant-selftest-$$"
+# Each fake's argv[0] embeds the program name it stands in for: the
+# stop command confirms /proc/<pid>/cmdline still names that program
+# before signalling (cell 5), so a stand-in that does not look like the
+# program would be spared and cells 1 and 4 would fail for the wrong
+# reason.
+MARKER="iperf3-${BASE}"
+MARKER_MPSTAT="mpstat-${BASE}"
 TAG="selftest_$$"
 cleanup() {
-    pkill -f "$MARKER" 2>/dev/null
+    pkill -f "$BASE" 2>/dev/null
     rm -rf "$TMP"
     rm -f "$(mouse_elephant_pidfile "$TAG")" "$(mouse_elephant_outfile "$TAG")"
 }
@@ -58,7 +65,7 @@ exec -a "$MARKER" sleep 4242
 FAKE
 chmod +x "${TMP}/iperf3"
 
-leaf_alive() { pgrep -f "$MARKER" >/dev/null 2>&1; }
+leaf_alive() { pgrep -f "${1:-$MARKER}" >/dev/null 2>&1; }
 
 # ---- 1. start writes a pidfile naming the LEAF; stop reaps it.
 PATH="${TMP}:${PATH}" setsid sh -c \
@@ -165,6 +172,84 @@ else
     else
         pass "stale-client check fails when an iperf3 client is already running"
     fi
+fi
+
+# ---- 4. the generic job layer, used by both mpstat samplers (#8270).
+#
+# Same property as the elephant: the pidfile must name the LEAF, and
+# the stop command must reap it. A separate cell rather than trusting
+# the elephant wrapper, because the samplers are what regressed --
+# #8268 fixed one call site and left two with the old shape.
+MPTAG="selftest_mpstat_$$"
+cat > "${TMP}/mpstat" <<FAKE
+#!/usr/bin/env bash
+exec -a "$MARKER_MPSTAT" sleep 4242
+FAKE
+chmod +x "${TMP}/mpstat"
+
+PATH="${TMP}:${PATH}" setsid sh -c \
+    "$(mouse_remote_job_start_cmd mpstat "$MPTAG" mpstat 1 60)" \
+    < /dev/null > /dev/null 2>&1 &
+for _ in $(seq 1 50); do
+    leaf_alive "$MARKER_MPSTAT" && break
+    sleep 0.1
+done
+if ! leaf_alive "$MARKER_MPSTAT"; then
+    fail "fake mpstat never started; the sampler stop path was NOT exercised"
+else
+    mp_pidfile="$(mouse_remote_job_pidfile mpstat "$MPTAG")"
+    mp_recorded="$(cat "$mp_pidfile" 2>/dev/null)"
+    mp_leaf="$(pgrep -f "$MARKER_MPSTAT" | head -1)"
+    if [[ "$mp_recorded" != "$mp_leaf" ]]; then
+        fail "sampler pidfile names $mp_recorded but the leaf is $mp_leaf (missing exec?)"
+    else
+        pass "sampler pidfile names the leaf process itself"
+    fi
+    sh -c "$(mouse_remote_job_kill_cmd mpstat "$MPTAG" mpstat)"
+    for _ in $(seq 1 30); do
+        leaf_alive "$MARKER_MPSTAT" || break
+        sleep 0.1
+    done
+    if leaf_alive "$MARKER_MPSTAT"; then
+        fail "sampler stop command left the process running"
+    else
+        pass "sampler stop command reaped the process"
+    fi
+fi
+rm -f "$(mouse_remote_job_pidfile mpstat "$MPTAG")" \
+      "$(mouse_remote_job_outfile mpstat "$MPTAG")"
+
+# ---- 5. the stop command refuses a pid that is no longer its job.
+#
+# This is the control that fails on CORRECT input rather than on a
+# mutant: the stop command now runs on every path, including reps that
+# finished normally, so by the time it fires the recorded pid may have
+# been reused by an unrelated process on the source container. A stop
+# command without the /proc/<pid>/cmdline check kills that stranger and
+# every other cell here still passes.
+REUSE_TAG="selftest_reuse_$$"
+INNOCENT="${BASE}-innocent"
+setsid bash -c "exec -a '$INNOCENT' sleep 4244" < /dev/null > /dev/null 2>&1 &
+for _ in $(seq 1 50); do
+    pgrep -f "$INNOCENT" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+innocent_pid="$(pgrep -f "$INNOCENT" | head -1)"
+if [[ -z "$innocent_pid" ]]; then
+    fail "could not start the pid-reuse stand-in; reuse control NOT run"
+else
+    echo "$innocent_pid" > "$(mouse_remote_job_pidfile mpstat "$REUSE_TAG")"
+    sh -c "$(mouse_remote_job_kill_cmd mpstat "$REUSE_TAG" mpstat)"
+    sleep 0.3
+    if pgrep -f "$INNOCENT" >/dev/null 2>&1; then
+        pass "stop command spares a reused pid that is not its job"
+    else
+        fail "stop command killed an unrelated process holding a reused pid"
+    fi
+    if [[ -e "$(mouse_remote_job_pidfile mpstat "$REUSE_TAG")" ]]; then
+        fail "stop command left the pidfile behind on the reuse path"
+    fi
+    pkill -f "$INNOCENT" 2>/dev/null
 fi
 
 if [[ $fails -ne 0 ]]; then

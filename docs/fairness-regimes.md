@@ -748,7 +748,28 @@ When the settle snapshot pull succeeds and diagnostics run, high-rate
 `cwnd-settle.json` records the final settle-window aggregate, threshold
 reasons, min/median/max of per-flow mean throughput, retransmits, and
 latest cwnd distribution. `mpstat-settle.txt`
-captures source-side CPU during the settle window. `manifest.json` records
+captures source-side CPU during the settle window.
+
+Every load generator and sampler the rep script backgrounds runs on the
+source container through `incus exec`, and each is stopped **on the
+container**, not by killing the local client (#7159, #8270). Killing a
+backgrounded `incus exec` client does not terminate the remote command —
+incus leaves it running when a non-interactive client disconnects — so
+before this the elephant and both mpstat samplers outlived any rep that
+exited early. For the elephant that corrupted the measurement rather
+than merely leaking: it kept sending for the rest of its 90 s budget
+while the next rep started ~8 s later, so the next rep's elephants
+shared the shaped class with the previous rep's, missed the cwnd-settle
+floor, exited early themselves, and orphaned another. One marginal
+rejection took the whole cell to zero valid reps with a plausible
+`cwnd-not-settled` reason. `test/incus/mouse-elephant-lib.sh` gives each
+remote job a pidfile (`echo $$ > <pidfile>; exec <cmd>`, both halves
+load-bearing) and stops it by that pid after confirming
+`/proc/<pid>/cmdline` still names the expected program, so a reused pid
+is spared. `make test-mouse-elephant-lib` self-tests it hermetically.
+A rep also refuses to start when an iperf3 client is already running on
+the source container (`INVALID-stale-elephant-client`), so a stranger
+sharing the class is a named invalidation instead of a halved rate. `manifest.json` records
 `settle_budget_s`, `cwnd_settle_elapsed_s`, and tri-state
 `cwnd_settle_ok`: `true` only after a successful settle diagnostic,
 `false` after an evaluated-but-unsettled diagnostic, and `null` for cells
