@@ -477,16 +477,17 @@ def render(result: Dict) -> str:
             f"headline {result['headline_metric']} = {result['value']} "
             f"({result.get('headline_direction')})"
         )
-    if result.get("baseline_n"):
+    if result.get("baseline_n") and "band_lo" in result:
         out.append(
             f"band over the last {result['baseline_n']} green run(s): "
-            + (
-                f"[{result['band_lo']:.6g}, {result['band_hi']:.6g}] "
-                f"median {result['band_median']:.6g}"
-                if "band_lo" in result
-                else "(not computed)"
-            )
+            f"[{result['band_lo']:.6g}, {result['band_hi']:.6g}] "
+            f"median {result['band_median']:.6g}"
         )
+    elif result.get("baseline_n"):
+        # Below the K floor there IS no band. Printing a "band over the last N
+        # green run(s)" line with a placeholder invites reading a number that
+        # was never computed; the note below says what happened instead.
+        out.append(f"green runs available: {result['baseline_n']} (below the K floor)")
     if result.get("note"):
         out.append(f"note: {result['note']}")
     inv = result.get("invariants") or {}
