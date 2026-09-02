@@ -1032,42 +1032,6 @@ must re-drive it, and a third that must NOT) and
 `TestClaimApplyRetryOnlyAfterAFailedApply`, in
 `dhcp_apply_converger_6535_test.go`.
 
-### Proxy-ARP for a NAT pool address follows RG ownership (#8297)
-
-Answering proxy-ARP for a source-NAT pool address is claiming a VIP-adjacent
-identity, so it belongs to whichever node owns the interface's redundancy
-group — the same question VRRP already answers for the VIPs themselves, and it
-answers it by NOT HOLDING the address rather than by filtering replies.
-
-Before this, both nodes installed the `NTF_PROXY` entry unconditionally.
-Measured on the loss userspace cluster: `fw0` (primary) and `fw1`
-(secondary-hold) each carried `172.16.80.7` and each answered with its own
-per-node RETH virtual MAC, so the upstream saw one IP at two MACs and pool-mode
-TCP never completed a handshake. The discriminating control was that a source
-matching the interface-mode rule reached 5.95 Gbit/s in the same second a
-source matching the pool rule timed out, while ICMP through the same pool
-worked — clearing translation, routing and the reverse path.
-
-`proxyARPOwnsInterface` (`proxyarp_rg_ownership_8297.go`) mirrors
-`relayMasterGateOpen` (#2456) and the DDNS per-RG writer gate exactly:
-standalone always answers; an interface with no redundancy group always
-answers; an RG-owned interface answers only while this node is MASTER for that
-RG, read from the live `rgStateMachine`. **The first two arms carry the wider
-blast radius** — gating a box with no RGs would break pool-mode NAT on every
-standalone deployment while passing every cluster test, so each has its own
-fail-on-revert cell.
-
-Losing ownership needs no removal path of its own: the interface drops out of
-the DESIRED set and the #4955 teardown already sweeps its `NTF_PROXY` entries
-and drives the per-interface sysctl down.
-
-Convergence is bounded by `proxyARPOwnershipPollInterval` (2s, matching the RG
-state loop's own cadence), not by the 30s reassert beat: a demoted node that
-kept answering for 30s would leave an upstream caching its MAC and steering
-pool return traffic at a node that no longer owns the address. The poll is a
-config lookup plus an `rgStateMachine` read per entry — no netlink, no apply
-semaphore — and only a CHANGE costs a reconcile.
-
 ### Cluster DHCP member scoping: node-local vs RG-scoped (#6520)
 
 `filterDHCPConfigForMasterRGs` decides which members of each
