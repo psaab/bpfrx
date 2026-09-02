@@ -416,6 +416,8 @@ pub(crate) fn is_fixture(rel: &str) -> bool {
         || rel.ends_with("/tests.rs")
         || rel.ends_with("_tests.rs")
         || rel.contains("/tests/")
+        || rel.starts_with("tests_")
+        || rel.contains("/tests_")
 }
 
 pub(crate) fn afxdp_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
