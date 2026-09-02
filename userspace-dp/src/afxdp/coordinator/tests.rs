@@ -4402,11 +4402,16 @@ fn six242_three_worker_bindings() -> Vec<BindingStatus> {
 /// fail.
 ///
 /// This pins the invariant the consolidation must preserve: because
-/// registration is now ONE `records.insert` POST-spawn-success, a failed worker
-/// has nothing to unwind and the launched records are NEVER touched on the
-/// spawn-fail arm. Fail-on-revert: make the spawn-fail arm also
-/// `coord.workers.records.clear()` (or move registration back pre-spawn) and the
-/// launched-records-survive assertions below flip RED.
+/// registration is now ONE `WorkerManager::register` POST-spawn-success, a
+/// failed worker has nothing to unwind and the launched records are NEVER
+/// touched on the spawn-fail arm. Fail-on-revert: make the spawn-fail arm also
+/// call `WorkerManager::stop_and_clear` (or move registration back pre-spawn)
+/// and the launched-records-survive assertions below flip RED.
+///
+/// #7209 note: the recipe above USED to say `coord.workers.records.clear()`,
+/// which no longer compiles — `records` is private and `clear_records` is too.
+/// A fail-on-revert recipe whose instructions do not build is a guard nobody
+/// can run, so it is respelled rather than left as archaeology.
 #[test]
 fn reconcile_partial_spawn_failure_preserves_launched_records_6242() {
     let mut coordinator = Coordinator::new();
@@ -4523,7 +4528,8 @@ fn reconcile_bind_incomplete_clears_all_records_6242() {
 
 /// #6242 — teardown atomicity / no double-clear. `stop_inner` drops each worker
 /// record's FOUR owners (handle + panic + exception ring + last-resolution)
-/// EXACTLY ONCE via `records.clear()`. The pre-#6242 layout ran three separate
+/// EXACTLY ONCE via the teardown's record publish (#7209: `clear_records`,
+/// formerly `records.clear()`). The pre-#6242 layout ran three separate
 /// `Coordinator.*.clear()` calls PLUS two dead content-clear loops that iterated
 /// the already-emptied maps (the #5289 double-clear drift artifact); both are
 /// deleted. This asserts the single-drop by holding external clones of the
@@ -4546,7 +4552,8 @@ fn stop_inner_drops_worker_record_owners_exactly_once_6242() {
 
     coordinator.stop_inner(false);
 
-    // records.clear() dropped the record — and its four owners — exactly once.
+    // the teardown's record publish dropped the record — and its four owners
+    // — exactly once (#7209: `clear_records`, formerly `records.clear()`).
     assert!(
         coordinator.workers.records().is_empty(),
         "stop_inner clears the records map"

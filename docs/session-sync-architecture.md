@@ -208,7 +208,7 @@ apply lands there for every session in the batch.
 replays the shared synced map once the new session map is up, so an entry
 recorded while the fd was absent is published by the next reconcile.
 
-**Corrected by #8171 — the capture→replay window is closed by construction, not
+**Corrected by #8157 (PR #8171) — the capture→replay window is closed by construction, not
 by the mutex.** This section previously said `teardown::tear_down` captures the
 whole map via `snapshot_shared_session_entries()` before `stop_inner(false)` and
 that an entry arriving between that capture and the replay was excluded only by
@@ -222,8 +222,9 @@ shutdown passes, #6652), which is what makes the live read sound. The historical
 shape is recorded here because the mutex-based reasoning it supported still
 appears in older comments.
 
-That mutex is what #7209 removes for `sync_session`, which is why the counter
-landed first. Before #8171, an import arriving in that window would have been
+That mutex is what #7209 PROPOSES to remove for `sync_session` — still open at
+the time of writing; `sync_session` continues to dispatch under it — which is why
+the counter landed first. Before #8171, an import arriving in that window would have been
 recorded, acked to Go as installed, never published and never replayed — with no
 signal anywhere. The conjunction is therefore split into one authority,
 `publish_synced_entry_or_note_unpublished`, and the absent-map arm bumps

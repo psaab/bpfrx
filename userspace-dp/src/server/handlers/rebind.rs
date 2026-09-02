@@ -18,9 +18,9 @@ pub(super) fn handle(
     // #1921: do NOT call guard.afxdp.stop() here. reconcile (via
     // reconcile_status_bindings -> tear_down) already stops + joins the
     // workers, and it gates a 500ms zero-copy teardown quiesce on
-    // `had_live_workers = !coord.workers.records.is_empty()`
+    // `had_live_workers = !coord.workers.records().is_empty()`
     // (coordinator/reconcile/teardown.rs). An explicit stop() runs
-    // stop_inner(true) which clears coord.workers.records BEFORE tear_down
+    // stop_inner(true) which clears the worker records BEFORE tear_down
     // samples them, so had_live_workers reads false, the quiesce is
     // BYPASSED, and the freshly-recreated sockets race the kernel's still
     // pending xsk_pool teardown -> EBUSY. The busy-binding watchdog then

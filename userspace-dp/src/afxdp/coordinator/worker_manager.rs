@@ -92,12 +92,19 @@ pub(in crate::afxdp) struct WorkerManager {
     /// silently went short. There is no second structure here: this `ArcSwap`
     /// IS the map, so a site that mutates without publishing cannot compile.
     ///
-    /// `ArcSwap` rather than `RwLock` deliberately. A lock here would add an
-    /// ordering edge against `sessions.synced`, which `upsert_synced_session`
-    /// takes while iterating this map — a lock-graph change, the category that
-    /// produced the #7095 self-deadlock. `ArcSwap` adds no edge, no blocking,
-    /// and no `...Locked` naming hazard, and it is the tree's existing idiom.
-    /// Writes are rcu (clone-modify-store) and cost nothing: there are exactly
+    /// `ArcSwap` rather than `RwLock` deliberately, and the reason has to be
+    /// stated precisely or a reader will check it and find it false. The
+    /// fan-out loop itself takes only the per-worker command mutex — NOT
+    /// `sessions.synced`, which `publish_shared_session` acquires and releases
+    /// earlier in the same call. The hazard is the other direction: an
+    /// `RwLock` read guard covering the whole import would be HELD ACROSS
+    /// `publish_shared_session`'s acquisition of `sessions.synced`, inventing
+    /// a records-before-sessions ordering that nothing else in the tree
+    /// observes. That is a lock-graph change, the category that produced the
+    /// #7095 self-deadlock and the category a green suite cannot see, because
+    /// every test calls in from outside the lock. `ArcSwap` adds no edge, no
+    /// blocking, and no `...Locked` naming hazard, and it is the tree's
+    /// existing idiom. Writes are read-clone-store and cost nothing: exactly
     /// two production mutation sites, both reconcile-rare.
     records: Arc<ArcSwap<BTreeMap<u32, Arc<WorkerRuntimeRecord>>>>,
     /// #7209: worker `JoinHandle`s, keyed by the same `worker_id` as `records`.
@@ -161,7 +168,7 @@ impl WorkerManager {
     /// join one worker while its peers are unsignalled and a peer that blocks
     /// on a shared resource deadlocks the join. The XSK/heartbeat slot deletion
     /// runs over `live` (slot-keyed) while the coordinator FDs are still open,
-    /// BEFORE clearing. `records.clear()` then drops each record's handle +
+    /// BEFORE clearing. `clear_records()` then drops each record's handle +
     /// panic + exception_ring + last_resolution `Arc`s together, in one step —
     /// subsuming the three `Coordinator.*.clear()` the pre-#6242 layout ran and
     /// removing the dead #5289 content-clear loops that iterated the
@@ -232,9 +239,14 @@ impl WorkerManager {
     }
 
     /// #7209: a READ-ONLY handle onto the SAME published map this manager
-    /// mutates — the seam the peer-synced import path reads through. Sharing
-    /// the cell, not a snapshot of it, so a holder observes every subsequent
-    /// `register` / teardown.
+    /// mutates. Sharing the cell, not a snapshot of it, so a holder observes
+    /// every subsequent `register` / teardown.
+    ///
+    /// NOT yet the seam the peer-synced import path reads through — that path
+    /// still reaches the manager directly via `records_snapshot()`, because it
+    /// still runs under the `ServerState` mutex. This exists so the sharing
+    /// property is bound by a test NOW, before the dispatch change relies on
+    /// it; its production consumer arrives with that change.
     ///
     /// Returns a [`WorkerRecordsReader`], NOT the `Arc<ArcSwap<..>>`. Handing
     /// out the `ArcSwap` would hand out `store` / `rcu` / `swap` through
@@ -294,6 +306,14 @@ impl WorkerManager {
     /// `cfg(test)` so it cannot become a production path by accident.
     #[cfg(test)]
     pub(in crate::afxdp) fn remove_record_for_test(&mut self, worker_id: u32) {
+        // Same invariant `clear_records` asserts, for the same reason: dropping
+        // a record whose thread is neither signalled nor joined detaches a
+        // worker that `stop_and_clear` can then never reach.
+        assert!(
+            !self.joins.contains_key(&worker_id),
+            "remove_record_for_test on worker {worker_id}, which still owns an \
+             un-joined thread handle"
+        );
         let mut next = (**self.records.load()).clone();
         next.remove(&worker_id);
         self.records.store(Arc::new(next));
@@ -373,14 +393,6 @@ impl WorkerRecordsReader {
         &self,
     ) -> arc_swap::Guard<Arc<BTreeMap<u32, Arc<WorkerRuntimeRecord>>>> {
         self.inner.load()
-    }
-
-    /// Take an OWNED snapshot — the right call when several facts about the
-    /// worker set must agree with each other. See
-    /// [`WorkerManager::records_snapshot`].
-    #[inline]
-    pub(in crate::afxdp) fn load_full(&self) -> Arc<BTreeMap<u32, Arc<WorkerRuntimeRecord>>> {
-        self.inner.load_full()
     }
 }
 
@@ -537,28 +549,45 @@ mod records_authority_tests_7209 {
             let peers: Vec<Arc<AtomicBool>> = stops.iter().map(Arc::clone).collect();
             let observed = Arc::clone(&observed);
             let join = std::thread::spawn(move || {
-                // Wait for our own stop, then record how many of the three were
-                // signalled at that instant.
+                // Wait for EVERY peer's stop flag, not just this worker's own.
                 //
-                // BOUNDED deliberately. A `stop_and_clear` that fails to signal
-                // this worker at all — which is exactly what a regression in
-                // the publish path produces, since the signal loop iterates the
-                // PUBLISHED map — would otherwise spin here forever and hang
-                // the join below, turning a red into a VOID cell that reports
-                // nothing. On timeout we record a sentinel the assertions
-                // reject, so the failure mode is a failure, not a hang.
-                // (Measured: without this bound, a mutant that made `register`
-                // skip the publish hung the suite instead of failing it.)
+                // The obvious version — spin on `peers[worker_id]`, then count
+                // how many of the three are set — is RACY, and its flake is
+                // indistinguishable from the regression it exists to catch.
+                // `stop_and_clear` sets the three flags with three sequential
+                // relaxed stores; if the signalling thread is descheduled
+                // mid-loop, worker 0 wakes and counts 1. That yields
+                // `[1, 2, 3]` — precisely the signature a COLLAPSED one-pass
+                // teardown produces, so a scheduling hiccup would read as a
+                // real #6242 regression and vice versa. (Found by review;
+                // demonstrated with forced preemption. It did not reproduce in
+                // 80 runs here, which is not evidence against it — the window
+                // is narrow, not absent.)
+                //
+                // Waiting on ALL peers removes the timing assumption instead of
+                // widening a margin. Under the correct signal-all-then-join-all
+                // order every worker's condition is already true when the joins
+                // begin, so all three exit promptly whatever the scheduler
+                // does. Under a collapsed signal-one-join-one order, worker 0
+                // is joined while workers 1 and 2 are unsignalled, so its
+                // condition can NEVER become true and it runs to the deadline —
+                // which is also what makes the bound load-bearing rather than a
+                // hang guard: it converts that deadlock into a recorded
+                // sentinel the assertions reject. Same bound covers a
+                // `register` that never published (nothing signals at all).
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while !peers[worker_id].load(Ordering::Relaxed) {
+                loop {
+                    let signalled = peers.iter().filter(|s| s.load(Ordering::Relaxed)).count();
+                    if signalled == peers.len() {
+                        observed.lock().expect("observed").push(signalled);
+                        return;
+                    }
                     if std::time::Instant::now() >= deadline {
                         observed.lock().expect("observed").push(NEVER_SIGNALLED);
                         return;
                     }
                     std::hint::spin_loop();
                 }
-                let signalled = peers.iter().filter(|s| s.load(Ordering::Relaxed)).count();
-                observed.lock().expect("observed").push(signalled);
             });
             workers.register(worker_id as u32, rec, Some(join));
         }
@@ -576,17 +605,23 @@ mod records_authority_tests_7209 {
         );
         assert!(
             !observed.contains(&NEVER_SIGNALLED),
-            "a worker timed out waiting to be signalled ({observed:?}). \
-             `stop_and_clear` signals through the PUBLISHED record map, so a \
-             registration that never published leaves its worker unsignalled — \
-             the bound above is what turns that into this assertion instead of \
-             a hung suite"
+            "a worker timed out waiting for every peer to be signalled \
+             ({observed:?}; {} is the sentinel). TWO regressions land here: a \
+             COLLAPSED signal-one-join-one teardown, where worker 0 is joined \
+             while its peers are unsignalled so its wait can never complete; \
+             and a `register` that never published, so `stop_and_clear` — which \
+             signals through the PUBLISHED map — signals nobody at all. The \
+             bound is what turns either into this assertion instead of a hung \
+             suite",
+            NEVER_SIGNALLED
         );
         assert!(
             observed.iter().all(|&signalled| signalled == 3),
-            "each worker must observe ALL THREE stop flags set at the moment it \
-             is joined: signal-all-then-join-all. Collapsing the two passes \
-             into one gives {observed:?} with a leading 1 or 2 (#6242)"
+            "every worker must have observed ALL THREE stop flags before it \
+             was joined: signal-all-then-join-all (#6242). Collapsing the two \
+             passes into one leaves worker 0 joined while its peers are \
+             unsignalled, so its wait never completes and it records the \
+             timeout sentinel: {observed:?}"
         );
         assert!(
             workers.records().is_empty(),
@@ -668,9 +703,13 @@ mod records_authority_tests_7209 {
         rec.handle.stop = Arc::clone(&stop);
         let spun = Arc::clone(&stop);
         let join = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Short: this cell panics by design, so the thread is orphaned.
+            // A long spin would burn a core alongside the rest of the suite,
+            // which under `make test-rust`'s single-threaded leg is the whole
+            // machine.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
             while !spun.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-                std::hint::spin_loop();
+                std::thread::yield_now();
             }
         });
         workers.register(5, rec, Some(join));
@@ -680,29 +719,13 @@ mod records_authority_tests_7209 {
         workers.clear_records();
     }
 
-    /// #7209: a reader holding a snapshot keeps its records alive across a
-    /// teardown. This is the refcount guarantee #8179 established for the BPF
-    /// map set, restated for the worker records, and it is what makes an
-    /// off-lock fan-out safe rather than a use-after-free.
-    #[test]
-    fn e_a_snapshot_outlives_a_concurrent_clear_7209() {
-        let mut workers = WorkerManager::new();
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        workers.register(3, record(Arc::clone(&queue)), None);
-        let snapshot = workers.records_snapshot();
-        workers.clear_records();
-        assert!(
-            workers.records().is_empty(),
-            "the manager itself must have dropped the record, or the assertion \
-             below is not about a teardown at all"
-        );
-        let rec = snapshot
-            .get(&3)
-            .expect("the snapshot still holds the record");
-        assert!(
-            Arc::ptr_eq(&rec.handle.commands, &queue),
-            "a fan-out already iterating the snapshot must still reach the real \
-             queue after the teardown published an empty map"
-        );
-    }
+    // #7209: there was a cell here asserting that a snapshot outlives a
+    // concurrent `clear_records`. It was DELETED rather than kept, because it
+    // could not fail: in safe Rust there is no implementation of
+    // `records_snapshot()` whose return could break the keep-alive claim, and
+    // even a detached deep copy of the map satisfies both its `get` and its
+    // `Arc::ptr_eq` (a `BTreeMap` clone clones the inner `Arc`s). Its one live
+    // assertion — that `clear_records` actually clears — is already made by
+    // cell `a`. A cell whose assertion cannot fail is worse than no cell: it
+    // reads as coverage of the refcount guarantee and provides none.
 }
