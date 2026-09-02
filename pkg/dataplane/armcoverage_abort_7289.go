@@ -65,5 +65,9 @@ func (m *Manager) abortAfterHostMutation(result *CompileResult, err error) error
 	// on the compile's own result, logged under its own stage so an operator can
 	// tell an abort verdict from a post-attach one in a log archive.
 	m.ProveArmCoverage(result).LogArmCoverage("apply-aborted", m.nextApplyGeneration())
+	// #8285: remember the host state this abort leaves unconverged, so a RETRY
+	// still reports it even though its own Phase 2 will find the host already in
+	// the desired shape and record nothing.
+	m.recordHostDivergence(result)
 	return err
 }

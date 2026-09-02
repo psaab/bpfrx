@@ -37,6 +37,9 @@ type Manager struct {
 	// armCoverage holds the most recent #7191 arm-coverage proof so the daemon
 	// can gate on per-interface attach coverage instead of only logging it.
 	armCoverage armCoverageCell
+	// hostDivergence is the #8285 sticky per-BOX record of host state an aborted
+	// apply left unconverged; hostdivergence_8285.go owns the rationale.
+	hostDivergence hostDivergenceCell
 	// loaded is the #2114 A3 armed-admission bit: atomic so the
 	// pre-registry loaded checks (AttachXDP/AttachTC/CompileConfig) and
 	// the externally visible IsLoaded() surface never race the shim
@@ -298,6 +301,9 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	//
 	// Blast radius, and why this MOVES rather than becoming recoverable:
 	// docs/log/7079.md. Bound by TestPinCleanupsRunAfterCompileConfig_7079.
+	// #8285: stamp a PREVIOUS abort's unconverged divergence onto this result.
+	// Placement is load-bearing: after CompileConfig, before the first abort.
+	m.inheritHostDivergence(result)
 	//
 	// #7289 R1: each of the three aborts below returns AFTER Phase 2 has
 	// mutated the host and BEFORE the arm-coverage proof at the tail, so each
@@ -340,6 +346,8 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	// logged report is a LIVE proof rather than a stashed one.
 	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
+	// #8285: ONLY the success tail may clear this (see hostdivergence_8285.go).
+	m.clearHostDivergence()
 	m.markVLANSubInterfaces(result)
 	m.lastCompile = result
 	m.recordApplyResult(ApplyResultFromCompileResult(result))
