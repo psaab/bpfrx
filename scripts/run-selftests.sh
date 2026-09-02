@@ -138,6 +138,8 @@ test/incus/test-fbf-steering.sh
 test/incus/newflow-ceiling-lib.sh
 test/incus/newflow-ceiling-selftest.sh
 test/incus/newflow-ceiling-harness.sh
+test/incus/mouse-elephant-lib.sh
+test/incus/mouse-elephant-selftest.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -249,6 +251,13 @@ run_bash test/incus/host-inbound-selftest.sh
 run_bash test/incus/iperf-throughput-selftest.sh
 run_bash test/incus/target-services-selftest.sh
 run_bash test/incus/with-cluster-selftest.sh
+# #7159: the mouse-latency elephant generator's remote lifecycle. Hermetic --
+# a fake iperf3 plus an unprivileged PID namespace; no incus, no cluster. The
+# defect it guards produced a CORRUPT MEASUREMENT, not an error: killing the
+# local incus-exec client left the remote 90 s iperf3 running, so the next rep
+# shared the shaped class with its own predecessor and the whole cell voided
+# with a plausible cwnd-not-settled reason. Needs bash.
+run_bash test/incus/mouse-elephant-selftest.sh
 
 # -- interpreter census (#8153) --
 #

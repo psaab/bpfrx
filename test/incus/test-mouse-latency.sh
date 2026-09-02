@@ -22,6 +22,8 @@ M="$2"
 DURATION="$3"
 OUT_DIR="$4"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=test/incus/mouse-elephant-lib.sh
+. "${SCRIPT_DIR}/mouse-elephant-lib.sh"
 
 # Constants from plan §3.1.
 INCUS_REMOTE="loss"
@@ -233,7 +235,21 @@ cleanup() {
     # Best-effort kill on early exit. The MPSTAT_PID is started AFTER
     # the probe is launched, so on early INVALID exit (e.g. during
     # cwnd-settle gate or step 4 cursor capture) it isn't running yet.
+    #
+    # #7159: killing $IPERF_PID only closes the LOCAL incus-exec
+    # client. incus leaves the command running inside the instance when
+    # a non-interactive client disconnects, so on an early INVALID exit
+    # the elephant kept sending for the rest of its 90 s budget while
+    # the next rep started ~8 s later -- and that rep then shared the
+    # 1 Gb/s exact class with its own predecessor. One marginal
+    # rejection cascaded into a cell of zero valid reps. Stop the
+    # elephant where it actually runs, on the source container.
+    # See test/incus/mouse-elephant-lib.sh.
     [[ -n "${IPERF_PID:-}" ]] && kill "$IPERF_PID" 2>/dev/null || true
+    if [[ -n "${IPERF_PID:-}" && "${IPERF_DONE:-0}" -ne 1 ]]; then
+        incus_exec "$SOURCE" sh -c "$(mouse_elephant_kill_cmd "$REP_TAG")" \
+            < /dev/null > /dev/null 2>&1 || true
+    fi
     [[ -n "${RG_POLL_PID:-}" ]] && kill "$RG_POLL_PID" 2>/dev/null || true
     [[ -n "${SETTLE_MPSTAT_PID:-}" ]] && kill "$SETTLE_MPSTAT_PID" 2>/dev/null || true
     [[ -n "${MPSTAT_PID:-}" ]] && kill "$MPSTAT_PID" 2>/dev/null || true
@@ -247,7 +263,7 @@ trap cleanup EXIT
 # previously left a stale file behind that the next reuse with the
 # same tag would inherit. Belt-and-suspenders.)
 incus_exec "$SOURCE" sh -c \
-    "rm -f /tmp/mouse_latency_probe.py /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/mpstat-settle-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt" \
+    "rm -f /tmp/mouse_latency_probe.py /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/mpstat-settle-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.pid" \
     < /dev/null > /dev/null 2>&1 || true
 
 # Push helper scripts to the source container (probe driver runs there).
@@ -265,6 +281,20 @@ if ! incus_exec "$SOURCE" timeout 2 bash -c \
     echo "ABORT: mouse echo not reachable on ${TARGET_V4}:${MOUSE_PORT}" >&2
     echo "       (set MOUSE_PORT or stand up the echo daemon)" >&2
     exit 1
+fi
+
+# ---- step 0a: no other elephant may already be running on the source
+# (#7159). Before the fix in mouse-elephant-lib.sh an early-INVALID rep
+# orphaned its 90 s iperf3, and the next rep measured a class it was
+# sharing with its own predecessor -- a silent halving of the offered
+# rate that reads as a dataplane result. A leftover client is now a
+# LOUD, attributed INVALID rather than a corrupted number. It also
+# catches the other way this happens: another agent driving traffic
+# from the same source container while this rep runs.
+if ! incus_exec "$SOURCE" sh -c "$(mouse_elephant_stale_check_cmd)" \
+        < /dev/null > /dev/null 2>&1; then
+    echo "an iperf3 client is already running on ${SOURCE}" >&2
+    invalidate "stale-elephant-client"
 fi
 
 # ---- step 1: CoS preflight (fixture-apply only, plan §3.3 + R4 MED 4).
@@ -345,7 +375,8 @@ IPERF_DURATION=$((SETTLE_BUDGET + DURATION + SLACK))
 
 if [[ "$N" -gt 0 ]]; then
     incus_exec "$SOURCE" sh -c \
-        "iperf3 -c ${TARGET_V4} -p ${ELEPHANT_PORT} -P ${N} -t ${IPERF_DURATION} -i 1 --forceflush > /tmp/iperf3-${REP_TAG}.txt 2>&1" \
+        "$(mouse_elephant_start_cmd "$REP_TAG" "$TARGET_V4" "$ELEPHANT_PORT" \
+                                    "$N" "$IPERF_DURATION")" \
         < /dev/null > /dev/null 2>&1 &
     IPERF_PID=$!
     incus_exec "$SOURCE" sh -c \
@@ -442,6 +473,7 @@ if [[ -n "${IPERF_PID:-}" ]]; then
     wait "$IPERF_PID"
     iperf_rc=$?
     set -e
+    IPERF_DONE=1
     incus_run file pull \
         "${INCUS_REMOTE}:${SOURCE}/tmp/iperf3-${REP_TAG}.txt" \
         "${OUT_DIR}/iperf3.txt" 2>/dev/null || true

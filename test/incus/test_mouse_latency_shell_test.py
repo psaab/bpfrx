@@ -82,5 +82,52 @@ class MouseLatencyShellTests(unittest.TestCase):
         self.assertIn("mpstat 1 ${SETTLE_BUDGET} > /tmp/mpstat-settle-${REP_TAG}.txt", SCRIPT)
 
 
+class ElephantLifecycleWiringTests(unittest.TestCase):
+    """#7159: the rep script must USE the elephant lifecycle library.
+
+    mouse-elephant-selftest.sh proves the library's start/stop pair
+    reaps the leaf process. It cannot see whether test-mouse-latency.sh
+    calls it -- and the whole defect was a call site, not a helper: the
+    EXIT trap killed the local incus-exec client and believed the
+    remote iperf3 had stopped. These bind the wiring.
+    """
+
+    def test_rep_script_sources_the_lifecycle_library(self):
+        self.assertIn('. "${SCRIPT_DIR}/mouse-elephant-lib.sh"', SCRIPT)
+
+    def test_elephant_is_launched_through_the_library(self):
+        # The raw `iperf3 -c ...` launch string is what leaked: it left
+        # nothing on the remote side that a kill could address.
+        self.assertNotIn('"iperf3 -c ${TARGET_V4}', SCRIPT)
+        self.assertIn('mouse_elephant_start_cmd "$REP_TAG" "$TARGET_V4" "$ELEPHANT_PORT"', SCRIPT)
+
+    def test_cleanup_stops_the_elephant_on_the_source_container(self):
+        # Killing IPERF_PID alone is the pre-#7159 behaviour: it closes
+        # the local client and leaves the remote process running.
+        self.assertRegex(
+            SCRIPT,
+            re.compile(
+                r'if \[\[ -n "\$\{IPERF_PID:-\}" && "\$\{IPERF_DONE:-0\}" -ne 1 \]\]; then\s+'
+                r'incus_exec "\$SOURCE" sh -c "\$\(mouse_elephant_kill_cmd "\$REP_TAG"\)"',
+                re.MULTILINE,
+            ),
+        )
+        # ... and a rep that ran to completion must not re-kill a pid
+        # the source may since have reused.
+        wait_idx = SCRIPT.index('wait "$IPERF_PID"')
+        done_idx = SCRIPT.index("IPERF_DONE=1")
+        self.assertLess(wait_idx, done_idx)
+
+    def test_stale_elephant_guard_runs_before_any_cos_mutation(self):
+        self.assertIn('mouse_elephant_stale_check_cmd', SCRIPT)
+        self.assertIn('invalidate "stale-elephant-client"', SCRIPT)
+        guard_idx = SCRIPT.index("mouse_elephant_stale_check_cmd")
+        cos_idx = SCRIPT.index('"${SCRIPT_DIR}/apply-cos-config.sh"')
+        self.assertLess(guard_idx, cos_idx)
+
+    def test_pidfile_is_swept_with_the_other_stale_rep_artifacts(self):
+        self.assertIn("/tmp/iperf3-${REP_TAG}.pid", SCRIPT)
+
+
 if __name__ == "__main__":
     unittest.main()

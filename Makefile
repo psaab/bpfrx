@@ -451,7 +451,7 @@ clean:
 # The standalone instance name defaults to xpf-fw; override it for an
 # ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
 # env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-mutate-lib test-cluster-lock-lib test-target-services-lib test-cluster-env-lib test-iperf-throughput-lib test-cos-apply-lib test-mouse-elephant-lib test-fbf-steering-lib test-host-inbound-lib test-host-inbound test-host-inbound-failover test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -514,6 +514,17 @@ test-target-services-lib:
 test-cos-apply-lib:
 	bash ./test/incus/cos-apply-lib-selftest.sh
 	go test -count=1 -run 6440 ./cmd/cli/
+
+# Self-test the #7159 mouse-latency elephant lifecycle. The defect it guards is
+# a CORRUPT MEASUREMENT rather than an error: the rep script stopped its
+# elephant by killing the LOCAL incus-exec client, which leaves the remote
+# 90 s iperf3 running, so an early-INVALID rep handed its load to the next one
+# and a whole cell voided reporting cwnd-not-settled. Hermetic -- fake iperf3
+# on PATH plus an unprivileged PID namespace for the stale-client controls; no
+# incus, no cluster. Run it after touching test-mouse-latency.sh.
+test-mouse-elephant-lib:
+	bash ./test/incus/mouse-elephant-selftest.sh
+	python3 -m unittest discover -s test/incus -p 'test_mouse_latency_shell_test.py'
 
 # Self-test the #7796 FBF DSCP ip-rule apply leg. The defect this guards is
 # INVISIBLE to a compile-side test: the pre-fix code built a well-formed
