@@ -420,6 +420,16 @@ type SessionListResponse struct {
 	// request that did not opt in. The local list above understates total
 	// HA state without it.
 	Peer *SessionListResponse `json:"peer,omitempty"`
+	// PeerStatus and PeerError report the OUTCOME of the peer fetch, which
+	// `Peer` alone cannot express: a nil Peer is produced both by a peer with
+	// no sessions and by a fetch that never happened, and before #7294 the
+	// list handler discarded the fetch error entirely and returned 200 with
+	// neither. The summary and zone-pair surfaces have always reported this;
+	// the list surface is the one that did not. Set only when the request
+	// opted in with include_peer, so a response that never asked for a peer
+	// is byte-identical to the pre-#7294 shape.
+	PeerStatus string `json:"peer_status,omitempty"`
+	PeerError  string `json:"peer_error,omitempty"`
 }
 
 // SessionSummary holds session table summary stats.
