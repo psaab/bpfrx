@@ -2729,6 +2729,34 @@ the drop fails loudly instead of going quietly vacuous.
     makes it reachable. It is fixed because it is wrong, not because item 3
     needs it: unreachable today is a property of the current call graph, not a
     guarantee, and the next change to that graph gets no warning.
+    **#7294 item 3 gives peer-directed work its own budget.** The peer-only
+    entry points (`PeerSessions`, `PeerSessionSummary`, `PeerZonePairSummary`)
+    drive NO local walk, but took a slot from `SessionWalkLimiter` anyway — so
+    a burst of peer-directed requests could refuse genuine local scans while
+    the local table was untouched, on a 4-slot budget shared across REST and
+    gRPC with `ShowText` fabric-reachable. They now take
+    `diagcmd.RemoteWalkLimiter`: same capacity (4), same fail-fast semantics,
+    same lease-aware `AcquireCtx`, its own budget. **This is not a loosening** —
+    an unleased peer call was bounded by 4 slots before and is bounded by 4
+    now; what changes is which budget, and therefore that saturating one can no
+    longer refuse the other. The budget is GLOBAL rather than per-peer (a
+    per-peer bound would fail to bound N peers, which is the reason to bound a
+    fabric-reachable surface at all) and its sole consumers are those three
+    methods; a shared budget bounds the SUM, so adding a consumer tightens it
+    for the existing ones and is a decision rather than a refactor.
+    Independence is asserted in BOTH directions, following #8151: one direction
+    alone passes on an implementation that merely renamed the shared limiter.
+    That was not hypothetical — measured by mutation, pointing the alias at
+    `SessionWalkLimiter` left all three independence cells green, because each
+    substitutes both aliases with fresh instances and the substitution destroys
+    the property. An instance-identity cell closes it.
+    #5880's lease-propagation property moved with the path rather than being
+    retired, and its guard was RESTATED rather than relaxed: the control still
+    requires an unleased call to be refused at capacity, now on the budget that
+    bounds it. That guard was landed first, in #8301, precisely so it could
+    observe this change instead of certifying it; #8306 landed second because
+    taking a real remote slot makes a previously-unreachable silent-degradation
+    path reachable.
     **#7294 also makes the admission discipline structural rather than remembered.** Every
     extension above — #5433, #5708, #5779, #5782, #5939, #6216, #6553, #7315,
     #8151 — was a surface someone noticed was walking without admission, and

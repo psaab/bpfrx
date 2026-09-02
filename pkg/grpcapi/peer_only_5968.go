@@ -31,18 +31,31 @@ import (
 // version negotiation — the REST bridge and the gRPC server are the same
 // process by construction.
 //
-// ADMISSION IS UNCHANGED. Each of these acquires through the SAME lease-aware
-// AcquireCtx the full methods use, so a REST caller holding the boundary slot
-// reuses it (#5880) and a caller without a lease acquires one. Skipping
-// admission here would have been tempting — these perform no local walk — but
-// it would silently retire the #5880 lease-propagation guard on exactly the
-// path that guard was written for, turning a live regression test vacuous. The
-// change is about the WALK, not about the bound; slot accounting is identical
-// before and after.
+// ADMISSION IS ON THE REMOTE BUDGET (#7294 item 3). These paths drive no local
+// walk, so charging them SessionWalkLimiter meant peer-directed work could
+// refuse genuine local scans while the local table was untouched. They now take
+// diagcmd.RemoteWalkLimiter — same capacity (4), same fail-fast semantics, same
+// lease-aware AcquireCtx, but a budget of its own.
 //
-// A dedicated remote budget — bounding peer-directed work independently of
-// local work — is the separate redesign #5968 also asks for, and is not built
-// here.
+// This is not a loosening. An unleased peer call was bounded by 4 slots before
+// and is bounded by 4 slots now; what changes is WHICH budget, and therefore
+// that saturating one can no longer refuse the other. Independence is asserted
+// in both directions, following the #8151 precedent that established this shape
+// for SnapshotReadLimiter.
+//
+// #5880's lease-propagation property moves with the path rather than being
+// retired: AcquireCtx is still the acquire, so nested in-process delegation
+// within one request graph still reuses the ancestor's slot instead of
+// self-rejecting — now on the limiter that actually governs this path. The
+// guard for it (TestPeerOnlyReusesAnAncestorLease7294) was written against the
+// session-walk limiter and is RESTATED, not relaxed: its control still requires
+// an unleased call to be refused at capacity, on the budget that now bounds it.
+//
+// One consequence was fixed BEFORE this change rather than with it (#8306): a
+// refused peer fetch on the REST list surface used to be discarded, returning
+// 200 with the peer table silently absent. That path was unreachable while
+// these methods reused the REST caller's session-walk lease; taking a real
+// remote slot makes it reachable, so it had to stop being wrong first.
 //
 // PEER-STATUS CLASSIFICATION is shared with the full paths through the
 // attachPeer* helpers rather than duplicated. A divergence between "how the
@@ -97,10 +110,10 @@ func (s *Server) PeerSessions(ctx context.Context, req *pb.GetSessionsRequest) (
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
-	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
+	release, _, err := remoteWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
-			"session scan concurrency limit reached; retry shortly")
+			"peer session fetch concurrency limit reached; retry shortly")
 	}
 	defer release()
 	// Field-by-field rather than a struct copy: a protobuf message embeds a
@@ -136,10 +149,10 @@ func (s *Server) PeerSessions(ctx context.Context, req *pb.GetSessionsRequest) (
 // PeerSessionSummary returns ONLY the cluster peer's session summary, with no
 // local table walk, classified identically to the full GetSessionSummary path.
 func (s *Server) PeerSessionSummary(ctx context.Context) (*pb.GetSessionSummaryResponse, error) {
-	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
+	release, _, err := remoteWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
-			"session scan concurrency limit reached; retry shortly")
+			"peer session fetch concurrency limit reached; retry shortly")
 	}
 	defer release()
 
@@ -158,10 +171,10 @@ func (s *Server) PeerSessionSummary(ctx context.Context) (*pb.GetSessionSummaryR
 // checking it here keeps the peer-only path's behaviour identical to the full
 // path's rather than relying on the caller to be the REST bridge.
 func (s *Server) PeerZonePairSummary(ctx context.Context) (*pb.GetZonePairSummaryResponse, error) {
-	release, _, err := sessionWalkLimiter.AcquireCtx(ctx)
+	release, _, err := remoteWalkLimiter.AcquireCtx(ctx)
 	if err != nil {
 		return nil, status.Error(codes.ResourceExhausted,
-			"session scan concurrency limit reached; retry shortly")
+			"peer session fetch concurrency limit reached; retry shortly")
 	}
 	defer release()
 

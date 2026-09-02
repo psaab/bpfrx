@@ -49,6 +49,11 @@ type sessionEgressKey struct {
 // swap in a fresh small-capacity limiter.
 var sessionWalkLimiter = diagcmd.SessionWalkLimiter
 
+// remoteWalkLimiter is the peer-directed budget (#7294 item 3). Aliased here
+// beside sessionWalkLimiter so a test can substitute either independently,
+// which is what the both-directions independence assertions need.
+var remoteWalkLimiter = diagcmd.RemoteWalkLimiter
+
 func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")

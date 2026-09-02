@@ -172,14 +172,16 @@ func TestPeerOnlyClassifiesIdenticallyToFullPath(t *testing.T) {
 // At capacity zero every acquire fails, so a method that acquires returns an
 // error and one that does not returns success.
 func TestPeerOnlyStillAcquiresAdmission(t *testing.T) {
-	orig := sessionWalkLimiter
-	sessionWalkLimiter = diagcmd.NewLimiter(1)
-	defer func() { sessionWalkLimiter = orig }()
+	// #7294 item 3: restated onto the remote budget, which is what these
+	// paths now take. Unchanged in what it asserts.
+	orig := remoteWalkLimiter
+	remoteWalkLimiter = diagcmd.NewLimiter(1)
+	defer func() { remoteWalkLimiter = orig }()
 
 	// Hold the only slot WITHOUT a lease, so a caller that acquires is rejected
 	// and a caller that does not acquire sails through. NewLimiter clamps to a
 	// minimum of 1, so this is how "no capacity" is expressed.
-	release, err := sessionWalkLimiter.Acquire()
+	release, err := remoteWalkLimiter.Acquire()
 	if err != nil {
 		t.Fatalf("seed acquire: %v", err)
 	}
