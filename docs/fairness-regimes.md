@@ -832,6 +832,98 @@ MOUSE_LATENCY_GATE_PERCENTILE=p999_us \
 ./test/incus/test-mouse-latency-matrix.sh /tmp/xpf-100e100m-surplus
 ```
 
+#### Measured verdict: surplus-sharing is incompatible with the 100E100M p99.9 contract
+
+**Do not ship the surplus fixture as a latency-bearing configuration.** It is a
+headroom diagnostic, and under the 100E100M contract it costs three orders of
+magnitude of mouse tail latency. Measured on `loss:xpf-userspace-fw0/fw1` at
+master `d8a876042` (2026-09-02), both legs in one session on a harness with the
+#8268/#8270 orphan defect fixed, and with the **surplus leg run first** so the
+result cannot be an artifact of elapsed session time:
+
+| | strict exact | surplus |
+|---|---|---|
+| gate verdict | **PASS**, ratio 1.19 | **INSUFFICIENT-DATA**, 0 of 15 reps valid |
+| idle p99.9 | 6 781 us | 6 662 us |
+| loaded p99.9 | 8 085 us (10/10 valid) | 740-1 349 **ms** (10 reps with probe data) |
+| implied loaded/idle | 1.19 | **111x - 202x** |
+| elephant settle | 950-959 Mb/s, util 0.944-0.951 | 977-1 117 Mb/s, util 0.907-1.060 |
+| mouse attempts, min vs median | 2 822 vs 2 871 | **53-206** vs ~2 885 |
+
+The tail is **path-side, not client-side**, by the phase decomposition
+(attribution rule fixed before the run): `sleep_overshoot_us` p99.9 is 3.3-3.9
+ms under exact and 3.1-3.6 ms under surplus, `drain_us` p99.9 is 49-54 us and
+53-69 us — comparable — while `read_us` p99.9, the echo path, carries the whole
+difference. Both legs settle their elephants above the shape on every rep, so
+this is not an unsettled or collapsed cell.
+
+The starvation is **concentrated, not uniform**: 10-15 of 100 mouse coroutines
+run at roughly 300 ms per transaction for the whole rep while 50-75 of their
+peers on the same best-effort class run at ~0.8 ms. The strict-exact control is
+uniform to within 2%.
+
+##### What the counters say about where it happens
+
+Loaded-cell deltas on `xpf_userspace_cos_queue_token_starvation_parks_total`
+for the elephant queue (`queue_id=2`), same procedure, same node, adjacent in
+time:
+
+| leg | delta over the loaded cell |
+|---|---|
+| strict exact | **+17 573 417** |
+| surplus | **0** |
+
+Under strict exact the queue parks at the shaper continuously; under surplus it
+never parks at all, because it is borrowing instead. Per-rep
+`show class-of-service interface` at the settle point agrees and localises it
+further (surplus vs exact, same rep index):
+
+| `queue_id=2` | surplus | strict exact |
+|---|---|---|
+| bytes served as guarantee / surplus | 178 M / **2 756 M** | 2 624 M / **0** |
+| sojourn ewma / peak | 8.0 ms / 90.2 ms | **29.2 ms / 250.9 ms** |
+| `flow_share` drops | 14 225 | 4 167 |
+| drain invocations | **1 821 857** | 93 929 |
+| waterfill `eligible_visits` -> `phase1_admit` | 3 668 362 -> **6 402** | 508 030 -> 93 929 |
+
+Two things follow, and the first is the one that keeps surprising people:
+
+1. **The mouse queue never queues, in either leg.** `queue_id=0` is identical
+   across the fixtures — 0 packets queued, 0 parked, `park_root=0`,
+   `park_queue=0`, no sojourn line. So the mouse tail is **not** CoS queue
+   residence. This reproduces the load-bearing negative result from 2026-06-10
+   (`docs/pr/1829-p2/evidence.md`) at a new head, and it is why looking for the
+   tail in queue-depth telemetry finds nothing.
+2. **Standing queue correlates with PASSING.** The elephant sojourn is *higher*
+   in the leg that passes (29.2 ms ewma against 8.0 ms). The correlation is
+   inverted, exactly as #1829 Phase 2 recorded.
+
+What the surplus leg does instead of queueing is spin: 7x the eligibility
+visits for 14x fewer admissions, and 19x the drain invocations, on the same
+owner worker. That is where the service delay is being spent.
+
+##### What this does NOT establish
+
+Why a *minority* of mouse flows is affected rather than the whole class. The
+tier sizes are near multiples of 100/6 and the mlx5 VF exposes 6 combined RX
+queues to 6 workers, which makes a per-worker effect the obvious hypothesis —
+but the artifacts carry no flow-to-worker mapping, so this measurement cannot
+choose between a per-worker arbitration effect and a whole-class effect that
+happens to spare most flows. Two surplus reps also tripped
+`error_rate >= 0.01` (0.0306 and 0.0337, 5 524 errors in one), which has not
+been seen in a strict-exact leg and is unexplained.
+
+##### The gate cannot say any of this itself
+
+Every surplus loaded rep above was rejected `degenerate-coroutine`, so the
+reducer reported `INSUFFICIENT-DATA` rather than FAIL for a cell whose tail was
+two orders of magnitude over the threshold. That is a defect in the apparatus,
+tracked separately as #8277: the rule is a fairness predicate used as a
+validity predicate, so a *concentrated* tail invalidates the rep that
+demonstrates it. A *uniform* slowdown would still FAIL correctly. Until that is
+fixed, an `INSUFFICIENT-DATA` verdict on this fixture must be read as a
+candidate masked FAIL and the per-rep `probe.json` read directly.
+
 Surplus give-back uses a reduced phase artifact instead of trying to
 infer phase semantics from unrelated per-class sweeps. The validator is:
 
