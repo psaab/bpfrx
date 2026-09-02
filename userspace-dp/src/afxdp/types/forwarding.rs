@@ -467,6 +467,11 @@ pub(in crate::afxdp) struct ForwardingState {
     /// keeps totals alive until the operator `clear_flood_counters` IPC resets
     /// them.
     pub(in crate::afxdp) flood_counter_store: crate::afxdp::flood_counters::FloodCounterStore,
+    /// #8291: cumulative GRE decap refusal totals. `Clone` shares the inner
+    /// `Arc`, so a worker publish and a config apply both keep the total alive
+    /// — the same contract as the two #3651 stores above, and carried at the
+    /// same site by `forwarding_build::attach_carried_counters`.
+    pub(in crate::afxdp) gre_decap_counters: crate::afxdp::gre::GreDecapCounters,
 }
 
 /// #3070/#3405: a zone's compiled host-inbound-traffic admission set. Built from

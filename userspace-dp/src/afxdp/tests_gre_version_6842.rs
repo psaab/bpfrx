@@ -42,10 +42,7 @@
 use super::tests_support::*;
 use super::*;
 use crate::afxdp::forwarding_build::build_forwarding_state;
-use crate::afxdp::gre::{
-    GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS, GRE_FLAG_KEY, GRE_FLAG_SEQUENCE,
-    try_native_gre_decap_from_frame,
-};
+use crate::afxdp::gre::{GRE_FLAG_KEY, GRE_FLAG_SEQUENCE, try_native_gre_decap_from_frame};
 
 /// RFC 2637 §4.1 Acknowledgment-Present bit. Unknown to RFC 2890, which is
 /// exactly why a version-blind parse mis-locates the payload.
@@ -228,10 +225,10 @@ fn gre_version_refusal_counter_only_counts_frames_offered_to_a_gre_endpoint() {
     // Row 1: version 1 at the configured endpoint — a real refusal.
     let frame = build_gre_versioned_outer_frame_v4(1, GRE_FLAG_KEY, 0, 0, TUNNEL_PEER, &inner);
     let meta = gre_to_self_outer_meta(0, frame.len());
-    let before = GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed);
+    let before = forwarding.gre_decap_counters.unsupported_version_refusals();
     assert!(try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none());
     assert_eq!(
-        GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed),
+        forwarding.gre_decap_counters.unsupported_version_refusals(),
         before + 1,
         "a version-1 frame offered to a configured GRE endpoint is a counted refusal"
     );
@@ -241,10 +238,10 @@ fn gre_version_refusal_counter_only_counts_frames_offered_to_a_gre_endpoint() {
     // it would make the metric a traffic gauge instead of a fault signal.
     let frame = build_gre_versioned_outer_frame_v4(1, GRE_FLAG_KEY, 0, 0, UNRELATED_PEER, &inner);
     let meta = gre_to_self_outer_meta(0, frame.len());
-    let before = GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed);
+    let before = forwarding.gre_decap_counters.unsupported_version_refusals();
     assert!(try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none());
     assert_eq!(
-        GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed),
+        forwarding.gre_decap_counters.unsupported_version_refusals(),
         before,
         "transit PPTP with no configured GRE endpoint must not be counted as a refusal"
     );
@@ -252,10 +249,10 @@ fn gre_version_refusal_counter_only_counts_frames_offered_to_a_gre_endpoint() {
     // Row 3: version 0 at the configured endpoint — decaps, counts nothing.
     let frame = build_gre_versioned_outer_frame_v4(0, GRE_FLAG_KEY, 0, 0, TUNNEL_PEER, &inner);
     let meta = gre_to_self_outer_meta(0, frame.len());
-    let before = GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed);
+    let before = forwarding.gre_decap_counters.unsupported_version_refusals();
     assert!(try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_some());
     assert_eq!(
-        GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed),
+        forwarding.gre_decap_counters.unsupported_version_refusals(),
         before,
         "an ordinary RFC 2890 GRE frame must not touch the version-refusal counter"
     );
@@ -277,11 +274,112 @@ fn gre_version_refusal_counter_ignores_a_non_gre_row_with_the_same_outer_tuple()
     let inner = build_gre_inner_icmp_packet_v4();
     let frame = build_gre_versioned_outer_frame_v4(1, GRE_FLAG_KEY, 0, 0, TUNNEL_PEER, &inner);
     let meta = gre_to_self_outer_meta(0, frame.len());
-    let before = GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed);
+    let before = forwarding.gre_decap_counters.unsupported_version_refusals();
     assert!(try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none());
     assert_eq!(
-        GRE_DECAP_UNSUPPORTED_VERSION_REFUSALS.load(Ordering::Relaxed),
+        forwarding.gre_decap_counters.unsupported_version_refusals(),
         before,
         "a WireGuard row with the same outer tuple is not a refused GRE decap"
+    );
+}
+
+/// #8291: the cumulative total SURVIVES a config apply.
+///
+/// This is the load-bearing half of moving the counter off a `static` and onto
+/// `ForwardingState`, and the one whose failure is invisible in normal use: a
+/// fresh box reads zero anyway, so a total that silently resets on every commit
+/// looks exactly like a quiet network. An operator would only notice by never
+/// seeing the alarm they were told to watch for.
+///
+/// FAIL-ON-REVERT: delete the `state.gre_decap_counters = previous...` carry in
+/// `forwarding_build::attach_zone_counters` and this reds — the rebuilt state
+/// gets a fresh `Arc` at zero. Measured, not assumed.
+#[test]
+fn the_refusal_total_survives_a_config_apply_8291() {
+    use crate::afxdp::forwarding_build::build_forwarding_state_with_policy_counters_and_previous;
+    use crate::policy::PolicyCounterStore;
+
+    let snapshot = gre_to_self_snapshot();
+    let policy = PolicyCounterStore::default();
+    let nat = crate::nat::NatCounterStore::default();
+
+    let first =
+        build_forwarding_state_with_policy_counters_and_previous(&snapshot, &policy, &nat, None)
+            .expect("first apply builds");
+    assert_eq!(
+        first.gre_decap_counters.unsupported_version_refusals(),
+        0,
+        "a first apply starts the total at zero, or the carry below is \
+         indistinguishable from a fresh counter"
+    );
+
+    // Drive a real refusal through the decap path, not a direct bump: the
+    // property is that what the PACKET PATH counts survives, and a direct
+    // increment would pass even if the path stopped counting.
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_versioned_outer_frame_v4(1, GRE_FLAG_KEY, 0, 0, TUNNEL_PEER, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(try_native_gre_decap_from_frame(&frame, meta, &first).is_none());
+    assert_eq!(
+        first.gre_decap_counters.unsupported_version_refusals(),
+        1,
+        "precondition: the refusal must be counted on the first state, or this \
+         cell asserts the survival of nothing"
+    );
+
+    // The second apply — the config commit whose rebuild used to reset it.
+    let second = build_forwarding_state_with_policy_counters_and_previous(
+        &snapshot,
+        &policy,
+        &nat,
+        Some(&first),
+    )
+    .expect("second apply builds");
+    assert_eq!(
+        second.gre_decap_counters.unsupported_version_refusals(),
+        1,
+        "the cumulative GRE refusal total must survive a config apply. A \
+         rebuilt ForwardingState that drops the carry hands the operator a \
+         counter that silently returns to zero on every commit (#8291)"
+    );
+
+    // And it is the SAME cell, not an equal copy: a further refusal counted
+    // through the new state must be visible through the old handle too.
+    assert!(try_native_gre_decap_from_frame(&frame, meta, &second).is_none());
+    assert_eq!(
+        first.gre_decap_counters.unsupported_version_refusals(),
+        2,
+        "carry must SHARE the Arc, not copy its value — a copy diverges the \
+         moment either side counts again"
+    );
+}
+
+/// #8291: the operator-visible surface still reports the number it reported
+/// before the counter moved off the `static`.
+///
+/// Reading through `self.forwarding` instead of a process global is a
+/// BEHAVIOUR change on the status path, not plumbing, so it gets its own
+/// assertion rather than riding on the isolation work.
+#[test]
+fn the_status_surface_reports_the_forwarding_states_total_8291() {
+    let mut coordinator = crate::afxdp::Coordinator::new();
+    coordinator.forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    assert_eq!(
+        coordinator.gre_decap_unsupported_version_refusals_total(),
+        0,
+        "a coordinator with no refusals reports zero"
+    );
+
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_versioned_outer_frame_v4(1, GRE_FLAG_KEY, 0, 0, TUNNEL_PEER, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(try_native_gre_decap_from_frame(&frame, meta, &coordinator.forwarding).is_none());
+
+    assert_eq!(
+        coordinator.gre_decap_unsupported_version_refusals_total(),
+        1,
+        "the status surface must report the refusal the dataplane counted. If \
+         this reds, the metric and the counter have been split apart and the \
+         operator's number stopped tracking the thing it names (#8291)"
     );
 }

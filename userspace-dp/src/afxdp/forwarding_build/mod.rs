@@ -199,7 +199,8 @@ pub(super) fn build_forwarding_state_with_counters(
 
 /// Build a candidate `ForwardingState`, then — and only then — bind it to the
 /// carried-forward per-zone counter stores (traffic, and since #3651's flood
-/// half, flood-event as well; `attach_zone_counters` binds both).
+/// half, flood-event as well, and since #8291 the GRE decap refusal total;
+/// `attach_zone_counters` binds all three).
 ///
 /// #5716: that two-step shape is the load-bearing part. `ZoneCounterStore` is
 /// `Arc`-backed, so the carry-forward `clone()` is a HANDLE ON THE LIVE STORE
@@ -297,6 +298,14 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     Ok(state)
 }
 
+/// Carry every cumulative counter store forward across a config apply.
+///
+/// NAME. It is still `attach_zone_counters` though #8291 added a store that is
+/// NOT per-zone. Renaming it would have broken ten rustdoc intra-doc links
+/// across five files that this change does not otherwise touch, and a widened
+/// diff is how an unrelated change rides in unreviewed. The name describes the
+/// majority of what it binds; this paragraph describes the rest.
+///
 /// #3651 per-zone counters — BOTH families: carry each cumulative store forward
 /// from the previous state (first apply creates it) so totals survive config
 /// commits, then build this snapshot's slot maps against them. The traffic
@@ -355,6 +364,18 @@ fn attach_zone_counters(
     state.flood_counter_slot_map =
         std::sync::Arc::new(FloodCounterSlotMap::build(&zone_ids, &flood_store));
     state.flood_counter_store = flood_store;
+    // #8291 GRE decap refusals: a THIRD cumulative store, NOT per-zone and not
+    // slot-mapped, carried here for the reason the flood half gives above — a
+    // separate attach function could be
+    // moved, reordered or dropped independently, and a cumulative
+    // operator-visible total that silently resets on every config commit is
+    // invisible in normal use, because a fresh box reads zero anyway. Sharing
+    // one call site makes that divergence unrepresentable rather than merely
+    // tested for. Not slot-mapped: it is process-wide, not per-zone, so it
+    // carries the store and nothing else.
+    state.gre_decap_counters = previous
+        .map(|p| p.gre_decap_counters.clone())
+        .unwrap_or_default();
 }
 
 /// Drop the per-zone counter blocks for zones `snapshot` no longer configures.
