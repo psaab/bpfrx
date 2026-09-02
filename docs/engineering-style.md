@@ -143,6 +143,58 @@ the mechanics, so this section is sequencing only.
    explicitly in the PR body with the reason. Never claim success for
    a check that wasn't executed.
 
+   **A green smoke owes a WITNESS that your change ran (#8280, #8290).**
+   A passing cluster run tells you the build is not broken. It does not
+   tell you the run reached your code, and the two are indistinguishable
+   in the output. #8280 passed **17/17 while never executing the change
+   it was owed for** — the cluster carries no pool-mode source-NAT rule,
+   so that run would have looked identical had the change been correct,
+   broken, or reverted. It could only be established afterwards, by
+   reading the cluster config.
+
+   Establish it FORWARD instead, with a counter:
+
+   1. Find a counter whose **only** increment site is downstream of your
+      change. Verify "only" by grep, with a positive control — search a
+      counter you know has several bump sites in the same command, so a
+      wrong pattern shows up as the control coming back empty rather
+      than as your counter looking unique.
+   2. Prefer one sitting behind a **short-circuit** your change
+      participates in. `&&` evaluates left to right, so a bump is a
+      proof that every clause to its left evaluated true — that is a
+      statement about which branch ran, not merely that the process
+      stayed alive.
+   3. Snapshot `/metrics` on both nodes before and after the run and
+      diff it. Report the delta, per node.
+
+   Worked example (#8290, taking `sync_session`'s worker-set read off an
+   owned map). `xpf_userspace_synced_import_reserve_refused_total` has
+   exactly one `fetch_add`, inside:
+
+   ```rust
+   if entry.origin.is_peer_synced()
+       && !entry.metadata.is_reverse
+       && !worker_records.is_empty()          // <-- the changed read
+       && !self.reserve_synced_translation(&entry)
+   ```
+
+   It moved 2 -> 12 on fw0 and 0 -> 2 on fw1, so twelve times the changed
+   line ran and evaluated non-empty. That is a witness; "17 passed" is
+   not.
+
+   **Then say what the run did NOT reach**, in the same breath and with
+   the same specificity. In the same #8290 run the cap's refusal branch
+   never fired (`synced_import_cap_drops_total` stayed 0), so a wrong cap
+   *magnitude* would have looked identical; and the property the change
+   existed for — several worker-set decisions sourced from one snapshot —
+   is **inert** while dispatch is single-threaded, so the green was
+   identical for the change and for its absence. An unexercised dimension
+   that goes unmentioned is read as covered, which is how a smoke's
+   verdict annexes dimensions it never measured.
+
+   A counter that stays flat is not a failure of the technique; it is the
+   answer, and it belongs in the PR body next to the ones that moved.
+
 9. **PR open + Copilot review + Codex re-review + merge** — see
    "PR discipline" and "Merging" below for the body template and
    mechanics. Two distinct review surfaces:
