@@ -255,6 +255,46 @@ logging rules, not these specific hot-path constants.
   order among the free ports is preserved. Fail-on-revert:
   `pool_snat_recycle_order_is_fifo_not_lifo` in `src/nat/tests_pool.rs`
   (reverting to a back-popping LIFO queue flips the reuse order RED).
+- **The recycle ring is bounded in LENGTH and in per-claim COST (#7174
+  M13)**: an out-of-band `reserve()` (HA session sync, persistent NAT,
+  deterministic NAT) sets a port's occupancy bit without removing the
+  port's queued FIFO token, so after HA role churn the ring holds tokens
+  that cannot be claimed. Two bounds, both in `AddressOccupancy`
+  (`src/nat/allocator.rs`), neither of which changes WHICH port is handed
+  out:
+  - **Cost.** `claim`'s recycled phase returns `None` immediately when
+    `occupied == range`. The retain-at-BACK policy already amortizes the
+    churn case (one O(K) sweep, then the reserved tokens sit behind the
+    free ones), but the EXHAUSTED address does not amortize: with no free
+    tokens left, every claim popped the whole ring, retained the whole
+    ring, allocated a K-element retain buffer and returned `None` — and
+    `None` is the CORRECT answer there, so nothing self-corrected. The
+    test is exact rather than a scan budget on purpose: a budget returns
+    `None` on exhaustion, callers read that as "this address is full",
+    and the result is a spuriously dropped translation on a pool that
+    still has free ports. `occupied` is a live counter maintained by the
+    only two sites that transition a bit (`claim_offset` / `free_offset`),
+    and `free_recycle` clears the bit AND queues the token under the same
+    per-address mutex `claim` holds, so the test is exact with respect to
+    the ring the claimer is about to walk rather than a hint.
+  - **Length.** `RecycleRing` pairs the `VecDeque` with a per-offset
+    "already queued" bitset, so a port holds at most ONE token and the
+    ring is bounded by the address's port `range`. Without it the retain
+    policy mints duplicates: a retained token means the bit was set at pop
+    time, and when that occupant later releases through `free_recycle` the
+    `1 -> 0` transition queues a SECOND token for the same port. That grew
+    per churn cycle, past `range`, forever.
+  Fail-on-revert:
+  `pool_snat_exhausted_address_does_not_walk_recycle_fifo_7174_m13`,
+  `pool_snat_partially_occupied_address_still_scans_recycle_fifo_7174_m13`
+  (the control — a NOT-full address must still scan, so a gate that fired
+  one port early reds here),
+  `pool_snat_recycle_ring_never_holds_a_duplicate_token_7174_m13` and
+  `pool_snat_occupancy_counter_agrees_with_bitmap_7174_m13` in
+  `src/nat/tests_pool.rs`. The cost assertion reads
+  `debug_recycle_scan_pops`, not the return value: an exhausted address
+  returns `None` with or without the short-circuit, so a test that
+  asserted only the outcome would be satisfied by no fix at all.
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
