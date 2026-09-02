@@ -572,6 +572,34 @@ test-host-inbound-lib:
 	python3 -m unittest discover -s test/incus -p 'host_inbound_probe_test.py'
 	bash ./test/incus/cluster-cell-selftest.sh
 
+# #7766: the #4555 shim/userspace IPv6 extension-header parity ACCEPTANCE
+# harness. It mutates userspace-xdp/src/ipv6_ext_walk.rs — advance arithmetic,
+# post-advance revalidation, the Fragment read length, MAX_EXT_HDRS — and
+# requires the parity guards in tests_shim_ext_parity.rs to RED on every one,
+# with two negative controls that must stay green.
+#
+# BEFORE THIS TARGET IT WAS RUN BY NOBODY: cited by three source comments as
+# proof the guards fire, invoked only when a human typed the path. It had
+# rotted accordingly — every mutation target still expected the pre-`unsafe {}`
+# spelling of read_bytes, so the harness could not apply a single mutant. Note
+# what rotted: not the assertions, which are correct, but the FIXTURES. An
+# unrun guard does not decay toward wrongness, it decays toward
+# INAPPLICABILITY, and running it is what keeps its targets matched to the code
+# they mutate. That is the argument for this target, stronger than "nobody runs
+# it".
+#
+# ~40 MINUTES ON AN IDLE BOX, and measured at 59+ when other gates are running
+# — it rebuilds the shim once per mutant across ~20 rows, so it is entirely at
+# the mercy of available CPU. If it seems to have hung, check for a running
+# rustc before killing it. It is
+# therefore in NO aggregate, deliberately. Folding it into `make selftest`
+# (billed "fast hermetic") or a pre-push target would technically satisfy
+# #7766 and practically undo it — a 40-minute leg does not get run, it gets the
+# whole target avoided, costing everything else that target catches. Run it
+# when ipv6_ext_walk.rs or the parity guards change.
+test-shim-ext-parity-lib:
+	bash ./test/mutation/shim-ext-parity-acceptance.sh
+
 # #8136: the WHOLE test/incus Python suite. Before this, the only target that
 # ran any of it passed a LITERAL filename as the discovery pattern, so 1 of 21
 # files ran and the other 20 were executed by nothing — long enough for real

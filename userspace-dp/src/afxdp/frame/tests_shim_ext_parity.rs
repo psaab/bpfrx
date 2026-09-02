@@ -461,7 +461,9 @@ fn shim_ext_parity_negative_control_unchanged_classifications() {
 // resolvable chain length, which types are walked) becomes an observable
 // outcome of running it.
 //
-// PROVING THESE GUARDS FIRE: `test/mutation/shim-ext-parity-acceptance.sh`
+// PROVING THESE GUARDS FIRE: `make test-shim-ext-parity-lib` (#7766; ~40 min,
+// it rebuilds the shim per mutant, so it is in no aggregate). It runs
+// `test/mutation/shim-ext-parity-acceptance.sh`, which
 // mutates `ipv6_ext_walk.rs` — each arm's advance arithmetic, each arm's
 // post-advance revalidation (deleted, and weakened by one byte), the Fragment
 // read length, the revalidation's L3 base, a statement inside the loop but
@@ -601,6 +603,12 @@ fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
 /// FILE ASSERTS ABOUT THE SHIM RATHER THAN RUNS", for why, and for the other
 /// three claims in the same position.
 const L3_OFFSETS: [usize; 3] = [0, 14, 18];
+
+/// #7780: how many divergences the corpus parity assertion RETAINS for its
+/// message. The count reported is always the true total; this bounds only the
+/// sample, so the failure text stays readable and the allocation stays flat on
+/// exactly the mutations that diverge most.
+const MAX_DRIFT_REPORTED: usize = 20;
 
 // WHAT THIS FILE ASSERTS ABOUT THE SHIM RATHER THAN RUNS — all of it.
 //
@@ -1276,8 +1284,8 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     // `chain` defeats every floor built on it at once. See `expect_chain`.
     //
     // None of them claims the corpus is ADEQUATE: adequacy is not a property of
-    // a floor, it is what `test/mutation/shim-ext-parity-acceptance.sh` measures
-    // by mutating the shim and requiring each guard to red. These floors exist
+    // a floor, it is what `make test-shim-ext-parity-lib` measures (#7766;
+    // ~40 min) by mutating the shim and requiring each guard to red. These floors exist
     // to stop a shape being DELETED between acceptance runs.
     //
     // #6920/#7766 — the caveat that sentence needs: "measures" is only true of
@@ -1686,7 +1694,7 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    deletion becomes a two-file change a reviewer sees rather than a
     //    silent narrowing between acceptance runs.
     //    Does NOT bind: that any of these shapes is PULLING ITS WEIGHT. Only
-    //    `test/mutation/shim-ext-parity-acceptance.sh` measures that, by
+    //    `make test-shim-ext-parity-lib` measures that (#7766; ~40 min), by
     //    mutating the shim and requiring the guards to red. A block that never
     //    detects anything would still be required here; floors stop deletion,
     //    the matrix measures value.
@@ -2035,7 +2043,24 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         names.len(),
     );
 
+    // #7780: the drift report is BOUNDED, and the bound is VISIBLE.
+    //
+    // This accumulated one format! per diverging pair over the whole corpus at
+    // three L3 offsets. Measured: a walker that diverges everywhere produces
+    // 9423 divergences over 9423 pairs, so the old code built 9423 Strings and
+    // joined them into one — allocating hardest on exactly the mutations this
+    // test exists to catch. Wiring the acceptance harness into a gate (#7766)
+    // turns that from a slow failure nobody runs into a gate that dies on its
+    // own subject matter, and an OOM presents as an environment problem rather
+    // than as the finding it is.
+    //
+    // The TOTAL is counted separately from the SAMPLE that is kept. Reporting
+    // the first N of an unknown total is a different defect wearing the same
+    // green: a reader cannot distinguish 20-of-20 from 20-of-9423, and the
+    // second is what says the two walkers diverged wholesale rather than one
+    // case regressing.
     let mut drift: Vec<String> = Vec::new();
+    let mut drift_total = 0usize;
     // What actually got COMPARED, recorded after the comparison. A counter
     // incremented inside these same loops is `X == X` — `compared += 1` and
     // the work it claims to count are the same statement sequence, so any edit
@@ -2057,7 +2082,10 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
             let s = shim_verdict(&buf, l3);
             let u = userspace_verdict(&buf, l3);
             if s != u {
-                drift.push(format!("[l3={l3}] {name}: shim={s:?} userspace={u:?}"));
+                drift_total += 1;
+                if drift.len() < MAX_DRIFT_REPORTED {
+                    drift.push(format!("[l3={l3}] {name}: shim={s:?} userspace={u:?}"));
+                }
             }
             // #6704: the FRAGMENT dimension, which could not be compared at
             // all until the shim's walk carried the sighting. Compared only
@@ -2067,9 +2095,13 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
             if let Some(shim_frag) = shim_fragment_sighting(&buf, l3) {
                 let us_frag = walk_ipv6_ext_chain(&buf, l3).non_first_fragment_offset_seen;
                 if shim_frag != us_frag {
-                    drift.push(format!(
-                        "[l3={l3}] {name}: FRAGMENT sighting shim={shim_frag} userspace={us_frag}"
-                    ));
+                    drift_total += 1;
+                    if drift.len() < MAX_DRIFT_REPORTED {
+                        drift.push(format!(
+                            "[l3={l3}] {name}: FRAGMENT sighting shim={shim_frag} \
+                             userspace={us_frag}"
+                        ));
+                    }
                 }
                 frag_compared.insert((l3, name.as_str()));
                 if shim_frag {
@@ -2111,15 +2143,21 @@ fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
         expected.len(),
     );
     let compared = visited.len();
+    // #7780: the count is the TOTAL, the list is a bounded sample, and the
+    // message says which is which. "showing 20 of 20" and "showing 20 of 9423"
+    // are different findings, and a message reporting only the sample could not
+    // tell them apart.
     assert!(
-        drift.is_empty(),
+        drift_total == 0,
         "#4555 BEHAVIOURAL parity drift between the shim's executed IPv6 extension-header walk \
-         and this crate's walk_ipv6_ext_chain, over {compared} chain/L3 pairs. These are outcomes \
-         of running both walkers on the same bytes, so a divergence here is a real \
-         packet-handling difference: the shim would compute a session key from a different L4 \
-         offset (or accept a chain the forwarding path refuses) and the flow would be mis-steered \
-         or dropped. Divergences:\n  {}",
-        drift.join("\n  ")
+         and this crate's walk_ipv6_ext_chain: {drift_total} divergence(s) over {compared} \
+         chain/L3 pairs, showing the first {shown}. These are outcomes of running both walkers \
+         on the same bytes, so a divergence here is a real packet-handling difference: the shim \
+         would compute a session key from a different L4 offset (or accept a chain the \
+         forwarding path refuses) and the flow would be mis-steered or dropped. \
+         Divergences:\n  {}",
+        drift.join("\n  "),
+        shown = drift.len(),
     );
 }
 

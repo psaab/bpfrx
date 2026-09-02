@@ -361,28 +361,28 @@ fi
 
 # --- mutation targets -----------------------------------------------------
 GENERIC_ARM='            EH_CLASS_GENERIC => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                let opt = unsafe { read_bytes(data, data_end, offset as usize, 2) }?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
-                read_bytes(
+                unsafe { read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;
+                ) }?;
             }'
 AUTH_ARM='            EH_CLASS_AUTH => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
+                let opt = unsafe { read_bytes(data, data_end, offset as usize, 2) }?;
                 protocol = opt[0];
                 offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
-                read_bytes(
+                unsafe { read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;
+                ) }?;
             }'
-FRAG_READ='                let frag = read_bytes(data, data_end, offset as usize, 8)?;'
+FRAG_READ='                let frag = unsafe { read_bytes(data, data_end, offset as usize, 8) }?;'
 FRAG_ADV='                offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;'
 LOOP_HEAD='    for _ in 0..MAX_EXT_HDRS {'
 
@@ -419,8 +419,8 @@ GENERIC_ADV16="${GENERIC_ARM/"+ 1) * 8"/"+ 1) * 16"}"
 GENERIC_REVAL_M1="${GENERIC_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
 AUTH_ADV8="${AUTH_ARM/"+ 2) * 4"/"+ 2) * 8"}"
 AUTH_REVAL_M1="${AUTH_ARM/"(offset - l3_offset) as usize"/"(offset - l3_offset - 1) as usize"}"
-FRAG_READ_7="${FRAG_READ/", 8)?;"/", 7)?;"}"
-FRAG_READ_2="${FRAG_READ/", 8)?;"/", 2)?;"}"
+FRAG_READ_7="${FRAG_READ/", 8) }?;"/", 7) }?;"}"
+FRAG_READ_2="${FRAG_READ/", 8) }?;"/", 2) }?;"}"
 # The revalidation's BASE offset, PER ARM. `${var/pat/rep}` replaces the first
 # match, which inside a single arm is that arm's `l3_offset as usize,` line —
 # `offset as usize, 2)` on the read above it does not contain the `l3_` prefix.
@@ -431,12 +431,12 @@ GENERIC_RENAMED="${GENERIC_ARM//opt/hdr}"
 # Drop the whole post-advance revalidation call from an arm.
 drop_reval() {
   printf '%s' "$1" | grep -v \
-    -e '^                read_bytes($' \
+    -e '^                unsafe { read_bytes($' \
     -e '^                    data,$' \
     -e '^                    data_end,$' \
     -e '^                    l3_offset as usize,$' \
     -e '^                    (offset - l3_offset) as usize,$' \
-    -e '^                )?;$'
+    -e '^                ) }?;$'
 }
 GENERIC_NO_REVAL="$(drop_reval "${GENERIC_ARM}")"
 AUTH_NO_REVAL="$(drop_reval "${AUTH_ARM}")"
@@ -498,20 +498,20 @@ GENERIC_NEXT_UDP="${GENERIC_ARM/"protocol = opt[0];"/"protocol = if opt[0] == 17
 # a fail-open of exactly the shape row 2 catches, hidden behind a next-header
 # check. `protocol` is reassigned inside the arm, so the entering value is
 # captured first.
-GENERIC_REVAL_SKIP_ROUTING="${GENERIC_ARM/"                let opt = read_bytes"/"                let entered = protocol;
-                let opt = read_bytes"}"
-GENERIC_REVAL_SKIP_ROUTING="${GENERIC_REVAL_SKIP_ROUTING/"                read_bytes(
+GENERIC_REVAL_SKIP_ROUTING="${GENERIC_ARM/"                let opt = unsafe { read_bytes"/"                let entered = protocol;
+                let opt = unsafe { read_bytes"}"
+GENERIC_REVAL_SKIP_ROUTING="${GENERIC_REVAL_SKIP_ROUTING/"                unsafe { read_bytes(
                     data,
                     data_end,
                     l3_offset as usize,
                     (offset - l3_offset) as usize,
-                )?;"/"                if entered != 43 {
-                    read_bytes(
+                ) }?;"/"                if entered != 43 {
+                    unsafe { read_bytes(
                         data,
                         data_end,
                         l3_offset as usize,
                         (offset - l3_offset) as usize,
-                    )?;
+                    ) }?;
                 }"}"
 
 m_generic_adv_at_len4()  { spec "${GENERIC_ARM}" "${GENERIC_ADV_AT_4}"    | py_sub 1; }
