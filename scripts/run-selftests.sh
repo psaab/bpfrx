@@ -140,6 +140,8 @@ test/incus/newflow-ceiling-selftest.sh
 test/incus/newflow-ceiling-harness.sh
 test/incus/mouse-elephant-lib.sh
 test/incus/mouse-elephant-selftest.sh
+scripts/harness-census.sh
+test/incus/harness-census-selftest.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -321,6 +323,28 @@ run_bash test/incus/with-cluster-selftest.sh
 # shared the shaped class with its own predecessor and the whole cell voided
 # with a plausible cwnd-not-settled reason. Needs bash.
 run_bash test/incus/mouse-elephant-selftest.sh
+# #8302: the harness reachability census's own self-test. Hermetic (fixture
+# repos under a mktemp -d). It is a gate ABOUT gates, so every defence is
+# asserted twice: a fixture that must score UNREACHED, and a MUTATION of the
+# census that must make that same fixture flip to reached. A mutation that does
+# NOT flip is an ESCAPE and fails -- a census with a broken matcher reports a
+# clean board, and nothing but a mutation can tell it from a healthy one.
+run_bash test/incus/harness-census-selftest.sh
+
+# -- harness reachability census (#8302) --
+#
+# The three censuses in this runner all guard the SELF-TEST layer. One layer up
+# -- the cluster and measurement harnesses under test/incus/ -- there was none,
+# and 28 of 41 runnable harnesses were reached by nothing; 15 of them are gates
+# the tree built, unit-tested, documented and then ran zero times. This is the
+# #7296 shape one layer up, so it gets the #7296 treatment: invoked by a
+# Makefile recipe (`make harness-census`) AND folded into this aggregate, red
+# on an empty sweep, and carrying a positive control.
+#
+# `sh` is correct here: scripts/harness-census.sh declares #!/bin/sh and is
+# POSIX (the #8153 interpreter census checks this).
+hdr "harness reachability census"
+run_shell scripts/harness-census.sh
 
 # -- interpreter census (#8153) --
 #
