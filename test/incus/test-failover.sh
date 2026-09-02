@@ -239,6 +239,28 @@ POOL_PORT="${POOL_PORT:-5210}"
 POOL_LAN_IF="${POOL_LAN_IF:-$(incus exec "$CLUSTER_LAN_HOST" -- \
 	bash -c "ip -4 -o route get ${LAN_GW:-10.0.61.1} 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p'" 2>/dev/null | tr -d '\r')}"
 
+# pool_session_count echoes the number of sessions on $1 whose translated tuple
+# carries the pool address, or the literal string "VOID" when the query did not
+# produce a session listing at all.
+#
+# The three states matter. `show security flow session` is an admission-gated
+# session-scan surface sharing one 4-slot budget across REST and gRPC, so a
+# refusal returns no listing — and a bare `grep -c` renders that as 0, which is
+# indistinguishable from "the allocator handed out nothing". The assertions
+# below would then report a confident NAT-allocator defect for an admission
+# event. "Total sessions:" is the listing's own terminator, so its presence is
+# what separates "ran and found none" from "did not run".
+pool_session_count() {
+	local node="$1" out
+	out=$(incus exec "$node" -- cli -c \
+		"show security flow session source-prefix ${POOL_SRC}" 2>/dev/null || true)
+	if ! grep -q "Total sessions:" <<<"$out"; then
+		echo VOID
+		return
+	fi
+	grep -c "$POOL_NAT_ADDR" <<<"$out" || true
+}
+
 pool_src_teardown() {
 	[[ -n "$POOL_LAN_IF" ]] || return 0
 	incus exec "$CLUSTER_LAN_HOST" -- pkill -9 -f "iperf3.*-B ${POOL_SRC}" 2>/dev/null || true
@@ -403,17 +425,19 @@ if [[ "$POOL_NAT_SMOKE" != 1 ]]; then
 elif [[ -z "$POOL_LAN_IF" ]]; then
 	fail "#8280 pool-mode NAT was NOT MEASURED: the LAN interface on ${CLUSTER_LAN_HOST} could not be resolved, so no traffic took the pool path. This is a VOID for the allocator, not a pass — the rest of this run says nothing about PortAllocator"
 else
-	pool_fw0=$(incus exec "$FW0" -- cli -c \
-		"show security flow session source-prefix ${POOL_SRC}" 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
-	if [[ "$pool_fw0" -ge 1 ]]; then
+	pool_fw0=$(pool_session_count "$FW0")
+	if [[ "$pool_fw0" == VOID ]]; then
+		fail "#8280: fw0's session query returned no listing, so pool-mode NAT was NOT MEASURED. This is most likely session-scan ADMISSION (the surface is gated on a 4-slot budget shared across REST and gRPC), not a NAT defect — re-run when nothing else is scanning rather than reading it as an allocator failure"
+	elif [[ "$pool_fw0" -ge 1 ]]; then
 		pass "fw0 translated $pool_fw0 pool-mode session(s) to $POOL_NAT_ADDR (PortAllocator::claim ran)"
 	else
 		fail "fw0 has no session translated to the pool address $POOL_NAT_ADDR. Either the pool-mode rule did not match ${POOL_SRC}, or the allocator refused — either way this run does NOT exercise the NAT port allocator (#8280)"
 	fi
 
-	pool_fw1=$(incus exec "$FW1" -- cli -c \
-		"show security flow session source-prefix ${POOL_SRC}" 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
-	if [[ "$pool_fw1" -ge 1 ]]; then
+	pool_fw1=$(pool_session_count "$FW1")
+	if [[ "$pool_fw1" == VOID ]]; then
+		fail "#8280: fw1's session query returned no listing, so the standby import was NOT MEASURED — see the admission note on the fw0 assertion above"
+	elif [[ "$pool_fw1" -ge 1 ]]; then
 		pass "fw1 imported $pool_fw1 pool-mode session(s) (reserve_flow -> occupancy.reserve)"
 	else
 		fail "fw1 imported no pool-mode session for ${POOL_SRC}. The standby's reserve_flow -> occupancy.reserve() path is what a NAT-allocator change most affects across a role change, and it did not run (#8280)"
@@ -592,9 +616,10 @@ if [[ "$POOL_NAT_SMOKE" == 1 && -n "$POOL_LAN_IF" ]]; then
 	incus exec "$CLUSTER_LAN_HOST" -- bash -c \
 		"timeout 6 iperf3 --connect-timeout 3000 -B ${POOL_SRC} -t 2 -c ${IPERF_TARGET} -p ${POOL_PORT} > /tmp/iperf3-pool-8280-post.log 2>&1 &" || true
 	sleep 5
-	post_pool=$(incus exec "$FW0" -- cli -c \
-		"show security flow session source-prefix ${POOL_SRC}" 2>/dev/null | grep -c "$POOL_NAT_ADDR" || true)
-	if [[ "$post_pool" -ge 1 ]]; then
+	post_pool=$(pool_session_count "$FW0")
+	if [[ "$post_pool" == VOID ]]; then
+		fail "#8280: the post-failback session query returned no listing, so the allocator's state after the role change was NOT MEASURED — see the admission note above. A VOID here is NOT evidence the allocator is healthy"
+	elif [[ "$post_pool" -ge 1 ]]; then
 		pass "the pool allocator still hands out a translation after a full primary->secondary->primary cycle"
 	else
 		fail "after the crash failover AND the manual failback, a FRESH flow from ${POOL_SRC} got NO pool translation. The ports fw1 imported as reservations while it was standby are the ones a reserve/recycle lifecycle bug strands, and this is the only assertion in this suite that enters that state (#8280 / #7174 M13)"
