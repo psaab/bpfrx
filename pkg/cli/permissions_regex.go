@@ -83,9 +83,14 @@ func (c *CLI) checkCommandRegex(line string) error {
 }
 
 // checkCommandRegexWith is the store-free whole decision, including the
-// fail-closed arms. Split out for the same reason loginRegexesFrom is: nothing
-// can put a `deny-commands` class into ActiveConfig until cut 6, so the error
-// branches are unreachable through a store and would go untested.
+// fail-closed arms. Split out for the same reason loginRegexesFrom is: the
+// error branches are awkward to reach through a store, so driving the decision
+// directly is what keeps them tested.
+//
+// #8289: this doc used to say "nothing can put a `deny-commands` class into
+// ActiveConfig until cut 6". That is STALE — #7172 cut 6 landed and retired the
+// #5831/#6838 admission gate (`pkg/config/compiler_tailgates.go` records it),
+// so such a config commits now AND takes effect.
 func checkCommandRegexWith(cfg *config.Config, class, line, pipeSuffix string) error {
 	if class == "" {
 		return nil
@@ -106,11 +111,22 @@ func checkCommandRegexWith(cfg *config.Config, class, line, pipeSuffix string) e
 // an error or nil out. Split from checkCommandRegex so the decision can be
 // driven directly in tests.
 //
-// That seam matters more than usual here. Cut 3's enforcement is UNREACHABLE
-// through the commit path until cut 6 retires #6838's gate, which refuses every
-// config carrying `deny-commands`. A test that drove this through a committed
-// config could not exist yet, and writing one that bypasses commit would be
-// testing a path no operator can reach while looking like an end-to-end test.
+// That seam matters more than usual here, and the reason has CHANGED — read
+// this rather than the sentence it replaced.
+//
+// It used to say cut 3's enforcement was "UNREACHABLE through the commit path
+// until cut 6 retires #6838's gate". #7172 cut 6 has landed
+// (`pkg/config/compiler_tailgates.go`: "a config carrying deny-commands /
+// deny-configuration was REJECTED at commit before this and commits now — and
+// takes effect"), so this path IS reachable by an ordinary operator config. A
+// rationale asserting unreachability outlived the change that made it
+// reachable, and nothing re-checked it; #8289 found the enforcement defect that
+// staleness was hiding.
+//
+// The seam is still worth having — it is what lets the decision be driven
+// directly, including by the #8289 cell that proves an anchored
+// `deny-commands` is not defeated by appending a sibling keyword to the denied
+// command.
 func evaluateCommandRegex(
 	rules config.CompiledLoginRegexes,
 	class, line, pipeSuffix string,

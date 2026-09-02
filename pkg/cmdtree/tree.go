@@ -1744,9 +1744,31 @@ func Canonicalize(tree map[string]*Node, words []string) ([]string, Canonicalize
 		out[wi] = name
 		currentNode = node
 		parentTyped = node.IsTypedLeaf()
-		if node.Children == nil {
-			continue
-		}
+		// #8289: descend UNCONDITIONALLY, including to a leaf's nil child map.
+		// This used to `continue` when `node.Children == nil`, leaving `current`
+		// pointing at the PARENT map, so the next word resolved against the
+		// leaf's own SIBLINGS: `show version configuration` canonicalized OK as
+		// a three-word command.
+		//
+		// That is an RBAC bypass, and not the one it looks like. Both
+		// dispatchers run it as plain `show version` — `case "version"` in
+		// pkg/cli/cli_show.go and pkg/grpcapi/server_show.go both call a
+		// no-argument showVersion and drop the rest — so the trailing word is
+		// NOT executed as `show configuration`. The hazard is the reverse:
+		// `evaluateCommandRegex` decides on `strings.Join(canon, " ")`, so it
+		// judged the three-word string while the box ran the two-word command.
+		// An operator's anchored `deny-commands "^show version$"` therefore did
+		// not match, and appending ANY sibling keyword ran the denied command.
+		// Measured:
+		//
+		//	deny="^show version$"  line="show version"                -> denied
+		//	deny="^show version$"  line="show version configuration"  -> ALLOWED
+		//
+		// Assigning nil sends the next word into the `!ok` arm above, which
+		// still admits the legitimate consumers of a word after a keyword — a
+		// typed leaf's value (`parentTyped`), a dynamic node, a placeholder —
+		// and refuses anything else as CanonicalUnknown. Callers fail closed on
+		// that, per this function's own contract.
 		current = node.Children
 	}
 	return out, CanonicalOK

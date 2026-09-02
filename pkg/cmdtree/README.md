@@ -96,6 +96,51 @@ package (`Canonicalize`, #8057). What would be a trust violation — the
 server importing `cmd/cli`'s table — is a different thing and remains
 forbidden.
 
+## Canonicalization is the authorization input, so a leaf must END the walk
+
+`Canonicalize` resolves an operator's abbreviated words to their full keyword
+spellings, and `pkg/cli`'s `evaluateCommandRegex` matches a login class's
+`allow-commands` / `deny-commands` against `strings.Join(canon, " ")`. That
+makes the walk a **security surface**, not just a completion helper: whatever
+the walk decides the command IS, is what the authorizer judges.
+
+**#8289 — a word after a childless leaf used to resolve against the leaf's own
+SIBLINGS.** The walk `continue`d on `node.Children == nil`, leaving `current`
+at the PARENT map, so `show version configuration` canonicalized OK as a
+three-word command.
+
+The bypass is the reverse of what it looks like. Both dispatchers run it as
+plain `show version` — `case "version"` in `pkg/cli/cli_show.go` and
+`pkg/grpcapi/server_show.go` each call a no-argument `showVersion` and drop the
+rest — so the trailing word is **not** executed as `show configuration`. The
+hazard is that the authorizer judged three words while the box ran two, so an
+operator's anchored deny missed:
+
+```
+deny="^show version$"  line="show version"                -> denied
+deny="^show version$"  line="show version configuration"  -> ALLOWED   (pre-fix)
+```
+
+The unanchored form never had the hole — matching is unanchored partial, so
+`show version` matches inside the longer string. **The operator who followed
+Junos's own advice to use anchors is the one who was bypassed**, which is why
+the regression cell uses the anchored form; an unanchored-only test passes on
+the broken code.
+
+The walk now descends unconditionally, including to a leaf's nil child map, so
+the next word falls into the not-a-keyword arm. That arm still admits the
+legitimate consumers of a following word — a typed leaf's value, a dynamic
+node, a placeholder — and refuses anything else as `CanonicalUnknown`, which
+callers must fail closed on.
+
+Over-rejection is the risk to watch when touching this, because a caller MUST
+fail closed on anything other than `CanonicalOK`: refusing too much REFUSES a
+lawful command for every operator with a restricted class. The regression cells
+therefore carry control rows for value slots (`ping <host>`,
+`show interfaces <name>`, `monitor traffic interface <name>`) and for genuine
+child descents, and the change was verified differentially against master —
+the only row whose result moved is `show version configuration`.
+
 ## Typed leaves
 
 A `Node` with `ValueType != ValueAny` is a typed leaf: it expects exactly
