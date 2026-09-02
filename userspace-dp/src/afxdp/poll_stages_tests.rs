@@ -3783,3 +3783,93 @@ fn stage_ipsec_passthrough_claims_local_and_nat_to_self_dst_5620() {
         }
     }
 }
+
+/// #8298 REACHABILITY: a teardrop fragment declaring `IHL = 0` reaches the LIVE
+/// flowless screen path and must still be dropped.
+///
+/// This is the cell that decides the issue's severity, and it is deliberately
+/// end-to-end rather than a `check_teardrop` unit test. The mechanism —
+/// `hdr_len = ip_ihl * 4` under-counting when IHL < 5 — was already proven at
+/// the unit level. What was NOT established is whether a frame can arrive at
+/// screening without having passed an `ihl < 20` rejection, and that is what
+/// separates defence-in-depth from a live bypass.
+///
+/// It can, and the fragment path is why. `parse_session_flow_from_bytes`
+/// returns `None` for a non-first fragment (`frame/inspect.rs`, #2344) — a
+/// FLOWLESS classification, not a drop, taken BEFORE any header-length
+/// validation. The packet then reaches `stage_screen_check`'s flowless branch,
+/// which calls `extract_screen_info`, whose two fail-closed checks both guard
+/// the header being LONGER than the capture and so admit IHL < 5. Neither
+/// `poll_descriptor/mod.rs` nor `poll_stages.rs` contains an `ihl` check at
+/// all. So the frames that skip flow parsing are exactly the non-first
+/// fragments teardrop exists to screen.
+///
+/// The fixture is the canonical teardrop the `< 8` test was written for: a
+/// non-first fragment (offset 1 unit) carrying 4 bytes of payload. Its sibling
+/// `flowless_teardrop_fragment_dropped_3064` — the same frame WITHOUT the IHL
+/// mutation — passes today, which is the control proving this cell differs from
+/// it by the IHL nibble alone and nothing else.
+///
+/// With `IHL = 0`, `hdr_len` computes as 0 and the payload reads as the whole
+/// `total_len` of 24, clearing the `< 8` test the real 4-byte payload would
+/// have failed.
+#[test]
+fn flowless_teardrop_fragment_with_ihl_zero_is_still_dropped_8298() {
+    let mut frame = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 4);
+    // Version 4, IHL 0. RFC 791 makes IHL >= 5 mandatory; nothing on this path
+    // enforces it.
+    frame[14] = 0x40;
+    let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+    assert!(
+        parse_session_flow_from_bytes(&frame, meta).is_none(),
+        "precondition: the frame must still be classified flowless, or this \
+         cell is not exercising the path the bypass runs on"
+    );
+    let mut screen = fragment_screen();
+    let (dropped, drops) = run_stage_screen(&mut screen, &frame, meta, None);
+    assert!(
+        dropped && drops == 1,
+        "a non-first fragment whose REAL payload is 4 bytes (< 8) must be \
+         dropped as teardrop regardless of the IHL it declares. With IHL = 0 \
+         `check_teardrop` computes hdr_len = 0 and reads the payload as the \
+         full total_len, so the attacker selects a value that clears the < 8 \
+         test. The attacker controls IHL, total_len and frag_off \
+         independently, and this path never validates the header length \
+         (#8298)"
+    );
+}
+
+/// #8298 CONTROL: the IHL floor must not reject a LEGITIMATE fragment.
+///
+/// A guard that reds on the mutant only proves it has power; a control on the
+/// most nearly-correct input is what proves the power is aimed right. This is
+/// the minimal legal header (IHL = 5, the value RFC 791 mandates as the floor)
+/// carrying a payload of exactly 8 — the first size the `< 8` teardrop test
+/// admits. If the floor were written `< 6`, or applied before the version
+/// check, or if `extract_screen_info` started failing closed on ordinary
+/// traffic, this cell reds while the bypass cell above stays green.
+#[test]
+fn flowless_legitimate_ihl5_fragment_is_not_dropped_8298() {
+    let frame = ipv4_fragment_frame(0x0001, FRAG_PROTO_UDP, 8);
+    assert_eq!(
+        frame[14] & 0x0F,
+        5,
+        "fixture must carry the minimal LEGAL header, or this control is not \
+         adjacent to the boundary it guards"
+    );
+    let meta = ipv4_fragment_meta(&frame, FRAG_PROTO_UDP);
+    assert!(
+        parse_session_flow_from_bytes(&frame, meta).is_none(),
+        "precondition: still the flowless path, so this control and the \
+         bypass cell above differ only in the declared header length"
+    );
+    let mut screen = fragment_screen();
+    let (dropped, drops) = run_stage_screen(&mut screen, &frame, meta, None);
+    assert!(
+        !dropped && drops == 0,
+        "a non-first fragment with the minimal legal IHL of 5 and an 8-byte \
+         payload is ordinary traffic and must pass the screen. The #8298 \
+         fail-closed floor rejects IHL < 5 only; if this reds, the floor is \
+         over-rejecting real fragments (#8298)"
+    );
+}

@@ -126,6 +126,38 @@ pub(crate) fn extract_screen_info(
         // overshoot fail-closed check. A minimal IHL=5 header always
         // survives — `l3_offset + 20 <= frame.len()` was just asserted.
         let ihl_bytes = (info.ip_ihl as usize) * 4;
+        // FAIL-CLOSED (#8298): RFC 791 makes IHL >= 5 mandatory, and the two
+        // checks around this one cannot catch a SHORTER-than-legal header —
+        // both guard the header being LONGER than the capture, and
+        // `ihl_bytes` of 0..16 is smaller than the 20 bytes already asserted
+        // present, so both pass. The declared length is then believed by every
+        // downstream consumer.
+        //
+        // `check_teardrop` is the consumer that matters: it computes
+        // `hdr_len = ip_ihl * 4` and subtracts it from `ip_total_len`, so an
+        // IHL of 0 makes the payload read as the WHOLE total length. The
+        // canonical teardrop — a non-first fragment whose real payload is
+        // under 8 bytes — then clears the `< 8` test it exists to fail, and
+        // the attacker picks IHL, total_len and frag_off independently.
+        //
+        // REACHABLE, measured rather than assumed. A non-first fragment is
+        // classified FLOWLESS by `parse_session_flow_from_bytes` (#2344) — a
+        // classification, not a drop — before any header-length validation,
+        // and neither `poll_descriptor/mod.rs` nor `poll_stages.rs` checks
+        // `ihl` at all. So the frames that skip flow parsing are exactly the
+        // non-first fragments this screen is for. Bound end-to-end by
+        // `flowless_teardrop_fragment_with_ihl_zero_is_still_dropped_8298`,
+        // whose sibling `flowless_teardrop_fragment_dropped_3064` is the
+        // control: the same frame without the IHL mutation.
+        //
+        // Rejecting here rather than clamping in `check_teardrop` because this
+        // is the documented fail-closed boundary — "a runt/malformed capture
+        // shorter than the base header its own layout requires" is exactly an
+        // IHL below 5, declared rather than measured — and a clamp would leave
+        // every other consumer of `ip_ihl` believing the bogus value.
+        if info.ip_ihl < 5 {
+            return Err(ScreenParseError::TruncatedIpv4Header);
+        }
         if l3_offset + ihl_bytes > frame.len() {
             return Err(ScreenParseError::TruncatedIpv4Header);
         }
