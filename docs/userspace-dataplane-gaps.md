@@ -528,7 +528,7 @@ enforced.
 
 | Protocol | Where decapsulation happens | Why the dataplane does not see the inner packet |
 |----------|-----------------------------|--------------------------------------------------|
-| WireGuard (#5618) | `userspace-dp/src/afxdp/coordinator/wg_control/dispatch.rs` — the helper's WireGuard control thread authenticates the record, enforces the peer's `allowed-ips` against the inner SOURCE address, then calls `slowpath::write_packet_nonblocking(tun_fd, inner)`. | The XDP shim deliberately steers inbound UDP on the configured listen port to the kernel (`wg_steer_to_kernel`, #5582) so the control thread can receive the outer transport, and the plaintext is written straight to the `wgN` TUN. The in-source comment states it: "the kernel routes/firewalls it (NOT the AF_XDP policy engine)". |
+| WireGuard (#5618) | `userspace-dp/src/afxdp/coordinator/wg_control/dispatch.rs` — the helper's WireGuard control thread authenticates the record, enforces the peer's `allowed-ips` against the inner SOURCE address, then calls `slowpath::write_packet_nonblocking(tun_fd, inner)`. | The XDP shim deliberately steers inbound UDP on the configured listen port to the kernel (`wg_steer_to_kernel`, #5582) so the control thread can receive the outer transport, and the plaintext is written straight to the `wgN` TUN. The in-source comment states it: "the kernel routes/firewalls it (NOT the AF_XDP policy engine)". **Only the INBOUND direction is affected — see the asymmetry note below.** |
 | Route-based IPsec (#5619) | The kernel XFRM stack; the plaintext is delivered on the `xfrmi` netdev. | There is no path to hand a plaintext frame back INTO an `xfrmi` for the egress direction, so the dataplane cannot own the interface end-to-end. |
 
 In both cases the interface row is excluded from the ingress-adjudication set:
@@ -538,10 +538,44 @@ IPsec through the `SecureTunnel` class, so the row is left out of
 `buildUserspaceIngressIfindexes` and of the AF_XDP binding plan, and
 `syncInterfaceAttachments` detaches the shim from the netdev.
 
+> **That is not true of the WireGuard BASE row under the canonical spelling
+> (#8279).** The base row's flag is `Tunnel: iface.Tunnel != nil`
+> (`interfaces.go:371`) — INTERFACE-level only; the unit row at `:446` is the
+> OR. The zone fans UP from the unit. So
+> `set interfaces wgN unit 0 tunnel mode wireguard` produces a base row with
+> `Tunnel = false` and a Zone, which matches no exclusion class and IS admitted
+> to both the ingress set and the RSS/binding allowlist — pinned by
+> `TestRefusedNetdevNeedsEveryOwnerToAgree/canonical_wireguard_spelling`. Since
+> a tunnel on a userspace-dataplane box is an anchor TUN (ARPHRD_NONE, raw L3)
+> and the shim's `parse_l2` is Ethernet-only, that admission is a defect in its
+> own right; #8279 carries it. Read the exclusion claim above as applying to
+> the UNIT row and to the interface-level spelling.
+
+**WireGuard is asymmetric: only the INBOUND direction bypasses (#7167).**
+WireGuard ENCAPSULATION already runs inside the AF_XDP worker, on a packet
+that has been through screen, flow cache, session, route, policy and NAT —
+`frame/mod.rs` dispatches `TunnelKind::WireGuard` to `wg::wg_encap_frame`
+(`userspace-dp/src/afxdp/frame/wg.rs`), which reads the live engine from
+`ForwardingState.wg_engines`, does its own AllowedIPs longest-prefix match,
+and resolves the physical underlay NIC into
+`decision.resolution.tx_ifindex`. DECAPSULATION runs in the control thread
+and is adjudicated by nothing. So the worker already holds every input the
+decap direction needs — the engine (`try_decap` takes `&self`), the
+tunnel's `logical_ifindex`, and #8062's
+`logical_ingress::build_logical_ingress_packet` — and it holds the outer
+ECN bits *better* than the socket path does, because the outer IP header is
+still in the frame rather than having to be recovered out-of-band via
+`IP_RECVTOS`. The adjudication in
+`docs/research/7167-tunnel-ingress/adjudication.md` records why this makes
+the WireGuard fix "move decap to the side that already does encap" rather
+than "build a bounded cross-thread packet handoff".
+
 **Operator-visible consequence.** Inter-zone authority for tunnel traffic is
 delegated to the kernel FIB plus nftables, and xpf installs only `hook input`
-chains while force-enabling `ip_forward` — so tunnel-to-LAN transit is
-forwarded unfiltered. `allowed-ips` is not a substitute: it is a cryptographic
+chains while keeping `ip_forward` at 1 for as long as the dataplane is armed
+(#5275's arm gate makes the knob conditional on `dataplaneArmed`, and its
+comment names *this* path as the reason it must never be lowered while
+armed) — so tunnel-to-LAN transit is forwarded unfiltered. `allowed-ips` is not a substitute: it is a cryptographic
 peer/source ownership gate on the inner source address, with no destination, no
 zone-pair, no application and no direction. Leaving the tunnel out of a zone is
 not a mitigation either: the plaintext never reaches zone policy at all, so
@@ -572,7 +606,13 @@ The advisories make the bypass VISIBLE. They do not enforce policy on the inner
 traffic; enforcement (re-injecting the decapsulated packet into the AF_XDP
 forward/zone-policy pipeline on the tunnel's logical interface, the model native
 GRE decap already follows in `userspace-dp/src/afxdp/gre.rs`) is tracked
-separately. Native GRE is the contrast case and is NOT affected: it decaps
+separately in #7167, whose shared synthesize/rebind/reparse primitive
+(`userspace-dp/src/afxdp/logical_ingress.rs`) shipped in #8062 with GRE as its
+only caller. **Do not try to enforce by un-excluding the tunnel netdev.** Both
+planners put an ifindex into the shim's ingress-adjudication map before any
+AF_XDP binding exists for it, and the shim's `BINDING_MISSING` arm then takes
+`drop_degraded_transit` — so admitting the interface without a working binding
+produces a black-holed tunnel, not a policy fix. Native GRE is the contrast case and is NOT affected: it decaps
 inside the worker pipeline, rebinds `ingress_ifindex` to the tunnel's
 `logical_ifindex`, derives `ingress_zone` from
 `ForwardingState.ifindex_to_zone_id`, and continues through screen, session,

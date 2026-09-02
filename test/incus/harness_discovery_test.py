@@ -25,6 +25,8 @@ pytest-style file from being invisible the day it lands.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -92,3 +94,72 @@ class HarnessDiscoveryTest(unittest.TestCase):
             + "\n  ".join(hyphenated)
             + "\nRename the hyphens to underscores.",
         )
+
+
+class CollectionAgreementTest(unittest.TestCase):
+    """#8278: a pytest-style file must collect the same tests both ways.
+
+    `test_every_test_file_contributes_at_least_one_test` above is a LOWER
+    BOUND, and a lower bound cannot see a file that collects MOST of its
+    tests. step3 defined three `_7424` cases below its `__main__` block:
+    `unittest discover` ran all 14, `python3 <file>` ran 11, and both
+    reported success. step1 ran 17 and 0 the same way. The bound was
+    satisfied in every case.
+
+    So this asserts the AGREEMENT between the two ways of running the
+    file rather than pinning either count -- pinning one would encode
+    which of them we trust, and the defect is precisely that they can
+    disagree while both look healthy.
+    """
+
+    HERE = Path(__file__).parent
+
+    @staticmethod
+    def _ran(out: str) -> int:
+        for line in out.splitlines():
+            if line.startswith("Ran "):
+                return int(line.split()[1])
+        return 0
+
+    def test_direct_execution_collects_what_discovery_collects(self) -> None:
+        # Match the ASSIGNMENT, not a mention. A marker matching any file
+        # that DISCUSSES the collector matches this file's own docstring,
+        # and the check then runs itself as a subprocess, forever -- the
+        # shape the #7296 census comment warns about, a source-scanning
+        # gate satisfied by its own documentation. Excluded by
+        # construction rather than by a name allowlist that can rot.
+        marker = "load_tests = collect_module_tests("
+        subjects = sorted(
+            q for q in self.HERE.glob("*_test.py")
+            if q.name != Path(__file__).name and marker in q.read_text()
+        )
+        # Positive control: if the glob or the marker string stops
+        # matching, this test would pass over an empty set and report a
+        # clean sweep of nothing.
+        self.assertGreater(
+            len(subjects), 0,
+            "no pytest-style test module found -- the collect_module_tests "
+            "marker moved and this check is now vacuous",
+        )
+        for path in subjects:
+            with self.subTest(module=path.name):
+                direct = subprocess.run(
+                    [sys.executable, str(path)],
+                    capture_output=True, text=True, cwd=self.HERE, timeout=120,
+                )
+                disc = subprocess.run(
+                    [sys.executable, "-m", "unittest", "discover",
+                     "-s", str(self.HERE), "-p", path.name],
+                    capture_output=True, text=True, cwd=self.HERE, timeout=120,
+                )
+                n_direct = self._ran(direct.stdout + direct.stderr)
+                n_disc = self._ran(disc.stdout + disc.stderr)
+                self.assertEqual(
+                    n_direct, n_disc,
+                    f"{path.name} collects {n_direct} tests when run directly "
+                    f"and {n_disc} under discovery. unittest.main() collects at "
+                    f"call time and never returns, so anything defined below "
+                    f"the __main__ block -- a load_tests collector, or a test "
+                    f"appended later -- is invisible to it.",
+                )
+                self.assertGreater(n_disc, 0, f"{path.name} collects nothing")

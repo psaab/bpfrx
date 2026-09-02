@@ -231,28 +231,44 @@ invalidate() {
     exit 0
 }
 
+# Stop one backgrounded remote job: close the local incus-exec client,
+# then stop the process where it actually runs.
+#
+# #7159/#8270: killing the local $PID only closes the client. incus
+# leaves the command running inside the instance when a non-interactive
+# client disconnects, so on an early INVALID exit the remote process
+# outlived its rep. For the elephant that was not a leak but a
+# CORRUPTED CELL -- it kept sending for the rest of its 90 s budget
+# while the next rep started ~8 s later, and that rep then shared the
+# 1 Gb/s exact class with its own predecessor, so one marginal
+# rejection cascaded into a cell of zero valid reps. For the mpstat
+# samplers it is unaccounted CPU on the very container whose p99.9 tail
+# this harness measures, plus an orphan still writing the file a later
+# same-tag reuse reads.
+#
+# Unconditional, including on a rep that finished normally: the kill
+# command confirms the recorded pid still belongs to the expected
+# program before signalling, so there is nothing to gain by tracking
+# whether we already waited, and running it always is what removes the
+# pidfile on every path. See test/incus/mouse-elephant-lib.sh.
+stop_remote_job() { # <local pid> <job name> <program name>
+    local local_pid="$1" job="$2" prog="$3"
+    [[ -n "$local_pid" ]] || return 0
+    kill "$local_pid" 2>/dev/null || true
+    incus_exec "$SOURCE" sh -c \
+        "$(mouse_remote_job_kill_cmd "$job" "$REP_TAG" "$prog")" \
+        < /dev/null > /dev/null 2>&1 || true
+}
+
 cleanup() {
-    # Best-effort kill on early exit. The MPSTAT_PID is started AFTER
-    # the probe is launched, so on early INVALID exit (e.g. during
-    # cwnd-settle gate or step 4 cursor capture) it isn't running yet.
-    #
-    # #7159: killing $IPERF_PID only closes the LOCAL incus-exec
-    # client. incus leaves the command running inside the instance when
-    # a non-interactive client disconnects, so on an early INVALID exit
-    # the elephant kept sending for the rest of its 90 s budget while
-    # the next rep started ~8 s later -- and that rep then shared the
-    # 1 Gb/s exact class with its own predecessor. One marginal
-    # rejection cascaded into a cell of zero valid reps. Stop the
-    # elephant where it actually runs, on the source container.
-    # See test/incus/mouse-elephant-lib.sh.
-    [[ -n "${IPERF_PID:-}" ]] && kill "$IPERF_PID" 2>/dev/null || true
-    if [[ -n "${IPERF_PID:-}" && "${IPERF_DONE:-0}" -ne 1 ]]; then
-        incus_exec "$SOURCE" sh -c "$(mouse_elephant_kill_cmd "$REP_TAG")" \
-            < /dev/null > /dev/null 2>&1 || true
-    fi
+    stop_remote_job "${IPERF_PID:-}" iperf3 iperf3
+    stop_remote_job "${SETTLE_MPSTAT_PID:-}" mpstat-settle mpstat
+    stop_remote_job "${MPSTAT_PID:-}" mpstat mpstat
+    # RG_POLL_PID is a LOCAL subshell, not an incus-exec client: its $!
+    # is a process on this host, so a plain kill is the correct and
+    # complete stop. Routing it through stop_remote_job would add a
+    # pointless remote round-trip per rep and stop nothing.
     [[ -n "${RG_POLL_PID:-}" ]] && kill "$RG_POLL_PID" 2>/dev/null || true
-    [[ -n "${SETTLE_MPSTAT_PID:-}" ]] && kill "$SETTLE_MPSTAT_PID" 2>/dev/null || true
-    [[ -n "${MPSTAT_PID:-}" ]] && kill "$MPSTAT_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -263,7 +279,7 @@ trap cleanup EXIT
 # previously left a stale file behind that the next reuse with the
 # same tag would inherit. Belt-and-suspenders.)
 incus_exec "$SOURCE" sh -c \
-    "rm -f /tmp/mouse_latency_probe.py /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/mpstat-settle-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.pid" \
+    "rm -f /tmp/mouse_latency_probe.py /tmp/probe-${REP_TAG}.json /tmp/mpstat-${REP_TAG}.txt /tmp/mpstat-settle-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.txt /tmp/iperf3-${REP_TAG}.pid /tmp/mpstat-${REP_TAG}.pid /tmp/mpstat-settle-${REP_TAG}.pid" \
     < /dev/null > /dev/null 2>&1 || true
 
 # Push helper scripts to the source container (probe driver runs there).
@@ -380,7 +396,8 @@ if [[ "$N" -gt 0 ]]; then
         < /dev/null > /dev/null 2>&1 &
     IPERF_PID=$!
     incus_exec "$SOURCE" sh -c \
-        "mpstat 1 ${SETTLE_BUDGET} > /tmp/mpstat-settle-${REP_TAG}.txt 2>&1" \
+        "$(mouse_remote_job_start_cmd mpstat-settle "$REP_TAG" \
+                                      mpstat 1 "$SETTLE_BUDGET")" \
         < /dev/null > /dev/null 2>&1 &
     SETTLE_MPSTAT_PID=$!
 
@@ -432,7 +449,7 @@ fi
 # mpstat's count == DURATION, so it exits naturally just as the probe
 # does and writes the Average: line.
 incus_exec "$SOURCE" sh -c \
-    "mpstat 1 ${DURATION} > /tmp/mpstat-${REP_TAG}.txt 2>&1" \
+    "$(mouse_remote_job_start_cmd mpstat "$REP_TAG" mpstat 1 "$DURATION")" \
     < /dev/null > /dev/null 2>&1 &
 MPSTAT_PID=$!
 
@@ -473,7 +490,6 @@ if [[ -n "${IPERF_PID:-}" ]]; then
     wait "$IPERF_PID"
     iperf_rc=$?
     set -e
-    IPERF_DONE=1
     incus_run file pull \
         "${INCUS_REMOTE}:${SOURCE}/tmp/iperf3-${REP_TAG}.txt" \
         "${OUT_DIR}/iperf3.txt" 2>/dev/null || true

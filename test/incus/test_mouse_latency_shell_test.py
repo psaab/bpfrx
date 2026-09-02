@@ -1,5 +1,6 @@
 import pathlib
 import re
+import subprocess
 import unittest
 
 
@@ -79,54 +80,126 @@ class MouseLatencyShellTests(unittest.TestCase):
         ):
             self.assertIn(artifact, SCRIPT)
         self.assertIn("show class-of-service interface", SCRIPT)
-        self.assertIn("mpstat 1 ${SETTLE_BUDGET} > /tmp/mpstat-settle-${REP_TAG}.txt", SCRIPT)
+        # The settle sampler's count is still SETTLE_BUDGET and its
+        # remote artifact path is still /tmp/mpstat-settle-<tag>.txt.
+        # #8270 moved the launch behind mouse_remote_job_start_cmd, so
+        # the assertion moved with it rather than being deleted: the
+        # count is pinned here and the path is pinned in
+        # RemoteJobArtifactPathTests below, where the library derives it.
+        self.assertIn('mouse_remote_job_start_cmd mpstat-settle "$REP_TAG"', SCRIPT)
+        self.assertIn('mpstat 1 "$SETTLE_BUDGET"', SCRIPT)
 
 
-class ElephantLifecycleWiringTests(unittest.TestCase):
-    """#7159: the rep script must USE the elephant lifecycle library.
+class RemoteJobArtifactPathTests(unittest.TestCase):
+    """The library must keep deriving the historical remote paths.
+
+    #8270 replaced three literal launch strings with a derivation. If
+    the derivation drifts, every artifact pull in the rep script starts
+    missing its file -- and the rep script's own pulls name the old
+    paths literally, so the two would disagree silently.
+    """
+
+    LIB = pathlib.Path(__file__).with_name("mouse-elephant-lib.sh")
+
+    def _lib_eval(self, expr):
+        return subprocess.run(
+            ["bash", "-c", f'. "{self.LIB}"; {expr}'],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def test_remote_paths_match_what_the_rep_script_pulls(self):
+        for job, want in (
+            ("iperf3", "/tmp/iperf3-TAG.txt"),
+            ("mpstat", "/tmp/mpstat-TAG.txt"),
+            ("mpstat-settle", "/tmp/mpstat-settle-TAG.txt"),
+        ):
+            with self.subTest(job=job):
+                self.assertEqual(
+                    self._lib_eval(f'mouse_remote_job_outfile {job} TAG'), want)
+                self.assertEqual(
+                    self._lib_eval(f'mouse_remote_job_pidfile {job} TAG'),
+                    want[:-len(".txt")] + ".pid")
+        # The rep script pulls these literal paths; they must be the
+        # same strings the library builds.
+        for literal in (
+            "/tmp/iperf3-${REP_TAG}.txt",
+            "/tmp/mpstat-${REP_TAG}.txt",
+            "/tmp/mpstat-settle-${REP_TAG}.txt",
+        ):
+            self.assertIn(literal, SCRIPT)
+
+
+class RemoteJobLifecycleWiringTests(unittest.TestCase):
+    """#7159/#8270: every BACKGROUNDED REMOTE job must be stopped remotely.
 
     mouse-elephant-selftest.sh proves the library's start/stop pair
-    reaps the leaf process. It cannot see whether test-mouse-latency.sh
-    calls it -- and the whole defect was a call site, not a helper: the
-    EXIT trap killed the local incus-exec client and believed the
-    remote iperf3 had stopped. These bind the wiring.
+    reaps the leaf process. It cannot see WHICH call sites use it -- and
+    the whole defect is a call site: the EXIT trap killed the local
+    incus-exec client and believed the remote process had stopped.
+    #8268 fixed one of the three and left two with the old shape, which
+    is exactly the regression these bind.
     """
+
+    # (local pid var, job name, program name) for every job backgrounded
+    # through incus_exec in the rep script.
+    REMOTE_JOBS = (
+        ("IPERF_PID", "iperf3", "iperf3"),
+        ("SETTLE_MPSTAT_PID", "mpstat-settle", "mpstat"),
+        ("MPSTAT_PID", "mpstat", "mpstat"),
+    )
 
     def test_rep_script_sources_the_lifecycle_library(self):
         self.assertIn('. "${SCRIPT_DIR}/mouse-elephant-lib.sh"', SCRIPT)
 
-    def test_elephant_is_launched_through_the_library(self):
-        # The raw `iperf3 -c ...` launch string is what leaked: it left
-        # nothing on the remote side that a kill could address.
+    def test_every_remote_job_is_launched_through_the_library(self):
+        # The raw launch strings are what leaked: they left nothing on
+        # the remote side that a kill could address.
         self.assertNotIn('"iperf3 -c ${TARGET_V4}', SCRIPT)
+        self.assertNotIn('"mpstat 1 ${DURATION}', SCRIPT)
+        self.assertNotIn('"mpstat 1 ${SETTLE_BUDGET}', SCRIPT)
         self.assertIn('mouse_elephant_start_cmd "$REP_TAG" "$TARGET_V4" "$ELEPHANT_PORT"', SCRIPT)
+        self.assertIn('mouse_remote_job_start_cmd mpstat-settle "$REP_TAG"', SCRIPT)
+        self.assertIn('mouse_remote_job_start_cmd mpstat "$REP_TAG" mpstat 1 "$DURATION"', SCRIPT)
 
-    def test_cleanup_stops_the_elephant_on_the_source_container(self):
-        # Killing IPERF_PID alone is the pre-#7159 behaviour: it closes
-        # the local client and leaves the remote process running.
-        self.assertRegex(
+    def test_cleanup_stops_every_remote_job_on_the_source_container(self):
+        for pid_var, job, prog in self.REMOTE_JOBS:
+            with self.subTest(job=job):
+                self.assertIn(
+                    f'stop_remote_job "${{{pid_var}:-}}" {job} {prog}',
+                    SCRIPT,
+                    f"{job} is not stopped on the source container: a local "
+                    f"kill of {pid_var} only closes the incus-exec client",
+                )
+        # ... and stop_remote_job must actually reach the container.
+        self.assertIn(
+            'incus_exec "$SOURCE" sh -c \\\n        "$(mouse_remote_job_kill_cmd "$job" "$REP_TAG" "$prog")"',
             SCRIPT,
-            re.compile(
-                r'if \[\[ -n "\$\{IPERF_PID:-\}" && "\$\{IPERF_DONE:-0\}" -ne 1 \]\]; then\s+'
-                r'incus_exec "\$SOURCE" sh -c "\$\(mouse_elephant_kill_cmd "\$REP_TAG"\)"',
-                re.MULTILINE,
-            ),
         )
-        # ... and a rep that ran to completion must not re-kill a pid
-        # the source may since have reused.
-        wait_idx = SCRIPT.index('wait "$IPERF_PID"')
-        done_idx = SCRIPT.index("IPERF_DONE=1")
-        self.assertLess(wait_idx, done_idx)
+
+    def test_local_subshell_poller_is_not_routed_through_the_remote_stop(self):
+        # RG_POLL_PID has the same `kill "$VAR"` spelling and is NOT
+        # affected: its $! is a local subshell, so a plain kill is the
+        # complete stop. Sending it through stop_remote_job would add a
+        # remote round-trip per rep that stops nothing. This is the
+        # discriminator that keeps the fix a fix rather than a pattern
+        # applied everywhere it matches.
+        self.assertNotIn("stop_remote_job \"${RG_POLL_PID", SCRIPT)
+        self.assertIn(
+            '[[ -n "${RG_POLL_PID:-}" ]] && kill "$RG_POLL_PID" 2>/dev/null || true',
+            SCRIPT,
+        )
 
     def test_stale_elephant_guard_runs_before_any_cos_mutation(self):
-        self.assertIn('mouse_elephant_stale_check_cmd', SCRIPT)
+        self.assertIn("mouse_elephant_stale_check_cmd", SCRIPT)
         self.assertIn('invalidate "stale-elephant-client"', SCRIPT)
         guard_idx = SCRIPT.index("mouse_elephant_stale_check_cmd")
         cos_idx = SCRIPT.index('"${SCRIPT_DIR}/apply-cos-config.sh"')
         self.assertLess(guard_idx, cos_idx)
 
-    def test_pidfile_is_swept_with_the_other_stale_rep_artifacts(self):
-        self.assertIn("/tmp/iperf3-${REP_TAG}.pid", SCRIPT)
+    def test_every_remote_job_pidfile_is_swept_with_the_stale_artifacts(self):
+        for _, job, _ in self.REMOTE_JOBS:
+            with self.subTest(job=job):
+                self.assertIn("/tmp/%s-${REP_TAG}.pid" % job, SCRIPT)
 
 
 if __name__ == "__main__":

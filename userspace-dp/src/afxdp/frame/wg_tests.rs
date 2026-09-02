@@ -1492,3 +1492,95 @@ fn non_wg_forward_keeps_the_tx_ifindex_fast_path_6345() {
         "a non-tunnel forward must take tx_ifindex verbatim"
     );
 }
+
+// === #7167: the tunnel-kind DISPATCHER's WireGuard arm ===
+
+/// FAIL-ON-REVERT for the WIRING, not the builder.
+///
+/// Every other WireGuard encap cell in this file calls `wg_encap_frame`
+/// DIRECTLY. None of them drives `build_forwarded_frame_from_frame`, so none
+/// of them can see the `match kind { Some(TunnelKind::WireGuard) => ... }` arm
+/// in `frame/mod.rs` that actually reaches it. Deleting that arm leaves this
+/// file's other 20+ WG cells green while every WireGuard packet on the box
+/// falls to the #2327 fail-closed `None` and is silently dropped. Native GRE
+/// has had `build_forwarded_frame_from_frame_encapsulates_native_gre` guarding
+/// its arm of the same `match` since #2327; WireGuard had no counterpart.
+///
+/// This matters beyond the missing cell. #7167's adjudication rests on the
+/// fact that WireGuard ENCAPSULATION already runs inside the AF_XDP worker,
+/// post-adjudication, while DECAPSULATION runs in the control thread with no
+/// adjudication at all — the asymmetry IS the defect, and the reason the fix
+/// is "move decap to the side that already does encap" rather than "build a
+/// bounded cross-thread packet handoff". If this arm were ever removed or
+/// re-pointed, that argument would rot silently, exactly the way this issue's
+/// other premises did (`docs/research/7167-tunnel-ingress/adjudication.md`).
+///
+/// Asserted STRUCTURALLY rather than by comparing against `wg_encap_frame`'s
+/// own output: WireGuard encap is not deterministic (each call consumes a
+/// fresh nonce counter and produces different ciphertext), so a byte-equality
+/// pairing would fail for a reason that has nothing to do with the wiring.
+/// The properties below are ones ONLY a WireGuard encapsulation has — the
+/// sibling GRE arm of the same `match` emits IP protocol 47 with no UDP
+/// header and no type-4 record, so re-pointing the arm reds here too.
+#[test]
+fn build_forwarded_frame_from_frame_encapsulates_wireguard_7167() {
+    let mut state = build_forwarding_state(&wg_outer_mtu_snapshot());
+    let peer_ep: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+    state
+        .wg_engines
+        .insert(1, Arc::new(established_initiator_engine(peer_ep, "10.123.0.0/24")));
+
+    let decision = wg_encap_decision();
+    let frame = inner_v4_frame();
+
+    let built = crate::afxdp::frame::build_forwarded_frame_from_frame(
+        &frame,
+        inner_v4_meta(),
+        &decision,
+        &state,
+        false,
+        None,
+    )
+    .expect(
+        "the tunnel-kind dispatcher must route TunnelKind::WireGuard to wg_encap_frame; \
+         `None` here means the arm was deleted and every WG packet now fail-closed drops",
+    );
+
+    // Outer L2: reth0.80's 802.1Q tag, so the IPv4 header starts at 18.
+    assert_eq!(
+        &built[12..14],
+        &[0x81, 0x00],
+        "outer must carry the physical egress 802.1Q tag"
+    );
+    assert_eq!(&built[16..18], &[0x08, 0x00], "outer ethertype must be IPv4");
+
+    // Outer L3: UDP to the peer endpoint. The GRE arm of the same `match`
+    // would write PROTO_GRE (47) here and no UDP header at all.
+    assert_eq!(built[18] >> 4, 4, "outer must be IPv4");
+    assert_eq!(
+        built[18 + 9],
+        PROTO_UDP,
+        "WireGuard's outer transport is UDP — PROTO_GRE here means the \
+         dispatcher arm was re-pointed at the GRE builder"
+    );
+    assert_eq!(
+        &built[34..38],
+        &[203, 0, 113, 7],
+        "outer destination must be the WG peer endpoint"
+    );
+
+    // Outer L4: the peer's listen port, then the WireGuard type-4
+    // transport-data record (type=4, 3 reserved zero bytes).
+    assert_eq!(
+        u16::from_be_bytes([built[40], built[41]]),
+        51820,
+        "outer UDP destination port must be the peer's WG endpoint port"
+    );
+    assert_eq!(
+        &built[46..50],
+        &[0x04, 0x00, 0x00, 0x00],
+        "the UDP payload must open with the WireGuard type-4 transport-data \
+         header — this is what distinguishes a real WG encapsulation from any \
+         other builder the dispatcher could have selected"
+    );
+}
