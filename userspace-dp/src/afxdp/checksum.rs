@@ -353,13 +353,20 @@ pub(super) fn dnat_steering_holder_count(
         .map_or(0, |v| v.len())
 }
 
-#[cfg(test)]
-pub(super) fn reset_dnat_steering_holders() {
-    DNAT_STEERING_HOLDERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
+// #8291: `reset_dnat_steering_holders()` was REMOVED, not merely left unused.
+//
+// It cleared the ENTIRE `DNAT_STEERING_HOLDERS` registry, and its callers were
+// cells asserting ABSOLUTE holder counts. Under a parallel `cargo test` each
+// one wiped its siblings' setup — this module failed 14 of 20 runs on its own.
+// The cells now publish under per-cell steering keys (a unique
+// `rewrite_src_port`, see `isolated_snat_decision_8291`), so each asserts over
+// a row nothing else touches and no clear is needed.
+//
+// Deleting it is the point rather than a tidy-up. A test-only "clear all shared
+// state" helper is a loaded gun for the next author: it looks like isolation
+// and is the opposite, because it isolates the caller by destroying everyone
+// else's. Removing the capability is what stops it coming back; a comment
+// asking people not to call it would not.
 
 /// #2979: delete the dynamic reverse-NAT `dnat_table` / `dnat_table_v6` entry
 /// published by `publish_dnat_table_entry` when the SNAT'd session closes or
