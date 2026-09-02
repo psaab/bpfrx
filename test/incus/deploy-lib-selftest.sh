@@ -413,6 +413,43 @@ test_verify_running_match() {
 	rm -f "$lb"; teardown_fake_vm
 }
 
+# #8302: the running-exe readback was EXTRACTED from deploy_verify_running_xpfd
+# into deploy_running_xpfd_sha256 so the ledger emitter
+# (test/incus/harness-result.sh) reuses the one readback rather than growing a
+# second one free to disagree with it. The cells above exercise it through the
+# wrapper; these two pin the extracted function's OWN contract, which the
+# wrapper cannot express because it dies on both of these inputs.
+test_running_sha_returns_the_live_sha() {
+	setup_fake_vm
+	local lb; lb=$(mktemp); make_local_bin "$lb" "RUNNING-OK"
+	cp "$lb" "$FAKE_VM/usr/local/sbin/xpfd"
+	FAKE_MAINPID="4242"
+	local want got
+	want=$(sha256sum "$lb" | awk '{print $1}')
+	got=$(deploy_running_xpfd_sha256 vm 1)
+	if [[ "$got" == "$want" ]]; then
+		ok "running_sha: echoes the LIVE process image's sha256"
+	else
+		bad "running_sha: got '$got', want '$want'"
+	fi
+	rm -f "$lb"; teardown_fake_vm
+}
+
+test_running_sha_empty_instance_does_not_read_the_local_host() {
+	setup_fake_vm
+	# An empty instance name must NOT fall through to reading this machine's
+	# own xpfd -- that would be a value indistinguishable from a healthy
+	# readback, attributing a measurement to the wrong binary entirely.
+	local got rc
+	got=$(deploy_running_xpfd_sha256 "" 1); rc=$?
+	if [[ $rc -ne 0 && -z "$got" ]]; then
+		ok "running_sha: an empty instance name returns EMPTY rc!=0, never a local fallback"
+	else
+		bad "running_sha: empty instance gave rc=$rc out='$got'"
+	fi
+	teardown_fake_vm
+}
+
 test_verify_running_stale_pin_hardfails() {
 	setup_fake_vm
 	local lb; lb=$(mktemp); make_local_bin "$lb" "RUNNING-OK"
@@ -1189,6 +1226,8 @@ test_reconcile_stale_pin_foreign_override_hardfails
 test_reconcile_dangling_sbin_removes
 test_reconcile_dangling_sbin_keeps_valid
 test_verify_running_match
+test_running_sha_returns_the_live_sha
+test_running_sha_empty_instance_does_not_read_the_local_host
 test_verify_running_stale_pin_hardfails
 test_verify_running_stale_binary_hardfails
 test_reassert_verifier_accepts_all_primary

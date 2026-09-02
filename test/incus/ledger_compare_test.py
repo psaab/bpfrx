@@ -1,0 +1,478 @@
+"""Cells for ledger_compare.py — including the four the loop cannot live without.
+
+A comparator with a broken band is INDISTINGUISHABLE from a healthy one on
+every green run, and a loop is green almost all the time by construction. So
+the cells that matter here are not the ones that check a happy path; they are
+the ones that go RED when a specific piece of the guard is removed. Each of
+those carries a `MUTATION:` line naming the edit it must survive, and
+`test/incus/harness-ledger-mutation-selftest.sh` applies exactly those edits to
+a copy of the module and asserts this file reds for each one. A cell without a
+mutation behind it is a cell nobody has proved has power.
+
+Falsifiability of this file: if ledger_compare.py's band, VOID exclusion, K
+floor or NO-BASELINE distinction is broken, at least one cell here fails by
+NAME. If a fixture stops reaching the code under test, the arrange-side
+assertions (baseline_n, outcome on the healthy path) fail rather than the cell
+passing vacuously. On an empty input the cells assert NO-BASELINE explicitly —
+the empty set is never allowed to reach an assertion-free path.
+"""
+
+import json
+import unittest
+import uuid
+
+from ledger_compare import (
+    BAND_REL_FLOOR,
+    BAND_Z,
+    IMPROVED,
+    LEDGER_CORRUPT,
+    LedgerError,
+    MIN_BASELINE_RUNS,
+    NO_BASELINE,
+    REGRESSION,
+    VOID,
+    WITHIN_BAND,
+    band,
+    classify,
+    compare,
+    exit_status,
+    lint_ledger,
+    lint_row,
+    parse_ledger,
+)
+
+GATE = "test-failover"
+ENV = "loss-userspace-cluster"
+
+
+def row(
+    ts,
+    verdict="PASS",
+    value=100.0,
+    gate=GATE,
+    env=ENV,
+    headline="throughput_gbps",
+    direction="higher-better",
+    metrics=None,
+    void_reason="",
+    exe_check="MATCH",
+    extra=None,
+    run_id=None,
+):
+    """One ledger row. Complete enough to survive lint_row(), so the same
+    fixtures can be round-tripped through parse_ledger()."""
+    if metrics is None:
+        metrics = {} if (verdict == "VOID" and value is None) else {headline: value}
+    if extra:
+        metrics = dict(metrics, **extra)
+    return {
+        "schema": 1,
+        "run_id": run_id or uuid.uuid4().hex[:16],
+        "ts": ts,
+        "gate": gate,
+        "env": env,
+        "verdict": verdict,
+        "void_reason": void_reason or ("did not measure" if verdict == "VOID" else ""),
+        "headline_metric": "" if verdict == "VOID" else headline,
+        "headline_direction": "" if verdict == "VOID" else direction,
+        "metrics": metrics,
+        "build_git_sha": "abc123",
+        "build_exe_sha256": "d" * 64,
+        "running_exe_sha256": "d" * 64,
+        "exe_check": exe_check,
+        "duration_s": 300,
+        "artifacts": None,
+        "adapter": "ha-smoke",
+        "node": "loss:xpf-userspace-fw0",
+    }
+
+
+def greens(values, start=1):
+    return [row(f"2026-09-01T00:{i:02d}:00Z", value=v) for i, v in enumerate(values, start=start)]
+
+
+class BandArithmetic(unittest.TestCase):
+    def test_band_is_median_mad_not_mean_stddev(self):
+        # One wild point must NOT widen the band: that is the whole reason the
+        # estimator is median/MAD. mean/stddev over [100,100,100,10] gives a
+        # band wide enough to swallow a 40% regression.
+        med, lo, hi = band([100.0, 100.0, 100.0, 10.0])
+        self.assertEqual(med, 100.0)
+        self.assertLess(hi - lo, 40.0)
+
+    def test_identical_baseline_gets_relative_floor_not_zero_width(self):
+        # Without the floor a perfectly repeatable gate gets a zero-width band
+        # and every later run reports REGRESSION on ordinary jitter.
+        med, lo, hi = band([100.0, 100.0, 100.0])
+        self.assertAlmostEqual(lo, 95.0)
+        self.assertAlmostEqual(hi, 105.0)
+
+    def test_band_over_empty_baseline_raises(self):
+        # The empty set must not produce a band. A band over nothing is a
+        # number with the shape of evidence.
+        with self.assertRaises(ValueError):
+            band([])
+
+    def test_classify_directions(self):
+        self.assertEqual(classify(100, 95, 105, "higher-better"), WITHIN_BAND)
+        self.assertEqual(classify(90, 95, 105, "higher-better"), REGRESSION)
+        self.assertEqual(classify(110, 95, 105, "higher-better"), IMPROVED)
+        self.assertEqual(classify(110, 95, 105, "lower-better"), REGRESSION)
+        self.assertEqual(classify(90, 95, 105, "lower-better"), IMPROVED)
+        # "neither": a move is reported, never celebrated.
+        self.assertEqual(classify(110, 95, 105, "neither"), REGRESSION)
+        self.assertEqual(classify(90, 95, 105, "neither"), REGRESSION)
+
+
+class RequiredMutationCells(unittest.TestCase):
+    """The four the brief names, plus the two the design adds."""
+
+    def test_void_rows_do_not_satisfy_the_k_floor(self):
+        # MUTATION: delete the `verdict == "PASS"` filter from the baseline.
+        #
+        # Two greens and one VOID. A VOID row is not a data point, so the
+        # baseline is 2 and the answer is NO-BASELINE. A comparator that lets
+        # the void count reaches 3 and reports a band instead — which is the
+        # loop quietly starting to answer questions it has no grounds to
+        # answer.
+        rows = greens([100.0, 100.0]) + [
+            row("2026-09-01T00:03:00Z", verdict="VOID", value=100.0),
+            row("2026-09-01T00:04:00Z", value=60.0),
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 2)
+
+    def test_void_rows_do_not_enter_the_band(self):
+        # MUTATION: delete the `verdict == "PASS"` filter from the baseline.
+        #
+        # Four greens at 100 then two VOIDs at 50. The greens' band is
+        # [95, 105] and the newest run at 50 is plainly outside it. A
+        # comparator that lets voids in bands [100, 50, 50] instead — median
+        # 50, half-width 2.5 — and reports the same 50 as WITHIN-BAND.
+        rows = greens([100.0, 100.0, 100.0, 100.0]) + [
+            row("2026-09-01T00:05:00Z", verdict="VOID", value=50.0),
+            row("2026-09-01T00:06:00Z", verdict="VOID", value=50.0),
+            row("2026-09-01T00:07:00Z", value=50.0),
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], REGRESSION)
+        self.assertEqual(res["baseline_values"], [100.0, 100.0, 100.0])
+
+    def test_no_baseline_is_not_a_pass(self):
+        # MUTATION: return WITHIN-BAND (or PASS) where NO-BASELINE is returned;
+        # MUTATION: make exit_status treat NO-BASELINE as 0.
+        #
+        # "We have no grounds to judge this" and "this is fine" are different
+        # answers, and the exit status must not collapse them either.
+        rows = greens([100.0]) + [row("2026-09-01T00:02:00Z", value=60.0)]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertNotEqual(res["outcome"], WITHIN_BAND)
+        self.assertEqual(exit_status(res), 2, "NO-BASELINE must not exit 0")
+
+    def test_k_floor_is_at_least_three(self):
+        # MUTATION: MIN_BASELINE_RUNS = 3 -> 1 (or 2).
+        #
+        # Both halves matter: the constant itself, and the behaviour of a
+        # two-green ledger. Pinning only the constant would leave a comparator
+        # free to ignore it; asserting only the behaviour would pass under
+        # K=2 for a three-green fixture.
+        self.assertGreaterEqual(MIN_BASELINE_RUNS, 3)
+        rows = greens([100.0, 100.0]) + [row("2026-09-01T00:03:00Z", value=60.0)]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 2)
+
+    def test_a_real_regression_does_not_fit_inside_the_band(self):
+        # MUTATION: BAND_REL_FLOOR 0.05 -> 1.0, or BAND_Z 3.0 -> 50.0.
+        #
+        # A widened band is the decay mode with no symptom: every run reports
+        # WITHIN-BAND and the history looks perfect. 23.1 Gbps baseline, 12.0
+        # Gbps newest — a halving on the cluster's own documented figure.
+        rows = greens([23.1, 23.0, 23.2]) + [row("2026-09-01T00:04:00Z", value=12.0)]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], REGRESSION)
+        self.assertLess(res["band_lo"], 23.0)
+        self.assertGreater(res["band_lo"], 12.0)
+        self.assertEqual(exit_status(res), 1)
+
+    def test_band_comparison_is_not_inverted(self):
+        # MUTATION: invert the `lo <= value <= hi` test in classify().
+        #
+        # An inverted comparator reports REGRESSION on every healthy run and
+        # WITHIN-BAND on the one run that matters, so BOTH directions are
+        # asserted here — pinning only the regression side is satisfied by an
+        # implementation that never returns WITHIN-BAND at all.
+        rows = greens([23.1, 23.0, 23.2]) + [row("2026-09-01T00:04:00Z", value=12.0)]
+        self.assertEqual(compare(rows, GATE, ENV)["outcome"], REGRESSION)
+        rows = greens([23.1, 23.0, 23.2]) + [row("2026-09-01T00:04:00Z", value=23.05)]
+        self.assertEqual(compare(rows, GATE, ENV)["outcome"], WITHIN_BAND)
+
+
+class EmptyAndMismatchedSets(unittest.TestCase):
+    def test_zero_matching_rows_is_no_baseline(self):
+        # The empty-set pass, at the comparator layer.
+        res = compare([], GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 0)
+        self.assertEqual(exit_status(res), 2)
+
+    def test_rows_for_another_gate_do_not_leak_in(self):
+        rows = [row(f"2026-09-01T00:0{i}:00Z", gate="test-ha-crash") for i in range(1, 5)]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+
+    def test_rows_from_another_env_do_not_enter_the_band(self):
+        # MUTATION: drop the env filter.
+        #
+        # Five greens, all at the wrong env. Mixing envs into one band is how a
+        # comparator reports a clean history for a gate whose runs never
+        # actually compared to each other.
+        rows = [
+            row(f"2026-09-01T00:0{i}:00Z", env="standalone-vm", value=100.0)
+            for i in range(1, 6)
+        ]
+        rows.append(row("2026-09-01T00:06:00Z", env=ENV, value=60.0))
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 0)
+
+    def test_env_is_resolved_from_the_newest_row_when_unspecified(self):
+        # MUTATION: drop the same-env filter on `prior`.
+        #
+        # The wrong-env row sits IMMEDIATELY BEFORE the newest, inside the
+        # last-K window. An earlier version of this fixture put it first,
+        # where the window never reached it — so the cell passed with the
+        # filter deleted and the mutation ESCAPED. A fixture that does not
+        # enter the state under test is mutation-blind however carefully it
+        # is read.
+        rows = [
+            row("2026-09-01T00:01:00Z", env=ENV, value=100.0),
+            row("2026-09-01T00:02:00Z", env=ENV, value=100.0),
+            row("2026-09-01T00:03:00Z", env=ENV, value=100.0),
+            row("2026-09-01T00:04:00Z", env="standalone-vm", value=1.0),
+            row("2026-09-01T00:05:00Z", env=ENV, value=60.0),
+        ]
+        res = compare(rows, GATE, env=None)
+        self.assertEqual(res["env"], ENV)
+        self.assertEqual(res["baseline_values"], [100.0, 100.0, 100.0])
+        self.assertEqual(res["baseline_n"], 3)
+        self.assertEqual(res["outcome"], REGRESSION)
+
+    def test_a_prior_row_measuring_a_different_headline_does_not_count(self):
+        # A row that measured something else is not a prior measurement of
+        # this. Counting it toward K is a baseline made of unrelated numbers.
+        rows = [
+            row("2026-09-01T00:01:00Z", headline="cells_passed", value=21),
+            row("2026-09-01T00:02:00Z", headline="cells_passed", value=21),
+            row("2026-09-01T00:03:00Z", headline="cells_passed", value=21),
+            row("2026-09-01T00:04:00Z", value=60.0),
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 0)
+
+    def test_fail_rows_do_not_enter_the_band(self):
+        rows = greens([100.0, 100.0]) + [
+            row("2026-09-01T00:03:00Z", verdict="FAIL", value=100.0),
+            row("2026-09-01T00:04:00Z", value=60.0),
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], NO_BASELINE)
+        self.assertEqual(res["baseline_n"], 2)
+
+
+class VoidNewestRow(unittest.TestCase):
+    def test_void_newest_row_reports_void_not_a_band_outcome(self):
+        rows = greens([100.0, 100.0, 100.0]) + [
+            row("2026-09-01T00:04:00Z", verdict="VOID", value=None, void_reason="helper restarted")
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], VOID)
+        self.assertEqual(res["void_reason"], "helper restarted")
+        self.assertEqual(exit_status(res), 2)
+        self.assertNotIn("band_lo", res)
+
+
+class FlakeVersusRegressionSignal(unittest.TestCase):
+    def _rows(self, newest_headline, newest_invariant, baseline_invariant=21):
+        rows = []
+        for i, v in enumerate([23.1, 23.0, 23.2], start=1):
+            rows.append(
+                row(
+                    f"2026-09-01T00:0{i}:00Z",
+                    value=v,
+                    extra={"cells_passed": baseline_invariant, "cells_failed": 0},
+                )
+            )
+        rows.append(
+            row(
+                "2026-09-01T00:04:00Z",
+                value=newest_headline,
+                extra={"cells_passed": newest_invariant, "cells_failed": 0},
+            )
+        )
+        return rows
+
+    def test_headline_moved_invariants_held_is_a_flake_candidate(self):
+        res = compare(self._rows(12.0, 21), GATE, ENV)
+        self.assertEqual(res["outcome"], REGRESSION)
+        self.assertEqual(res["signal"], "flake-candidate")
+        self.assertTrue(all(i["held"] for i in res["invariants"].values()))
+
+    def test_headline_moved_with_an_invariant_is_a_regression_candidate(self):
+        res = compare(self._rows(12.0, 14), GATE, ENV)
+        self.assertEqual(res["outcome"], REGRESSION)
+        self.assertEqual(res["signal"], "regression-candidate")
+        self.assertIn("cells_passed", res["signal_note"])
+
+    def test_no_invariant_with_a_baseline_is_undetermined_not_a_flake(self):
+        # The empty set again, one level in: "every invariant held" and "there
+        # were no invariants to check" are the same sentence only if you do
+        # not look. Reporting flake-candidate here would tell an operator to
+        # re-run when nothing supports that.
+        rows = greens([23.1, 23.0, 23.2]) + [row("2026-09-01T00:04:00Z", value=12.0)]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], REGRESSION)
+        self.assertEqual(res["invariants"], {})
+        self.assertEqual(res["signal"], "undetermined")
+
+    def test_within_band_carries_no_signal(self):
+        res = compare(self._rows(23.05, 21), GATE, ENV)
+        self.assertEqual(res["outcome"], WITHIN_BAND)
+        self.assertIsNone(res.get("signal"))
+
+
+class ExitStatusMapping(unittest.TestCase):
+    def test_mapping_matches_mouse_latency_aggregate_not_newflow_analyze(self):
+        self.assertEqual(exit_status({"outcome": WITHIN_BAND, "verdict": "PASS"}), 0)
+        self.assertEqual(exit_status({"outcome": IMPROVED, "verdict": "PASS"}), 0)
+        self.assertEqual(exit_status({"outcome": REGRESSION, "verdict": "PASS"}), 1)
+        self.assertEqual(exit_status({"outcome": VOID, "verdict": "VOID"}), 2)
+        self.assertEqual(exit_status({"outcome": NO_BASELINE, "verdict": "PASS"}), 2)
+        self.assertEqual(exit_status({"outcome": LEDGER_CORRUPT}), 2)
+
+    def test_a_fail_row_inside_the_band_still_exits_one(self):
+        # The band says the metric did not move; the row says the gate was
+        # violated. The second one wins — a FAIL that reads as success is
+        # C175-HC-029 repeating one layer up.
+        rows = greens([23.1, 23.0, 23.2]) + [
+            row("2026-09-01T00:04:00Z", verdict="FAIL", value=23.05)
+        ]
+        res = compare(rows, GATE, ENV)
+        self.assertEqual(res["outcome"], WITHIN_BAND)
+        self.assertEqual(res["verdict"], "FAIL")
+        self.assertEqual(exit_status(res), 1)
+
+
+class LedgerParsingAndLint(unittest.TestCase):
+    def test_a_damaged_line_refuses_rather_than_being_skipped(self):
+        # A skipped row does not count toward K, so a corrupt ledger silently
+        # produces a thinner baseline that still reports WITHIN-BAND.
+        text = "\n".join(json.dumps(r) for r in greens([100.0, 100.0])) + "\n{not json\n"
+        with self.assertRaises(LedgerError):
+            parse_ledger(text)
+
+    def test_a_committed_conflict_marker_is_a_red_gate(self):
+        text = (
+            json.dumps(greens([100.0])[0])
+            + "\n<<<<<<< HEAD\n"
+            + json.dumps(greens([101.0])[0])
+            + "\n"
+        )
+        problems = lint_ledger(text)
+        self.assertTrue(problems)
+        self.assertTrue(any("not parseable" in p for p in problems))
+
+    def test_an_empty_ledger_is_not_a_clean_lint(self):
+        self.assertTrue(lint_ledger(""))
+        self.assertIn("zero rows", " ".join(lint_ledger("")))
+        self.assertIn("zero rows", " ".join(lint_ledger("\n \n")))
+
+    def test_lint_rejects_the_same_shapes_the_emitter_refuses(self):
+        bad = dict(greens([100.0])[0], verdict="MAYBE")
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0], verdict="VOID", void_reason="")
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0], void_reason="something")
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0], exe_check="MISMATCH")
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0], metrics={"throughput_gbps": "fast"})
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0], headline_metric="absent_metric")
+        self.assertTrue(lint_row(bad, 1))
+        bad = dict(greens([100.0])[0])
+        del bad["exe_check"]
+        self.assertTrue(lint_row(bad, 1))
+
+    def test_lint_accepts_a_row_the_emitter_would_write(self):
+        # The positive control. A linter that rejects everything would satisfy
+        # every cell above while being useless, and a control that passes on
+        # the CORRECT input is what proves the rejections are aimed.
+        self.assertEqual(lint_row(greens([100.0])[0], 1), [])
+        void = row("2026-09-01T00:01:00Z", verdict="VOID", value=None)
+        self.assertEqual(lint_row(void, 1), [])
+        self.assertEqual(lint_ledger(json.dumps(greens([100.0])[0])), [])
+
+    def test_a_byte_identical_repeat_is_deduped_not_counted_twice(self):
+        # MUTATION: drop the dedup `continue` in parse_ledger.
+        #
+        # `merge=union` on the ledger resolves a conflicting hunk by keeping
+        # BOTH sides' lines, so a row both branches carried appears twice. A
+        # baseline is a count of RUNS; counting one run twice inflates it and
+        # can satisfy the K floor with two rows.
+        dup = row("2026-09-01T00:01:00Z", value=100.0)
+        text = "\n".join(json.dumps(r) for r in [dup, dup]) + "\n"
+        rows = parse_ledger(text)
+        self.assertEqual(len(rows), 1)
+
+    def test_a_repeated_run_id_with_different_content_is_refused(self):
+        # MUTATION: accept a conflicting repeat.
+        #
+        # Identical repeats are a benign merge artifact. Two DIFFERENT runs
+        # claiming one identity is corruption, and deduping it would silently
+        # drop a real measurement or admit a foreign one.
+        a = row("2026-09-01T00:01:00Z", value=100.0, run_id="collide")
+        b = row("2026-09-01T00:02:00Z", value=42.0, run_id="collide")
+        text = "\n".join(json.dumps(r) for r in [a, b]) + "\n"
+        with self.assertRaises(LedgerError):
+            parse_ledger(text)
+        problems = lint_ledger(text)
+        self.assertTrue(any("repeats with DIFFERENT content" in p for p in problems))
+
+    def test_lint_does_not_flag_a_benign_identical_repeat(self):
+        # The positive control for the cell above. A linter that flagged every
+        # repeat would red on an ordinary union merge and be turned off.
+        dup = row("2026-09-01T00:01:00Z", value=100.0)
+        text = "\n".join(json.dumps(r) for r in [dup, dup]) + "\n"
+        self.assertEqual(lint_ledger(text), [])
+
+    def test_lint_requires_a_run_id(self):
+        bad = row("2026-09-01T00:01:00Z")
+        del bad["run_id"]
+        self.assertTrue(lint_row(bad, 1))
+
+    def test_rows_out_of_timestamp_order_on_disk_are_sorted(self):
+        # Parallel worktrees append to one ledger; the file is not guaranteed
+        # to be in ts order.
+        rows = greens([100.0, 100.0, 100.0])
+        newest = row("2026-09-01T00:09:00Z", value=60.0)
+        res = compare([newest] + rows, GATE, ENV)
+        self.assertEqual(res["ts"], "2026-09-01T00:09:00Z")
+        self.assertEqual(res["outcome"], REGRESSION)
+
+
+class ConstantsAreWhatTheCommentsClaim(unittest.TestCase):
+    def test_constants(self):
+        # These are asserted because the mutation runner edits them, and a
+        # mutation that changed a constant nothing reads would score as an
+        # escape and read as "the guard has no power".
+        self.assertEqual(MIN_BASELINE_RUNS, 3)
+        self.assertEqual(BAND_Z, 3.0)
+        self.assertEqual(BAND_REL_FLOOR, 0.05)
+
+
+if __name__ == "__main__":
+    unittest.main()
