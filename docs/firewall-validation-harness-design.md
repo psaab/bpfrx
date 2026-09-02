@@ -1,35 +1,100 @@
-# Dataplane Firewall Validation: Harness Gap Analysis & Falsifiability Specification
+# Dataplane Firewall Validation: Harness Architecture, Testbed Specification & Failure Gates
 
-- **Document Version:** `3.0.0-PROPOSED`
+- **Document Version:** `3.1.0-PRODUCTION-SPEC`
 - **Target System:** `xpf` (Userspace AF_XDP Dataplane & Go Control Plane)
 - **Base Kernel Requirements:** Linux `>= 6.18` (AF_XDP verifier floor, `init_on_alloc=0`, 2MB Hugepages)
-- **Status:** Revised per PR #8302 Falsifiability Audit
+- **Status:** Integrated Architecture & Verification Specification
 
 ---
 
-## 1. Context & Architectural Invariants
+## 1. Testbed Topology & Spin-Up Specification
 
-The `xpf` repository already maintains over 5,200 in-process unit tests (`cargo test` and `go test`), 149 packet-injection call sites, and cluster orchestration tooling (`test/incus/setup.sh`, `scripts/userspace-ha-validation.sh`, `test/incus/cluster-lock.sh`). 
+The canonical validation environment for `xpf` leverages Incus system containers and virtual machines defined in `test/incus/setup.sh`. It isolates the Dataplane Under Test (DUT) to eliminate gateway ARP collision and NAPI driver stalls (#1961, #1992).
 
-This document defines an implementation specification for **four missing out-of-process wire verification gates** and **one owed in-tree benchmark**, grounded strictly in the architectural invariants of `origin/master`:
+### 1.1 Network Architecture & Addressing
+The testbed instantiates three isolated Layer 2 bridges without bridge-level DHCP (`none:false`), allowing the firewall VM to own all default gateway IP addresses:
 
-### 1.1 The #68 Fail-Closed Mandate
-- In high-availability clusters (`test/incus/test-ha-crash.sh:381`), stopping or killing `xpfd` on the primary node MUST immediately clear `rg_active`, tear down BPF maps, halt transit forwarding on that node, and trigger backup takeover.
-- In standalone deployments, if `xpfd` or `xpf-userspace-dp` crashes or terminates, kernel transit forwarding and BPF redirection MUST halt. Transit traffic must NEVER bypass firewall inspection to flow uninspected through the Linux kernel. A test that asserts traffic continues forwarding through a stopped daemon is asserting a critical fail-open regression.
+```
+                      +-----------------------------+
+                      |     xpf-fw / bpfrx-fw       |
+                      |  (Ubuntu 26.04, >=6.18 VM)  |
+                      |   xpfd + xpf-userspace-dp   |
+                      +--+-----------+-----------+--+
+                         | ge-0-0-0  | ge-0-0-1  | ge-0-0-2
+                         | 10.0.1.10 | 10.0.2.10 | 10.0.30.10
+                         |           |           |
+       +-----------------+           |           +-----------------+
+       |                             |                             |
++------+------+               +------+------+               +------+------+
+|  xpf-trust  |               | xpf-untrust |               |   xpf-dmz   |
+| (10.0.1/24) |               | (10.0.2/24) |               | (10.0.30/24)|
++------+------+               +------+------+               +------+------+
+       |                             |                             |
++------+------+               +------+------+               +------+------+
+| trust-host  |               | untrust-host|               |  dmz-host   |
+| 10.0.1.102  |               | 10.0.2.102  |               | 10.0.30.101 |
++-------------+               +-------------+               +-------------+
+```
 
-### 1.2 Clustering Cold-Boot Overlap
-- Per `pkg/cluster/README.md:3383` and `README.md:393`, a 10–15 second dual-active overlap during simultaneous cold boot is **intentional and accepted** while heartbeat and VRRP converge. The harness asserts clean, stable priority-based demotion after the 15-second window, not immediate mutual exclusion during boot.
+- **`xpf-trust` Bridge:** Gateway `ge-0-0-0` (`10.0.1.10`, `2001:559:8585:bf01::10`). Host: `trust-host` (`10.0.1.102`).
+- **`xpf-untrust` Bridge:** Gateway `ge-0-0-1` (`10.0.2.10`, `2001:559:8585:bf02::10`). Host: `untrust-host` (`10.0.2.102`).
+- **`xpf-dmz` Bridge:** Gateway `ge-0-0-2` (`10.0.30.10`, `2001:559:8585:bf03::10`). Host: `dmz-host` (`10.0.30.101`).
+- **Protocol Test Hosts:** Dedicated endpoints attached to test multi-family translation:
+  - `nat64-host`: Validates stateful NAT64 translation against well-known prefix `64:ff9b::/96`.
+  - `nptv6-host`: Validates stateless NPTv6 (RFC 6296) prefix translation between ULA (`fd01:203:405:bf02::/64`) and GUA (`2001:559:8585:bf02::/64`).
 
-### 1.3 Grounded Capacity & Performance Ceilings
-- **Session Table:** Per-worker capacity is `DEFAULT_MAX_SESSIONS = 131,072` (`session_manager.rs:107`, `session/mod.rs:78`). On the 6-worker cluster, the logical capacity is `6 * 131,072 = 786,432` sessions; the entry ceiling is `2 * worker_count * DEFAULT_MAX_SESSIONS = 1,572,864` entries. The session table enforces a hard cap (`len() >= max_sessions -> false`, #1861); LRU eviction applies exclusively to the per-worker `FlowCache`.
+### 1.2 Spin-Up & Provisioning Lifecycle
+Spinning up the complete environment is owned by `test/incus/setup.sh`. Hand-rolled deployment scripts are prohibited:
+1. **Host Isolation:** `assert_sole_dataplane_owner()` verifies that no peer firewall instances share gateway bridges, preventing ARP nondeterminism.
+2. **Cluster Exclusion:** Adheres to advisory file locking on `/tmp/xpf-cluster.lock` (with metadata in `/tmp/xpf-cluster.owner`) via `test/incus/cluster-lock.sh` (#1875, #4020).
+3. **Execution Commands:**
+   ```bash
+   # Spin up networks, firewall VM, and test containers
+   ./test/incus/setup.sh up
+   # Build and deploy userspace-dp + xpfd into the VM
+   ./test/incus/setup.sh deploy
+   ```
+
+---
+
+## 2. Baseline Feature & Policy Verification
+
+Baseline correctness is evaluated using existing test estates before running failure-mode or wire-level property suites:
+
+1. **Host-Inbound Protection (`test/incus/test-host-inbound.sh`):**
+   - Validates traffic directed to the router itself across physical interfaces and tagged VLAN sub-units (`reth0.50`).
+   - Strict positive controls: every DENY probe (e.g. SSH on untrust) is verified against a successful ICMP echo to the same IP. Probes differentiate ICMP drop from TCP RST (packet-carrying admission signal).
+2. **Forwarding & Cross-Zone Policy (`test/incus/test-connectivity.sh`):**
+   - Verifies default-deny between zones unless explicitly permitted by policy.
+   - Proves bidirectional transit (trust $\leftrightarrow$ untrust, trust $\leftrightarrow$ dmz) across IPv4 and IPv6.
+3. **Translation Functional Correctness:**
+   - **Source NAT:** Proves outbound flows from `trust` have source IP translated to egress interface or pool IP, with conntrack state matching return packets.
+   - **NAT64:** Validates synthesized IPv6 datagrams targeting `64:ff9b::/96` correctly map to IPv4 endpoints on `untrust`.
+   - **NPTv6:** Validates 1:1 prefix substitution between ULA and GUA without state tracking.
+
+---
+
+## 3. Core Architectural Invariants
+
+Validation suites must align strictly with the production runtime invariants of `origin/master`:
+
+### 3.1 The #68 Fail-Closed Mandate
+- In HA clusters (`test/incus/test-ha-crash.sh:381`), stopping or killing `xpfd` on the primary node MUST immediately clear `rg_active`, tear down BPF maps, halt transit forwarding on that node, and trigger backup takeover.
+- In standalone deployments, if `xpfd` or `xpf-userspace-dp` terminates, kernel transit forwarding and BPF redirection MUST halt. Transit traffic must NEVER bypass firewall inspection to flow uninspected through the Linux kernel. A test that asserts traffic continues forwarding through a stopped daemon asserts a fail-open security violation.
+
+### 3.2 Clustering Cold-Boot Overlap
+- Per `pkg/cluster/README.md:3383` and `README.md:393`, a 10–15 second dual-active overlap during simultaneous cold boot is **intentional and accepted** while heartbeat and VRRP converge. The harness asserts clean, priority-based demotion after the 15-second convergence window, not immediate mutual exclusion during boot.
+
+### 3.3 Grounded Capacity & Performance Ceilings
+- **Session Table:** Per-worker capacity is `DEFAULT_MAX_SESSIONS = 131,072` (`session_manager.rs:107`, `session/mod.rs:78`). On a 6-worker cluster, logical capacity is `6 * 131,072 = 786,432` sessions; entry ceiling is `2 * worker_count * DEFAULT_MAX_SESSIONS = 1,572,864` entries. The session table enforces a hard cap (`len() >= max_sessions -> false`, #1861); LRU eviction applies exclusively to the per-worker `FlowCache`.
 - **Forwarding Limits:** Virtio standalone forwarding caps at `~2 Gbit/s`. The cold-path flooder in container virtio environments caps at `~870 Kpps` (#1615). Measured 6-worker cluster hardware ceiling is `C_phys ~= 22–24 Gbit/s` (`docs/fairness-regimes.md`).
-- **Core Allocation:** Dataplane workers use standard thread affinity; whole-system `isolcpus` was plan-killed (#739, #1756) due to softirq distribution across all cores.
+- **Core Allocation:** Dataplane workers use standard thread affinity; whole-system `isolcpus` was plan-killed (#739, #1756).
 
 ---
 
-## 2. The Falsifiability & Positive-Evidence Discipline
+## 4. The Falsifiability & Positive-Evidence Discipline
 
-A test that cannot return a distinguishable negative provides no engineering signal (#6567, #4907, #7424, #8244, #8277). To eliminate meaningless greens, every gate in this harness MUST adhere to the following rules:
+A test that cannot return a distinguishable negative provides zero engineering signal (#6567, #4907, #7424, #8244, #8277). Every gate in this harness MUST adhere to the following rules:
 
 1. **The Positive-Evidence Precondition:** *Every gate must assert positive evidence that the mechanism under test executed before evaluating its invariant.*
    - A carrier flap gate must observe the interface state transition to `DOWN` and verify throughput drops to zero *before* asserting recovery.
@@ -43,16 +108,14 @@ A test that cannot return a distinguishable negative provides no engineering sig
 
 ---
 
-## 3. Specification of the Five Verification Gates
+## 5. Specification of the Five Verification Gates
 
 ```
-+----------------------------------------------------------------------------------------------------+
-|                                    VERIFICATION GATE MATRIX                                        |
 +-----+-------------------------------+-------------------------+------------------------------------+
 | Gate| Focus                         | Target Script           | Underlying Invariant Tested        |
 +-----+-------------------------------+-------------------------+------------------------------------+
 | 1   | Wire-Level Packet Properties  | test-wire-properties.sh | PMTUD ICMP reflection, L4 offload  |
-| 2   | Two-Plane Surface Parity      | test-surface-parity.sh  | Wire truth vs socket/CLI/API/stats |
+| 2   | Two-Plane Observability Parity| test-surface-parity.sh  | Wire truth vs socket/CLI/API/stats |
 | 3   | Link Carrier Flap Recovery    | test-carrier-flap.sh    | XSK unbind/rebind, no leak/stall   |
 | 4   | NAT Port Exhaustion (Single)  | test-nat-exhaustion.sh  | 64,512 flows, zero cross-talk      |
 | 5   | Owed Connection-Rate (CPS)    | newflow-ceiling-harness | SNAT & cross-worker lock ceilings  |
@@ -131,12 +194,13 @@ A test that cannot return a distinguishable negative provides no engineering sig
 
 ---
 
-## 4. Integration into Existing Tooling
+## 6. Integration, Tooling & Guard Architecture
 
+- **Automated Design Guard:** Bound directly to code invariants by [`pkg/api/firewall_validation_harness_doc_guard_test.go`](file:///home/ps/git/gemini-xpf/pkg/api/firewall_validation_harness_doc_guard_test.go), asserting all ceilings, constants, and paths against live Go and Rust sources.
 - **Test Placement & Census:** All test scripts reside in `test/incus/` using standard Python `unittest` (`test/incus/unittest_shim.py`) and standard Bash wrappers. All scripts are registered with `run-selftests.sh` to ensure `ran == on-disk` (#4210, #8136).
 - **Cluster Mutex:** Tests running against shared cluster nodes MUST acquire the flock at `/tmp/xpf-cluster.lock` (with metadata in `/tmp/xpf-cluster.owner`) via `test/incus/cluster-lock.sh` (#1875/#4020).
 - **Standard Makefile Targets:**
-  - `make test-wire-properties` -> executes Gate 1.
+  - `make test-wire-properties` -> executes Gate 1 (`test/incus/test-wire-properties.sh`).
   - `make test-surface-parity` -> executes Gate 2.
   - `make test-carrier-flap` -> executes Gate 3.
   - `make test-nat-exhaustion` -> executes Gate 4.
