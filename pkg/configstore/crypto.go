@@ -426,9 +426,45 @@ func unmarshalEnvelope(data []byte) (encryptedTreeEnvelope, bool, error) {
 		// boot a committed-empty config (loss of policy) instead of failing
 		// closed with ErrConfigDBUnreadable. Only a body with NO format AND no
 		// AES-GCM fields is a genuine plaintext body and passes through.
-		if env.Format != "" || env.Salt != "" || env.Nonce != "" || env.Data != "" {
+		// #8288: the discriminator is KEY PRESENCE, not a hand-listed subset of
+		// the decoded fields. It used to read
+		// `env.Format != "" || env.Salt != "" || env.Nonce != "" || env.Data != ""`
+		// — four of the envelope's FIVE fields, omitting PRF — so a body whose
+		// only envelope key was `prf` satisfied "no format AND no AES-GCM
+		// fields" and took the plaintext passthrough the comment above
+		// describes. `{"prf":"sha256"}` is well-formed JSON, so it also never
+		// reached the #7454 key-presence guard, which is consulted only inside
+		// the decode-FAILURE branch. The two guards had a gap between them and
+		// this body fell through it: json.Unmarshal drops the unknown field,
+		// an EMPTY ConfigTree decodes, and Store.Load boots an active firewall
+		// with no security policy, reporting success. Silently — the #4579
+		// plaintext-downgrade warning keys on masterPasswordPRF(tree) != "" and
+		// the tree is empty.
+		//
+		// Deliberately NOT fixed by appending `|| env.PRF != ""`. That works,
+		// but the DEFECT IS a five-field struct guarded by a hand-maintained
+		// four-field list, and adding a fifth item reproduces the shape that
+		// caused it. `envKeys` answers the same question #7454 already answers
+		// — "was this MEANT to be an envelope" — and is derived from the body,
+		// so it cannot drift out of sync with the struct.
+		//
+		// It is also strictly STRONGER than the field test, and safe to be:
+		// `{"format":""}` carries the key with an empty value, which the field
+		// test passed through and this refuses. A body that names an envelope
+		// key at all was meant to be an envelope.
+		//
+		// Over-rejection is not a risk here, and that is a property of the
+		// data rather than a hope: `config.ConfigTree` has exactly ONE field
+		// (`Children []*Node`, pkg/config/ast.go) with no omitempty, so a
+		// genuine plaintext body's top-level key set is always exactly
+		// {"Children"} whatever it contains — verified by marshalling one, not
+		// by reading. The non-object shapes envelopeKeysPresent tolerates
+		// (`null`, an array, a scalar, garbage) return no keys and keep the
+		// plaintext passthrough #7454's acceptance requires.
+		if len(envKeys) > 0 {
 			return encryptedTreeEnvelope{}, false, fmt.Errorf(
-				"unsupported encrypted config envelope format %q (too-new or corrupted config DB)", env.Format)
+				"unsupported encrypted config envelope format %q (too-new or corrupted config DB) "+
+					"(envelope fields present: %s)", env.Format, strings.Join(envKeys, ", "))
 		}
 		return encryptedTreeEnvelope{}, false, nil
 	}
