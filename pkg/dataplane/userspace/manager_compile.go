@@ -302,6 +302,29 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 // fail-closed direction. So the window this ordering opens can only be as
 // permissive as the detach it replaces, never more.
 //
+// #8279: the first half of that sentence WAS NOT TRUE when it was written, and
+// this note stays because the claim is load-bearing and its failure was not
+// visible from here. "An ifindex absent from userspace_ingress_ifaces takes
+// cpumap_or_pass" was true of three of the shim's four arms; the fourth, an L3
+// PARSE FAILURE, took drop_degraded_transit — and it sat ABOVE the ingress-map
+// test, so it applied to interfaces this dataplane does not adjudicate. That
+// mattered because the attach set here is strictly LARGER than the ingress set
+// (compiler_iface.go puts every zoned netdev in st.xdpIfindexes, tunnels
+// included) and a tunnel netdev is raw L3 with no Ethernet header, so the
+// shim's Ethernet-only parse read its IP SOURCE octets as an ethertype. The
+// ordering is fixed in userspace-xdp/src/lib.rs and pinned by
+// shim_ingress_test_precedes_the_l3_parse_8279, so the sentence above is now
+// true of every arm.
+//
+// What is still NOT covered by it, stated so the next reader does not
+// over-read it a second time: the ctrl-DISABLED path
+// (degraded_ctrl_disabled_action) never consults the ingress map at all, by
+// design — a disabled ctrl must fail closed on every attached interface. On a
+// raw-L3 netdev its local/control exemption is evaluated against a misparsed
+// header, so what it exempts there is not trustworthy. That residual is an
+// interface-ADMISSION question (a raw-L3 netdev should not be carrying this
+// shim at all) rather than an ordering one, and it is tracked on #8279.
+//
 // The ATTACH half stays before the publish deliberately: the helper cannot bind
 // an AF_XDP socket to an interface with no shim, so staging it later is not
 // possible, and its failure mode is an extra fail-closed drop on an interface
