@@ -101,6 +101,18 @@ make selftest        # Run ALL day-0/image/dist/deploy self-tests
                      # grow-root, bake sign-order, dist roundtrip, validate.py
                      # helpers, xpf-deploy mixed-base HA gate. Tool-gated legs
                      # SKIP. Run before touching image/day-0/dist/deploy tooling.
+make harness-census  # Reachability census over the RUNNABLE harnesses, one
+                     # layer above `make selftest` (#8302). Every harness under
+                     # test/incus/ + scripts/userspace-*.sh must be INVOKED by a
+                     # Makefile recipe (directly or transitively) or declared in
+                     # test/incus/HARNESSES.unreached with a reason — a comment,
+                     # a similarly-named target, a `bash -n` lint and a bare path
+                     # in a lint list all do NOT count. Hermetic, <1 s; also runs
+                     # inside `make selftest`.
+make test-harness-census-lib # Self-test the census itself (mutation cells: a
+                     # census with a broken matcher reports a CLEAN BOARD, so
+                     # each defence is asserted by a fixture AND by a mutation
+                     # that must flip it). Hermetic.
 ```
 
 ## Test Environment (Incus VM)

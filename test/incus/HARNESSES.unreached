@@ -1,0 +1,61 @@
+# HARNESSES.unreached — runnable harnesses that NO Makefile recipe invokes.
+#
+# Enforced by `make harness-census` (scripts/harness-census.sh, #8302). Every
+# runnable harness under test/incus/ and scripts/userspace-*.sh must either be
+# invoked by a Makefile recipe — directly or transitively through another
+# harness that is itself invoked — or be listed here with a one-line reason.
+#
+# Format: <repo-relative path><whitespace><one-line reason>
+# A line with no reason is a FAIL: a declaration without a reason is a
+# suppression, and the whole point of this file is to make someone say, once,
+# what the project intends to do with each of these.
+#
+# THIS LIST IS ONLY ALLOWED TO SHRINK. The census FAILS if an entry here
+# becomes reached (delete the line), if an entry does not exist (delete the
+# line), or if an entry is not a runnable harness. It cannot be used to
+# re-hide a harness later.
+#
+# Reason vocabulary, so the two cases stay distinguishable:
+#   GATE          — asserts a property and can fail; it is owed a Makefile
+#                   recipe. Every one of these is a gate the tree built,
+#                   unit-tested, documented, and then ran zero times.
+#   DIAGNOSTIC    — an operator tool with no verdict; hand-invoked by design.
+#   COMPOSED      — only ever run as a step of another harness in this list;
+#                   it becomes reached for free when its caller does.
+#
+# 28 entries on the day this landed (23 under test/incus/, 5 under scripts/).
+# 15 of them are GATE.
+
+# ── GATE — built, tested, documented, invoked by nothing ──
+test/incus/newflow-ceiling-harness.sh        GATE: #4800 connection-rate ceiling; docs/userspace-newflow-ceiling.md opens "the code ships; the measurement is OWED". Makefile:672 names it only under `bash -n` — lint-reachable, run-unreachable.
+test/incus/test-mouse-latency-matrix.sh      GATE: the full 12-cell #905 mouse-latency matrix; mouse_latency_aggregate.py returns PASS/FAIL/INSUFFICIENT-DATA and nothing calls the harness that feeds it.
+test/incus/test-mouse-latency.sh             GATE: one #905 mouse-latency rep. Makefile:524 names it only in a COMMENT ("Run it after touching test-mouse-latency.sh"); the target beside that comment runs the hermetic selftest.
+test/incus/test-mouse-latency-same-class.sh  GATE: same-class 1 Gbps variant of the #905 rep — the control for the cross-class default.
+test/incus/test-fbf-steering.sh              GATE: #1827 two-upstream FBF steering smoke. `make test-fbf-steering-lib` runs fbf-steering-selftest.sh, not this — registered via a DIFFERENT TARGET's name.
+test/incus/cc-rollback-functional.sh         GATE: #1922 commit-confirmed auto-revert must re-apply to the DATAPLANE; a store-only revert is exactly the bug and only a live run can see it.
+test/incus/dhcp-lease-failover.sh            GATE: #2261 Kea lease survives a hard failover; pins the memfile CSV header against a real Kea 3.0.x.
+test/incus/persistent-nat-failover.sh        GATE: #7360 persistent-NAT binding survives promotion via live session sync.
+test/incus/wg-interop.sh                     GATE: #1736 WireGuard interop against an INDEPENDENT kernel-WireGuard peer.
+test/incus/reverse-key-collision-probe.sh    GATE: #1760 W2 live-fire NAT reverse-key collision watch.
+test/incus/cos-simul-load-smoke.sh           GATE: #1614 all-11-class simul-load acceptance gates. Calls cos-gate1-small-four-alone.sh, and the pair is collectively unreached.
+test/incus/cos-gate1-small-four-alone.sh     GATE: #1630 Gate 1 solo >=95% shape check. Only caller is cos-simul-load-smoke.sh, itself unreached.
+test/incus/cos-be-contention-harness.sh      GATE: exact-queue behaviour under best-effort contention; docs/cos-best-effort-contention-harness.md.
+test/incus/fairness-cos-throughput-headroom.sh GATE: strict-exact vs surplus-sharing headroom comparison; calls fairness-cos-class-sweep.sh.
+test/incus/fairness-cos-class-sweep.sh       GATE: per-class multi-sample fairness gap contract, non-zero on any class failing. Only caller is fairness-cos-throughput-headroom.sh, itself unreached.
+
+# ── COMPOSED — reached for free once the caller above gets a recipe ──
+test/incus/fairness-harness.sh               COMPOSED: the per-class run driver invoked by fairness-cos-class-sweep.sh; docs/fairness-regimes.md.
+test/incus/apply-cos-config.sh               COMPOSED: re-applies the CoS fixture a deploy wipes; invoked by test-mouse-latency.sh, step1-capture.sh, cos-be-contention-harness.sh and fairness-cos-throughput-headroom.sh — all unreached. Also named in a with-cluster.sh COMMENT, which is not an invocation.
+test/incus/step1-capture.sh                  COMPOSED: #816 per-cell capture driver, invoked by step1-baseline-and-matrix.sh and step2-sched-switch-capture.sh.
+
+# ── DIAGNOSTIC — operator tools with no verdict; hand-invoked by design ──
+test/incus/analyze-userspace-traces.sh       DIAGNOSTIC: reduces xpfd journal worker-stat lines; reports, does not assert.
+test/incus/capture-cold-stall.sh             DIAGNOSTIC: #1782 one-shot evidence capture for an overnight idle window.
+test/incus/step1-baseline-and-matrix.sh      DIAGNOSTIC: #816 evidence-collection orchestrator; writes into docs/pr/816-step1-rerun/evidence/.
+test/incus/step1-classify.sh                 DIAGNOSTIC: post-hoc classifier over a step1 evidence directory.
+test/incus/step2-sched-switch-capture.sh     DIAGNOSTIC: #821 sched_switch perf capture composed on step1-capture.sh.
+scripts/userspace-ha-validation.sh           DIAGNOSTIC: long-form userspace HA validation walkthrough; superseded as a gate by the 8 Makefile HA smokes.
+scripts/userspace-ha-failover-validation.sh  DIAGNOSTIC: long-form failover validation walkthrough; superseded as a gate by `make test-failover`.
+scripts/userspace-native-gre-validation.sh   DIAGNOSTIC: native-GRE validation walkthrough.
+scripts/userspace-perf-compare.sh            DIAGNOSTIC: ad-hoc perf A/B between two builds.
+scripts/userspace-phase-cycle.sh             DIAGNOSTIC: wrapper that re-runs userspace-ha-validation.sh across phases.

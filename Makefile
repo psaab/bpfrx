@@ -388,6 +388,40 @@ docs-check:
 selftest:
 	sh scripts/run-selftests.sh
 
+# Reachability census over the RUNNABLE HARNESSES, one layer above `make
+# selftest` (#8302). `run-selftests.sh` carries three censuses and each exists
+# because a test accumulated on disk that NOTHING ran; one layer up — the
+# cluster/measurement harnesses — there was no census at all, and 28 of 41
+# runnable harnesses were reached by nothing. 15 of those are GATES: the #4800
+# new-flow ceiling (whose own doc opens "the code ships; the measurement is
+# OWED"), the #905 mouse-latency matrix, #1827 FBF steering, #1922
+# commit-confirmed rollback, #2261 DHCP lease failover, #7360 persistent-NAT
+# failover, #1736 WireGuard interop, and the CoS/fairness sweeps.
+#
+# Every runnable harness must be INVOKED by a Makefile recipe — directly or
+# transitively through another invoked harness — or declared in
+# test/incus/HARNESSES.unreached with a one-line reason. That list is only
+# allowed to SHRINK: the census fails if an entry becomes reached, or stops
+# existing, or carries no reason.
+#
+# A mention in a comment, a similarly-named target, a `bash -n` lint, or a bare
+# relative path in a lint list does NOT count as an invocation — all four are
+# real shapes in this Makefile, and all four are mutation cells in
+# test/incus/harness-census-selftest.sh. Hermetic: a pure file scan, <1 s.
+# Also runs inside `make selftest`.
+.PHONY: harness-census test-harness-census-lib
+harness-census:
+	sh scripts/harness-census.sh
+
+# Self-test the census itself. This is a gate ABOUT gates, so its failure mode
+# is invisible: a census whose matcher is broken reports a CLEAN BOARD, and
+# every green run of a broken census looks exactly like a healthy one. Each
+# defence is therefore asserted twice — a fixture that must score UNREACHED,
+# and a MUTATION of the census that must make that same fixture flip. A
+# mutation that does not flip is an ESCAPE and fails this target.
+test-harness-census-lib:
+	bash ./test/incus/harness-census-selftest.sh
+
 # Bake the distributable appliance image (#1879 Path C): one
 # offline-built bootable root disk (REVIEWED-PIN Ubuntu server cloudimg
 # base — PINNED_BASE_RELEASE + PINNED_BASE_SHA256 in bake.py, not

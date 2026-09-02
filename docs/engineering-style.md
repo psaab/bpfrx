@@ -618,6 +618,27 @@ next test is written, which is how this reached four packages.
 - **A tool-gated leg that SKIPs is a green that measured nothing.** Say
   whether it ran. `nft`-dependent parity, cargo legs, cluster smoke:
   report tests-collected, not just `ok`.
+- **A harness nothing INVOKES is a gate that never ran, and it does not
+  SKIP — it is silent.** `make selftest` carries three censuses (#8153,
+  #7296, #8278) and each exists because a test accumulated on disk that
+  nothing executed. One layer up the same thing had happened at scale:
+  28 of 41 runnable harnesses under `test/incus/` and
+  `scripts/userspace-*.sh` were reached by no Makefile recipe, 15 of
+  them gates the tree had built, unit-tested, documented, and run zero
+  times — the #4800 new-flow ceiling among them, whose own doc opens
+  *"the code ships; the measurement is OWED"*. `make harness-census`
+  (#8302) is that census: every runnable harness is invoked by a recipe
+  — directly or transitively through another invoked harness — or
+  declared in `test/incus/HARNESSES.unreached` with a one-line reason,
+  and that list is only allowed to shrink.
+
+  Four shapes LOOK like registration and are not, all four real in this
+  Makefile: a mention in a **comment**; a similarly-named **sibling
+  target** (`test-fbf-steering-lib` runs the selftest, not the harness);
+  a **`bash -n` lint** (run-unreachable, lint-reachable); and a **bare
+  relative path in a lint list**. Adding a harness means adding a recipe
+  or writing the reason down — there is no third option that leaves the
+  board green.
 - **Format the files you TOUCHED, never a directory.** `gofmt -w pkg/daemon`
   reformatted **12 pre-existing unformatted files** a lane had never
   touched, silently widening its diff. Master carries unformatted files,
