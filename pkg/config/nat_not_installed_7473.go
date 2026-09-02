@@ -28,11 +28,37 @@ func SourceNATRuleNotInstalledReason(cfg *Config, rule *NATRule) string {
 	if cfg == nil || rule == nil || rule.Then.PoolName == "" {
 		return ""
 	}
-	pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-	if !ok || pool == nil {
-		return ""
-	}
-	return SourceNATPoolUnusableReason(pool)
+	// #8329: NO early return for a missing pool. This used to be
+	//
+	//	pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
+	//	if !ok || pool == nil {
+	//		return ""      // <- "armed"
+	//	}
+	//
+	// which reported a rule naming an UNDEFINED pool as installed. The builder
+	// does the opposite: it marks the rule unusable with the reason token
+	// "missing_pool" (nat_source.go:98-102). So the surface said armed about a
+	// rule the dataplane had disarmed -- the #6534 defect this very file exists
+	// to prevent, in the composition written to prevent it.
+	//
+	// The fix is a DELETION, because the answer was already here:
+	// SourceNATPoolUnusableReason returns "missing_pool" for a nil pool, and a
+	// map miss yields exactly that nil. The short-circuit discarded a correct
+	// verdict the predicate was about to give, and it discarded it in favour of
+	// the one value that means "nothing is wrong".
+	//
+	// REACHABILITY, which is why this is a live defect and not dead code:
+	// CompileConfig (strict) REFUSES an undefined pool reference, so the branch
+	// is unreachable there. CompileConfigLenient ACCEPTS it -- and lenient is
+	// the stored-config load and HA peer-sync path, i.e. a node that booted
+	// from disk or took a config from its peer. That is precisely where a
+	// config arrives without strict re-validation, and precisely where an
+	// operator has no other signal.
+	//
+	// The empty-pool-name arm above is NOT this bug and must stay: an
+	// interface-mode rule legitimately has no pool and IS armed. The two share
+	// an exit and mean opposite things.
+	return SourceNATPoolUnusableReason(cfg.Security.NAT.SourcePools[rule.Then.PoolName])
 }
 
 // DestinationNATRuleNotInstalledReason reports why the snapshot builder will
