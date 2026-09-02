@@ -121,6 +121,50 @@ deploy_verify_pushed_sha() {
 	info "Verified $label sha256 on $rinst ($local_sum)."
 }
 
+# deploy_running_xpfd_sha256 <rinst> [tries]
+#
+# Read back the sha256 of the LIVE xpfd process image on <rinst> and echo it on
+# stdout; echo nothing (rc 1) if the unit has no live MainPID after <tries>
+# one-second attempts (default 15). Never dies -- the caller decides whether an
+# unreadable running-binary sha is fatal (a deploy: yes, #2176) or a recorded
+# VOID (a ledger row: see test/incus/harness-result.sh).
+#
+# Extracted from deploy_verify_running_xpfd so there is exactly ONE running-exe
+# readback in the tree. A second implementation would be free to disagree with
+# this one about which process it read, and the whole point of the readback is
+# that it is the authority on what is actually executing.
+#
+# Falsifiability: if the node is running something other than the pushed build
+# this returns that other binary's sha, and every caller compares. If the
+# measurement did not happen (no MainPID, incus unreachable, the unit dead) it
+# returns EMPTY with rc 1 -- it never falls back to the on-disk path's sha,
+# which would be a value indistinguishable from a healthy readback. On an empty
+# instance name it returns empty rc 1 rather than reading the local host.
+deploy_running_xpfd_sha256() {
+	local rinst="${1:-}" tries_max="${2:-15}"
+	[[ -n "$rinst" ]] || return 1
+	local tries=0 run_raw="" run_sum=""
+	while [[ $tries -lt $tries_max ]]; do
+		# The remote emits the raw `sha256sum /proc/PID/exe` line; the first
+		# field is split off locally to avoid nested single-quote awk fragility.
+		# sha256sum on /proc/PID/exe reads the LIVE process image even if the
+		# on-disk file was replaced after exec ("(deleted)").
+		run_raw=$(incus exec "$rinst" -- bash -c '
+			p=$(systemctl show -p MainPID --value xpfd 2>/dev/null)
+			[ -n "$p" ] && [ "$p" != "0" ] || exit 1
+			sha256sum "/proc/$p/exe" 2>/dev/null || exit 1
+		' 2>/dev/null || true)
+		run_sum=${run_raw%% *}
+		[[ -n "$run_sum" ]] && break
+		tries=$((tries + 1))
+		# The wait exists so a unit that is still coming up is not read as
+		# absent; it is a backstop on a WAIT, not a pass criterion.
+		[[ $tries -lt $tries_max ]] && sleep 1
+	done
+	[[ -n "$run_sum" ]] || return 1
+	printf '%s\n' "$run_sum"
+}
+
 # deploy_verify_running_xpfd <rinst> <local_xpfd_path>
 #
 # After (re)start, assert the LIVE xpfd process is the binary we just pushed
@@ -145,25 +189,9 @@ deploy_verify_running_xpfd() {
 		die "xpfd ExecStart on $rinst is '$exec_path', not the base-unit '$want_exec' — a version pin survived this deploy (#2176); systemd is launching a different binary than was pushed"
 	fi
 
-	# Running-process exe sha must equal the local build. Wait briefly for the
-	# unit to come up (enable --now / restart returns before the main PID is
-	# necessarily settled).
-	local tries=0 run_raw="" run_sum=""
-	while [[ $tries -lt 15 ]]; do
-		# The remote emits the raw `sha256sum /proc/PID/exe` line; the first
-		# field is split off locally to avoid nested single-quote awk fragility.
-		# sha256sum on /proc/PID/exe reads the LIVE process image even if the
-		# on-disk file was replaced after exec ("(deleted)").
-		run_raw=$(incus exec "$rinst" -- bash -c '
-			p=$(systemctl show -p MainPID --value xpfd 2>/dev/null)
-			[ -n "$p" ] && [ "$p" != "0" ] || exit 1
-			sha256sum "/proc/$p/exe" 2>/dev/null || exit 1
-		' 2>/dev/null || true)
-		run_sum=${run_raw%% *}
-		[[ -n "$run_sum" ]] && break
-		tries=$((tries + 1))
-		sleep 1
-	done
+	# Running-process exe sha must equal the local build.
+	local run_sum=""
+	run_sum=$(deploy_running_xpfd_sha256 "$rinst")
 	if [[ -z "$run_sum" ]]; then
 		die "xpfd is not running on $rinst after deploy (no live MainPID) — cannot verify the running binary"
 	fi

@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust test-race-dp audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test test-go test-rust test-race-dp audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity test-harness-ledger-lib harness-compare harness-ledger-lint
 
 all: generate build build-ctl
 
@@ -689,6 +689,32 @@ test-cluster-env-lib:
 # while still summarising "0 failed". Hermetic — sources the lib and feeds it
 # literal [SUM] lines; no incus, cluster, network or iperf3.
 # Run this after touching test-failover.sh's throughput cell.
+# Self-test the #8302 harness result ledger: the adapter table that maps each
+# tool's verdict vocabulary onto PASS/FAIL/VOID, the emitter's refusals, the
+# band comparator, and the MUTATION cells over the comparator itself.
+#
+# The mutation leg is the one that matters. A comparator with a broken band is
+# indistinguishable from a healthy one on every green run, and a loop is green
+# almost always -- only a mutation can see it. Hermetic; no cluster, no lock.
+test-harness-ledger-lib:
+	@bash ./test/incus/harness-result-selftest.sh
+	@bash ./test/incus/harness-ledger-mutation-selftest.sh
+	@python3 -m unittest discover -s test/incus -p ledger_compare_test.py
+
+# Compare the newest run of GATE against the band over the last K>=3 green runs
+# at the same env. Exit 0 = within band / improved, 1 = regression or a FAIL
+# row, 2 = VOID / NO-BASELINE (undetermined -- NOT a pass).
+#   make harness-compare GATE=test-failover [ENV=loss-userspace-cluster]
+harness-compare:
+	@test -n "$(GATE)" || { echo "usage: make harness-compare GATE=<gate> [ENV=<env>]" >&2; exit 2; }
+	@python3 ./test/incus/ledger_compare.py --gate $(GATE) $(if $(ENV),--env $(ENV),)
+
+# Lint every row in the tracked ledger. FAILS on a zero-row ledger and names
+# the first unparseable line, so a committed conflict marker is a red gate
+# rather than silent corruption. Also runs as a leg of `make selftest`.
+harness-ledger-lint:
+	@python3 ./test/incus/ledger_compare.py --lint
+
 test-iperf-throughput-lib:
 	bash ./test/incus/iperf-throughput-selftest.sh
 
@@ -735,39 +761,57 @@ test-journal:
 MODE ?= all
 PRIVATE_RG_MODE ?= $(if $(filter all,$(MODE)),full,$(MODE))
 test-connectivity:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-connectivity.sh $(MODE)
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-connectivity --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-connectivity.sh $(MODE)
 
 # Cluster failover test (iperf3 through reboot — requires cluster + iperf3 server)
 test-failover:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-failover.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-failover --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-failover.sh
 
 # Double failover test (crash fw0 → fw1 takes over → fw0 rejoins → crash fw1 → fw0 takes over)
 test-double-failover:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-double-failover.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-double-failover --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-double-failover.sh
 
 # Active/active per-RG failover test (iperf3 through RG split — requires cluster + iperf3 server)
 test-active-active:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-active-active.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-active-active --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-active-active.sh
 
 # Rapid failover stress test (repeated failover cycles — requires cluster + iperf3 server)
 test-stress-failover:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-stress-failover.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-stress-failover --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-stress-failover.sh
 
 # Hard-crash / hung-node HA test (force-stop + daemon stop + multi-cycle — requires cluster + iperf3 server)
 test-ha-crash:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-ha-crash.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-ha-crash --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-ha-crash.sh
 
 # Chained hard-reset failover test (fw0 crash → fw1 crash → both rejoin — requires cluster + iperf3 server)
 test-chained-crash:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-chained-crash.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-chained-crash --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-chained-crash.sh
 
 # Private RG election test (enable/disable private-rg-election, verify VRRP behavior)
 test-private-rg:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-private-rg.sh $(PRIVATE_RG_MODE)
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-private-rg --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-private-rg.sh $(PRIVATE_RG_MODE)
 
 # Restart connectivity regression test (verify no transient loss during daemon restart — requires cluster + iperf3 server)
 test-restart-connectivity:
-	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/test-restart-connectivity.sh
+	BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/harness-result.sh run \
+		--gate test-restart-connectivity --adapter ha-smoke --env $(HARNESS_ENV) --cluster \
+		-- ./test/incus/test-restart-connectivity.sh
 
 # Canonical cluster HA test environment (isolated loss userspace cluster).
 # Override CLUSTER_ENV= to use cluster-setup.sh local xpf-fw0/xpf-fw1 defaults.
@@ -778,6 +822,13 @@ CLUSTER_ENV := test/incus/loss-userspace-cluster.env
 else
 CLUSTER_ENV := $(BPFRX_CLUSTER_ENV)
 endif
+
+# Ledger `env` label for a gate run (test/results/ledger.jsonl). A band is only
+# comparable WITHIN one env, so this label is what keeps runs on the loss
+# userspace cluster from being compared against runs on the legacy local
+# cluster. It is the env file's basename, or `local-cluster` when CLUSTER_ENV
+# is empty (cluster-setup.sh's local xpf-fw0/xpf-fw1 defaults).
+HARNESS_ENV := $(if $(CLUSTER_ENV),$(notdir $(basename $(CLUSTER_ENV))),local-cluster)
 endif
 LOSS_CLUSTER_ENV ?= test/incus/loss-cluster.env
 CLUSTER_SETUP = BPFRX_CLUSTER_ENV=$(CLUSTER_ENV) ./test/incus/cluster-setup.sh

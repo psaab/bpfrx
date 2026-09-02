@@ -118,6 +118,25 @@ the mechanics, so this section is sequencing only.
    dataplane: there the pass criterion is ≈ 3 Gbit/s, and a result near 23 means
    the shaper is NOT engaging.
 
+   **Every gate in this table now leaves a ledger row (#8302).** The nine
+   cluster gates run through `test/incus/harness-result.sh`, which appends one
+   JSON row per run to the tracked `test/results/ledger.jsonl`: verdict as a
+   STRING (`PASS` / `FAIL` / **`VOID`**), the headline metric, and the sha256 of
+   the binary that was actually RUNNING on the node. Two things follow for you
+   as an author:
+
+   * **`make test-failover` still exits exactly as it did.** The row's verdict
+     and the gate's exit status are separate; an unattributable run records a
+     VOID row and does not red the gate. The one change is in the safe
+     direction — a gate that exits 0 without reaching its summary now exits 2,
+     a state that used to be indistinguishable from a clean run.
+   * **"no regression vs previous run" has an instrument now.** Run
+     `make harness-compare GATE=test-failover` instead of eyeballing the last
+     number. It bands the last K ≥ 3 green runs at the same env and answers
+     `WITHIN-BAND` / `REGRESSION` / `IMPROVED` / `NO-BASELINE` / `VOID`.
+     `NO-BASELINE` is **not** a pass — it means the ledger has no grounds to
+     judge the run yet. See [`harness-ledger.md`](harness-ledger.md).
+
    **`-P 16` is canonical, not illustrative — dropping it costs 4.4x.** The
    invocation in the row IS the method; a figure reported without it is an
    anecdote, not a measurement. Measured on a healthy fw0 with CoS applied,

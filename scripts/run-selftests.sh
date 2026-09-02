@@ -142,6 +142,9 @@ test/incus/mouse-elephant-lib.sh
 test/incus/mouse-elephant-selftest.sh
 scripts/harness-census.sh
 test/incus/harness-census-selftest.sh
+test/incus/harness-result.sh
+test/incus/harness-result-selftest.sh
+test/incus/harness-ledger-mutation-selftest.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -330,6 +333,22 @@ run_bash test/incus/mouse-elephant-selftest.sh
 # NOT flip is an ESCAPE and fails -- a census with a broken matcher reports a
 # clean board, and nothing but a mutation can tell it from a healthy one.
 run_bash test/incus/harness-census-selftest.sh
+# #8302: the harness result ledger. Hermetic -- fixtures only, no cluster.
+#
+# harness-result-selftest.sh drives the whole adapter table, whose reason for
+# existing is that the tree's own tools disagree about what `exit 1` means:
+# INVALID ("did not measure") in newflow_ceiling_analyze.py, a measured FAIL in
+# mouse_latency_aggregate.py, and iperf-throughput-lib.sh has no void state at
+# all. Its load-bearing cell EXTRACTS the real summary line from each of the
+# nine gates that carry the shape, so an adapter anchored on a label prefix --
+# which silently covers six of eight -- goes red here.
+run_bash test/incus/harness-result-selftest.sh
+# ...and the mutation gate over the comparator and the adapter table. A
+# comparator with a broken band is INDISTINGUISHABLE from a healthy one on
+# every green run, and a loop is green almost all the time by construction, so
+# no amount of reading separates the two. Each cell removes one guard and
+# asserts the suite reds; an ESCAPED mutation is the report.
+run_bash test/incus/harness-ledger-mutation-selftest.sh
 
 # -- harness reachability census (#8302) --
 #
@@ -412,6 +431,39 @@ elif [ -n "$census_missing" ]; then
 	faill "self-test census (not invoked by this runner:$census_missing)"
 else
 	passl "self-test census ($census_seen hermetic test/incus self-tests, all invoked)"
+fi
+
+# ── 5. ledger lint (#8302 §4.1) ──
+#
+# test/results/ledger.jsonl is git-tracked and appended to by every gate run,
+# from many worktrees in parallel. It carries merge=union in .gitattributes --
+# a driver docs/log/README.md measured SILENTLY FUSING two _Log.md entries
+# whose `- **Timestamp**` lines aligned, and says should not be added for that
+# file. The ledger differs: one self-contained row per line, no shared closer,
+# no meaningful order, and every row carries a random run_id so two rows are
+# never byte-identical and union has nothing to align.
+#
+# This leg is what catches that reasoning being wrong rather than trusting it:
+# every line must parse as JSON and satisfy the same contract the emitter
+# enforces at write time, and a repeated run_id whose payload DIFFERS is
+# reported -- so a committed conflict marker, a hand-edited row, or a damaged
+# union resolve is a RED GATE rather than silent corruption.
+#
+# It FAILS on a zero-row ledger. Linting an empty file and reporting success is
+# the swept-nothing pass this runner already guards against in three other
+# places.
+hdr "harness ledger"
+if command -v python3 >/dev/null 2>&1; then
+	out=$(python3 test/incus/ledger_compare.py --lint --ledger test/results/ledger.jsonl 2>&1)
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		passl "ledger-lint ($out)"
+	else
+		faill "ledger-lint"
+		echo "$out" | sed 's/^/      /'
+	fi
+else
+	skipl "ledger-lint (python3 not installed)"
 fi
 
 # ── summary ──
