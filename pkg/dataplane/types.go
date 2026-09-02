@@ -4,6 +4,8 @@ package dataplane
 
 import (
 	"strconv"
+
+	"github.com/psaab/xpf/pkg/config"
 	"strings"
 )
 
@@ -1494,7 +1496,15 @@ type IfaceZoneValue struct {
 }
 
 // MaxRedundancyGroups is the maximum number of RG entries.
-const MaxRedundancyGroups = 16
+//
+// #8317: an ALIAS of config.MaxRedundancyGroups, not a second literal. The
+// commit-time bound on a redundancy-group id has to be the same number as the
+// length of the arrays that id indexes, and a duplicate is what let them
+// diverge — ids 16..255 committed against arrays whose valid indices are 0..15.
+// Aliasing makes the agreement a compile-time identity rather than something a
+// test has to remember to assert, and it keeps this name (and every reference
+// to it, including the #7465 array-declaration cell) working unchanged.
+const MaxRedundancyGroups = config.MaxRedundancyGroups
 
 // IfaceFlagTunnel marks an interface as a tunnel (GRE/IPsec).
 const IfaceFlagTunnel = 1 << 0

@@ -24,6 +24,31 @@ const MaxHeartbeatRedundancyGroups = 255
 // then collide on the same GroupID byte and corrupt peer election.
 const MaxHeartbeatRedundancyGroupID = 255
 
+// MaxRedundancyGroups is the number of redundancy-group SLOTS the dataplane can
+// index, so the highest usable RG id is MaxRedundancyGroups-1.
+//
+// #8317: it lives HERE, not in pkg/dataplane, and that direction is the fix
+// rather than an accident of where it was easiest to put. `pkg/dataplane`
+// already imports `pkg/config` and the reverse would be an import cycle, so
+// this is the only package both the commit gate and the map sizing can share.
+// `dataplane.MaxRedundancyGroups` is now an ALIAS of this — not a second
+// literal — which makes "the commit bound equals the array length" a
+// compile-time identity instead of a test that has to be remembered.
+//
+// WHY THAT MATTERS AND NOT JUST THE BOUND. The value 16 was already written
+// down, as the max_entries of the `rg_active` and `ha_watchdog` BPF arrays. It
+// was simply never connected to the id an operator can type, so ids 16..255
+// committed against arrays whose valid indices are 0..15. Measured: a BPF array
+// with max_entries 16 accepts an update at key 15 and returns E2BIG
+// ("key too big for map") at 16, 17 and 255. `Manager.UpdateRGActive` returns
+// that error to its caller BEFORE recording the group or syncing HA state to
+// the helper, so such an RG never activates — the reconcile loop retries it
+// forever (#757) and the RG's RETH interfaces never forward.
+//
+// A second literal in this package would have re-created exactly the drift that
+// produced the gap, so there is deliberately only one.
+const MaxRedundancyGroups = 16
+
 // MinRedundancyGroupNodePriority / MaxRedundancyGroupNodePriority bound a
 // redundancy-group node priority (Junos vSRX 1..254). 0 is treated as unset
 // (VRRP maps pri==0 to the default 100) and 255 is the RFC 5798 IP-owner
@@ -178,6 +203,26 @@ func validateChassisClusterStrict(cfg *Config) error {
 				"above %d truncates on the wire and collides with another "+
 				"redundancy-group) — renumber the redundancy-group",
 				id, MaxHeartbeatRedundancyGroupID, MaxHeartbeatRedundancyGroupID)
+		}
+		// #8317: the SECOND ceiling on the same value, and until now the
+		// unenforced one. The id is used directly as the index into the
+		// dataplane's `rg_active` / `ha_watchdog` arrays, which hold
+		// MaxRedundancyGroups entries, so an id at or above that length cannot
+		// be written at all: the BPF update returns E2BIG and UpdateRGActive
+		// propagates it before the group is recorded or synced to the helper.
+		// The RG then never activates and its RETH interfaces never forward,
+		// while the reconcile loop retries forever.
+		//
+		// Checked SECOND so the wire-truncation message still wins for an id
+		// that violates both — it names the more surprising consequence
+		// (a silent collision with another group) and renumbering fixes both.
+		if id >= MaxRedundancyGroups {
+			return fmt.Errorf("chassis cluster: redundancy-group id %d is out of "+
+				"range 0..%d (the dataplane indexes its rg_active and ha_watchdog "+
+				"arrays by this id and they hold %d entries; an id at or above %d "+
+				"cannot be written, so the group would never activate and its reth "+
+				"interfaces would never forward) — renumber the redundancy-group",
+				id, MaxRedundancyGroups-1, MaxRedundancyGroups, MaxRedundancyGroups)
 		}
 	}
 
