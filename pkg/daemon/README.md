@@ -1835,6 +1835,34 @@ never lock an operator out of a remote box it manages.
     link's identity could not be read", so a readback fault disarms like a real
     attach failure — the conservative direction, recorded in
     `daemon_arm_coverage_7191.go`.
+  - **The gate is only as good as the verdict it reads, and an ABORTED apply
+    used to leave it describing a different one (#7289 R1).**
+    `ProveArmCoverage` is the sole publisher of the coverage cell and it runs at
+    the TAIL of `CompileUserspaceShim`, so every abort between Phase 2's host
+    mutation and that tail returned first. Two reachable states, neither of
+    which disarmed: on a box's FIRST apply the cell had never been published, so
+    the verdict was `armCoverageUnknown` and the switch above has no case for it;
+    on any LATER apply the cell still held the PREVIOUS generation's report,
+    which said `Ran=true, Uncovered=0`, so the gate classified **Complete** and
+    logged "arm coverage complete" for an apply that had just failed to attach
+    anything. `pkg/dataplane/armcoverage_publish.go` states the opposite as its
+    own invariant — "a stale report answering for a previous generation is worse
+    than no report" — and the abort path is where that was not honoured.
+
+    `CompileUserspaceShim`'s post-`CompileConfig` aborts now route through
+    `Manager.abortAfterHostMutation`
+    (`pkg/dataplane/armcoverage_abort_7289.go`), which runs the REAL proof
+    before returning the caller's error unchanged. Running it, rather than
+    publishing a synthetic "everything uncovered" report, is the whole design: a
+    re-attach can fail while the PREVIOUS shim is still attached and still
+    adjudicating that interface, and disarming there is a brick, not a fence.
+    The live proof answers both directions correctly. It does **not** restore
+    the host state Phase 2 already moved — PR #7288 makes that divergence
+    visible, and this makes the forwarding surface it leaves adjudicated.
+    Fail-on-revert: `TestAbortAfterHostMutationRepublishesCoverage7289`, its
+    control `TestAbortAfterHostMutationDoesNotDisarmAStillAttachedSurface7289`
+    (which reds on the synthetic-report implementation), and the wiring guard
+    `TestEveryPostCompileAbortPublishesCoverage7289`.
   - **What is NOT covered.** FRR adjacencies and VRRP/RG ownership are *not*
     relinquished by this gate — an unarmed node can still hold a VIP and
     advertise routes, so peers may keep steering transit at it (a blackhole
