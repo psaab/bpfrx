@@ -786,6 +786,41 @@ fn colliding_sessions_share_one_steering_key_6745() {
     assert_eq!(a.src_port, b.src_port);
 }
 
+
+/// #8291: a SNAT decision whose steering key is unique to one cell.
+///
+/// The steering row is keyed by `(protocol, snat_ip, snat_port)` — all but the
+/// protocol come from the NAT decision, not the session key. `dnat_snat_decision()`
+/// pins port 54321, so every cell in this file that publishes with it lands on
+/// ONE shared row in the process-global `DNAT_STEERING_HOLDERS`. The holder
+/// cells then asserted ABSOLUTE counts, so run in parallel they saw each
+/// other's publishes and each other's `reset_dnat_steering_holders()` — which
+/// clears the WHOLE registry, not one row. Measured: this module failed 14 of
+/// 20 runs on its own, 0 of 20 with `--test-threads=1`.
+///
+/// Varying the port gives each cell a row nothing else touches, which makes the
+/// absolute assertions true by construction instead of by scheduling. The
+/// global clear then becomes unnecessary AND harmful, so the cells no longer
+/// call it — a cell that clears the whole registry is a cell that breaks its
+/// siblings.
+///
+/// Ports are taken from a band no other fixture uses; each cell asserts its row
+/// starts EMPTY, which is the control that the isolation is real rather than
+/// assumed.
+fn isolated_snat_decision_8291(tag: u16) -> NatDecision {
+    let mut nat = dnat_snat_decision();
+    nat.rewrite_src_port = Some(40_000 + tag);
+    nat
+}
+
+/// v6 sibling of [`isolated_snat_decision_8291`], for the cell that asserts the
+/// two families are held independently.
+fn isolated_snat_decision_v6_8291(tag: u16) -> NatDecision {
+    let mut nat = dnat_snat_decision_v6();
+    nat.rewrite_src_port = Some(40_000 + tag);
+    nat
+}
+
 #[test]
 fn a_shared_steering_row_survives_the_first_close_6745() {
     // OBSERVED THROUGH delete_dnat_table_entry, not through the accounting
@@ -807,9 +842,15 @@ fn a_shared_steering_row_survives_the_first_close_6745() {
     use std::sync::atomic::Ordering;
 
 
-    reset_dnat_steering_holders();
     let (a, b) = colliding_pair_6745();
-    let nat = dnat_snat_decision();
+    let nat = isolated_snat_decision_8291(1);
+    assert_eq!(
+        dnat_steering_holder_count(&a, nat),
+        0,
+        "#8291: this cell's steering row must start EMPTY. If it does not, the \
+         port band is no longer unique and every absolute assertion below is \
+         measuring another test's state"
+    );
     let fds = DnatTableFds {
         v4: Some(-1),
         v6: None,
@@ -847,10 +888,10 @@ fn republishing_one_session_does_not_add_a_second_hold_6745() {
     // re-publish. If each added a hold, the row would outlive its last real
     // user by however many times it was republished -- a leak that only shows
     // up under map pressure.
-    reset_dnat_steering_holders();
     let key = dnat_v4_key();
-    let nat = dnat_snat_decision();
+    let nat = isolated_snat_decision_8291(2);
     let fds = DnatTableFds::default();
+    assert_eq!(dnat_steering_holder_count(&key, nat), 0, "#8291: row starts empty");
 
     publish_dnat_table_entry(&fds, &key, nat);
     publish_dnat_table_entry(&fds, &key, nat);
@@ -874,14 +915,20 @@ fn an_unaccounted_row_is_still_deleted_6745() {
     let _g = crate::afxdp::checksum::dnat_counter_guard();
     use std::sync::atomic::Ordering;
 
-    reset_dnat_steering_holders();
     let key = dnat_v4_key();
+    let nat = isolated_snat_decision_8291(3);
     let fds = DnatTableFds {
         v4: Some(-1),
         v6: None,
     };
+    assert_eq!(
+        dnat_steering_holder_count(&key, nat),
+        0,
+        "#8291: an UNACCOUNTED row is the subject, so this row must have no \
+         holder — that is the precondition, not an incidental"
+    );
     let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
-    delete_dnat_table_entry(&fds, &key, dnat_snat_decision());
+    delete_dnat_table_entry(&fds, &key, nat);
     assert_eq!(
         DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed),
         before + 1,
@@ -894,19 +941,22 @@ fn an_unaccounted_row_is_still_deleted_6745() {
 fn the_v6_steering_row_is_held_independently_6745() {
     // The v6 key is a different width and a different map. A holder set that
     // collapsed the two families would let a v4 close release a v6 row.
-    reset_dnat_steering_holders();
     let v4 = dnat_v4_key();
     let v6 = dnat_v6_key();
+    let nat4 = isolated_snat_decision_8291(4);
+    let nat6 = isolated_snat_decision_v6_8291(4);
     let fds = DnatTableFds::default();
+    assert_eq!(dnat_steering_holder_count(&v4, nat4), 0, "#8291: v4 row starts empty");
+    assert_eq!(dnat_steering_holder_count(&v6, nat6), 0, "#8291: v6 row starts empty");
 
-    publish_dnat_table_entry(&fds, &v4, dnat_snat_decision());
-    publish_dnat_table_entry(&fds, &v6, dnat_snat_decision_v6());
-    assert_eq!(dnat_steering_holder_count(&v4, dnat_snat_decision()), 1);
-    assert_eq!(dnat_steering_holder_count(&v6, dnat_snat_decision_v6()), 1);
+    publish_dnat_table_entry(&fds, &v4, nat4);
+    publish_dnat_table_entry(&fds, &v6, nat6);
+    assert_eq!(dnat_steering_holder_count(&v4, nat4), 1);
+    assert_eq!(dnat_steering_holder_count(&v6, nat6), 1);
 
-    assert!(release_dnat_steering_holder(&v4, dnat_snat_decision()));
+    assert!(release_dnat_steering_holder(&v4, nat4));
     assert_eq!(
-        dnat_steering_holder_count(&v6, dnat_snat_decision_v6()),
+        dnat_steering_holder_count(&v6, nat6),
         1,
         "releasing the v4 row must not touch the v6 row"
     );
@@ -927,9 +977,8 @@ fn every_publisher_accounts_because_the_callee_does_6745() {
     // every site inherits it by construction and there is no per-site variant
     // to get wrong. This test pins that the FUNCTIONS account, which is the
     // property the call sites rely on.
-    reset_dnat_steering_holders();
     let key = dnat_v4_key();
-    let nat = dnat_snat_decision();
+    let nat = isolated_snat_decision_8291(5);
     assert_eq!(dnat_steering_holder_count(&key, nat), 0);
     publish_dnat_table_entry(&DnatTableFds::default(), &key, nat);
     assert_eq!(
@@ -944,7 +993,9 @@ fn every_publisher_accounts_because_the_callee_does_6745() {
 fn a_non_snat_session_holds_nothing_6745() {
     // No source rewrite means no row was ever published, so nothing may be
     // recorded and a close must stay the no-op it already was.
-    reset_dnat_steering_holders();
+    // #8291: no source rewrite means `dnat_steering_key` yields None, so this
+    // cell touches no row at all and needs neither a unique port nor the global
+    // clear it used to perform.
     let key = dnat_v4_key();
     let no_nat = NatDecision::default();
     publish_dnat_table_entry(&DnatTableFds::default(), &key, no_nat);
