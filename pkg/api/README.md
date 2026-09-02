@@ -2700,7 +2700,36 @@ the drop fails loudly instead of going quietly vacuous.
     `context.Background()` instead of the request context), both counting
     VISITED ROWS with a live-context control, because a rendered tally of 0 is
     also what "the walk never ran" looks like.
-    **#7294 makes the discipline structural rather than remembered.** Every
+    **#7294 makes a failed peer fetch on the session LIST surface visible.**
+    `writeSessionList` discarded the error (`if pr, err := ...; err == nil`),
+    so a failed or refused peer fetch returned HTTP 200 with the peer table
+    simply absent and no indication why — an operator could not tell "the peer
+    has no sessions" from "we never asked". The summary and zone-pair surfaces
+    have always classified this; the list surface was the one that did not,
+    which is the shape that survives review because two of three places look
+    right. The response now carries `peer_status` / `peer_error`, set ONLY when
+    the request opted in with `include_peer` so a response that never asked for
+    a peer is byte-identical to the pre-#7294 shape.
+    A fetch failure is also no longer uniformly reported as `unreachable`: an
+    admission refusal (`codes.ResourceExhausted`) means the peer is REACHABLE
+    and this node declined to ask, and calling that a partition sends an
+    operator debugging a fabric problem after a network fault that does not
+    exist. Refusals now report `busy`; genuine failures still report
+    `unreachable`, and both sides are pinned so the fix cannot degrade into
+    renaming everything. Two scoped residuals, stated rather than papered over:
+    `pb.PeerFetchStatus` has no BUSY member, so a gRPC client still sees
+    UNREACHABLE for a refusal (adding an enum value is a wire change whose
+    rolling-upgrade behaviour deserves its own decision); and
+    `GetSessionsResponse` carries no `peer_status` field at all, so unlike the
+    summary surfaces this one cannot distinguish a peer that returned an empty
+    table from a standalone node.
+    The path is currently UNREACHABLE — the REST handler stamps the session-walk
+    lease before delegating, so `PeerSessions` takes `AcquireCtx`'s reuse arm and
+    never returns `ErrBusy` — and #7294 item 3's separate remote budget is what
+    makes it reachable. It is fixed because it is wrong, not because item 3
+    needs it: unreachable today is a property of the current call graph, not a
+    guarantee, and the next change to that graph gets no warning.
+    **#7294 also makes the admission discipline structural rather than remembered.** Every
     extension above — #5433, #5708, #5779, #5782, #5939, #6216, #6553, #7315,
     #8151 — was a surface someone noticed was walking without admission, and
     each was pinned by its own behavioural test covering exactly that surface.

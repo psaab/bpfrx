@@ -14,6 +14,9 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -473,11 +476,32 @@ func (s *Server) writeSessionList(w http.ResponseWriter, r *http.Request, resp S
 		if svc := s.clusterSession(); svc != nil {
 			// #5968: PeerSessions, not GetSessions — the local list is already
 			// built above and the delegate's own local walk was thrown away.
-			if pr, err := svc.PeerSessions(r.Context(), peerSessionsRequest(r)); err == nil {
+			//
+			// #7294: the error is CLASSIFIED, not discarded. `if err == nil`
+			// returned 200 with the peer table silently absent, which an
+			// operator cannot tell from a peer that genuinely has no
+			// sessions. The summary and zone-pair surfaces already do this;
+			// the list surface was the one that did not.
+			pr, err := svc.PeerSessions(r.Context(), peerSessionsRequest(r))
+			if err != nil {
+				resp.PeerStatus = peerFetchErrorStatus(err)
+				resp.PeerError = err.Error()
+			} else {
 				if peer := pr.GetPeer(); peer != nil {
 					resp.Peer = sessionListFromPB(peer)
 				}
+				// "ok" means the FETCH succeeded, which is the thing the
+				// discarded error was hiding. Scoped residual, stated rather
+				// than papered over: unlike GetSessionSummaryResponse and
+				// GetZonePairSummaryResponse, GetSessionsResponse carries no
+				// peer_status field, so this surface cannot distinguish a
+				// peer that returned an empty table from a standalone node
+				// the way the summary surfaces can. Closing that needs a
+				// proto addition and is not what this change is for.
+				resp.PeerStatus = "ok"
 			}
+		} else {
+			resp.PeerStatus = "not-applicable"
 		}
 	}
 	writeOK(w, resp)
@@ -622,6 +646,27 @@ func sessionSummaryFromPB(p *pb.GetSessionSummaryResponse) *SessionSummary {
 // JSON string surfaced on SessionSummary / ZonePairSummaryResponse (#5320). The
 // UNSPECIFIED zero value renders "" (omitted) so an older/absent gRPC server
 // does not fabricate a status.
+// peerFetchErrorStatus classifies a FAILED peer fetch.
+//
+// Not every failure is a partition. An admission refusal means the peer is
+// reachable and we declined to ask — folding that into "unreachable" sends an
+// operator debugging a fabric problem after a network fault that is not there.
+// The gRPC surfaces map an over-cap peer fetch to codes.ResourceExhausted
+// (peer_only_5968.go), so the distinction is already on the error and only
+// needed carrying through.
+//
+// Scoped residual: pb.PeerFetchStatus has no BUSY member, so a gRPC client
+// still sees UNREACHABLE for a refusal. Adding an enum value is a wire change
+// whose rolling-upgrade behaviour (an older cli rendering an unknown number)
+// deserves its own decision rather than riding along here. This corrects the
+// surface an operator actually reads.
+func peerFetchErrorStatus(err error) string {
+	if status.Code(err) == codes.ResourceExhausted {
+		return "busy"
+	}
+	return "unreachable"
+}
+
 func peerFetchStatusString(s pb.PeerFetchStatus) string {
 	switch s {
 	case pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE:
@@ -752,7 +797,7 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 			// walk was discarded.
 			pr, err := svc.PeerSessionSummary(r.Context())
 			if err != nil {
-				summary.PeerStatus = "unreachable"
+				summary.PeerStatus = peerFetchErrorStatus(err)
 				summary.PeerError = err.Error()
 			} else {
 				if peer := pr.GetPeer(); peer != nil {
@@ -999,7 +1044,7 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 			if err != nil {
 				// #5320: a failed local RPC still leaves the breakdown
 				// incomplete — mark it unreachable rather than silently OK.
-				resp.PeerStatus = "unreachable"
+				resp.PeerStatus = peerFetchErrorStatus(err)
 				resp.PeerError = err.Error()
 			} else {
 				if peer := pr.GetPeer(); peer != nil {
