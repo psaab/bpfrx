@@ -829,6 +829,19 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 			[]string{"pool", "rule"},
 			nil,
 		),
+		// #8447: the persistent-NAT admission pair.
+		userspaceSNATPoolPersistentAdmittedTotal: prometheus.NewDesc(
+			"xpf_userspace_source_nat_pool_persistent_admitted_total",
+			"persistent admitted",
+			[]string{"pool", "rule"},
+			nil,
+		),
+		userspaceSNATPoolPersistentDeclinedTotal: prometheus.NewDesc(
+			"xpf_userspace_source_nat_pool_persistent_declined_total",
+			"persistent declined",
+			[]string{"pool", "rule"},
+			nil,
+		),
 		// #4800: the residual live-state mutex (denominator, contended) pair.
 		userspaceSNATPoolLiveLockAcquisitionsTotal: prometheus.NewDesc(
 			"xpf_userspace_source_nat_pool_live_lock_acquisitions_total",
@@ -857,6 +870,11 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 			// above, so a mis-wired collector cannot pass by coincidence.
 			LiveLockAcquisitionsTotal: 11,
 			LiveLockContendedTotal:    4,
+			// #8447: distinct values, for the reason the #4800 pair below
+			// records — a collector that emitted one of the pair into the
+			// other's series would pass on equal fixtures.
+			PersistentAdmittedTotal: 13,
+			PersistentDeclinedTotal: 6,
 		}},
 	}
 
@@ -869,9 +887,10 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	// 6 pre-#4800 series + the live-lock (denominator, contended) pair.
-	if len(got) != 8 {
-		t.Fatalf("emitUserspaceSourceNATPoolMetrics: want 8 metrics, got %d", len(got))
+	// 6 pre-#4800 series + the live-lock (denominator, contended) pair
+	// + the #8447 persistent-NAT (admitted, declined) pair.
+	if len(got) != 10 {
+		t.Fatalf("emitUserspaceSourceNATPoolMetrics: want 10 metrics, got %d", len(got))
 	}
 
 	labels := map[string]string{"pool": "pool-a", "rule": "snat-a"}
@@ -887,6 +906,12 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 	// rather than passing on a coincidence.
 	assertCounterClose(t, got, c.userspaceSNATPoolLiveLockAcquisitionsTotal, labels, 11)
 	assertCounterClose(t, got, c.userspaceSNATPoolLiveLockContendedTotal, labels, 4)
+	// #8447: same discipline for the persistent-NAT admission pair. Swapping
+	// the two emissions fails here rather than passing on equal fixtures —
+	// which matters more than usual for this pair, because its whole purpose
+	// is telling "declined" apart from "never ran".
+	assertCounterClose(t, got, c.userspaceSNATPoolPersistentAdmittedTotal, labels, 13)
+	assertCounterClose(t, got, c.userspaceSNATPoolPersistentDeclinedTotal, labels, 6)
 }
 
 func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
