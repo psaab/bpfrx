@@ -123,6 +123,18 @@ impl SessionTable {
         now_ns: u64,
         ha: Option<&ExpireHaContext<'_>>,
     ) -> Vec<ExpiredSession> {
+        // #7699: age out PPTP call associations in the same sweep the sessions
+        // use, because the hazard they carry is on the same clock.
+        //
+        // The association must expire whether or not a Call-Disconnect-Notify
+        // ever arrives: a lost notify, a restarted peer or a control channel
+        // torn down mid-call otherwise leaves an association that re-pairs a
+        // REUSED 16-bit call id onto a dead handle. That is a MIS-ATTRIBUTION —
+        // call B's traffic resolving to call A's session — not a memory leak,
+        // which is why it is bounded here rather than left to a capacity cap.
+        self.pptp
+            .expire_idle(now_ns, crate::session::pptp::ASSOCIATION_IDLE_TIMEOUT_NS);
+
         // Reset per-call stats BEFORE the gc-interval gate so that a
         // gated no-op call returns zeroed stats rather than leftovers
         // from a prior call (Codex impl-review round-2 non-blocking note).

@@ -273,11 +273,16 @@ pub(crate) mod tests;
 pub(in crate::afxdp) fn broadcast_pptp_install(
     queues: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     call: crate::session::pptp::PptpCall,
+    control: crate::session::pptp::ControlChannelId,
+    learned_ns: u64,
 ) -> usize {
     let mut accepted = 0;
     for q in queues {
         let mut pending = lock_recover(q);
-        if push_bounded(&mut pending, WorkerCommand::InstallPptpCall(call)) {
+        if push_bounded(
+            &mut pending,
+            WorkerCommand::InstallPptpCall { call, control, learned_ns },
+        ) {
             accepted += 1;
         }
     }
@@ -314,6 +319,15 @@ mod pptp_broadcast_tests_7699 {
         (0..n).map(|_| Arc::new(Mutex::new(VecDeque::new()))).collect()
     }
 
+    fn a_ctl() -> crate::session::pptp::ControlChannelId {
+        crate::session::pptp::ControlChannelId::new(
+            "198.51.100.7".parse().unwrap(),
+            49152,
+            "203.0.113.9".parse().unwrap(),
+            1723,
+        )
+    }
+
     fn a_call() -> PptpCall {
         PptpCall::new(
             "198.51.100.7".parse().unwrap(),
@@ -333,11 +347,11 @@ mod pptp_broadcast_tests_7699 {
     #[test]
     fn an_install_reaches_every_worker_7699() {
         let qs = queues(4);
-        assert_eq!(broadcast_pptp_install(&qs, a_call()), 4);
+        assert_eq!(broadcast_pptp_install(&qs, a_call(), a_ctl(), 0), 4);
         for (i, q) in qs.iter().enumerate() {
             let pending = q.lock().expect("queue");
             assert_eq!(pending.len(), 1, "worker {i} did not receive the install");
-            assert!(matches!(pending[0], WorkerCommand::InstallPptpCall(_)));
+            assert!(matches!(pending[0], WorkerCommand::InstallPptpCall { .. }));
         }
     }
 
@@ -373,7 +387,7 @@ mod pptp_broadcast_tests_7699 {
             }
         }
         assert_eq!(
-            broadcast_pptp_install(&qs, a_call()),
+            broadcast_pptp_install(&qs, a_call(), a_ctl(), 0),
             1,
             "a broadcast that reached only one of two workers must report 1; \
              reporting 2 would let a caller treat a half-delivered association \

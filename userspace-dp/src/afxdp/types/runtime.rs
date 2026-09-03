@@ -504,7 +504,16 @@ pub(in crate::afxdp) enum WorkerCommand {
     /// (TCP/1723) and the GRE data channel are not reliably co-located — RSS
     /// hashes the flow tuple, so they share a worker only by chance — and the
     /// data packets must resolve on whichever worker they land on.
-    InstallPptpCall(crate::session::pptp::PptpCall),
+    InstallPptpCall {
+        call: crate::session::pptp::PptpCall,
+        /// The control channel that taught it — an association must not
+        /// outlive the channel that set it up (#7699 stage 3).
+        control: crate::session::pptp::ControlChannelId,
+        /// When it was learned, carried rather than read from a clock in the
+        /// drain so the idle bound is deterministic in tests and identical on
+        /// every worker receiving this broadcast.
+        learned_ns: u64,
+    },
     /// #7699: forget a PPTP call association, by handle. Also broadcast.
     ///
     /// Teardown must reach every worker for the same reason the install does; a

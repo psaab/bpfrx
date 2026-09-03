@@ -127,6 +127,58 @@ pub(crate) const PPTP_CALL_IDS_ABSENT: u64 = 0;
 /// Present-form tag; the pair rides in the low 32 bits as `(lo << 16) | hi`.
 pub(crate) const PPTP_CALL_IDS_PRESENT: u64 = 1 << 32;
 
+/// The TCP/1723 control channel an association was learned on (#7699 stage 3).
+///
+/// Canonical (lower endpoint first) so both directions of the control
+/// connection name one channel. An association must not outlive the channel
+/// that taught it: when the control session goes away, the calls it set up are
+/// gone whether or not their Call-Disconnect-Notify was ever seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ControlChannelId {
+    lo: (IpAddr, u16),
+    hi: (IpAddr, u16),
+}
+
+impl ControlChannelId {
+    pub(crate) fn new(a: IpAddr, a_port: u16, b: IpAddr, b_port: u16) -> Self {
+        if (a, a_port) <= (b, b_port) {
+            Self { lo: (a, a_port), hi: (b, b_port) }
+        } else {
+            Self { lo: (b, b_port), hi: (a, a_port) }
+        }
+    }
+}
+
+/// A learned association plus the state that bounds its life.
+#[derive(Clone, Copy, Debug)]
+struct AssociationRecord {
+    call: PptpCall,
+    /// The channel that taught it. Removing the channel removes the call.
+    control: ControlChannelId,
+    /// Last time a data packet resolved through it, or install time.
+    ///
+    /// This is what makes the lifetime independent of ever seeing a teardown:
+    /// a call whose peer vanished stops refreshing and expires on its own.
+    last_seen_ns: u64,
+}
+
+/// How long an association survives with no data traffic resolving through it.
+///
+/// **This is the bound on mis-attribution exposure, not a memory policy.** The
+/// hazard is not that a dead association wastes a map entry — it is that PPTP
+/// call ids are 16 bits and REUSED, so a stale association pairs a NEW call's
+/// packets onto a DEAD call's handle. Traffic for call B resolving to call A's
+/// session is a correctness failure with security-adjacent consequences, and
+/// this constant is how long that window can stay open when a
+/// Call-Disconnect-Notify is never seen.
+///
+/// Fifteen minutes: long enough that a live call idle between transfers is not
+/// torn down under it (data traffic refreshes it, and a call with no data for
+/// this long is not carrying anything), short enough to bound the window. It is
+/// a ceiling, not a target — the ordinary path is the explicit teardown, and
+/// the control-channel binding removes a whole channel's calls at once.
+pub(crate) const ASSOCIATION_IDLE_TIMEOUT_NS: u64 = 15 * 60 * 1_000_000_000;
+
 /// Why an association was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PptpInstallError {
@@ -148,8 +200,8 @@ pub(crate) struct PptpAssociations {
     /// belongs to the peer it is being sent to. Two entries per call — one per
     /// peer — which is what makes both directions resolve to one handle.
     by_allocator: FxHashMap<(IpAddr, u16), u32>,
-    /// `handle -> association`, for teardown and for collision detection.
-    by_handle: FxHashMap<u32, PptpCall>,
+    /// `handle -> record`, for teardown, expiry and collision detection.
+    by_handle: FxHashMap<u32, AssociationRecord>,
     /// Version-1 packets that resolved to no association.
     ///
     /// **Expected non-zero during startup and after a restart**, and after any
@@ -162,16 +214,32 @@ pub(crate) struct PptpAssociations {
 
 impl PptpAssociations {
     /// Learn a call. Idempotent for an identical association.
-    pub(crate) fn install(&mut self, call: PptpCall) -> Result<u32, PptpInstallError> {
+    pub(crate) fn install(
+        &mut self,
+        call: PptpCall,
+        control: ControlChannelId,
+        now_ns: u64,
+    ) -> Result<u32, PptpInstallError> {
         let handle = call.handle();
         match self.by_handle.get(&handle) {
-            Some(existing) if *existing == call => return Ok(handle),
+            Some(existing) if existing.call == call => {
+                // Idempotent re-learn (a retransmitted reply). Refresh rather
+                // than refuse: the call is real and this is evidence of it.
+                self.by_handle.entry(handle).and_modify(|r| r.last_seen_ns = now_ns);
+                return Ok(handle);
+            }
             Some(existing) => {
-                return Err(PptpInstallError::HandleCollision { existing: *existing, handle });
+                return Err(PptpInstallError::HandleCollision {
+                    existing: existing.call,
+                    handle,
+                });
             }
             None => {}
         }
-        self.by_handle.insert(handle, call);
+        self.by_handle.insert(
+            handle,
+            AssociationRecord { call, control, last_seen_ns: now_ns },
+        );
         self.by_allocator.insert((call.lo, call.lo_call_id), handle);
         self.by_allocator.insert((call.hi, call.hi_call_id), handle);
         Ok(handle)
@@ -187,11 +255,85 @@ impl PptpAssociations {
         self.by_allocator.get(&(dst, call_id)).copied()
     }
 
+    /// The data-path form: resolve AND refresh the association's idle clock.
+    ///
+    /// Refreshing on use is what makes [`ASSOCIATION_IDLE_TIMEOUT_NS`] mean "no
+    /// traffic" rather than "old". A long-lived call carrying data is never
+    /// expired under it; a call whose peer vanished stops refreshing and ages
+    /// out without anyone announcing its death.
+    ///
+    /// **No production caller yet.** The data path reaches this once the
+    /// packet-path dispatch lands (stage 2's remaining half, #7699). Until
+    /// then the idle clock advances only at install, so an association's life
+    /// is bounded from when it was LEARNED rather than from its last packet —
+    /// the conservative direction (it expires sooner, never later), but not the
+    /// intended semantics, and worth saying so here rather than letting a
+    /// reader infer the refresh already happens.
+    pub(crate) fn resolve_and_touch(
+        &mut self,
+        dst: IpAddr,
+        call_id: u16,
+        now_ns: u64,
+    ) -> Option<u32> {
+        let handle = *self.by_allocator.get(&(dst, call_id))?;
+        if let Some(rec) = self.by_handle.get_mut(&handle) {
+            rec.last_seen_ns = now_ns;
+        }
+        Some(handle)
+    }
+
+    /// Drop every association idle longer than `timeout_ns`. Returns how many.
+    ///
+    /// The lifetime bound that does NOT depend on a teardown arriving. Without
+    /// it, a Call-Disconnect-Notify lost to a dropped packet, a restarted peer
+    /// or a control channel torn down mid-call leaves an association that
+    /// re-pairs a REUSED 16-bit call id onto a dead handle — a mis-attribution,
+    /// not a leak.
+    pub(crate) fn expire_idle(&mut self, now_ns: u64, timeout_ns: u64) -> usize {
+        let stale: Vec<u32> = self
+            .by_handle
+            .iter()
+            .filter(|(_, rec)| now_ns.saturating_sub(rec.last_seen_ns) > timeout_ns)
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in &stale {
+            self.remove(*handle);
+        }
+        stale.len()
+    }
+
+    /// Drop every association learned on a control channel. Returns how many.
+    ///
+    /// An association must not outlive the channel that taught it: once the
+    /// control session is gone the calls it set up cannot be renegotiated or
+    /// torn down through it, so keeping them serves nothing and risks pairing a
+    /// reused call id. Intended to fire on FIN/RST or the control session's
+    /// own timeout, not waiting for per-call notifies that will never arrive.
+    ///
+    /// **No production caller yet**, for the honest reason that nothing yet
+    /// observes a control channel closing — that is the packet-path dispatch,
+    /// stage 2's remaining half (#7699). Until it lands this path is bound by
+    /// its cells and by nothing else, and the idle bound above is the only
+    /// association lifetime that actually runs on a live box.
+    pub(crate) fn forget_control_channel(&mut self, control: ControlChannelId) -> usize {
+        let doomed: Vec<u32> = self
+            .by_handle
+            .iter()
+            .filter(|(_, rec)| rec.control == control)
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in &doomed {
+            self.remove(*handle);
+        }
+        doomed.len()
+    }
+
     /// Forget a call, by handle. Returns whether anything was removed.
     pub(crate) fn remove(&mut self, handle: u32) -> bool {
-        let Some(call) = self.by_handle.remove(&handle) else {
+        let Some(rec) = self.by_handle.remove(&handle) else {
             return false;
         };
+        let call = rec.call;
         self.by_allocator.remove(&(call.lo, call.lo_call_id));
         self.by_allocator.remove(&(call.hi, call.hi_call_id));
         true
@@ -218,7 +360,14 @@ impl PptpAssociations {
     /// path — the shape that quietly rots into a fail-open one. Test-only.
     #[cfg(test)]
     pub(crate) fn force_handle_for_test(&mut self, call: PptpCall, handle: u32) {
-        self.by_handle.insert(handle, call);
+        self.by_handle.insert(
+            handle,
+            AssociationRecord {
+                call,
+                control: ControlChannelId::new(call.lo, 1723, call.hi, 1723),
+                last_seen_ns: 0,
+            },
+        );
         self.by_allocator.insert((call.lo, call.lo_call_id), handle);
         self.by_allocator.insert((call.hi, call.hi_call_id), handle);
     }
@@ -233,6 +382,12 @@ mod tests_7699 {
         s.parse().unwrap()
     }
 
+    /// The control channel a fixture's calls are learned on. Stage-3 cells that
+    /// care about the channel build their own.
+    fn ctl(a: IpAddr, b: IpAddr) -> ControlChannelId {
+        ControlChannelId::new(a, 49152, b, 1723)
+    }
+
     /// THE PROPERTY THE WHOLE DESIGN EXISTS FOR: both directions of one call
     /// resolve to the SAME handle.
     ///
@@ -245,7 +400,7 @@ mod tests_7699 {
         let (a, b) = (ip("198.51.100.7"), ip("203.0.113.9"));
         let (a_id, b_id) = (0x1111u16, 0x2222u16);
         let mut t = PptpAssociations::default();
-        let handle = t.install(PptpCall::new(a, a_id, b, b_id)).expect("install");
+        let handle = t.install(PptpCall::new(a, a_id, b, b_id), ctl(a, b), 0).expect("install");
 
         // A→B carries B's call id, so it is keyed on the destination B.
         assert_eq!(
@@ -269,8 +424,8 @@ mod tests_7699 {
     fn two_calls_between_one_endpoint_pair_get_distinct_handles_7699() {
         let (a, b) = (ip("198.51.100.7"), ip("203.0.113.9"));
         let mut t = PptpAssociations::default();
-        let h1 = t.install(PptpCall::new(a, 0x1001, b, 0x2001)).expect("call 1");
-        let h2 = t.install(PptpCall::new(a, 0x1002, b, 0x2002)).expect("call 2");
+        let h1 = t.install(PptpCall::new(a, 0x1001, b, 0x2001), ctl(a, b), 0).expect("call 1");
+        let h2 = t.install(PptpCall::new(a, 0x1002, b, 0x2002), ctl(a, b), 0).expect("call 2");
         assert_ne!(
             h1, h2,
             "two calls between one endpoint pair shared a handle, so they share \
@@ -351,7 +506,7 @@ mod tests_7699 {
         let mut t = PptpAssociations::default();
         t.force_handle_for_test(squatter, handle);
 
-        match t.install(victim) {
+        match t.install(victim, ctl(a, b), 0) {
             Err(PptpInstallError::HandleCollision { existing, handle: h }) => {
                 assert_eq!(existing, squatter);
                 assert_eq!(h, handle);
@@ -373,9 +528,9 @@ mod tests_7699 {
         // and the assertion would be about the seam rather than about
         // idempotence.
         let mut clean = PptpAssociations::default();
-        let first = clean.install(squatter).expect("first install");
+        let first = clean.install(squatter, ctl(a, b), 0).expect("first install");
         assert_eq!(
-            clean.install(squatter),
+            clean.install(squatter, ctl(a, b), 0),
             Ok(first),
             "re-learning an identical association must be idempotent"
         );
@@ -407,7 +562,7 @@ mod tests_7699 {
     fn removing_a_call_clears_both_directions_7699() {
         let (a, b) = (ip("198.51.100.7"), ip("203.0.113.9"));
         let mut t = PptpAssociations::default();
-        let handle = t.install(PptpCall::new(a, 0x1111, b, 0x2222)).expect("install");
+        let handle = t.install(PptpCall::new(a, 0x1111, b, 0x2222), ctl(a, b), 0).expect("install");
         assert!(t.remove(handle));
         assert_eq!(t.resolve(a, 0x1111), None, "A-side entry survived teardown");
         assert_eq!(t.resolve(b, 0x2222), None, "B-side entry survived teardown");
@@ -431,6 +586,238 @@ mod tests_7699 {
             "the reverse companion must carry the same handle; if this ever \
              transforms, a reply is looked up under a key the stored companion \
              does not equal and matches no session at all"
+        );
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests_7699 {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    const T0: u64 = 1_000_000_000_000;
+
+    /// THE CELL STAGE 3 EXISTS FOR: a MISSED teardown must not mis-attribute a
+    /// later call that reuses the call id.
+    ///
+    /// The fixture enters the missed-teardown state deliberately. Call A ends
+    /// and its Call-Disconnect-Notify is never seen — a lost packet, a
+    /// restarted peer, a control channel torn down mid-call. Nothing calls
+    /// `remove`. Then a NEW call reuses A's 16-bit id on the same peer, and its
+    /// own control channel has not been seen yet.
+    ///
+    /// **The failure this guards is a mis-attribution, not a leak.** Without
+    /// expiry, the new call's data packet resolves to the DEAD call's handle,
+    /// so its traffic lands on call A's session — A's policy decision, A's NAT
+    /// state, A's counters. A cell that only ever sends a clean teardown passes
+    /// under an implementation that never expires anything and would not see
+    /// this at all.
+    #[test]
+    fn a_missed_teardown_does_not_mis_attribute_a_reused_call_id_7699() {
+        let (pac, pns) = (ip("198.51.100.7"), ip("203.0.113.9"));
+        let ctl = ControlChannelId::new(pac, 49152, pns, 1723);
+        let mut t = PptpAssociations::default();
+
+        let dead = t
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), ctl, T0)
+            .expect("install");
+
+        // The call ends. No notify arrives; nothing calls remove(). Time passes
+        // with no data traffic refreshing it.
+        let later = T0 + ASSOCIATION_IDLE_TIMEOUT_NS + 1;
+        assert_eq!(
+            t.expire_idle(later, ASSOCIATION_IDLE_TIMEOUT_NS),
+            1,
+            "an association idle past the bound must age out without a teardown"
+        );
+
+        // A new call reuses 0xBBBB on the PNS; its control channel is not yet
+        // seen, so nothing has been learned for it.
+        assert_eq!(
+            t.resolve(pns, 0xBBBB),
+            None,
+            "a reused call id resolved to the DEAD call's handle — the new \
+             call's traffic would land on the old call's session. This is the \
+             mis-attribution the expiry exists to prevent, and it is what a \
+             clean-teardown-only fixture cannot see"
+        );
+        assert_ne!(
+            t.resolve(pns, 0xBBBB),
+            Some(dead),
+            "explicitly: not the dead handle"
+        );
+    }
+
+    /// ANTI-VACUITY: a call still carrying data is NOT expired.
+    ///
+    /// Without this, the cell above is satisfied by an implementation that
+    /// expires everything on every sweep — which would tear down live calls and
+    /// look identical in a test that only checks that stale entries go away.
+    #[test]
+    fn a_call_carrying_data_is_not_expired_7699() {
+        let (pac, pns) = (ip("198.51.100.7"), ip("203.0.113.9"));
+        let ctl = ControlChannelId::new(pac, 49152, pns, 1723);
+        let mut t = PptpAssociations::default();
+        let handle = t
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), ctl, T0)
+            .expect("install");
+
+        // Data keeps flowing right up to the bound.
+        let touched_at = T0 + ASSOCIATION_IDLE_TIMEOUT_NS;
+        assert_eq!(
+            t.resolve_and_touch(pns, 0xBBBB, touched_at),
+            Some(handle),
+            "a live call must resolve"
+        );
+
+        // A sweep just under a full timeout after that touch leaves it alone.
+        assert_eq!(
+            t.expire_idle(touched_at + ASSOCIATION_IDLE_TIMEOUT_NS, ASSOCIATION_IDLE_TIMEOUT_NS),
+            0,
+            "a call refreshed by data traffic must survive; the bound is time \
+             SINCE TRAFFIC, not age"
+        );
+        assert_eq!(t.resolve(pns, 0xBBBB), Some(handle));
+
+        // ...and one tick past it, the same call does age out — so the
+        // assertion above is about the refresh and not about a timeout that
+        // never fires.
+        assert_eq!(
+            t.expire_idle(
+                touched_at + ASSOCIATION_IDLE_TIMEOUT_NS + 1,
+                ASSOCIATION_IDLE_TIMEOUT_NS
+            ),
+            1
+        );
+    }
+
+    /// An association must not outlive the control channel that taught it.
+    ///
+    /// Also a missed-teardown shape: the channel goes away by FIN/RST or its
+    /// own timeout, and the per-call notifies for the calls it set up will now
+    /// never arrive. Waiting out the idle bound would leave that window open
+    /// for no reason — the calls cannot be renegotiated through a channel that
+    /// is gone.
+    #[test]
+    fn losing_the_control_channel_forgets_its_calls_7699() {
+        let (pac, pns) = (ip("198.51.100.7"), ip("203.0.113.9"));
+        let doomed = ControlChannelId::new(pac, 49152, pns, 1723);
+        let other = ControlChannelId::new(pac, 49153, pns, 1723);
+        let mut t = PptpAssociations::default();
+
+        let a = t
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), doomed, T0)
+            .expect("call A");
+        let b = t
+            .install(PptpCall::new(pac, 0xCCCC, pns, 0xDDDD), doomed, T0)
+            .expect("call B");
+        let survivor = t
+            .install(PptpCall::new(pac, 0xEEEE, pns, 0xFFFF), other, T0)
+            .expect("call on another channel");
+
+        assert_eq!(
+            t.forget_control_channel(doomed),
+            2,
+            "both calls learned on that channel must go, with NO time passing \
+             and NO Call-Disconnect-Notify"
+        );
+        assert_eq!(t.resolve(pns, 0xBBBB), None);
+        assert_eq!(t.resolve(pns, 0xDDDD), None);
+        let _ = (a, b);
+
+        // NEGATIVE CONTROL: a call on a DIFFERENT channel is untouched.
+        // Without it, `forget_control_channel` could clear the whole table and
+        // every assertion above would still pass.
+        assert_eq!(
+            t.resolve(pns, 0xFFFF),
+            Some(survivor),
+            "losing one control channel must not forget calls set up on another"
+        );
+        assert_eq!(t.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod sweep_wiring_tests_7699 {
+    use super::*;
+    use crate::session::SessionTable;
+
+    /// The expiry runs from the PERIODIC SWEEP, not just when a test calls it.
+    ///
+    /// Every cell in `expiry_tests_7699` calls `expire_idle` directly, so all of
+    /// them stay green against a build where nothing in production ever calls
+    /// it — the association would then live forever on a real box and
+    /// mis-attribute a reused call id, with the suite entirely quiet. That is
+    /// the two-correct-halves-and-no-join shape that hid a missing metrics
+    /// wiring in #7685 and a missing drain arm in #8392, and that I wrote an
+    /// unfalsifiable comment about in #8396.
+    ///
+    /// So this drives `SessionTable::expire_stale_entries` — the real sweep the
+    /// worker loop calls — and asserts the association is gone afterwards.
+    ///
+    /// FAIL-ON-REVERT: delete the `self.pptp.expire_idle(..)` call from
+    /// `expire_stale_entries_ha` and this reds while every direct-call cell
+    /// passes.
+    #[test]
+    fn the_periodic_sweep_expires_stale_associations_7699() {
+        let (pac, pns): (IpAddr, IpAddr) = (
+            "198.51.100.7".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
+        let ctl = ControlChannelId::new(pac, 49152, pns, 1723);
+        const T0: u64 = 1_000_000_000_000;
+
+        let mut sessions = SessionTable::new();
+        sessions
+            .pptp_mut()
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), ctl, T0)
+            .expect("install");
+        assert!(
+            sessions.pptp().resolve(pns, 0xBBBB).is_some(),
+            "precondition: the association must be present before the sweep"
+        );
+
+        // The sweep the worker loop runs, one tick past the idle bound.
+        sessions.expire_stale_entries(T0 + ASSOCIATION_IDLE_TIMEOUT_NS + 1);
+
+        assert_eq!(
+            sessions.pptp().resolve(pns, 0xBBBB),
+            None,
+            "the periodic sweep did not age the association out, so nothing in \
+             production bounds it: a missed Call-Disconnect-Notify would leave \
+             it resolving a REUSED call id onto a dead handle forever"
+        );
+    }
+
+    /// ANTI-VACUITY for the cell above: the same sweep run BEFORE the bound
+    /// leaves the association alone.
+    ///
+    /// Without this, a sweep that unconditionally cleared the table would
+    /// satisfy the wiring cell while tearing down every live call.
+    #[test]
+    fn the_periodic_sweep_leaves_fresh_associations_alone_7699() {
+        let (pac, pns): (IpAddr, IpAddr) = (
+            "198.51.100.7".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
+        let ctl = ControlChannelId::new(pac, 49152, pns, 1723);
+        const T0: u64 = 1_000_000_000_000;
+
+        let mut sessions = SessionTable::new();
+        let handle = sessions
+            .pptp_mut()
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), ctl, T0)
+            .expect("install");
+
+        sessions.expire_stale_entries(T0 + ASSOCIATION_IDLE_TIMEOUT_NS - 1);
+
+        assert_eq!(
+            sessions.pptp().resolve(pns, 0xBBBB),
+            Some(handle),
+            "the sweep expired a live association before its idle bound"
         );
     }
 }
