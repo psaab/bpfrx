@@ -792,6 +792,66 @@ mod sweep_wiring_tests_7699 {
         );
     }
 
+    /// The association expiry runs ONCE PER GC INTERVAL, not on every call.
+    ///
+    /// `expire_stale_entries_ha` is called from the worker poll loop and its
+    /// gc-interval gate is what makes it periodic. When this landed the
+    /// `expire_idle` call sat ABOVE that gate, so it scanned the whole
+    /// association map at POLL frequency — per-poll work in a tree whose entire
+    /// discipline is not doing per-poll work. Every cell in this file passed
+    /// either way, because they all assert what the table ends up containing
+    /// and the placement changes only how often it is computed.
+    ///
+    /// So the placement is bound by its OBSERVABLE consequence: a sweep the
+    /// gate short-circuits must not expire anything, even something already
+    /// stale. Above the gate it would.
+    ///
+    /// The three steps are the whole point — the middle one is the assertion,
+    /// and the third proves the association really was expirable, so the middle
+    /// is about the GATE rather than about a timeout that never fires.
+    #[test]
+    fn the_association_expiry_respects_the_gc_interval_gate_7699() {
+        let (pac, pns): (IpAddr, IpAddr) = (
+            "198.51.100.7".parse().unwrap(),
+            "203.0.113.9".parse().unwrap(),
+        );
+        let ctl = ControlChannelId::new(pac, 49152, pns, 1723);
+        const T0: u64 = 1_000_000_000_000;
+        const HALF_SECOND: u64 = 500_000_000;
+        const SECOND: u64 = 1_000_000_000;
+
+        let mut sessions = SessionTable::new();
+        let handle = sessions
+            .pptp_mut()
+            .install(PptpCall::new(pac, 0xAAAA, pns, 0xBBBB), ctl, T0)
+            .expect("install");
+
+        // 1. A sweep exactly AT the bound: not yet stale (`> timeout`), and it
+        //    sets the gc clock so the next call is gated.
+        sessions.expire_stale_entries(T0 + ASSOCIATION_IDLE_TIMEOUT_NS);
+        assert_eq!(sessions.pptp().resolve(pns, 0xBBBB), Some(handle));
+
+        // 2. Half a second later the association IS stale — but the gate
+        //    short-circuits this call, so no expiry work happens.
+        sessions.expire_stale_entries(T0 + ASSOCIATION_IDLE_TIMEOUT_NS + HALF_SECOND);
+        assert_eq!(
+            sessions.pptp().resolve(pns, 0xBBBB),
+            Some(handle),
+            "a gc-gated call expired an association, so the expiry is running \
+             ABOVE the gate — i.e. on every poll-loop call, scanning the whole \
+             association map at poll frequency"
+        );
+
+        // 3. Past the interval the gate opens and the same association goes,
+        //    proving step 2 was about the gate and not an inert timeout.
+        sessions.expire_stale_entries(T0 + ASSOCIATION_IDLE_TIMEOUT_NS + SECOND + HALF_SECOND);
+        assert_eq!(
+            sessions.pptp().resolve(pns, 0xBBBB),
+            None,
+            "control: once the gate opens the stale association must go"
+        );
+    }
+
     /// ANTI-VACUITY for the cell above: the same sweep run BEFORE the bound
     /// leaves the association alone.
     ///
