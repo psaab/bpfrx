@@ -448,3 +448,53 @@ func TestEmptiedChainDenyCollisionFailsClosed7625(t *testing.T) {
 		t.Errorf("guard fired on a config that never references the deny: %v", err)
 	}
 }
+
+// The withdrawal must be ALERTABLE, not just logged. An emptied chain denies
+// every route in that direction, which is the same operator-visible consequence
+// the #6807 oversized cases carry, so it belongs in the same quarantine gauge —
+// and the set is rebuilt per render, so a config that no longer empties must
+// stop reporting rather than stay latched.
+func TestEmptiedChainDenyIsQuarantineCounted7625(t *testing.T) {
+	po := policyOptions7625("REAL")
+	m := New()
+
+	emptied := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.8", PeerAS: 65009, FamilyInet: true, Import: []string{"GHOST"}},
+			},
+		},
+	}
+	m.buildManagedSection(emptied)
+	found := false
+	for _, n := range m.QuarantinedRouteMaps() {
+		if n == emptiedChainDenyName {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("emptied-chain deny is not quarantine-counted; got %v", m.QuarantinedRouteMaps())
+	}
+
+	// Re-rendering a config with nothing emptied must CLEAR it: an alert that
+	// keeps firing after the operator restores the policy is how the next real
+	// one gets missed.
+	fixed := &FullConfig{
+		PolicyOptions: po,
+		BGP: &config.BGPConfig{
+			LocalAS: 65001, RouterID: "1.1.1.1",
+			Neighbors: []*config.BGPNeighbor{
+				{Address: "10.0.2.8", PeerAS: 65009, FamilyInet: true, Import: []string{"REAL"}},
+			},
+		},
+	}
+	m.buildManagedSection(fixed)
+	for _, n := range m.QuarantinedRouteMaps() {
+		if n == emptiedChainDenyName {
+			t.Errorf("quarantine stayed latched after the config stopped emptying: %v",
+				m.QuarantinedRouteMaps())
+		}
+	}
+}
