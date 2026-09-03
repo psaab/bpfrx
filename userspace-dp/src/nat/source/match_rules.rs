@@ -17,6 +17,7 @@
 //! round-robin). Everything else remains the moved code.
 
 use super::*;
+use crate::nat::allocator::AddressOnlyReverseKey;
 
 /// #6979 F6: refuse a PAT identity a PEER pool already owns, and roll ours back.
 ///
@@ -56,6 +57,87 @@ use super::*;
 ///
 /// `None` on every config with no overlapping pools — `overlap_owners` is
 /// `None` there and the whole call is one `Option::is_none`.
+/// #8115 R1: does a PEER pool's allocator already own this WIRE identity, in
+/// EITHER ownership space?
+///
+/// #6979 F6 asked only the bitmap question, which is the right one for a PAT
+/// mint against a PAT peer and blind in both directions to the OTHER space: a
+/// `port no-translation` / port-less flow claims no occupancy bit at all. So a
+/// peer preserving `X:P` did not stop a PAT mint of `X:P`, and two address-only
+/// flows in different pools collided whenever protocol and remote matched.
+///
+/// The two sub-questions are not equally precise, and the difference is worth
+/// stating because it decides where an over-rejection can occur:
+///
+///   - `peer_holds_identity` is REMOTE-AGNOSTIC. The occupancy bit means "this
+///     allocator may publish `X:P`", not "toward this remote". Refusing on it
+///     can therefore decline a flow whose remote differs from the peer flow's,
+///     which is not a wire collision. That is #6979 F6's shipped posture and is
+///     kept: for a PAT mint the cost is one rotation to another port, and the
+///     conservative direction is the safe one for a token that is the sole
+///     ownership word.
+///   - `peer_holds_address_only_identity` is REMOTE-SPECIFIC — the key carries
+///     `dst_ip`/`dst_port` — so a match is an exact duplicate of the wire
+///     5-tuple and carries no over-rejection at all.
+///
+/// The key is built by `AddressOnlyReverseKey::for_flow`, the SAME constructor
+/// the reserve paths insert with. Building it from three literals here would
+/// reproduce the #6751 defect that constructor exists to prevent: a check keyed
+/// differently from its insert finds nothing, every mint "succeeds", and no
+/// behavioural test can see it.
+///
+/// `false` on every config with no overlapping pools — `overlap_owners` is
+/// `None` there and this is one `Option::is_none`.
+fn peer_owns_wire_identity(
+    rule: &SourceNatRule,
+    flow: SourceNatFlowKey,
+    translated: TranslatedTuple,
+) -> bool {
+    if rule.overlap_owners.is_none() {
+        return false;
+    }
+    std::sync::atomic::fence(Ordering::SeqCst);
+    rule.peer_holds_identity(translated.ip, translated.port)
+        || rule.peer_holds_address_only_identity(&AddressOnlyReverseKey::for_flow(
+            &flow,
+            translated.ip,
+            translated.port,
+        ))
+}
+
+/// #8115 R1: the ADDRESS-ONLY sibling of [`reject_peer_owned_identity`].
+///
+/// Same shape as the PAT arm deliberately — post-mint check, rollback, and the
+/// same `PoolPeerAddressOverlap` reason — so the two cannot drift on what a
+/// peer-owned identity means.
+///
+/// Rolling back rather than rotating to a free sibling address is a deliberate
+/// non-goal, not an oversight: the #6226 probe loop inside
+/// `reserve_address_only_roundrobin` could consult peers per candidate address
+/// and rotate, which would be strictly better, but it means threading the
+/// overlap index into the allocator. Matching #6979 F6's reviewed shape keeps
+/// this change the bounded one the split asked for. `rollback_flow` is correct
+/// for an address-only record: #6528's `unlink_live_allocation_locked` clears
+/// the reverse-identity token and frees NO port bit for an `address_only`
+/// allocation, which is exactly what this mint claimed.
+fn reject_peer_owned_address_only_identity(
+    rule: &SourceNatRule,
+    flow: SourceNatFlowKey,
+    translated: TranslatedTuple,
+    now_ns: u64,
+    holder: NatHolder,
+) -> Option<SourceNatLookup> {
+    if !peer_owns_wire_identity(rule, flow, translated) {
+        return None;
+    }
+    rule.pool_allocator
+        .rollback_flow(flow, translated, now_ns, holder);
+    Some(SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+        rule,
+        SourceNatFailureReason::PoolPeerAddressOverlap,
+    )))
+}
+
 fn reject_peer_owned_identity(
     rule: &SourceNatRule,
     flow: SourceNatFlowKey,
@@ -63,11 +145,7 @@ fn reject_peer_owned_identity(
     now_ns: u64,
     holder: NatHolder,
 ) -> Option<SourceNatLookup> {
-    if rule.overlap_owners.is_none() {
-        return None;
-    }
-    std::sync::atomic::fence(Ordering::SeqCst);
-    if !rule.peer_holds_identity(translated.ip, translated.port) {
+    if !peer_owns_wire_identity(rule, flow, translated) {
         return None;
     }
     // Undo OUR reservation before failing, or the refused flow leaves a port
@@ -557,6 +635,16 @@ pub(crate) fn match_source_nat_result_for_tuple(
                             .reserve_address_only(flow, IpAddr::V4(pool_addr), NatHolder::Untracked)
                         {
                             Ok(translated) => {
+                                // #8115 R1: see the round-robin arms.
+                                if let Some(refused) = reject_peer_owned_address_only_identity(
+                                    rule,
+                                    flow,
+                                    translated,
+                                    now_ns,
+                                    NatHolder::Untracked,
+                                ) {
+                                    return refused;
+                                }
                                 return SourceNatLookup::Matched(NatDecision {
                                     rewrite_src: Some(translated.ip),
                                     rewrite_dst: None,
@@ -691,6 +779,14 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     };
                     match reserved {
                         Ok(translated) => {
+                            // #8115 R1: an address-only mint publishes a wire
+                            // identity too, so it owes the same peer-pool check
+                            // the PAT arms run.
+                            if let Some(refused) = reject_peer_owned_address_only_identity(
+                                rule, flow, translated, now_ns, holder,
+                            ) {
+                                return refused;
+                            }
                             return SourceNatLookup::Matched(NatDecision {
                                 rewrite_src: Some(translated.ip),
                                 rewrite_dst: None,
@@ -810,6 +906,14 @@ pub(crate) fn match_source_nat_result_for_tuple(
                     };
                     match reserved {
                         Ok(translated) => {
+                            // #8115 R1: an address-only mint publishes a wire
+                            // identity too, so it owes the same peer-pool check
+                            // the PAT arms run.
+                            if let Some(refused) = reject_peer_owned_address_only_identity(
+                                rule, flow, translated, now_ns, holder,
+                            ) {
+                                return refused;
+                            }
                             return SourceNatLookup::Matched(NatDecision {
                                 rewrite_src: Some(translated.ip),
                                 rewrite_dst: None,

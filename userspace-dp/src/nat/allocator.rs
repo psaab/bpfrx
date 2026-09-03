@@ -444,7 +444,11 @@ impl AddressOnlyReverseKey {
     /// re-keying them is not this change's business. The end-to-end release
     /// test binds this constructor against what
     /// `unlink_live_allocation_locked` removes.)
-    fn for_flow(flow: &SourceNatFlowKey, translated_ip: IpAddr, translated_port: u16) -> Self {
+    pub(super) fn for_flow(
+        flow: &SourceNatFlowKey,
+        translated_ip: IpAddr,
+        translated_port: u16,
+    ) -> Self {
         Self {
             protocol: flow.protocol,
             translated_ip,
@@ -1445,6 +1449,24 @@ impl PortAllocator {
             },
             None => false,
         }
+    }
+
+    /// #8115 R1: is this allocator holding the ADDRESS-ONLY reverse identity
+    /// `rkey`?
+    ///
+    /// The sibling of [`Self::holds_port`] for the OTHER ownership space. A
+    /// `port no-translation` / port-less flow claims no occupancy bit — its
+    /// token is an entry in `address_only_owners` — so `holds_port` answers
+    /// `false` for an address the allocator very much does own. #6979 F6 wired
+    /// only the bitmap question, which left both directions of the
+    /// address-only route open: a peer's preserved `X:P` did not stop a PAT
+    /// mint of `X:P`, and two address-only flows in different pools collided
+    /// whenever protocol and remote matched.
+    ///
+    /// Unlike the bitmap this key is REMOTE-SPECIFIC, so a match is an exact
+    /// wire-identity collision rather than a conservative one.
+    pub(crate) fn holds_address_only_identity(&self, rkey: &AddressOnlyReverseKey) -> bool {
+        self.lock_live().address_only_owners.contains_key(rkey)
     }
 
     /// Test-only alias of [`Self::holds_port`]. Kept as an ALIAS rather than a

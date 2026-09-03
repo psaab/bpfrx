@@ -14,25 +14,48 @@
 //!
 //! # What this covers, and what it does NOT
 //!
-//! COVERED: the LOCAL, port-translating (PAT) mint — v4 round-robin/persistent,
-//! v6 round-robin/persistent, and deterministic-v4 — where the occupancy bit is
-//! the ownership token.
+//! COVERED: every LOCAL mint, in BOTH ownership spaces.
+//!   - the port-translating (PAT) mint — v4 round-robin/persistent, v6
+//!     round-robin/persistent, and deterministic-v4 — where the occupancy bit
+//!     is the ownership token (#6979 F6);
+//!   - the ADDRESS-ONLY mint (`port no-translation`, port-less protocols) on
+//!     the same three arms, where the token is an `address_only_owners`
+//!     reverse-identity entry and NO occupancy bit is claimed (#8115 R1).
 //!
-//! NOT COVERED, and each is a separate route to the same duplicate rather than
-//! a rounding error (Codex round 1 on PR #8111):
-//!   - the ADDRESS-ONLY path (`port no-translation`, port-less protocols) mints
-//!     an `address_only_owners` reverse-identity token and claims NO occupancy
-//!     bit, so it is invisible to this query in both directions;
-//!   - the HA synced reserve (`synced.rs`) calls `reserve_flow` on one
-//!     allocator directly and never reaches this check, so an imported flow can
-//!     take a tuple a LOCAL flow already owns in a peer pool;
-//!   - NAT64 prefixes are their own allocators (`nat64.rs`) and are not indexed
-//!     here at all.
-//! All three are reachable only from the same tolerated / peer-synced /
-//! handcrafted population as the covered case (the Go #5144 strict gate rejects
-//! overlapping pools at commit) and are tracked as follow-up work.
+//! Both mints ask BOTH questions, through `peer_owns_wire_identity`. Wiring
+//! only the bitmap left the address-only route open in both directions: a peer
+//! preserving `X:P` toward a remote did not stop a PAT mint of `X:P` toward it,
+//! and two address-only flows in different pools collided whenever protocol and
+//! remote matched.
+//!
+//! The two questions are not equally precise. `peer_holds` is REMOTE-AGNOSTIC —
+//! an occupancy bit means "this allocator may publish `X:P`", not "toward this
+//! remote" — so refusing on it can decline a flow that is not a wire collision;
+//! that is F6's shipped posture and costs a PAT mint one port rotation.
+//! `peer_holds_address_only` is REMOTE-SPECIFIC (the key carries
+//! `dst_ip`/`dst_port`), so it over-rejects nothing.
+//!
+//! NOT COVERED, each a separate route to the same duplicate rather than a
+//! rounding error (Codex round 1 on PR #8111; tracked in #8115):
+//!   - R2, the HA synced reserve (`synced.rs`) calls `reserve_flow` /
+//!     `reserve_address_only` on one allocator directly and never reaches this
+//!     check, so an imported flow can take a tuple a LOCAL flow already owns in
+//!     a peer pool. It needs a DECISION rather than a patch: the synced path
+//!     exists to reproduce what the active node decided (#6211 pass 1), so it
+//!     must surface the conflict rather than simply refuse;
+//!   - R3, NAT64 prefixes are their own allocators (`nat64.rs`) and are not
+//!     indexed here at all.
+//! Both are reachable only from the same tolerated / peer-synced / handcrafted
+//! population as the covered case (the Go #5144 strict gate rejects overlapping
+//! pools at commit on address overlap alone). That population is real and
+//! verified, not hypothetical: `lenientCompileOpts` is wired at
+//! `configstore.Store` load and SyncApply, and unlike its `lenientNPTv6` /
+//! `lenientNAT64Prefix` siblings the dataplane does NOT reject the overlapping
+//! snapshot — the compiler's own doc records that it "installs with a LATENT
+//! reverse-index collision that persists until corrected".
 
 use super::*;
+use crate::nat::allocator::AddressOnlyReverseKey;
 
 /// One allocator that covers a pool address, and the index that address has in
 /// THAT allocator's occupancy vector.
@@ -107,6 +130,25 @@ impl PoolAddressOwners {
             !owner.allocator.same_allocator(own) && owner.allocator.holds_port(owner.index, port)
         })
     }
+
+    /// #8115 R1: is the ADDRESS-ONLY reverse identity `rkey` held by an
+    /// allocator OTHER than `own`?
+    ///
+    /// Indexed by `rkey.translated_ip` — the same shared-address key the bitmap
+    /// query uses, so a config with no overlapping pools builds no index and
+    /// this is never reached. The owner's stored `index` is NOT used: an
+    /// address-only token claims no occupancy bit, so its ownership is keyed by
+    /// the reverse identity alone.
+    fn peer_holds_address_only(&self, own: &PortAllocator, rkey: &AddressOnlyReverseKey) -> bool {
+        let owners = match rkey.translated_ip {
+            IpAddr::V4(v4) => self.v4.get(&v4),
+            IpAddr::V6(v6) => self.v6.get(&v6),
+        };
+        owners.into_iter().flatten().any(|owner| {
+            !owner.allocator.same_allocator(own)
+                && owner.allocator.holds_address_only_identity(rkey)
+        })
+    }
 }
 
 impl SourceNatRule {
@@ -118,6 +160,17 @@ impl SourceNatRule {
     pub(crate) fn peer_holds_identity(&self, addr: IpAddr, port: u16) -> bool {
         match &self.overlap_owners {
             Some(owners) => owners.peer_holds(&self.pool_allocator, addr, port),
+            None => false,
+        }
+    }
+
+    /// #8115 R1: is the ADDRESS-ONLY reverse identity `rkey` already owned by a
+    /// PEER pool's allocator?
+    ///
+    /// Same index, same `Option::is_none` fast path, other ownership space.
+    pub(crate) fn peer_holds_address_only_identity(&self, rkey: &AddressOnlyReverseKey) -> bool {
+        match &self.overlap_owners {
+            Some(owners) => owners.peer_holds_address_only(&self.pool_allocator, rkey),
             None => false,
         }
     }
