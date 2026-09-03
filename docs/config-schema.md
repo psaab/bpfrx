@@ -9640,6 +9640,67 @@ commit clean again; reverting the `parseBurstSizeLimit` delegation makes
 the overflow test go RED (the old inline multiply returned a wrapped
 nonzero, e.g. `20000000000000g` → `3729424098846048256`).
 
+### #8445 — firewall policer `then` terminal-vs-marking conflict (commit fail-closed)
+
+A policer's `then` block compiles into the SINGLE-VALUED
+`PolicerConfig.ThenAction`, last-write-wins. So a `then` carrying both
+`discard` and a marking action kept only whichever was written last, and
+the two orders do not merely differ in the marking — they differ in
+whether the rate limit exists at all:
+
+```
+then { discard; loss-priority high; }  ->  ThenAction "loss-priority high"
+                                       ->  DiscardExcess false
+                                       ->  policer METERS AND DROPS NOTHING
+then { loss-priority high; discard; }  ->  ThenAction "discard"
+                                       ->  DiscardExcess true, limit enforced
+```
+
+`buildPolicerSnapshots` (`pkg/dataplane/userspace/filters.go`) sets
+`DiscardExcess` only for exactly `"discard"`, and the Rust
+`build_single_rate_policer_state` then selects
+`ThreeColorTreatments::default()` — no drop — for everything else. So the
+first form is not a degraded rate limit; it is a **complete no-op that
+commits clean**.
+
+**Why reject rather than compose.** The dataplane enforces exactly one
+policer action. A marking action is METERED BUT NOT ACTED UPON — that
+function's own doc says "the marking action is not wired here" — so
+"drop the excess AND mark it" has no representation to compile to; a
+composing fix would have to invent the half that does not exist. It is
+also contradictory on its own terms: a discarded packet is not marked.
+
+**What the gate reads.** The AUTHORED action set
+(`PolicerConfig.ThenActions`, recorded in source order by the compile
+loop), not the survivor. A check on `ThenAction` cannot see the conflict
+— the compiled value IS what was authored, for one of the two
+statements. Recording the set was part of the fix, not an implementation
+detail.
+
+`validateFirewallPolicerThenConflictStrict` rejects a policer or
+three-color-policer whose `then` carries both `discard` and
+`loss-priority` / `forwarding-class`. Repeating the SAME action is a
+redundancy, not a conflict, and is allowed — mirroring
+`validateFilterTerminalConflictStrict` (#4375), whose shape this follows.
+`forwarding-class` is rejected alongside `discard` even though the
+compiler never acted on it: it is an action the operator wrote and the
+config silently dropped.
+
+Supported forms, named in the rejection message:
+
+- `then discard` alone — enforces the limit by dropping the excess.
+- `then loss-priority <level>` / `then forwarding-class <class>` alone —
+  **meters only**; this dataplane does not yet act on a policer marking
+  action. That limitation is pre-existing and out of scope here, but the
+  error names it so an operator is not left believing the marking-only
+  form rate-limits.
+
+Strict on commit / commit-check; lenient on load / peer-sync
+(`lenientPolicerThenConflict`, #1960 no-brick — the last-wins
+`ThenAction` drives the dataplane exactly as it did before the gate, so a
+leniently-loaded config is no worse off than before).
+
+
 ### #3043 — Security-policy missing/conflicting terminal action (commit fail-closed)
 
 `PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`:
