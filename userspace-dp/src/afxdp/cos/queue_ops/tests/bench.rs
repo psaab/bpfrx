@@ -78,7 +78,7 @@ use super::*;
 // rules out the inner drain loop as the limiter on this host.
 // ---------------------------------------------------------------------
 #[test]
-#[ignore]
+#[ignore = "MEASUREMENT: micro-benchmark, not an assertion — it prints a rate and rules the inner drain loop in or out as the limiter ON THIS HOST; run with --release --ignored --nocapture"]
 fn cos_exact_drain_throughput_micro_bench() {
     use std::time::Instant;
 
@@ -281,7 +281,7 @@ fn cos_exact_drain_throughput_micro_bench() {
 // Run: cargo test --release -p xpf-userspace-dp -- bench_pop_commit_settle_publish --nocapture --ignored
 // ---------------------------------------------------------------------
 #[test]
-#[ignore]
+#[ignore = "MEASUREMENT: micro-benchmark, not an assertion — it times the pop/commit/settle/publish cycle to locate the publish cost; run with --release --ignored --nocapture"]
 fn bench_pop_commit_settle_publish() {
     use std::time::Instant;
     const PACKET_LEN: usize = 1500;

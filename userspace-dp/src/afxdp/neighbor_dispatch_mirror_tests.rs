@@ -427,7 +427,7 @@
     /// and a `probe_due` evaluation. Plus one fresh `Vec<(i32, IpAddr)>` of the
     /// whole key set per sweep, and the sweep runs TWICE per poll iteration.
     #[test]
-    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    #[ignore = "MEASUREMENT: not an assertion; run with --ignored --nocapture"]
     fn measure_pending_neigh_sweep_cost_7156() {
         use std::time::Instant;
         let key_bytes = std::mem::size_of::<(i32, IpAddr)>();

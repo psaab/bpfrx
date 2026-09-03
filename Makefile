@@ -696,6 +696,18 @@ test-cluster-env-lib:
 # The mutation leg is the one that matters. A comparator with a broken band is
 # indistinguishable from a healthy one on every green run, and a loop is green
 # almost always -- only a mutation can see it. Hermetic; no cluster, no lock.
+# Census over `#[ignore]`d Rust cells (#8352). Every #[ignore] must carry a
+# reason that DECLARES its kind -- `MEASUREMENT: ...` (stays ignored) or
+# `#<issue>: ...` (comes back when that issue closes). With `gh` available it
+# also asserts every named issue is still OPEN, so closing the issue reds this
+# and whoever closed it must un-ignore the cell.
+.PHONY: ignored-cell-census test-ignored-cell-census-lib
+ignored-cell-census:
+	sh scripts/ignored-cell-census.sh --check-issues
+
+test-ignored-cell-census-lib:
+	bash ./test/incus/ignored-cell-census-selftest.sh
+
 test-harness-ledger-lib:
 	@bash ./test/incus/harness-result-selftest.sh
 	@bash ./test/incus/harness-ledger-mutation-selftest.sh

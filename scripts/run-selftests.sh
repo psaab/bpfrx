@@ -145,6 +145,8 @@ test/incus/harness-census-selftest.sh
 test/incus/harness-result.sh
 test/incus/harness-result-selftest.sh
 test/incus/harness-ledger-mutation-selftest.sh
+scripts/ignored-cell-census.sh
+test/incus/ignored-cell-census-selftest.sh
 "
 for s in $SH_SCRIPTS; do
 	[ -f "$s" ] || continue
@@ -349,6 +351,13 @@ run_bash test/incus/harness-result-selftest.sh
 # no amount of reading separates the two. Each cell removes one guard and
 # asserts the suite reds; an ESCAPED mutation is the report.
 run_bash test/incus/harness-ledger-mutation-selftest.sh
+# #8352: the ignored-cell census's own self-test. Hermetic -- fixture trees and
+# a MOCKED issue-state command, so the branch that carries the whole point (an
+# issue CLOSES and the census reds) is exercised without a network. Paired
+# cells throughout: a fixture that must fail and its nearly-identical twin that
+# must pass, because a census that reddened on everything would satisfy every
+# failure cell while being useless.
+run_bash test/incus/ignored-cell-census-selftest.sh
 
 # -- harness reachability census (#8302) --
 #
@@ -364,6 +373,25 @@ run_bash test/incus/harness-ledger-mutation-selftest.sh
 # POSIX (the #8153 interpreter census checks this).
 hdr "harness reachability census"
 run_shell scripts/harness-census.sh
+
+# -- ignored-cell census (#8352) --
+#
+# An `#[ignore]`d fail-until-fixed cell has no wake-up: `#[ignore]` is invisible
+# to `make test-rust`, so when the defect it documents is fixed the cell stays
+# ignored, stays green, and guards nothing forever. A green run with the cell
+# ignored is byte-identical to a green run with it passing.
+#
+# Two halves, deliberately. Checks (1) every #[ignore] carries a reason and (2)
+# every reason DECLARES its kind with a marker are a pure file scan and always
+# run. Check (3) -- the named issue is still OPEN, which is the wake-up -- needs
+# `gh`, so without it the script exits 77 and this leg SKIPs. It exits 1 rather
+# than 77 when the hermetic half failed, so a machine without gh keeps the
+# census instead of losing it to a blanket skip.
+#
+# `sh` is correct: the script declares #!/bin/sh and is POSIX (the #8153
+# interpreter census checks this).
+hdr "ignored-cell census"
+run_shell scripts/ignored-cell-census.sh --check-issues
 
 # -- interpreter census (#8153) --
 #

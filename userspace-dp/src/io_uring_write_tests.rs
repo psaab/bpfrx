@@ -732,7 +732,7 @@ fn drain_empty_is_noop() {
 /// during the storm that produces deferrals, none has. So this measures the
 /// accumulation directly rather than reasoning about it.
 #[test]
-#[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+#[ignore = "MEASUREMENT: not an assertion; run with --ignored --nocapture"]
 fn measure_teardown_residual_7106() {
     // Payload sizes of the two real ring users:
     //   slowpath.rs:590   ring.write(fd, bytes, false, "slow-path")  -- one packet
