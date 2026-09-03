@@ -72,10 +72,18 @@ pub(crate) struct WorkerBindShortfall {
 }
 
 /// Typed reconcile progress / outcome, replacing the free-form
-/// `last_reconcile_stage` string. Every variant renders a byte-identical
-/// legacy operator string via [`std::fmt::Display`] (the ONLY place the string
-/// is produced). `Default` is [`ReconcileStage::Idle`], matching the
+/// `last_reconcile_stage` string. [`std::fmt::Display`] is the ONLY place the
+/// string is produced. `Default` is [`ReconcileStage::Idle`], matching the
 /// constructor's `"idle"` seed.
+///
+/// Every variant renders its byte-identical legacy operator string EXCEPT
+/// `WorkerBindIncomplete`, which has been deliberately extended twice: #6245
+/// appended the explicit per-slot causes, and #7497 added the NIC coordinate to
+/// each cause. This sentence used to say "every variant" without the exception,
+/// which #6245 had already made false. Nothing parses these strings — they are
+/// operator diagnostics — so extending one is a decision about legibility, not
+/// a wire change; the exception is recorded here so the next editor knows the
+/// blanket claim is not the contract.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum ReconcileStage {
     /// Constructor seed. Renders `idle`.
@@ -210,9 +218,11 @@ fn render_binding_setup_failures(failures: &[BindingSetupFailure]) -> String {
         .iter()
         .map(|failure| {
             format!(
-                "{}:slot={}:{}",
+                "{}:slot={}:{}:q{}:{}",
                 failure.phase.as_str(),
                 failure.slot,
+                failure.interface,
+                failure.queue_id,
                 failure.reason
             )
         })
@@ -225,6 +235,79 @@ fn render_binding_setup_failures(failures: &[BindingSetupFailure]) -> String {
 mod tests {
     use super::*;
     use crate::afxdp::types::BindingSetupPhase;
+
+    /// #7497: the coordinate capture copies every field from the plan's status.
+    ///
+    /// This is what the renderer cell below CANNOT check. That one builds a
+    /// `BindingSetupFailure` directly, so it proves the string carries whatever
+    /// the failure holds — not that the failure holds the right thing. Measured:
+    /// replacing the interface capture with `String::new()` at the worker site
+    /// passed the entire Rust suite, because no cell reaches that code without a
+    /// real AF_XDP bind failure.
+    ///
+    /// Routing both sites through `BindingCoordinate::of` does not close that
+    /// gap completely — `of(&plan.status)` at the call site is still unproven —
+    /// but it moves the field-by-field copy somewhere a mutation reds, and
+    /// leaves each site a single expression that cannot read the wrong field
+    /// without being visibly wrong.
+    #[test]
+    fn binding_coordinate_copies_the_status_7497() {
+        let mut status = crate::protocol::BindingStatus::default();
+        status.slot = 9;
+        status.interface = "ge-7-0-2".to_string();
+        status.queue_id = 11;
+
+        let coord = crate::afxdp::types::BindingCoordinate::of(&status);
+        assert_eq!(coord.slot, 9, "slot not copied");
+        assert_eq!(coord.interface, "ge-7-0-2", "interface not copied");
+        assert_eq!(coord.queue_id, 11, "queue_id not copied");
+
+        // ...and the failure built at that coordinate carries all three through.
+        let failure = BindingSetupFailure::at(
+            &coord,
+            BindingSetupPhase::Private,
+            "Device or resource busy".to_string(),
+        );
+        assert_eq!(failure.slot, 9);
+        assert_eq!(failure.interface, "ge-7-0-2");
+        assert_eq!(failure.queue_id, 11);
+    }
+
+    /// #7497: a fail-closed bringup refusal must name the NIC coordinate, not
+    /// only the slot.
+    ///
+    /// Asserted as a PROPERTY rather than against a byte string. The pinned
+    /// legacy-string cells above would also red if the coordinate were dropped,
+    /// but they red on any format change at all, so they cannot say WHICH part
+    /// of the string is load-bearing. This one can: an operator hit by a total
+    /// outage has to learn which interface and which queue failed, because the
+    /// slot number moves whenever any interface's queue count changes and the
+    /// remedy (cap that NIC's queues, or find what else holds the socket) is
+    /// per-interface.
+    #[test]
+    fn bind_shortfall_names_the_nic_coordinate_7497() {
+        let rendered = ReconcileStage::WorkerBindIncomplete(WorkerBindShortfall {
+            worker_id: 2,
+            bound: Some(15),
+            planned: 16,
+            failures: vec![BindingSetupFailure {
+                slot: 9,
+                interface: "ge-7-0-2".to_string(),
+                queue_id: 11,
+                phase: BindingSetupPhase::Private,
+                reason: "Device or resource busy".to_string(),
+            }],
+        })
+        .to_string();
+
+        for needle in ["ge-7-0-2", "q11", "bound=15", "planned=16", "Device or resource busy"] {
+            assert!(
+                rendered.contains(needle),
+                "the fail-closed refusal must name {needle:?} — an operator cannot \
+                 act on a slot number. Got: {rendered}"
+            );
+        }
+    }
 
     /// #6245: the explicit-failure renderer is deterministic and never blank —
     /// empty input yields a "no explicit cause" marker, and populated input
@@ -241,12 +324,16 @@ mod tests {
 
         let one = [BindingSetupFailure {
             slot: 3,
+
+            interface: "ge-0-0-1".to_string(),
+
+            queue_id: 3,
             phase: BindingSetupPhase::Private,
             reason: "create binding umem: ENOMEM".to_string(),
         }];
         assert_eq!(
             render_binding_setup_failures(&one),
-            "failures=[private:slot=3:create binding umem: ENOMEM]",
+            "failures=[private:slot=3:ge-0-0-1:q3:create binding umem: ENOMEM]",
         );
 
         // Two failures (already slot-sorted by the producer) with distinct
@@ -254,18 +341,26 @@ mod tests {
         let many = [
             BindingSetupFailure {
                 slot: 1,
+
+                interface: "ge-0-0-1".to_string(),
+
+                queue_id: 1,
                 phase: BindingSetupPhase::Private,
                 reason: "a".to_string(),
             },
             BindingSetupFailure {
                 slot: 4,
+
+                interface: "ge-0-0-1".to_string(),
+
+                queue_id: 4,
                 phase: BindingSetupPhase::SharedFallback,
                 reason: "b".to_string(),
             },
         ];
         assert_eq!(
             render_binding_setup_failures(&many),
-            "failures=[private:slot=1:a; shared-fallback:slot=4:b]",
+            "failures=[private:slot=1:ge-0-0-1:q1:a; shared-fallback:slot=4:ge-0-0-1:q4:b]",
         );
     }
 
@@ -345,11 +440,19 @@ mod tests {
             .to_string(),
             "spawn_worker_failed:3:Resource temporarily unavailable (os error 11)"
         );
-        // #6245: the partial-bind (`Some`) variant now APPENDS the explicit
+        // #6245: the partial-bind (`Some`) variant APPENDS the explicit
         // per-slot binding-setup failures. This is the ONE variant whose
         // rendered string intentionally changes over the pre-#6245 legacy
-        // (the counts prefix is retained; the `:failures=[...]` cause is
-        // added) — byte-identical to #6245's original barrier string.
+        // (the counts prefix is retained; the `:failures=[...]` cause is added).
+        //
+        // #7497 extended it again: each cause now carries the NIC coordinate
+        // (`:<interface>:q<queue>`) between the slot and the reason. A slot is a
+        // position in the minted sequence with no external meaning, and since
+        // per-interface queue planning the slot -> (interface, queue) mapping
+        // moves whenever any interface's queue count changes — so an operator
+        // reading this fail-closed refusal could not tell WHICH queue failed.
+        // This is the loud blocker of #7497: the failure was always noticed,
+        // but it did not say enough to act on.
         assert_eq!(
             ReconcileStage::WorkerBindIncomplete(WorkerBindShortfall {
                 worker_id: 1,
@@ -357,12 +460,16 @@ mod tests {
                 planned: 1,
                 failures: vec![BindingSetupFailure {
                     slot: 1,
+
+                    interface: "ge-0-0-1".to_string(),
+
+                    queue_id: 1,
                     phase: BindingSetupPhase::Private,
                     reason: "create binding umem: ENOMEM".to_string(),
                 }],
             })
             .to_string(),
-            "worker_bind_incomplete:1:bound=0:planned=1:failures=[private:slot=1:create binding umem: ENOMEM]"
+            "worker_bind_incomplete:1:bound=0:planned=1:failures=[private:slot=1:ge-0-0-1:q1:create binding umem: ENOMEM]"
         );
         // A partial bind with no recorded cause still renders an explicit
         // no-cause marker (never a blank suffix).

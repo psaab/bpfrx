@@ -217,8 +217,61 @@ impl BindingSetupPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) struct BindingSetupFailure {
     pub(in crate::afxdp) slot: u32,
+    /// #7497: the NIC coordinate the slot was for. A slot number is a position
+    /// in the minted sequence with no external meaning, and since per-interface
+    /// queue planning the slot -> (interface, queue) mapping shifts whenever any
+    /// interface's queue count changes — so an operator reading a fail-closed
+    /// bringup refusal could not tell WHICH queue failed.
+    pub(in crate::afxdp) interface: String,
+    pub(in crate::afxdp) queue_id: u32,
     pub(in crate::afxdp) phase: BindingSetupPhase,
     pub(in crate::afxdp) reason: String,
+}
+
+/// #7497: the NIC coordinate of a binding, captured from its plan's status
+/// before the plan is moved into the bind call.
+///
+/// Exists so the capture is ONE named operation with a test behind it. The
+/// three fields were previously read individually at each failure site, which
+/// left the capture unguarded: emptying the interface there passed the entire
+/// suite, because every cell that renders a failure constructs one directly
+/// rather than going through a bind. Routing the capture through here does not
+/// make the call sites' `of(&plan.status)` provable — that still needs a real
+/// bind failure — but it reduces each site to one expression that cannot
+/// silently read the wrong field, and puts the field-by-field copy under test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct BindingCoordinate {
+    pub(in crate::afxdp) slot: u32,
+    pub(in crate::afxdp) interface: String,
+    pub(in crate::afxdp) queue_id: u32,
+}
+
+impl BindingCoordinate {
+    pub(in crate::afxdp) fn of(status: &crate::protocol::BindingStatus) -> Self {
+        Self {
+            slot: status.slot,
+            interface: status.interface.clone(),
+            queue_id: status.queue_id,
+        }
+    }
+}
+
+impl BindingSetupFailure {
+    /// Build a failure at a coordinate, so the three coordinate fields travel
+    /// together rather than being re-listed at each site.
+    pub(in crate::afxdp) fn at(
+        coord: &BindingCoordinate,
+        phase: BindingSetupPhase,
+        reason: String,
+    ) -> Self {
+        Self {
+            slot: coord.slot,
+            interface: coord.interface.clone(),
+            queue_id: coord.queue_id,
+            phase,
+            reason,
+        }
+    }
 }
 
 /// #6245: a shared-UMEM group whose group bind FAILED but which then RECOVERED

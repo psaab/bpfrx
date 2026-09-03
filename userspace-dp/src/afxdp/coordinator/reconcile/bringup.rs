@@ -756,6 +756,8 @@ fn spawn_workers(
                 .next()
                 .map(|slot| BindingSetupFailure {
                     slot,
+                    interface: "ge-0-0-1".to_string(),
+                    queue_id: slot,
                     phase: BindingSetupPhase::Private,
                     reason: "forced private bind failure (test seam #6245)".to_string(),
                 })
