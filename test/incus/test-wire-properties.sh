@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # xpf out-of-process on-wire properties test suite — Gate 1 (#8302)
 #
-# Verifies on-wire packet properties that unit tests structurally cannot:
+# Verifies on-wire transit properties that unit tests structurally cannot:
 #   1. PMTUD ICMP reflection (Type 3 Code 4) on DF=1 oversized transit packets.
-#   2. NPTv6 RFC 6296 1s-complement checksum neutrality across prefix translation.
+#   2. Dual-stack IPv6 transit and header forwarding across firewall zones.
 #
 # Strict Tri-State Exit Discipline (#8244):
 #   Exit 0:  PASS (positive evidence verified and all invariants held)
@@ -84,10 +84,10 @@ else
 	fail "PMTUD reflection violated: oversized packet dropped silently with no ICMP feedback"
 fi
 
-# ── Test 2: NPTv6 Connectivity & Header Integrity ─────────────────────
-echo "==> Gate 1.2: IPv6 reachability and header transit"
+# ── Test 2: Dual-Stack IPv6 Transit ───────────────────────────────────
+echo "==> Gate 1.2: Dual-stack IPv6 transit and header forwarding"
 if incus exec trust-host -- ping6 -c 1 -W 2 2001:559:8585:bf02::102 </dev/null &>/dev/null; then
-	pass "IPv6 end-to-end transit verified: trust-host -> untrust-host (2001:559:8585:bf02::102)"
+	pass "IPv6 transit confirmed: trust-host -> untrust-host (2001:559:8585:bf02::102)"
 else
 	fail "IPv6 transit failed: untrust-host unreachable on 2001:559:8585:bf02::102"
 fi

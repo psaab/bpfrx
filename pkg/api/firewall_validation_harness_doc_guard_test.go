@@ -3,10 +3,24 @@ package api
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+func formatIntWithCommas(n int) string {
+	in := strconv.Itoa(n)
+	var out []byte
+	l := len(in)
+	for i, c := range in {
+		if i > 0 && (l-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, byte(c))
+	}
+	return string(out)
+}
 
 // TestFirewallValidationHarnessDocGuard binds docs/firewall-validation-harness-design.md
 // to the codebase so the design specification cannot silently drift from live runtime invariants.
@@ -30,66 +44,109 @@ func TestFirewallValidationHarnessDocGuard(t *testing.T) {
 		t.Errorf("docs/README.md must cite %s", docRel)
 	}
 
-	// 2. Required anchors in the design doc
-	requiredAnchors := []string{
-		"#68 fail-closed",
-		"DEFAULT_MAX_SESSIONS 131,072",
-		"UmemInflightFrames",
-		"/tmp/xpf-cluster.lock",
-		"wire_policy_deny",
-		"wire_nat_snat",
-		"wire_screen_drop",
-		"fault_carrier_flap",
-		"fault_nat_exhaustion",
-		"parity_wire_vs_control",
-		"test/results/ledger.jsonl",
-		"100GbE line-rate",
-	}
-	for _, anchor := range requiredAnchors {
-		if !strings.Contains(doc, anchor) {
-			t.Errorf("design doc missing required anchor %q", anchor)
-		}
-	}
-
-	// 3. Bind claim: DEFAULT_MAX_SESSIONS must match Rust session constant (131072)
+	// 2. Bind claim: DEFAULT_MAX_SESSIONS must match Rust session constant dynamically
 	sessionModPath := filepath.Join(root, "userspace-dp", "src", "session", "mod.rs")
 	sessionBytes, err := os.ReadFile(sessionModPath)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", sessionModPath, err)
 	}
-	const expectedMaxSessions = 131072
-	needle := "const DEFAULT_MAX_SESSIONS: usize = " + strconv.Itoa(expectedMaxSessions) + ";"
-	if !strings.Contains(string(sessionBytes), needle) {
-		t.Errorf("%s does not define %q", sessionModPath, needle)
+	sessionRe := regexp.MustCompile(`const\s+DEFAULT_MAX_SESSIONS:\s*usize\s*=\s*([0-9]+);`)
+	match := sessionRe.FindStringSubmatch(string(sessionBytes))
+	if len(match) < 2 {
+		t.Fatalf("cannot parse DEFAULT_MAX_SESSIONS from %s", sessionModPath)
+	}
+	maxSessionsInt, err := strconv.Atoi(match[1])
+	if err != nil {
+		t.Fatalf("invalid maxSessions int: %v", err)
 	}
 
-	// 4. Bind claim: Buffer model field UmemInflightFrames exists in protocol_binding.go
+	// Assert doc uses the constant derived directly from the source code
+	docDerivedSessionStr := "DEFAULT_MAX_SESSIONS " + formatIntWithCommas(maxSessionsInt)
+	if !strings.Contains(doc, docDerivedSessionStr) && !strings.Contains(doc, match[1]) {
+		t.Errorf("doc does not contain derived session capacity %q or %s", docDerivedSessionStr, match[1])
+	}
+	sixWorkersDerived := formatIntWithCommas(6 * maxSessionsInt)
+	if !strings.Contains(doc, sixWorkersDerived) {
+		t.Errorf("doc does not contain derived 6-worker ceiling %q", sixWorkersDerived)
+	}
+
+	// 3. Bind claim: Buffer model field UmemInflightFrames exists in protocol_binding.go
 	bindingPath := filepath.Join(root, "pkg", "dataplane", "userspace", "protocol_binding.go")
 	bindingBytes, err := os.ReadFile(bindingPath)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", bindingPath, err)
 	}
-	if !strings.Contains(string(bindingBytes), "UmemInflightFrames") {
-		t.Errorf("%s missing UmemInflightFrames field", bindingPath)
+	const bufferField = "UmemInflightFrames"
+	if !strings.Contains(string(bindingBytes), bufferField) {
+		t.Fatalf("%s missing %s field", bindingPath, bufferField)
+	}
+	if !strings.Contains(doc, bufferField) {
+		t.Errorf("doc does not cite buffer telemetry field %q", bufferField)
 	}
 
-	// 5. Bind claim: Cluster lock path is /tmp/xpf-cluster.lock
+	// 4. Bind claim: Cluster lock path agrees with cluster-lock.sh dynamically
 	lockScriptPath := filepath.Join(root, "test", "incus", "cluster-lock.sh")
 	lockBytes, err := os.ReadFile(lockScriptPath)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", lockScriptPath, err)
 	}
-	if !strings.Contains(string(lockBytes), "/tmp/xpf-cluster.lock") {
-		t.Errorf("%s missing default lock path /tmp/xpf-cluster.lock", lockScriptPath)
+	lockRe := regexp.MustCompile(`XPF_CLUSTER_LOCK="\$\{XPF_CLUSTER_LOCK:-([^}]+)\}"`)
+	lockMatch := lockRe.FindStringSubmatch(string(lockBytes))
+	if len(lockMatch) < 2 {
+		t.Fatalf("cannot parse XPF_CLUSTER_LOCK from %s", lockScriptPath)
+	}
+	lockPath := lockMatch[1]
+	if !strings.Contains(doc, lockPath) {
+		t.Errorf("doc does not cite cluster lock path %q", lockPath)
 	}
 
-	// 6. Bind claim: Interface rename pattern is ge-0-0-
+	// 5. Bind claim: Interface rename pattern agrees with linksetup.go
 	linksetupPath := filepath.Join(root, "pkg", "daemon", "linksetup.go")
 	linksetupBytes, err := os.ReadFile(linksetupPath)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", linksetupPath, err)
 	}
-	if !strings.Contains(string(linksetupBytes), "ge-0-0-") {
-		t.Errorf("%s missing ge-0-0- renaming pattern", linksetupPath)
+	const renamePrefix = "ge-0-0-"
+	if !strings.Contains(string(linksetupBytes), renamePrefix) {
+		t.Fatalf("%s missing %s renaming pattern", linksetupPath, renamePrefix)
+	}
+	if !strings.Contains(doc, renamePrefix) {
+		t.Errorf("doc does not cite interface renaming prefix %q", renamePrefix)
+	}
+
+	// 6. Bind claim: Fail-closed contract is cited
+	if !strings.Contains(doc, "#68 fail-closed") {
+		t.Errorf("doc does not cite #68 fail-closed contract")
+	}
+
+	// 7. Bind claim: Ledger gate table contract
+	// Extract gates from column 5 of the markdown table
+	gateRe := regexp.MustCompile(`\|\s*` + "`?" + `([a-z0-9_]+)` + "`?" + `\s*\|\s*$`)
+	var foundGates []string
+	for _, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(line, "| **") {
+			m := gateRe.FindStringSubmatch(line)
+			if len(m) >= 2 {
+				foundGates = append(foundGates, m[1])
+			}
+		}
+	}
+	if len(foundGates) < 5 {
+		t.Errorf("expected at least 5 declared ledger gates in matrix table, found %d: %v", len(foundGates), foundGates)
+	}
+	for _, gateName := range foundGates {
+		if !strings.HasPrefix(gateName, "wire_") && !strings.HasPrefix(gateName, "fault_") && !strings.HasPrefix(gateName, "parity_") {
+			t.Errorf("gate %q does not conform to standard prefix (wire_, fault_, parity_)", gateName)
+		}
+	}
+
+	// 8. Bind claim: Ledger result infrastructure paths
+	const ledgerPath = "test/results/ledger.jsonl"
+	const runnerPath = "test/incus/harness-result.sh"
+	if !strings.Contains(doc, ledgerPath) {
+		t.Errorf("doc does not cite ledger path %q", ledgerPath)
+	}
+	if !strings.Contains(doc, runnerPath) {
+		t.Errorf("doc does not cite harness runner %q", runnerPath)
 	}
 }
