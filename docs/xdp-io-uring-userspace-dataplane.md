@@ -481,6 +481,18 @@ also used by the state writer. Its `WriteMode` (`IoUring(RingWriter)` |
   behaviour. The old code returned at the ceiling and let the caller free the
   buffer with the SQE possibly still in flight (a UAF-class
   disclosure/corruption); the fix moves ownership instead of weakening lifetime.
+- **Per-SQE length clamp (#7751 row 12).** `io_uring_sqe.len` is a `u32`, so one
+  `Write` SQE cannot describe more than `MAX_SQE_WRITE_LEN` (`u32::MAX`) bytes.
+  `write_all` CLAMPS each SQE to that ceiling rather than narrowing the length
+  with an `as` cast. The distinction matters because a silent `usize -> u32`
+  truncation is not a short write: for a remaining length that is an exact
+  multiple of 2^32 it yields **0**, the kernel completes a 0-byte write,
+  `offset += 0`, and the `while offset < len` loop never advances — a livelock,
+  not a lost byte. Clamping is sound here precisely because the loop already
+  resumes at `offset + n` (a file, and the TUN stream, are byte streams). The
+  cap is injected via `write_all_capped` so the split path is testable with a
+  4-byte cap instead of a 4 GiB allocation.
+
 - **Per-call fallback (#2477).** An io_uring failure that put NOTHING on the TUN
   (`WriteResult::NothingWritten`) hands the owned buffer back and is rescued by a
   synchronous write of the SAME packet — the frame is still deliverable. A
