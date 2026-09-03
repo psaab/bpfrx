@@ -43,6 +43,14 @@ func TestRetryOwnerGaugesTrackTheirFn7615(t *testing.T) {
 			"management listener", "xpf_management_listener_down",
 			func(s *Server, v bool) { s.managementListenerDownFn = func() bool { return v } },
 		},
+		{
+			// #7685: the sixth owner. Its debt is NOT "the kernel drifted" —
+			// that is expected after a link flap and self-corrects on the next
+			// tick — but a CONFIGURED proxy-arp interface whose netdev does not
+			// resolve, which persists until the interface exists.
+			"proxy-arp unresolved", "xpf_proxy_arp_unresolved_pending",
+			func(s *Server, v bool) { s.proxyARPUnresolvedFn = func() bool { return v } },
+		},
 	} {
 		for _, leg := range []struct {
 			owed bool
@@ -75,6 +83,7 @@ func TestRetryOwnerGaugesAreOptional7615(t *testing.T) {
 		"xpf_ra_dead_sender_pending",
 		"xpf_fabric_overlay_missing",
 		"xpf_management_listener_down",
+		"xpf_proxy_arp_unresolved_pending",
 	} {
 		if _, ok := gatherSingleSample7615(t, s, name); ok {
 			t.Errorf("%s was emitted with no fn wired; an unwired node publishes a "+

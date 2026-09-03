@@ -307,7 +307,10 @@ type Config struct {
 	// two above. Each reports whether its loop currently owes a repair; nil on
 	// a server that does not wire it, in which case the series is OMITTED
 	// rather than published as an authoritative 0.
-	RADeadSenderPendingFn    func() bool
+	RADeadSenderPendingFn func() bool
+	// ProxyARPUnresolvedFn reports whether a configured proxy-arp interface
+	// failed to resolve on the most recent reconcile (#7685). Same nil contract.
+	ProxyARPUnresolvedFn     func() bool
 	FabricOverlayMissingFn   func() bool
 	ManagementListenerDownFn func() bool
 	// SchedulerRepublishFailedFn reports whether the most recent
@@ -490,6 +493,7 @@ type Server struct {
 	managedServiceReloadOwedFn           func() map[string]bool
 	managedServiceReloadFailuresFn       func() map[string]uint64
 	raDeadSenderPendingFn                func() bool
+	proxyARPUnresolvedFn                 func() bool
 	fabricOverlayMissingFn               func() bool
 	managementListenerDownFn             func() bool
 	schedulerRepublishFailedFn           func() bool
@@ -605,6 +609,7 @@ func NewServer(cfg Config) *Server {
 		managedServiceReloadOwedFn:           cfg.ManagedServiceReloadOwedFn,
 		managedServiceReloadFailuresFn:       cfg.ManagedServiceReloadFailuresFn,
 		raDeadSenderPendingFn:                cfg.RADeadSenderPendingFn,
+		proxyARPUnresolvedFn:                 cfg.ProxyARPUnresolvedFn,
 		fabricOverlayMissingFn:               cfg.FabricOverlayMissingFn,
 		managementListenerDownFn:             cfg.ManagementListenerDownFn,
 		schedulerRepublishFailedFn:           cfg.SchedulerRepublishFailedFn,

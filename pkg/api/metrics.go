@@ -252,6 +252,7 @@ type xpfCollector struct {
 	// owes a repair, so a node re-driving a failing recovery stops looking
 	// identical to a healthy one.
 	raDeadSenderPending    *prometheus.Desc
+	proxyARPUnresolved     *prometheus.Desc
 	fabricOverlayMissing   *prometheus.Desc
 	managementListenerDown *prometheus.Desc
 
@@ -852,6 +853,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.managedServiceReloadPending
 	ch <- c.managedServiceReloadFailures
 	ch <- c.raDeadSenderPending
+	ch <- c.proxyARPUnresolved
 	ch <- c.fabricOverlayMissing
 	ch <- c.managementListenerDown
 	ch <- c.configPersistDegraded
@@ -1271,6 +1273,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		desc *prometheus.Desc
 	}{
 		{c.srv.raDeadSenderPendingFn, c.raDeadSenderPending},
+		{c.srv.proxyARPUnresolvedFn, c.proxyARPUnresolved},
 		{c.srv.fabricOverlayMissingFn, c.fabricOverlayMissing},
 		{c.srv.managementListenerDownFn, c.managementListenerDown},
 	} {

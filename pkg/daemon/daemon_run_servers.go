@@ -465,6 +465,7 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		// blind as before (#6852), which is why these assignments are pinned by
 		// a source-level cell.
 		RADeadSenderPendingFn:    d.RADeadSenderPending,
+		ProxyARPUnresolvedFn:     d.ProxyARPUnresolved,
 		FabricOverlayMissingFn:   d.FabricOverlayMissing,
 		ManagementListenerDownFn: d.ManagementListenerDown,
 		// #3780: surface scheduler republish-failure so

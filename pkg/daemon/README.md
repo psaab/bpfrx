@@ -2519,14 +2519,38 @@ never lock an operator out of a remote box it manages.
   could report 0 while the loop was still re-driving, and both halves would look
   correct alone. Emitted before the dataplane gate (these repairs all run in
   config-only mode) and OMITTED rather than published as `0` when unwired
-  (#6828). `proxyARPReassertLoop` is deliberately absent: it keeps no debt and
-  re-runs its reconcile unconditionally, so a gauge could only report a
-  constant; giving it a real signal needs a predicate invented first, tracked as
-  **#7685**. Tests: `pkg/api/metrics_retry_owner_visibility_7615_test.go`
+  (#6828). Tests: `pkg/api/metrics_retry_owner_visibility_7615_test.go`
   (paired per gauge through a pedantic registry, plus the absent-vs-zero
   contract) and `pkg/daemon/retry_owner_visibility_7615_test.go` (the
   source-level wiring cell, and a cell binding each accessor to its loop's own
   gate in both directions).
+
+  **The sixth owner joined in #7685, by a different predicate than expected.**
+  `proxyARPReassertLoop` was left out of #7615 because it keeps no debt — it
+  re-runs its reconcile unconditionally every tick — and the follow-up assumed
+  the missing signal was drift detection: read the per-interface
+  `proxy_arp`/`proxy_ndp` sysctl before writing and report when it disagreed.
+  That is the wrong signal. **Drift is expected**: a link DOWN/UP outside a
+  commit re-defaults the sysctl, and the loop corrects it on the next tick, so a
+  gauge reads false except inside a 30 s window a scrape rarely catches, and a
+  counter reports a routine event — the metric operators learn to ignore.
+
+  The reconcile already held a real debt, and the code already called it that.
+  A **configured** proxy-arp interface whose Linux netdev does not resolve is
+  retained rather than torn down (#6536, `retainUnresolvedProxyResponders`),
+  with a log line naming it debt. That condition does **not** self-heal on the
+  next tick — it persists until the interface exists — and while it holds the
+  responder is not answering on a node whose commit reported success. That is
+  published as `ProxyARPUnresolved` / `xpf_proxy_arp_unresolved_pending`.
+
+  It costs nothing on the path the loop's design depends on: `proxyARPIfaceMap`
+  is not called at all when no proxy-arp is configured, so the added tracking
+  performs zero interface lookups there — measured by a cell that counts
+  resolver calls, with a positive control proving the counter can move. The
+  value is the one the reconcile computed, stored rather than recomputed, so the
+  gauge and the reconcile cannot disagree; and it is cleared when proxy-arp is
+  unconfigured, since a signal that keeps firing after the fix gets muted. Tests:
+  `pkg/daemon/proxyarp_unresolved_debt_7685_test.go`.
 
   **sshd is the third instance, and the one the "already covered" reading
   misses.** `applySSHConfig`'s UPDATE path does have a retry owner: #2062's

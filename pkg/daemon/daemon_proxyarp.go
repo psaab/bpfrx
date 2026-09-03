@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sort"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -171,6 +172,11 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	d.proxyARPEnabledMu.Unlock()
 
 	if !hasEntries && len(priorNames) == 0 {
+		// #7685: nothing configured and nothing installed — no debt is possible,
+		// so clear any retained from a prior config. Without this a commit that
+		// REMOVES proxy-arp leaves the gauge latched on an interface nobody is
+		// asking for any more.
+		d.setProxyARPUnresolved(nil)
 		return
 	}
 
@@ -181,6 +187,11 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 	if hasEntries {
 		ifaceMap, ifaceNames, unresolved = proxyARPIfaceMap(cfg)
 	}
+	// #7685: retain the debt this pass observed. Set on EVERY completing pass,
+	// including the teardown pass where hasEntries is false and unresolved is
+	// therefore empty, so the value always describes the latest reconcile rather
+	// than the last one that happened to find something.
+	d.setProxyARPUnresolved(unresolved)
 
 	// Always run the reconcile: even with zero configured entries it sweeps the
 	// orphaned NTF_PROXY entries on the prior interfaces (desired is empty
@@ -356,4 +367,32 @@ func (d *Daemon) reassertProxyARPOnce(ctx context.Context) {
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		proxyARPReconcileFn(d, cfg)
 	}
+}
+
+// setProxyARPUnresolved records the configured proxy-arp interfaces whose
+// kernel identity did not resolve on this reconcile pass (#7685). Copies rather
+// than aliasing the caller's slice: `unresolved` is reused by
+// retainUnresolvedProxyResponders on the same pass, and a retained alias would
+// let the published debt change under a reader.
+func (d *Daemon) setProxyARPUnresolved(unresolved []string) {
+	d.proxyARPEnabledMu.Lock()
+	if len(unresolved) == 0 {
+		d.proxyARPUnresolved = nil
+	} else {
+		d.proxyARPUnresolved = append([]string(nil), unresolved...)
+	}
+	d.proxyARPEnabledMu.Unlock()
+}
+
+// proxyARPUnresolvedNames returns those interfaces, sorted, for the operator
+// signal. Allocation-free on the healthy path (nil debt returns nil).
+func (d *Daemon) proxyARPUnresolvedNames() []string {
+	d.proxyARPEnabledMu.Lock()
+	defer d.proxyARPEnabledMu.Unlock()
+	if len(d.proxyARPUnresolved) == 0 {
+		return nil
+	}
+	out := append([]string(nil), d.proxyARPUnresolved...)
+	sort.Strings(out)
+	return out
 }
