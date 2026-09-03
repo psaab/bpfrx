@@ -52,7 +52,7 @@ type interfaceRangeDef struct {
 // cannot be expanded, a range with no members). It is a no-op — returning nil
 // and leaving the tree byte-identical — when there is no interface-range
 // stanza, so a config without the construct is unaffected.
-func expandInterfaceRanges(tree *ConfigTree) []string {
+func expandInterfaceRanges(tree *ConfigTree) ([]string, error) {
 	// #5675: union across EVERY top-level `interfaces` root, not just the first.
 	// A hierarchical config can split its interfaces across two sibling
 	// `interfaces { }` stanzas, and compileSections compiles them all — so if
@@ -61,7 +61,7 @@ func expandInterfaceRanges(tree *ConfigTree) []string {
 	// dropping the range's shared config for its members.
 	ifaceRoots := tree.FindChildren("interfaces")
 	if len(ifaceRoots) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Separate interface-range definitions from real interface children, across
@@ -100,13 +100,32 @@ func expandInterfaceRanges(tree *ConfigTree) []string {
 	}
 	if !sawRange {
 		// No interface-range stanza present — leave the tree untouched.
-		return nil
+		return nil, nil
 	}
 	// Strip every interface-range node (in every root) so the range name is
 	// never compiled as a phantom interface, even if the stanza was malformed
 	// and yielded no expandable range.
 	for ri, ifaces := range ifaceRoots {
 		ifaces.Children = keptByRoot[ri]
+	}
+
+	// #8438 TOTAL EXPANSION BUDGET. Debited by BOTH spellings, across every
+	// range, and checked BEFORE any statement is replayed — see the constant's
+	// comment for the measurements that set the number and for why a
+	// member-COUNT cap does not bound the cost.
+	if total, over := interfaceRangeExpansionCost(ranges); over {
+		return append(warnings, fmt.Sprintf(
+				"interfaces interface-range: total expansion of %d statement applications "+
+					"across %d range(s) exceeds the %d limit; no interface-range was expanded "+
+					"(each range costs members x shared-statements: a 4096-member range with 6 "+
+					"shared statements takes 78s to compile, and the cost grows faster than "+
+					"linearly in both)",
+				total, len(ranges), interfaceRangeMaxExpansion)),
+			fmt.Errorf(
+				"interfaces interface-range: total expansion of %d statement applications "+
+					"across %d range(s) exceeds the %d limit; reduce the member lists or the "+
+					"shared configuration (cost is members x shared-statements per range)",
+				total, len(ranges), interfaceRangeMaxExpansion)
 	}
 
 	// Build the ordered, de-duplicated member set and, per member, the
@@ -170,7 +189,7 @@ func expandInterfaceRanges(tree *ConfigTree) []string {
 			}
 		}
 	}
-	return warnings
+	return warnings, nil
 }
 
 // parseHierInterfaceRange parses a hierarchical `interface-range <name> { ... }`
@@ -340,4 +359,79 @@ func flattenNodesToPaths(nodes []*Node, prefix []string) [][]string {
 		out = append(out, flattenNodesToPaths(c.Children, path)...)
 	}
 	return out
+}
+
+// interfaceRangeMaxExpansion bounds the TOTAL interface-range expansion work in
+// one config — every range, both spellings, one budget (#8438).
+//
+// WHY A MEMBER-COUNT CAP IS NOT ENOUGH. The obvious guard, and the one the
+// issue proposed by pointing at the sibling `member-range` cap, is a limit on
+// the number of members. Measured on this tree, that does not bound the cost:
+//
+//	members  shared stmts  compile
+//	  2,000       1          0.4 s
+//	  4,096       1          1.4 s
+//	  4,096       3         23.2 s
+//	  4,096       6         77.9 s
+//	  2,000      20        268   s
+//
+// A 4096-MEMBER cap admits every row above: 4096 members with six shared
+// statements — an mtu, a description, a unit with an address — is a 78-second
+// commit that a member-count guard waves through. The cost is driven by the
+// PRODUCT, members x shared-statements, because each statement is replayed
+// through ConfigTree.SetPath under each member and SetPath locates the member
+// by a linear scan of the `interfaces` root, which by then holds every member.
+// A CPU profile of the expansion is 100% SetPathQuotedGrouped, 55% of it in
+// keysEqual/memeqbody. So the budget debits that product, not the member count.
+//
+// WHY 4096. It is the number the sibling per-range `member-range` cap already
+// ships (interfaceRangeMaxMembers), so the two guards state one limit rather
+// than two; and it bounds the worst admitted case at ~1.4 s (the 4,096 x 1 row).
+// It is enormously generous against real configuration: the largest
+// interface-range anywhere in this tree — fixtures included — is 23 members,
+// and no shipped .conf uses the construct at all. A 23-member range would need
+// 178 shared statements to reach the limit.
+//
+// WHAT AN OPERATOR SEES ON EXCEEDING IT. At commit / commit-check, a hard
+// rejection naming the total, the number of ranges and the limit. On the
+// tolerant load / peer-sync path, the same text as a warning and NO expansion:
+// the members simply do not materialize. Warn-and-expand-anyway was rejected as
+// the tolerant disposition because the harm here IS the expansion — a config
+// that reached the store this way would otherwise stall the peer and every
+// subsequent boot for minutes to hours, which is the availability failure the
+// guard exists to stop. Skipping matches what the shipped `member-range` cap
+// already does with an over-limit range ("ignored" with a warning).
+//
+// The count cannot diverge between cluster nodes, so this cannot reject on one
+// node and accept on its peer (the sync-wedging shape): expansion cost is a
+// property of the statement list, and the per-node mechanisms — apply-groups
+// and ${node} substitution — rewrite member NAMES without changing how many
+// statements there are. Measured both: identical counts on node 0 and node 1.
+const interfaceRangeMaxExpansion = 4096
+
+// interfaceRangeExpansionCost totals the expansion work across every range and
+// reports whether it exceeds the budget. The cost of one range is its member
+// count times its shared-statement count — the number of SetPath replays it
+// will drive. A range with no shared statements still debits its members (it
+// still costs the per-member node sweep), hence the floor of 1.
+//
+// Accumulation is short-circuited so a hostile input cannot overflow the
+// counter on the way to being rejected: once the running total is over the
+// budget the answer cannot change, since every remaining term is non-negative.
+func interfaceRangeExpansionCost(ranges []interfaceRangeDef) (int, bool) {
+	total := 0
+	for _, rd := range ranges {
+		perMember := len(rd.shared)
+		if perMember < 1 {
+			perMember = 1
+		}
+		if len(rd.members) > interfaceRangeMaxExpansion/perMember {
+			return interfaceRangeMaxExpansion + 1, true
+		}
+		total += len(rd.members) * perMember
+		if total > interfaceRangeMaxExpansion {
+			return total, true
+		}
+	}
+	return total, false
 }
